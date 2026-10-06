@@ -68,3 +68,33 @@ received-byte identity and truthful document acknowledgement. Its manifest
 specifies the prerequisite ingress patch and before/after hashes. Apply and
 verify the ingress layer before this overlay. See `docs/file-transport.md` for
 the input-staging contract and remaining live integration requirements.
+
+## Authenticated plugin controls
+
+`patches/hermes/gateway-controls.patch` follows the context, ingress, bounded
+file-transfer and gateway work/delivery overlays in that order. Its manifest
+pins every prerequisite and changed file. Apply only in a separately owned
+checkout; compare before/after hashes as described above.
+
+An in-process plugin may register a command with `gateway_control=True` after
+its own profile explicitly grants `allow_gateway_control: true`. Both native
+busy guards dispatch the control through the existing gateway executor.
+`ctx.get_command_context()` exposes a detached, invocation-scoped snapshot of
+the authorized originating bot, user, chat, topic and canonical profile. The
+consumer must still match this proof against the original owned task. A valid
+control does not grant a new worker, deadline, destination or workspace.
+
+Missing provenance, revoked consent, shutdown, draining, handler failures and
+unloaded registrations refuse recognized controls without passing their text
+to the model or interrupting an unrelated agent. The native emergency-pause
+policy remains in force. Retired names stay reserved in their owning profile;
+another profile's ordinary command retains its meaning. The invocation proof
+expires on completion, cancellation or unload. Process-isolated plugin hosts
+cannot claim this gateway capability.
+
+Independent component review verified 123 controls and the exact cumulative
+five-overlay result: 47 affected files. The parent ran 155 affected native tests
+and all eleven repository checks. These are offline component observations.
+The concrete Friday consumer, built-in `/stop` and `/new` forwarding, live
+Telegram authorization and actual worker cessation remain separate integration
+and release gates. Registration or a control reply alone proves no stop.

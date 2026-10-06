@@ -1,0 +1,980 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -4075,12 +4075,11 @@
+         # calling the message handler directly and sending the response.  Do NOT use
+         # _process_message_background — it manages session lifecycle and its cleanup
+         # races with the running task (split-brain, see PR #4926).
+-        # Certain commands must bypass the active-session guard and be dispatched directly to the gateway
+-        # runner. Without this, they are queued as pending messages and either: See #4926.
+         self._canonicalize(event.source)  # identity FIRST (direct callers may skip handle_message)
+         cmd = event.get_command()
+-        from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
+-        if should_bypass_active_session(cmd):
++        from hermes_cli.commands import is_interrupt_then_dispatch
++        from gateway.run_plugin_commands import should_dispatch_inline
++        if should_dispatch_inline(event):
+             try:
+                 # /stop, /new, /reset: cancel + response + drain; other bypasses don't cancel.
+                 if cmd and is_interrupt_then_dispatch(cmd):
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -1293,18 +1293,15 @@
+         if not is_internal:
+             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
+             record_gateway_slash_command(event)
+-        # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
+-        # not on the adapter's raw inbound: profile routing, the ignored-channel
+-        # guard, plugin hooks and user authorization all reject events above,
+-        # and a rejected event must not be able to clear a refusal belonging to
+-        # an active turn. This is also the single entry point every lane shares
+-        # — Discord interaction passthrough builds its own MessageEvent and
+-        # calls handle_message directly, so a teardown on the relay's inbound
+-        # handler left those turns muted.
+-
+         _paused_notice = self._hm_estop_gate(event, source, is_internal)
+         if _paused_notice is not None:
+             return _paused_notice
++
++        # Controls retain native pause policy and require no new agent/session.
++        from gateway.run_plugin_commands import dispatch_control
++        _control_handled, _control_reply = await dispatch_control(self, event, source)
++        if _control_handled:
++            return _control_reply
+ 
+         _quick_key = self._session_key_for_source(source)
+         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
+diff --git a/gateway/run_plugin_commands.py b/gateway/run_plugin_commands.py
+new file mode 100644
+--- /dev/null
++++ b/gateway/run_plugin_commands.py
+@@ -0,0 +1,185 @@
++"""Opt-in plugin controls on the existing authorized inline command path."""
++from __future__ import annotations
++
++import asyncio
++import logging
++import inspect
++
++from gateway.session_identity import identity_of
++
++logger = logging.getLogger(__name__)
++_REFUSED = "Plugin control unavailable."
++
++
++def _control_managers():
++    # Read existing registrations only: intake must never load plugins or select an
++    # ambient profile.
++    from hermes_cli import plugins
++    with plugins._plugin_managers_lock:
++        managers = list(plugins._plugin_managers_by_home.values())
++        if plugins._plugin_manager is not None and plugins._plugin_manager not in managers:
++            managers.append(plugins._plugin_manager)
++    return managers
++
++
++def _control_entries(name):
++    return [(manager, entry) for manager in _control_managers()
++            if (entry := manager._plugin_commands.get(name)) and entry.get("gateway_control") is True]
++
++
++def is_control_candidate(event):
++    name = (event.get_command() or "").replace("_", "-")
++    if not name:
++        return False
++    from hermes_cli.commands import resolve_command
++    if resolve_command(name) is not None:
++        return False  # Native owner controls always keep their existing meaning.
++    # The per-profile manager retains names after disposal/unload. A fresh
++    # message for a retired control must refuse, never steer/interrupt an agent.
++    from hermes_constants import hermes_home_key
++    identity = identity_of(event.source)
++    managers = _control_managers()
++    if identity is not None:
++        scope = hermes_home_key(identity.runtime_home)
++        managers = [manager for manager in managers if manager.scope_key == scope]
++    # Missing native identity cannot authorize execution; recognize known names
++    # conservatively so malformed controls cannot become ordinary agent input.
++    known = any(name in manager._gateway_control_names for manager in managers)
++    # Never let an active control fall through to the ordinary dispatcher under
++    # an unresolved/foreign home. A genuine ordinary entry in the canonical home
++    # retains its own meaning even if another profile uses the same name.
++    local_ordinary = any((entry := manager._plugin_commands.get(name))
++                         and entry.get("gateway_control") is not True for manager in managers)
++    known = known or (not local_ordinary and bool(_control_entries(name)))
++    if getattr(event, "_plugin_control_command", None) == name or known:
++        event._plugin_control_command = name
++        return True
++    return False
++
++
++def should_dispatch_inline(event):
++    from hermes_cli.commands import should_bypass_active_session
++    return should_bypass_active_session(event.get_command()) or is_control_candidate(event)
++
++
++def _entry_for_source(name, source):
++    from hermes_constants import hermes_home_key
++    identity = identity_of(source)
++    if identity is None or identity.transport_inferred or identity.adapter() is None:
++        return None
++    if (source.profile or identity.runtime_profile) != identity.runtime_profile:
++        return None
++    scope = hermes_home_key(identity.runtime_home)
++    return next(((manager, entry) for manager, entry in _control_entries(name)
++                 if manager.scope_key == scope), None)
++
++
++def _allowed(manager, entry, name):
++    from hermes_cli.plugins import _plugin_home_scope, _plugin_settings_entry, load_config_readonly
++    context = entry["control_context"]
++    if (manager._plugin_commands.get(name) is not entry or context._load_abandoned
++            or getattr(manager, "_gateway_unloading", False)):
++        return False
++    with _plugin_home_scope(manager.home_path):
++        config = load_config_readonly() or {}
++    return (_plugin_settings_entry(config, context.plugin_id) or {}).get("allow_gateway_control") is True
++
++
++def _complete_message_proof(proof, source, event):
++    message = proof.get("message") if isinstance(proof, dict) else None
++    if not isinstance(message, dict):
++        return False
++    if any(not isinstance(message.get(key), str) or not message[key]
++           for key in ("bot_id", "user_id", "chat_id", "message_id", "platform_update_id")):
++        return False
++    return (message["user_id"] == source.user_id and message["chat_id"] == source.chat_id
++            and message.get("thread_id") == (source.thread_id or "")
++            and message["message_id"] == event.message_id)
++
++
++def _receipt(runner, event, source, name):
++    from gateway.admitted_ingress import admitted_ingress
++    identity = identity_of(source)
++    if (event.internal or not event.allow_gateway_control or event.source is not source
++            or runner._intake_adapter_for(source) is not identity.adapter()):
++        return None
++    key = runner._session_key_for_source(source)
++    proof = admitted_ingress(event, source, key)
++    if not _complete_message_proof(proof, source, event):
++        return None
++    return {"command": name, "session_key": key, "admitted_ingress": proof,
++            "source": {"platform": source.platform.value, "user_id": source.user_id,
++                       "chat_id": source.chat_id, "chat_type": source.chat_type,
++                       "thread_id": source.thread_id or "", "profile": identity.runtime_profile}}
++
++
++def _still_allowed(runner, manager, entry, name):
++    try:
++        return (getattr(runner, "_running", None) is not False
++                and not getattr(runner, "_executor_closing", False)
++                and not getattr(runner, "_draining", False) and _allowed(manager, entry, name))
++    except Exception:  # health: allow BLE001 -- Revoked/unreadable consent invalidates retained invocation context.
++        return False
++
++
++def _call_sync(runner, manager, entry, name, args):
++    # Unload/revocation may race the executor thread starting after admission.
++    if not _still_allowed(runner, manager, entry, name):
++        return _REFUSED
++    return entry["handler"](args)
++
++
++async def _invoke(runner, event, source, name, manager, entry, receipt):
++    from gateway.run import _async_profile_runtime_scope
++    from gateway.session import build_session_context
++    from hermes_cli.plugin_command_context import _command_context
++    async with _async_profile_runtime_scope(manager.home_path):
++        if not _still_allowed(runner, manager, entry, name):
++            return _REFUSED
++        context = build_session_context(source, runner.config)
++        context.session_key = receipt["session_key"]
++        with runner._session_env_scope(context), _command_context(
++            entry["control_context"], receipt,
++            valid=lambda: _still_allowed(runner, manager, entry, name),
++        ):
++            handler = entry["handler"]
++            args = event.get_command_args().strip()
++            if inspect.iscoroutinefunction(handler):
++                result = await handler(args)
++            else:
++                result = await runner._run_in_executor_with_context(_call_sync, runner, manager, entry, name, args)
++                if asyncio.iscoroutine(result):
++                    if not _still_allowed(runner, manager, entry, name):
++                        result.close()
++                        return _REFUSED
++                    result = await result
++        return str(result) if result else None
++
++
++async def dispatch_control(runner, event, source):
++    """Called after native user/bot admission, before either busy or idle dispatch.
++
++    Recognized controls are consumed on every refusal/failure; they cannot turn
++    into a model prompt or interrupt a native turn. Ordinary plugin commands keep
++    their existing idle behavior.
++    """
++    if not is_control_candidate(event):
++        return False, None
++    name = event._plugin_control_command
++    try:
++        found = _entry_for_source(name, source)
++        if found is None:
++            return True, _REFUSED
++        denied = runner._check_slash_access(source, name)
++        if denied is not None:
++            return True, denied
++        receipt = _receipt(runner, event, source, name)
++        if receipt is None:
++            return True, _REFUSED
++        manager, entry = found
++        return True, await _invoke(runner, event, source, name, manager, entry, receipt)
++    except asyncio.CancelledError:
++        raise
++    except Exception:  # health: allow BLE001 -- Fail closed without logging handler/SDK exception secrets.
++        logger.warning("Plugin control dispatch failed")
++        return True, _REFUSED
+diff --git a/hermes_cli/plugin_command_context.py b/hermes_cli/plugin_command_context.py
+new file mode 100644
+--- /dev/null
++++ b/hermes_cli/plugin_command_context.py
+@@ -0,0 +1,39 @@
++"""Invocation-local authenticated provenance for native gateway plugin controls.
++
++The receipt proves message admission, never ownership of a plugin's task. Consumers
++must compare bot, user, chat, topic and profile to their own original task owner.
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++from copy import deepcopy
++
++_current = ContextVar("plugin_command_context", default=None)
++
++
++def get_command_context(context=None):
++    """Return a detached receipt during this invocation, otherwise None.
++
++    Child tasks inherit the lease, which is revoked when the handler exits.
++    No SDK handles, credentials, command arguments or conversation text are exposed.
++    """
++    lease = _current.get()
++    if lease is None or not lease["active"]:
++        return None
++    if context is not None and lease["owner"] is not context:
++        return None
++    if lease["valid"] is not None and not lease["valid"]():
++        return None
++    return deepcopy(lease["receipt"])
++
++
++@contextmanager
++def _command_context(context, receipt, *, valid=None):
++    lease = {"active": True, "owner": context, "receipt": receipt, "valid": valid}
++    token = _current.set(lease)
++    try:
++        yield
++    finally:
++        lease["active"] = False
++        _current.reset(token)
+diff --git a/hermes_cli/plugin_host.py b/hermes_cli/plugin_host.py
+--- a/hermes_cli/plugin_host.py
++++ b/hermes_cli/plugin_host.py
+@@ -380,6 +380,8 @@
+         resolve = functools.partial(self._resolve_ref, base=base)
+         args = decode(params.get("args") or [], resolve)
+         kwargs = decode(params.get("kwargs") or {}, resolve)
++        if method == "register_command" and kwargs.get("gateway_control") is True:
++            raise PluginHostUnsupported("gateway control commands require in-process dispatch")
+         result = getattr(ctx, method)(*args, **kwargs)
+         return self._encode_for_host(result)
+ 
+diff --git a/hermes_cli/plugin_isolation.py b/hermes_cli/plugin_isolation.py
+--- a/hermes_cli/plugin_isolation.py
++++ b/hermes_cli/plugin_isolation.py
+@@ -33,6 +33,7 @@
+ # raw platform SDK clients, argparse parsers, adapter classes bound to the gateway's event loop, the
+ # launch-scope dashboard auth registry. A plugin calling one of these runs only in-process.
+ HOST_UNSUPPORTED_CTX_METHODS: Dict[str, str] = {
++    "get_command_context": "authenticated control context lives only in the native gateway dispatch",
+     "register_platform": "platform adapters run on the gateway's event loop with native SDK clients",
+     "register_platform_handler": "the handler factory receives the platform's native SDK client",
+     "register_telegram_handler": "the handler factory receives the native Telegram Application",
+diff --git a/hermes_cli/plugin_isolation_audit.py b/hermes_cli/plugin_isolation_audit.py
+--- a/hermes_cli/plugin_isolation_audit.py
++++ b/hermes_cli/plugin_isolation_audit.py
+@@ -145,6 +145,12 @@
+                 self.reasons.append(f"{self.rel}:{node.lineno} setattr() on {owner} (patches a Hermes module)")
+         if isinstance(func, ast.Attribute):
+             name = func.attr
++            if name == "register_command" and any(
++                kw.arg == "gateway_control" and not (
++                    isinstance(kw.value, ast.Constant) and kw.value.value is False)
++                for kw in node.keywords
++            ):
++                self.reasons.append(f"{self.rel}:{node.lineno} gateway controls require native dispatch")
+             if name in self._unsupported:
+                 self.reasons.append(f"{self.rel}:{node.lineno} ctx.{name}(): {self._unsupported[name]}")
+             elif name in self._skipped:
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -235,8 +235,7 @@
+         self.manifest = manifest
+         self._manager = manager
+         self._llm: Any = None  # lazy; tests preseed it (see ``llm``)
+-        # Set when this context's load overran ``plugins.load_timeout_seconds``: the abandoned worker may
+-        # still be running register(), and nothing it registers from then on may reach a registry.
++        # A timed-out loader must never publish registrations from its abandoned worker.
+         self._load_abandoned = False
+ 
+     def _abandon_load(self) -> None:
+@@ -635,30 +634,16 @@
+     @_serialized_replacement
+     def register_command(
+         self, name: str, handler: Callable, description: str = "", args_hint: str = "",
+-        argument_mode: str | None = None,
++        argument_mode: str | None = None, *, gateway_control: bool = False,
+     ) -> Optional[PluginRegistration]:
+-        """Register an in-session slash command (``/name``); handler ``fn(raw_args: str) -> str | None``
+-        (sync or async). ``args_hint`` (e.g. ``"<file>"``) lets adapters like Discord surface an argument
+-        field; without it the command registers parameterless there but still accepts trailing text."""
+-        clean = name.lower().strip().lstrip("/").replace(" ", "-")
+-        if not clean:
+-            logger.warning("Plugin '%s' tried to register a command with an empty name.", self.manifest.name)
+-            return
+-        with suppress(Exception):  # reject if it conflicts with a built-in command
+-            from hermes_cli.commands import resolve_command
+-            if resolve_command(clean) is not None:
+-                logger.warning("Plugin '%s' tried to register command '/%s' which conflicts "
+-                               "with a built-in command. Skipping.", self.manifest.name, clean)
+-                return
+-        hint = (args_hint or "").strip()
+-        entry = {
+-            "handler": handler, "description": description or "Plugin command",
+-            "plugin": self.manifest.name, "plugin_key": self.plugin_id, "args_hint": hint,
+-            "argument_mode": argument_mode if argument_mode in {"options", "text", "mixed"}
+-            else ("text" if hint else None),
+-        }
+-        return self._register_entry("command", clean, self._manager._plugin_commands, entry,
+-                                    "Plugin %s registered command: /%s", clean)
++        """Register fn(raw_args), sync/async. Opt-in controls need owning-profile consent;
++        see plugins/gateway-controls.md. args_hint exposes trailing text on adapters."""
++        from hermes_cli.plugins_command_registration import register_command
++        return register_command(self, name, handler, description, args_hint, argument_mode, gateway_control)
++
++    def get_command_context(self) -> Optional[dict]:
++        from hermes_cli.plugin_command_context import get_command_context
++        return get_command_context(self)
+ 
+     def dispatch_tool(self, tool_name: str, args: dict, **kwargs) -> str:
+         """Dispatch a tool call through the registry with the parent agent (when available)
+@@ -1182,6 +1167,7 @@
+         self._plugin_platform_names: Set[str] = set()
+         self._cli_commands: Dict[str, dict] = {}
+         self._plugin_commands: Dict[str, dict] = {}
++        self._gateway_control_names: Set[str] = set()  # Retired controls must never become agent input.
+         self._system_prompt_sections: Dict[str, PluginSystemPromptSection] = {}
+         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
+         self._automation_blueprints: Dict[str, Any] = {}  # "<plugin>:<key>" -> AutomationBlueprint
+diff --git a/plugins/platforms/telegram/telegram_ingress.py b/plugins/platforms/telegram/telegram_ingress.py
+--- a/plugins/platforms/telegram/telegram_ingress.py
++++ b/plugins/platforms/telegram/telegram_ingress.py
+@@ -35,6 +35,9 @@
+         if bot is not adapter._bot:
+             return None
+         source = event.source
++        chat_type = {"private": "dm", "group": "group", "supergroup": "group", "channel": "channel"}.get(message.chat.type)
++        if source.chat_type != chat_type:
++            return None
+         bot_id = _id(bot.id)
+         message_id = _id(message.message_id)
+         user_id = _id(message.from_user.id)
+diff --git a/tests/gateway/test_plugin_control_commands.py b/tests/gateway/test_plugin_control_commands.py
+new file mode 100644
+--- /dev/null
++++ b/tests/gateway/test_plugin_control_commands.py
+@@ -0,0 +1,483 @@
++"""Offline controls through the installed PTB SDK and real native gateway guards.
++
++Synthetic Updates and a locally seeded Bot are fixtures, never live Telegram proof.
++"""
++import asyncio
++import threading
++from dataclasses import replace
++from unittest.mock import AsyncMock
++
++import pytest
++
++from tests.gateway.test_admitted_ingress import (
++    _bot, native as native_fixture, offline_boundary as boundary_fixture,
++)
++
++native = native_fixture
++offline_boundary = boundary_fixture
++from gateway.platforms.base import SendResult
++from gateway.session_identity import identity_of
++from hermes_cli.plugin_command_context import get_command_context, _command_context
++from hermes_cli.plugins import PluginContext, PluginManifest, get_plugin_manager
++from hermes_cli.config import atomic_config_write
++
++
++@pytest.fixture
++def control(native):
++    manager = get_plugin_manager()
++    manager._discovered = True
++    context = PluginContext(PluginManifest(name="control-fixture", source="user"), manager)
++    config = {"plugins": {"entries": {"control-fixture": {"allow_gateway_control": True}}}}
++    atomic_config_write(manager.home_path / "config.yaml", config)
++    seen = []
++
++    def handler(args):
++        seen.append((args, context.get_command_context()))
++        return "controlled"
++
++    registration = context.register_command("task-control", handler, gateway_control=True)
++    native.adapter._message_handler = native.runner._handle_message
++    native.adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="900"))
++    yield context, manager, seen, registration
++    native.runner._shutdown_executor(drain_timeout=2)
++    manager.unload()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("busy", [False, True])
++@pytest.mark.parametrize("verb", ["status", "stop", "pause"])
++async def test_actual_guard_idle_busy_parity(native, control, busy, verb):
++    context, manager, seen, _ = control
++    _, event = native.make(text=f"/task_control {verb} id-7")
++    key = native.runner._session_key_for_source(event.source)
++    guard = asyncio.Event()
++    if busy:
++        native.adapter._active_sessions[key] = guard
++        native.adapter._session_tasks[key] = asyncio.current_task()
++        native.runner._session_state(key).turn.agent = object()
++        await native.adapter.handle_message(event)
++        assert native.adapter._active_sessions[key] is guard
++        assert not guard.is_set()
++        assert key not in native.adapter._pending_messages
++    else:
++        assert await native.runner._handle_message(event) == "controlled"
++    assert len(seen) == 1
++    args, proof = seen[0]
++    assert args == f"{verb} id-7"
++    assert proof["source"] == {"platform": "telegram", "user_id": "111", "chat_id": "-100123",
++                               "chat_type": "group", "thread_id": "17", "profile": "default"}
++    assert proof["admitted_ingress"]["message"]["bot_id"] == "123456"
++    assert proof["admitted_ingress"]["message"]["platform_update_id"] == "701"
++    assert proof["session_key"] == key
++    assert context.get_command_context() is None
++    assert get_command_context() is None
++    native.runner._handle_message_with_agent.assert_not_awaited()
++    assert not native.runner.session_store.get_or_create.called
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("busy", [False, True])
++@pytest.mark.parametrize("guard", ["emergency_pause", "draining"])
++async def test_controls_keep_native_pause_and_drain_policy(native, control, busy, guard):
++    from agent import estop
++
++    context, manager, seen, registration = control
++    _, event = native.make(text="/task-control stop id-7")
++    key = native.runner._session_key_for_source(event.source)
++    if busy:
++        native.runner._session_state(key).turn.agent = object()
++    if guard == "emergency_pause":
++        estop.engage("offline control boundary")
++    else:
++        native.runner._draining = True
++    try:
++        response = await native.runner._handle_message(event)
++        # Native emergency pause permits controls of an already running turn.
++        allowed = guard == "emergency_pause" and busy
++        assert len(seen) == int(allowed)
++        assert (response == "controlled") is allowed
++        assert context.get_command_context() is None
++        native.runner._handle_message_with_agent.assert_not_awaited()
++    finally:
++        if guard == "emergency_pause":
++            estop.disengage()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("failure", ["bot", "inferred", "identity", "profile", "topic", "chat_type",
++                                     "update", "revoked", "shutdown", "unload", "slash", "user"])
++@pytest.mark.parametrize("busy", [False, True])
++async def test_controls_refuse_without_model_or_interrupt(native, control, failure, busy):
++    context, manager, seen, registration = control
++    _, event = native.make(text="/task-control stop id-7")
++    from gateway.run_plugin_commands import is_control_candidate
++    assert is_control_candidate(event)
++    def forget_identity():
++        del event.source._identity
++        del event.source._transport_adapter_ref
++        event.raw_message = None
++    def revoke():
++        atomic_config_write(manager.home_path / "config.yaml", {"plugins": {"entries": {
++            "control-fixture": {"allow_gateway_control": False}}}})
++    mutations = {
++        "bot": lambda: event.raw_message.set_bot(_bot(987654)),
++        "inferred": lambda: setattr(event.source, "_identity", replace(identity_of(event.source), transport_inferred=True)),
++        "identity": forget_identity,
++        "profile": lambda: setattr(event.source, "profile", "foreign"),
++        "topic": lambda: setattr(event.source, "thread_id", "99"),
++        "chat_type": lambda: setattr(event.source, "chat_type", "dm"),
++        "update": lambda: setattr(event, "platform_update_id", 702),
++        "revoked": revoke,
++        "shutdown": lambda: setattr(native.runner, "_executor_closing", True),
++        "unload": registration.dispose,
++        "slash": lambda: native.adapter.config.extra.update(group_allow_admin_from=["222"]),
++        "user": lambda: setattr(event.source, "user_id", "999"),
++    }
++    mutations[failure]()
++    if busy:
++        key = native.runner._session_key_for_source(event.source)
++        guard = asyncio.Event()
++        native.adapter._active_sessions[key] = guard
++        native.adapter._session_tasks[key] = asyncio.current_task()
++        native.runner._session_state(key).turn.agent = object()
++        await native.adapter.handle_message(event)
++        assert native.adapter._active_sessions[key] is guard
++        assert not guard.is_set()
++        assert key not in native.adapter._pending_messages
++    else:
++        await native.runner._handle_message(event)
++    assert seen == []
++    assert get_command_context() is None
++    native.runner._handle_message_with_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_foreign_manager_cannot_grant_optin(native, control, tmp_path):
++    _, manager, seen, _ = control
++    _, event = native.make(text="/task-control status")
++    event.source._identity = replace(identity_of(event.source), runtime_home=tmp_path / "foreign")
++    assert await native.runner._handle_message(event) == "Plugin control unavailable."
++    assert seen == []
++    native.runner._handle_message_with_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_blocked_native_worker_does_not_starve_sync_control(native, control):
++    started, release = threading.Event(), threading.Event()
++
++    def blocked_turn():
++        started.set()
++        assert release.wait(5)
++
++    work = asyncio.create_task(native.runner._run_in_executor_with_context(blocked_turn))
++    try:
++        assert await asyncio.to_thread(started.wait, 3)
++        _, event = native.make(text="/task-control status")
++        assert await asyncio.wait_for(native.runner._handle_message(event), 3) == "controlled"
++        assert not work.done()
++    finally:
++        release.set()
++        await work
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("kind", ["async", "sync", "sync_returns_async"])
++async def test_failure_resets_context_without_echo(native, control, kind, caplog):
++    context, manager, seen, _ = control
++    async def fail_async(args):
++        seen.append(context.get_command_context())
++        raise ValueError("SECRET_CONTROL_ARGUMENT")
++    def fail_sync(args):
++        seen.append(context.get_command_context())
++        raise ValueError("SECRET_CONTROL_ARGUMENT")
++    handler = {"async": fail_async, "sync": fail_sync, "sync_returns_async": lambda args: fail_async(args)}[kind]
++    context.register_command("task-control", handler, gateway_control=True)
++    _, event = native.make(text="/task-control SECRET_CONTROL_ARGUMENT")
++    assert await native.runner._handle_message(event) == "Plugin control unavailable."
++    assert seen[0]["admitted_ingress"]["message"]["bot_id"] == "123456"
++    assert "SECRET_CONTROL_ARGUMENT" not in caplog.text
++    assert get_command_context() is None
++    assert await native.runner._run_in_executor_with_context(get_command_context) is None
++    native.runner._handle_message_with_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_nested_context_and_inherited_task_revoke(control):
++    context = control[0]
++    gate = asyncio.Event()
++    async def delayed():
++        await gate.wait()
++        return get_command_context()
++    with _command_context(context, {"outer": True}):
++        with pytest.raises(ValueError):
++            with _command_context(context, {"inner": True}):
++                assert context.get_command_context() == {"inner": True}
++                raise ValueError("nested")
++        assert context.get_command_context() == {"outer": True}
++        task = asyncio.create_task(delayed())
++    gate.set()
++    assert await task is None
++    assert get_command_context() is None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("command", ["stop", "status", "pause"])
++async def test_native_owner_stop_keeps_native_handler(native, control, command):
++    _, event = native.make(text=f"/{command}")
++    setattr(native.runner, f"_handle_{command}_command", AsyncMock(return_value="native-control"))
++    assert await native.runner._handle_message(event) == "native-control"
++    assert control[2] == []
++
++
++@pytest.mark.asyncio
++async def test_ordinary_idle_plugin_command_keeps_raw_args(native, control):
++    context = control[0]
++    observed = []
++    context.register_command("ordinary", lambda args: observed.append((args, context.get_command_context())))
++    _, event = native.make(text="/ordinary unchanged args")
++    assert await native.runner._handle_message(event) is None
++    assert observed == [("unchanged args", None)]
++
++
++def test_host_audit_refuses_context_and_control_optin(tmp_path):
++    from hermes_cli.plugin_isolation_audit import audit_plugin_dir
++    for body in ("ctx.get_command_context()", "ctx.register_command('task', handler, gateway_control=True)"):
++        (tmp_path / "__init__.py").write_text("def register(ctx):\n    " + body + "\n")
++        assert audit_plugin_dir(tmp_path, {"name": "fixture"}).host_ready is False
++
++
++def test_host_cannot_proxy_control_registration(control):
++    from hermes_cli.plugin_host import PluginHost
++    from hermes_cli.plugin_host_wire import PluginHostUnsupported
++    client = object.__new__(PluginHost)
++    client._plugin_ctx = lambda params: control[0]
++    client._resolve_ref = lambda value, **kwargs: value
++    with pytest.raises(PluginHostUnsupported):
++        client._serve_ctx({"method": "register_command", "args": ["task-control", "unused"],
++                           "kwargs": {"gateway_control": True}})
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("revoke", ["unload", "consent", "shutdown", "cancel"])
++async def test_context_revokes_during_suspended_handler(native, control, revoke):
++    context, manager, seen, _ = control
++    entered, release = asyncio.Event(), asyncio.Event()
++    observed = []
++    async def handler(args):
++        observed.append(context.get_command_context())
++        entered.set()
++        try:
++            await release.wait()
++        except asyncio.CancelledError:
++            # A copied background reader loses proof once dispatch unwinds.
++            async def late_reader():
++                await release.wait()
++                observed.append(context.get_command_context())
++            seen.append(asyncio.create_task(late_reader()))
++            raise
++        observed.append(context.get_command_context())
++    context.register_command("task-control", handler, gateway_control=True)
++    _, event = native.make(text="/task-control stop")
++    work = asyncio.create_task(native.runner._handle_message(event))
++    await asyncio.wait_for(entered.wait(), 3)
++    actions = {
++        "unload": manager.unload,
++        "consent": lambda: atomic_config_write(manager.home_path / "config.yaml", {"plugins": {"entries": {
++            "control-fixture": {"allow_gateway_control": False}}}}),
++        "shutdown": lambda: setattr(native.runner, "_executor_closing", True),
++        "cancel": work.cancel,
++    }
++    actions[revoke]()
++    if revoke == "cancel":
++        with pytest.raises(asyncio.CancelledError):
++            await work
++        release.set()
++        await seen[0]
++    else:
++        release.set()
++        await work
++    assert observed[0] is not None
++    assert observed[1] is None
++    assert get_command_context() is None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("actual_topic", [17, 18])
++async def test_consumer_checks_original_task_ownership_separately(native, control, actual_topic):
++    context, _, _, _ = control
++    original = {"bot_id": "123456", "user_id": "111", "chat_id": "-100123", "thread_id": "17"}
++    task = {"owner": original.copy(), "budget": 40, "paused": False}
++    def handler(args):
++        proof = context.get_command_context()
++        if any(proof["admitted_ingress"]["message"][k] != v for k, v in original.items()):
++            return "not task owner"
++        task["paused"] = True
++        return "paused"
++    context.register_command("task-control", handler, gateway_control=True)
++    _, event = native.make(text="/task-control pause id-7", thread_id=actual_topic)
++    assert await native.runner._handle_message(event) == ("paused" if actual_topic == 17 else "not task owner")
++    assert task["owner"] == original
++    assert task["budget"] == 40
++    assert task["paused"] is (actual_topic == 17)
++    native.runner._handle_message_with_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_routed_owning_profile_controls_scope_and_consent(native, control, tmp_path):
++    from hermes_cli.plugins import _plugin_home_scope
++    from hermes_constants import get_hermes_home
++    runtime_home = tmp_path / "satellite"
++    runtime_home.mkdir()
++    with _plugin_home_scope(runtime_home):
++        manager = get_plugin_manager()
++        manager._discovered = True
++        context = PluginContext(PluginManifest(name="satellite-control", source="user"), manager)
++    atomic_config_write(runtime_home / "config.yaml", {"plugins": {"entries": {
++        "satellite-control": {"allow_gateway_control": True}}}})
++    seen = []
++    def handler(args):
++        seen.append((context.get_command_context(), get_hermes_home()))
++        return "satellite-controlled"
++    context.register_command("task-control", handler, gateway_control=True)
++    try:
++        _, event = native.make(text="/task-control status")
++        event.source.profile = "satellite"
++        event.source._identity = replace(identity_of(event.source), runtime_profile="satellite", runtime_home=runtime_home)
++        assert await native.runner._handle_message(event) == "satellite-controlled"
++        assert control[2] == []
++        proof, actual_home = seen[0]
++        assert actual_home == runtime_home
++        assert proof["admitted_ingress"]["runtime_profile"] == "satellite"
++        assert proof["admitted_ingress"]["transport_profile"] == "default"
++        assert proof["source"]["profile"] == "satellite"
++    finally:
++        manager.unload()
++
++
++@pytest.mark.asyncio
++async def test_native_bot_admission_still_applies(native, control):
++    from tests.gateway.test_admitted_ingress import build_update
++    payload = build_update(text="/task-control stop").to_dict()
++    payload["message"]["from"]["is_bot"] = True
++    _, event = native.make(payload=payload)
++    from gateway.bot_loop_guard import BotLoopGuard, BotLoopGuardSettings
++    native.runner._bot_loop_guard = BotLoopGuard(settings=lambda: BotLoopGuardSettings(max_events=1))
++    assert event.source.is_bot
++    assert await native.runner._handle_message(event) == "controlled"
++    payload["update_id"] += 1
++    _, next_event = native.make(payload=payload)
++    assert await native.runner._handle_message(next_event) is None
++    assert len(control[2]) == 1
++    native.runner._handle_message_with_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("invalid", [None, {}, {"bot_id": "123456"}])
++async def test_incomplete_adapter_proof_is_refused(native, control, monkeypatch, invalid):
++    monkeypatch.setattr(native.adapter, "message_provenance", lambda event: invalid)
++    _, event = native.make(text="/task-control stop")
++    assert await native.runner._handle_message(event) == "Plugin control unavailable."
++    assert control[2] == []
++    native.runner._handle_message_with_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_unloaded_fresh_control_does_not_interrupt_busy_turn(native, control):
++    ctx, manager, seen, registration = control
++    registration.dispose()
++    _, event = native.make(text='/task-control cancel same-current-task')
++    key = native.runner._session_key_for_source(event.source)
++    guard = asyncio.Event()
++    native.adapter._active_sessions[key] = guard
++    native.adapter._session_tasks[key] = asyncio.current_task()
++    native.runner._session_state(key).turn.agent = object()
++    await native.adapter.handle_message(event)
++    assert seen == []
++    assert key not in native.adapter._pending_messages, 'unloaded control was queued as ordinary input'
++    assert native.adapter._active_sessions[key] is guard
++    assert not guard.is_set()
++    native.runner._handle_message_with_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('lifecycle', ['loaded', 'dispose', 'unload'])
++@pytest.mark.parametrize('mode', ['interrupt', 'steer'])
++async def test_registered_then_unloaded_control_never_reaches_native_agent_input(native, control, monkeypatch, lifecycle, mode):
++    ctx, manager, seen, registration = control
++    if lifecycle == 'dispose':
++        registration.dispose()
++    if lifecycle == 'unload':
++        manager.unload()
++    # Brand-new native event after unloading: no preseeded private candidate marker.
++    _, event = native.make(text='/task-control cancel same-current-task')
++    key = native.runner._session_key_for_source(event.source)
++    class ObservedAgent:
++        _active_children = []
++        def __init__(self):
++            self.calls = []
++        def interrupt(self, text):
++            self.calls.append(('interrupt', text))
++        def steer(self, text):
++            self.calls.append(('steer', text))
++            return True
++    agent = ObservedAgent()
++    guard = asyncio.Event()
++    native.adapter._active_sessions[key] = guard
++    native.adapter._session_tasks[key] = asyncio.current_task()
++    native.adapter.set_busy_session_handler(native.runner._handle_active_session_busy_message)
++    native.runner._session_state(key).turn.agent = agent
++    native.runner._busy_input_mode = mode
++    native.runner._busy_text_mode = 'interrupt'
++    monkeypatch.setenv('HERMES_GATEWAY_BUSY_ACK_ENABLED', 'false')
++    await native.adapter.handle_message(event)
++    assert agent.calls == [], f'control reached native agent input: {agent.calls!r}'
++    assert len(seen) == (1 if lifecycle == 'loaded' else 0)
++    assert native.adapter._active_sessions[key] is guard and not guard.is_set()
++    native.runner._handle_message_with_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("gateway_control", [False, True])
++async def test_retired_control_requires_checked_reregistration(native, control, gateway_control):
++    ctx, manager, seen, registration = control
++    registration.dispose()
++    replacement_calls = []
++
++    def replacement(args):
++        replacement_calls.append(ctx.get_command_context())
++        return "replacement"
++
++    ctx.register_command("task-control", replacement, gateway_control=gateway_control)
++    _, event = native.make(text="/task-control status")
++    result = await native.runner._handle_message(event)
++    assert result == ("replacement" if gateway_control else "Plugin control unavailable.")
++    assert len(replacement_calls) == int(gateway_control)
++    if replacement_calls:
++        assert replacement_calls[0]["admitted_ingress"]["message"]["bot_id"] == "123456"
++    native.runner._handle_message_with_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("retired", [False, True])
++async def test_foreign_profile_retired_name_cannot_disable_ordinary_command(native, control, tmp_path, retired):
++    from hermes_cli.plugins import _plugin_home_scope, get_plugin_manager
++    ctx, manager, seen, registration = control
++    calls = []
++    ctx.register_command('ordinary-collision', lambda args: calls.append(args) or 'ordinary-ok')
++    _, before = native.make(text='/ordinary-collision before')
++    assert await native.runner._handle_message(before) == 'ordinary-ok'
++    foreign_home = tmp_path / 'foreign-profile'
++    foreign_home.mkdir()
++    with _plugin_home_scope(foreign_home):
++        foreign_manager = get_plugin_manager()
++        foreign_manager._discovered = True
++        foreign_ctx = PluginContext(PluginManifest(name='foreign-controls', source='user'), foreign_manager)
++    foreign_registration = foreign_ctx.register_command('ordinary-collision', lambda args:'foreign-control', gateway_control=True)
++    if retired:
++        foreign_registration.dispose()
++        foreign_manager.unload()
++    _, after = native.make(text='/ordinary-collision after', update_id=702)
++    assert await native.runner._handle_message(after) == 'ordinary-ok', 'foreign retired name disabled another profile ordinary command'
++    assert calls == ['before', 'after']
++    foreign_manager.unload()
++
+diff --git a/website/docs/developer-guide/plugins/gateway-controls.md b/website/docs/developer-guide/plugins/gateway-controls.md
+new file mode 100644
+--- /dev/null
++++ b/website/docs/developer-guide/plugins/gateway-controls.md
+@@ -0,0 +1,57 @@
++# Native gateway plugin controls
++
++An in-process plugin can register a control that remains available during an agent turn:
++
++```python
++def register(ctx):
++    def control(raw_args):
++        proof = ctx.get_command_context()
++        if proof is None:
++            return "Control unavailable."
++        # Compare proof.source and proof.admitted_ingress.message against the
++        # ORIGINAL task owner (bot/user/chat/topic/profile) before any action.
++        return controller.control(raw_args, proof)
++
++    ctx.register_command("task-control", control, gateway_control=True)
++```
++
++The owning runtime profile must explicitly grant
++`plugins.entries.<plugin-id>.allow_gateway_control: true` in its `config.yaml`.
++Registration alone grants no authority. Consent is reread on every dispatch.
++Existing commands without `gateway_control=True` retain their idle behavior.
++Built-in commands such as `/stop`, `/pause` and `/status` cannot be shadowed.
++Registered control names remain reserved for the lifetime of their profile's
++plugin manager. After disposal or unload, fresh commands are refused rather
++than becoming agent input. Re-registering a control restores its checked path;
++downgrading that name to an ordinary command does not bypass this reservation.
++
++`ctx.get_command_context()` returns a detached plain dictionary only inside this
++plugin's authenticated command invocation. Its `source` contains `platform`,
++`user_id`, `chat_id`, `chat_type`, `thread_id` and explicit runtime `profile`.
++`session_key` and `command` identify the native command lane.
++`admitted_ingress` contains the canonical transport/runtime profile and original
++native message proof (`bot_id`, `user_id`, `chat_id`, `thread_id`, `message_id`,
++`platform_update_id`, reply and media provenance). No SDK objects, credentials,
++conversation text or arguments are copied into the context. `raw_args` remains
++an ordinary handler argument. The public `get_command_context()` accessor in
++`hermes_cli.plugin_command_context` exposes the same invocation-local receipt.
++
++The gateway supplies the receipt only after native user, bot and slash admission,
++and only with a non-inferred routing identity and proof from the actual receiving
++adapter. Missing provenance, a foreign profile, revoked consent, shutdown or an
++exception consumes the control without invoking the model. Native task ownership
++is separate: plugins must verify their own original task owner and budget. A
++receipt is not a capability to control another task or start another session.
++
++Controls bypass both native busy guards inline, after the existing
++emergency-pause policy; draining refuses dispatch
++and revokes an invocation's context. No new pause exception is introduced.
++Async handlers run on the gateway loop; sync handlers use the existing gateway
++executor with copied ContextVars.
++Blocking inference does not occupy the only control worker: that native executor
++is unbounded. Handlers must remain bounded and return promptly. The context is
++reset on success, cancellation and failure; inherited tasks lose access after the
++invocation ends. Saved receipt dictionaries are snapshots, not renewable authority.
++
++The isolated plugin host cannot register gateway controls or obtain native
++command context. The host audit reports these surfaces as in-process only.
+diff --git a/hermes_cli/plugins_command_registration.py b/hermes_cli/plugins_command_registration.py
+new file mode 100644
+--- /dev/null
++++ b/hermes_cli/plugins_command_registration.py
+@@ -0,0 +1,31 @@
++"""Register native plugin commands while retaining retired control names."""
++from contextlib import suppress
++import logging
++
++logger = logging.getLogger(__name__)
++
++
++def register_command(context, name, handler, description, args_hint, argument_mode, gateway_control):
++    clean = name.lower().strip().lstrip("/").replace(" ", "-")
++    if not clean:
++        logger.warning("Plugin '%s' tried to register a command with an empty name.", context.manifest.name)
++        return
++    with suppress(Exception):  # reject if it conflicts with a built-in command
++        from hermes_cli.commands import resolve_command
++        if resolve_command(clean) is not None:
++            logger.warning("Plugin '%s' tried to register command '/%s' which conflicts "
++                           "with a built-in command. Skipping.", context.manifest.name, clean)
++            return
++    hint = (args_hint or "").strip()
++    entry = {
++        "handler": handler, "description": description or "Plugin command",
++        "gateway_control": gateway_control is True, "control_context": context if gateway_control is True else None,
++        "plugin": context.manifest.name, "plugin_key": context.plugin_id, "args_hint": hint,
++        "argument_mode": argument_mode if argument_mode in {"options", "text", "mixed"}
++        else ("text" if hint else None),
++    }
++    registration = context._register_entry("command", clean, context._manager._plugin_commands, entry,
++                                         "Plugin %s registered command: /%s", clean)
++    if registration is not None and gateway_control is True:
++        context._manager._gateway_control_names.add(clean)
++    return registration
