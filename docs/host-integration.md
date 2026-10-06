@@ -10,6 +10,19 @@ namespace ancestor and a shared writable runner directory were correctly refused
 No production guard was relaxed. These are component checks; runtime admission,
 actual host-to-worker execution and product acceptance remain separate.
 
+On 2026-10-07 at 02:49 MSK, the first actual local Hermes → Harness coding
+scenario completed in 26.76 seconds. The native agent admitted one worker,
+Harness read the supplied bytes through `/job-input/verified`, repaired the
+calculator and returned a diff. The host staged the returned files and ran the
+unchanged owner tests in a separate read-only sandbox. An independent check
+confirmed the original failed and the actual returned file passed. Ninety-three
+live worker samples were retained; all four sampled worker process identities
+and the outer process ceased. This used the temporary local test profile
+(context 40960, output 4096) and synthetic Telegram ingress. Actual Telegram
+delivery, the production goal-verification consumer and release acceptance
+remain unverified. The reproducible input and checker are in
+[`fixtures/host-repair`](../fixtures/host-repair/README.md).
+
 `register(ctx)` registers the same three-field `friday_work` tool, the existing
 post-admission hook and native tool middleware. It adds native registered
 `/friday-stop [reference]`, `/friday-pause [reference]` and
