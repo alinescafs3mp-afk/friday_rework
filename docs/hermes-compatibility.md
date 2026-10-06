@@ -62,3 +62,9 @@ The existing message builder and channel prompt lookup are extracted into small
 modules to respect the donor's code-health limits; no routing resolver or agent
 loop is replaced. `docs/plugin-boundary.md` describes the consumer and the
 remaining attachment, control, supervision and product gates.
+
+The subsequent `bounded-file-transfer.patch` overlay adds bounded file receive,
+received-byte identity and truthful document acknowledgement. Its manifest
+specifies the prerequisite ingress patch and before/after hashes. Apply and
+verify the ingress layer before this overlay. See `docs/file-transport.md` for
+the input-staging contract and remaining live integration requirements.

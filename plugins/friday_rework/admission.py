@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import re
 
 from .associations import Associations, _sync_directory
 from .boundary import bound_owner, parse_brief, work_handler
@@ -46,10 +47,18 @@ def _snapshot(value):
     if not isinstance(message["media"], list) or len(message["media"]) > 64:
         raise ValueError("invalid_ingress")
     for media in message["media"]:
-        if not isinstance(media, dict) or set(media) != {"local_reference", "mime_type", "origin"}:
+        required_media = {"local_reference", "mime_type", "origin"}
+        if not isinstance(media, dict) or set(media) not in (required_media, required_media | {"content"}):
             raise ValueError("invalid_ingress")
         _text(media["local_reference"], 2048)
         _text(media["mime_type"], 256)
+        if "content" in media:
+            content = media["content"]
+            if (not isinstance(content, dict) or set(content) != {"size_bytes", "sha256"}
+                    or type(content["size_bytes"]) is not int or content["size_bytes"] < 0
+                    or not isinstance(content["sha256"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", content["sha256"])):
+                raise ValueError("invalid_ingress_content")
         origin = media["origin"]
         if origin is not None:
             required = {"bot_id", "chat_id", "thread_id", "message_id", "file_id", "file_unique_id", "declared_bytes"}

@@ -162,6 +162,32 @@ class IngressTests(unittest.TestCase):
                 self.record(changed)
             self.assertEqual(original, self.state.path.read_bytes())
 
+    def test_native_content_receipt_persists_and_cannot_be_rewritten(self):
+        proof = copy.deepcopy(PROOF)
+        media = dict(local_reference="/native/cache/code.py", mime_type="text/x-python",
+                     origin=dict(bot_id="9001", chat_id="-1001", thread_id="17", message_id="501",
+                                 file_id="native-file", file_unique_id="native-unique", declared_bytes=3),
+                     content=dict(size_bytes=3, sha256="a" * 64))
+        proof["message"]["media"] = [media]
+        self.record(proof)
+        value, _ = self.match(admission=IngressAdmissions(PluginState("friday_ingress_test")))
+        self.assertEqual(value, proof)
+        before = self.state.path.read_bytes()
+        for field, changed in (("size_bytes", 4), ("sha256", "b" * 64)):
+            altered = copy.deepcopy(proof)
+            altered["message"]["media"][0]["content"][field] = changed
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "conflict"):
+                self.record(altered)
+            self.assertEqual(before, self.state.path.read_bytes())
+
+    def test_legacy_file_receipt_remains_readable_without_adding_byte_proof(self):
+        proof = copy.deepcopy(PROOF)
+        proof["message"]["media"] = [dict(local_reference="/native/cache/code.py",
+                                          mime_type="text/x-python", origin=None)]
+        self.record(proof)
+        value, _ = self.match(admission=IngressAdmissions(PluginState("friday_ingress_test")))
+        self.assertNotIn("content", value["message"]["media"][0])
+
     def test_corruption_and_failed_directory_barrier_refuse_match(self):
         self.record()
         with patch("friday_ingress_test.admission._sync_directory", side_effect=OSError("fixture fsync failure")):
