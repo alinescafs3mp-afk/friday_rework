@@ -84,7 +84,7 @@ REST integration, cancellation and product acceptance remain **NOT_RUN**.
 ## Verification controls
 
 ```sh
-A0_TEST_TMP_ROOT=/home/jericho/jericho/Friday_rework/.donors/a0/.git \
+A0_TEST_TMP_ROOT=.donors/a0/.git \
   python3 -B -m unittest discover -s tests -p test_a0_prepare.py -v
 ```
 

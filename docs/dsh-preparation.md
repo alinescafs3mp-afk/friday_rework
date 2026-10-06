@@ -5,11 +5,11 @@ The complete donor stays at `.donors/dsh`, detached at the commit and tree in `s
 Run from the assigned Friday_rework checkout, using Python 3.10 or newer:
 
 ```sh
-python3 scripts/dsh_prepare.py source --donor /home/jericho/jericho/Friday_rework/.donors/dsh --evidence .evidence/frw002-sol
-python3 scripts/dsh_prepare.py toolchain --donor /home/jericho/jericho/Friday_rework/.donors/dsh --evidence .evidence/frw002-sol
-python3 scripts/dsh_prepare.py build --donor /home/jericho/jericho/Friday_rework/.donors/dsh --evidence .evidence/frw002-sol
-python3 scripts/dsh_prepare.py smoke --donor /home/jericho/jericho/Friday_rework/.donors/dsh --evidence .evidence/frw002-sol
-python3 scripts/dsh_prepare.py check --donor /home/jericho/jericho/Friday_rework/.donors/dsh --evidence .evidence/frw002-sol
+python3 scripts/dsh_prepare.py source --donor .donors/dsh --evidence .evidence/frw002-sol
+python3 scripts/dsh_prepare.py toolchain --donor .donors/dsh --evidence .evidence/frw002-sol
+python3 scripts/dsh_prepare.py build --donor .donors/dsh --evidence .evidence/frw002-sol
+python3 scripts/dsh_prepare.py smoke --donor .donors/dsh --evidence .evidence/frw002-sol
+python3 scripts/dsh_prepare.py check --donor .donors/dsh --evidence .evidence/frw002-sol
 python3 -B -m unittest discover -s tests -p 'test_*_prepare.py'
 ```
 

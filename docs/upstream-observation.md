@@ -71,7 +71,7 @@ status code, never server prose or response bodies. Rate limits are failures, no
 no-change observations. Default worst-case network time is 75 seconds; there is
 no background loop. This command targets the Linux/POSIX host.
 
-## Optional daily user timer (not installed or enabled)
+## Optional daily user timer (activation blocked on the current host)
 
 Templates live in `deploy/systemd/friday-upstream-check.service.in` and
 `deploy/systemd/friday-upstream-check.timer`. The parent integrator may review and
@@ -100,3 +100,14 @@ properties does not prove that a user manager enforced those mounts.
 API contracts: [compare commits](https://docs.github.com/en/rest/commits/commits#compare-two-commits),
 [resolve a commit/ref](https://docs.github.com/en/rest/commits/commits#get-a-commit),
 and [latest release](https://docs.github.com/en/rest/releases/releases#get-the-latest-release).
+
+## Observed integration checkpoint — 2026-10-06
+
+The source command and private report writer passed independent component review.
+A native offline probe persisted the captured upstream observation byte for byte.
+However, a native outside-write control failed: AppArmor denied the user systemd
+executor the namespace capability needed for the requested read-only mounts, and
+the unit still ran without those mounts. The declared properties therefore did
+not establish the claimed boundary. The daily timer remains disabled; no global
+AppArmor or sysctl policy was changed. Source preparation is complete, scheduled
+operation is not accepted.
