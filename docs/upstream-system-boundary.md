@@ -63,7 +63,7 @@ test ! -L /etc/systemd/system/friday-upstream-check-system.service
 test ! -e /etc/systemd/system/friday-upstream-check-system.timer
 test ! -L /etc/systemd/system/friday-upstream-check-system.timer
 systemd-analyze verify --man=no deploy/systemd/system/friday-upstream-check-system.service deploy/systemd/system/friday-upstream-check-system.timer
-sudo install -d -o root -g root -m 0755 /usr/local/lib/friday-upstream-check-system/scripts
+sudo install -d -o root -g root -m 0755 /usr/local/lib/friday-upstream-check-system /usr/local/lib/friday-upstream-check-system/scripts
 sudo install -o root -g root -m 0644 scripts/check_upstream.py scripts/check_upstream_system.py /usr/local/lib/friday-upstream-check-system/scripts/
 sudo install -o root -g root -m 0644 sources.lock.json /usr/local/lib/friday-upstream-check-system/
 sudo install -o jericho -g jericho -m 0600 /dev/null /var/lib/friday-upstream-check-system-control
@@ -73,14 +73,17 @@ sudo systemctl daemon-reload
 
 No service code is run as root. The system manager creates the private state
 directory on the first authorized start; the existing per-user state is untouched.
+Both source directories must be named explicitly: `install -d -m 0755` does
+not apply that mode to an implicitly created parent under a restrictive umask.
+Verify both directories are root-owned `0755` before starting the service.
 The new distinct unit names prevent an accidental operation on the blocked user
 units. Check that the old user timer is still disabled/inactive before any future
 scheduled use; do not run both timers.
 
 ## Live acceptance still NOT_RUN
 
-Root installation and system-manager execution have not been authorized or run
-in this package. After installation, the first authorized run must be offline:
+The source candidate alone does not prove system-manager execution. After
+installation, the first run must be offline:
 use this exact runtime-only override (only if that override path is absent),
 start the service once, and inspect the actual result and journal.
 
