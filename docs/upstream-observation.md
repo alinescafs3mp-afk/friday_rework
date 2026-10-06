@@ -111,3 +111,7 @@ the unit still ran without those mounts. The declared properties therefore did
 not establish the claimed boundary. The daily timer remains disabled; no global
 AppArmor or sysctl policy was changed. Source preparation is complete, scheduled
 operation is not accepted.
+
+A concrete alternative using the existing system manager, an ordinary user and
+root-owned staged source is prepared in [the system boundary candidate](upstream-system-boundary.md).
+Its installation and live acceptance remain NOT_RUN; the user timer stays disabled.
