@@ -15,7 +15,7 @@ spec = importlib.util.spec_from_file_location("friday_native_input_test", root /
 package = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = package
 spec.loader.exec_module(package)
-from friday_native_input_test.admission import IngressAdmissions, native_call_scope
+from friday_native_input_test.admission import IngressAdmissions, native_call_scope, delivery_route
 from friday_native_input_test.artifacts import ArtifactError
 from friday_native_input_test.inputs import stage_inputs
 
@@ -73,13 +73,21 @@ class NativeInputJoinTests(unittest.IsolatedAsyncioTestCase):
                     admission = IngressAdmissions(PluginState("native-input-join"))
                     source = {key: received[key] for key in ("user_id", "chat_id", "thread_id", "message_id")}
                     admission.record(admitted_ingress=proof, session_key="native-key", message_id="11",
-                                     source={**source, "profile": ""}, platform="telegram")
-                    owner = dict(platform="telegram", key="native-key", profile="", id="native-session", **source)
+                                     source={**source, "profile": "", "chat_type": event.source.chat_type}, platform="telegram")
+                    owner = dict(platform="telegram", key="native-key", profile="", id="native-session",
+                                 chat_type=event.source.chat_type, **source)
                     call = dict(task_id="native-session", session_id="native-session", turn_id="turn",
                                 api_request_id="request", tool_call_id="call")
                     reopened = IngressAdmissions(PluginState("native-input-join"))
                     matched, _ = native_call_scope(tool_name="friday_work", args={},
                         next_call=lambda _: reopened.match(owner, task_id="native-session", session_id="native-session"), **call)
+                    from gateway.run_plugin_delivery import freeze_route
+                    route = freeze_route(delivery_route(matched))
+                    self.assertEqual(route["source"]["chat_type"], "dm")
+                    self.assertEqual(route["source"]["message_id"], "11")
+                    self.assertEqual(route["source"]["chat_id"], "77")
+                    self.assertIsNone(route["source"]["thread_id"])
+                    self.assertEqual(route["bot_id"], "123")
                     args = dict(matched_ingress=matched, admitted_reference="native:turn/request/call",
                                 cache_roots=(cache,), staging_root=stage, worker_input_root="/job/inputs",
                                 max_file_bytes=8, max_total_bytes=16)

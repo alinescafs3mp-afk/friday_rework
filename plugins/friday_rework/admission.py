@@ -35,8 +35,12 @@ def _encoded(value):
 def _snapshot(value):
     top = {"platform", "session_key", "source_profile", "transport_profile", "runtime_profile", "message"}
     fields = {"bot_id", "user_id", "chat_id", "thread_id", "message_id", "platform_update_id", "reply_to_message_id", "media"}
-    if not isinstance(value, dict) or set(value) != top or value["platform"] != "telegram":
+    if (not isinstance(value, dict) or set(value) not in (top, top | {"chat_type"})
+            or value["platform"] != "telegram"):
         raise ValueError("unproved_ingress")
+    if "chat_type" in value and (not isinstance(value["chat_type"], str)
+                                or value["chat_type"] not in {"dm", "group", "channel", "thread"}):
+        raise ValueError("invalid_ingress_chat_type")
     for key in top - {"message"}:
         _text(value[key], empty=key == "source_profile")
     message = value["message"]
@@ -81,6 +85,27 @@ def _receipt_key(value):
     return hashlib.sha256(_encoded([
         value["session_key"], value["source_profile"], value["message"]["message_id"]
     ])).hexdigest()
+
+
+def delivery_route(matched_ingress):
+    """Route from the persisted, matched receipt, never an ambient session.
+
+    Historical receipts remain readable, but cannot invent the missing native
+    chat type. The gateway rechecks current authorization and actual adapter.
+    """
+    value = _snapshot(matched_ingress)
+    if "chat_type" not in value:
+        raise ValueError("missing_admitted_delivery_route")
+    message = value["message"]
+    return {
+        "source": {
+            "platform": value["platform"], "chat_id": message["chat_id"],
+            "chat_type": value["chat_type"], "user_id": message["user_id"],
+            "thread_id": message["thread_id"] or None, "message_id": message["message_id"],
+        },
+        "transport_profile": value["transport_profile"],
+        "runtime_profile": value["runtime_profile"], "bot_id": message["bot_id"],
+    }
 
 
 def native_call_scope(*, tool_name, args, next_call, **context):
@@ -132,6 +157,11 @@ class IngressAdmissions:
                 or any((source.get(k) or "") != message[k] for k in ("user_id", "chat_id", "thread_id", "message_id"))
                 or (source.get("profile") or "") != snapshot["source_profile"]):
             raise ValueError("ingress_source_mismatch")
+        chat_type = source.get("chat_type")
+        if (not isinstance(chat_type, str) or chat_type not in {"dm", "group", "channel", "thread"}
+                or ("chat_type" in snapshot and snapshot["chat_type"] != chat_type)):
+            raise ValueError("ingress_source_mismatch")
+        snapshot["chat_type"] = chat_type
         with self.associations._locked():
             document = self._read()
             key = _receipt_key(snapshot)
@@ -155,6 +185,7 @@ class IngressAdmissions:
             if snapshot is None:
                 raise ValueError("missing_admitted_ingress")
             if (snapshot["platform"] != owner["platform"]
+                    or ("chat_type" in snapshot and snapshot["chat_type"] != owner.get("chat_type"))
                     or any(snapshot["message"][k] != owner[k] for k in ("user_id", "chat_id", "thread_id", "message_id"))):
                 raise ValueError("foreign_admitted_ingress")
             # Native state may have committed before an earlier caller failed

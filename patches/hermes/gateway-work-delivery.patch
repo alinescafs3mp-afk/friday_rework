@@ -1,0 +1,999 @@
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -60,6 +60,7 @@
+     is_valid_system_prompt_section_id,
+ )
+ from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
++from hermes_cli.plugins_gateway_work import PluginGatewayWorkMixin
+ from hermes_cli.plugins_state import (
+     PluginState, _locked_plugin_state, _nested_plugin_mapping, _nested_plugin_value,
+     _plugin_relative_segments, _plugin_settings_entry, save_plugin_setting,
+@@ -227,7 +228,7 @@
+     deferred: bool = False
+ 
+ 
+-class PluginContext:
++class PluginContext(PluginGatewayWorkMixin):
+     """Facade given to plugins so they can register tools and hooks."""
+ 
+     def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
+@@ -414,18 +415,6 @@
+         handle = self._track("on_unload", getattr(callback, "__name__", "callback"), callback)
+         logger.debug("Plugin %s registered on_unload callback", self.manifest.name)
+         return handle
+-
+-    def spawn_task(self, coro, *, name: Optional[str] = None) -> "asyncio.Task":
+-        """Spawn a supervised asyncio task; unload/force reload cancels it. Needs a running loop."""
+-        if not asyncio.iscoroutine(coro):
+-            raise TypeError("spawn_task expects a coroutine")
+-        loop = asyncio.get_running_loop()
+-        task_name = name or f"plugin:{self.plugin_id}:task"
+-        task = loop.create_task(coro, name=task_name)
+-        handle = self._track("background_task", task_name, lambda: task.done() or task.cancel())
+-        task.add_done_callback(lambda _t: handle.dispose())
+-        logger.debug("Plugin %s spawned supervised task: %s", self.manifest.name, task_name)
+-        return task
+ 
+     def register_approval_transport(self, name: str, present_fn: Callable) -> None:
+         """Register a human approval transport, inactive until ``security.approval.transport:
+@@ -1152,6 +1141,14 @@
+ 
+ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
+     """Central manager that discovers, loads, and invokes plugins."""
++
++    def _unload_scoped(self, plugin=None) -> bool:
++        previous = getattr(self, "_gateway_unloading", False)
++        self._gateway_unloading = True
++        try:
++            return super()._unload_scoped(plugin)
++        finally:
++            self._gateway_unloading = previous
+ 
+     def __init__(self, scope_key: Optional[str] = None) -> None:
+         # Capture the home immutably. Unload can run from a different ambient
+--- a/gateway/run_plugin_injection.py
++++ b/gateway/run_plugin_injection.py
+@@ -23,6 +23,15 @@
+ 
+ 
+ class GatewayPluginInjectionMixin:
++    def _plugin_document_route(self, context, route):
++        """Resolve a strict original route for owned plugin work and delivery."""
++        from gateway.run_plugin_delivery import resolve_document_route
++        return resolve_document_route(self, context, route)
++
++    async def _deliver_plugin_document(self, context, **kwargs):
++        from gateway.run_plugin_delivery import deliver_document
++        return await deliver_document(self, context, **kwargs)
++
+     def _install_plugin_message_injector(self) -> None:
+         """Publish this live gateway's plugin message scheduler process-wide."""
+         from hermes_cli.plugins import publish_gateway_message_host
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -5375,6 +5375,16 @@
+                     TelegramAdapter, self,
+                 ).send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)))
+ 
++    async def send_document_bytes(
++        self, chat_id: str, data: bytes, *, file_name: str, reply_to: str,
++        caption: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """One exact-byte document attempt; no path reopen, warning-success or retarget retry."""
++        from .telegram_document_bytes import send_document_bytes
++        return await send_document_bytes(
++            self, chat_id, data, file_name=file_name, reply_to=reply_to,
++            caption=caption, metadata=metadata)
++
+     async def send_video(
+         self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
+         metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
+--- /dev/null
++++ b/hermes_cli/plugins_gateway_work.py
+@@ -0,0 +1,208 @@
++"""Owned plugin work on the already published gateway loop; no new runtime owner."""
++from __future__ import annotations
++
++import asyncio
++import concurrent.futures
++import inspect
++import logging
++from typing import Any, Mapping
++
++logger = logging.getLogger("hermes_cli.plugins")
++
++
++def cancel_task(task):
++    """Unload may run in a discovery thread, whereas Task.cancel is loop-affine."""
++    loop = task.get_loop()
++    if task.done() or loop.is_closed():
++        return
++    try:
++        current = asyncio.get_running_loop()
++    except RuntimeError:
++        current = None
++    if current is loop:
++        task.cancel()
++    else:
++        loop.call_soon_threadsafe(task.cancel)
++
++
++def _close_unstarted(coro):
++    if inspect.iscoroutine(coro) and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED:
++        coro.close()
++    elif inspect.isgenerator(coro) and inspect.getgeneratorstate(coro) == inspect.GEN_CREATED:
++        coro.close()
++
++
++def require_capability(context, flag, *, owner=None):
++    """Read consent from the immutable manager home and reject stale plugin contexts."""
++    from hermes_cli.plugins import _plugin_home_scope, _plugin_settings_entry, load_config_readonly
++    manager = context._manager
++    loaded = manager._plugins.get(context.plugin_id)
++    lease = getattr(context, "_gateway_work_lease", None)
++    if (context._load_abandoned or getattr(manager, "_gateway_unloading", False)
++            or loaded is None or not loaded.enabled
++            or loaded.manifest is not context.manifest or (lease is not None and not lease.active)):
++        raise RuntimeError("plugin_unloaded")
++    host = manager._gateway_message_injector
++    if host is None or (owner is not None and host[0] is not owner):
++        raise RuntimeError("gateway_offline")
++    runner = host[0]
++    loop = getattr(runner, "_gateway_loop", None)
++    if (not callable(getattr(runner, "_plugin_document_route", None))
++            or not runner._plugin_injection_accepting() or loop is None
++            or loop.is_closed() or not loop.is_running()):
++        raise RuntimeError("gateway_offline")
++    try:
++        with _plugin_home_scope(manager.home_path):
++            cfg = load_config_readonly() or {}
++        allowed = (_plugin_settings_entry(cfg, context.plugin_id) or {}).get(flag) is True
++    except Exception:  # health: allow BLE001 -- Consent read fails closed without exposing configuration or secrets.
++        allowed = False
++    if not allowed:
++        raise RuntimeError("gateway_capability_denied")
++    if lease is None:
++        context._gateway_work_lease = context.on_unload(lambda: None)
++    return runner
++
++
++async def _run_owned(context, runner, route, coro):
++    from gateway.run import _async_profile_runtime_scope
++    from hermes_cli.plugins import _plugin_home_scope
++    # The initial scope also accompanies native secret hydration's thread hop.
++    with _plugin_home_scope(context._manager.home_path):
++        async with _async_profile_runtime_scope(context._manager.home_path):
++            require_capability(context, "allow_gateway_work", owner=runner)
++            try:
++                runner._plugin_document_route(context, route)
++            except Exception:  # health: allow BLE001 -- Authorization/routing failures must not disclose SDK or configuration secrets.
++                raise RuntimeError("gateway_route_rejected") from None
++            return await coro
++
++
++def _start_owned(context, runner, route, coro, name, future, pending):
++    """The gateway callback atomically hands pending ownership to spawn_task's ledger."""
++    with context._manager._discovery_lock:
++        if future.cancelled():
++            _close_unstarted(coro)
++            pending.dispose()
++            return
++        try:
++            require_capability(context, "allow_gateway_work", owner=runner)
++            owned = _run_owned(context, runner, route, coro)
++            try:
++                task = context.spawn_task(owned, name=name)
++            except BaseException:
++                owned.close()
++                raise
++        except Exception:  # health: allow BLE001 -- Public admission returns a sanitized refusal; closes caller coroutine.
++            _close_unstarted(coro)
++            _settle(future, error=RuntimeError("gateway_work_rejected"))
++            pending.dispose()
++            return
++        # Pending disposal must not cancel the accepted task/future at this handoff.
++        pending.release = lambda: None
++        pending.dispose()
++        runner._background_tasks.add(task)
++        task.add_done_callback(runner._background_tasks.discard)
++
++    def finish(completed):
++        _close_unstarted(coro)
++        if completed.cancelled():
++            future.cancel()
++            return
++        error = completed.exception()
++        _settle(future, error=error, result=None if error else completed.result())
++
++    task.add_done_callback(finish)
++    future.add_done_callback(lambda done: cancel_task(task) if done.cancelled() else None)
++
++
++def _settle(future, *, error=None, result=None):
++    try:
++        if error is not None:
++            future.set_exception(error)
++        else:
++            future.set_result(result)
++    except concurrent.futures.InvalidStateError:
++        # Another thread may cancel between task completion and Future completion.
++        if not future.cancelled():
++            raise
++
++
++def schedule_gateway_work(context, coro, *, route, name=None):
++    if not asyncio.iscoroutine(coro):
++        raise TypeError("schedule_gateway_work expects a coroutine")
++    pending = None
++    try:
++        with context._manager._discovery_lock:
++            runner = require_capability(context, "allow_gateway_work")
++            # Detach the persisted input before crossing the thread boundary.
++            from gateway.run_plugin_delivery import freeze_route
++            original_route = freeze_route(route)
++            future = concurrent.futures.Future()
++            def release_pending():
++                future.cancel()
++                _close_unstarted(coro)
++            pending = context._track("gateway_work_pending", name or "gateway_work", release_pending)
++            runner._gateway_loop.call_soon_threadsafe(
++                _start_owned, context, runner, original_route, coro, name, future, pending)
++            return future
++    except BaseException:
++        _close_unstarted(coro)
++        if pending is not None:
++            pending.dispose()
++        raise
++
++
++async def deliver_gateway_document(context, **kwargs):
++    from gateway.run import _async_profile_runtime_scope
++    from gateway.run_plugin_delivery import freeze_route
++    from hermes_cli.plugins import _plugin_home_scope
++    try:
++        with context._manager._discovery_lock:
++            runner = require_capability(context, "allow_gateway_delivery")
++        if asyncio.get_running_loop() is not runner._gateway_loop:
++            raise RuntimeError("gateway_loop_required")
++        kwargs["route"] = freeze_route(kwargs["route"])
++        with _plugin_home_scope(context._manager.home_path):
++            async with _async_profile_runtime_scope(context._manager.home_path):
++                require_capability(context, "allow_gateway_delivery", owner=runner)
++                return await runner._deliver_plugin_document(context, **kwargs)
++    except Exception:  # health: allow BLE001 -- Route/configuration refusal is sanitized; cancellation remains a BaseException.
++        return {"state": "FAILED", "error": "gateway_delivery_rejected"}
++
++
++class PluginGatewayWorkMixin:
++    """Public context methods for owned asyncio work and gateway delivery."""
++
++    def spawn_task(self, coro, *, name: str | None = None) -> asyncio.Task:
++        """Spawn a supervised asyncio task; unload/force reload cancels it. Needs a running loop."""
++        if not asyncio.iscoroutine(coro):
++            raise TypeError("spawn_task expects a coroutine")
++        loop = asyncio.get_running_loop()
++        task_name = name or f"plugin:{self.plugin_id}:task"
++        task = loop.create_task(coro, name=task_name)
++        handle = self._track("background_task", task_name, lambda: cancel_task(task))
++        task.add_done_callback(lambda _t: handle.dispose())
++        logger.debug("Plugin %s spawned supervised task: %s", self.manifest.name, task_name)
++        return task
++
++    def schedule_gateway_work(self, coro, *, route: Mapping[str, Any], name: str | None = None):
++        """Submit owned work to the live gateway loop, including from a sync tool thread.
++
++        Returns a concurrent Future. Refusal closes the coroutine and raises RuntimeError.
++        Cancellation requests asyncio cancellation; it does not stop a blocking worker.
++        Requires this profile's per-plugin ``allow_gateway_work: true`` and original route.
++        """
++        return schedule_gateway_work(self, coro, route=route, name=name)
++
++    async def deliver_gateway_document(
++        self, *, route: Mapping[str, Any], data: bytes, file_name: str,
++        caption: str | None = None, timeout: float = 60,
++    ) -> dict:
++        """Deliver immutable bytes on the gateway loop to a persisted original route.
++
++        Requires ``allow_gateway_delivery: true``. Returns DELIVERED only with a native
++        document acknowledgement; UNKNOWN must not be automatically retried.
++        """
++        return await deliver_gateway_document(
++            self, route=route, data=data, file_name=file_name, caption=caption, timeout=timeout)
+--- /dev/null
++++ b/gateway/run_plugin_delivery.py
+@@ -0,0 +1,106 @@
++"""Strict original-route, immutable-document delivery for the public plugin context."""
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import math
++from collections.abc import Mapping
++
++from gateway.config import Platform
++from gateway.session import SessionSource
++from gateway.session_identity import canonical_identity, restore_identity
++
++
++def freeze_route(route):
++    """Copy only the minimal persisted native source; reject all ambiguous defaults."""
++    if not isinstance(route, Mapping) or not isinstance(route.get("source"), Mapping):
++        raise ValueError("original_route_required")
++    fields = ("platform", "chat_id", "chat_type", "user_id", "thread_id", "message_id")
++    try:
++        source = {key: route["source"][key] for key in fields}
++        result = {key: route[key] for key in ("transport_profile", "runtime_profile", "bot_id")}
++    except KeyError:
++        raise ValueError("incomplete_original_route") from None
++    for value in [*result.values(), *(source[key] for key in fields if key != "thread_id")]:
++        if not isinstance(value, str) or not value or value != value.strip():
++            raise ValueError("invalid_original_route")
++    if source["platform"] != "telegram" or source["chat_type"] not in {"dm", "group", "channel", "thread"}:
++        raise ValueError("unsupported_original_route")
++    for value in (result["bot_id"], source["user_id"], source["message_id"]):
++        if not value.isascii() or not value.isdecimal() or int(value) <= 0:
++            raise ValueError("invalid_original_identity")
++    if str(int(source["chat_id"])) != source["chat_id"] or int(source["chat_id"]) == 0:
++        raise ValueError("invalid_original_chat")
++    topic = source["thread_id"]
++    if topic is not None and (not isinstance(topic, str) or not topic.isascii()
++                              or not topic.isdecimal() or int(topic) <= 0):
++        raise ValueError("invalid_original_topic")
++    source["profile"] = result["runtime_profile"]
++    result["source"] = source
++    return result
++
++
++def resolve_document_route(runner, context, route):
++    """Restore original transport identity, never consult a mutable latest session."""
++    from hermes_constants import hermes_home_key
++    route = freeze_route(route)
++    profile = runner._served_profile_for_home(context._manager.home_path)
++    if profile is None or profile != route["runtime_profile"]:
++        raise RuntimeError("plugin_profile_not_served")
++    source = SessionSource.from_dict(route["source"])
++    identity = restore_identity(source, runner=runner, transport_profile=route["transport_profile"])
++    if identity is None:
++        # Standalone mode still requires explicit transport ownership and profile scope.
++        if route["transport_profile"] != profile:
++            raise RuntimeError("transport_profile_mismatch")
++        adapter = runner._adapters_for_profile(profile).get(Platform.TELEGRAM)
++        if adapter is None:
++            raise RuntimeError("original_bot_offline")
++        identity = canonical_identity(source, runner=runner, adapter=adapter,
++                                      transport_profile=route["transport_profile"])
++    if (identity is None or identity.transport_inferred
++            or identity.runtime_profile != profile
++            or hermes_home_key(identity.runtime_home) != hermes_home_key(context._manager.home_path)):
++        raise RuntimeError("runtime_home_mismatch")
++    adapter = runner._delivery_adapter_for(source)
++    if (adapter is None or adapter.is_connected is not True
++            or str(getattr(getattr(adapter, "_bot", None), "id", "")) != route["bot_id"]):
++        raise RuntimeError("original_bot_offline")
++    registered, owner = runner._owning_profile(adapter, source.platform)
++    actual_owner = owner or getattr(runner, "_primary_profile_name", None)
++    if not registered or actual_owner != route["transport_profile"]:
++        raise RuntimeError("transport_owner_mismatch")
++    if not runner._is_user_authorized_for_source(source, allow_adapter_delegation=False):
++        raise RuntimeError("original_route_no_longer_authorized")
++    return source, adapter
++
++
++async def deliver_document(runner, context, *, route, data, file_name, caption, timeout):
++    if (type(data) is not bytes or not isinstance(file_name, str) or not file_name
++            or len(file_name) > 255 or any(ord(c) < 32 or c in "/\\" for c in file_name)
++            or file_name in {".", ".."} or (caption is not None and not isinstance(caption, str))
++            or isinstance(timeout, bool) or not isinstance(timeout, (int, float))
++            or not math.isfinite(timeout) or timeout <= 0):
++        return {"state": "FAILED", "error": "invalid_document"}
++    source, adapter = resolve_document_route(runner, context, route)
++    if not callable(getattr(adapter, "send_document_bytes", None)):
++        return {"state": "FAILED", "error": "document_bytes_unsupported"}
++    from gateway.platforms.base import SendResult, _thread_metadata_for_source
++    expected = {
++        "kind": "document", "sha256": hashlib.sha256(data).hexdigest(),
++        "bytes": len(data), "file_name": file_name, "bot_id": route["bot_id"],
++        "chat_id": source.chat_id, "thread_id": source.thread_id, "reply_to": source.message_id,
++    }
++    try:
++        result = await asyncio.wait_for(adapter.send_document_bytes(
++            source.chat_id, data, file_name=file_name, caption=caption, reply_to=source.message_id,
++            metadata=_thread_metadata_for_source(source, source.message_id)), timeout)
++    except Exception:  # health: allow BLE001 -- Transport failures may have committed; never expose SDK error text or traceback.
++        return {"state": "UNKNOWN", "error": "document_ack_unavailable", **expected}
++    proof = result.raw_response if isinstance(result, SendResult) else None
++    if (isinstance(result, SendResult) and result.success is True and isinstance(proof, dict)
++            and all(proof.get(key) == value for key, value in expected.items())
++            and isinstance(result.message_id, str) and result.message_id.isdecimal()
++            and int(result.message_id) > 0 and proof.get("message_id") == result.message_id):
++        return {"state": "DELIVERED", **expected, "message_id": result.message_id}
++    return {"state": "UNKNOWN", "error": "document_ack_unavailable", **expected}
+--- /dev/null
++++ b/plugins/platforms/telegram/telegram_document_bytes.py
+@@ -0,0 +1,40 @@
++"""One native Telegram document attempt over an immutable byte snapshot."""
++from __future__ import annotations
++
++import hashlib
++import io
++
++from gateway.platforms.base import SendResult
++
++
++async def send_document_bytes(adapter, chat_id, data, *, file_name, reply_to, caption, metadata):
++    if type(data) is not bytes:
++        raise TypeError("document data must be immutable bytes")
++    if not adapter._bot or adapter.is_connected is not True:
++        return SendResult(success=False, error="original_bot_offline")
++    if not reply_to:
++        return SendResult(success=False, error="original_reply_required")
++    _, kwargs = adapter._media_send_kwargs(chat_id, reply_to, metadata)
++    # Retrying without a missing reply/topic silently changes the authorized destination.
++    # Use the existing bot and native media routing, but attempt precisely once.
++    try:
++        with io.BytesIO(data) as stream:
++            message = await adapter._bot.send_document(
++                **kwargs, document=stream, filename=file_name, caption=adapter._caption_1024(caption))
++        document = getattr(message, "document", None)
++        message_id = getattr(message, "message_id", None)
++        if (document is None or not getattr(document, "file_id", None)
++                or type(message_id) is not int or message_id <= 0
++                or str(getattr(getattr(message, "chat", None), "id", "")) != str(chat_id)
++                or getattr(message, "message_thread_id", None) != kwargs.get("message_thread_id")
++                or (getattr(document, "file_size", None) is not None and document.file_size != len(data))):
++            return SendResult(success=False, error="document_ack_unavailable")
++        proof = {
++            "kind": "document", "sha256": hashlib.sha256(data).hexdigest(),
++            "bytes": len(data), "file_name": file_name, "bot_id": str(adapter._bot.id),
++            "chat_id": str(chat_id), "thread_id": adapter._metadata_thread_id(metadata),
++            "reply_to": str(reply_to), "message_id": str(message_id),
++        }
++        return SendResult(success=True, message_id=str(message_id), raw_response=proof)
++    except Exception:  # health: allow BLE001 -- SDK errors can contain bot credentials; ambiguous sends are never retried here.
++        return SendResult(success=False, error="document_ack_unavailable")
+--- /dev/null
++++ b/tests/gateway/test_plugin_gateway_work.py
+@@ -0,0 +1,390 @@
++"""Public plugin work/delivery contracts with real discovery and the native Telegram adapter."""
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import inspect
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++
++from gateway.config import GatewayConfig, Platform, PlatformConfig
++from gateway.run import GatewayRunner
++from hermes_cli import plugins
++from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
++from plugins.platforms.telegram.adapter import TelegramAdapter
++
++
++def _route():
++    return {
++        "source": {"platform": "telegram", "chat_id": "-123", "chat_type": "group",
++                   "user_id": "7", "thread_id": "12", "message_id": "31"},
++        "transport_profile": "default", "runtime_profile": "default", "bot_id": "91",
++    }
++
++
++def _configure(home, **overrides):
++    import hermes_yaml as yaml
++    entry = {"allow_gateway_work": True, "allow_gateway_delivery": True, **overrides}
++    (home / "config.yaml").write_text(yaml.safe_dump({
++        "plugins": {"enabled": ["gateway_probe"], "entries": {"gateway_probe": entry}},
++    }))
++
++
++@pytest.fixture
++def setup(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    directory = home / "plugins" / "gateway_probe"
++    directory.mkdir(parents=True)
++    (directory / "plugin.yaml").write_text("name: gateway_probe\nversion: 0.1.0\n")
++    (directory / "__init__.py").write_text("def register(ctx):\n    global context\n    context = ctx\n")
++    _configure(home)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: tmp_path / "empty")
++    monkeypatch.setattr(plugins.PluginManager, "_scan_entry_points", lambda self: [])
++    plugins._reset_plugin_managers_for_tests()
++    manager = plugins.get_plugin_manager()
++    manager.discover_and_load()
++    context = manager._plugins["gateway_probe"].module.context
++    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="offline-test"))
++    adapter._running = True
++    adapter._bot = SimpleNamespace(id=91)
++    sent = []
++
++    async def send(**kwargs):
++        sent.append({**kwargs, "bytes": kwargs["document"].read()})
++        return SimpleNamespace(
++            message_id=52, chat=SimpleNamespace(id=-123), message_thread_id=12,
++            document=SimpleNamespace(file_id="native-file", file_size=len(sent[-1]["bytes"])))
++
++    adapter._bot.send_document = AsyncMock(side_effect=send)
++    runner = object.__new__(GatewayRunner)
++    runner.config = GatewayConfig(multiplex_profiles=False)
++    runner._primary_profile_name = "default"
++    runner.adapters = {Platform.TELEGRAM: adapter}
++    runner._profile_adapters = {}
++    runner._running = True
++    runner._draining = False
++    runner._background_tasks = set()
++    runner._is_user_authorized_for_source = lambda source, **kw: source.user_id == "7"
++    yield SimpleNamespace(home=home, context=context, manager=manager, adapter=adapter,
++                          runner=runner, sent=sent)
++    runner._clear_plugin_message_injector()
++    manager.unload()
++    plugins._reset_plugin_managers_for_tests()
++
++
++def _install(setup):
++    setup.runner._gateway_loop = asyncio.get_running_loop()
++    setup.runner._install_plugin_message_injector()
++
++
++@pytest.mark.asyncio
++async def test_sync_thread_work_uses_live_loop_profile_and_exact_native_document(setup):
++    _install(setup)
++    payload = b"immutable\x00artifact\xff"
++    loop = asyncio.get_running_loop()
++
++    async def work():
++        assert asyncio.get_running_loop() is loop
++        assert get_hermes_home() == setup.home
++        return await setup.context.deliver_gateway_document(route=_route(), data=payload, file_name="result.py")
++
++    def submit():
++        token = set_hermes_home_override(setup.home.parent / "wrong")
++        try:
++            return setup.context.schedule_gateway_work(work(), route=_route())
++        finally:
++            reset_hermes_home_override(token)
++
++    future = await asyncio.to_thread(submit)
++    receipt = await asyncio.wrap_future(future)
++    assert receipt["state"] == "DELIVERED"
++    assert receipt["bytes"] == len(payload)
++    assert receipt["sha256"] == hashlib.sha256(payload).hexdigest()
++    assert receipt["file_name"] == "result.py"
++    assert receipt["message_id"] == "52"
++    assert setup.sent[0]["bytes"] == payload
++    assert setup.sent[0]["reply_to_message_id"] == 31
++    assert setup.sent[0]["message_thread_id"] == 12
++    assert setup.adapter._bot.send_document.await_count == 1
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("reason", ["offline", "draining", "unloaded", "abandoned", "optout"])
++async def test_rejected_schedule_closes_coroutine(setup, reason):
++    _install(setup)
++    {
++        "offline": setup.runner._clear_plugin_message_injector,
++        "draining": lambda: setattr(setup.runner, "_draining", True),
++        "unloaded": setup.manager.unload,
++        "abandoned": setup.context._abandon_load,
++        "optout": lambda: _configure(setup.home, allow_gateway_work=False),
++    }[reason]()
++    coro = asyncio.sleep(0)
++    with pytest.raises(RuntimeError):
++        setup.context.schedule_gateway_work(coro, route=_route())
++    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
++
++
++@pytest.mark.asyncio
++async def test_revocation_after_enqueue_never_starts_work(setup):
++    _install(setup)
++    reached = []
++    async def work():
++        reached.append(True)
++    coro = work()
++    future = setup.context.schedule_gateway_work(coro, route=_route())
++    _configure(setup.home, allow_gateway_work=False)
++    with pytest.raises(RuntimeError):
++        await asyncio.wrap_future(future)
++    assert not reached
++    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
++
++
++@pytest.mark.asyncio
++async def test_unload_from_sync_thread_cancels_owned_task(setup):
++    _install(setup)
++    started, cancelled = asyncio.Event(), asyncio.Event()
++    async def work():
++        started.set()
++        try:
++            await asyncio.Event().wait()
++        finally:
++            cancelled.set()
++    future = setup.context.schedule_gateway_work(work(), route=_route())
++    await asyncio.wait_for(started.wait(), 5)
++    assert setup.runner._scale_to_zero_has_live_background_work()
++    await asyncio.to_thread(setup.manager.unload)
++    await asyncio.wait_for(cancelled.wait(), 5)
++    with pytest.raises(asyncio.CancelledError):
++        await asyncio.wrap_future(future)
++
++
++@pytest.mark.asyncio
++async def test_pending_unload_closes_before_loop_dispatch(setup):
++    _install(setup)
++    coro = asyncio.sleep(0)
++    future = setup.context.schedule_gateway_work(coro, route=_route())
++    setup.manager.unload()
++    assert future.cancelled()
++    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
++    await asyncio.sleep(0)
++
++
++@pytest.mark.asyncio
++async def test_unload_callback_cannot_enqueue(setup):
++    _install(setup)
++    refused = []
++    def callback():
++        setup.manager.unload("absent-nested-plugin")
++        coro = asyncio.sleep(0)
++        with pytest.raises(RuntimeError):
++            setup.context.schedule_gateway_work(coro, route=_route())
++        refused.append(inspect.getcoroutinestate(coro))
++    setup.context.on_unload(callback)
++    setup.manager.unload()
++    assert refused == [inspect.CORO_CLOSED]
++
++
++@pytest.mark.asyncio
++async def test_stale_owner_clear_and_later_manager_keep_new_host(setup):
++    _install(setup)
++    old = setup.runner
++    newer = object.__new__(GatewayRunner)
++    newer._install_plugin_message_injector()
++    old._clear_plugin_message_injector()
++    token = set_hermes_home_override(setup.home / "later")
++    try:
++        later = plugins.get_plugin_manager()
++        assert later._gateway_message_injector[0] is newer
++        assert setup.manager._gateway_message_injector[0] is newer
++    finally:
++        reset_hermes_home_override(token)
++        newer._clear_plugin_message_injector()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("change", ["bot", "user", "runtime", "transport", "offline", "missing_type", "missing_topic", "optout"])
++async def test_delivery_refuses_route_or_consent_drift(setup, change):
++    _install(setup)
++    route = _route()
++    {
++        "bot": lambda: route.update(bot_id="92"),
++        "user": lambda: route["source"].update(user_id="8"),
++        "runtime": lambda: route.update(runtime_profile="other"),
++        "transport": lambda: route.update(transport_profile="other"),
++        "offline": lambda: setattr(setup.adapter, "_running", False),
++        "missing_type": lambda: route["source"].pop("chat_type"),
++        "missing_topic": lambda: route["source"].pop("thread_id"),
++        "optout": lambda: _configure(setup.home, allow_gateway_delivery=False),
++    }[change]()
++    result = await setup.context.deliver_gateway_document(route=route, data=b"x", file_name="x.py")
++    assert result["state"] == "FAILED"
++    assert not setup.sent
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("failure", ["exception", "timeout", "warning", "wrong_topic", "missing_document"])
++async def test_native_failure_is_unknown_sanitized_and_not_retried(setup, failure):
++    from gateway.platforms.base import SendResult
++    _install(setup)
++    if failure == "exception":
++        setup.adapter._bot.send_document.side_effect = RuntimeError("SECRET_TOKEN")
++    elif failure == "timeout":
++        async def pending(**kw):
++            await asyncio.Event().wait()
++        setup.adapter._bot.send_document.side_effect = pending
++    elif failure == "warning":
++        setup.adapter.send_document_bytes = AsyncMock(return_value=SendResult(success=True, message_id="10"))
++    else:
++        setup.adapter._bot.send_document.side_effect = None
++        setup.adapter._bot.send_document.return_value = SimpleNamespace(
++            message_id=52, chat=SimpleNamespace(id=-123), message_thread_id=99 if failure == "wrong_topic" else 12,
++            document=None if failure == "missing_document" else SimpleNamespace(file_id="x", file_size=1))
++    result = await setup.context.deliver_gateway_document(route=_route(), data=b"x", file_name="x.py", timeout=0.05)
++    assert result["state"] == "UNKNOWN"
++    assert "SECRET_TOKEN" not in str(result)
++    assert setup.adapter._bot.send_document.await_count <= 1
++
++
++@pytest.mark.asyncio
++async def test_send_cancellation_propagates(setup):
++    _install(setup)
++    setup.adapter._bot.send_document.side_effect = asyncio.CancelledError()
++    with pytest.raises(asyncio.CancelledError):
++        await setup.context.deliver_gateway_document(route=_route(), data=b"x", file_name="x.py")
++
++
++@pytest.mark.asyncio
++async def test_route_is_frozen_at_submission(setup):
++    _install(setup)
++    route = _route()
++    async def work():
++        return "done"
++    future = setup.context.schedule_gateway_work(work(), route=route)
++    route["source"]["user_id"] = "8"
++    assert await asyncio.wrap_future(future) == "done"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("data,name", [(bytearray(b"x"), "x.py"), (b"x", "../x"), (b"x", "bad\nname")])
++async def test_mutable_bytes_and_unsafe_name_rejected(setup, data, name):
++    _install(setup)
++    result = await setup.context.deliver_gateway_document(route=_route(), data=data, file_name=name)
++    assert result["state"] == "FAILED"
++    assert not setup.sent
++
++
++@pytest.mark.asyncio
++async def test_routed_profile_uses_original_bot_and_own_config(setup):
++    import shutil
++    worker_home = setup.home / "profiles" / "worker"
++    shutil.copytree(setup.home / "plugins", worker_home / "plugins")
++    _configure(worker_home)
++    setup.runner.config.multiplex_profiles = True
++    other_bot = TelegramAdapter(PlatformConfig(enabled=True, token="other-offline-test"))
++    other_bot._running = True
++    other_bot._bot = SimpleNamespace(id=92, send_document=AsyncMock())
++    setup.runner._profile_adapters = {"worker": {Platform.TELEGRAM: other_bot}}
++    _install(setup)
++    token = set_hermes_home_override(worker_home)
++    try:
++        manager = plugins.get_plugin_manager()
++        manager.discover_and_load()
++        context = manager._plugins["gateway_probe"].module.context
++    finally:
++        reset_hermes_home_override(token)
++    route = _route()
++    route["runtime_profile"] = "worker"
++    try:
++        result = await context.deliver_gateway_document(route=route, data=b"x", file_name="x.py")
++        assert result["state"] == "DELIVERED"
++        assert setup.adapter._bot.send_document.await_count == 1
++        assert other_bot._bot.send_document.await_count == 0
++        # The native map can represent a shared satellite by borrowing primary;
++        # an explicitly persisted transport owner must still never be guessed.
++        setup.runner._profile_adapters["worker"] = {}
++        setup.runner._is_shared_bot_satellite = lambda profile: True
++        altered = {**route, "transport_profile": "worker"}
++        refused = await context.deliver_gateway_document(route=altered, data=b"x", file_name="x.py")
++        assert refused["state"] == "FAILED"
++        assert setup.adapter._bot.send_document.await_count == 1
++        _configure(worker_home, allow_gateway_delivery=False)
++        result = await context.deliver_gateway_document(route=route, data=b"x", file_name="x.py")
++        assert result["state"] == "FAILED"
++        assert setup.adapter._bot.send_document.await_count == 1
++    finally:
++        manager.unload()
++
++
++@pytest.mark.asyncio
++async def test_missing_original_bot_never_borrows_profile_bot(setup):
++    _install(setup)
++    setup.runner.adapters.clear()
++    result = await setup.context.deliver_gateway_document(route=_route(), data=b"x", file_name="x.py")
++    assert result["state"] == "FAILED"
++    assert not setup.sent
++
++
++@pytest.mark.asyncio
++async def test_stale_host_and_auth_rejected_before_body(setup):
++    _install(setup)
++    ran = []
++    async def work():
++        ran.append(True)
++    route = _route()
++    route["source"]["user_id"] = "8"
++    coro = work()
++    future = setup.context.schedule_gateway_work(coro, route=route)
++    with pytest.raises(RuntimeError, match="gateway_route_rejected"):
++        await asyncio.wrap_future(future)
++    assert not ran
++    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
++    coro = work()
++    future = setup.context.schedule_gateway_work(coro, route=_route())
++    setup.runner._clear_plugin_message_injector()
++    with pytest.raises(RuntimeError):
++        await asyncio.wrap_future(future)
++    assert not ran
++    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
++
++
++@pytest.mark.asyncio
++async def test_cancel_does_not_claim_blocking_worker_stopped(setup):
++    import threading
++    _install(setup)
++    started = asyncio.Event()
++    release, stopped = threading.Event(), threading.Event()
++    loop = asyncio.get_running_loop()
++    def blocking():
++        loop.call_soon_threadsafe(started.set)
++        try:
++            release.wait(5)
++        finally:
++            stopped.set()
++    async def work():
++        await asyncio.to_thread(blocking)
++    future = setup.context.schedule_gateway_work(work(), route=_route())
++    try:
++        await asyncio.wait_for(started.wait(), 5)
++        future.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await asyncio.wrap_future(future)
++        assert not stopped.is_set()
++    finally:
++        release.set()
++        assert await asyncio.to_thread(stopped.wait, 5)
++
++
++@pytest.mark.asyncio
++async def test_delivery_on_foreign_loop_refused(setup):
++    _install(setup)
++    def invoke():
++        return asyncio.run(setup.context.deliver_gateway_document(route=_route(), data=b"x", file_name="x.py"))
++    result = await asyncio.to_thread(invoke)
++    assert result["state"] == "FAILED"
++    assert not setup.sent
+--- /dev/null
++++ b/website/docs/developer-guide/plugins/gateway-work.md
+@@ -0,0 +1,94 @@
++# Owned gateway work and immutable documents
++
++In-process plugins can submit a coroutine from a synchronous tool thread to the existing
++live messaging gateway loop. This is useful for a controller that prepares a native
++worker and later delivers a checked artifact. The concrete consumer is Friday's
++`controller.py` with `artifacts.read_staged`; its worker supervisor remains responsible
++for actual execution and stop. These APIs create no model tool, executor, service,
++queue, bot client or separate plugin manager. They are unavailable in isolated plugin
++hosts and when only the CLI/TUI host is running.
++
++The owning profile must explicitly grant each operation in `config.yaml`:
++
++```yaml
++plugins:
++  entries:
++    my-plugin:
++      allow_gateway_work: true
++      allow_gateway_delivery: true
++```
++
++Both flags default to false and are reread for each operation and after a thread hop.
++The plugin must have completed loading and still belong to its original manager.
++Unload cancels pending and running asyncio work through the existing ownership ledger.
++A draining, replaced or offline gateway refuses new work. Existing gateway publication
++and owner-safe clear also cover profile managers resolved after publication.
++
++Persist the original route at authorized ingress, together with the job association:
++
++```python
++route = {
++    "source": {
++        "platform": "telegram",
++        "chat_id": source.chat_id,
++        "chat_type": source.chat_type,
++        "user_id": source.user_id,
++        "thread_id": source.thread_id,  # explicit None when absent
++        "message_id": source.message_id,
++    },
++    "transport_profile": admitted["transport_profile"],
++    "runtime_profile": admitted["runtime_profile"],
++    "bot_id": admitted["message"]["bot_id"],
++}
++```
++
++`source` must be the actual post-admission native `SessionSource`, with the bot proof
++from the same admission. Do not infer `chat_type` from a chat ID or obtain any field
++from a subsequent/latest session. The runtime profile must match the plugin manager's
++immutable home. Current authorization is checked again, and the connected adapter must
++still belong to the original transport profile and report the original bot ID. A
++removed adapter never borrows another profile's bot. Persisted route data is trusted
++plugin-owned state, not an authorization token for untrusted model input.
++
++```python
++async def work():
++    # Keep blocking controller calls off the gateway event loop using the existing
++    # host execution facility, preserving profile context. Do not invent a worker pool.
++    data = artifacts.read_staged(
++        staging_root=staging_root, artifact=artifact, max_bytes=delivery_limit,
++    )
++    delivery = await ctx.deliver_gateway_document(
++        route=route, data=data, file_name=artifact.logical_name, timeout=60,
++    )
++    persist_delivery(delivery)
++
++future = ctx.schedule_gateway_work(work(), route=route, name="checked-artifact")
++```
++
++Pass the verified immutable `bytes` returned by `read_staged` directly; never re-open a path after hashing. Calling
++`deliver_gateway_document` requires the live gateway loop. `schedule_gateway_work`
++returns a `concurrent.futures.Future`; do not call its blocking `.result()` on that loop.
++Malformed, disabled, unloaded or offline synchronous admission closes the submitted
++coroutine and raises. Authorization can also reject via the Future before the coroutine
++body starts. The supplied route is detached before the thread hop.
++
++The document API returns a dictionary with `state`:
++
++- `DELIVERED`: a native Telegram document acknowledgement with `message_id`, `kind`,
++  `file_name`, `bytes`, `sha256`, `bot_id`, `chat_id`, `thread_id`, and `reply_to`.
++  The hash and length describe precisely the immutable bytes sent through `BytesIO`.
++- `FAILED`: refusal before sending, with a sanitized `error`.
++- `UNKNOWN`: an attempted send has no validated document acknowledgement. A timeout,
++  SDK failure or warning-only success cannot prove delivery. Keep the staged artifact
++  and do not automatically retry; execution must not be repeated to retry delivery.
++
++There is exactly one native send attempt. The original reply and topic are passed to
++the existing adapter's bot; errors never trigger reply/topic removal or another bot.
++Ordinary path-based adapter sends retain their established behavior. Only Telegram
++currently implements immutable-document acknowledgement; unsupported routes refuse.
++
++Cancellation propagates as `CancelledError`. A cancelled send may already have reached
++Telegram and must be recorded by the consumer as unknown. Cancelling the Future requests
++asyncio cancellation; it does **not** establish that a blocking controller thread or a
++native worker stopped. The controller's existing supervisor must stop the owned worker
++and record its actual terminal observation separately from delivery state.
+diff --git a/hermes_cli/plugin_isolation.py b/hermes_cli/plugin_isolation.py
+--- a/hermes_cli/plugin_isolation.py
++++ b/hermes_cli/plugin_isolation.py
+@@ -39,6 +39,8 @@
+     "register_slack_action_handler": "the callback receives native slack_bolt ack/body objects",
+     "register_dashboard_auth_provider": "dashboard auth is owned by the launch process, not a profile",
+     "register_approval_transport": "approval transports hold the live approval request/response channel",
++    "schedule_gateway_work": "gateway work requires a coroutine on the owning gateway event loop",
++    "deliver_gateway_document": "document delivery uses the owning gateway's live platform adapter",
+ }
+ 
+ # Registered in-process only; skipped (with a warning, the plugin still loads) inside the host
+diff --git a/tests/hermes_cli/test_gateway_work_isolation.py b/tests/hermes_cli/test_gateway_work_isolation.py
+new file mode 100644
+--- /dev/null
++++ b/tests/hermes_cli/test_gateway_work_isolation.py
+@@ -0,0 +1,39 @@
++"""Gateway loop capabilities must refuse the isolated plugin host before RPC."""
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli.plugin_host import PluginHost
++from hermes_cli.plugin_host_child import RemotePluginContext
++from hermes_cli.plugin_host_wire import PluginHostUnsupported
++from hermes_cli.plugin_isolation_audit import audit_plugin_dir
++
++
++@pytest.mark.parametrize("method", ["schedule_gateway_work", "deliver_gateway_document"])
++def test_audit_requires_in_process_gateway_capabilities(tmp_path, method):
++    (tmp_path / "plugin.yaml").write_text("name: gateway_boundary\nversion: 1.0\n")
++    (tmp_path / "__init__.py").write_text(
++        f"def register(ctx):\n    ctx.{method}(None)\n")
++    report = audit_plugin_dir(tmp_path)
++    assert report.verdict == "in_process"
++    assert any(method in reason for reason in report.reasons)
++
++
++@pytest.mark.parametrize("method", ["schedule_gateway_work", "deliver_gateway_document"])
++def test_remote_context_refuses_before_rpc(method):
++    runtime = Mock()
++    context = RemotePluginContext(runtime, "gateway_boundary", {"ctx_methods": [method]})
++    with pytest.raises(PluginHostUnsupported, match=method):
++        getattr(context, method)(None)
++    assert not runtime.mock_calls
++
++
++@pytest.mark.parametrize("method", ["schedule_gateway_work", "deliver_gateway_document"])
++def test_parent_rpc_refuses_before_calling_native_context(method):
++    native = Mock()
++    host = object.__new__(PluginHost)
++    host._contexts = {"gateway_boundary": SimpleNamespace(**{method: native})}
++    with pytest.raises(PluginHostUnsupported, match=method):
++        host._serve_ctx({"plugin": "gateway_boundary", "method": method})
++    native.assert_not_called()

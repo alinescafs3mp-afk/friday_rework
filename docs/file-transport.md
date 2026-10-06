@@ -48,3 +48,35 @@ delivery, durable per-artifact delivery outcomes, large-file streaming and
 final product acceptance remain separate work. Per-file bounds do not impose
 a total memory budget on concurrent downloads; the SDK can hold multiple
 bounded copies. Worker execution remains disabled in the registered tool.
+
+## Original delivery route
+
+The admitted ingress receipt retains the actual native `chat_type` alongside
+its original bot, chat, topic, message and transport/runtime profile. The
+plugin constructs its delivery route from that persisted receipt. A later
+message or `/new` does not supply a replacement route. Hermes must still check
+current authorization, profile ownership and the receiving bot before sending.
+Historical receipts without `chat_type` remain readable for inspection but
+cannot silently assume a direct message or authorize delivery.
+
+`patches/hermes/gateway-work-delivery.patch` adds two supported in-process
+PluginContext methods: `schedule_gateway_work` uses the existing gateway loop
+and plugin ownership ledger; `deliver_gateway_document` sends verified bytes
+through the original receiving adapter. The owning profile must separately
+enable `allow_gateway_work` and `allow_gateway_delivery` in its plugin entry.
+Revocation, profile/bot changes and unload refuse work. The isolated plugin
+host and its audit explicitly reject both methods before RPC.
+
+Document delivery submits once, checks the native acknowledgement against
+the original chat/topic and byte length, and records the supplied bytes' hash.
+Timeouts remain UNKNOWN, without automatic resend or destination fallback.
+The host must persist delivery intent and its outcome around this call; that
+integration and live Telegram acceptance remain unimplemented.
+
+Apply this overlay after the context, ingress and bounded-file overlays,
+using the exact hashes and before/after files in its manifest. Independent
+review verified canonical application and all 39 cumulative output files;
+the repaired host boundary and existing gateway paths passed 40 native tests.
+The earlier route/byte transfer review also exercised the installed Telegram
+SDK against an offline transport. These are component results, not a live
+Telegram or release claim.

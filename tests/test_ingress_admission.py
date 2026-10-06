@@ -15,10 +15,11 @@ spec = importlib.util.spec_from_file_location("friday_ingress_test", root / "__i
 package = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = package
 spec.loader.exec_module(package)
-from friday_ingress_test.admission import IngressAdmissions, native_call_scope, KEY
+from friday_ingress_test.admission import IngressAdmissions, native_call_scope, delivery_route, KEY
 from hermes_cli.plugins_state import PluginState
 
 PROOF = {"platform": "telegram", "session_key": "native-key", "source_profile": "",
+         "chat_type": "group",
          "transport_profile": "default", "runtime_profile": "default",
          "message": dict(bot_id="9001", user_id="111", chat_id="-1001", thread_id="17",
                          message_id="501", platform_update_id="701", reply_to_message_id="", media=[])}
@@ -40,7 +41,7 @@ class IngressTests(unittest.TestCase):
     def record(self, proof=None, **source_changes):
         proof = copy.deepcopy(PROOF if proof is None else proof)
         source = {k: proof["message"][k] for k in ("user_id", "chat_id", "thread_id", "message_id")}
-        source.update(profile=proof["source_profile"])
+        source.update(profile=proof["source_profile"], chat_type=proof.get("chat_type", "group"))
         source.update(source_changes)
         return self.admission.record(admitted_ingress=proof, session_key=proof["session_key"],
                                      message_id=proof["message"]["message_id"], source=source, platform="telegram")
@@ -81,9 +82,47 @@ class IngressTests(unittest.TestCase):
 
     def test_cross_owner_topic_profile_and_message_do_not_match(self):
         self.record()
-        for key in ("user_id", "chat_id", "thread_id", "profile", "message_id", "id", "key"):
+        for key in ("user_id", "chat_id", "thread_id", "profile", "message_id", "id", "key", "chat_type"):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 self.match(owner={**OWNER, key: "other"})
+
+    def test_delivery_route_survives_reopen_and_does_not_borrow_new_message(self):
+        self.record()
+        original, _ = self.match(admission=IngressAdmissions(PluginState("friday_ingress_test")))
+        next_proof = copy.deepcopy(PROOF)
+        next_proof["message"].update(message_id="502", platform_update_id="702")
+        self.record(next_proof)
+        expected = dict(source=dict(platform="telegram", chat_id="-1001", chat_type="group",
+                                    user_id="111", thread_id="17", message_id="501"),
+                        transport_profile="default", runtime_profile="default", bot_id="9001")
+        self.assertEqual(delivery_route(original), expected)
+        self.assertEqual(delivery_route(self.match()[0]), expected)
+
+    def test_receiving_hook_requires_actual_native_chat_type(self):
+        for value in (None, "", "private", "invented", "dm", {}, []):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "mismatch"):
+                self.record(chat_type=value)
+        self.assertIsNone(self.state.get(KEY))
+
+    def test_historical_receipt_without_chat_type_is_readable_but_cannot_deliver(self):
+        self.record()
+        document = self.state.get(KEY)
+        for value in document["receipts"].values():
+            del value["chat_type"]
+        self.state.set(KEY, document)
+        before = self.state.path.read_bytes()
+        matched, _ = self.match()
+        with self.assertRaisesRegex(ValueError, "missing_admitted_delivery_route"):
+            delivery_route(matched)
+        self.assertEqual(before, self.state.path.read_bytes())
+
+    def test_actual_dm_route_keeps_explicit_null_thread(self):
+        proof = copy.deepcopy(PROOF)
+        proof["chat_type"] = "dm"
+        proof["message"]["thread_id"] = ""
+        self.record(proof)
+        matched, _ = self.match(owner={**OWNER, "chat_type": "dm", "thread_id": ""})
+        self.assertIsNone(delivery_route(matched)["source"]["thread_id"])
 
     def test_same_native_call_id_in_another_turn_retains_full_tuple(self):
         self.record()
