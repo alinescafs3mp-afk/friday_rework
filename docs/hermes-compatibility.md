@@ -98,3 +98,33 @@ and all eleven repository checks. These are offline component observations.
 The concrete Friday consumer, built-in `/stop` and `/new` forwarding, live
 Telegram authorization and actual worker cessation remain separate integration
 and release gates. Registration or a control reply alone proves no stop.
+
+
+## Native stop and new-session controls
+
+`patches/hermes/builtin-controls.patch` is the sixth overlay, after the five
+layers above. Its manifest pins the preceding controls patch and all twelve
+changed files. Six-overlay forward reconstruction matched all 54 affected files.
+
+An explicitly authorized in-process plugin can add
+`native_controls=("stop", "new")` to its existing `gateway_control=True`
+registration. Native stop/reset behavior runs first in active, pending and idle
+paths. Confirmed resets retain the original authenticated receipt; displaying or
+cancelling a confirmation does not invoke the plugin. A nested busy reset sends
+one notification. The callback receives empty arguments and the invocation's
+`command`, `native_operation` and registered `control_command` fields.
+
+Native storage errors still trigger bounded external-stop notification and retain
+the original native exception. Failed, revoked or timed-out callbacks report
+external work as UNKNOWN. Disposed/unloaded registrations retain metadata in the
+owning profile's manager, so a new registration cannot silently certify old work
+as stopped. Retired callbacks never resume. The timeout revokes their invocation
+context; it cannot kill a Python thread. A callback returning no owned work leaves
+the ordinary native response unchanged.
+
+Independent review passed 214 affected native tests and 24 additional controls.
+Seventeen injected regressions failed as expected; restoring the exact source
+passed the final affected checks. The eleven native repository checks also passed.
+These are source/component observations. Concrete Friday consumer wiring,
+original-task matching, real worker cessation and live Telegram acceptance remain
+required before product stop support is accepted.

@@ -188,15 +188,25 @@ class UpstreamTests(unittest.TestCase):
 
     def test_unsafe_writable_ancestor_refused_before_private_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
-            ancestor = Path(directory)
+            root = Path(directory)
+            ancestor = root / "unsafe"
+            ancestor.mkdir()
             private = ancestor / "private"
             private.mkdir(mode=0o700)
             ancestor.chmod(0o777)
-            try:
+            native_open = os.open
+
+            def fixture_root(path, flags, *args, **kwargs):
+                # A private TMPDIR would establish the protection boundary
+                # before this test's unsafe ancestor. Only relocate the root
+                # descriptor; all descendant opens and mode checks stay real.
+                if path == "/" and kwargs.get("dir_fd") is None:
+                    path = root
+                return native_open(path, flags, *args, **kwargs)
+
+            with patch.object(m.os, "open", side_effect=fixture_root):
                 with self.assertRaisesRegex(m.ObservationError, "unsafe_report_ancestor"):
-                    m.write_report(private, {})
-            finally:
-                ancestor.chmod(0o700)
+                    m.write_report("/unsafe/private", {})
 
     def test_writable_descendant_inside_private_boundary(self):
         with tempfile.TemporaryDirectory() as directory:

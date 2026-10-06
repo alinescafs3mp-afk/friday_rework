@@ -1,0 +1,1172 @@
+diff --git a/gateway/run_busy.py b/gateway/run_busy.py
+--- a/gateway/run_busy.py
++++ b/gateway/run_busy.py
+@@ -6,6 +6,8 @@
+ """
+ 
+ from __future__ import annotations
++
++from gateway.run_native_controls import native_control
+ 
+ import logging
+ from typing import TYPE_CHECKING
+@@ -1015,6 +1017,7 @@
+         from hermes_cli.proxy_cli import format_status_text
+         return format_status_text()
+ 
++    @native_control("stop")
+     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
+         # Hard-kill: a soft interrupt can't reach a truly hung executor thread.
+         from gateway.run import _INTERRUPT_REASON_STOP
+@@ -1024,6 +1027,7 @@
+         logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
+         return EphemeralReply(t("gateway.stop.stopped"))
+ 
++    @native_control("new")
+     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):
+         # /reset and /new bypass the running-agent guard (else they'd queue as user text and replay
+         # into the same broken history); clear pending messages so the old text doesn't replay.
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -855,8 +855,11 @@
+         return False, None, command, canonical
+ 
+     async def _hm_confirm_destructive(self, event, command: str, detail: str, handler) -> Tuple[bool, Optional[str]]:
++        from gateway.run_native_controls import capture_native_control, native_control_scope
++        binding = capture_native_control(self, event, command)
+         async def _execute():
+-            return await handler(event)
++            with native_control_scope(event, binding):
++                return await handler(event)
+         return True, await self._maybe_confirm_destructive_slash(
+             event=event, command=command, title=f"/{command}", detail=detail, execute=_execute,
+         )
+diff --git a/gateway/run_native_controls.py b/gateway/run_native_controls.py
+new file mode 100644
+--- /dev/null
++++ b/gateway/run_native_controls.py
+@@ -0,0 +1,143 @@
++"""Post-action bindings of existing plugin controls to native escape hatches."""
++from __future__ import annotations
++
++import asyncio
++from contextlib import contextmanager
++from contextvars import ContextVar
++from copy import deepcopy
++from dataclasses import dataclass
++from functools import wraps
++import logging
++
++from gateway.run_plugin_commands import _control_managers, _control_scope, _entry_for_source, _invoke, _receipt
++from gateway.session_identity import replace_source
++
++logger = logging.getLogger(__name__)
++_NATIVE_CONTROL_TIMEOUT = 2.0
++_UNKNOWN = "External plugin work: UNKNOWN (control unavailable, failed or timed out)."
++_binding = ContextVar("native_control_binding", default=None)
++
++
++@dataclass(frozen=True)
++class _Binding:
++    operation: str
++    source: object
++    targets: tuple
++
++
++def capture_native_control(runner, event, operation):
++    """Bind native provenance before an action/confirmation, without calling plugins."""
++    if operation not in ("stop", "new"):
++        return None
++    targets = []
++    source = event.source
++    try:
++        scope = _control_scope(source)
++        for manager in _control_managers():
++            if manager.scope_key != scope:
++                continue
++            if any(operation in owner[2] for owner in tuple(manager._retired_native_controls.values())):
++                targets.append((None, None, None, None))
++            for name, entry in tuple(manager._plugin_commands.items()):
++                if operation not in entry.get("native_controls", ()):
++                    continue
++                if _entry_for_source(name, source) != (manager, entry):
++                    continue
++                receipt = None
++                if (runner._is_user_authorized_for_source(source)
++                        and runner._check_slash_access(source, operation) is None):
++                    receipt = _receipt(runner, event, source, operation)
++                if receipt is not None:
++                    receipt = deepcopy(receipt)
++                    receipt.update(native_operation=operation, control_command=name)
++                targets.append((manager, name, entry, receipt))
++        return _Binding(operation, replace_source(source) if targets else source, tuple(targets))
++    except Exception:  # health: allow BLE001 -- Optional preparation must never suppress a native escape hatch.
++        logger.warning("Native plugin control provenance unavailable")
++        return _Binding(operation, source, ((None, None, None, None),))
++
++
++@contextmanager
++def native_control_scope(event, binding, *, running=False):
++    token = _binding.set((event, binding, running))
++    try:
++        yield
++    finally:
++        _binding.reset(token)
++
++
++def _consume_completion(task):
++    if not task.cancelled():
++        task.exception()  # A timed-out coroutine may finish later; never leak its exception text.
++
++
++async def _notify(runner, event, binding, target):
++    manager, name, entry, receipt = target
++    if receipt is None:
++        return _UNKNOWN
++    active = True
++    task = asyncio.create_task(_invoke(
++        runner, event, binding.source, name, manager, entry, receipt,
++        args="", valid=lambda: active,
++    ))
++    try:
++        done, _ = await asyncio.wait((task,), timeout=_NATIVE_CONTROL_TIMEOUT)
++        if not done or task.cancelled():
++            return _UNKNOWN
++        result = task.result()
++        from gateway.run_plugin_commands import _REFUSED
++        return _UNKNOWN if result == _REFUSED else result
++    except Exception:  # health: allow BLE001 -- Native response survives callback failure without exposing plugin secrets.
++        logger.warning("Native plugin control callback failed")
++        return _UNKNOWN
++    finally:
++        # Executor threads cannot be killed. Revoke their context immediately;
++        # UNKNOWN explicitly does not claim that external work has quiesced.
++        active = False
++        if not task.done():
++            task.cancel()
++            task.add_done_callback(_consume_completion)
++
++
++async def _append_results(runner, event, binding, result):
++    if binding is None or not binding.targets:
++        return result
++    notices = await asyncio.gather(*(_notify(runner, event, binding, target)
++                                    for target in binding.targets))
++    notices = [notice for notice in notices if notice]
++    if not notices:
++        return result
++    text = "\n\n".join([str(result or ""), *notices]).lstrip()
++    from gateway.platforms.base import EphemeralReply
++    if isinstance(result, EphemeralReply):
++        return EphemeralReply(text, ttl_seconds=result.ttl_seconds)
++    return text
++
++
++def native_control(operation):
++    """Wrap real fire sites; a nested busy-new → reset emits exactly once."""
++    def decorate(handler):
++        @wraps(handler)
++        async def execute(runner, event, *args, **kwargs):
++            current = _binding.get()
++            if (current is not None and current[0] is event and current[1] is not None
++                    and current[1].operation == operation):
++                if current[2]:
++                    return await handler(runner, event, *args, **kwargs)
++                binding = current[1]
++            else:
++                binding = capture_native_control(runner, event, operation)
++            try:
++                with native_control_scope(event, binding, running=True):
++                    result = await handler(runner, event, *args, **kwargs)
++            except (Exception, asyncio.CancelledError):
++                # Storage failure or native cancellation must not skip the
++                # independent escape hatch, or lose the original native error.
++                try:
++                    await _append_results(runner, event, binding, None)
++                except (Exception, asyncio.CancelledError):  # health: allow BLE001 -- Preserve the original native error without leaking plugin exception secrets.
++                    logger.warning("Native plugin control notification interrupted after native failure")
++                raise
++            return await _append_results(runner, event, binding, result)
++        return execute
++    return decorate
+diff --git a/gateway/run_plugin_commands.py b/gateway/run_plugin_commands.py
+--- a/gateway/run_plugin_commands.py
++++ b/gateway/run_plugin_commands.py
+@@ -62,14 +62,20 @@
+     return should_bypass_active_session(event.get_command()) or is_control_candidate(event)
+ 
+ 
+-def _entry_for_source(name, source):
++def _control_scope(source):
+     from hermes_constants import hermes_home_key
+     identity = identity_of(source)
+     if identity is None or identity.transport_inferred or identity.adapter() is None:
+         return None
+     if (source.profile or identity.runtime_profile) != identity.runtime_profile:
+         return None
+-    scope = hermes_home_key(identity.runtime_home)
++    return hermes_home_key(identity.runtime_home)
++
++
++def _entry_for_source(name, source):
++    scope = _control_scope(source)
++    if scope is None:
++        return None
+     return next(((manager, entry) for manager, entry in _control_entries(name)
+                  if manager.scope_key == scope), None)
+ 
+@@ -78,6 +84,7 @@
+     from hermes_cli.plugins import _plugin_home_scope, _plugin_settings_entry, load_config_readonly
+     context = entry["control_context"]
+     if (manager._plugin_commands.get(name) is not entry or context._load_abandoned
++            or (entry.get("native_registration") is not None and not entry["native_registration"].active)
+             or getattr(manager, "_gateway_unloading", False)):
+         return False
+     with _plugin_home_scope(manager.home_path):
+@@ -122,34 +129,34 @@
+         return False
+ 
+ 
+-def _call_sync(runner, manager, entry, name, args):
++def _call_sync(runner, manager, entry, name, args, valid=None):
+     # Unload/revocation may race the executor thread starting after admission.
+-    if not _still_allowed(runner, manager, entry, name):
++    if not _still_allowed(runner, manager, entry, name) or (valid is not None and not valid()):
+         return _REFUSED
+     return entry["handler"](args)
+ 
+ 
+-async def _invoke(runner, event, source, name, manager, entry, receipt):
++async def _invoke(runner, event, source, name, manager, entry, receipt, *, args=None, valid=None):
+     from gateway.run import _async_profile_runtime_scope
+     from gateway.session import build_session_context
+     from hermes_cli.plugin_command_context import _command_context
+     async with _async_profile_runtime_scope(manager.home_path):
+-        if not _still_allowed(runner, manager, entry, name):
++        if not _still_allowed(runner, manager, entry, name) or (valid is not None and not valid()):
+             return _REFUSED
+         context = build_session_context(source, runner.config)
+         context.session_key = receipt["session_key"]
+         with runner._session_env_scope(context), _command_context(
+             entry["control_context"], receipt,
+-            valid=lambda: _still_allowed(runner, manager, entry, name),
++            valid=lambda: _still_allowed(runner, manager, entry, name) and (valid is None or valid()),
+         ):
+             handler = entry["handler"]
+-            args = event.get_command_args().strip()
++            args = event.get_command_args().strip() if args is None else args
+             if inspect.iscoroutinefunction(handler):
+                 result = await handler(args)
+             else:
+-                result = await runner._run_in_executor_with_context(_call_sync, runner, manager, entry, name, args)
++                result = await runner._run_in_executor_with_context(_call_sync, runner, manager, entry, name, args, valid)
+                 if asyncio.iscoroutine(result):
+-                    if not _still_allowed(runner, manager, entry, name):
++                    if not _still_allowed(runner, manager, entry, name) or (valid is not None and not valid()):
+                         result.close()
+                         return _REFUSED
+                     result = await result
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -4,6 +4,8 @@
+ the one-off commands.  run.py helpers are imported lazily."""
+ 
+ from __future__ import annotations
++
++from gateway.run_native_controls import native_control
+ 
+ import asyncio
+ import contextlib
+@@ -417,6 +419,7 @@
+         await asyncio.to_thread(_sub)
+         return True
+ 
++    @native_control("stop")
+     async def _handle_stop_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+         """Handle /stop command - interrupt a running agent.  A truly hung agent (blocked thread
+         never checking _interrupt_requested) is caught by the early intercept in _handle_message();
+diff --git a/gateway/slash_commands_session.py b/gateway/slash_commands_session.py
+--- a/gateway/slash_commands_session.py
++++ b/gateway/slash_commands_session.py
+@@ -5,6 +5,8 @@
+ the import cycle."""
+ 
+ from __future__ import annotations
++
++from gateway.run_native_controls import native_control
+ 
+ import asyncio
+ import contextlib
+@@ -152,6 +154,7 @@
+         await self.hooks.emit("session:end", dict(hook_payload))
+         await self.hooks.emit("session:reset", dict(hook_payload))
+ 
++    @native_control("new")
+     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+         """Handle /new or /reset command."""
+         source = event.source
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -635,11 +635,13 @@
+     def register_command(
+         self, name: str, handler: Callable, description: str = "", args_hint: str = "",
+         argument_mode: str | None = None, *, gateway_control: bool = False,
++        native_controls: tuple[str, ...] = (),
+     ) -> Optional[PluginRegistration]:
+         """Register fn(raw_args), sync/async. Opt-in controls need owning-profile consent;
+         see plugins/gateway-controls.md. args_hint exposes trailing text on adapters."""
+         from hermes_cli.plugins_command_registration import register_command
+-        return register_command(self, name, handler, description, args_hint, argument_mode, gateway_control)
++        return register_command(self, name, handler, description, args_hint, argument_mode, gateway_control,
++                                native_controls)
+ 
+     def get_command_context(self) -> Optional[dict]:
+         from hermes_cli.plugin_command_context import get_command_context
+@@ -1168,6 +1170,7 @@
+         self._cli_commands: Dict[str, dict] = {}
+         self._plugin_commands: Dict[str, dict] = {}
+         self._gateway_control_names: Set[str] = set()  # Retired controls must never become agent input.
++        self._retired_native_controls: Dict[object, tuple] = {}  # Metadata only, scoped to this manager's lifetime.
+         self._system_prompt_sections: Dict[str, PluginSystemPromptSection] = {}
+         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
+         self._automation_blueprints: Dict[str, Any] = {}  # "<plugin>:<key>" -> AutomationBlueprint
+diff --git a/hermes_cli/plugins_command_registration.py b/hermes_cli/plugins_command_registration.py
+--- a/hermes_cli/plugins_command_registration.py
++++ b/hermes_cli/plugins_command_registration.py
+@@ -5,7 +5,27 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def register_command(context, name, handler, description, args_hint, argument_mode, gateway_control):
++def _retain_native_retirement(manager, registration, entry, name):
++    # Each registration owns separate external work. A later registration (even
++    # of the same callback/name) cannot certify that the retired work quiesced.
++    token = object()
++    owner = (name, entry["plugin_key"], entry["native_controls"])
++    release = registration.release
++
++    def retire():
++        manager._retired_native_controls[token] = owner
++        release()
++
++    registration.release = retire
++    entry["native_registration"] = registration
++
++
++def register_command(context, name, handler, description, args_hint, argument_mode, gateway_control,
++                     native_controls=()):
++    if (not isinstance(native_controls, (tuple, list))
++            or any(operation not in ("stop", "new") for operation in native_controls)
++            or (native_controls and gateway_control is not True)):
++        raise ValueError("native_controls requires gateway_control=True and canonical stop/new names")
+     clean = name.lower().strip().lstrip("/").replace(" ", "-")
+     if not clean:
+         logger.warning("Plugin '%s' tried to register a command with an empty name.", context.manifest.name)
+@@ -19,6 +39,7 @@
+     hint = (args_hint or "").strip()
+     entry = {
+         "handler": handler, "description": description or "Plugin command",
++        "native_controls": tuple(dict.fromkeys(native_controls)),
+         "gateway_control": gateway_control is True, "control_context": context if gateway_control is True else None,
+         "plugin": context.manifest.name, "plugin_key": context.plugin_id, "args_hint": hint,
+         "argument_mode": argument_mode if argument_mode in {"options", "text", "mixed"}
+@@ -28,4 +49,6 @@
+                                          "Plugin %s registered command: /%s", clean)
+     if registration is not None and gateway_control is True:
+         context._manager._gateway_control_names.add(clean)
++        if native_controls:
++            _retain_native_retirement(context._manager, registration, entry, clean)
+     return registration
+diff --git a/tests/gateway/test_native_plugin_controls.py b/tests/gateway/test_native_plugin_controls.py
+new file mode 100644
+--- /dev/null
++++ b/tests/gateway/test_native_plugin_controls.py
+@@ -0,0 +1,424 @@
++"""Native /stop and /new fire sites with real offline PTB provenance and guards."""
++import asyncio
++import threading
++from datetime import datetime
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from tests.gateway.test_plugin_control_commands import (
++    control as control_fixture, native as native_fixture, offline_boundary as boundary_fixture,
++)
++
++control = control_fixture
++native = native_fixture
++offline_boundary = boundary_fixture
++from tests.gateway.test_admitted_ingress import _bot
++from gateway.config import Platform
++from gateway.platforms.base import EphemeralReply
++from gateway.run import _AGENT_PENDING_SENTINEL
++from gateway.session import SessionEntry
++from hermes_cli.config import atomic_config_write
++
++
++@pytest.fixture
++def builtin(native, control):
++    runner = native.runner
++    _, event = native.make(text="/stop")
++    key = runner._session_key_for_source(event.source)
++    entry = SessionEntry(session_key=key, session_id="old-session", created_at=datetime.now(),
++                         updated_at=datetime.now(), platform=Platform.TELEGRAM, chat_type="group")
++    fresh = SessionEntry(session_key=key, session_id="new-session", created_at=datetime.now(),
++                         updated_at=datetime.now(), platform=Platform.TELEGRAM, chat_type="group")
++    runner.session_store.get_or_create_session.return_value = entry
++    runner.session_store.reset_session.return_value = fresh
++    runner.session_store._entries = {key: entry}
++    runner._session_db = None
++    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
++    runner._reset_notice_session_info = lambda source: ""
++    runner._telegram_topic_new_header = lambda source: None
++    runner._is_telegram_topic_lane = lambda source: False
++    runner._is_telegram_topic_root_lobby = lambda source: False
++    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": False}}
++    context, manager, seen, _ = control
++    observed = []
++
++    def register(handler=None):
++        def callback(args):
++            proof = context.get_command_context()
++            assert key not in runner._running_agents
++            observed.append((args, proof))
++            return "External task stopped; quiescence verified."
++        return context.register_command("task-control", handler or callback, gateway_control=True,
++                                        native_controls=("stop", "new"))
++
++    register()
++    return SimpleNamespace(key=key, context=context, manager=manager, observed=observed, register=register)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("command", ["stop", "new", "reset"])
++@pytest.mark.parametrize("state", ["idle", "pending", "busy"])
++async def test_native_routes_action_then_callback_once(native, builtin, command, state):
++    from hermes_cli.commands import resolve_command
++    # Exercise every actual reset alias, without inventing another dispatcher.
++    definition = resolve_command(command)
++    assert definition is not None
++    _, event = native.make(text=f"/{command}")
++    agent = MagicMock()
++    if state != "idle":
++        native.runner._session_state(builtin.key).turn.agent = (
++            _AGENT_PENDING_SENTINEL if state == "pending" else agent)
++        native.adapter._pending_messages[builtin.key] = native.make(text="stale human input")[1]
++    result = await native.runner._handle_message(event)
++    if command != "stop" or state != "idle":
++        assert isinstance(result, EphemeralReply)
++    assert "External task stopped; quiescence verified." in result
++    assert len(builtin.observed) == 1
++    args, receipt = builtin.observed[0]
++    assert args == ""
++    expected = "stop" if command == "stop" else "new"
++    assert receipt["command"] == receipt["native_operation"] == expected
++    assert receipt["control_command"] == "task-control"
++    assert receipt["admitted_ingress"]["message"]["platform_update_id"] == "701"
++    assert receipt["source"]["thread_id"] == "17"
++    if state == "busy":
++        agent.interrupt.assert_called_once()
++    if command != "stop":
++        native.runner.session_store.reset_session.assert_called_once_with(builtin.key)
++    native.runner._handle_message_with_agent.assert_not_awaited()
++    assert builtin.context.get_command_context() is None
++
++
++@pytest.mark.asyncio
++async def test_confirm_preserves_original_proof_and_only_fires_after_yes(native, builtin):
++    callbacks = []
++    async def request(**kwargs):
++        callbacks.append(kwargs["handler"])
++        return "confirmation pending"
++    native.runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": True}}
++    native.runner._request_slash_confirm = request
++    _, event = native.make(text="/reset")
++    assert await native.runner._handle_message(event) == "confirmation pending"
++    assert builtin.observed == []
++    native.runner.session_store.reset_session.assert_not_called()
++    assert "cancel" in str(await callbacks[0]("cancel")).lower()
++    assert builtin.observed == []
++    # Simulate later receipt/source mutation: the original proof/route is already bound.
++    event.source.thread_id = "88"
++    event.platform_update_id = 999
++    result = await callbacks[0]("once")
++    assert "External task stopped" in result
++    assert len(builtin.observed) == 1
++    receipt = builtin.observed[0][1]
++    assert receipt["source"]["thread_id"] == "17"
++    assert receipt["admitted_ingress"]["message"]["platform_update_id"] == "701"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("fault", ["bot", "user", "chat", "topic", "profile", "revoked", "unload"])
++@pytest.mark.parametrize("busy", [False, True])
++async def test_native_provenance_and_consent_fail_closed(native, builtin, fault, busy):
++    _, event = native.make(text="/stop")
++    actions = {
++        "bot": lambda: event.raw_message.set_bot(_bot(987654)),
++        "user": lambda: setattr(event.source, "user_id", "999"),
++        "chat": lambda: setattr(event.source, "chat_id", "-100999"),
++        "topic": lambda: setattr(event.source, "thread_id", "99"),
++        "profile": lambda: setattr(event.source, "profile", "foreign"),
++        "revoked": lambda: atomic_config_write(builtin.manager.home_path / "config.yaml", {
++            "plugins": {"entries": {"control-fixture": {"allow_gateway_control": False}}}}),
++        "unload": builtin.manager.unload,
++    }
++    actions[fault]()
++    if busy:
++        native.runner._session_state(builtin.key).turn.agent = MagicMock()
++    await native.runner._handle_message(event)
++    assert builtin.observed == []
++    native.runner._handle_message_with_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("kind", ["sync", "async", "sync_returns_async", "error", "cancel", "noop"])
++async def test_callback_results_do_not_replace_native_action(native, builtin, kind):
++    calls = []
++    def body(args):
++        calls.append(builtin.context.get_command_context())
++        assert builtin.key not in native.runner._running_agents
++        if kind == "error":
++            raise ValueError("secret-not-for-output")
++        if kind == "cancel":
++            raise asyncio.CancelledError()
++        return None if kind == "noop" else "external stopped"
++    async def async_body(args):
++        return body(args)
++    handler = {"async": async_body, "cancel": async_body,
++               "sync_returns_async": lambda args: async_body(args)}.get(kind, body)
++    builtin.register(handler)
++    agent = MagicMock()
++    native.runner._session_state(builtin.key).turn.agent = agent
++    _, event = native.make(text="/stop")
++    result = await native.runner._handle_message(event)
++    agent.interrupt.assert_called_once()
++    assert len(calls) == 1
++    assert "stopped" in str(result).lower()
++    assert ("UNKNOWN" in result) == (kind in ("error", "cancel"))
++    assert "secret-not-for-output" not in result
++    assert builtin.context.get_command_context() is None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("kind", ["sync", "async"])
++async def test_slow_callback_deadline_revokes_lease_after_native_stop(native, builtin, kind, monkeypatch):
++    from gateway import run_native_controls
++    monkeypatch.setattr(run_native_controls, "_NATIVE_CONTROL_TIMEOUT", 0.05)
++    release = threading.Event()
++    entered = threading.Event()
++    after = []
++    def slow(args):
++        assert builtin.key not in native.runner._running_agents
++        assert builtin.context.get_command_context() is not None
++        entered.set()
++        release.wait(5)
++        after.append(builtin.context.get_command_context())
++    async def slow_async(args):
++        assert builtin.key not in native.runner._running_agents
++        assert builtin.context.get_command_context() is not None
++        entered.set()
++        try:
++            await asyncio.Event().wait()
++        finally:
++            after.append(builtin.context.get_command_context())
++    builtin.register(slow if kind == "sync" else slow_async)
++    agent = MagicMock()
++    native.runner._session_state(builtin.key).turn.agent = agent
++    _, event = native.make(text="/stop")
++    try:
++        result = await asyncio.wait_for(native.runner._handle_message(event), 3)
++        assert entered.is_set()
++        assert "UNKNOWN" in result
++        agent.interrupt.assert_called_once()
++    finally:
++        release.set()
++        await native.runner._run_in_executor_with_context(lambda: None)
++    if kind == "sync":
++        await asyncio.to_thread(native.runner._shutdown_executor, drain_timeout=2)
++    assert after == [None]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("revocation", ["unload", "consent", "shutdown"])
++async def test_revocation_at_reset_preserves_native_result(native, builtin, revocation):
++    original = native.runner._clear_conversation_scope
++    def clear(key, *, reason):
++        original(key, reason=reason)
++        if revocation == "unload":
++            builtin.manager.unload()
++        elif revocation == "consent":
++            atomic_config_write(builtin.manager.home_path / "config.yaml", {"plugins": {"entries": {
++                "control-fixture": {"allow_gateway_control": False}}}})
++        else:
++            native.runner._executor_closing = True
++    native.runner._clear_conversation_scope = clear
++    _, event = native.make(text="/new")
++    result = await native.runner._handle_message(event)
++    assert "UNKNOWN" in result
++    native.runner.session_store.reset_session.assert_called_once()
++    assert builtin.observed == []
++
++
++def test_native_binding_requires_control_and_canonical_names(builtin):
++    for kwargs in ({"native_controls": ("stop",)},
++                   {"native_controls": ("reset",), "gateway_control": True},
++                   {"native_controls": "stop", "gateway_control": True}):
++        with pytest.raises(ValueError):
++            builtin.context.register_command("other-control", lambda args: None, **kwargs)
++
++
++@pytest.mark.asyncio
++async def test_adapter_busy_guard_reaches_native_binding(native, builtin):
++    _, event = native.make(text="/stop")
++    gate = asyncio.Event()
++    native.adapter._active_sessions[builtin.key] = gate
++    native.adapter._session_tasks[builtin.key] = asyncio.create_task(gate.wait())
++    native.runner._session_state(builtin.key).turn.agent = MagicMock()
++    await native.adapter.handle_message(event)
++    assert len(builtin.observed) == 1
++    assert builtin.key not in native.runner._running_agents
++    assert builtin.key not in native.adapter._pending_messages
++    assert "External task stopped" in native.adapter.send.call_args.kwargs["content"]
++
++
++@pytest.mark.asyncio
++async def test_original_receipt_survives_native_reset_mutation(native, builtin):
++    _, event = native.make(text="/new")
++    original = native.runner._clear_conversation_scope
++    def clear(key, *, reason):
++        original(key, reason=reason)
++        event.source.thread_id = "99"
++        event.source.user_id = "999"
++        event.raw_message = None
++    native.runner._clear_conversation_scope = clear
++    await native.runner._handle_message(event)
++    proof = builtin.observed[0][1]
++    assert proof["source"]["thread_id"] == "17"
++    assert proof["source"]["user_id"] == "111"
++    assert proof["session_key"] == builtin.key
++    assert proof["admitted_ingress"]["message"]["bot_id"] == "123456"
++
++
++@pytest.mark.asyncio
++async def test_normal_session_end_and_no_owned_job_keep_native_behavior(native, builtin):
++    from hermes_cli.plugins import invoke_hook
++    invoke_hook("on_session_end", session_id="old-session")
++    assert builtin.observed == []
++    builtin.register(lambda args: None)
++    _, event = native.make(text="/stop")
++    with_noop = await native.runner._handle_stop_command(event)
++    assert "UNKNOWN" not in with_noop
++    builtin.manager.unload()
++    without_binding = await native.runner._handle_stop_command(event)
++    assert without_binding.startswith(with_noop)
++    assert "UNKNOWN" in without_binding
++    assert type(with_noop) is type(without_binding)
++
++
++@pytest.mark.asyncio
++async def test_outer_cancellation_keeps_native_stop_and_revokes_callback(native, builtin):
++    entered = asyncio.Event()
++    revoked = []
++    async def callback(args):
++        assert builtin.key not in native.runner._running_agents
++        entered.set()
++        try:
++            await asyncio.Event().wait()
++        finally:
++            revoked.append(builtin.context.get_command_context())
++    builtin.register(callback)
++    agent = MagicMock()
++    native.runner._session_state(builtin.key).turn.agent = agent
++    _, event = native.make(text="/stop")
++    task = asyncio.create_task(native.runner._handle_message(event))
++    await asyncio.wait_for(entered.wait(), 3)
++    task.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await task
++    await asyncio.sleep(0)
++    agent.interrupt.assert_called_once()
++    assert builtin.key not in native.runner._running_agents
++    assert revoked == [None]
++
++
++@pytest.mark.asyncio
++async def test_native_binding_uses_only_own_profile_consent(native, builtin, tmp_path):
++    from dataclasses import replace
++    from gateway.session_identity import identity_of
++    from hermes_cli.plugins import _plugin_home_scope, get_plugin_manager, PluginContext, PluginManifest
++    from hermes_constants import get_hermes_home
++    runtime_home = tmp_path / "satellite"
++    runtime_home.mkdir()
++    with _plugin_home_scope(runtime_home):
++        manager = get_plugin_manager()
++        manager._discovered = True
++        context = PluginContext(PluginManifest(name="satellite-control", source="user"), manager)
++    seen = []
++    def handler(args):
++        seen.append((context.get_command_context(), get_hermes_home()))
++        return "satellite stopped"
++    context.register_command("task-control", handler, gateway_control=True, native_controls=("stop",))
++    try:
++        _, event = native.make(text="/stop")
++        event.source.profile = "satellite"
++        event.source._identity = replace(identity_of(event.source), runtime_profile="satellite", runtime_home=runtime_home)
++        # The default profile's true consent must not authorize this profile.
++        result = await native.runner._handle_message(event)
++        assert "UNKNOWN" in result
++        assert seen == [] and builtin.observed == []
++        atomic_config_write(runtime_home / "config.yaml", {"plugins": {"entries": {
++            "satellite-control": {"allow_gateway_control": True}}}})
++        result = await native.runner._handle_message(event)
++        assert "satellite stopped" in result
++        proof, home = seen[0]
++        assert home == runtime_home
++        assert proof["source"]["profile"] == "satellite"
++        assert proof["admitted_ingress"]["transport_profile"] == "default"
++        assert builtin.observed == []
++    finally:
++        manager.unload()
++
++
++@pytest.mark.asyncio
++async def test_expired_callback_cannot_extend_native_response_deadline(native, builtin, monkeypatch):
++    from gateway import run_native_controls
++    monkeypatch.setattr(run_native_controls, "_NATIVE_CONTROL_TIMEOUT", 0.05)
++    release = asyncio.Event()
++    finished = asyncio.Event()
++    after = []
++    async def callback(args):
++        try:
++            await asyncio.Event().wait()
++        except asyncio.CancelledError:
++            after.append(builtin.context.get_command_context())
++            await release.wait()
++        finally:
++            finished.set()
++    builtin.register(callback)
++    _, event = native.make(text="/stop")
++    try:
++        result = await asyncio.wait_for(native.runner._handle_message(event), 3)
++        assert "UNKNOWN" in result
++        assert not finished.is_set()
++        assert after == [None]
++    finally:
++        release.set()
++        await asyncio.wait_for(finished.wait(), 3)
++
++
++@pytest.mark.asyncio
++async def test_explicit_command_unchanged_with_native_binding(native, builtin):
++    calls = []
++    def callback(args):
++        calls.append((args, builtin.context.get_command_context()))
++        return "explicit result"
++    builtin.register(callback)
++    _, event = native.make(text="/task-control stop owned-task")
++    assert await native.runner._handle_message(event) == "explicit result"
++    assert calls[0][0] == "stop owned-task"
++    assert calls[0][1]["command"] == "task-control"
++    assert "native_operation" not in calls[0][1]
++    native.runner.session_store.reset_session.assert_not_called()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("grant", [None, False, "true", 1])
++async def test_native_binding_requires_literal_consent(native, builtin, grant):
++    atomic_config_write(builtin.manager.home_path / "config.yaml", {"plugins": {"entries": {
++        "control-fixture": {"allow_gateway_control": grant}}}})
++    _, event = native.make(text="/stop")
++    agent = MagicMock()
++    native.runner._session_state(builtin.key).turn.agent = agent
++    result = await native.runner._handle_message(event)
++    agent.interrupt.assert_called_once()
++    assert "UNKNOWN" in result
++    assert builtin.observed == []
++
++
++@pytest.mark.asyncio
++async def test_context_is_detached_and_ends_with_native_callback(native, builtin):
++    release = asyncio.Event()
++    children = []
++    async def later():
++        await release.wait()
++        return builtin.context.get_command_context()
++    async def callback(args):
++        proof = builtin.context.get_command_context()
++        proof["source"]["user_id"] = "999"
++        proof["admitted_ingress"]["message"]["bot_id"] = "999"
++        assert builtin.context.get_command_context()["source"]["user_id"] == "111"
++        children.append(asyncio.create_task(later()))
++    builtin.register(callback)
++    _, event = native.make(text="/stop")
++    await native.runner._handle_message(event)
++    release.set()
++    assert await children[0] is None
+diff --git a/website/docs/developer-guide/plugins/gateway-controls.md b/website/docs/developer-guide/plugins/gateway-controls.md
+--- a/website/docs/developer-guide/plugins/gateway-controls.md
++++ b/website/docs/developer-guide/plugins/gateway-controls.md
+@@ -55,3 +55,49 @@
+ 
+ The isolated plugin host cannot register gateway controls or obtain native
+ command context. The host audit reports these surfaces as in-process only.
++
++
++## Following native stop and reset
++
++An existing control may opt into native actions without replacing their handlers:
++
++```python
++ctx.register_command("task-control", control, gateway_control=True,
++                     native_controls=("stop", "new"))
++```
++
++Only canonical `stop` and `new` are accepted; native `/reset` follows `new`.
++The same callback receives `raw_args=""` and the usual authenticated context,
++with `command` and `native_operation` set to the canonical native operation and
++`control_command` set to the registered custom command name. Explicit custom
++commands retain their original arguments and have no `native_operation` field.
++The plugin must compare the original task owner before touching its own work.
++Return `None` when there is no owned work so the normal native reply is unchanged.
++
++Native interruption/reset is attempted first, for idle, pending and busy sessions.
++The callback cannot veto it. Busy new followed by reset invokes the binding once.
++If the native attempt raises, the same bounded notification is still attempted,
++then the original native exception or cancellation propagates. Plugin failures
++cannot replace that error. Cancelling a pending confirmation invokes neither action.
++A destructive confirmation prompt does not invoke it; confirmation retains the
++original command's detached provenance and route before the native reset, then
++invokes only after execution. Normal session-end hooks do not invoke this binding.
++No latest-message receipt or invented native identity is used.
++
++Each callback has a two-second response deadline. Successful nonempty text is
++appended to the native reply, preserving its ephemeral lifetime. Refusal, failure,
++cancellation of the callback, or timeout appends `External plugin work: UNKNOWN`
++instead of claiming external work stopped. Empty successful callbacks add nothing.
++Caller cancellation still propagates after the native action; it cannot undo it.
++Consent, owning profile, unload and shutdown guards and invocation leases are the
++same as explicit controls. Timeout immediately revokes the lease, including in
++executor threads; Python cannot kill those threads, so plugins must cooperate and
++must not retain authority from saved receipt dictionaries. Async callbacks must
++cooperate with the event loop. New registrations during native execution do not
++receive an already captured command. Disposed bindings are not invoked.
++Their operation ownership remains as metadata in the owning profile's manager,
++so fresh native commands report `UNKNOWN` after disposal or unload. A new
++registration cannot certify quiescence for an older retired generation, including
++when disposal restores a still-live predecessor. Profiles that never registered
++that native operation retain their existing replies. No disposed callback is retained
++in the retirement metadata or invoked through it.
+diff --git a/tests/gateway/test_builtin_independent_review.py b/tests/gateway/test_builtin_independent_review.py
+new file mode 100644
+--- /dev/null
++++ b/tests/gateway/test_builtin_independent_review.py
+@@ -0,0 +1,108 @@
++"""Independent offline builtin contract checks; no real external worker is claimed."""
++from unittest.mock import MagicMock
++import pytest
++from tests.gateway.test_native_plugin_controls import (
++    builtin as builtin_fixture, native as native_fixture,
++    control as control_fixture, offline_boundary as boundary_fixture,
++)
++from hermes_cli.config import atomic_config_write
++
++builtin = builtin_fixture
++native = native_fixture
++control = control_fixture
++offline_boundary = boundary_fixture
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('retirement', ['dispose', 'unload'])
++@pytest.mark.parametrize('command', ['stop', 'new'])
++@pytest.mark.parametrize('busy', [False, True])
++async def test_fresh_native_event_reports_unknown_after_retirement(native, builtin, retirement, command, busy):
++    registration = next(r for r in reversed(builtin.manager._registration_order)
++                        if r.kind == "command" and r.key == "task-control")
++    if retirement == 'dispose': registration.dispose()
++    else: builtin.manager.unload()
++    _, event = native.make(text='/' + command)  # A fresh event, first seen after retirement.
++    agent = MagicMock()
++    if busy: native.runner._session_state(builtin.key).turn.agent = agent
++    response = await native.runner._handle_message(event)
++    if busy: agent.interrupt.assert_called_once()
++    assert builtin.observed == []
++    native.runner._handle_message_with_agent.assert_not_awaited()
++    print('RETIRED:', retirement, command, busy, repr(str(response)))
++    assert 'UNKNOWN' in response, 'retired external binding silently becomes bare native success/no-active'
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('busy', [False, True])
++async def test_native_reset_storage_failure_still_notifies_original_binding(native, builtin, busy):
++    _, event = native.make(text='/new')
++    agent=MagicMock()
++    if busy: native.runner._session_state(builtin.key).turn.agent=agent
++    original=OSError('offline injected session storage fault')
++    native.runner.session_store.reset_session.side_effect=original
++    with pytest.raises(OSError) as observed:
++        if busy: await native.runner._busy_new_command(event,builtin.key,event.source)
++        else: await native.runner._handle_reset_command(event)
++    assert observed.value is original, 'preserve original native exception'
++    if busy: agent.interrupt.assert_called_once()
++    assert builtin.key not in native.runner._running_agents
++    print('RESET ERROR:', busy, 'native error preserved; callbacks=',len(builtin.observed))
++    assert len(builtin.observed)==1, 'native reset storage error skips the only external stop callback'
++
++@pytest.mark.asyncio
++async def test_native_stop_storage_failure_still_notifies_original_binding(native,builtin):
++    _,event=native.make(text='/stop')
++    original=OSError('offline injected session lookup fault')
++    native.runner.session_store.get_or_create_session.side_effect=original
++    with pytest.raises(OSError) as observed:
++        await native.runner._handle_stop_command(event)
++    assert observed.value is original
++    assert len(builtin.observed)==1, 'native session lookup error skips the only external stop callback'
++
++@pytest.mark.asyncio
++async def test_cancelled_confirmation_does_not_stop_external_work(native,builtin):
++    requests=[]
++    async def prompt(**kwargs): requests.append(kwargs['handler']); return 'pending'
++    native.runner._read_user_config=lambda:{'approvals':{'destructive_slash_confirm':True}}
++    native.runner._request_slash_confirm=prompt
++    _,event=native.make(text='/reset')
++    assert await native.runner._handle_message(event)=='pending'
++    result=await requests[0]('cancel')
++    assert 'cancel' in str(result).lower()
++    assert builtin.observed==[]
++    native.runner.session_store.reset_session.assert_not_called()
++
++@pytest.mark.asyncio
++async def test_consent_revoked_during_confirmation_remains_unknown(native,builtin):
++    requests=[]
++    async def prompt(**kwargs): requests.append(kwargs['handler']); return 'pending'
++    native.runner._read_user_config=lambda:{'approvals':{'destructive_slash_confirm':True}}
++    native.runner._request_slash_confirm=prompt
++    _,event=native.make(text='/reset')
++    assert await native.runner._handle_message(event)=='pending'
++    atomic_config_write(builtin.manager.home_path/'config.yaml',{'plugins':{'entries':{'control-fixture':{'allow_gateway_control':False}}}})
++    result=await requests[0]('once')
++    assert 'UNKNOWN' in result
++    assert builtin.observed==[]
++    native.runner.session_store.reset_session.assert_called_once()
++
++@pytest.mark.asyncio
++async def test_replacement_during_native_action_cannot_claim_original_event(native,builtin):
++    original_clear=native.runner._clear_conversation_scope
++    unexpected=[]
++    def clear(key,*,reason):
++        original_clear(key,reason=reason)
++        builtin.register(lambda args: unexpected.append(args) or 'unexpected')
++    native.runner._clear_conversation_scope=clear
++    _,event=native.make(text='/new')
++    result=await native.runner._handle_message(event)
++    assert 'UNKNOWN' in result
++    assert unexpected==[] and builtin.observed==[]
++
++@pytest.mark.asyncio
++async def test_never_registered_native_control_keeps_existing_reply(native,control):
++    # Ordinary explicit control fixture exists but never opted into a native operation.
++    _,event=native.make(text='/stop')
++    native.runner.session_store.get_or_create_session.return_value=MagicMock(session_key='agent:main:telegram:fixture',session_id='s')
++    reply=await native.runner._handle_stop_command(event)
++    assert 'UNKNOWN' not in reply
++    assert control[2]==[]
+diff --git a/tests/gateway/test_native_control_lifecycle.py b/tests/gateway/test_native_control_lifecycle.py
+new file mode 100644
+--- /dev/null
++++ b/tests/gateway/test_native_control_lifecycle.py
+@@ -0,0 +1,190 @@
++"""Retired native ownership and exception escape hatches with offline ingress."""
++import asyncio
++from dataclasses import replace
++from unittest.mock import MagicMock
++
++import pytest
++
++from gateway.session_identity import identity_of
++from hermes_cli.plugins import PluginContext, PluginManifest, _plugin_home_scope, get_plugin_manager
++from tests.gateway.test_native_plugin_controls import (
++    builtin as builtin_fixture, control as control_fixture,
++    native as native_fixture, offline_boundary as boundary_fixture,
++)
++
++builtin = builtin_fixture
++control = control_fixture
++native = native_fixture
++offline_boundary = boundary_fixture
++
++
++def registration(builtin):
++    return next(item for item in reversed(builtin.manager._registration_order)
++                if item.kind == "command" and item.key == "task-control")
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("retire", ["dispose", "unload"])
++@pytest.mark.parametrize("replacement", ["native", "ordinary", "none"])
++async def test_retired_generation_survives_reregistration(native, builtin, retire, replacement):
++    if retire == "dispose":
++        registration(builtin).dispose()
++    else:
++        builtin.manager.unload()
++    seen = []
++    if replacement == "native":
++        builtin.register(lambda args: seen.append(builtin.context.get_command_context()) or "new owner")
++    elif replacement == "ordinary":
++        builtin.context.register_command("task-control", lambda args: seen.append(args) or "ordinary")
++    _, event = native.make(text="/stop")
++    result = await native.runner._handle_message(event)
++    assert "UNKNOWN" in result
++    assert len(seen) == int(replacement == "native")
++    assert builtin.observed == []
++    if seen:
++        assert seen[0]["native_operation"] == "stop"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("dispose_newest", [False, True])
++async def test_disposal_restores_only_live_generation_and_keeps_retired_unknown(native, builtin, dispose_newest):
++    first = registration(builtin)
++    seen = []
++    second = builtin.register(lambda args: seen.append(args) or "second")
++    (second if dispose_newest else first).dispose()
++    _, event = native.make(text="/stop")
++    result = await native.runner._handle_message(event)
++    assert "UNKNOWN" in result
++    assert len(builtin.observed) == int(dispose_newest)
++    assert len(seen) == int(not dispose_newest)
++    first.dispose()
++    second.dispose()
++    _, event = native.make(text="/new")
++    result = await native.runner._handle_message(event)
++    assert "UNKNOWN" in result
++    assert len(builtin.observed) == int(dispose_newest)
++    assert len(seen) == int(not dispose_newest)
++
++
++@pytest.mark.asyncio
++async def test_retired_ownership_does_not_cross_profile_or_operation(native, builtin, tmp_path):
++    home = tmp_path / "satellite"
++    home.mkdir()
++    with _plugin_home_scope(home):
++        manager = get_plugin_manager()
++        manager._discovered = True
++        context = PluginContext(PluginManifest(name="retired-satellite", source="user"), manager)
++    seen = []
++    handle = context.register_command("task-control", lambda args: seen.append(args),
++                                      gateway_control=True, native_controls=("stop",))
++    handle.dispose()
++    _, event = native.make(text="/stop")
++    result = await native.runner._handle_message(event)
++    assert "UNKNOWN" not in result
++    assert len(builtin.observed) == 1
++    event.source.profile = "satellite"
++    event.source._identity = replace(identity_of(event.source), runtime_profile="satellite", runtime_home=home)
++    result = await native.runner._handle_stop_command(event)
++    assert "UNKNOWN" in result
++    _, reset = native.make(text="/new")
++    reset.source.profile = "satellite"
++    reset.source._identity = replace(identity_of(reset.source), runtime_profile="satellite", runtime_home=home)
++    result = await native.runner._handle_reset_command(reset)
++    assert "UNKNOWN" not in result
++    assert seen == [] and len(builtin.observed) == 1
++    manager.unload()
++
++
++@pytest.mark.asyncio
++async def test_disposal_during_native_attempt_refuses_captured_callback(native, builtin):
++    handle = registration(builtin)
++    original = native.runner._clear_conversation_scope
++    def clear(key, *, reason):
++        original(key, reason=reason)
++        handle.dispose()
++    native.runner._clear_conversation_scope = clear
++    _, event = native.make(text="/new")
++    result = await native.runner._handle_message(event)
++    assert "UNKNOWN" in result and builtin.observed == []
++    native.runner.session_store.reset_session.assert_called_once()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("failure", ["storage", "native_cancel"])
++@pytest.mark.parametrize("callback", ["success", "error", "self_cancel", "timeout"])
++async def test_exception_notification_preserves_original_error_and_once_only(native, builtin, failure, callback, monkeypatch):
++    from gateway import run_native_controls
++    monkeypatch.setattr(run_native_controls, "_NATIVE_CONTROL_TIMEOUT", 0.05)
++    original = OSError("storage-original") if failure == "storage" else asyncio.CancelledError("native-original")
++    native.runner.session_store.reset_session.side_effect = original
++    seen = []
++    revoked = []
++    async def notify(args):
++        seen.append(builtin.context.get_command_context())
++        assert builtin.key not in native.runner._running_agents
++        if callback == "error":
++            raise ValueError("private-plugin-error")
++        if callback == "self_cancel":
++            raise asyncio.CancelledError("plugin-cancel")
++        if callback == "timeout":
++            try:
++                await asyncio.Event().wait()
++            finally:
++                revoked.append(builtin.context.get_command_context())
++        return "external stopped"
++    builtin.register(notify)
++    agent = MagicMock()
++    native.runner._session_state(builtin.key).turn.agent = agent
++    _, event = native.make(text="/new")
++    with pytest.raises(type(original)) as raised:
++        await asyncio.wait_for(native.runner._busy_new_command(event, builtin.key, event.source), 3)
++    assert raised.value is original
++    agent.interrupt.assert_called_once()
++    native.runner.session_store.reset_session.assert_called_once()
++    assert len(seen) == 1 and seen[0]["native_operation"] == "new"
++    assert builtin.context.get_command_context() is None
++    await asyncio.sleep(0)
++    assert revoked == ([None] if callback == "timeout" else [])
++
++
++@pytest.mark.asyncio
++async def test_outer_cancel_during_error_notification_keeps_original_error_and_revokes(native, builtin):
++    original = OSError("storage-original")
++    native.runner.session_store.reset_session.side_effect = original
++    entered = asyncio.Event()
++    revoked = []
++    async def notify(args):
++        entered.set()
++        try:
++            await asyncio.Event().wait()
++        finally:
++            revoked.append(builtin.context.get_command_context())
++    builtin.register(notify)
++    _, event = native.make(text="/new")
++    task = asyncio.create_task(native.runner._handle_reset_command(event))
++    await asyncio.wait_for(entered.wait(), 3)
++    task.cancel()
++    with pytest.raises(OSError) as raised:
++        await task
++    assert raised.value is original
++    await asyncio.sleep(0)
++    assert revoked == [None]
++
++
++@pytest.mark.asyncio
++async def test_confirmation_capture_does_not_transfer_to_new_generation(native, builtin):
++    prompts = []
++    async def prompt(**kwargs):
++        prompts.append(kwargs["handler"])
++        return "pending"
++    native.runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": True}}
++    native.runner._request_slash_confirm = prompt
++    _, event = native.make(text="/reset")
++    assert await native.runner._handle_message(event) == "pending"
++    builtin.manager.unload()
++    seen = []
++    builtin.register(lambda args: seen.append(args) or "replacement")
++    result = await prompts[0]("once")
++    assert "UNKNOWN" in result
++    assert seen == [] and builtin.observed == []
++    native.runner.session_store.reset_session.assert_called_once()
