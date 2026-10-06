@@ -139,7 +139,7 @@ class IngressAdmissions:
         self.associations = Associations(state)
 
     def _read(self):
-        document = self.state.get(KEY, {"schema_version": 1, "receipts": {}})
+        document = self.associations.state_get(KEY, {"schema_version": 1, "receipts": {}})
         if (not isinstance(document, dict) or set(document) != {"schema_version", "receipts"}
                 or type(document["schema_version"]) is not int or document["schema_version"] != 1
                 or not isinstance(document["receipts"], dict)):
@@ -171,7 +171,7 @@ class IngressAdmissions:
                     raise ValueError("ingress_identity_conflict")
                 return
             document["receipts"][key] = snapshot
-            self.state.set(KEY, document)
+            self.associations.state_set(KEY, document)
             _sync_directory(Path(self.state.data_dir))
 
     def match(self, owner, *, task_id, session_id):

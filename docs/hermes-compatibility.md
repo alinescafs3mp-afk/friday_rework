@@ -1,5 +1,15 @@
 # Temporary local context compatibility
 
+The host integration additionally requires the seventh overlay,
+`patches/hermes/bounded-state.patch`, after the six existing overlays.
+`bounded-state-manifest.json` pins its prerequisite and every changed file.
+It adds an explicit cumulative lock acquisition budget to native PluginState;
+absolute deadlines and default blocking behavior are retained. The allowance
+belongs to the creator Thread object, cannot be transferred through copied
+contexts and excludes time spent doing native work. It does not change a
+worker's original deadline. Apply only through the owned-checkout and exact
+hash checks below; no runtime configuration is enabled by applying source.
+
 `patches/hermes/bounded-local-context.patch` applies to Hermes commit
 `781334eea4b9225a3e194faf0c241d9afe218634`. Its SHA-256 is
 `a13d7b4fc469597cdaa5c4bd9c7139eade5adaca908b196288fa3aac0a61d465`.

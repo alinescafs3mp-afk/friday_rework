@@ -1,0 +1,449 @@
+diff --git a/hermes_cli/plugins_state.py b/hermes_cli/plugins_state.py
+--- a/hermes_cli/plugins_state.py
++++ b/hermes_cli/plugins_state.py
+@@ -3,10 +3,13 @@
+ from __future__ import annotations
+ 
+ import json
++import errno
++import math
+ import os
+ import re
+ import threading
+-from contextlib import contextmanager
++import time
++from contextlib import contextmanager, nullcontext
+ from pathlib import Path
+ from typing import Any, Dict, Mapping
+ 
+@@ -101,14 +104,100 @@
+     return _portable_skill_namespace(candidate)
+ 
+ 
++class LockAcquisitionBudget:
++    """Cumulative acquisition allowance for sequential calls on one thread.
++
++    Time outside ``acquiring`` (including native work and filesystem I/O) is
++    excluded. A copied context cannot spend the same allowance concurrently:
++    cross-thread use and overlapping acquisition scopes fail closed, without
++    introducing another lock. Exhaustion persists for this object's lifetime.
++    """
++
++    def __init__(self, seconds: float) -> None:
++        if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
++                or not math.isfinite(seconds) or seconds < 0):
++            raise ValueError("lock budget must be finite nonnegative seconds")
++        self._remaining = seconds
++        # Thread identifiers can be reused after exit; retain the creator itself.
++        self._owner_thread = threading.current_thread()
++        self._acquiring = False
++
++    @contextmanager
++    def acquiring(self):
++        if threading.current_thread() is not self._owner_thread or self._acquiring:
++            raise RuntimeError("lock budget requires sequential same-thread acquisition")
++        if self._remaining <= 0:
++            raise TimeoutError("Plugin state lock budget exceeded")
++        began = time.monotonic()
++        self._acquiring = True
++        try:
++            yield began + self._remaining
++        finally:
++            self._remaining = max(0.0, self._remaining - max(0.0, time.monotonic() - began))
++            self._acquiring = False
++
++
++def _acquisition_scope(deadline, budget):
++    return budget.acquiring() if budget is not None else nullcontext(deadline)
++
++
++def _lock_remaining(deadline):
++    remaining = deadline - time.monotonic()
++    if remaining <= 0:
++        raise TimeoutError("Plugin state lock deadline exceeded")
++    return remaining
++
++
+ @contextmanager
+-def _locked_plugin_state(path: Path):
++def _thread_state_lock(lock, deadline, budget=None):
++    with _acquisition_scope(deadline, budget) as acquisition_deadline:
++        if acquisition_deadline is None:
++            lock.acquire()
++        elif not lock.acquire(timeout=_lock_remaining(acquisition_deadline)):
++            raise TimeoutError("Plugin state lock deadline exceeded")
++    try:
++        yield
++    finally:
++        lock.release()
++
++
++def _acquire_state_file(handle, deadline):
++    if os.name == "nt":  # pragma: no cover - Windows CI
++        import msvcrt
++        def acquire():
++            handle.seek(0)
++            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if deadline is None else msvcrt.LK_NBLCK, 1)
++    else:
++        import fcntl
++        def acquire():
++            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (fcntl.LOCK_NB if deadline is not None else 0))
++    while True:
++        if deadline is not None:
++            _lock_remaining(deadline)
++        try:
++            acquire()
++            return
++        except OSError as exc:
++            if deadline is None or exc.errno not in (errno.EACCES, errno.EAGAIN):
++                raise
++            time.sleep(min(.01, _lock_remaining(deadline)))
++
++
++@contextmanager
++def _locked_plugin_state(path: Path, *, lock_deadline: float | None = None,
++                         lock_budget: LockAcquisitionBudget | None = None):
+     """Serialize state read-modify-write across threads/processes (fcntl / msvcrt). The lock lives in a
+     sibling file because atomic replacement changes the target's inode."""
++    if lock_deadline is not None and (isinstance(lock_deadline, bool)
++            or not isinstance(lock_deadline, (float, int)) or not math.isfinite(lock_deadline)):
++        raise ValueError("lock_deadline must be a finite monotonic timestamp")
++    if lock_budget is not None and (not isinstance(lock_budget, LockAcquisitionBudget)
++                                    or lock_deadline is not None):
++        raise ValueError("lock_budget must be a LockAcquisitionBudget, without lock_deadline")
+     lock_path = path.with_name(f".{path.name}.lock")
+-    with _PLUGIN_STATE_LOCKS_GUARD:
++    with _thread_state_lock(_PLUGIN_STATE_LOCKS_GUARD, lock_deadline, lock_budget):
+         thread_lock = _PLUGIN_STATE_LOCKS.setdefault(str(lock_path.resolve(strict=False)), threading.RLock())
+-    with thread_lock:
++    with _thread_state_lock(thread_lock, lock_deadline, lock_budget):
+         lock_path.parent.mkdir(parents=True, exist_ok=True)
+         with open(lock_path, "a+b") as handle:
+             if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+@@ -117,10 +206,8 @@
+                     handle.write(b"\0")
+                     handle.flush()
+                 handle.seek(0)
+-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+-            else:
+-                import fcntl
+-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
++            with _acquisition_scope(lock_deadline, lock_budget) as acquisition_deadline:
++                _acquire_state_file(handle, acquisition_deadline)
+             try:
+                 yield
+             finally:
+@@ -128,6 +215,7 @@
+                     handle.seek(0)
+                     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                 else:
++                    import fcntl
+                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+ 
+ 
+@@ -170,16 +258,18 @@
+             raise RuntimeError(f"Cannot parse plugin state {self.path}: root must be an object")
+         return data
+ 
+-    def get(self, key: str, default: Any = None) -> Any:
+-        """Read a JSON value, returning *default* when the key is absent."""
++    def get(self, key: str, default: Any = None, *, lock_deadline: float | None = None,
++            lock_budget: LockAcquisitionBudget | None = None) -> Any:
++        """Read JSON; opt into an absolute deadline or cumulative acquisition budget."""
+         self._validate_key(key)
+-        with _locked_plugin_state(self.path):
++        with _locked_plugin_state(self.path, lock_deadline=lock_deadline, lock_budget=lock_budget):
+             return self._read_unlocked().get(key, default)
+ 
+-    def set(self, key: str, value: Any) -> None:
++    def set(self, key: str, value: Any, *, lock_deadline: float | None = None,
++            lock_budget: LockAcquisitionBudget | None = None) -> None:
+         """Atomically set one JSON value without dropping concurrent updates."""
+         self._validate_key(key)
+-        with _locked_plugin_state(self.path):
++        with _locked_plugin_state(self.path, lock_deadline=lock_deadline, lock_budget=lock_budget):
+             data = self._read_unlocked()
+             data[key] = value
+             try:
+diff --git a/tests/hermes_cli/test_plugin_state_deadline.py b/tests/hermes_cli/test_plugin_state_deadline.py
+new file mode 100644
+--- /dev/null
++++ b/tests/hermes_cli/test_plugin_state_deadline.py
+@@ -0,0 +1,89 @@
++"""Opt-in bounded native state retains its writer and thread/process exclusion."""
++from contextvars import copy_context
++import os
++import threading
++import time
++
++import pytest
++
++from hermes_cli import plugins_state as state_module
++from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++
++
++@pytest.fixture
++def state(tmp_path):
++    token = set_hermes_home_override(tmp_path / 'profile')
++    value = state_module.PluginState('bounded-test')
++    value.set('original', {'keep': True})
++    yield value
++    reset_hermes_home_override(token)
++
++
++@pytest.mark.platforms('posix')
++@pytest.mark.parametrize('layer', ['guard', 'thread', 'file'])
++@pytest.mark.parametrize('operation', ['get', 'set'])
++def test_contended_lock_times_out_before_holder_release(state, layer, operation):
++    path = state.path.with_name('.state.json.lock')
++    lock = (state_module._PLUGIN_STATE_LOCKS_GUARD if layer == 'guard' else
++            state_module._PLUGIN_STATE_LOCKS[str(path.resolve())])
++    held, release, done = threading.Event(), threading.Event(), threading.Event()
++    errors = []
++    before = state.path.read_bytes()
++    def holder():
++        if layer == 'file':
++            import fcntl
++            with path.open('a+b') as fd:
++                fcntl.flock(fd, fcntl.LOCK_EX)
++                held.set()
++                assert release.wait(5)
++        else:
++            with lock:
++                held.set()
++                assert release.wait(5)
++    def reader():
++        try:
++            if operation == 'get':
++                state.get('original', lock_deadline=time.monotonic() + .1)
++            else:
++                state.set('original', 'changed', lock_deadline=time.monotonic() + .1)
++        except BaseException as error:
++            errors.append(error)
++        finally:
++            done.set()
++    holding = threading.Thread(target=holder)
++    stopping = threading.Thread(target=copy_context().run, args=(reader,))
++    holding.start()
++    try:
++        assert held.wait(3)
++        stopping.start()
++        assert done.wait(3), 'bounded operation must finish with holder still locked'
++        assert len(errors) == 1 and isinstance(errors[0], TimeoutError)
++        assert state.path.read_bytes() == before
++    finally:
++        release.set()
++        holding.join(3)
++        if stopping.ident is not None:
++            stopping.join(3)
++        assert not holding.is_alive() and not stopping.is_alive()
++    state.set('next', 1, lock_deadline=time.monotonic() + 2)
++    assert state.get('original') == {'keep': True}
++    assert state.get('next') == 1
++
++
++@pytest.mark.parametrize('deadline', [True, float('nan'), float('inf'), 'later'])
++def test_invalid_deadline_cannot_mutate(state, deadline):
++    before = state.path.read_bytes()
++    with pytest.raises(ValueError):
++        state.set('original', 9, lock_deadline=deadline)
++    assert state.path.read_bytes() == before
++
++
++def test_expired_deadline_and_bounded_quota_use_original_writer(state, monkeypatch):
++    before = state.path.read_bytes()
++    with pytest.raises(TimeoutError):
++        state.set('original', 9, lock_deadline=time.monotonic() - 1)
++    monkeypatch.setattr(state_module, '_PLUGIN_STATE_QUOTA_BYTES', 10)
++    with pytest.raises(ValueError, match='quota'):
++        state.set('large', 'x' * 100, lock_deadline=time.monotonic() + 2)
++    assert state.path.read_bytes() == before
++    assert os.stat(state.path).st_mode & 0o777 == 0o600
+diff --git a/tests/hermes_cli/test_plugin_state_budget.py b/tests/hermes_cli/test_plugin_state_budget.py
+new file mode 100644
+--- /dev/null
++++ b/tests/hermes_cli/test_plugin_state_budget.py
+@@ -0,0 +1,152 @@
++"""Cumulative acquisition budgets exclude work and preserve original state semantics."""
++from contextvars import ContextVar, copy_context
++import threading
++import time
++
++import pytest
++
++from hermes_cli import plugins_state as state_module
++from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++
++
++@pytest.fixture
++def state(tmp_path):
++    token = set_hermes_home_override(tmp_path / 'profile')
++    value = state_module.PluginState('acquisition-budget-test')
++    value.set('original', {'keep': True})
++    yield value
++    reset_hermes_home_override(token)
++
++
++@pytest.mark.parametrize('seconds', [True, -1, float('nan'), float('inf'), 'later'])
++def test_invalid_budget(seconds):
++    with pytest.raises(ValueError):
++        state_module.LockAcquisitionBudget(seconds)
++
++
++def test_exhausted_and_ambiguous_budget_cannot_mutate(state):
++    before = state.path.read_bytes()
++    with pytest.raises(TimeoutError):
++        state.set('original', 9, lock_budget=state_module.LockAcquisitionBudget(0))
++    with pytest.raises(ValueError):
++        state.set('original', 9, lock_budget=state_module.LockAcquisitionBudget(1),
++                  lock_deadline=time.monotonic() + 1)
++    with pytest.raises(ValueError):
++        state.set('original', 9, lock_budget=object())
++    assert state.path.read_bytes() == before
++
++
++def test_slow_filesystem_and_time_between_calls_do_not_spend_acquisition_budget(state, monkeypatch):
++    budget = state_module.LockAcquisitionBudget(.1)
++    original = state._read_unlocked
++    def slow_read():
++        threading.Event().wait(.15)
++        return original()
++    monkeypatch.setattr(state, '_read_unlocked', slow_read)
++    state.set('first', 1, lock_budget=budget)
++    threading.Event().wait(.15)
++    assert state.get('first', lock_budget=budget) == 1
++    state.set('second', 2, lock_budget=budget)
++    assert state.get('original') == {'keep': True}
++
++
++@pytest.mark.platforms('posix')
++def test_guard_then_real_flock_spend_one_allowance(state, monkeypatch):
++    import fcntl
++    budget = state_module.LockAcquisitionBudget(.25)
++    guard = state_module._PLUGIN_STATE_LOCKS_GUARD
++    held, release = threading.Event(), threading.Event()
++    def holder():
++        with guard:
++            held.set()
++            assert release.wait(3)
++    holder_thread = threading.Thread(target=holder)
++    holder_thread.start()
++    assert held.wait(3)
++    fd = state.path.with_name('.state.json.lock').open('a+b')
++    fcntl.flock(fd, fcntl.LOCK_EX)
++    original = state_module._acquire_state_file
++    remaining = []
++    def acquire(handle, deadline):
++        remaining.append(deadline - time.monotonic())
++        return original(handle, deadline)
++    monkeypatch.setattr(state_module, '_acquire_state_file', acquire)
++    # Start release only when the real guard acquisition begins.
++    class Guard:
++        def acquire(self, **kwargs):
++            timer.start()
++            return guard.acquire(**kwargs)
++        def release(self):
++            guard.release()
++    timer = threading.Timer(.12, release.set)
++    monkeypatch.setattr(state_module, '_PLUGIN_STATE_LOCKS_GUARD', Guard())
++    before = state.path.read_bytes()
++    try:
++        with pytest.raises(TimeoutError):
++            state.set('original', 'must not write', lock_budget=budget)
++        assert len(remaining) == 1 and 0 < remaining[0] < .15
++        assert state.path.read_bytes() == before
++        # Unlocking later never revives the exhausted shared allowance.
++        fcntl.flock(fd, fcntl.LOCK_UN)
++        with pytest.raises(TimeoutError):
++            state.get('original', lock_budget=budget)
++    finally:
++        release.set()
++        holder_thread.join(3)
++        if timer.ident is not None:
++            timer.join(3)
++        fd.close()
++        assert not holder_thread.is_alive()
++
++
++def test_copied_context_cannot_share_or_reset_budget_across_threads(state):
++    budget = state_module.LockAcquisitionBudget(.25)
++    errors = []
++    def attempt():
++        try:
++            state.set('foreign-thread', True, lock_budget=budget)
++        except Exception as error:
++            errors.append(error)
++    thread = threading.Thread(target=copy_context().run, args=(attempt,))
++    thread.start()
++    thread.join(3)
++    assert not thread.is_alive() and len(errors) == 1 and isinstance(errors[0], RuntimeError)
++    assert state.get('foreign-thread') is None
++    # Refusal did not replenish or corrupt the owner's allowance.
++    state.set('owner', True, lock_budget=budget)
++    assert state.get('owner', lock_budget=budget) is True
++
++
++def test_overlapping_acquisition_scope_refused(state):
++    budget = state_module.LockAcquisitionBudget(.25)
++    with budget.acquiring():
++        with pytest.raises(RuntimeError, match='sequential'):
++            state.set('nested', True, lock_budget=budget)
++    assert state.get('nested') is None
++
++
++def test_exited_creator_cannot_transfer_budget_through_copied_context(state):
++    slot = ContextVar('exited-creator-budget')
++    captured = {}
++
++    def creator():
++        slot.set(state_module.LockAcquisitionBudget(.25))
++        captured['context'] = copy_context()
++
++    owner = threading.Thread(target=copy_context().run, args=(creator,))
++    owner.start()
++    owner.join(3)
++    assert not owner.is_alive()
++
++    def successor():
++        try:
++            state.set('foreign-thread', True, lock_budget=slot.get())
++        except Exception as error:
++            captured['error'] = error
++
++    replacement = threading.Thread(target=captured['context'].run, args=(successor,))
++    replacement.start()
++    replacement.join(3)
++    assert not replacement.is_alive()
++    assert isinstance(captured.get('error'), RuntimeError)
++    assert state.get('foreign-thread') is None
+diff --git a/website/docs/developer-guide/plugins/index.md b/website/docs/developer-guide/plugins/index.md
+--- a/website/docs/developer-guide/plugins/index.md
++++ b/website/docs/developer-guide/plugins/index.md
+@@ -2162,3 +2162,27 @@
+ # Good — model knows exactly when and how
+ "description": "Evaluate a mathematical expression. Use for arithmetic, trig, logarithms. Supports: +, -, *, /, **, sqrt, sin, cos, log, pi, e."
+ ```
++
++For cancellation-sensitive metadata operations, `ctx.state.get(key, default=None,
++lock_deadline=deadline)` and `ctx.state.set(key, value, lock_deadline=deadline)` accept
++an optional absolute `time.monotonic()` deadline. The same deadline bounds the
++state registry guard, per-path thread lock, and native process lock; contention
++raises `TimeoutError` without a write. Pass one deadline through all reads and
++writes in a compound operation. Omitting it preserves blocking behavior. This
++bounds lock acquisition, not filesystem I/O, and keeps the native atomic writer,
++profile namespace, and quota checks.
++
++For compound operations containing separately bounded native work or filesystem
++I/O, pass one `LockAcquisitionBudget(seconds)` from `hermes_cli.plugins_state` as
++`lock_budget=budget` to every `get`/`set`. Only intervals spent acquiring the
++registry, per-path and process locks consume that shared allowance. The caller
++can include its own outer metadata lock using `with budget.acquiring() as deadline:` and acquire that lock with the remaining absolute deadline. End the
++acquisition scope as soon as the lock is acquired; protected work runs outside
++it. Exhaustion permanently refuses further acquisitions on that budget, even
++if locks are later free. Start one budget at the compound-operation boundary,
++never one per nested lock. The budget is sequential and thread-owned: copied
++contexts used on another thread or overlapping acquisition scopes fail closed
++without an additional lock or a fresh allowance. `lock_budget` and
++`lock_deadline` cannot be combined. The absolute-deadline option keeps its fixed
++wall-time cutoff; omitting both options keeps the original blocking behavior.
++Neither option extends a task grant or makes filesystem I/O preemptible.

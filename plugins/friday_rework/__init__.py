@@ -4,6 +4,8 @@ from .admission import IngressAdmissions, native_call_scope
 
 def register(ctx):
     admission = IngressAdmissions(ctx.state)
+    from .host import register_host
+    host = register_host(ctx, admission)
     ctx.register_hook("post_gateway_admission", admission.record)
     ctx.register_middleware("tool_execution", native_call_scope)
     ctx.register_tool(
@@ -28,6 +30,6 @@ def register(ctx):
                 "additionalProperties": False,
             },
         },
-        handler=admission.handle,
+        handler=host.handle,
         override=False,
     )

@@ -81,7 +81,7 @@ class Controller:
             raise ControllerError("worker_not_admitted") from exc
 
     def _journal(self):
-        value = self.associations.state.get(KEY, {"schema_version": 1, "jobs": {}})
+        value = self.associations.state_get(KEY, {"schema_version": 1, "jobs": {}})
         if (not isinstance(value, dict) or set(value) != {"schema_version", "jobs"}
                 or type(value["schema_version"]) is not int or value["schema_version"] != 1
                 or not isinstance(value["jobs"], dict)):
@@ -99,7 +99,7 @@ class Controller:
         return value
 
     def _save(self, value):
-        self.associations.state.set(KEY, value)
+        self.associations.state_set(KEY, value)
         _sync_directory(Path(self.associations.state.data_dir))
 
     @staticmethod
@@ -284,6 +284,12 @@ class Controller:
         row = self.associations.get_for_control(task_id, principal)
         try:
             row = self.associations.request_stop(task_id, row["owner"], intent)
+            if row["submission_observation"] == "NOT_SUBMITTED":
+                # Preparation is harmless. The durable stop prevents both a
+                # pending prepare and its later submission without creating a
+                # preparation receipt just to cancel an unstarted assignment.
+                return NativeObservation("", "", "association:" + task_id + "#stop_intent",
+                                         row["elapsed_seconds"], "stopped")
             prepared = self._load(row)
             return self._stop(row, prepared, row["stop_intent"])
         except BaseException as exc:

@@ -330,10 +330,10 @@ class ControllerTests(unittest.TestCase):
 
     def test_reservation_survives_auxiliary_write_failure(self):
         real = self.controller.associations.state.set
-        def fail(key, value):
+        def fail(key, value, **kwargs):
             if key == KEY:
                 raise OSError("auxiliary reservation write failed")
-            return real(key, value)
+            return real(key, value, **kwargs)
         with patch.object(self.controller.associations.state, "set", side_effect=fail):
             with self.assertRaisesRegex(OSError, "auxiliary"):
                 self.prepare()
@@ -369,6 +369,24 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "invalid_association_store"):
             self.prepare()
         self.assertEqual(self.adapter.prepares, 0)
+
+    def test_pending_stop_needs_no_preparation_and_prevents_later_prepare(self):
+        result = self.controller.stop("task", PRINCIPAL, "cancel")
+        self.assertEqual(result.state, "stopped")
+        self.assertFalse(self.row()["preparation_reserved"])
+        self.assertEqual(self.row()["submission_observation"], "NOT_SUBMITTED")
+        self.assertEqual((self.adapter.prepares, self.adapter.submits, self.adapter.stops), (0, 0, 0))
+        self.assertEqual(self.emergencies, [])
+        with self.assertRaisesRegex(ControllerError, "stopped"):
+            self.prepare()
+
+    def test_pending_cancel_cannot_be_revived_by_pause_after_reopen(self):
+        self.controller.stop("task", PRINCIPAL, "cancel")
+        reopened = self.reopen()
+        self.assertEqual(reopened.stop("task", PRINCIPAL, "pause").state, "stopped")
+        self.assertEqual(self.row()["stop_intent"], "cancel")
+        self.assertEqual(self.row()["deadline_unix"], 1060)
+        self.assertEqual((self.adapter.prepares, self.adapter.submits), (0, 0))
 
 
 if __name__ == "__main__":

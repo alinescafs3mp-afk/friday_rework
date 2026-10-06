@@ -7,6 +7,7 @@ if recording stop intent fails. This store itself cannot stop execution.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 import copy
 import fcntl
 import hashlib
@@ -16,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import threading
 import time
 
 from .boundary import WorkBrief, parse_brief
@@ -93,8 +95,11 @@ def _validate_store(data):
         admissions, supervisors, invocations, workers = set(), set(), set(), set()
         for task_id, row in data["jobs"].items():
             _text(task_id, 128)
-            if not isinstance(row, dict) or set(row) != ROW_FIELDS:
+            if not isinstance(row, dict) or set(row) not in (ROW_FIELDS, ROW_FIELDS | {"host"}):
                 raise AssociationError("invalid_association_store")
+            if "host" in row:
+                from .host_record import validate_host_record
+                validate_host_record(row)
             if _text(row["existing_task_id"], 128) != task_id:
                 raise AssociationError("invalid_association_store")
             for field in ("admission_hash", "brief_sha256"):
@@ -157,16 +162,52 @@ def _sync_directory(directory):
 class Associations:
     """Serializes compound operations around the native atomic get/set API.
 
-    One nonblocking flock in the actual profile's private data directory is
-    held only during metadata updates. Busy admission is an explicit error,
-    not a polling loop. All production mutations must pass this same boundary.
+    Threads sharing this owned store serialize short metadata operations before
+    taking the nonblocking flock. Another writer still receives admission_busy;
+    native preparation/control never holds either metadata lock.
     """
     def __init__(self, native_state, *, clock=time.time):
         self.state = native_state
         self.clock = clock
+        self._thread_lock = threading.RLock()
+        self._lock_allowance = ContextVar("association_lock_allowance", default=None)
+
+    @contextmanager
+    def lock_budget(self):
+        """One cumulative acquisition allowance, excluding native work and I/O."""
+        from hermes_cli.plugins_state import LockAcquisitionBudget
+        budget = self._lock_allowance.get()
+        token = self._lock_allowance.set(budget if budget is not None else LockAcquisitionBudget(.25))
+        try:
+            yield
+        finally:
+            self._lock_allowance.reset(token)
+
+    def state_get(self, key, default=None):
+        with self.lock_budget():
+            return self.state.get(key, default, lock_budget=self._lock_allowance.get())
+
+    def state_set(self, key, value):
+        with self.lock_budget():
+            self.state.set(key, value, lock_budget=self._lock_allowance.get())
 
     @contextmanager
     def _locked(self):
+        # Unload and coroutine cancellation use the same owned store through
+        # different executor threads. Their contention is not a foreign writer.
+        with self.lock_budget():
+            with self._lock_allowance.get().acquiring() as deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._thread_lock.acquire(timeout=remaining):
+                    raise TimeoutError("association_lock_deadline")
+            try:
+                with self._locked_file() as data:
+                    yield data
+            finally:
+                self._thread_lock.release()
+
+    @contextmanager
+    def _locked_file(self):
         directory = Path(self.state.data_dir)
         if not directory.is_absolute() or directory.resolve() != directory:
             raise AssociationError("unsafe_state_directory")
@@ -181,7 +222,8 @@ class Associations:
                     or ls.st_nlink != 1 or stat.S_IMODE(ls.st_mode) != 0o600):
                 raise AssociationError("unsafe_admission_lock")
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self._lock_allowance.get().acquiring():
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise AssociationError("admission_busy") from exc
             # Native PluginState opens these paths itself. They must be inside
@@ -198,7 +240,7 @@ class Associations:
             if marker not in (b"", b"v1\n"):
                 raise AssociationError("invalid_admission_marker")
             missing = object()
-            data = self.state.get(KEY, missing)
+            data = self.state_get(KEY, missing)
             if data is missing:
                 if marker:
                     raise AssociationError("association_store_lost")
@@ -220,7 +262,7 @@ class Associations:
 
     def _save(self, data):
         _validate_store(data)
-        self.state.set(KEY, data)
+        self.state_set(KEY, data)
         # PluginState fsyncs its temporary file, but not the replacement's
         # directory. Keep its native writer/store; finish the commit under our
         # compound-operation lock and propagate an uncertain durability error.
@@ -235,7 +277,7 @@ class Associations:
         return row
 
     def claim(self, *, task_id, admission_key, owner, brief: WorkBrief,
-              workspace_reference, supervisor, budget_seconds, deadline_unix):
+              workspace_reference, supervisor, budget_seconds, deadline_unix, host_binding=None):
         """Save trusted launch intent. Duplicate input returns the old grant.
 
         A replay with a later deadline cannot replenish its original budget.
@@ -259,9 +301,14 @@ class Associations:
                 if old_id == task_id or row.get("admission_hash") == admission_hash:
                     if row.get("admission_hash") != admission_hash or any(row.get(k) != v for k, v in identity.items()):
                         raise AssociationError("admission_conflict")
+                    if host_binding is not None and row.get("host", {}).get("binding") != host_binding:
+                        raise AssociationError("admission_conflict")
                     return copy.deepcopy(row), False
                 if row.get("supervisor") == identity["supervisor"]:
                     raise AssociationError("supervisor_already_owned")
+            if host_binding is not None and any(
+                    row.get("host", {}).get("quiescence") is None for row in data["jobs"].values()):
+                raise AssociationError("worker_capacity_reserved")
             now = _number(self.clock())
             if budget_seconds <= 0 or deadline_unix <= now or deadline_unix > now + budget_seconds:
                 raise AssociationError("invalid_deadline")
@@ -272,9 +319,40 @@ class Associations:
                    "preparation_reserved": False,
                    "stop_intent": None, "execution_observation": None,
                    "goal_verification": "NOT_RUN", "delivery": "NOT_RUN"}
+            if host_binding is not None:
+                row["host"] = {"binding": copy.deepcopy(host_binding), "inputs": None,
+                               "observation": None, "terminal": None, "quiescence": None}
             data["jobs"][task_id] = row
             self._save(data)
             return copy.deepcopy(row), True
+
+    def snapshot(self):
+        """Checked profile snapshot; callers still enforce ownership per control."""
+        with self._locked() as data:
+            return copy.deepcopy(data["jobs"])
+
+    def retain_inputs(self, task_id, owner, inputs):
+        with self._locked() as data:
+            row = self._owned(data, task_id, owner)
+            if "host" not in row or row["host"]["inputs"] is not None or row["preparation_reserved"]:
+                raise AssociationError("inputs_already_retained_or_unowned")
+            row["host"]["inputs"] = copy.deepcopy(inputs)
+            self._save(data)
+            return copy.deepcopy(row)
+
+    def retain_outcome(self, task_id, owner, *, observation=None, terminal=None, quiescence=None):
+        """First terminal truth is immutable; UNKNOWN alone never releases capacity."""
+        with self._locked() as data:
+            row = self._owned(data, task_id, owner)
+            if "host" not in row:
+                raise AssociationError("missing_host_binding")
+            if observation is not None and row["host"]["terminal"] is None:
+                row["host"]["observation"] = copy.deepcopy(observation)
+            for key, value in (("terminal", terminal), ("quiescence", quiescence)):
+                if value is not None and row["host"][key] is None:
+                    row["host"][key] = copy.deepcopy(value)
+            self._save(data)
+            return copy.deepcopy(row)
 
     def get(self, task_id, owner):
         with self._locked() as data:

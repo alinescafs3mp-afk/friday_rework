@@ -32,13 +32,13 @@ calls mask their parent's correlation before validation; unexpected validation
 failures reach the handler with no proof. Native downstream exceptions propagate
 once and restore the outer scope, following Hermes' existing middleware contract.
 
-This source establishes registration, input validation and the ingress join.
-A verified request still returns `accepted: false`, `worker_not_admitted`; an
-unproved request returns `unproved_admission`. Only ingress receipts and the
-existing association store initialization are persisted: no worker association,
-queued receipt, workspace or execution is created. Enable the plugin only for
-component checks until supervision and adapters are integrated. Native policy
-refusal remains authoritative and never reaches worker execution.
+Default registration remains effect-free and unconfigured requests return
+`worker_not_admitted`; unproved requests return `unproved_admission`. An explicit
+operator runtime grant now connects matched ingress to the existing Controller
+and exact DSH adapter through Hermes's public gateway scheduler. The
+[host integration contract](host-integration.md) defines configuration,
+reconciliation and native registered controls. No deployment is enabled by this
+candidate. Native policy refusal remains authoritative before worker execution.
 
 ## Shared adapter seam
 
@@ -76,23 +76,23 @@ harmless context before `api_message`. Exceptions and lost responses are
 reconciled, never automatically replayed. These signatures do not establish
 adapter readiness.
 
-No worker is admitted until its actual file boundary, deadline without the
-gateway, descendant stop and recovery have passed. The observed user-systemd
-mount-protection failure is therefore material to live admission. `/stop`,
-idle/pending cancellation, attachment staging and Telegram delivery remain
-separate integration work. Plugin discovery is not AC005/AC008 or release
-acceptance on its own.
+No deployment is admitted until its actual file boundary, deadline without the
+gateway, descendant stop and recovery have passed. The host requires a pinned
+operator readiness receipt tied to exact runtime mapping and DSH source.
+Native `/friday-stop`, `/friday-pause`, `/friday-status` use authenticated command
+receipts. Built-in `/stop` and `/new` forwarding and verified Telegram result
+delivery remain separate gates. Discovery is not AC005/AC008 or release acceptance.
 
 ## Current provenance limits
 
 The receipt records attachment origins separately from local cache references.
 A single own/replied attachment can have a proved origin; ambiguous media
 carries no origin. Coalesced events are denied until their producer retains
-each original source. Cached paths are not yet worker inputs: bounded download,
-actual byte/hash staging and explicit host/worker mapping remain required.
-Busy-session steering and idle control messages do not traverse this native
-post-admission fire-site; they cannot inherit an earlier worker admission.
-These incomplete product paths remain release gates, not supported fallbacks.
+each original source. Cached paths alone are not worker inputs. The host stages
+only native stamped received bytes and records the checked host/worker mapping
+before scheduling. Busy-session steering cannot inherit an earlier admission.
+Registered controls use separate admitted-command proof and compare the original
+task principal; they never borrow the last work message's proof.
 
 Exact repeated receipts are idempotent. Another bot/update cannot replace the
 same routed message. Receipt persistence uses profile PluginState under the

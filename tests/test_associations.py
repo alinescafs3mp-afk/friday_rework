@@ -31,10 +31,10 @@ class MemoryState:
         self.data = {}
         self.fail_write = False
 
-    def get(self, key, default):
+    def get(self, key, default, *, lock_budget=None):
         return copy.deepcopy(self.data[key]) if key in self.data else default
 
-    def set(self, key, value):
+    def set(self, key, value, *, lock_budget=None):
         if self.fail_write:
             raise OSError("fixture write failure")
         self.data[key] = copy.deepcopy(value)
@@ -423,7 +423,7 @@ class NativeAssociationTests(unittest.TestCase):
             store.claim(**args)
             real_set = state.set
 
-            def postcommit(key, value):
+            def postcommit(key, value, **kwargs):
                 real_set(key, value)
                 raise OSError("injected native postcommit failure")
 
