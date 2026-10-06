@@ -103,6 +103,8 @@ class DshLocalProfile(unittest.TestCase):
     def test_public_or_symlinked_output_parent_rejects(self):
         with tempfile.TemporaryDirectory() as root:
             parent = Path(root)/'public'; parent.mkdir(mode=0o755)
+            # The negative control must be public even under a private umask.
+            parent.chmod(0o755)
             with self.assertRaises(ValueError):
                 renderer.publish_private(parent/'x', [])
             parent.chmod(0o700)

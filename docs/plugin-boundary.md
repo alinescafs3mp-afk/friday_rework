@@ -13,22 +13,41 @@ kwargs are tolerated, and a supplied session ID must match bound native context.
 
 Routing observations come only from the current native session ContextVars,
 not model arguments or process environment fallback. They are observations,
-not authorization: the gateway's admitted message and actual bot/update/media
-identity still need a trusted join. CLI/cron and unbound contexts currently
-fail closed. No destination, credential or brief is echoed in error results.
+not authorization. The supported `post_gateway_admission` hook persists a
+bounded ingress receipt only after native authorization. A small Hermes patch
+adds plain receiving-bot/update/routing/media provenance, using its existing
+RoutingIdentity and native Telegram adapter. No raw SDK object, secret, message
+text or live host handle enters that receipt. The tool handler independently
+joins this receipt to bound session observations and the full native
+`task_id/session_id/turn_id/api_request_id/tool_call_id` tuple. Its supported
+`tool_execution` middleware always calls the native policy/handler chain and
+clears its context in `finally`. CLI/cron, missing provenance and foreign
+message/profile/topic contexts fail closed. Error results contain no route,
+credential or brief.
 
-This source establishes registration and input validation. Every valid request
-currently returns `accepted: false`, `worker_not_admitted`. It does not create
-a task ID, queued receipt, workspace, state record or pretend execution. Enable
-the plugin only for component checks until the following integration is verified.
+An optional provenance provider failure yields no proof and preserves ordinary
+post-admission consumers. Its warning omits exception text and traceback because
+SDK errors can contain credentials. Cancellation still propagates. Nested tool
+calls mask their parent's correlation before validation; unexpected validation
+failures reach the handler with no proof. Native downstream exceptions propagate
+once and restore the outer scope, following Hermes' existing middleware contract.
+
+This source establishes registration, input validation and the ingress join.
+A verified request still returns `accepted: false`, `worker_not_admitted`; an
+unproved request returns `unproved_admission`. Only ingress receipts and the
+existing association store initialization are persisted: no worker association,
+queued receipt, workspace or execution is created. Enable the plugin only for
+component checks until supervision and adapters are integrated. Native policy
+refusal remains authoritative and never reaches worker execution.
 
 ## Shared adapter seam
 
 Hermes remains the conversation/Telegram owner. Its profile-scoped `ctx.state`
 is the selected existing durable store for small worker associations. Its
 individual writes are atomic; a get/set pair is not a transaction or admission
-lock. FRW-010 must serialize admission using the existing owned execution
-boundary and record launch intent before effects. No parallel job database,
+lock. The reviewed Associations component serializes metadata with its existing
+private admission lock and completes file/directory durability barriers.
+The controller must record launch intent before effects. No parallel job database,
 queue daemon or transcript store is introduced by this component.
 
 The association maps the existing task/admission ID and originating authorized
@@ -46,9 +65,16 @@ and a validated brief; it maps submit/observe/stop to the intact native worker.
 Model text cannot provide a command, unit name, writable path, deadline or
 delivery route. Existing native process/container state determines observed
 status; adapter responses cannot independently mark the goal verified or
-delivery complete. Exact callable signatures will be added with the native
-supervision implementation before adapter assignments, not inferred from
-this descriptive contract.
+delivery complete. The callable signatures are in `adapters/contract.py`: `prepare`, `submit`,
+`observe` and `stop`. Preparation returns an actual native reference and a
+durable evidence receipt. Before effectful submission the controller persists
+that preparation and the original association, then records UNKNOWN.
+`on_native_observed` attaches the real supervisor invocation and worker
+reference immediately, preserving concurrent stop intent. DSH obtains its
+session ID from the native opening event; A0 must already have a persisted
+harmless context before `api_message`. Exceptions and lost responses are
+reconciled, never automatically replayed. These signatures do not establish
+adapter readiness.
 
 No worker is admitted until its actual file boundary, deadline without the
 gateway, descendant stop and recovery have passed. The observed user-systemd
@@ -56,3 +82,21 @@ mount-protection failure is therefore material to live admission. `/stop`,
 idle/pending cancellation, attachment staging and Telegram delivery remain
 separate integration work. Plugin discovery is not AC005/AC008 or release
 acceptance on its own.
+
+## Current provenance limits
+
+The receipt records attachment origins separately from local cache references.
+A single own/replied attachment can have a proved origin; ambiguous media
+carries no origin. Coalesced events are denied until their producer retains
+each original source. Cached paths are not yet worker inputs: bounded download,
+actual byte/hash staging and explicit host/worker mapping remain required.
+Busy-session steering and idle control messages do not traverse this native
+post-admission fire-site; they cannot inherit an earlier worker admission.
+These incomplete product paths remain release gates, not supported fallbacks.
+
+Exact repeated receipts are idempotent. Another bot/update cannot replace the
+same routed message. Receipt persistence uses profile PluginState under the
+existing admission lock; invalid/corrupt state and failed directory barriers
+do not authorize a worker. The native call ID is only batch-local, so the
+controller must retain the full tuple and ingress identity before creating a
+compact association address. No new independent task identity is invented.

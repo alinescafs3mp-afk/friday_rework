@@ -1,0 +1,786 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index eaa0febd..12416e41 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -20,6 +20,7 @@ import weakref
+ from abc import ABC, abstractmethod
+ from urllib.parse import urlsplit
+ 
++from gateway.platforms.channel_prompt import resolve_channel_prompt as resolve_channel_prompt
+ from utils import normalize_proxy_url
+ from agent.i18n import t
+ from agent.retry_utils import jittered_backoff
+@@ -1859,19 +1860,6 @@ _RETRYABLE_ERROR_PATTERNS = (
+ MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
+ 
+ 
+-def resolve_channel_prompt(config_extra: dict, channel_id: str, parent_id: str | None = None) -> str | None:
+-    """Per-channel ephemeral prompt from ``config.extra["channel_prompts"]``: exact *channel_id*
+-    first, then *parent_id* (threads inherit the parent prompt). Blank prompts count as absent."""
+-    prompts = config_extra.get("channel_prompts") or {}
+-    if not isinstance(prompts, dict):
+-        return None
+-    for key in (channel_id, parent_id):
+-        prompt = prompts.get(key) if key else None
+-        if prompt is not None and (prompt := str(prompt).strip()):
+-            return prompt
+-    return None
+-
+-
+ def resolve_channel_skills(
+     config_extra: dict, channel_id: str, parent_id: str | None = None) -> list[str] | None:
+     """Auto-loaded skill(s) for a channel/thread from ``channel_skill_bindings`` (entries
+@@ -4810,6 +4798,15 @@ class BasePlatformAdapter(ABC):
+         """Get and clear any pending message for a session."""
+         return self._pending_messages.pop(session_key, None)
+ 
++    def message_provenance(self, event: MessageEvent) -> Optional[dict]:
++        """Optional plain inbound provenance for an authorized plugin consumer.
++
++        None means this transport cannot establish it. Implementations must
++        return only identity/selected-media references, never tokens, SDK
++        objects or message text. The gateway adds its resolved profile identity.
++        """
++        return None
++
+     def build_source(
+         self, chat_id: str, chat_name: Optional[str] = None, chat_type: str = "dm",
+         user_id: Optional[str] = None, user_name: Optional[str] = None,
+diff --git a/gateway/platforms/event.py b/gateway/platforms/event.py
+index eef3a9d3..947a7e21 100644
+--- a/gateway/platforms/event.py
++++ b/gateway/platforms/event.py
+@@ -104,11 +104,18 @@ class MessageEvent:
+ 
+     # Process-local admission receipt, never routing metadata or execution acknowledgement.
+     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
++    # Coalescing currently retains only one raw transport Message. Consumers
++    # requiring original per-message provenance must not mistake it for all.
++    _ingress_merged: bool = field(default=False, init=False, repr=False, compare=False)
++    # Original transport update, assigned only by the receiving event builder.
++    _ingress_update_id: Optional[int] = field(default=None, init=False, repr=False, compare=False)
+     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
+     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
+ 
+     def absorb_reply_expected(self, other: "MessageEvent") -> None:
+         """One turn now answers *other* too: an addressed message wins, then an unknown one."""
++        if other is not self:
++            self._ingress_merged = True
+         if self.reply_expected is not True and other.reply_expected is not False:
+             self.reply_expected = other.reply_expected
+ 
+diff --git a/gateway/run_inbound_consumer.py b/gateway/run_inbound_consumer.py
+index 691e9565..5404519a 100644
+--- a/gateway/run_inbound_consumer.py
++++ b/gateway/run_inbound_consumer.py
+@@ -40,10 +40,12 @@ async def run_post_admission_hook(
+             from hermes_cli.lifecycle import ainvoke_hook, has_hook
+             if not has_hook(POST_ADMISSION_HOOK):
+                 return False, None
++            from gateway.admitted_ingress import admitted_ingress
+             results = await ainvoke_hook(
+                 POST_ADMISSION_HOOK, session_key=session_key,
+                 platform=source.platform.value if source.platform else "",
+                 source=source.to_dict(), message_id=event.message_id, text=event.text or "",
++                admitted_ingress=admitted_ingress(event, source, session_key),
+             )
+     except asyncio.CancelledError:
+         raise
+diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
+index 5850c208..487fc82c 100644
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -140,6 +140,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
+ from gateway.authz_mixin import _coerce_allow_set
+ from agent.i18n import get_language, t
+ from gateway.config import Platform, PlatformConfig
++from plugins.platforms.telegram.telegram_entities import expand_link_entities
+ from gateway.platforms.base import (
+     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
+     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
+@@ -178,7 +179,6 @@ _MEDIA_KIND_KEYS = {
+     "video file": "platform.telegram.media.kind_video"}
+ 
+ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+-from plugins.platforms.telegram.telegram_entities import expand_link_entities
+ from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
+ from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+ from plugins.platforms.telegram.telegram_network import (
+@@ -6619,6 +6619,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+         if existing is None:
+             pending[key] = event
+             return
++        existing._ingress_merged = True
+         existing.media_urls.extend(event.media_urls)
+         existing.media_types.extend(event.media_types)
+         if event.text:
+@@ -7066,45 +7067,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+                 reply_to_text = None
+         return reply_to_id, reply_to_text
+ 
++    def message_provenance(self, event: MessageEvent) -> Optional[dict]:
++        from .telegram_ingress import message_provenance
++        return message_provenance(self, event)
++
+     def _build_message_event(self, message: Message, msg_type: MessageType, update_id: Optional[int] = None) -> MessageEvent:
+-        """Build a MessageEvent from a Telegram message. ``update_id`` lets ``/restart`` record the
+-        triggering offset so the new gateway process advances past it."""
+-        chat = message.chat
+-        user = message.from_user
+-        telegram_chat_type = self._chat_type_str(chat)  # str() so PTB enums and plain-string mocks both work
+-        chat_type = "group" if telegram_chat_type in {"group", "supergroup"} else ("channel" if telegram_chat_type == "channel" else "dm")
+-        # Shared normalizer so gating and session routing agree (reply-UI anchors dropped, General → "1").
+-        # Resolve routable thread id for DM topics and forum group topics via the shared normalizer, so
+-        # gating and session routing agree on one value. Only real topic/forum messages keep a thread id;
+-        # ordinary reply-UI anchors are dropped (they are not durable session threads and sends against them
+-        # hit 'Message thread not found', #3206), while forum General-topic messages
+-        # (message_thread_id=None) normalize to the General-topic id so replies route back to General
+-        # (#22423).
+-        thread_id_str = self._effective_message_thread_id(message)
+-        chat_topic, topic_skill = self._resolve_topic_binding(message, chat_type, thread_id_str)
+-        has_full_name = hasattr(chat, "full_name")
+-        if user:
+-            user_name = user.full_name
+-        elif has_full_name and chat_type == "dm":
+-            user_name = chat.full_name
+-        else:
+-            user_name = chat.title if chat_type == "channel" else None
+-        source = self.build_source(
+-            chat_id=str(chat.id), chat_name=chat.title or (chat.full_name if has_full_name else None), chat_type=chat_type,
+-            user_id=(str(user.id) if user else (str(chat.id) if chat_type in {"dm", "channel"} else None)),
+-            user_name=user_name, thread_id=thread_id_str, chat_topic=chat_topic, message_id=str(message.message_id),
+-            is_bot=bool(getattr(user, "is_bot", False)) if user else False)
+-        reply_to_id, reply_to_text = self._reply_context(message)
+-        from gateway.platforms.base import resolve_channel_prompt  # per-channel/topic ephemeral prompt
+-        from plugins.platforms.telegram.telegram_context import group_identity_prompt
+-        _chat_id_str = str(chat.id)
+-        channel_prompt = resolve_channel_prompt(self.config.extra, thread_id_str or _chat_id_str, _chat_id_str if thread_id_str else None)
+-        return MessageEvent(
+-            text=expand_link_entities(message), message_type=msg_type, source=source, raw_message=message,
+-            message_id=str(message.message_id), platform_update_id=update_id,
+-            reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, auto_skill=topic_skill,
+-            channel_prompt=group_identity_prompt(self, message, channel_prompt),
+-            timestamp=message.date)
++        from .telegram_message_event import build_message_event
++        return build_message_event(self, message, msg_type, update_id)
+ 
+     # -- Message reactions (processing lifecycle) --
+ 
+diff --git a/gateway/admitted_ingress.py b/gateway/admitted_ingress.py
+new file mode 100644
+index 00000000..e307c8e4
+--- /dev/null
++++ b/gateway/admitted_ingress.py
+@@ -0,0 +1,41 @@
++"""Plain provenance for consumers of the existing post-admission hook.
++
++This is called only after gateway authorization. It adds no admission decision,
++transport lookup, SDK object, secret, or conversation content to the hook.
++"""
++from __future__ import annotations
++
++import logging
++
++from gateway.session_identity import identity_of
++
++logger = logging.getLogger(__name__)
++
++
++def admitted_ingress(event, source, session_key):
++    if event.internal or event.source is not source:
++        return None
++    identity = identity_of(source)
++    if identity is None or identity.transport_inferred:
++        return None
++    adapter = identity.adapter()
++    if adapter is None:
++        return None
++    try:
++        provenance = adapter.message_provenance(event)
++    except Exception:  # health: allow BLE001 -- Optional proof fails closed; SDK exception text may contain credentials.
++        # Optional provenance failure cannot suppress ordinary hook consumers.
++        # Fatal/cancellation BaseExceptions still propagate to the native host.
++        logger.warning("Inbound message provenance unavailable")
++        return None
++    if provenance is None:
++        return None
++    # Reuse the already resolved identity; do not choose another bot or profile.
++    return {
++        "platform": source.platform.value,
++        "session_key": session_key,
++        "source_profile": source.profile or "",
++        "transport_profile": identity.transport_profile,
++        "runtime_profile": identity.runtime_profile,
++        "message": provenance,
++    }
+diff --git a/gateway/platforms/channel_prompt.py b/gateway/platforms/channel_prompt.py
+new file mode 100644
+index 00000000..f650a932
+--- /dev/null
++++ b/gateway/platforms/channel_prompt.py
+@@ -0,0 +1,13 @@
++"""Shared per-channel prompt lookup; public compatibility export stays in base."""
++
++def resolve_channel_prompt(config_extra: dict, channel_id: str, parent_id: str | None = None) -> str | None:
++    """Per-channel ephemeral prompt from ``config.extra["channel_prompts"]``: exact *channel_id*
++    first, then *parent_id* (threads inherit the parent prompt). Blank prompts count as absent."""
++    prompts = config_extra.get("channel_prompts") or {}
++    if not isinstance(prompts, dict):
++        return None
++    for key in (channel_id, parent_id):
++        prompt = prompts.get(key) if key else None
++        if prompt is not None and (prompt := str(prompt).strip()):
++            return prompt
++    return None
+diff --git a/plugins/platforms/telegram/telegram_ingress.py b/plugins/platforms/telegram/telegram_ingress.py
+new file mode 100644
+index 00000000..9dcda3c8
+--- /dev/null
++++ b/plugins/platforms/telegram/telegram_ingress.py
+@@ -0,0 +1,85 @@
++"""Identity from the receiving native Telegram Message, without a network call."""
++from __future__ import annotations
++
++
++def _id(value, *, signed=False):
++    if type(value) is not int or (value == 0 if signed else value <= 0):
++        raise ValueError("unresolved_telegram_identity")
++    return str(value)
++
++
++def _attachment(message):
++    if message is None:
++        return None
++    if message.photo:
++        return message.photo[-1]
++    for name in ("document", "video", "audio", "voice", "sticker", "animation"):
++        value = getattr(message, name, None)
++        if value is not None:
++            return value
++    return None
++
++
++def message_provenance(adapter, event):
++    """Do not infer bot identity or associate merged paths with the first upload.
++
++    Native media caching currently loses each merged item's source. Only an
++    unambiguous single own/replied attachment can carry an origin here. These
++    references still require bounded transfer, staging and byte/hash verification
++    before any worker may consume them.
++    """
++    message = event.raw_message
++    if message is None or event.internal or event._ingress_merged:
++        return None
++    try:
++        bot = message.get_bot()
++        if bot is not adapter._bot:
++            return None
++        source = event.source
++        bot_id = _id(bot.id)
++        message_id = _id(message.message_id)
++        user_id = _id(message.from_user.id)
++        chat_id = _id(message.chat.id, signed=True)
++        update_id = _id(event.platform_update_id)
++        if update_id != _id(event._ingress_update_id):
++            return None
++        thread_id = adapter._effective_message_thread_id(message) or ""
++        if (source.user_id != user_id or source.chat_id != chat_id
++                or (source.thread_id or "") != thread_id
++                or event.message_id != message_id or source.message_id != message_id):
++            return None
++        reply = message.reply_to_message
++        reply_id = _id(reply.message_id) if reply is not None else ""
++        if (event.reply_to_message_id or "") != reply_id:
++            return None
++        paths, types = event.media_urls, event.media_types
++        if len(paths) != len(types) or len(paths) > 64:
++            return None
++        media = []
++        candidates = [(msg, _attachment(msg)) for msg in (message, reply)]
++        candidates = [(msg, file) for msg, file in candidates if file is not None]
++        for path, mime in zip(paths, types):
++            origin = None
++            if len(paths) == 1 and len(candidates) == 1:
++                original, file = candidates[0]
++                original_chat = _id(original.chat.id, signed=True)
++                original_thread = adapter._effective_message_thread_id(original) or ""
++                if original_chat == chat_id and original_thread == thread_id:
++                    origin = {
++                        "bot_id": bot_id, "chat_id": original_chat,
++                        "thread_id": original_thread,
++                        "message_id": _id(original.message_id),
++                        "file_id": file.file_id, "file_unique_id": file.file_unique_id,
++                        "declared_bytes": file.file_size,
++                    }
++            media.append({"local_reference": path, "mime_type": mime, "origin": origin})
++        return {
++            "bot_id": bot_id, "user_id": user_id, "chat_id": chat_id,
++            "thread_id": thread_id, "message_id": message_id,
++            "platform_update_id": update_id, "reply_to_message_id": reply_id,
++            "media": media,
++        }
++    except (AttributeError, RuntimeError, TypeError, ValueError):
++        # Restored/synthetic events have no live SDK identity. Ordinary Hermes
++        # handling continues, but no provenance-dependent effect is authorized.
++        return None
+diff --git a/plugins/platforms/telegram/telegram_message_event.py b/plugins/platforms/telegram/telegram_message_event.py
+new file mode 100644
+index 00000000..429be3ed
+--- /dev/null
++++ b/plugins/platforms/telegram/telegram_message_event.py
+@@ -0,0 +1,53 @@
++"""Native Telegram MessageEvent construction and original update binding."""
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Optional
++
++from gateway.platforms.event import MessageEvent, MessageType
++from .telegram_entities import expand_link_entities
++
++if TYPE_CHECKING:
++    from telegram import Message
++
++
++def build_message_event(self, message: Message, msg_type: MessageType, update_id: Optional[int] = None) -> MessageEvent:
++    """Build a MessageEvent from a Telegram message. ``update_id`` lets ``/restart`` record the
++    triggering offset so the new gateway process advances past it."""
++    chat = message.chat
++    user = message.from_user
++    telegram_chat_type = self._chat_type_str(chat)  # str() so PTB enums and plain-string mocks both work
++    chat_type = "group" if telegram_chat_type in {"group", "supergroup"} else ("channel" if telegram_chat_type == "channel" else "dm")
++    # Shared normalizer so gating and session routing agree (reply-UI anchors dropped, General → "1").
++    # Resolve routable thread id for DM topics and forum group topics via the shared normalizer, so
++    # gating and session routing agree on one value. Only real topic/forum messages keep a thread id;
++    # ordinary reply-UI anchors are dropped (they are not durable session threads and sends against them
++    # hit 'Message thread not found', #3206), while forum General-topic messages
++    # (message_thread_id=None) normalize to the General-topic id so replies route back to General
++    # (#22423).
++    thread_id_str = self._effective_message_thread_id(message)
++    chat_topic, topic_skill = self._resolve_topic_binding(message, chat_type, thread_id_str)
++    has_full_name = hasattr(chat, "full_name")
++    if user:
++        user_name = user.full_name
++    elif has_full_name and chat_type == "dm":
++        user_name = chat.full_name
++    else:
++        user_name = chat.title if chat_type == "channel" else None
++    source = self.build_source(
++        chat_id=str(chat.id), chat_name=chat.title or (chat.full_name if has_full_name else None), chat_type=chat_type,
++        user_id=(str(user.id) if user else (str(chat.id) if chat_type in {"dm", "channel"} else None)),
++        user_name=user_name, thread_id=thread_id_str, chat_topic=chat_topic, message_id=str(message.message_id),
++        is_bot=bool(getattr(user, "is_bot", False)) if user else False)
++    reply_to_id, reply_to_text = self._reply_context(message)
++    from gateway.platforms.base import resolve_channel_prompt  # per-channel/topic ephemeral prompt
++    from plugins.platforms.telegram.telegram_context import group_identity_prompt
++    _chat_id_str = str(chat.id)
++    channel_prompt = resolve_channel_prompt(self.config.extra, thread_id_str or _chat_id_str, _chat_id_str if thread_id_str else None)
++    event = MessageEvent(
++        text=expand_link_entities(message), message_type=msg_type, source=source, raw_message=message,
++        message_id=str(message.message_id), platform_update_id=update_id,
++        reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, auto_skill=topic_skill,
++        channel_prompt=group_identity_prompt(self, message, channel_prompt),
++        timestamp=message.date)
++    event._ingress_update_id = update_id
++    return event
+diff --git a/tests/gateway/test_admitted_ingress.py b/tests/gateway/test_admitted_ingress.py
+new file mode 100644
+index 00000000..e08404d9
+--- /dev/null
++++ b/tests/gateway/test_admitted_ingress.py
+@@ -0,0 +1,396 @@
++"""Offline native Telegram ingress contract; no authenticated/live bot claim.
++
++The Update builders are reused from the FRW native PTB fixture. Downloaded
++media paths are cache metadata fixtures; no file transfer or byte verification
++is claimed. Bot identity is seeded locally, never fetched with get_me().
++"""
++import sys
++from copy import deepcopy
++
++# The canonical per-file runner isolates this module. Gateway conftest installs
++# SDK mocks before collection; this contract must exercise the installed PTB.
++if "telegram" in sys.modules and not hasattr(sys.modules["telegram"], "__file__"):
++    for _module in tuple(sys.modules):
++        if _module == "telegram" or _module.startswith("telegram."):
++            del sys.modules[_module]
++
++from telegram import Message, Update
++from gateway.config import PlatformConfig
++from gateway.platforms.event import MessageType
++from plugins.platforms.telegram.adapter import TelegramAdapter
++
++
++def build_update(*, update_id=701, message_id=501, sender_id=111, chat_id=-100123,
++                 chat_type="supergroup", thread_id=17, is_forum=True, is_topic=True,
++                 text="offline fixture brief", reply=True, document=False):
++    chat = {"id": chat_id, "type": chat_type, "title": "Offline fixture", "is_forum": is_forum}
++    if chat_type == "private":
++        chat = {"id": chat_id, "type": chat_type, "first_name": "Offline"}
++    message = {
++        "message_id": message_id, "date": 1791309600, "chat": chat,
++        "from": {"id": sender_id, "is_bot": False, "first_name": "Fixture", "username": "fixture_user"},
++        "text": text, "is_topic_message": is_topic,
++    }
++    if thread_id is not None:
++        message["message_thread_id"] = thread_id
++    if reply:
++        message["reply_to_message"] = {
++            "message_id": 500, "date": 1791309590, "chat": deepcopy(chat),
++            "from": {"id": 222, "is_bot": False, "first_name": "Earlier"},
++            "text": "previous complete message",
++        }
++        message["quote"] = {"text": "complete", "position": 9, "is_manual": True}
++    if document:
++        message.pop("text")
++        message["caption"] = text
++        message["document"] = {"file_id": "OFFLINE_FILE_ID", "file_unique_id": "OFFLINE_UNIQUE_ID",
++                               "file_name": "fixture.txt", "mime_type": "text/plain", "file_size": 14}
++    return Update.de_json({"update_id": update_id, "message": message}, bot=None)
++
++
++def build_native_event(update, *, adapter=None, message_type=None):
++    if adapter is None:
++        adapter = TelegramAdapter(PlatformConfig(enabled=True, extra={}))
++    message = update.effective_message
++    if not isinstance(message, Message):
++        raise ValueError("Update does not contain a real Telegram Message")
++    return adapter._build_message_event(message, message_type or MessageType.TEXT,
++                                        update_id=update.update_id)
++
++
++import json
++from dataclasses import replace
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++from telegram import Bot, User
++from telegram.request import BaseRequest
++
++from gateway.config import GatewayConfig, Platform
++from gateway.run import GatewayRunner
++from gateway.run_inbound_consumer import run_post_admission_hook
++from gateway.session import SessionSource
++from gateway.session_identity import identity_of, resolve_identity, restore_identity
++from hermes_cli.plugins import get_plugin_manager
++
++
++@pytest.fixture(autouse=True)
++def offline_boundary(monkeypatch):
++    async def no_network(*args, **kwargs):
++        raise AssertionError("offline ingress tests must not make Telegram requests")
++
++    monkeypatch.setattr(BaseRequest, "post", no_network)
++    monkeypatch.setattr(BaseRequest, "retrieve", no_network)
++    for key in ("GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
++                "TELEGRAM_ALLOW_ALL_USERS", "TELEGRAM_GROUP_ALLOWED_USERS",
++                "TELEGRAM_GROUP_ALLOWED_CHATS"):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
++
++
++def _bot(bot_id=123456):
++    bot = Bot(f"{bot_id}:OFFLINE_FIXTURE_NOT_A_CREDENTIAL")
++    bot._bot_user = User(bot_id, "Offline", is_bot=True, username="offline_fixture_bot")
++    return bot
++
++
++@pytest.fixture
++def native():
++    adapter = TelegramAdapter(PlatformConfig(enabled=True, extra={}))
++    adapter._bot = _bot()
++    adapter.send = AsyncMock(side_effect=AssertionError("no outbound delivery"))
++    runner = object.__new__(GatewayRunner)
++    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: adapter.config})
++    runner.adapters = {Platform.TELEGRAM: adapter}
++    runner.pairing_store = MagicMock()
++    runner.pairing_store.is_approved.return_value = False
++    runner.session_store = MagicMock()
++    runner._rescue_orphaned_overflow = lambda _key, _adapter: None
++    runner._enqueue_fifo = MagicMock()
++    runner._handle_message_with_agent = AsyncMock(return_value="ordinary-agent")
++    runner._run_post_turn_hooks = AsyncMock()
++    adapter.gateway_runner = runner
++
++    def make(*, payload=None, **kwargs):
++        update = Update.de_json(payload or build_update(**kwargs).to_dict(), adapter._bot)
++        event = build_native_event(update, adapter=adapter)
++        resolved = resolve_identity(event.source, runner=runner, adapter=adapter)
++        assert identity_of(event.source) is resolved
++        assert resolved.adapter() is adapter
++        return update, event
++
++    return SimpleNamespace(adapter=adapter, runner=runner, make=make)
++
++
++def _register(callback):
++    manager = get_plugin_manager()
++    manager._discovered = True
++    manager._hooks.setdefault("post_gateway_admission", []).append(callback)
++
++
++async def _receipt(native, event, *, source=None):
++    seen = []
++    _register(lambda **payload: seen.append(payload))
++    assert await run_post_admission_hook(
++        native.runner, event, source or event.source, "agent:main:telegram:fixture"
++    ) == (False, None)
++    assert len(seen) == 1, "ordinary hook must still execute when provenance is unavailable"
++    return seen[0]["admitted_ingress"]
++
++
++@pytest.mark.asyncio
++async def test_native_authorized_ingress_runs_actual_hook_with_plain_receipt(native):
++    update, event = native.make()
++    seen = []
++
++    def consume(**payload):
++        seen.append(payload)
++        return {"action": "handled", "reply": "accepted"}
++
++    _register(consume)
++    assert await native.runner._handle_message(event) == "accepted"
++    assert len(seen) == 1
++    receipt = seen[0]["admitted_ingress"]
++    assert receipt["message"] == {
++        "bot_id": "123456", "user_id": "111", "chat_id": "-100123",
++        "thread_id": "17", "message_id": "501", "platform_update_id": str(update.update_id),
++        "reply_to_message_id": "500", "media": [],
++    }
++    assert receipt["platform"] == "telegram"
++    assert receipt["session_key"] == seen[0]["session_key"]
++    assert receipt["transport_profile"] == identity_of(event.source).transport_profile
++    assert receipt["runtime_profile"] == identity_of(event.source).runtime_profile
++    assert json.loads(json.dumps(receipt)) == receipt
++    assert "offline fixture brief" not in json.dumps(receipt)
++    assert "OFFLINE_FIXTURE_NOT_A_CREDENTIAL" not in json.dumps(receipt)
++    native.runner._handle_message_with_agent.assert_not_awaited()
++    native.adapter.send.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_actual_native_auth_rejects_unauthorized_sender_before_hook(native):
++    _, event = native.make(sender_id=999)
++    seen = []
++    _register(lambda **payload: seen.append(payload))
++    assert native.runner._is_user_authorized_for_source(event.source) is False
++    assert await native.runner._handle_message(event) is None
++    assert seen == []
++    assert event._gateway_accepted is False
++    native.runner._handle_message_with_agent.assert_not_awaited()
++    native.adapter.send.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("field,value", [
++    ("user_id", "999"), ("chat_id", "-100999"), ("thread_id", "18"),
++    ("message_id", "502"),
++])
++async def test_source_identity_mismatch_has_no_receipt(native, field, value):
++    _, event = native.make()
++    setattr(event.source, field, value)
++    assert await _receipt(native, event) is None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("field,value", [
++    ("message_id", "502"), ("reply_to_message_id", "499"),
++    ("platform_update_id", None), ("platform_update_id", 0),
++    ("platform_update_id", -1), ("platform_update_id", True),
++    ("platform_update_id", "701"),
++])
++async def test_event_identity_mismatch_or_invalid_update_has_no_receipt(native, field, value):
++    _, event = native.make()
++    setattr(event, field, value)
++    assert await _receipt(native, event) is None
++
++
++@pytest.mark.asyncio
++async def test_wrong_positive_update_cannot_claim_a_different_native_update(native):
++    update, event = native.make()
++    event.platform_update_id = update.update_id + 1
++    assert await _receipt(native, event) is None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("bot_id", [123456, 654321])
++async def test_other_bot_object_even_same_numeric_id_has_no_receipt(native, bot_id):
++    _, event = native.make()
++    event.raw_message.set_bot(_bot(bot_id))
++    assert await _receipt(native, event) is None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("mutation", [
++    lambda event: setattr(event, "internal", True),
++    lambda event: delattr(event.source, "_identity"),
++    lambda event: setattr(event.source, "_identity", replace(identity_of(event.source), transport_inferred=True)),
++    lambda event: setattr(event, "raw_message", None),
++    lambda event: setattr(event, "_ingress_update_id", None),
++], ids=["internal", "absent", "inferred", "raw_absent", "update_origin_absent"])
++async def test_unresolved_native_event_has_no_receipt(native, mutation):
++    _, event = native.make()
++    mutation(event)
++    assert await _receipt(native, event) is None
++
++
++@pytest.mark.asyncio
++async def test_restored_event_has_no_receipt(native):
++    _, event = native.make()
++    event.source = SessionSource.from_dict(event.source.to_dict())
++    native.runner.config.multiplex_profiles = True
++    assert restore_identity(event.source, runner=native.runner, transport_profile="default")
++    native.runner.config.multiplex_profiles = False
++    assert identity_of(event.source).adapter() is None
++    assert await _receipt(native, event) is None
++
++
++@pytest.mark.asyncio
++async def test_merged_event_has_no_single_origin(native):
++    _, event = native.make()
++    _, other = native.make(message_id=502, update_id=702)
++    event.absorb_reply_expected(other)
++    assert await _receipt(native, event) is None
++
++
++@pytest.mark.asyncio
++async def test_different_source_object_cannot_borrow_an_events_receipt(native):
++    _, event = native.make()
++    assert await _receipt(native, event, source=replace(event.source)) is None
++
++
++def _media_payload(*, own=False, reply=False, reply_chat=-100123, reply_thread=17):
++    payload = build_update(document=own, reply=reply).to_dict()
++    if reply:
++        msg = payload["message"]["reply_to_message"]
++        msg["chat"]["id"] = reply_chat
++        msg["message_thread_id"] = reply_thread
++        msg["is_topic_message"] = True
++        msg["document"] = {
++            "file_id": "REPLY_FILE_ID", "file_unique_id": "REPLY_UNIQUE_ID",
++            "file_name": "reply.txt", "mime_type": "text/plain", "file_size": 23,
++        }
++    return payload
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("own", [True, False], ids=["own", "reply"])
++async def test_single_native_attachment_keeps_exact_file_origin(native, own):
++    _, event = native.make(payload=_media_payload(own=own, reply=not own))
++    event.media_urls = ["/offline/cache/selected.txt"]
++    event.media_types = ["text/plain"]
++    receipt = await _receipt(native, event)
++    media = receipt["message"]["media"]
++    assert media == [{
++        "local_reference": "/offline/cache/selected.txt", "mime_type": "text/plain",
++        "origin": {
++            "bot_id": "123456", "chat_id": "-100123", "thread_id": "17",
++            "message_id": "501" if own else "500",
++            "file_id": "OFFLINE_FILE_ID" if own else "REPLY_FILE_ID",
++            "file_unique_id": "OFFLINE_UNIQUE_ID" if own else "REPLY_UNIQUE_ID",
++            "declared_bytes": 14 if own else 23,
++        },
++    }]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("mode", ["own_and_reply", "two_paths", "foreign_chat", "foreign_topic", "no_attachment"])
++async def test_ambiguous_or_foreign_media_never_borrows_another_file_origin(native, mode):
++    payload = _media_payload(
++        own=mode in {"own_and_reply", "two_paths"},
++        reply=mode in {"own_and_reply", "foreign_chat", "foreign_topic"},
++        reply_chat=-100999 if mode == "foreign_chat" else -100123,
++        reply_thread=18 if mode == "foreign_topic" else 17,
++    )
++    _, event = native.make(payload=payload)
++    event.media_urls = ["/offline/cache/first.txt"]
++    if mode == "two_paths":
++        event.media_urls.append("/offline/cache/second.txt")
++    event.media_types = ["text/plain"] * len(event.media_urls)
++    receipt = await _receipt(native, event)
++    assert len(receipt["message"]["media"]) == len(event.media_urls)
++    assert all(item["origin"] is None for item in receipt["message"]["media"])
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("count,types", [(1, []), (65, ["text/plain"] * 65)])
++async def test_malformed_media_vectors_have_no_receipt(native, count, types):
++    _, event = native.make(document=True)
++    event.media_urls = [f"/offline/cache/{index}.txt" for index in range(count)]
++    event.media_types = types
++    assert await _receipt(native, event) is None
++
++
++@pytest.mark.asyncio
++async def test_ordinary_plugin_can_handle_when_native_provenance_is_unavailable(native):
++    _, event = native.make()
++    event.raw_message = None
++    seen = []
++
++    def ordinary(**payload):
++        seen.append(payload)
++        return {"action": "handled", "reply": "ordinary-hook"}
++
++    _register(ordinary)
++    assert await native.runner._handle_message(event) == "ordinary-hook"
++    assert seen[0]["admitted_ingress"] is None
++    assert seen[0]["text"] == event.text
++    native.runner._handle_message_with_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_ordinary_plugin_exception_preserves_agent_fallback(native):
++    _, event = native.make()
++
++    def broken(**payload):
++        raise RuntimeError("offline fixture hook error")
++
++    _register(broken)
++    assert await native.runner._handle_message(event) == "ordinary-agent"
++    native.runner._handle_message_with_agent.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
++async def test_legacy_narrow_hook_signature_survives_additive_receipt(native, asynchronous):
++    _, event = native.make()
++    seen = []
++
++    def legacy(session_key, platform, source, message_id, text):
++        seen.append((session_key, platform, source, message_id, text))
++        return {"action": "handled", "reply": "legacy-hook"}
++
++    async def async_legacy(session_key, platform, source, message_id, text):
++        return legacy(session_key, platform, source, message_id, text)
++
++    _register(async_legacy if asynchronous else legacy)
++    assert await native.runner._handle_message(event) == "legacy-hook"
++    assert len(seen) == 1
++    assert seen[0][1:] == ("telegram", event.source.to_dict(), event.message_id, event.text)
++    native.runner._handle_message_with_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_optional_provenance_failure_preserves_ordinary_hook(native, monkeypatch, caplog):
++    _, event = native.make()
++    seen = []
++    def failing(_):
++        raise OSError("offline SDK credential-shaped secret sentinel")
++    monkeypatch.setattr(native.adapter, "message_provenance", failing)
++    _register(lambda **payload: seen.append(payload) or {"action": "handled", "reply": "ordinary hook"})
++    assert await native.runner._handle_message(event) == "ordinary hook"
++    assert seen[0]["admitted_ingress"] is None
++    assert "Inbound message provenance unavailable" in caplog.text
++    assert "credential-shaped secret sentinel" not in caplog.text
++    native.runner._handle_message_with_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_provenance_cancellation_still_propagates(native, monkeypatch):
++    import asyncio
++    _, event = native.make()
++    def cancelled(_):
++        raise asyncio.CancelledError()
++    monkeypatch.setattr(native.adapter, "message_provenance", cancelled)
++    with pytest.raises(asyncio.CancelledError):
++        await _receipt(native, event)

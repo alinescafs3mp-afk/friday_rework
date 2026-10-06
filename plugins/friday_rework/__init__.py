@@ -1,8 +1,11 @@
 """Supported Hermes entry point. No process, model, network or timer at load."""
-from .boundary import work_handler
+from .admission import IngressAdmissions, native_call_scope
 
 
 def register(ctx):
+    admission = IngressAdmissions(ctx.state)
+    ctx.register_hook("post_gateway_admission", admission.record)
+    ctx.register_middleware("tool_execution", native_call_scope)
     ctx.register_tool(
         name="friday_work",
         toolset="friday_rework",
@@ -25,6 +28,6 @@ def register(ctx):
                 "additionalProperties": False,
             },
         },
-        handler=work_handler,
+        handler=admission.handle,
         override=False,
     )

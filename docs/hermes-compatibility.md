@@ -44,3 +44,21 @@ conservative accounting units as tokens, so those fields are excluded from
 token-usage acceptance. Full host, worker, Telegram and release acceptance
 have not run. These component results do not transfer automatically to a
 different profile, tool set, model or source revision.
+
+## Admitted message provenance
+
+`patches/hermes/admitted-ingress.patch` is a separate delta against the same
+pinned Hermes commit. Its exact hash and resulting files are recorded in
+`patches/hermes/admitted-ingress-manifest.json`. It uses the same owned-checkout,
+base/SHA/applicability and changed-file verification procedure above. Its files
+are separate from the context patch; neither patch updates the other.
+
+The existing post-authorization hook gains an optional plain ingress snapshot.
+The native Telegram builder retains the original update ID; source identity,
+receiving bot and current update must agree before the snapshot is supplied.
+Unresolved or merged provenance produces no worker admission. Ordinary hooks,
+including callbacks with the old argument list, retain their native behavior.
+The existing message builder and channel prompt lookup are extracted into small
+modules to respect the donor's code-health limits; no routing resolver or agent
+loop is replaced. `docs/plugin-boundary.md` describes the consumer and the
+remaining attachment, control, supervision and product gates.
