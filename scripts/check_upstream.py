@@ -233,11 +233,16 @@ def write_report(directory, report):
     path = Path(directory)
     if ".." in path.parts:
         raise ObservationError("unsafe_report_directory")
+    # A supervisor can select a private cwd before entering a user namespace.
+    # Pin that existing directory directly: traversing its absolute ancestors
+    # would mistake unmapped host root for an untrusted owner. Never trust the
+    # overflow UID (which also represents unrelated users), or relax path walks.
+    from_cwd = path == Path(".")
     path = Path(os.path.abspath(path))
-    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    fd = os.open("." if from_cwd else "/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     private_boundary = False
     try:
-        for part in path.parts[1:]:
+        for part in (() if from_cwd else path.parts[1:]):
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = child
@@ -273,8 +278,9 @@ def main():
     if args.report_dir:
         try:
             print(write_report(args.report_dir, report))
-        except (OSError, ObservationError):
-            print("report_write_refused_or_failed; current observation follows", file=sys.stderr)
+        except (OSError, ObservationError) as exc:
+            reason = str(exc) if isinstance(exc, ObservationError) else f"os_error_errno_{exc.errno}"
+            print(f"report_write_refused_or_failed:{reason}; current observation follows", file=sys.stderr)
             print(json.dumps(report, ensure_ascii=True, indent=2))
             return 2
     else:

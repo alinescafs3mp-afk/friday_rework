@@ -220,6 +220,54 @@ class UpstreamTests(unittest.TestCase):
             with self.assertRaises(m.ObservationError):
                 m.write_report(real / ".." / "real", {})
 
+    def test_private_cwd_is_pinned_without_walking_namespace_ancestors(self):
+        original = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                os.chdir(directory)
+                report = Path(m.write_report(Path("."), {"status": "ok"}))
+                self.assertEqual(report.parent, Path(directory))
+                self.assertEqual(report.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(json.loads(report.read_text()), {"status": "ok"})
+                # Cwd anchoring must not relax the final owner or mode checks.
+                with patch.object(m.os, "getuid", return_value=os.getuid() + 1):
+                    with self.assertRaisesRegex(m.ObservationError, "owned_mode_0700"):
+                        m.write_report(Path("."), {})
+                os.chmod(".", 0o750)
+                try:
+                    with self.assertRaisesRegex(m.ObservationError, "owned_mode_0700"):
+                        m.write_report(Path("."), {})
+                finally:
+                    os.chmod(".", 0o700)
+        finally:
+            os.fchdir(original)
+            os.close(original)
+
+    def test_private_cwd_cannot_overwrite_regular_symlink_or_hardlink(self):
+        original = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                os.chdir(directory)
+                victim = Path("victim")
+                victim.write_text("unchanged")
+                target = Path("fixed-fixed.json")
+                fixed = type("Id", (), {"hex": "fixed"})()
+                with patch.object(m.uuid, "uuid4", return_value=fixed), patch.object(m, "datetime") as dt:
+                    dt.now.return_value.strftime.return_value = "fixed-"
+                    for create in (lambda: target.write_text("existing"),
+                                   lambda: target.symlink_to(victim),
+                                   lambda: os.link(victim, target)):
+                        create()
+                        before = target.read_bytes()
+                        with self.assertRaises(FileExistsError):
+                            m.write_report(Path("."), {"wrong": True})
+                        self.assertEqual(target.read_bytes(), before)
+                        self.assertEqual(victim.read_text(), "unchanged")
+                        target.unlink()
+        finally:
+            os.fchdir(original)
+            os.close(original)
+
 
 if __name__ == "__main__":
     unittest.main()

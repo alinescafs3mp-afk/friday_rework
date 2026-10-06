@@ -25,6 +25,13 @@ If persistence fails, the current report still goes to stdout, stderr explains
 that writing failed, and exit status is 2. A stopped process can leave an incomplete
 new file; consumers must reject incomplete JSON rather than reuse an older success.
 
+The explicit `--report-dir .` form pins the existing current directory directly;
+it must still be owned by the caller with mode exactly 0700. The caller/supervisor
+selecting that directory is the trust boundary. No absolute ancestor is traversed
+for this form. This supports user systemd namespaces, where host root can appear
+as an unmapped UID. Unmapped UIDs are never added to the trusted-owner list; all
+other report paths retain the full ancestor and symlink checks.
+
 Each branch head is captured once and compared as `PIN...OBSERVED_SHA`, never by a
 second mutable branch lookup. The direction is **upstream relative to the pin**:
 
@@ -77,12 +84,18 @@ No helper installs or enables these units.
 The existing user systemd supervisor owns the oneshot and daily scheduling.
 `StateDirectory=friday-upstream-check` supplies a private per-user state directory;
 `%S` selects that user's state root without embedding a home path or user name.
-The service has a 100-second supervisor deadline, restrictive umask, read-only
+The manager selects this state directory as `WorkingDirectory`, and the writer
+pins `.`. The script and its default lock retain their absolute project paths.
+The service requests a 100-second supervisor deadline, restrictive umask, read-only
 home/system mounts and only its report directory writable. Nonzero observations
 mark the unit failed and remain visible in the current report/journal. The daily
 timer runs with up to 30 minutes of jitter and may catch up once when activated.
 Installation, host-specific unit validation and activation remain parent review
-steps; no unit was started for this implementation.
+steps; offline probe units do not constitute deployment acceptance.
+
+Host acceptance must verify the effective mounts and a denied write outside the
+allowed report directory. Merely accepting `ProtectSystem`/`ProtectHome` unit
+properties does not prove that a user manager enforced those mounts.
 
 API contracts: [compare commits](https://docs.github.com/en/rest/commits/commits#compare-two-commits),
 [resolve a commit/ref](https://docs.github.com/en/rest/commits/commits#get-a-commit),
