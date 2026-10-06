@@ -8,6 +8,6 @@ Use Hermes native state for the minimum durable job association and existing sys
 
 Route main and every enabled auxiliary/child model consumer explicitly to existing local inference. Start with one effectful model job; server concurrency limits alone do not establish safe practical capacity. Disabled/unknown capabilities remain explicit.
 
-The existing production Telegram token is already consumed by old Friday. A separate authorized test bot/route or an explicitly prepared cutover is required before starting the new Telegram consumer. Development CLI and offline checks can proceed independently.
+The owner has stopped and disabled old Friday's backend and bridge and requires that they remain off. Prepare switching the existing Telegram bot only after the candidate is verified; do not start a consumer during preparation or restart old Friday as an automatic rollback. Development CLI and offline checks can proceed independently.
 
 Cancellation preserves original budgets and stop intent across reconnects. Unknown submissions are reconciled rather than replayed. Verified outputs are staged separately from execution so delivery retries do not rerun work. Product acceptance remains NOT_RUN until the real paths and negative controls are exercised.
