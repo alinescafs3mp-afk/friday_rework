@@ -27,7 +27,8 @@ ROW_FIELDS = {"existing_task_id", "admission_hash", "owner", "worker_kind",
               "brief_sha256", "workspace_reference", "supervisor",
               "created_at_unix", "budget_seconds", "deadline_unix",
               "elapsed_seconds", "submission_observation", "native",
-              "stop_intent", "execution_observation", "goal_verification", "delivery"}
+              "stop_intent", "execution_observation", "goal_verification", "delivery",
+              "preparation_reserved"}
 
 
 class AssociationError(RuntimeError):
@@ -103,6 +104,8 @@ def _validate_store(data):
             _text(row["workspace_reference"], 2048)
             supervisor = _supervisor(row["supervisor"])
             if row["worker_kind"] not in ("dsh", "a0"):
+                raise AssociationError("invalid_association_store")
+            if type(row["preparation_reserved"]) is not bool:
                 raise AssociationError("invalid_association_store")
             created, budget, deadline, elapsed = (
                 _number(row[field]) for field in
@@ -266,6 +269,7 @@ class Associations:
                    "created_at_unix": now, "budget_seconds": budget_seconds,
                    "deadline_unix": deadline_unix, "elapsed_seconds": 0,
                    "submission_observation": "NOT_SUBMITTED", "native": None,
+                   "preparation_reserved": False,
                    "stop_intent": None, "execution_observation": None,
                    "goal_verification": "NOT_RUN", "delivery": "NOT_RUN"}
             data["jobs"][task_id] = row
