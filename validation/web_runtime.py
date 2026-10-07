@@ -418,20 +418,36 @@ class Native:
         _require(not errors, "native_cleanup_unconfirmed")
 
 
+def _repr_string_body(value, quote, ascii_only):
+    # SDK status errors render a dict using Python repr, which chooses either
+    # quote style from the whole surrounding message. Generate both styles:
+    # a partial echo can choose a different quote than the complete credential.
+    render = ascii if ascii_only else repr
+    return "".join(("\\" + ch if ch == quote else ch) if ch in "\"'"
+                   else render(ch)[1:-1] for ch in value)
+
+
 def _secret_form_prefixes(secret_values):
-    # Eight actual credential characters are meaningful partial evidence. A
-    # generic type prefix (sk-, local-, friday-) or an incidental letter is not.
-    # Apply escaping to both the value and that prefix, so JSON backslashes do
-    # not count as additional credential characters.
-    forms = {value: len(value[:8]) for value in secret_values if value}
-    # Tool JSON may itself be a string inside the SDK request JSON and debug
-    # dump. Cover those actual nested serialization boundaries explicitly.
+    # Thresholds count eight ORIGINAL characters, not escaping characters.
+    # Preserve raw + three JSON layers; also cover the actual SDK dict repr
+    # at any one of those boundaries before the subsequent debug JSON dump.
+    # Repeated arbitrary encodings are not unboundedly enumerated.
+    states = {(value, False): len(value[:8]) for value in secret_values if value}
+    forms = {value: length for (value, _), length in states.items()}
     for _ in range(3):
-        for value, length in tuple(forms.items()):
+        for (value, has_repr), length in tuple(states.items()):
             for ascii_only in (False, True):
-                escaped = json.dumps(value, ensure_ascii=ascii_only)[1:-1]
-                prefix = json.dumps(value[:length], ensure_ascii=ascii_only)[1:-1]
-                forms[escaped] = min(forms.get(escaped, len(prefix)), len(prefix))
+                pairs = [(json.dumps(value, ensure_ascii=ascii_only)[1:-1],
+                          json.dumps(value[:length], ensure_ascii=ascii_only)[1:-1],
+                          has_repr)]
+                if not has_repr:
+                    pairs += [(_repr_string_body(value, quote, ascii_only),
+                               _repr_string_body(value[:length], quote, ascii_only), True)
+                              for quote in ("'", '\"')]
+                for escaped, prefix, repr_done in pairs:
+                    states[escaped, repr_done] = min(
+                        states.get((escaped, repr_done), len(prefix)), len(prefix))
+                    forms[escaped] = min(forms.get(escaped, len(prefix)), len(prefix))
     return forms
 
 

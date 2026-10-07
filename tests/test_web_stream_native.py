@@ -29,7 +29,7 @@ build = runpy.run_path(str(Q/'tools/configure_local_test.py'))['build_config']
     + [('explicit','retry_4xx','local-local-SYNTHETIC_CREDENTIAL_123456789','local-'),
        ('explicit','retry_4xx','sk-sk-sk-SYNTHETIC_CREDENTIAL_123456789','sk-'),
        ('explicit','escaped_stream','JSON"\\яяJSON"\\яя_SYNTHETIC_CREDENTIAL_123456789','JSON"\\яя')])
-def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,mode,variant,credential,overlap_prefix,construction_failure=False):
+def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,mode,variant,credential,overlap_prefix,construction_failure=False,sdk_error_echo=None):
     case=variant
     marker='SYNTHETIC_QUOTE"SLASH\\UNICODEя' if variant=='escaped_stream' else 'SYNTHETIC_SCOPED_CREDENTIAL'
     marker=credential or marker
@@ -126,7 +126,7 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
                 assert marker[:17] not in json.dumps(retained)
                 assert len(retained['tool_source_observations'])>=2
                 if variant=='retry_4xx':
-                    return httpx.Response(400,json={'error':{'message':'synthetic terminal '+marker[:17],
+                    return httpx.Response(400,json={'error':{'message':'synthetic terminal '+(marker[:17] if sdk_error_echo is None else sdk_error_echo),
                         'type':'invalid_request_error','code':'fixture_invalid_request'}},request=request)
             class BrokenStream(httpx.SyncByteStream):
                 def __iter__(self):
@@ -284,7 +284,8 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
         assert any(p.name==expected_name and p.read_text()==expected_page for p in spills)
     if variant=='retry_4xx':
         dumps=list((home/'sessions').glob('request_dump_*.json'))
-        assert dumps and any('[REDACTED_PARTIAL]' in p.read_text() for p in dumps)
+        error_marker = '[REDACTED]' if sdk_error_echo == marker else '[REDACTED_PARTIAL]'
+        assert dumps and any(error_marker in p.read_text() for p in dumps)
         assert all(url in p.read_text() for p in dumps)
         for p in dumps:
             body=json.loads(p.read_text())['request']['body']

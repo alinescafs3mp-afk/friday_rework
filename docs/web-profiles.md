@@ -223,8 +223,15 @@ Crossing a cap or failing persistence requests native interruption and prevents
 success. Native continuation/retry policy and request/iteration budgets are unchanged.
 A streaming trie with suffix failure links conceals full credentials of any length and incomplete known-secret
 prefixes containing at least eight original credential characters. Escaping does
-not count as additional characters; the same threshold follows three nested JSON
-serialization boundaries and all chunk splits. Meaningful prefixes stay concealed
+not count as additional characters. The same threshold follows up to three
+serialization boundaries: JSON, and at most one native SDK Python dictionary
+`repr` in either quote style, with printable or ASCII-escaped Unicode. This covers
+the SDK status-error message before its surrounding debug JSON, including a
+partial echo whose quote style differs from the complete credential. All chunk
+splits retain the same policy. The existing 64-form/65,536-character form caps
+remain enforced; arbitrary repeated external encodings are not enumerated.
+Actual SDK regressions decode the saved error message and check both complete
+and partial echoes alongside structured body/response fields. Meaningful prefixes stay concealed
 on mismatch/reset. Shorter incidental matches (including `s`, `sk-`, `local-` and
 `friday-`) are preserved literally, including at natural end of text; they alone
 are not evidence of a credential. At artificial input truncation even a one-character
