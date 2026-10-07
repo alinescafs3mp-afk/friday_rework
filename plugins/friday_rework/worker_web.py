@@ -143,7 +143,7 @@ try {
     const a=addresses[0];
     const status=await new Promise((resolve,reject)=>{
       const r=https.request(u,{method:'HEAD',agent:false,rejectUnauthorized:true,
-        lookup:(name,opts,cb)=>cb(null,a.address,a.family)},res=>{
+        lookup:(name,opts,cb)=>opts.all ? cb(null,[a]) : cb(null,a.address,a.family)},res=>{
         if (!res.socket.authorized || res.statusCode<200 || res.statusCode>=500) {
           res.destroy();reject(Error('tls_http'));return;
         }
