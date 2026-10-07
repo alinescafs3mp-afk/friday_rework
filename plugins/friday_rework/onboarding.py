@@ -104,17 +104,28 @@ def validate_template(template):
             or not {'web', 'friday_rework'} <= set(config.get('toolsets', []))):
         raise ValueError('useful_native_worker_result_hooks_required')
     # Config is nonsecret, including recursively nested plugin/provider fields.
-    def nonsecret(value):
+    # Native normal profiles carry these token *counts*, not credentials. Keep
+    # the exception path-specific and numeric so arbitrary "token" fields,
+    # nested plugin credentials and string/callable interpolation still refuse.
+    native_counts = {
+        ('compression', 'proactive_prune_tokens'),
+        ('compression', 'proactive_prune_min_reclaim_tokens'),
+        ('compression', 'micro_compact_defrag_threshold_tokens'),
+        ('delegation', 'compression_threshold_tokens'),
+        ('tools', 'tool_search', 'listing_max_tokens'),
+    }
+    def nonsecret(value, path=()):
         if isinstance(value, dict):
             for k, v in value.items():
-                if re.search(r'password|secret|token|credential|api[_-]?key', str(k), re.I) and k not in (
+                count = path + (k,) in native_counts and type(v) is int and v >= 0
+                if not count and re.search(r'password|secret|token|credential|api[_-]?key', str(k), re.I) and k not in (
                         'key_env', 'api_key_env', 'context_length', 'threshold_tokens', 'server_max_input_tokens',
                         'main_max_output_tokens', 'compression_max_output_tokens', 'safety_margin_tokens',
                         'template_overhead_tokens', 'max_tokens'):
                     raise ValueError('inline_credentials_refused')
-                nonsecret(v)
+                nonsecret(v, path + (k,))
         elif isinstance(value, list):
-            for v in value: nonsecret(v)
+            for v in value: nonsecret(v, path + ('[]',))
         elif isinstance(value, str) and ('${' in value or 'Bearer ' in value):
             raise ValueError('ambient_templates_or_credentials_refused')
     nonsecret(config)
