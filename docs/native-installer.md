@@ -1,6 +1,6 @@
 # Native Friday installation candidate
 
-`scripts/friday_install.py {plan,install,check,start} --input <private JSON>`
+`scripts/friday_install.py {plan,install,check,dashboard-check,start} --input <private JSON>`
 is a finite composition of existing preparers, native PM and build APIs. It
 does not run a service manager, keep a worker daemon or create an account store.
 The current candidate installs a template and **refuses startup**. It is not
@@ -97,16 +97,85 @@ The native profile consumer verifies real auth engagement, the explicit Basic
 operator, mandatory Exa and absent cloud fallback. Before future native build,
 existing live host records with foreign home/profile/authority or uncertain
 process incarnation refuse installation. Matching records are policy inputs,
-not proof of HTTP/auth/source ownership. This does not solve the final native
-Dashboard attach race, verify a gateway unit, load credentials, validate channel
-account/token ownership or admit workers. A receipt marked READY cannot bypass
+not proof of HTTP/auth/source ownership. The Dashboard overlay below closes
+the native pre-bind/attach boundary at source level. This task does not verify
+a gateway unit, read live credentials, validate channel account/token ownership
+or admit workers. A receipt marked READY cannot bypass
 the entry's startup refusal.
 
 Remaining integration requirements are concrete: portable A0 image/toolchain
 preparation or separately admitted exact fixed deployment; useful web for A0 and
-both workers in the normal compiler; final same-home/source/auth Dashboard owner
-enforcement; protected launch credentials and scoped pool/channel ownership;
+both workers in the normal compiler; independent review and actual authenticated
+Dashboard startup/attach acceptance; protected launch credentials and scoped pool/channel ownership;
 native gateway exact-home unit installation/readiness; final PM/build realization
 and independent acceptance of all six mandatory web/admin journeys. Ordinary
 SAFE-tool and text-only capacity compatibility limitations remain as documented
 in the normal profile. None is removed by this source candidate.
+
+
+The `dashboard-owner` donor overlay extends existing native CLI attachment,
+`gateway.host_rendezvous`, server startup and the existing identity route. It
+adds no supervisor, lock directory, account store, service flags or token gate.
+For a Friday installation, native CLI validates the actual complete Hermes
+source receipt/file bytes/modes and dirty external install stamp, the complete
+installed Friday plugin, exact home/default profile/public authority, configured
+admin operator and native Basic settings. The initial source check is mandatory
+before Desktop/isolation/headless shortcuts. Missing installation/profile markers
+refuse; ordinary unmarked Hermes retains its native behavior.
+
+Native startup validates the registered real Basic provider and active auth gate,
+then claims the existing per-OS-user `serve` lock before uvicorn configuration,
+port probe or bind. Contention refuses; this path never binds as observe-only or
+reaps another owner. The same lock remains held until shutdown, including a
+post-bind identity/publication failure; shutdown runs before lock release and
+before uvicorn re-raises a captured termination signal. Friday does not register
+the native signal pre-handler that would release before shutdown. An unknown
+startup or failed shutdown retains the native host lock until OS-process exit or
+explicit reconciliation by its existing owner; it never frees a slot on an
+unconfirmed stop. Native
+publication must succeed with a process-start fingerprint. The record carries
+computed source/home/operator/auth binding; it is never accepted on label alone.
+
+Attachment requires native positive `(pid,startTime)` liveness, exact record
+source/home/profile/authority, consistent private rendezvous token, a matching
+live identity and an unchanged record/incarnation/token after the probe. The
+Basic signing secret HMAC-binds the native credential selection to the declared
+identity; neither passwords, signing keys nor password hashes are published.
+Ambient Basic credential values must match the selected home's private native
+`.env`; native protected config credentials are also supported. Native plaintext
+password and password-hash selection remain supported. A stable configured
+signing key is necessary for reattachment; native random per-process keys are
+explicitly unprovable.
+
+The native role token cannot pass the general Basic cookie/bearer gate. Friday
+therefore extends the existing native gate for only `GET /api/host/identity`:
+the private native role token establishes same-OS-user authority, a real
+registered Basic provider supplies a local request principal and the unchanged
+Friday admin policy validates it. No operator cookie/bearer is sent to an
+unproved port, returned to this caller or persisted. All other routes retain
+normal Basic authentication; a role token alone cannot enter administration.
+The identity response HMAC-binds a fresh per-probe nonce, actual PID/start
+fingerprint, role-token fingerprint and computed source/home/auth policy to the
+actual Basic signing key. Client verification uses its original nonce; replay,
+foreign listeners and caller-written identity labels cannot substitute a proof.
+
+`GET /api/host/identity` is the sole added read route in the existing Friday admin
+allowlist. Source/config/provider drift refuses, and Basic-authenticated foreign
+principals remain denied. OS-user control of private installation files/signing
+keys remains the native trust boundary; this does not defend against an attacker
+already controlling that OS account.
+
+`dashboard-check` consumes the installed native source checker after ordinary
+pinned installation inspection. It verifies source/install metadata only and
+returns `SOURCE_OWNERSHIP_VERIFIED_RUNTIME_NOT_RUN`, `ready=false`, credentials
+unchecked. Whole `start` still refuses absent A0/web/kernel admission. Successful
+source fixtures or this narrow check do not authorize native units, workers,
+channel login, model calls or all-six release acceptance.
+
+Validation uses the actual composed donor, private synthetic source/config and
+Basic keys, native lock/record/parser/CLI/auth middleware and ASGI identity route.
+Network transports and bind/main-loop boundaries remain intercepted. The record
+policy cases reuse a once-verified complete source identity; byte-drift cases and
+full-source positives use the uncached native consumer. Actual authenticated
+HTTP/socket startup, race under independently scheduled real processes and all
+six live journeys still require parent integration and independent acceptance.

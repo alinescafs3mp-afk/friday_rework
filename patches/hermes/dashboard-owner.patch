@@ -1,0 +1,703 @@
+--- a/gateway/host_rendezvous.py
++++ b/gateway/host_rendezvous.py
+@@ -103,6 +103,7 @@
+     #: so a wall-clock resync cannot make a live owner look like a recycled PID. Optional for
+     #: records written by older Hermes versions, which still fall back to create_time.
+     start_time: Optional[int] = None
++    friday_owner: Optional[dict] = None
+
+     def to_json(self) -> dict[str, Any]:
+         return {
+@@ -117,6 +118,7 @@
+             "tokenFingerprint": self.token_fingerprint,
+             "profiles": list(self.profiles),
+             "updatedAt": self.updated_at,
++            "fridayOwner": self.friday_owner,
+         }
+
+     @classmethod
+@@ -148,6 +150,7 @@
+             profiles=tuple(str(p) for p in profiles if isinstance(p, str)) if isinstance(profiles, list) else (),
+             updated_at=str(payload.get("updatedAt") or ""),
+             home=str(payload.get("home") or ""),
++            friday_owner=payload.get("fridayOwner") if isinstance(payload.get("fridayOwner"), dict) else None,
+         )
+
+
+@@ -294,6 +297,15 @@
+     """
+     if not record.port:
+         return None
++    token = read_token(record.role)
++    headers = {"X-Hermes-Token": token, "Authorization": f"Bearer {token}"} if token else {}
++    if record.friday_owner is not None:
++        from hermes_cli.friday_dashboard_owner import probe_headers
++        try:
++            headers = probe_headers(record)
++        except (OSError, ValueError, KeyError, TypeError):
++            return None
++
+     import socket
+
+     host = dial_host(record)
+@@ -306,8 +318,6 @@
+
+     import urllib.request
+
+-    token = read_token(record.role)
+-    headers = {"X-Hermes-Token": token, "Authorization": f"Bearer {token}"} if token else {}
+     request = urllib.request.Request(
+         f"http://{host}:{record.port}{HOST_IDENTITY_PATH}", headers=headers)
+     try:
+@@ -322,6 +332,12 @@
+         return None
+     if payload.get("role") != record.role or payload.get("pid") != record.pid:
+         return None
++    if record.friday_owner is not None:
++        from hermes_cli.friday_dashboard_owner import verify_probe
++        try:
++            verify_probe(record, payload, headers['X-Hermes-Probe-Nonce'])
++        except (OSError, ValueError, KeyError, TypeError):
++            return None
+     return payload
+
+
+@@ -470,6 +486,7 @@
+     profiles: Sequence[str] = (),
+     token: Optional[str] = None,
+     home: str = "",
++    friday_owner: Optional[dict] = None,
+ ) -> Optional[HostRecord]:
+     """Publish this process as the host owner of ``role``. ``None`` when the write failed.
+
+@@ -492,6 +509,7 @@
+         profiles=tuple(str(p) for p in profiles),
+         updated_at=datetime.now(timezone.utc).isoformat(),
+         home=str(home or ""),
++        friday_owner=friday_owner,
+     )
+     try:
+         ensure_host_state_dir()
+--- a/hermes_cli/main_dashboard.py
++++ b/hermes_cli/main_dashboard.py
+@@ -892,6 +892,8 @@
+
+     Returns normally — leaving the caller to BIND — when no owner answers.
+     """
++    from hermes_cli.friday_dashboard_owner import cli_guard, check_attachment, cli_check
++    cli_check(cli_guard, args, headless_backend)
+     if getattr(args, "isolated", False) or _is_desktop_owned_backend():
+         return
+     record = _host_backend_attachment()
+@@ -901,12 +903,14 @@
+     from gateway import host_rendezvous as hr
+     from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
+
++    cli_check(check_attachment, record)
+     identity = hr.probe_owner(record)
+     if identity is None:
+         # Unprovable liveness (no psutil), a closed port, a foreign listener: all mean "no owner
+         # answered". Fall through to the bind — never exit 0 on an attach that did not happen.
+         return
+
++    cli_check(check_attachment, record, identity)
+     typed = _explicit_endpoint_flags()
+     conflict = _endpoint_conflict(args, record, typed)
+     if conflict:
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -696,7 +696,13 @@
+
+     Registered between host_header and auth_middleware: host check → cookie auth → token auth.
+     """
+-    from hermes_cli.dashboard_auth.middleware import gated_auth_middleware
++    from hermes_cli.dashboard_auth.middleware import gated_auth_middleware, _product_call_next
++    from hermes_cli.friday_dashboard_owner import identity_session
++    try:
++        if identity_session(request):
++            return await _product_call_next(request, call_next)
++    except (OSError, ValueError, KeyError, TypeError):
++        return JSONResponse(status_code=503, content={"detail": "Dashboard ownership changed"})
+     return await gated_auth_middleware(request, call_next)
+
+
+@@ -1314,6 +1320,8 @@
+     # can reach the backend hosting the open chats on a Desktop-only box (#119644).
+     from gateway import host_rendezvous as hr
+
++    from hermes_cli.friday_dashboard_owner import live_identity
++    friday_identity = live_identity(app)
+     desktop_child = is_desktop_owned_backend()
+     role = hr.ROLE_DESKTOP_SERVE if desktop_child else hr.ROLE_SERVE
+
+@@ -1344,7 +1352,7 @@
+         )
+         return
+     app.state.host_role = role
+-    hr.publish_record(
++    published = hr.publish_record(
+         role,
+         host=host,
+         port=port,
+@@ -1352,9 +1360,15 @@
+         # The live session token, so an attaching client of the same OS user can
+         # authenticate even when the backend is gated and `GET /` withholds it.
+         token=_SESSION_TOKEN,
++        home=friday_identity["home"] if friday_identity else "",
++        friday_owner=friday_identity,
+     )
+-    # SIGTERM included: it is the normal stop, and it does not run atexit here.
+-    hr.cleanup_on_exit(role)
++    if friday_identity and (published is None or published.start_time is None):
++        raise ValueError("friday_dashboard_owner_publish_failed")
++    # Friday uses the serving-loop finally below: releasing from the native
++    # signal pre-handler would unlock before uvicorn has actually shut down.
++    if friday_identity is None:
++        hr.cleanup_on_exit(role)
+
+
+ def _on_server_started(
+@@ -1448,7 +1462,10 @@
+     # for any profile find this process and attach instead of binding a second port. Published
+     # after the bind so the record carries the real port, and beside — not instead of — the
+     # spawn-ledger entry above, which Desktop's attach ladder reads.
+-    _best_effort("host rendezvous publish", lambda: _publish_host_rendezvous(host, actual_port))
++    if getattr(app.state, "friday_dashboard_owner", None) is not None:
++        _publish_host_rendezvous(host, actual_port)
++    else:
++        _best_effort("host rendezvous publish", lambda: _publish_host_rendezvous(host, actual_port))
+
+     _write_dashboard_ready_file(actual_port)
+     # Port-discovery sentinel parsed by the Desktop spawn. Written to fd 1:
+@@ -1610,86 +1627,110 @@
+
+     import uvicorn  # noqa: F401 — fail fast (before any side effects) when the dashboard extra is missing
+
+-    try:
+-        from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
+-
+-        start_nous_auth_keepalive()
+-    except Exception as exc:
+-        _log.debug("Nous auth keepalive did not start: %s", exc)
+-
+     _configure_auth_gate(host, allow_public, ssh_session_token, ssh_owner_nonce)
+-
+-    # host_header_middleware validates Host against this (DNS rebinding,
+-    # GHSA-ppp5-vxwm-4cf7).
+-    app.state.bound_host = host
+-    # The SPA bootstrap reads this so profile-less deep links (/chat?resume=<id>) inherit the
+-    # launcher's preselected profile instead of silently running in the launch scope (#73085).
+-    app.state.initial_profile = str(initial_profile or "")
+-
+-    config, server = _build_uvicorn_server(host, port, ssh_isolated=bool(ssh_session_token))
+-
+-    # Flush-on-kill guard (#94724): chaining SIGTERM/SIGINT handlers persist
+-    # in-memory transcripts to state.db before shutdown. Installed BEFORE
+-    # uvicorn's capture_signals() so uvicorn re-raises into them as the
+-    # "original" handlers — kills outside the serve window are covered too.
+-    try:
+-        from tui_gateway.server import install_exit_flush_signal_handlers
+-
+-        install_exit_flush_signal_handlers()
+-    except Exception as exc:
+-        _log.debug("exit-flush signal handlers not installed: %s", exc)
+-
+-    # #93608: uvicorn's bind_socket() would exit 1 with a bare ERROR line,
+-    # indistinguishable from "backend broken". Probe first so a conflict
+-    # surfaces as the BACKEND_PORT_IN_USE sentinel + distinct exit code.
+-    # ``--port 0`` is skipped by the probe.
+-    if _port_bind_conflict(host, port):
+-        _report_port_in_use(host, port)
+-        raise SystemExit(PORT_IN_USE_EXIT_CODE)
+-
+-    # LAST boot step, deliberately. One host process serves every profile and this one can be asked
+-    # for any of them via ``?profile=``, so the decision is made here instead of on the first such
+-    # request — activation is one-way, and everything the backend had already done by then
+-    # (idle-reaper flushes, hosted rooms, cron) stayed on single-profile assumptions. It runs after
+-    # the keepalive / auth gate / uvicorn build because activation FREEZES ``os.environ`` as the
+-    # launch profile's credentials, and that snapshot is the only source for launch keys with no
+-    # ``.env`` to rebuild from (systemd ``Environment=``, ``op run``, Compose): anything injected or
+-    # rotated by a later boot step would otherwise be invisible for the process lifetime. No-op on a
+-    # single-profile host; `gateway.multiplex_profiles: false` is retired and no longer skips it.
+-    try:
+-        from tui_gateway.launch_profile_policy import activate_multi_profile_hosting_eagerly
+-
+-        activate_multi_profile_hosting_eagerly()
+-    except Exception:
+-        _log.warning("eager multi-profile activation failed", exc_info=True)
+-
+-    async def _serve():
+-        # startup split from main_loop so the bound (ephemeral) port is readable.
+-        if not config.loaded:
+-            config.load()
+-        server.lifespan = config.lifespan_class(config)
+-        with server.capture_signals():
+-            await server.startup()
+-            if server.should_exit:
+-                return
+-
+-            _on_server_started(
+-                server,
+-                host=host,
+-                port=port,
+-                headless=headless,
+-                isolated=isolated,
+-                open_browser=open_browser,
+-                initial_profile=initial_profile,
+-                start_mcp_discovery_after_bind=start_mcp_discovery_after_bind,
+-                ssh_lock_path=ssh_lock_path,
+-            )
+-            if headless:
+-                from hermes_cli.observability.shared_metrics_startup import record_process_ready
+-                record_process_ready("serve_boot", background=True)
+-
+-            await server.main_loop()
+-            if server.started:
+-                await server.shutdown()
+-
+-    _run_serve(_serve, config, host, port)
++    from hermes_cli.friday_dashboard_owner import prepare_start
++    friday_claim = prepare_start(app, host, port, isolated=isolated, headless=headless,
++                                 ssh=bool(ssh_session_token or ssh_owner_nonce))
++
++    friday_safe_release = True
++    try:
++        try:
++            from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
++
++            start_nous_auth_keepalive()
++        except Exception as exc:
++            _log.debug("Nous auth keepalive did not start: %s", exc)
++
++        # host_header_middleware validates Host against this (DNS rebinding,
++        # GHSA-ppp5-vxwm-4cf7).
++        app.state.bound_host = host
++        # The SPA bootstrap reads this so profile-less deep links (/chat?resume=<id>) inherit the
++        # launcher's preselected profile instead of silently running in the launch scope (#73085).
++        app.state.initial_profile = str(initial_profile or "")
++
++        config, server = _build_uvicorn_server(host, port, ssh_isolated=bool(ssh_session_token))
++
++        # Flush-on-kill guard (#94724): chaining SIGTERM/SIGINT handlers persist
++        # in-memory transcripts to state.db before shutdown. Installed BEFORE
++        # uvicorn's capture_signals() so uvicorn re-raises into them as the
++        # "original" handlers — kills outside the serve window are covered too.
++        try:
++            from tui_gateway.server import install_exit_flush_signal_handlers
++
++            install_exit_flush_signal_handlers()
++        except Exception as exc:
++            _log.debug("exit-flush signal handlers not installed: %s", exc)
++
++        # #93608: uvicorn's bind_socket() would exit 1 with a bare ERROR line,
++        # indistinguishable from "backend broken". Probe first so a conflict
++        # surfaces as the BACKEND_PORT_IN_USE sentinel + distinct exit code.
++        # ``--port 0`` is skipped by the probe.
++        if _port_bind_conflict(host, port):
++            _report_port_in_use(host, port)
++            raise SystemExit(PORT_IN_USE_EXIT_CODE)
++
++        # LAST boot step, deliberately. One host process serves every profile and this one can be asked
++        # for any of them via ``?profile=``, so the decision is made here instead of on the first such
++        # request — activation is one-way, and everything the backend had already done by then
++        # (idle-reaper flushes, hosted rooms, cron) stayed on single-profile assumptions. It runs after
++        # the keepalive / auth gate / uvicorn build because activation FREEZES ``os.environ`` as the
++        # launch profile's credentials, and that snapshot is the only source for launch keys with no
++        # ``.env`` to rebuild from (systemd ``Environment=``, ``op run``, Compose): anything injected or
++        # rotated by a later boot step would otherwise be invisible for the process lifetime. No-op on a
++        # single-profile host; `gateway.multiplex_profiles: false` is retired and no longer skips it.
++        try:
++            from tui_gateway.launch_profile_policy import activate_multi_profile_hosting_eagerly
++
++            activate_multi_profile_hosting_eagerly()
++        except Exception:
++            _log.warning("eager multi-profile activation failed", exc_info=True)
++
++        async def _serve():
++            nonlocal friday_safe_release
++            # startup split from main_loop so the bound (ephemeral) port is readable.
++            if not config.loaded:
++                config.load()
++            server.lifespan = config.lifespan_class(config)
++            with server.capture_signals():
++                friday_safe_release = False
++                await server.startup()
++                if server.should_exit:
++                    if friday_claim:
++                        raise ValueError("friday_dashboard_startup_not_running")
++                    return
++
++                try:
++                    _on_server_started(
++                        server,
++                        host=host,
++                        port=port,
++                        headless=headless,
++                        isolated=isolated,
++                        open_browser=open_browser,
++                        initial_profile=initial_profile,
++                        start_mcp_discovery_after_bind=start_mcp_discovery_after_bind,
++                        ssh_lock_path=ssh_lock_path,
++                    )
++                    if headless:
++                        from hermes_cli.observability.shared_metrics_startup import record_process_ready
++                        record_process_ready("serve_boot", background=True)
++
++                    await server.main_loop()
++                finally:
++                    if server.started:
++                        await server.shutdown()
++                    friday_safe_release = True
++                    if friday_claim:
++                        # Before capture_signals re-raises SIGTERM into its
++                        # original disposition, but only after actual shutdown.
++                        from gateway import host_rendezvous as hr
++                        hr.clear_record(hr.ROLE_SERVE)
++                        hr.release_host_lock(hr.ROLE_SERVE)
++
++        _run_serve(_serve, config, host, port)
++    finally:
++        if friday_claim and friday_safe_release:
++            from gateway import host_rendezvous as hr
++            hr.clear_record(hr.ROLE_SERVE)
++            hr.release_host_lock(hr.ROLE_SERVE)
++            app.state.friday_dashboard_owner = None
+--- a/hermes_cli/web_routers/status.py
++++ b/hermes_cli/web_routers/status.py
+@@ -141,9 +141,22 @@
+     # ``role`` is the host ROLE this process published (gateway/host_rendezvous.ROLE_SERVE, or
+     # ROLE_DESKTOP_SERVE for a Desktop-owned child), not the launch mode: `hermes serve` and
+     # `hermes dashboard` are one host role that differ in SPA.
+-    return {"ok": True, "protocolVersion": 1, "pid": os.getpid(),
++    from hermes_cli.friday_dashboard_owner import live_identity
++    from gateway.status import get_process_start_time
++    try:
++        friday_identity = live_identity(app)
++    except (OSError, ValueError, KeyError, TypeError):
++        raise HTTPException(status_code=503, detail="Dashboard ownership changed") from None
++    extra = {}
++    if friday_identity and request.headers.get("x-hermes-probe-nonce"):
++        from hermes_cli.friday_dashboard_owner import identity_proof
++        extra = identity_proof(app, request.headers["x-hermes-probe-nonce"])
++    return {"ok": True, **extra, "protocolVersion": 1, "pid": os.getpid(),
++            "startTime": get_process_start_time(os.getpid()),
+             "role": getattr(app.state, "host_role", None) or "serve",
+-            "servesSpa": bool(getattr(app.state, "serves_spa", False))}
++            "servesSpa": bool(getattr(app.state, "serves_spa", False)),
++            "auth_required": bool(getattr(app.state, "auth_required", False)),
++            "fridayOwner": friday_identity}
+
+
+ @router.get("/api/health/idle")
+--- /dev/null
++++ b/hermes_cli/friday_dashboard_owner.py
+@@ -0,0 +1,298 @@
++"""Friday's native Dashboard ownership contract, using the host's existing lock.
++
++Source provenance is a complete byte check, not an upstream Git version. The
++Basic provider remains the only authentication implementation; no key is
++published. This boundary does not admit engineering workers or a whole release.
++"""
++from __future__ import annotations
++
++import hashlib
++import hmac
++import io
++import json
++import os
++from pathlib import Path
++import stat
++
++SOURCE = Path(__file__).resolve().parents[1]
++
++
++def require(ok):
++    if not ok:
++        raise ValueError('friday_dashboard_owner_unproved')
++
++
++def read_owned(path, *, private=False):
++    path = Path(path)
++    require(path.is_absolute() and path.resolve() == path)
++    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
++    try:
++        before = os.fstat(fd)
++        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
++                and before.st_nlink == 1 and (not private or not before.st_mode & 0o077))
++        with os.fdopen(fd, 'rb', closefd=False) as stream:
++            data = stream.read(64 * 1024**2 + 1)
++        after = os.fstat(fd)
++        fields = ('st_dev', 'st_ino', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_uid', 'st_nlink')
++        require(len(data) <= 64 * 1024**2 and all(getattr(before, k) == getattr(after, k) for k in fields))
++        return data
++    finally:
++        os.close(fd)
++
++
++def sha(data):
++    return hashlib.sha256(data).hexdigest()
++
++
++def source_identity(home, *, source=None):
++    """Actual complete composed source and truthful native install stamp."""
++    source = SOURCE if source is None else Path(source)
++    require(source == Path(home) / 'hermes-agent' and source.resolve() == source
++            and not (source / '.git').exists())
++    raw = read_owned(source.parent / 'hermes-agent.source.json', private=True)
++    receipt = json.loads(raw)
++    require(receipt.get('schema') == 'friday.hermes-source.v1'
++            and receipt.get('status') == 'SOURCE_COMPOSED_NOT_RUNTIME_ACCEPTED')
++    files = receipt.get('files'); require(isinstance(files, dict) and len(files) > 1000)
++    require('hermes_cli/friday_dashboard_owner.py' in files)
++    for name, row in files.items():
++        p = Path(name)
++        require(not p.is_absolute() and '..' not in p.parts and name == str(p))
++        data = read_owned(source / name)
++        require(sha(data) == row['sha256'] and len(data) == row['bytes']
++                and bool((source / name).stat().st_mode & 0o111) == (row['mode'] == '100755'))
++    stamp = json.loads(read_owned(source / 'install-stamp.json', private=True))
++    require(stamp.get('fridaySource') == {'baseTree': receipt['base_tree'], 'layers': receipt['layers']}
++            and stamp.get('commit') == receipt['commit'] and stamp.get('dirty') is True)
++    # Generated native dependencies/products are separate from declared source.
++    # A hidden source .env or an extra importable Python module is never adopted.
++    require(not (source / '.env').exists() and not (source / '.env').is_symlink())
++    generated = ('.hermes/', 'node_modules/', 'ui-tui/node_modules/', 'web/node_modules/',
++                 'ui-tui/dist/', 'hermes_cli/web_dist/')
++    for p in source.rglob('*.py'):
++        name = str(p.relative_to(source))
++        require(name in files or name.startswith(generated))
++    marker = json.loads(read_owned(Path(home) / 'FRIDAY-INSTALL.json', private=True))
++    require(marker.get('schema') == 'friday.native-install.v1'
++            and marker.get('state') == 'INSTALLED_TEMPLATE_INCOMPLETE'
++            and marker.get('home') == str(home) and marker.get('source') == str(source)
++            and marker.get('source_receipt_sha256') == sha(raw))
++    plugins = marker.get('plugin_files')
++    require(isinstance(plugins, dict) and 'plugins/friday_rework/plugin.yaml' in plugins)
++    for name, expected in plugins.items():
++        require(name.startswith('plugins/friday_rework/') and '..' not in Path(name).parts
++                and sha(read_owned(Path(home) / name, private=True)) == expected)
++    target = Path(home) / 'plugins/friday_rework'
++    require({str(p.relative_to(home)) for p in target.rglob('*') if not p.is_dir()} == set(plugins))
++    return {'root': str(source), 'receipt': sha(raw), 'commit': receipt['commit'],
++            'baseTree': receipt['base_tree'], 'plugin': sha(json.dumps(plugins, sort_keys=True).encode())}
++
++
++def declared(home, *, source=None):
++    contract = json.loads(read_owned(Path(home) / 'FRIDAY-PROFILE.json', private=True))
++    dash = contract['native_dashboard']; operator = dash['operator']
++    require(contract['profile'] == 'default' and operator['provider'] == 'basic'
++            and operator['org_id'] == '' and bool(operator['user_id']))
++    return {'home': str(home), 'profile': contract['profile'],
++            'source': source_identity(home, source=source), 'operator': operator,
++            'host': dash['host'], 'port': dash['port'], 'public_url': dash['public_url']}
++
++
++def enabled():
++    from hermes_constants import get_hermes_home
++    home = get_hermes_home()
++    # Deleting one marker cannot silently fall back to an ordinary donor launch.
++    return ((home / 'FRIDAY-PROFILE.json').exists()
++            or (SOURCE.parent / 'hermes-agent.source.json').exists())
++
++
++def credentials(home, operator):
++    """Reuse native settings; require ambient Basic values to belong to this home."""
++    from dotenv import dotenv_values
++    from plugins.dashboard_auth import basic
++    from plugins.dashboard_auth._shared import resolve_env_or_cfg
++    env_path = Path(home) / '.env'
++    scoped = dotenv_values(stream=io.StringIO(read_owned(env_path, private=True).decode()),
++                           interpolate=False) if env_path.exists() or env_path.is_symlink() else {}
++    names = ('USERNAME', 'PASSWORD', 'PASSWORD_HASH', 'SECRET', 'TTL_SECONDS')
++    for suffix in names:
++        name = 'HERMES_DASHBOARD_BASIC_AUTH_' + suffix
++        value = os.environ.get(name, '').strip()
++        require(not value or scoped.get(name) == value)
++    section = basic._load_config_basic_auth_section()
++    require(section.get('username') == operator['user_id'])
++    secret = resolve_env_or_cfg('HERMES_DASHBOARD_BASIC_AUTH_SECRET', section.get('secret'))
++    require(bool(secret))  # Native per-process random signing keys cannot prove reattachment.
++    settings = basic._settings()
++    require(settings['username'] == operator['user_id'] and len(settings['secret']) >= 16)
++    plaintext = os.environ.get('HERMES_DASHBOARD_BASIC_AUTH_PASSWORD', '').strip()
++    encoded = resolve_env_or_cfg('HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH', section.get('password_hash', ''))
++    if not encoded and not plaintext:
++        plaintext = resolve_env_or_cfg('HERMES_DASHBOARD_BASIC_AUTH_PASSWORD', section.get('password', ''))
++    material = 'plaintext:' + plaintext if plaintext else 'scrypt:' + encoded
++    require(bool(plaintext or encoded))
++    return basic, settings, plaintext, material
++
++
++def expected(*, registered=False, auth_required=None, host=None, port=None):
++    from hermes_constants import get_hermes_home
++    from hermes_cli.config_effective import load_user_config_effective
++    from hermes_cli.dashboard_auth.prefix import resolve_public_url
++    home = get_hermes_home(); value = declared(home)
++    from hermes_yaml import YAMLError
++    read_owned(home / 'config.yaml', private=True)
++    try:
++        cfg = load_user_config_effective(home / 'config.yaml', fail_closed=True)
++    except YAMLError:
++        raise ValueError('friday_dashboard_config_unreadable') from None
++    dash = cfg.get('dashboard') or {}; plugins = cfg.get('plugins') or {}
++    require(not os.environ.get('HERMES_DASHBOARD_PUBLIC_URL')
++            or os.environ['HERMES_DASHBOARD_PUBLIC_URL'] == value['public_url'])
++    admin = plugins.get('entries', {}).get('friday_rework', {}).get('settings', {}).get('admin')
++    require(admin == {'enabled': True, 'operators': [value['operator']], 'profiles': [value['profile']]})
++    require(dash.get('public_url') == value['public_url']
++            and resolve_public_url() == value['public_url']
++            and 'dashboard_auth/basic' in plugins.get('enabled', [])
++            and not set(plugins.get('disabled', [])).intersection({'basic', 'dashboard_auth/basic'}))
++    require(host is None or host == value['host']); require(port is None or port == value['port'])
++    basic, settings, plaintext, material = credentials(home, value['operator'])
++    if registered:
++        from hermes_cli.dashboard_auth import get_provider
++        provider = get_provider('basic')
++        require(type(provider) is basic.BasicAuthProvider and auth_required is True
++                and provider._username == settings['username']
++                and hmac.compare_digest(provider._secret, settings['secret']))
++        require(basic._verify_password(plaintext, provider._password_hash) if plaintext
++                else hmac.compare_digest(provider._password_hash, settings['password_hash']))
++    value['authBinding'] = hmac.new(settings['secret'],
++        ('friday-dashboard-v1\0' + material + '\0' + json.dumps(value, sort_keys=True)).encode(),
++        hashlib.sha256).hexdigest()
++    return value
++
++
++def prepare_start(app, host, port, *, isolated=False, headless=False, ssh=False):
++    """Claim the native serve lock BEFORE uvicorn config, port probe or bind."""
++    if not enabled():
++        return False
++    from gateway import host_rendezvous as hr
++    from hermes_cli.process_identity import is_desktop_owned_backend
++    require(not isolated and not headless and not ssh and not is_desktop_owned_backend())
++    identity = expected(registered=True, auth_required=app.state.auth_required, host=host, port=port)
++    from gateway.status import get_process_start_time
++    require(get_process_start_time(os.getpid()) is not None)
++    outcome, _ = hr.claim_host_lock(hr.ROLE_SERVE)
++    require(outcome is hr.HostLockOutcome.ACQUIRED)
++    app.state.friday_dashboard_owner = identity
++    return True
++
++
++def live_identity(app):
++    boot = getattr(app.state, 'friday_dashboard_owner', None)
++    if boot is None:
++        require(not enabled())
++        return None
++    from gateway import host_rendezvous as hr
++    require(hr.owns_host_lock(hr.ROLE_SERVE))
++    current = expected(registered=True, auth_required=app.state.auth_required,
++                       host=app.state.bound_host, port=app.state.bound_port)
++    require(current == boot)
++    return boot
++
++
++def check_attachment(record, identity=None):
++    """A native record nominates a candidate; authenticated live identity proves it."""
++    if not enabled():
++        return
++    from gateway import host_rendezvous as hr
++    value = expected()
++    require(record.role == hr.ROLE_SERVE and record.home == value['home']
++            and record.start_time is not None and hr.liveness_is_proven(record)
++            and record.protocol_version == hr.HOST_PROTOCOL_VERSION
++            and value['profile'] in record.profiles
++            and record.host == value['host'] and record.port == value['port']
++            and record.friday_owner == value and bool(record.token_fingerprint)
++            and hr.record_token_is_consistent(record))
++    if identity is not None:
++        verify_probe(record, identity, identity.get('probeNonce'))
++        require(identity.get('protocolVersion') == hr.HOST_PROTOCOL_VERSION
++                and identity.get('pid') == record.pid and identity.get('startTime') == record.start_time
++                and identity.get('role') == record.role and identity.get('fridayOwner') == value
++                and identity.get('auth_required') is True and identity.get('servesSpa') is True)
++        require(hr.read_record(hr.ROLE_SERVE, include_stale=True) == record
++                and hr.liveness_is_proven(record) and hr.record_token_is_consistent(record))
++
++
++def cli_guard(args, headless):
++    """Run before Desktop/isolation shortcuts or native attach probing."""
++    if not enabled():
++        return
++    from hermes_cli.main_dashboard import _is_desktop_owned_backend
++    require(not getattr(args, 'isolated', False) and not headless and not _is_desktop_owned_backend()
++            and not getattr(args, 'open_profile', ''))
++    expected(host=args.host, port=args.port)
++
++
++def probe_headers(record):
++    """Send only the existing role token; never send an admin bearer to an unproved port."""
++    import secrets
++    require(enabled()); check_attachment(record)
++    from gateway import host_rendezvous as hr
++    token = read_owned(hr.token_path(record.role), private=True).decode('utf-8-sig').strip()
++    require(hr.token_fingerprint(token) == record.token_fingerprint)
++    from hermes_cli.web_server import _SESSION_HEADER_NAME
++    return {_SESSION_HEADER_NAME: token, 'X-Hermes-Probe-Nonce': secrets.token_hex(16)}
++
++
++def proof_mac(identity, nonce, pid, start_time, token, secret):
++    import re
++    require(isinstance(nonce, str) and re.fullmatch('[0-9a-f]{32}', nonce))
++    message = {'identity': identity, 'nonce': nonce, 'pid': pid, 'startTime': start_time,
++               'tokenFingerprint': sha(token.encode())[:16]}
++    return hmac.new(secret, json.dumps(message, sort_keys=True).encode(), hashlib.sha256).hexdigest()
++
++
++def verify_probe(record, payload, nonce):
++    require(payload.get('probeNonce') == nonce)
++    _, settings, _, _ = credentials(Path(record.home), record.friday_owner['operator'])
++    from gateway import host_rendezvous as hr
++    token = read_owned(hr.token_path(record.role), private=True).decode('utf-8-sig').strip()
++    require(hr.token_fingerprint(token) == record.token_fingerprint)
++    actual = proof_mac(record.friday_owner, nonce, record.pid, record.start_time, token, settings['secret'])
++    require(isinstance(payload.get('ownerProof'), str) and hmac.compare_digest(payload['ownerProof'], actual))
++
++
++def identity_session(request):
++    """Native same-OS-user identity IPC only; all other routes retain Basic login.
++
++    The existing private role token authorizes this single read. A real registered
++    Basic provider creates the local request principal; no cookie/token is sent
++    back or accepted on another route, and native Friday admin policy still runs.
++    """
++    from gateway.host_rendezvous import HOST_IDENTITY_PATH
++    if request.method != 'GET' or request.url.path != HOST_IDENTITY_PATH or not enabled():
++        return False
++    from hermes_cli.web_server import _has_valid_session_token
++    if not _has_valid_session_token(request):
++        return False
++    identity = live_identity(request.app)
++    from hermes_cli.dashboard_auth import get_provider
++    request.state.session = get_provider('basic')._mint_session(identity['operator']['user_id'])
++    return True
++
++
++def identity_proof(app, nonce):
++    identity = live_identity(app)
++    from hermes_cli.dashboard_auth import get_provider
++    from hermes_cli.web_server import _SESSION_TOKEN
++    from gateway.status import get_process_start_time
++    return {'probeNonce': nonce, 'ownerProof': proof_mac(identity, nonce, os.getpid(),
++            get_process_start_time(os.getpid()), _SESSION_TOKEN, get_provider('basic')._secret)}
++
++
++def cli_check(function, *args):
++    import sys
++    try:
++        return function(*args)
++    except (OSError, ValueError, KeyError, TypeError):
++        sys.stderr.write("Friday Dashboard ownership unproved; refusing attachment/start\n")
++        raise SystemExit(78) from None
+--- a/hermes_cli/friday_product_access.py
++++ b/hermes_cli/friday_product_access.py
+@@ -193,7 +193,7 @@
+         if not path.startswith("/api/"):
+             return True
+         return (path.startswith("/api/plugins/friday_rework/")
+-                or (request.method == "GET" and path in {"/api/auth/me", "/api/plugins", "/api/dashboard/plugins"})
++                or (request.method == "GET" and path in {"/api/auth/me", "/api/plugins", "/api/dashboard/plugins", "/api/host/identity"})
+                 or (request.method == "POST" and path == "/api/auth/ws-ticket"))
+     except Exception:  # health: allow BLE001 -- Deny the HTTP route when policy, profile or request evaluation fails.
+         return False
