@@ -45,14 +45,15 @@ def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None):
     from .onboarding import validate_template
     # Validate the actual profile, including local routes and accepted SAFE tools.
     validate_template({'config': config, 'tools': sorted(scope.SAFE),
-                       'required_secrets': [config['providers']['friday-local']['key_env'], 'EXA_API_KEY']})
+                       'required_secrets': [config['providers']['friday-local']['key_env'],
+                           *([] if config['web']['keyless_fallback'] else ['EXA_API_KEY'])]})
     c, root = own_runtime(home, profile, worker, runtime)
     files = {}; names = []; unobserved = ['native execution', 'model', 'network', 'runtime receipt', 'independent review']
     if worker == 'dsh':
         if a0_network is not None:
             raise HostUnavailable('unexpected_a0_inputs')
         d = c['dsh']; provider = config['providers']['friday-local']; model = config['model']
-        if d['key_name'] != provider['key_env'] or d['web']['profile'] != 'exa-paid':
+        if d['key_name'] != provider['key_env'] or d['web']['profile'] != ('exa-keyless' if config['web']['keyless_fallback'] else 'exa-paid'):
             raise HostUnavailable('own_worker_credential_and_web_required')
         from tools.render_dsh_local import build_patch
         capacity = provider['models'][model['default']]; bounds = capacity['bounded_context']
@@ -60,7 +61,7 @@ def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None):
             base_url=model['base_url'], model=model['default'], api_key_env=d['key_name'],
             context_window=capacity['context_length'], max_tokens=bounds['main_max_output_tokens'],
             summary_max_tokens=bounds['compression_max_output_tokens'],
-            headroom_tokens=bounds['safety_margin_tokens'] + bounds['template_overhead_tokens'], web_profile='exa-paid')
+            headroom_tokens=bounds['safety_margin_tokens'] + bounds['template_overhead_tokens'], web_profile=d['web']['profile'])
         data = (json.dumps(rows, ensure_ascii=False, indent=2) + '\n').encode()
         expected = {'path': str(root / 'inputs/dsh-local.json'), 'sha256': hashlib.sha256(data).hexdigest()}
         if d['patch'] != expected:
@@ -69,9 +70,9 @@ def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None):
         from .worker_web import DshWebInputs
         # Read every pinned source/web input; no shared receipt or key is read.
         for p in (d['node'], d['cli'], *d['native_files']): _pin(p).read()
-        web = DshWebInputs(*(_pin(d['web'][k]) for k in ('resolver', 'trust_bundle', 'egress_evidence', 'research_policy')))
+        web = DshWebInputs(*(_pin(d['web'][k]) for k in ('resolver', 'trust_bundle', 'egress_evidence', 'research_policy')), profile=d['web']['profile'])
         web.checked_patch(data)
-        names = [d['key_name'], 'EXA_API_KEY']
+        names = [d['key_name'], *([] if d['web']['profile'] == 'exa-keyless' else ['EXA_API_KEY'])]
     else:
         if not isinstance(a0_network, dict) or set(a0_network) != {'name', 'endpoints', 'policy'}:
             raise HostUnavailable('explicit_a0_local_network_inputs_required')
@@ -96,7 +97,7 @@ def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None):
         # Explicit native file contents only. Installation/network/capability are
         # intentionally unobserved. Nothing is installed into a donor or service.
         files[root / 'inputs/a0-native-files.json'] = (json.dumps({**native, **(service_files(c['a0']['web']) if 'web' in c['a0'] else a0_web_files('searxng-google'))}, sort_keys=True, indent=2) + '\n').encode()
-        names = list(KEY_REFERENCES.values()) + ['EXA_API_KEY']
+        names = list(KEY_REFERENCES.values()) + ([] if config['web']['keyless_fallback'] else ['EXA_API_KEY'])
         if 'web' in c['a0']: names.append('SEARXNG_SECRET')
         unobserved.append('A0 reconciliation and current per-job capability')
     for k in ('workspace_root', 'staging_root', 'cache_roots', 'runtime_home'):

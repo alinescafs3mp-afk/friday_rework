@@ -154,7 +154,7 @@ def main():
     parser.add_argument("--api-key-env", action=Once)
     parser.add_argument("--request-timeout-ms", action=Once)
     parser.add_argument("--web-profile", action=Once,
-                        help="disabled (default) or exa-paid; retrieval only")
+                        help="disabled (default), exa-paid or exa-keyless; retrieval only")
     for name in ("web-search-max-results", "web-search-max-queries", "web-timeout-ms",
                  "web-fetch-max-chars", "web-fetch-max-bytes"):
         parser.add_argument("--" + name, action=Once)

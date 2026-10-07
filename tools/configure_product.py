@@ -110,8 +110,8 @@ def compose_product(spec):
     # are not copied into the normal product configuration.
     local = build_config(**inference)
     web = _exact(spec['web'], {'profile', 'extract_char_limit', 'extract_timeout'}, 'web')
-    if web['profile'] != 'exa-paid':
-        raise ValueError('mandatory_explicit_scoped_paid_web_required')
+    if web['profile'] not in ('exa-paid','exa-keyless'):
+        raise ValueError('mandatory_explicit_scoped_web_required')
     if any(web[k] is None for k in ('extract_char_limit', 'extract_timeout')):
         raise ValueError('web_limits_required')
     retrieval = hermes_web_config(**{'profile': web['profile'],
@@ -148,7 +148,7 @@ def compose_product(spec):
             if kind == 'a0':
                 if selected_runtime['a0'].get('web',{}).get('profile') != 'searxng-google':
                     raise ValueError('a0_useful_web_runtime_contract_unavailable')
-            elif selected_runtime.get('dsh', {}).get('web', {}).get('profile') != 'exa-paid':
+            elif selected_runtime.get('dsh', {}).get('web', {}).get('profile') != web['profile']:
                 raise ValueError('mandatory_worker_web_contract_required')
 
     # Config loading supplies the remaining untouched native defaults. Copy
@@ -227,7 +227,8 @@ def compose_product(spec):
     if 'a0' in runtime or 'a0' in runtime.get('workers', {}):
         if inference['key_env'] != 'FRIDAY_LLM_API_KEY':
             raise ValueError('a0_scoped_inference_key_required')
-        required += ['FRIDAY_EMBEDDINGS_API_KEY','SEARXNG_SECRET']
+        service_names = ['FRIDAY_EMBEDDINGS_API_KEY','SEARXNG_SECRET']
+        required += service_names
     if (len(set(required)) != len(required) or inference['key_env'] in AUTH_NAMES
             or any(inference['key_env'] in names for names in channel_names.values())):
         raise ValueError('separate_scoped_credential_references_required')
@@ -240,7 +241,8 @@ def compose_product(spec):
     return {'config': config, 'soul': soul.decode(), 'contract': {
         'schema': 'friday.product-profile.v1', 'kind': 'normal_product', 'profile': profile,
         'state': 'TEMPLATE_INCOMPLETE', 'ready': False,
-        'required_scoped_names': {'inference_web': required, 'dashboard': list(AUTH_NAMES), 'channels': channel_names},
+        'required_scoped_names': {'inference_web': required, 'inference': [inference['key_env']],
+            'web': web_names, 'worker_service': service_names, 'dashboard': list(AUTH_NAMES), 'channels': channel_names},
         'native_dashboard': {'host': dashboard['host'], 'port': dashboard['port'],
             'public_url': config['dashboard']['public_url'], 'auth_required': True,
             'operator': dashboard['operator'], 'insecure': False,

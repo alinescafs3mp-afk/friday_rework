@@ -74,7 +74,7 @@ def validate_runtime(value):
     if 'web' in dsh:
         web = dsh['web']
         if (not isinstance(web, dict) or set(web) != {'profile','resolver','trust_bundle','egress_evidence','research_policy'}
-                or web['profile'] != 'exa-paid' or dsh['key_name'] == 'EXA_API_KEY'):
+                or web['profile'] not in ('exa-paid', 'exa-keyless') or dsh['key_name'] == 'EXA_API_KEY'):
             raise HostUnavailable('invalid_worker_web_config')
         for key in ('resolver','trust_bundle','egress_evidence','research_policy'):
             _pin(web[key])
@@ -189,6 +189,9 @@ def check_runtime(value, associations):
         expected = {'plugins/friday_rework/worker_web.py':hashlib.sha256(Path(__file__).with_name('worker_web.py').read_bytes()).hexdigest(),
                     'tools/web_profile.py':hashlib.sha256(Path(profile_helper.__file__).read_bytes()).hexdigest(),
                     'config/RESEARCH.md':hashlib.sha256(web.research_policy.read()).hexdigest()}
+        if web.profile == 'exa-keyless':
+            from .worker_web import keyless_source
+            expected['plugins/friday_rework/adapters/dsh_keyless_web.mjs'] = hashlib.sha256(keyless_source()).hexdigest()
         if not isinstance(receipt,dict) or receipt.get('web_source_pins') != expected:
             raise HostUnavailable('worker_web_source_not_verified')
     if (not isinstance(receipt, dict) or set(receipt) != fields
@@ -218,7 +221,7 @@ def dsh_binding(value, associations, *, web_network_check=None):
     dsh = config["dsh"]
     web = _dsh_web(dsh)
     def environment():
-        names = (dsh['key_name'], 'EXA_API_KEY') if web else (dsh['key_name'],)
+        names = (dsh['key_name'], 'EXA_API_KEY') if web and web.profile == 'exa-paid' else (dsh['key_name'],)
         try:
             return scoped_environment(config['runtime_home'], names)
         except WorkerWebError:

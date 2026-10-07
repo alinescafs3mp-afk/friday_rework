@@ -114,7 +114,7 @@ class WebProfiles(unittest.TestCase):
                 with self.subTest(value=value, build=build.__name__), self.assertRaises(ValueError):
                     build(value)
         with self.assertRaises(ValueError):
-            dsh_web_patch("exa-keyless")  # This donor has no native keyless Exa provider.
+            dsh_web_patch("mcp-unrestricted")
 
     def test_invalid_limits_do_not_silently_enable_or_relax_tools(self):
         specifications = (

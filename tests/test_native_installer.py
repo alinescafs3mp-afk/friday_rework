@@ -255,7 +255,7 @@ def test_parser_does_not_echo_secret_inputs(tmp_path, monkeypatch, capsys):
 
 @pytest.mark.parametrize('path,value', [('inference.base_url', 'https://api.openai.com/v1'),
     ('inference.model', 'auto'), ('inference.context', True), ('inference.main_output', 32768),
-    ('web.profile', 'exa-keyless'), ('web.extract_timeout', None),
+    ('web.profile', 'foreign-web'), ('web.extract_timeout', None),
     ('dashboard.host', 'SECRET_CANARY_HOST'), ('dashboard.port', True),
     ('dashboard.public_url', 'https://user:SECRET_CANARY@friday.example:9119'),
     ('dashboard.public_url', 'http://friday.example:9119'),
@@ -309,8 +309,10 @@ def test_composition_is_bound_to_reviewed_lock_and_exact_overlays(install_input,
         entry.composition_checked(install_input, Path(install_input['home']), receipt, {})
 
 
-def test_whole_finite_composition_and_completed_idempotence_with_native_config(install_input, tmp_path, monkeypatch):
+@pytest.mark.parametrize('web_profile',['exa-paid','exa-keyless'])
+def test_whole_finite_composition_and_completed_idempotence_with_native_config(install_input, tmp_path, monkeypatch,web_profile):
     """Commands are intercepted; native config/files are real. No PM acceptance."""
+    install_input['product']['web']['profile']=web_profile
     p = tmp_path / 'input.json'; p.write_text(json.dumps(install_input)); p.chmod(0o600)
     home = Path(install_input['home']); calls = []
     from scripts import dsh_prepare
@@ -336,6 +338,8 @@ def test_whole_finite_composition_and_completed_idempotence_with_native_config(i
                 'status': 'SOURCE_COMPOSED_NOT_RUNTIME_ACCEPTED', 'commit': donor['commit'],
                 'base_tree': donor['tree'], 'files': files, 'layers': rows,
                 'sources_lock_sha256': install_input['sources_lock']['sha256']})
+        elif str(entry.ROOT / 'scripts/dsh_prepare.py') in argv and 'source' in argv:
+            Path(install_input['dsh_donor']).mkdir(mode=0o700) # Synthetic intact build boundary only.
         elif '-c' in argv:
             return str(Path(os.sys.executable)), {'synthetic': True}
         elif str(entry.ROOT / 'scripts/friday_native.py') in argv:

@@ -43,7 +43,7 @@ class DshWebInputs:
     profile: str = 'exa-paid'
 
     def pins(self):
-        if self.profile != 'exa-paid':
+        if self.profile not in ('exa-paid', 'exa-keyless'):
             raise WorkerWebError('unsupported_worker_web_profile')
         return (self.resolver, self.trust_bundle, self.egress_evidence, self.research_policy)
 
@@ -59,7 +59,7 @@ class DshWebInputs:
             # can replace Exa's config, including its URL or inline credential.
             # Include that entry in the exact rendered web configuration check.
             selected = [r for r in rows if isinstance(r, dict) and
-                        (r.get('id') in {'web', 'web-search-exa', 'web-fetch-http', 'tool-web'} or 'insert' in r)]
+                        (r.get('id') in {'web', 'web-search-exa', 'web-search-exa-keyless', 'mcp-exa', 'web-fetch-http', 'tool-web'} or 'insert' in r)]
             tool = next(r['config'] for r in selected if r.get('id') == 'tool-web')
             fetch = next(r['config'] for r in selected if r.get('id') == 'web-fetch-http')
             expected = dsh_web_patch(self.profile,
@@ -241,7 +241,7 @@ class DshNetworkCheck:
         before = identity()
         if before != (policy['boot_id'],policy['net_namespace']):
             raise WorkerWebError('worker_web_namespace_changed')
-        urls = ['https://api.exa.ai/',*policy['document_probes']]
+        urls = [('https://mcp.exa.ai/' if web.profile == 'exa-keyless' else 'https://api.exa.ai/'),*policy['document_probes']]
         left = self.adapter._remaining(row)
         if left <= 5:
             raise WorkerWebError('worker_web_original_budget_exhausted')
@@ -270,3 +270,8 @@ class DshNetworkCheck:
                 or web_policy(web,self.config['runtime_home'],self.config['runtime_profile'],self.store.clock()) != policy):
             raise WorkerWebError('worker_web_changed_during_probe')
         return {'identity':_identity(after),'policy_sha256':web.egress_evidence.sha256,'observation':v}
+
+
+def keyless_source():
+    """Exact shipped native provider glue, staged after intact Harness build."""
+    return Path(__file__).resolve().with_name("adapters").joinpath("dsh_keyless_web.mjs").read_bytes()

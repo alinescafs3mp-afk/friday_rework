@@ -79,7 +79,9 @@ def validate_template(template):
     web = config.get('web', {})
     if (web.get('backend') != 'exa' or web.get('search_backend') != 'exa'
             or web.get('extract_backend') != 'exa' or web.get('keyless_rescue') is not False
-            or web.get('keyless_fallback') is not False or 'EXA_API_KEY' not in names):
+            or type(web.get('keyless_fallback')) is not bool
+            or web.get('provider_tier',{}).get('exa') != ('free' if web['keyless_fallback'] else 'paid')
+            or ('EXA_API_KEY' in names) is web['keyless_fallback']):
         raise ValueError('explicit_useful_scoped_web_required')
     plugins = config.get('plugins', {})
     if not {'friday_rework', 'web/exa'} <= set(plugins.get('enabled', [])):

@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 HERMES_PROFILES = ("disabled", "exa-paid", "exa-keyless")
-DSH_PROFILES = ("disabled", "exa-paid")
+DSH_PROFILES = ("disabled", "exa-paid", "exa-keyless")
 
 
 def _profile(value, supported, options):
@@ -65,12 +65,18 @@ def dsh_web_patch(profile="disabled", *, search_max_results=None, search_max_que
     timeout = _bound(timeout_ms, 30000, 1, 120000)
     chars = _bound(fetch_max_chars, 15000, 2000, 200000)
     size = _bound(fetch_max_bytes, 1000000, 1, 5000000)
+    provider = ({"id": "web-search-exa", "name": "@deepseek-ai/dsh-web-search-exa",
+                     "config": {"baseURL": "https://api.exa.ai", "searchType": "auto",
+                                "numResults": results, "highlightsPerResult": 1}}
+                if profile == "exa-paid" else
+                {"id": "web-search-exa-keyless", "name": "/payload/friday-web-keyless.mjs",
+                 "config": {"endpoint": "https://mcp.exa.ai/mcp?tools=web_search_exa",
+                            "maxResults": results, "timeoutMs": min(timeout, 30000),
+                            "maxResponseBytes": min(size, 1000000), "maxOutputChars": min(chars, 15000)}})
     return [
         {"id": "web", "config": {"searchProvider": "exa", "fetchProvider": "http"}},
         # Exa is absent from the base. A plain id/config patch would be skipped.
-        {"insert": [{"id": "web-search-exa", "name": "@deepseek-ai/dsh-web-search-exa",
-                     "config": {"baseURL": "https://api.exa.ai", "searchType": "auto",
-                                "numResults": results, "highlightsPerResult": 1}}]},
+        {"insert": [provider]},
         {"id": "web-fetch-http", "disabled": False, "config": {
             "maxResponseBytes": size, "maxBodyChars": chars, "timeoutMs": timeout,
             "maxRedirects": 3,

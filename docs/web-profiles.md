@@ -20,7 +20,7 @@ values; renderers never read credentials or select providers from the environmen
 | --- | --- | --- |
 | `disabled` | Existing empty component-test toolset | Existing disabled native tool row |
 | `exa-paid` | Native Exa SDK index search and extraction, paid tier | Native Exa index search and native public HTTP fetch |
-| `exa-keyless` | Native anonymous Exa MCP search and extraction, free tier | Rejected: this pinned Harness provider requires a key |
+| `exa-keyless` | Native anonymous Exa MCP search and extraction, free tier | Fixed bounded Exa search call through native web seam and native HTTP fetch |
 
 Both enabled Hermes profiles set `web.backend`, `search_backend` and
 `extract_backend` to `exa`. They select the native `web` toolset (`web_search` and
@@ -324,3 +324,31 @@ with Retry-After respected and no POST/other status retries. The prompt and reci
 are statically aligned with these branches in pinned source. Header delay, status/
 method cases and total exhaustion remain **NOT_RUN** pending an admissible normal
 verification boundary; no supplemental Retry semantic execution is authorized here.
+
+The ordinary product may explicitly select `exa-keyless`. Hermes retains its
+native free Exa route; every alternative vendor stays paid and rescue is off.
+The protected contract separates inference, web and worker-service names. This
+profile requires no `EXA_API_KEY`; an ambient key does not change its route.
+A0 still requires its own embeddings/SearXNG service credentials and actual
+capability admission. Startup health continues to reject unqualified A0.
+
+Harness reuses its native `ctx.web`, `web_search` and bounded HTTP `web_fetch`.
+A small pinned provider in `adapters/dsh_keyless_web.mjs` makes only the fixed
+Exa `web_search_exa` call. It does not initialize/discover remote MCP tools or
+import server instructions. Local admission validates the whole exact overlay,
+not just the endpoint query. Search has one request, no retry or alternate
+provider, at most 30 seconds, 1 MB ingress and 15,000 output characters. Rate
+limits, malformed envelopes and unavailable transport remain failures. Page and
+search text remain untrusted evidence; offline controls do not prove a model's
+resistance to instructions embedded in source text.
+
+Normal installation stages this exact additional provider after building the
+complete unchanged Harness donor. Each keyless launch must include its current
+source pin, an independent runtime receipt and current namespace DNS/TLS proof
+for `mcp.exa.ai:443` plus the configured document probes. Existing whole-job
+deadline, stop, settlement and sandbox checks remain in force. This is source
+composition only. Real endpoint protocol/availability, TLS/DNS, output at the
+service and complete product journeys still need independent live qualification.
+The Hermes bounded transport uses the pinned requests/urllib3 socket seam; an
+unsupported transport is refused. DNS resolution/connection settlement and the
+existing extraction thread deadline still require actual runtime verification.

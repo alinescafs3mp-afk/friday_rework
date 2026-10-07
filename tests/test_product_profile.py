@@ -75,7 +75,7 @@ def test_explicit_capacity_variants(context, max_input, main, summary):
 
 
 @pytest.mark.parametrize('path,value', [
-    ('web.profile','disabled'),('web.profile','exa-keyless'),('web.extract_timeout',None),
+    ('web.profile','disabled'),('web.profile','foreign-web'),('web.extract_timeout',None),
     ('dashboard.operator.provider','auto'),('dashboard.operator.user_id',''),('dashboard.operator.org_id',None),
     ('dashboard.public_url','https://user:secret@friday.example:9119'),
     ('dashboard.public_url','https://friday.example:9119/path'),('dashboard.public_url','http://friday.example:9119'),

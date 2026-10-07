@@ -112,18 +112,19 @@ def test_native_transport_negative_and_changed_owner_refuse(producer,kind):
     with patch('subprocess.run',run),pytest.raises((RuntimeError,ValueError)):c(f.f.row,f.web)
 
 
+@pytest.mark.parametrize("web_profile",["exa-paid","exa-keyless"])
 @pytest.mark.asyncio
-async def test_ordinary_native_host_calls_concrete_producer_twice_then_same_worker(setup,tmp_path,monkeypatch):
+async def test_ordinary_native_host_calls_concrete_producer_twice_then_same_worker(setup,tmp_path,monkeypatch,web_profile):
     config=copy.deepcopy(setup.runtime);d=config['dsh']; fields={}
     data={'resolver':b'nameserver 1.1.1.1\n','trust_bundle':b'SYNTHETIC CA\n',
           'egress_evidence':json.dumps(policy(str(setup.home),'default',setup.host.store.clock())).encode(),
           'research_policy':(ROOT/'config/RESEARCH.md').read_bytes()}
     for key,b in data.items():
         p=tmp_path/(key+'.input');p.write_bytes(b);p.chmod(0o600);fields[key]=pin(p)
-    d['web']={'profile':'exa-paid',**fields}
+    d['web']={'profile':web_profile,**fields}
     rows=build_patch(purpose='temporary-local-test',api='openai-completions',base_url='http://127.0.0.1:8011/v1',
         model='local-fixture',context_window=40960,max_tokens=4096,summary_max_tokens=2048,headroom_tokens=4096,
-        api_key_env=d['key_name'],web_profile='exa-paid')
+        api_key_env=d['key_name'],web_profile=web_profile)
     p=tmp_path/'patch.json';p.write_text(json.dumps(rows));d['patch']=pin(p)
     module=sys.modules[setup.module.__name__.rsplit('.',1)[0]+'.host_runtime']
     import tools.web_profile as helper
@@ -132,14 +133,20 @@ async def test_ordinary_native_host_calls_concrete_producer_twice_then_same_work
         adapter_sha256=pin(Path(module.__file__).parent/'adapters/dsh.py')['sha256'],evidence=[fields['egress_evidence']],
         web_source_pins={'plugins/friday_rework/worker_web.py':pin(Path(module.__file__).parent/'worker_web.py')['sha256'],
                          'tools/web_profile.py':pin(Path(helper.__file__))['sha256'],'config/RESEARCH.md':fields['research_policy']['sha256']})
+    if web_profile == 'exa-keyless':
+        native=Path(d['payload_root'])/'friday-web-keyless.mjs';native.write_bytes((ROOT/'plugins/friday_rework/adapters/dsh_keyless_web.mjs').read_bytes());d['native_files'].append(pin(native))
+        receipt['runtime_sha256']=setup.record.digest({k:v for k,v in config.items() if k!='runtime_receipt'})
+        receipt['web_source_pins']['plugins/friday_rework/adapters/dsh_keyless_web.mjs']=pin(native)['sha256']
     p=tmp_path/'receipt.json';p.write_text(json.dumps(receipt));config['runtime_receipt']=pin(p);setup.configure(config)
-    with (setup.home/'.env').open('a') as out:out.write('EXA_API_KEY=SYNTHETIC_EXA\n')
+    if web_profile == 'exa-paid':
+        with (setup.home/'.env').open('a') as out:out.write('EXA_API_KEY=SYNTHETIC_EXA\n')
     prior=subprocess.run;seen=[]
     def run(argv,**kw):
         if argv[0]=='/usr/bin/bwrap':
             seen.append(argv);assert 'EXA_API_KEY' not in kw['env']
             return subprocess.CompletedProcess(argv,0,json.dumps(observation(json.loads(argv[-1]))).encode(),b'')
-        assert kw['env']['EXA_API_KEY']=='SYNTHETIC_EXA'
+        if web_profile == 'exa-paid':assert kw['env']['EXA_API_KEY']=='SYNTHETIC_EXA'
+        else:assert 'EXA_API_KEY' not in kw['env']
         return prior(argv,**kw)
     monkeypatch.setattr(subprocess,'run',run)
     proof=await ingress(setup);r=invoke(setup,proof);await settle(setup)

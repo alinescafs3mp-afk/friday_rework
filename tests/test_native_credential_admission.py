@@ -162,7 +162,7 @@ def test_normal_cold_boot_refuses_unproved_source_home_or_operator(operator,monk
         target=operator.home/'foreign';target.mkdir(mode=0o700)
     elif kind=='ambient_operator':monkeypatch.setenv('HERMES_DASHBOARD_BASIC_AUTH_SECRET','FOREIGN_OPERATOR_SECRET')
     else:
-        changed=operator.source/'hermes_cli/friday_credential_admission.py';before=changed.read_bytes();changed.write_bytes(before+b'\n')
+        changed=operator.source/'hermes_cli/friday_credential_admission.py';before=changed.read_bytes();changed.chmod(0o600);changed.write_bytes(before+b'\n')
     try:
         with pytest.raises((ValueError,OSError)):load_hermes_dotenv(hermes_home=target)
     finally:

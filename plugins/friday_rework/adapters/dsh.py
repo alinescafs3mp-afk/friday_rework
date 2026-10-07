@@ -273,13 +273,18 @@ class DshAdapter:
         c = self.config
         if c.web is not None:
             c.web.checked_patch(c.patch.read())
+            if c.web.profile == 'exa-keyless':
+                from ..worker_web import keyless_source
+                candidates = [p for p in c.native_files if p.path == c.payload_root / 'friday-web-keyless.mjs']
+                if len(candidates) != 1 or candidates[0].read() != keyless_source():
+                    raise AdapterError('worker_keyless_source_not_verified')
         else:
             try:
                 rows = json.loads(c.patch.read())
             except (ValueError, UnicodeError):
                 rows = []  # Existing reviewed non-JSON native profiles.
-            if isinstance(rows, list) and any(isinstance(r, dict) and r.get('id') == 'tool-web'
-                    and r.get('disabled') is False for r in rows):
+            if isinstance(rows, list) and any(isinstance(r, dict) and (('insert' in r) or
+                    (r.get('id') in ('tool-web','mcp-exa','web-search-exa-keyless') and r.get('disabled') is not True)) for r in rows):
                 raise AdapterError('worker_web_inputs_missing')
         return {str(p.path): hashlib.sha256(p.read()).hexdigest()
                 for p in (c.node, c.cli, c.patch, *c.native_files,
@@ -624,7 +629,7 @@ class DshAdapter:
     def _credential_names(self):
         if self.config.web and self.config.key_name == 'EXA_API_KEY':
             raise AdapterError('web_and_inference_credentials_overlap')
-        return (self.config.key_name, 'EXA_API_KEY') if self.config.web else (self.config.key_name,)
+        return (self.config.key_name, 'EXA_API_KEY') if self.config.web and self.config.web.profile == 'exa-paid' else (self.config.key_name,)
 
     def observe(self, association, prepared):
         row, _ = self._row(association)

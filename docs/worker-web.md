@@ -183,3 +183,10 @@ arbitrary deployment endpoint/IPv6 kernel support remains unresolved. Actual nft
 parser/kernel qualification, reviewed full A0 image/service startup, current live
 capability and all six product journeys remain NOT_RUN. G4 is consumed/closed;
 G5 and kernel120 were not granted or run. A0/legacy Friday remain OFF.
+
+`exa-keyless` is an explicit ordinary DSH web profile. Provisioning renders the
+same profile, requires only the scoped inference key, and pins the additional
+native search provider. Current network observations use `mcp.exa.ai`, so an old
+paid Exa observation cannot admit it. Paid `exa-paid` still requires its own
+Exa key. Both keep native HTTP fetch and the original execution/cleanup budget.
+No A0 capability or product readiness follows from keyless configuration.

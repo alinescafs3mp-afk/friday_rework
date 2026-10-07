@@ -105,7 +105,8 @@ def native_profile_check(bundle, home, *, records=()):
             and dash['operator']['provider'] == 'basic' and dash['operator']['org_id'] == '',
             'native_operator_identity_mismatch')
     require(config['web']['backend'] == config['web']['search_backend'] == config['web']['extract_backend'] == 'exa'
-            and config['web']['keyless_rescue'] is False and config['web']['keyless_fallback'] is False
+            and config['web']['keyless_rescue'] is False and type(config['web']['keyless_fallback']) is bool
+            and config['web']['provider_tier']['exa'] == ('free' if config['web']['keyless_fallback'] else 'paid')
             and 'web/exa' in config['plugins']['enabled'],
             'mandatory_web_route_missing')
     for record in records:

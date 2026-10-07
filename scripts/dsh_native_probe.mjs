@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { validateWebOverlay } from '../plugins/friday_rework/adapters/dsh_keyless_web.mjs';
 /** Finite, keyless component inspection of the pinned built Harness runtime. */
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -155,12 +156,14 @@ async function main() {
   const row = id => { const hit = rows.find(item => item.id === id); assert(hit, `missing effective row ${id}`); return hit; };
   const disabled = ['llm-deepseek', 'llm-deepseek-account', 'deepseek-account', 'session-title-llm',
     'web-search-deepseek', 'tool-web', 'tool-goal', 'command-goal', 'goal-round-driver', 'tool-workflow', 'session-telemetry-otel'];
-  for (const id of disabled) assert.equal(row(id).disabled, true, `independent route must be disabled: ${id}`);
-  assert.equal(overlay.some(item => item.insert || item.name || item.remove), false, 'probe accepts row updates only');
+  const webEnabled = validateWebOverlay(overlay);
+  for (const id of disabled.filter(id=>!(webEnabled&&id==='tool-web'))) assert.equal(row(id).disabled, true, `independent route must be disabled: ${id}`);
+  assert.equal(overlay.some(item => item.name || item.remove), false, 'probe accepts exact reviewed web insert and row updates only');
   assert(!fs.readFileSync(patch, 'utf8').includes('!!js'), 'probe patch must not contain executable expressions');
   assert(!JSON.stringify(overlay).includes('__jsExpr'), 'probe patch must not contain expression nodes');
-  const permittedRows = new Set(['llm-pi-ai', 'agent-default-model', 'compaction-basic', ...disabled]);
+  const permittedRows = new Set(['llm-pi-ai', 'agent-default-model', 'compaction-basic', ...disabled, ...(webEnabled?['web','web-fetch-http']:[])]);
   for (const item of overlay) {
+    if (webEnabled && item.insert) continue; // validateWebOverlay already checked exact whole insert.
     assert(permittedRows.has(item.id), 'unsupported probe overlay row');
     assert(Object.keys(item).every(key => ['id', 'config', 'disabled'].includes(key)), 'unsupported row update');
   }

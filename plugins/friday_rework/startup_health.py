@@ -65,7 +65,7 @@ def worker_health():
                     if kind == "a0":
                         # Selection does not grant current native A0 admission.
                         raise HostUnavailable("a0_useful_web_runtime_contract_unavailable")
-                    if checked["dsh"].get("web", {}).get("profile") != "exa-paid":
+                    if checked["dsh"].get("web", {}).get("profile") not in ("exa-paid", "exa-keyless"):
                         raise HostUnavailable("mandatory_worker_web_contract_required")
                 except (OSError, ValueError, RuntimeError, KeyError, TypeError):
                     rows.append({"profile": profile, "worker": kind, "deployment_verified": False,

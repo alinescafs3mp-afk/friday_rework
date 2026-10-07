@@ -104,7 +104,7 @@ def spec_checked(value):
     files = value['project_files']
     require(isinstance(files, dict) and files, 'reviewed_project_inventory_required')
     required = {'scripts/friday_install.py', 'scripts/friday_native.py',
-                'scripts/dsh_prepare.py', 'scripts/a0_prepare.py', 'scripts/install_containment.py',
+                'scripts/dsh_prepare.py', 'plugins/friday_rework/adapters/dsh_keyless_web.mjs', 'scripts/a0_prepare.py', 'scripts/install_containment.py',
                 'scripts/friday_start.py',
                 'scripts/a0_runtime.py', 'scripts/rootless_docker_launch.py',
                 'tools/configure_product.py', 'tools/configure_local_test.py',
@@ -152,7 +152,7 @@ def spec_checked(value):
                 and chat['max_output_tokens'] == selected['main_output']
                 and selected['key_env'] == 'FRIDAY_LLM_API_KEY', 'a0_product_inference_profile_mismatch')
     build_config(**product['inference'])
-    require(product['web'].get('profile') == 'exa-paid'
+    require(product['web'].get('profile') in ('exa-paid','exa-keyless')
             and set(product['web']) == {'profile', 'extract_char_limit', 'extract_timeout'}
             and all(product['web'][k] is not None for k in ('extract_char_limit', 'extract_timeout')),
             'mandatory_scoped_web_required')
@@ -359,6 +359,8 @@ def install(value, input_path, *, budget=None):
              '--input', str(input_path), '--deadline', str(budget.deadline)], source)
     for command in argv['harness']:
         execute(command, ROOT)
+    if value['product']['web']['profile'] == 'exa-keyless':
+        budget.call(stage_keyless_provider, Path(value['dsh_donor']))
     execute(argv['a0_inventory'], ROOT, 120)
     budget.call(composition_checked, value, source, receipt, donors['hermes'])
     marker = {'schema': SCHEMA, 'state': 'INSTALLED_TEMPLATE_INCOMPLETE',
@@ -495,6 +497,17 @@ def main():
         # Native errors/inputs can contain credentials: print no exception body.
         parser.exit(2, 'Friday entry refused: pinned inputs, owned fresh installation and admitted native dependencies required\n')
 
+
+
+def stage_keyless_provider(harness):
+    """After intact donor build/smoke; exact extra product source, no ready grant."""
+    raw = owned_file(ROOT / "plugins/friday_rework/adapters/dsh_keyless_web.mjs")
+    target = harness / "friday-web-keyless.mjs"
+    require(target.parent.resolve() == target.parent and not target.exists() and not target.is_symlink(), "existing_keyless_provider_not_replaced")
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as f:
+        f.write(raw); f.flush(); os.fsync(f.fileno())
+    return {"path": str(target), "sha256": digest(raw), "runtime_ready": False}
 
 if __name__ == '__main__':
     main()
