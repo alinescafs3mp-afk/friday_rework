@@ -95,14 +95,15 @@ async def test_unadmitted_a0_is_not_redirected_to_ready_dsh(setup, tmp_path):
     assert setup.host.store.snapshot() == {}
 
 
-def test_normal_profile_preserves_both_worker_configs_and_credential_domains(setup, tmp_path):
+@pytest.mark.parametrize('web_profile', ['exa-paid', 'exa-keyless'])
+def test_normal_profile_preserves_both_worker_configs_and_credential_domains(setup, tmp_path, web_profile):
     from test_product_profile import inputs
     from tools.configure_product import compose_product
     value = mapped(setup, tmp_path)
     d = copy.deepcopy(value['workers']['dsh'])
     value['workers']['dsh'] = d
     p = {'path': str(tmp_path / 'unused-web-source'), 'sha256': 'a' * 64}
-    d['dsh']['web'] = dict(profile='exa-paid', **{k: copy.deepcopy(p) for k in
+    d['dsh']['web'] = dict(profile=web_profile, **{k: copy.deepcopy(p) for k in
         ('resolver', 'trust_bundle', 'egress_evidence', 'research_policy')})
     value['workers']['a0']['a0']['web'] = {
         'profile': 'searxng-google', 'timeout_seconds': 10, 'dns': ['1.1.1.1'],
@@ -113,12 +114,13 @@ def test_normal_profile_preserves_both_worker_configs_and_credential_domains(set
             '/usr/local/searxng/searxng-src/searx/settings_loader.py': 'a' * 64,
             '/a0/helpers/searxng.py': '4020eca255497dbf95076166ebefaff14a095abafaff69cb6176a8ae31c2fcc2',
             '/a0/tools/search_engine.py': 'c13c14560d0ac1947b63ed1ad795bd2fad5e026673d2cc615f34ef6da57a9efb'}}
-    spec = inputs(); spec['runtime'] = value
+    spec = inputs(); spec['runtime'] = value; spec['web']['profile'] = web_profile
     spec['inference']['key_env'] = 'FRIDAY_LLM_API_KEY'
     bundle = compose_product(spec)
     assert bundle['config']['plugins']['entries']['friday_rework']['settings']['runtime'] == value
     assert {'FRIDAY_LLM_API_KEY', 'FRIDAY_EMBEDDINGS_API_KEY', 'SEARXNG_SECRET'} <= set(
         bundle['contract']['required_scoped_names']['inference_web'])
+    assert ('EXA_API_KEY' in bundle['contract']['required_scoped_names']['inference_web']) == (web_profile == 'exa-paid')
     assert bundle['contract']['ready'] is False
     value['workers']['a0']['runtime_profile'] = 'foreign'
     with pytest.raises(ValueError): compose_product(spec)

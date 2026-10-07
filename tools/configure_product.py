@@ -223,7 +223,9 @@ def compose_product(spec):
         'runtime': {'enabled': False}, 'results': {'enabled': True}}
     # Per-user native skill dirs start empty; no owner/project auto-discovery.
     ordinary['skills'].update(external_dirs=[], project_discovery=False, trusted_project_dirs=[], auto_load=[])
-    required = [inference['key_env'], 'EXA_API_KEY']
+    web_names = ['EXA_API_KEY'] if web['profile'] == 'exa-paid' else []
+    service_names = []
+    required = [inference['key_env'], *web_names]
     if 'a0' in runtime or 'a0' in runtime.get('workers', {}):
         if inference['key_env'] != 'FRIDAY_LLM_API_KEY':
             raise ValueError('a0_scoped_inference_key_required')
