@@ -1,0 +1,120 @@
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5669,8 +5669,10 @@
+             except concurrent.futures.TimeoutError:
+                 return {"multiplex": True, "pending": True, "served_profiles": runner.served_profile_names()}
+ 
++        from hermes_cli.plugins_gateway_control import plugin_control_verb
+         _control_server = GatewayControlServer(
+-            verb_handlers={"pause-for-update": _pause_for_update_handler,
++            verb_handlers={"plugin-control": plugin_control_verb(runner, _main_loop),
++                           "pause-for-update": _pause_for_update_handler,
+                            "rescan-profiles": _rescan_profiles_handler,
+                            "unserve-profile": unserve_profile_verb(runner),
+                            "serve-profile": serve_profile_verb(runner),
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -646,6 +646,12 @@
+         return register_command(self, name, handler, description, args_hint, argument_mode, gateway_control,
+                                 native_controls)
+ 
++    @_serialized_replacement
++    def register_gateway_control(self, name: str, handler: Callable) -> Optional[PluginRegistration]:
++        """Lease a consented local-control callback; never a chat command."""
++        from hermes_cli.plugins_gateway_control import register_gateway_control
++        return register_gateway_control(self, name, handler)
++
+     def get_command_context(self) -> Optional[dict]:
+         from hermes_cli.plugin_command_context import get_command_context
+         return get_command_context(self)
+@@ -1172,6 +1178,7 @@
+         self._plugin_platform_names: Set[str] = set()
+         self._cli_commands: Dict[str, dict] = {}
+         self._plugin_commands: Dict[str, dict] = {}
++        self._gateway_verb_handlers: Dict[str, dict] = {}  # Owner-leased local controls; not chat commands.
+         self._gateway_control_names: Set[str] = set()  # Retired controls must never become agent input.
+         self._retired_native_controls: Dict[object, tuple] = {}  # Metadata only, scoped to this manager's lifetime.
+         self._system_prompt_sections: Dict[str, PluginSystemPromptSection] = {}
+--- /dev/null
++++ b/hermes_cli/plugins_gateway_control.py
+@@ -0,0 +1,70 @@
++"""Consented local plugin controls on the existing gateway socket/owner registry."""
++import asyncio
++import concurrent.futures
++import json
++import re
++from hermes_constants import get_process_hermes_home, set_hermes_home_override, reset_hermes_home_override
++
++
++def plugin_control_verb(runner, loop):
++    launch_home = get_process_hermes_home()
++    def handler(params):
++        # Never return native exception messages: a provider may include a token.
++        async def dispatch():
++            def invoke():
++                try:
++                    from hermes_cli.profiles import get_profile_dir
++                    from hermes_cli.plugins import get_plugin_manager
++                    if not isinstance(params, dict) or set(params) != {"profile", "plugin", "control", "arguments"}:
++                        return {"accepted": False, "error": "invalid_admin_control"}
++                    token = set_hermes_home_override(launch_home)
++                    try:
++                        if params["profile"] not in runner.served_profile_names():
++                            return {"accepted": False, "error": "owning_profile_unavailable"}
++                        home = get_profile_dir(params["profile"])
++                    finally:
++                        reset_hermes_home_override(token)
++                    token = set_hermes_home_override(home)
++                    try:
++                        manager = get_plugin_manager()
++                        # Look only at the native registry's ALREADY loaded owner.
++                        # Do not call discover/load: this must never create a host.
++                        loaded = manager._plugins.get(params["plugin"])
++                        entry = manager._gateway_verb_handlers.get(params["plugin"] + ":" + params["control"])
++                        if not loaded or not loaded.enabled or not entry or entry["plugin_key"] != params["plugin"]:
++                            return {"accepted": False, "error": "owning_host_not_loaded"}
++                        arguments = params["arguments"]
++                        if not isinstance(arguments, dict) or "profile" in arguments:
++                            return {"accepted": False, "error": "invalid_owning_arguments"}
++                        result = entry["handler"](json.dumps({"profile": params["profile"], **arguments}))
++                        return result if isinstance(result, dict) else {"accepted": False, "error": "invalid_owning_response", "execution": "UNKNOWN"}
++                    finally:
++                        reset_hermes_home_override(token)
++                except Exception:
++                    return {"accepted": False, "error": "owning_control_unconfirmed", "execution": "UNKNOWN"}
++            # Same gateway loop/executor; the registered callback separately
++            # restores its actual native owner context and re-verifies authority.
++            return await asyncio.to_thread(invoke)
++        try:
++            future = asyncio.run_coroutine_threadsafe(dispatch(), loop)
++            return future.result(timeout=1.5)
++        except concurrent.futures.TimeoutError:
++            # No future cancellation/false cessation. Stop may still be in flight.
++            return {"accepted": False, "error": "owning_control_pending", "execution": "UNKNOWN"}
++        except Exception:
++            return {"accepted": False, "error": "owning_gateway_unavailable", "execution": "UNKNOWN"}
++    return handler
++
++
++def register_gateway_control(context, name, handler):
++    """Existing native consent and owner lease, shared by all local-control plugins."""
++    from hermes_cli.config import load_config_readonly
++    entry = (load_config_readonly().get("plugins") or {}).get("entries", {}).get(context.plugin_id, {})
++    if entry.get("allow_gateway_control") is not True:
++        return None
++    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name) or not callable(handler):
++        raise ValueError("Invalid native gateway control registration")
++    return context._register_entry("gateway_control", context.plugin_id + ":" + name, context._manager._gateway_verb_handlers,
++        {"handler": handler, "plugin": context.manifest.name, "plugin_key": context.plugin_id},
++        "Plugin %s registered protected gateway control: %s", name)
++
+--- a/hermes_cli/plugin_isolation.py
++++ b/hermes_cli/plugin_isolation.py
+@@ -33,6 +33,7 @@
+ # raw platform SDK clients, argparse parsers, adapter classes bound to the gateway's event loop, the
+ # launch-scope dashboard auth registry. A plugin calling one of these runs only in-process.
+ HOST_UNSUPPORTED_CTX_METHODS: Dict[str, str] = {
++    "register_gateway_control": "local control belongs to the already loaded gateway owner",
+     "get_command_context": "authenticated control context lives only in the native gateway dispatch",
+     "register_platform": "platform adapters run on the gateway's event loop with native SDK clients",
+     "register_platform_handler": "the handler factory receives the platform's native SDK client",

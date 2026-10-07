@@ -34,6 +34,10 @@ def masked(value):
 
 
 class Administration:
+    def __init__(self):
+        from hermes_constants import get_process_hermes_home
+        self.launch_home = get_process_hermes_home()
+
     def profiles(self):
         policy = admin_policy()
         if policy is None:
@@ -178,7 +182,8 @@ class Administration:
             "inputs": [{"index": i, "logical_name": Path(a["host_path"]).name,
                 "size_bytes": a["size_bytes"], "sha256": a["sha256"], "ownership": "RECHECK_ON_DOWNLOAD"}
                 for i, a in enumerate((row.get("host") or {}).get("inputs") or [])],
-            "stop_available": False, "stop_reason": "OWNING_HOST_ADMIN_CAPABILITY_NOT_CONNECTED"}
+            "stop_available": True, "stop_reason": "VERIFY_CURRENT_ADMIN_AND_OWNING_GATEWAY_ON_ACTION",
+            "quiescent": (row.get("host") or {}).get("quiescence") is not None}
 
     def tasks(self, profile):
         with self.scope(profile):
@@ -292,11 +297,41 @@ class Administration:
             return read_staged(staging_root=root, artifact=artifact, max_bytes=16 * 1024**2)
 
     def effective(self, profile):
-        with self.scope(profile):
+        with self.scope(profile) as home:
             from hermes_cli.config import load_config_readonly
+            from .admin_settings import options, private_config
             cfg = load_config_readonly()
             return {"profile": profile, "settings": {k: cfg.get(k) for k in
-                ("model", "auxiliary", "gateway", "toolsets", "web", "plugins")},
-                "changes_available": False, "reason": "CONFIGURATION_EFFECT_AND_LOCAL_WORKER_REBIND_NOT_YET_ACCEPTED",
+                ("model", "auxiliary", "gateway", "platform_toolsets", "skills", "web", "plugins")},
+                "changes_available": True, "typed_options": options(cfg, home),
+                "config_sha256": private_config(home / "config.yaml"),
+                "runtime_application": "PERSISTED_NEXT_NATIVE_SESSION_OR_RELOAD",
                 "native_stores": "PairingStore / SessionDB / Friday PluginState",
                 "web_worker_journeys": "NOT_RUN"}
+
+    def control(self, profile, session, task_id, action):
+        from .admin_controls import authority_home, request_control
+        from hermes_cli.friday_product_access import admin_policy, session_allowed
+        with authority_home(self.launch_home):
+            if admin_policy() is None or not session_allowed(session) or profile not in self.profiles():
+                raise PermissionError("verified_admin_required")
+        return request_control(self.launch_home, profile, session, task_id, action)
+
+    def _verify_session(self, profile, session):
+        from .admin_controls import authority_home
+        from hermes_cli.friday_product_access import admin_policy, session_allowed
+        with authority_home(self.launch_home):
+            if admin_policy() is None or not session_allowed(session) or profile not in self.profiles():
+                raise PermissionError("verified_admin_required")
+
+    def write_settings(self, profile, body, session):
+        from .admin_settings import edit
+        self._verify_session(profile, session)
+        with self.scope(profile) as home:
+            return edit(profile, home, body, lambda: self._verify_session(profile, session))
+
+    def schedules(self, profile, action=None, job_id=None, session=None):
+        from .admin_settings import schedules
+        if action is not None: self._verify_session(profile, session)
+        with self.scope(profile):
+            return schedules(action, job_id)

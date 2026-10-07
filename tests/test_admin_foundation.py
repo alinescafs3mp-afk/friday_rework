@@ -279,7 +279,8 @@ def test_task_projection_uses_actual_native_association_and_no_cancel_mutation(e
     native_sessions(env)
     joined = env.admin.conversation("default", "session-1")["tasks"]
     assert len(joined) == 1 and joined[0]["existing_task_id"] == "owned-task"
-    assert joined[0]["stop_available"] is False and joined[0]["goal_verification"] == "NOT_RUN"
+    assert joined[0]["stop_available"] is True and joined[0]["goal_verification"] == "NOT_RUN"
+    assert joined[0]["stop_reason"] == "VERIFY_CURRENT_ADMIN_AND_OWNING_GATEWAY_ON_ACTION"
     assert env.admin.conversation("default", "session-2")["tasks"] == []
     assert store.get("owned-task", owner) == row
 
