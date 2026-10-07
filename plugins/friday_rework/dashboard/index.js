@@ -137,7 +137,7 @@
       h("h1", null, "Friday Administration"),
       h("label", null, "Product profile ", h("select", {value: profile, disabled: busy, onChange: e => setProfile(e.target.value)},
         ...profiles.map(p => h("option", {key: p, value: p}, p)))),
-      h("nav", null, ...["users", "onboarding", "pairing", "conversations", "tasks", "effective", "schedules"].map(v => button(v, () => setView(v), {key: v}))),
+      h("nav", null, ...["users", "onboarding", "pairing", "conversations", "tasks", "effective", "schedules", "health"].map(v => button(v === "health" ? "Worker health" : v, () => setView(v), {key: v}))),
       view === "conversations" ? h("label", null, "Search ", h("input", {value: query, maxLength: 512, onChange: e => setQuery(e.target.value)})) : null,
       view === "conversations" ? h("div", null,
         ...["platform", "user_id", "account_id", "chat_id", "thread_id"].map(k => h("label", {key: k}, k + " ",
@@ -188,6 +188,12 @@
           button("Download " + file.logical_name, () => download(task, file), {key: task.existing_task_id + "/" + file.index}))),
         ...session.tasks.flatMap(task => task.inputs.map(file =>
           button("Received attachment " + file.logical_name, () => download(task, file, "inputs"), {key: task.existing_task_id + "/input/" + file.index})))) : null,
+      view === "health" && data && Array.isArray(data.workers) ? h("div", {"aria-label": "Worker health"},
+        h("p", null, "Live execution has not been checked. Full Friday readiness is unconfirmed."),
+        h("p", null, "Unavailable required workers: " + (data.missing_workers || []).join(", ")),
+        h("ul", null, ...data.workers.map(row => h("li", {key: row.profile},
+          row.profile + " / " + (row.worker || "unconfigured") + ": " +
+          (row.deployment_verified ? "deployment checked" : "unavailable"))))) : null,
       ["tasks", "effective"].includes(view) && data ? h("pre", {style: {whiteSpace: "pre-wrap"}}, JSON.stringify(data, null, 2)) : null,
       view === "tasks" && Array.isArray(data) ? h("ul", null, ...data.map(task => h("li", {key: task.existing_task_id}, task.existing_task_id,
         button("Check task", () => taskControl(task, "status")),

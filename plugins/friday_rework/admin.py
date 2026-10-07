@@ -367,6 +367,11 @@ class Administration:
             root = Path(runtime["staging_root"]) / task_id
             return read_staged(staging_root=root, artifact=artifact, max_bytes=16 * 1024**2)
 
+    def health(self):
+        # Existing admin route authority is checked before this read-only view.
+        from .startup_health import worker_health
+        return worker_health()
+
     def effective(self, profile):
         with self.scope(profile) as home:
             from hermes_cli.config import load_config_readonly

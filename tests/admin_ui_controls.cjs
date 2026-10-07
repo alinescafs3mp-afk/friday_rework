@@ -51,6 +51,7 @@ const context = {
     else if (path.endsWith("/users")) data = input.users || {accounts: [], users: []};
     else if (path.endsWith("/pairing")) data = input.pending || {pending: []};
     else if (path.endsWith("/pairing/approve")) data = {recorded: true};
+    else if (path.endsWith("/health")) data = input.health;
     else if (path.endsWith("/tasks")) data = input.tasks;
     else if (path.endsWith("/effective")) data = input.effective;
     else if (path.endsWith("/settings")) data = {recorded: true, runtime_application: "PERSISTED_NEXT_NATIVE_SESSION_OR_RELOAD"};
@@ -92,6 +93,20 @@ const click = async label => {render(); const node = find(tree, label); assert(n
     assert(find(tree, "Next messages").props.disabled);
     await click("Previous messages"); observe();
     assert(find(tree, "Previous messages").props.disabled);
+  } else if (input.action === "health") {
+    await click("Worker health");
+    assert.equal(requests.filter(r => r.url.includes("/health")).length, 0, "Health must not poll or auto-load");
+    await click("Load current native state");
+    assert(text(tree).includes("Live execution has not been checked"));
+    assert(text(tree).includes("Full Friday readiness is unconfirmed"));
+    for (const row of input.health.workers) {
+      assert(text(tree).includes(row.profile + " / " + (row.worker || "unconfigured") + ": " +
+        (row.deployment_verified ? "deployment checked" : "unavailable")));
+    }
+    assert(text(tree).includes("Unavailable required workers: " + input.health.missing_workers.join(", ")));
+    assert(requests.every(r => r.method === "GET"));
+    assert.equal(requests.filter(r => r.url.includes("/health")).length, 1);
+    assert(requests.every(r => r.headers["x-hermes-session-token"] === input.token));
   } else if (input.action === "approve") {
     await click("pairing"); await click("Load current native state"); await click("Approve native access");
   } else if (["cancel_task", "pause_task", "check_task"].includes(input.action)) {

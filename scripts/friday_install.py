@@ -105,6 +105,7 @@ def spec_checked(value):
     require(isinstance(files, dict) and files, 'reviewed_project_inventory_required')
     required = {'scripts/friday_install.py', 'scripts/friday_native.py',
                 'scripts/dsh_prepare.py', 'scripts/a0_prepare.py', 'scripts/install_containment.py',
+                'scripts/friday_start.py',
                 'tools/configure_product.py', 'tools/configure_local_test.py',
                 'tools/web_profile.py', 'config/SOUL.md', 'config/RESEARCH.md'}
     required.update(str(p.relative_to(ROOT)) for p in (ROOT / 'plugins/friday_rework').rglob('*')
@@ -417,13 +418,28 @@ def inspect(value, input_hash):
             'invocation_completion': 'NOT_PROVEN_BY_OUTPUT_RECEIPT'}
 
 
-def start(value, input_hash):
-    # This candidate deliberately has no grant-converting switch. Calling a
-    # source renderer "READY" or providing a receipt alone cannot launch it.
-    inspect(value, input_hash)
-    # A0/web/kernel admission is still absent. The Dashboard is now guarded at
-    # its native CLI and pre-bind host lock, not by a check-then-launch wrapper.
-    raise ValueError('mandatory_a0_web_kernel_and_final_native_dashboard_owner_not_admitted')
+def start(value, input_hash, *, budget=None, input_path=None):
+    from scripts.install_containment import Budget, Containment
+    budget = budget or Budget(value.get('seconds'))
+    budget.call(inspect, value, input_hash)
+    # A source/rendered status cannot stand in for any configured runtime.
+    require(value['product']['runtime'].get('enabled') is True,
+            'mandatory_a0_web_kernel_and_final_native_dashboard_owner_not_admitted')
+    require(input_path is not None, 'original_start_input_required')
+    require(digest(budget.call(owned_file, input_path, private=True)) == input_hash,
+            'original_start_input_changed')
+    home = Path(value['home']); source = home / 'hermes-agent'
+    custody = Containment(value['containment'], budget, clean_environment(home))
+    expression = 'from pm.environments import project_python; from pathlib import Path; print(project_python(Path.cwd()))'
+    selected = custody.run([value['bootstrap_python']['path'], '-B', '-c', expression], source, timeout=15)[0]
+    require(Path(selected).is_absolute() and Path(selected).is_file(), 'native_pm_python_missing')
+    # Re-exec the existing internal completion helper in the exact selected PM
+    # generation. It revalidates all bytes and gates before any service effect.
+    budget.call(inspect, value, input_hash)
+    argv = [selected, '-B', str(ROOT / 'scripts/friday_native.py'), 'start',
+            '--input', str(input_path), '--deadline', str(budget.deadline)]
+    budget.check()
+    os.execve(selected, argv, clean_environment(home))
 
 
 def main():
@@ -453,7 +469,7 @@ def main():
             from scripts.friday_native import dashboard_source_check
             result = dashboard_source_check(Path(value['home']))
         else:
-            result = start(value, sha)
+            result = start(value, sha, budget=budget, input_path=args.input)
         payload = json.dumps(result, sort_keys=True, indent=2)
         budget.check()
         print(payload, flush=True)

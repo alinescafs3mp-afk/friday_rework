@@ -89,6 +89,11 @@ class ScheduleChange(BaseModel):
     action: Literal["pause", "resume"]
 
 
+@router.get("/health")
+def health():
+    return call(_admin.health)
+
+
 @router.get("/profiles")
 def profiles():
     return call(_admin.profiles)
