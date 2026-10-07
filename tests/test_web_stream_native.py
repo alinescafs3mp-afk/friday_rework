@@ -29,7 +29,7 @@ build = runpy.run_path(str(Q/'tools/configure_local_test.py'))['build_config']
     + [('explicit','retry_4xx','local-local-SYNTHETIC_CREDENTIAL_123456789','local-'),
        ('explicit','retry_4xx','sk-sk-sk-SYNTHETIC_CREDENTIAL_123456789','sk-'),
        ('explicit','escaped_stream','JSON"\\яяJSON"\\яя_SYNTHETIC_CREDENTIAL_123456789','JSON"\\яя')])
-def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,mode,variant,credential,overlap_prefix,construction_failure=False,sdk_error_echo=None):
+def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,mode,variant,credential,overlap_prefix,construction_failure=False,sdk_error_echo=None,sdk_error_complete=None):
     case=variant
     marker='SYNTHETIC_QUOTE"SLASH\\UNICODEя' if variant=='escaped_stream' else 'SYNTHETIC_SCOPED_CREDENTIAL'
     marker=credential or marker
@@ -38,6 +38,8 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     from tools import web_tools as wt
     from tools import web_tools_truncate, tool_result_storage
     from agent import redact, agent_runtime_helpers
+    from plugins.web import keyless_mcp
+    old_response_text=keyless_mcp._response_text
     old_registered_redact=redact.redact_registered_vault_values
     old_debug_write=agent_runtime_helpers.atomic_json_write
     old_spills=(web_tools_truncate._store_full_text,tool_result_storage._write_to_spillover)
@@ -234,6 +236,7 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
         M['execute'](plan,task,boundary,native=obj,mono=lambda:110.,wall=lambda:1010.,boot='fixture-boot')
     result=M['recover'](plan,task)
     assert redact.redact_registered_vault_values is old_registered_redact
+    assert keyless_mcp._response_text is old_response_text
     if construction_failure:
         from agent.secret_scope import current_secret_scope
         assert result['status']=='FAILED_OR_UNCERTAIN' and boundary.settles==1
@@ -284,7 +287,8 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
         assert any(p.name==expected_name and p.read_text()==expected_page for p in spills)
     if variant=='retry_4xx':
         dumps=list((home/'sessions').glob('request_dump_*.json'))
-        error_marker = '[REDACTED]' if sdk_error_echo == marker else '[REDACTED_PARTIAL]'
+        complete = sdk_error_echo == marker if sdk_error_complete is None else sdk_error_complete
+        error_marker = '[REDACTED]' if complete else '[REDACTED_PARTIAL]'
         assert dumps and any(error_marker in p.read_text() for p in dumps)
         assert all(url in p.read_text() for p in dumps)
         for p in dumps:

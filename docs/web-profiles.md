@@ -260,8 +260,19 @@ credentials for the authenticated profile. Otherwise an earlier full replacement
 can leave an interior fragment that the later JSON sink can no longer recognize.
 Foreign profiles retain their native registry behavior. These scoped bindings,
 including the registry hook and native request-debug JSON sink, are restored at
-close, also after failed construction; an unexpectedly replaced registry hook
-causes an explicit cleanup failure instead of being overwritten. This policy requires the new private profile and
+close, also after failed construction. Keyless Exa search/extract additionally
+conceal the intact decoded MCP response before native line normalization,
+HTTP-error slicing, parsing or page truncation. JSON/SSE shape, unrelated text,
+citations and native error classification are preserved. This shared keyless
+transport seam does not establish paid Exa SDK coverage.
+
+The owned agent's diagnostic Authorization mask conceals the whole credential,
+including a live key changed by native Unicode recovery; callable credentials
+are identified without invoking them. Authentication and recovery are unchanged.
+Unexpected replacement of the registry, response or owned-agent mask hook causes
+an explicit cleanup failure instead of being overwritten. Regression checks scan
+all original eight-character windows through recursively decoded retained JSON,
+in addition to full-token and serialized-prefix checks. This policy requires the new private profile and
 dedicated process; it is not suitable for a concurrent gateway. Pinned persistence,
 redaction, spill and logging sources are mandatory inputs. Offline regressions scan
 every actual profile/workspace/output artifact and captured console for synthetic

@@ -341,6 +341,20 @@ class Native:
             return original_registered_redact(text)
         self.registered_redactor = redact_before_native_registry
         native_redact.redact_registered_vault_values = self.registered_redactor
+        # Exa's native keyless parser normalizes lines and later truncates
+        # content. Conceal the complete decoded envelope before either loss,
+        # including HTTP/MCP errors, rather than guessing normalized secrets.
+        from plugins.web import keyless_mcp
+        self.keyless_module = keyless_mcp
+        self.old_response_text = keyless_mcp._response_text
+        original_response_text = self.old_response_text
+        def redact_web_response(response):
+            text = original_response_text(response)
+            if str(get_hermes_home().resolve()) == home:
+                text = _redact(text, self.secrets)
+            return text
+        self.response_redactor = redact_web_response
+        keyless_mcp._response_text = self.response_redactor
         for form in _secret_forms(self.secrets):
             register_vault_redaction_value(form)
         web_tools_truncate._store_full_text = lambda url, content: self.old_spill(
@@ -366,6 +380,14 @@ class Native:
             tool_complete_callback=self._tool_complete,
             session_id=plan["task_id"], run_budget_seconds=remaining,
             fallback_model={}, cwd=plan["workspace"])
+        # Native Unicode recovery may replace the live client key. Diagnostic
+        # authorization needs no credential prefix/suffix, original or changed.
+        # Scope this to the owned agent and never invoke callable credentials.
+        self.had_debug_mask = "_mask_api_key_for_logs" in vars(self.agent)
+        self.old_debug_mask = vars(self.agent).get("_mask_api_key_for_logs")
+        self.debug_mask = lambda key: ("<entra-id-bearer>" if callable(key) and not isinstance(key, str)
+                                      else "[REDACTED]" if key else None)
+        self.agent._mask_api_key_for_logs = self.debug_mask
         self.rendered_prompt = self.agent._build_system_prompt()
         _require(policy in self.rendered_prompt, "native_rendered_research_policy_missing")
         _require(_read(plan["soul"]).decode().strip() in self.rendered_prompt, "native_rendered_soul_missing")
@@ -393,6 +415,21 @@ class Native:
             if value is not None:
                 try: value.close()
                 except Exception: errors.append(name)
+        if hasattr(self, "old_debug_mask"):
+            if vars(self.agent).get("_mask_api_key_for_logs") is self.debug_mask:
+                if self.had_debug_mask:
+                    self.agent._mask_api_key_for_logs = self.old_debug_mask
+                else:
+                    del self.agent._mask_api_key_for_logs
+                del self.old_debug_mask
+            else:
+                errors.append("native_debug_mask_ownership")
+        if hasattr(self, "old_response_text"):
+            if self.keyless_module._response_text is self.response_redactor:
+                self.keyless_module._response_text = self.old_response_text
+                del self.old_response_text
+            else:
+                errors.append("native_web_response_hook_ownership")
         if hasattr(self, "old_registered_redact"):
             if self.redact_module.redact_registered_vault_values is self.registered_redactor:
                 self.redact_module.redact_registered_vault_values = self.old_registered_redact
