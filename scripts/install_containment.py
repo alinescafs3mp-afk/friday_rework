@@ -59,7 +59,10 @@ def checked_binary(pin):
 def argv(binary, command):
     # Keep current installation filesystem/network semantics. This boundary
     # supplies process lifetime custody, not a new filesystem or network grant.
-    return [binary, '--unshare-pid', '--die-with-parent', '--new-session',
+    # The finite command is namespace PID 1. Bubblewrap therefore waits for
+    # namespace-init exit, after the kernel has drained its descendants, rather
+    # than returning the application-status event while its reaper still exits.
+    return [binary, '--unshare-pid', '--die-with-parent', '--new-session', '--as-pid-1',
             '--bind', '/', '/', '--proc', '/proc', '--', *command]
 
 
@@ -69,12 +72,31 @@ class Containment:
         self.binary = budget.call(checked_binary, pin)
 
     def run(self, command, cwd, *, timeout=1800):
-        from scripts.dsh_prepare import run
+        from scripts.dsh_prepare import run, StopUnconfirmed
         self.budget.call(checked_binary, self.pin)
         # Reserve cleanup *inside* the original deadline; no fresh grace clock.
         limit = min(timeout, self.budget.check(reserve=1))
-        result = run(argv(self.binary, command), cwd, timeout=limit, env=self.env,
-                     deadline=self.budget.deadline)
+        try:
+            result = run(argv(self.binary, command), cwd, timeout=limit, env=self.env,
+                         deadline=self.budget.deadline)
+        except StopUnconfirmed:
+            raise
+        except BaseException as exc:
+            observation = getattr(exc, 'observation', None)
+            # Only a normally exiting bwrap monitor has waited for namespace
+            # PID 1. A killed monitor, timeout, or missing native status leaves
+            # that barrier unknown even when its own pipes are closed/reaped.
+            known = (isinstance(observation, dict)
+                     and type(observation.get('returncode')) is int
+                     and observation['returncode'] >= 0
+                     and observation.get('timeout') is False
+                     and observation.get('reaped') is True)
+            if not known or observation['returncode'] == 3:
+                stopped = StopUnconfirmed('STOP_UNCONFIRMED: namespace init exit not established')
+                if observation is not None:
+                    stopped.observation = observation
+                raise stopped from exc
+            raise
         self.budget.check()
         return result
 
