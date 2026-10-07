@@ -26,7 +26,7 @@ def worker_health():
 
     from .admin import Administration
     from .associations import Associations
-    from .host_runtime import HostUnavailable, check_runtime
+    from .host_runtime import HostUnavailable, check_runtime, configured_runtimes
 
     admin = Administration()
     rows = []
@@ -49,46 +49,30 @@ def worker_health():
                     }
                 )
                 continue
-            kind = "a0" if "a0" in runtime else ("dsh" if "dsh" in runtime else None)
-            if runtime.get("enabled") is not True:
-                rows.append(
-                    {
-                        "profile": profile,
-                        "worker": kind,
-                        "deployment_verified": False,
-                        "blocker": "worker_disabled",
-                        "execution": "NOT_OBSERVED",
-                    }
-                )
+            if runtime == {"enabled": False}:
+                rows.append({"profile": profile, "worker": None, "deployment_verified": False,
+                             "blocker": "worker_disabled", "execution": "NOT_OBSERVED"})
                 continue
             try:
-                checked = check_runtime(runtime, Associations(PluginState("friday_rework")))
-                if kind == "a0":
-                    # The original v2 A0 contract has no accepted useful-web
-                    # consumer. Keep that dependency; do not invent a new field.
-                    raise HostUnavailable("a0_useful_web_runtime_contract_unavailable")
-                if checked["dsh"].get("web", {}).get("profile") != "exa-paid":
-                    raise HostUnavailable("mandatory_worker_web_contract_required")
+                configured = configured_runtimes(runtime)
             except (OSError, ValueError, RuntimeError, KeyError, TypeError):
-                rows.append(
-                    {
-                        "profile": profile,
-                        "worker": kind,
-                        "deployment_verified": False,
-                        "blocker": "worker_runtime_or_web_unverified",
-                        "execution": "NOT_OBSERVED",
-                    }
-                )
-            else:
-                rows.append(
-                    {
-                        "profile": profile,
-                        "worker": kind,
-                        "deployment_verified": True,
-                        "blocker": None,
-                        "execution": "NOT_OBSERVED",
-                    }
-                )
+                rows.append({"profile": profile, "worker": None, "deployment_verified": False,
+                             "blocker": "worker_runtime_or_web_unverified", "execution": "NOT_OBSERVED"})
+                continue
+            for kind, selected in configured.items():
+                try:
+                    checked = check_runtime(selected, Associations(PluginState("friday_rework")))
+                    if kind == "a0":
+                        # Selection does not grant current native A0 admission.
+                        raise HostUnavailable("a0_useful_web_runtime_contract_unavailable")
+                    if checked["dsh"].get("web", {}).get("profile") != "exa-paid":
+                        raise HostUnavailable("mandatory_worker_web_contract_required")
+                except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+                    rows.append({"profile": profile, "worker": kind, "deployment_verified": False,
+                                 "blocker": "worker_runtime_or_web_unverified", "execution": "NOT_OBSERVED"})
+                else:
+                    rows.append({"profile": profile, "worker": kind, "deployment_verified": True,
+                                 "blocker": None, "execution": "NOT_OBSERVED"})
     observed = {r["worker"] for r in rows if r["deployment_verified"]}
     return {
         "workers": rows,

@@ -97,6 +97,64 @@ def private_directory(path):
     return path
 
 
+def configured_runtimes(value):
+    """Select from one native profile; each job still binds one exact runtime.
+
+    Existing single-worker profiles remain valid. The optional map owns no
+    queue, capability or lifecycle: the existing Associations capacity lock
+    continues to serialize both workers. A disabled profile admits neither.
+    """
+    if isinstance(value, dict) and set(value) == {"enabled"} and value["enabled"] is False:
+        return {}
+    if not isinstance(value, dict) or "workers" not in value:
+        runtime = validate_runtime(value)
+        return {"a0" if "a0" in runtime else "dsh": runtime}
+    workers = value.get("workers")
+    if (set(value) != {"enabled", "workers"} or value["enabled"] is not True
+            or not isinstance(workers, dict) or not workers
+            or not set(workers) <= {"dsh", "a0"}):
+        raise HostUnavailable("invalid_worker_selection")
+    result = {}
+    identity = None
+    paths = []
+    for kind, candidate in workers.items():
+        runtime = validate_runtime(candidate)
+        if ("a0" in runtime) != (kind == "a0"):
+            raise HostUnavailable("worker_runtime_mismatch")
+        current = (runtime["runtime_home"], runtime["runtime_profile"])
+        if identity is not None and current != identity:
+            raise HostUnavailable("foreign_worker_runtime_home")
+        identity = current
+        roots = [Path(runtime[k]) for k in ("workspace_root", "staging_root")]
+        roots += [Path(p) for p in runtime["cache_roots"]]
+        if any(a.is_relative_to(b) or b.is_relative_to(a) for a in roots for b in paths):
+            raise HostUnavailable("overlapping_worker_roots")
+        paths.extend(roots)
+        result[kind] = runtime
+    return result
+
+
+def select_runtime(value, worker):
+    if worker not in {"dsh", "a0"}:
+        raise HostUnavailable("worker_not_admitted")
+    selected = configured_runtimes(value).get(worker)
+    if selected is None:
+        raise HostUnavailable("worker_not_admitted")
+    return selected
+
+
+def add_runtime(value, worker, runtime):
+    """Add a separately checked worker; never replace or revive an old one."""
+    rows = configured_runtimes(value)
+    if worker in rows:
+        raise HostUnavailable("existing_worker_not_adopted")
+    rows[worker] = runtime
+    output = {"enabled": True, "workers": rows}
+    configured_runtimes(output)
+    # Preserve the historical single-worker representation for a first setup.
+    return copy.deepcopy(runtime if len(rows) == 1 else output)
+
+
 def check_runtime(value, associations):
     if isinstance(value, dict) and "a0" in value:
         return check_a0_runtime(value, associations)

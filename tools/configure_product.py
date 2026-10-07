@@ -137,18 +137,19 @@ def compose_product(spec):
         seen.add(key)
     runtime = copy.deepcopy(spec['runtime'])
     if runtime != {'enabled': False}:
-        from plugins.friday_rework.host_runtime import validate_runtime, HostUnavailable
+        from plugins.friday_rework.host_runtime import configured_runtimes, HostUnavailable
         try:
-            validate_runtime(runtime)
+            runtime_rows = configured_runtimes(runtime)
         except HostUnavailable as exc:
             raise ValueError('explicit_worker_runtime_contract_required') from exc
-        if runtime['runtime_profile'] != profile:
-            raise ValueError('foreign_worker_runtime_profile')
-        if 'a0' in runtime:
-            if runtime['a0'].get('web',{}).get('profile') != 'searxng-google':
-                raise ValueError('a0_useful_web_runtime_contract_unavailable')
-        elif runtime.get('dsh', {}).get('web', {}).get('profile') != 'exa-paid':
-            raise ValueError('mandatory_worker_web_contract_required')
+        for kind, selected_runtime in runtime_rows.items():
+            if selected_runtime['runtime_profile'] != profile:
+                raise ValueError('foreign_worker_runtime_profile')
+            if kind == 'a0':
+                if selected_runtime['a0'].get('web',{}).get('profile') != 'searxng-google':
+                    raise ValueError('a0_useful_web_runtime_contract_unavailable')
+            elif selected_runtime.get('dsh', {}).get('web', {}).get('profile') != 'exa-paid':
+                raise ValueError('mandatory_worker_web_contract_required')
 
     # Config loading supplies the remaining untouched native defaults. Copy
     # the useful sections explicitly, not historical owner settings/state.
@@ -223,7 +224,7 @@ def compose_product(spec):
     # Per-user native skill dirs start empty; no owner/project auto-discovery.
     ordinary['skills'].update(external_dirs=[], project_discovery=False, trusted_project_dirs=[], auto_load=[])
     required = [inference['key_env'], 'EXA_API_KEY']
-    if 'a0' in runtime:
+    if 'a0' in runtime or 'a0' in runtime.get('workers', {}):
         if inference['key_env'] != 'FRIDAY_LLM_API_KEY':
             raise ValueError('a0_scoped_inference_key_required')
         required += ['FRIDAY_EMBEDDINGS_API_KEY','SEARXNG_SECRET']
@@ -276,7 +277,8 @@ def materialize_product(home, spec):
         raise FileExistsError('existing_home_not_adopted')
     bundle = compose_product(spec)
     runtime = bundle['config']['plugins']['entries']['friday_rework']['settings']['runtime']
-    if runtime.get('enabled') is True and runtime['runtime_home'] != str(home):
+    from plugins.friday_rework.host_runtime import configured_runtimes
+    if any(r['runtime_home'] != str(home) for r in configured_runtimes(runtime).values()):
         raise ValueError('foreign_worker_runtime_home')
     from hermes_cli.config import atomic_config_replace, config_write_transaction
     home.mkdir(mode=0o700)

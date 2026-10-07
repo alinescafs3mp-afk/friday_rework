@@ -25,7 +25,8 @@ def profile_write(home, spec):
     require(not (home / 'FRIDAY-PROFILE.json').exists() and not (home / 'FRIDAY-PROFILE.json').is_symlink(),
             'existing_profile_identity_not_replaced')
     runtime = spec['runtime']
-    require(runtime.get('enabled') is not True or runtime.get('runtime_home') == str(home),
+    from plugins.friday_rework.host_runtime import configured_runtimes
+    require(all(r['runtime_home'] == str(home) for r in configured_runtimes(runtime).values()),
             'foreign_worker_home')
     soul = home / 'SOUL.md'
     if soul.exists() or soul.is_symlink():

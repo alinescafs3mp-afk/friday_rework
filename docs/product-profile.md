@@ -32,6 +32,21 @@ onboarding use the same validation as native routing.
 | `accounts` | Nonempty list of exact `platform`, `transport_profile`, `account_id`; transport must equal the receiving profile |
 | `runtime` | Explicit `{"enabled": false}` while unavailable, or the unchanged native validated worker configuration with exact receipt/source references |
 
+A profile can also supply `runtime: {"enabled": true, "workers": {"dsh":
+<existing DSH runtime>, "a0": <existing A0 runtime>}}`. Each child keeps its
+own exact deployment receipt, limits and exclusive workspace/staging/cache
+roots. Both belong to the same native home/profile. The host selects the
+requested worker, binds that exact configuration to its existing association,
+and retains the shared capacity lock; this adds no queue or execution owner.
+Missing or unadmitted workers are refused without routing to another worker.
+An active job is checked against its selected configuration, so a change to
+that configuration withdraws its execution through the existing stop path.
+Disabled-user onboarding can prepare an additional unconfigured worker without
+replacing an existing one; all original admission and activation checks remain.
+Health reports each configured worker separately. A0's current admission gate
+is retained. Selection alone does not provide task continuation, repository
+seeding, warm reuse, an A0 grant or a verified mixed-worker journey.
+
 Inference endpoints must be credential-free local literal `/v1` endpoints.
 There are no model, context, output-reservation, endpoint or credential defaults.
 The accepted bounded-context extension retains its compatibility label

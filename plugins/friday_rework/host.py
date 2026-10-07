@@ -20,7 +20,7 @@ from .associations import AssociationError, _native, _sync_directory
 from .boundary import bound_owner, parse_brief
 from .controller import Controller
 from .host_record import association_address, owner_from_ingress, quiescence_record
-from .host_runtime import HostUnavailable, check_runtime, dsh_binding, a0_binding, private_directory
+from .host_runtime import HostUnavailable, check_runtime, select_runtime, dsh_binding, a0_binding, private_directory
 from .inputs import stage_inputs
 from .supervision import NativeSupervisor, UnitObservation
 
@@ -105,7 +105,7 @@ class WorkerHost:
             if any(not callable(getattr(self.ctx, api, None))
                    for api in ("get_command_context", "schedule_gateway_work")):
                 raise HostUnavailable("worker_not_available")
-            runtime = check_runtime(configured, self.store)
+            runtime = check_runtime(select_runtime(configured, brief.worker), self.store)
             if ('a0' in runtime) != (brief.worker == 'a0'):
                 raise HostUnavailable('worker_runtime_mismatch')
             if runtime["runtime_profile"] != ingress["runtime_profile"]:
@@ -179,7 +179,7 @@ class WorkerHost:
         from hermes_cli.friday_user_scope import check_retained_job
         check_retained_job(row)
         runtime = row['host']['binding']['runtime']
-        if row['worker_kind'] != 'a0' or self.ctx.get_config('runtime') != runtime:
+        if row['worker_kind'] != 'a0' or select_runtime(self.ctx.get_config('runtime'), 'a0') != runtime:
             raise HostUnavailable('foreign_a0_runtime_binding')
         session = self._controller(row).bindings['a0'].adapter
         row, fresh = self.store.attach_a0_capability(task_id, owner, pin, session.validate_capability)
@@ -261,7 +261,7 @@ class WorkerHost:
             # Withdrawal precedes prepare; expiry never gets a fresh budget.
             return self._stop(row, "cancel")
         runtime = row["host"]["binding"]["runtime"]
-        if self.ctx.get_config("runtime") != runtime:
+        if select_runtime(self.ctx.get_config("runtime"), row["worker_kind"]) != runtime:
             return self._stop(row, "cancel")
         check_runtime(runtime, self.store)
         brief = parse_brief(row["host"]["binding"]["brief"])
@@ -329,7 +329,7 @@ class WorkerHost:
             current = await asyncio.shield(execution)
             while current["host"]["quiescence"] is None:
                 await asyncio.sleep(min(1.0, max(.01, current["deadline_unix"] - self.store.clock())))
-                if self._closed or self.ctx.get_config("runtime") != row["host"]["binding"]["runtime"]:
+                if self._closed or select_runtime(self.ctx.get_config("runtime"), row["worker_kind"]) != row["host"]["binding"]["runtime"]:
                     current = await asyncio.to_thread(self._stop, current, "cancel")
                 else:
                     current = await asyncio.to_thread(self._reconcile, current)

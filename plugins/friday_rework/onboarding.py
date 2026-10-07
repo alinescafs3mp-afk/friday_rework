@@ -98,8 +98,8 @@ def validate_template(template):
         checked_profile(config['a0_deployment'])
     runtime = settings.get('runtime')
     if runtime != {'enabled': False}:
-        from .host_runtime import validate_runtime
-        validate_runtime(runtime)
+        from .host_runtime import configured_runtimes
+        configured_runtimes(runtime)
     friday = plugins['entries']['friday_rework']
     if (settings.get('results') != {'enabled': True}
             or friday.get('allow_gateway_work') is not True
@@ -245,7 +245,9 @@ class Onboarding:
             if home.parent.exists(): scope._private(home.parent, directory=True)
             if home.parent.resolve() != home.parent: raise PermissionError('unsafe_profile_parent')
             runtime = native_config['plugins']['entries']['friday_rework']['settings']['runtime']
-            if runtime.get('enabled') is True and (runtime['runtime_home'] != str(home) or runtime['runtime_profile'] != runtime_profile):
+            from .host_runtime import configured_runtimes
+            if any(r['runtime_home'] != str(home) or r['runtime_profile'] != runtime_profile
+                   for r in configured_runtimes(runtime).values()):
                 raise ValueError('foreign_worker_runtime_template')
             binding = dict(platform=platform, transport_profile=transport_profile, account_id=account_id,
                            user_id=user_id, runtime_profile=runtime_profile, tools=tools)
@@ -380,7 +382,8 @@ class Onboarding:
                 if digest(home / 'config.yaml') != proof['config_sha256']:
                     raise PermissionError('prepared_home_changed')
                 config = require_readable_config_before_write(home / 'config.yaml')
-                if config['plugins']['entries']['friday_rework']['settings']['runtime'] != {'enabled': False}:
+                from .host_runtime import configured_runtimes
+                if worker in configured_runtimes(config['plugins']['entries']['friday_rework']['settings']['runtime']):
                     raise PermissionError('existing_worker_not_adopted')
                 c, directory, files, names, unobserved = prepare_inputs(home, binding['runtime_profile'], worker, runtime, config, a0_network=a0_network)
                 if directory.exists() or directory.is_symlink():
@@ -454,13 +457,15 @@ class Onboarding:
                 if digest(home / 'config.yaml') != proof['config_sha256']:
                     raise PermissionError('prepared_home_changed')
                 config = require_readable_config_before_write(home / 'config.yaml')
-                if config['plugins']['entries']['friday_rework']['settings']['runtime'] != {'enabled': False}:
+                from .host_runtime import configured_runtimes, add_runtime
+                current_runtime = config['plugins']['entries']['friday_rework']['settings']['runtime']
+                if worker in configured_runtimes(current_runtime):
                     raise PermissionError('existing_worker_not_adopted')
                 from hermes_cli.plugins_state import PluginState
                 try: check_runtime(c, Associations(PluginState('friday_rework')))
                 except (HostUnavailable, OSError, ValueError):
                     return {'state': 'DISABLED_WORKER_RUNTIME_UNVERIFIED', 'enabled': False}
-                config['plugins']['entries']['friday_rework']['settings']['runtime'] = c
+                config['plugins']['entries']['friday_rework']['settings']['runtime'] = add_runtime(current_runtime, worker, c)
                 prepared = prepare_admin_config_edit(home, config)
                 self._verify_operator(profile, session)
                 atomic_config_write(home / 'config.yaml', config)
@@ -497,12 +502,15 @@ class Onboarding:
                 with scope.authority(home):
                     runtime = load_config_readonly()['plugins']['entries']['friday_rework']['settings']['runtime']
                     if runtime.get('enabled') is True:
-                        if 'a0' in runtime:
+                        from .host_runtime import configured_runtimes
+                        rows = configured_runtimes(runtime)
+                        if 'a0' in rows:
                             return {'state': 'DISABLED_A0_RECONCILIATION_REQUIRED', 'enabled': False}
                         from .host_runtime import check_runtime, HostUnavailable
                         from hermes_cli.plugins_state import PluginState
                         try:
-                            check_runtime(runtime, Associations(PluginState('friday_rework')))
+                            for selected in rows.values():
+                                check_runtime(selected, Associations(PluginState('friday_rework')))
                         except (HostUnavailable, OSError, ValueError):
                             return {'state': 'DISABLED_WORKER_RUNTIME_UNVERIFIED', 'enabled': False}
                 marker = {'schema': 'friday.user-home.v1', 'principal': principal_id(*(binding[k] for k in IDENTITY)),
