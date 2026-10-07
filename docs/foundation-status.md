@@ -41,3 +41,16 @@ Hermes and Harness web-profile renderers are published at `f0d2ec5`: native Exa 
 The worker web source connection (`51037a1` plus reviewed correction `dd49daa`) adds scoped Harness credentials and pinned DNS/TLS inputs, exact native Exa configuration checks and an intact A0 search/document overlay with bounded requests. Independent review rejected 24 direct/nested/duplicate provider overrides before keys or launch. The combined worker, host, A0 and administration-foundation suite passed 296 tests and 150 subtests; all 12 finite children were reaped. These checks use native donor interfaces with synthetic external transport. Current network admission, actual protected SearXNG secret and service startup, model behavior and both complete worker journeys remain required. See [worker web](worker-web.md).
 
 The Hermes Dashboard administration foundation now connects the native authenticated plugin UI to product users, receiving-channel admission, conversations, paged messages, checked attachments and retained task state. Independent review closed six defects in WebSocket/profile access, verified organization, historical account identity, receiving-profile writes, browser JSON and pagination; the retained-connection follow-up passed 26 independent controls. This is source/component evidence, with synthetic identities and native stores. Ordinary-user recall/memory/file/tool isolation, actual task stop/configuration controls, normal installation/startup and complete live journeys remain mandatory. Unaudited native WebSocket, PTY and RPC features are currently refused in the product-admin profile; this explicit restriction is not an accepted final feature deferral. See [the administration contract](admin-foundation.md).
+
+The ordinary-user source component through `456dee7` binds native recall, memory,
+tools and retained worker/result access to authenticated principals and private
+runtime homes. Durable access generations prevent old handles from reviving
+after disable/re-enable. Native receiving-profile and runtime-profile identity
+remain distinct, including events with an implicit source profile. The final
+changed-area suite passed 82 producer and 53 independent checks through actual
+native admission, middleware and worker/result/delivery joins with synthetic
+execution and transport. These counts are separate from earlier component
+checks. Protected onboarding, complete ordinary tool support, composition with
+administrative execution controls, real two-user channel/browser/revocation,
+normal startup and all six complete journeys remain unaccepted. See
+[ordinary-user isolation and its explicit gaps](user-isolation.md).

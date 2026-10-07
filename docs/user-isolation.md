@@ -1,9 +1,12 @@
 # Native ordinary-user isolation candidate
 
-This is source/offline preparation for FRW026, not installation, independent
-acceptance or a complete two-user product journey. Apply the exact
+This is an independently reviewed source/offline component for FRW026, not
+installation or a complete two-user product journey. The final implicit-profile
+repair passed 82 producer checks and 53 independent checks; earlier retained
+grant and batch repairs remain separately pinned evidence. Apply the exact
 `patches/hermes/user-isolation.patch` after main `6dc2eb0`; the manifest pins
-every native input/output. Admin-controls `130248c` is a separate candidate.
+every native input/output. Administrative execution controls remain a separate
+candidate; their skill-loader/cache review is not accepted yet.
 
 The capability is minted only after the original native principal admission
 succeeds. It binds platform, receiving transport profile, configured account and
