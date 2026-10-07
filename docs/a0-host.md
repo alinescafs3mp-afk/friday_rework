@@ -51,7 +51,9 @@ row, never a new management database. No public model/worker tool exposes this
 producer method. Old preclaim configuration, v1 receipt and v1 A0 row are
 explicitly invalid; this candidate does not rewrite historical records.
 
-**The authorized production producer, current native gates, result consumer join,
+The retained A0 artifacts now use the shared [result consumer](result-consumer.md)
+for list, inspect, assessment and delivery; the join has offline verification.
+**The authorized production producer, current native gates,
 worker web path and administrative complete journeys remain missing/NOT_RUN.**
 Offline proof inputs and native interfaces are explicitly fabricated controls;
 they never constitute production evidence or an enabled deployment.

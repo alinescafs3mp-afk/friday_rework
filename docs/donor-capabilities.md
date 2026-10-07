@@ -277,11 +277,11 @@ Whole A0 loop/extensions/tools, stateful code execution, document/browser/office
 **Selected reuse:** Keep intact dedicated A0 and UI behind protected administrator access. Hermes remains product admin; A0 UI is engineering inspection/control, not product user authority.
 
 - **Planned:** Retain/reuse in product; no donor upgrade.
-- **Implemented:** Native source and REST adapter exist. Current public host binds DSH only; rejected A0core8ce is not accepted.
-- **Connected:** A0 UI/API component startup evidence exists in foundation docs; engineering/host integration not accepted.
-- **Verified:** Source inspected only; no live check in this assignment.
+- **Implemented:** Native source, REST adapter and repaired host binding exist; the rejected historical A0core8ce is not accepted.
+- **Connected:** Retained A0 files join Friday's common result inspection/assessment/delivery path. Normal capability production, web/runtime admission and warm reuse remain open.
+- **Verified:** Shared result path has affected offline checks; ordinary A0 engineering and delivery journeys remain live-unverified.
 
-**Remaining integration:** Accept repaired A0 candidate, bind host, preserve UI/API auth and resource limits. api_terminate_chat deletes context/history; use dedicated environment supervisor for real cancel and retain staged results.
+**Remaining integration:** Complete normal A0 admission, scheduling, warm reuse and live journeys while preserving UI/API auth and resource limits. api_terminate_chat deletes context/history; use dedicated environment supervisor for real cancel and retain staged results.
 
 Sources: [A_START](https://github.com/agent0ai/agent-zero/blob/e3051fb584b1a36be2b0a0c90606f1c2c2d356ec/run_ui.py), [A_UI_AUTH](https://github.com/agent0ai/agent-zero/blob/e3051fb584b1a36be2b0a0c90606f1c2c2d356ec/helpers/ui_server.py), [A_API_AUTH](https://github.com/agent0ai/agent-zero/blob/e3051fb584b1a36be2b0a0c90606f1c2c2d356ec/helpers/api.py), [A_MESSAGE](https://github.com/agent0ai/agent-zero/blob/e3051fb584b1a36be2b0a0c90606f1c2c2d356ec/api/api_message.py), [A_TERMINATE](https://github.com/agent0ai/agent-zero/blob/e3051fb584b1a36be2b0a0c90606f1c2c2d356ec/api/api_terminate_chat.py), [A_SETTINGS](https://github.com/agent0ai/agent-zero/blob/e3051fb584b1a36be2b0a0c90606f1c2c2d356ec/helpers/settings.py), [F_A0_NATIVE](https://github.com/alinescafs3mp-afk/friday_rework/blob/f80e187e25090427581fb696070d104ef4748ab3/plugins/friday_rework/adapters/a0_native.py), [F_RUNTIME](https://github.com/alinescafs3mp-afk/friday_rework/blob/f80e187e25090427581fb696070d104ef4748ab3/plugins/friday_rework/host_runtime.py).
 

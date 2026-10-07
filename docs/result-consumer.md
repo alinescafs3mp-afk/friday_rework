@@ -23,7 +23,8 @@ not a durable revocation event; current settings are checked at each boundary.
 
 The `friday_result` tool derives ownership from the actual native call and
 session/profile context. Its reference and paths select owned content, not
-authority. `list` enumerates bounded regular files in the quiescent DSH workspace;
+authority. `list` enumerates bounded regular files in the quiescent DSH workspace
+or logical filenames in the verified A0 retained manifest;
 `inspect` freezes a selected manifest into private staging and reads the checked
 bytes. Absolute, hidden, escaping, linked, duplicate and oversized inputs are
 refused. Files have stable names, lengths and hashes; later delivery rereads
@@ -32,6 +33,14 @@ Copying holds a separate, nonblocking per-task file lock. A competing inspection
 refuses before copying; it does not hold the association/control lock. Retained
 and orphan files share a ceiling of 32 entries and twice the configured total
 artifact bytes. Failed evidence remains intact and consumes that allowance.
+
+A0 reads reuse the original controller preparation journal and adapter verifier:
+the association, grant, context, input and response receipts, confirmed dedicated
+environment cessation and artifact bytes must agree. No keys, HTTP request or
+worker restart is needed after completion. Selected files enter the same private
+output staging, inspection, assessment and delivery path as Harness. A source
+change between verification and copying refuses the manifest. This source join
+does not establish warm reuse or a live A0 runtime.
 
 `assess` records the original parent's judgment together with references to its
 actual file reads. Its method is explicitly `parent_file_review`. Text previews
@@ -48,7 +57,7 @@ external await. Only a matching native acknowledgement establishes DELIVERED.
 Explicit retries are allowed only after a proven pre-send rejection. A timeout,
 cancellation, post-send exception or lost acknowledgement stays UNKNOWN; reload
 or another call cannot silently resend it. Partial/stopped output and absent
-goal checks remain explicit in the caption. Retrying delivery never starts DSH.
+goal checks remain explicit in the caption. Retrying delivery never starts either worker.
 The caption uses the current stop/assessment snapshot from the durable send
 reservation, taken after the awaited staging read.
 
@@ -60,5 +69,8 @@ Default upstream behavior remains unchanged when the opt-in is absent.
 
 Validation uses the real plugin manager, middleware, state, injection scheduler
 and document API with explicit offline worker/Telegram fixtures. Actual Telegram
-delivery, real model consumption, executed goal checks, A0 output binding,
+delivery, real model consumption, executed goal checks,
 restart/runtime gates and complete release acceptance remain NOT_RUN.
+The common A0/Harness result join has 52 passing offline checks, including
+retained A0 output after controller cache loss, foreign-owner/changed-evidence
+refusal and delivery deduplication. These are component observations, not a live journey.

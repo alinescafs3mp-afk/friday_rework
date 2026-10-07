@@ -15,7 +15,8 @@ from .admission import CALL_FIELDS, _call, delivery_route
 from .associations import AssociationError
 from .boundary import bound_owner
 from .host_runtime import private_directory
-from .results import collect_outputs, deliver_artifact, inspect_outputs, record_inspection, assess_result
+from .results import (collect_outputs, deliver_artifact, inspect_outputs, record_inspection, assess_result,
+                      a0_retained_outputs, require_result_quiescence)
 
 
 async def notify_finished(host, row):
@@ -94,11 +95,13 @@ def owned_result(host, reference, kwargs):
     return row
 
 
-def list_outputs(row):
-    from .supervision import NativeSupervisor
-    if (row["worker_kind"] != "dsh" or row["host"]["quiescence"] is None
-            or row["native"] is None or not NativeSupervisor().observe(row).quiescent):
-        raise AssociationError("result_not_quiescent")
+def list_outputs(row, store=None):
+    if row["worker_kind"] == "a0":
+        if store is None:
+            raise AssociationError("missing_preparation_store")
+        return sorted(({"path": item.logical_name, "bytes": item.size_bytes}
+                       for item in a0_retained_outputs(store, row)), key=lambda item: item["path"])
+    require_result_quiescence(row)
     root = private_directory(Path(row["workspace_reference"]) / "workspace")
     files, seen = [], 0
     pending = [(Path(), os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))]
@@ -147,7 +150,7 @@ class ResultTool:
             row = owned_result(self.host, args.get("reference"), kwargs)
             action = args["action"]
             if action == "list":
-                return json.dumps({**status(row), "files": list_outputs(row)})
+                return json.dumps({**status(row), "files": list_outputs(row, self.host.store)})
             if action == "inspect":
                 row = collect_outputs(self.host.store, row, args.get("paths"))
                 previews = inspect_outputs(row)
@@ -184,7 +187,7 @@ class ResultTool:
             if self.host._closed or self.host.ctx.get_config("results") != {"enabled": True}:
                 return
             row = await deliver_artifact(self.host.ctx, self.host.store, current, artifact["reference"], retry=retry)
-        return row["delivery"]
+        return self.host.store.get(row["existing_task_id"], row["owner"])["delivery"]
 
 
 def register_result_tool(ctx, host):

@@ -268,18 +268,22 @@ def output_copy_lock(row):
 
 def _collect_outputs(store, row, paths):
     from .host_runtime import private_directory
-    from .supervision import NativeSupervisor
     # Recheck the durable selection only after gaining exclusive copy ownership.
     row = store.get(row["existing_task_id"], row["owner"])
     if "result" in row:
         if paths is not None and paths != row["result"]["source_paths"]:
             raise AssociationError("result_selection_already_retained")
         return row
-    if (row["worker_kind"] != "dsh" or row["host"]["quiescence"] is None
-            or row["native"] is None or not NativeSupervisor().observe(row).quiescent):
-        raise AssociationError("result_not_quiescent")
+    require_result_quiescence(row)
     labels = selection_names(paths)
-    source = private_directory(Path(row["workspace_reference"]) / "workspace")
+    retained = None
+    if row["worker_kind"] == "a0":
+        retained = {item.logical_name: item for item in a0_retained_outputs(store, row)}
+        if any(path not in retained for path in paths):
+            raise AssociationError("unknown_a0_output")
+        source = private_directory(output_root(row).parent / "a0-outputs")
+    else:
+        source = private_directory(Path(row["workspace_reference"]) / "workspace")
     destination = output_root(row)
     private_directory(destination.parent)
     destination.mkdir(mode=0o700, exist_ok=True)
@@ -304,12 +308,51 @@ def _collect_outputs(store, row, paths):
     for path, label in zip(paths, labels):
         if remaining <= 0:
             raise AssociationError("result_total_limit")
-        item = stage_file(source_root=source, relative_path=path, staging_root=destination,
-                          logical_name=label, media_type="application/octet-stream",
+        original = retained[path] if retained is not None else None
+        item = stage_file(source_root=source, relative_path=original.reference if original else path,
+                          staging_root=destination, logical_name=label,
+                          media_type=original.media_type if original else "application/octet-stream",
                           origin_reference=row["existing_task_id"], max_bytes=min(runtime["max_file_bytes"], remaining))
+        if original and (item.sha256 != original.sha256 or item.size_bytes != original.size_bytes):
+            raise AssociationError("a0_output_changed_during_copy")
         remaining -= item.size_bytes
         artifacts.append(item)
     return retain_artifacts(store, row["existing_task_id"], row["owner"], artifacts, paths)
+
+
+def require_result_quiescence(row):
+    from .supervision import NativeSupervisor
+    quiet = row["host"]["quiescence"]
+    if (row["worker_kind"] not in {"dsh", "a0"} or quiet is None
+            or row["native"] is None
+            or row["worker_kind"] == "a0" and quiet["kind"] != "a0"
+            or not NativeSupervisor().observe(row).quiescent):
+        raise AssociationError("result_not_quiescent")
+
+
+def a0_retained_outputs(store, row):
+    """Read the original durable preparation and checked A0 artifacts only.
+
+    No runtime binding, keys, container API or recovery launch is needed. The
+    existing verifier checks the grant, context, input and response receipts,
+    bounded artifact bytes and the separately retained A0 cessation evidence.
+    """
+    from .adapters.a0 import ExpectedFile, job_prefix, read_retained_result
+    from .adapters.a0_native import NativeGrant
+    from .controller import Controller
+    row = store.get(row["existing_task_id"], row["owner"])
+    if row["worker_kind"] != "a0":
+        raise AssociationError("foreign_a0_result")
+    require_result_quiescence(row)
+    prepared = Controller(store, {})._load(row)
+    a0 = row["host"]["a0"]
+    prefix = job_prefix(row)
+    expected = tuple(ExpectedFile('/a0/usr/workdir/' + prefix + '/' + prefix + '-' + item['logical_name'],
+                                  **item) for item in a0['expected_files'])
+    runtime = row["host"]["binding"]["runtime"]
+    return read_retained_result(row, prepared, NativeGrant(**a0['grant']), expected,
+                                output_root(row).parent / "a0-outputs",
+                                min(runtime['max_file_bytes'], runtime['max_total_bytes']))
 
 
 def selection_names(paths):
