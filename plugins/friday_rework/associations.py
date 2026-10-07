@@ -95,11 +95,19 @@ def _validate_store(data):
         admissions, supervisors, invocations, workers = set(), set(), set(), set()
         for task_id, row in data["jobs"].items():
             _text(task_id, 128)
-            if not isinstance(row, dict) or set(row) not in (ROW_FIELDS, ROW_FIELDS | {"host"}):
+            if (not isinstance(row, dict) or set(row) - {"result", "notification"} not in (ROW_FIELDS, ROW_FIELDS | {"host"})
+                    or ("result" in row or "notification" in row) and "host" not in row):
                 raise AssociationError("invalid_association_store")
             if "host" in row:
                 from .host_record import validate_host_record
                 validate_host_record(row)
+            if "notification" in row:
+                notice = row["notification"]
+                if (not isinstance(notice, dict) or set(notice) != {"state", "at_unix"}
+                        or notice["state"] not in {"UNKNOWN", "SCHEDULED", "FAILED", "OBSERVED"}
+                        or row["host"]["quiescence"] is None):
+                    raise AssociationError("invalid_result_notification")
+                _number(notice["at_unix"])
             if _text(row["existing_task_id"], 128) != task_id:
                 raise AssociationError("invalid_association_store")
             for field in ("admission_hash", "brief_sha256"):
@@ -124,7 +132,10 @@ def _validate_store(data):
                 raise AssociationError("invalid_association_store")
             if row["stop_intent"] not in (None, "cancel", "pause"):
                 raise AssociationError("invalid_association_store")
-            if row["goal_verification"] != "NOT_RUN" or row["delivery"] != "NOT_RUN":
+            if "result" in row:
+                from .results import validate_result
+                validate_result(row)
+            elif row["goal_verification"] != "NOT_RUN" or row["delivery"] != "NOT_RUN":
                 raise AssociationError("invalid_association_store")
             observation = row["execution_observation"]
             if observation is not None:

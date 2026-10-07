@@ -114,7 +114,7 @@ def native_call_scope(*, tool_name, args, next_call, **context):
     Native policy is inside next_call. If this wrapper fails, Hermes may fall
     through; therefore the registered handler independently requires a scope.
     """
-    if tool_name != "friday_work":
+    if tool_name not in {"friday_work", "friday_result"}:
         return next_call(args)
     # Mask an outer invocation before allocation/validation can fail. Hermes
     # falls through after middleware exceptions, so no such fallback may use

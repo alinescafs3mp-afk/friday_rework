@@ -1,0 +1,668 @@
+diff --git a/gateway/run_plugin_delivery.py b/gateway/run_plugin_delivery.py
+--- a/gateway/run_plugin_delivery.py
++++ b/gateway/run_plugin_delivery.py
+@@ -82,7 +82,10 @@
+             or isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+             or not math.isfinite(timeout) or timeout <= 0):
+         return {"state": "FAILED", "error": "invalid_document"}
+-    source, adapter = resolve_document_route(runner, context, route)
++    try:
++        source, adapter = resolve_document_route(runner, context, route)
++    except Exception:  # health: allow BLE001 -- This route refusal precedes every send; safe to retry only after configuration repair.
++        return {"state": "FAILED", "error": "gateway_document_route_rejected"}
+     if not callable(getattr(adapter, "send_document_bytes", None)):
+         return {"state": "FAILED", "error": "document_bytes_unsupported"}
+     from gateway.platforms.base import SendResult, _thread_metadata_for_source
+diff --git a/gateway/run_plugin_injection.py b/gateway/run_plugin_injection.py
+--- a/gateway/run_plugin_injection.py
++++ b/gateway/run_plugin_injection.py
+@@ -47,6 +47,7 @@
+     def _schedule_plugin_message_injection(
+         self, *, content: str, plugin_id: str, session_key: Optional[str] = None,
+         origin: Optional[Mapping[str, Any]] = None, plugin_home: Optional[Path] = None,
++        expected_session_id: Optional[str] = None,
+     ) -> bool:
+         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe).
+ 
+@@ -57,6 +58,13 @@
+         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
+             return False
+ 
++        if expected_session_id is not None and (
++            not isinstance(expected_session_id, str) or not expected_session_id
++            or expected_session_id != expected_session_id.strip()
++            or not isinstance(session_key, str) or not session_key.strip()
++            or origin is not None or plugin_home is None
++        ):
++            return False
+         if origin is not None:
+             source = self._plugin_origin_source(origin, plugin_home=plugin_home, plugin_id=plugin_id)
+             if source is None:
+@@ -67,6 +75,7 @@
+             target = f"session={session_key}"
+             coro = self._dispatch_plugin_message_injection(
+                 session_key=session_key, content=content, plugin_id=plugin_id,
++                expected_session_id=expected_session_id, plugin_home=plugin_home,
+             )
+         try:
+             current_loop = asyncio.get_running_loop()
+@@ -133,7 +142,8 @@
+         return authorized
+ 
+     async def _dispatch_plugin_message_injection(
+-        self, *, session_key: str, content: str, plugin_id: str
++        self, *, session_key: str, content: str, plugin_id: str,
++        expected_session_id: Optional[str] = None, plugin_home: Optional[Path] = None,
+     ) -> bool:
+         """Route a plugin-triggered turn through the session's live adapter."""
+         if not self._plugin_injection_accepting():
+@@ -142,8 +152,21 @@
+         if entry is None or entry.origin is None or not self._plugin_injection_accepting():
+             return False
+ 
++        if expected_session_id is not None and (
++            not isinstance(expected_session_id, str) or not expected_session_id
++            or expected_session_id != expected_session_id.strip()
++            or entry.session_id != expected_session_id
++        ):
++            return False
++        session_id = expected_session_id or entry.session_id
+         from gateway.session_identity import replace_source
+         source = replace_source(self._restored_source(entry))
++        if expected_session_id is not None:
++            from hermes_constants import hermes_home_key
++            profile = self._served_profile_for_home(plugin_home)
++            if (profile is None or (source.profile and source.profile != profile)
++                    or hermes_home_key(self._resolve_profile_home_for_source(source)) != hermes_home_key(plugin_home)):
++                return False
+         if not self._plugin_injection_authorized(source, plugin_id=plugin_id, target=f"session={session_key}"):
+             return False
+ 
+@@ -157,13 +180,13 @@
+                 allow_gateway_control=False,
+                 metadata={
+                     "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
+-                    "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
++                    "gateway_session_key": session_key, "gateway_session_id": session_id,
+                     "gateway_session_strict": True,
+                 },
+             ))
+         logger.info(
+             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
+-            plugin_id, session_key, entry.session_id,
++            plugin_id, session_key, session_id,
+         )
+         return True
+ 
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -590,22 +590,22 @@
+     # manager's home, never the active profile's (#65593 constraint).
+     def inject_message(
+         self, content: str, role: str = "user", *, session_key: str | None = None,
+-        origin: Mapping[str, Any] | None = None,
++        origin: Mapping[str, Any] | None = None, expected_session_id: str | None = None,
+     ) -> bool:
+         """Inject a message into a CLI, Ink TUI/desktop, or messaging-gateway conversation.
+ 
+-        CLI uses the attached REPL queues. Ink TUI and desktop use a separate injector
+-        from the messaging gateway and queue onto the live session named by ``session_key``
+-        (the durable key, not the ephemeral UI session id). ``origin`` (a
++        CLI uses REPL queues; TUI/desktop queue onto the durable ``session_key``.
++        ``origin`` (a
+         ``SessionSource.to_dict()``-shaped mapping: platform, chat_id, chat_type, thread_id,
+-        user_id, ...) instead names a messaging chat: the gateway starts (or continues) that
+-        chat's session in THIS plugin's own profile and runs a turn there; the plugin cannot
++        user_id, ...) names a messaging chat to start/continue in THIS plugin's profile; it cannot
+         target another profile. Non-CLI injection needs ``session_key`` or ``origin`` plus
+         ``plugins.entries.<plugin_id>.allow_gateway_injection`` in the plugin's profile config.
+-        ``True`` means a host accepted the request, not that the turn completed.
++        ``expected_session_id`` pins an existing messaging session in this plugin's profile;
++        mismatched IDs and CLI/TUI/origin routes refuse. ``True`` means scheduled, not delivered.
+         """
+         from hermes_cli.plugins_injection import inject_plugin_message
+-        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
++        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin,
++                                     expected_session_id=expected_session_id)
+ 
+     def _gateway_injection_allowed(self) -> bool:
+         """Return whether this plugin may trigger gateway session turns (read from the plugin's
+diff --git a/hermes_cli/plugins_gateway_work.py b/hermes_cli/plugins_gateway_work.py
+--- a/hermes_cli/plugins_gateway_work.py
++++ b/hermes_cli/plugins_gateway_work.py
+@@ -157,6 +157,7 @@
+     from gateway.run import _async_profile_runtime_scope
+     from gateway.run_plugin_delivery import freeze_route
+     from hermes_cli.plugins import _plugin_home_scope
++    delivery_entered = False
+     try:
+         with context._manager._discovery_lock:
+             runner = require_capability(context, "allow_gateway_delivery")
+@@ -166,9 +167,12 @@
+         with _plugin_home_scope(context._manager.home_path):
+             async with _async_profile_runtime_scope(context._manager.home_path):
+                 require_capability(context, "allow_gateway_delivery", owner=runner)
++                delivery_entered = True
+                 return await runner._deliver_plugin_document(context, **kwargs)
+-    except Exception:  # health: allow BLE001 -- Route/configuration refusal is sanitized; cancellation remains a BaseException.
+-        return {"state": "FAILED", "error": "gateway_delivery_rejected"}
++    except Exception:  # health: allow BLE001 -- Errors after delivery entry may follow a committed send; never authorize replay.
++        if delivery_entered:
++            return {"state": "UNKNOWN", "error": "gateway_delivery_uncertain"}
++        return {"state": "FAILED", "error": "gateway_delivery_preflight_rejected"}
+ 
+ 
+ class PluginGatewayWorkMixin:
+diff --git a/hermes_cli/plugins_injection.py b/hermes_cli/plugins_injection.py
+--- a/hermes_cli/plugins_injection.py
++++ b/hermes_cli/plugins_injection.py
+@@ -11,11 +11,18 @@
+ 
+ def inject_plugin_message(
+     ctx: Any, content: str, role: str, *, session_key: Optional[str],
+-    origin: Optional[Mapping[str, Any]],
++    origin: Optional[Mapping[str, Any]], expected_session_id: Optional[str] = None,
+ ) -> bool:
+     manager = ctx._manager
+     msg = content if role == "user" else f"[{role}] {content}"
+     cli = manager._cli_ref
++    if expected_session_id is not None:
++        if (not isinstance(expected_session_id, str) or not expected_session_id
++                or expected_session_id != expected_session_id.strip()
++                or not isinstance(session_key, str) or not session_key.strip()
++                or origin is not None or cli is not None or manager.has_tui_message_injector):
++            logger.warning("inject_message: session pin requires an existing messaging-gateway session")
++            return False
+     # An origin names a messaging chat; the local REPL is never that chat.
+     if cli is not None and origin is None:
+         queue_ = cli._interrupt_queue if getattr(cli, "_agent_running", False) else cli._pending_input
+@@ -51,6 +58,8 @@
+         return False
+     if origin is None:
+         target: dict[str, Any] = {"session_key": session_key}
++        if expected_session_id is not None:
++            target.update(expected_session_id=expected_session_id, plugin_home=manager.home_path)
+     else:
+         # The manager's immutable home is the plugin's profile: the gateway creates the session
+         # there or nowhere (never the ambient HERMES_HOME of whatever thread called us).
+diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -2031,6 +2031,9 @@
+         action never quiesced, so it is handed to the supervisor for a rebuild before any backoff."""
+         if self._teardown_started or self.has_fatal_error:
+             return
++        if not self._drop_pending_on_cold_boot and self._looks_like_polling_conflict(error):
++            await self._handle_polling_conflict(error)
++            return
+         if isinstance(error, _PollingStallError):
+             # Not a retry: no counter bump, no backoff, no in-place stop/drain. The supervisor's rebuild
+             # runs disconnect(), which performs the same bounded updater.stop() and app.shutdown().
+@@ -2395,7 +2398,7 @@
+         MAX_CONFLICT_RETRIES = 5
+         # 15s, 25s, 35s, 45s, 55s — clears Telegram's ~30s session window without hammering the API.
+         RETRY_DELAY = 10 + (self._polling_conflict_count * 10)  # seconds
+-        if self._polling_conflict_count <= MAX_CONFLICT_RETRIES:
++        if self._drop_pending_on_cold_boot and self._polling_conflict_count <= MAX_CONFLICT_RETRIES:
+             logger.warning(
+                 "[%s] Telegram polling conflict (%d/%d) — previous session still "
+                 "held open on Telegram's servers. Waiting %ds for it to expire. Error: %s",
+@@ -2412,11 +2415,6 @@
+                 return
+             # Stable local ref: a concurrent disconnect() may null self._app across the awaits above.
+             app = self._app
+-            # Capture a stable local reference: self._app can be reassigned to None by a concurrent
+-            # disconnect() while we're suspended across the awaits above (same race #55992 fixed on the
+-            # network path). Re-reading self._app after that point would raise AttributeError deep inside
+-            # start_polling instead of failing fast here, where the except below reschedules or escalates to
+-            # fatal.
+             expected_generation = self._polling_generation + 1
+             if not app:
+                 raise RuntimeError("Telegram application was torn down during conflict reconnect")
+@@ -2452,13 +2450,17 @@
+                     self._polling_conflict_recovery_generation = None
+         if self._teardown_started:
+             return
+-        # Retries exhausted — fatal so the runner surfaces it and the user knows to act.
++        # Preserve policy forbids queue-dropping retries; use the same nonretryable fatal boundary.
+         message = (
+             "Telegram polling could not recover after %d retries (%ds total wait). "
+             "The previous gateway session is still held open on Telegram's servers, "
+             "or another process is using the same bot token. To recover: ensure no other Hermes or OpenClaw instance is running "
+             "with this token, then restart the gateway with 'hermes gateway restart'."
+             % (MAX_CONFLICT_RETRIES, sum(10 + i * 10 for i in range(1, MAX_CONFLICT_RETRIES + 1))))
++        if not self._drop_pending_on_cold_boot:
++            message = (
++                "Telegram polling conflict: stopped to preserve pending updates. "
++                "Resolve the competing consumer before restarting; no retry or queue drop was attempted.")
+         logger.error("[%s] %s Original error: %s", self.name, message, _redact_telegram_error_text(error))
+         # Snapshot whether WE transition to fatal: a concurrent retry task suspended past the entry
+         # guard reaches this branch too. Only the first transition notifies.
+@@ -3133,9 +3135,15 @@
+         loop = asyncio.get_running_loop()
+ 
+         def _polling_error_callback(error: Exception) -> None:
+-            if self._teardown_started or self._recovery_in_flight():
++            if self._teardown_started or (not self._drop_pending_on_cold_boot and self.has_fatal_error):
+                 return
+-            if self._looks_like_polling_conflict(error):
++            conflict = self._looks_like_polling_conflict(error)
++            if self._recovery_in_flight():
++                if self._drop_pending_on_cold_boot or not conflict:
++                    return
++                # Preserve policy must also stop a conflict arriving during network recovery.
++                self._polling_error_task.cancel()
++            if conflict:
+                 # Stop PTB's network_retry_loop synchronously BEFORE scheduling async recovery, else PTB's
+                 # retry and our stop->restart overlap and produce a fresh 409.
+                 self._disarm_ptb_retry_loop()
+@@ -3216,12 +3224,6 @@
+             # line made healthy startups look stalled at "attempt 1/8".
+             logger.warning("[%s] Connected to Telegram (%s mode)", self.name, "webhook" if self._webhook_mode else "polling")
+             # Heartbeat only in polling mode: webhook mode has no long-poll socket to wedge in CLOSE-WAIT.
+-            # WARNING, not INFO: the "Connecting to Telegram (attempt N/8)…" line above is emitted at
+-            # WARNING and reaches the terminal (the gateway's default stderr handler is WARNING-only), but
+-            # this success line was INFO and went to the log file only. A healthy startup therefore looked
+-            # permanently stalled at "attempt 1/8" on the console — the logging illusion in #90835. Both
+-            # sides of the connect transition must share a terminal-visible level so a real hang is the
+-            # *absence* of this line, not ambiguity.
+             if not self._webhook_mode:
+                 self._restart_task_attr("_polling_heartbeat_task", self._polling_heartbeat_loop())
+             # Seed the live identity from PTB's initialize() cache; polling rides the heartbeat's get_me(),
+@@ -3232,10 +3234,6 @@
+                 self._restart_task_attr("_bot_identity_refresh_task", self._bot_identity_refresh_loop())
+             # Command menu / DM topics / status indicator can stall for some tokens: defer to a cancellable
+             # task so one slow call can't sink the (gateway-timed) connect while transport is live.
+-            # Command-menu registration, DM-topic setup, and the status indicator each make Bot API calls
+-            # that can stall for certain tokens. Running them here — inside the connect() coroutine that the
+-            # gateway wraps in a connect timeout — means one slow call blows the whole connect and the
+-            # adapter never comes up, even though polling/webhook is already live (#46298).
+             self._start_post_connect_housekeeping()
+             return True
+         except Exception as e:
+@@ -3249,6 +3247,8 @@
+                     "The token is invalid or was revoked — generate a new one "
+                     "with @BotFather and update TELEGRAM_BOT_TOKEN.")
+                 self._set_fatal_error("telegram_auth_error", message, retryable=False)
++            elif not self._drop_pending_on_cold_boot and self._looks_like_polling_conflict(e):
++                await self._handle_polling_conflict(e)
+             else:
+                 self._set_fatal_error("telegram_connect_error", f"Telegram startup failed: {safe_error}", retryable=True)
+             logger.error("[%s] Failed to connect to Telegram: %s", self.name, safe_error)
+diff --git a/tests/gateway/test_plugin_delivery_phase.py b/tests/gateway/test_plugin_delivery_phase.py
+new file mode 100644
+--- /dev/null
++++ b/tests/gateway/test_plugin_delivery_phase.py
+@@ -0,0 +1,48 @@
++from contextlib import asynccontextmanager
++import pytest
++from tests.gateway.test_plugin_gateway_work import setup, _install, _route, _configure
++
++@pytest.mark.asyncio
++async def test_real_native_send_then_profile_exit_error_is_unknown(setup, monkeypatch):
++    from gateway import run
++    original = run._async_profile_runtime_scope
++    @asynccontextmanager
++    async def broken(home):
++        async with original(home):
++            yield
++        raise RuntimeError("PRIVATE_TEARDOWN_ERROR")
++    monkeypatch.setattr(run, '_async_profile_runtime_scope', broken)
++    _install(setup)
++    result = await setup.context.deliver_gateway_document(route=_route(), data=b'actual-bytes', file_name='answer.txt')
++    assert len(setup.sent) == 1 and setup.sent[0]['bytes'] == b'actual-bytes'
++    assert result == {'state': 'UNKNOWN', 'error': 'gateway_delivery_uncertain'}
++    assert 'PRIVATE' not in str(result)
++
++@pytest.mark.asyncio
++async def test_native_send_then_callee_exception_is_unknown(setup, monkeypatch):
++    _install(setup)
++    original = setup.runner._deliver_plugin_document
++    async def broken(context, **kwargs):
++        result = await original(context, **kwargs)
++        assert result['state'] == 'DELIVERED'
++        raise RuntimeError('PRIVATE_POST_SEND')
++    monkeypatch.setattr(setup.runner, '_deliver_plugin_document', broken)
++    result = await setup.context.deliver_gateway_document(route=_route(), data=b'x', file_name='x.txt')
++    assert len(setup.sent) == 1 and result['state'] == 'UNKNOWN'
++    assert 'PRIVATE' not in str(result)
++
++@pytest.mark.asyncio
++async def test_preflight_optout_proves_no_send(setup):
++    _install(setup)
++    _configure(setup.home, allow_gateway_delivery=False)
++    result = await setup.context.deliver_gateway_document(route=_route(), data=b'x', file_name='x.txt')
++    assert result == {'state': 'FAILED', 'error': 'gateway_delivery_preflight_rejected'}
++    assert not setup.sent
++
++@pytest.mark.asyncio
++async def test_native_route_refusal_proves_no_send(setup):
++    _install(setup)
++    route = _route(); route['bot_id'] = '999'
++    result = await setup.context.deliver_gateway_document(route=route, data=b'x', file_name='x.txt')
++    assert result == {'state': 'FAILED', 'error': 'gateway_document_route_rejected'}
++    assert not setup.sent
+diff --git a/tests/gateway/test_plugin_message_injection.py b/tests/gateway/test_plugin_message_injection.py
+--- a/tests/gateway/test_plugin_message_injection.py
++++ b/tests/gateway/test_plugin_message_injection.py
+@@ -6,6 +6,7 @@
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+ import pytest
++import pytest_asyncio
+ import hermes_yaml as yaml
+ 
+ from gateway.config import GatewayConfig, Platform
+@@ -455,3 +456,116 @@
+     assert manager.has_gateway_message_injector is True
+     assert manager.inject_gateway_message(value="kept") is True
+     newer_injector.assert_called_once_with(value="kept")
++
++
++@pytest_asyncio.fixture
++async def original_pin_gateway(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {"entries": {"notify-plugin": {"allow_gateway_injection": True}}}}))
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    # Profiles also consult Path.home(), so keep that resolution inside the fixture.
++    from pathlib import Path
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
++    entry = store.get_or_create_session(_entry().origin)
++    adapter = _RoutingAdapter()
++    adapter.set_message_handler(AsyncMock(return_value=None))
++    runner = _runner(entry, adapter)
++    runner.session_store = store
++    runner._async_session_store = None
++    runner._gateway_loop = asyncio.get_running_loop()
++    runner._queued_events = {}
++    runner.config = GatewayConfig()
++    runner._primary_profile_name = "default"
++    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
++    manager = PluginManager(scope_key=str(home))
++    ctx = PluginContext(PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager)
++    manager.set_gateway_message_injector(runner, runner._schedule_plugin_message_injection)
++    return SimpleNamespace(home=home, store=store, entry=entry, adapter=adapter, runner=runner, ctx=ctx)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("reset_before_dispatch", [False, True])
++async def test_original_session_pin_survives_scheduler_and_refuses_new(original_pin_gateway, reset_before_dispatch):
++    g = original_pin_gateway
++    original_id = g.entry.session_id
++    g.adapter._active_sessions[g.entry.session_key] = asyncio.Event()
++    human = MessageEvent(text="human input", message_type=MessageType.TEXT, source=g.entry.origin)
++    g.adapter._pending_messages[g.entry.session_key] = human
++    if reset_before_dispatch:
++        replacement = g.store.reset_session(g.entry.session_key)
++        assert replacement.session_id != original_id
++    assert g.ctx.inject_message("/approve always", session_key=g.entry.session_key, expected_session_id=original_id) is True
++    tasks = tuple(g.runner._background_tasks)
++    results = await asyncio.gather(*tasks)
++    await asyncio.sleep(0)
++    assert results == [not reset_before_dispatch]
++    if reset_before_dispatch:
++        assert g.runner._queued_events == {}
++    else:
++        queued = g.runner._queued_events[g.entry.session_key][0]
++        assert queued.metadata["gateway_session_id"] == original_id
++        assert queued.metadata["gateway_session_strict"] is True
++        assert queued.internal and not queued.allow_gateway_control
++        assert queued.get_command() is None
++        # /new after queueing must be caught by the existing turn-time fence.
++        replacement = g.store.reset_session(g.entry.session_key)
++        assert replacement.session_id != original_id
++        assert await g.runner._hmwa_resolve_session(queued, queued.source) is None
++    g.adapter._message_handler.assert_not_awaited()
++    assert g.adapter._pending_messages[g.entry.session_key] is human
++    assert not g.runner._background_tasks
++    g.adapter._active_sessions.clear()
++    g.adapter._pending_messages.clear()
++
++
++@pytest.mark.asyncio
++async def test_original_pin_dispatches_current_id_without_claiming_delivery(original_pin_gateway):
++    g = original_pin_gateway
++    assert g.ctx.inject_message("result ready", session_key=g.entry.session_key, expected_session_id=g.entry.session_id) is True
++    g.adapter._message_handler.assert_not_awaited()  # True was only scheduling.
++    assert await asyncio.gather(*tuple(g.runner._background_tasks)) == [True]
++    # The adapter owns a background message task; settle it without a model/network.
++    await asyncio.gather(*tuple(g.adapter._session_tasks.values()))
++    await asyncio.sleep(0)
++    event = g.adapter._message_handler.await_args.args[0]
++    assert event.metadata["gateway_session_id"] == g.entry.session_id
++    assert event._gateway_accepted is True  # Adapter admission is a later, separate fact.
++    assert not g.runner._background_tasks
++    assert not g.adapter._active_sessions
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("failure", ["invalid", "missing", "foreign", "unserved", "denied", "draining"])
++async def test_original_pin_dispatch_refuses_unsafe_target(original_pin_gateway, failure):
++    g = original_pin_gateway
++    pin, home, key = g.entry.session_id, g.home, g.entry.session_key
++    if failure == "invalid":
++        pin = " "
++    elif failure == "missing":
++        key = "agent:main:telegram:dm:404"
++    elif failure == "foreign":
++        g.entry.origin.profile = "foreign"
++    elif failure == "unserved":
++        home = g.home / "unserved"
++    elif failure == "denied":
++        g.runner._is_user_authorized.return_value = False
++    else:
++        g.runner._draining = True
++    assert await g.runner._dispatch_plugin_message_injection(
++        session_key=key, content="ready", plugin_id="notify-plugin", expected_session_id=pin, plugin_home=home
++    ) is False
++    g.adapter._message_handler.assert_not_awaited()
++    assert not g.adapter._active_sessions
++    assert not g.runner._background_tasks
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("target", [dict(origin={"platform": "telegram"}), dict(), dict(session_key=" "), dict(session_key="key", expected_session_id=42)])
++async def test_scheduler_refuses_unsupported_or_invalid_pin(original_pin_gateway, target):
++    g = original_pin_gateway
++    args = dict(content="ready", plugin_id="notify-plugin", expected_session_id=g.entry.session_id, plugin_home=g.home)
++    args.update(target)
++    assert g.runner._schedule_plugin_message_injection(**args) is False
++    assert not g.runner._background_tasks
+diff --git a/tests/gateway/test_telegram_conflict.py b/tests/gateway/test_telegram_conflict.py
+--- a/tests/gateway/test_telegram_conflict.py
++++ b/tests/gateway/test_telegram_conflict.py
+@@ -15,7 +15,10 @@
+         return []
+     monkeypatch.setattr("plugins.platforms.telegram.adapter.discover_fallback_ips", _noop)
+     # Mock HTTPXRequest so the builder chain doesn't fail
+-    monkeypatch.setattr("plugins.platforms.telegram.adapter.HTTPXRequest", lambda **kwargs: MagicMock())
++    class FakeHTTPXRequest:
++        def __init__(self, **kwargs):
++            self._client = MagicMock()
++    monkeypatch.setattr("plugins.platforms.telegram.adapter.HTTPXRequest", FakeHTTPXRequest)
+ 
+ 
+ async def _cancel_heartbeat(adapter):
+@@ -652,3 +655,113 @@
+     for _ in range(10):
+         await asyncio.sleep(0)
+     await _cancel_heartbeat(adapter)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stop_raises", [False, True])
++async def test_preserve_queue_conflict_stops_without_retry_or_drop(monkeypatch, stop_raises):
++    monkeypatch.setattr("asyncio.sleep", AsyncMock())
++    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token", extra={"drop_pending_on_cold_boot": False}))
++    captured = {}
++    stop_event = asyncio.Event()
++    updater = SimpleNamespace(running=True, start_polling=AsyncMock(), stop=AsyncMock(side_effect=RuntimeError("stop failed") if stop_raises else None))
++    setattr(updater, "_Updater__polling_task_stop_event", stop_event)
++    app = SimpleNamespace(updater=updater, bot=SimpleNamespace(delete_webhook=AsyncMock()), running=False, shutdown=AsyncMock())
++    adapter._app = app
++    adapter._delete_webhook_best_effort = AsyncMock()
++    async def resilient(**kwargs):
++        captured.update(kwargs)
++        return True
++    adapter._start_polling_resilient = resilient
++    adapter._drain_polling_connections = AsyncMock()
++    adapter._start_polling_once = AsyncMock()
++    adapter._restart_polling_in_task = MagicMock()
++    completed = []
++    async def fatal_handler(failed):
++        assert failed.fatal_error_code == "telegram_polling_conflict"
++        assert failed.fatal_error_retryable is False
++        assert failed._polling_error_task is None
++        await failed.disconnect()
++        completed.append(True)
++    adapter.set_fatal_error_handler(fatal_handler)
++    await adapter._start_polling_mode(is_reconnect=False)
++    assert captured["drop_pending_updates"] is False
++    conflict = type("Conflict", (Exception,), {})
++    captured["error_callback"](conflict("409"))
++    assert stop_event.is_set()
++    recovery = adapter._polling_error_task
++    assert recovery is not None
++    await recovery
++    assert completed == [True]
++    assert adapter.has_fatal_error
++    assert adapter.fatal_error_code == "telegram_polling_conflict"
++    assert adapter.fatal_error_retryable is False
++    adapter._start_polling_once.assert_not_awaited()
++    updater.start_polling.assert_not_awaited()
++    app.bot.delete_webhook.assert_not_awaited()
++    adapter._drain_polling_connections.assert_not_awaited()
++    adapter._restart_polling_in_task.assert_not_called()
++    assert adapter._polling_error_task is None
++    assert adapter._app is None
++    assert not adapter._detached_fatal_tasks
++    await adapter._handle_polling_conflict(conflict("duplicate"))
++    assert completed == [True]
++
++
++@pytest.mark.asyncio
++async def test_preserve_queue_conflict_during_network_recovery_is_permanent(monkeypatch):
++    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token", extra={"drop_pending_on_cold_boot": False}))
++    adapter._app = SimpleNamespace(updater=SimpleNamespace(running=True, stop=AsyncMock()))
++    adapter.set_fatal_error_handler(AsyncMock())
++    adapter._start_polling_once = AsyncMock()
++    conflict = type("Conflict", (Exception,), {})
++    await adapter._handle_polling_network_error(conflict("409"))
++    assert adapter.fatal_error_code == "telegram_polling_conflict"
++    assert adapter.fatal_error_retryable is False
++    assert adapter._polling_network_error_count == 0
++    adapter._start_polling_once.assert_not_awaited()
++    assert adapter._polling_error_task is None
++
++
++@pytest.mark.asyncio
++async def test_preserve_callback_cancels_pending_recovery_before_conflict_stop():
++    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token", extra={"drop_pending_on_cold_boot": False}))
++    stop_event = asyncio.Event()
++    updater = SimpleNamespace(running=True, stop=AsyncMock())
++    setattr(updater, "_Updater__polling_task_stop_event", stop_event)
++    adapter._app = SimpleNamespace(updater=updater)
++    adapter._delete_webhook_best_effort = AsyncMock()
++    adapter._start_polling_resilient = AsyncMock(return_value=True)
++    adapter.set_fatal_error_handler(AsyncMock())
++    await adapter._start_polling_mode(is_reconnect=False)
++    async def pending():
++        await asyncio.Future()
++    adapter._spawn_polling_recovery(asyncio.get_running_loop(), pending())
++    old = adapter._polling_error_task
++    conflict = type("Conflict", (Exception,), {})
++    adapter._polling_error_callback_ref(conflict("409"))
++    assert stop_event.is_set()
++    new = adapter._polling_error_task
++    assert new is not old
++    await asyncio.gather(old, new, return_exceptions=True)
++    await asyncio.sleep(0)
++    assert old.cancelled()
++    assert adapter.fatal_error_code == "telegram_polling_conflict"
++    assert adapter.fatal_error_retryable is False
++    assert adapter._polling_error_task is None
++    assert not adapter._background_tasks
++
++
++@pytest.mark.asyncio
++async def test_preserve_cold_start_conflict_cannot_be_retryable(monkeypatch):
++    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token", extra={"drop_pending_on_cold_boot": False}))
++    _build_polling_app(monkeypatch, adapter)
++    conflict = type("Conflict", (Exception,), {})
++    # Exercise connect's exception classification at the native cold-readiness boundary.
++    adapter._start_polling_mode = AsyncMock(side_effect=conflict("409"))
++    adapter.set_fatal_error_handler(AsyncMock())
++    assert await adapter.connect() is False
++    assert adapter.fatal_error_code == "telegram_polling_conflict"
++    assert adapter.fatal_error_retryable is False
++    assert adapter._polling_error_task is None
++    adapter._fatal_error_handler.assert_awaited_once()
+diff --git a/tests/hermes_cli/test_plugin_message_injection.py b/tests/hermes_cli/test_plugin_message_injection.py
+--- a/tests/hermes_cli/test_plugin_message_injection.py
++++ b/tests/hermes_cli/test_plugin_message_injection.py
+@@ -5,6 +5,7 @@
+ from unittest.mock import MagicMock, patch
+ 
+ import hermes_yaml as yaml
++import pytest
+ 
+ import hermes_cli.plugins as plugins_mod
+ from agent import secret_scope
+@@ -316,3 +317,54 @@
+ 
+     assert context.inject_message("x", origin=ORIGIN) is False
+     assert cli._pending_input.empty() and cli._interrupt_queue.empty()
++
++
++# Original-session completions must never degrade to an unpinned host route.
++
++
++@pytest.mark.parametrize("pin", ["", " ", " session-42", 42, False, [], {}])
++def test_invalid_original_session_pin_refuses_before_host(tmp_path, monkeypatch, pin):
++    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
++    context, manager = _context()
++    injector = MagicMock(return_value=True)
++    manager.set_gateway_message_injector(object(), injector)
++    assert context.inject_message("ready", session_key="agent:main:telegram:dm:42", expected_session_id=pin) is False
++    injector.assert_not_called()
++
++
++@pytest.mark.parametrize("route", ["cli", "tui", "origin", "missing-key"])
++def test_unsupported_original_session_pin_never_reaches_unpinned_host(tmp_path, monkeypatch, route):
++    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
++    context, manager = _context()
++    injector = MagicMock(return_value=True)
++    manager.set_gateway_message_injector(object(), injector)
++    tui = MagicMock(return_value=True)
++    target = {"session_key": "agent:main:telegram:dm:42"}
++    if route == "cli":
++        manager._cli_ref = SimpleNamespace(_agent_running=False, _pending_input=SimpleQueue(), _interrupt_queue=SimpleQueue())
++    elif route == "tui":
++        manager.set_tui_message_injector(object(), tui)
++    elif route == "origin":
++        target = {"origin": {"platform": "telegram", "chat_id": "42"}}
++    else:
++        target = {}
++    assert context.inject_message("ready", expected_session_id="original", **target) is False
++    injector.assert_not_called()
++    tui.assert_not_called()
++    if route == "cli":
++        assert manager._cli_ref._pending_input.empty()
++        assert manager._cli_ref._interrupt_queue.empty()
++
++
++def test_pin_uses_plugin_manager_home_not_ambient_home(tmp_path, monkeypatch):
++    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
++    context, manager = _context()
++    injector = MagicMock(return_value=True)
++    manager.set_gateway_message_injector(object(), injector)
++    token = set_hermes_home_override(tmp_path / "foreign")
++    try:
++        assert context.inject_message("ready", session_key="agent:main:telegram:dm:42", expected_session_id="original") is True
++    finally:
++        reset_hermes_home_override(token)
++    injector.assert_called_once_with(content="ready", plugin_id="notify-plugin", session_key="agent:main:telegram:dm:42",
++                                     expected_session_id="original", plugin_home=manager.home_path)

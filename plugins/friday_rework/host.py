@@ -252,6 +252,8 @@ class WorkerHost:
                     current = await asyncio.to_thread(self._stop, current, "cancel")
                 else:
                     current = await asyncio.to_thread(self._reconcile, current)
+            from .result_tool import notify_finished
+            await notify_finished(self, current)
             return status(current)
         except asyncio.CancelledError as error:
             # Native stop first, then wait for the bounded in-flight launch to

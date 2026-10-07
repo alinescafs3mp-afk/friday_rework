@@ -6,6 +6,8 @@ def register(ctx):
     admission = IngressAdmissions(ctx.state)
     from .host import register_host
     host = register_host(ctx, admission)
+    from .result_tool import register_result_tool
+    register_result_tool(ctx, host)
     ctx.register_hook("post_gateway_admission", admission.record)
     ctx.register_middleware("tool_execution", native_call_scope)
     ctx.register_tool(
