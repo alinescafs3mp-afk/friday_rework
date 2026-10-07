@@ -142,7 +142,8 @@ def test_non_friday_gateway_keeps_native_wildcard_behavior(env):
 def test_routed_runtime_cannot_override_transport_disable(env):
     env.monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "*")
     user(env, enabled=False)
-    env.admin.set_user("satellite", platform="telegram", transport_profile="default", account_id="bot-A", user_id="1", enabled=True, role="user")
+    with pytest.raises(PermissionError, match="receiving_transport_authority"):
+        env.admin.set_user("satellite", platform="telegram", transport_profile="default", account_id="bot-A", user_id="1", enabled=True, role="user")
     value = source(env, profile="satellite")
     token = set_hermes_home_override(str(env.satellite))
     try:
@@ -234,16 +235,19 @@ def test_target_profile_cannot_replace_launch_auth_policy(env):
     try:
         assert session_allowed(session()) and not session_allowed(session("ordinary"))
     finally: reset_hermes_home_override(token)
-    assert env.admin.users("satellite")["profile"] == "satellite"
+    with pytest.raises(PermissionError, match="receiving_transport_authority"):
+        env.admin.users("satellite")
+    assert env.admin.effective("satellite")["profile"] == "satellite"
 
 
 def native_sessions(env):
     from hermes_state import SessionDB
     db = SessionDB(env.home / "state.db")
     for uid, topic in [("1", "topic-A"), ("2", "topic-B")]:
-        origin = dict(platform="telegram", user_id=uid, chat_id="shared-chat", thread_id=topic)
-        db.create_session("session-" + uid, "telegram", user_id=uid, chat_id="shared-chat", thread_id=topic,
-            session_key="key-" + uid, origin_json=json.dumps(origin), transport_profile="default", profile_name="default")
+        from gateway.session_recovery import SessionRecoveryMixin
+        value = source(env, uid); value.chat_id = "shared-chat"; value.thread_id = topic
+        db.create_session(**SessionRecoveryMixin._session_create_kwargs(session_id="session-" + uid,
+            session_key="key-" + uid, origin=value, source_value="telegram", display_name=None, parent_session_id=None))
         db.append_message("session-" + uid, "user", "native-message-" + uid)
     db.create_session("unknown-history", "telegram")
     db.close()
@@ -370,7 +374,7 @@ def test_native_basic_signed_auth_asgi_two_users_foreign_and_disable(env):
             assert denied.status_code == 403
             result = await client.put("/api/plugins/friday_rework/users?profile=default", json=body, headers={"Authorization": "Bearer " + owner_token})
             assert result.status_code == 200 and result.json()["recorded"] is True
-            assert (await get(owner_token, profile="satellite")).status_code == 200
+            assert (await get(owner_token, profile="satellite")).status_code == 403
             bad = await client.put("/api/plugins/friday_rework/users?profile=default", json=body | {"enabled": 1, "admin": True}, headers={"Authorization": "Bearer " + owner_token})
             assert bad.status_code == 422
     asyncio.run(scenario())
@@ -448,12 +452,12 @@ def test_ws_native_ticket_operator_and_ordinary_refusal_before_accept(env):
     from starlette.websockets import WebSocket
     async def unused(*args): raise AssertionError("no WebSocket effects allowed")
     def ws(uid):
-        ticket = mint_ticket(user_id=uid, provider="basic")
+        ticket = mint_ticket(user_id=uid, provider="basic", extra={"org_id": ""})
         return WebSocket(dict(type="websocket", path="/api/ws", root_path="", query_string=("ticket=" + ticket).encode(),
             headers=[], scheme="ws", server=("synthetic", 80), client=("synthetic", 1), app=app), unused, unused)
-    assert chat._ws_auth_reason(ws("owner")) == (None, "ticket")
+    assert chat._ws_auth_reason(ws("owner")) == ("product_websocket_surface_unaudited", "ticket")
     assert chat._ws_auth_reason(ws("ordinary"))[0] == "product_dashboard_forbidden"
-    value = ws("owner"); assert chat._ws_auth_reason(value)[0] is None
+    value = ws("owner"); assert chat._ws_auth_reason(value)[0] == "product_websocket_surface_unaudited"
     assert chat._ws_auth_reason(value)[0] == "ticket_invalid"  # actual native once-only ticket
     value = ws("owner"); value.scope["query_string"] += b"&profile=foreign"
     assert chat._ws_auth_reason(value)[0] == "product_profile_forbidden"

@@ -11,10 +11,21 @@ class ProductAccess:
         self.state = state
         self.store = Associations(state)
 
+    @staticmethod
+    def require_transport(transport_profile):
+        from hermes_constants import get_hermes_home
+        from hermes_cli.profiles import get_profile_dir
+        if get_hermes_home().resolve() != get_profile_dir(transport_profile).resolve():
+            raise PermissionError("receiving_transport_authority_required")
+
     def users(self):
-        return copy.deepcopy(current_access(self.state)["users"])
+        rows = current_access(self.state)["users"]
+        for row in rows.values():
+            self.require_transport(row["transport_profile"])
+        return copy.deepcopy(rows)
 
     def set_user(self, *, platform, transport_profile, account_id, user_id, enabled, role):
+        self.require_transport(transport_profile)
         policy = access_policy()
         if policy is None or not any(
             (a["platform"], a["transport_profile"], a["account_id"]) == (platform, transport_profile, account_id)

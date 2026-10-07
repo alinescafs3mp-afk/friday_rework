@@ -33,7 +33,7 @@
     async function change(row, enabled, role = row.role) {
       setBusy(true); setError("");
       try { await fetchJSON(base + "/users?" + new URLSearchParams({profile}), {
-        method: "PUT", body: JSON.stringify({platform: row.platform, transport_profile: row.transport_profile,
+        method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({platform: row.platform, transport_profile: row.transport_profile,
           account_id: row.account_id, user_id: row.user_id, enabled, role})});
         setData(await fetchJSON(base + "/users?" + new URLSearchParams({profile})));
       } catch (_) { setError("Access write unconfirmed. Reload before another action."); }
@@ -45,16 +45,16 @@
       if (candidates.length !== 1) { setError("No unique configured receiving account for this request."); return; }
       setBusy(true); setError("");
       try { const a = candidates[0]; await fetchJSON(base + "/pairing/approve?" + new URLSearchParams({profile}), {
-        method: "POST", body: JSON.stringify({platform: a.platform, transport_profile: a.transport_profile,
+        method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({platform: a.platform, transport_profile: a.transport_profile,
           account_id: a.account_id, request_id: row.request_id})});
         setData(await fetchJSON(base + "/pairing?" + new URLSearchParams({profile})));
       } catch (_) { setError("Onboarding unconfirmed; native grant may exist. Inspect current users before continuing."); }
       finally { setBusy(false); }
     }
-    async function open(row) {
+    async function open(row, messageOffset = 0) {
       setBusy(true); setError("");
       try { setSession(await fetchJSON(base + "/conversations/" + encodeURIComponent(row.session_id)
-        + "?" + new URLSearchParams({profile}))); }
+        + "?" + new URLSearchParams({profile, limit: "100", offset: String(messageOffset)}))); }
       catch (_) { setError("Conversation unavailable or scope refused."); }
       finally { setBusy(false); }
     }
@@ -77,7 +77,7 @@
       button(row.role === "admin" ? "Channel user role" : "Channel admin role", () => change(row, row.enabled, row.role === "admin" ? "user" : "admin")));
     return h("section", {"aria-label": "Friday administration", style: {padding: "1rem", display: "grid", gap: "1rem"}},
       h("h1", null, "Friday Administration"),
-      h("label", null, "Product profile ", h("select", {value: profile, onChange: e => setProfile(e.target.value)},
+      h("label", null, "Product profile ", h("select", {value: profile, disabled: busy, onChange: e => setProfile(e.target.value)},
         ...profiles.map(p => h("option", {key: p, value: p}, p)))),
       h("nav", null, ...["users", "pairing", "conversations", "tasks", "effective"].map(v => button(v, () => setView(v), {key: v}))),
       view === "conversations" ? h("label", null, "Search ", h("input", {value: query, maxLength: 512, onChange: e => setQuery(e.target.value)})) : null,
@@ -89,12 +89,17 @@
         h("span", null, " Native page offset: " + offset + ". Load to apply; an empty filtered page does not prove no later matches.")) : null,
       button("Load current native state", () => load()),
       error ? h("p", {role: "alert"}, error) : null,
+      ["users", "pairing"].includes(view) ? h("p", null, "Select the receiving account profile for user access and pairing. Execution profiles do not own these controls.") : null,
       view === "users" && data ? h("ul", null, ...data.users.map(renderUser)) : null,
       view === "pairing" && data ? h("ul", null, ...data.pending.map(row => h("li", {key: row.request_id || row.user_id},
         `${row.platform} / ${row.user_id} `, button("Approve and enable", () => approve(row), {disabled: busy || !row.request_id})))) : null,
       view === "conversations" && Array.isArray(data) ? h("ul", null, ...data.map(row => h("li", {key: row.session_id},
         button(row.title || row.session_id, () => open(row)), h("pre", null, JSON.stringify(row.identity, null, 2))))) : null,
       session ? h("article", null, h("h2", null, session.session_id),
+        h("nav", {"aria-label": "Message pages"},
+          button("Previous messages", () => open(session, session.page.previous_offset), {disabled: busy || session.page.previous_offset === null}),
+          button("Next messages", () => open(session, session.page.next_offset), {disabled: busy || session.page.next_offset === null}),
+          h("span", null, ` Messages offset ${session.page.offset}, count ${session.page.count}; ${session.page.state === "END" ? "end of history" : session.page.state === "MORE" ? "more messages available" : "bounded navigation limit reached"}.`)),
         ...session.messages.map((m, i) => h("div", {key: m.id || i}, h("strong", null, m.role), h("pre", {style: {whiteSpace: "pre-wrap"}}, m.content))),
         h("pre", null, JSON.stringify(session.tasks, null, 2)),
         ...session.tasks.flatMap(task => task.attachments.map(file =>

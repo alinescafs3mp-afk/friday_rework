@@ -42,7 +42,9 @@ _admin = Administration()
 def call(method, *args, **kwargs):
     try:
         return masked(method(*args, **kwargs))
-    except PermissionError:
+    except PermissionError as exc:
+        if str(exc) == "receiving_transport_authority_required":
+            raise HTTPException(403, "receiving_transport_authority_required_select_receiving_profile") from None
         raise HTTPException(403, "product_scope_refused") from None
     except (ValueError, KeyError, IndexError):
         raise HTTPException(400, "invalid_or_unproved_product_reference") from None

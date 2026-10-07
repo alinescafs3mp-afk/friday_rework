@@ -83,16 +83,22 @@ class Administration:
     def users(self, profile):
         with self.scope(profile):
             policy = access_policy()
-            return {"profile": profile, "accounts": [] if policy is None else policy["accounts"],
+            if policy is None or not any(a["transport_profile"] == profile for a in policy["accounts"]):
+                raise PermissionError("receiving_transport_authority_required")
+            accounts = [a for a in policy["accounts"] if a["transport_profile"] == profile]
+            return {"profile": profile, "authority": "RECEIVING_TRANSPORT", "accounts": accounts,
                     "users": [{"principal_id": key, **row} for key, row in ProductAccess(self._state()).users().items()]}
 
     def set_user(self, profile, **values):
+        if values.get("transport_profile") != profile:
+            raise PermissionError("receiving_transport_authority_required")
         with self.scope(profile):
             result = ProductAccess(self._state()).set_user(**values)
             return {"recorded": True, "admission": "PRODUCT_INTERSECTION_NEXT_REQUEST",
                     "native_grant": "REQUIRED_SEPARATELY", "user": result}
 
     def pairing(self, profile):
+        self.users(profile)  # prove this is an actual receiving transport authority
         with self.scope(profile):
             from gateway.pairing import PairingStore
             store = PairingStore()
@@ -101,6 +107,8 @@ class Administration:
             return {"pending": pending, "approved": store.list_approved()}
 
     def approve(self, profile, *, platform, transport_profile, account_id, request_id):
+        if transport_profile != profile:
+            raise PermissionError("receiving_transport_authority_required")
         with self.scope(profile):
             policy = access_policy()
             if policy is None or not any((a["platform"], a["transport_profile"], a["account_id"]) ==
@@ -142,11 +150,19 @@ class Administration:
             (origin.get(k) or "") != (row.get(k) or "") for k in ("user_id", "chat_id", "thread_id")
         ) or origin.get("platform") != platform:
             return identity
-        candidates = [] if policy is None else [a for a in policy["accounts"] if
-            a["platform"] == platform and a["transport_profile"] == row.get("transport_profile")]
-        if len(candidates) == 1 and row.get("user_id"):
-            identity.update(account_id=candidates[0]["account_id"], evidence="NATIVE_ORIGIN_EXPLICIT_ACCOUNT",
-                principal_id=principal_id(platform, row["transport_profile"], candidates[0]["account_id"], row["user_id"]))
+        # Historical account evidence belongs to the native row at creation.
+        # The current mutable account policy must never relabel old conversations.
+        account = origin.get("friday_account_origin")
+        if (not isinstance(account, dict) or set(account) != {"schema", "platform", "transport_profile", "account_id"}
+                or account["schema"] != "friday.account_origin.v1" or account["platform"] != platform
+                or account["transport_profile"] != row.get("transport_profile") or not row.get("user_id")):
+            return identity
+        try:
+            key = principal_id(platform, account["transport_profile"], account["account_id"], row["user_id"])
+        except ValueError:
+            return identity
+        identity.update(account_id=account["account_id"], evidence="NATIVE_CREATED_TRANSPORT_ACCOUNT",
+                        principal_id=key)
         return identity
 
     @staticmethod
@@ -196,14 +212,23 @@ class Administration:
             return [r for r in projected if all(r["identity"].get(k) == v for k, v in filters.items())]
 
     def conversation(self, profile, session_id, *, limit=100, offset=0):
-        if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", session_id) or not 1 <= limit <= 200 or not 0 <= offset <= 100000:
+        if (not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", session_id)
+                or type(limit) is not int or type(offset) is not int
+                or not 1 <= limit <= 200 or not 0 <= offset <= 100000):
             raise ValueError("invalid_admin_session")
         with self.scope(profile) as home, self._db(home) as db:
             row = db.get_session(session_id)
             if row is None:
                 raise ValueError("native_session_not_found")
             identity = self._identity(row, access_policy())
-            messages = db.get_messages(session_id, limit=limit, offset=offset, include_ancestors=False)
+            messages = db.get_messages(session_id, limit=limit + 1, offset=offset, include_ancestors=False)
+            has_more = len(messages) > limit
+            messages = messages[:limit]
+            next_offset = offset + limit if has_more and offset + limit <= 100000 else None
+            page = {"offset": offset, "limit": limit, "count": len(messages), "has_more": has_more,
+                    "previous_offset": max(0, offset - limit) if offset else None,
+                    "next_offset": next_offset, "end": not has_more,
+                    "state": "BOUNDED_LIMIT" if has_more and next_offset is None else ("MORE" if has_more else "END")}
             joined = []
             for task in self._rows(self._state()).values():
                 owner = task["owner"]
@@ -215,7 +240,7 @@ class Administration:
                     joined.append(self._task_projection(task))
             return {"profile": profile, "session_id": session_id, "identity": identity,
                     "messages": [{k: m.get(k) for k in ("id", "role", "content", "timestamp", "tool_name")} for m in messages],
-                    "tasks": joined, "ancestor_history": "NOT_MERGED", "attachments": "USE_VERIFIED_TASK_REFERENCES_ONLY"}
+                    "tasks": joined, "page": page, "ancestor_history": "NOT_MERGED", "attachments": "USE_VERIFIED_TASK_REFERENCES_ONLY"}
 
     def attachment(self, profile, task_id, index):
         from .artifacts import StagedArtifact, read_staged
