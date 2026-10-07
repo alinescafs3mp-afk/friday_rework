@@ -90,7 +90,7 @@ def directory(path):
 def spec_checked(value):
     fields = {'home', 'bootstrap_python', 'hermes_donor', 'hermes_prepare',
               'sources_lock', 'dsh_donor', 'a0_donor', 'product', 'project_files', 'seconds', 'containment'}
-    require(isinstance(value, dict) and set(value) == fields, 'explicit_install_fields_required')
+    require(isinstance(value, dict) and set(value) == fields | ({'dashboard_tls'} if 'dashboard_tls' in value else set()), 'explicit_install_fields_required')
     home = canonical(value['home']); directory(home.parent)
     require(home != Path.home() / '.hermes' and home != ROOT
             and not ROOT.is_relative_to(home), 'separate_product_home_required')
@@ -121,7 +121,7 @@ def spec_checked(value):
     require(isinstance(product, dict) and product.get('profile') == 'default',
             'native_default_receiving_home_required')
     require(isinstance(product.get('dashboard'), dict)
-            and set(product['dashboard']) == {'host', 'port', 'public_url', 'operator'},
+            and set(product['dashboard']) == {'host', 'port', 'public_url', 'operator'} | ({'tls'} if 'tls' in product['dashboard'] else set()),
             'explicit_dashboard_authority_required')
     # Reuse the existing pure local/capacity validator before any install
     # effects. Full native profile/provider/auth consumption happens later.
@@ -153,10 +153,37 @@ def spec_checked(value):
             and public.password is None and public.port == dash['port']
             and public.path in ('', '/') and not public.query and not public.fragment,
             'protected_dashboard_public_authority_required')
+    dashboard_tls_inputs(value, home)
     lock = json.loads(owned_file(pin(value['sources_lock'])))
     donors = {r['id']: r for r in lock['repositories']}
     require({'hermes', 'dsh', 'a0'}.issubset(donors), 'complete_donor_pins_required')
     return home, donors
+
+
+def dashboard_tls_inputs(value, home):
+    """Explicit protected deployment inputs; no issuer or trust-store writes."""
+    dash = value['product']['dashboard']
+    names = {'certfile': 'dashboard-tls/server.pem', 'keyfile': 'dashboard-tls/server.key',
+             'cafile': 'dashboard-tls/ca.pem'}
+    if 'tls' not in dash:
+        require('dashboard_tls' not in value, 'undeclared_dashboard_tls_inputs')
+        return {}
+    require(dash['tls'] == names, 'explicit_owned_dashboard_tls_files_required')
+    bind = ipaddress.ip_address(dash['host'])
+    require(not bind.is_unspecified and not bind.is_multicast
+            and urlsplit(dash['public_url']).scheme == 'https', 'explicit_dashboard_tls_authority_required')
+    inputs = value.get('dashboard_tls')
+    require(isinstance(inputs, dict) and set(inputs) == set(names), 'dashboard_tls_deployment_inputs_required')
+    parents = set(); output = {}
+    for key, row in inputs.items():
+        path = pin(row); directory(path.parent); parents.add(path.parent)
+        require(path.name == Path(names[key]).name and not path.is_relative_to(home),
+                'separate_owned_dashboard_tls_input_required')
+        raw = owned_file(path, private=True)
+        require(digest(raw) == row['sha256'], 'dashboard_tls_input_changed')
+        output[key] = raw
+    require(len(parents) == 1, 'one_owned_dashboard_tls_input_scope_required')
+    return output
 
 
 def commands(value):
@@ -327,6 +354,11 @@ def install(value, input_path, *, budget=None):
               'gateway_installed': False, 'remaining': gaps(),
               'original_attempt': claim,
               'invocation_completion': 'NOT_PROVEN_BY_OUTPUT_RECEIPT'}
+    if 'tls' in value['product']['dashboard']:
+        marker['tls_files'] = {path: digest(budget.call(owned_file, home / path, private=True))
+            for path in value['product']['dashboard']['tls'].values()}
+        require(marker['tls_files'] == {path: value['dashboard_tls'][key]['sha256']
+            for key, path in value['product']['dashboard']['tls'].items()}, 'installed_dashboard_tls_changed')
     marker['profile_files'] = {name: digest(budget.call(owned_file, home / name, private=True))
                                for name in ('config.yaml', 'SOUL.md', 'FRIDAY-PROFILE.json')}
     marker['plugin_files'] = {name: sha for name, sha in value['project_files'].items()
@@ -359,6 +391,12 @@ def inspect(value, input_hash):
     require(marker.get('schema') == SCHEMA and marker.get('home') == str(home)
             and marker.get('input_sha256') == input_hash
             and marker.get('state') == 'INSTALLED_TEMPLATE_INCOMPLETE', 'foreign_or_partial_install')
+    if 'tls' in value['product']['dashboard']:
+        expected = {path: value['dashboard_tls'][key]['sha256']
+            for key, path in value['product']['dashboard']['tls'].items()}
+        require(marker.get('tls_files') == expected
+                and all(digest(owned_file(home / path, private=True)) == pin for path, pin in expected.items()),
+                'installed_dashboard_tls_changed')
     receipt_path = home / 'hermes-agent.source.json'
     require(digest(owned_file(receipt_path)) == marker.get('source_receipt_sha256'),
             'source_receipt_changed')

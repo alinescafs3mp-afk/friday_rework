@@ -122,3 +122,16 @@ Product admission still requires its own native grants; no ready receipt or
 enabled user is fabricated. Offline synthetic consumer checks demonstrate
 source wiring only. Independent review, actual installation, useful web for
 both workers and all six live product journeys remain required.
+
+The native Dashboard also has an explicit direct-TLS option for the declared
+VMware owner LAN route (guest `192.168.12.128:9119`, host LAN IP supplied at
+deployment). Set `dashboard.tls` to the three protected `dashboard-tls` file
+paths documented in `native-installer.md`, and provide pinned certificate/key/CA
+inputs to normal installation. Uvicorn loads them through the existing Dashboard
+lifecycle; native attachment validates the actual guest certificate and existing
+nonce/HMAC owner proof, and the public Host/Origin includes the exact host port.
+No certificate issuer, proxy service or browser trust change is introduced.
+Local protected HTTP and externally terminated HTTPS remain separate supported
+configurations. Source checks cannot establish actual certificate provisioning,
+NAT/browser trust or runtime readiness; original whole-product admission gaps
+remain in force.

@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def profile_write(home, spec):
     from tools.configure_product import compose_product
     bundle = compose_product(spec)
+    from hermes_cli.friday_dashboard_tls import declared_settings
+    declared_settings(home, bundle['contract']['native_dashboard'])
     from hermes_cli.config import atomic_config_write, config_write_transaction, DEFAULT_SOUL_MD
     from scripts.friday_install import require, publish, owned_file
     require(not (home / 'config.yaml').exists() and not (home / 'config.yaml').is_symlink(),
@@ -91,6 +93,9 @@ def native_profile_check(bundle, home, *, records=()):
             and should_require_dashboard_auth(dash['host'], frozenset({urlsplit(dash['public_url']).hostname}),
                                               require_auth=config['dashboard']['require_auth']),
             'native_dashboard_auth_off')
+    from hermes_cli.friday_dashboard_tls import declared_settings
+    require(config['dashboard'].get('tls') == dash.get('tls'), 'dashboard_tls_config_contract_mismatch')
+    declared_settings(home, dash)
     require(config['fallback_providers'] == [] and config['fallback_model'] == {},
             'model_fallback_refused')
     require('dashboard_auth/basic' in config['plugins']['enabled']
@@ -116,6 +121,24 @@ def install_stamp(receipt):
     return stamp
 
 
+def stage_dashboard_tls(value, home):
+    from scripts.friday_install import dashboard_tls_inputs, require, directory
+    inputs = dashboard_tls_inputs(value, home)
+    if not inputs:
+        return
+    folder = home / 'dashboard-tls'
+    require(not folder.exists() and not folder.is_symlink(), 'existing_dashboard_tls_not_adopted')
+    folder.mkdir(mode=0o700); directory(folder)
+    for key, data in inputs.items():
+        path = home / value['product']['dashboard']['tls'][key]
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+    from hermes_cli.friday_dashboard_tls import checked
+    dash = value['product']['dashboard']
+    checked(home, dash['tls'], dash['host'], dash['port'], dash['public_url'])
+
+
 def complete(value, home, receipt):
     from scripts.friday_install import require, owned_file, digest, publish
     from hermes_constants import get_hermes_home
@@ -129,6 +152,7 @@ def complete(value, home, receipt):
             and owning_home_root(source) in (None, home), 'native_pm_install_owner_mismatch')
     require(not (source / '.git').exists(), 'exported_full_patched_source_required')
     from tools.configure_product import compose_product
+    stage_dashboard_tls(value, home)
     bundle = compose_product(value['product'])
     from gateway.host_rendezvous import read_record, record_is_stale
     records = tuple(r for role in ('serve', 'gateway')
