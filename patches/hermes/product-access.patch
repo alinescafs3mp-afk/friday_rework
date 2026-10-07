@@ -1,0 +1,308 @@
+diff --git a/gateway/authz_mixin.py b/gateway/authz_mixin.py
+--- a/gateway/authz_mixin.py
++++ b/gateway/authz_mixin.py
+@@ -628,6 +628,31 @@
+ 
+     def _principal_authorized(self, source: SessionSource, *, allow_adapter_delegation: bool) -> bool:
+         """The allowlist verdict alone, before the bot loop guard."""
++        # Product admission is an intersection, before every native grant (including
++        # trusted/role/group/wildcard grants). Read current native state, not a cache.
++        from hermes_cli.friday_product_access import gateway_allowed
++        from gateway.session_identity import identity_of
++        identity = identity_of(source)
++        if identity is not None:
++            transport_profile = identity.transport_profile
++            runtime_profile = identity.runtime_profile
++        elif getattr(getattr(self, "config", None), "multiplex_profiles", False):
++            transport_profile = runtime_profile = None  # unknown product identity; native legacy remains unchanged
++        else:
++            from hermes_cli.profiles import get_active_profile_name
++            transport_profile = get_active_profile_name() or "default"
++            runtime_profile = source.profile or transport_profile
++        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++        access_token = (set_hermes_home_override(str(identity.authorization_home))
++                        if identity is not None else None)
++        try:
++            product_allowed = gateway_allowed(source, transport_profile=transport_profile, runtime_profile=runtime_profile)
++        finally:
++            if access_token is not None:
++                reset_hermes_home_override(access_token)
++        if not product_allowed:
++            return False
++
+         # Webhook events are HMAC-verified; a ``trusted_inbound`` platform's events come from the
+         # service its adapter authenticated to (no human sender to allowlist).
+         if source.platform == Platform.WEBHOOK or getattr(_registry_entry(source.platform), "trusted_inbound", False) is True:
+diff --git a/hermes_cli/dashboard_auth/middleware.py b/hermes_cli/dashboard_auth/middleware.py
+--- a/hermes_cli/dashboard_auth/middleware.py
++++ b/hermes_cli/dashboard_auth/middleware.py
+@@ -130,7 +130,7 @@
+     the ROTATED RT is mandatory: Portal runs reuse detection, so replaying the stale RT would
+     revoke the session."""
+     request.state.session = new_session
+-    response = await call_next(request)
++    response = await _product_call_next(request, call_next)
+     set_session_cookies(
+         response, access_token=new_session.access_token, refresh_token=new_session.refresh_token,
+         access_token_expires_in=_expires_in_seconds(new_session), use_https=detect_https(request),
+@@ -150,15 +150,24 @@
+     return response
+ 
+ 
++async def _product_call_next(request, call_next):
++    from hermes_cli.friday_product_access import request_allowed
++    if not request_allowed(request):
++        return JSONResponse({"error": "product_dashboard_forbidden"}, status_code=403)
++    return await call_next(request)
++
++
+ async def gated_auth_middleware(
+     request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+     """Engaged only when ``app.state.auth_required is True``."""
+     if not getattr(request.app.state, "auth_required", False):
+-        return await call_next(request)
++        return await _product_call_next(request, call_next)
+     # Already authenticated by the token-auth seam (service caller on a registered token
+     # route): not a cookie session, must not bounce to /login.
+-    if getattr(request.state, "token_authenticated", False) or _path_is_public(request.url.path):
++    if _path_is_public(request.url.path):
+         return await call_next(request)
++    if getattr(request.state, "token_authenticated", False):
++        return await _product_call_next(request, call_next)
+     # RFC 8252 native-app bearer path: the same provider-minted access token the cookie flow
+     # stores, verified with the same provider stack, no cookie read or set. A presented-but-
+     # invalid bearer gets the structured 401 so the desktop refreshes/re-logs instead of
+@@ -171,7 +180,7 @@
+             return unreachable_response(str(e))
+         if bearer_session is not None:
+             request.state.session = bearer_session
+-            return await call_next(request)
++            return await _product_call_next(request, call_next)
+         return _unauth_response(request, reason="invalid_or_expired_session")
+ 
+     at, _rt = read_session_cookies(request)
+@@ -202,7 +211,7 @@
+         return await _serve_refreshed(request, call_next, *refreshed)
+ 
+     request.state.session = session
+-    response = await call_next(request)
++    response = await _product_call_next(request, call_next)
+     if not provider_hint and session.provider:
+         set_session_provider_cookie(
+             response, provider=session.provider, use_https=detect_https(request),
+diff --git a/hermes_cli/friday_product_access.py b/hermes_cli/friday_product_access.py
+new file mode 100644
+--- /dev/null
++++ b/hermes_cli/friday_product_access.py
+@@ -0,0 +1,175 @@
++"""Friday policy over native configuration/PluginState, not a user database.
++
++Read on every admission. Import has no registration, config or filesystem effect.
++Only an explicitly enabled product policy changes normal Hermes behavior.
++"""
++import hashlib
++import json
++import re
++import time
++
++KEY = "product_access.v1"
++
++
++def text(value, *, empty=False):
++    if (not isinstance(value, str) or (not empty and not value)
++            or len(value.encode()) > 512 or any(ord(c) < 32 for c in value)):
++        raise ValueError("invalid_product_identity")
++    return value
++
++
++def profile_name(value):
++    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value):
++        raise ValueError("invalid_product_profile")
++    return value
++
++
++def settings():
++    from hermes_cli.config import load_config_readonly, require_readable_config_before_write
++    # Diagnostic validation stops the permissive loader from erasing a corrupt policy.
++    require_readable_config_before_write()
++    value = (load_config_readonly().get("plugins") or {}).get("entries", {}).get("friday_rework", {})
++    return value.get("settings", {})
++
++
++def access_policy():
++    policy = settings().get("product_access")
++    if policy is None or (isinstance(policy, dict) and set(policy) == {"enabled"} and policy["enabled"] is False):
++        return None
++    if not isinstance(policy, dict) or set(policy) != {"enabled", "accounts"} or policy["enabled"] is not True:
++        raise ValueError("invalid_product_access_policy")
++    accounts = policy["accounts"]
++    if not isinstance(accounts, list) or not 0 < len(accounts) <= 64:
++        raise ValueError("invalid_product_accounts")
++    seen = set()
++    for account in accounts:
++        if not isinstance(account, dict) or set(account) != {"platform", "transport_profile", "account_id", "runtime_profiles"}:
++            raise ValueError("invalid_product_account")
++        for k in ["platform", "account_id"]:
++            text(account[k])
++        profile_name(account["transport_profile"])
++        if not isinstance(account["runtime_profiles"], list) or not account["runtime_profiles"]:
++            raise ValueError("invalid_product_runtime_profiles")
++        for p in account["runtime_profiles"]:
++            profile_name(p)
++        pair = (account["platform"], account["transport_profile"])
++        if pair in seen:
++            raise ValueError("ambiguous_product_account")
++        seen.add(pair)
++    return policy
++
++
++def principal_id(platform, transport_profile, account_id, user_id):
++    values = [text(platform), profile_name(transport_profile), text(account_id), text(user_id)]
++    return hashlib.sha256(json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
++
++
++def validate_access(document):
++    if not isinstance(document, dict) or set(document) != {"schema", "users"} or document["schema"] != KEY:
++        raise ValueError("invalid_product_access_store")
++    if not isinstance(document["users"], dict) or len(document["users"]) > 10000:
++        raise ValueError("invalid_product_users")
++    for key, row in document["users"].items():
++        if (not isinstance(row, dict) or set(row) != {"platform", "transport_profile", "account_id", "user_id", "enabled", "role"}
++                or type(row["enabled"]) is not bool or row["role"] not in {"user", "admin"}
++                or key != principal_id(row["platform"], row["transport_profile"], row["account_id"], row["user_id"])):
++            raise ValueError("invalid_product_user")
++    return document
++
++
++def current_access(state=None):
++    if state is None:
++        from hermes_cli.plugins_state import PluginState
++        state = PluginState("friday_rework")
++    return validate_access(state.get(KEY, {"schema": KEY, "users": {}}, lock_deadline=time.monotonic() + 2))
++
++
++def gateway_allowed(source, *, transport_profile, runtime_profile):
++    """A product allow is necessary but never replaces native grant authorization."""
++    try:
++        policy = access_policy()
++        if policy is None:
++            return True
++        platform = source.platform.value
++        matches = [a for a in policy["accounts"] if a["platform"] == platform and a["transport_profile"] == transport_profile]
++        if len(matches) != 1 or runtime_profile not in matches[0]["runtime_profiles"]:
++            return False
++        account = matches[0]
++        key = principal_id(platform, transport_profile, account["account_id"], source.user_id)
++        row = current_access()["users"].get(key)
++        return row is not None and row["enabled"] is True
++    except Exception:
++        return False
++
++
++def admin_policy():
++    # Dashboard auth authority belongs to its launch home, never ?profile=.
++    from hermes_constants import get_process_hermes_home, set_hermes_home_override, reset_hermes_home_override
++    token = set_hermes_home_override(str(get_process_hermes_home()))
++    try:
++        policy = settings().get("admin")
++    finally:
++        reset_hermes_home_override(token)
++    if policy is None or (isinstance(policy, dict) and set(policy) == {"enabled"} and policy["enabled"] is False):
++        return None
++    if not isinstance(policy, dict) or set(policy) != {"enabled", "operators", "profiles"} or policy["enabled"] is not True:
++        raise ValueError("invalid_product_admin_policy")
++    if not isinstance(policy["operators"], list) or not policy["operators"]:
++        raise ValueError("invalid_product_operators")
++    for operator in policy["operators"]:
++        if not isinstance(operator, dict) or set(operator) != {"provider", "user_id", "org_id"}:
++            raise ValueError("invalid_product_operator")
++        text(operator["provider"]); text(operator["user_id"]); text(operator["org_id"], empty=True)
++    if not isinstance(policy["profiles"], list) or not policy["profiles"] or len(policy["profiles"]) > 32:
++        raise ValueError("invalid_product_profiles")
++    for p in policy["profiles"]:
++        profile_name(p)
++    return policy
++
++
++def operator_allowed(identity):
++    try:
++        policy = admin_policy()
++        if policy is None:
++            return True
++        return any(identity == op for op in policy["operators"])
++    except Exception:
++        return False
++
++
++def session_allowed(session):
++    try:
++        if admin_policy() is None:
++            return True
++        from hermes_cli.dashboard_auth.base import Session
++        return (isinstance(session, Session) and session.expires_at > time.time()
++                and operator_allowed({k: getattr(session, k) for k in ("provider", "user_id", "org_id")}))
++    except Exception:
++        return False
++
++
++def request_allowed(request):
++    """Deny unaudited native data/config routes in the product administration profile.
++
++    Native login/cookie/CSRF still owns authentication. The plugin provides the
++    scoped data surfaces; remaining privileged donor pages need explicit review.
++    """
++    try:
++        if admin_policy() is None:
++            return True
++        if not getattr(request.app.state, "auth_required", False) or not session_allowed(getattr(request.state, "session", None)):
++            return False
++        prefix = request.scope.get("root_path", "").rstrip("/")
++        path = request.url.path
++        if prefix and path.startswith(prefix + "/"):
++            path = path[len(prefix):]
++        requested_profile = request.query_params.get("profile")
++        if requested_profile is not None and requested_profile not in admin_policy()["profiles"]:
++            return False
++        if not path.startswith("/api/"):
++            return True
++        return (path.startswith("/api/plugins/friday_rework/")
++                or (request.method == "GET" and path in {"/api/auth/me", "/api/plugins", "/api/dashboard/plugins"})
++                or (request.method == "POST" and path == "/api/auth/ws-ticket"))
++    except Exception:
++        return False
+diff --git a/hermes_cli/web_server_chat.py b/hermes_cli/web_server_chat.py
+--- a/hermes_cli/web_server_chat.py
++++ b/hermes_cli/web_server_chat.py
+@@ -247,7 +247,31 @@
+     })
+ 
+ 
+-def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
++def _ws_auth_reason(ws):
++    reason, credential = _native_ws_auth_reason(ws)
++    if reason is not None:
++        return reason, credential
++    from hermes_cli.friday_product_access import admin_policy, operator_allowed
++    try:
++        policy = admin_policy()
++        if policy is not None:
++            target_profile = ws.query_params.get("profile")
++            if target_profile is not None and target_profile not in policy["profiles"]:
++                return "product_profile_forbidden", credential
++            info = getattr(ws, "_hermes_auth_identity", None)
++            # Native tickets omit org_id; only explicitly org-less operators may
++            # use that native credential. No guessed org or peer-supplied role.
++            if not isinstance(info, dict) or not operator_allowed({
++                "provider": info.get("provider"), "user_id": info.get("user_id"),
++                "org_id": info.get("org_id", ""),
++            }):
++                return "product_dashboard_forbidden", credential
++    except Exception:
++        return "product_dashboard_forbidden", credential
++    return None, credential
++
++
++def _native_ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
+     """Validate WS-upgrade auth; return ``(reason, credential)``.
+ 
+     ``reason`` is None when accepted, else a short token (``no_credential``,
