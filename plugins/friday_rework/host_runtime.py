@@ -374,6 +374,11 @@ class A0HostSession:
             self.runtime.start(plan_path,m.sha(plan_path),before_ui=before_ui,on_created=on_created)
             self._current(row)
             r=self.runtime.receipt();obj=self.runtime.inspect(r);sample=self.runtime.snapshot_container(obj)
+            # Keep sampled descendants before any later observation or receipt
+            # write can fail. Emergency stop must still check this exact sample.
+            r['observations'].append(sample)
+            self.runtime.known=r
+            m.write_json(self.runtime.receipt_path,r,replace=True)
             # Dedicated daemon invocation is an actual independent observation.
             reply=self.runtime.runner(['/usr/bin/systemctl','--user','show',m.DAEMON,'--property=ActiveState,InvocationID'],3)
             fields=dict(x.split('=',1) for x in reply.splitlines())

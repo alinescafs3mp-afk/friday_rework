@@ -6,6 +6,64 @@ import pytest
 from test_a0_host import configure_a0,launch_row,scoped_start
 from test_host_native import setup,isolated,native,offline_boundary,ingress
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault', ['daemon', 'receipt_before', 'receipt_after'])
+async def test_pregrant_sample_survives_failure_until_descendants_cease(setup,tmp_path,monkeypatch,fault):
+    """Stopped container/PID0 cannot erase an earlier sampled live descendant.
+
+    Native process/cgroup observations are explicit fakes; launch, receipt I/O,
+    emergency stop, retained capacity and original key cleanup are real source.
+    """
+    proof=await ingress(setup);s=configure_a0(setup,proof,tmp_path,monkeypatch);row=launch_row(setup,s,proof)
+    init=s.module.Runtime.__init__;snapshot=s.module.Runtime.snapshot_container
+    write=s.module.write_json
+    samples=[];checked=[];alive=[False];injected=[False]
+    def sample(runtime,obj):
+        value=snapshot(runtime,obj);samples.append(copy.deepcopy(value));alive[0]=True
+        return value
+    def cessation(value):
+        checked.append(copy.deepcopy(value))
+        return {'confirmed':not alive[0],'classification':'EXPLICIT_FAKE_PID_START_AND_CGROUP'}
+    def fail():
+        injected[0]=True;s.running=False;s.obj['State'].update(Running=False,Pid=0)
+        raise RuntimeError('INJECTED_FAILURE_AFTER_INITIAL_SAMPLE')
+    def wrapped_init(runtime,*args,**kwargs):
+        init(runtime,*args,**kwargs);run=runtime.runner
+        def command(argv,timeout):
+            if fault=='daemon' and argv[-1]=='--property=ActiveState,InvocationID':fail()
+            return run(argv,timeout)
+        runtime.runner=command
+    def write_receipt(path,value,**kwargs):
+        target=(fault!='daemon' and not injected[0] and path.name=='native.json'
+                and isinstance(value,dict) and value.get('observations'))
+        if target and fault=='receipt_before':fail()
+        answer=write(path,value,**kwargs)
+        if target:fail()
+        return answer
+    monkeypatch.setattr(s.module.Runtime,'__init__',wrapped_init)
+    monkeypatch.setattr(s.module.Runtime,'snapshot_container',sample)
+    monkeypatch.setattr(s.module,'cessation',cessation)
+    monkeypatch.setattr(s.module,'write_json',write_receipt)
+    with pytest.raises(Exception,match='INJECTED_FAILURE_AFTER_INITIAL_SAMPLE'):scoped_start(setup,row)
+    assert injected[0] and len(samples)==1 and checked and alive[0]
+    assert all(value==samples[0] for value in checked)
+    assert s.session.runtime.known['observations']==samples
+    with pytest.raises(Exception,match='STOP_UNCONFIRMED'):
+        setup.host._stop(setup.host.store.get(row['existing_task_id'],row['owner']),'cancel')
+    retained=setup.host.store.get(row['existing_task_id'],row['owner'])
+    assert retained['host']['quiescence'] is None
+    assert s.session.key_cleanup=='PREPARED'
+    # Only changed observed cessation permits the same owned cancellation to
+    # settle. No worker/task POST or launch is replayed.
+    before_posts=list(s.posts);before_creates=sum('create' in argv for argv in s.calls)
+    alive[0]=False
+    stopped=setup.host._stop(retained,'cancel')
+    assert stopped['host']['quiescence']['kind']=='a0_pre_grant'
+    assert stopped['host']['quiescence']['observation']['native_cessation'] is True
+    assert s.session.key_cleanup=='REMOVED'
+    assert s.posts==before_posts and sum('create' in argv for argv in s.calls)==before_creates
+
 @pytest.mark.asyncio
 async def test_original_fractional_wall_monotonic_and_boot_are_not_reset(setup,tmp_path,monkeypatch):
     proof=await ingress(setup);s=configure_a0(setup,proof,tmp_path,monkeypatch);row=launch_row(setup,s,proof)
