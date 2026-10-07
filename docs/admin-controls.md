@@ -149,3 +149,14 @@ that entry and re-enters the real loader; unchanged allowed policy retains the
 existing useful dedup behavior. Eight actual registered-handler witnesses first
 failed after disable and now form policy-change regressions. This cache change
 does not erase content already delivered or change active worker budgets.
+
+Repeat-view success now follows the real loader's copy resolution and current
+policy/platform checks. Entries identify the owning profile, actual skill file
+and qualified plugin registration. Short names and suffixes cannot alias a
+different duplicate or plugin copy. Local category aliases retain dedup when
+they resolve to the same authorized copy; each linked file has its own entry
+after traversal and containment checks. Policy changes invalidate old entries
+even when a denied request exits before lookup, so enabling reloads useful
+content. Resolution retains the native local metadata reads; a denied plugin
+is refused before its body is read. Source/offline collision, alias, reload and
+task-boundary regressions do not establish live acceptance.
