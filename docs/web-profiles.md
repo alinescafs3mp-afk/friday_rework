@@ -269,6 +269,33 @@ transport seam does not establish paid Exa SDK coverage.
 The owned agent's diagnostic Authorization mask conceals the whole credential,
 including a live key changed by native Unicode recovery; callable credentials
 are identified without invoking them. Authentication and recovery are unchanged.
+Before constructing the stream automaton or installing any persistence hook,
+the driver creates one immutable credential policy. It retains all admitted
+original values, the resolved local key, its scoped `key_env` refresh value
+(`strip()`), and the result of the pinned native `_strip_non_ascii` for those
+runtime values. The same policy feeds the stream, early web response and native
+registry hooks, both spill paths, debug JSON, and execute's observer/final/partial
+observations. It never learns a new key after output or resets a pending stream.
+
+This finite closure follows the actual custom/chat-completions recovery code:
+Unicode repair updates the agent, client and client kwargs; primary recovery can
+restore the constructor key. Both originals and repaired values remain protected.
+The new private profile must have no `.env` or `auth.json`, the named provider
+must use a static scoped key rather than `key_cmd`/inline credentials, and the
+existing no-fallback/no-pool/no-reconfiguration execution boundary still applies.
+The driver now requires source pins for native credential resolution, refresh,
+Unicode sanitization and recovery. This is not a guarantee for arbitrary providers
+or external credential/configuration mutation.
+
+The admission cap remains eight distinct original values and 8192 characters;
+all original and reachable values together must fit the existing 64 encoded forms
+and 65536 form characters. A closure exceeding either form cap is refused before
+agent construction, even when the original-only forms would fit. Partial matching
+still counts eight credential characters before JSON/repr escaping. Synthetic
+native regressions echo the actual Authorization key sent after Unicode repair,
+exercise native primary rollback, preserve stream state across rollback, and scan
+all original/reachable eight-character windows in product files and separately
+identified fixture diagnostics. HTTP/model responses remain synthetic.
 Unexpected replacement of the registry, response or owned-agent mask hook causes
 an explicit cleanup failure instead of being overwritten. Regression checks scan
 all original eight-character windows through recursively decoded retained JSON,

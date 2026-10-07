@@ -164,7 +164,9 @@ def verify_plan(plan, task):
                  "tools/web_result_cache.py", "plugins/web/exa/provider.py", "plugins/web/keyless_mcp.py",
                  "hermes_cli/config_defaults.py", "agent/session_persistence.py", "agent/tool_executor.py",
                  "tools/web_tools_truncate.py", "tools/tool_result_storage.py", "hermes_logging.py",
-                 "agent/redact.py", "agent/agent_runtime_helpers.py", "agent/stream_delivery.py", "agent/chat_completion_helpers.py", "agent/conversation_loop.py", "agent/turn_context.py", "agent/turn_finalizer.py", "agent/turn_facade.py", "agent/turn_tool_round.py"}
+                 "agent/redact.py", "agent/agent_runtime_helpers.py", "agent/stream_delivery.py", "agent/chat_completion_helpers.py", "agent/conversation_loop.py", "agent/turn_context.py", "agent/turn_finalizer.py", "agent/turn_facade.py", "agent/turn_tool_round.py",
+                 "agent/message_sanitization.py", "agent/turn_recovery.py", "agent/turn_api_error.py",
+                 "agent/client_lifecycle.py", "agent/credential_pool.py", "hermes_cli/runtime_provider_custom.py"}
     _require(mandatory <= set(plan["source_files"]), "native_candidate_pins_incomplete")
     for rel, digest in plan["source_files"].items():
         p = root / rel
@@ -181,6 +183,8 @@ def verify_plan(plan, task):
         _require(p.stat().st_uid == os.getuid() and not p.stat().st_mode & 0o077, "private_directory_required")
     home = Path(plan["profile"]["path"]).parent
     _require(not home.stat().st_mode & 0o077 and home.stat().st_uid == os.getuid(), "private_profile_required")
+    _require(not any(os.path.lexists(home / name) for name in (".env", "auth.json")),
+             "fresh_credential_profile_required")
     _require(not (Path(plan["output"]) / "observation.json").exists(), "observation_already_exists_no_replay")
 
 
@@ -306,11 +310,25 @@ class Native:
                 _require(row.get("provider") == model["provider"] and row.get("base_url") == model["base_url"]
                          and row.get("model") == model["default"] and not row.get("fallback_chain"), "auxiliary_cloud_route_refused")
         key_name = config["providers"]["friday-local"]["key_env"]
+        provider = config["providers"]["friday-local"]
+        _require(not provider.get("key_cmd") and not provider.get("api_key"), "static_scoped_credential_required")
         required_keys = {key_name} | ({"EXA_API_KEY"} if plan["web_profile"] == "exa-paid" else set())
         _require(set(secrets) == required_keys, "wrong_scoped_credential_set")
         runtime = resolve_runtime_provider(requested=model["provider"], target_model=model["default"])
         _require(runtime["base_url"].rstrip("/") == plan["inference_endpoint"].rstrip("/")
-                 and runtime["api_mode"] == "chat_completions", "native_runtime_route_mismatch")
+                 and runtime["api_mode"] == "chat_completions" and runtime["provider"] == "custom",
+                 "native_runtime_route_mismatch")
+        _require(isinstance(runtime["api_key"], str), "static_scoped_credential_required")
+        # Pin and use the native transformation itself. This private key_env
+        # profile has no dotenv/pool/fallback/dynamic credential source. Refresh
+        # resolves the scoped stripped value, Unicode repair removes non-ASCII,
+        # and primary recovery restores the constructor snapshot. Both operations
+        # are idempotent; retain every original as well as this finite closure.
+        from agent.message_sanitization import _strip_non_ascii
+        self.secrets = tuple(secrets.values())
+        runtime_values = (runtime["api_key"], secrets[key_name].strip())
+        self.credential_policy = _CredentialPolicy.create(self.secrets,
+            (*runtime_values, *(_strip_non_ascii(value) for value in runtime_values)))
         # Supported native no-store mode: no SQLite, WAL, transcript divert or
         # trajectory. The driver retains only bounded redacted observations.
         # Long web_extract pages still spill with cache_enabled=False. Scrub at
@@ -318,8 +336,7 @@ class Native:
         from tools import web_tools_truncate
         self.spill_module = web_tools_truncate
         self.old_spill = web_tools_truncate._store_full_text
-        self.secrets = tuple(secrets.values()) + (runtime["api_key"],)
-        self.stream_redactor = _SecretPrefixRedactor(self.secrets)
+        self.stream_redactor = _SecretPrefixRedactor(self.credential_policy)
         # Native 4xx request dumps invoke redact_sensitive_text(force=True)
         # even when verbose logging and trajectories are disabled. Use its
         # supported profile-scoped exact-value registry for arbitrary secrets,
@@ -337,7 +354,7 @@ class Native:
         original_registered_redact = self.old_registered_redact
         def redact_before_native_registry(text):
             if isinstance(text, str) and str(get_hermes_home().resolve()) == home:
-                text = _redact(text, self.secrets)
+                text = _redact(text, self.credential_policy)
             return original_registered_redact(text)
         self.registered_redactor = redact_before_native_registry
         native_redact.redact_registered_vault_values = self.registered_redactor
@@ -351,19 +368,19 @@ class Native:
         def redact_web_response(response):
             text = original_response_text(response)
             if str(get_hermes_home().resolve()) == home:
-                text = _redact(text, self.secrets)
+                text = _redact(text, self.credential_policy)
             return text
         self.response_redactor = redact_web_response
         keyless_mcp._response_text = self.response_redactor
-        for form in _secret_forms(self.secrets):
+        for form in _secret_forms(self.credential_policy):
             register_vault_redaction_value(form)
         web_tools_truncate._store_full_text = lambda url, content: self.old_spill(
-            _redact(url, self.secrets), _redact(content, self.secrets))
+            _redact(url, self.credential_policy), _redact(content, self.credential_policy))
         from tools import tool_result_storage
         self.result_storage = tool_result_storage
         self.old_result_spill = tool_result_storage._write_to_spillover
         tool_result_storage._write_to_spillover = lambda content, filename: self.old_result_spill(
-            _redact(content, self.secrets), _redact(filename, self.secrets))
+            _redact(content, self.credential_policy), _redact(filename, self.credential_policy))
         # A partial-delivery stub may enter a later 4xx request dump. Its
         # incomplete prefixes are absent from the native exact-value registry.
         # Scrub the actual native JSON persistence seam too, restoring on close.
@@ -371,7 +388,7 @@ class Native:
         self.runtime_helpers = agent_runtime_helpers
         self.old_debug_write = agent_runtime_helpers.atomic_json_write
         agent_runtime_helpers.atomic_json_write = lambda path, value, **kw: self.old_debug_write(
-            path, _bounded_public(value, self.secrets), **kw)
+            path, _bounded_public(value, self.credential_policy), **kw)
         self.agent = AIAgent(model=model["default"], base_url=runtime["base_url"], api_key=runtime["api_key"],
             provider=runtime["provider"], api_mode=runtime["api_mode"], requested_provider=model["provider"],
             max_iterations=plan["max_iterations"], enabled_toolsets=["web"], skip_context_files=True,
@@ -488,8 +505,31 @@ def _secret_form_prefixes(secret_values):
     return forms
 
 
+@dataclass(frozen=True)
+class _CredentialPolicy:
+    """Original admission limits and a finite native runtime value closure.
+
+    Derived credentials count against the existing form/character budget, not
+    as additional user-supplied originals. No observer discovers keys lazily.
+    """
+    originals: tuple
+    values: tuple
+
+    @classmethod
+    def create(cls, originals, reachable):
+        originals = tuple(dict.fromkeys(originals))
+        _require(all(isinstance(value, str) and value for value in originals),
+                 "native_scoped_credentials_required")
+        _require(len(originals) <= 8 and sum(map(len, originals)) <= 8192, "secret_redaction_limit")
+        values = tuple(dict.fromkeys((*originals, *(value for value in reachable if value))))
+        forms = _secret_form_prefixes(values)
+        _require(len(forms) <= 64 and sum(map(len, forms)) <= 65536, "secret_redaction_limit")
+        return cls(originals, values)
+
+
 def _secret_forms(secret_values):
-    return sorted(_secret_form_prefixes(secret_values), key=len, reverse=True)
+    values = secret_values.values if isinstance(secret_values, _CredentialPolicy) else secret_values
+    return sorted(_secret_form_prefixes(values), key=len, reverse=True)
 
 
 class _SecretPrefixRedactor:
@@ -502,8 +542,10 @@ class _SecretPrefixRedactor:
     mismatch, callback split or native retry cannot forget an overlapping start.
     """
     def __init__(self, secret_values):
-        values = tuple(set(secret_values))
-        _require(len(values) <= 8 and sum(map(len, values)) <= 8192, "secret_redaction_limit")
+        policy = secret_values if isinstance(secret_values, _CredentialPolicy) else None
+        values = policy.values if policy else tuple(set(secret_values))
+        originals = policy.originals if policy else values
+        _require(len(originals) <= 8 and sum(map(len, originals)) <= 8192, "secret_redaction_limit")
         forms = _secret_form_prefixes(values)
         _require(len(forms) <= 64 and sum(map(len, forms)) <= 65536, "secret_redaction_limit")
         self.edges, self.fail, self.depth = [{}], [0], [0]
@@ -812,7 +854,12 @@ def execute(plan, task, boundary, *, native=None, mono=time.monotonic, wall=time
     capture_lock = threading.RLock()
     def capture(result, *, partial=False):
         with capture_lock:
-            observed = _observation(result, (*secrets.values(), *getattr(obj, "secrets", ())))
+            # The same precompiled value closure covers stream, callbacks,
+            # retained/error results and all native persistence boundaries.
+            policy = getattr(obj, "credential_policy", None)
+            if policy is None:
+                policy = (*secrets.values(), *getattr(obj, "secrets", ()))
+            observed = _observation(result, policy)
             if partial:
                 for key in ("tool_calls", "tool_source_observations"):
                     observed[key] = (record.get(key, []) + observed[key])[:32]
@@ -825,7 +872,7 @@ def execute(plan, task, boundary, *, native=None, mono=time.monotonic, wall=time
                 observed['partial_response'] = record.get('partial_response', '')
             bounded = _bounded_public({key: observed[key] for key in (
                 'final_response', 'partial_response', 'tool_calls', 'tool_source_observations')},
-                (*secrets.values(), *getattr(obj, 'secrets', ())))
+                policy)
             bounded['observation_truncated'] |= observed['observation_truncated'] or record.get('observation_truncated', False)
             observed.update(bounded)
             observed["status"] = "RUNNING_OR_UNCERTAIN"

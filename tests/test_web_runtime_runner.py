@@ -27,7 +27,8 @@ def prepared(tmp_path):
              "tools/web_result_cache.py","plugins/web/exa/provider.py","plugins/web/keyless_mcp.py","hermes_cli/config_defaults.py",
              "agent/session_persistence.py","agent/tool_executor.py","tools/web_tools_truncate.py",
              "tools/tool_result_storage.py","hermes_logging.py","agent/redact.py","agent/agent_runtime_helpers.py",
-             "agent/stream_delivery.py", "agent/chat_completion_helpers.py", "agent/conversation_loop.py", "agent/turn_context.py", "agent/turn_finalizer.py", "agent/turn_facade.py", "agent/turn_tool_round.py"]
+             "agent/stream_delivery.py", "agent/chat_completion_helpers.py", "agent/conversation_loop.py", "agent/turn_context.py", "agent/turn_finalizer.py", "agent/turn_facade.py", "agent/turn_tool_round.py",
+          "agent/message_sanitization.py", "agent/turn_recovery.py", "agent/turn_api_error.py", "agent/client_lifecycle.py", "agent/credential_pool.py", "hermes_cli/runtime_provider_custom.py"]
     source_files = {}
     for rel in files:
         p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text("# synthetic source pin\n");source_files[rel]=pin(p)["sha256"]

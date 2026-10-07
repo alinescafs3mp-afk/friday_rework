@@ -55,7 +55,8 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
           'plugins/web/exa/provider.py','plugins/web/keyless_mcp.py','hermes_cli/config_defaults.py',
           'agent/session_persistence.py','agent/tool_executor.py','tools/web_tools_truncate.py',
           'tools/tool_result_storage.py','hermes_logging.py','agent/redact.py','agent/agent_runtime_helpers.py',
-          'agent/stream_delivery.py', 'agent/chat_completion_helpers.py', 'agent/conversation_loop.py', 'agent/turn_context.py', 'agent/turn_finalizer.py', 'agent/turn_facade.py', 'agent/turn_tool_round.py']
+          'agent/stream_delivery.py', 'agent/chat_completion_helpers.py', 'agent/conversation_loop.py', 'agent/turn_context.py', 'agent/turn_finalizer.py', 'agent/turn_facade.py', 'agent/turn_tool_round.py',
+          'agent/message_sanitization.py', 'agent/turn_recovery.py', 'agent/turn_api_error.py', 'agent/client_lifecycle.py', 'agent/credential_pool.py', 'hermes_cli/runtime_provider_custom.py']
     plan={'task_id':'offline-native-'+mode,'mode':mode,'source':str(root),'source_files':{r:pin(root/r)['sha256'] for r in rels},
           'profile':pin(home/'config.yaml'),'soul':pin(home/'SOUL.md'),'policy':pin(Q/'config/RESEARCH.md'),
           'driver':pin(Q/'validation/web_runtime.py'),'web_profile_source':pin(Q/'tools/web_profile.py'),
