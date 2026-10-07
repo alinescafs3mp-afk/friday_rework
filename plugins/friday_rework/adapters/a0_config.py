@@ -17,7 +17,8 @@ import tempfile
 import time
 from typing import Callable
 
-from .dsh import PinnedFile, _private, _regular, _sync
+from .dsh import PinnedFile, _private, _regular, _sync, _directory
+from .a0_profile import checked_profile, endpoint_urls, legacy_profile, local_endpoint, profile_templates, ProfileError
 
 
 class A0Error(RuntimeError):
@@ -41,28 +42,30 @@ class LocalNetwork:
     name: str = "none"
     endpoints: tuple[str, ...] = ()
     policy: PinnedFile | None = None
+    deployment: dict | None = None
 
     def checked(self):
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", self.name)
                 and self.name not in {"host", "bridge", "default"}, "unsafe_network")
         if self.name == "none":
-            require(not self.endpoints and self.policy is None, "network_none_mismatch")
+            require(not self.endpoints and self.policy is None and self.deployment is None, "network_none_mismatch")
         else:
-            require(len(self.endpoints) == 2 and len(set(self.endpoints)) == 2
+            require(isinstance(self.endpoints, tuple) and 2 <= len(self.endpoints) <= 3
+                    and len(set(self.endpoints)) == len(self.endpoints)
                     and isinstance(self.policy, PinnedFile), "local_policy_required")
-            from urllib.parse import urlsplit
-            for endpoint in self.endpoints:
-                u = urlsplit(endpoint)
-                try:
-                    ip = ipaddress.ip_address(u.hostname or "")
-                    valid = (ip.is_private and not ip.is_loopback and not ip.is_link_local
-                             and u.scheme == "http" and u.port in {8001, 8002}
-                             and u.path == "/v1" and not u.query and not u.fragment
-                             and not u.username and not u.password)
-                except ValueError:
-                    valid = False
-                require(valid, "nonlocal_endpoint")
-            require({urlsplit(x).port for x in self.endpoints} == {8001, 8002}, 'local_slots_required')
+            try:
+                for endpoint in self.endpoints:
+                    local_endpoint(endpoint)
+                if self.deployment is None:
+                    from urllib.parse import urlsplit
+                    require(len(self.endpoints) == 2
+                            and {urlsplit(x).port for x in self.endpoints} == {8001, 8002}, 'local_slots_required')
+                    require(all(x.startswith('http://') for x in self.endpoints), 'local_slots_required')
+                else:
+                    profile = checked_profile(self.deployment)
+                    require(set(self.endpoints) == set(endpoint_urls(profile)), 'local_profile_routes_mismatch')
+            except ProfileError as exc:
+                raise A0Error(str(exc)) from None
             self.policy.read()
         return self
 
@@ -84,6 +87,7 @@ class A0Deployment:
     network: LocalNetwork = field(default_factory=LocalNetwork)
     python: str = "/opt/venv-a0/bin/python"
     port: int = 5000
+    web: dict | None = None
 
     def checked(self):
         self.docker.read(); self.daemon_unit.read(); self.network.checked()
@@ -101,6 +105,9 @@ class A0Deployment:
                 "unchecked_start_command")
         require(self.python == "/opt/venv-a0/bin/python" and self.port == 5000,
                 "unreviewed_native_api")
+        if self.web is not None:
+            from .a0_web import checked_web
+            checked_web(self.web)
         return self
 
     def container_arguments(self, *, name, labels):
@@ -119,6 +126,8 @@ class A0Deployment:
             require(isinstance(value, str) and value and not any(c in value for c in "\n\r\x00"),
                     "invalid_native_labels")
             args += ["--label", key + "=" + value]
+        if self.web is not None:
+            args += ['--mount',f'type=bind,src={self.state_dir}/web/settings.yml,dst=/etc/searxng/settings.yml,readonly,bind-propagation=rprivate']
         args += ["--mount", f"type=bind,src={self.state_dir},dst=/a0/usr",
                  "--mount", f"type=bind,src={self.git_dir},dst=/a0/.git,readonly,bind-propagation=rprivate",
                  "--env=HF_HUB_OFFLINE=1", "--env=TRANSFORMERS_OFFLINE=1", "--workdir=/a0",
@@ -135,18 +144,15 @@ def local_profile(network: LocalNetwork):
     network.checked()
     require(network.name != 'none', 'local_profile_needs_explicit_routes')
     from urllib.parse import urlsplit
-    endpoints = {urlsplit(x).port: x for x in network.endpoints}
-    chat = dict(provider='openai', name='dispatcher', api_base=endpoints[8001], ctx_length=40960,
-                ctx_history=.7, vision=False, rl_requests=0, rl_input=0, rl_output=0,
-                kwargs={'max_tokens':4096,'timeout':60,'a0_api_mode':'chat'})
-    utility = dict(chat); utility.pop('ctx_history'); utility['ctx_input'] = .7
-    return {'plugins/_model_config/presets.yaml': [{'name':'Default','chat':chat,'utility':utility,
-                'embedding': {'provider':'other','name':'qwen3-embedding-0.6b','api_base':endpoints[8002],
-                              'kwargs':{'timeout':30},'rl_requests':0,'rl_input':0}}],
-            'plugins/_model_config/config.json': {'model_preset':'Default'},
-            'plugins/_code_execution/config.json': {'ssh_enabled':'false'},
-            'settings.json': {'agent_profile':'agent0','workdir_path':'/a0/usr/workdir',
-                              'uvicorn_access_logs_enabled':False}}
+    if network.deployment is None:
+        endpoints = {urlsplit(x).port: x for x in network.endpoints}
+        profile = legacy_profile(endpoints[8001], endpoints[8002])
+    else:
+        profile = network.deployment
+    try:
+        return profile_templates(profile)
+    except ProfileError as exc:
+        raise A0Error(str(exc)) from None
 
 
 KEY_REFERENCES = {"API_KEY_OPENAI": "FRIDAY_LLM_API_KEY",
@@ -262,3 +268,50 @@ def prepare_keys(state_dir: Path, resolve: Callable[[str], str]):
         lines.append(name.encode() + b"=" + value.encode() + b"\n")
     _replace_env(path, before, before + b"".join(lines))
     return KeyMaterial(path, tuple(lines), time.monotonic())
+
+
+class WebKeyMaterial:
+    """Existing job keys plus one private native-service secret; never serialize."""
+    def __init__(self, base, path, content):
+        self.base, self.path, self.secret_path = base, base.path, path
+        self.content = content
+        self.prepared_monotonic = base.prepared_monotonic
+
+    def admitted(self):
+        return self.base.admitted()
+
+    def ready(self):
+        self.base.ready()
+        require(_key_bytes(self.secret_path) == self.content, 'native_web_secret_changed')
+
+    def remove(self, *, cessation_confirmed):
+        require(cessation_confirmed is True, 'keys_require_confirmed_cessation')
+        if self.secret_path.exists():
+            before = _key_bytes(self.secret_path)
+            require(before in (b'',self.content), 'native_web_secret_changed')
+            if before: _replace_env(self.secret_path, self.content, b'')
+        self.base.remove(cessation_confirmed=True)
+
+
+def prepare_web_keys(base, state_dir, resolve):
+    """Previously absent job-owned secret. No source/config/argv/receipt value."""
+    base.ready()
+    value = resolve('SEARXNG_SECRET')
+    require(isinstance(value,str) and re.fullmatch(r'[A-Za-z0-9_-]{32,256}',value)
+            and value.lower() not in {'ultrasecretkey','changeme','change_me','default','secret'},
+            'native_web_secret_missing_or_default')
+    path = state_dir / 'web/secret.env'
+    _directory(path.parent)
+    require(path.parent.stat().st_uid == os.getuid() and not path.parent.stat().st_mode & 0o022,
+            'unsafe_web_secret_root')
+    content = b'SEARXNG_SECRET=' + value.encode() + b'\n'
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd,'wb') as f:
+            f.write(content); f.flush(); os.fsync(f.fileno())
+        _sync(path.parent)
+    except BaseException:
+        # Own freshly created file only; no native execution can have started.
+        path.unlink(missing_ok=True)
+        raise
+    return WebKeyMaterial(base,path,content)

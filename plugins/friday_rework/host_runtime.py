@@ -17,7 +17,7 @@ import stat
 from .adapters.dsh import DshAdapter, DshHostConfig, PinnedFile
 from .controller import WorkerBinding
 from .supervision import NativeSupervisor
-from .worker_web import DshWebInputs, WorkerWebError, scoped_environment
+from .worker_web import DshWebInputs, WorkerWebError, scoped_environment, DshNetworkCheck
 
 
 class HostUnavailable(RuntimeError):
@@ -174,7 +174,12 @@ def dsh_binding(value, associations, *, web_network_check=None):
         web=web, verify_web_network=web_network_check,
         current_association=lambda row: associations.get(row["existing_task_id"], row["owner"]),
         **{k: dsh[k] for k in ("profile", "memory_bytes", "cpu_percent", "tasks", "shutdown_seconds", "tmp_bytes")})
-    return WorkerBinding(DshAdapter(native, supervisor=supervisor, clock=associations.clock), supervisor.stop)
+    adapter = DshAdapter(native, supervisor=supervisor, clock=associations.clock)
+    if web and web_network_check is None:
+        # Normal Hermes factory uses the concrete current producer. Explicit
+        # fixture injection remains a trusted Python seam, never config input.
+        object.__setattr__(native, "verify_web_network", DshNetworkCheck(config, associations, adapter))
+    return WorkerBinding(adapter, supervisor.stop)
 
 
 def validate_a0_runtime(value):
@@ -192,8 +197,19 @@ def validate_a0_runtime(value):
         if type(value[k]) is not int or not low <= value[k] <= high:
             raise HostUnavailable('invalid_a0_bounds')
     a = value['a0']
-    if (not isinstance(a,dict) or set(a) != {'runtime','launcher','docker','daemon_unit','git_metadata','expected_files','capability','policy','owner_slot'}):
+    a_fields = {'runtime','launcher','docker','daemon_unit','git_metadata','expected_files','capability','policy','owner_slot'}
+    if (not isinstance(a,dict) or set(a) not in (a_fields,a_fields|{'deployment'},a_fields|{'web'},a_fields|{'deployment','web'})):
         raise HostUnavailable('invalid_a0_config')
+    if 'web' in a:
+        from .adapters.a0_web import checked_web
+        try: checked_web(a['web'])
+        except ValueError: raise HostUnavailable('invalid_a0_web_service') from None
+    if 'deployment' in a:
+        from .adapters.a0_profile import checked_profile
+        try:
+            checked_profile(a['deployment'])
+        except ValueError:
+            raise HostUnavailable('invalid_a0_deployment_profile') from None
     if a['owner_slot'] not in {'astra','sol'}:raise HostUnavailable('invalid_a0_operator_slot')
     for k in ('runtime','launcher','docker','daemon_unit','policy'): _pin(a[k])
     _pin(value['runtime_receipt'])
@@ -231,7 +247,7 @@ def check_a0_runtime(value, associations):
     actual = {k: hashlib.sha256((source/p).read_bytes()).hexdigest() for k,p in {
         'host':'host.py','host_runtime':'host_runtime.py','host_record':'host_record.py',
         'associations':'associations.py','adapter':'adapters/a0.py','native':'adapters/a0_native.py',
-        'config':'adapters/a0_config.py'}.items()}
+        'config':'adapters/a0_config.py','profile':'adapters/a0_profile.py','web':'adapters/a0_web.py'}.items()}
     if (not isinstance(receipt,dict) or set(receipt) != {'schema','ready','runtime_sha256','source_pins','evidence'}
             or receipt['schema'] != 'friday-rework.a0-runtime.v2' or receipt['ready'] is not True
             or receipt['runtime_sha256'] != digest({k:v for k,v in c.items() if k != 'runtime_receipt'})
@@ -313,6 +329,12 @@ class A0HostSession:
         pin = _pin(self.config['a0']['runtime']); data = pin.read()
         m = types.ModuleType('frw_pinned_a0_runtime');m.__file__=str(pin.path)
         exec(compile(data,str(pin.path),'exec'),m.__dict__)
+        actual_profile = Path(__file__).parent / 'adapters/a0_profile.py'
+        if hashlib.sha256(m.PROFILE_SOURCE.read_bytes()).hexdigest() != hashlib.sha256(actual_profile.read_bytes()).hexdigest():
+            raise HostUnavailable('a0_runtime_profile_source_mismatch')
+        actual_web = Path(__file__).parent / 'adapters/a0_web.py'
+        if hashlib.sha256(m.WEB_SOURCE.read_bytes()).hexdigest() != hashlib.sha256(actual_web.read_bytes()).hexdigest():
+            raise HostUnavailable('a0_runtime_web_source_mismatch')
         return m
 
     def _capability(self, row, pin=None):
@@ -328,6 +350,10 @@ class A0HostSession:
                 or not isinstance(v['live_evidence'],list) or not v['live_evidence']
                 or v['network']['launcher_sha256'] != self.config['a0']['launcher']['sha256']):
             raise HostUnavailable('foreign_or_stale_a0_capability')
+        # Current route authority is tied to the configured inference profile.
+        self._module().local_network(v['network'],
+            f"{self.config['a0']['owner_slot']}:{row['existing_task_id']}#1",
+            self.config['a0'].get('deployment'), self.config['a0'].get('web'))
         checks = {'namespace_recheck','current_route'}
         for p in v['live_evidence']:
             proof = strict_json(_pin(p).read())
@@ -386,6 +412,7 @@ class A0HostSession:
                     return super().admit(current)
                 session._current(current); session._capability(current)
                 session.runtime.check_network(container_id=boundary.grant.container_id)
+                session.runtime.check_web(boundary.grant.container_id)
                 return super().admit(current)
 
             def _sample(boundary, obj, *, caps):
@@ -443,8 +470,11 @@ class A0HostSession:
         return A0Deployment(_pin(a['docker']),_pin(a['daemon_unit']),
             'unix:///run/user/1000/friday-rework-docker/docker.sock',plan['image'],
             Path(plan['state_dir']),Path(plan['git_metadata']['source']),
-            ('-ceu', 'umask 077; . /ins/setup_venv.sh; . /ins/copy_A0.sh; mkdir -p /a0/usr/uploads; cd /a0; exec python run_ui.py --dockerized=true --host=127.0.0.1 --port=5000'),
-            LocalNetwork(n['id'],('http://192.168.1.78:8001/v1','http://192.168.1.78:8002/v1'),policy))
+            ('-ceu', self._module().startup_script(plan)),
+            LocalNetwork(n['id'],
+                tuple(self._module().profile_module().endpoint_urls(a['deployment'])) if 'deployment' in a
+                else tuple('http://' + x['ip'] + ':' + str(x['port']) + '/v1' for x in n['endpoints']),
+                policy, a.get('deployment')), web=a.get('web'))
 
     def _launch(self, row):
         from dataclasses import asdict
@@ -460,7 +490,7 @@ class A0HostSession:
         m = self._module();cap=self._capability(row);a=row['host']['a0']['acceptance']
         p=m.plan(row['created_at_unix'],row['deadline_unix'],assignment=row['existing_task_id'],generation=1,
             owner_slot=self.config['a0']['owner_slot'],original_budget_seconds=row['budget_seconds'],git_metadata=self.config['a0']['git_metadata'],
-            network=cap['network'],association_binding=_identity(row),accepted_monotonic_ns=a['accepted_monotonic_ns'],boot_id=a['boot_id'])
+            network=cap['network'],deployment=self.config['a0'].get('deployment'),web=self.config['a0'].get('web'),association_binding=_identity(row),accepted_monotonic_ns=a['accepted_monotonic_ns'],boot_id=a['boot_id'])
         if (str(m.DOCKER) != self.config['a0']['docker']['path']
                 or p['docker_sha256'] != self.config['a0']['docker']['sha256']
                 or str(m.PROJECT/'.runtime/rootless-docker/supervisor/friday-rework-docker.service') != self.config['a0']['daemon_unit']['path']
@@ -490,6 +520,7 @@ class A0HostSession:
         def before_ui(usr):
             self._current(row)
             scope=current_secret_scope();names={'FRIDAY_LLM_API_KEY','FRIDAY_EMBEDDINGS_API_KEY'}
+            if 'web' in self.config['a0']: names.add('SEARXNG_SECRET')
             if scope is None or current_secret_scope_home() != self.config['runtime_home'] or not names.issubset(scope):
                 raise HostUnavailable('a0_scoped_keys_unavailable')
             def resolve(name):
@@ -498,6 +529,9 @@ class A0HostSession:
                 return value
             self.key_preparation_attempted=True
             self.keys=prepare_keys(usr,resolve)
+            if 'web' in self.config['a0']:
+                from .adapters.a0_config import prepare_web_keys
+                self.keys=prepare_web_keys(self.keys,usr,resolve)
             self.key_cleanup='PREPARED'
             self.store.retain_a0(row['existing_task_id'],row['owner'],'keys_prepared_monotonic',self.keys.prepared_monotonic)
             self.store.retain_a0(row['existing_task_id'],row['owner'],'key_cleanup','PREPARED')
@@ -523,6 +557,7 @@ class A0HostSession:
             g=NativeGrant(r['container_id'],p['container_name'],r['invocation_id'],m.labels(p),row['created_at_unix'],row['deadline_unix'],
                 sample['group'],a['boot_id'],True,self.keys.prepared_monotonic,fields['InvocationID'],a['accepted_monotonic_ns']/1e9)
             self.grant=asdict(g)
+            self.runtime.check_web(r['container_id'])
             self.boundary=self._boundary(row)
             native_runner=self.boundary.runner
             def bounded_api_runner(argv,data,timeout):

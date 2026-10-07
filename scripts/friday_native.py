@@ -186,9 +186,32 @@ def complete(value, home, receipt):
     for path in target.rglob('*'):
         if path.is_dir():
             os.chmod(path, 0o700)
+    stage_worker_runtime(value, home)
     bundle = profile_write(home, value['product'])
     return native_profile_check(bundle, home)
 
+
+
+def stage_worker_runtime(value, home):
+    """Normal installation ships exact source; no live launcher overwrite/grant."""
+    from scripts.friday_install import directory,require,owned_file,digest
+    destination = home / 'worker-runtime-source'
+    require(not destination.exists() and not destination.is_symlink(), 'existing_worker_source_not_adopted')
+    names = ('scripts/a0_runtime.py','scripts/rootless_docker_launch.py',
+             'plugins/friday_rework/adapters/a0_profile.py','plugins/friday_rework/adapters/a0_web.py')
+    payload = {}
+    for name in names:
+        require(name in value['project_files'], 'worker_runtime_source_not_pinned')
+        data = owned_file(ROOT/name)
+        require(digest(data)==value['project_files'][name], 'worker_runtime_source_changed')
+        payload[name]=data
+    destination.mkdir(mode=0o700);directory(destination)
+    for name,data in payload.items():
+        path=destination/name;path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+        fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400)
+        with os.fdopen(fd,'wb') as stream:
+            stream.write(data);stream.flush();os.fsync(stream.fileno())
+    return destination
 
 def main():
     started = time.monotonic()

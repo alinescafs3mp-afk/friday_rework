@@ -34,7 +34,7 @@ def test_native_host_factory_requires_source_pins_and_never_manufactures_web_adm
     assert module.check_runtime(config,setup.host.store)==config
     binding=module.dsh_binding(config,setup.host.store)
     assert binding.adapter.config.web.profile=='exa-paid'
-    assert binding.adapter.config.verify_web_network is None
+    assert isinstance(binding.adapter.config.verify_web_network,module.DshNetworkCheck)
     assert binding.adapter.config.key_name==setup.runtime['dsh']['key_name']
     for bad in [None, {'unknown':'wrong'}]:
         changed=copy.deepcopy(receipt);changed['web_source_pins']=bad

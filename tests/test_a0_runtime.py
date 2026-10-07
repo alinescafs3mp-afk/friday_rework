@@ -543,7 +543,7 @@ class Controls(unittest.TestCase):
                 self.calls.append(argv)
                 self.assertLessEqual(timeout, 15)
                 self.assertEqual(argv[3:8], ['exec', '--workdir=/a0', CID, '/opt/venv-a0/bin/python', '-B'])
-                self.assertIn('native_probe()', argv[-1])
+                self.assertIn('native_probe(DEPLOYMENT)', argv[-1])
                 return json.dumps({'status': 'REFUSED', 'code': 'native_token_cache_unavailable'})
             return self.command(argv, timeout)
         self.runtime.runner = runner
@@ -939,7 +939,7 @@ class NativeProbeControls(unittest.TestCase):
     def test_standalone_script_same_functions_suppresses_native_prints_and_raw_errors(self):
         # Execute the exact generated functions with dependency doubles and only
         # the fixed container Path translated to the owned test directory.
-        script = a0.probe_script(); body, tail = script.rsplit('try:\n print(json.dumps(native_probe()', 1)
+        script = a0.probe_script(); body, tail = script.rsplit('try:\n print(json.dumps(native_probe(DEPLOYMENT)', 1)
         namespace = {}; exec(compile(body, '<native-probe>', 'exec'), namespace)
         namespace['Path'] = lambda *a: self.usr if a == ('/a0/usr',) else Path(*a)
         original = self.native.get_config

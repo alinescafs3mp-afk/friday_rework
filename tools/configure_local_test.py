@@ -58,7 +58,7 @@ def build_config(*, base_url, model, key_env, context, max_input,
         port = url.port
     except ValueError as exc:
         raise ValueError("Use a verified literal local server address") from exc
-    networks = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+    networks = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"))
     local = address.is_loopback or any(address.version == n.version and address in n for n in networks)
     if (not local or url.scheme not in ("http", "https") or not port
             or url.username is not None or url.password is not None or url.query or url.fragment

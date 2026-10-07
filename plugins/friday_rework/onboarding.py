@@ -93,6 +93,9 @@ def validate_template(template):
             or config.get('display', {}).get('personality')
             or config.get('agent', {}).get('system_prompt')):
         raise ValueError('explicit_private_context_and_friday_persona_required')
+    if 'a0_deployment' in config:
+        from .adapters.a0_profile import checked_profile
+        checked_profile(config['a0_deployment'])
     runtime = settings.get('runtime')
     if runtime != {'enabled': False}:
         from .host_runtime import validate_runtime
@@ -113,6 +116,8 @@ def validate_template(template):
         ('compression', 'micro_compact_defrag_threshold_tokens'),
         ('delegation', 'compression_threshold_tokens'),
         ('tools', 'tool_search', 'listing_max_tokens'),
+        ('a0_deployment', 'chat', 'max_output_tokens'),
+        ('a0_deployment', 'utility', 'max_output_tokens'),
     }
     def nonsecret(value, path=()):
         if isinstance(value, dict):

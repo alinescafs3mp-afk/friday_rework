@@ -23,7 +23,7 @@ from ..associations import _validate_store
 from ..boundary import WorkBrief, parse_brief
 from ..supervision import NativeSupervisor
 from .contract import NativeObservation, PreparedNative, VerifiedInput
-from ..worker_web import DshWebInputs, WorkerWebError
+from ..worker_web import DshWebInputs, WorkerWebError, DSH_NETWORK_PROBE
 
 
 class AdapterError(RuntimeError):
@@ -334,6 +334,7 @@ class DshAdapter:
         _write(root / "inputs/local.patch.yml", self.config.patch.read())
         if self.config.web:
             _write(root / 'inputs/web-ca.pem', self.config.web.trust_bundle.read())
+            _write(root / 'inputs/web-network.mjs', DSH_NETWORK_PROBE.encode())
         _write(control / "finalize.py", _FINALIZE)
         names = self._credential_names()
         bootstrap = ('import os,sys\nenv={"PATH":sys.argv[1]+":/usr/bin:/bin","HOME":"/job-home","DSH_HOME":"/job-home/dsh","LANG":"C.UTF-8","DSH_TELEMETRY_DISABLED":"1","DSH_PERMISSION_MODE":"workspace-write"}\n'
@@ -346,7 +347,7 @@ class DshAdapter:
         for name in ("events.ndjson", "stderr"):
             _write(control / name, b"")
         files = [control/"brief", control/"finalize.py", root/"inputs/bootstrap.py", root/"inputs/local.patch.yml",
-                 *([root/'inputs/web-ca.pem'] if self.config.web else []),
+                 *([root/'inputs/web-ca.pem',root/'inputs/web-network.mjs'] if self.config.web else []),
                  *(root/"inputs/verified"/Path(v.worker_path).name for v, _ in values)]
         receipt = {"schema": 1, "identity": _identity(row), "pins": pins,
                    "files": {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},

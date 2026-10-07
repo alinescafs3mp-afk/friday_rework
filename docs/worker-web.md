@@ -139,3 +139,47 @@ Complete live ordinary/explicit research, BOTH worker mid-task journeys,
 unavailable/hostile-page model behavior, two-user administration, real stop/config
 effects and normal installation/startup remain mandatory **NOT_RUN_NOT_READY**.
 The source package cannot close any of those six product acceptance journeys.
+
+
+## Current admission candidate (FRW036-WORKER-WEB-ADMISSION)
+
+The ordinary Hermes factory now binds DshNetworkCheck. The private egress input
+uses schema `friday.worker-web.policy.v1`: exact runtime_home/runtime_profile,
+current boot_id and net_namespace [device,inode], expires_unix, explicit
+allow_public_https=true and one or two credential-free HTTPS document_probes.
+Before keys and immediately before launch, the pinned native Node performs
+bounded HEAD/DNS/TLS observations of Exa and those documents in the exact DSH
+bwrap mounts, resolver, CA and inherited host network namespace. It rejects
+private DNS answers, failed TLS/HTTP, stale policy, changed inputs, stop and the
+original exhausted grant. Native web tools continue to enforce their own public
+URL/DNS/redirect policy. Probe success proves sampled connectivity only; it does
+not grant a model result, arbitrary future network success or release readiness.
+
+Explicit a0.web requires profile=searxng-google, timeout_seconds, public IPv4 DNS,
+immutable image, observed native service version and source_pins. It pins the
+existing four-file worker-web overlay, native SearXNG startup/settings sources,
+materializes single-engine settings/document_query bounds, mounts the nonsecret
+settings read-only and starts native supervisord with only UI/SearXNG. The
+existing cap-drop=ALL is retained; both services use the dedicated container's
+cap-free root, avoiding an unavailable setuid capability. A job-owned 0600
+SEARXNG_SECRET is introduced through the actual receiving scope, verified against
+native effective settings and running process environments, and removed only
+after confirmed cessation. Service/version/source/secret/identity changes refuse.
+The normal product contract declares those names and onboarding preserves each
+user's own inputs; no credential value/hash enters the plan or argv.
+
+The normal installer ships pinned immutable helpers under
+`<product-home>/worker-runtime-source/{scripts,plugins/friday_rework/adapters}`.
+The runtime pin must target its staged scripts/a0_runtime.py with adjacent shared
+profile/web helpers. `scripts/rootless_docker_launch.py` is the source replacement
+for the existing `.runtime/rootless-docker/launch.py`; only Astra may qualify and
+publish that exact replacement under the existing owner workflow. This task did
+not update the live launcher, request, unit, network or image. The source guard
+retains sole daemon/PID-start/boot/held-and-reopened namespaces, semantic nft
+readback, original budget and default drop. Optional checked request.web matches
+network.web, adds exact DNS and public IPv4 HTTPS independently of inference.
+Its unchanged local inference endpoints remain the old temporary 8001/8002;
+arbitrary deployment endpoint/IPv6 kernel support remains unresolved. Actual nft
+parser/kernel qualification, reviewed full A0 image/service startup, current live
+capability and all six product journeys remain NOT_RUN. G4 is consumed/closed;
+G5 and kernel120 were not granted or run. A0/legacy Friday remain OFF.

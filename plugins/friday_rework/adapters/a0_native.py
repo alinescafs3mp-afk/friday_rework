@@ -297,12 +297,16 @@ class A0NativeBoundary:
                 and h.get("PidMode", "") == "" and h.get("IpcMode") in {"", "private"}
                 and h.get("RestartPolicy") == {"Name": "no", "MaximumRetryCount": 0}, "native_exposure_changed")
         mounts = obj.get("Mounts", [])
-        require(len(mounts) == 2 and len({m.get("Destination") for m in mounts}) == 2,
+        require(len(mounts) == (3 if self.config.web else 2) and len({m.get("Destination") for m in mounts}) == len(mounts),
                 "native_mounts_changed")
         for target, source, rw in [("/a0/usr", self.config.state_dir, True), ("/a0/.git", self.config.git_dir, False)]:
             m = next((m for m in mounts if m.get("Destination") == target), {})
             require(m.get("Type") == "bind" and m.get("Source") == str(source)
                     and m.get("RW") is rw and m.get("Propagation") == "rprivate", "native_mounts_changed")
+        if self.config.web:
+            m = next((m for m in mounts if m.get('Destination') == '/etc/searxng/settings.yml'),{})
+            require(m.get('Type')=='bind' and m.get('Source')==str(self.config.state_dir/'web/settings.yml')
+                    and m.get('RW') is False and m.get('Propagation')=='rprivate', 'native_web_mount_changed')
         require(c.get("Entrypoint") == ["/bin/bash"] and c.get("Cmd") == list(self.config.command)
                 and c.get("WorkingDir") == "/a0", "native_command_changed")
         require(type(s.get("Running")) is bool and type(s.get("Pid")) is int and s["Pid"] >= 0
