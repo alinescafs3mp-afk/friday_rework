@@ -163,3 +163,67 @@ journeys remain NOT_RUN. Production inference stays on the configured local
 endpoints with no cloud fallback; temporary test capacities are not deployment
 limits. Astra owns independent review, final composition, installation and
 release.
+
+
+## Profile-specific worker preparation
+
+The protected operator uses the existing signed dashboard API (same receiving
+`profile`, exact identity, current native generation and config CAS) after
+`/onboarding/prepare`. New endpoints are:
+
+- `POST /onboarding/worker/prepare`: adds `worker` (`dsh` or `a0`), an explicit
+  original `host_runtime.validate_runtime` configuration, and `a0_network` only
+  for A0. This is a preparation input, never proof that its receipt exists.
+- `POST /onboarding/worker/configure`: adds `worker`, the returned exact
+  `preparation` pin, and the independently produced own `runtime_receipt` pin.
+  This does not activate a user or launch a worker.
+
+Both share `/api/plugins/friday_rework` and the original operator authentication.
+No ordinary user/model tool can call either operation. The existing admin API
+and config locks protect the receiving policy and private profile writes.
+Templates remain nonsecret and cannot adopt an existing principal or home.
+
+Use `runtime_home=<new user home>`, the same `runtime_profile`, and exact private
+`<home>/workers/<worker>/{jobs,staging,cache}` roots. The own receipt path is
+`<home>/workers/<worker>/runtime-receipt.json`; it is never created or copied by
+preparation. Shared intact source/toolchain pins remain read-only; owner
+receipts, writable homes, secrets, histories and capabilities are not shared.
+All original runtime limit values are explicit and retained unchanged. The
+Harness patch pin must describe the exact existing renderer output at
+`<home>/workers/dsh/inputs/dsh-local.json`, using the profile's actual local
+model/capacity and owned inference reference, with native paid Exa settings.
+Wrong source/web pins or a different route/credential/receipt refuse.
+
+For A0, `a0_network={name,endpoints,policy}` is explicit preparation data passed
+to the original `LocalNetwork`/`local_profile` checker. Its current supported
+contract still requires the original dispatcher and embedding routes on ports
+8001/8002 and chat capacity40960/output4096. It is not a generic portable A0
+installer. Native agent0/no-project settings and SearXNG/document-query contents
+are retained as private preparation inputs, never installed into the worker.
+The original native A0 key references are added to the same onboarding proof's
+required names, so credential capture uses the existing protected writer. No
+secret is read or copied during worker preparation. A0 live reconciliation and
+per-job capability remain blocked and separate; kernel120 is not granted.
+
+The returned `PREPARED_RUNTIME_UNOBSERVED` state has `enabled=false`. Partial
+writes stay disabled and are not adopted on retry. For Harness, configuration
+requires the exact own source/web/readiness receipt plus scoped keys and the
+native grant. It remains disabled after `CONFIGURED_NATIVE_ACTIVATION_REQUIRED`;
+only the original `/onboarding/activate` can admit the next authenticated native
+request. The native WorkerHost and result tool recheck the user's retained
+principal/generation, original budget, stop intent and ownership. Re-enable
+cannot revive old jobs or grant access to their results.
+
+This candidate is based on167154b842659ebd2da0bae0be036fb93a25f451, which includes
+the exact prior product profile, user-isolation/onboarding/admin joins,
+dashboard-owner and credential-admission overlays. Canonical integration must
+compose these exact dependencies with Astra's separately moving native
+installer/source manifest and independently verify the final bytes. No moving
+installer, native launch module or host_runtime/adapter API is changed here.
+Fixtures use actual native onboarding, grants, config, protected scopes,
+PluginManager/middleware/WorkerHost/result admission and synthetic source/key/
+review receipts. Worker scheduling is intercepted before execution. They are
+not independent review, live acceptance or a runtime readiness producer. Both
+workers' useful autonomous web, full authenticated admin and all six product
+journeys still require their mandatory actual checks. Direct ordinary
+skill/cron/terminal remains a separate explicit policy gap.

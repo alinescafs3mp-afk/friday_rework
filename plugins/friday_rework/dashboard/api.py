@@ -225,3 +225,25 @@ def onboarding_credentials(body: OnboardingCredential, profile: str):
 @router.post("/onboarding/activate")
 def onboarding_activate(body: OnboardingActivate, profile: str):
     return call(_admin.onboarding_activate, profile, **body.model_dump())
+
+
+class WorkerPrepare(OnboardingActivate):
+    worker: Literal['dsh', 'a0']
+    runtime: dict
+    a0_network: dict | None = None
+
+
+class WorkerConfigure(OnboardingActivate):
+    worker: Literal['dsh', 'a0']
+    preparation: dict
+    runtime_receipt: dict
+
+
+@router.post('/onboarding/worker/prepare')
+def onboarding_worker_prepare(body: WorkerPrepare, profile: str):
+    return call(_admin.onboarding_worker_prepare, profile, **body.model_dump())
+
+
+@router.post('/onboarding/worker/configure')
+def onboarding_worker_configure(body: WorkerConfigure, profile: str):
+    return call(_admin.onboarding_worker_configure, profile, **body.model_dump())

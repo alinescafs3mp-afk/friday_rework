@@ -146,6 +146,14 @@ class Administration:
         from .onboarding import Onboarding
         return Onboarding(self).credentials(profile, **values)
 
+    def onboarding_worker_prepare(self, profile, **values):
+        from .onboarding import Onboarding
+        return Onboarding(self).prepare_worker(profile, **values)
+
+    def onboarding_worker_configure(self, profile, **values):
+        from .onboarding import Onboarding
+        return Onboarding(self).configure_worker(profile, **values)
+
     def onboarding_activate(self, profile, **values):
         from .onboarding import Onboarding
         return Onboarding(self).activate(profile, **values)

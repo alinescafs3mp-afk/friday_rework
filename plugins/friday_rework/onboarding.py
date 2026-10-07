@@ -331,6 +331,104 @@ class Onboarding:
                 finally: reset_secret_scope(token)
             return {'state': 'DISABLED_SETUP_PENDING', 'recorded': True, 'enabled': False}
 
+    def prepare_worker(self, profile, *, expected_config_sha256, generation, platform,
+                       transport_profile, account_id, user_id, worker, runtime, a0_network=None):
+        """Operator-only source/config preparation for one disabled own profile.
+
+        Exactly one fresh worker input tree, no adoption/retry of partial writes.
+        Original budget/limits and reviewed source references are caller inputs.
+        """
+        if transport_profile != profile: raise PermissionError('receiving_transport_authority_required')
+        from .worker_provision import prepare_inputs, pin
+        with self.transaction(profile, expected_config_sha256) as (root, access, _):
+            home, binding, row, proof = self._prepared(root, access.state, platform, transport_profile, account_id, user_id, generation)
+            if row['enabled'] or (home / scope.MARKER).exists():
+                raise PermissionError('disabled_fresh_worker_setup_required')
+            from hermes_cli.config import require_readable_config_before_write, config_write_transaction
+            with scope.authority(home), config_write_transaction(home / 'config.yaml'):
+                if digest(home / 'config.yaml') != proof['config_sha256']:
+                    raise PermissionError('prepared_home_changed')
+                config = require_readable_config_before_write(home / 'config.yaml')
+                if config['plugins']['entries']['friday_rework']['settings']['runtime'] != {'enabled': False}:
+                    raise PermissionError('existing_worker_not_adopted')
+                c, directory, files, names, unobserved = prepare_inputs(home, binding['runtime_profile'], worker, runtime, config, a0_network=a0_network)
+                if directory.exists() or directory.is_symlink():
+                    raise FileExistsError('existing_worker_preparation_not_adopted')
+                parent = directory.parent
+                if parent.exists(): scope._private(parent, directory=True)
+                else: parent.mkdir(mode=0o700)
+                directory.mkdir(mode=0o700)
+                for name in ('jobs', 'staging', 'cache', 'inputs'):
+                    (directory / name).mkdir(mode=0o700)
+                for path, data in files.items(): _new_file(path, data)
+                candidate = dict(runtime=c, inputs=[pin(p) for p in files],
+                    principal_binding_sha256=scope._fingerprint(binding), generation=generation,
+                    state='PREPARED_RUNTIME_UNOBSERVED', unobserved=unobserved)
+                path = directory / 'runtime-input.json'
+                _new_file(path, (json.dumps(candidate, sort_keys=True, indent=2) + '\n').encode())
+                # Same existing protected scoped credential capture, no key copy.
+                # No new receipt/schema or activation marker is produced.
+                updated = dict(proof, required_secrets=list(dict.fromkeys(proof['required_secrets'] + names)))
+                previous_sha = digest(home / scope.ONBOARDING)
+                if json.loads((home / scope.ONBOARDING).read_text()) != proof:
+                    raise PermissionError('prepared_home_changed')
+                import secrets
+                temporary = home / (scope.ONBOARDING + '.worker-' + secrets.token_hex(8))
+                try:
+                    _new_file(temporary, (json.dumps(updated, sort_keys=True) + '\n').encode())
+                    if digest(home / scope.ONBOARDING) != previous_sha:
+                        raise PermissionError('prepared_home_changed')
+                    os.replace(temporary, home / scope.ONBOARDING); _sync_directory(home)
+                finally:
+                    if temporary.exists(): temporary.unlink()
+            return {'state': 'PREPARED_RUNTIME_UNOBSERVED', 'enabled': False,
+                    'worker': worker, 'preparation': pin(path), 'runtime': c,
+                    'required_names': updated['required_secrets'], 'unobserved': unobserved}
+
+    def configure_worker(self, profile, *, expected_config_sha256, generation, platform,
+                         transport_profile, account_id, user_id, worker, preparation, runtime_receipt):
+        """Attach independently supplied evidence via the original host checker.
+
+        A0 remains blocked. No launch, receipt fabrication, budget or grant reset.
+        """
+        if transport_profile != profile: raise PermissionError('receiving_transport_authority_required')
+        from .worker_provision import preparation as read_preparation, own_runtime
+        from .host_runtime import check_runtime, HostUnavailable
+        from hermes_cli.config import atomic_config_write, require_readable_config_before_write, config_write_transaction
+        with self.transaction(profile, expected_config_sha256) as (root, access, _):
+            home, binding, row, proof = self._prepared(root, access.state, platform, transport_profile, account_id, user_id, generation)
+            if row['enabled'] or (home / scope.MARKER).exists():
+                raise PermissionError('disabled_fresh_worker_setup_required')
+            v, c = read_preparation(home, binding['runtime_profile'], worker, preparation)
+            if v['principal_binding_sha256'] != scope._fingerprint(binding) or v['generation'] != generation:
+                raise PermissionError('foreign_or_revoked_worker_preparation')
+            # The receipt hash is supplied by its independent evidence producer,
+            # never generated from these preparation bytes or the owner runtime.
+            c['runtime_receipt'] = runtime_receipt
+            own_runtime(home, binding['runtime_profile'], worker, c)
+            if worker == 'a0':
+                return {'state': 'DISABLED_A0_RECONCILIATION_REQUIRED', 'enabled': False}
+            scope.check_onboarding_home(root, home, binding)
+            from gateway.pairing import PairingStore
+            if not PairingStore().is_approved(platform, user_id):
+                return {'state': 'DISABLED_NATIVE_GRANT_MISSING', 'enabled': False}
+            with scope.authority(home), config_write_transaction(home / 'config.yaml'):
+                if digest(home / 'config.yaml') != proof['config_sha256']:
+                    raise PermissionError('prepared_home_changed')
+                config = require_readable_config_before_write(home / 'config.yaml')
+                if config['plugins']['entries']['friday_rework']['settings']['runtime'] != {'enabled': False}:
+                    raise PermissionError('existing_worker_not_adopted')
+                from hermes_cli.plugins_state import PluginState
+                try: check_runtime(c, Associations(PluginState('friday_rework')))
+                except (HostUnavailable, OSError, ValueError):
+                    return {'state': 'DISABLED_WORKER_RUNTIME_UNVERIFIED', 'enabled': False}
+                config['plugins']['entries']['friday_rework']['settings']['runtime'] = c
+                prepared = prepare_admin_config_edit(home, config)
+                atomic_config_write(home / 'config.yaml', config)
+                finish_admin_config_edit(home, prepared)
+            return {'state': 'CONFIGURED_NATIVE_ACTIVATION_REQUIRED', 'enabled': False,
+                    'runtime_acceptance': 'SOURCE_CONTRACT_CHECKED_LIVE_NOT_RUN'}
+
     def activate(self, profile, *, expected_config_sha256, generation, platform,
                  transport_profile, account_id, user_id):
         if transport_profile != profile: raise PermissionError('receiving_transport_authority_required')
