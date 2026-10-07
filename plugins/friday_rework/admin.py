@@ -138,17 +138,25 @@ class Administration:
         from .onboarding import Onboarding
         return Onboarding(self).templates(profile)
 
-    def onboarding_prepare(self, profile, **values):
+    def onboarding_prepare(self, profile, *, session=None, **values):
         from .onboarding import Onboarding
-        return Onboarding(self).prepare(profile, **values)
+        return Onboarding(self).prepare(profile, session=session, **values)
 
-    def onboarding_credentials(self, profile, **values):
+    def onboarding_credentials(self, profile, *, session=None, **values):
         from .onboarding import Onboarding
-        return Onboarding(self).credentials(profile, **values)
+        return Onboarding(self).credentials(profile, session=session, **values)
 
-    def onboarding_activate(self, profile, **values):
+    def onboarding_worker_prepare(self, profile, *, session=None, **values):
         from .onboarding import Onboarding
-        return Onboarding(self).activate(profile, **values)
+        return Onboarding(self).prepare_worker(profile, session=session, **values)
+
+    def onboarding_worker_configure(self, profile, *, session=None, **values):
+        from .onboarding import Onboarding
+        return Onboarding(self).configure_worker(profile, session=session, **values)
+
+    def onboarding_activate(self, profile, *, session=None, **values):
+        from .onboarding import Onboarding
+        return Onboarding(self).activate(profile, session=session, **values)
 
     def pairing(self, profile):
         self.users(profile)  # prove this is an actual receiving transport authority

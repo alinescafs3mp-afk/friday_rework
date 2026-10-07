@@ -6,6 +6,8 @@ import asyncio
 import contextvars
 import copy
 import hashlib
+import importlib.util
+import sys
 import json
 import os
 from pathlib import Path
@@ -21,6 +23,20 @@ from test_admin_foundation import Administration, ProductAccess, mounted_app
 from tools.configure_local_test import build_config
 from tools.web_profile import research_policy
 from friday_admin_controls.onboarding import Onboarding, validate_template
+
+
+def signed_operator():
+    """Actual native provider signing and verification; synthetic in-memory key."""
+    path = Path(__import__('hermes_cli').__path__[-1]).parent / 'plugins/dashboard_auth/basic/__init__.py'
+    spec = importlib.util.spec_from_file_location('onboarding_fixture_basic', path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    provider = module.BasicAuthProvider(username='owner', password_hash='unused-synthetic-only',
+        secret=b'synthetic-onboarding-key-at-least-32bytes')
+    actor = provider.verify_session(access_token=provider._mint_session('owner').access_token)
+    assert actor is not None
+    return provider, actor
 
 
 @pytest.fixture
@@ -54,7 +70,9 @@ def env(tmp_path, monkeypatch):
     (home / 'config.yaml').write_text(json.dumps(cfg));(home / 'config.yaml').chmod(0o600)
     token = set_hermes_home_override(str(home))
     try:
+        provider, operator = signed_operator()
         yield SimpleNamespace(home=home, cfg=cfg, template=template, monkeypatch=monkeypatch,
+            provider=provider, operator=operator,
             state=PluginState('friday_rework'), admin=Administration(), setup=Onboarding(Administration()))
     finally: reset_hermes_home_override(token)
 
@@ -63,13 +81,13 @@ def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 def ident(uid='1'): return dict(platform='telegram', transport_profile='default', account_id='bot-A', user_id=uid)
 def cas(env): return sha(env.home / 'config.yaml')
 def prepare(env, uid='1', **changes):
-    return env.setup.prepare('default', expected_config_sha256=cas(env), template='approved-local',
+    return env.setup.prepare('default', session=env.operator, expected_config_sha256=cas(env), template='approved-local',
         runtime_profile='user-' + uid, **(ident(uid) | changes))
 def row(env, uid='1'): return current_access(env.state)['users'][principal_id(**ident(uid))]
 def home(env, uid='1'): return env.home / 'profiles' / ('user-' + uid)
 def secrets(env, uid='1'):
     for name in env.template['required_secrets']:
-        env.setup.credentials('default', expected_config_sha256=cas(env), generation=row(env, uid)['generation'],
+        env.setup.credentials('default', session=env.operator, expected_config_sha256=cas(env), generation=row(env, uid)['generation'],
                               **ident(uid), name=name, value='synthetic-' + uid + '-' + name)
 def grant(env, uid='1'):
     from gateway.pairing import PairingStore
@@ -77,7 +95,7 @@ def grant(env, uid='1'):
     ref=next(r['request_id'] for r in store.list_pending() if r['user_id']==uid)
     return store.approve_request('telegram',ref)
 def activate(env, uid='1', generation=None):
-    return env.setup.activate('default', expected_config_sha256=cas(env),
+    return env.setup.activate('default', session=env.operator, expected_config_sha256=cas(env),
         generation=row(env,uid)['generation'] if generation is None else generation, **ident(uid))
 def source(env, uid='1', chat='shared-chat', thread='topic'):
     from gateway.session import SessionSource
@@ -162,7 +180,7 @@ def test_missing_scoped_credentials_never_admit(env,missing):
     prepare(env);grant(env)
     for name in env.template['required_secrets']:
         if missing not in ('all',name):
-            env.setup.credentials('default', expected_config_sha256=cas(env),generation=row(env)['generation'],
+            env.setup.credentials('default', session=env.operator, expected_config_sha256=cas(env),generation=row(env)['generation'],
                                   **ident(),name=name,value='synthetic-only')
     assert activate(env)['state']=='DISABLED_SCOPED_KEYS_MISSING'
     assert not row(env)['enabled'] and not admitted(env)[0]
@@ -177,7 +195,7 @@ def test_foreign_or_invalid_identity_refused_before_state(env,mutation):
     if mutation=='traversal_profile':target='../owner'
     if mutation=='default_profile':target='default'
     with pytest.raises((PermissionError,ValueError)):
-        env.setup.prepare('default', expected_config_sha256=before, template='approved-local',runtime_profile=target,**kwargs)
+        env.setup.prepare('default', session=env.operator, expected_config_sha256=before, template='approved-local',runtime_profile=target,**kwargs)
     assert cas(env)==before and current_access(env.state)['users']=={}
 
 
@@ -190,7 +208,7 @@ def test_source_config_cas_and_private_boundaries(env,mutation):
     elif mutation=='hardlink':os.link(p,env.home/'alias')
     elif mutation=='public':p.chmod(0o644)
     with pytest.raises((PermissionError,ValueError,RuntimeError)):
-        env.setup.prepare('default',expected_config_sha256=expected,template='approved-local',runtime_profile='user-1',**ident())
+        env.setup.prepare('default', session=env.operator,expected_config_sha256=expected,template='approved-local',runtime_profile='user-1',**ident())
     assert not home(env).exists()
 
 
@@ -209,7 +227,7 @@ def test_preexisting_home_is_never_adopted(env,kind):
 def test_duplicate_original_cas_and_fresh_cas_cannot_reprepare(env):
     old=cas(env);prepare(env);after=cas(env)
     for expected in (old,after):
-        with pytest.raises(ValueError):env.setup.prepare('default',expected_config_sha256=expected,
+        with pytest.raises(ValueError):env.setup.prepare('default', session=env.operator,expected_config_sha256=expected,
             template='approved-local',runtime_profile='user-1',**ident())
     assert cas(env)==after and len(current_access(env.state)['users'])==1
 
@@ -311,8 +329,8 @@ def test_scoped_capture_refuses_unknown_names_foreign_identity_and_no_secret_res
     prepare(env)
     for changes in ({'name':'PATH'},{'name':'UNAPPROVED_KEY'},{'user_id':'2'},{'account_id':'bot-B'},{'generation':2}):
         kwargs=dict(expected_config_sha256=cas(env),generation=row(env)['generation'],**ident(),name='LOCAL_KEY',value='synthetic-secret-canary')|changes
-        with pytest.raises((PermissionError,ValueError)):env.setup.credentials('default',**kwargs)
-    result=env.setup.credentials('default',expected_config_sha256=cas(env),generation=row(env)['generation'],
+        with pytest.raises((PermissionError,ValueError)):env.setup.credentials('default', session=env.operator,**kwargs)
+    result=env.setup.credentials('default', session=env.operator,expected_config_sha256=cas(env),generation=row(env)['generation'],
         **ident(),name='LOCAL_KEY',value='synthetic-secret-canary')
     assert 'synthetic-secret-canary' not in json.dumps(result)
 
@@ -383,7 +401,7 @@ def test_read_only_recovery_uses_same_home_original_generation_and_no_adoption(e
     assert len(pending)==1 and pending[0]['recoverable'] and pending[0]['generation']==initial['generation']
     assert pending[0]['config_sha256']==before and pending[0]['principal_id']==initial['principal_id']
     assert home(env).stat().st_ino==st.st_ino and cas(env)==before
-    grant(env);assert Onboarding(Administration()).activate('default',expected_config_sha256=before,
+    grant(env);assert Onboarding(Administration()).activate('default', session=env.operator,expected_config_sha256=before,
         generation=pending[0]['generation'],**ident())['enabled']
     assert env.setup.templates('default')['pending']==[]
 
@@ -407,7 +425,7 @@ def test_same_user_id_different_receiving_platform_is_distinct_principal(env):
     settings['onboarding']['templates']['approved-local']['config']['platform_toolsets']['discord']=env.template['config']['toolsets']
     save(env,cfg);complete(env,'1')
     other=dict(platform='discord',transport_profile='default',account_id='bot-B',user_id='1')
-    result=env.setup.prepare('default',expected_config_sha256=cas(env),template='approved-local',runtime_profile='discord-user-1',**other)
+    result=env.setup.prepare('default', session=env.operator,expected_config_sha256=cas(env),template='approved-local',runtime_profile='discord-user-1',**other)
     assert result['principal_id'] != principal_id(**ident()) and result['generation']==1
     assert not result['enabled'] and row(env)['enabled']
     cfg=raw(env);routes=cfg['gateway']['profile_routes'];assert len(routes)==2

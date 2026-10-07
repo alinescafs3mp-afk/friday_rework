@@ -108,11 +108,24 @@ strings, booleans, negative counts and similarly named credentials are refused.
 Ordinary users still have the accepted memory/history/file/web/worker/result
 SAFE set. Direct skill/cron/terminal expansion remains a concrete policy gap,
 not a grant from this composer. A reusable user template cannot safely share
-the operator's worker home/receipt, so its worker runtime remains explicitly
-disabled until a profile-specific reviewed runtime is supplied. Existing
-onboarding runtime/receipt/source-hash checks remain intact, including the A0
-reconciliation refusal. Root integration must resolve this missing capability
-before claiming a complete normal installation.
+the operator's worker home/receipt. The existing signed onboarding API now
+prepares private profile-specific Harness/A0 inputs through
+`/onboarding/worker/prepare`, with original explicit runtime/source/resource
+inputs. It renders the Harness local patch from that user's actual provider
+capacity and key reference; A0 uses its original native local settings and
+SearXNG/document-query preparation helpers. Both intact workers remain selected.
+No preparation creates a runtime receipt or an admission marker.
+
+`/onboarding/worker/configure` accepts the exact protected preparation pin and
+an independently supplied own receipt. For Harness it calls the original
+`check_runtime`, preserves original source/web/budget checks, then updates
+native configuration and its existing onboarding proof. The user remains
+disabled until the original scoped-key/native-grant/activation checks pass.
+A0 configuration remains `DISABLED_A0_RECONCILIATION_REQUIRED`; rendering
+settings cannot release the existing stop or grant a current job capability.
+The original WorkerHost retains one selected runtime per profile; these APIs
+add no second worker manager, task store, queue or automatic launch. Actual
+installation and independent/live acceptance remain required.
 
 The credential admission overlay runs from native `load_hermes_dotenv` before
 project, ambient or managed fallback. It checks the installed source through
