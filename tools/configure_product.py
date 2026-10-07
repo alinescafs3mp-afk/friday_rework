@@ -145,8 +145,9 @@ def compose_product(spec):
         if runtime['runtime_profile'] != profile:
             raise ValueError('foreign_worker_runtime_profile')
         if 'a0' in runtime:
-            raise ValueError('a0_useful_web_runtime_contract_unavailable')
-        if runtime.get('dsh', {}).get('web', {}).get('profile') != 'exa-paid':
+            if runtime['a0'].get('web',{}).get('profile') != 'searxng-google':
+                raise ValueError('a0_useful_web_runtime_contract_unavailable')
+        elif runtime.get('dsh', {}).get('web', {}).get('profile') != 'exa-paid':
             raise ValueError('mandatory_worker_web_contract_required')
 
     # Config loading supplies the remaining untouched native defaults. Copy
@@ -222,6 +223,10 @@ def compose_product(spec):
     # Per-user native skill dirs start empty; no owner/project auto-discovery.
     ordinary['skills'].update(external_dirs=[], project_discovery=False, trusted_project_dirs=[], auto_load=[])
     required = [inference['key_env'], 'EXA_API_KEY']
+    if 'a0' in runtime:
+        if inference['key_env'] != 'FRIDAY_LLM_API_KEY':
+            raise ValueError('a0_scoped_inference_key_required')
+        required += ['FRIDAY_EMBEDDINGS_API_KEY','SEARXNG_SECRET']
     if (len(set(required)) != len(required) or inference['key_env'] in AUTH_NAMES
             or any(inference['key_env'] in names for names in channel_names.values())):
         raise ValueError('separate_scoped_credential_references_required')

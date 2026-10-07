@@ -105,6 +105,7 @@ def spec_checked(value):
     require(isinstance(files, dict) and files, 'reviewed_project_inventory_required')
     required = {'scripts/friday_install.py', 'scripts/friday_native.py',
                 'scripts/dsh_prepare.py', 'scripts/a0_prepare.py', 'scripts/install_containment.py',
+                'scripts/a0_runtime.py', 'scripts/rootless_docker_launch.py',
                 'tools/configure_product.py', 'tools/configure_local_test.py',
                 'tools/web_profile.py', 'config/SOUL.md', 'config/RESEARCH.md'}
     required.update(str(p.relative_to(ROOT)) for p in (ROOT / 'plugins/friday_rework').rglob('*')

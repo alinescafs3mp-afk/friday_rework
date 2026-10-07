@@ -17,7 +17,7 @@ import tempfile
 import time
 from typing import Callable
 
-from .dsh import PinnedFile, _private, _regular, _sync
+from .dsh import PinnedFile, _private, _regular, _sync, _directory
 from .a0_profile import checked_profile, endpoint_urls, legacy_profile, local_endpoint, profile_templates, ProfileError
 
 
@@ -87,6 +87,7 @@ class A0Deployment:
     network: LocalNetwork = field(default_factory=LocalNetwork)
     python: str = "/opt/venv-a0/bin/python"
     port: int = 5000
+    web: dict | None = None
 
     def checked(self):
         self.docker.read(); self.daemon_unit.read(); self.network.checked()
@@ -104,6 +105,9 @@ class A0Deployment:
                 "unchecked_start_command")
         require(self.python == "/opt/venv-a0/bin/python" and self.port == 5000,
                 "unreviewed_native_api")
+        if self.web is not None:
+            from .a0_web import checked_web
+            checked_web(self.web)
         return self
 
     def container_arguments(self, *, name, labels):
@@ -122,6 +126,8 @@ class A0Deployment:
             require(isinstance(value, str) and value and not any(c in value for c in "\n\r\x00"),
                     "invalid_native_labels")
             args += ["--label", key + "=" + value]
+        if self.web is not None:
+            args += ['--mount',f'type=bind,src={self.state_dir}/web/settings.yml,dst=/etc/searxng/settings.yml,readonly,bind-propagation=rprivate']
         args += ["--mount", f"type=bind,src={self.state_dir},dst=/a0/usr",
                  "--mount", f"type=bind,src={self.git_dir},dst=/a0/.git,readonly,bind-propagation=rprivate",
                  "--env=HF_HUB_OFFLINE=1", "--env=TRANSFORMERS_OFFLINE=1", "--workdir=/a0",
@@ -262,3 +268,50 @@ def prepare_keys(state_dir: Path, resolve: Callable[[str], str]):
         lines.append(name.encode() + b"=" + value.encode() + b"\n")
     _replace_env(path, before, before + b"".join(lines))
     return KeyMaterial(path, tuple(lines), time.monotonic())
+
+
+class WebKeyMaterial:
+    """Existing job keys plus one private native-service secret; never serialize."""
+    def __init__(self, base, path, content):
+        self.base, self.path, self.secret_path = base, base.path, path
+        self.content = content
+        self.prepared_monotonic = base.prepared_monotonic
+
+    def admitted(self):
+        return self.base.admitted()
+
+    def ready(self):
+        self.base.ready()
+        require(_key_bytes(self.secret_path) == self.content, 'native_web_secret_changed')
+
+    def remove(self, *, cessation_confirmed):
+        require(cessation_confirmed is True, 'keys_require_confirmed_cessation')
+        if self.secret_path.exists():
+            before = _key_bytes(self.secret_path)
+            require(before in (b'',self.content), 'native_web_secret_changed')
+            if before: _replace_env(self.secret_path, self.content, b'')
+        self.base.remove(cessation_confirmed=True)
+
+
+def prepare_web_keys(base, state_dir, resolve):
+    """Previously absent job-owned secret. No source/config/argv/receipt value."""
+    base.ready()
+    value = resolve('SEARXNG_SECRET')
+    require(isinstance(value,str) and re.fullmatch(r'[A-Za-z0-9_-]{32,256}',value)
+            and value.lower() not in {'ultrasecretkey','changeme','change_me','default','secret'},
+            'native_web_secret_missing_or_default')
+    path = state_dir / 'web/secret.env'
+    _directory(path.parent)
+    require(path.parent.stat().st_uid == os.getuid() and not path.parent.stat().st_mode & 0o022,
+            'unsafe_web_secret_root')
+    content = b'SEARXNG_SECRET=' + value.encode() + b'\n'
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd,'wb') as f:
+            f.write(content); f.flush(); os.fsync(f.fileno())
+        _sync(path.parent)
+    except BaseException:
+        # Own freshly created file only; no native execution can have started.
+        path.unlink(missing_ok=True)
+        raise
+    return WebKeyMaterial(base,path,content)

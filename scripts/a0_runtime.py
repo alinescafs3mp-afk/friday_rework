@@ -152,6 +152,23 @@ def templates(deployment=None):
     return profile_module().profile_templates(deployment)
 
 
+WEB_SOURCE = Path(__file__).resolve().parents[1] / 'plugins/friday_rework/adapters/a0_web.py'
+
+
+def web_module():
+    import types
+    p = WEB_SOURCE
+    require(p.resolve() == p and p.is_file() and not p.stat().st_mode & 0o022, 'web_source_identity_changed')
+    data = p.read_bytes(); require(len(data)<=65536, 'web_source_identity_changed')
+    m = types.ModuleType('frw_a0_web'); m.__file__ = str(p)
+    exec(compile(data,str(p),'exec'),m.__dict__)
+    return m
+
+
+def startup_script(p):
+    return web_module().START_SCRIPT if 'web' in p else START_SCRIPT
+
+
 def metadata_descriptor(value):
     """Only a new owned standalone clone; never a donor or worktree pointer."""
     require(isinstance(value, dict) and set(value) == {'source', 'manifest_sha256'}
@@ -380,12 +397,12 @@ def probe_report_checked(data, deployment=None):
     return data
 
 
-def local_network(value, owner, deployment=None):
+def local_network(value, owner, deployment=None, web=None):
     """A previously created bridge and fresh guarded namespace, never permission."""
     keys = {'schema', 'name', 'id', 'owner', 'nonce', 'labels', 'bridge', 'endpoints',
             'launcher_sha256', 'policy_sha256', 'request_sha256', 'guard_receipt_sha256',
             'invocation_id', 'namespaces'}
-    require(isinstance(value, dict) and set(value) == keys
+    require(isinstance(value, dict) and set(value) == (keys | {'web'} if web is not None else keys)
             and value['schema'] == 'friday.a0.local-network.v1'
             and value['owner'] == owner
             and isinstance(value['nonce'], str) and re.fullmatch(r'[0-9a-f]{32}', value['nonce'])
@@ -397,6 +414,8 @@ def local_network(value, owner, deployment=None):
                 for k in ('id', 'launcher_sha256', 'policy_sha256', 'request_sha256', 'guard_receipt_sha256'))
             and isinstance(value['invocation_id'], str) and re.fullmatch(r'[0-9a-f]{32}', value['invocation_id']),
             'invalid_local_network_pins')
+    if web is not None:
+        require(value['web'] == web_module().route_web(web), 'a0_web_route_permission_changed')
     ns = value['namespaces']
     require(isinstance(ns, dict) and set(ns) == {'user', 'mnt', 'net'}
             and all(isinstance(x, list) and len(x) == 2 and all(type(y) is int and y > 0 for y in x)
@@ -423,7 +442,7 @@ def network_checked(value, obj, *, container_id=None):
 
 def plan(accepted_unix, deadline_unix, *, assignment, generation, owner_slot,
          original_budget_seconds, mode='runtime', pins=None, git_metadata=None, network=None,
-         association_binding=None, accepted_monotonic_ns=None, boot_id=None, deployment=None):
+         association_binding=None, accepted_monotonic_ns=None, boot_id=None, deployment=None, web=None):
     """Create operator input, never a launch grant or implicit continuation.
 
     The private reviewed plan retains the original independent phase identity
@@ -441,6 +460,9 @@ def plan(accepted_unix, deadline_unix, *, assignment, generation, owner_slot,
     if deployment is not None:
         require(mode == 'runtime', 'inventory_profile_refused')
         deployment = profile_module().checked_profile(deployment)
+    if web is not None:
+        require(mode == 'runtime' and network is not None, 'web_requires_current_network')
+        web = web_module().checked_web(web)
     owner = f'{owner_slot}:{assignment}#{generation}'
     identity_input = {'owner': owner, 'assignment': assignment, 'generation': generation,
                       'accepted_unix': accepted_unix, 'mode': mode}
@@ -457,11 +479,13 @@ def plan(accepted_unix, deadline_unix, *, assignment, generation, owner_slot,
                               accepted_monotonic_ns=accepted_monotonic_ns, boot_id=boot_id)
     else:
         require(accepted_monotonic_ns is None and boot_id is None, 'unbound_host_clock')
+    if web is not None:
+        identity_input.update(web=web,web_source_sha256=sha(WEB_SOURCE))
     if deployment is not None:
         identity_input.update(deployment=deployment, profile_source_sha256=sha(PROFILE_SOURCE))
     if network is not None:
         require(mode == 'runtime', 'inventory_local_network_refused')
-        network = local_network(network, owner, deployment)
+        network = local_network(network, owner, deployment, web)
         identity_input['local_network'] = network
     if git_metadata is not None:
         require(mode == 'runtime', 'inventory_git_mount_refused')
@@ -476,7 +500,7 @@ def plan(accepted_unix, deadline_unix, *, assignment, generation, owner_slot,
             'invalid_pins')
     result = {'schema': 'friday.a0.runtime-plan.v2', 'assignment': assignment,
             'generation': generation, 'owner_slot': owner_slot, 'owner': owner, 'identity': identity,
-            'image': IMAGE, 'donor': DONOR, 'mode': mode,
+            'image': web['image'] if web is not None else IMAGE, 'donor': DONOR, 'mode': mode,
             'runtime_root': str(RUNTIME), 'state_dir': str(RUNTIME / identity / 'usr'),
             'unit': 'friday-rework-worker-' + identity[:32] + '.service',
             'container_name': 'frw-a0-' + identity[:32],
@@ -487,6 +511,7 @@ def plan(accepted_unix, deadline_unix, *, assignment, generation, owner_slot,
             'startup_seconds': STARTUP_SECONDS, 'stop_seconds': STOP_SECONDS,
             'templates_sha256': digest(templates(deployment)), **pins,
             **({'deployment': deployment, 'profile_source_sha256': sha(PROFILE_SOURCE)} if deployment is not None else {}),
+            **({'web':web,'web_source_sha256':sha(WEB_SOURCE)} if web is not None else {}),
             **({'git_metadata': dict(git_metadata)} if git_metadata is not None else {})}
     if association_binding is not None:
         result.update(association_binding=binding, accepted_monotonic_ns=accepted_monotonic_ns,
@@ -521,7 +546,7 @@ def validate(p, *, check_files=True):
                     git_metadata=p.get('git_metadata'),
                     network=None if p['network'] == 'none' else p['network'],
                     association_binding=p.get('association_binding'),
-                    accepted_monotonic_ns=p.get('accepted_monotonic_ns'), boot_id=p.get('boot_id'), deployment=p.get('deployment'))
+                    accepted_monotonic_ns=p.get('accepted_monotonic_ns'), boot_id=p.get('boot_id'), deployment=p.get('deployment'), web=p.get('web'))
     require(p == expected, 'plan_identity_or_boundary_changed')
     if check_files and 'git_metadata' in p:
         check_git_metadata(p['git_metadata'])
@@ -563,9 +588,11 @@ def create_argv(p):
     args += ['--mount', 'type=bind,src=' + p['state_dir'] + ',dst=/a0/usr']
     if 'git_metadata' in p:
         args += ['--mount', 'type=bind,src=' + p['git_metadata']['source'] + ',dst=/a0/.git,readonly,bind-propagation=rprivate']
+    if 'web' in p:
+        args += ['--mount','type=bind,src='+p['state_dir']+'/web/settings.yml,dst=/etc/searxng/settings.yml,readonly,bind-propagation=rprivate']
     return args + [
                    '--env=HF_HUB_OFFLINE=1', '--env=TRANSFORMERS_OFFLINE=1',
-                   '--workdir=/a0', '--entrypoint=/bin/bash', IMAGE, '-ceu', START_SCRIPT]
+                   '--workdir=/a0', '--entrypoint=/bin/bash', p['image'], '-ceu', startup_script(p)]
 
 
 def container_checked(p, obj, cid=None, *, stop_owned=False):
@@ -578,8 +605,8 @@ def container_checked(p, obj, cid=None, *, stop_owned=False):
             'invalid_container_id')
     require(cid is None or obj['Id'] == cid, 'container_replaced')
     actual_labels = obj['Config'].get('Labels') or {}
-    require(obj.get('Name') == '/' + p['container_name'] and obj.get('Image') == IMAGE
-            and obj['Config'].get('Image') == IMAGE
+    require(obj.get('Name') == '/' + p['container_name'] and obj.get('Image') == p['image']
+            and obj['Config'].get('Image') == p['image']
             and {k: v for k, v in actual_labels.items() if k.startswith('friday.rework.')} == labels(p),
             'container_owner_or_image_changed')
     h = obj['HostConfig']
@@ -614,7 +641,7 @@ def container_checked(p, obj, cid=None, *, stop_owned=False):
     else:
         mounts = obj.get('Mounts')
         require(h.get('ReadonlyRootfs') is False and isinstance(mounts, list)
-                and len(mounts) == (2 if 'git_metadata' in p else 1),
+                and len(mounts) == (2 if 'git_metadata' in p else 1) + (1 if 'web' in p else 0),
                 'runtime_mounts_changed')
         by_dest = {m.get('Destination'): m for m in mounts}
         require(len(by_dest) == len(mounts) and '/a0/usr' in by_dest, 'runtime_mounts_changed')
@@ -627,8 +654,12 @@ def container_checked(p, obj, cid=None, *, stop_owned=False):
             require(m.get('Type') == 'bind' and m.get('Source') == p['git_metadata']['source']
                     and m.get('Destination') == '/a0/.git' and m.get('RW') is False
                     and m.get('Propagation') == 'rprivate', 'git_mount_identity_changed')
+        if 'web' in p:
+            w = by_dest.get('/etc/searxng/settings.yml',{})
+            require(w.get('Type')=='bind' and w.get('Source')==p['state_dir']+'/web/settings.yml'
+                    and w.get('RW') is False and w.get('Propagation')=='rprivate', 'web_service_mount_changed')
         require(obj['Config'].get('Entrypoint') == ['/bin/bash']
-                and obj['Config'].get('Cmd') == ['-ceu', START_SCRIPT]
+                and obj['Config'].get('Cmd') == ['-ceu', startup_script(p)]
                 and obj['Config'].get('WorkingDir') == '/a0', 'runtime_command_changed')
     if not stop_owned:
         require(h.get('Memory') == MEMORY and h.get('MemorySwap') == MEMORY
@@ -747,7 +778,7 @@ class Runtime:
 
     def check_network(self, *, container_id=None):
         if self.p['network'] == 'none': return None
-        n = self.p['network']; local_network(n, self.p['owner'], self.p.get('deployment'))
+        n = self.p['network']; local_network(n, self.p['owner'], self.p.get('deployment'), self.p.get('web'))
         # Load only exact reviewed bytes, no import-path fallback or helper service.
         before = LAUNCHER.lstat()
         require(LAUNCHER.resolve() == LAUNCHER and stat.S_ISREG(before.st_mode)
@@ -779,6 +810,32 @@ class Runtime:
         require(isinstance(xs, list) and len(xs) == 1, 'local_network_unknown')
         network_checked(n, xs[0], container_id=container_id)
         return {'status': 'CURRENT_LOCAL_NETWORK_CHECKED', 'id': n['id']}
+
+    def check_web(self, container_id):
+        if 'web' not in self.p: return None
+        remaining(self.p); self.check_network(container_id=container_id)
+        for relative, value in web_module().service_files(self.p['web']).items():
+            path=Path(self.p['state_dir'])/relative
+            require(path.resolve()==path and path.is_file(), 'a0_web_service_input_changed')
+            actual=path.read_text() if isinstance(value,str) else json.loads(path.read_text())
+            require(actual==value, 'a0_web_service_input_changed')
+        script = web_module().service_probe(self.p['web'])
+        # Suppress native import/error output; export only the bounded report.
+        script = 'import contextlib,io\nwith contextlib.redirect_stderr(io.StringIO()):\n' + '\n'.join(' '+line for line in script.splitlines())
+        data = json.loads(self.docker('exec','--workdir=/usr/local/searxng/searxng-src',container_id,
+            '/usr/local/searxng/searx-pyenv/bin/python','-B','-c',script,timeout=min(5,remaining(self.p))))
+        require(isinstance(data,dict) and set(data)=={'status','version','processes'}
+                and data['status']=='CURRENT_NATIVE_WEB_SERVICE_CHECKED' and data['version']==self.p['web']['version']
+                and isinstance(data['processes'],list) and len(data['processes'])==2
+                and {x.get('name') for x in data['processes']}=={'run_ui','run_searxng'}
+                and all(set(x)=={'name','pid','start','statename'} and x['statename']=='RUNNING'
+                        and type(x['pid']) is int and x['pid']>0 and type(x['start']) is int
+                        and x['start']>0 for x in data['processes']), 'a0_effective_web_service_not_ready')
+        if getattr(self,'web_observation',None) is not None:
+            require(self.web_observation==data, 'a0_native_web_service_replaced')
+        self.check_network(container_id=container_id); remaining(self.p)
+        self.web_observation=data
+        return data
 
     def unit_argv(self, cid, plan_path, plan_file_sha):
         seconds = min(remaining(self.p), STARTUP_SECONDS)
@@ -849,7 +906,7 @@ class Runtime:
             self.directory.mkdir(mode=0o700)
             write_json(self.directory / 'attempt.json', {'plan_sha256': digest(self.p), 'phase': 'CREATE_UNKNOWN'})
             if self.p['mode'] == 'runtime':
-                materialize(self.directory / 'usr', self.p.get('deployment'))
+                materialize(self.directory / 'usr', self.p.get('deployment'), self.p.get('web'))
                 if before_ui is not None:
                     before_ui(self.directory / 'usr')
                     remaining(self.p)
@@ -1059,7 +1116,7 @@ class Runtime:
             return probe_report_checked(data, self.p.get('deployment'))
 
 
-def materialize(usr, deployment=None):
+def materialize(usr, deployment=None, web=None):
     """New owned usr only. No existing state, credentials or source is copied."""
     usr.mkdir(mode=0o700)
     for relative, value in templates(deployment).items():
@@ -1071,6 +1128,15 @@ def materialize(usr, deployment=None):
             private(parent, directory=True)
         # JSON is a supported YAML subset; no host dependency/install needed.
         write_json(p, value)
+    if web is not None:
+        for relative, value in web_module().service_files(web).items():
+            path = usr / relative; path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+            if isinstance(value,str):
+                path.write_text(value); path.chmod(0o600)
+            else: write_json(path,value)
+        # The native SearXNG uid needs its nonsecret settings. Secret remains
+        # root-owned 0600 and is passed only to the native supervisor environment.
+        (usr/'web').chmod(0o755); (usr/'web/settings.yml').chmod(0o644)
     for name in ['uploads', 'workdir']:
         (usr / name).mkdir(mode=0o700)
     fd = os.open(usr / '.env', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)

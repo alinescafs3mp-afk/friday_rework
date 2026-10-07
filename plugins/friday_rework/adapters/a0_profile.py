@@ -92,6 +92,9 @@ def checked_profile(value):
         require_profile(
             type(slot["timeout"]) is int and 1 <= slot["timeout"] <= 120, "invalid_a0_model_timeout"
         )
+        if kind == "embedding":
+            require_profile(not slot["model"].startswith(("sentence-transformers/", "huggingface/sentence-transformers/")),
+                            "native_embedding_provider_alias_refused")
         minimum = 0 if kind == "embedding" else 1
         require_profile(
             type(slot["context_length"]) is int and minimum <= slot["context_length"] <= 2**31 - 1,

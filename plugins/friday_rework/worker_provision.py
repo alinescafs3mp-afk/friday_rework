@@ -76,6 +76,7 @@ def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None):
         if not isinstance(a0_network, dict) or set(a0_network) != {'name', 'endpoints', 'policy'}:
             raise HostUnavailable('explicit_a0_local_network_inputs_required')
         from .adapters.a0_config import LocalNetwork, local_profile, KEY_REFERENCES
+        from .adapters.a0_web import service_files
         from .worker_web import a0_web_files
         deployment = c['a0'].get('deployment')
         if deployment != config.get('a0_deployment'):
@@ -94,8 +95,9 @@ def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None):
         for k in ('runtime', 'launcher', 'docker', 'daemon_unit', 'policy'): _pin(c['a0'][k]).read()
         # Explicit native file contents only. Installation/network/capability are
         # intentionally unobserved. Nothing is installed into a donor or service.
-        files[root / 'inputs/a0-native-files.json'] = (json.dumps({**native, **a0_web_files('searxng-google')}, sort_keys=True, indent=2) + '\n').encode()
+        files[root / 'inputs/a0-native-files.json'] = (json.dumps({**native, **(service_files(c['a0']['web']) if 'web' in c['a0'] else a0_web_files('searxng-google'))}, sort_keys=True, indent=2) + '\n').encode()
         names = list(KEY_REFERENCES.values()) + ['EXA_API_KEY']
+        if 'web' in c['a0']: names.append('SEARXNG_SECRET')
         unobserved.append('A0 reconciliation and current per-job capability')
     for k in ('workspace_root', 'staging_root', 'cache_roots', 'runtime_home'):
         if k in c[worker]: raise HostUnavailable('duplicate_worker_roots')
