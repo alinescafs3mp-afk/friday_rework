@@ -166,7 +166,7 @@ def verify_plan(plan, task):
                  "tools/web_tools_truncate.py", "tools/tool_result_storage.py", "hermes_logging.py",
                  "agent/redact.py", "agent/agent_runtime_helpers.py", "agent/stream_delivery.py", "agent/chat_completion_helpers.py", "agent/conversation_loop.py", "agent/turn_context.py", "agent/turn_finalizer.py", "agent/turn_facade.py", "agent/turn_tool_round.py",
                  "agent/message_sanitization.py", "agent/turn_recovery.py", "agent/turn_api_error.py",
-                 "agent/client_lifecycle.py", "agent/credential_pool.py", "hermes_cli/runtime_provider_custom.py"}
+                 "agent/client_lifecycle.py", "agent/credential_pool.py", "hermes_cli/runtime_provider_custom.py", "agent/turn_truncation.py", "agent/bounded_context.py"}
     _require(mandatory <= set(plan["source_files"]), "native_candidate_pins_incomplete")
     for rel, digest in plan["source_files"].items():
         p = root / rel

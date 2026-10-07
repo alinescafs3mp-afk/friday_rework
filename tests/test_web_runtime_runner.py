@@ -28,7 +28,7 @@ def prepared(tmp_path):
              "agent/session_persistence.py","agent/tool_executor.py","tools/web_tools_truncate.py",
              "tools/tool_result_storage.py","hermes_logging.py","agent/redact.py","agent/agent_runtime_helpers.py",
              "agent/stream_delivery.py", "agent/chat_completion_helpers.py", "agent/conversation_loop.py", "agent/turn_context.py", "agent/turn_finalizer.py", "agent/turn_facade.py", "agent/turn_tool_round.py",
-          "agent/message_sanitization.py", "agent/turn_recovery.py", "agent/turn_api_error.py", "agent/client_lifecycle.py", "agent/credential_pool.py", "hermes_cli/runtime_provider_custom.py"]
+          "agent/message_sanitization.py", "agent/turn_recovery.py", "agent/turn_api_error.py", "agent/client_lifecycle.py", "agent/credential_pool.py", "hermes_cli/runtime_provider_custom.py", "agent/turn_truncation.py", "agent/bounded_context.py"]
     source_files = {}
     for rel in files:
         p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text("# synthetic source pin\n");source_files[rel]=pin(p)["sha256"]
@@ -227,3 +227,14 @@ def test_native_defaults_allowed_explicit_emitted_selection_cannot_drift():
     assert not M['_emitted_options'](expected,{'web':{'search_backend':'auto','cache_enabled':False},'toolsets':['web']})
     assert not M['_emitted_options'](expected,{'web':{'search_backend':'exa','cache_enabled':True},'toolsets':['web']})
     assert not M['_emitted_options'](expected,{'web':expected['web'],'toolsets':['web','terminal']})
+
+
+@pytest.mark.parametrize('missing', ['agent/turn_truncation.py','agent/bounded_context.py'])
+def test_continuation_and_final_guard_pins_required_before_admission(prepared, missing):
+    plan, task = prepared
+    plan['source_files'].pop(missing)
+    task=OriginalTask(task.task_id,100.,1000.,90.,task.boot_id,digest(plan))
+    native=FakeNative();boundary=FakeBoundary()
+    with pytest.raises(Refused,match='native_candidate_pins_incomplete'):
+        execute((plan,task),native,boundary)
+    assert native.opens == boundary.admits == boundary.consumed == 0

@@ -21,7 +21,7 @@ build = runpy.run_path(str(Q/'tools/configure_local_test.py'))['build_config']
 
 
 @pytest.mark.parametrize('mode,variant,credential,overlap_prefix',
-    [('explicit',v,None,'') for v in ('partial_stream','escaped_stream','retry_4xx','callback_failure')]
+    [('explicit',v,None,'') for v in ('partial_stream','escaped_stream','retry_4xx','callback_failure','complete_continuation','complete_tool_retry')]
     + [('explicit','retry_4xx',key,'') for key in (
         'sk-synthetic_credential_only_1234567890', 'a1234567-89ab-4cde-8012-3456789abcde',
         'local-synthetic_credential_only', 'friday-synthetic_credential_only')]
@@ -31,6 +31,7 @@ build = runpy.run_path(str(Q/'tools/configure_local_test.py'))['build_config']
        ('explicit','escaped_stream','JSON"\\яяJSON"\\яя_SYNTHETIC_CREDENTIAL_123456789','JSON"\\яя')])
 def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,mode,variant,credential,overlap_prefix,construction_failure=False,sdk_error_echo=None,sdk_error_complete=None,runtime_key_echo=False):
     case=variant
+    completes = variant in {'complete_continuation', 'complete_tool_retry'}
     marker='SYNTHETIC_QUOTE"SLASH\\UNICODEя' if variant=='escaped_stream' else 'SYNTHETIC_SCOPED_CREDENTIAL'
     marker=credential or marker
     echo_value=overlap_prefix+marker
@@ -67,7 +68,7 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
           'agent/session_persistence.py','agent/tool_executor.py','tools/web_tools_truncate.py',
           'tools/tool_result_storage.py','hermes_logging.py','agent/redact.py','agent/agent_runtime_helpers.py',
           'agent/stream_delivery.py', 'agent/chat_completion_helpers.py', 'agent/conversation_loop.py', 'agent/turn_context.py', 'agent/turn_finalizer.py', 'agent/turn_facade.py', 'agent/turn_tool_round.py',
-          'agent/message_sanitization.py', 'agent/turn_recovery.py', 'agent/turn_api_error.py', 'agent/client_lifecycle.py', 'agent/credential_pool.py', 'hermes_cli/runtime_provider_custom.py']
+          'agent/message_sanitization.py', 'agent/turn_recovery.py', 'agent/turn_api_error.py', 'agent/client_lifecycle.py', 'agent/credential_pool.py', 'hermes_cli/runtime_provider_custom.py', 'agent/turn_truncation.py', 'agent/bounded_context.py']
     plan={'task_id':'offline-native-'+mode,'mode':mode,'source':str(root),'source_files':{r:pin(root/r)['sha256'] for r in rels},
           'profile':pin(home/'config.yaml'),'soul':pin(home/'SOUL.md'),'policy':pin(Q/'config/RESEARCH.md'),
           'driver':pin(Q/'validation/web_runtime.py'),'web_profile_source':pin(Q/'tools/web_profile.py'),
@@ -122,7 +123,8 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     def send(client,request,**kw):
         assert str(request.url)=='http://127.0.0.1:8011/v1/chat/completions'
         body=json.loads(request.content);api.append(body)
-        if len(api)>=partial_call:
+        assert body.get('max_tokens', body.get('max_completion_tokens')) <= 4096
+        if len(api)>=partial_call and not (completes and len(api)>partial_call):
             # Real native continuation sees durable evidence before reset.
             if len(api)>partial_call:
                 retained=M['recover'](plan,task)
@@ -148,7 +150,7 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
                     for text in texts:
                         chunk={'id':'partial','created':1,'object':'chat.completion.chunk','model':config['model']['default'],'choices':[{'index':0,'delta':{'role':'assistant','content':text},'finish_reason':None}]}
                         yield ('data: '+json.dumps(chunk)+'\n\n').encode()
-                    if variant=='retry_4xx':
+                    if variant in {'retry_4xx','complete_tool_retry'}:
                         chunk={'id':'partial','created':1,'object':'chat.completion.chunk','model':config['model']['default'],'choices':[{'index':0,'delta':{'tool_calls':[{'index':0,'id':'incomplete','type':'function','function':{'name':'web_search','arguments':'{"query":'}}]},'finish_reason':None}]}
                         yield ('data: '+json.dumps(chunk)+'\n\n').encode()
                     raise httpx.ReadError('synthetic broken stream',request=request)
@@ -236,8 +238,11 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     monkeypatch.setattr(os,'open',fail_stream_snapshot)
     obj=OfflineNative();boundary=FakeBoundary()
     boundary.admit=lambda *args:{'FRIDAY_FIXTURE_KEY':marker}
-    with pytest.raises(M['Refused']):
+    if completes:
         M['execute'](plan,task,boundary,native=obj,mono=lambda:110.,wall=lambda:1010.,boot='fixture-boot')
+    else:
+        with pytest.raises(M['Refused']):
+            M['execute'](plan,task,boundary,native=obj,mono=lambda:110.,wall=lambda:1010.,boot='fixture-boot')
     result=M['recover'](plan,task)
     assert redact.redact_registered_vault_values is old_registered_redact
     assert keyless_mcp._response_text is old_response_text
@@ -250,7 +255,10 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
         assert not api and not transport
         return
     (tmp_path/'callback-diagnostic.json').write_text(json.dumps({'callback_error':getattr(obj,'callback_error',None),'stream_callbacks':obj.stream_callbacks,'api_calls':len(api),'secret_lengths':[len(v) for v in obj.secrets],'native_diagnostic':getattr(obj,'native_diagnostic',{})},indent=2)+'\n')
-    assert result['status']=='FAILED_OR_UNCERTAIN'
+    assert result['status']==('OBSERVED_REQUIRES_INDEPENDENT_CHECK' if completes else 'FAILED_OR_UNCERTAIN')
+    if completes:
+        assert len(api)==3 and result['model_completed'] is True
+        assert 'allowed_methods' in result['final_response']
     assert len(result['tool_source_observations'])>=2 and len(transport)==2
     url='https://urllib3.readthedocs.io/en/stable/reference/urllib3.util.html'
     assert url in result['tool_source_observations'][0]['content']
@@ -268,14 +276,12 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
         assert len(api)>=partial_call
         if variant=='retry_4xx':
             assert len(api)>partial_call, 'Genuine native mid-tool retry/reset was not reached'
-        elif runtime_key_echo and variant=='escaped_stream':
-            # Enumerating repaired-key encodings can hit native's repetition
-            # guard before the output reservation. Both are real bounded stops;
-            # neither guard is disabled for the synthetic stream fixture.
-            assert ('output cap exceeds policy reservation' in obj.native_diagnostic['error']
-                    or obj.native_diagnostic['error'] == 'Model output entered a repetition loop and was truncated mid-loop; refusing to continue a degenerate response.')
-        else:
-            assert 'output cap exceeds policy reservation' in obj.native_diagnostic['error']
+        elif not completes:
+            assert 'output cap exceeds policy reservation' not in obj.native_diagnostic.get('error', '')
+            assert (obj.native_diagnostic.get('error') or
+                    obj.native_diagnostic.get('turn_exit_reason') == 'max_iterations_reached(4/4)'), \
+                'Repeated broken streams must retain an actual native failure/iteration limit'
+        assert len(api) <= 5, 'Original native iteration allowance was enlarged'
         assert 'available retained text' in result['partial_response']
         assert '[REDACTED_PARTIAL]' in result['partial_response']
     assert all(k['function']['name'] in {'web_search','web_extract'} for request in api for k in request.get('tools',[]))
@@ -320,7 +326,7 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
         escaped_tails = [form for tail in tails for form in M['_secret_forms']((tail,))]
         disclosed = [name for name in artifacts if any(tail.encode() in (tmp_path/name).read_bytes() for tail in escaped_tails)]
         assert not disclosed, 'Overlapping credential tail persisted: '+repr(disclosed)
-    (tmp_path/'partial-stream-witness.json').write_text(json.dumps({'record':result,'api_calls':len(api),'parsed_deltas':parsed_deltas,'stream_callback_attached':any(d['consumer_attached'] for d in parsed_deltas),'native_buffer_chars_after_run':len(obj.agent._current_streamed_assistant_text),'resets':resets,'stream_callbacks':obj.stream_callbacks,'stream_publications':obj.stream_publications,'prefix_artifacts':[]},indent=2)+'\n')
+    (tmp_path/'partial-stream-witness.json').write_text(json.dumps({'record':result,'api_calls':len(api),'parsed_deltas':parsed_deltas,'stream_callback_attached':any(d['consumer_attached'] for d in parsed_deltas),'native_buffer_chars_after_run':len(obj.agent._current_streamed_assistant_text),'resets':resets,'wire_output_caps':[r.get('max_tokens',r.get('max_completion_tokens')) for r in api],'stream_callbacks':obj.stream_callbacks,'stream_publications':obj.stream_publications,'prefix_artifacts':[]},indent=2)+'\n')
     assert not any(b'PRIVATE_SYNTHETIC_REASONING' in (tmp_path/name).read_bytes() for name in artifacts), 'Hidden reasoning persisted'
     assert not leaked, 'Native artifact contains synthetic scoped credential: '+repr(leaked)
     (tmp_path/'artifact-scan.json').write_text(json.dumps({'variant':case,'files':artifacts,'disclosure_files':leaked,

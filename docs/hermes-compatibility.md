@@ -138,3 +138,20 @@ passed the final affected checks. The eleven native repository checks also passe
 These are source/component observations. Concrete Friday consumer wiring,
 original-task matching, real worker cessation and live Telegram acceptance remain
 required before product stop support is accepted.
+
+## Continuation within the selected output reservation
+
+`patches/hermes/bounded-continuation.patch` follows the bounded-local-context
+layer. Its separate manifest pins the untouched donor truncation module and
+the resulting bytes; the preceding overlays and their hashes are unchanged.
+Native text continuation and incomplete-tool retries read the running agent's
+immutable output reservation. Native growth can use a larger configured
+reservation, but cannot enlarge it. Invalid or already excessive input caps
+refuse instead of being silently clamped. The final request-envelope guard,
+original iteration/retry limits, model and reasoning settings remain intact.
+
+The source fixture exercises genuine Hermes and OpenAI SDK streaming through
+synthetic HTTP transport, including partial ReadError then successful text or
+tool-call continuation, exhaustion, and retained/redacted observations. This
+is source-component evidence; local-model, Telegram and mandatory product
+journeys require their own supervised execution and acceptance.
