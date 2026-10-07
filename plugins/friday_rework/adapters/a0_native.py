@@ -19,6 +19,7 @@ import time
 
 from ..supervision import NativeSupervisor
 from .a0_config import A0Deployment, A0Error, require, local_profile
+from .dsh import PinnedFile
 
 
 def strict_json(data):
@@ -122,6 +123,26 @@ except BaseException:
 '''
 
 
+# Startup GET only. Connection-refused/HTTP503 mean observed NOT_READY; all
+# identity/key/parse/native errors stop rather than being retried or hidden.
+READINESS_SCRIPT = API_SCRIPT.replace(
+    "assert v['path'] in ('/api/api_message','/api/api_log_get','/api/api_files_get')",
+    "assert v['path']=='/api/health' and v['method']=='GET'").replace(
+    "with opener.open(request,timeout=v['timeout']) as response:",
+    """import errno,urllib.error
+ try:
+  response=opener.open(request,timeout=v['timeout'])
+ except urllib.error.HTTPError as e:
+  if e.code != 503: raise
+  checked_keys();print('{"ok":true,"ready":false}');raise SystemExit(0)
+ except urllib.error.URLError as e:
+  if not isinstance(e.reason,OSError) or e.reason.errno!=errno.ECONNREFUSED: raise
+  checked_keys();print('{"ok":true,"ready":false}');raise SystemExit(0)
+ with response:""").replace(
+    "except BaseException:\n print('{\"ok\":false}')",
+    "except SystemExit:\n raise\nexcept BaseException:\n print('{\"ok\":false}')")
+
+
 def native_file(root, relative, limit):
     """Walk with dirfds/no-follow; reject changed files and hard links."""
     import stat
@@ -198,8 +219,24 @@ def _duration(value):
 
 class A0NativeBoundary:
     def __init__(self, deployment: A0Deployment, grant: NativeGrant, *, supervisor=None,
-                 runner=None, clock=time.time, monotonic=time.monotonic):
-        self.config, self.grant = deployment.checked(), grant
+                 runner=None, clock=time.time, monotonic=time.monotonic, stop_only=False):
+        self.stop_only = stop_only
+        if stop_only:
+            # Retained exact ownership is a stop capability, never admission.
+            # Mutable launch/policy/daemon pins cannot withhold owned cessation.
+            require(isinstance(deployment, A0Deployment)
+                    and isinstance(deployment.docker, PinnedFile)
+                    and re.fullmatch('sha256:[0-9a-f]{64}', deployment.image)
+                    and deployment.socket.startswith('unix:///')
+                    and not any(c in deployment.socket for c in '\n\r\x00 ,')
+                    and all(p.is_absolute() and '..' not in p.parts for p in (deployment.state_dir, deployment.git_dir))
+                    and isinstance(deployment.command, tuple) and len(deployment.command) == 2
+                    and deployment.command[0] == '-ceu', 'invalid_stop_descriptor')
+            deployment.docker.read()
+            self.config = deployment
+        else:
+            self.config = deployment.checked()
+        self.grant = grant
         self.supervisor = supervisor or NativeSupervisor()
         self.runner = runner or self._run
         self.clock, self.monotonic = clock, monotonic
@@ -312,6 +349,7 @@ class A0NativeBoundary:
                 and (root/'pids.max').read_text().strip() == '2048', 'daemon_kernel_caps_changed')
 
     def admit(self, row):
+        require(not self.stop_only, 'stop_only_capability')
         require(row["stop_intent"] is None and self.clock() < row["deadline_unix"]
                 and row["elapsed_seconds"] < row["budget_seconds"], "stopped_or_expired")
         require(self.config.network.name != "none" and self.grant.network_verified is True,
@@ -372,6 +410,7 @@ class A0NativeBoundary:
         return unit
 
     def _keys(self):
+        require(not self.stop_only, 'stop_only_capability')
         material = getattr(self, "key_material", None)
         require(material is not None and material.path == self.config.state_dir / ".env"
                 and material.prepared_monotonic == self.grant.keys_prepared_monotonic, "foreign_key_material")
@@ -391,6 +430,21 @@ class A0NativeBoundary:
                                  self.config.python, "-B", "-c", script], data=data, timeout=timeout)
         except BaseException:
             raise A0Error("native_call_unknown") from None
+
+    def readiness(self, row, timeout):
+        """Finite checked GET readiness; this never bootstraps or calls a model."""
+        value = strict_json(self._exec(row, READINESS_SCRIPT,
+            {'method':'GET','path':'/api/health','payload':{},
+             'admitted_keys':self._keys().admitted(),'timeout':max(.1,timeout-.5),'max_bytes':4096}, timeout))
+        if (isinstance(value,dict) and set(value)=={'ok','ready'}
+                and value['ok'] is True and value['ready'] is False): return False
+        require(isinstance(value,dict) and set(value)=={'ok','body'} and value['ok'] is True,
+                'a0_readiness_unknown')
+        body = strict_json(decode_file(value['body'],4096))
+        require(isinstance(body,dict) and set(body)=={'gitinfo','error'}
+                and isinstance(body['gitinfo'],dict) and body['gitinfo'] and body['error'] is None,
+                'a0_readiness_invalid')
+        return True
 
     def request(self, row, method, path, payload, timeout, max_bytes):
         material = self._keys()

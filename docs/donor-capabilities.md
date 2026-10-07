@@ -1,6 +1,14 @@
 # Donor capability inventory — 2026-10-07
 
-This is a source and integration checkpoint, not a second task register. It reflects published source `f80e187` plus the reviewed Hermes overlays. The donor commits remain pinned in [sources.lock.json](../sources.lock.json). All six mandatory web/admin product journeys are **NOT_RUN**. Source presence, implementation, connection and verified behavior are distinct below. Historical component evidence is not promoted to new candidate acceptance.
+This is a source and integration checkpoint, not a second task register. The detailed donor inventory below was inspected at `f80e187` plus the reviewed Hermes overlays; the subsequent implementation delta is recorded here. The donor commits remain pinned in [sources.lock.json](../sources.lock.json). All six mandatory web/admin product journeys are **NOT_RUN**. Source presence, implementation, connection and verified behavior are distinct below. Historical component evidence is not promoted to new candidate acceptance.
+
+| Subsequent implementation | Published / candidate | Connected and verified limits |
+| --- | --- | --- |
+| Hermes and Harness native web profiles | Published `f0d2ec5`; explicit Exa and retrieval configuration, bounded requests and research policy. | Source/native-interface checks passed. Actual provider access and both mid-task worker journeys remain unrun. |
+| Dedicated A0 host and restart recovery | Published reviewed source `475945e`; uses existing associations, controller and runtime interfaces. | 531 source tests plus 451 subtests; 62 final independent recovery checks; 34 merged host/recovery checks. Current native grant, engineering, result delivery and A0 web remain incomplete. |
+| Product administration through Hermes Dashboard | Separate candidate; coherent repair of six independently reproduced defects is active. | Not merged or accepted. Full ordinary-user isolation, live control/configuration and packaged startup remain required. |
+
+See [the current foundation checkpoint](foundation-status.md) for evidence boundaries. No useful donor capability below has been excluded or deferred by these implementation stages.
 
 The selected product surface is Hermes Dashboard, using its authentication, native state and APIs. Keep intact Harness and dedicated A0, including A0’s native WebUI. The smallest missing integration consists of effective product identity/access checks, views over existing conversations/tasks/attachments, a real control path to their owner, and worker web connectivity. Ordinary users can remain on authorized messaging channels; the administration console is administrator-only. No ordinary dashboard account is required to provide product access.
 

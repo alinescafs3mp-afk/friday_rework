@@ -8,7 +8,8 @@ from __future__ import annotations
 import asyncio
 import copy
 from contextvars import copy_context
-from dataclasses import asdict
+from dataclasses import asdict, replace
+import time
 import json
 import logging
 from pathlib import Path
@@ -19,7 +20,7 @@ from .associations import AssociationError, _native, _sync_directory
 from .boundary import bound_owner, parse_brief
 from .controller import Controller
 from .host_record import association_address, owner_from_ingress, quiescence_record
-from .host_runtime import HostUnavailable, check_runtime, dsh_binding, private_directory
+from .host_runtime import HostUnavailable, check_runtime, dsh_binding, a0_binding, private_directory
 from .inputs import stage_inputs
 from .supervision import NativeSupervisor, UnitObservation
 
@@ -44,10 +45,25 @@ class WorkerHost:
         # Cached *checked* associations permit emergency stop after store damage.
         # They are not an admission authority, task database or execution queue.
         self._owned = {}
+        self._a0_controllers = {}
+        self._a0_admissions = set()
         self._closed = False
         self._cleanup_future = None
 
     def _controller(self, row):
+        if row['worker_kind'] == 'a0':
+            from .adapters.a0 import A0Controller
+            from .adapters.dsh import _identity
+            address = row['existing_task_id']
+            old = self._a0_controllers.get(address)
+            if old is not None:
+                old.bindings['a0'].adapter._same(row)
+                return old
+            binding = a0_binding(row['host']['binding']['runtime'], self.store, row)
+            controller = A0Controller(self.store, {'a0': binding})
+            controller = self._a0_controllers.setdefault(address, controller)
+            controller.bindings['a0'].adapter._same(row)
+            return controller
         return Controller(self.store, {"dsh": dsh_binding(row["host"]["binding"]["runtime"], self.store)})
 
     def handle(self, args, **kwargs):
@@ -60,7 +76,7 @@ class WorkerHost:
                 owner, task_id=kwargs.get("task_id"), session_id=kwargs.get("session_id"))
         except (ValueError, RuntimeError, OSError):
             return json.dumps({"accepted": False, "error": "unproved_admission"})
-        if brief.worker != "dsh":
+        if brief.worker not in {'dsh', 'a0'}:
             return json.dumps({"accepted": False, "error": "worker_not_admitted"})
         row = None
         try:
@@ -84,20 +100,29 @@ class WorkerHost:
                    for api in ("get_command_context", "schedule_gateway_work")):
                 raise HostUnavailable("worker_not_available")
             runtime = check_runtime(configured, self.store)
+            if ('a0' in runtime) != (brief.worker == 'a0'):
+                raise HostUnavailable('worker_runtime_mismatch')
             if runtime["runtime_profile"] != ingress["runtime_profile"]:
                 raise HostUnavailable("runtime_profile_mismatch")
             route = delivery_route(ingress)
             owner = owner_from_ingress(correlation, ingress)
+            acceptance = None
+            if brief.worker == 'a0':
+                acceptance = {'accepted_unix': self.store.clock(), 'accepted_monotonic_ns': time.monotonic_ns(),
+                              'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
             row, fresh = self.store.claim(
                 task_id=address, admission_key=address, owner=owner, brief=brief,
                 workspace_reference=str(Path(runtime["workspace_root"]) / address),
                 supervisor={"scope": "user", "unit": "friday-rework-worker-" + address[7:39] + ".service"},
-                budget_seconds=runtime["budget_seconds"], deadline_unix=self.store.clock() + runtime["budget_seconds"],
+                budget_seconds=runtime["budget_seconds"],
+                deadline_unix=(acceptance['accepted_unix'] if acceptance else self.store.clock()) + runtime["budget_seconds"],
+                acceptance=acceptance,
                 host_binding={"correlation": correlation, "ingress": ingress,
                               "brief": vars(brief), "runtime": runtime})
             if not fresh:
                 return json.dumps(status(row))
             self._owned[address] = copy.deepcopy(row)
+            if brief.worker == 'a0': self._a0_admissions.add(address)
             # No fallback to a shared directory, no clobber of earlier artifacts.
             workspace = Path(row["workspace_reference"])
             staging = Path(runtime["staging_root"]) / address
@@ -111,9 +136,17 @@ class WorkerHost:
                 cache_roots=runtime["cache_roots"], staging_root=staging,
                 worker_input_root="/job-input/verified", max_file_bytes=runtime["max_file_bytes"],
                 max_total_bytes=runtime["max_total_bytes"])
+            if brief.worker == 'a0':
+                from .adapters.a0 import input_path
+                if len(inputs) > 16 or sum(v.size_bytes for v in inputs) > runtime['max_file_bytes']:
+                    raise HostUnavailable('a0_input_limit')
+                inputs = tuple(replace(v,worker_path=input_path(row,i)) for i,v in enumerate(inputs))
             row = self.store.retain_inputs(address, owner, [asdict(item) for item in inputs])
             self._owned[address] = copy.deepcopy(row)
-            self.ctx.schedule_gateway_work(self._run(row), route=route, name="friday:" + address)
+            # A0 reserves immutable clocks/identity first. A separately authorized
+            # current producer attaches once, then uses this existing scheduler.
+            if brief.worker != 'a0':
+                self.ctx.schedule_gateway_work(self._run(row), route=route, name="friday:" + address)
             return json.dumps(status(row))
         except (ValueError, RuntimeError, OSError, TypeError):
             # Any admitted partial setup remains reserved and non-replayable.
@@ -123,6 +156,26 @@ class WorkerHost:
             if row is not None:
                 answer["reference"] = row["existing_task_id"]
             return json.dumps(answer)
+
+    def attach_a0_capability(self, task_id, owner, pin):
+        """Host/operator-only entry; never exported as a worker/model tool.
+
+        Current producer receives the already reserved row. A restored host is
+        stop-only: it cannot redispatch a precrash reservation or attachment.
+        """
+        if self._closed or task_id not in self._a0_admissions:
+            raise HostUnavailable('a0_attachment_requires_current_owner')
+        row = self.store.get(task_id, owner)
+        runtime = row['host']['binding']['runtime']
+        if row['worker_kind'] != 'a0' or self.ctx.get_config('runtime') != runtime:
+            raise HostUnavailable('foreign_a0_runtime_binding')
+        session = self._controller(row).bindings['a0'].adapter
+        row, fresh = self.store.attach_a0_capability(task_id, owner, pin, session.validate_capability)
+        self._remember(row)
+        if fresh:
+            self.ctx.schedule_gateway_work(self._run(row), route=delivery_route(row['host']['binding']['ingress']),
+                                           name='friday:'+task_id)
+        return status(row)
 
     def _remember(self, row):
         self._owned[row["existing_task_id"]] = copy.deepcopy(row)
@@ -150,7 +203,8 @@ class WorkerHost:
         try:
             if Path(self.store.state.data_dir) != self._state_directory:
                 raise HostUnavailable("foreign_runtime_home")
-            observed = NativeSupervisor().stop(copy.deepcopy(row))
+            observed = (self._controller(row).bindings['a0'].emergency_stop(copy.deepcopy(row))
+                        if row['worker_kind'] == 'a0' else NativeSupervisor().stop(copy.deepcopy(row)))
             if not isinstance(observed, UnitObservation) or not observed.quiescent:
                 raise HostUnavailable("STOP_UNCONFIRMED")
         except BaseException as stop_error:
@@ -164,8 +218,13 @@ class WorkerHost:
         if isinstance(observation, NativeObservation) and observation.state in {"completed", "failed", "stopped"}:
             terminal = {"state": observation.state, "evidence_reference": observation.evidence_reference,
                         "at_unix": self.store.clock()}
-        if row["submission_observation"] == "NOT_SUBMITTED" and row["stop_intent"]:
+        if (row["submission_observation"] == "NOT_SUBMITTED" and row["stop_intent"]
+                and (row['worker_kind'] != 'a0' or row['host']['a0']['launch'] is None)):
             quiet = {"kind": "never_submitted", "observation": None, "at_unix": self.store.clock()}
+        elif terminal is not None and row['worker_kind'] == 'a0':
+            binding = self._controller(row).bindings['a0']
+            binding.emergency_stop(row)
+            quiet = binding.adapter.quiescence(row)
         elif terminal is not None and row["native"] is not None:
             observed = NativeSupervisor().observe(row)
             if observed.quiescent:
@@ -211,6 +270,11 @@ class WorkerHost:
         if row["host"]["terminal"] is not None and row["host"]["quiescence"] is not None:
             return row
         if row["submission_observation"] == "NOT_SUBMITTED":
+            if row['worker_kind'] == 'a0' and row['host']['a0']['launch'] is not None:
+                session = self._controller(row).bindings['a0'].adapter
+                if session.preparing and not row['stop_intent'] and self.store.clock() < row['deadline_unix']:
+                    return row
+                return self._stop(row,row['stop_intent'] or 'cancel')
             if row["stop_intent"] or self.store.clock() >= row["deadline_unix"]:
                 return self._stop(row, row["stop_intent"] or "cancel")
             return row  # Restart/status never prepares or launches.
@@ -226,7 +290,8 @@ class WorkerHost:
             if Path(self.store.state.data_dir) != self._state_directory:
                 raise HostUnavailable("foreign_runtime_home")
             row = self._remember(self.store.request_stop(row["existing_task_id"], row["owner"], intent))
-            if row["submission_observation"] == "NOT_SUBMITTED":
+            if (row["submission_observation"] == "NOT_SUBMITTED"
+                    and (row['worker_kind'] != 'a0' or row['host']['a0']['launch'] is None)):
                 return self._settle(row, NativeObservation("", "", "association:" + row["existing_task_id"] + "#stop_intent",
                                                          row["elapsed_seconds"], "stopped"))
             principal = {k: row["owner"][k] for k in PRINCIPAL}
