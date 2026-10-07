@@ -147,3 +147,57 @@ availability, mid-task retrieval for both workers, original deadline/stop behavi
 hostile-page behavior with a real model, admin journeys and normal packaged startup
 are **NOT_RUN** here. Normal Friday installation must deliver the working selected
 web path; these component commands do not shift that assembly work to the owner.
+
+## Exact no-cache search and the prepared native research runner
+
+`patches/hermes/web-exact-limit.patch` changes only the native search fetch count:
+with `web.cache_enabled=false`, the provider receives the existing validated
+native limit (including clamping/coercion). Limit 3 therefore serializes as Exa
+MCP `numResults=3`. Default/cache-enabled behavior keeps bucket 10, memo hits,
+single-flight, slicing and non-caching of failures. Provider selection, keyless
+ring, rescue policy, extraction and inference are unchanged. Apply only to the
+exact file hash in its separate manifest, after the existing canonical overlays;
+verify the resulting hash and patch roundtrip. The prior refused native probe is
+immutable and must not be retried or have its protected receipt enlarged.
+
+`validation/web_runtime.py` is an inert, source-only preparation for a **new**
+parent-authorized ordinary/explicit research task. It uses the real Hermes
+`AIAgent`, native local runtime resolver, in-memory profile secret scope, native
+SessionDB and web tools. It adds no scheduler, service launcher, task database or
+authorization command. The small `validation_profile` delta takes task names
+from the pinned native defaults and pins every model-capable auxiliary row to the
+same explicit configured local route. Models and capacities remain renderer
+inputs. Publish a new private home through the native atomic writer, preserve
+Friday SOUL, then pin its actual config/SOUL bytes; do not edit an installed home.
+
+The driver binds the original task and a canonical JSON plan hash, exact candidate
+files, profile, SOUL, RESEARCH, driver, web helper and inference endpoint. It clears
+ambient policy/provider/proxy overrides before native imports, requires the
+effective native tool set to be exactly search/extract, verifies the actual native
+rendered SOUL/policy and allows no main/auxiliary cloud fallback. The trusted parent
+supplies the existing current durable association and scoped credentials. Admission
+checks the native transient unit owner/invocation/cgroup and current MainPID,
+original boot/monotonic/wall clocks, a native RuntimeMax deadline that cannot extend
+the original task, the already held inherited exclusive-lock FD and a separately
+reviewed original network admission. It never acquires a free lease or creates one.
+
+**The complete trusted live admission producer is missing and NOT ACCEPTED.**
+The historical smoke/preflight records do not provide it. The parent still needs
+an exact new scope and current reviewed egress (local inference separately from
+selected web), the existing supervised/exclusive boundary, protected scoped
+credential delivery and independent proof of remote inference settlement. After
+driver exit it must observe the entire cgroup quiescent before releasing the
+lease. An in-process `agent.close` or callback cannot attest the driver's own
+terminal cgroup. Refusal/uncertain stop must retain the original budget, process
+identity, partial observations and ownership; no automatic retry.
+
+The one private observation keeps input, effective native metadata, tool calls,
+source responses, final response and uncertainty separate, redacts scoped secrets,
+and never accepts a model's claim of success. Real native SDK/stream/relay/tool
+execution with **synthetic** HTTP/model responses is an offline control, not proof
+of autonomous research, provider availability or normal product startup. Known
+provider registration and denied optional metadata probes are recorded fixture
+limitations. Use [web-runtime-recipe.json](../validation/web-runtime-recipe.json)
+for the next independent actual-source/configuration check and negative controls.
+Both worker mid-job retrieval, normal discovery/install/start and all six complete
+web/admin journeys remain mandatory and **NOT_RUN**, pending their own admission.
