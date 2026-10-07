@@ -43,6 +43,13 @@ def pin(path):
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
+    import hermes_constants
+    from agent import secret_scope
+    # Match the donor's per-test isolation: Dashboard tests can pin a different
+    # process home; this fixture owns a fresh gateway and its own native home.
+    monkeypatch.setattr(hermes_constants, "_PINNED_PROCESS_HERMES_HOME", None)
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", False)
+    monkeypatch.setattr(secret_scope, "_AUTO_PINNED_HOME", None)
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))

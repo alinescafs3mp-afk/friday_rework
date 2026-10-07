@@ -6,9 +6,9 @@ This is a source and integration checkpoint, not a second task register. The det
 | --- | --- | --- |
 | Hermes and Harness native web profiles | Published `f0d2ec5`; explicit Exa and retrieval configuration, bounded requests and research policy. | Source/native-interface checks passed. Actual provider access and both mid-task worker journeys remain unrun. |
 | Dedicated A0 host and restart recovery | Published reviewed source `475945e`; uses existing associations, controller and runtime interfaces. | 531 source tests plus 451 subtests; 62 final independent recovery checks; 34 merged host/recovery checks. Current native grant, engineering, result delivery and A0 web remain incomplete. |
-| Product administration through Hermes Dashboard | Separate candidate; coherent repair of six independently reproduced defects is active. | Not merged or accepted. Full ordinary-user isolation, live control/configuration and packaged startup remain required. |
+| Product administration through Hermes Dashboard | Independently reviewed native UI/API foundation: users, real receiving admission, conversations/messages, attachments and retained task projections. | Source/offline only; six findings closed plus 26 independent retained-WebSocket controls. Full ordinary-user isolation, live control/configuration and packaged startup remain required. |
 
-See [the current foundation checkpoint](foundation-status.md) for evidence boundaries. No useful donor capability below has been excluded or deferred by these implementation stages.
+See [the current foundation checkpoint](foundation-status.md) for evidence boundaries. The product-admin deployment currently refuses unaudited native WebSocket/PTY/RPC features while keeping the donor implementation intact. This explicit restriction still needs a final disposition; it is not a silent exclusion or an accepted release waiver. The detailed rows below describe their original inventory snapshot unless superseded by this implementation table.
 
 The selected product surface is Hermes Dashboard, using its authentication, native state and APIs. Keep intact Harness and dedicated A0, including A0’s native WebUI. The smallest missing integration consists of effective product identity/access checks, views over existing conversations/tasks/attachments, a real control path to their owner, and worker web connectivity. Ordinary users can remain on authorized messaging channels; the administration console is administrator-only. No ordinary dashboard account is required to provide product access.
 
@@ -22,7 +22,7 @@ The selected product surface is Hermes Dashboard, using its authentication, nati
 | FRW-029 / FRW-036 | Native tools/skills and autonomous research behavior become required; prior optional AC043 classification superseded. | AC053–056, source references, retrieval outage and hostile-page controls. |
 | FRW-022 / final acceptance | Extend existing final journeys without dropping earlier controls. | Cumulative AC001–052 plus AC053–058 on final product bytes. |
 
-The temporary FRW041 inventory assignment is preparation for these existing scopes, not a replacement backlog. Sol’s current FRW014 core repair preserves integration seams; web/UI work must not weaken its ownership or readiness checks.
+The temporary FRW041 inventory assignment is preparation for these existing scopes, not a replacement backlog. The published A0 core and current worker-web work preserve these integration seams; web/UI work must not weaken ownership or readiness checks.
 
 ## Reused capabilities and actual stage
 

@@ -10,8 +10,14 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-from tools.web_profile import dsh_web_patch, hermes_web_config, research_policy
+# Hermes owns a separate, regular ``tools`` package in native integration runs.
+# Load this repository's standalone renderer helper by its exact source path.
+_web_spec = importlib.util.spec_from_file_location("friday_web_profile_test", ROOT / "tools/web_profile.py")
+_web_module = importlib.util.module_from_spec(_web_spec)
+_web_spec.loader.exec_module(_web_module)
+dsh_web_patch = _web_module.dsh_web_patch
+hermes_web_config = _web_module.hermes_web_config
+research_policy = _web_module.research_policy
 
 
 def renderer(name):
