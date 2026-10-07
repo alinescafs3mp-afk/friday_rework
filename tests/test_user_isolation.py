@@ -499,3 +499,61 @@ def test_same_user_id_in_second_configured_native_account_is_a_distinct_principa
             own.load_from_disk()
             assert 'ACCOUNT-B-OWN' in own.format_for_system_prompt('memory')
             assert 'ACCOUNT-A-PRIVATE' not in own.format_for_system_prompt('memory')
+
+
+def test_scoped_file_utf8_roundtrip_is_independent_of_locale(users):
+    from tools.file_tools import read_file_tool, write_file_tool
+    with users.enter(0):
+        body = 'Привет, пятница\n日本語 — café'
+        result = json.loads(write_file_tool('unicode.txt', body))
+        assert result['success']
+        assert result['bytes_written'] == len(body.encode('utf-8'))
+        assert (users.homes[0] / 'workspace/unicode.txt').read_bytes() == body.encode('utf-8')
+        read = json.loads(read_file_tool('unicode.txt'))
+        assert read['content'] == '1: Привет, пятница\n2: 日本語 — café'
+
+
+def test_private_numeric_owner_mismatch_revokes_before_file_bytes(users):
+    from tools.file_tools import read_file_tool
+    with users.enter(0) as cap:
+        expected_uid = scope._owner_uid()
+        users.monkeypatch.setattr(scope, '_owner_uid', lambda: expected_uid + 1)
+        assert json.loads(read_file_tool('secret.txt')) == {
+            'success': False, 'error': 'product_user_scope_refused'}
+        assert cap.revoked
+
+
+@pytest.mark.parametrize('raw', ['{broken', '[]'])
+def test_malformed_database_origin_revokes_without_disclosure(users, raw):
+    db = native_history(users, 0, content='SYNTHETIC_PRIVATE_TRANSCRIPT')
+    try:
+        with db._lock:
+            db._conn.execute('UPDATE sessions SET origin_json=?', (raw,))
+        with pytest.raises(scope.ScopeDenied, match='^product_user_scope_refused$'):
+            with users.enter(0):
+                raise AssertionError('malformed origin was admitted')
+        assert users.sources[0]._friday_user_scope.revoked
+    finally:
+        db.close()
+
+
+def test_unexpected_policy_failure_revokes_without_secret_text(users):
+    with users.enter(0) as cap:
+        def broken_policy(home):
+            raise RuntimeError('SYNTHETIC_POLICY_SECRET')
+        users.monkeypatch.setattr(scope, 'policy', broken_policy)
+        with pytest.raises(scope.ScopeDenied, match='^product_user_scope_refused$'):
+            cap.check()
+        assert cap.revoked
+        assert not scope.slash_allowed(users.sources[0], 'status')
+
+
+def test_matching_private_marker_accepts_utf8_bom_but_not_invalid_json(users):
+    marker = users.homes[0] / scope.MARKER
+    marker.write_bytes(b'\xef\xbb\xbf' + marker.read_bytes())
+    with users.enter(0) as cap:
+        assert cap.check() is cap
+        marker.write_bytes(b'\xef\xbb\xbf{broken')
+        with pytest.raises(scope.ScopeDenied, match='^product_user_scope_refused$'):
+            cap.check()
+        assert cap.revoked
