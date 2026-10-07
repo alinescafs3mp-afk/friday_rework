@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import ipaddress
+import importlib.util
+import importlib
 import json
 import os
 from pathlib import Path
@@ -87,7 +89,7 @@ def directory(path):
 
 def spec_checked(value):
     fields = {'home', 'bootstrap_python', 'hermes_donor', 'hermes_prepare',
-              'sources_lock', 'dsh_donor', 'a0_donor', 'product', 'project_files', 'seconds'}
+              'sources_lock', 'dsh_donor', 'a0_donor', 'product', 'project_files', 'seconds', 'containment'}
     require(isinstance(value, dict) and set(value) == fields, 'explicit_install_fields_required')
     home = canonical(value['home']); directory(home.parent)
     require(home != Path.home() / '.hermes' and home != ROOT
@@ -102,7 +104,7 @@ def spec_checked(value):
     files = value['project_files']
     require(isinstance(files, dict) and files, 'reviewed_project_inventory_required')
     required = {'scripts/friday_install.py', 'scripts/friday_native.py',
-                'scripts/dsh_prepare.py', 'scripts/a0_prepare.py',
+                'scripts/dsh_prepare.py', 'scripts/a0_prepare.py', 'scripts/install_containment.py',
                 'tools/configure_product.py', 'tools/configure_local_test.py',
                 'tools/web_profile.py', 'config/SOUL.md', 'config/RESEARCH.md'}
     required.update(str(p.relative_to(ROOT)) for p in (ROOT / 'plugins/friday_rework').rglob('*')
@@ -123,8 +125,17 @@ def spec_checked(value):
             'explicit_dashboard_authority_required')
     # Reuse the existing pure local/capacity validator before any install
     # effects. Full native profile/provider/auth consumption happens later.
-    from tools.configure_local_test import build_config
-    from tools.web_profile import hermes_web_config
+    # Load pure validators without claiming Hermes' native `tools` package.
+    name = '_friday_install_validation'
+    if name not in sys.modules:
+        module = importlib.util.module_from_spec(importlib.machinery.ModuleSpec(name, loader=None, is_package=True))
+        module.__path__ = [str(ROOT / 'tools')]
+        sys.modules[name] = module
+    require(list(sys.modules[name].__path__) == [str(ROOT / 'tools')], 'foreign_validator_package')
+    build_config = importlib.import_module(name + '.configure_local_test').build_config
+    hermes_web_config = importlib.import_module(name + '.web_profile').hermes_web_config
+    from scripts.install_containment import checked_binary
+    checked_binary(value['containment'])
     require(set(product) == {'profile', 'inference', 'web', 'dashboard', 'accounts', 'runtime'},
             'explicit_normal_product_required')
     build_config(**product['inference'])
@@ -239,79 +250,95 @@ def composition_checked(value, source, receipt, donor):
     return source_checked(source, receipt, donor)
 
 
-def publish(path, value):
+def publish(path, value, *, budget=None):
+    # Serialize before opening a file; long serialization cannot admit a write.
+    payload = json.dumps(value, sort_keys=True, indent=2) + '\n'
+    if budget: budget.check()
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'w') as f:
-        json.dump(value, f, sort_keys=True, indent=2); f.write('\n'); f.flush(); os.fsync(f.fileno())
+        if budget: budget.check()
+        f.write(payload)
+        if budget: budget.check()
+        f.flush()
+        if budget: budget.check()
+        os.fsync(f.fileno())
+        if budget: budget.check()
     fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
+        if budget: budget.check()
         os.fsync(fd)
+        if budget: budget.check()
     finally:
         os.close(fd)
 
 
-def install(value, input_path):
-    """Future operator flow. Failed partial installs require reconciliation."""
-    home, donors = spec_checked(value); argv = commands(value)
-    raw = owned_file(input_path, private=True)
+def partial_claim(input_hash, budget):
+    return {'schema': SCHEMA, 'state': 'PARTIAL', 'input_sha256': input_hash,
+            'deadline_mono': budget.deadline,
+            'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+
+
+def install(value, input_path, *, budget=None):
+    """One original clock includes intake, execution, IO and final admission."""
+    from scripts.install_containment import Budget, Containment
+    require(isinstance(value, dict), 'explicit_install_fields_required')
+    budget = budget or Budget(value.get('seconds'))
+    home, donors = budget.call(spec_checked, value)
+    argv = budget.call(commands, value)
+    raw = budget.call(owned_file, input_path, private=True)
     require(json.loads(raw, object_pairs_hook=unique) == value, 'install_input_changed')
-    input_hash = digest(raw)
+    input_hash = digest(raw); budget.check()
     if home.exists():
-        directory(home)
-        marker = read_json(home / MARKER)
+        budget.call(directory, home)
+        marker = budget.call(read_json, home / MARKER)
         require(marker.get('schema') == SCHEMA and marker.get('input_sha256') == input_hash,
                 'foreign_existing_install_not_adopted')
         require(marker.get('state') == 'INSTALLED_TEMPLATE_INCOMPLETE',
                 'partial_install_requires_reconciliation')
-        return inspect(value, input_hash)
-    # Exact exclusive claim, before preparers or PM write anything. No reset,
-    # recursive chmod, overwrite, rollback or adoption on a subsequent failure.
-    home.mkdir(mode=0o700)
-    publish(home / MARKER, {'schema': SCHEMA, 'state': 'PARTIAL', 'input_sha256': input_hash})
-    from scripts.dsh_prepare import run
-    deadline = time.monotonic() + value['seconds']
+        return budget.call(inspect, value, input_hash)
+    containment = Containment(value['containment'], budget, clean_environment(home))
+    # Actual required namespace capability before claiming/writing any home.
+    containment.probe(value['bootstrap_python']['path'], ROOT)
+    budget.call(home.mkdir, mode=0o700)
+    claim = partial_claim(input_hash, budget)
+    publish(home / MARKER, claim, budget=budget)
     def execute(command, cwd, timeout=1800):
-        remaining = int(deadline - time.monotonic())
-        require(remaining > 0, 'original_install_budget_exhausted')
-        return run(command, cwd, timeout=min(timeout, remaining), env=clean_environment(home))[0]
+        return containment.run(command, cwd, timeout=timeout)[0]
     execute(argv['compose'], ROOT, 130)
     source = home / 'hermes-agent'; receipt_path = home / 'hermes-agent.source.json'
-    receipt = read_json(receipt_path); composition_checked(value, source, receipt, donors['hermes'])
+    receipt = budget.call(read_json, receipt_path)
+    budget.call(composition_checked, value, source, receipt, donors['hermes'])
     for phase in ('tools', 'dependencies'):
         execute(argv[phase], source)
-    # Native PM selected interpreter; never substitute an unrelated venv.
     expression = 'from pm.environments import project_python; from pathlib import Path; print(project_python(Path.cwd()))'
     selected = execute([value['bootstrap_python']['path'], '-B', '-c', expression], source, 15)
-    # Native venv executables may be symlinks to the selected store Python.
-    # The native completion entry verifies project_python before imports/build.
     require(Path(selected).is_absolute() and Path(selected).is_file(), 'native_pm_python_missing')
     execute([selected, '-B', str(ROOT / 'scripts/friday_native.py'), 'install',
-             '--input', str(input_path)], source)
+             '--input', str(input_path), '--deadline', str(budget.deadline)], source)
     for command in argv['harness']:
         execute(command, ROOT)
     execute(argv['a0_inventory'], ROOT, 120)
-    composition_checked(value, source, receipt, donors['hermes'])
-    # Native source receipt and original input bind this finite installation.
-    # A native PM/build success cannot grant the absent A0/web/kernel boundary.
+    budget.call(composition_checked, value, source, receipt, donors['hermes'])
     marker = {'schema': SCHEMA, 'state': 'INSTALLED_TEMPLATE_INCOMPLETE',
-              'input_sha256': input_hash, 'source_receipt_sha256': digest(owned_file(receipt_path)),
+              'input_sha256': input_hash, 'source_receipt_sha256': digest(budget.call(owned_file, receipt_path)),
               'home': str(home), 'source': str(source), 'runtime_ready': False,
               'gateway_installed': False, 'remaining': gaps()}
-    marker['profile_files'] = {name: digest(owned_file(home / name, private=True))
+    marker['profile_files'] = {name: digest(budget.call(owned_file, home / name, private=True))
                                for name in ('config.yaml', 'SOUL.md', 'FRIDAY-PROFILE.json')}
     marker['plugin_files'] = {name: sha for name, sha in value['project_files'].items()
                               if name.startswith('plugins/friday_rework/')}
     pending = home / (MARKER + '.completed')
-    publish(pending, marker)
-    # Exact private claim only: no overwrite of an arbitrary existing home.
-    require(read_json(home / MARKER) == {'schema': SCHEMA, 'state': 'PARTIAL',
-                                       'input_sha256': input_hash}, 'install_claim_changed')
-    os.replace(pending, home / MARKER)
+    publish(pending, marker, budget=budget)
+    require(budget.call(read_json, home / MARKER) == claim, 'install_claim_changed')
+    budget.call(os.replace, pending, home / MARKER)
+    budget.check()
     fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        os.fsync(fd)
+        budget.check()
+        budget.call(os.fsync, fd)
     finally:
         os.close(fd)
+    budget.check()
     return marker
 
 
@@ -355,6 +382,7 @@ def start(value, input_hash):
 
 
 def main():
+    started = time.monotonic()  # before parser/input IO; never reset on dispatch
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('phase', choices=('plan', 'install', 'check', 'start'))
     parser.add_argument('--input', required=True, type=Path, help='Private pinned JSON, no credential values')
@@ -363,19 +391,26 @@ def main():
     try:
         raw = owned_file(args.input, private=True)
         value = json.loads(raw, object_pairs_hook=unique); sha = digest(raw)
+        from scripts.install_containment import Budget
+        require(isinstance(value, dict), 'explicit_install_fields_required')
+        budget = Budget(value.get('seconds'), started=started)
+        budget.check()
         if args.phase == 'plan':
             result = {'state': 'PLANNED_NOT_EXECUTED', 'ready': False,
                       'commands': commands(value), 'remaining': gaps()}
         elif args.phase == 'install':
-            result = install(value, args.input)
+            result = install(value, args.input, budget=budget)
         elif args.phase == 'check':
             result = inspect(value, sha)
         else:
             result = start(value, sha)
+        payload = json.dumps(result, sort_keys=True, indent=2)
+        budget.check()
+        print(payload, flush=True)
+        budget.check()
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         # Native errors/inputs can contain credentials: print no exception body.
         parser.exit(2, 'Friday entry refused: pinned inputs, owned fresh installation and admitted native dependencies required\n')
-    print(json.dumps(result, sort_keys=True, indent=2))
 
 
 if __name__ == '__main__':

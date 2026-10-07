@@ -8,7 +8,9 @@ normal-install/start acceptance or a release. Installation/download/build are
 future explicitly invoked effects; this implementation task executes none.
 
 Input fields are `home`, `bootstrap_python`, `hermes_donor`, `hermes_prepare`,
-`sources_lock`, `dsh_donor`, `a0_donor`, `product`, `project_files`, `seconds`.
+`sources_lock`, `dsh_donor`, `a0_donor`, `product`, `project_files`, `seconds`,
+`containment`. The latter is the exact `{ "path": "/usr/bin/bwrap", "sha256":
+"<reviewed system binary SHA-256>" }` pin.
 Pins have exactly `path` and `sha256`; JSON is private, owner-only, single-link,
 canonical and duplicate-field-free. `project_files` maps reviewed repository
 relative paths to SHA-256, including the installer/helpers, profile compiler,
@@ -42,8 +44,34 @@ Friday plugin; native atomic additive configuration and actual SOUL; existing
 Harness source/toolchain/build/smoke; A0 source inventory. OS account HOME stays
 unchanged. Ambient credentials, PYTHONPATH, profile/runtime and host-lock
 overrides are stripped. No global launcher or user PATH is published. The
-original finite invocation budget bounds all commands via the existing preparer
-process-group runner; it is not reset between phases.
+original monotonic budget starts before input intake, includes verification,
+serialization, publication, fsync and final success admission, and is inherited
+by native completion. The private PARTIAL claim binds that deadline and the
+Linux boot ID; a newly supplied deadline cannot restart internal completion. Long admitted filesystem IO can leave an observation
+before expiry is detected; that invocation fails and never grants runtime or
+successful completion. Incomplete claims/work remain for explicit reconciliation.
+There is no reset or per-phase cleanup allowance. Every command reserves cleanup
+inside this same deadline; unconfirmed closure is `STOP_UNCONFIRMED`.
+
+Normal installer packaging now requires the distribution's **bubblewrap** OS
+package at `/usr/bin/bwrap` and working unprivileged PID namespaces. Supply the
+reviewed binary hash as `containment`; the installer neither downloads nor
+installs this dependency, and refuses changed/unprotected binaries. Before
+claiming a fresh home, it runs a harmless actual namespace capability check.
+Every complete source-preparer, PM, native build, Harness and A0 family then runs
+inside `bwrap --unshare-pid --die-with-parent --new-session`, including descendants
+that call `setsid`. Linux namespace teardown closes these detached descendants
+when the outer command/parent exits or times out. There is no process-group-only
+fallback, new service manager or independent lifetime budget. This namespace
+adds lifetime custody; it does not change the original filesystem/network grant.
+A machine that cannot create it must obtain the normal supported OS dependency
+and namespace policy before a separately authorized install can proceed.
+
+Pure pre-source validation uses a distinct project module namespace. After every
+native source byte is verified, completion loads the native `tools` and `plugins`
+regular packages, verifies their source paths, and then appends project modules.
+Profile identity uses the official validator before any effectful native config
+import. Cold entry tests must not preload packages that hide this ordering.
 
 Harness writes a new `home/harness` donor checkout and retains its intact native
 source/build machinery. It never builds over the frozen donor. A0 inventory is

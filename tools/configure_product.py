@@ -91,12 +91,13 @@ def compose_product(spec):
     accepted scope; this renderer cannot expand its SAFE set or admit workers.
     """
     _exact(spec, {'profile', 'inference', 'web', 'dashboard', 'accounts', 'runtime'}, 'product')
-    from hermes_cli.config import DEFAULT_CONFIG, validate_env_var_name_for_write
     from hermes_cli.friday_product_access import profile_name
+    # Identity validation is pure; native config imports can create home state.
+    profile = profile_name(spec['profile'])
+    from hermes_cli.config import DEFAULT_CONFIG, validate_env_var_name_for_write
     from hermes_cli import friday_user_scope as scope
     from plugins.friday_rework.onboarding import validate_template
 
-    profile = profile_name(spec['profile'])
     inference = _exact(spec['inference'], INFERENCE, 'inference')
     validate_env_var_name_for_write(inference['key_env'])
     # Reuse the accepted local/capacity validator and bounded-context contract.

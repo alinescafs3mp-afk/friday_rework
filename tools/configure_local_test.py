@@ -17,8 +17,8 @@ import sys
 from urllib.parse import urlsplit
 
 try:
-    from tools.web_profile import hermes_web_config, research_policy
-except ModuleNotFoundError:  # Direct script invocation from outside the repository.
+    from .web_profile import hermes_web_config, research_policy
+except (ImportError, ModuleNotFoundError):  # Direct script invocation from outside the repository.
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from web_profile import hermes_web_config, research_policy
 

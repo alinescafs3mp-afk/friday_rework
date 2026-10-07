@@ -8,19 +8,20 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def profile_write(home, spec):
     from tools.configure_product import compose_product
+    bundle = compose_product(spec)
     from hermes_cli.config import atomic_config_write, config_write_transaction, DEFAULT_SOUL_MD
     from scripts.friday_install import require, publish, owned_file
     require(not (home / 'config.yaml').exists() and not (home / 'config.yaml').is_symlink(),
             'existing_profile_config_not_replaced')
     require(not (home / 'FRIDAY-PROFILE.json').exists() and not (home / 'FRIDAY-PROFILE.json').is_symlink(),
             'existing_profile_identity_not_replaced')
-    bundle = compose_product(spec)
     runtime = spec['runtime']
     require(runtime.get('enabled') is not True or runtime.get('runtime_home') == str(home),
             'foreign_worker_home')
@@ -144,27 +145,40 @@ def complete(value, home, receipt):
 
 
 def main():
+    started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('phase', choices=('install',))
     parser.add_argument('--input', required=True, type=Path)
+    parser.add_argument('--deadline', required=True, type=float, help='Inherited original monotonic deadline')
     args = parser.parse_args()
     # Validate stdlib-only ownership and pins before importing installed code.
     sys.path.insert(0, str(ROOT))
     from scripts.friday_install import spec_checked, read_json, composition_checked, directory
-    value = read_json(args.input); home, donors = spec_checked(value); directory(home)
-    from scripts.friday_install import MARKER, SCHEMA, digest, owned_file, require
-    require(read_json(home / MARKER) == {'schema': SCHEMA, 'state': 'PARTIAL',
-                                       'input_sha256': digest(owned_file(args.input, private=True))},
+    value = read_json(args.input)
+    from scripts.install_containment import Budget
+    budget = Budget(value.get('seconds'), started=started, deadline=args.deadline)
+    home, donors = budget.call(spec_checked, value); budget.call(directory, home)
+    from scripts.friday_install import MARKER, digest, owned_file, require, partial_claim
+    require(read_json(home / MARKER) == partial_claim(digest(owned_file(args.input, private=True)), budget),
             'fresh_install_claim_required')
     source = home / 'hermes-agent'; receipt = read_json(home / 'hermes-agent.source.json')
-    composition_checked(value, source, receipt, donors['hermes'])
+    budget.call(composition_checked, value, source, receipt, donors['hermes'])
     sys.path.insert(0, str(source))
     import tools, plugins, scripts
-    tools.__path__.append(str(ROOT / 'tools'))
-    plugins.__path__.append(str(ROOT / 'plugins'))
+    # A cached project namespace must never stand in for the verified native
+    # regular package. Native __init__ executes before adding project modules.
+    for package in (tools, plugins):
+        expected = source / package.__name__ / '__init__.py'
+        require(Path(package.__file__ or '').resolve() == expected
+                and list(package.__path__) == [str(expected.parent)],
+                'native_package_provenance_required')
+        package.__path__.append(str(ROOT / package.__name__))
     scripts.__path__.append(str(source / 'scripts'))
-    result = complete(value, home, receipt)
-    print(json.dumps(result, sort_keys=True))
+    result = budget.call(complete, value, home, receipt)
+    payload = json.dumps(result, sort_keys=True)
+    budget.check()
+    print(payload, flush=True)
+    budget.check()
 
 
 if __name__ == '__main__':

@@ -34,6 +34,7 @@ def install_input(tmp_path):
         'hermes_donor': str(tmp_path / 'hermes-input'), 'hermes_prepare': pinned(script),
         'sources_lock': pinned(root / 'sources.lock.json'), 'dsh_donor': str(tmp_path / 'friday/harness'),
         'a0_donor': str(tmp_path / 'a0-input'), 'product': inputs(),
+        'containment': pinned(Path('/usr/bin/bwrap')),
         'project_files': {str(p.relative_to(root)): sha(p) for p in paths}, 'seconds': 1800}
     return value
 
@@ -59,7 +60,7 @@ def test_native_complete_install_commands_parse_in_real_donor(install_input):
 
 
 @pytest.mark.parametrize('field', ['home', 'bootstrap_python', 'hermes_prepare', 'sources_lock',
-                                  'dsh_donor', 'a0_donor', 'product', 'project_files', 'seconds'])
+                                  'dsh_donor', 'a0_donor', 'product', 'project_files', 'seconds', 'containment'])
 def test_missing_mandatory_install_input_refuses_before_effect(install_input, field):
     value = copy.deepcopy(install_input); del value[field]
     with pytest.raises((ValueError, KeyError)): entry.commands(value)
@@ -101,14 +102,16 @@ def test_partial_install_never_replayed_or_cleaned(install_input, tmp_path, monk
     from scripts import dsh_prepare
     calls = []
     def failed(*a, **kw):
-        calls.append((a, kw)); raise RuntimeError('synthetic finite preparer failure')
+        calls.append((a, kw))
+        if len(calls) == 1: return 'FRIDAY_PID_NAMESPACE_OK', {}
+        raise RuntimeError('synthetic finite preparer failure')
     monkeypatch.setattr(dsh_prepare, 'run', failed)
     with pytest.raises(RuntimeError): entry.install(install_input, input_path)
     assert entry.read_json(home / entry.MARKER)['state'] == 'PARTIAL'
     (home / 'retained-work.txt').write_text('preserve')
     with pytest.raises(ValueError, match='partial_install_requires_reconciliation'):
         entry.install(install_input, input_path)
-    assert len(calls) == 1 and (home / 'retained-work.txt').read_text() == 'preserve'
+    assert len(calls) == 2 and (home / 'retained-work.txt').read_text() == 'preserve'
 
 
 def test_install_process_environment_has_no_ambient_keys_or_routing(tmp_path, monkeypatch):
@@ -140,7 +143,7 @@ def test_duplicate_fields_and_inline_yaml_are_not_adopted(tmp_path):
 
 def test_source_receipt_checks_actual_complete_pinned_native(tmp_path):
     # Existing frozen full native fixture, bytes verified by the outer guard.
-    e = Path(os.environ['FRIDAY_FIXTURE_EVIDENCE']); source = e / 'native'
+    e = Path(os.environ['FRIDAY_FIXTURE_EVIDENCE']); source = (e / 'native').resolve()
     files = {str(p.relative_to(source)): {'sha256': sha(p), 'bytes': p.stat().st_size,
                                         'mode': '100755' if p.stat().st_mode & 0o111 else '100644'}
              for p in source.rglob('*') if p.is_file()}
@@ -313,6 +316,10 @@ def test_whole_finite_composition_and_completed_idempotence_with_native_config(i
     from scripts import dsh_prepare
     e = Path(os.environ['FRIDAY_FIXTURE_EVIDENCE']); source = home / 'hermes-agent'
     def intercepted(argv, cwd, **kw):
+        assert argv[:4] == ['/usr/bin/bwrap', '--unshare-pid', '--die-with-parent', '--new-session']
+        argv = argv[argv.index('--') + 1:]
+        if '-c' in argv and 'FRIDAY_PID_NAMESPACE_OK' in argv[-1]:
+            return 'FRIDAY_PID_NAMESPACE_OK', {}
         calls.append({'argv': argv, 'cwd': str(cwd), 'timeout': kw['timeout'], 'env': kw['env']})
         if '--destination' in argv:
             shutil.copytree(e / 'native', source, copy_function=shutil.copy2)
