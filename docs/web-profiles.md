@@ -138,9 +138,12 @@ untrusted output labeling were exercised without making provider requests. Unit
 controls cover malformed/injected inputs, redacted CLI errors, independent configs,
 synthetic credential canaries, unchanged inference and protected publication/backup.
 
-The current Harness launcher still needs approved provider environment forwarding
-and DNS/TLS/proxy/trust-store integration inside its restricted namespace. A0 still
-needs its separate approved egress, native search service and host integration.
+The worker source connection is described in [worker-web.md](worker-web.md):
+Harness explicitly forwards receiving-scope Exa/local credentials with pinned
+DNS/TLS inputs, refusing absent current network admission. A0's native retrieval
+configuration and narrow bounded-search overlay are prepared. Its existing
+startup/kernel guard still blocks native service/external-egress integration.
+Both need the documented checked installation and live admission prerequisites.
 Hermes tool registration is not a worker web broker; `mcp_serve.py` exposes messaging
 and history, not arbitrary web tools. Browser interaction, actual provider
 availability, mid-task retrieval for both workers, original deadline/stop behavior,

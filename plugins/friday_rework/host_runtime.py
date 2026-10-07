@@ -17,6 +17,7 @@ import stat
 from .adapters.dsh import DshAdapter, DshHostConfig, PinnedFile
 from .controller import WorkerBinding
 from .supervision import NativeSupervisor
+from .worker_web import DshWebInputs, WorkerWebError, scoped_environment
 
 
 class HostUnavailable(RuntimeError):
@@ -59,7 +60,8 @@ def validate_runtime(value):
     dsh = value["dsh"]
     required_dsh = {"payload_root", "toolchain_root", "node", "cli", "patch", "native_files", "key_name",
                     "profile", "memory_bytes", "cpu_percent", "tasks", "shutdown_seconds", "tmp_bytes"}
-    if not isinstance(dsh, dict) or set(dsh) != required_dsh or dsh["profile"] != "headless":
+    if (not isinstance(dsh, dict) or set(dsh) not in (required_dsh, required_dsh | {'web'})
+            or dsh["profile"] != "headless"):
         raise HostUnavailable("invalid_dsh_config")
     for key in ("payload_root", "toolchain_root"):
         _path(dsh[key])
@@ -69,6 +71,13 @@ def validate_runtime(value):
         raise HostUnavailable("missing_native_pins")
     for pin in dsh["native_files"]:
         _pin(pin)
+    if 'web' in dsh:
+        web = dsh['web']
+        if (not isinstance(web, dict) or set(web) != {'profile','resolver','trust_bundle','egress_evidence','research_policy'}
+                or web['profile'] != 'exa-paid' or dsh['key_name'] == 'EXA_API_KEY'):
+            raise HostUnavailable('invalid_worker_web_config')
+        for key in ('resolver','trust_bundle','egress_evidence','research_policy'):
+            _pin(web[key])
     for key, maximum in (("memory_bytes", 2*1024**3), ("cpu_percent", 400), ("tasks", 64),
                          ("shutdown_seconds", 2), ("tmp_bytes", 64*1024**2)):
         if type(dsh[key]) is not int or not 0 < dsh[key] <= maximum:
@@ -110,9 +119,21 @@ def check_runtime(value, associations):
     dsh = config["dsh"]
     for pin in (dsh["node"], dsh["cli"], dsh["patch"], *dsh["native_files"]):
         _pin(pin).read()
+    web = _dsh_web(dsh)
+    if web:
+        web.checked_patch(_pin(dsh['patch']).read())
     receipt = json.loads(_pin(config["runtime_receipt"]).read())
     adapter_hash = hashlib.sha256(Path(__file__).with_name("adapters").joinpath("dsh.py").read_bytes()).hexdigest()
-    if (not isinstance(receipt, dict) or set(receipt) != {"schema", "ready", "runtime_sha256", "adapter_sha256", "evidence"}
+    fields = {"schema", "ready", "runtime_sha256", "adapter_sha256", "evidence"}
+    if web:
+        fields.add('web_source_pins')
+        import tools.web_profile as profile_helper
+        expected = {'plugins/friday_rework/worker_web.py':hashlib.sha256(Path(__file__).with_name('worker_web.py').read_bytes()).hexdigest(),
+                    'tools/web_profile.py':hashlib.sha256(Path(profile_helper.__file__).read_bytes()).hexdigest(),
+                    'config/RESEARCH.md':hashlib.sha256(web.research_policy.read()).hexdigest()}
+        if not isinstance(receipt,dict) or receipt.get('web_source_pins') != expected:
+            raise HostUnavailable('worker_web_source_not_verified')
+    if (not isinstance(receipt, dict) or set(receipt) != fields
             or receipt["schema"] != "friday-rework.dsh-runtime.v1" or receipt["ready"] is not True
             or receipt["adapter_sha256"] != adapter_hash
             or receipt["runtime_sha256"] != digest({k: v for k, v in config.items() if k != "runtime_receipt"})
@@ -123,7 +144,13 @@ def check_runtime(value, associations):
     return config
 
 
-def dsh_binding(value, associations):
+def _dsh_web(dsh):
+    web = dsh.get('web')
+    return (DshWebInputs(*(_pin(web[k]) for k in ('resolver','trust_bundle','egress_evidence','research_policy')),
+                        profile=web['profile']) if web is not None else None)
+
+
+def dsh_binding(value, associations, *, web_network_check=None):
     """Concrete config factory; recovery preserves retained config and budgets.
 
     Stop does not re-read readiness or launch pins. DSH's own stop and emergency
@@ -131,25 +158,20 @@ def dsh_binding(value, associations):
     """
     config = validate_runtime(value)
     dsh = config["dsh"]
+    web = _dsh_web(dsh)
     def environment():
-        from agent.secret_scope import current_secret_scope, current_secret_scope_home
-        from gateway.platforms._shared import get_scoped_secret
-        from hermes_constants import get_hermes_home
-        scope = current_secret_scope()
-        if (scope is None or current_secret_scope_home() != config["runtime_home"]
-                or get_hermes_home() != Path(config["runtime_home"]) or dsh["key_name"] not in scope):
-            raise HostUnavailable("runtime_key_unavailable")
-        value = get_scoped_secret(dsh["key_name"])
-        if (not isinstance(value, str) or not value or "\x00" in value
-                or value != scope[dsh["key_name"]]):
-            raise HostUnavailable("runtime_key_unavailable")
-        return {dsh["key_name"]: value}
+        names = (dsh['key_name'], 'EXA_API_KEY') if web else (dsh['key_name'],)
+        try:
+            return scoped_environment(config['runtime_home'], names)
+        except WorkerWebError:
+            raise HostUnavailable('runtime_key_unavailable') from None
     supervisor = NativeSupervisor()
     native = DshHostConfig(
         workspace_root=Path(config["workspace_root"]), payload_root=Path(dsh["payload_root"]),
         toolchain_root=Path(dsh["toolchain_root"]), node=_pin(dsh["node"]), cli=_pin(dsh["cli"]),
         patch=_pin(dsh["patch"]), native_files=tuple(_pin(p) for p in dsh["native_files"]),
         environment=environment, key_name=dsh["key_name"],
+        web=web, verify_web_network=web_network_check,
         current_association=lambda row: associations.get(row["existing_task_id"], row["owner"]),
         **{k: dsh[k] for k in ("profile", "memory_bytes", "cpu_percent", "tasks", "shutdown_seconds", "tmp_bytes")})
     return WorkerBinding(DshAdapter(native, supervisor=supervisor, clock=associations.clock), supervisor.stop)

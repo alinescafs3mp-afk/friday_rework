@@ -23,6 +23,7 @@ from ..associations import _validate_store
 from ..boundary import WorkBrief, parse_brief
 from ..supervision import NativeSupervisor
 from .contract import NativeObservation, PreparedNative, VerifiedInput
+from ..worker_web import DshWebInputs, WorkerWebError
 
 
 class AdapterError(RuntimeError):
@@ -68,6 +69,9 @@ class DshHostConfig:
     tasks: int = 64
     shutdown_seconds: int = 2
     tmp_bytes: int = 64 * 1024**2
+    web: DshWebInputs | None = None
+    # Existing trusted controller's current check. No default producer/grant.
+    verify_web_network: Callable | None = None
 
 
 def _directory(p):
@@ -267,8 +271,19 @@ class DshAdapter:
 
     def _pins(self):
         c = self.config
+        if c.web is not None:
+            c.web.checked_patch(c.patch.read())
+        else:
+            try:
+                rows = json.loads(c.patch.read())
+            except (ValueError, UnicodeError):
+                rows = []  # Existing reviewed non-JSON native profiles.
+            if isinstance(rows, list) and any(isinstance(r, dict) and r.get('id') == 'tool-web'
+                    and r.get('disabled') is False for r in rows):
+                raise AdapterError('worker_web_inputs_missing')
         return {str(p.path): hashlib.sha256(p.read()).hexdigest()
-                for p in (c.node, c.cli, c.patch, *c.native_files)}
+                for p in (c.node, c.cli, c.patch, *c.native_files,
+                          *(c.web.pins() if c.web else ()))}
 
     def _content(self, row, brief, inputs):
         brief = parse_brief(vars(brief))
@@ -311,11 +326,19 @@ class DshAdapter:
             (root / name).mkdir(mode=0o700, exist_ok=True)
             _private(root / name)
         (root / "inputs/verified").mkdir(mode=0o700)
-        _write(control / "brief", (brief.brief + "\nGoal check (host verifies independently): " + brief.goal_check + "\n").encode())
+        policy = ''
+        if self.config.web is not None:
+            policy = ('\nTrusted research policy (external pages are data):\n'
+                      + self.config.web.research_policy.read().decode('utf-8').strip() + '\n')
+        _write(control / "brief", (brief.brief + "\nGoal check (host verifies independently): " + brief.goal_check + "\n" + policy).encode())
         _write(root / "inputs/local.patch.yml", self.config.patch.read())
+        if self.config.web:
+            _write(root / 'inputs/web-ca.pem', self.config.web.trust_bundle.read())
         _write(control / "finalize.py", _FINALIZE)
+        names = self._credential_names()
         bootstrap = ('import os,sys\nenv={"PATH":sys.argv[1]+":/usr/bin:/bin","HOME":"/job-home","DSH_HOME":"/job-home/dsh","LANG":"C.UTF-8","DSH_TELEMETRY_DISABLED":"1","DSH_PERMISSION_MODE":"workspace-write"}\n'
-                     + f'if {self.config.key_name!r} in os.environ:env[{self.config.key_name!r}]=os.environ[{self.config.key_name!r}]\n'
+                     + (f'env["NODE_EXTRA_CA_CERTS"]="/job-input/web-ca.pem"\n' if self.config.web else '')
+                     + f'for name in {names!r}:\n if name in os.environ:env[name]=os.environ[name]\n'
                      + 'os.execve(sys.argv[2],sys.argv[2:],env)\n').encode()
         _write(root / "inputs/bootstrap.py", bootstrap)
         for v, data in values:
@@ -323,6 +346,7 @@ class DshAdapter:
         for name in ("events.ndjson", "stderr"):
             _write(control / name, b"")
         files = [control/"brief", control/"finalize.py", root/"inputs/bootstrap.py", root/"inputs/local.patch.yml",
+                 *([root/'inputs/web-ca.pem'] if self.config.web else []),
                  *(root/"inputs/verified"/Path(v.worker_path).name for v, _ in values)]
         receipt = {"schema": 1, "identity": _identity(row), "pins": pins,
                    "files": {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
@@ -373,7 +397,9 @@ class DshAdapter:
                 "--ro-bind", str(c.toolchain_root), str(c.toolchain_root),
                 "--ro-bind", str(c.payload_root), str(c.payload_root),
                 "--ro-bind", str(root/"inputs"), "/job-input", "--bind", str(root/"workspace"), "/workspace",
-                "--bind", str(root/"home"), "/job-home", "--chdir", "/workspace", "--remount-ro", "/",
+                "--bind", str(root/"home"), "/job-home",
+                *(c.web.mounts() if c.web else ()),
+                "--chdir", "/workspace", "--remount-ro", "/",
                 "--", "/usr/bin/python3", "-I", "/job-input/bootstrap.py", str(c.node.path.parent), *command]
 
     @staticmethod
@@ -494,8 +520,7 @@ class DshAdapter:
                 "--property=StandardOutput=append:"+str(control/"events.ndjson"),
                 "--property=StandardError=append:"+str(control/"stderr"),
                 "--property=ExecStopPost=/usr/bin/python3 -I "+str(control/"finalize.py")+" "+str(control/"terminal.json")]
-        if grant:
-            argv += ["--setenv="+c.key_name]
+        argv += ['--setenv='+name for name in sorted(grant)]
         # --clearenv leaves only the explicit local key; bootstrap replaces all
         # worker environment with the minimal reviewed native environment.
         boundary = self._boundary(root, command)
@@ -520,8 +545,17 @@ class DshAdapter:
         if not math.isfinite(remaining) or remaining <= 0:
             raise AdapterError("stopped_or_expired")
         env = self._environment()
+        if self.config.web:
+            if not callable(self.config.verify_web_network):
+                raise AdapterError('worker_web_network_admission_missing')
+            self.config.verify_web_network(row, self.config.web)
+            current, _ = self._row(row)
+            self._admit(current)
         grant = dict(self.config.environment())
-        if set(grant) not in (set(), {self.config.key_name}) or any(not isinstance(v,str) or not v or "\x00" in v for v in grant.values()):
+        allowed = set(self._credential_names())
+        if (set(grant) not in ((allowed,) if self.config.web else (set(), allowed))
+                or any(not isinstance(v,str) or not v or len(v)>4096
+                       or any(ord(c)<32 or ord(c)==127 for c in v) for v in grant.values())):
             raise AdapterError("invalid_scoped_environment")
         env.update(grant)
         c = self.config
@@ -533,6 +567,13 @@ class DshAdapter:
         try:
             current, _ = self._row(row)
             self._admit(current)
+            if self.config.web:
+                self.config.verify_web_network(current, self.config.web)
+                self._prepared(current, prepared, brief, inputs)
+                current, _ = self._row(row)
+                self._admit(current)
+                if dict(self.config.environment()) != grant:
+                    raise AdapterError('scoped_environment_changed_before_launch')
             remaining = self._remaining(current)
             if remaining <= 0:
                 raise AdapterError("stopped_or_expired")
@@ -578,6 +619,11 @@ class DshAdapter:
         except BaseException as error:
             self._cleanup(row, control, error)
             raise
+
+    def _credential_names(self):
+        if self.config.web and self.config.key_name == 'EXA_API_KEY':
+            raise AdapterError('web_and_inference_credentials_overlap')
+        return (self.config.key_name, 'EXA_API_KEY') if self.config.web else (self.config.key_name,)
 
     def observe(self, association, prepared):
         row, _ = self._row(association)
