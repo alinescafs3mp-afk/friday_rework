@@ -68,11 +68,19 @@ Dashboard authentication is mandatory. This implementation supports the native
 BasicAuth identity: `provider: basic`, `user_id` equal to the actual configured
 username, and explicit `org_id: ""`. Other native auth providers need their own
 reviewed settings; display names cannot stand in for an identity. The renderer
-uses the actual native auth-gate predicate and refuses loopback plus loopback
-public URL. A loopback backend with an explicit non-loopback HTTPS public URL
-engages the native gate. Alternatively, an explicit non-loopback bind engages
-it. The port in the declared public authority currently must match the listener;
-proxy prefix/port translation requires a separate reviewed launcher contract.
+sets the explicit native `dashboard.require_auth: true` policy. The existing
+Hermes gate, password provider, sessions, CSRF and Host/Origin checks apply on
+loopback as well. A local URL such as `http://127.0.0.1:9119` requires a loopback
+bind; plain HTTP cannot expose the listener to the network. A real external
+HTTPS authority remains supported. No fictional domain is needed for local
+administration. The port in the declared authority must match the listener;
+proxy prefix/port translation needs a separately reviewed launcher contract.
+
+The native policy accepts only a boolean. An explicit required gate cannot be
+bypassed by `--insecure` or the Desktop loopback exemption; absent providers
+stop startup. Friday's source/owner proof additionally requires this policy to
+remain true in the effective protected configuration. Donor deployments that
+do not select the policy retain their existing behavior.
 
 Only `dashboard_auth/basic` is selected; alternative bundled auth backends are
 explicitly disabled. The contract names the native username, password-hash and

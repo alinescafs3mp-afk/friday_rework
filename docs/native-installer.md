@@ -179,3 +179,20 @@ policy cases reuse a once-verified complete source identity; byte-drift cases an
 full-source positives use the uncached native consumer. Actual authenticated
 HTTP/socket startup, race under independently scheduled real processes and all
 six live journeys still require parent integration and independent acceptance.
+
+
+## Protected local Dashboard profile
+
+Normal configuration always selects the native `dashboard.require_auth: true`
+policy and existing Basic provider. A loopback HTTP authority is supported with
+a loopback bind; external authority still requires HTTPS. Both installer input
+validation and the native profile compiler enforce the same distinction. The
+native startup gate remains mandatory even under Desktop or `--insecure`, and
+Friday refuses effective configuration that removes its required-auth policy.
+This adds no alternate login, credential store or public listener.
+
+The changed source passed 16 new local-policy/password controls, 132 existing
+profile/installer checks, 75 Dashboard ownership checks and all eleven complete
+native source checks. Password checks use synthetic private profiles and the
+real native provider without sockets. Independent review and actual browser,
+credential, runtime and complete product journeys remain required.

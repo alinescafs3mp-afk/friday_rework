@@ -87,7 +87,9 @@ def native_profile_check(bundle, home, *, records=()):
     from urllib.parse import urlsplit
     require(get_hermes_home() == home, 'native_home_mismatch')
     config = bundle['config']; contract = bundle['contract']; dash = contract['native_dashboard']
-    require(should_require_dashboard_auth(dash['host'], frozenset({urlsplit(dash['public_url']).hostname})),
+    require(config['dashboard'].get('require_auth') is True
+            and should_require_dashboard_auth(dash['host'], frozenset({urlsplit(dash['public_url']).hostname}),
+                                              require_auth=config['dashboard']['require_auth']),
             'native_dashboard_auth_off')
     require(config['fallback_providers'] == [] and config['fallback_model'] == {},
             'model_fallback_refused')
