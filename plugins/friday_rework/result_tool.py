@@ -78,6 +78,10 @@ def owned_result(host, reference, kwargs):
             or owner["chat_type"] != binding["ingress"]["chat_type"]
             or any(owner[k] != original[k] for k in ("user_id", "chat_id", "thread_id"))):
         raise AssociationError("foreign_result_owner")
+    from hermes_cli.friday_user_scope import current
+    scope = current()
+    if scope is not None:
+        scope.require_owner(owner, binding["ingress"])
     # A native notification/new message in the SAME session can inspect it.
     # A /new replacement session cannot inherit this access by matching chat.
     return row

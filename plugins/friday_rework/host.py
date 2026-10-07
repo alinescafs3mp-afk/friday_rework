@@ -72,8 +72,12 @@ class WorkerHost:
                 raise HostUnavailable("foreign_runtime_home")
             brief = parse_brief(args)
             owner = bound_owner(session_id=kwargs.get("session_id"))
+            from hermes_cli.friday_user_scope import current
+            scope = current()
             ingress, correlation = self.admission.match(
                 owner, task_id=kwargs.get("task_id"), session_id=kwargs.get("session_id"))
+            if scope is not None:
+                scope.require_owner(owner, ingress)
         except (ValueError, RuntimeError, OSError):
             return json.dumps({"accepted": False, "error": "unproved_admission"})
         if brief.worker not in {'dsh', 'a0'}:

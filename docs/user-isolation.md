@@ -1,0 +1,119 @@
+# Native ordinary-user isolation candidate
+
+This is source/offline preparation for FRW026, not installation, independent
+acceptance or a complete two-user product journey. Apply the exact
+`patches/hermes/user-isolation.patch` after main `6dc2eb0`; the manifest pins
+every native input/output. Admin-controls `130248c` is a separate candidate.
+
+The capability is minted only after the original native principal admission
+succeeds. It binds platform, receiving transport profile, configured account and
+user to one exclusive runtime profile and its private native home. Chat, topic,
+session, message and task identities remain separate. A channel `admin` role
+does not become a signed Dashboard operator. The authoritative native admin API
+keeps its intentional access to all configured conversations.
+
+Native sync/async gateway profile scopes enter the capability before prompt,
+history and tools. Cached memory/agents must retain the same principal, home and
+binding; a new authenticated event from that same user remains useful. Memory
+load/mutation/frozen prompt, history readers, native cwd/context files, agent
+turn/API admission, registry, Tool Search, sequential/concurrent/inline tools,
+and slash/quick/plugin command admission recheck it. Loss of execution context,
+changed/disabled identities, copied capabilities, foreign profiles or changed
+bindings refuse. Revocation is latched on the retained capability; enable does
+not restart an old task, clear stop intent or reset a budget.
+
+## Explicit native setup
+
+Place protected policy and the existing `product_access.v1` PluginState in the
+**receiving transport authorization home**. Add to Friday native plugin settings:
+
+```json
+{
+  "user_isolation": {
+    "enabled": true,
+    "bindings": [
+      {"platform":"telegram","transport_profile":"default","account_id":"actual-bot-A","user_id":"user-A","runtime_profile":"user-A","tools":["memory","session_search","read_file","write_file","web_search","web_extract","friday_work","friday_result"]},
+      {"platform":"telegram","transport_profile":"default","account_id":"actual-bot-A","user_id":"user-B","runtime_profile":"user-B","tools":["memory","session_search","read_file","write_file","web_search","web_extract","friday_work","friday_result"]}
+    ]
+  }
+}
+```
+
+Every runtime profile is unique; `default` cannot be a user runtime. Existing
+native routing must resolve each authenticated principal to that exact profile.
+The profile must also be explicitly admitted by the receiving account policy.
+Missing/invalid bindings or a route to somebody else's profile deny admission.
+Without `user_isolation`, the old source is still **unaccepted for ordinary-user
+privacy**; it is not silently promoted by having `product_access` enabled.
+
+`provision_new_home` is a trusted installation preparation primitive, never a
+model tool or onboarding grant. It creates a **new** native profile with empty
+memory/workspace and a private principal/binding marker. Existing homes refuse
+adoption, so owner histories, secrets, arbitrary skills and context are never
+cloned. Only explicit non-secret native model/tool settings are inputs; model
+routes must be literal approved local addresses and `/v1`, with no cloud,
+credentials in URLs or fallback. The product installer must supply the verified
+Friday persona, explicitly scoped provider secrets and trusted plugin/worker
+configuration through their existing protected paths. This source assignment
+does not perform that installation or change any existing deployment profile.
+
+## Data and useful actions
+
+Native SessionDB remains the only history store. Before transcript/preview/FTS
+access the exclusive home's native rows must all carry the same user, profile
+and persisted receiving-account origin. Legacy, unknown, mixed or unreadable
+stores refuse; current routing never relabels them. Inspection is bounded at
+10,000 rows: a larger store is explicitly unaccepted until an indexed/budgeted
+integrity join is reviewed, not partially searched. Own native profile links
+remain usable; cross-profile links and caller-supplied foreign DBs refuse.
+
+Memory uses the original MemoryStore and its native locking, limits, threat
+scan, atomic writes and frozen prompt. Native profile/context and secret scopes
+remain intact. Files use the existing `read_file`/`write_file` names with a small
+descriptor-only local backend rooted in the user's private workspace. Relative
+and absolute own-workspace paths work. Parent components, symlinks, hardlinks,
+devices, loose/private foreign files, hidden paths and paths outside that root
+refuse before reading or writing. Reads are bounded UTF-8 text; writes are
+create-only and cannot replace an existing inode. No shell fallback is used.
+
+Actual permitted functions are the explicit binding `tools` list, visible in
+the existing administrator effective plugin settings. The intact donor catalog
+is not erased: catalog visibility does not grant execution. Ordinary shell,
+code execution, arbitrary MCP/connectors, native subagent/profile delegation,
+config mutation and unreviewed file/skill/browser operations are refused. Safe
+ordinary native commands are help/status/stop/cancel/new/reset/queue/memory.
+This list is a declared **unaccepted capability gap**, not full donor acceptance
+by feature exclusion. Coding/engineering stays on the existing `friday_work`
+path into intact Harness/A0; result access uses the original checked
+`friday_result`. Both joins additionally require the authenticated scope and
+exact retained ingress account/user/runtime, preserving the original native
+identity, inputs, budgets, stop and output checks. No new worker/queue/database
+or unsupervised alternative terminal is created.
+
+## Required joins and remaining acceptance
+
+The independent integrator must compose the minimal `host.py` insertion after
+admin-controls' existing-host changes; this candidate does not import that
+moving patch or change its worktree. `result_tool.py` adds the same scope check.
+The native delta touches distinct files from the four generic admin-control
+files. Apply against the manifest bytes, not a guessed donor version.
+
+Remaining release blockers are explicit: normal protected per-user profile
+onboarding/routing and plugin/secret/persona configuration; actual two-user
+browser/channel/revocation journey; verified received-attachment staging into
+ordinary read context (shared transport cache paths are not an ordinary grant);
+indexed large-history integrity; reviewed existing-file CAS edits/search,
+skill/provider/browser capabilities and any additional native inline surfaces;
+full context/memory-provider and delegated-worker behavior on the final
+candidate. Do not claim those from the bounded component tests. Activate policy
+at a reconciled native boundary, keeping already admitted jobs on their original
+owners/homes/budgets and preserving every pause/cancel/uncertain delivery.
+
+Mandatory autonomous web remains required. Source tests exercise registry
+dispatch with a clearly synthetic bounded transport, not retrieval acceptance.
+Both real intact workers must discover a documentation gap mid-task, retrieve
+through their scoped worker path, apply it and continue. All six complete owner
+journeys remain NOT_RUN. Production inference stays on the configured local
+endpoints with no cloud fallback; temporary test capacities are not deployment
+limits. Astra owns independent review, final composition, installation and
+release.
