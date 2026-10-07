@@ -85,10 +85,7 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
         if variant=='outage':raise requests.ConnectionError('synthetic selected provider unavailable')
         args=kw['json']['params']['arguments']
         if kw['json']['params']['name']=='web_search_exa':
-            # Native memoization fetches the published bucket, then slices the
-            # caller's original limit. Assert the real producer contract.
-            from tools.web_result_cache import bucket_limit
-            assert args['numResults']==bucket_limit(3)
+            assert args['numResults']==3
             text='Title: urllib3 official source\nURL: https://urllib3.readthedocs.io/en/stable/reference/urllib3.util.html\nHighlights:\nRetry API'
         else:text='# Retry\ntotal, allowed_methods, status_forcelist, respect_retry_after_header: synthetic official-text fixture'
         if echo:
