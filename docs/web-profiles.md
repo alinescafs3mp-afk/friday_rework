@@ -150,3 +150,177 @@ availability, mid-task retrieval for both workers, original deadline/stop behavi
 hostile-page behavior with a real model, admin journeys and normal packaged startup
 are **NOT_RUN** here. Normal Friday installation must deliver the working selected
 web path; these component commands do not shift that assembly work to the owner.
+
+## Exact no-cache search and the prepared native research runner
+
+`patches/hermes/web-exact-limit.patch` changes only the native search fetch count:
+with `web.cache_enabled=false`, the provider receives the existing validated
+native limit (including clamping/coercion). Limit 3 therefore serializes as Exa
+MCP `numResults=3`. Default/cache-enabled behavior keeps bucket 10, memo hits,
+single-flight, slicing and non-caching of failures. Provider selection, keyless
+ring, rescue policy, extraction and inference are unchanged. Apply only to the
+exact file hash in its separate manifest, after the existing canonical overlays;
+verify the resulting hash and patch roundtrip. The prior refused native probe is
+immutable and must not be retried or have its protected receipt enlarged.
+
+`validation/web_runtime.py` is an inert, source-only preparation for a **new**
+parent-authorized ordinary/explicit research task. It uses the real Hermes
+`AIAgent`, native local runtime resolver, in-memory profile secret scope, native
+web tools with the supported `session_db=None` mode. It adds no scheduler, service launcher, task database or
+authorization command. The small `validation_profile` delta takes task names
+from the pinned native defaults and pins every model-capable auxiliary row to the
+same explicit configured local route. Models and capacities remain renderer
+inputs. Publish a new private home through the native atomic writer, preserve
+Friday SOUL, then pin its actual config/SOUL bytes; do not edit an installed home.
+
+The driver binds the original task and a canonical JSON plan hash, exact candidate
+files, profile, SOUL, RESEARCH, driver, web helper and inference endpoint. It clears
+ambient policy/provider/proxy overrides before native imports, requires the
+effective native tool set to be exactly search/extract, verifies the actual native
+rendered SOUL/policy and allows no main/auxiliary cloud fallback. The trusted parent
+supplies the existing current durable association and scoped credentials. Admission
+checks the native transient unit owner/invocation/cgroup and current MainPID,
+original boot/monotonic/wall clocks, a native RuntimeMax deadline that cannot extend
+the original task, the already held inherited exclusive-lock FD and a separately
+reviewed original network admission. It never acquires a free lease or creates one.
+
+Before `Native.open`, the driver consumes the **original research admission**
+through the existing `Associations.begin_submission` transition from
+`NOT_SUBMITTED` to `UNKNOWN`. `ExistingBoundary` requires that association store
+and its original owner, and compares the exact original row before and after the
+durable transition. The already supervised wrapper is distinct from the research
+submission it is about to execute: an already submitted worker row is refused.
+No controller or association schema is changed. A crash, lost acknowledgment or
+failed publication never clears consumption, even if all output files are removed.
+The missing trusted producer must supply this original row; the driver cannot
+create or retrofit it.
+
+**The complete trusted live admission producer is missing and NOT ACCEPTED.**
+The historical smoke/preflight records do not provide it. The parent still needs
+an exact new scope and current reviewed egress (local inference separately from
+selected web), the existing supervised/exclusive boundary, protected scoped
+credential delivery and independent proof of remote inference settlement. After
+driver exit it must observe the entire cgroup quiescent before releasing the
+lease. An in-process `agent.close` or callback cannot attest the driver's own
+terminal cgroup. Refusal/uncertain stop must retain the original budget, process
+identity, partial observations and ownership; no automatic retry.
+
+The private `partial-observation.json` is atomically replaced and fsynced before
+execution, at native tool-complete callbacks, at bounded visible-stream snapshots,
+on native return and after cleanup.
+Returned observations are stored before checking the original deadline; failures,
+incomplete model turns and unknown cleanup remain failed/uncertain. Text is
+redacted before truncation (64 Ki characters in aggregate, 16 Ki per field, bounded
+collections/depth, with a hard 1 MiB serialized-file cap). `observation.json` remains an exclusive final publication.
+`recover(plan, task)` reads these retained observations with the original identity,
+even after expiry/reboot or a failed final publication. It does not admit, settle,
+execute or reset any budget. An interrupted capture may leave only the preceding
+durable partial; it remains uncertain. Native complete tool callbacks provide
+incremental source evidence. The supported native `run_conversation(stream_callback=...)` consumes
+real visible deltas after native thinking/context scrubbers and writer fencing.
+Its accumulator survives native retry/reset. The first delta is fsynced immediately;
+later writes coalesce at 512 input characters or 250 ms on an incoming callback,
+with no timer or new thread. Caps are 64 Ki input characters, 16 Ki retained text,
+4,096 callbacks and 256 stream publications within the original remaining deadline.
+Crossing a cap or failing persistence requests native interruption and prevents
+success. Native continuation/retry policy and request/iteration budgets are unchanged.
+A streaming trie with suffix failure links conceals full credentials of any length and incomplete known-secret
+prefixes containing at least eight original credential characters. Escaping does
+not count as additional characters. The same threshold follows up to three
+serialization boundaries: JSON, and at most one native SDK Python dictionary
+`repr` in either quote style, with printable or ASCII-escaped Unicode. This covers
+the SDK status-error message before its surrounding debug JSON, including a
+partial echo whose quote style differs from the complete credential. All chunk
+splits retain the same policy. The existing 64-form/65,536-character form caps
+remain enforced; arbitrary repeated external encodings are not enumerated.
+Actual SDK regressions decode the saved error message and check both complete
+and partial echoes alongside structured body/response fields. Meaningful prefixes stay concealed
+on mismatch/reset. Shorter incidental matches (including `s`, `sk-`, `local-` and
+`friday-`) are preserved literally, including at natural end of text; they alone
+are not evidence of a credential. At artificial input truncation even a one-character
+pending match is concealed and the observation is marked truncated. No policy can
+distinguish ordinary text identical to a known full credential or its meaningful
+prefix; those exact spans remain redacted. Schema, tool names and nonsecret URLs
+otherwise remain intact. The capped trie buffers only the short undecided prefix,
+never a growing raw stream. Every overlapping start survives meaningful/full
+matches and mismatches. All matched spans are concealed as their complete union;
+a connected span containing any full credential uses `[REDACTED]`, otherwise
+`[REDACTED_PARTIAL]`. This includes starts inside an already concealed span,
+self-overlap and different credentials sharing a suffix/prefix. A native buffer
+reset and a snapshot do not consume this state. The bounded automaton retains
+significant tails as state rather than raw text; short unresolved positions are
+bounded by the longest escaped eight-character threshold. Tool/final observations and spill/debug sinks use the
+same policy so meaningful partial native stubs cannot escape through a later 4xx dump.
+
+No native SQLite transcript or trajectory is enabled. During the dedicated run,
+native console output is discarded and logging is suppressed, including native
+construction and cleanup; only the redacted observation sink is public. Actual
+native full-page and tool-result spill writers receive redacted text and filenames
+before writing. Native API-error request dumps use the existing profile-scoped
+exact-value redaction registry, including escaped credential forms. Before its
+sequential replacements, the dedicated driver conceals the union of overlapping
+credentials for the authenticated profile. Otherwise an earlier full replacement
+can leave an interior fragment that the later JSON sink can no longer recognize.
+Foreign profiles retain their native registry behavior. These scoped bindings,
+including the registry hook and native request-debug JSON sink, are restored at
+close, also after failed construction. Keyless Exa search/extract additionally
+conceal the intact decoded MCP response before native line normalization,
+HTTP-error slicing, parsing or page truncation. JSON/SSE shape, unrelated text,
+citations and native error classification are preserved. This shared keyless
+transport seam does not establish paid Exa SDK coverage.
+
+The owned agent's diagnostic Authorization mask conceals the whole credential,
+including a live key changed by native Unicode recovery; callable credentials
+are identified without invoking them. Authentication and recovery are unchanged.
+Before constructing the stream automaton or installing any persistence hook,
+the driver creates one immutable credential policy. It retains all admitted
+original values, the resolved local key, its scoped `key_env` refresh value
+(`strip()`), and the result of the pinned native `_strip_non_ascii` for those
+runtime values. The same policy feeds the stream, early web response and native
+registry hooks, both spill paths, debug JSON, and execute's observer/final/partial
+observations. It never learns a new key after output or resets a pending stream.
+
+This finite closure follows the actual custom/chat-completions recovery code:
+Unicode repair updates the agent, client and client kwargs; primary recovery can
+restore the constructor key. Both originals and repaired values remain protected.
+The new private profile must have no `.env` or `auth.json`, the named provider
+must use a static scoped key rather than `key_cmd`/inline credentials, and the
+existing no-fallback/no-pool/no-reconfiguration execution boundary still applies.
+The driver now requires source pins for native credential resolution, refresh,
+Unicode sanitization and recovery. This is not a guarantee for arbitrary providers
+or external credential/configuration mutation.
+
+The admission cap remains eight distinct original values and 8192 characters;
+all original and reachable values together must fit the existing 64 encoded forms
+and 65536 form characters. A closure exceeding either form cap is refused before
+agent construction, even when the original-only forms would fit. Partial matching
+still counts eight credential characters before JSON/repr escaping. Synthetic
+native regressions echo the actual Authorization key sent after Unicode repair,
+exercise native primary rollback, preserve stream state across rollback, and scan
+all original/reachable eight-character windows in product files and separately
+identified fixture diagnostics. HTTP/model responses remain synthetic.
+Unexpected replacement of the registry, response or owned-agent mask hook causes
+an explicit cleanup failure instead of being overwritten. Regression checks scan
+all original eight-character windows through recursively decoded retained JSON,
+in addition to full-token and serialized-prefix checks. This policy requires the new private profile and
+dedicated process; it is not suitable for a concurrent gateway. Pinned persistence,
+redaction, spill and logging sources are mandatory inputs. Offline regressions scan
+every actual profile/workspace/output artifact and captured console for synthetic
+credential echoes on success, SDK failure, deadline and uncertain remote stop.
+
+Observations keep input, effective native metadata, tool calls, source responses,
+final response and uncertainty separate, and never accept a model's claim of
+success. Real native SDK/stream/relay/tool
+execution with **synthetic** HTTP/model responses is an offline control, not proof
+of autonomous research, provider availability or normal product startup. Known
+provider registration and denied optional metadata probes are recorded fixture
+limitations. Use [web-runtime-recipe.json](../validation/web-runtime-recipe.json)
+for the next independent actual-source/configuration check and negative controls.
+Both worker mid-job retrieval, normal discovery/install/start and all six complete
+web/admin journeys remain mandatory and **NOT_RUN**, pending their own admission.
+
+The prepared urllib3 example explicitly requests GET503 and header-driven GET413/429,
+with Retry-After respected and no POST/other status retries. The prompt and recipe
+are statically aligned with these branches in pinned source. Header delay, status/
+method cases and total exhaustion remain **NOT_RUN** pending an admissible normal
+verification boundary; no supplemental Retry semantic execution is authorized here.
