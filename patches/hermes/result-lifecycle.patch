@@ -20,11 +20,11 @@ diff --git a/gateway/run_plugin_injection.py b/gateway/run_plugin_injection.py
      def _schedule_plugin_message_injection(
          self, *, content: str, plugin_id: str, session_key: Optional[str] = None,
          origin: Optional[Mapping[str, Any]] = None, plugin_home: Optional[Path] = None,
-+        expected_session_id: Optional[str] = None,
++        expected_session_id: Optional[str] = None, plugin_context: Any = None,
      ) -> bool:
          """Schedule a plugin-triggered turn on the live gateway loop (thread-safe).
  
-@@ -57,6 +58,13 @@
+@@ -57,6 +58,24 @@
          if not getattr(self, "_running", False) or loop is None or loop.is_closed():
              return False
  
@@ -32,31 +32,44 @@ diff --git a/gateway/run_plugin_injection.py b/gateway/run_plugin_injection.py
 +            not isinstance(expected_session_id, str) or not expected_session_id
 +            or expected_session_id != expected_session_id.strip()
 +            or not isinstance(session_key, str) or not session_key.strip()
-+            or origin is not None or plugin_home is None
++            or origin is not None or plugin_home is None or plugin_context is None
 +        ):
 +            return False
++        if expected_session_id is not None:
++            try:
++                from hermes_cli.plugins_injection import require_pinned_injection
++                from hermes_constants import hermes_home_key
++                with plugin_context._manager._discovery_lock:
++                    if (plugin_context.plugin_id != plugin_id
++                            or hermes_home_key(plugin_context._manager.home_path) != hermes_home_key(plugin_home)):
++                        return False
++                    require_pinned_injection(plugin_context, owner=self)
++            except Exception:  # health: allow BLE001 -- Refuse stale owners before scheduling; expose no config data.
++                return False
          if origin is not None:
              source = self._plugin_origin_source(origin, plugin_home=plugin_home, plugin_id=plugin_id)
              if source is None:
-@@ -67,6 +75,7 @@
+@@ -67,6 +86,8 @@
              target = f"session={session_key}"
              coro = self._dispatch_plugin_message_injection(
                  session_key=session_key, content=content, plugin_id=plugin_id,
 +                expected_session_id=expected_session_id, plugin_home=plugin_home,
++                plugin_context=plugin_context,
              )
          try:
              current_loop = asyncio.get_running_loop()
-@@ -133,7 +142,8 @@
+@@ -133,7 +154,9 @@
          return authorized
  
      async def _dispatch_plugin_message_injection(
 -        self, *, session_key: str, content: str, plugin_id: str
 +        self, *, session_key: str, content: str, plugin_id: str,
 +        expected_session_id: Optional[str] = None, plugin_home: Optional[Path] = None,
++        plugin_context: Any = None,
      ) -> bool:
          """Route a plugin-triggered turn through the session's live adapter."""
          if not self._plugin_injection_accepting():
-@@ -142,8 +152,21 @@
+@@ -142,8 +165,21 @@
          if entry is None or entry.origin is None or not self._plugin_injection_accepting():
              return False
  
@@ -78,26 +91,138 @@ diff --git a/gateway/run_plugin_injection.py b/gateway/run_plugin_injection.py
          if not self._plugin_injection_authorized(source, plugin_id=plugin_id, target=f"session={session_key}"):
              return False
  
-@@ -157,13 +180,13 @@
-                 allow_gateway_control=False,
-                 metadata={
-                     "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
+@@ -151,21 +187,70 @@
+         if adapter is None:
+             return False
+ 
++        event = MessageEvent(
++            text=content, message_type=MessageType.TEXT, source=source, internal=True,
++            allow_gateway_control=False,
++            metadata={
++                "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
++                "gateway_session_key": session_key, "gateway_session_id": session_id,
++                "gateway_session_strict": True,
++            },
++        )
++        if expected_session_id is not None:
++            event.metadata["hermes_plugin_pinned"] = True
++            # Ephemeral authority is deliberately not serializable/recoverable. A
++            # reconstructed event retains the marker and fails closed without this load.
++            event._plugin_injection_context = plugin_context
+         async with self._plugin_injection_scope(source):
+-            await adapter.handle_message(MessageEvent(
+-                text=content, message_type=MessageType.TEXT, source=source, internal=True,
+-                allow_gateway_control=False,
+-                metadata={
+-                    "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
 -                    "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
-+                    "gateway_session_key": session_key, "gateway_session_id": session_id,
-                     "gateway_session_strict": True,
-                 },
-             ))
+-                    "gateway_session_strict": True,
+-                },
+-            ))
++            if not await self._plugin_pinned_event_current(event, source):
++                return False
++            await adapter.handle_message(event)
          logger.info(
              "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
 -            plugin_id, session_key, entry.session_id,
 +            plugin_id, session_key, session_id,
          )
          return True
++
++    async def _plugin_pinned_event_current(self, event, source, *, session_id=None) -> bool:
++        """Revalidate a pinned completion at dispatch, including a native FIFO drain.
++
++        The context's existing unload registration is the originating-load fence;
++        manager id/home alone would let a replacement load revive old notifications.
++        """
++        metadata = getattr(event, "metadata", None) or {}
++        if not metadata.get("hermes_plugin_pinned"):
++            return True  # Existing unpinned injection keeps its historical behavior.
++        if getattr(event, "_plugin_injection_rejected", False):
++            return False
++        try:
++            context = getattr(event, "_plugin_injection_context", None)
++            key, pin = metadata.get("gateway_session_key"), metadata.get("gateway_session_id")
++            if (context is None or context.plugin_id != metadata.get("hermes_plugin_id")
++                    or not metadata.get("gateway_session_strict") or not key or not pin
++                    or (session_id is not None and session_id != pin)
++                    or self._session_key_for_source(source) != key):
++                raise RuntimeError("plugin_notification_stale")
++            entry = await self.async_session_store.lookup_by_session_key(key)
++            if entry is None or entry.session_id != pin:
++                raise RuntimeError("plugin_notification_stale")
++            # No awaited operation between current consent/lifetime validation and
++            # the caller's adapter/agent dispatch. Discovery and unload share this lock.
++            from hermes_cli.plugins_injection import require_pinned_injection
++            from hermes_constants import hermes_home_key
++            with context._manager._discovery_lock:
++                require_pinned_injection(context, owner=self)
++                home = context._manager.home_path
++                profile = self._served_profile_for_home(home)
++                if (profile is None or (source.profile and source.profile != profile)
++                        or hermes_home_key(self._resolve_profile_home_for_source(source)) != hermes_home_key(home)
++                        or not self._plugin_injection_authorized(source, plugin_id=context.plugin_id,
++                                                                 target=f"session={key}")):
++                    raise RuntimeError("plugin_notification_stale")
++            return True
++        except Exception:  # health: allow BLE001 -- Stale queued authority fails closed; never replay it.
++            event._plugin_injection_rejected = True
++            logger.warning("Dropping stale pinned plugin notification")
++            return False
  
+     def _served_profile_for_home(self, home: Optional[Path]) -> Optional[str]:
+         """Name of the profile this gateway serves at *home* (a plugin manager's immutable home), or
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -457,6 +457,9 @@
+             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
+         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
+         if not await resolve_heartbeat_owner(self, event, session_entry):
++            return
++        if ((getattr(event, "metadata", None) or {}).get("hermes_plugin_pinned")
++            and not await self._plugin_pinned_event_current(event, source, session_id=session_entry.session_id)):
+             return
+         return source, session_entry, session_key
+ 
+@@ -2194,6 +2197,9 @@
+                 # Persist the coherent context+channel pair before execution: a crash during the
+                 # human turn may be followed by an internal startup-resume on the next process.
+                 await self._persist_prompt_pins(session_key, _run_start_session_id)
++            if ((getattr(event, "metadata", None) or {}).get("hermes_plugin_pinned")
++                and not await self._plugin_pinned_event_current(event, _turn_source, session_id=_run_start_session_id)):
++                return
+             agent_result = await self._run_agent(
+                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
+                 session_id=_run_start_session_id, session_key=session_key,
+@@ -3865,6 +3871,11 @@
+         # See #60671.
+         if pending_event is not None:
+             next_source = getattr(pending_event, "source", None) or source
++            # The in-band FIFO recurses into _run_agent without resolving a session
++            # through _handle_message_with_agent; retain the same pinned authority fence.
++            if ((getattr(pending_event, "metadata", None) or {}).get("hermes_plugin_pinned")
++                and not await self._plugin_pinned_event_current(pending_event, next_source, session_id=session_id)):
++                return result
+             if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
+                 logger.info(
+                     "Discarding stale goal continuation for session %s — goal is no longer active",
+@@ -3939,6 +3950,11 @@
+         try:
+             await self._refresh_agent_cache_message_count(session_key, session_id)
+ 
++            if ((getattr(pending_event, "metadata", None) or {}).get("hermes_plugin_pinned")
++                and not await self._plugin_pinned_event_current(pending_event, next_source, session_id=session_id)):
++                await _run_followup_processing_hook(
++                    _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.CANCELLED)
++                return result
+             followup_result = await self._run_agent(
+                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
+                 source=next_source, session_id=session_id, session_key=next_session_key,
 diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
 --- a/hermes_cli/plugins.py
 +++ b/hermes_cli/plugins.py
-@@ -590,22 +590,22 @@
+@@ -590,22 +590,25 @@
      # manager's home, never the active profile's (#65593 constraint).
      def inject_message(
          self, content: str, role: str = "user", *, session_key: str | None = None,
@@ -119,7 +244,10 @@ diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
          ``plugins.entries.<plugin_id>.allow_gateway_injection`` in the plugin's profile config.
 -        ``True`` means a host accepted the request, not that the turn completed.
 +        ``expected_session_id`` pins an existing messaging session in this plugin's profile;
-+        mismatched IDs and CLI/TUI/origin routes refuse. ``True`` means scheduled, not delivered.
++        mismatched IDs and CLI/TUI/origin routes refuse. Pinned notifications remain owned
++        by this plugin load: current consent, config enablement, gateway ownership and route
++        are rechecked before dispatch, including queued turns. Unload/reload retires them.
++        ``True`` means scheduled, not delivered; a later refusal is never automatically replayed.
          """
          from hermes_cli.plugins_injection import inject_plugin_message
 -        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
@@ -157,8 +285,26 @@ diff --git a/hermes_cli/plugins_gateway_work.py b/hermes_cli/plugins_gateway_wor
 diff --git a/hermes_cli/plugins_injection.py b/hermes_cli/plugins_injection.py
 --- a/hermes_cli/plugins_injection.py
 +++ b/hermes_cli/plugins_injection.py
-@@ -11,11 +11,18 @@
+@@ -9,13 +9,36 @@
+ logger = logging.getLogger("hermes_cli.plugins")
  
+ 
++def require_pinned_injection(context, *, owner=None):
++    """Current load/host lease, capability and native config enablement; caller holds discovery lock."""
++    from hermes_cli.plugins import _plugin_home_scope, load_config_readonly
++    from hermes_cli.plugins_discovery import gate_manifest
++    from hermes_cli.plugins_gateway_work import require_capability
++    runner = require_capability(context, "allow_gateway_injection", owner=owner)
++    with _plugin_home_scope(context._manager.home_path):
++        settings = (load_config_readonly() or {}).get("plugins") or {}
++        enabled, disabled = settings.get("enabled"), settings.get("disabled", [])
++        gate = gate_manifest(context.manifest, set(disabled) if isinstance(disabled, list) else set(),
++                             set(enabled) if isinstance(enabled, list) else None)
++    if gate.action not in {"load", "load_now", "defer"} and not gate.enabled:
++        raise RuntimeError("plugin_disabled")
++    return runner
++
++
  def inject_plugin_message(
      ctx: Any, content: str, role: str, *, session_key: Optional[str],
 -    origin: Optional[Mapping[str, Any]],
@@ -177,15 +323,26 @@ diff --git a/hermes_cli/plugins_injection.py b/hermes_cli/plugins_injection.py
      # An origin names a messaging chat; the local REPL is never that chat.
      if cli is not None and origin is None:
          queue_ = cli._interrupt_queue if getattr(cli, "_agent_running", False) else cli._pending_input
-@@ -51,6 +58,8 @@
+@@ -51,11 +74,19 @@
          return False
      if origin is None:
          target: dict[str, Any] = {"session_key": session_key}
 +        if expected_session_id is not None:
-+            target.update(expected_session_id=expected_session_id, plugin_home=manager.home_path)
++            target.update(expected_session_id=expected_session_id, plugin_home=manager.home_path,
++                          plugin_context=ctx)
      else:
          # The manager's immutable home is the plugin's profile: the gateway creates the session
          # there or nowhere (never the ambient HERMES_HOME of whatever thread called us).
+         target = {"origin": dict(origin), "plugin_home": manager.home_path}
+     try:
++        if expected_session_id is not None:
++            # Reuse the native registration lease: unloading this load retires queued
++            # notifications even when a replacement reuses the same plugin id/manifest.
++            with manager._discovery_lock:
++                require_pinned_injection(ctx)
+         return bool(manager.inject_gateway_message(**target, content=msg, plugin_id=ctx.plugin_id))
+     except Exception:
+         logger.warning("inject_message: gateway scheduling failed for plugin %s", ctx.plugin_id, exc_info=True)
 diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
 --- a/plugins/platforms/telegram/adapter.py
 +++ b/plugins/platforms/telegram/adapter.py
@@ -354,7 +511,16 @@ diff --git a/tests/gateway/test_plugin_message_injection.py b/tests/gateway/test
  import hermes_yaml as yaml
  
  from gateway.config import GatewayConfig, Platform
-@@ -455,3 +456,116 @@
+@@ -16,7 +17,7 @@
+ from gateway.platforms.event import MessageEvent, MessageType
+ from gateway.run import GatewayRunner
+ from gateway.session import SessionEntry, SessionSource, SessionStore, build_session_key
+-from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
++from hermes_cli.plugins import LoadedPlugin, PluginContext, PluginManager, PluginManifest
+ 
+ 
+ def _entry(*, origin=True) -> SessionEntry:
+@@ -455,3 +456,330 @@
      assert manager.has_gateway_message_injector is True
      assert manager.inject_gateway_message(value="kept") is True
      newer_injector.assert_called_once_with(value="kept")
@@ -364,7 +530,7 @@ diff --git a/tests/gateway/test_plugin_message_injection.py b/tests/gateway/test
 +async def original_pin_gateway(tmp_path, monkeypatch):
 +    home = tmp_path / "home"
 +    home.mkdir()
-+    (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {"entries": {"notify-plugin": {"allow_gateway_injection": True}}}}))
++    (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {"enabled": ["notify-plugin"], "entries": {"notify-plugin": {"allow_gateway_injection": True}}}}))
 +    monkeypatch.setenv("HERMES_HOME", str(home))
 +    # Profiles also consult Path.home(), so keep that resolution inside the fixture.
 +    from pathlib import Path
@@ -383,6 +549,7 @@ diff --git a/tests/gateway/test_plugin_message_injection.py b/tests/gateway/test
 +    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
 +    manager = PluginManager(scope_key=str(home))
 +    ctx = PluginContext(PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager)
++    manager._plugins[ctx.plugin_id] = LoadedPlugin(manifest=ctx.manifest, enabled=True)
 +    manager.set_gateway_message_injector(runner, runner._schedule_plugin_message_injection)
 +    return SimpleNamespace(home=home, store=store, entry=entry, adapter=adapter, runner=runner, ctx=ctx)
 +
@@ -456,7 +623,7 @@ diff --git a/tests/gateway/test_plugin_message_injection.py b/tests/gateway/test
 +    else:
 +        g.runner._draining = True
 +    assert await g.runner._dispatch_plugin_message_injection(
-+        session_key=key, content="ready", plugin_id="notify-plugin", expected_session_id=pin, plugin_home=home
++        session_key=key, content="ready", plugin_id="notify-plugin", expected_session_id=pin, plugin_home=home, plugin_context=g.ctx
 +    ) is False
 +    g.adapter._message_handler.assert_not_awaited()
 +    assert not g.adapter._active_sessions
@@ -471,6 +638,219 @@ diff --git a/tests/gateway/test_plugin_message_injection.py b/tests/gateway/test
 +    args.update(target)
 +    assert g.runner._schedule_plugin_message_injection(**args) is False
 +    assert not g.runner._background_tasks
++
++
++def _revoke_pin(g, failure, monkeypatch):
++    manager = g.ctx._manager
++    config_path = g.home / "config.yaml"
++    config = yaml.safe_load(config_path.read_text())
++    if failure == "consent":
++        config["plugins"]["entries"]["notify-plugin"]["allow_gateway_injection"] = False
++        config_path.write_text(yaml.safe_dump(config))
++    elif failure == "config_disabled":
++        config["plugins"]["disabled"] = ["notify-plugin"]
++        config_path.write_text(yaml.safe_dump(config))
++    elif failure == "config_removed":
++        config["plugins"]["enabled"] = []
++        config_path.write_text(yaml.safe_dump(config))
++    elif failure == "config_error":
++        monkeypatch.setattr("hermes_cli.plugins.load_config_readonly", lambda: 1 / 0)
++    elif failure == "unload":
++        manager.unload()
++    elif failure == "reload_same_manifest":
++        manager.unload()
++        manager._plugins[g.ctx.plugin_id] = LoadedPlugin(manifest=g.ctx.manifest, enabled=True)
++    elif failure == "replace_load":
++        manager._plugins[g.ctx.plugin_id] = LoadedPlugin(
++            manifest=PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), enabled=True)
++    elif failure == "disabled":
++        manager._plugins[g.ctx.plugin_id].enabled = False
++    elif failure == "gateway_replaced":
++        manager.set_gateway_message_injector(object(), lambda **kw: True)
++    elif failure == "profile":
++        monkeypatch.setattr(g.runner, "_resolve_profile_home_for_source", lambda source: g.home / "foreign")
++    elif failure == "user":
++        g.runner._is_user_authorized.return_value = False
++    elif failure == "session":
++        g.store.reset_session(g.entry.session_key)
++    elif failure != "none":
++        raise AssertionError(failure)
++
++
++_PIN_REVOCATIONS = ["consent", "config_disabled", "config_removed", "config_error", "unload",
++                    "reload_same_manifest", "replace_load", "disabled", "gateway_replaced", "profile", "user", "session"]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("failure", ["none", *_PIN_REVOCATIONS])
++async def test_pinned_dispatch_rechecks_after_awaited_lookup(original_pin_gateway, monkeypatch, failure):
++    g = original_pin_gateway
++    entered, release = asyncio.Event(), asyncio.Event()
++    lookup = g.runner.async_session_store.lookup_by_session_key
++    async def blocked(key):
++        entered.set()
++        await asyncio.wait_for(release.wait(), 3)
++        return await lookup(key)
++    monkeypatch.setattr(g.runner.async_session_store, "lookup_by_session_key", blocked)
++    handled = AsyncMock()
++    monkeypatch.setattr(g.adapter, "handle_message", handled)
++    assert g.ctx.inject_message("ready", session_key=g.entry.session_key, expected_session_id=g.entry.session_id)
++    tasks = tuple(g.runner._background_tasks)
++    await asyncio.wait_for(entered.wait(), 3)
++    _revoke_pin(g, failure, monkeypatch)
++    release.set()
++    assert await asyncio.gather(*tasks) == [failure == "none"]
++    assert handled.await_count == int(failure == "none")
++    assert not g.runner._background_tasks
++
++
++async def _queued_pin(g):
++    g.adapter._active_sessions[g.entry.session_key] = asyncio.Event()
++    assert g.ctx.inject_message("ready", session_key=g.entry.session_key, expected_session_id=g.entry.session_id)
++    assert await asyncio.gather(*tuple(g.runner._background_tasks)) == [True]
++    # Native FIFO owns this exact event and its private load reference.
++    queued = g.adapter._pending_messages.pop(g.entry.session_key)
++    assert queued._plugin_injection_context is g.ctx
++    return queued
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("failure", _PIN_REVOCATIONS)
++async def test_pinned_busy_fifo_rejects_retired_authority(original_pin_gateway, monkeypatch, failure):
++    g = original_pin_gateway
++    event = await _queued_pin(g)
++    session_id = g.entry.session_id
++    _revoke_pin(g, failure, monkeypatch)
++    runner = g.runner
++    runner._run_agent = AsyncMock()
++    turn = SimpleNamespace(source=event.source, session_id=session_id, session_key=g.entry.session_key,
++                           run_generation=1, _interrupt_depth=0, history=[], context_prompt="offline", _status_thread_metadata={})
++    result = {"interrupted": True, "messages": []}
++    assert await runner._run_agent_queued_followup(turn, g.adapter, event.text, event, None, result, None) is result
++    runner._run_agent.assert_not_awaited()
++    assert event._plugin_injection_rejected is True
++    assert not await runner._plugin_pinned_event_current(event, event.source)
++    g.adapter._active_sessions.clear()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("late_revoke", [False, True])
++async def test_pinned_busy_fifo_rechecks_after_preparation(original_pin_gateway, monkeypatch, late_revoke):
++    g = original_pin_gateway
++    event = await _queued_pin(g)
++    runner = g.runner
++    runner._run_agent = AsyncMock(return_value={"messages": [], "final_response": "offline fixture"})
++    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value=event.text)
++    runner._pinned_channel_inputs = lambda key, prompt, source, **kw: (prompt, source)
++    runner._intake_adapter_for = lambda source: g.adapter
++    async def refresh(*args):
++        if late_revoke:
++            _revoke_pin(g, "consent", monkeypatch)
++    runner._refresh_agent_cache_message_count = refresh
++    turn = SimpleNamespace(source=event.source, session_id=g.entry.session_id, session_key=g.entry.session_key,
++                           run_generation=1, _interrupt_depth=0, history=[], context_prompt="offline", _status_thread_metadata={})
++    result = {"interrupted": True, "messages": []}
++    answer = await runner._run_agent_queued_followup(turn, g.adapter, event.text, event, None, result, None)
++    assert runner._run_agent.await_count == int(not late_revoke)
++    if late_revoke:
++        assert answer is result
++    g.adapter._active_sessions.clear()
++
++
++@pytest.mark.asyncio
++async def test_reconstructed_pinned_event_cannot_replay_without_load(original_pin_gateway):
++    g = original_pin_gateway
++    event = await _queued_pin(g)
++    recovered = MessageEvent(text=event.text, source=event.source, internal=True,
++                             allow_gateway_control=False, metadata=dict(event.metadata))
++    assert not await g.runner._plugin_pinned_event_current(recovered, recovered.source)
++    assert await g.runner._plugin_pinned_event_current(event, event.source)
++    g.adapter._active_sessions.clear()
++
++
++@pytest.mark.asyncio
++async def test_stale_context_cannot_schedule_after_same_manifest_reload(original_pin_gateway):
++    g = original_pin_gateway
++    event = await _queued_pin(g)
++    manager = g.ctx._manager
++    manager.unload()
++    manager._plugins[g.ctx.plugin_id] = LoadedPlugin(manifest=g.ctx.manifest, enabled=True)
++    assert not g.ctx.inject_message("stale", session_key=g.entry.session_key, expected_session_id=g.entry.session_id)
++    fresh = PluginContext(g.ctx.manifest, manager)
++    assert fresh.inject_message("fresh", session_key=g.entry.session_key, expected_session_id=g.entry.session_id)
++    assert await asyncio.gather(*tuple(g.runner._background_tasks)) == [True]
++    assert not await g.runner._plugin_pinned_event_current(event, event.source)
++    g.adapter._active_sessions.clear()
++    g.runner._queued_events.clear()
++    g.adapter._pending_messages.clear()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("late_revoke", [False, True])
++async def test_pinned_idle_turn_rechecks_after_start_hook(original_pin_gateway, monkeypatch, late_revoke):
++    g = original_pin_gateway
++    event = await _queued_pin(g)
++    runner = g.runner
++    # Exact native handler and final admission fence; model preparation/entry are offline boundaries.
++    runner._hmwa_resolve_session = AsyncMock(return_value=(event.source, g.entry, g.entry.session_key))
++    prepared = runner._PreparedTurn([], "offline", event.text, event.text, None, None)
++    runner._hmwa_prepare_turn = AsyncMock(return_value=(prepared, {}))
++    runner._clear_session_env = MagicMock()
++    runner._pinned_channel_inputs = lambda key, prompt, source, **kw: (prompt, source)
++    async def start(*args):
++        if late_revoke:
++            _revoke_pin(g, "unload", monkeypatch)
++    runner.hooks = SimpleNamespace(emit=start)
++    class ModelBoundary(BaseException):
++        pass
++    runner._run_agent = AsyncMock(side_effect=ModelBoundary)
++    if late_revoke:
++        assert await runner._handle_message_with_agent(event, event.source, g.entry.session_key, 1) is None
++    else:
++        with pytest.raises(ModelBoundary):
++            await runner._handle_message_with_agent(event, event.source, g.entry.session_key, 1)
++    assert runner._run_agent.await_count == int(not late_revoke)
++    runner._clear_session_env.assert_called_once_with({})
++    g.adapter._active_sessions.clear()
++
++
++@pytest.mark.asyncio
++async def test_pinned_session_resolution_rechecks_after_lookup(original_pin_gateway, monkeypatch):
++    g = original_pin_gateway
++    event = await _queued_pin(g)
++    runner = g.runner
++    runner._cache_session_source = MagicMock()
++    def lane(source):
++        _revoke_pin(g, "consent", monkeypatch)
++        return False
++    runner._is_telegram_topic_lane = lane
++    assert await runner._hmwa_resolve_session(event, event.source) is None
++    assert event._plugin_injection_rejected is True
++    g.adapter._active_sessions.clear()
++
++
++@pytest.mark.asyncio
++async def test_scheduler_binds_load_before_waiting(original_pin_gateway, monkeypatch):
++    g = original_pin_gateway
++    assert not hasattr(g.ctx, "_gateway_work_lease")
++    entered, release = asyncio.Event(), asyncio.Event()
++    lookup = g.runner.async_session_store.lookup_by_session_key
++    async def blocked(key):
++        entered.set()
++        await asyncio.wait_for(release.wait(), 3)
++        return await lookup(key)
++    monkeypatch.setattr(g.runner.async_session_store, "lookup_by_session_key", blocked)
++    handled = AsyncMock()
++    monkeypatch.setattr(g.adapter, "handle_message", handled)
++    assert g.runner._schedule_plugin_message_injection(
++        content="ready", plugin_id=g.ctx.plugin_id, plugin_context=g.ctx,
++        session_key=g.entry.session_key, expected_session_id=g.entry.session_id, plugin_home=g.home)
++    tasks = tuple(g.runner._background_tasks)
++    await asyncio.wait_for(entered.wait(), 3)
++    _revoke_pin(g, "reload_same_manifest", monkeypatch)
++    release.set()
++    assert await asyncio.gather(*tasks) == [False]
++    handled.assert_not_awaited()
 diff --git a/tests/gateway/test_telegram_conflict.py b/tests/gateway/test_telegram_conflict.py
 --- a/tests/gateway/test_telegram_conflict.py
 +++ b/tests/gateway/test_telegram_conflict.py
@@ -611,7 +991,16 @@ diff --git a/tests/hermes_cli/test_plugin_message_injection.py b/tests/hermes_cl
  
  import hermes_cli.plugins as plugins_mod
  from agent import secret_scope
-@@ -316,3 +317,54 @@
+@@ -22,7 +23,7 @@
+     hermes_home = tmp_path / "hermes"
+     hermes_home.mkdir()
+     (hermes_home / "config.yaml").write_text(
+-        yaml.safe_dump({"plugins": {"entries": {"notify-plugin": entry}}})
++        yaml.safe_dump({"plugins": {"enabled": ["notify-plugin"], "entries": {"notify-plugin": entry}}})
+     )
+     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+ 
+@@ -316,3 +317,58 @@
  
      assert context.inject_message("x", origin=ORIGIN) is False
      assert cli._pending_input.empty() and cli._interrupt_queue.empty()
@@ -658,11 +1047,15 @@ diff --git a/tests/hermes_cli/test_plugin_message_injection.py b/tests/hermes_cl
 +    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
 +    context, manager = _context()
 +    injector = MagicMock(return_value=True)
-+    manager.set_gateway_message_injector(object(), injector)
++    from hermes_cli.plugins import LoadedPlugin
++    manager._plugins[context.plugin_id] = LoadedPlugin(manifest=context.manifest, enabled=True)
++    owner = MagicMock()
++    owner._gateway_loop.is_closed.return_value = False
++    manager.set_gateway_message_injector(owner, injector)
 +    token = set_hermes_home_override(tmp_path / "foreign")
 +    try:
 +        assert context.inject_message("ready", session_key="agent:main:telegram:dm:42", expected_session_id="original") is True
 +    finally:
 +        reset_hermes_home_override(token)
 +    injector.assert_called_once_with(content="ready", plugin_id="notify-plugin", session_key="agent:main:telegram:dm:42",
-+                                     expected_session_id="original", plugin_home=manager.home_path)
++                                     expected_session_id="original", plugin_home=manager.home_path, plugin_context=context)

@@ -13,6 +13,13 @@ Native dispatch refuses a replacement session after `/new`; the existing strict
 turn fence also checks a reset after queuing. `SCHEDULED` means only accepted by
 the scheduler. Only an authenticated parent inspection records `OBSERVED`.
 An uncertain notification is retained without automatic resend.
+Pinned notifications also belong to their originating plugin load. Native dispatch
+checks current consent, enabled state, gateway ownership and user authorization
+after resolving the session and before adapter or model entry, including the
+busy-session FIFO. Unload permanently retires that load's pending notifications;
+loading the plugin again cannot revive them. Already admitted model turns are
+outside this notification fence. A revoke and regrant entirely between checks is
+not a durable revocation event; current settings are checked at each boundary.
 
 The `friday_result` tool derives ownership from the actual native call and
 session/profile context. Its reference and paths select owned content, not
