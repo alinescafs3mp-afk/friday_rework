@@ -1,6 +1,6 @@
 # Native Friday installation candidate
 
-`scripts/friday_install.py {plan,install,check,dashboard-check,start,reconcile} --input <private JSON>`
+`scripts/friday_install.py {plan,install,check,dashboard-check,start,reconcile,resume-harness} --input <private JSON>`
 is a finite composition of existing preparers, native PM and build APIs. It
 does not run a service manager, keep a worker daemon or create an account store.
 The current candidate installs a template and connects conditional native
@@ -113,10 +113,33 @@ or credentials, performs no native commands, and preserves work and stop intent.
 It **never admits resume** or resets the budget. Legacy claims did not retain a
 native child receipt; an empty home, absent parent or available lock cannot prove
 current cessation. Repairing source pins also requires the lead's independent
-review. No `resume` command, automatic replay, renamed/deleted home or alternate
-installation route is introduced. A separately reviewed continuation still needs
-current native cessation and sufficient original budget; this source package
-does not authorize or execute one.
+review. Automatic replay and renamed/deleted homes remain refused.
+
+`resume-harness` is an explicit, narrow continuation of a settled
+`harness_build` nonzero exit. Its private input contains exactly four pins:
+`original_input`, `original_claim`, `original_failure`, and `current_input`.
+The original claim and failure must be the installation's existing marker and
+failure files. Timeout, unconfirmed namespace closure, changed boot, exhausted
+original deadline, or an already consumed continuation refuses. There is no
+deadline option and no fresh clock. The current input can change only the exact
+reviewed hashes of `scripts/friday_install.py` and `scripts/dsh_prepare.py`;
+all operational settings, other source hashes and donor pins stay identical.
+The operator retains the existing exclusive execution slot and independently
+reviews the specific source, input and current native cessation before invoking it.
+
+Consumption is exclusive and durable before the first contained command. The
+raw original claim is retained as `FRIDAY-INSTALL.json.original`; the original
+failure and Harness logs stay intact. New command evidence goes into
+`preparation/harness-resume`, with a separate continuation failure receipt.
+Failure or a crash after consumption requires reconciliation; calling the same
+command again does not retry it. Preflight checks the complete Hermes export,
+installed PM Python, profile/config/personality, plugin/TLS bytes, native
+compiler freshness receipts, and the previous Harness source/toolchain identity.
+Only the remaining normal build, smoke, keyless staging, A0 inventory and final
+template marker path executes. `original_attempt` retains the original claim;
+the final marker identifies the current input without granting runtime readiness.
+These are source and isolated contract controls; an actual continuation remains
+an independently admitted operator action.
 
 Pure pre-source validation uses a distinct project module namespace. After every
 native source byte is verified, completion loads the native `tools` and `plugins`

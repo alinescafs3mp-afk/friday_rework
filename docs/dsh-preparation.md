@@ -23,6 +23,14 @@ Evidence records source/tree, source-lock and dependency-lock hashes, notice has
 
 ## Next headless adapter
 
+The preparer's clean environment supplies the fixed
+`NODE_OPTIONS=--disable-wasm-trap-handler` and discards ambient `NODE_OPTIONS`.
+This supported [Node option](https://nodejs.org/download/release/v22.23.2/docs/api/cli.html#--disable-wasm-trap-handler)
+uses inline WebAssembly bounds checks instead of the large virtual memory cage.
+It keeps memory checking, existing limits, exact package-manager/lockfile pins
+and TLS verification. It does not grant a retry, reset an installation deadline,
+or establish that a complete build has succeeded.
+
 Use an argument array, a task-owned isolated repository cwd, and stdin bytes:
 
 ```text

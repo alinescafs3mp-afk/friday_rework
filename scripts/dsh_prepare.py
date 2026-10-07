@@ -52,6 +52,7 @@ def clean_environment(donor):
                COREPACK_HOME=str(donor / ".git/friday-corepack"),
                npm_config_cache=str(donor / ".git/friday-npm-cache"),
                npm_config_child_concurrency="4", npm_config_network_concurrency="8",
+               NODE_OPTIONS="--disable-wasm-trap-handler",
                DSH_TELEMETRY_DISABLED="1", DSH_HOME=str(donor / ".git/friday-smoke-home"))
     return env
 

@@ -510,6 +510,11 @@ def install(value, input_path, *, budget=None):
              '--input', str(input_path), '--deadline', str(budget.deadline)], source)
     for phase, command in zip(('source', 'toolchain', 'build', 'smoke'), argv['harness']):
         execute('harness_' + phase, command, ROOT)
+    return finish_install(value, input_hash, home, donors, source, receipt, receipt_path, claim, budget, execute, argv)
+
+
+def finish_install(value, input_hash, home, donors, source, receipt, receipt_path, claim, budget, execute, argv):
+    """The same remaining completion path for fresh and explicitly resumed installs."""
     if value['product']['web']['profile'] == 'exa-keyless':
         budget.call(stage_keyless_provider, Path(value['dsh_donor']))
     execute('a0_inventory', argv['a0_inventory'], ROOT, 120)
@@ -549,6 +554,190 @@ def gaps():
             'Both-worker configuration is available; A0 useful-web runtime admission and mixed live execution remain unverified',
             'Native Dashboard boundary requires independent source review and actual authenticated startup/attach acceptance',
             'Protected credential provisioning, actual account ownership, PM/build realization and all seven live journeys require independent acceptance']
+
+
+RESUME = 'FRIDAY-INSTALL.harness-resume.json'
+
+
+def resume_inputs(request):
+    """Explicit pinned continuation of one settled failure, never a new clock."""
+    require(isinstance(request, dict) and set(request) ==
+            {'original_input', 'original_claim', 'original_failure', 'current_input'},
+            'explicit_harness_resume_pins_required')
+    paths = {name: pin(row) for name, row in request.items()}
+    # Operational input and all retained evidence are private owned documents.
+    old, value, claim, failure = (read_json(paths[name]) for name in
+        ('original_input', 'current_input', 'original_claim', 'original_failure'))
+    require(all(isinstance(v, dict) for v in (old, value, claim, failure)), 'invalid_resume_input_shape')
+    home = canonical(old['home']); directory(home)
+    require(paths['original_claim'] == home / MARKER
+            and paths['original_failure'] == home / FAILURE,
+            'original_install_evidence_path_required')
+    require(set(claim) == {'schema', 'state', 'input_sha256', 'deadline_mono', 'boot_id'}
+            and claim['schema'] == SCHEMA and claim['state'] == 'PARTIAL'
+            and claim['input_sha256'] == request['original_input']['sha256'],
+            'exact_original_partial_claim_required')
+    require(claim['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            'original_install_boot_changed')
+    deadline = claim['deadline_mono']
+    require(type(deadline) in (int, float) and math.isfinite(deadline) and deadline > 0,
+            'original_install_deadline_required')
+    from scripts.install_containment import Budget
+    budget = Budget(old.get('seconds'), deadline=deadline)
+    diagnostic = failure.get('diagnostic', {})
+    require(isinstance(diagnostic, dict), 'invalid_resume_diagnostic_shape')
+    require(set(failure) == {'schema', 'original_attempt', 'diagnostic', 'resume_allowed'}
+            and failure.get('schema') == 'friday.native-install-failure.v1'
+            and failure.get('original_attempt') == claim and failure.get('resume_allowed') is False
+            and diagnostic.get('phase') == 'harness_build'
+            and diagnostic.get('reason') == 'command_nonzero_exit'
+            and type(diagnostic.get('returncode')) is int and diagnostic['returncode'] > 0
+            and diagnostic.get('timeout') is False and diagnostic.get('reaped') is True
+            and diagnostic.get('namespace_init_exit_verified') is True
+            and diagnostic.get('cessation') == 'REAPED', 'settled_harness_build_failure_required')
+    allowed = {'scripts/friday_install.py', 'scripts/dsh_prepare.py'}
+    require(isinstance(old.get('project_files'), dict) and isinstance(value, dict)
+            and isinstance(value.get('project_files'), dict)
+            and set(old['project_files']) == set(value['project_files']),
+            'resume_project_inventory_changed')
+    require({k: v for k, v in old.items() if k != 'project_files'} ==
+            {k: v for k, v in value.items() if k != 'project_files'},
+            'resume_operational_settings_changed')
+    require(all(value['project_files'][name] == sha for name, sha in old['project_files'].items()
+                if name not in allowed), 'resume_unrelated_source_changed')
+    require(not (home / RESUME).exists() and not (home / RESUME).is_symlink(),
+            'harness_resume_already_consumed')
+    budget.call(spec_checked, value)
+    return value, paths, claim, budget
+
+
+def verify_completed_native(input_path, deadline):
+    """Read-only preflight in the installed PM Python and native namespace."""
+    from scripts.install_containment import Budget
+    value = read_json(input_path); budget = Budget(value['seconds'], deadline=deadline)
+    home, donors = budget.call(spec_checked, value); source = home / 'hermes-agent'
+    receipt = budget.call(read_json, home / 'hermes-agent.source.json')
+    budget.call(composition_checked, value, source, receipt, donors['hermes'])
+    sys.path.insert(0, str(source))
+    import tools, plugins, scripts
+    for package in (tools, plugins):
+        expected = source / package.__name__ / '__init__.py'
+        require(Path(package.__file__ or '').resolve() == expected
+                and list(package.__path__) == [str(expected.parent)], 'native_package_provenance_required')
+        package.__path__.append(str(ROOT / package.__name__))
+    scripts.__path__.append(str(source / 'scripts'))
+    from pm.environments import project_python
+    from pm.paths import repo_root
+    require(repo_root() == source and Path(sys.executable) == project_python(source),
+            'native_pm_install_owner_mismatch')
+    from tools.configure_product import compose_product
+    from scripts.friday_native import native_profile_check
+    bundle = budget.call(compose_product, value['product'])
+    budget.call(completed_profile_checked, value, home, bundle, budget)
+    budget.call(native_profile_check, bundle, home)
+    stamp = budget.call(read_json, source / 'install-stamp.json')
+    require(stamp.get('fridaySource') == {'baseTree': receipt['base_tree'], 'layers': receipt['layers']}
+            and stamp.get('commit') == receipt['commit'], 'completed_install_stamp_changed')
+    # Reuse the native pure launcher renderer; do not republish commands.
+    import shlex
+    from hermes_cli._launchers import ENTRY_POINTS, _launcher_script, resolve_store_python
+    interpreter = budget.call(resolve_store_python, source, publication=True)
+    require(interpreter is not None, 'completed_launcher_python_missing')
+    for name in ENTRY_POINTS:
+        path = source / '.hermes/bin' / name
+        command = [str(interpreter), '-I', '-c', _launcher_script(name, source, None)]
+        expected = f'#!/bin/sh\nexec {shlex.join(command)} "$@"\n'.encode()
+        require(budget.call(owned_file, path) == expected and os.access(path, os.X_OK),
+                'completed_native_launcher_changed')
+    from hermes_cli.source_build import source_product_current
+    require(budget.call(source_product_current, source, 'tui', source / 'ui-tui/dist')
+            and budget.call(source_product_current, source, 'web', source / 'hermes_cli/web_dist'),
+            'native_frontend_freshness_not_verified')
+    return {'state': 'COMPLETED_NATIVE_REVALIDATED', 'ready': False}
+
+
+def completed_profile_checked(value, home, bundle, budget):
+    import hermes_yaml as yaml
+    require(budget.call(read_json, home / 'FRIDAY-PROFILE.json') == bundle['contract']
+            and yaml.safe_load(budget.call(owned_file, home / 'config.yaml', private=True)) == bundle['config']
+            and budget.call(owned_file, home / 'SOUL.md', private=True) == bundle['soul'].encode(),
+            'completed_profile_changed')
+    for name, sha in value['project_files'].items():
+        if name.startswith('plugins/friday_rework/'):
+            require(digest(budget.call(owned_file, home / name)) == sha, 'installed_plugin_changed')
+    for key, name in value['product']['dashboard'].get('tls', {}).items():
+        require(digest(budget.call(owned_file, home / name, private=True)) == value['dashboard_tls'][key]['sha256'],
+                'installed_dashboard_tls_changed')
+
+
+def resume_harness(request, request_path, *, prepared=None):
+    value, paths, claim, budget = prepared or resume_inputs(request)
+    require(read_json(request_path) == request, 'resume_request_changed')
+    home, donors = budget.call(spec_checked, value); argv = budget.call(commands, value)
+    source = home / 'hermes-agent'; receipt_path = home / 'hermes-agent.source.json'
+    receipt = budget.call(read_json, receipt_path)
+    budget.call(composition_checked, value, source, receipt, donors['hermes'])
+    require(not any((home / name).exists() or (home / name).is_symlink() for name in
+                    (MARKER + '.original', MARKER + '.completed', 'preparation/harness-resume',
+                     'preparation/a0.json', 'FRIDAY-INSTALL.harness-resume.failure.json')),
+            'resume_destination_already_exists')
+    from scripts.install_containment import Containment
+    custody = Containment(value['containment'], budget, clean_environment(home))
+    # Claim consumption before the first command. A crash or failed preflight
+    # remains consumed and requires reconciliation, never an automatic retry.
+    publish(home / RESUME, {'original_attempt': claim, 'request': request,
+                          'state': 'CONSUMED_NOT_COMPLETE'}, budget=budget)
+    # Preserve the precise original bytes before the normal final marker swap.
+    original = budget.call(owned_file, paths['original_claim'], private=True)
+    fd = os.open(home / (MARKER + '.original'), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as stream:
+        budget.check(); stream.write(original); stream.flush(); os.fsync(stream.fileno()); budget.check()
+    evidence = home / 'preparation/harness-resume'
+    budget.call(evidence.mkdir, mode=0o700)
+    def execute(phase, command, cwd, timeout=1800):
+        try:
+            budget.call(resume_pins_unchanged, request, claim, budget)
+            return custody.run(command, cwd, timeout=timeout)[0]
+        except (OSError, ValueError, RuntimeError) as exc:
+            diagnostic = safe_diagnostic(exc, phase)
+            exc.friday_diagnostic = diagnostic; exc.friday_attempt = claim
+            try:
+                publish(home / 'FRIDAY-INSTALL.harness-resume.failure.json', {
+                    'schema': 'friday.native-install-failure.v1', 'original_attempt': claim,
+                    'diagnostic': diagnostic, 'resume_allowed': False}, budget=budget)
+            except (OSError, ValueError, RuntimeError):
+                diagnostic['failure_receipt'] = 'NOT_PUBLISHED'
+            raise
+    expression = 'from pm.environments import project_python; from pathlib import Path; print(project_python(Path.cwd()))'
+    selected = execute('pm_python', [value['bootstrap_python']['path'], '-B', '-c', expression], source, 15)
+    require(Path(selected).is_absolute() and Path(selected).is_file(), 'native_pm_python_missing')
+    code = ('import sys;sys.path.insert(0,' + repr(str(ROOT)) + ');'
+            'from scripts.friday_install import verify_completed_native;'
+            'verify_completed_native(sys.argv[1],float(sys.argv[2]))')
+    execute('completed_native_check', [selected, '-B', '-c', code,
+                                     str(paths['current_input']), str(budget.deadline)], source, 120)
+    # Check complete tracked source and the exact previous Node/toolchain identity.
+    command = list(argv['harness'][0]); command[3] = 'check'
+    command[command.index('--evidence') + 1] = str(evidence)
+    execute('harness_check', command, ROOT, 120)
+    checked = budget.call(read_json, evidence / 'dsh-check.json')
+    previous = budget.call(read_json, home / 'preparation/harness/dsh-toolchain.json')
+    require(checked['source'] == previous['source'] and checked['donor'] == previous['donor']
+            and checked['toolchain'] == {k: v for k, v in previous['toolchain'].items() if k != 'observed_pnpm'},
+            'completed_harness_identity_changed')
+    for phase, command in zip(('build', 'smoke'), argv['harness'][2:]):
+        command = list(command); command[command.index('--evidence') + 1] = str(evidence)
+        execute('harness_' + phase, command, ROOT)
+    budget.call(resume_pins_unchanged, request, claim, budget)
+    return finish_install(value, request['current_input']['sha256'], home, donors, source,
+                          receipt, receipt_path, claim, budget, execute, argv)
+
+
+def resume_pins_unchanged(request, claim, budget):
+    budget.check()
+    for row in request.values():
+        budget.call(pin, row)
+    require(budget.call(read_json, request['original_claim']['path']) == claim, 'install_claim_changed')
 
 
 def inspect(value, input_hash):
@@ -610,7 +799,7 @@ def start(value, input_hash, *, budget=None, input_path=None):
 def main():
     started = time.monotonic()  # before parser/input IO; never reset on dispatch
     parser = SafeParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'reconcile'))
+    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'reconcile', 'resume-harness'))
     parser.add_argument('--input', required=True, type=Path, help='Private pinned JSON, no credential values')
     args = parser.parse_args(); os.umask(0o077)
     sys.path.insert(0, str(ROOT))
@@ -620,9 +809,12 @@ def main():
         value = json.loads(raw, object_pairs_hook=unique); sha = digest(raw)
         from scripts.install_containment import Budget
         require(isinstance(value, dict), 'explicit_install_fields_required')
-        budget = Budget(value.get('seconds'), started=started)
+        prepared = resume_inputs(value) if args.phase == 'resume-harness' else None
+        budget = prepared[3] if prepared else Budget(value.get('seconds'), started=started)
         budget.check()
-        if args.phase == 'reconcile':
+        if args.phase == 'resume-harness':
+            result = resume_harness(value, args.input, prepared=prepared)
+        elif args.phase == 'reconcile':
             result = reconcile(value, sha)
         elif args.phase == 'plan':
             result = {'state': 'PLANNED_NOT_EXECUTED', 'ready': False,
