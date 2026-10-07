@@ -28,7 +28,7 @@ def prepared(tmp_path):
              "agent/session_persistence.py","agent/tool_executor.py","tools/web_tools_truncate.py",
              "tools/tool_result_storage.py","hermes_logging.py","agent/redact.py","agent/agent_runtime_helpers.py",
              "agent/stream_delivery.py", "agent/chat_completion_helpers.py", "agent/conversation_loop.py", "agent/turn_context.py", "agent/turn_finalizer.py", "agent/turn_facade.py", "agent/turn_tool_round.py",
-          "agent/message_sanitization.py", "agent/turn_recovery.py", "agent/turn_api_error.py", "agent/client_lifecycle.py", "agent/credential_pool.py", "hermes_cli/runtime_provider_custom.py", "agent/turn_truncation.py", "agent/bounded_context.py"]
+          "agent/message_sanitization.py", "agent/turn_recovery.py", "agent/turn_api_error.py", "agent/client_lifecycle.py", "agent/credential_pool.py", "hermes_cli/runtime_provider_custom.py", "agent/turn_truncation.py", "agent/bounded_context.py", "agent/coding_context.py", "tools/env_probe.py"]
     source_files = {}
     for rel in files:
         p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text("# synthetic source pin\n");source_files[rel]=pin(p)["sha256"]
@@ -213,6 +213,9 @@ def test_profile_delta_pins_actual_native_auxiliary_rows_without_mutating_input(
                   max_input=40954,main_output=4096,summary_output=2048,margin=1024,template_overhead=2048,web_profile='exa-keyless')
     before=copy.deepcopy(initial);result=M['validation_profile'](initial,DEFAULT_CONFIG)
     assert before==initial and result['model']==initial['model'] and result['web']==initial['web']
+    assert result['agent']['environment_probe'] is False and result['agent']['coding_context']=='off'
+    assert initial['agent'].get('environment_probe') is not False
+    assert initial['agent'].get('coding_context') != 'off'
     for key,row in DEFAULT_CONFIG['auxiliary'].items():
         if isinstance(row,dict) and 'provider' in row:
             assert result['auxiliary'][key]['provider']=='custom:friday-local'
@@ -229,7 +232,7 @@ def test_native_defaults_allowed_explicit_emitted_selection_cannot_drift():
     assert not M['_emitted_options'](expected,{'web':expected['web'],'toolsets':['web','terminal']})
 
 
-@pytest.mark.parametrize('missing', ['agent/turn_truncation.py','agent/bounded_context.py'])
+@pytest.mark.parametrize('missing', ['agent/turn_truncation.py','agent/bounded_context.py','agent/coding_context.py','tools/env_probe.py'])
 def test_continuation_and_final_guard_pins_required_before_admission(prepared, missing):
     plan, task = prepared
     plan['source_files'].pop(missing)

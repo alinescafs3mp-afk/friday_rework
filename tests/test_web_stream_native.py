@@ -30,7 +30,7 @@ build = runpy.run_path(str(Q/'tools/configure_local_test.py'))['build_config']
     + [('explicit','retry_4xx','local-local-SYNTHETIC_CREDENTIAL_123456789','local-'),
        ('explicit','retry_4xx','sk-sk-sk-SYNTHETIC_CREDENTIAL_123456789','sk-'),
        ('explicit','escaped_stream','JSON"\\яяJSON"\\яя_SYNTHETIC_CREDENTIAL_123456789','JSON"\\яя')])
-def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,mode,variant,credential,overlap_prefix,construction_failure=False,sdk_error_echo=None,sdk_error_complete=None,runtime_key_echo=False):
+def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,mode,variant,credential,overlap_prefix,construction_failure=False,sdk_error_echo=None,sdk_error_complete=None,runtime_key_echo=False,profile_drift=None):
     case=variant
     completes = variant in {'complete_continuation', 'complete_tool_retry'}
     marker='SYNTHETIC_QUOTE"SLASH\\UNICODEя' if variant=='escaped_stream' else 'SYNTHETIC_SCOPED_CREDENTIAL'
@@ -59,6 +59,10 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
                  web_profile='exa-keyless')
     from hermes_cli.config_defaults import DEFAULT_CONFIG
     config=M['validation_profile'](config,DEFAULT_CONFIG)
+    if profile_drift is not None:
+        key,value=profile_drift
+        if value is None:config['agent'].pop(key,None)
+        else:config['agent'][key]=value
     atomic_config_replace(home/'config.yaml',config)
     (home/'SOUL.md').write_text('FRIDAY_SYNTHETIC_SOUL_NATIVE_DRIVER\n')
     output=tmp_path/'output';output.mkdir(mode=0o700)
@@ -69,7 +73,7 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
           'agent/session_persistence.py','agent/tool_executor.py','tools/web_tools_truncate.py',
           'tools/tool_result_storage.py','hermes_logging.py','agent/redact.py','agent/agent_runtime_helpers.py',
           'agent/stream_delivery.py', 'agent/chat_completion_helpers.py', 'agent/conversation_loop.py', 'agent/turn_context.py', 'agent/turn_finalizer.py', 'agent/turn_facade.py', 'agent/turn_tool_round.py',
-          'agent/message_sanitization.py', 'agent/turn_recovery.py', 'agent/turn_api_error.py', 'agent/client_lifecycle.py', 'agent/credential_pool.py', 'hermes_cli/runtime_provider_custom.py', 'agent/turn_truncation.py', 'agent/bounded_context.py']
+          'agent/message_sanitization.py', 'agent/turn_recovery.py', 'agent/turn_api_error.py', 'agent/client_lifecycle.py', 'agent/credential_pool.py', 'hermes_cli/runtime_provider_custom.py', 'agent/turn_truncation.py', 'agent/bounded_context.py', 'agent/coding_context.py', 'tools/env_probe.py']
     plan={'task_id':'offline-native-'+mode,'mode':mode,'source':str(root),'source_files':{r:pin(root/r)['sha256'] for r in rels},
           'profile':pin(home/'config.yaml'),'soul':pin(home/'SOUL.md'),'policy':pin(Q/'config/RESEARCH.md'),
           'driver':pin(Q/'validation/web_runtime.py'),'web_profile_source':pin(Q/'tools/web_profile.py'),
@@ -253,7 +257,7 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     monkeypatch.setattr(turn_iteration_prep,'boosted_output_cap',observe_boost)
     obj=OfflineNative();boundary=FakeBoundary()
     boundary.admit=lambda *args:{'FRIDAY_FIXTURE_KEY':marker}
-    if completes:
+    if completes and profile_drift is None:
         M['execute'](plan,task,boundary,native=obj,mono=lambda:110.,wall=lambda:1010.,boot='fixture-boot')
     else:
         with pytest.raises(M['Refused']):
@@ -261,6 +265,15 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     result=M['recover'](plan,task)
     assert redact.redact_registered_vault_values is old_registered_redact
     assert keyless_mcp._response_text is old_response_text
+    if profile_drift is not None:
+        from agent.secret_scope import current_secret_scope
+        assert obj.open_failure=='Refused: validation_environment_probe_refused'
+        assert not hasattr(obj,'agent') and not api and not transport
+        assert result['status']=='FAILED_OR_UNCERTAIN' and boundary.settles==1
+        assert current_secret_scope() is None
+        assert agent_runtime_helpers.atomic_json_write is old_debug_write
+        assert (web_tools_truncate._store_full_text,tool_result_storage._write_to_spillover)==old_spills
+        return
     if construction_failure:
         from agent.secret_scope import current_secret_scope
         assert result['status']=='FAILED_OR_UNCERTAIN' and boundary.settles==1
@@ -352,3 +365,13 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     (tmp_path/'artifact-scan.json').write_text(json.dumps({'variant':case,'files':artifacts,'disclosure_files':leaked,
         'native_db':'DISABLED_SUPPORTED_NONE','scripted_model_calls':len(api),'scripted_provider_calls':len(transport),
         'status':result['status'],'live_research':'NOT_RUN'},indent=2)+'\n')
+
+
+@pytest.mark.parametrize('key,value', [
+    ('environment_probe',True), ('environment_probe',0), ('environment_probe',None),
+    ('coding_context','auto'), ('coding_context','on'), ('coding_context',None),
+])
+def test_native_profile_drift_refused_before_constructor(tmp_path,monkeypatch,capsys,key,value):
+    test_real_native_agent_reaches_web_and_cleanup(
+        tmp_path,monkeypatch,capsys,'explicit','complete_continuation',None,'',
+        profile_drift=(key,value))

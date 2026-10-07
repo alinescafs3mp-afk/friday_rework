@@ -155,3 +155,9 @@ synthetic HTTP transport, including partial ReadError then successful text conti
 tool JSON with a native length finish then successful retry, exhaustion, and retained/redacted observations. This
 is source-component evidence; local-model, Telegram and mandatory product
 journeys require their own supervised execution and acceptance.
+
+The dedicated web validation profile uses Hermes' native `environment_probe: false`
+and `coding_context: off` switches before constructing its agent. The driver
+refuses effective configuration drift before construction, and pins both native
+consumers. This avoids unrelated Python/Git probes inside the finite web-only
+fixture; donor defaults and the product's coding profiles remain unchanged.

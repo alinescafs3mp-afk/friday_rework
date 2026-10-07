@@ -104,6 +104,11 @@ def validation_profile(config, native_defaults):
         if isinstance(row,dict) and "provider" in row:
             result["auxiliary"].setdefault(name,{}).update(copy.deepcopy(route))
     result["auxiliary"]["transient_retries"] = 0
+    # This private web-only validation process does not inspect the coding
+    # environment. Use native profile switches before agent construction;
+    # product profiles and donor defaults retain their existing capabilities.
+    result["agent"]["environment_probe"] = False
+    result["agent"]["coding_context"] = "off"
     return result
 
 
@@ -166,7 +171,8 @@ def verify_plan(plan, task):
                  "tools/web_tools_truncate.py", "tools/tool_result_storage.py", "hermes_logging.py",
                  "agent/redact.py", "agent/agent_runtime_helpers.py", "agent/stream_delivery.py", "agent/chat_completion_helpers.py", "agent/conversation_loop.py", "agent/turn_context.py", "agent/turn_finalizer.py", "agent/turn_facade.py", "agent/turn_tool_round.py",
                  "agent/message_sanitization.py", "agent/turn_recovery.py", "agent/turn_api_error.py",
-                 "agent/client_lifecycle.py", "agent/credential_pool.py", "hermes_cli/runtime_provider_custom.py", "agent/turn_truncation.py", "agent/bounded_context.py"}
+                 "agent/client_lifecycle.py", "agent/credential_pool.py", "hermes_cli/runtime_provider_custom.py", "agent/turn_truncation.py", "agent/bounded_context.py",
+                 "agent/coding_context.py", "tools/env_probe.py"}
     _require(mandatory <= set(plan["source_files"]), "native_candidate_pins_incomplete")
     for rel, digest in plan["source_files"].items():
         p = root / rel
@@ -298,6 +304,9 @@ class Native:
         _require(model["provider"] == "custom:friday-local" and model["base_url"].rstrip("/") == plan["inference_endpoint"].rstrip("/"), "profile_inference_route_mismatch")
         _require(not config.get("fallback_providers") and not config.get("fallback_model")
                  and config.get("agent", {}).get("auto_recovery_cycles") == 0, "inference_fallback_refused")
+        _require(config["agent"].get("environment_probe") is False
+                 and config["agent"].get("coding_context") == "off",
+                 "validation_environment_probe_refused")
         hermes_web_config = runpy.run_path(plan["web_profile_source"]["path"])["hermes_web_config"]
         expected = hermes_web_config(plan["web_profile"],
                         extract_char_limit=config["web"].get("extract_char_limit"),
