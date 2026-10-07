@@ -151,7 +151,7 @@ refuse instead of being silently clamped. The final request-envelope guard,
 original iteration/retry limits, model and reasoning settings remain intact.
 
 The source fixture exercises genuine Hermes and OpenAI SDK streaming through
-synthetic HTTP transport, including partial ReadError then successful text or
-tool-call continuation, exhaustion, and retained/redacted observations. This
+synthetic HTTP transport, including partial ReadError then successful text continuation and incomplete
+tool JSON with a native length finish then successful retry, exhaustion, and retained/redacted observations. This
 is source-component evidence; local-model, Telegram and mandatory product
 journeys require their own supervised execution and acceptance.
