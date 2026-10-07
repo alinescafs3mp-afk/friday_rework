@@ -269,6 +269,8 @@ def edit(profile, home, body, verify):
                     raise ValueError("invalid_native_skill_policy")
                 if is_disabled_entry(selected, _normalize_string_set(names) - ESSENTIAL_SKILLS):
                     raise PermissionError("effective_native_skill_denied")
+        from .onboarding import prepare_admin_config_edit, finish_admin_config_edit
+        managed_setup = prepare_admin_config_edit(home, candidate)
         verify()
         if private_config(path) != sha:
             raise ValueError("native_config_changed_reload_required")
@@ -276,6 +278,8 @@ def edit(profile, home, body, verify):
         reread = config.require_readable_config_before_write(path)
         if reread != candidate:
             raise RuntimeError("native_config_write_unconfirmed")
+        verify()
+        finish_admin_config_edit(home, managed_setup)
         return {"recorded": True, "profile": profile, "config_sha256": private_config(path),
             "changed": changed, "runtime_application": "PERSISTED_NEXT_NATIVE_SESSION_OR_RELOAD",
             "active_worker_binding": "UNCHANGED_ORIGINAL_BUDGET", "observed_live_reload": False}

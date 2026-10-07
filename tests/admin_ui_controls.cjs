@@ -93,7 +93,7 @@ const click = async label => {render(); const node = find(tree, label); assert(n
     await click("Previous messages"); observe();
     assert(find(tree, "Previous messages").props.disabled);
   } else if (input.action === "approve") {
-    await click("pairing"); await click("Load current native state"); await click("Approve and enable");
+    await click("pairing"); await click("Load current native state"); await click("Approve native access");
   } else if (["cancel_task", "pause_task", "check_task"].includes(input.action)) {
     await click("tasks"); await click("Load current native state");
     await click({cancel_task: "Cancel task", pause_task: "Pause task", check_task: "Check task"}[input.action]);

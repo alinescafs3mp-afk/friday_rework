@@ -4,6 +4,8 @@ import copy
 import json
 from pathlib import Path
 import re
+import hashlib
+import hashlib
 
 from hermes_cli.friday_product_access import admin_policy, access_policy, principal_id, profile_name, settings
 from .access import ProductAccess
@@ -96,10 +98,57 @@ class Administration:
     def set_user(self, profile, **values):
         if values.get("transport_profile") != profile:
             raise PermissionError("receiving_transport_authority_required")
-        with self.scope(profile):
+        with self.scope(profile) as root:
+            if values.get("enabled") is True:
+                self._require_complete_onboarding(root, values)
             result = ProductAccess(self._state()).set_user(**values)
             return {"recorded": True, "admission": "PRODUCT_INTERSECTION_NEXT_REQUEST",
                     "native_grant": "REQUIRED_SEPARATELY", "user": result}
+
+    @staticmethod
+    def _require_complete_onboarding(root, values):
+        from hermes_cli import friday_user_scope as scope
+        active = scope.policy(root)
+        if active is None: return
+        key = principal_id(*(values[k] for k in ("platform", "transport_profile", "account_id", "user_id")))
+        bindings = [b for b in active["bindings"] if principal_id(*(b[k] for k in
+                    ("platform", "transport_profile", "account_id", "user_id"))) == key]
+        if len(bindings) != 1: raise PermissionError("private_profile_setup_required")
+        from hermes_constants import get_default_hermes_root
+        binding = bindings[0]; home = get_default_hermes_root(home=root) / "profiles" / binding["runtime_profile"]
+        scope._private(home, directory=True)
+        scope._private(home / scope.MARKER)
+        marker = json.loads((home / scope.MARKER).read_text())
+        expected = {"schema": "friday.user-home.v1", "principal": key,
+                    "profile": binding["runtime_profile"], "binding_sha256": scope._fingerprint(binding)}
+        if (home / scope.ONBOARDING).exists() or (home / scope.ONBOARDING).is_symlink() or (
+                isinstance(marker, dict) and "onboarding_sha256" in marker):
+            # Digest-bound setup cannot downgrade to the legacy-home contract
+            # by deleting its receipt. Missing readiness never enables access.
+            try:
+                scope._private(home / scope.ONBOARDING)
+                scope.check_onboarding_home(root, home, binding)
+                expected["onboarding_sha256"] = hashlib.sha256((home / scope.ONBOARDING).read_bytes()).hexdigest()
+            except OSError as exc:
+                raise PermissionError("private_profile_setup_required") from exc
+        if marker != expected:
+            raise PermissionError("private_profile_setup_required")
+
+    def onboarding_templates(self, profile):
+        from .onboarding import Onboarding
+        return Onboarding(self).templates(profile)
+
+    def onboarding_prepare(self, profile, **values):
+        from .onboarding import Onboarding
+        return Onboarding(self).prepare(profile, **values)
+
+    def onboarding_credentials(self, profile, **values):
+        from .onboarding import Onboarding
+        return Onboarding(self).credentials(profile, **values)
+
+    def onboarding_activate(self, profile, **values):
+        from .onboarding import Onboarding
+        return Onboarding(self).activate(profile, **values)
 
     def pairing(self, profile):
         self.users(profile)  # prove this is an actual receiving transport authority
@@ -131,6 +180,20 @@ class Administration:
                 _sync_directory(store._dir)
                 if not PairingStore().is_approved(platform, user_id):
                     raise RuntimeError("native_pairing_write_unconfirmed")
+                from hermes_cli import friday_user_scope as scope
+                active = scope.policy(Path(__import__("hermes_constants").get_hermes_home()))
+                if active is not None:
+                    key = principal_id(platform, transport_profile, account_id, user_id)
+                    binding = next((b for b in active["bindings"] if principal_id(*(b[k] for k in
+                        ("platform", "transport_profile", "account_id", "user_id"))) == key), None)
+                    if binding:
+                        from hermes_constants import get_default_hermes_root, get_hermes_home
+                        home = get_default_hermes_root(home=get_hermes_home()) / "profiles" / binding["runtime_profile"]
+                        if (home / scope.ONBOARDING).exists() and not (home / scope.MARKER).exists():
+                            return {"recorded": True, "enabled": False, "admission": "DISABLED_SETUP_PENDING",
+                                    "native_grant": "PAIRING_APPROVED"}
+                self._require_complete_onboarding(Path(__import__("hermes_constants").get_hermes_home()),
+                    dict(platform=platform, transport_profile=transport_profile, account_id=account_id, user_id=user_id))
                 result = ProductAccess(self._state()).set_user(platform=platform,
                     transport_profile=transport_profile, account_id=account_id,
                     user_id=user_id, enabled=True, role="user")

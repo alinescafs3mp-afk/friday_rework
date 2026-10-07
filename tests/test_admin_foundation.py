@@ -38,6 +38,8 @@ def env(tmp_path, monkeypatch):
     home = tmp_path / "home"; home.mkdir(mode=0o700)
     satellite = home / "profiles/satellite"; satellite.mkdir(parents=True, mode=0o700)
     monkeypatch.setenv("HERMES_HOME", str(home))
+    import hermes_constants
+    monkeypatch.setattr(hermes_constants, '_PINNED_PROCESS_HERMES_HOME', str(home))
     # Empty synthetic env; no real profile/environment is inherited by an auth test.
     for key in ("GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS", "TELEGRAM_ALLOWED_USERS",
                 "TELEGRAM_ALLOW_ALL_USERS", "TELEGRAM_GROUP_ALLOWED_CHATS", "TELEGRAM_GROUP_ALLOWED_USERS"):

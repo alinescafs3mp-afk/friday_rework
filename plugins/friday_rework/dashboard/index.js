@@ -12,6 +12,9 @@
     const [data, setData] = R.useState(null), [error, setError] = R.useState("");
     const [session, setSession] = R.useState(null), [busy, setBusy] = R.useState(false);
     const [control, setControl] = R.useState(null), [edit, setEdit] = R.useState({kind: "model", slot: "main", route: "0", web: "exa-paid", timeout: "30", chars: "15000", name: "", enabled: true, key: "agent.max_turns", value: "30"});
+    const [setup, setSetup] = R.useState({platform: "telegram", account_id: "", user_id: "", runtime_profile: "", template: ""});
+    const [prepared, setPrepared] = R.useState(null), [secretName, setSecretName] = R.useState("");
+    const [secretValue, setSecretValue] = R.useState("");
     R.useEffect(() => { let active = true;
       fetchJSON(base + "/profiles").then(p => { if (active) { setProfiles(p); setProfile(p[0] || ""); } })
         .catch(() => { if (active) setError("Administrator access or native configuration unavailable."); });
@@ -31,6 +34,7 @@
       finally { setBusy(false); }
     }
     R.useEffect(() => { setData(null); setSession(null); setControl(null); setOffset(0); }, [profile, view]);
+    R.useEffect(() => { setPrepared(null); setSecretValue(""); }, [profile]);
     async function change(row, enabled, role = row.role) {
       setBusy(true); setError("");
       try { await fetchJSON(base + "/users?" + new URLSearchParams({profile}), {
@@ -51,6 +55,23 @@
         setData(await fetchJSON(base + "/pairing?" + new URLSearchParams({profile})));
       } catch (_) { setError("Onboarding unconfirmed; native grant may exist. Inspect current users before continuing."); }
       finally { setBusy(false); }
+    }
+    async function onboard(action) {
+      if (!profile || busy) return;
+      setBusy(true); setError("");
+      try {
+        const identity = {platform: setup.platform, transport_profile: profile, account_id: setup.account_id,
+          user_id: setup.user_id, expected_config_sha256: prepared ? prepared.config_sha256 : data.config_sha256};
+        let body = action === "prepare" ? {...identity, runtime_profile: setup.runtime_profile, template: setup.template}
+          : {...identity, generation: prepared.generation};
+        if (action === "credentials") body = {...body, name: secretName, value: secretValue};
+        const result = await fetchJSON(base + "/onboarding/" + action + "?" + new URLSearchParams({profile}), {
+          method: action === "credentials" ? "PUT" : "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+        if (action === "prepare") { setPrepared(result); setSecretName((result.required_names || [])[0] || "");
+          setProfiles(await fetchJSON(base + "/profiles")); }
+        else setPrepared({...prepared, state: result.state, enabled: result.enabled});
+      } catch (_) { setError("Setup write unconfirmed or refused. Inspect current native state before any further action."); }
+      finally { setSecretValue(""); setBusy(false); }
     }
     async function open(row, messageOffset = 0) {
       setBusy(true); setError("");
@@ -116,7 +137,7 @@
       h("h1", null, "Friday Administration"),
       h("label", null, "Product profile ", h("select", {value: profile, disabled: busy, onChange: e => setProfile(e.target.value)},
         ...profiles.map(p => h("option", {key: p, value: p}, p)))),
-      h("nav", null, ...["users", "pairing", "conversations", "tasks", "effective", "schedules"].map(v => button(v, () => setView(v), {key: v}))),
+      h("nav", null, ...["users", "onboarding", "pairing", "conversations", "tasks", "effective", "schedules"].map(v => button(v, () => setView(v), {key: v}))),
       view === "conversations" ? h("label", null, "Search ", h("input", {value: query, maxLength: 512, onChange: e => setQuery(e.target.value)})) : null,
       view === "conversations" ? h("div", null,
         ...["platform", "user_id", "account_id", "chat_id", "thread_id"].map(k => h("label", {key: k}, k + " ",
@@ -128,9 +149,32 @@
       error ? h("p", {role: "alert"}, error) : null,
       control ? h("pre", {role: "status"}, JSON.stringify(control, null, 2)) : null,
       ["users", "pairing"].includes(view) ? h("p", null, "Select the receiving account profile for user access and pairing. Execution profiles do not own these controls.") : null,
+      view === "onboarding" && data ? h("div", {"aria-label": "New private Friday profile"},
+        h("p", null, "Prepare a new private profile, capture its scoped keys, approve native channel access, then activate. Incomplete setup stays disabled."),
+        ...["platform", "account_id", "user_id", "runtime_profile"].map(k => h("label", {key: k}, k + " ",
+          h("input", {value: setup[k], disabled: busy || !!prepared, maxLength: k.includes("profile") ? 64 : 512,
+            onChange: e => setSetup({...setup, [k]: e.target.value})}))),
+        h("label", null, "Approved configuration ", h("select", {value: setup.template, disabled: busy || !!prepared,
+          onChange: e => setSetup({...setup, template: e.target.value})}, h("option", {value: ""}, "Select"),
+          ...data.templates.map(t => h("option", {key: t, value: t}, t)))),
+        button("Prepare disabled profile", () => onboard("prepare"), {disabled: busy || !!prepared || !setup.template}),
+        !prepared ? h("ul", null, ...(data.pending || []).map(row => h("li", {key: row.principal_id},
+          row.runtime_profile + ": " + row.state + " ", row.recoverable ? button("Continue existing disabled setup", () => {
+            setSetup({platform: row.platform, account_id: row.account_id, user_id: row.user_id,
+              runtime_profile: row.runtime_profile, template: row.template}); setPrepared(row);
+            setSecretName((row.required_names || [])[0] || ""); setSecretValue("");
+          }) : null))) : null,
+        prepared ? h("div", null,
+          h("p", {role: "status"}, prepared.state),
+          h("select", {value: secretName, disabled: busy || prepared.enabled, onChange: e => setSecretName(e.target.value)},
+            ...(prepared.required_names || []).map(n => h("option", {key: n, value: n}, n))),
+          h("input", {type: "password", autoComplete: "new-password", value: secretValue, disabled: busy || prepared.enabled,
+            "aria-label": "New profile scoped key", onChange: e => setSecretValue(e.target.value)}),
+          button("Store scoped key", () => onboard("credentials"), {disabled: busy || prepared.enabled || !secretName || !secretValue}),
+          button("Activate complete profile", () => onboard("activate"), {disabled: busy || prepared.enabled})) : null) : null,
       view === "users" && data ? h("ul", null, ...data.users.map(renderUser)) : null,
       view === "pairing" && data ? h("ul", null, ...data.pending.map(row => h("li", {key: row.request_id || row.user_id},
-        `${row.platform} / ${row.user_id} `, button("Approve and enable", () => approve(row), {disabled: busy || !row.request_id})))) : null,
+        `${row.platform} / ${row.user_id} `, button("Approve native access", () => approve(row), {disabled: busy || !row.request_id})))) : null,
       view === "conversations" && Array.isArray(data) ? h("ul", null, ...data.map(row => h("li", {key: row.session_id},
         button(row.title || row.session_id, () => open(row)), h("pre", null, JSON.stringify(row.identity, null, 2))))) : null,
       session ? h("article", null, h("h2", null, session.session_id),

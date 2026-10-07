@@ -26,11 +26,17 @@ from hermes_state import SessionDB
 
 @pytest.fixture
 def users(tmp_path, monkeypatch):
+    # Native startup discovers builtins before an admission fixture snapshots
+    # the registry. Otherwise teardown erases late first-import registrations
+    # while Python keeps their modules cached, corrupting later package cases.
+    import model_tools
     from tools.registry import registry
     with registry._lock:
         saved_tools = dict(registry._tools); saved_checks = dict(registry._toolset_checks)
     root = tmp_path / 'home'; root.mkdir(mode=0o700)
     monkeypatch.setenv('HERMES_HOME', str(root))
+    import hermes_constants
+    monkeypatch.setattr(hermes_constants, '_PINNED_PROCESS_HERMES_HOME', str(root))
     monkeypatch.setenv('GATEWAY_ALLOWED_USERS', '*')
     monkeypatch.setattr(scope, '_ENGAGED', False)
     monkeypatch.setattr(scope, '_CURRENT', contextvars.ContextVar('fixture_scope', default=None))
@@ -275,7 +281,9 @@ def test_no_existing_home_or_secret_context_bootstrap(users):
     with pytest.raises(scope.ScopeDenied):scope.provision_new_home(users.root,users.bindings[0],{'env':{'KEY':'other'}})
     with pytest.raises(scope.ScopeDenied):scope.provision_new_home(users.root,users.bindings[0],{'model':{'api_key':'owner'}})
     for home in users.homes:
-        assert set(p.name for p in home.iterdir())=={'config.yaml',scope.MARKER,'memories','workspace'}
+        assert set(p.name for p in home.iterdir())=={'config.yaml','config.yaml.lock',scope.MARKER,'memories','workspace'}
+        lock=home/'config.yaml.lock';assert lock.read_bytes()==b'' and lock.stat().st_nlink==1
+        assert lock.stat().st_uid==__import__('os').getuid() and not lock.stat().st_mode & 0o077
 
 
 def test_shared_runtime_binding_refused(users):

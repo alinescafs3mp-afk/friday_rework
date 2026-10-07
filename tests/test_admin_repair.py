@@ -316,7 +316,7 @@ def test_executed_ui_native_fetchjson_bytes_succeed_at_actual_signed_router(env,
     store = PairingStore(); store.generate_code("telegram", "new-user", "synthetic-only")
     pending = store.list_pending()[0]
     users = env.admin.users("default")
-    if action == "enable": env.admin.set_user("default", **{k: v for k, v in users["users"][0].items() if k != "principal_id"} | {"enabled": False}); users = env.admin.users("default")
+    if action == "enable": env.admin.set_user("default", **{k: v for k, v in users["users"][0].items() if k in {"platform", "transport_profile", "account_id", "user_id", "enabled", "role"}} | {"enabled": False}); users = env.admin.users("default")
     # Gated browsers authenticate with native cookies; fetchJSON must keep include.
     result = run_ui(dict(action=action, users=users, pending=env.admin.pairing("default")))
     writes = [r for r in result["requests"] if r["method"] in {"PUT", "POST"}]
