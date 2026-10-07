@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Native install completion; internal entry, explicit input and owned source."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def profile_write(home, spec):
+    from tools.configure_product import compose_product
+    from hermes_cli.config import atomic_config_write, config_write_transaction, DEFAULT_SOUL_MD
+    from scripts.friday_install import require, publish, owned_file
+    require(not (home / 'config.yaml').exists() and not (home / 'config.yaml').is_symlink(),
+            'existing_profile_config_not_replaced')
+    require(not (home / 'FRIDAY-PROFILE.json').exists() and not (home / 'FRIDAY-PROFILE.json').is_symlink(),
+            'existing_profile_identity_not_replaced')
+    bundle = compose_product(spec)
+    runtime = spec['runtime']
+    require(runtime.get('enabled') is not True or runtime.get('runtime_home') == str(home),
+            'foreign_worker_home')
+    soul = home / 'SOUL.md'
+    if soul.exists() or soul.is_symlink():
+        require(owned_file(soul, private=True) == DEFAULT_SOUL_MD.encode(),
+                'existing_custom_persona_not_replaced')
+    staged = home / 'SOUL.md.friday'
+    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(bundle['soul']); f.flush(); os.fsync(f.fileno())
+    # Config/module initialization can seed the native default before writing.
+    # Only that exact seed in this fresh installation is replaced; owner text
+    # and an interrupted already-published Friday identity remain untouched.
+    os.replace(staged, soul)
+    with config_write_transaction(home / 'config.yaml'):
+        atomic_config_write(home / 'config.yaml', bundle['config'])
+    publish(home / 'FRIDAY-PROFILE.json', bundle['contract'])
+    return bundle
+
+
+def host_owner(record, home, profile, *, dashboard=None):
+    """Policy for actual native records, used before/final ownership checks.
+
+    A matching record is still not an observation of HTTP/auth/source identity.
+    The native probe and process/install checks remain required by integration.
+    """
+    from scripts.friday_install import require
+    require(record.home == str(home) and profile in record.profiles
+            and record.start_time is not None and record.protocol_version == 1,
+            'foreign_or_unproved_native_host_owner')
+    if dashboard is not None:
+        require(record.host == dashboard['host'] and record.port == dashboard['port'],
+                'foreign_dashboard_authority')
+    return True
+
+
+def native_profile_check(bundle, home, *, records=()):
+    """Read-only real config/auth/scope validation; inspect no secret values."""
+    from scripts.friday_install import require
+    from hermes_constants import get_hermes_home
+    from hermes_cli.web_server import should_require_dashboard_auth
+    from urllib.parse import urlsplit
+    require(get_hermes_home() == home, 'native_home_mismatch')
+    config = bundle['config']; contract = bundle['contract']; dash = contract['native_dashboard']
+    require(should_require_dashboard_auth(dash['host'], frozenset({urlsplit(dash['public_url']).hostname})),
+            'native_dashboard_auth_off')
+    require(config['fallback_providers'] == [] and config['fallback_model'] == {},
+            'model_fallback_refused')
+    require('dashboard_auth/basic' in config['plugins']['enabled']
+            and 'friday_rework' in config['plugins']['enabled'], 'mandatory_native_plugins_missing')
+    require(config['dashboard']['basic_auth']['username'] == dash['operator']['user_id']
+            and dash['operator']['provider'] == 'basic' and dash['operator']['org_id'] == '',
+            'native_operator_identity_mismatch')
+    require(config['web']['backend'] == config['web']['search_backend'] == config['web']['extract_backend'] == 'exa'
+            and config['web']['keyless_rescue'] is False and config['web']['keyless_fallback'] is False
+            and 'web/exa' in config['plugins']['enabled'],
+            'mandatory_web_route_missing')
+    for record in records:
+        host_owner(record, home, contract['profile'],
+                   dashboard=dash if record.role == 'serve' else None)
+    return {'state': 'TEMPLATE_INCOMPLETE', 'ready': False, 'credentials_checked': False}
+
+
+def install_stamp(receipt):
+    from scripts.write_install_stamp import build_stamp
+    stamp = build_stamp(update_mechanism='external', commit=receipt['commit'], dirty=True,
+                        branch='friday-rework', source='local', distribution='friday-rework')
+    stamp['fridaySource'] = {'baseTree': receipt['base_tree'], 'layers': receipt['layers']}
+    return stamp
+
+
+def complete(value, home, receipt):
+    from scripts.friday_install import require, owned_file, digest, publish
+    from hermes_constants import get_hermes_home
+    require(get_hermes_home() == home, 'foreign_native_home')
+    source = home / 'hermes-agent'
+    # Only the native PM selected generation and this installation may publish
+    # commands. Publication is local; expose_cli/user PATH is never called.
+    from pm.paths import repo_root
+    from pm.environments import owning_home_root, project_python
+    require(repo_root() == source and Path(sys.executable) == project_python(source)
+            and owning_home_root(source) in (None, home), 'native_pm_install_owner_mismatch')
+    require(not (source / '.git').exists(), 'exported_full_patched_source_required')
+    from tools.configure_product import compose_product
+    bundle = compose_product(value['product'])
+    from gateway.host_rendezvous import read_record, record_is_stale
+    records = tuple(r for role in ('serve', 'gateway')
+                    if (r := read_record(role, include_stale=True)) is not None and not record_is_stale(r))
+    native_profile_check(bundle, home, records=records)
+    from hermes_cli.source_build import (source_build_env, prepare_source_dependencies,
+                                         build_source_tui, build_source_web, source_product_current)
+    env = source_build_env(explicit=True)
+    prepare_source_dependencies(source, ('ui-tui', 'web'), env=env, explicit=True)
+    build_source_tui(source, env=env); build_source_web(source, env=env)
+    require(source_product_current(source, 'tui', source / 'ui-tui/dist')
+            and source_product_current(source, 'web', source / 'hermes_cli/web_dist'),
+            'native_frontend_freshness_not_verified')
+    from hermes_cli._launchers import ensure_install_launchers, ENTRY_POINTS
+    written = ensure_install_launchers(source, source / '.hermes/bin')
+    require(len(written) == len(ENTRY_POINTS), 'native_launcher_publication_failed')
+    # Truthful upstream base plus overlays; never claim a clean upstream build.
+    publish(source / 'install-stamp.json', install_stamp(receipt))
+    target = home / 'plugins/friday_rework'
+    require(not target.exists() and not target.is_symlink(), 'existing_plugin_not_adopted')
+    target.parent.mkdir(mode=0o700, exist_ok=True)
+    from scripts.friday_install import directory
+    directory(target.parent)
+    shutil.copytree(ROOT / 'plugins/friday_rework', target)
+    for name, sha in value['project_files'].items():
+        prefix = 'plugins/friday_rework/'
+        if name.startswith(prefix):
+            p = target / name[len(prefix):]
+            require(digest(owned_file(p)) == sha, 'installed_plugin_source_changed')
+            os.chmod(p, 0o600)
+    for path in target.rglob('*'):
+        if path.is_dir():
+            os.chmod(path, 0o700)
+    bundle = profile_write(home, value['product'])
+    return native_profile_check(bundle, home)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument('phase', choices=('install',))
+    parser.add_argument('--input', required=True, type=Path)
+    args = parser.parse_args()
+    # Validate stdlib-only ownership and pins before importing installed code.
+    sys.path.insert(0, str(ROOT))
+    from scripts.friday_install import spec_checked, read_json, composition_checked, directory
+    value = read_json(args.input); home, donors = spec_checked(value); directory(home)
+    from scripts.friday_install import MARKER, SCHEMA, digest, owned_file, require
+    require(read_json(home / MARKER) == {'schema': SCHEMA, 'state': 'PARTIAL',
+                                       'input_sha256': digest(owned_file(args.input, private=True))},
+            'fresh_install_claim_required')
+    source = home / 'hermes-agent'; receipt = read_json(home / 'hermes-agent.source.json')
+    composition_checked(value, source, receipt, donors['hermes'])
+    sys.path.insert(0, str(source))
+    import tools, plugins, scripts
+    tools.__path__.append(str(ROOT / 'tools'))
+    plugins.__path__.append(str(ROOT / 'plugins'))
+    scripts.__path__.append(str(source / 'scripts'))
+    result = complete(value, home, receipt)
+    print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == '__main__':
+    main()
