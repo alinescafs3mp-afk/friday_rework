@@ -96,7 +96,10 @@ wrapper is reaped, because external native units can have separate lifetimes.
 
 Finite installer commands run as the bubblewrap PID namespace's PID 1. On a
 normal monitor exit, bubblewrap has waited for that init and the kernel has
-drained its descendants. This changes command signal handling and orphan
+drained its descendants. A private native `--json-status-fd` pipe must also
+contain the init announcement and matching exit status. The command does not
+inherit that pipe; missing or mismatched records refuse completion, including a
+zero monitor status. This changes command signal handling and orphan
 reaping compared with bubblewrap's separate init, so actual preparer/PM
 compatibility is required before runtime acceptance. A monitor timeout, signal,
 missing status or internal exit 3 remains `STOP_UNCONFIRMED`; pipe EOF and

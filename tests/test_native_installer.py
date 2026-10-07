@@ -97,13 +97,16 @@ def test_existing_foreign_home_not_adopted_even_if_empty(install_input, tmp_path
 
 
 def test_partial_install_never_replayed_or_cleaned(install_input, tmp_path, monkeypatch):
+    from test_installer_lifetime import metadata, native_status
     home = Path(install_input['home']); input_path = tmp_path / 'input.json'
     input_path.write_text(json.dumps(install_input)); input_path.chmod(0o600)
     from scripts import dsh_prepare
     calls = []
     def failed(*a, **kw):
         calls.append((a, kw))
-        if len(calls) == 1: return 'FRIDAY_PID_NAMESPACE_OK', {}
+        if len(calls) == 1:
+            native_status(kw, 0)
+            return 'FRIDAY_PID_NAMESPACE_OK', metadata()
         raise RuntimeError('synthetic finite preparer failure')
     monkeypatch.setattr(dsh_prepare, 'run', failed)
     with pytest.raises(RuntimeError): entry.install(install_input, input_path)
@@ -316,12 +319,15 @@ def test_whole_finite_composition_and_completed_idempotence_with_native_config(i
     p = tmp_path / 'input.json'; p.write_text(json.dumps(install_input)); p.chmod(0o600)
     home = Path(install_input['home']); calls = []
     from scripts import dsh_prepare
+    from test_installer_lifetime import metadata, native_status
     e = Path(os.environ['FRIDAY_FIXTURE_EVIDENCE']); source = home / 'hermes-agent'
     def intercepted(argv, cwd, **kw):
-        assert argv[:4] == ['/usr/bin/bwrap', '--unshare-pid', '--die-with-parent', '--new-session']
+        assert argv[0] == '/usr/bin/bwrap' and '--as-pid-1' in argv
+        assert argv[argv.index('--json-status-fd')+1] == str(kw['pass_fds'][0])
+        native_status(kw, 0)
         argv = argv[argv.index('--') + 1:]
         if '-c' in argv and 'FRIDAY_PID_NAMESPACE_OK' in argv[-1]:
-            return 'FRIDAY_PID_NAMESPACE_OK', {}
+            return 'FRIDAY_PID_NAMESPACE_OK', metadata()
         calls.append({'argv': argv, 'cwd': str(cwd), 'timeout': kw['timeout'], 'env': kw['env']})
         if '--destination' in argv:
             shutil.copytree(e / 'native', source, copy_function=shutil.copy2)
@@ -341,14 +347,14 @@ def test_whole_finite_composition_and_completed_idempotence_with_native_config(i
         elif str(entry.ROOT / 'scripts/dsh_prepare.py') in argv and 'source' in argv:
             Path(install_input['dsh_donor']).mkdir(mode=0o700) # Synthetic intact build boundary only.
         elif '-c' in argv:
-            return str(Path(os.sys.executable)), {'synthetic': True}
+            return str(Path(os.sys.executable)), metadata()
         elif str(entry.ROOT / 'scripts/friday_native.py') in argv:
             with native_home(home): native.profile_write(home, install_input['product'])
             target = home / 'plugins/friday_rework'; target.parent.mkdir(mode=0o700)
             shutil.copytree(entry.ROOT / 'plugins/friday_rework', target)
             for f in target.rglob('*'):
                 f.chmod(0o700 if f.is_dir() else 0o600)
-        return '', {'synthetic': True}
+        return '', metadata()
     monkeypatch.setattr(dsh_prepare, 'run', intercepted)
     result = entry.install(install_input, p)
     assert result['state'] == 'INSTALLED_TEMPLATE_INCOMPLETE' and result['runtime_ready'] is False

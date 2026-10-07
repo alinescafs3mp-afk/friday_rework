@@ -34,8 +34,12 @@ def test_containment_has_private_devices_and_same_lifetime(command):
 
 
 def test_probe_checks_real_device_io_before_home_admission(install_input, monkeypatch, tmp_path):
+    from test_installer_lifetime import metadata, native_status
     calls = []
-    monkeypatch.setattr(dsh_prepare, 'run', lambda args, *a, **k: (calls.append(args) or ('FRIDAY_PID_NAMESPACE_OK', {})))
+    def returned(args, *a, **k):
+        calls.append(args); native_status(k, 0)
+        return 'FRIDAY_PID_NAMESPACE_OK', metadata()
+    monkeypatch.setattr(dsh_prepare, 'run', returned)
     custody.Containment(install_input['containment'], custody.Budget(30), {}).probe('/bootstrap', tmp_path)
     code = calls[0][-1]
     assert 'os.O_RDWR' in code and 'os.read(fd,1)' in code and 'os.write(fd,b"probe")' in code
@@ -80,13 +84,16 @@ def test_cli_failed_phase_original_identity_and_custody(install_input, tmp_path,
     path = input_file(tmp_path, install_input); calls = []
     class Process:
         pid = 98765
-        def __init__(self):
+        def __init__(self, kwargs):
             self.returncode = 0 if not calls else child_code
+            self.kwargs = kwargs
             calls.append(self)
         def communicate(self, timeout):
+            from test_installer_lifetime import native_status
+            native_status(self.kwargs, self.returncode)
             if self.returncode == 0: return 'FRIDAY_PID_NAMESPACE_OK', ''
             return 'PRIVATE_STDOUT', "fatal: could not open '/dev/null' for reading and writing: Permission denied\nPRIVATE_CANARY"
-    monkeypatch.setattr(dsh_prepare.subprocess, 'Popen', lambda *a, **k: Process())
+    monkeypatch.setattr(dsh_prepare.subprocess, 'Popen', lambda *a, **k: Process(k))
     monkeypatch.setattr(sys, 'argv', ['friday', 'install', '--input', str(path)])
     with pytest.raises(SystemExit) as failed: entry.main()
     out = capsys.readouterr()

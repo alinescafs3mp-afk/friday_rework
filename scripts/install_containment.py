@@ -5,6 +5,7 @@ No process discovery, service manager, weaker fallback or background monitor.
 """
 from __future__ import annotations
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -66,37 +67,63 @@ def argv(binary, command):
             '--bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--', *command]
 
 
+def namespace_exit(data, observation):
+    """Only bwrap's monitor owns this pipe; sandbox commands never inherit it."""
+    try:
+        rows = [json.loads(line) for line in data.splitlines() if line.strip()]
+        return (len(data) <= 4096 and len(rows) == 2
+                and isinstance(rows[0], dict) and type(rows[0].get('child-pid')) is int
+                and rows[0]['child-pid'] > 0
+                and rows[1] == {'exit-code': observation['returncode']}
+                and type(rows[1]['exit-code']) is int
+                and observation['returncode'] >= 0
+                and observation['timeout'] is False and observation['reaped'] is True)
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
 class Containment:
     def __init__(self, pin, budget, env):
         self.pin, self.budget, self.env = pin, budget, env
         self.binary = budget.call(checked_binary, pin)
 
     def run(self, command, cwd, *, timeout=1800):
-        from scripts.dsh_prepare import run, StopUnconfirmed
+        from scripts.dsh_prepare import run, CommandFailed, StopUnconfirmed
         self.budget.call(checked_binary, self.pin)
         # Reserve cleanup *inside* the original deadline; no fresh grace clock.
         limit = min(timeout, self.budget.check(reserve=1))
+        reader, writer = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+        failure = None; result = None; observation = {}; data = b''
         try:
-            result = run(argv(self.binary, command), cwd, timeout=limit, env=self.env,
-                         deadline=self.budget.deadline)
-        except StopUnconfirmed:
-            raise
+            args = argv(self.binary, command)
+            args[1:1] = ['--json-status-fd', str(writer)]
+            try:
+                result = run(args, cwd, timeout=limit, env=self.env,
+                             deadline=self.budget.deadline, pass_fds=(writer,))
+                observation = result[1]
+            except BaseException as exc:
+                failure = exc
+                if isinstance(exc, CommandFailed): observation = exc.observation
+            os.close(writer); writer = None
+            # Exactly two small native records fit in the pipe. Never wait for
+            # EOF from an uncertain monitor or use its stdout as proof.
+            try:
+                data = os.read(reader, 4097)
+            except BlockingIOError:
+                pass
         except BaseException as exc:
-            observation = getattr(exc, 'observation', None)
-            # Only a normally exiting bwrap monitor has waited for namespace
-            # PID 1. A killed monitor, timeout, or missing native status leaves
-            # that barrier unknown even when its own pipes are closed/reaped.
-            known = (isinstance(observation, dict)
-                     and type(observation.get('returncode')) is int
-                     and observation['returncode'] >= 0
-                     and observation.get('timeout') is False
-                     and observation.get('reaped') is True)
-            if not known or observation['returncode'] == 3:
-                stopped = StopUnconfirmed('STOP_UNCONFIRMED: namespace init exit not established')
-                if observation is not None:
-                    stopped.observation = observation
-                raise stopped from exc
-            raise
+            failure = exc
+            data = b''
+        finally:
+            if writer is not None: os.close(writer)
+            os.close(reader)
+        known = namespace_exit(data, observation)
+        if not known or observation.get('returncode') == 3:
+            stopped = StopUnconfirmed('STOP_UNCONFIRMED: namespace init exit not established')
+            if observation: stopped.observation = observation
+            raise stopped from failure
+        observation['namespace_init_exit_verified'] = True
+        if failure is not None: raise failure
         self.budget.check()
         return result
 

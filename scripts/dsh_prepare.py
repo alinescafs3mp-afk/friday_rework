@@ -49,7 +49,7 @@ def clean_environment(donor):
     return env
 
 
-def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None):
+def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None, pass_fds=()):
     """Bound one group; callers needing detached-tree custody use a PID namespace."""
     if argv[0] == "git":
         argv = ["git", "-c", "core.hooksPath=" + os.devnull,
@@ -58,7 +58,7 @@ def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None):
     start = time.monotonic()
     process = subprocess.Popen(argv, cwd=donor, env=env or clean_environment(donor),
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, start_new_session=True)
+                               text=True, start_new_session=True, pass_fds=pass_fds)
     try:
         starttime = int(Path(f'/proc/{process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
     except (OSError, ValueError, IndexError):

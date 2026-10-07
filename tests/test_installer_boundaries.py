@@ -78,15 +78,21 @@ def test_late_replace_is_observation_not_success(tmp_path):
 
 
 def test_cleanup_reserve_uses_original_deadline(install_input, tmp_path, monkeypatch):
+    from test_installer_lifetime import metadata, native_status
     budget = custody.Budget(30)
     from scripts import dsh_prepare
     calls = []
-    monkeypatch.setattr(dsh_prepare, 'run', lambda *a, **kw: (calls.append((a, kw)) or ('ok', {})))
+    def returned(*a, **kw):
+        calls.append((a, kw)); native_status(kw, 0)
+        return 'ok', metadata()
+    monkeypatch.setattr(dsh_prepare, 'run', returned)
     runner = custody.Containment(install_input['containment'], budget, {})
     runner.run(['/not-executed'], tmp_path, timeout=100)
     a, kw = calls[0]
     assert kw['deadline'] == budget.deadline
-    assert 0 < kw['timeout'] < 29 and a[0][1:4] == ['--unshare-pid','--die-with-parent','--new-session']
+    assert 0 < kw['timeout'] < 29
+    assert '--as-pid-1' in a[0] and '--unshare-pid' in a[0]
+    assert a[0][a[0].index('--json-status-fd')+1] == str(kw['pass_fds'][0])
 
 
 def test_cleanup_deadline_failure_is_stop_unconfirmed(monkeypatch, tmp_path):
@@ -186,10 +192,12 @@ def test_cli_checks_final_success_after_serialization_and_flush(install_input, t
 
 def test_command_return_after_original_deadline_is_refused(install_input, tmp_path, monkeypatch):
     from scripts import dsh_prepare
+    from test_installer_lifetime import metadata, native_status
     budget = AdmissionClock(30)
     runner = custody.Containment(install_input['containment'], budget, {})
     def late(*a, **kw):
-        budget.expired = True; return 'late observation', {}
+        native_status(kw, 0)
+        budget.expired = True; return 'late observation', metadata()
     monkeypatch.setattr(dsh_prepare, 'run', late)
     with pytest.raises(ValueError, match='budget_exhausted'):
         runner.run(['/not-executed'], tmp_path)
@@ -208,16 +216,18 @@ def test_actual_cli_preserves_unknown_cessation_and_existing_claim(
     class Process:
         pid = 98765
         returncode = 0
-        def __init__(self): self.number = len(starts)
+        def __init__(self, kwargs): self.number = len(starts); self.kwargs = kwargs
         def communicate(self, timeout):
             waits.append(timeout)
             if stage == 'compose' and self.number == 1:
+                from test_installer_lifetime import native_status
+                native_status(self.kwargs, 0)
                 return 'FRIDAY_PID_NAMESPACE_OK', ''
             if cause == 'cleanup_budget_exhausted':
                 monkeypatch.setattr(dsh_prepare, 'time', SimpleNamespace(monotonic=lambda: now + 8000))
             raise subprocess.TimeoutExpired('PRIVATE_PROCESS_CANARY', timeout)
     def spawn(*a, **kw):
-        starts.append(True); return Process()
+        starts.append(True); return Process(kw)
     monkeypatch.setattr(dsh_prepare.subprocess, 'Popen', spawn)
     monkeypatch.setattr(dsh_prepare.os, 'killpg', lambda *a: killed.append(a))
     monkeypatch.setattr('sys.argv', ['friday', 'install', '--input', str(path)])
