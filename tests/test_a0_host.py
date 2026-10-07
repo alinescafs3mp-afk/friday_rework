@@ -17,8 +17,8 @@ def configure_a0(setup,proof,tmp_path,monkeypatch):
     aa=importlib.import_module(package+'.adapters.a0')
     address=setup.record.association_address(CALL,proof)
     accepted=time.time();mono=time.monotonic_ns();boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
-    setup.host.store.clock=lambda:accepted
-    monkeypatch.setattr(setup.module.time,'monotonic_ns',lambda:mono)
+    # Real advancing clocks: capability is produced only AFTER reservation.
+    setup.host.store.clock=time.time
     root=tmp_path/'native-fixture';root.mkdir(mode=0o700)
     runtime_root=root/'runtime';runtime_root.mkdir(mode=0o700)
     docker=root/'docker';docker.write_bytes(b'OFFLINE EXECUTABLE PIN; NEVER EXECUTED')
@@ -88,7 +88,7 @@ def configure_a0(setup,proof,tmp_path,monkeypatch):
     monkeypatch.setattr(m.Runtime,'__init__',rt_init)
     def route(self,container_id=None):
         state.checks+=1
-        assert self.p['accepted_monotonic_ns']==mono
+        assert self.p['accepted_monotonic_ns']==setup.host.store.get(address,identity['owner'])['host']['a0']['acceptance']['accepted_monotonic_ns']
         assert self.p['association_binding']['existing_task_id']==address
         return {'status':'EXPLICIT_FAKE_CURRENT_LOCAL_NETWORK_CHECKED','id':self.p['network']['id']}
     monkeypatch.setattr(m.Runtime,'check_network',route)
@@ -103,8 +103,8 @@ def configure_a0(setup,proof,tmp_path,monkeypatch):
         assert not boundary.stop_only
         boundary._association(row);obj=boundary.inspect(row)
         assert obj['State']['Running'] and boundary.grant.network_verified
-        assert boundary.grant.accepted_monotonic==mono/1e9
-        assert boundary.grant.keys_prepared_monotonic>=mono/1e9
+        assert boundary.grant.accepted_monotonic==row['host']['a0']['acceptance']['accepted_monotonic_ns']/1e9
+        assert boundary.grant.keys_prepared_monotonic>=boundary.grant.accepted_monotonic
         return sup.observe(boundary._association(row))
     monkeypatch.setattr(an.A0NativeBoundary,'admit',admit)
     def path(boundary,worker):return boundary.config.state_dir.parent/worker.removeprefix('/a0/')
@@ -147,23 +147,39 @@ def configure_a0(setup,proof,tmp_path,monkeypatch):
     # This entire receipt is an explicitly fabricated OFFLINE input fixture,
     # never a production readiness artifact. Actual native interfaces above
     # are intercepted, so these booleans make NO live acceptance claim.
-    evidence=root/'FAKE-offline-live-readiness.json'
-    evidence.write_text(json.dumps({'schema':'friday.a0.host-live-readiness.v1','accepted':True,
-        'association_sha256':setup.record.digest(identity),
-        'acceptance_sha256':setup.record.digest({'accepted_unix':accepted,'accepted_monotonic_ns':mono,'boot_id':boot}),
-        'network_sha256':setup.record.digest(network),'runtime_source_sha256':pin(SOURCE/'scripts/a0_runtime.py')['sha256'],
-        'checks':{k:True for k in ('packet_egress','negative_egress','native_deadline','native_stop','pre_ui_keys','namespace_recheck')}}))
-    capability=root/'capability.json';capability.write_text(json.dumps({'schema':'friday.a0.host-capability.v1',
-        'association':identity,'acceptance':{'accepted_unix':accepted,'accepted_monotonic_ns':mono,'boot_id':boot},
-        'network':network,'live_evidence':[pin(evidence)]}))
-    runtime['a0']['capability']=pin(capability)
+    evidence=root/'FAKE-offline-reviewed-deployment.json'
+    evidence.write_text(json.dumps({'classification':'EXPLICIT_FAKE_DEPLOYMENT_REVIEW_NOT_LIVE',
+        'checks':{k:True for k in ('packet_egress','negative_egress','native_deadline','native_stop','pre_ui_keys')}}))
+    capability=root/'capability.json'
     receipt=root/'receipt.json';destination=setup.home/'plugins/friday_rework'
     source_pins={k:pin(destination/p)['sha256'] for k,p in {'host':'host.py','host_runtime':'host_runtime.py','host_record':'host_record.py',
         'associations':'associations.py','adapter':'adapters/a0.py','native':'adapters/a0_native.py','config':'adapters/a0_config.py'}.items()}
-    receipt.write_text(json.dumps({'schema':'friday-rework.a0-runtime.v1','ready':True,'runtime_sha256':setup.record.digest(runtime),
-        'source_pins':source_pins,'evidence':[pin(evidence)],'capability_sha256':pin(capability)['sha256']}))
+    receipt.write_text(json.dumps({'schema':'friday-rework.a0-runtime.v2','ready':True,'runtime_sha256':setup.record.digest(runtime),
+        'source_pins':source_pins,'evidence':[pin(evidence)]}))
     runtime['runtime_receipt']=pin(receipt);setup.configure(runtime)
     state.runtime=runtime;state.args=args;state.capability=capability;state.module=m;state.native=an;state.a0=aa;state.hr=hr;state.evidence=evidence
+    def produce(row):
+        from importlib import import_module
+        exact=import_module(package+'.adapters.dsh')._identity(row)
+        observed=root/'FAKE-current-route.json'
+        observed.write_text(json.dumps({'schema':'friday.a0.host-current-route.v2','accepted':True,
+            'association_sha256':setup.record.digest(exact),'acceptance_sha256':setup.record.digest(row['host']['a0']['acceptance']),
+            'network_sha256':setup.record.digest(network),'runtime_source_sha256':pin(SOURCE/'scripts/a0_runtime.py')['sha256'],
+            'checks':{'namespace_recheck':True,'current_route':True}}))
+        capability.write_text(json.dumps({'schema':'friday.a0.host-capability.v2','association':exact,
+            'acceptance':row['host']['a0']['acceptance'],'network':network,'live_evidence':[pin(observed)]}))
+        return pin(capability)
+    state.produce=produce
+    state.schedules=[]
+    original_schedule=setup.ctx.schedule_gateway_work
+    def schedule(coro,**kwargs):
+        state.schedules.append(dict(kwargs))
+        return original_schedule(coro,**kwargs)
+    monkeypatch.setattr(setup.ctx,'schedule_gateway_work',schedule)
+    def readiness(boundary,row,timeout):
+        boundary._keys();boundary.admit(row)
+        return True
+    monkeypatch.setattr(an.A0NativeBoundary,'readiness',readiness)
     def capture():
         if state.session is not None:
             (root/'FAKE-native-observations.json').write_text(json.dumps({
@@ -177,12 +193,19 @@ def configure_a0(setup,proof,tmp_path,monkeypatch):
     return state
 
 
-def launch_row(setup,state,proof):
+def launch_row(setup,state,proof,*,attach=True):
     setup.native.runner._draining=True
     value=invoke(setup,proof,args=state.args)
     assert value.get('reference'),value
     row=setup.host.store.get(value['reference'],setup.record.owner_from_ingress(CALL,proof))
     assert row['host']['inputs'] is not None
+    if attach:
+        try:setup.host.attach_a0_capability(row['existing_task_id'],row['owner'],state.produce(row))
+        except RuntimeError as e:
+            # Actual Hermes offline scheduler refuses/ closes the coroutine;
+            # the persisted one-shot attachment still cannot be replayed.
+            assert str(e)=='gateway_offline'
+        row=setup.host.store.get(row['existing_task_id'],row['owner'])
     return row
 
 
@@ -229,6 +252,7 @@ async def test_bound_core_real_plan_argv_controller_and_retained_bytes(setup,tmp
 @pytest.mark.parametrize('mutation',['owner','clock','unit','network_id','capability_pin'])
 async def test_stale_capability_refuses_before_create(setup,tmp_path,monkeypatch,mutation):
     proof=await ingress(setup);s=configure_a0(setup,proof,tmp_path,monkeypatch)
+    row=launch_row(setup,s,proof,attach=False);s.produce(row)
     value=json.loads(s.capability.read_text())
     if mutation=='owner':value['association']['owner']['user_id']='foreign'
     elif mutation=='clock':value['acceptance']['accepted_monotonic_ns']+=1
@@ -236,15 +260,9 @@ async def test_stale_capability_refuses_before_create(setup,tmp_path,monkeypatch
     elif mutation=='network_id':value['network']['id']='bridge'
     else:value['extra']=True
     s.capability.write_text(json.dumps(value))
-    # A self-consistent new operator pin/receipt must still reject the actual
-    # wrong association/clock/schema; this is not five copies of a SHA test.
-    s.runtime['a0']['capability']=pin(s.capability)
-    receipt=Path(s.runtime['runtime_receipt']['path']);data=json.loads(receipt.read_text())
-    data['capability_sha256']=pin(s.capability)['sha256']
-    data['runtime_sha256']=setup.record.digest({k:v for k,v in s.runtime.items() if k!='runtime_receipt'})
-    receipt.write_text(json.dumps(data));s.runtime['runtime_receipt']=pin(receipt);setup.configure(s.runtime)
-    row=launch_row(setup,s,proof)
-    with pytest.raises(Exception):scoped_start(setup,row)
+    # Self-consistent operator pin still must reject exact owner/clock/schema.
+    with pytest.raises(Exception):setup.host.attach_a0_capability(row['existing_task_id'],row['owner'],pin(s.capability))
+    assert setup.host.store.get(row['existing_task_id'],row['owner'])['host']['a0']['capability'] is None
     assert not s.posts and not any('create' in v for v in s.calls)
     assert setup.host.store.get(row['existing_task_id'],row['owner'])['host']['quiescence'] is None
 

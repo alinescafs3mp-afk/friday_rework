@@ -43,8 +43,8 @@ def validate_a0_record(row):
     from .adapters.a0_native import NativeGrant
     from .adapters.dsh import _identity
     a = row['host']['a0']
-    if (not isinstance(a, dict) or set(a) != {'schema', 'acceptance', 'expected_files', 'launch', 'grant', 'key_cleanup'}
-            or a['schema'] != 'friday.a0.host.v1'):
+    if (not isinstance(a, dict) or set(a) != {'schema', 'acceptance', 'expected_files', 'launch', 'grant', 'key_cleanup', 'capability'}
+            or a['schema'] != 'friday.a0.host.v2'):
         raise ValueError()
     validate_acceptance(a['acceptance'])
     if (a['acceptance']['accepted_unix'] != row['created_at_unix']
@@ -53,7 +53,11 @@ def validate_a0_record(row):
             or a['expected_files'] != row['host']['binding']['runtime']['a0']['expected_files']
             or a['key_cleanup'] not in {'NOT_PREPARED', 'PREPARED', 'REMOVED', 'RECONCILIATION_REQUIRED'}):
         raise ValueError()
+    if a['capability'] is not None:
+        from .host_runtime import _pin
+        _pin(a['capability']) # structure only; stop/recovery cannot depend on drifted source
     launch = a['launch']
+    if launch is not None and a['capability'] is None: raise ValueError()
     if launch is not None:
         if not isinstance(launch, dict) or set(launch) != {'plan', 'plan_pin', 'keys_prepared_monotonic', 'created'}:
             raise ValueError()

@@ -727,8 +727,8 @@ class Runtime:
             a['native'] = {'invocation_id': r['invocation_id'], 'worker_reference': r['container_id']}
         return a
 
-    def inspect(self, r, *, stop_owned=False):
-        xs = json.loads(self.docker('inspect', r['container_id']))
+    def inspect(self, r, *, stop_owned=False, timeout=10):
+        xs = json.loads(self.docker('inspect', r['container_id'], timeout=timeout))
         require(isinstance(xs, list) and len(xs) == 1, 'container_observation_unknown')
         obj = container_checked(self.p, xs[0], r['container_id'], stop_owned=stop_owned)
         if not stop_owned:

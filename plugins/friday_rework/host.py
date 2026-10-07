@@ -46,6 +46,7 @@ class WorkerHost:
         # They are not an admission authority, task database or execution queue.
         self._owned = {}
         self._a0_controllers = {}
+        self._a0_admissions = set()
         self._closed = False
         self._cleanup_future = None
 
@@ -121,6 +122,7 @@ class WorkerHost:
             if not fresh:
                 return json.dumps(status(row))
             self._owned[address] = copy.deepcopy(row)
+            if brief.worker == 'a0': self._a0_admissions.add(address)
             # No fallback to a shared directory, no clobber of earlier artifacts.
             workspace = Path(row["workspace_reference"])
             staging = Path(runtime["staging_root"]) / address
@@ -141,7 +143,10 @@ class WorkerHost:
                 inputs = tuple(replace(v,worker_path=input_path(row,i)) for i,v in enumerate(inputs))
             row = self.store.retain_inputs(address, owner, [asdict(item) for item in inputs])
             self._owned[address] = copy.deepcopy(row)
-            self.ctx.schedule_gateway_work(self._run(row), route=route, name="friday:" + address)
+            # A0 reserves immutable clocks/identity first. A separately authorized
+            # current producer attaches once, then uses this existing scheduler.
+            if brief.worker != 'a0':
+                self.ctx.schedule_gateway_work(self._run(row), route=route, name="friday:" + address)
             return json.dumps(status(row))
         except (ValueError, RuntimeError, OSError, TypeError):
             # Any admitted partial setup remains reserved and non-replayable.
@@ -151,6 +156,26 @@ class WorkerHost:
             if row is not None:
                 answer["reference"] = row["existing_task_id"]
             return json.dumps(answer)
+
+    def attach_a0_capability(self, task_id, owner, pin):
+        """Host/operator-only entry; never exported as a worker/model tool.
+
+        Current producer receives the already reserved row. A restored host is
+        stop-only: it cannot redispatch a precrash reservation or attachment.
+        """
+        if self._closed or task_id not in self._a0_admissions:
+            raise HostUnavailable('a0_attachment_requires_current_owner')
+        row = self.store.get(task_id, owner)
+        runtime = row['host']['binding']['runtime']
+        if row['worker_kind'] != 'a0' or self.ctx.get_config('runtime') != runtime:
+            raise HostUnavailable('foreign_a0_runtime_binding')
+        session = self._controller(row).bindings['a0'].adapter
+        row, fresh = self.store.attach_a0_capability(task_id, owner, pin, session.validate_capability)
+        self._remember(row)
+        if fresh:
+            self.ctx.schedule_gateway_work(self._run(row), route=delivery_route(row['host']['binding']['ingress']),
+                                           name='friday:'+task_id)
+        return status(row)
 
     def _remember(self, row):
         self._owned[row["existing_task_id"]] = copy.deepcopy(row)

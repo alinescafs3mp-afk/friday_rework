@@ -347,10 +347,10 @@ class Associations:
                 if brief.worker == 'a0':
                     if acceptance is None:
                         raise AssociationError('original_acceptance_missing')
-                    row['host']['a0'] = {'schema': 'friday.a0.host.v1',
+                    row['host']['a0'] = {'schema': 'friday.a0.host.v2',
                         'acceptance': copy.deepcopy(acceptance),
                         'expected_files': copy.deepcopy(host_binding['runtime']['a0']['expected_files']),
-                        'launch': None, 'grant': None, 'key_cleanup': 'NOT_PREPARED'}
+                        'launch': None, 'grant': None, 'key_cleanup': 'NOT_PREPARED', 'capability': None}
             data["jobs"][task_id] = row
             self._save(data)
             return copy.deepcopy(row), True
@@ -359,6 +359,28 @@ class Associations:
         """Checked profile snapshot; callers still enforce ownership per control."""
         with self._locked() as data:
             return copy.deepcopy(data["jobs"])
+
+    def attach_a0_capability(self, task_id, owner, pin, validate):
+        """Once-only trusted producer attachment in the existing durable row.
+
+        Persisted attachment consumes dispatch before scheduling. Lost schedule
+        acknowledgement/restart cannot acquire a second dispatch or reset clocks.
+        """
+        with self._locked() as data:
+            row = self._owned(data, task_id, owner)
+            a = row['host']['a0']
+            if a['capability'] is not None:
+                if a['capability'] != pin: raise AssociationError('a0_capability_conflict')
+                return copy.deepcopy(row), False
+            if (row['stop_intent'] or row['preparation_reserved'] or row['native'] is not None
+                    or row['submission_observation'] != 'NOT_SUBMITTED'
+                    or row['host']['terminal'] is not None or row['host']['quiescence'] is not None
+                    or row['host']['inputs'] is None or a['launch'] is not None):
+                raise AssociationError('a0_capability_attachment_not_admitted')
+            validate(copy.deepcopy(row), copy.deepcopy(pin))
+            a['capability'] = copy.deepcopy(pin)
+            self._save(data)
+            return copy.deepcopy(row), True
 
     def retain_a0(self, task_id, owner, field, value):
         """One-way nonsecret ownership metadata, in the existing locked row."""

@@ -123,6 +123,26 @@ except BaseException:
 '''
 
 
+# Startup GET only. Connection-refused/HTTP503 mean observed NOT_READY; all
+# identity/key/parse/native errors stop rather than being retried or hidden.
+READINESS_SCRIPT = API_SCRIPT.replace(
+    "assert v['path'] in ('/api/api_message','/api/api_log_get','/api/api_files_get')",
+    "assert v['path']=='/api/health' and v['method']=='GET'").replace(
+    "with opener.open(request,timeout=v['timeout']) as response:",
+    """import errno,urllib.error
+ try:
+  response=opener.open(request,timeout=v['timeout'])
+ except urllib.error.HTTPError as e:
+  if e.code != 503: raise
+  checked_keys();print('{"ok":true,"ready":false}');raise SystemExit(0)
+ except urllib.error.URLError as e:
+  if not isinstance(e.reason,OSError) or e.reason.errno!=errno.ECONNREFUSED: raise
+  checked_keys();print('{"ok":true,"ready":false}');raise SystemExit(0)
+ with response:""").replace(
+    "except BaseException:\n print('{\"ok\":false}')",
+    "except SystemExit:\n raise\nexcept BaseException:\n print('{\"ok\":false}')")
+
+
 def native_file(root, relative, limit):
     """Walk with dirfds/no-follow; reject changed files and hard links."""
     import stat
@@ -410,6 +430,21 @@ class A0NativeBoundary:
                                  self.config.python, "-B", "-c", script], data=data, timeout=timeout)
         except BaseException:
             raise A0Error("native_call_unknown") from None
+
+    def readiness(self, row, timeout):
+        """Finite checked GET readiness; this never bootstraps or calls a model."""
+        value = strict_json(self._exec(row, READINESS_SCRIPT,
+            {'method':'GET','path':'/api/health','payload':{},
+             'admitted_keys':self._keys().admitted(),'timeout':max(.1,timeout-.5),'max_bytes':4096}, timeout))
+        if (isinstance(value,dict) and set(value)=={'ok','ready'}
+                and value['ok'] is True and value['ready'] is False): return False
+        require(isinstance(value,dict) and set(value)=={'ok','body'} and value['ok'] is True,
+                'a0_readiness_unknown')
+        body = strict_json(decode_file(value['body'],4096))
+        require(isinstance(body,dict) and set(body)=={'gitinfo','error'}
+                and isinstance(body['gitinfo'],dict) and body['gitinfo'] and body['error'] is None,
+                'a0_readiness_invalid')
+        return True
 
     def request(self, row, method, path, payload, timeout, max_bytes):
         material = self._keys()

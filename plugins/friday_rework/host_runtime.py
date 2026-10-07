@@ -175,7 +175,8 @@ def validate_a0_runtime(value):
     if a['owner_slot'] not in {'astra','sol'}:raise HostUnavailable('invalid_a0_operator_slot')
     for k in ('runtime','launcher','docker','daemon_unit','policy'): _pin(a[k])
     _pin(value['runtime_receipt'])
-    if a['capability'] is not None: _pin(a['capability'])
+    # Fresh capability is attached to the reserved row, never static config.
+    if a['capability'] is not None: raise HostUnavailable('obsolete_preclaim_a0_capability')
     files = a['expected_files']
     if (not isinstance(files,list) or not 0 < len(files) <= 16
             or any(not isinstance(x,dict) or set(x) != {'logical_name','media_type'}
@@ -209,16 +210,14 @@ def check_a0_runtime(value, associations):
         'host':'host.py','host_runtime':'host_runtime.py','host_record':'host_record.py',
         'associations':'associations.py','adapter':'adapters/a0.py','native':'adapters/a0_native.py',
         'config':'adapters/a0_config.py'}.items()}
-    if (not isinstance(receipt,dict) or set(receipt) != {'schema','ready','runtime_sha256','source_pins','evidence','capability_sha256'}
-            or receipt['schema'] != 'friday-rework.a0-runtime.v1' or receipt['ready'] is not True
+    if (not isinstance(receipt,dict) or set(receipt) != {'schema','ready','runtime_sha256','source_pins','evidence'}
+            or receipt['schema'] != 'friday-rework.a0-runtime.v2' or receipt['ready'] is not True
             or receipt['runtime_sha256'] != digest({k:v for k,v in c.items() if k != 'runtime_receipt'})
-            or receipt['source_pins'] != actual or not isinstance(receipt['evidence'],list) or not receipt['evidence']
-            or c['a0']['capability'] is None or receipt['capability_sha256'] != c['a0']['capability']['sha256']):
+            or receipt['source_pins'] != actual or not isinstance(receipt['evidence'],list) or not receipt['evidence']):
         raise HostUnavailable('a0_readiness_not_verified')
     for p in receipt['evidence']: _pin(p).read()
-    # This does not mint a grant. The exact row/clock and actual current route
-    # check below are mandatory. No production capability producer is installed.
-    _pin(c['a0']['capability']).read()
+    # Reusable reviewed deployment evidence; this grants no per-job effects.
+    # The producer attaches the exact freshly reserved row below.
     return c
 
 
@@ -246,10 +245,12 @@ class A0HostSession:
         self.cancelled = False
         self.launching = False
         self.unit = None
+        self.startup_active = False
         self.native_cessation = False
         self.no_create_confirmed = False
         self.pre_grant_confirmed = False
         self.created = copy.deepcopy((row['host']['a0']['launch'] or {}).get('created'))
+        self.retained_samples = []
         self.key_preparation_attempted = False
         self.key_cleanup = row['host']['a0']['key_cleanup']
         self.preparing = False
@@ -265,7 +266,12 @@ class A0HostSession:
 
     def _current(self, row):
         self._same(row)
-        r = self.store.get(row['existing_task_id'],row['owner']);self._same(r)
+        return self._eligible(self.store.get(row['existing_task_id'],row['owner']))
+
+    def _eligible(self, r):
+        # The locked producer seam supplies the actual durable row directly;
+        # it must not recursively acquire the existing admission flock.
+        self._same(r)
         a = r['host']['a0']['acceptance']
         import time
         if (self.cancelled or r['stop_intent'] or self.store.clock() < a['accepted_unix']
@@ -282,25 +288,25 @@ class A0HostSession:
         exec(compile(data,str(pin.path),'exec'),m.__dict__)
         return m
 
-    def _capability(self, row):
+    def _capability(self, row, pin=None):
         from .adapters.a0_native import strict_json
         from .adapters.dsh import _identity
         from .host_record import digest
-        pin = self.config['a0']['capability']
+        pin = row['host']['a0']['capability'] if pin is None else pin
         if pin is None: raise HostUnavailable('current_a0_capability_missing')
         v = strict_json(_pin(pin).read())
         if (not isinstance(v,dict) or set(v) != {'schema','association','acceptance','network','live_evidence'}
-                or v['schema'] != 'friday.a0.host-capability.v1' or v['association'] != _identity(row)
+                or v['schema'] != 'friday.a0.host-capability.v2' or v['association'] != _identity(row)
                 or v['acceptance'] != row['host']['a0']['acceptance']
                 or not isinstance(v['live_evidence'],list) or not v['live_evidence']
                 or v['network']['launcher_sha256'] != self.config['a0']['launcher']['sha256']):
             raise HostUnavailable('foreign_or_stale_a0_capability')
-        checks = {'packet_egress','negative_egress','native_deadline','native_stop','pre_ui_keys','namespace_recheck'}
+        checks = {'namespace_recheck','current_route'}
         for p in v['live_evidence']:
             proof = strict_json(_pin(p).read())
             if (not isinstance(proof,dict) or set(proof) != {'schema','accepted','association_sha256',
                     'acceptance_sha256','network_sha256','runtime_source_sha256','checks'}
-                    or proof['schema'] != 'friday.a0.host-live-readiness.v1' or proof['accepted'] is not True
+                    or proof['schema'] != 'friday.a0.host-current-route.v2' or proof['accepted'] is not True
                     or proof['association_sha256'] != digest(_identity(row))
                     or proof['acceptance_sha256'] != digest(row['host']['a0']['acceptance'])
                     or proof['network_sha256'] != digest(v['network'])
@@ -309,6 +315,56 @@ class A0HostSession:
                     or any(x is not True for x in proof['checks'].values())):
                 raise HostUnavailable('current_live_a0_readiness_missing')
         return v
+
+    def validate_capability(self, row, pin):
+        """Trusted host producer seam; no user/model handler or launch authority."""
+        self._eligible(row)
+        check_a0_runtime(self.config, self.store)
+        return self._capability(row, pin)
+
+    def _startup_left(self, row):
+        import time
+        current = self._current(row)
+        a = current['host']['a0']['acceptance']
+        left = min(current['deadline_unix'] - self.store.clock(),
+                   current['budget_seconds'] - (time.monotonic_ns()-a['accepted_monotonic_ns'])/1e9) - 25
+        if left <= 1: raise HostUnavailable('a0_startup_original_budget_exhausted')
+        return left
+
+    def _retain_sample(self, m, r, sample):
+        # Cache both owners before receipt I/O or any other fallible observation.
+        self.retained_samples.append(copy.deepcopy(sample))
+        r['observations'].append(copy.deepcopy(sample))
+        self.runtime.known = r
+        m.write_json(self.runtime.receipt_path, r, replace=True)
+
+    def _container_ready(self, m, row, r):
+        import time
+        # Finite native startup observations, never replaying create/start/POST.
+        for _ in range(row['budget_seconds']*10+1):
+            left = self._startup_left(row)
+            self.keys.ready(); self._capability(self._current(row))
+            obj = self.runtime.inspect(r, timeout=min(3, left))
+            if obj['State']['Running'] and obj['State']['Pid'] > 0:
+                sample = self.runtime.snapshot_container(obj)
+                self._retain_sample(m, r, sample)
+                return sample
+            unit = self.runtime.supervisor.observe(self.runtime.association(r))
+            if unit.quiescent or unit.invocation_id != r['invocation_id']:
+                raise HostUnavailable('a0_startup_unit_lost')
+            time.sleep(min(.1, self._startup_left(row)))
+        raise HostUnavailable('a0_startup_observation_limit')
+
+    def _api_ready(self, row):
+        import time
+        for _ in range(row['budget_seconds']*10+1):
+            left = self._startup_left(row)
+            # GuardedBoundary repeats current route, exact identity and keys.
+            if self.boundary.readiness(self._current(row), min(3, left)):
+                self._startup_left(row)
+                return
+            time.sleep(min(.1, self._startup_left(row)))
+        raise HostUnavailable('a0_startup_observation_limit')
 
     def _deployment(self, plan):
         from .adapters.a0_config import A0Deployment, LocalNetwork
@@ -347,9 +403,15 @@ class A0HostSession:
         self.plan=p
         plan_path=Path(row['workspace_reference'])/'a0-plan.json';m.write_json(plan_path,p)
         self.runtime=m.Runtime(p)
+        original_runner=self.runtime.runner
+        def startup_runner(argv,timeout):
+            if self.startup_active: timeout=min(timeout,self._startup_left(row))
+            return original_runner(argv,timeout)
+        self.runtime.runner=startup_runner
         self.store.retain_a0(row['existing_task_id'],row['owner'],'launch',
             {'plan':p,'plan_pin':{'path':str(plan_path),'sha256':m.sha(plan_path)},'keys_prepared_monotonic':None,'created':None})
         self.launching=True
+        self.startup_active=True
         def before_ui(usr):
             self._current(row)
             scope=current_secret_scope();names={'FRIDAY_LLM_API_KEY','FRIDAY_EMBEDDINGS_API_KEY'}
@@ -366,19 +428,18 @@ class A0HostSession:
             self.store.retain_a0(row['existing_task_id'],row['owner'],'key_cleanup','PREPARED')
             self.keys.ready();self._current(row)
         def on_created(known):
-            self.runtime.inspect(known,stop_owned=True)
+            # Creation already happened: cancellation/expiry cannot withhold
+            # checked exact-ID caching and stop-only ownership reconciliation.
+            self.startup_active=False
+            self.runtime.inspect(known,stop_owned=True,timeout=3)
             self.created={'container_id':known['container_id'],'plan_sha256':m.digest(p)}
             self.store.retain_a0(row['existing_task_id'],row['owner'],'created',self.created)
             self._current(row)
+            self.startup_active=True
         try:
             self.runtime.start(plan_path,m.sha(plan_path),before_ui=before_ui,on_created=on_created)
             self._current(row)
-            r=self.runtime.receipt();obj=self.runtime.inspect(r);sample=self.runtime.snapshot_container(obj)
-            # Keep sampled descendants before any later observation or receipt
-            # write can fail. Emergency stop must still check this exact sample.
-            r['observations'].append(sample)
-            self.runtime.known=r
-            m.write_json(self.runtime.receipt_path,r,replace=True)
+            r=self.runtime.receipt();sample=self._container_ready(m,row,r)
             # Dedicated daemon invocation is an actual independent observation.
             reply=self.runtime.runner(['/usr/bin/systemctl','--user','show',m.DAEMON,'--property=ActiveState,InvocationID'],3)
             fields=dict(x.split('=',1) for x in reply.splitlines())
@@ -394,6 +455,20 @@ class A0HostSession:
                     session.runtime.check_network(container_id=boundary.grant.container_id)
                     return super().admit(current)
             self.boundary=GuardedBoundary(self._deployment(p),g,clock=self.store.clock)
+            native_runner=self.boundary.runner
+            def bounded_api_runner(argv,data,timeout):
+                if self.startup_active: timeout=min(timeout,self._startup_left(row))
+                return native_runner(argv,data,timeout)
+            self.boundary.runner=bounded_api_runner
+            unit_command=getattr(self.boundary.supervisor,'_command',None)
+            if callable(unit_command):
+                def bounded_unit_command(arguments,timeout):
+                    if self.startup_active: timeout=min(timeout,self._startup_left(row))
+                    return unit_command(arguments,timeout)
+                self.boundary.supervisor._command=bounded_unit_command
+            # Carry the initial exact descendants into grant-based stop too.
+            self.boundary.samples.extend((Path('/sys/fs/cgroup')/s['group'].lstrip('/'),
+                [(v['pid'],v['start_ticks']) for v in s['processes']]) for s in self.retained_samples)
             self.store.retain_a0(row['existing_task_id'],row['owner'],'grant',self.grant)
             def expected(current):
                 return tuple(ExpectedFile('/a0/usr/workdir/'+job_prefix(current)+'/'+job_prefix(current)+'-'+x['logical_name'],**x)
@@ -403,11 +478,14 @@ class A0HostSession:
             self.adapter=A0Adapter(A0HostConfig(Path(self.config['workspace_root']),staging,outputs,
                 lambda current:self.store.get(current['existing_task_id'],current['owner']),expected,self.keys,
                 max_file_bytes=min(self.config['max_file_bytes'],self.config['max_total_bytes'])),self.boundary,clock=self.store.clock)
+            self._api_ready(row)
         except BaseException as error:
             try:self.emergency_stop(row)
             except BaseException:error.add_note('owned execution STOP_UNCONFIRMED')
             raise
-        finally:self.launching=False
+        finally:
+            self.startup_active=False
+            self.launching=False
 
     def prepare(self,row,brief,inputs):
         self.preparing=True
@@ -445,6 +523,7 @@ class A0HostSession:
 
     def emergency_stop(self,row):
         self._same(row);self.cancelled=True
+        self.startup_active=False # Owned stop is never withheld by an expired launch budget.
         from .adapters.a0_native import A0NativeBoundary, NativeGrant
         if self.boundary is None:
             if self.grant is not None:
@@ -457,6 +536,7 @@ class A0HostSession:
                         or stopped.get('status') != 'STOP_CONFIRMED'
                         or stopped.get('container_id') != self.created['container_id']
                         or stopped.get('current_sampling') == 'UNKNOWN'
+                        or len(stopped.get('descendant_checks',[])) < len(self.retained_samples)
                         or any(x.get('confirmed') is not True for x in stopped.get('descendant_checks',[]))):
                     raise HostUnavailable('STOP_UNCONFIRMED; pending or incomplete pre-grant cessation')
                 self.unit=unit;self.pre_grant_confirmed=True;self.native_cessation=True
