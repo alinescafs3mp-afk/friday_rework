@@ -42,6 +42,26 @@ def profile_write(home, spec):
     return bundle
 
 
+def dashboard_source_check(home):
+    """Installed actual native consumer; reads source/stamp, never credentials."""
+    from types import ModuleType
+    from scripts.friday_install import owned_file, read_json, digest, require
+    source = home / 'hermes-agent'
+    path = source / 'hermes_cli/friday_dashboard_owner.py'
+    receipt = read_json(home / 'hermes-agent.source.json')
+    raw = owned_file(path)
+    row = receipt['files']['hermes_cli/friday_dashboard_owner.py']
+    require(digest(raw) == row['sha256'] and len(raw) == row['bytes'],
+            'native_dashboard_source_code_changed')
+    # Execute those exact validated bytes, not a second path read after checking.
+    module = ModuleType('_friday_dashboard_source_check')
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), 'exec'), module.__dict__)
+    identity = module.declared(home, source=source)
+    return {'state': 'SOURCE_OWNERSHIP_VERIFIED_RUNTIME_NOT_RUN', 'ready': False,
+            'identity': identity, 'credentials_checked': False}
+
+
 def host_owner(record, home, profile, *, dashboard=None):
     """Policy for actual native records, used before/final ownership checks.
 

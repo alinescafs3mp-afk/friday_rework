@@ -318,7 +318,7 @@ def install(value, input_path):
 def gaps():
     return ['A0 portable image/toolchain preparation is absent; fixed deployment needs separately admitted kernel/resources',
             'Current product compiler refuses an A0 useful-web runtime and cannot configure both workers',
-            'Native Dashboard attachment still needs final same-home/source/auth ownership enforcement',
+            'Native Dashboard boundary requires independent source review and actual authenticated startup/attach acceptance',
             'Protected credential provisioning, actual account ownership, PM/build realization and all six live journeys require independent acceptance']
 
 
@@ -351,12 +351,14 @@ def start(value, input_hash):
     # This candidate deliberately has no grant-converting switch. Calling a
     # source renderer "READY" or providing a receipt alone cannot launch it.
     inspect(value, input_hash)
+    # A0/web/kernel admission is still absent. The Dashboard is now guarded at
+    # its native CLI and pre-bind host lock, not by a check-then-launch wrapper.
     raise ValueError('mandatory_a0_web_kernel_and_final_native_dashboard_owner_not_admitted')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('phase', choices=('plan', 'install', 'check', 'start'))
+    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start'))
     parser.add_argument('--input', required=True, type=Path, help='Private pinned JSON, no credential values')
     args = parser.parse_args(); os.umask(0o077)
     sys.path.insert(0, str(ROOT))
@@ -370,6 +372,10 @@ def main():
             result = install(value, args.input)
         elif args.phase == 'check':
             result = inspect(value, sha)
+        elif args.phase == 'dashboard-check':
+            inspect(value, sha)
+            from scripts.friday_native import dashboard_source_check
+            result = dashboard_source_check(Path(value['home']))
         else:
             result = start(value, sha)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
