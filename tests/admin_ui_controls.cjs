@@ -51,6 +51,12 @@ const context = {
     else if (path.endsWith("/users")) data = input.users || {accounts: [], users: []};
     else if (path.endsWith("/pairing")) data = input.pending || {pending: []};
     else if (path.endsWith("/pairing/approve")) data = {recorded: true};
+    else if (path.endsWith("/tasks")) data = input.tasks;
+    else if (path.endsWith("/effective")) data = input.effective;
+    else if (path.endsWith("/settings")) data = {recorded: true, runtime_application: "PERSISTED_NEXT_NATIVE_SESSION_OR_RELOAD"};
+    else if (path.endsWith("/schedules")) data = input.schedules;
+    else if (path.includes("/tasks/") && path.endsWith("/control")) data = input.control;
+    else if (path.includes("/schedules/") && path.endsWith("/control")) data = {recorded: true};
     else if (path.endsWith("/conversations")) data = input.conversations;
     else if (path.includes("/conversations/")) {
       data = input.pages[parsed.searchParams.get("offset")]; assert(data, "Unexpected message page");
@@ -87,7 +93,26 @@ const click = async label => {render(); const node = find(tree, label); assert(n
     await click("Previous messages"); observe();
     assert(find(tree, "Previous messages").props.disabled);
   } else if (input.action === "approve") {
-    await click("pairing"); await click("Load current native state"); await click("Approve and enable");
+    await click("pairing"); await click("Load current native state"); await click("Approve native access");
+  } else if (["cancel_task", "pause_task", "check_task"].includes(input.action)) {
+    await click("tasks"); await click("Load current native state");
+    await click({cancel_task: "Cancel task", pause_task: "Pause task", check_task: "Check task"}[input.action]);
+    if (!input.control.accepted) assert(text(tree).includes("Control refused or outcome unknown"));
+  } else if (input.action === "schedule") {
+    await click("schedules"); await click("Load current native state"); await click("Pause schedule");
+  } else if (input.action === "settings") {
+    await click("effective"); await click("Load current native state");
+    const locate = (node, label) => {
+      if (!node || typeof node !== "object") return null;
+      if (node.props["aria-label"] === label) return node;
+      for (const child of node.children || []) {const hit = locate(child, label); if (hit) return hit;}
+      return null;
+    };
+    locate(tree, "kind").props.onChange({target: {value: input.kind}}); render();
+    for (const [field, value] of Object.entries(input.fields || {})) {
+      locate(tree, field).props.onChange({target: {value}}); render();
+    }
+    await click("Save operational settings");
   } else {
     await click("Load current native state");
     await click({disable: "Disable", enable: "Enable", role: "Channel admin role"}[input.action]);

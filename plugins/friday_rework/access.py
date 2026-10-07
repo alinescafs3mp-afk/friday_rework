@@ -37,12 +37,17 @@ class ProductAccess:
                    user_id=user_id, enabled=enabled, role=role)
         validate_access({"schema": KEY, "users": {key: row}})
         with self.store._locked():
-            document = current_access(self.state)
-            document["users"][key] = row
-            validate_access(document)
-            self.store.state_set(KEY, document)
-            _sync_directory(self.state.data_dir)
-            confirmed = current_access(self.state)["users"].get(key)
-            if not confirmed or any(confirmed.get(k) != v for k, v in row.items()):
-                raise RuntimeError("product_access_write_unconfirmed")
+            return self._write_user_locked(key, row)
+
+    def _write_user_locked(self, key, row):
+        """Compound administrative setup already holds this exact store lock."""
+        validate_access({"schema": KEY, "users": {key: row}})
+        document = current_access(self.state)
+        document["users"][key] = row
+        validate_access(document)
+        self.store.state_set(KEY, document)
+        _sync_directory(self.state.data_dir)
+        confirmed = current_access(self.state)["users"].get(key)
+        if not confirmed or any(confirmed.get(k) != v for k, v in row.items()):
+            raise RuntimeError("product_access_write_unconfirmed")
         return {"principal_id": key, **confirmed}

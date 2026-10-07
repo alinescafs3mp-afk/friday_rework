@@ -1,0 +1,134 @@
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -130,9 +130,14 @@
+                 raise ScopeDenied()
+             _private(self.home / MARKER)
+             marker = json.loads((self.home / MARKER).read_text())
+-            if marker != {'schema': 'friday.user-home.v1', 'principal': self.key,
+-                          'profile': self.profile, 'binding_sha256': _fingerprint(self.binding)}:
+-                raise ScopeDenied()
++            expected = {'schema': 'friday.user-home.v1', 'principal': self.key,
++                        'profile': self.profile, 'binding_sha256': _fingerprint(self.binding)}
++            if 'onboarding_sha256' in marker:
++                _private(self.home / ONBOARDING)
++                expected['onboarding_sha256'] = hashlib.sha256((self.home / ONBOARDING).read_bytes()).hexdigest()
++            if marker != expected:
++                raise ScopeDenied()
++            check_onboarding_home(self.authorization_home, self.home, self.binding)
+             for name in ('memories', 'workspace'):
+                 _private(self.home / name, directory=True)
+             for name in ('state.db', 'config.yaml', '.env', 'auth.json', 'SOUL.md'):
+@@ -457,7 +462,7 @@
+         connection.close()
+
+
+-def provision_new_home(authorization_home, binding, native_config):
++def provision_new_home(authorization_home, binding, native_config, *, publish=True):
+     """Operator-only preparation primitive; never called by a model/tool.
+
+     No clone/import. Native profile name must be declared by protected policy;
+@@ -498,7 +503,11 @@
+         marker = {'schema': 'friday.user-home.v1',
+                   'principal': principal_id(*(binding[k] for k in ('platform', 'transport_profile', 'account_id', 'user_id'))),
+                   'profile': binding['runtime_profile'], 'binding_sha256': _fingerprint(binding)}
+-        for name, value in [('config.yaml', native_config), (MARKER, marker)]:
++        from hermes_cli.config import atomic_config_write
++        with authority(home):
++            atomic_config_write(home / 'config.yaml', native_config)
++        files = [(MARKER, marker)] if publish else []
++        for name, value in files:
+             fd = os.open(home / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+             with os.fdopen(fd, 'w') as f:
+                 json.dump(value, f); f.write('\n'); f.flush(); os.fsync(f.fileno())
+@@ -576,3 +585,76 @@
+         raise ScopeDenied() from None
+     finally:
+         os.close(fd)
++
++
++ONBOARDING = '.friday-onboarding.json'
++
++
++def check_onboarding_home(root, home, binding):
++    """Managed new homes stay unusable until their whole native setup is intact.
++
++    Existing reviewed homes without this preparation receipt retain their old
++    contract. No alternate identity store or ambient credential fallback.
++    """
++    path = home / ONBOARDING
++    if not path.exists() and not path.is_symlink():
++        return
++    _private(path)
++    receipt = json.loads(path.read_text())
++    required = {'schema', 'binding_sha256', 'config_sha256', 'soul_sha256',
++                'required_secrets', 'directory_identity', 'template', 'authorization_home'}
++    st = _private(home, directory=True)
++    if (not isinstance(receipt, dict) or set(receipt) != required
++            or receipt['schema'] != 'friday.onboarding.v1'
++            or receipt['binding_sha256'] != _fingerprint(binding)
++            or receipt['authorization_home'] != str(root)
++            or receipt['directory_identity'] != [st.st_dev, st.st_ino]):
++        raise ScopeDenied()
++    for name, field in [('config.yaml', 'config_sha256'), ('SOUL.md', 'soul_sha256')]:
++        _private(home / name)
++        if hashlib.sha256((home / name).read_bytes()).hexdigest() != receipt[field]:
++            raise ScopeDenied()
++    from agent.secret_scope import load_env_file
++    names = receipt['required_secrets']
++    if not isinstance(names, list) or not names or any(not isinstance(k, str) for k in names):
++        raise ScopeDenied()
++    _private(home / '.env')
++    values = load_env_file(home / '.env')
++    if any(not values.get(k) for k in names):
++        raise ScopeDenied()
++    from hermes_cli.config import load_config_readonly
++    with authority(root):
++        gateway = load_config_readonly().get('gateway', {})
++    route = {'name': 'friday-' + principal_id(*(binding[k] for k in
++             ('platform', 'transport_profile', 'account_id', 'user_id'))),
++             'platform': binding['platform'], 'bot_profile': binding['transport_profile'],
++             'user_id': binding['user_id'], 'profile': binding['runtime_profile'], 'enabled': True}
++    routes = gateway.get('profile_routes', [])
++    competing = [r for r in routes if isinstance(r, dict)
++                 and r.get('platform') == binding['platform']
++                 and (r.get('bot_profile') or 'default') == binding['transport_profile']
++                 and r.get('user_id') == binding['user_id']]
++    if gateway.get('multiplex_profiles') is not True or competing != [route]:
++        raise ScopeDenied()
++
++
++def onboarding_profile_routes(existing):
++    """Refresh committed onboarding routes at native per-event resolution only.
++
++    A running primary multiplexer must not admit through cached pre-setup routes.
++    Ordinary gateways and previously reviewed profiles keep the native contract.
++    """
++    from hermes_constants import get_routing_process_hermes_home
++    from hermes_cli.friday_product_access import settings
++    from hermes_cli.config import load_config_readonly
++    from gateway.profile_routing import parse_profile_routes
++    root = get_routing_process_hermes_home()
++    with authority(root):
++        if settings().get('onboarding') is None:
++            return existing
++        _private(root, directory=True)
++        _private(root / 'config.yaml')
++        gateway = load_config_readonly().get('gateway', {})
++        if gateway.get('multiplex_profiles') is not True:
++            raise ScopeDenied()
++        return parse_profile_routes(gateway.get('profile_routes', []))
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4462,6 +4462,12 @@
+         if not getattr(config, "multiplex_profiles", False):
+             return None
+         routes = getattr(config, "profile_routes", None)
++        from hermes_cli.friday_user_scope import onboarding_profile_routes
++        from gateway.profile_routing import ProfileRouteRejected
++        try:
++            routes = onboarding_profile_routes(routes)
++        except Exception as exc:  # health: allow BLE001 -- Refuse native route admission when the protected onboarding config cannot be verified.
++            raise ProfileRouteRejected("onboarding_config_unavailable") from exc
+         if not routes:
+             return None
+         if adapter_profile is None:

@@ -76,7 +76,9 @@ def build_config(*, base_url, model, key_env, context, max_input,
              "key_env": key_env, "api_mode": "chat_completions", "fallback_chain": []}
     auxiliary = {name: {**route, "fallback_chain": []} for name in (
         "compression", "vision", "approval", "skills_hub", "mcp", "title_generation",
-        "background_review", "review")}
+        "background_review", "review", "memory_query_rewrite", "tts_audio_tags",
+        "triage_specifier", "kanban_decomposer", "profile_describer", "goal_judge",
+        "curator", "monitor", "moa_reference", "moa_aggregator")}
     auxiliary["compression"].update(context_length=context, extra_body={"max_tokens": summary_output})
     auxiliary["title_generation"].update(enabled=False, model_upgrade_enabled=False)
     auxiliary["background_review"]["enabled"] = False
