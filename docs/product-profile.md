@@ -129,7 +129,10 @@ product contract and cannot name web, channel or dashboard credentials.
 Native main, auxiliary (sync/async), rebuild and delegation paths retain the
 admitted route through SDK request construction. The Friday SDK subclass checks
 the serialized model, URL, Authorization and Host after extension merging, and
-disables redirects. SDK copies retain that boundary. Config aliases and per-call
+disables redirects. URL and Host checks use the same HTTPX canonical representation
+for explicit default ports and IPv6. Native provider display-name/key collisions
+are refused before credential lookup; generic custom requests retain the admitted
+named identity and its owned pool. SDK copies retain that boundary. Config aliases and per-call
 extensions cannot replace route fields or authentication. Non-authority header
 overrides are limited to Accept, Accept-Language, User-Agent, X-Request-ID,
 X-Correlation-ID, traceparent and tracestate. Capacity and reasoning bodies remain
