@@ -350,7 +350,8 @@ class Associations:
                     row['host']['a0'] = {'schema': 'friday.a0.host.v2',
                         'acceptance': copy.deepcopy(acceptance),
                         'expected_files': copy.deepcopy(host_binding['runtime']['a0']['expected_files']),
-                        'launch': None, 'grant': None, 'key_cleanup': 'NOT_PREPARED', 'capability': None}
+                        'launch': None, 'grant': None, 'key_cleanup': 'NOT_PREPARED', 'capability': None,
+                        'observations': {'pending': False, 'samples': []}}
             data["jobs"][task_id] = row
             self._save(data)
             return copy.deepcopy(row), True
@@ -381,6 +382,33 @@ class Associations:
             a['capability'] = copy.deepcopy(pin)
             self._save(data)
             return copy.deepcopy(row), True
+
+    def a0_observation(self, task_id, owner, sample=None):
+        """Persist intent before sampling and the full sample before acknowledging it.
+
+        An interrupted sample stays pending across a host restart. Never reset
+        that uncertainty or replace a missing legacy record with an empty list.
+        """
+        from .host_record import validate_a0_observations
+        with self._locked() as data:
+            row = self._owned(data, task_id, owner)
+            a0 = row['host']['a0']
+            observations = a0.get('observations')
+            if observations is None or (a0['launch'] or {}).get('created') is None:
+                raise AssociationError('a0_observation_ownership_unknown')
+            if sample is None:
+                if observations['pending']:
+                    raise AssociationError('a0_observation_requires_reconciliation')
+                observations['pending'] = True
+            else:
+                if not observations['pending']:
+                    raise AssociationError('a0_observation_not_reserved')
+                validate_a0_observations({'pending': False, 'samples': [sample]},
+                                        a0['launch']['created']['container_id'])
+                observations['samples'].append(copy.deepcopy(sample))
+                observations['pending'] = False
+            self._save(data)
+            return copy.deepcopy(observations)
 
     def retain_a0(self, task_id, owner, field, value):
         """One-way nonsecret ownership metadata, in the existing locked row."""

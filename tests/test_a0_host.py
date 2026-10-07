@@ -92,13 +92,16 @@ def configure_a0(setup,proof,tmp_path,monkeypatch):
         assert self.p['association_binding']['existing_task_id']==address
         return {'status':'EXPLICIT_FAKE_CURRENT_LOCAL_NETWORK_CHECKED','id':self.p['network']['id']}
     monkeypatch.setattr(m.Runtime,'check_network',route)
-    monkeypatch.setattr(m.Runtime,'snapshot_container',lambda self,obj:{'group':'/user.slice/offline/docker-'+obj['Id']+'.scope','populated':True,'processes':[{'pid':777777,'start_ticks':'fake'}]})
+    monkeypatch.setattr(m.Runtime,'snapshot_container',lambda self,obj:{'group':'/user.slice/offline/docker-'+obj['Id']+'.scope','populated':True,'processes':[{'pid':777777,'start_ticks':'1'}]})
     monkeypatch.setattr(m,'cessation',lambda sample:{'confirmed':not state.running,'fixture':True})
     def module(session):state.session=session;return m
     monkeypatch.setattr(hr.A0HostSession,'_module',module)
     monkeypatch.setattr(an,'NativeSupervisor',lambda:sup)
     monkeypatch.setattr(an.A0NativeBoundary,'_run',staticmethod(lambda argv,data,timeout:command(argv,timeout)))
-    monkeypatch.setattr(an.A0NativeBoundary,'_sample',lambda self,obj,caps:None)
+    def native_sample(boundary,obj,*,caps):
+        boundary.samples.append((Path('/sys/fs/cgroup')/boundary.grant.container_cgroup.lstrip('/'),
+                                 [(777777,'1')]))
+    monkeypatch.setattr(an.A0NativeBoundary,'_sample',native_sample)
     def admit(boundary,row):
         assert not boundary.stop_only
         boundary._association(row);obj=boundary.inspect(row)
@@ -375,7 +378,11 @@ async def test_damaged_store_after_actual_grant_still_reaches_cached_whole_stop(
     with pytest.raises(Exception):scoped_start(setup,row)
     assert not s.running
     assert any(v[0]=='FAKE_UNIT_STOP' for v in s.calls)
-    assert s.session.native_cessation
+    # Both native stops still happen. A broken authoritative store prevents
+    # durable observation, so cessation/capacity and key cleanup stay unknown.
+    assert not s.session.native_cessation
+    assert s.session.quiescence(row) is None and s.session.observation_pending
+    assert s.session.keys.path.exists() and s.session.key_cleanup=='PREPARED'
 
 @pytest.mark.asyncio
 async def test_foreign_row_cannot_get_cached_stop_capability(setup,tmp_path,monkeypatch):

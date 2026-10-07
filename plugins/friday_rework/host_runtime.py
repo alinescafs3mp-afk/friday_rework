@@ -250,7 +250,12 @@ class A0HostSession:
         self.no_create_confirmed = False
         self.pre_grant_confirmed = False
         self.created = copy.deepcopy((row['host']['a0']['launch'] or {}).get('created'))
-        self.retained_samples = []
+        observations = row['host']['a0'].get('observations')
+        # Legacy/missing observation evidence is unknown, not proof of no
+        # descendants. Construction remains pure and never restores secrets.
+        self.observation_pending = (observations is None or observations['pending']
+                                    or (row['host']['a0']['grant'] is not None and not observations['samples']))
+        self.retained_samples = copy.deepcopy([] if observations is None else observations['samples'])
         self.key_preparation_attempted = False
         self.key_cleanup = row['host']['a0']['key_cleanup']
         self.preparing = False
@@ -331,12 +336,52 @@ class A0HostSession:
         if left <= 1: raise HostUnavailable('a0_startup_original_budget_exhausted')
         return left
 
+    def _begin_sample(self, row):
+        if self.observation_pending:
+            raise HostUnavailable('STOP_UNCONFIRMED; prior observation incomplete')
+        self.observation_pending = True
+        self.store.a0_observation(row['existing_task_id'], row['owner'])
+
+    def _finish_sample(self, row, sample):
+        # Keep the new identity in memory even if the durable write fails.
+        self.retained_samples.append(copy.deepcopy(sample))
+        self.store.a0_observation(row['existing_task_id'], row['owner'], sample)
+        self.observation_pending = False
+
     def _retain_sample(self, m, r, sample):
         # Cache both owners before receipt I/O or any other fallible observation.
-        self.retained_samples.append(copy.deepcopy(sample))
         r['observations'].append(copy.deepcopy(sample))
         self.runtime.known = r
         m.write_json(self.runtime.receipt_path, r, replace=True)
+
+    def _boundary(self, row, *, stop_only=False):
+        from .adapters.a0_native import A0NativeBoundary, NativeGrant
+        session = self
+
+        class RetainingBoundary(A0NativeBoundary):
+            def admit(boundary, current):
+                if boundary.stop_only:
+                    return super().admit(current)
+                session._current(current); session._capability(current)
+                session.runtime.check_network(container_id=boundary.grant.container_id)
+                return super().admit(current)
+
+            def _sample(boundary, obj, *, caps):
+                session._begin_sample(row)
+                super()._sample(obj, caps=caps)
+                root, processes = boundary.samples[-1]
+                session._finish_sample(row, {
+                    'group': '/' + str(root.relative_to('/sys/fs/cgroup')),
+                    'populated': True,
+                    'processes': [{'pid': pid, 'start_ticks': start} for pid, start in processes],
+                })
+
+        boundary = RetainingBoundary(self._deployment(self.plan), NativeGrant(**self.grant),
+                                     clock=self.store.clock, stop_only=stop_only)
+        boundary.samples.extend((Path('/sys/fs/cgroup') / s['group'].lstrip('/'),
+                                 [(v['pid'], v['start_ticks']) for v in s['processes']])
+                                for s in self.retained_samples)
+        return boundary
 
     def _container_ready(self, m, row, r):
         import time
@@ -403,6 +448,14 @@ class A0HostSession:
         self.plan=p
         plan_path=Path(row['workspace_reference'])/'a0-plan.json';m.write_json(plan_path,p)
         self.runtime=m.Runtime(p)
+        native_snapshot = self.runtime.snapshot_container
+        def retained_snapshot(obj):
+            # Also covers pre-grant cleanup observations made by Runtime.
+            self._begin_sample(row)
+            sample = native_snapshot(obj)
+            self._finish_sample(row, sample)
+            return sample
+        self.runtime.snapshot_container = retained_snapshot
         original_runner=self.runtime.runner
         def startup_runner(argv,timeout):
             if self.startup_active: timeout=min(timeout,self._startup_left(row))
@@ -448,13 +501,7 @@ class A0HostSession:
             g=NativeGrant(r['container_id'],p['container_name'],r['invocation_id'],m.labels(p),row['created_at_unix'],row['deadline_unix'],
                 sample['group'],a['boot_id'],True,self.keys.prepared_monotonic,fields['InvocationID'],a['accepted_monotonic_ns']/1e9)
             self.grant=asdict(g)
-            session=self
-            class GuardedBoundary(A0NativeBoundary):
-                def admit(boundary,current):
-                    session._current(current);session._capability(current)
-                    session.runtime.check_network(container_id=boundary.grant.container_id)
-                    return super().admit(current)
-            self.boundary=GuardedBoundary(self._deployment(p),g,clock=self.store.clock)
+            self.boundary=self._boundary(row)
             native_runner=self.boundary.runner
             def bounded_api_runner(argv,data,timeout):
                 if self.startup_active: timeout=min(timeout,self._startup_left(row))
@@ -466,9 +513,6 @@ class A0HostSession:
                     if self.startup_active: timeout=min(timeout,self._startup_left(row))
                     return unit_command(arguments,timeout)
                 self.boundary.supervisor._command=bounded_unit_command
-            # Carry the initial exact descendants into grant-based stop too.
-            self.boundary.samples.extend((Path('/sys/fs/cgroup')/s['group'].lstrip('/'),
-                [(v['pid'],v['start_ticks']) for v in s['processes']]) for s in self.retained_samples)
             self.store.retain_a0(row['existing_task_id'],row['owner'],'grant',self.grant)
             def expected(current):
                 return tuple(ExpectedFile('/a0/usr/workdir/'+job_prefix(current)+'/'+job_prefix(current)+'-'+x['logical_name'],**x)
@@ -527,12 +571,12 @@ class A0HostSession:
         from .adapters.a0_native import A0NativeBoundary, NativeGrant
         if self.boundary is None:
             if self.grant is not None:
-                self.boundary=A0NativeBoundary(self._deployment(self.plan),
-                    NativeGrant(**self.grant),clock=self.store.clock,stop_only=True)
+                self.boundary=self._boundary(row,stop_only=True)
             elif self.runtime is not None and self.runtime.known is not None:
                 stopped=self.runtime.stop()
                 unit=self.runtime.supervisor.observe(self.runtime.association(self.runtime.known))
                 if (self.launching or self.preparing or self.created is None or not unit.quiescent
+                        or self.observation_pending
                         or stopped.get('status') != 'STOP_CONFIRMED'
                         or stopped.get('container_id') != self.created['container_id']
                         or stopped.get('current_sampling') == 'UNKNOWN'
@@ -548,7 +592,10 @@ class A0HostSession:
                 self.unit=unit;self.no_create_confirmed=True;self.native_cessation=True
             else:raise HostUnavailable('STOP_UNCONFIRMED; pending or unknown create')
         if self.boundary is not None:
-            unit=self.boundary.stop(row);self.unit=unit;self.native_cessation=True
+            unit=self.boundary.stop(row);self.unit=unit
+            if self.observation_pending or not self.retained_samples:
+                raise HostUnavailable('STOP_UNCONFIRMED; retained observations incomplete')
+            self.native_cessation=True
         if self.keys is None:
             if self.key_cleanup != 'REMOVED' and (not self.no_create_confirmed or self.key_preparation_attempted):
                 self.key_cleanup='RECONCILIATION_REQUIRED'

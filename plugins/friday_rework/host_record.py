@@ -39,11 +39,34 @@ def validate_acceptance(value):
         raise AssociationError('invalid_original_acceptance')
 
 
+def validate_a0_observations(value, container_id=None):
+    """Nonsecret original process identities in the existing association store."""
+    if (not isinstance(value, dict) or set(value) != {'pending', 'samples'}
+            or type(value['pending']) is not bool or not isinstance(value['samples'], list)):
+        raise ValueError()
+    for sample in value['samples']:
+        if (not isinstance(sample, dict) or set(sample) != {'group', 'populated', 'processes'}
+                or sample['populated'] is not True or not isinstance(sample['group'], str)
+                or not sample['group'].startswith('/user.slice/')
+                or str(Path(sample['group'])) != sample['group'] or '..' in Path(sample['group']).parts
+                or not re.search(r'/docker-[0-9a-f]{64}\.scope$', sample['group'])
+                or (container_id is not None and not sample['group'].endswith('/docker-'+container_id+'.scope'))
+                or not isinstance(sample['processes'], list) or not sample['processes']):
+            raise ValueError()
+        for process in sample['processes']:
+            if (not isinstance(process, dict) or set(process) != {'pid', 'start_ticks'}
+                    or type(process['pid']) is not int or process['pid'] <= 0
+                    or not isinstance(process['start_ticks'], str)
+                    or not re.fullmatch('[0-9]{1,32}', process['start_ticks'])):
+                raise ValueError()
+
+
 def validate_a0_record(row):
     from .adapters.a0_native import NativeGrant
     from .adapters.dsh import _identity
     a = row['host']['a0']
-    if (not isinstance(a, dict) or set(a) != {'schema', 'acceptance', 'expected_files', 'launch', 'grant', 'key_cleanup', 'capability'}
+    required = {'schema', 'acceptance', 'expected_files', 'launch', 'grant', 'key_cleanup', 'capability'}
+    if (not isinstance(a, dict) or set(a) not in (required, required | {'observations'})
             or a['schema'] != 'friday.a0.host.v2'):
         raise ValueError()
     validate_acceptance(a['acceptance'])
@@ -57,6 +80,9 @@ def validate_a0_record(row):
         from .host_runtime import _pin
         _pin(a['capability']) # structure only; stop/recovery cannot depend on drifted source
     launch = a['launch']
+    if 'observations' in a:
+        created = (launch or {}).get('created')
+        validate_a0_observations(a['observations'], None if created is None else created['container_id'])
     if launch is not None and a['capability'] is None: raise ValueError()
     if launch is not None:
         if not isinstance(launch, dict) or set(launch) != {'plan', 'plan_pin', 'keys_prepared_monotonic', 'created'}:

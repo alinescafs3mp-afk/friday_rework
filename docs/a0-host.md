@@ -129,6 +129,18 @@ removal was already retained. Invalid/missing grant descriptors, including an
 unresolved pre-grant crash, yield STOP_UNCONFIRMED; the existing native timeout/
 ExecStopPost is the external cleanup authority, not a reconstructed grant.
 
+All host-owned PID/start observations, including later native boundary samples
+and pre-grant cleanup samples, are retained in the same locked association row.
+The host saves a pending marker before sampling and the complete sample before
+acknowledging it. Restart restores this full history into the stop-only boundary;
+a stopped container and missing cgroup cannot erase a still-live sampled process.
+Missing legacy history, an empty history with a grant, or an interrupted sample
+remain unknown. A fresh stop sample cannot replace missing earlier evidence.
+These cases still attempt the owned container and unit stops, while retaining
+capacity and keys until cessation can be confirmed. A damaged association store
+likewise permits cached stop attempts but cannot yield a positive cessation claim.
+No new store, keys, process launch, clock reset or automatic migration is added.
+
 ## Retained outputs and remaining join
 
 `read_retained_result` is pure: exact association/preparation/context/container/
@@ -162,7 +174,12 @@ provenance/order/coverage mutations.
 The bounded offline runner denies network, shell and external workloads; only
 finite allowlisted Git commands in disposable private fixture repositories run.
 Affinity is four CPUs, per-process AS 4 GiB/CPU 180 seconds/core 0; no aggregate
-quota is claimed. Original test assertions are unchanged. Failed runner setup
+quota is claimed. The recovery extension uses two CPUs and a 2 GiB address-space
+limit. Its damaged-store control retains the actual stop assertions and now also
+requires unknown cessation, retained keys and no quiescence. New controls cover
+initial and later live process observations, process-start mismatch, interrupted
+writes before/after persistence, absent/empty/pending history and foreign or
+malformed samples. Failed runner setup
 attempts and corrected test errors are retained in evidence, not converted to
 acceptance. Final full-gate source/test pins, process cleanup and exact local
 commit are recorded in the protected manifest. Independent review and separately
