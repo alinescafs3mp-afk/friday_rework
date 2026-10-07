@@ -70,6 +70,8 @@ def read_retained_result(row, prepared, grant, expected_files, staging_root, max
             and receipt["invocation_id"] == grant.invocation_id
             and receipt["native_grant"] == asdict(grant)
             and receipt["outputs"] == [asdict(v) for v in expected_files], "preparation_changed")
+    if "host" in row:
+        require(receipt["inputs"] == row["host"]["inputs"], "prepared_inputs_changed")
     require(isinstance(expected_files, tuple) and 0 < len(expected_files) <= 16
             and all(isinstance(v, ExpectedFile) for v in expected_files) and type(max_file_bytes) is int
             and 0 < max_file_bytes <= 16*1024**2, "invalid_retained_bounds")

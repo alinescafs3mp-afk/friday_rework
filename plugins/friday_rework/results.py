@@ -339,12 +339,14 @@ def a0_retained_outputs(store, row):
     """
     from .adapters.a0 import ExpectedFile, job_prefix, read_retained_result
     from .adapters.a0_native import NativeGrant
+    from .adapters.contract import VerifiedInput
     from .controller import Controller
     row = store.get(row["existing_task_id"], row["owner"])
     if row["worker_kind"] != "a0":
         raise AssociationError("foreign_a0_result")
     require_result_quiescence(row)
-    prepared = Controller(store, {})._load(row)
+    inputs = tuple(VerifiedInput(**item) for item in row["host"]["inputs"])
+    prepared = Controller(store, {})._load(row, inputs)
     a0 = row["host"]["a0"]
     prefix = job_prefix(row)
     expected = tuple(ExpectedFile('/a0/usr/workdir/' + prefix + '/' + prefix + '-' + item['logical_name'],

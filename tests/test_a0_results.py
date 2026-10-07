@@ -15,8 +15,8 @@ from test_result_tool import enable_results, invoke_result
 from test_result_delivery import receipt
 
 
-async def finished(setup, tmp_path, monkeypatch):
-    proof = await ingress(setup)
+async def finished(setup, tmp_path, monkeypatch, *, file=False):
+    proof = await ingress(setup, file=file)
     state = configure_a0(setup, proof, tmp_path, monkeypatch)
     row = scoped_start(setup, launch_row(setup, state, proof))
     assert row['host']['terminal']['state'] == 'completed'
@@ -35,8 +35,9 @@ async def finished(setup, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a0_same_native_result_inspection_assessment_delivery_after_restart(setup, tmp_path, monkeypatch):
-    state, row, module = await finished(setup, tmp_path, monkeypatch)
+@pytest.mark.parametrize('file', [False, True])
+async def test_a0_same_native_result_inspection_assessment_delivery_after_restart(setup, tmp_path, monkeypatch, file):
+    state, row, module = await finished(setup, tmp_path, monkeypatch, file=file)
     original_posts, original_calls = copy.deepcopy(state.posts), copy.deepcopy(state.calls)
     ref = {'reference': row['existing_task_id']}
     listed = invoke_result(setup, row, {**ref, 'action': 'list'})
@@ -106,6 +107,42 @@ async def test_a0_common_results_refuse_changed_or_foreign_evidence(setup, tmp_p
     assert response == {'accepted': False, 'error': 'result_unavailable'}
     assert 'result' not in setup.host.store.get(row['existing_task_id'], row['owner'])
     assert state.posts == original_posts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mutation', ['journal_digest', 'host_inputs', 'joint_host_and_journal', 'receipt_inputs'])
+async def test_a0_input_evidence_must_agree_across_host_journal_and_receipt(setup, tmp_path, monkeypatch, mutation):
+    _, row, _ = await finished(setup, tmp_path, monkeypatch, file=True)
+    store = setup.host.store
+    controller = importlib.import_module(setup.module.__package__ + '.controller')
+    inputs = copy.deepcopy(row['host']['inputs'])
+    assert len(inputs) == 1
+    inputs[0]['sha256'] = '0' * 64
+    if mutation in {'host_inputs', 'joint_host_and_journal'}:
+        with store._locked() as data:
+            current = store._owned(data, row['existing_task_id'], row['owner'])
+            current['host']['inputs'] = inputs
+            store._save(data)
+    if mutation in {'journal_digest', 'joint_host_and_journal'}:
+        journal = store.state_get(controller.KEY, None)
+        journal['jobs'][row['existing_task_id']]['inputs_sha256'] = controller._digest(inputs)
+        store.state_set(controller.KEY, journal)
+    if mutation == 'receipt_inputs':
+        root = Path(row['workspace_reference'])
+        path = root / 'a0-prepared.json'
+        value = json.loads(path.read_text())
+        value['inputs'] = inputs
+        path.chmod(0o600)
+        path.write_text(json.dumps(value))
+        # Even a self-consistent altered acknowledgement must not supersede
+        # the original host inputs and preparation journal.
+        import hashlib
+        verified = root / 'inputs-verified.json'
+        verified.chmod(0o600)
+        verified.write_text(json.dumps({'receipt_sha256': hashlib.sha256(path.read_bytes()).hexdigest()}))
+    response = invoke_result(setup, row, {'action': 'inspect', 'reference': row['existing_task_id'], 'paths': ['report.txt']})
+    assert response == {'accepted': False, 'error': 'result_unavailable'}
+    assert 'result' not in store.get(row['existing_task_id'], row['owner'])
 
 
 @pytest.mark.asyncio
