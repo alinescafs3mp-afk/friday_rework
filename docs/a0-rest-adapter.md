@@ -103,6 +103,12 @@ state. Cleanup is idempotent only when both introduced names are absent.
 The native API helper receives the original admitted values through private
 stdin, checks the actual bounded/no-follow `.env` before initialization/request
 and after response, and redacts those original values after JSON decoding.
+The file helper uses the same original binding through private stdin and checks
+dotenv before and after initialization and after reading the selected file.
+Files containing an original admitted key or the current native API token are
+refused even if the environment changes between host validation and execution.
+Only a successful bounded file read may emit file bytes; failures emit an empty
+object. This closes the file path independently of API response redaction.
 Keys never enter command arguments, request bodies, receipts or evidence.
 A new process must reconstruct it from the private scoped source and current
 receipt under its existing owner, without copying/swapping logins or budgets.

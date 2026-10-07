@@ -43,16 +43,8 @@ def decode_file(value, limit):
     return data
 
 
-# Body and effective native key never enter argv or a transport error. Only
-# bounded successful raw JSON crosses stdout; the host rejects duplicate fields.
-API_SCRIPT = '''import base64,contextlib,io,json,sys,urllib.request,os,stat
-try:
- v=json.load(sys.stdin)
- assert v['path'] in ('/api/api_message','/api/api_log_get','/api/api_files_get')
- assert v['method'] in ('GET','POST')
- with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
-  from helpers import dotenv,runtime,settings
-  from dotenv.parser import parse_stream
+# Shared by API and file helpers; original admitted keys cross only private stdin.
+_BOUND_KEYS_SCRIPT = '''  from dotenv.parser import parse_stream
   expected=v['admitted_keys']
   assert set(expected)=={'API_KEY_OPENAI','API_KEY_OTHER'}
   assert all(isinstance(x,str) and x for x in expected.values())
@@ -75,7 +67,19 @@ try:
     assert not any(b.error for b in bindings)
     assert all([b.value for b in bindings if b.key==name]==[value] for name,value in expected.items())
    finally:os.close(fd)
-  checked_keys()
+'''
+
+
+# Body and effective native key never enter argv or a transport error. Only
+# bounded successful raw JSON crosses stdout; the host rejects duplicate fields.
+API_SCRIPT = '''import base64,contextlib,io,json,sys,urllib.request,os,stat
+try:
+ v=json.load(sys.stdin)
+ assert v['path'] in ('/api/api_message','/api/api_log_get','/api/api_files_get')
+ assert v['method'] in ('GET','POST')
+ with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+  from helpers import dotenv,runtime,settings
+''' + _BOUND_KEYS_SCRIPT + '''  checked_keys()
   runtime.initialize();dotenv.load_dotenv()
   checked_keys()
   assert all(os.getenv(name)==value for name,value in expected.items())
@@ -151,13 +155,17 @@ def native_file(root, relative, limit):
 
 def file_script():
     import inspect
-    return ("import os,json,base64,hashlib,sys\nclass A0Error(RuntimeError): pass\n"
+    return ("import os,json,base64,hashlib,sys,stat\nclass A0Error(RuntimeError): pass\n"
             + inspect.getsource(require) + inspect.getsource(native_file)
-            + "try:\n v=json.load(sys.stdin);value=native_file('/a0',v['relative'],v['limit'])\n"
+            + "try:\n v=json.load(sys.stdin)\n"
             + " import contextlib,io\n with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):\n"
-            + "  from helpers import dotenv,runtime,settings\n  runtime.initialize();dotenv.load_dotenv()\n"
-            + "  secrets=(settings.get_settings()['mcp_server_token'],os.getenv('API_KEY_OPENAI'),os.getenv('API_KEY_OTHER'))\n"
-            + " data=base64.b64decode(value['base64'],validate=True)\n"
+            + "  from helpers import dotenv,runtime,settings\n"
+            + _BOUND_KEYS_SCRIPT
+            + "  checked_keys()\n  runtime.initialize();dotenv.load_dotenv()\n  checked_keys()\n"
+            + "  assert all(os.getenv(name)==value for name,value in expected.items())\n"
+            + "  secrets=(settings.get_settings()['mcp_server_token'],*expected.values(),os.getenv('API_KEY_OPENAI'),os.getenv('API_KEY_OTHER'))\n"
+            + " value=native_file('/a0',v['relative'],v['limit'])\n"
+            + " data=base64.b64decode(value['base64'],validate=True)\n checked_keys()\n"
             + " require(not any(s and s.encode() in data for s in secrets),'runtime_secret_in_file')\n"
             + " print(json.dumps(value))\n"
             + "except BaseException:\n print('{}');raise SystemExit(1)\n")
@@ -394,7 +402,9 @@ class A0NativeBoundary:
 
     def file(self, row, path, limit, timeout):
         require(path.startswith("/a0/") and "\x00" not in path, "unsafe_native_file")
-        return strict_json(self._exec(row, file_script(), {"relative": path[4:], "limit": limit}, timeout))
+        material = self._keys()
+        return strict_json(self._exec(row, file_script(), {"relative": path[4:], "limit": limit,
+                            "admitted_keys": material.admitted()}, timeout))
 
     def stop(self, row):
         errors = []

@@ -446,3 +446,86 @@ class NativeKeyBoundaryRegressions(unittest.TestCase):
         self.assertEqual(payload['admitted_keys'], self.keys.admitted())
         self.assertEqual(payload['payload'], {'message':'fixture'})
         self.assertTrue(all(secret not in str(argv) for secret in self.keys.admitted().values()))
+
+    def test_file_helper_receives_original_keys_only_in_private_stdin(self):
+        self.boundary.file(self.row, '/a0/usr/uploads/task-input.txt', 4096, 10)
+        argv, data, timeout = self.commands[-1]
+        self.assertEqual(json.loads(data)['admitted_keys'], self.keys.admitted())
+        self.assertTrue(all(secret not in str(argv) for secret in self.keys.admitted().values()))
+
+
+class NativeFileKeyRegressions(unittest.TestCase):
+    setUp = t.AdapterTests.setUp
+
+    def script(self, content=b'ordinary result', mutate_runtime=None, mutate_read=None, omit_keys=False):
+        helpers = t.types.ModuleType('helpers'); helpers.__path__ = []
+        files = t.types.ModuleType('helpers.files'); files.get_abs_path = lambda _: str(self.env)
+        module = t.types.ModuleType('helpers.dotenv'); module.__package__ = 'helpers'
+        source = (pathlib.Path(os.environ['FRW_A0_DONOR'])/'helpers/dotenv.py').read_text()
+        with patch.dict(sys.modules, {'helpers':helpers, 'helpers.files':files, 'helpers.dotenv':module}):
+            exec(compile(source, 'actual-donor/helpers/dotenv.py', 'exec'), module.__dict__)
+        helpers.dotenv = module
+        helpers.runtime = t.NS(initialize=mutate_runtime or (lambda:None))
+        helpers.settings = t.NS(get_settings=lambda:{'mcp_server_token':'synthetic-native-token'})
+        path = self.usr/'selected.txt'; path.write_bytes(content)
+        payload = {'relative':'usr/selected.txt', 'limit':4096, 'admitted_keys':self.keys.admitted()}
+        if omit_keys: payload.pop('admitted_keys')
+        original_open, original_read = os.open, os.read
+        selected_fds = set(); reads = []
+        def mapped_open(path, *args, **kwargs):
+            fd = original_open(str(self.native_root) if path == '/a0' else path, *args, **kwargs)
+            if path == 'selected.txt': selected_fds.add(fd)
+            return fd
+        def observed_read(fd, size):
+            data = original_read(fd, size)
+            if fd in selected_fds and data:
+                selected_fds.discard(fd)
+                reads.append(data)
+                if mutate_read: mutate_read()
+            return data
+        output = t.io.StringIO(); error = None
+        with patch.dict(sys.modules, {'helpers':helpers}), patch.dict(os.environ), \
+             patch('os.open', side_effect=mapped_open), patch('os.read', side_effect=observed_read), \
+             patch('sys.stdin', t.io.StringIO(json.dumps(payload))), t.contextlib.redirect_stdout(output):
+            try: exec(compile(t.file_script(), 'actual-native-file-script', 'exec'), {})
+            except SystemExit as caught: error = caught.code
+        return output.getvalue(), error, reads
+
+    def test_plain_file_roundtrip_uses_real_donor_dotenv(self):
+        out, error, reads = self.script()
+        self.assertIsNone(error)
+        self.assertEqual(t.decode_file(json.loads(out)['base64'],4096), b'ordinary result')
+        self.assertIn(b'ordinary result', reads)
+
+    def test_both_original_keys_and_current_native_token_are_refused(self):
+        for secret in (*self.keys.admitted().values(), 'synthetic-native-token'):
+            with self.subTest(key_kind=secret.rsplit('-',1)[-1]):
+                out, error, _ = self.script(secret.encode())
+                self.assertEqual(error, 1); self.assertEqual(out.strip(), '{}')
+
+    def test_duplicate_binding_refuses_before_file_read(self):
+        with self.env.open('a') as f: f.write('API_KEY_OPENAI=synthetic-replacement\n')
+        out, error, reads = self.script(self.keys.admitted()['API_KEY_OPENAI'].encode())
+        self.assertEqual(error, 1); self.assertEqual(out.strip(), '{}'); self.assertEqual(reads, [])
+
+    def test_replaced_binding_refuses_before_file_read(self):
+        original = self.keys.admitted()['API_KEY_OTHER']
+        self.env.write_text(self.env.read_text().replace(original, 'synthetic-replacement'))
+        out, error, reads = self.script(original.encode())
+        self.assertEqual(error, 1); self.assertEqual(out.strip(), '{}'); self.assertEqual(reads, [])
+
+    def test_runtime_mutation_refuses_before_file_read(self):
+        def mutate():
+            with self.env.open('a') as f: f.write('API_KEY_OTHER=synthetic-replacement\n')
+        out, error, reads = self.script(mutate_runtime=mutate)
+        self.assertEqual(error, 1); self.assertEqual(out.strip(), '{}'); self.assertEqual(reads, [])
+
+    def test_key_mutation_during_file_read_refuses_stdout(self):
+        def mutate():
+            with self.env.open('a') as f: f.write('API_KEY_OTHER=synthetic-replacement\n')
+        out, error, reads = self.script(mutate_read=mutate)
+        self.assertTrue(reads); self.assertEqual(error, 1); self.assertEqual(out.strip(), '{}')
+
+    def test_missing_original_binding_refuses_before_file_read(self):
+        out, error, reads = self.script(omit_keys=True)
+        self.assertEqual(error, 1); self.assertEqual(out.strip(), '{}'); self.assertEqual(reads, [])
