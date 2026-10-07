@@ -183,7 +183,9 @@ def test_native_auxiliary_resolver_reads_only_named_scoped_keys(tmp_path, monkey
     from agent import auxiliary_client as aux
     parent=tmp_path/'private';parent.mkdir(mode=0o700);home=parent/'new'
     materialize_product(home,inputs());token=set_hermes_home_override(str(home))
-    secret=set_secret_scope({'FRIDAY_LOCAL_KEY':'synthetic-local-scoped'},profile_home=str(home))
+    values={'FRIDAY_LOCAL_KEY':'synthetic-local-scoped','EXA_API_KEY':'synthetic-exa-scoped'}
+    protected_profile_keys(home, values)
+    secret=set_secret_scope(values,profile_home=str(home))
     try:
         cfg=load_config_readonly()
         from hermes_cli import plugins
@@ -279,6 +281,10 @@ def test_native_gateway_load_enables_only_declared_channels(tmp_path,monkeypatch
     parent=tmp_path/'private';parent.mkdir(mode=0o700);home=parent/'new'
     materialize_product(home,inputs());token=set_hermes_home_override(str(home))
     monkeypatch.setattr(plugins,'discover_plugins',lambda:None)
+    from agent.secret_scope import set_secret_scope,reset_secret_scope
+    values={'TELEGRAM_BOT_TOKEN':'synthetic-telegram-token'}
+    protected_profile_keys(home,values)
+    secret=set_secret_scope(values,profile_home=str(home))
     monkeypatch.setenv('TELEGRAM_BOT_TOKEN','synthetic-telegram-token')
     monkeypatch.setenv('DISCORD_BOT_TOKEN','AMBIENT_UNDECLARED_DISCORD_CANARY')
     try:
@@ -287,7 +293,7 @@ def test_native_gateway_load_enables_only_declared_channels(tmp_path,monkeypatch
         assert config.platforms[Platform.DISCORD].enabled is False
         assert all(not p.enabled for name,p in config.platforms.items() if name!=Platform.TELEGRAM)
         assert config.multiplex_profiles is True
-    finally:reset_hermes_home_override(token)
+    finally:reset_secret_scope(secret);reset_hermes_home_override(token)
 
 
 def test_partial_native_write_is_retained_and_cannot_be_adopted(tmp_path,monkeypatch):
@@ -341,7 +347,9 @@ def test_two_actual_native_provider_resolutions_do_not_borrow_credentials(tmp_pa
     for number in (1,2):
         spec=inputs();spec['inference'].update(model='fixture-'+str(number),base_url='http://127.0.0.1:'+str(9000+number)+'/v1')
         home=parent/('profile-'+str(number));materialize_product(home,spec)
-        token=set_hermes_home_override(str(home));secret=set_secret_scope({'FRIDAY_LOCAL_KEY':'synthetic-local-'+str(number)},profile_home=str(home))
+        values={'FRIDAY_LOCAL_KEY':'synthetic-local-'+str(number),'EXA_API_KEY':'synthetic-exa-'+str(number)}
+        protected_profile_keys(home,values)
+        token=set_hermes_home_override(str(home));secret=set_secret_scope(values,profile_home=str(home))
         try:
             config=load_config_readonly()
             runtime,fallback=resolve_runtime_with_fallback(config,requested='custom:friday-local',target_model=spec['inference']['model'])
@@ -399,3 +407,9 @@ def test_actual_protected_onboarding_two_users_remain_unready_without_keys(env):
 
 # Import the exact protected native fixture, not a new consumer implementation.
 from test_user_onboarding import env
+
+
+def protected_profile_keys(home, values):
+    # Admission now consumes the actual protected native dotenv, not an
+    # unproved mapping that exists only in the test caller.
+    p=home/'.env';p.write_text(''.join(k+'='+v+'\n' for k,v in values.items()));p.chmod(0o600)

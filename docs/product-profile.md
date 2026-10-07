@@ -101,11 +101,36 @@ onboarding runtime/receipt/source-hash checks remain intact, including the A0
 reconciliation refusal. Root integration must resolve this missing capability
 before claiming a complete normal installation.
 
-The native named-provider resolver checks credential pools before a configured
-key reference, and a missing local key can yield `no-key-required`. Rendering
-cannot prove those runtime ownership conditions. The launcher must verify fresh
-scoped credential/pool ownership and key readiness before any model request.
-Product admission still requires its own native grants; no ready receipt or
-enabled user is fabricated. Offline synthetic consumer checks demonstrate
-source wiring only. Independent review, actual installation, useful web for
-both workers and all six live product journeys remain required.
+The credential admission overlay runs from native `load_hermes_dotenv` before
+project, ambient or managed fallback. It checks the installed source through
+the existing dashboard-owner verifier, the declared receiving home/config and
+private native `.env`. It uses native secret context variables and the existing
+`auth.json` credential-pool schema; it creates no second credential store.
+The native pool still has priority, but only owned, explicitly local entries
+are admitted. Missing local credentials are refused, including the donor's
+`no-key-required` placeholder. This candidate supports keyed local routes;
+unauthenticated routes and external secret managers have no admission contract.
+
+The actual main and auxiliary resolvers and direct auxiliary client factory
+require the declared local endpoint/model and owned key. Cloud routes, alternate
+credentials, OAuth pool entries, ambient inference proxies and fallback routes
+are refused before client creation. Exa, native channel tokens and BasicAuth
+operator settings keep separate protected references. Native secret misses
+cannot borrow process, project, global-root or another user's credentials.
+Ordinary user resolution also requires its existing current native capability;
+an operator's receipt cannot activate a user or expand the accepted SAFE tools.
+
+Gateway configuration admits only declared channels and owned tokens before
+native weak-token diagnostics. The native Telegram adapter checks its actual
+initialized bot identity after `getMe` and before starting message consumption.
+A mismatch closes that adapter with a static, non-retryable refusal. The guarded
+fixture exercises the actual initialization against synthetic transport data;
+no live account, socket or exclusive channel consumption was observed. Other
+platforms have token-scope checks here; actual account proof remains unaccepted.
+
+These are source and offline consumer results. Product admission still requires
+its native grants. Independent review, canonical installer integration, portable
+runtime preparation, real authenticated cold startup, channel exclusivity,
+useful autonomous web for both intact workers, full administration and all six
+live product journeys remain required. The separate stopped A0 work is not
+restarted by this overlay.

@@ -148,6 +148,7 @@ def compose_product(spec):
     config = {k: copy.deepcopy(DEFAULT_CONFIG[k]) for k in
               ('agent', 'compression', 'memory', 'skills', 'tools', 'approvals', 'delegation')}
     config.update({k: copy.deepcopy(local[k]) for k in ('model', 'providers', 'fallback_providers', 'fallback_model')})
+    config['auth'] = {'adopt_external_logins': False}
     config['model']['key_env'] = inference['key_env']
     route = {'provider': config['model']['provider'], 'model': inference['model'],
              'base_url': config['model']['base_url'], 'key_env': inference['key_env'],
