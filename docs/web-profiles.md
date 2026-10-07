@@ -203,17 +203,30 @@ terminal cgroup. Refusal/uncertain stop must retain the original budget, process
 identity, partial observations and ownership; no automatic retry.
 
 The private `partial-observation.json` is atomically replaced and fsynced before
-execution, at native tool-complete callbacks, on native return and after cleanup.
+execution, at native tool-complete callbacks, at bounded visible-stream snapshots,
+on native return and after cleanup.
 Returned observations are stored before checking the original deadline; failures,
 incomplete model turns and unknown cleanup remain failed/uncertain. Text is
 redacted before truncation (64 Ki characters in aggregate, 16 Ki per field, bounded
-collections/depth). `observation.json` remains an exclusive final publication.
+collections/depth, with a hard 1 MiB serialized-file cap). `observation.json` remains an exclusive final publication.
 `recover(plan, task)` reads these retained observations with the original identity,
 even after expiry/reboot or a failed final publication. It does not admit, settle,
 execute or reset any budget. An interrupted capture may leave only the preceding
 durable partial; it remains uncertain. Native complete tool callbacks provide
-incremental source evidence; available visible streamed text is captured on return
-or exception, not durably after every token.
+incremental source evidence. The supported native `run_conversation(stream_callback=...)` consumes
+real visible deltas after native thinking/context scrubbers and writer fencing.
+Its accumulator survives native retry/reset. The first delta is fsynced immediately;
+later writes coalesce at 512 input characters or 250 ms on an incoming callback,
+with no timer or new thread. Caps are 64 Ki input characters, 16 Ki retained text,
+4,096 callbacks and 256 stream publications within the original remaining deadline.
+Crossing a cap or failing persistence requests native interruption and prevents
+success. Native continuation/retry policy and request/iteration budgets are unchanged.
+A streaming trie conceals full and incomplete known-secret prefixes, including
+nested JSON-escaped forms across chunks; incomplete prefixes are never released
+on mismatch/reset. This conservatively obscures benign text sharing those prefixes.
+Credential/trie sizes are capped before native execution; no growing raw text tail
+is stored by the observer. Tool/final observations and spill/debug sinks use the
+same prefix policy so partial native stubs cannot escape through a later 4xx dump.
 
 No native SQLite transcript or trajectory is enabled. During the dedicated run,
 native console output is discarded and logging is suppressed, including native
@@ -221,7 +234,7 @@ construction and cleanup; only the redacted observation sink is public. Actual
 native full-page and tool-result spill writers receive redacted text and filenames
 before writing. Native API-error request dumps use the existing profile-scoped
 exact-value redaction registry, including escaped credential forms. These scoped
-bindings are restored at close. This policy requires the new private profile and
+bindings, including the native request-debug JSON sink, are restored at close. This policy requires the new private profile and
 dedicated process; it is not suitable for a concurrent gateway. Pinned persistence,
 redaction, spill and logging sources are mandatory inputs. Offline regressions scan
 every actual profile/workspace/output artifact and captured console for synthetic
@@ -237,3 +250,9 @@ limitations. Use [web-runtime-recipe.json](../validation/web-runtime-recipe.json
 for the next independent actual-source/configuration check and negative controls.
 Both worker mid-job retrieval, normal discovery/install/start and all six complete
 web/admin journeys remain mandatory and **NOT_RUN**, pending their own admission.
+
+The prepared urllib3 example explicitly requests GET503 and header-driven GET413/429,
+with Retry-After respected and no POST/other status retries. The prompt and recipe
+are statically aligned with these branches in pinned source. Header delay, status/
+method cases and total exhaustion remain **NOT_RUN** pending an admissible normal
+verification boundary; no supplemental Retry semantic execution is authorized here.

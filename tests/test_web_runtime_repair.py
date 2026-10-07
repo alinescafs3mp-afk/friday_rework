@@ -161,7 +161,7 @@ def test_native_callback_failure_requests_existing_interrupt_and_retains_failure
     assert native.observation_failed and interrupts==['observation_persistence_failed']
 
 
-def test_visible_native_partial_strips_incomplete_secret_prefix():
+def test_visible_native_partial_requires_real_consumer_evidence():
     native=M['Native']();native.secrets=('SYNTHETIC_SCOPED_CREDENTIAL',)
-    native.agent=SimpleNamespace(_session_messages=[],_current_streamed_assistant_text='available source; SYNTHETIC_SCOPED_')
-    assert native.partial()['partial_response']=='available source; [REDACTED_PARTIAL]'
+    native.agent=SimpleNamespace(_session_messages=[],_current_streamed_assistant_text='unobserved namespace')
+    assert native.partial()['partial_response']==''

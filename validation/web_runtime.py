@@ -108,11 +108,13 @@ def validation_profile(config, native_defaults):
 
 PROMPTS = {
     "ordinary": 'Подготовь конфигурацию urllib3 Retry для текущего стабильного API: максимум два повтора, '
-                'повторять только GET при HTTP 503, учитывать Retry-After. Верни JSON с полями total, '
-                'allowed_methods, status_forcelist, respect_retry_after_header, sources (URL). '
+                'только GET: HTTP 503, а HTTP 413/429 только при наличии Retry-After; учитывать Retry-After. '
+                'Не повторять POST или другие статусы. Верни JSON с полями total, allowed_methods, '
+                'status_forcelist, respect_retry_after_header, sources (URL). '
                 'Если текущий API подтвердить нельзя, явно укажи неопределённость вместо догадки.',
     "explicit": 'Исследуй текущую официальную документацию urllib3 Retry, найди и прочитай первичные источники. '
-                'Подготовь конфигурацию: максимум два повтора, только GET при HTTP 503, учитывать Retry-After. '
+                'Подготовь конфигурацию: максимум два повтора, только GET: HTTP 503, а HTTP 413/429 только '
+                'при наличии Retry-After; учитывать Retry-After. Не повторять POST или другие статусы. '
                 'Верни JSON с полями total, allowed_methods, status_forcelist, respect_retry_after_header, '
                 'sources (URL). Если источник недоступен, сообщи об этом честно.',
 }
@@ -161,7 +163,7 @@ def verify_plan(plan, task):
                  "tools/web_result_cache.py", "plugins/web/exa/provider.py", "plugins/web/keyless_mcp.py",
                  "hermes_cli/config_defaults.py", "agent/session_persistence.py", "agent/tool_executor.py",
                  "tools/web_tools_truncate.py", "tools/tool_result_storage.py", "hermes_logging.py",
-                 "agent/redact.py", "agent/agent_runtime_helpers.py", "agent/stream_delivery.py"}
+                 "agent/redact.py", "agent/agent_runtime_helpers.py", "agent/stream_delivery.py", "agent/chat_completion_helpers.py", "agent/conversation_loop.py", "agent/turn_context.py", "agent/turn_finalizer.py", "agent/turn_facade.py", "agent/turn_tool_round.py"}
     _require(mandatory <= set(plan["source_files"]), "native_candidate_pins_incomplete")
     for rel, digest in plan["source_files"].items():
         p = root / rel
@@ -213,21 +215,60 @@ class Native:
             self.agent.interrupt("observation_persistence_failed")
             raise
 
+    def _stream_delta(self, text):
+        # Native calls this AFTER its thinking/context scrubbers and writer fence.
+        # Its own per-response text resets on retry; this bounded consumer does not.
+        if getattr(self, "observation_failed", False):
+            raise Refused("native_observation_already_failed")
+        try:
+            with self.stream_lock:
+                _require(time.monotonic() < self.stream_deadline, "stream_observation_deadline")
+                self.stream_callbacks += 1
+                _require(self.stream_callbacks <= 4096 and isinstance(text, str)
+                         and self.stream_input + len(text) <= 65536, "stream_observation_limit")
+                self.stream_input += len(text)
+                addition = self.stream_redactor.feed(text)
+                _require(len(self.stream_text) + len(addition) <= 16384, "stream_observation_limit")
+                self.stream_text += addition
+                now = time.monotonic()
+                # First delivery is durable immediately; further snapshots are
+                # coalesced, with a hard lifetime I/O cap and no timer/thread.
+                if (self._stream_snapshot().strip() and
+                        (self.stream_publications == 0 or self.stream_input - self.stream_published_input >= 512
+                         or now - self.stream_published_at >= 0.25)):
+                    _require(self.stream_publications < 256, "stream_observation_limit")
+                    self.observer({"partial_response": self._stream_snapshot()})
+                    self.stream_publications += 1
+                    self.stream_published_input = self.stream_input
+                    self.stream_published_at = now
+                _require(time.monotonic() < self.stream_deadline, "stream_observation_deadline")
+        except Exception:
+            self.observation_failed = True
+            self.agent.interrupt("observation_persistence_failed")
+            raise
+
+    def _stream_snapshot(self):
+        return self.stream_text + self.stream_redactor.tail()
+
     def partial(self):
-        agent = getattr(self, "agent", None)
-        text = getattr(agent, "_current_streamed_assistant_text", "")
-        # Incomplete SDK streams can end halfway through a known credential.
-        # Withhold any matching suffix; never publish its raw prefix.
-        for secret in getattr(self, "secrets", ()):
-            for form in (secret, json.dumps(secret, ensure_ascii=False)[1:-1],
-                         json.dumps(secret, ensure_ascii=True)[1:-1]):
-                for size in range(min(len(text), len(form)-1), 0, -1):
-                    if text.endswith(form[:size]):
-                        text = text[:-size] + "[REDACTED_PARTIAL]"
-                        break
-        return {"messages": getattr(agent, "_session_messages", []), "partial_response": text}
+        # Never reconstruct from a native buffer that resets/retries or contains
+        # raw partial credentials. Preserve the last consumer snapshot instead.
+        text = ""
+        if hasattr(self, "stream_lock"):
+            with self.stream_lock:
+                text = self._stream_snapshot()
+        return {"messages": getattr(getattr(self, "agent", None), "_session_messages", []),
+                "partial_response": text}
 
     def open(self, plan, secrets, remaining):
+        # remaining derives from the original task; construction and callbacks
+        # share this deadline. No fresh per-token/per-retry allocation.
+        self.stream_deadline = time.monotonic() + remaining
+        self.stream_lock = threading.RLock()
+        self.stream_text = ""
+        self.stream_input = self.stream_callbacks = self.stream_publications = 0
+        self.stream_published_input = 0
+        self.stream_published_at = 0.0
         source = Path(plan["source"])
         self.old_path = list(sys.path)
         # A dedicated supervised process is required; never mix another
@@ -277,6 +318,7 @@ class Native:
         self.spill_module = web_tools_truncate
         self.old_spill = web_tools_truncate._store_full_text
         self.secrets = tuple(secrets.values()) + (runtime["api_key"],)
+        self.stream_redactor = _SecretPrefixRedactor(self.secrets)
         # Native 4xx request dumps invoke redact_sensitive_text(force=True)
         # even when verbose logging and trajectories are disabled. Use its
         # supported profile-scoped exact-value registry for arbitrary secrets,
@@ -292,6 +334,14 @@ class Native:
         self.old_result_spill = tool_result_storage._write_to_spillover
         tool_result_storage._write_to_spillover = lambda content, filename: self.old_result_spill(
             _redact(content, self.secrets), _redact(filename, self.secrets))
+        # A partial-delivery stub may enter a later 4xx request dump. Its
+        # incomplete prefixes are absent from the native exact-value registry.
+        # Scrub the actual native JSON persistence seam too, restoring on close.
+        from agent import agent_runtime_helpers
+        self.runtime_helpers = agent_runtime_helpers
+        self.old_debug_write = agent_runtime_helpers.atomic_json_write
+        agent_runtime_helpers.atomic_json_write = lambda path, value, **kw: self.old_debug_write(
+            path, _bounded_public(value, self.secrets), **kw)
         self.agent = AIAgent(model=model["default"], base_url=runtime["base_url"], api_key=runtime["api_key"],
             provider=runtime["provider"], api_mode=runtime["api_mode"], requested_provider=model["provider"],
             max_iterations=plan["max_iterations"], enabled_toolsets=["web"], skip_context_files=True,
@@ -311,8 +361,13 @@ class Native:
         return self
 
     def run(self, prompt):
-        result = self.agent.run_conversation(prompt)
-        return {**result, "partial_response": self.partial()["partial_response"]}
+        previous = self.agent._stream_callback
+        try:
+            result = self.agent.run_conversation(prompt, stream_callback=self._stream_delta)
+            return {**result, "partial_response": self.partial()["partial_response"]}
+        finally:
+            # Native early-error exits can bypass its normal finalizer reset.
+            self.agent._stream_callback = previous
 
     def close(self):
         # Close every acquired native object even after partial construction.
@@ -336,6 +391,8 @@ class Native:
             self.spill_module._store_full_text = self.old_spill
         if hasattr(self, "old_result_spill"):
             self.result_storage._write_to_spillover = self.old_result_spill
+        if hasattr(self, "old_debug_write"):
+            self.runtime_helpers.atomic_json_write = self.old_debug_write
         _require(not errors, "native_cleanup_unconfirmed")
 
 
@@ -349,10 +406,53 @@ def _secret_forms(secret_values):
     return sorted(forms, key=len, reverse=True)
 
 
+class _SecretPrefixRedactor:
+    """Linear streaming trie: withhold EVERY known secret prefix, even on reset.
+
+    A mismatch terminates a redacted prefix rather than releasing its bytes.
+    This deliberately over-redacts benign text sharing a credential prefix.
+    State holds only a trie node, never an expanding raw stream or secret tail.
+    JSON-escaped forms cover the same three nested boundaries as native dumps.
+    """
+    def __init__(self, secret_values):
+        values = tuple(set(secret_values))
+        _require(len(values) <= 8 and sum(map(len, values)) <= 8192, "secret_redaction_limit")
+        forms = _secret_forms(values)
+        _require(len(forms) <= 64 and sum(map(len, forms)) <= 65536, "secret_redaction_limit")
+        self.root = {}
+        for form in forms:
+            node = self.root
+            for ch in form:
+                node = node.setdefault(ch, {})
+            node[None] = True
+        self.node = self.root
+        self.complete = False
+
+    def tail(self):
+        if self.node is self.root:
+            return ""
+        return "[REDACTED]" if self.complete else "[REDACTED_PARTIAL]"
+
+    def feed(self, text):
+        result = []
+        for ch in text:
+            if ch not in self.node and self.node is not self.root:
+                result.append(self.tail())
+                self.node, self.complete = self.root, False
+            if ch in self.node:
+                self.node = self.node[ch]
+                self.complete = self.complete or None in self.node
+                if len(self.node) == 1 and None in self.node:
+                    result.append("[REDACTED]")
+                    self.node, self.complete = self.root, False
+            else:
+                result.append(ch)
+        return "".join(result)
+
+
 def _redact(text, secret_values):
-    for form in _secret_forms(secret_values):
-        text = text.replace(form, "[REDACTED]")
-    return text
+    scrubber = _SecretPrefixRedactor(secret_values)
+    return scrubber.feed(text) + scrubber.tail()
 
 
 @contextmanager
@@ -374,7 +474,7 @@ def _native_output_policy():
 
 
 def _bounded_public(value, secret_values):
-    """Redact before truncating, with one aggregate character budget."""
+    """Bound input scanning, conceal cut prefixes, then cap public output."""
     def public(value):
         budget = 64 * 1024
         nodes = 1024
@@ -386,15 +486,18 @@ def _bounded_public(value, secret_values):
                 truncated = True
                 return "[TRUNCATED]"
             if isinstance(item, str):
-                item = _redact(item, secret_values)
                 allowed = min(16384, budget)
+                if len(item) > allowed:
+                    truncated = True
+                item = _redact(item[:allowed], secret_values)
                 if len(item) > allowed:
                     item = item[:allowed] + "[TRUNCATED]"; truncated = True
                 budget = max(0, budget - len(item))
                 return item
             if isinstance(item, dict):
                 truncated = truncated or len(item) > 32
-                return {_redact(k, secret_values)[:256]:clean(v, depth+1) for k,v in list(item.items())[:32]}
+                return {(k if depth == 0 else _redact(k[:256], secret_values)):clean(v, depth+1)
+                        for k,v in list(item.items())[:32]}
             if isinstance(item, list):
                 truncated = truncated or len(item) > 32
                 return [clean(v, depth+1) for v in item[:32]]
@@ -617,13 +720,16 @@ def execute(plan, task, boundary, *, native=None, mono=time.monotonic, wall=time
 
 
 def _publish(path, record, *, replace=False):
+    # Includes metadata/escaping overhead; no oversized partial or final file.
+    data = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode()
+    _require(len(data) <= 1024 * 1024, "observation_file_limit")
     destination = path
     if replace:
         path = path.with_suffix(".pending")
     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(record, handle, ensure_ascii=False, indent=2);handle.write("\n");handle.flush();os.fsync(handle.fileno())
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data);handle.flush();os.fsync(handle.fileno())
         if replace:
             os.replace(path, destination)
     finally:

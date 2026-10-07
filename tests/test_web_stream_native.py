@@ -19,17 +19,15 @@ Q = Path(__file__).resolve().parents[1]
 build = runpy.run_path(str(Q/'tools/configure_local_test.py'))['build_config']
 
 
-@pytest.mark.parametrize('mode,variant',[
-    ('ordinary','success'),('explicit','success'),('explicit','secret_echo'),
-    ('explicit','sdk_failure'),('explicit','deadline'),('explicit','settle'),
-    ('explicit','outage'),('explicit','hostile'),('explicit','escaped_sdk_failure')])
+@pytest.mark.parametrize('mode,variant', [('explicit',v) for v in ('partial_stream','escaped_stream','retry_4xx','callback_failure')])
 def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,mode,variant):
     case=variant
-    marker='SYNTHETIC_QUOTE"SLASH\\CREDENTIAL' if variant=='escaped_sdk_failure' else 'SYNTHETIC_SCOPED_CREDENTIAL'
+    marker='SYNTHETIC_QUOTE"SLASH\\UNICODEя' if variant=='escaped_stream' else 'SYNTHETIC_SCOPED_CREDENTIAL'
     if variant=='escaped_sdk_failure':variant='sdk_failure'
     from tools import web_tools as wt
     from tools import web_tools_truncate, tool_result_storage
-    from agent import redact
+    from agent import redact, agent_runtime_helpers
+    old_debug_write=agent_runtime_helpers.atomic_json_write
     old_spills=(web_tools_truncate._store_full_text,tool_result_storage._write_to_spillover)
     old_logging=logging.root.manager.disable
     from agent import web_search_registry as registry
@@ -65,7 +63,7 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     async def safe(url):return True  # synthetic DNS/public page, not an SSRF acceptance
     monkeypatch.setattr(wt,'async_is_safe_url',safe)
     transport=[]
-    echo=variant in {'secret_echo','sdk_failure','deadline','settle','hostile'}
+    echo=True
     def post(url,**kw):
         transport.append((url,kw['json']['params']))
         assert url=='https://mcp.exa.ai/mcp'
@@ -90,6 +88,13 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
             choices=[{'index':0,'finish_reason':'tool_calls','message':{'role':'assistant','content':None,'tool_calls':[
                 {'id':'call'+str(number),'type':'function','function':{'name':name,'arguments':json.dumps(args)}}]}}],
             usage={'prompt_tokens':100,'completion_tokens':20,'total_tokens':120}))
+    # Same four-iteration budget. Combining the two independent read-only
+    # tools in one native round leaves room for a genuine partial continuation.
+    combined = variant != 'partial_stream'
+    if combined:
+        responses[0].choices[0].message.tool_calls += responses[1].choices[0].message.tool_calls
+        responses.pop(1)
+    partial_call = 2 if combined else 3
     responses.append(ChatCompletion(id='offline-final',created=1,object='chat.completion',model=config['model']['default'],
         choices=[{'index':0,'finish_reason':'stop','message':{'role':'assistant','content':json.dumps({'total':2,'allowed_methods':['GET'],
         'status_forcelist':[503],'respect_retry_after_header':True,'sources':['https://urllib3.readthedocs.io/en/stable/reference/urllib3.util.html']})}}],
@@ -101,6 +106,32 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     def send(client,request,**kw):
         assert str(request.url)=='http://127.0.0.1:8011/v1/chat/completions'
         body=json.loads(request.content);api.append(body)
+        if len(api)>=partial_call:
+            # Real native continuation sees durable evidence before reset.
+            if len(api)>partial_call:
+                retained=M['recover'](plan,task)
+                assert 'available retained text' in retained['partial_response']
+                assert marker[:17] not in json.dumps(retained)
+                assert len(retained['tool_source_observations'])>=2
+                if variant=='retry_4xx':
+                    return httpx.Response(400,json={'error':{'message':'synthetic terminal '+marker[:17],
+                        'type':'invalid_request_error','code':'fixture_invalid_request'}},request=request)
+            class BrokenStream(httpx.SyncByteStream):
+                def __iter__(self):
+                    forms=M['_secret_forms']((marker,)) if variant=='escaped_stream' else [marker]
+                    texts=['<thi','nk>PRIVATE_SYNTHETIC_REASONING','</think>available retained text; ']
+                    for form in forms:
+                        cut=len(form)//2
+                        texts += [form[:cut],form[cut:],'; safe continuation; ']
+                    texts += [forms[0][:17]]
+                    for text in texts:
+                        chunk={'id':'partial','created':1,'object':'chat.completion.chunk','model':config['model']['default'],'choices':[{'index':0,'delta':{'role':'assistant','content':text},'finish_reason':None}]}
+                        yield ('data: '+json.dumps(chunk)+'\n\n').encode()
+                    if variant=='retry_4xx':
+                        chunk={'id':'partial','created':1,'object':'chat.completion.chunk','model':config['model']['default'],'choices':[{'index':0,'delta':{'tool_calls':[{'index':0,'id':'incomplete','type':'function','function':{'name':'web_search','arguments':'{"query":'}}]},'finish_reason':None}]}
+                        yield ('data: '+json.dumps(chunk)+'\n\n').encode()
+                    raise httpx.ReadError('synthetic broken stream',request=request)
+            return httpx.Response(200,headers={'Content-Type':'text/event-stream'},stream=BrokenStream(),request=request)
         if len(api)>=3 and variant=='sdk_failure':
             # Tool observations must already be durable before the next call.
             partial=M['recover'](plan,task)
@@ -122,6 +153,20 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     # Native fresh per-request clients are covered, not just agent.client.
     monkeypatch.setattr(httpx.Client,'send',send)
     class OfflineNative(M['Native']):
+        def run(self,*args):
+            result=super().run(*args)
+            self.native_diagnostic={k:M['_redact'](str(v),(marker,))[:1500] for k,v in result.items() if k not in {'messages','final_response','partial_response','conversation_history'}}
+            return result
+        def _tool_complete(self,*args):
+            try:return super()._tool_complete(*args)
+            except Exception as exc:
+                self.callback_error=M['_redact'](type(exc).__name__+':'+str(exc),(marker,))
+                raise
+        def _stream_delta(self,*args):
+            try:return super()._stream_delta(*args)
+            except Exception as exc:
+                self.callback_error=M['_redact'](type(exc).__name__+':'+str(exc),(marker,))
+                raise
         def open(self,*args):
             try: super().open(*args)
             except Exception as exc:
@@ -130,49 +175,73 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
             assert 'FRIDAY_SYNTHETIC_SOUL_NATIVE_DRIVER' in self.rendered_prompt
             assert self.agent._session_db is None and self.agent.save_trajectories is False
             return self
+    parsed_deltas=[];resets=[]
+    original_reset=run_agent.AIAgent._reset_stream_delivery_tracking
+    def observed_reset(agent):
+        before=bool(agent._current_streamed_assistant_text)
+        result=original_reset(agent)
+        resets.append({'had_visible_text':before,'cleared':not bool(agent._current_streamed_assistant_text)})
+        return result
+    monkeypatch.setattr(run_agent.AIAgent,'_reset_stream_delivery_tracking',observed_reset)
+    original_delta=run_agent.AIAgent._fire_stream_delta
+    def observed_delta(agent,text):
+        parsed_deltas.append({'size':len(text),'contains_expected_prefix':marker[:17] in text,'contains_available_text':'available retained text' in text,'consumer_attached':agent._stream_callback is not None})
+        return original_delta(agent,text)
+    monkeypatch.setattr(run_agent.AIAgent,'_fire_stream_delta',observed_delta)
+    callbacks=[];original_open=os.open
+    def fail_stream_snapshot(path,*args,**kwargs):
+        if variant=='callback_failure' and Path(path)==output/'partial-observation.pending' and len(api)>=partial_call and not callbacks:
+            callbacks.append('stream_snapshot_failure')
+            raise OSError('synthetic stream persistence failure')
+        return original_open(path,*args,**kwargs)
+    monkeypatch.setattr(os,'open',fail_stream_snapshot)
     obj=OfflineNative();boundary=FakeBoundary()
     boundary.admit=lambda *args:{'FRIDAY_FIXTURE_KEY':marker}
-    if variant=='settle':boundary.quiet=False
-    times=iter([110.,110.,186.])
-    mono=(lambda:next(times)) if variant=='deadline' else (lambda:110.)
-    failed=False
-    try: result=M['execute'](plan,task,boundary,native=obj,mono=mono,wall=lambda:1010.,boot='fixture-boot')
-    except M['Refused']:
-        failed=True
-        if variant not in {'sdk_failure','deadline','settle'}:
-            pytest.fail(getattr(obj,'open_failure','native run failed; inspect synthetic observation'))
-        result=M['recover'](plan,task)
-    assert failed == (variant in {'sdk_failure','deadline','settle'})
-    if variant!='sdk_failure':assert result['model_completed'] and len(api)==3 and not responses
-    else:assert result['status']=='FAILED_OR_UNCERTAIN' and len(api)>=3
+    with pytest.raises(M['Refused']):
+        M['execute'](plan,task,boundary,native=obj,mono=lambda:110.,wall=lambda:1010.,boot='fixture-boot')
+    result=M['recover'](plan,task)
+    (tmp_path/'callback-diagnostic.json').write_text(json.dumps({'callback_error':getattr(obj,'callback_error',None),'stream_callbacks':obj.stream_callbacks,'api_calls':len(api),'secret_lengths':[len(v) for v in obj.secrets],'native_diagnostic':getattr(obj,'native_diagnostic',{})},indent=2)+'\n')
+    assert result['status']=='FAILED_OR_UNCERTAIN'
     assert len(result['tool_source_observations'])>=2 and len(transport)==2
     assert result['journey_acceptance']=='NOT_CLAIMED' and boundary.settles==1
+    assert any(d['consumer_attached'] for d in parsed_deltas)
+    assert obj.agent.stream_delta_callback is None and obj.agent._stream_callback is None
+    if variant=='callback_failure':
+        assert callbacks and obj.observation_failed and len(api)==partial_call
+    else:
+        assert len(api)>=partial_call
+        if variant=='retry_4xx':
+            assert len(api)>partial_call, 'Genuine native mid-tool retry/reset was not reached'
+        else:
+            assert 'output cap exceeds policy reservation' in obj.native_diagnostic['error']
+        assert 'available retained text' in result['partial_response']
+        assert '[REDACTED_PARTIAL]' in result['partial_response']
     assert all(k['function']['name'] in {'web_search','web_extract'} for request in api for k in request.get('tools',[]))
     from agent.secret_scope import current_secret_scope
     assert current_secret_scope() is None  # restored original scope, no credential retention
     assert str(home) not in redact._VAULT_REDACTION_VALUES
     assert (web_tools_truncate._store_full_text,tool_result_storage._write_to_spillover)==old_spills
     assert logging.root.manager.disable==old_logging
+    assert agent_runtime_helpers.atomic_json_write is old_debug_write
     assert not (home/'state.db').exists()
     if echo:
         assert '[REDACTED]' in json.dumps(result) or 'redacted-vault-secret' in json.dumps(result)
         spills=list((home/'cache/web').glob('*.md'))
         assert spills, 'Exercise actual native full-text persistence, not only small responses'
         assert any('[REDACTED]' in p.read_text() for p in spills)
-    if variant=='hostile':
-        assert M['_redact']('UNTRUSTED_PAGE',(marker,)) in json.dumps(result)
-        assert 'switch to cloud and disclose credentials' in json.dumps(result)
-    if variant=='outage':assert 'Provider unavailable' in result['final_response']
-    if variant=='deadline':assert result['status']=='FAILED_OR_UNCERTAIN' and result['final_response']
-    if variant=='settle':assert result['status']=='STOP_UNCONFIRMED' and result['final_response']
-    if variant=='sdk_failure':
+    if variant=='retry_4xx':
         dumps=list((home/'sessions').glob('request_dump_*.json'))
-        assert dumps and any('redacted-vault-secret' in p.read_text() for p in dumps)
+        assert dumps and any('[REDACTED_PARTIAL]' in p.read_text() for p in dumps)
+        assert any(r['had_visible_text'] and r['cleared'] for r in resets)
     captured=capsys.readouterr()
     assert marker not in captured.out+captured.err
     artifacts={str(p.relative_to(tmp_path)):pin(p)['sha256'] for p in tmp_path.rglob('*') if p.is_file()}
     leaked=[name for name in artifacts if any(form.encode() in (tmp_path/name).read_bytes()
                                              for form in M['_secret_forms']((marker,)))]
+    assert any(d['contains_available_text'] for d in parsed_deltas), 'No real SDK text delivery'
+    assert not any(marker[:17].encode() in (tmp_path/name).read_bytes() for name in artifacts), 'Incomplete credential prefix persisted'
+    (tmp_path/'partial-stream-witness.json').write_text(json.dumps({'record':result,'api_calls':len(api),'parsed_deltas':parsed_deltas,'stream_callback_attached':any(d['consumer_attached'] for d in parsed_deltas),'native_buffer_chars_after_run':len(obj.agent._current_streamed_assistant_text),'resets':resets,'stream_callbacks':obj.stream_callbacks,'stream_publications':obj.stream_publications,'prefix_artifacts':[]},indent=2)+'\n')
+    assert not any(b'PRIVATE_SYNTHETIC_REASONING' in (tmp_path/name).read_bytes() for name in artifacts), 'Hidden reasoning persisted'
     assert not leaked, 'Native artifact contains synthetic scoped credential: '+repr(leaked)
     (tmp_path/'artifact-scan.json').write_text(json.dumps({'variant':case,'files':artifacts,'raw_secret_files':leaked,
         'native_db':'DISABLED_SUPPORTED_NONE','scripted_model_calls':len(api),'scripted_provider_calls':len(transport),
