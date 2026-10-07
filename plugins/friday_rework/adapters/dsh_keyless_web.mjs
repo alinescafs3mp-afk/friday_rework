@@ -22,7 +22,7 @@ function envelope(body) {
   if (!r || r.isError || Object.keys(r).some(k=>!['content','isError'].includes(k))
       || !Array.isArray(r.content) || r.content.length !== 1 || r.content[0].type !== 'text'
       || typeof r.content[0].text !== 'string'
-      || Object.keys(r.content[0]).some(k=>!['type','text'].includes(k))) fail('KEYLESS_TOOL_RESULT_REFUSED');
+      || Object.keys(r.content[0]).some(k=>!['type','text','_meta'].includes(k))) fail('KEYLESS_TOOL_RESULT_REFUSED');
   return r.content[0].text;
 }
 export function sources(text,config) {
@@ -68,7 +68,7 @@ export class KeylessSearchProvider {
     try {
       const response=await fetch(c.endpoint,{method:'POST',redirect:'error',signal:controller.signal,
         headers:{'content-type':'application/json','accept':'application/json, text/event-stream'},
-        body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'web_search_exa',arguments:{query:request.query,numResults:limit}}})});
+        body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'web_search_exa',arguments:{query:request.query,objective:request.query,numResults:limit}}})});
       if (!response.ok) fail(response.status===429?'KEYLESS_RATE_LIMITED':'KEYLESS_UNAVAILABLE');
       if (!/^application\/json|^text\/event-stream/.test(response.headers.get('content-type')||'')) fail('KEYLESS_CONTENT_TYPE');
       if (Number(response.headers.get('content-length')||0)>c.maxResponseBytes) fail('KEYLESS_BODY_BOUND');

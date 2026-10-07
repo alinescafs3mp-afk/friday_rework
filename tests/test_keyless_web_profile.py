@@ -73,7 +73,7 @@ def test_keyless_native_domains_cannot_borrow_or_lie(operator,change):
     with pytest.raises(admission.CredentialDenied):admission.profile_policy(operator.home,bundle['config'])
 
 
-@pytest.mark.parametrize('mode',['ok','sse','outage','429','instructions','agent-run','wrong-id','rpc-error','tool-error','nontext','oversize','malformed','sse-many','length','timeout'])
+@pytest.mark.parametrize('mode',['ok','sse','metadata','outage','429','instructions','agent-run','wrong-id','rpc-error','tool-error','nontext','oversize','malformed','sse-many','length','timeout'])
 def test_native_keyless_harness_search_and_bounded_fetch(mode,tmp_path):
     import subprocess,os
     root=Path(__file__).resolve().parents[1];source=root.parents[1]/'.runtime/dsh-native-complete/frw005-g1-012jccbe/dsh'
@@ -84,7 +84,7 @@ def test_native_keyless_harness_search_and_bounded_fetch(mode,tmp_path):
     result=json.loads(r.stdout);assert result['externalTransports']=='SYNTHETIC_ONLY'
     assert result['searchCalls']==1 and result['originalBudgetAndPermissionsUnchanged'] is True
 
-@pytest.mark.parametrize('mode',['ok','sse','429','redirect','oversize','text-bound','instructions','agent-run','malformed','wrong-id','bool-id','multiple','missing-transport','timeout'])
+@pytest.mark.parametrize('mode',['ok','sse','429','redirect','oversize','text-bound','instructions','agent-run','malformed','wrong-id','bool-id','metadata','multiple','missing-transport','timeout'])
 def test_actual_hermes_keyless_native_transport_has_finite_untrusted_ingress(mode,monkeypatch):
     from plugins.web import keyless_mcp as m
     import requests
@@ -94,6 +94,7 @@ def test_actual_hermes_keyless_native_transport_has_finite_untrusted_ingress(mod
     if mode=='agent-run':data['result']={'tools':[{'name':'agent_run'}]}
     if mode=='wrong-id':data['id']=2
     if mode=='bool-id':data['id']=True
+    if mode=='metadata':data['result']['content'][0]['_meta']={'searchTime':32,'instructions':'UNTRUSTED_IGNORED'}
     if mode=='text-bound':data['result']['content'][0]['text']='x'*15001
     body=json.dumps(data).encode()
     if mode=='sse':body=b'data: '+body+b'\n\n'
@@ -121,12 +122,14 @@ def test_actual_hermes_keyless_native_transport_has_finite_untrusted_ingress(mod
         def post(self,url,**kw):
             assert self.trust_env is False and kw['allow_redirects'] is False and kw['stream'] is True
             assert not any(k.lower()=='authorization' for k in kw['headers'])
-            assert kw['json']['params']['name']=='web_search_exa';calls.append(url);return Response()
+            assert kw['json']['params']['name']=='web_search_exa'
+            assert kw['json']['params']['arguments']=={'query':'official docs','objective':'official docs','numResults':3}
+            calls.append(url);return Response()
     monkeypatch.setattr(requests,'Session',Session)
     if mode=='timeout':
         import time
         ticks=iter([0,31]);monkeypatch.setattr(time,'monotonic',lambda:next(ticks))
-    if mode in ('ok','sse'):
+    if mode in ('ok','sse','metadata'):
         assert 'Untrusted' in m.mcp_call(m.EXA_MCP_URL,'web_search_exa',{'query':'official docs','numResults':3})
     else:
         with pytest.raises(m.KeylessMCPError):m.mcp_call(m.EXA_MCP_URL,'web_search_exa',{'query':'official docs','numResults':3})
