@@ -32,6 +32,14 @@ An isolated systemd deadline fixture stopped both its parent and a detached chil
 
 Donor integration, real tools, persona behavior, cancellation, delivery, privacy and complete release gates remain unaccepted.
 
+## Integrated native source checkpoint — 2026-10-07
+
+The current candidate composes the complete pinned Hermes tree with fifteen integration layers (17,627 files), including canonical profile validation, protected onboarding, native administration health, Dashboard ownership and bounded normal installation. Its exact full-source native gate passed all eleven checks. The joined installer/profile/onboarding/health consumers passed 105 checks; Dashboard ownership and the explicit OS owner-identity boundary passed 78. These are source and guarded offline results, not an installed product or a release gate.
+
+The installer retains the original attempt deadline and input identity in its output receipt. Unconfirmed process cleanup has a typed CLI result, `STOP_UNCONFIRMED`, and cannot be mistaken for an ordinary input error. A persisted output receipt does not prove that its originating invocation completed in time. Independently reviewed component evidence covers the unchanged process-lifetime boundary; this integration does not repeat native process experiments or authorize package installation.
+
+Dashboard startup now has an explicit native owner lock, source/home/profile binding and authenticated identity proof. It refuses an unavailable OS owner identity before opening a protected file. Canonical overlay rebasing and this small portability correction receive their own final integration review. Cold startup, actual credentials, channel exclusivity, full two-user access/revocation, both worker web journeys and all six owner scenarios remain unverified. Separate scoped credential admission is a candidate under independent review; user-specific worker provisioning remains implementation work. Neither is silently counted as part of this fifteen-layer result. A0 remains stopped at its existing execution boundary; no new runtime grant or retry follows from these source checks.
+
 ## Mandatory scope clarification, 2026-10-07
 
 Autonomous web retrieval, web access during both Harness and A0 work, and the product administrative WebUI are mandatory. The native administration foundation and worker web connections are implemented as reviewed source components; complete product journeys remain unverified. Hermes provides search/extract/browser and Dashboard components; current worker network admission, A0 service startup and product-wide user isolation still require integration. [The owner scope](mandatory-web-admin.md) and [AC053–AC058](../validation/acceptance-web-admin.json) are cumulative with the existing gates. No donor update, guard change, legacy restart or release acceptance follows from this clarification.
