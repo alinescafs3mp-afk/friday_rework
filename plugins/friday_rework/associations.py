@@ -288,7 +288,8 @@ class Associations:
         return row
 
     def claim(self, *, task_id, admission_key, owner, brief: WorkBrief,
-              workspace_reference, supervisor, budget_seconds, deadline_unix, host_binding=None):
+              workspace_reference, supervisor, budget_seconds, deadline_unix, host_binding=None,
+              acceptance=None):
         """Save trusted launch intent. Duplicate input returns the old grant.
 
         A replay with a later deadline cannot replenish its original budget.
@@ -321,6 +322,16 @@ class Associations:
                     row.get("host", {}).get("quiescence") is None for row in data["jobs"].values()):
                 raise AssociationError("worker_capacity_reserved")
             now = _number(self.clock())
+            if acceptance is not None:
+                from .host_record import validate_acceptance
+                validate_acceptance(acceptance)
+                if (brief.worker != 'a0' or host_binding is None
+                        or acceptance['accepted_monotonic_ns'] > time.monotonic_ns()
+                        or acceptance['boot_id'] != Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+                        or not acceptance['accepted_unix'] <= now < deadline_unix
+                        or deadline_unix != acceptance['accepted_unix'] + budget_seconds):
+                    raise AssociationError('invalid_original_acceptance')
+                now = acceptance['accepted_unix']
             if budget_seconds <= 0 or deadline_unix <= now or deadline_unix > now + budget_seconds:
                 raise AssociationError("invalid_deadline")
             row = {"existing_task_id": task_id, "admission_hash": admission_hash, **identity,
@@ -333,6 +344,13 @@ class Associations:
             if host_binding is not None:
                 row["host"] = {"binding": copy.deepcopy(host_binding), "inputs": None,
                                "observation": None, "terminal": None, "quiescence": None}
+                if brief.worker == 'a0':
+                    if acceptance is None:
+                        raise AssociationError('original_acceptance_missing')
+                    row['host']['a0'] = {'schema': 'friday.a0.host.v1',
+                        'acceptance': copy.deepcopy(acceptance),
+                        'expected_files': copy.deepcopy(host_binding['runtime']['a0']['expected_files']),
+                        'launch': None, 'grant': None, 'key_cleanup': 'NOT_PREPARED'}
             data["jobs"][task_id] = row
             self._save(data)
             return copy.deepcopy(row), True
@@ -341,6 +359,27 @@ class Associations:
         """Checked profile snapshot; callers still enforce ownership per control."""
         with self._locked() as data:
             return copy.deepcopy(data["jobs"])
+
+    def retain_a0(self, task_id, owner, field, value):
+        """One-way nonsecret ownership metadata, in the existing locked row."""
+        if field not in {'launch', 'grant', 'keys_prepared_monotonic', 'key_cleanup', 'created'}:
+            raise AssociationError('invalid_a0_retention')
+        with self._locked() as data:
+            row = self._owned(data, task_id, owner)
+            a0 = row['host']['a0']
+            target = a0['launch'] if field in {'keys_prepared_monotonic', 'created'} else a0
+            if target is None:
+                raise AssociationError('missing_a0_launch')
+            if field == 'key_cleanup':
+                allowed = {'NOT_PREPARED': {'PREPARED', 'RECONCILIATION_REQUIRED'}, 'PREPARED': {'REMOVED', 'RECONCILIATION_REQUIRED'},
+                           'RECONCILIATION_REQUIRED': set(), 'REMOVED': set()}
+                if value != target[field] and value not in allowed[target[field]]:
+                    raise AssociationError('a0_retention_conflict')
+            elif target[field] is not None and target[field] != value:
+                raise AssociationError('a0_retention_conflict')
+            target[field] = copy.deepcopy(value)
+            self._save(data)
+            return copy.deepcopy(row)
 
     def retain_inputs(self, task_id, owner, inputs):
         with self._locked() as data:

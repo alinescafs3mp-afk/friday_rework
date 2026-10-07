@@ -19,6 +19,7 @@ import time
 
 from ..supervision import NativeSupervisor
 from .a0_config import A0Deployment, A0Error, require, local_profile
+from .dsh import PinnedFile
 
 
 def strict_json(data):
@@ -198,8 +199,24 @@ def _duration(value):
 
 class A0NativeBoundary:
     def __init__(self, deployment: A0Deployment, grant: NativeGrant, *, supervisor=None,
-                 runner=None, clock=time.time, monotonic=time.monotonic):
-        self.config, self.grant = deployment.checked(), grant
+                 runner=None, clock=time.time, monotonic=time.monotonic, stop_only=False):
+        self.stop_only = stop_only
+        if stop_only:
+            # Retained exact ownership is a stop capability, never admission.
+            # Mutable launch/policy/daemon pins cannot withhold owned cessation.
+            require(isinstance(deployment, A0Deployment)
+                    and isinstance(deployment.docker, PinnedFile)
+                    and re.fullmatch('sha256:[0-9a-f]{64}', deployment.image)
+                    and deployment.socket.startswith('unix:///')
+                    and not any(c in deployment.socket for c in '\n\r\x00 ,')
+                    and all(p.is_absolute() and '..' not in p.parts for p in (deployment.state_dir, deployment.git_dir))
+                    and isinstance(deployment.command, tuple) and len(deployment.command) == 2
+                    and deployment.command[0] == '-ceu', 'invalid_stop_descriptor')
+            deployment.docker.read()
+            self.config = deployment
+        else:
+            self.config = deployment.checked()
+        self.grant = grant
         self.supervisor = supervisor or NativeSupervisor()
         self.runner = runner or self._run
         self.clock, self.monotonic = clock, monotonic
@@ -312,6 +329,7 @@ class A0NativeBoundary:
                 and (root/'pids.max').read_text().strip() == '2048', 'daemon_kernel_caps_changed')
 
     def admit(self, row):
+        require(not self.stop_only, 'stop_only_capability')
         require(row["stop_intent"] is None and self.clock() < row["deadline_unix"]
                 and row["elapsed_seconds"] < row["budget_seconds"], "stopped_or_expired")
         require(self.config.network.name != "none" and self.grant.network_verified is True,
@@ -372,6 +390,7 @@ class A0NativeBoundary:
         return unit
 
     def _keys(self):
+        require(not self.stop_only, 'stop_only_capability')
         material = getattr(self, "key_material", None)
         require(material is not None and material.path == self.config.state_dir / ".env"
                 and material.prepared_monotonic == self.grant.keys_prepared_monotonic, "foreign_key_material")

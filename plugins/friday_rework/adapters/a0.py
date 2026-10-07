@@ -57,6 +57,71 @@ def input_path(row, index, suffix=".bin"):
     return f"/a0/usr/uploads/{job_prefix(row)}-input-{index}{suffix}"
 
 
+def read_retained_result(row, prepared, grant, expected_files, staging_root, max_file_bytes):
+    """Pure retained bytes/provenance verification; no keys, HTTP or restart."""
+    _validate_store({"schema_version": 1, "jobs": {row["existing_task_id"]: row}})
+    root = _private(row["workspace_reference"])
+    require(isinstance(prepared, PreparedNative)
+            and prepared.receipt_reference == str(root / "a0-prepared.json"), "foreign_preparation")
+    receipt = _json(root / "a0-prepared.json")
+    require(set(receipt) == {"identity", "context_id", "container_id", "invocation_id", "native_grant", "inputs", "outputs"}
+            and receipt["identity"] == _identity(row) and receipt["context_id"] == prepared.reference
+            and receipt["container_id"] == grant.container_id
+            and receipt["invocation_id"] == grant.invocation_id
+            and receipt["native_grant"] == asdict(grant)
+            and receipt["outputs"] == [asdict(v) for v in expected_files], "preparation_changed")
+    require(isinstance(expected_files, tuple) and 0 < len(expected_files) <= 16
+            and all(isinstance(v, ExpectedFile) for v in expected_files) and type(max_file_bytes) is int
+            and 0 < max_file_bytes <= 16*1024**2, "invalid_retained_bounds")
+    prefix = job_prefix(row)
+    for value in expected_files:
+        path = PurePosixPath(value.worker_path)
+        require(str(path) == value.worker_path
+                and path.parent.as_posix() == '/a0/usr/workdir/' + prefix
+                and re.fullmatch(prefix + r'-[A-Za-z0-9_.-]{1,96}', path.name)
+                and isinstance(value.logical_name, str) and 0 < len(value.logical_name) <= 512
+                and isinstance(value.media_type, str) and 0 < len(value.media_type) <= 256,
+                'invalid_expected_file')
+    require(len({v.worker_path for v in expected_files}) == len(expected_files)
+            and len({v.logical_name for v in expected_files}) == len(expected_files), 'duplicate_basename')
+    native = row.get("native")
+    require(native is None or native == {"invocation_id": grant.invocation_id,
+        "worker_reference": "a0:" + grant.container_id + ":" + prepared.reference}, "foreign_retained_native")
+    require(_json(root / "inputs-verified.json") == {"receipt_sha256":
+        hashlib.sha256((root / "a0-prepared.json").read_bytes()).hexdigest()}, "inputs_not_verified")
+    response = _json(root / "worker-response.json")
+    require(isinstance(response, dict) and response.get("context_id") == prepared.reference
+            and isinstance(response.get("response"), str), "foreign_worker_response")
+    result = _json(root / "a0-result.json")
+    require(set(result) == {"artifacts", "identity", "outputs", "context_id", "stop_confirmed", 'worker_response_sha256',
+                            "goal_verification", "delivery"}
+            and result.get("identity") == _identity(row)
+            and result.get("outputs") == receipt["outputs"]
+            and result.get("goal_verification") == result.get("delivery") == "NOT_RUN"
+            and result.get("context_id") == prepared.reference and result.get("stop_confirmed") is True,
+            "result_requires_reconciliation")
+    require(result['worker_response_sha256'] == hashlib.sha256((root / 'worker-response.json').read_bytes()).hexdigest(),
+            'worker_response_changed')
+    values = result["artifacts"]
+    fields = set(StagedArtifact.__dataclass_fields__)
+    require(isinstance(values, list) and len(values) == len(receipt["outputs"])
+            and all(isinstance(v, dict) and set(v) == fields for v in values), "incomplete_result_manifest")
+    items = tuple(StagedArtifact(**v) for v in values)
+    require(len({v.reference for v in items}) == len(items)
+            and len({v.logical_name for v in items}) == len(items), "duplicate_result_artifact")
+    total = 0
+    for item, expected in zip(items, receipt["outputs"]):
+        require(item.logical_name == expected["logical_name"] and item.media_type == expected["media_type"]
+                and item.origin_reference == str(root / "worker-response.json")
+                and item.complete is True and item.verification == "verified"
+                and type(item.size_bytes) is int and 0 <= item.size_bytes <= max_file_bytes,
+                "foreign_or_incomplete_result_artifact")
+        total += item.size_bytes; require(total <= max_file_bytes, "outputs_too_large")
+        read_staged(staging_root=staging_root, artifact=item, max_bytes=max_file_bytes)
+    return items
+
+
+
 class A0Adapter:
     def __init__(self, config: A0HostConfig, boundary: A0NativeBoundary, *, clock=time.time):
         self.config, self.boundary, self.clock = config, boundary, clock
@@ -285,6 +350,7 @@ class A0Adapter:
             _write(root / "a0-result.json", {"artifacts": [asdict(v) for v in staged],
                    "identity": _identity(row), "outputs": receipt["outputs"],
                    "context_id": prepared.reference, "stop_confirmed": True,
+                   'worker_response_sha256': hashlib.sha256((root / 'worker-response.json').read_bytes()).hexdigest(),
                    "goal_verification": "NOT_RUN", "delivery": "NOT_RUN"})
             return self._obs(row, prepared.reference, root / "a0-result.json", "completed")
         except BaseException as error:
@@ -293,32 +359,9 @@ class A0Adapter:
             self.inflight = False
 
     def artifacts(self, association, prepared):
-        row, root, receipt = self._prepared(association, prepared)
-        result = _json(root / "a0-result.json")
-        require(set(result) == {"artifacts", "identity", "outputs", "context_id", "stop_confirmed",
-                                "goal_verification", "delivery"}
-                and result.get("identity") == _identity(row)
-                and result.get("outputs") == receipt["outputs"]
-                and result.get("goal_verification") == result.get("delivery") == "NOT_RUN"
-                and result.get("context_id") == prepared.reference and result.get("stop_confirmed") is True,
-                "result_requires_reconciliation")
-        values = result["artifacts"]
-        fields = set(StagedArtifact.__dataclass_fields__)
-        require(isinstance(values, list) and len(values) == len(receipt["outputs"])
-                and all(isinstance(v, dict) and set(v) == fields for v in values), "incomplete_result_manifest")
-        items = tuple(StagedArtifact(**v) for v in values)
-        require(len({v.reference for v in items}) == len(items)
-                and len({v.logical_name for v in items}) == len(items), "duplicate_result_artifact")
-        total = 0
-        for item, expected in zip(items, receipt["outputs"]):
-            require(item.logical_name == expected["logical_name"] and item.media_type == expected["media_type"]
-                    and item.origin_reference == str(root / "worker-response.json")
-                    and item.complete is True and item.verification == "verified"
-                    and type(item.size_bytes) is int and 0 <= item.size_bytes <= self.config.max_file_bytes,
-                    "foreign_or_incomplete_result_artifact")
-            total += item.size_bytes; require(total <= self.config.max_file_bytes, "outputs_too_large")
-            read_staged(staging_root=self.config.staging_root, artifact=item, max_bytes=self.config.max_file_bytes)
-        return items
+        row, _ = self._row(association)
+        return read_retained_result(row, prepared, self.boundary.grant, self._outputs(row),
+                                    self.config.staging_root, self.config.max_file_bytes)
 
     def observe(self, association, prepared):
         row, root, _ = self._prepared(association, prepared)
