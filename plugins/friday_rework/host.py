@@ -382,6 +382,49 @@ class WorkerHost:
         with self.store.lock_budget():
             return self._control_bounded(command, raw_args)
 
+    def admin_control(self, profile, reference, action, verify):
+        """Separate verified admin entry to the same original control operation.
+
+        No admitted Telegram receipt is synthesized. Ownership comes from the
+        exact durable row in this already loaded host, never request strings.
+        """
+        from .host_record import validate_host_record
+        if (action not in ("status", "pause", "cancel") or self._closed
+                or Path(self.store.state.data_dir) != self._state_directory):
+            raise HostUnavailable("owning_host_unavailable")
+        with self.store.lock_budget():
+            verify()
+            try:
+                row = self.store.snapshot().get(reference)
+            except (ValueError, RuntimeError, OSError) as error:
+                # An authenticated exact stop cannot wait for damaged metadata.
+                # This is the existing host's checked cache, not new authority.
+                cached = self._owned.get(reference)
+                if (action in ("pause", "cancel") and cached is not None
+                        and (cached["owner"]["profile"] or "default") == profile):
+                    validate_host_record(cached)
+                    verify()
+                    try:
+                        # The original stop path still attempts to retain intent
+                        # before exact-native stop and has its own emergency
+                        # cleanup if this write is also unavailable.
+                        self._stop(copy.deepcopy(cached), "cancel" if action == "cancel" or cached["stop_intent"] == "cancel" else "pause")
+                    except (ValueError, RuntimeError, OSError) as stop_error:
+                        error.add_note("owned administrative stop unconfirmed: " + type(stop_error).__name__)
+                raise
+            if row is None or (row["owner"]["profile"] or "default") != profile:
+                raise PermissionError("foreign_host_task")
+            validate_host_record(row)
+            from hermes_cli.plugins_state import PluginState
+            if Path(PluginState("friday_rework").data_dir) != self._state_directory:
+                raise PermissionError("foreign_host_home")
+            self._remember(row)
+            verify()  # Expiry/revocation after store acquisition cannot authorize stop.
+            if row["host"]["quiescence"] is not None:
+                return status(row)  # Retained pause/cancel never becomes resume.
+            return status(self._reconcile(row) if action == "status" else
+                          self._stop(row, "cancel" if action == "cancel" or row["stop_intent"] == "cancel" else "pause"))
+
     @staticmethod
     def _matches_control(row, principal, receipt):
         return ("host" in row and row["host"]["quiescence"] is None
@@ -476,6 +519,12 @@ class WorkerHost:
 def register_host(ctx, admission):
     host = WorkerHost(ctx, admission)
     ctx.on_unload(host.close)
+    from .admin_controls import host_command
+    # Owner-leased callback in the existing native PluginManager. Opaque tokens
+    # never become chat command text. Old native versions retain normal workers
+    # and explicitly lack this new protected control capability.
+    if callable(getattr(ctx, "register_gateway_control", None)):
+        ctx.register_gateway_control("friday-admin-control", host_command(host))
     if callable(getattr(ctx, "get_command_context", None)):
         for command in ("friday-stop", "friday-pause", "friday-status"):
             def handler(raw_args, name=command):

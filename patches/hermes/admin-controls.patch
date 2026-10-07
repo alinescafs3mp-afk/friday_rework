@@ -1,0 +1,766 @@
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5669,8 +5669,10 @@
+             except concurrent.futures.TimeoutError:
+                 return {"multiplex": True, "pending": True, "served_profiles": runner.served_profile_names()}
+
++        from hermes_cli.plugins_gateway_control import plugin_control_verb
+         _control_server = GatewayControlServer(
+-            verb_handlers={"pause-for-update": _pause_for_update_handler,
++            verb_handlers={"plugin-control": plugin_control_verb(runner, _main_loop),
++                           "pause-for-update": _pause_for_update_handler,
+                            "rescan-profiles": _rescan_profiles_handler,
+                            "unserve-profile": unserve_profile_verb(runner),
+                            "serve-profile": serve_profile_verb(runner),
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -646,6 +646,12 @@
+         return register_command(self, name, handler, description, args_hint, argument_mode, gateway_control,
+                                 native_controls)
+
++    @_serialized_replacement
++    def register_gateway_control(self, name: str, handler: Callable) -> Optional[PluginRegistration]:
++        """Lease a consented local-control callback; never a chat command."""
++        from hermes_cli.plugins_gateway_control import register_gateway_control
++        return register_gateway_control(self, name, handler)
++
+     def get_command_context(self) -> Optional[dict]:
+         from hermes_cli.plugin_command_context import get_command_context
+         return get_command_context(self)
+@@ -1172,6 +1178,7 @@
+         self._plugin_platform_names: Set[str] = set()
+         self._cli_commands: Dict[str, dict] = {}
+         self._plugin_commands: Dict[str, dict] = {}
++        self._gateway_verb_handlers: Dict[str, dict] = {}  # Owner-leased local controls; not chat commands.
+         self._gateway_control_names: Set[str] = set()  # Retired controls must never become agent input.
+         self._retired_native_controls: Dict[object, tuple] = {}  # Metadata only, scoped to this manager's lifetime.
+         self._system_prompt_sections: Dict[str, PluginSystemPromptSection] = {}
+diff --git a/hermes_cli/plugins_gateway_control.py b/hermes_cli/plugins_gateway_control.py
+new file mode 100644
+--- /dev/null
++++ b/hermes_cli/plugins_gateway_control.py
+@@ -0,0 +1,70 @@
++"""Consented local plugin controls on the existing gateway socket/owner registry."""
++import asyncio
++import concurrent.futures
++import json
++import re
++from hermes_constants import get_process_hermes_home, set_hermes_home_override, reset_hermes_home_override
++
++
++def plugin_control_verb(runner, loop):
++    launch_home = get_process_hermes_home()
++    def handler(params):
++        # Never return native exception messages: a provider may include a token.
++        async def dispatch():
++            def invoke():
++                try:
++                    from hermes_cli.profiles import get_profile_dir
++                    from hermes_cli.plugins import get_plugin_manager
++                    if not isinstance(params, dict) or set(params) != {"profile", "plugin", "control", "arguments"}:
++                        return {"accepted": False, "error": "invalid_admin_control"}
++                    token = set_hermes_home_override(launch_home)
++                    try:
++                        if params["profile"] not in runner.served_profile_names():
++                            return {"accepted": False, "error": "owning_profile_unavailable"}
++                        home = get_profile_dir(params["profile"])
++                    finally:
++                        reset_hermes_home_override(token)
++                    token = set_hermes_home_override(home)
++                    try:
++                        manager = get_plugin_manager()
++                        # Look only at the native registry's ALREADY loaded owner.
++                        # Do not call discover/load: this must never create a host.
++                        loaded = manager._plugins.get(params["plugin"])
++                        entry = manager._gateway_verb_handlers.get(params["plugin"] + ":" + params["control"])
++                        if not loaded or not loaded.enabled or not entry or entry["plugin_key"] != params["plugin"]:
++                            return {"accepted": False, "error": "owning_host_not_loaded"}
++                        arguments = params["arguments"]
++                        if not isinstance(arguments, dict) or "profile" in arguments:
++                            return {"accepted": False, "error": "invalid_owning_arguments"}
++                        result = entry["handler"](json.dumps({"profile": params["profile"], **arguments}))
++                        return result if isinstance(result, dict) else {"accepted": False, "error": "invalid_owning_response", "execution": "UNKNOWN"}
++                    finally:
++                        reset_hermes_home_override(token)
++                except Exception:
++                    return {"accepted": False, "error": "owning_control_unconfirmed", "execution": "UNKNOWN"}
++            # Same gateway loop/executor; the registered callback separately
++            # restores its actual native owner context and re-verifies authority.
++            return await asyncio.to_thread(invoke)
++        try:
++            future = asyncio.run_coroutine_threadsafe(dispatch(), loop)
++            return future.result(timeout=1.5)
++        except concurrent.futures.TimeoutError:
++            # No future cancellation/false cessation. Stop may still be in flight.
++            return {"accepted": False, "error": "owning_control_pending", "execution": "UNKNOWN"}
++        except Exception:
++            return {"accepted": False, "error": "owning_gateway_unavailable", "execution": "UNKNOWN"}
++    return handler
++
++
++def register_gateway_control(context, name, handler):
++    """Existing native consent and owner lease, shared by all local-control plugins."""
++    from hermes_cli.config import load_config_readonly
++    entry = (load_config_readonly().get("plugins") or {}).get("entries", {}).get(context.plugin_id, {})
++    if entry.get("allow_gateway_control") is not True:
++        return None
++    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name) or not callable(handler):
++        raise ValueError("Invalid native gateway control registration")
++    return context._register_entry("gateway_control", context.plugin_id + ":" + name, context._manager._gateway_verb_handlers,
++        {"handler": handler, "plugin": context.manifest.name, "plugin_key": context.plugin_id},
++        "Plugin %s registered protected gateway control: %s", name)
++
+--- a/hermes_cli/plugin_isolation.py
++++ b/hermes_cli/plugin_isolation.py
+@@ -33,6 +33,7 @@
+ # raw platform SDK clients, argparse parsers, adapter classes bound to the gateway's event loop, the
+ # launch-scope dashboard auth registry. A plugin calling one of these runs only in-process.
+ HOST_UNSUPPORTED_CTX_METHODS: Dict[str, str] = {
++    "register_gateway_control": "local control belongs to the already loaded gateway owner",
+     "get_command_context": "authenticated control context lives only in the native gateway dispatch",
+     "register_platform": "platform adapters run on the gateway's event loop with native SDK clients",
+     "register_platform_handler": "the handler factory receives the platform's native SDK client",
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -283,15 +283,17 @@
+
+
+ @contextlib.contextmanager
+-def _jobs_lock():
++def _jobs_lock(*, strict: bool = False):
+     """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
+     threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
+     otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
+     reuse the held lock. Without a flock backend, or on flock timeout (logged loudly), it
+     degrades to in-process-only locking: a briefly torn cross-process write beats a dead
+-    scheduler."""
++    scheduler. ``strict=True`` administrative callers refuse degraded locks."""
+     depth = getattr(_jobs_lock_state, "depth", 0)
+     if depth:
++        if strict and not getattr(_jobs_lock_state, "cross_process", False):
++            raise RuntimeError("strict_cron_lock_unavailable")
+         _jobs_lock_state.depth = depth + 1
+         try:
+             yield
+@@ -307,12 +309,19 @@
+         # See #80703.
+         _jobs_lock_state.load_stamp = None
+         lock_fd = None
++        _jobs_lock_state.cross_process = False
+         try:
+             try:
+                 ensure_dirs()
+                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8-sig")
+                 lock_fd.seek(0)
+-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
++                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
++                _jobs_lock_state.cross_process = acquired is True
++                if strict and acquired is not True:
++                    if acquired is False:
++                        raise TimeoutError("strict_cron_lock_timeout")
++                    raise RuntimeError("strict_cron_lock_unavailable")
++                if acquired is False:
+                     logger.error(
+                         "Timed out after %.0fs waiting for the cron "
+                         "jobs lock (%s) — another process is holding "
+@@ -323,15 +332,20 @@
+                         lock_fd.close()
+                     lock_fd = None
+             except (OSError, IOError) as e:
++                if strict:
++                    raise
+                 # A locking failure must never take down cron writes — in-process lock still held.
+                 logger.warning("jobs.json cross-process lock unavailable (%s); "
+                                "proceeding with in-process lock only", e)
+-            try:
+-                yield
+-            finally:
+-                if lock_fd is not None:
++            yield
++        finally:
++            if lock_fd is not None:
++                if _jobs_lock_state.cross_process:
+                     _release_flock(lock_fd)
+-        finally:
++                else:
++                    with contextlib.suppress(OSError):
++                        lock_fd.close()
++            _jobs_lock_state.cross_process = False
+             _jobs_lock_state.depth = 0
+             _jobs_lock_state.load_stamp = None
+
+@@ -1624,11 +1638,11 @@
+
+
+ def _with_job(
+-    job_id: Any, fn: Callable[[List[Dict[str, Any]], int, Dict[str, Any]], Any], missing: Any = None
++    job_id: Any, fn: Callable[[List[Dict[str, Any]], int, Dict[str, Any]], Any], missing: Any = None, *, strict_lock: bool = False
+ ) -> Any:
+     """Run ``fn(jobs, i, job)`` on the first match under ``_jobs_lock()``; ``fn`` saves. *missing*
+     if none."""
+-    with _jobs_lock():
++    with _jobs_lock(strict=strict_lock):
+         jobs = load_jobs()
+         for i, job in enumerate(jobs):
+             if job.get("id") == job_id:
+@@ -2107,7 +2121,9 @@
+     updated["next_run_at"] = next_run
+
+
+-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
++def update_job(job_id: str, updates: Dict[str, Any], *,
++               before_write: Optional[Callable[[], None]] = None,
++               strict_lock: bool = False) -> Optional[Dict[str, Any]]:
+     """Update a job by ID, refreshing derived schedule fields when needed."""
+     # ``id`` is a path component under OUTPUT_DIR — changing it would leak path-escape values.
+     bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
+@@ -2142,14 +2158,20 @@
+             updated.pop("pending_slot", None)
+         _fill_missing_next_run(updated)
+         _reject_terminal_activation(job, updated, job_id)
++        # Administrative callers retain their current authority until the
++        # existing locked mutation, after reads/normalization and before save.
++        if before_write is not None:
++            before_write()
+         jobs[i] = updated
+         save_jobs(jobs)
+         return _normalize_job_record(updated)
+
+-    return _with_job(job_id, apply)
+-
+-
+-def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
++    return _with_job(job_id, apply, strict_lock=strict_lock)
++
++
++def pause_job(job_id: str, reason: Optional[str] = None, *,
++              before_write: Optional[Callable[[], None]] = None,
++               strict_lock: bool = False) -> Optional[Dict[str, Any]]:
+     """Pause a job without deleting it. Accepts a job ID or name."""
+     job = resolve_job_ref(job_id)
+     if not job:
+@@ -2159,10 +2181,12 @@
+         "state": "paused",
+         "paused_at": _hermes_now().isoformat(),
+         "paused_reason": reason,
+-    })
+-
+-
+-def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
++    }, before_write=before_write, strict_lock=strict_lock)
++
++
++def resume_job(job_id: str, *,
++               before_write: Optional[Callable[[], None]] = None,
++               strict_lock: bool = False) -> Optional[Dict[str, Any]]:
+     """Resume a paused job. Accepts a job ID or name.
+
+     A recurring job paused across one of its slots must not lose that slot silently: the stored
+@@ -2199,7 +2223,7 @@
+         "paused_at": None,
+         "paused_reason": None,
+         "next_run_at": next_run_at,
+-    })
++    }, before_write=before_write, strict_lock=strict_lock)
+
+
+ def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[Dict[str, Any]]:
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -2073,7 +2073,31 @@
+     return omitted
+
+
+-def _write_config_state(
++@contextmanager
++def config_write_transaction(config_path: Path):
++    """Serialize native config commits and administrative read/CAS/write.
++
++    Reuse the native reentrant file-lock implementation and per-path holder.
++    Lock ordering is always the configuration RLock, then this file lock.
++    The plugin-state lock remains independent; it is never acquired here.
++    """
++    from hermes_cli.auth import _file_lock
++    config_path = Path(config_path)
++    with _CONFIG_LOCK, _file_lock(
++        config_path.with_name(config_path.name + ".lock"),
++        _env_write_lock_holder(config_path), 2.0,
++        "Timed out waiting for the native configuration write lock",
++    ):
++        yield
++
++
++def _write_config_state(*args, **kwargs):
++    config_path = args[0] if args else kwargs["config_path"]
++    with config_write_transaction(config_path):
++        return _write_config_state_unlocked(*args, **kwargs)
++
++
++def _write_config_state_unlocked(
+     config_path: Path, data: Dict[str, Any], *, allow_omissions: bool,
+     extra_content_on_create: Optional[str] = None,
+ ) -> None:
+@@ -2520,35 +2544,36 @@
+             return
+
+         config_path = get_config_path()
+-        _refuse_failed_read(config_path, config)
+-        config = _strip_managed_keys_for_save(config)
+-
+-        ensure_hermes_home()
+-        # Explicit user paths come from the RAW dict BEFORE normalisation (which may inject
+-        # agent.max_turns) so _strip_default_values keeps exactly what the user set. The
+-        # fail-closed read is the single authority here: ``read_raw_config()`` is cached and
+-        # swallows transient stat/open errors into ``{}``, and a ``{}`` at this point makes the
+-        # strip pass drop every user section whose value matches a default (#113301).
+-        _raw_for_paths = require_readable_config_before_write(config_path)
+-        if merge_existing and _raw_for_paths:
+-            config = _merge_partial_save(_raw_for_paths, config)
+-
+-        current_normalized = _canonicalize_config(config)
+-        normalized = current_normalized
+-        if _raw_for_paths:
+-            normalized = _preserve_env_ref_templates(
+-                normalized, _canonicalize_config(_raw_for_paths),
+-                _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)))
+-
+-        if strip_defaults:
+-            # ``_strip_default_values`` always preserves ``_config_version`` itself.
+-            effective_preserve_keys = _explicit_config_paths(_raw_for_paths) | set(preserve_keys or ())
+-            normalized = _strip_default_values(normalized, DEFAULT_CONFIG, preserve_keys=effective_preserve_keys)
+-
+-        atomic_config_replace(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized))
+-        _secure_file(config_path)
+-        _RAW_CONFIG_CACHE.pop(str(config_path), None)
+-        _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
++        with config_write_transaction(config_path):
++            _refuse_failed_read(config_path, config)
++            config = _strip_managed_keys_for_save(config)
++
++            ensure_hermes_home()
++            # Explicit user paths come from the RAW dict BEFORE normalisation (which may inject
++            # agent.max_turns) so _strip_default_values keeps exactly what the user set. The
++            # fail-closed read is the single authority here: ``read_raw_config()`` is cached and
++            # swallows transient stat/open errors into ``{}``, and a ``{}`` at this point makes the
++            # strip pass drop every user section whose value matches a default (#113301).
++            _raw_for_paths = require_readable_config_before_write(config_path)
++            if merge_existing and _raw_for_paths:
++                config = _merge_partial_save(_raw_for_paths, config)
++
++            current_normalized = _canonicalize_config(config)
++            normalized = current_normalized
++            if _raw_for_paths:
++                normalized = _preserve_env_ref_templates(
++                    normalized, _canonicalize_config(_raw_for_paths),
++                    _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)))
++
++            if strip_defaults:
++                # ``_strip_default_values`` always preserves ``_config_version`` itself.
++                effective_preserve_keys = _explicit_config_paths(_raw_for_paths) | set(preserve_keys or ())
++                normalized = _strip_default_values(normalized, DEFAULT_CONFIG, preserve_keys=effective_preserve_keys)
++
++            atomic_config_replace(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized))
++            _secure_file(config_path)
++            _RAW_CONFIG_CACHE.pop(str(config_path), None)
++            _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+     from hermes_cli.observability.shared_metrics_disabled import record_config_saved
+     record_config_saved(_raw_for_paths, current_normalized)
+
+--- a/agent/skill_utils.py
++++ b/agent/skill_utils.py
+@@ -261,8 +261,12 @@
+ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
+     """Disabled skill names from config.yaml: global list ∪ platform list
+     (*platform* defaults to ``HERMES_PLATFORM`` / ``HERMES_SESSION_PLATFORM``)."""
+-    skills_cfg = _skills_cfg()
+-    if skills_cfg is None:
++    # Use the same administrator overlay as effective native configuration.
++    # Read-only merge; never mutate or persist the shared raw cache.
++    from hermes_cli.config import _merge_managed_overlay
++    effective, _ = _merge_managed_overlay(_load_raw_config())
++    skills_cfg = effective.get("skills")
++    if not isinstance(skills_cfg, dict):
+         return set()
+     from gateway.session_context import get_session_env
+     resolved_platform = platform or os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM")
+diff --git a/tests/hermes_cli/test_skills_config.py b/tests/hermes_cli/test_skills_config.py
+--- a/tests/hermes_cli/test_skills_config.py
++++ b/tests/hermes_cli/test_skills_config.py
+@@ -44,12 +44,13 @@
+ class TestIsSkillDisabled:
+
+
+-    @patch("hermes_cli.config.load_config")
+-    def test_platform_disabled(self, mock_load):
+-        mock_load.return_value = {"skills": {
++    def test_platform_disabled(self, tmp_path, monkeypatch):
++        import json
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        (tmp_path / "config.yaml").write_text(json.dumps({"skills": {
+             "disabled": ["a/one"],
+             "platform_disabled": {"telegram": ["tg-skill"]}
+-        }}
++        }}))
+         from tools.skills_tool import _is_skill_disabled
+         assert _is_skill_disabled("tg-skill", platform="telegram") is True
+         # Any of several identifiers (declared name, duplicate's load path) disables.
+@@ -59,12 +60,13 @@
+
+
+
+-    @patch("hermes_cli.config.load_config")
+-    @patch.dict("os.environ", {"HERMES_PLATFORM": "discord"})
+-    def test_env_var_platform(self, mock_load):
+-        mock_load.return_value = {"skills": {
++    def test_env_var_platform(self, tmp_path, monkeypatch):
++        import json
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        monkeypatch.setenv("HERMES_PLATFORM", "discord")
++        (tmp_path / "config.yaml").write_text(json.dumps({"skills": {
+             "platform_disabled": {"discord": ["discord-skill"]}
+-        }}
++        }}))
+         from tools.skills_tool import _is_skill_disabled
+         assert _is_skill_disabled("discord-skill") is True
+
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -14,7 +14,6 @@
+
+ from hermes_constants import get_hermes_home
+ from tools.registry import registry, tool_error
+-from hermes_cli.config import cfg_get
+ from agent.skill_utils import (
+     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS, is_skill_support_path as _is_skill_support_path)
+ from tools.skills_tool_setup import (  # noqa: F401
+@@ -25,7 +24,8 @@
+     _mark_background_review_read, _preprocess_skill, _read_skill_text, _safe_frontmatter,
+     _serve_plugin_skill, _serve_skill_file, _truncate_description)
+ from tools.skills_tool_dedup import (  # noqa: F401
+-    _check_skill_view_dedup, _record_skill_view, reset_skill_view_dedup)
++    _check_skill_view_dedup, _record_skill_view, reset_skill_view_dedup,
++    _skill_view_identity, _invalidate_skill_view_policy)
+ from tools.skill_provenance import is_background_review
+
+ logger = logging.getLogger(__name__)
+@@ -154,24 +154,12 @@
+
+
+ def _is_skill_disabled(*names: str, platform: str = None) -> bool:
+-    """Any of *names* disabled in config (one config load)? Platform precedence: explicit arg,
+-    ``HERMES_PLATFORM``, session ``HERMES_SESSION_PLATFORM``. A globally-disabled skill stays disabled on every platform
+-    (keep in sync with agent.skill_utils.get_disabled_skill_names)."""
+-    try:
+-        from hermes_cli.config import load_config
+-        skills_cfg = load_config().get("skills", {})
+-        resolved_platform = platform or os.getenv("HERMES_PLATFORM")
+-        if not resolved_platform:
+-            with suppress(Exception):
+-                from gateway.session_context import get_session_env
+-                resolved_platform = get_session_env("HERMES_SESSION_PLATFORM") or ""
+-        platform_disabled = None
+-        if resolved_platform:
+-            platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
+-        disabled = skills_cfg.get("disabled", [])
+-        return any((platform_disabled is not None and n in platform_disabled) or n in disabled for n in names)
+-    except Exception:
+-        return False
++    """Use the catalog's effective normalized policy, including managed and
++    platform denials and essential-name exemptions. Callers pass the declared
++    name and only the resolved load name belonging to this copy; entries remain
++    literal, never wildcard patterns. Reader failures propagate before serving.
++    """
++    return not _get_disabled_skill_names(platform).isdisjoint(names)
+
+
+ def _skill_search_dirs() -> Tuple[List[Tuple[int, Path]], Path]:
+@@ -275,7 +263,7 @@
+         return tool_error(str(e), success=False)
+
+
+-def _resolve_plugin_skill(name, file_path, task_id, preprocess):
++def _resolve_plugin_skill(name, file_path, task_id, preprocess, dedup_task_id=None):
+     """``plugin:skill`` dispatch: ``(result_json, None)`` when answered, else ``(None,
+     local_category_name)`` to fall through to the flat-tree scan — categorized local skills also use
+     ``category:skill`` in config/gateway prompts, so the on-disk ``category/skill`` form returns."""
+@@ -310,7 +298,8 @@
+             f"has been cleaned up — try again after the plugin is reloaded."), None
+     if plugin_skill_md is not None:
+         return _serve_plugin_skill(
+-            plugin_skill_md, namespace, bare, file_path=file_path, preprocess=preprocess, session_id=task_id), None
++            plugin_skill_md, namespace, bare, file_path=file_path, preprocess=preprocess,
++            session_id=task_id, dedup_task_id=dedup_task_id), None
+     if available := pm.list_plugin_skills(namespace):  # plugin exists but this specific skill is missing
+         return _fail(
+             f"Skill '{bare}' not found in plugin '{namespace}'.",
+@@ -548,7 +537,8 @@
+
+
+ def skill_view(
+-    name: str, file_path: str = None, task_id: str = None, preprocess: bool = True) -> str:
++    name: str, file_path: str = None, task_id: str = None, preprocess: bool = True,
++    *, dedup_task_id: str = None) -> str:
+     """View a skill (SKILL.md) or a file within its directory, as JSON. ``name`` is a skill name
+     or path ("axolotl", "03-fine-tuning/axolotl"); "plugin:skill" resolves plugin-provided
+     skills. ``preprocess`` applies the configured SKILL.md template / inline shell rendering;
+@@ -560,7 +550,7 @@
+             return _fail(lookup_error, hint=_LOOKUP_HINT)
+         local_category_name: str | None = None
+         if ":" in name:  # plugin registry; bare names use the flat-tree scan below
+-            served, local_category_name = _resolve_plugin_skill(name, file_path, task_id, preprocess)
++            served, local_category_name = _resolve_plugin_skill(name, file_path, task_id, preprocess, dedup_task_id)
+             if served is not None:
+                 return served
+         # The fall-through form (namespace/bare) joins onto each search dir too; re-validate it
+@@ -587,10 +577,14 @@
+         if _is_skill_disabled(resolved_name, rel) and (_is_skill_disabled(resolved_name) or any(
+                 e["path"] == skill_md and e["load_name"] == rel for e in _skill_catalog(skip_disabled=True, include_hidden=True))):
+             return _fail(f"Skill '{resolved_name}' is disabled. Enable it with `hermes skills` or inspect the files directly on disk.")
++        identity = _skill_view_identity(skill_md)
+         if file_path and skill_dir:
+             return _serve_skill_file(
+                 skill_dir, file_path, name, list_available=True, mark_read=True,
+-                hint="Use a relative path within the skill directory")
++                hint="Use a relative path within the skill directory",
++                dedup_task_id=dedup_task_id, skill_identity=identity)
++        if (stub := _check_skill_view_dedup(dedup_task_id, identity, None)) is not None:
++            return stub
+         # tags/related_skills: metadata.hermes.* (agentskills.io) first, then top-level.
+         metadata = frontmatter.get("metadata")
+         hermes_meta = (metadata.get("hermes", {}) or {}) if isinstance(metadata, dict) else {}
+@@ -640,7 +634,7 @@
+             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'" if linked_files else None,
+             **readiness,
+             # Internal: absolute source path for the repeat-view dedup fingerprint.
+-            "_source_path": str(skill_md),
++            "_source_path": str(skill_md), "_skill_identity": identity,
+             **readiness_extras}
+         if deps_note:
+             result["deps_note"] = deps_note
+@@ -705,9 +699,9 @@
+     # possibly-pruned transcript copy (#95976). No dedup in the fork; None also keeps its views
+     # out of the parent's bucket.
+     dedup_task_id = None if is_background_review() else task_id
+-    if (stub := _check_skill_view_dedup(dedup_task_id, name, args.get("file_path"))) is not None:
+-        return stub
+-    result = skill_view(name, file_path=args.get("file_path"), task_id=task_id)
++    _invalidate_skill_view_policy(dedup_task_id)
++    result = skill_view(name, file_path=args.get("file_path"), task_id=task_id,
++                        dedup_task_id=dedup_task_id)
+     with suppress(Exception):
+         parsed = json.loads(result)
+         if isinstance(parsed, dict) and parsed.get("success"):
+diff --git a/tools/skills_tool_dedup.py b/tools/skills_tool_dedup.py
+--- a/tools/skills_tool_dedup.py
++++ b/tools/skills_tool_dedup.py
+@@ -1,4 +1,4 @@
+-"""skill_view repeat-view dedup registry: per-task cache of (skill name, file_path) ->
++"""skill_view repeat-view dedup registry: per-task cache of (canonical copy, file_path) ->
+ (skill file mtime+size). A repeat view of an UNCHANGED file returns a short stub — the earlier
+ tool result already carries the content verbatim. Cleared via ``reset_skill_view_dedup()`` on
+ context compression AND on a committed proactive tool-result prune, because both replace the
+@@ -27,7 +27,8 @@
+         return None
+     try:
+         st = os.stat(src)
+-        return (src, st.st_mtime_ns, st.st_size)
++        from tools.skills_tool import _get_disabled_skill_names
++        return (src, st.st_mtime_ns, st.st_size, frozenset(_get_disabled_skill_names()))
+     except OSError:
+         return None
+
+@@ -41,44 +42,82 @@
+         return
+     if (fp := _skill_view_fingerprint(payload)) is None:
+         return
+-    key = (str(payload.get("name") or name), file_path or "")
++    identity = payload.get("_skill_identity")
++    if identity is None:
++        return
++    key = (tuple(identity), file_path or "")
+     with _skill_view_tracker_lock:
+         cache = _skill_view_tracker.setdefault(str(task_id), {})
+-        cache[key] = fp
++        cache[key] = (*fp, str(payload.get("name") or name))
+         while len(cache) > _SKILL_VIEW_DEDUP_CAP:  # FIFO eviction
+             del cache[next(iter(cache))]
+
+
+-def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
+-    """Dedup stub when this exact skill file was already served to this task and
+-    is unchanged on disk; None otherwise."""
++def _check_skill_view_dedup(task_id, identity, file_path) -> str | None:
++    """Check an already resolved, authorized copy, never a requested name alias.
++
++    Called by the loader after its policy/platform and support-path gates. The
++    source identity includes the owning profile and plugin registration, so an
++    unrelated homonym cannot acknowledge a denied copy or hide its real content.
++    """
+     if not task_id:
+         return None
+-    n = str(name)
++    from tools.skills_tool import _get_disabled_skill_names
++    disabled = frozenset(_get_disabled_skill_names())
++    key = (identity, file_path or "")
+     with _skill_view_tracker_lock:
+-        if not (cache := _skill_view_tracker.get(str(task_id))):
++        cache = _skill_view_tracker.get(str(task_id))
++        if not cache or key not in cache:
+             return None
+-        # Record key is the RESOLVED name; match raw and resolved forms so
+-        # 'category/skill' and bare-name views coalesce.
+-        for key, (src, mtime_ns, size) in list(cache.items()):
+-            rec_name, rec_fp = key
+-            if rec_fp != (file_path or "") or (
+-                    rec_name != n and not n.endswith("/" + rec_name)
+-                    and not rec_name.endswith("/" + n) and n.split(":")[-1] != rec_name):
+-                continue
+-            try:
+-                st = os.stat(src)
+-                changed = (st.st_mtime_ns, st.st_size) != (mtime_ns, size)
+-            except OSError:
+-                changed = True
+-            if changed:
++        src, mtime_ns, size, prior_disabled, label = cache[key]
++        if disabled != prior_disabled:
++            cache.pop(key, None)
++            return None
++        try:
++            st = os.stat(src)
++            changed = (st.st_mtime_ns, st.st_size) != (mtime_ns, size)
++        except OSError:
++            changed = True
++        if changed:
++            cache.pop(key, None)
++            return None
++        return json.dumps({
++            "success": True, "status": "unchanged", "name": label,
++            "file": file_path or "SKILL.md", "dedup": True, "content_returned": False,
++            "message": _SKILL_VIEW_DEDUP_MESSAGE}, ensure_ascii=False)
++
++
++def _invalidate_skill_view_policy(task_id) -> None:
++    """Observe policy changes even when the loader refuses before cache lookup.
++
++    This only invalidates entries; it cannot acknowledge a view. After a deny
++    followed by enable, the useful full content must be loaded again.
++    """
++    if not task_id:
++        return
++    from tools.skills_tool import _get_disabled_skill_names
++    try:
++        disabled = frozenset(_get_disabled_skill_names())
++    except Exception:
++        reset_skill_view_dedup(str(task_id))
++        raise
++    with _skill_view_tracker_lock:
++        cache = _skill_view_tracker.get(str(task_id), {})
++        for key, fingerprint in list(cache.items()):
++            if fingerprint[3] != disabled:
+                 cache.pop(key, None)
+-                return None
+-            return json.dumps({
+-                "success": True, "status": "unchanged", "name": rec_name,
+-                "file": file_path or "SKILL.md", "dedup": True, "content_returned": False,
+-                "message": _SKILL_VIEW_DEDUP_MESSAGE}, ensure_ascii=False)
+-    return None
++
++
++def _skill_view_identity(skill_md, qualified_name="") -> tuple:
++    """Resolved native copy, lexical load location and qualified registration.
++
++    Constructed without reading the skill body. Local aliases that select the
++    same copy share it; distinct duplicates and plugin registrations do not.
++    """
++    from pathlib import Path
++    from hermes_constants import get_hermes_home
++    return (str(get_hermes_home().resolve()), qualified_name,
++            str(Path(skill_md).absolute()), str(Path(skill_md).resolve()))
+
+
+ def reset_skill_view_dedup(task_id: str | None = None) -> None:
+diff --git a/tools/skills_tool_plugin.py b/tools/skills_tool_plugin.py
+--- a/tools/skills_tool_plugin.py
++++ b/tools/skills_tool_plugin.py
+@@ -67,7 +67,8 @@
+
+ def _serve_skill_file(
+     skill_root: Path, file_path: str, label: str, *, hint: str | None = None,
+-    list_available: bool = False, read_error_prefix: bool = False, mark_read: bool = False) -> str:
++    list_available: bool = False, read_error_prefix: bool = False, mark_read: bool = False,
++    dedup_task_id: str | None = None, skill_identity: tuple | None = None) -> str:
+     """Serve one linked file from a skill directory as a skill_view JSON result. ``hint``
+     decorates traversal/containment errors; ``list_available`` adds the available-files listing
+     on not-found (local); ``read_error_prefix`` wraps non-decode read errors (plugin) instead
+@@ -85,6 +86,14 @@
+             "available_files": _available_skill_files(skill_root),
+             "hint": "Use one of the available file paths listed above"}
+         return _fail(f"File '{file_path}' not found in skill '{label}'.", **listing)
++    # Bind the authorized support source without reading its body. A linked file
++    # can select a different in-root target with the same timestamp and size.
++    if skill_identity is not None:
++        skill_identity = (*skill_identity, str(target.resolve()))
++    from tools.skills_tool_dedup import _check_skill_view_dedup
++    if skill_identity is not None and (stub := _check_skill_view_dedup(
++            dedup_task_id, skill_identity, file_path)) is not None:
++        return stub
+     try:
+         content = _read_skill_text(target)
+     except UnicodeDecodeError:
+@@ -99,7 +108,8 @@
+         _mark_background_review_read(target)
+     return _json({  # _source_path: internal, feeds the repeat-view dedup fingerprint
+         "success": True, "name": label, "file": file_path, "content": content,
+-        "file_type": target.suffix, "_source_path": str(target)})
++        "file_type": target.suffix, "_source_path": str(target),
++        "_skill_identity": skill_identity})
+
+
+ def _mark_background_review_read(path: Path) -> None:
+@@ -122,25 +132,31 @@
+
+ def _serve_plugin_skill(
+     skill_md: Path, namespace: str, bare: str, file_path: str | None = None, *,
+-    preprocess: bool = True, session_id: str | None = None) -> str:
++    preprocess: bool = True, session_id: str | None = None,
++    dedup_task_id: str | None = None) -> str:
+     """Read a plugin-provided skill, apply guards, return JSON."""
+     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
+     from tools import skills_tool as _st
+     if namespace in _get_disabled_plugins():
+         return _fail(f"Plugin '{namespace}' is disabled. Re-enable with: hermes plugins enable {namespace}")
+     qualified_name = f"{namespace}:{bare}"
++    if _st._is_skill_disabled(qualified_name):
++        return _fail(f"Skill '{qualified_name}' is disabled.")
+     try:
+         content = _read_skill_text(skill_md)
+     except Exception as e:
+         return _fail(f"Failed to read skill '{qualified_name}': {e}")
+     parsed_frontmatter = _safe_frontmatter(content=content)
+-    if _st._is_skill_disabled(qualified_name):
+-        return _fail(f"Skill '{qualified_name}' is disabled.")
+     if not _st.skill_matches_platform(parsed_frontmatter):
+         return _fail(f"Skill '{qualified_name}' is not supported on this platform.",
+                      readiness_status=SkillReadinessStatus.UNSUPPORTED.value)
++    identity = _st._skill_view_identity(skill_md, qualified_name)
+     if file_path:
+-        return _serve_skill_file(skill_md.parent, file_path, qualified_name, read_error_prefix=True)
++        return _serve_skill_file(
++            skill_md.parent, file_path, qualified_name, read_error_prefix=True,
++            dedup_task_id=dedup_task_id, skill_identity=identity)
++    if (stub := _st._check_skill_view_dedup(dedup_task_id, identity, None)) is not None:
++        return stub
+     if any(p in content.lower() for p in _INJECTION_PATTERNS):
+         logger.warning(
+             "Plugin skill '%s:%s' contains patterns that may indicate prompt injection", namespace, bare)
+@@ -158,7 +174,8 @@
+         "description": _truncate_description(str(parsed_frontmatter.get("description", ""))),
+         "linked_files": _plugin_skill_linked_files(skill_md.parent),
+         "readiness_status": SkillReadinessStatus.AVAILABLE.value,
+-        "skill_dir": str(skill_md.parent), "_source_path": str(skill_md)})
++        "skill_dir": str(skill_md.parent), "_source_path": str(skill_md),
++        "_skill_identity": identity})
+
+
+ def _plugin_skill_linked_files(skill_root: Path) -> Dict[str, List[str]] | None:

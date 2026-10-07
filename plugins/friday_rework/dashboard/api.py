@@ -34,6 +34,8 @@ def require_admin(request: Request):
     if not allowed:
         raise HTTPException(403, "product_admin_required")
 
+    return request.state.session
+
 
 router = APIRouter(dependencies=[Depends(require_admin)])
 _admin = Administration()
@@ -68,6 +70,23 @@ class PairApproval(BaseModel):
     transport_profile: str = Field(min_length=1, max_length=64)
     account_id: str = Field(min_length=1, max_length=512)
     request_id: str = Field(min_length=1, max_length=128)
+
+
+class TaskControl(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["status", "pause", "cancel"]
+
+
+class SettingsChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    kind: Literal["model", "web", "toolset", "skill", "operational"]
+    values: dict = Field(max_length=8)
+
+
+class ScheduleChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["pause", "resume"]
 
 
 @router.get("/profiles")
@@ -111,6 +130,26 @@ def conversation(session_id: str, profile: str, limit: int = Query(100, ge=1, le
 @router.get("/tasks")
 def tasks(profile: str):
     return call(_admin.tasks, profile)
+
+
+@router.post("/tasks/{task_id}/control")
+def task_control(task_id: str, body: TaskControl, profile: str, session=Depends(require_admin)):
+    return call(_admin.control, profile, session, task_id, body.action)
+
+
+@router.put("/settings")
+def settings_change(body: SettingsChange, profile: str, session=Depends(require_admin)):
+    return call(_admin.write_settings, profile, body.model_dump(), session)
+
+
+@router.get("/schedules")
+def schedules(profile: str):
+    return call(_admin.schedules, profile)
+
+
+@router.post("/schedules/{job_id}/control")
+def schedule_control(job_id: str, body: ScheduleChange, profile: str, session=Depends(require_admin)):
+    return call(_admin.schedules, profile, body.action, job_id, session)
 
 
 @router.get("/attachments/{task_id}/{index}")
