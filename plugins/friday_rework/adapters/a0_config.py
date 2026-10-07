@@ -18,6 +18,7 @@ import time
 from typing import Callable
 
 from .dsh import PinnedFile, _private, _regular, _sync
+from .a0_profile import checked_profile, endpoint_urls, legacy_profile, local_endpoint, profile_templates, ProfileError
 
 
 class A0Error(RuntimeError):
@@ -41,28 +42,30 @@ class LocalNetwork:
     name: str = "none"
     endpoints: tuple[str, ...] = ()
     policy: PinnedFile | None = None
+    deployment: dict | None = None
 
     def checked(self):
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", self.name)
                 and self.name not in {"host", "bridge", "default"}, "unsafe_network")
         if self.name == "none":
-            require(not self.endpoints and self.policy is None, "network_none_mismatch")
+            require(not self.endpoints and self.policy is None and self.deployment is None, "network_none_mismatch")
         else:
-            require(len(self.endpoints) == 2 and len(set(self.endpoints)) == 2
+            require(isinstance(self.endpoints, tuple) and 2 <= len(self.endpoints) <= 3
+                    and len(set(self.endpoints)) == len(self.endpoints)
                     and isinstance(self.policy, PinnedFile), "local_policy_required")
-            from urllib.parse import urlsplit
-            for endpoint in self.endpoints:
-                u = urlsplit(endpoint)
-                try:
-                    ip = ipaddress.ip_address(u.hostname or "")
-                    valid = (ip.is_private and not ip.is_loopback and not ip.is_link_local
-                             and u.scheme == "http" and u.port in {8001, 8002}
-                             and u.path == "/v1" and not u.query and not u.fragment
-                             and not u.username and not u.password)
-                except ValueError:
-                    valid = False
-                require(valid, "nonlocal_endpoint")
-            require({urlsplit(x).port for x in self.endpoints} == {8001, 8002}, 'local_slots_required')
+            try:
+                for endpoint in self.endpoints:
+                    local_endpoint(endpoint)
+                if self.deployment is None:
+                    from urllib.parse import urlsplit
+                    require(len(self.endpoints) == 2
+                            and {urlsplit(x).port for x in self.endpoints} == {8001, 8002}, 'local_slots_required')
+                    require(all(x.startswith('http://') for x in self.endpoints), 'local_slots_required')
+                else:
+                    profile = checked_profile(self.deployment)
+                    require(set(self.endpoints) == set(endpoint_urls(profile)), 'local_profile_routes_mismatch')
+            except ProfileError as exc:
+                raise A0Error(str(exc)) from None
             self.policy.read()
         return self
 
@@ -135,18 +138,15 @@ def local_profile(network: LocalNetwork):
     network.checked()
     require(network.name != 'none', 'local_profile_needs_explicit_routes')
     from urllib.parse import urlsplit
-    endpoints = {urlsplit(x).port: x for x in network.endpoints}
-    chat = dict(provider='openai', name='dispatcher', api_base=endpoints[8001], ctx_length=40960,
-                ctx_history=.7, vision=False, rl_requests=0, rl_input=0, rl_output=0,
-                kwargs={'max_tokens':4096,'timeout':60,'a0_api_mode':'chat'})
-    utility = dict(chat); utility.pop('ctx_history'); utility['ctx_input'] = .7
-    return {'plugins/_model_config/presets.yaml': [{'name':'Default','chat':chat,'utility':utility,
-                'embedding': {'provider':'other','name':'qwen3-embedding-0.6b','api_base':endpoints[8002],
-                              'kwargs':{'timeout':30},'rl_requests':0,'rl_input':0}}],
-            'plugins/_model_config/config.json': {'model_preset':'Default'},
-            'plugins/_code_execution/config.json': {'ssh_enabled':'false'},
-            'settings.json': {'agent_profile':'agent0','workdir_path':'/a0/usr/workdir',
-                              'uvicorn_access_logs_enabled':False}}
+    if network.deployment is None:
+        endpoints = {urlsplit(x).port: x for x in network.endpoints}
+        profile = legacy_profile(endpoints[8001], endpoints[8002])
+    else:
+        profile = network.deployment
+    try:
+        return profile_templates(profile)
+    except ProfileError as exc:
+        raise A0Error(str(exc)) from None
 
 
 KEY_REFERENCES = {"API_KEY_OPENAI": "FRIDAY_LLM_API_KEY",

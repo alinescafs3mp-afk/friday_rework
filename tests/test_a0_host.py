@@ -156,7 +156,7 @@ def configure_a0(setup,proof,tmp_path,monkeypatch):
     capability=root/'capability.json'
     receipt=root/'receipt.json';destination=setup.home/'plugins/friday_rework'
     source_pins={k:pin(destination/p)['sha256'] for k,p in {'host':'host.py','host_runtime':'host_runtime.py','host_record':'host_record.py',
-        'associations':'associations.py','adapter':'adapters/a0.py','native':'adapters/a0_native.py','config':'adapters/a0_config.py'}.items()}
+        'associations':'associations.py','adapter':'adapters/a0.py','native':'adapters/a0_native.py','config':'adapters/a0_config.py','profile':'adapters/a0_profile.py'}.items()}
     receipt.write_text(json.dumps({'schema':'friday-rework.a0-runtime.v2','ready':True,'runtime_sha256':setup.record.digest(runtime),
         'source_pins':source_pins,'evidence':[pin(evidence)]}))
     runtime['runtime_receipt']=pin(receipt);setup.configure(runtime)

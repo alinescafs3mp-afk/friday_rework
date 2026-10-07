@@ -94,7 +94,8 @@ def compose_product(spec):
     Operator capabilities use native defaults. Ordinary users retain the exact
     accepted scope; this renderer cannot expand its SAFE set or admit workers.
     """
-    _exact(spec, {'profile', 'inference', 'web', 'dashboard', 'accounts', 'runtime'}, 'product')
+    _exact(spec, {'profile', 'inference', 'web', 'dashboard', 'accounts', 'runtime'} |
+           ({'a0_deployment'} if isinstance(spec, dict) and 'a0_deployment' in spec else set()), 'product')
     from hermes_cli.friday_product_access import profile_name
     # Identity validation is pure; native config imports can create home state.
     profile = profile_name(spec['profile'])
@@ -153,6 +154,16 @@ def compose_product(spec):
     config = {k: copy.deepcopy(DEFAULT_CONFIG[k]) for k in
               ('agent', 'compression', 'memory', 'skills', 'tools', 'approvals', 'delegation')}
     config.update({k: copy.deepcopy(local[k]) for k in ('model', 'providers', 'fallback_providers', 'fallback_model')})
+    if 'a0_deployment' in spec:
+        from plugins.friday_rework.adapters.a0_profile import checked_profile
+        deployment = checked_profile(spec['a0_deployment'])
+        chat = deployment['chat']
+        if (chat['endpoint'] != config['model']['base_url'] or chat['model'] != inference['model']
+                or chat['context_length'] != inference['context']
+                or chat['max_output_tokens'] != inference['main_output']
+                or inference['key_env'] != 'FRIDAY_LLM_API_KEY'):
+            raise ValueError('a0_product_inference_profile_mismatch')
+        config['a0_deployment'] = deployment
     config['auth'] = {'adopt_external_logins': False}
     config['model']['key_env'] = inference['key_env']
     route = {'provider': config['model']['provider'], 'model': inference['model'],

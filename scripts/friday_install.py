@@ -136,8 +136,19 @@ def spec_checked(value):
     hermes_web_config = importlib.import_module(name + '.web_profile').hermes_web_config
     from scripts.install_containment import checked_binary
     checked_binary(value['containment'])
-    require(set(product) == {'profile', 'inference', 'web', 'dashboard', 'accounts', 'runtime'},
+    require(set(product) == {'profile', 'inference', 'web', 'dashboard', 'accounts', 'runtime'} | ({'a0_deployment'} if 'a0_deployment' in product else set()),
             'explicit_normal_product_required')
+    if 'a0_deployment' in product:
+        spec = importlib.util.spec_from_file_location('_friday_a0_profile_validator', ROOT / 'plugins/friday_rework/adapters/a0_profile.py')
+        profile_validator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(profile_validator)
+        deployment = profile_validator.checked_profile(product['a0_deployment'])
+        selected = product['inference']
+        chat = deployment['chat']
+        require(chat['endpoint'] == selected['base_url'] and chat['model'] == selected['model']
+                and chat['context_length'] == selected['context']
+                and chat['max_output_tokens'] == selected['main_output']
+                and selected['key_env'] == 'FRIDAY_LLM_API_KEY', 'a0_product_inference_profile_mismatch')
     build_config(**product['inference'])
     require(product['web'].get('profile') == 'exa-paid'
             and set(product['web']) == {'profile', 'extract_char_limit', 'extract_timeout'}

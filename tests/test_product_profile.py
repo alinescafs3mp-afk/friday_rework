@@ -391,8 +391,9 @@ def test_actual_protected_onboarding_two_users_remain_unready_without_keys(env):
     # Existing exact native fixture; replace only installation-owned nonsecret
     # template/config. Native CAS, grant, scope and activation remain unchanged.
     from test_user_onboarding import prepare,activate,grant,home,cas,row,admitted
-    cfg=compose_product(inputs())['config'];env.cfg=cfg
-    cfg['plugins']['entries']['friday_rework']['settings']['onboarding']['templates']['approved-local']=template(compose_product(inputs()))
+    spec=inputs();spec['dashboard']['operator']['user_id']='owner'  # Exact existing fixture operator.
+    bundle=compose_product(spec);cfg=bundle['config'];env.cfg=cfg
+    cfg['plugins']['entries']['friday_rework']['settings']['onboarding']['templates']['approved-local']=template(bundle)
     (env.home/'config.yaml').write_text(json.dumps(cfg));(env.home/'config.yaml').chmod(0o600)
     for uid in ('1','2'):
         result=prepare(env,uid);assert result['enabled'] is False

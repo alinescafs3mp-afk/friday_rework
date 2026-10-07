@@ -192,8 +192,14 @@ def validate_a0_runtime(value):
         if type(value[k]) is not int or not low <= value[k] <= high:
             raise HostUnavailable('invalid_a0_bounds')
     a = value['a0']
-    if (not isinstance(a,dict) or set(a) != {'runtime','launcher','docker','daemon_unit','git_metadata','expected_files','capability','policy','owner_slot'}):
+    if (not isinstance(a,dict) or set(a) not in ({'runtime','launcher','docker','daemon_unit','git_metadata','expected_files','capability','policy','owner_slot'}, {'runtime','launcher','docker','daemon_unit','git_metadata','expected_files','capability','policy','owner_slot','deployment'})):
         raise HostUnavailable('invalid_a0_config')
+    if 'deployment' in a:
+        from .adapters.a0_profile import checked_profile
+        try:
+            checked_profile(a['deployment'])
+        except ValueError:
+            raise HostUnavailable('invalid_a0_deployment_profile') from None
     if a['owner_slot'] not in {'astra','sol'}:raise HostUnavailable('invalid_a0_operator_slot')
     for k in ('runtime','launcher','docker','daemon_unit','policy'): _pin(a[k])
     _pin(value['runtime_receipt'])
@@ -231,7 +237,7 @@ def check_a0_runtime(value, associations):
     actual = {k: hashlib.sha256((source/p).read_bytes()).hexdigest() for k,p in {
         'host':'host.py','host_runtime':'host_runtime.py','host_record':'host_record.py',
         'associations':'associations.py','adapter':'adapters/a0.py','native':'adapters/a0_native.py',
-        'config':'adapters/a0_config.py'}.items()}
+        'config':'adapters/a0_config.py','profile':'adapters/a0_profile.py'}.items()}
     if (not isinstance(receipt,dict) or set(receipt) != {'schema','ready','runtime_sha256','source_pins','evidence'}
             or receipt['schema'] != 'friday-rework.a0-runtime.v2' or receipt['ready'] is not True
             or receipt['runtime_sha256'] != digest({k:v for k,v in c.items() if k != 'runtime_receipt'})
@@ -313,6 +319,9 @@ class A0HostSession:
         pin = _pin(self.config['a0']['runtime']); data = pin.read()
         m = types.ModuleType('frw_pinned_a0_runtime');m.__file__=str(pin.path)
         exec(compile(data,str(pin.path),'exec'),m.__dict__)
+        actual_profile = Path(__file__).parent / 'adapters/a0_profile.py'
+        if hashlib.sha256(m.PROFILE_SOURCE.read_bytes()).hexdigest() != hashlib.sha256(actual_profile.read_bytes()).hexdigest():
+            raise HostUnavailable('a0_runtime_profile_source_mismatch')
         return m
 
     def _capability(self, row, pin=None):
@@ -328,6 +337,10 @@ class A0HostSession:
                 or not isinstance(v['live_evidence'],list) or not v['live_evidence']
                 or v['network']['launcher_sha256'] != self.config['a0']['launcher']['sha256']):
             raise HostUnavailable('foreign_or_stale_a0_capability')
+        # Current route authority is tied to the configured inference profile.
+        self._module().local_network(v['network'],
+            f"{self.config['a0']['owner_slot']}:{row['existing_task_id']}#1",
+            self.config['a0'].get('deployment'))
         checks = {'namespace_recheck','current_route'}
         for p in v['live_evidence']:
             proof = strict_json(_pin(p).read())
@@ -444,7 +457,10 @@ class A0HostSession:
             'unix:///run/user/1000/friday-rework-docker/docker.sock',plan['image'],
             Path(plan['state_dir']),Path(plan['git_metadata']['source']),
             ('-ceu', 'umask 077; . /ins/setup_venv.sh; . /ins/copy_A0.sh; mkdir -p /a0/usr/uploads; cd /a0; exec python run_ui.py --dockerized=true --host=127.0.0.1 --port=5000'),
-            LocalNetwork(n['id'],('http://192.168.1.78:8001/v1','http://192.168.1.78:8002/v1'),policy))
+            LocalNetwork(n['id'],
+                tuple(self._module().profile_module().endpoint_urls(a['deployment'])) if 'deployment' in a
+                else tuple('http://' + x['ip'] + ':' + str(x['port']) + '/v1' for x in n['endpoints']),
+                policy, a.get('deployment')))
 
     def _launch(self, row):
         from dataclasses import asdict
@@ -460,7 +476,7 @@ class A0HostSession:
         m = self._module();cap=self._capability(row);a=row['host']['a0']['acceptance']
         p=m.plan(row['created_at_unix'],row['deadline_unix'],assignment=row['existing_task_id'],generation=1,
             owner_slot=self.config['a0']['owner_slot'],original_budget_seconds=row['budget_seconds'],git_metadata=self.config['a0']['git_metadata'],
-            network=cap['network'],association_binding=_identity(row),accepted_monotonic_ns=a['accepted_monotonic_ns'],boot_id=a['boot_id'])
+            network=cap['network'],deployment=self.config['a0'].get('deployment'),association_binding=_identity(row),accepted_monotonic_ns=a['accepted_monotonic_ns'],boot_id=a['boot_id'])
         if (str(m.DOCKER) != self.config['a0']['docker']['path']
                 or p['docker_sha256'] != self.config['a0']['docker']['sha256']
                 or str(m.PROJECT/'.runtime/rootless-docker/supervisor/friday-rework-docker.service') != self.config['a0']['daemon_unit']['path']
