@@ -221,7 +221,7 @@ with no timer or new thread. Caps are 64 Ki input characters, 16 Ki retained tex
 4,096 callbacks and 256 stream publications within the original remaining deadline.
 Crossing a cap or failing persistence requests native interruption and prevents
 success. Native continuation/retry policy and request/iteration budgets are unchanged.
-A streaming trie conceals full credentials of any length and incomplete known-secret
+A streaming trie with suffix failure links conceals full credentials of any length and incomplete known-secret
 prefixes containing at least eight original credential characters. Escaping does
 not count as additional characters; the same threshold follows three nested JSON
 serialization boundaries and all chunk splits. Meaningful prefixes stay concealed
@@ -232,7 +232,14 @@ pending match is concealed and the observation is marked truncated. No policy ca
 distinguish ordinary text identical to a known full credential or its meaningful
 prefix; those exact spans remain redacted. Schema, tool names and nonsecret URLs
 otherwise remain intact. The capped trie buffers only the short undecided prefix,
-never a growing raw stream. Tool/final observations and spill/debug sinks use the
+never a growing raw stream. Every overlapping start survives meaningful/full
+matches and mismatches. All matched spans are concealed as their complete union;
+a connected span containing any full credential uses `[REDACTED]`, otherwise
+`[REDACTED_PARTIAL]`. This includes starts inside an already concealed span,
+self-overlap and different credentials sharing a suffix/prefix. A native buffer
+reset and a snapshot do not consume this state. The bounded automaton retains
+significant tails as state rather than raw text; short unresolved positions are
+bounded by the longest escaped eight-character threshold. Tool/final observations and spill/debug sinks use the
 same policy so meaningful partial native stubs cannot escape through a later 4xx dump.
 
 No native SQLite transcript or trajectory is enabled. During the dedicated run,

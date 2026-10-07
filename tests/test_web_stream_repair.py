@@ -1,5 +1,6 @@
 """Bounded consumer controls; SDK integration is in test_web_stream_native."""
 import json
+import random
 import threading
 import time
 from types import SimpleNamespace
@@ -149,3 +150,113 @@ def test_redacted_keys_preserve_values_and_key_cutoff_is_explicit():
     assert not any(secret in json.dumps(value) for secret in secrets)
     value=M['_bounded_public']({'nested':{'Z'*255+secrets[0]:'retained'}},secrets)
     assert value['observation_truncated'] and list(value['nested'].values())==['retained']
+
+
+def interval_oracle(text, secrets, *, truncated=False):
+    """Exhaustive span oracle: no trie, streaming state or production helper."""
+    forms = {}
+    for secret in secrets:
+        pairs = {(secret, secret[:8])}
+        for _ in range(3):
+            pairs |= {(json.dumps(v, ensure_ascii=a)[1:-1],
+                       json.dumps(p, ensure_ascii=a)[1:-1])
+                      for v, p in tuple(pairs) for a in (False, True)}
+        for form, prefix in pairs:
+            forms[form] = min(forms.get(form, len(prefix)), len(prefix))
+    covered, full_ends = set(), set()
+    for start in range(len(text)):
+        for form, threshold in forms.items():
+            length = 0
+            while length < min(len(form), len(text)-start) and text[start+length] == form[length]:
+                length += 1
+            full = length == len(form)
+            if full or length >= threshold or (truncated and length and start+length == len(text)):
+                covered.update(range(start, start+length))
+                if full:
+                    full_ends.add(start+length-1)
+    result = []
+    index = 0
+    while index < len(text):
+        if index not in covered:
+            result.append(text[index]); index += 1
+        else:
+            end = index
+            while end < len(text) and end in covered:
+                end += 1
+            result.append('[REDACTED]' if full_ends.intersection(range(index, end)) else '[REDACTED_PARTIAL]')
+            index = end
+    return ''.join(result)
+
+
+OVERLAPS = [
+    (('local-local-SYNTHETIC_CREDENTIAL_123456789',), 'local-local-local-SYNTHETIC_CREDENTIAL_123456789'),
+    (('sk-sk-sk-SYNTHETIC_CREDENTIAL_123456789',), 'sk-sk-sk-sk-SYNTHETIC_CREDENTIAL_123456789'),
+    (('abcdefghX','hIJKLMNOPQRSTUVWXYZ'), 'abcdefghIJKLMNOPQRSTUVWXYZ'),
+    (('abcdefgh','fghijklmnopqrstuvwxyz'), 'abcdefghijklmnopqrstuvwxyz'),
+    (('aaaab-synthetic-credential','aaab-synthetic-second'), 'aaaab-synthetic-second'),
+    (('ABCDEFGH-long-secret','secret-secondary-credential'), 'ABCDEFGH-long-secret-secondary-credential'),
+    (('abcdefghX','hijklmnopY'), 'abcdefghijklmnop! ordinary'),
+    (('aaaab_secret_credential',), 'aaaaaaaab_secret_credential'),
+    (('xyxy',), 'xyxyxy'),
+    (('ab','bc','cd'), 'abcd'),
+    (('"\\я"\\я_SYNTHETIC_CREDENTIAL',), '"\\я"\\я"\\я_SYNTHETIC_CREDENTIAL'),
+]
+
+
+@pytest.mark.parametrize('secrets,text', OVERLAPS)
+@pytest.mark.parametrize('escaping', [None, False, True])
+def test_overlapping_union_every_boundary_snapshot_reset_and_cut(secrets, text, escaping):
+    if escaping is not None:
+        for _ in range(3):
+            text = json.dumps(text, ensure_ascii=escaping)[1:-1]
+    expected = interval_oracle(text, secrets)
+    assert M['_redact'](text, secrets) == expected
+    for cut in range(len(text)+1):
+        n = consumer(secrets)
+        n._stream_delta('Evidence: '+text[:cut])
+        before = n.partial()['partial_response']
+        assert before == 'Evidence: '+interval_oracle(text[:cut], secrets)
+        assert n.partial()['partial_response'] == before  # snapshot must not consume state
+        n.agent._current_streamed_assistant_text = ''
+        n._stream_delta(text[cut:]+'; usable URL https://example.org/source')
+        assert n.partial()['partial_response'] == interval_oracle('Evidence: '+text+'; usable URL https://example.org/source', secrets)
+        assert M['_redact'](text[:cut], secrets, truncated=True) == interval_oracle(text[:cut], secrets, truncated=True)
+    n = consumer(secrets)
+    for char in text:
+        n._stream_delta(char)
+    assert n.partial()['partial_response'] == expected
+    public = M['_bounded_public']({'final_response':text, 'tool_source_observations':[
+        {'role':'tool','tool_call_id':'c1','name':'web_extract','content':text}]}, secrets)
+    assert public['final_response'] == expected
+    assert public['tool_source_observations'][0]['content'] == expected
+    assert not public['observation_truncated']
+
+
+def test_union_independent_generated_intervals_and_pending_bound():
+    rng = random.Random(36180)
+    for _ in range(250):
+        keys = tuple(''.join(rng.choices('abcd', k=rng.randrange(1, 22))) for _ in range(3))
+        text = '~'.join(''.join(rng.choices('abcd', k=6))+rng.choice(keys)[:rng.randrange(1, 24)] for _ in range(4))
+        expected = interval_oracle(text, keys)
+        assert M['_redact'](text, keys) == expected
+        n = consumer(keys)
+        for start in range(0, len(text), 3):
+            n._stream_delta(text[start:start+3])
+        assert n.partial()['partial_response'] == expected
+    redactor = M['_SecretPrefixRedactor'](('a'*8191+'b',))
+    for _ in range(64):
+        assert redactor.feed('a'*1024) == ''
+        assert redactor.pending == []
+    assert redactor.tail() == '[REDACTED_PARTIAL]'
+    assert redactor.feed('b! usable')+redactor.tail() == '[REDACTED]! usable'
+    assert len(redactor.edges) == 8193
+
+
+def test_artificial_cut_conceals_overlapping_union_without_incidental_corruption():
+    key = 'local-local-SYNTHETIC_CREDENTIAL_123456789'
+    text = 'local-'+key
+    for visible in range(1, len(text)):
+        public = M['_bounded_public']({'final_response':'Z'*(16384-visible)+text}, (key,))
+        assert public['observation_truncated']
+        expected = interval_oracle(text[:visible], (key,), truncated=True)
+        assert public['final_response'].lstrip('Z') == (expected[:visible]+'[TRUNCATED]' if len(expected)>visible else expected)

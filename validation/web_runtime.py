@@ -8,6 +8,7 @@ the file is inert. There is deliberately no command that can self-authorize.
 from __future__ import annotations
 
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
+from collections import deque
 import copy
 from dataclasses import dataclass
 import hashlib
@@ -418,75 +419,103 @@ def _secret_forms(secret_values):
 
 
 class _SecretPrefixRedactor:
-    """Bounded streaming trie with an explicit partial-credential threshold.
+    """Conceal the union of matches while retaining every overlapping start.
 
-    Full credentials (even short ones) and prefixes of >=8 original characters
-    are concealed, including on mismatch/reset. Short incidental matches are
-    retained until disambiguated and rendered literally in snapshots. At an
-    artificial truncation boundary even a short pending prefix is concealed.
-    Only the short undecided prefix is buffered; significant secret tails use
-    trie state alone. Escaping follows the three actual JSON boundaries.
+    Failure links retain suffix matches across full/meaningful matches, without
+    rescanning or retaining their raw secret text. Only undecided short prefixes
+    are buffered. A connected masked span becomes one marker; any complete
+    credential in it upgrades that marker. Snapshots are non-destructive, so a
+    mismatch, callback split or native retry cannot forget an overlapping start.
     """
     def __init__(self, secret_values):
         values = tuple(set(secret_values))
         _require(len(values) <= 8 and sum(map(len, values)) <= 8192, "secret_redaction_limit")
         forms = _secret_form_prefixes(values)
         _require(len(forms) <= 64 and sum(map(len, forms)) <= 65536, "secret_redaction_limit")
-        self.root = {}
+        self.edges, self.fail, self.depth = [{}], [0], [0]
+        self.mark, self.full = [0], [False]
+        self.pending_limit = max(forms.values(), default=0)
         for form, threshold in forms.items():
-            node = self.root
+            node = 0
             for index, ch in enumerate(form, 1):
-                node = node.setdefault(ch, {})
+                if ch not in self.edges[node]:
+                    self.edges[node][ch] = len(self.edges)
+                    self.edges.append({}); self.fail.append(0)
+                    self.depth.append(index); self.mark.append(0); self.full.append(False)
+                node = self.edges[node][ch]
                 if index >= threshold:
-                    node[""] = True
-            node[None] = True
-        self.node = self.root
-        self.complete = False
+                    self.mark[node] = index
+            self.full[node] = True
+        queue = deque(self.edges[0].values())
+        while queue:
+            parent = queue.popleft()
+            suffix = self.fail[parent]
+            self.mark[parent] = max(self.mark[parent], self.mark[suffix])
+            self.full[parent] = self.full[parent] or self.full[suffix]
+            for ch, child in self.edges[parent].items():
+                fallback = suffix
+                while fallback and ch not in self.edges[fallback]:
+                    fallback = self.fail[fallback]
+                self.fail[child] = self.edges[fallback].get(ch, 0)
+                queue.append(child)
+        self.node = 0
         self.pending = []
+        self.masked = self.complete = False
+
+    @staticmethod
+    def _marker(complete):
+        return "[REDACTED]" if complete else "[REDACTED_PARTIAL]"
 
     def tail(self, *, truncated=False):
-        if self.node is self.root:
-            return ""
-        if self.complete:
-            return "[REDACTED]"
-        if "" in self.node or truncated:
-            return "[REDACTED_PARTIAL]"
-        return "".join(self.pending)
-
-    def _reset(self):
-        self.node, self.complete = self.root, False
-        self.pending = []
+        # Integer entries are masked positions, never raw credential tails.
+        # Keep terminal flags in the pending span until its literals resolve.
+        result = []
+        masked, complete = self.masked, self.complete
+        for item in self.pending:
+            if not isinstance(item, str) or truncated:
+                masked = True
+                complete = complete or item == 1
+            else:
+                if masked:
+                    result.append(self._marker(complete)); masked = complete = False
+                result.append(item)
+        if masked:
+            result.append(self._marker(complete))
+        return "".join(result)
 
     def feed(self, text):
         result = []
         for ch in text:
-            retry = [ch]
-            while retry:
-                ch = retry.pop()
-                if ch not in self.node and self.node is not self.root:
-                    if self.complete or "" in self.node:
-                        result.append(self.tail())
-                    else:
-                        # Release only the first disambiguated character and
-                        # rescan the short suffix: overlapping starts must not
-                        # cause a complete credential to pass through unchanged.
-                        result.append(self.pending[0])
-                        retry.extend(reversed(self.pending[1:] + [ch]))
-                        self._reset()
-                        continue
-                    self._reset()
-                if ch in self.node:
-                    self.node = self.node[ch]
-                    self.complete = self.complete or None in self.node
-                    if self.complete or "" in self.node:
-                        self.pending = []
-                    else:
-                        self.pending.append(ch)
-                    if None in self.node and all(k in (None, "") for k in self.node):
-                        result.append("[REDACTED]")
-                        self._reset()
+            while self.node and ch not in self.edges[self.node]:
+                self.node = self.fail[self.node]
+            self.node = self.edges[self.node].get(ch, 0)
+            self.pending.append(ch)
+            length = self.mark[self.node]
+            if length:
+                for index in range(max(0, len(self.pending) - length), len(self.pending)):
+                    if isinstance(self.pending[index], str):
+                        self.pending[index] = 0
+                if self.full[self.node]:
+                    self.pending[-1] = 1
+            # Literals in the longest active prefix are still undecided. Masked
+            # positions can be consumed immediately while automaton state alone
+            # retains all starts, including starts inside the concealed span.
+            safe = len(self.pending) - self.depth[self.node]
+            consumed = 0
+            for item in self.pending:
+                if isinstance(item, str):
+                    if consumed >= safe:
+                        break
+                    if self.masked:
+                        result.append(self._marker(self.complete))
+                        self.masked = self.complete = False
+                    result.append(item)
                 else:
-                    result.append(ch)
+                    self.masked = True
+                    self.complete = self.complete or item == 1
+                consumed += 1
+            del self.pending[:consumed]
+            _require(len(self.pending) < max(1, self.pending_limit), "secret_redaction_limit")
         return "".join(result)
 
 
