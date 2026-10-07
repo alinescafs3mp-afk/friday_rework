@@ -3,8 +3,8 @@
 This package prepares source/offline connections, without installation or live
 product acceptance. Apply the exact `patches/hermes/admin-controls.patch` after
 the published b44be05 composition, then install the trusted native Friday plugin
-through the normal installation workflow. Its manifest binds the six changed
-native files. Older unpatched hosts retain ordinary workers and refuse the
+through the normal installation workflow. Its manifest binds the eleven changed
+native source/test files. Older unpatched hosts retain ordinary workers and refuse the
 unavailable administrative control capability.
 
 The Dashboard exposes task status/pause/cancel, typed operational settings and
@@ -128,3 +128,24 @@ Delegation config inherits the validated local parent route or names a declared
 local route; remote, undeclared, command and fallback routes are refused before
 config persistence. This validates configuration; it does not establish live
 worker execution or final product acceptance.
+
+Actual native `skill_view` now uses the catalog's effective normalized deny reader,
+including managed/platform policy and the essential declared-name exemption.
+Specific duplicate load-name denies remain effective; a directory alias for a
+unique copy does not invent a load-name deny. Names and wildcard-looking values
+retain native literal matching. The qualified plugin registry uses the same
+reader and refuses before reading the registered skill or its linked files.
+Local copy resolution retains its metadata reads; denial precedes content
+serving, linked-file reads and preprocessing. Reader errors do not fail open.
+
+Source fixtures cover actual catalog, aliases, typed enables, registry loads and
+useful allowed content. The previously reported 34 loader failures are retained
+as regressions. This repair still requires Astra's independent review and does
+not establish installation, live policy application or six-journey acceptance.
+
+The registered tool's native repeat-view cache also fingerprints the effective
+normalized skill denial set. A global, platform or managed policy change evicts
+that entry and re-enters the real loader; unchanged allowed policy retains the
+existing useful dedup behavior. Eight actual registered-handler witnesses first
+failed after disable and now form policy-change regressions. This cache change
+does not erase content already delivered or change active worker budgets.

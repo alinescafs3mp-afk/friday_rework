@@ -383,3 +383,144 @@ new file mode 100644
          return set()
      from gateway.session_context import get_session_env
      resolved_platform = platform or os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM")
+diff --git a/tests/hermes_cli/test_skills_config.py b/tests/hermes_cli/test_skills_config.py
+--- a/tests/hermes_cli/test_skills_config.py
++++ b/tests/hermes_cli/test_skills_config.py
+@@ -44,12 +44,13 @@
+ class TestIsSkillDisabled:
+
+
+-    @patch("hermes_cli.config.load_config")
+-    def test_platform_disabled(self, mock_load):
+-        mock_load.return_value = {"skills": {
++    def test_platform_disabled(self, tmp_path, monkeypatch):
++        import json
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        (tmp_path / "config.yaml").write_text(json.dumps({"skills": {
+             "disabled": ["a/one"],
+             "platform_disabled": {"telegram": ["tg-skill"]}
+-        }}
++        }}))
+         from tools.skills_tool import _is_skill_disabled
+         assert _is_skill_disabled("tg-skill", platform="telegram") is True
+         # Any of several identifiers (declared name, duplicate's load path) disables.
+@@ -59,12 +60,13 @@
+
+
+
+-    @patch("hermes_cli.config.load_config")
+-    @patch.dict("os.environ", {"HERMES_PLATFORM": "discord"})
+-    def test_env_var_platform(self, mock_load):
+-        mock_load.return_value = {"skills": {
++    def test_env_var_platform(self, tmp_path, monkeypatch):
++        import json
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        monkeypatch.setenv("HERMES_PLATFORM", "discord")
++        (tmp_path / "config.yaml").write_text(json.dumps({"skills": {
+             "platform_disabled": {"discord": ["discord-skill"]}
+-        }}
++        }}))
+         from tools.skills_tool import _is_skill_disabled
+         assert _is_skill_disabled("discord-skill") is True
+
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -14,7 +14,6 @@
+
+ from hermes_constants import get_hermes_home
+ from tools.registry import registry, tool_error
+-from hermes_cli.config import cfg_get
+ from agent.skill_utils import (
+     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS, is_skill_support_path as _is_skill_support_path)
+ from tools.skills_tool_setup import (  # noqa: F401
+@@ -154,24 +153,12 @@
+
+
+ def _is_skill_disabled(*names: str, platform: str = None) -> bool:
+-    """Any of *names* disabled in config (one config load)? Platform precedence: explicit arg,
+-    ``HERMES_PLATFORM``, session ``HERMES_SESSION_PLATFORM``. A globally-disabled skill stays disabled on every platform
+-    (keep in sync with agent.skill_utils.get_disabled_skill_names)."""
+-    try:
+-        from hermes_cli.config import load_config
+-        skills_cfg = load_config().get("skills", {})
+-        resolved_platform = platform or os.getenv("HERMES_PLATFORM")
+-        if not resolved_platform:
+-            with suppress(Exception):
+-                from gateway.session_context import get_session_env
+-                resolved_platform = get_session_env("HERMES_SESSION_PLATFORM") or ""
+-        platform_disabled = None
+-        if resolved_platform:
+-            platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
+-        disabled = skills_cfg.get("disabled", [])
+-        return any((platform_disabled is not None and n in platform_disabled) or n in disabled for n in names)
+-    except Exception:
+-        return False
++    """Use the catalog's effective normalized policy, including managed and
++    platform denials and essential-name exemptions. Callers pass the declared
++    name and only the resolved load name belonging to this copy; entries remain
++    literal, never wildcard patterns. Reader failures propagate before serving.
++    """
++    return not _get_disabled_skill_names(platform).isdisjoint(names)
+
+
+ def _skill_search_dirs() -> Tuple[List[Tuple[int, Path]], Path]:
+diff --git a/tools/skills_tool_dedup.py b/tools/skills_tool_dedup.py
+--- a/tools/skills_tool_dedup.py
++++ b/tools/skills_tool_dedup.py
+@@ -27,7 +27,8 @@
+         return None
+     try:
+         st = os.stat(src)
+-        return (src, st.st_mtime_ns, st.st_size)
++        from tools.skills_tool import _get_disabled_skill_names
++        return (src, st.st_mtime_ns, st.st_size, frozenset(_get_disabled_skill_names()))
+     except OSError:
+         return None
+
+@@ -54,18 +55,25 @@
+     is unchanged on disk; None otherwise."""
+     if not task_id:
+         return None
++    from tools.skills_tool import _get_disabled_skill_names
++    disabled = frozenset(_get_disabled_skill_names())
+     n = str(name)
+     with _skill_view_tracker_lock:
+         if not (cache := _skill_view_tracker.get(str(task_id))):
+             return None
+         # Record key is the RESOLVED name; match raw and resolved forms so
+         # 'category/skill' and bare-name views coalesce.
+-        for key, (src, mtime_ns, size) in list(cache.items()):
++        for key, (src, mtime_ns, size, prior_disabled) in list(cache.items()):
+             rec_name, rec_fp = key
+             if rec_fp != (file_path or "") or (
+                     rec_name != n and not n.endswith("/" + rec_name)
+                     and not rec_name.endswith("/" + n) and n.split(":")[-1] != rec_name):
+                 continue
++            # A managed/global/platform deny can change without the skill
++            # file changing. Re-enter the actual loader before any success stub.
++            if disabled != prior_disabled:
++                cache.pop(key, None)
++                return None
+             try:
+                 st = os.stat(src)
+                 changed = (st.st_mtime_ns, st.st_size) != (mtime_ns, size)
+diff --git a/tools/skills_tool_plugin.py b/tools/skills_tool_plugin.py
+--- a/tools/skills_tool_plugin.py
++++ b/tools/skills_tool_plugin.py
+@@ -129,13 +129,13 @@
+     if namespace in _get_disabled_plugins():
+         return _fail(f"Plugin '{namespace}' is disabled. Re-enable with: hermes plugins enable {namespace}")
+     qualified_name = f"{namespace}:{bare}"
++    if _st._is_skill_disabled(qualified_name):
++        return _fail(f"Skill '{qualified_name}' is disabled.")
+     try:
+         content = _read_skill_text(skill_md)
+     except Exception as e:
+         return _fail(f"Failed to read skill '{qualified_name}': {e}")
+     parsed_frontmatter = _safe_frontmatter(content=content)
+-    if _st._is_skill_disabled(qualified_name):
+-        return _fail(f"Skill '{qualified_name}' is disabled.")
+     if not _st.skill_matches_platform(parsed_frontmatter):
+         return _fail(f"Skill '{qualified_name}' is not supported on this platform.",
+                      readiness_status=SkillReadinessStatus.UNSUPPORTED.value)
