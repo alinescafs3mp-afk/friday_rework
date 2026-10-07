@@ -21,6 +21,10 @@ authority. `list` enumerates bounded regular files in the quiescent DSH workspac
 bytes. Absolute, hidden, escaping, linked, duplicate and oversized inputs are
 refused. Files have stable names, lengths and hashes; later delivery rereads
 those exact staged bytes. A retained manifest cannot be silently replaced.
+Copying holds a separate, nonblocking per-task file lock. A competing inspection
+refuses before copying; it does not hold the association/control lock. Retained
+and orphan files share a ceiling of 32 entries and twice the configured total
+artifact bytes. Failed evidence remains intact and consumes that allowance.
 
 `assess` records the original parent's judgment together with references to its
 actual file reads. Its method is explicitly `parent_file_review`. Text previews
@@ -38,6 +42,8 @@ Explicit retries are allowed only after a proven pre-send rejection. A timeout,
 cancellation, post-send exception or lost acknowledgement stays UNKNOWN; reload
 or another call cannot silently resend it. Partial/stopped output and absent
 goal checks remain explicit in the caption. Retrying delivery never starts DSH.
+The caption uses the current stop/assessment snapshot from the durable send
+reservation, taken after the awaited staging read.
 
 The paired native deltas distinguish preflight refusal from an exception after
 entering document delivery, and preserve pending Telegram updates on a polling

@@ -165,7 +165,8 @@ async def test_foreign_owner_and_late_receipt_cannot_change_result(setup, monkey
     artifact = row["result"]["artifacts"][0]
     with pytest.raises(RuntimeError, match="foreign"):
         module.begin_delivery(setup.host.store, row["existing_task_id"], {**row["owner"], "chat_id": "-999"}, artifact["reference"])
-    attempt = module.begin_delivery(setup.host.store, row["existing_task_id"], row["owner"], artifact["reference"])
+    attempt, snapshot = module.begin_delivery(setup.host.store, row["existing_task_id"], row["owner"], artifact["reference"])
+    assert snapshot["delivery"] == "UNKNOWN"
     with pytest.raises(RuntimeError, match="foreign_delivery_attempt"):
         module.finish_delivery(setup.host.store, row["existing_task_id"], row["owner"], artifact["reference"], 999, receipt(module, row, artifact))
     done = module.finish_delivery(setup.host.store, row["existing_task_id"], row["owner"], artifact["reference"], attempt["number"], receipt(module, row, artifact))
@@ -195,10 +196,10 @@ async def test_multiple_files_keep_individual_receipts_and_never_duplicate_succe
     (workspace / "second.txt").write_text("second")
     row = module.collect_outputs(setup.host.store, row, ["answer.txt", "second.txt"])
     a, b = row["result"]["artifacts"]
-    n = module.begin_delivery(setup.host.store, row["existing_task_id"], row["owner"], a["reference"])["number"]
+    n = module.begin_delivery(setup.host.store, row["existing_task_id"], row["owner"], a["reference"])[0]["number"]
     row = module.finish_delivery(setup.host.store, row["existing_task_id"], row["owner"], a["reference"], n, receipt(module, row, a))
     assert row["delivery"] == "PARTIAL"
-    n = module.begin_delivery(setup.host.store, row["existing_task_id"], row["owner"], b["reference"])["number"]
+    n = module.begin_delivery(setup.host.store, row["existing_task_id"], row["owner"], b["reference"])[0]["number"]
     row = module.finish_delivery(setup.host.store, row["existing_task_id"], row["owner"], b["reference"], n, receipt(module, row, b))
     assert row["delivery"] == "DELIVERED"
     with pytest.raises(RuntimeError, match="reconciliation"):

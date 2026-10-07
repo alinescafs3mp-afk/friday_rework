@@ -9,6 +9,9 @@ from __future__ import annotations
 import copy
 import asyncio
 import os
+import fcntl
+import stat
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 import re
@@ -237,8 +240,36 @@ def collect_outputs(store, row, paths):
     It cannot overwrite an earlier manifest.
     This does not execute returned code or assert that a task succeeded.
     """
+    # Separate per-job filesystem ownership, never the control metadata lock.
+    # A competing call refuses immediately. Kernel close/crash releases it.
+    row = store.get(row["existing_task_id"], row["owner"])
+    with output_copy_lock(row):
+        return _collect_outputs(store, row, paths)
+
+
+@contextmanager
+def output_copy_lock(row):
+    from .host_runtime import private_directory
+    directory = private_directory(output_root(row).parent)
+    fd = os.open(directory / ".outputs-copy.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600):
+            raise AssociationError("unsafe_output_copy_lock")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise AssociationError("output_copy_busy") from exc
+        yield
+    finally:
+        os.close(fd)
+
+
+def _collect_outputs(store, row, paths):
     from .host_runtime import private_directory
     from .supervision import NativeSupervisor
+    # Recheck the durable selection only after gaining exclusive copy ownership.
     row = store.get(row["existing_task_id"], row["owner"])
     if "result" in row:
         if paths is not None and paths != row["result"]["source_paths"]:
@@ -253,15 +284,23 @@ def collect_outputs(store, row, paths):
     private_directory(destination.parent)
     destination.mkdir(mode=0o700, exist_ok=True)
     private_directory(destination)
-    # Keep failed selection attempts bounded without deleting retained evidence.
+    # Include orphan bytes from failed copies in the per-task bound. Never erase
+    # unresolved evidence to create capacity. This count stays stable under lock.
+    runtime = row["host"]["binding"]["runtime"]
+    remaining = 2 * runtime["max_total_bytes"]
+    count = 0
     with os.scandir(destination) as entries:
-        for count, _ in enumerate(entries, 1):
-            if count >= 2 * MAX_ARTIFACTS:
+        for entry in entries:
+            count += 1
+            info = entry.stat(follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid()):
+                raise AssociationError("unsafe_retained_output")
+            remaining -= info.st_size
+            if count + len(paths) > 2 * MAX_ARTIFACTS or remaining <= 0:
                 raise AssociationError("staging_reconciliation_required")
     from .associations import _sync_directory
     _sync_directory(destination.parent)
-    runtime = row["host"]["binding"]["runtime"]
-    artifacts, remaining = [], runtime["max_total_bytes"]
+    artifacts, remaining = [], min(remaining, runtime["max_total_bytes"])
     for path, label in zip(paths, labels):
         if remaining <= 0:
             raise AssociationError("result_total_limit")
@@ -322,6 +361,7 @@ def retain_artifacts(store, task_id, owner, artifacts, source_paths):
 
 
 def begin_delivery(store, task_id, owner, reference, *, retry=False):
+    """Reserve the attempt and return its current presentation snapshot."""
     with store._locked() as data:
         row = store._owned(data, task_id, owner)
         if "result" not in row or reference not in row["result"]["deliveries"]:
@@ -335,7 +375,7 @@ def begin_delivery(store, task_id, owner, reference, *, retry=False):
         attempts.append(attempt)
         row["delivery"] = delivery_state(row["result"]["deliveries"])
         store._save(data)
-        return copy.deepcopy(attempt)
+        return copy.deepcopy(attempt), copy.deepcopy(row)
 
 
 def finish_delivery(store, task_id, owner, reference, number, receipt):
@@ -366,7 +406,7 @@ async def deliver_artifact(ctx, store, row, reference, *, retry=False):
     # Recheck bytes BEFORE reserving a send. A changed staging file never sends.
     payload = await asyncio.to_thread(read_staged, staging_root=output_root(row), artifact=StagedArtifact(**artifact),
                                       max_bytes=row["host"]["binding"]["runtime"]["max_file_bytes"])
-    attempt = begin_delivery(store, row["existing_task_id"], row["owner"], reference, retry=retry)
+    attempt, row = begin_delivery(store, row["existing_task_id"], row["owner"], reference, retry=retry)
     terminal = row["host"]["terminal"]
     partial = row["stop_intent"] is not None or terminal is None or terminal["state"] != "completed"
     check = {"NOT_RUN": "Проверка цели не выполнена.", "UNKNOWN": "Проверка цели не завершена.",
