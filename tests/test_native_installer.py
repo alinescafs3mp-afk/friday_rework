@@ -197,7 +197,7 @@ def test_real_native_config_writer_and_readonly_consumer(tmp_path):
 def test_actual_native_auth_web_and_local_fallback_negative(mutation, tmp_path):
     from tools.configure_product import compose_product
     bundle = compose_product(inputs()); c = bundle['config']; d = bundle['contract']['native_dashboard']
-    if mutation == 'authoff': d['public_url'] = 'http://127.0.0.1:9119'
+    if mutation == 'authoff': c['dashboard']['require_auth'] = False
     elif mutation == 'provider': c['plugins']['enabled'].remove('dashboard_auth/basic')
     elif mutation == 'operator': c['dashboard']['basic_auth']['username'] = 'foreign-user'
     elif mutation == 'cloudfallback': c['fallback_providers'] = [{'provider': 'openai'}]

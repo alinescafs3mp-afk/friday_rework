@@ -147,7 +147,9 @@ def spec_checked(value):
     dash = product['dashboard']; ipaddress.ip_address(dash['host'])
     require(type(dash['port']) is int and 1 <= dash['port'] <= 65535, 'explicit_dashboard_port_required')
     public = urlsplit(dash['public_url'])
-    require(public.scheme == 'https' and public.hostname and public.username is None
+    local_http = (public.scheme == 'http' and public.hostname in ('localhost', '127.0.0.1', '::1')
+                  and ipaddress.ip_address(dash['host']).is_loopback)
+    require((public.scheme == 'https' or local_http) and public.hostname and public.username is None
             and public.password is None and public.port == dash['port']
             and public.path in ('', '/') and not public.query and not public.fragment,
             'protected_dashboard_public_authority_required')

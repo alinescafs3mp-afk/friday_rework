@@ -71,9 +71,10 @@ def _dashboard(value):
             raise ValueError('exact_dashboard_hostname_required')
     # This is the actual native gate predicate, not an inert YAML auth flag.
     from hermes_cli.web_server import should_require_dashboard_auth
-    if not should_require_dashboard_auth(host, frozenset({p.hostname.lower()})):
+    if not should_require_dashboard_auth(host, frozenset({p.hostname.lower()}), require_auth=True):
         raise ValueError('loopback_alone_does_not_require_dashboard_auth')
-    if p.hostname not in ('localhost', '127.0.0.1', '::1') and p.scheme != 'https':
+    if p.scheme != 'https' and (p.hostname not in ('localhost', '127.0.0.1', '::1')
+                               or not ipaddress.ip_address(host).is_loopback):
         raise ValueError('remote_dashboard_https_required')
     operator = _exact(value['operator'], {'provider', 'user_id', 'org_id'}, 'operator')
     # Native BasicAuth mints provider=basic, user_id=username, org_id="".
@@ -181,7 +182,7 @@ def compose_product(spec):
         'product_access': {'enabled': True, 'accounts': [dict(a, runtime_profiles=[profile]) for a in accounts]}}
     config['plugins']['entries'] = {'friday_rework': {'allow_gateway_work': True,
         'allow_gateway_control': True, 'settings': settings}}
-    config['dashboard'] = {'public_url': dashboard['public_url'].rstrip('/'),
+    config['dashboard'] = {'public_url': dashboard['public_url'].rstrip('/'), 'require_auth': True,
                            'basic_auth': {'username': dashboard['operator']['user_id']}}
     config['gateway'] = {'multiplex_profiles': True, 'profile_routes': []}
     # Explicit disables beat credential-presence auto enable in native gateway
