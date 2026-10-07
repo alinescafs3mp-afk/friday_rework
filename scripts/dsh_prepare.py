@@ -19,6 +19,17 @@ class StopUnconfirmed(RuntimeError):
     """An owned command was signalled but its cessation was not observed."""
 
 
+class CommandFailed(RuntimeError):
+    """Reaped command failure; never carry argv, environment or raw output."""
+
+    def __init__(self, observation):
+        keys = ('returncode', 'elapsed_seconds', 'timeout', 'stdout_sha256',
+                'stderr_sha256', 'stdout_bytes', 'stderr_bytes', 'pid',
+                'starttime_ticks', 'reaped', 'reason')
+        self.observation = {k: observation[k] for k in keys}
+        super().__init__('command_timeout' if observation['timeout'] else 'command_nonzero_exit')
+
+
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -48,6 +59,10 @@ def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None):
     process = subprocess.Popen(argv, cwd=donor, env=env or clean_environment(donor),
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, start_new_session=True)
+    try:
+        starttime = int(Path(f'/proc/{process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        starttime = None
     timed_out = False
     try:
         out, err = process.communicate(timeout=timeout)
@@ -75,18 +90,34 @@ def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None):
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 out, err = process.communicate(timeout=5)
+    reason = ('device_null_unavailable' if
+              "fatal: could not open '/dev/null' for reading and writing: Permission denied" in err
+              else 'command_timeout' if timed_out else 'command_nonzero_exit' if process.returncode else 'command_succeeded')
+    source_reasons = {'git_source_operation_failed': 'source_git_operation_failed',
+                      'source_preparation_deadline': 'source_preparation_deadline',
+                      'source_input_or_io_failed': 'source_input_or_io_failed',
+                      'fresh_destination_required': 'source_destination_exists',
+                      'dirty_donor_refused': 'source_donor_changed',
+                      'donor_identity_changed': 'source_donor_changed',
+                      'overlay_hash_mismatch': 'source_overlay_changed'}
+    for code, stable in source_reasons.items():
+        if err.strip() == 'FRIDAY_SOURCE_REFUSED reason=' + code:
+            reason = stable
+            break
     observation = {"argv": argv, "returncode": process.returncode,
                    "elapsed_seconds": round(time.monotonic() - start, 3),
                    "timeout": timed_out, "stdout_sha256": hashlib.sha256(out.encode()).hexdigest(),
-                   "stderr_sha256": hashlib.sha256(err.encode()).hexdigest()}
+                   "stderr_sha256": hashlib.sha256(err.encode()).hexdigest(),
+                   "stdout_bytes": len(out.encode()), "stderr_bytes": len(err.encode()),
+                   "pid": process.pid, "starttime_ticks": starttime,
+                   "reaped": process.returncode is not None, "reason": reason}
     if log:
         log.parent.mkdir(parents=True, exist_ok=True)
         log.with_suffix(".stdout").write_text(out)
         log.with_suffix(".stderr").write_text(err)
         log.with_suffix(".json").write_text(json.dumps(observation, indent=2) + "\n")
     if timed_out or process.returncode:
-        raise RuntimeError(f"Command failed: {argv!r}; exit={process.returncode}; "
-                           f"timeout={timed_out}; stderr={err[-2000:]}")
+        raise CommandFailed(observation)
     return out.strip(), observation
 
 

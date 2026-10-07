@@ -1,6 +1,6 @@
 # Native Friday installation candidate
 
-`scripts/friday_install.py {plan,install,check,dashboard-check,start} --input <private JSON>`
+`scripts/friday_install.py {plan,install,check,dashboard-check,start,reconcile} --input <private JSON>`
 is a finite composition of existing preparers, native PM and build APIs. It
 does not run a service manager, keep a worker daemon or create an account store.
 The current candidate installs a template and connects conditional native
@@ -71,8 +71,40 @@ that call `setsid`. Linux namespace teardown closes these detached descendants
 when the outer command/parent exits or times out. There is no process-group-only
 fallback, new service manager or independent lifetime budget. This namespace
 adds lifetime custody; it does not change the original filesystem/network grant.
+The namespace uses `--dev /dev` for bubblewrap's private standard devices;
+it never binds host hardware devices. A root bind alone is mounted without
+device access and made Git's `/dev/null` open fail in the first normal attempt.
+The required pre-claim probe now verifies read/write access to `/dev/null` as
+well as the distinct PID namespace, so that defect refuses before home creation.
+The host verifies the root-owned binary and exact SHA before planning/admission
+and again before every contained launch. The pure input/source consumer does
+not repeat host UID ownership checks inside the user namespace, where UID 0 is
+unmapped; no weaker binary check, alternate launcher or fallback is introduced.
+Cold source validation imports `importlib.machinery` explicitly rather than
+depending on a previous caller's imports.
 A machine that cannot create it must obtain the normal supported OS dependency
 and namespace policy before a separately authorized install can proceed.
+
+Failures report a fixed phase/reason, child exit/timeout/reap facts where
+observed, and the original input hash. Child argv, raw stdout/stderr, environment,
+credential values and credential paths are not printed. Protected
+`FRIDAY-INSTALL.failure.json` retains bounded status/hash/byte-count metadata,
+process incarnation when observed, and the original boot/deadline/input claim.
+Failure-receipt publication can fail; that never converts uncertain custody to
+a normal refusal. Native helper exit 3 remains `STOP_UNCONFIRMED` even after its
+wrapper is reaped, because external native units can have separate lifetimes.
+
+`reconcile` is read-only. It verifies an exact original PARTIAL claim, the same
+boot, original input bytes and any bound failure receipt, and reports the
+remaining original clock (including exhaustion). It reads no referenced TLS
+or credentials, performs no native commands, and preserves work and stop intent.
+It **never admits resume** or resets the budget. Legacy claims did not retain a
+native child receipt; an empty home, absent parent or available lock cannot prove
+current cessation. Repairing source pins also requires the lead's independent
+review. No `resume` command, automatic replay, renamed/deleted home or alternate
+installation route is introduced. A separately reviewed continuation still needs
+current native cessation and sufficient original budget; this source package
+does not authorize or execute one.
 
 Pure pre-source validation uses a distinct project module namespace. After every
 native source byte is verified, completion loads the native `tools` and `plugins`

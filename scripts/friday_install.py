@@ -10,8 +10,10 @@ import argparse
 import hashlib
 import ipaddress
 import importlib.util
+import importlib.machinery
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -23,11 +25,55 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = 'friday.native-install.v1'
 MARKER = 'FRIDAY-INSTALL.json'
+FAILURE = 'FRIDAY-INSTALL.failure.json'
+
+
+class SafeParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(2, 'Friday entry refused: phase=arguments reason=invalid_cli_arguments\n')
+
+
+class Refused(ValueError):
+    """A reason supplied by this source, rather than arbitrary exception text."""
+    def __init__(self, reason):
+        self.reason = reason if re.fullmatch('[a-z][a-z0-9_]{0,127}', reason) else 'invalid_input'
+        super().__init__(self.reason)
 
 
 def require(condition, reason):
     if not condition:
-        raise ValueError(reason)
+        raise Refused(reason)
+
+
+def safe_diagnostic(exc, phase):
+    from scripts.dsh_prepare import CommandFailed, StopUnconfirmed
+    result = {'phase': phase, 'reason': 'native_operation_failed'}
+    if isinstance(exc, StopUnconfirmed):
+        result.update(reason='stop_unconfirmed', cessation='UNCONFIRMED')
+        if hasattr(exc, 'observation'):
+            result.update(exc.observation)
+            result.update(reason='stop_unconfirmed', cessation='UNCONFIRMED')
+    elif isinstance(exc, CommandFailed):
+        result.update(exc.observation)
+        result['cessation'] = 'REAPED' if exc.observation['reaped'] else 'UNCONFIRMED'
+    elif isinstance(exc, Refused):
+        result['reason'] = exc.reason
+    elif isinstance(exc, OSError):
+        result.update(reason='native_io_failed', errno=exc.errno)
+    elif isinstance(exc, (KeyError, TypeError)):
+        result['reason'] = 'invalid_input_shape'
+    elif isinstance(exc, ValueError) and exc.args == ('original_install_budget_exhausted',):
+        result['reason'] = 'original_install_budget_exhausted'
+    return result
+
+
+def diagnostic_text(value):
+    parts = [f"phase={value['phase']}", f"reason={value['reason']}"]
+    if 'returncode' in value:
+        parts.extend([f"child_exit={value['returncode']}",
+                      f"timeout={str(value['timeout']).lower()}",
+                      f"reaped={str(value['reaped']).lower()}"])
+    return ' '.join(parts)
 
 
 def canonical(value):
@@ -174,8 +220,14 @@ def spec_checked(value):
     require(list(sys.modules[name].__path__) == [str(ROOT / 'tools')], 'foreign_validator_package')
     build_config = importlib.import_module(name + '.configure_local_test').build_config
     hermes_web_config = importlib.import_module(name + '.web_profile').hermes_web_config
-    from scripts.install_containment import checked_binary
-    checked_binary(value['containment'])
+    # Host-root ownership is checked at command admission, not by this pure
+    # consumer inside an unprivileged namespace (where host UID 0 is unmapped).
+    containment = value['containment']
+    require(isinstance(containment, dict) and set(containment) == {'path', 'sha256'}
+            and containment['path'] == '/usr/bin/bwrap'
+            and isinstance(containment['sha256'], str)
+            and re.fullmatch('[0-9a-f]{64}', containment['sha256']),
+            'explicit_system_bubblewrap_pin_required')
     require(set(product) == {'profile', 'inference', 'web', 'dashboard', 'accounts', 'runtime'} | ({'a0_deployment'} if 'a0_deployment' in product else set()),
             'explicit_normal_product_required')
     if 'a0_deployment' in product:
@@ -240,6 +292,8 @@ def dashboard_tls_inputs(value, home):
 def commands(value):
     """Generate native argv; no custom PM flags or replacement service backend."""
     home, _ = spec_checked(value); source = home / 'hermes-agent'
+    from scripts.install_containment import checked_binary
+    checked_binary(value['containment'])
     python = value['bootstrap_python']['path']; helper = str(ROOT / 'scripts/friday_native.py')
     launcher = str(source / '.hermes/bin/hermes')
     return {
@@ -358,6 +412,46 @@ def partial_claim(input_hash, budget):
             'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
 
 
+def reconcile(value, input_hash):
+    """Read-only PARTIAL observation, with no replay or fresh execution grant.
+
+    Legacy claims contain no durable child identity/cessation receipt. A clean
+    directory, absent parent or lock availability cannot fill that evidence gap.
+    Even a new failure receipt is historical evidence, not current quiescence.
+    """
+    require(isinstance(value, dict), 'explicit_install_fields_required')
+    home = canonical(value['home']); directory(home)
+    claim = read_json(home / MARKER)
+    require(set(claim) == {'schema', 'state', 'input_sha256', 'deadline_mono', 'boot_id'}
+            and claim['schema'] == SCHEMA and claim['state'] == 'PARTIAL'
+            and claim['input_sha256'] == input_hash, 'exact_original_partial_claim_required')
+    require(claim['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            'original_install_boot_changed')
+    deadline = claim['deadline_mono']
+    require(type(deadline) in (int, float) and math.isfinite(deadline) and deadline > 0,
+            'original_install_deadline_required')
+    extra = False; count = 0
+    with os.scandir(home) as entries:
+        for item in entries:
+            count += 1
+            if item.name not in (MARKER, FAILURE): extra = True
+            require(count <= 128, 'partial_observation_inventory_limit')
+    failure = home / FAILURE
+    has_failure = failure.exists() or failure.is_symlink()
+    if has_failure:
+        observation = read_json(failure)
+        require(observation.get('schema') == 'friday.native-install-failure.v1'
+                and observation.get('original_attempt') == claim
+                and observation.get('resume_allowed') is False, 'failure_receipt_not_bound')
+    remaining = max(0, deadline - time.monotonic())
+    return {'state': 'PARTIAL_RETAINED_NO_REPLAY', 'effects': 'NONE', 'ready': False,
+            'resume_allowed': False, 'original_attempt': claim,
+            'original_remaining_seconds': remaining, 'original_budget_expired': remaining == 0,
+            'contains_other_files': extra, 'historical_failure_receipt_bound': has_failure,
+            'cessation': 'CURRENT_NATIVE_VERIFICATION_REQUIRED',
+            'next': 'Independent lead review of original attempt, current cessation, repaired source pins and original clock; no replay admission'}
+
+
 def install(value, input_path, *, budget=None):
     """One original clock includes intake, execution, IO and final admission."""
     from scripts.install_containment import Budget, Containment
@@ -378,28 +472,47 @@ def install(value, input_path, *, budget=None):
         return budget.call(inspect, value, input_hash)
     containment = Containment(value['containment'], budget, clean_environment(home))
     # Actual required namespace capability before claiming/writing any home.
-    containment.probe(value['bootstrap_python']['path'], ROOT)
+    try:
+        containment.probe(value['bootstrap_python']['path'], ROOT)
+    except (OSError, ValueError, RuntimeError) as exc:
+        exc.friday_diagnostic = safe_diagnostic(exc, 'namespace_probe')
+        raise
     budget.call(home.mkdir, mode=0o700)
     claim = partial_claim(input_hash, budget)
     publish(home / MARKER, claim, budget=budget)
-    def execute(command, cwd, timeout=1800):
-        return containment.run(command, cwd, timeout=timeout)[0]
-    execute(argv['compose'], ROOT, 130)
+    def execute(phase, command, cwd, timeout=1800):
+        try:
+            return containment.run(command, cwd, timeout=timeout)[0]
+        except (OSError, ValueError, RuntimeError) as exc:
+            diagnostic = safe_diagnostic(exc, phase)
+            exc.friday_diagnostic = diagnostic
+            exc.friday_attempt = claim
+            # This receipt is evidence, never permission to replay the attempt.
+            failure = {'schema': 'friday.native-install-failure.v1',
+                       'original_attempt': claim, 'diagnostic': diagnostic,
+                       'resume_allowed': False}
+            try:
+                require(read_json(home / MARKER) == claim, 'install_claim_changed')
+                publish(home / FAILURE, failure, budget=budget)
+            except (OSError, ValueError, RuntimeError):
+                diagnostic['failure_receipt'] = 'NOT_PUBLISHED'
+            raise
+    execute('compose', argv['compose'], ROOT, 130)
     source = home / 'hermes-agent'; receipt_path = home / 'hermes-agent.source.json'
     receipt = budget.call(read_json, receipt_path)
     budget.call(composition_checked, value, source, receipt, donors['hermes'])
     for phase in ('tools', 'dependencies'):
-        execute(argv[phase], source)
+        execute(phase, argv[phase], source)
     expression = 'from pm.environments import project_python; from pathlib import Path; print(project_python(Path.cwd()))'
-    selected = execute([value['bootstrap_python']['path'], '-B', '-c', expression], source, 15)
+    selected = execute('pm_python', [value['bootstrap_python']['path'], '-B', '-c', expression], source, 15)
     require(Path(selected).is_absolute() and Path(selected).is_file(), 'native_pm_python_missing')
-    execute([selected, '-B', str(ROOT / 'scripts/friday_native.py'), 'install',
+    execute('native_completion', [selected, '-B', str(ROOT / 'scripts/friday_native.py'), 'install',
              '--input', str(input_path), '--deadline', str(budget.deadline)], source)
-    for command in argv['harness']:
-        execute(command, ROOT)
+    for phase, command in zip(('source', 'toolchain', 'build', 'smoke'), argv['harness']):
+        execute('harness_' + phase, command, ROOT)
     if value['product']['web']['profile'] == 'exa-keyless':
         budget.call(stage_keyless_provider, Path(value['dsh_donor']))
-    execute(argv['a0_inventory'], ROOT, 120)
+    execute('a0_inventory', argv['a0_inventory'], ROOT, 120)
     budget.call(composition_checked, value, source, receipt, donors['hermes'])
     marker = {'schema': SCHEMA, 'state': 'INSTALLED_TEMPLATE_INCOMPLETE',
               'input_sha256': input_hash, 'source_receipt_sha256': digest(budget.call(owned_file, receipt_path)),
@@ -496,8 +609,8 @@ def start(value, input_hash, *, budget=None, input_path=None):
 
 def main():
     started = time.monotonic()  # before parser/input IO; never reset on dispatch
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start'))
+    parser = SafeParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'reconcile'))
     parser.add_argument('--input', required=True, type=Path, help='Private pinned JSON, no credential values')
     args = parser.parse_args(); os.umask(0o077)
     sys.path.insert(0, str(ROOT))
@@ -509,7 +622,9 @@ def main():
         require(isinstance(value, dict), 'explicit_install_fields_required')
         budget = Budget(value.get('seconds'), started=started)
         budget.check()
-        if args.phase == 'plan':
+        if args.phase == 'reconcile':
+            result = reconcile(value, sha)
+        elif args.phase == 'plan':
             result = {'state': 'PLANNED_NOT_EXECUTED', 'ready': False,
                       'commands': commands(value), 'remaining': gaps()}
         elif args.phase == 'install':
@@ -526,14 +641,18 @@ def main():
         budget.check()
         print(payload, flush=True)
         budget.check()
-    except StopUnconfirmed:
+    except StopUnconfirmed as exc:
         # Fixed text only: neither argv, stderr nor a chained error is safe to
         # print. Keep uncertain process custody distinct from a normal refusal.
-        parser.exit(3, 'STOP_UNCONFIRMED: owned command cessation is unconfirmed; '
+        detail = diagnostic_text(getattr(exc, 'friday_diagnostic', safe_diagnostic(exc, args.phase)))
+        if hasattr(exc, 'friday_attempt'): detail += ' attempt=' + exc.friday_attempt['input_sha256']
+        parser.exit(3, 'STOP_UNCONFIRMED: ' + detail + '; owned command cessation is unconfirmed; '
                        'do not retry or release ownership before reconciliation\n')
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
         # Native errors/inputs can contain credentials: print no exception body.
-        parser.exit(2, 'Friday entry refused: pinned inputs, owned fresh installation and admitted native dependencies required\n')
+        detail = diagnostic_text(getattr(exc, 'friday_diagnostic', safe_diagnostic(exc, args.phase)))
+        if hasattr(exc, 'friday_attempt'): detail += ' attempt=' + exc.friday_attempt['input_sha256']
+        parser.exit(2, 'Friday entry refused: ' + detail + '\n')
 
 
 

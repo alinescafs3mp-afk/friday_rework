@@ -122,7 +122,7 @@ def test_actual_original_30s_final_verification_refuses_success(install_input, t
     monkeypatch.setattr(entry, 'install', install)
     monkeypatch.setattr(entry, 'composition_checked', verify)
     with pytest.raises(ValueError, match='original_install_budget_exhausted'):
-        fixture(install_input, tmp_path, monkeypatch)
+        fixture(install_input, tmp_path, monkeypatch, 'exa-paid')
     home = Path(install_input['home']); marker = entry.read_json(home / entry.MARKER)
     assert len(checks) == 2 and marker['state'] == 'PARTIAL'
     assert not (home / (entry.MARKER + '.completed')).exists()
@@ -260,7 +260,7 @@ def test_late_final_output_keeps_attempt_provenance_and_readonly_idempotence(ins
         if Path(dst) == home / entry.MARKER: budget.expired = True
         return out
     monkeypatch.setattr(entry, 'install', install); monkeypatch.setattr(entry.os, 'replace', replace)
-    with pytest.raises(ValueError, match='budget_exhausted'): fixture(install_input, tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match='budget_exhausted'): fixture(install_input, tmp_path, monkeypatch, 'exa-paid')
     marker = entry.read_json(home / entry.MARKER)
     claim = marker['original_attempt']
     assert claim['state'] == 'PARTIAL' and claim['deadline_mono'] == budget.deadline

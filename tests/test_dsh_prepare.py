@@ -16,7 +16,8 @@ spec.loader.exec_module(dsh)
 
 class SourceChecks(unittest.TestCase):
     def setUp(self):
-        parent = ROOT / ".evidence/frw002-sol/test-fixtures"
+        parent = (Path(os.environ['FRIDAY_FIXTURE_EVIDENCE']) / 'dsh-source-fixtures'
+                  if 'FRIDAY_FIXTURE_EVIDENCE' in os.environ else ROOT / '.evidence/frw002-sol/test-fixtures')
         parent.mkdir(parents=True, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(dir=parent)
         self.addCleanup(self.tmp.cleanup)

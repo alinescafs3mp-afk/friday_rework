@@ -15,11 +15,17 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
+import sys
 import time
 
 
 class Refused(RuntimeError):
     pass
+
+
+class SafeParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(2, 'FRIDAY_SOURCE_REFUSED reason=invalid_cli_arguments\n')
 
 
 def require(condition, reason):
@@ -276,7 +282,7 @@ def _compose(repository, donor, destination, budget):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = SafeParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--repository", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--donor", required=True, type=Path)
     parser.add_argument("--destination", required=True, type=Path)
@@ -300,4 +306,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Refused as exc:
+        # Reasons originate in this checked source; never print a Git exception,
+        # argv, traceback, environment or path supplied by an operator.
+        reason = str(exc)
+        if not re.fullmatch('[a-z_]{1,100}', reason):
+            reason = 'source_refused'
+        print('FRIDAY_SOURCE_REFUSED reason=' + reason, file=sys.stderr)
+        sys.exit(2)
+    except subprocess.TimeoutExpired:
+        print('FRIDAY_SOURCE_REFUSED reason=source_preparation_deadline', file=sys.stderr)
+        sys.exit(2)
+    except (OSError, ValueError, KeyError, TypeError):
+        print('FRIDAY_SOURCE_REFUSED reason=source_input_or_io_failed', file=sys.stderr)
+        sys.exit(2)

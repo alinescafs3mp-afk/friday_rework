@@ -13,6 +13,11 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class SafeParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(2, 'Friday native operation refused: phase=arguments reason=invalid_cli_arguments\n')
+
+
 def profile_write(home, spec):
     from tools.configure_product import compose_product
     bundle = compose_product(spec)
@@ -217,7 +222,7 @@ def stage_worker_runtime(value, home):
 
 def main():
     started = time.monotonic()
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser = SafeParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('phase', choices=('install', 'start'))
     parser.add_argument('--input', required=True, type=Path)
     parser.add_argument('--deadline', required=True, type=float, help='Inherited original monotonic deadline')

@@ -63,7 +63,7 @@ def argv(binary, command):
     # namespace-init exit, after the kernel has drained its descendants, rather
     # than returning the application-status event while its reaper still exits.
     return [binary, '--unshare-pid', '--die-with-parent', '--new-session', '--as-pid-1',
-            '--bind', '/', '/', '--proc', '/proc', '--', *command]
+            '--bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--', *command]
 
 
 class Containment:
@@ -103,7 +103,9 @@ class Containment:
     def probe(self, python, cwd):
         outer = os.readlink('/proc/self/ns/pid')
         code = ('import os; assert os.readlink("/proc/self/ns/pid") != ' + repr(outer)
-                + '; print("FRIDAY_PID_NAMESPACE_OK")')
+                + '; fd=os.open("/dev/null",os.O_RDWR); '
+                  'assert os.read(fd,1)==b""; assert os.write(fd,b"probe")==5; '
+                  'os.close(fd); print("FRIDAY_PID_NAMESPACE_OK")')
         result = self.run([python, '-B', '-c', code], cwd, timeout=5)[0]
         if result != 'FRIDAY_PID_NAMESPACE_OK':
             raise ValueError('required_pid_namespace_unavailable')
