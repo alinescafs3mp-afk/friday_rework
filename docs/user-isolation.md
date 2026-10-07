@@ -163,3 +163,13 @@ journeys remain NOT_RUN. Production inference stays on the configured local
 endpoints with no cloud fallback; temporary test capacities are not deployment
 limits. Astra owns independent review, final composition, installation and
 release.
+
+The current source-health delta requires independent review; prior component
+results above describe their pinned revisions. It keeps numeric POSIX owner verification mandatory;
+unsupported owner APIs refuse before new profile creation. Private marker reads
+and descriptor text writes use UTF-8 explicitly. Storage/schema errors remain
+sanitized refusals, while policy/plugin admission boundaries retain documented
+secret-safe catch-all handling and sticky revocation. The concurrent pre-tool
+hook now lives beside the existing inline executors; read conflict diagnostics
+live in the existing read-tracking helper, after bounding and redaction. Native
+IDs, stop controls, tool order, output grants and continuation budgets are unchanged.
