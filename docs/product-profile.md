@@ -18,6 +18,11 @@ reconciliation; repeating the command cannot silently adopt it.
 
 Required input fields:
 
+Profile IDs must already satisfy the native Hermes name validator. Mixed-case
+and reserved names are refused before profile creation or product admission;
+individual identity fields are never silently normalized. The compiler and
+onboarding use the same validation as native routing.
+
 | Field | Explicit operator values |
 |---|---|
 | `profile` | Actual native receiving/administrative profile name |
