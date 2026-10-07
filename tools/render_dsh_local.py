@@ -9,8 +9,15 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import tempfile
 from urllib.parse import urlsplit
+
+try:
+    from tools.web_profile import dsh_web_patch
+except ModuleNotFoundError:  # Direct script invocation from outside the repository.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from web_profile import dsh_web_patch
 
 
 DISABLED_ROWS = (
@@ -22,7 +29,12 @@ DISABLED_ROWS = (
 
 def build_patch(*, purpose, api, base_url, model, context_window, max_tokens,
                 summary_max_tokens, headroom_tokens,
-                api_key_env=None, request_timeout_ms=30000):
+                api_key_env=None, request_timeout_ms=30000, web_profile="disabled",
+                web_search_max_results=None, web_search_max_queries=None, web_timeout_ms=None,
+                web_fetch_max_chars=None, web_fetch_max_bytes=None):
+    web = dsh_web_patch(web_profile, search_max_results=web_search_max_results,
+                        search_max_queries=web_search_max_queries, timeout_ms=web_timeout_ms,
+                        fetch_max_chars=web_fetch_max_chars, fetch_max_bytes=web_fetch_max_bytes)
     if purpose != "temporary-local-test":
         raise ValueError("An explicit temporary-local-test purpose is required")
     if api != "openai-completions":
@@ -85,7 +97,9 @@ def build_patch(*, purpose, api, base_url, model, context_window, max_tokens,
             "summarizationProvider": "friday-local", "summarizationModel": model,
             "maxTokens": summary_max_tokens, "headroomTokens": headroom_tokens,
         }},
-        *({"id": row, "disabled": True} for row in DISABLED_ROWS),
+        *({"id": row, "disabled": True} for row in DISABLED_ROWS
+          if not (web and row == "tool-web")),
+        *web,
     ]
 
 
@@ -139,6 +153,11 @@ def main():
         parser.add_argument("--" + name, required=True, action=Once)
     parser.add_argument("--api-key-env", action=Once)
     parser.add_argument("--request-timeout-ms", action=Once)
+    parser.add_argument("--web-profile", action=Once,
+                        help="disabled (default) or exa-paid; retrieval only")
+    for name in ("web-search-max-results", "web-search-max-queries", "web-timeout-ms",
+                 "web-fetch-max-chars", "web-fetch-max-bytes"):
+        parser.add_argument("--" + name, action=Once)
     args = parser.parse_args()
     try:
         integer = {}
@@ -148,8 +167,17 @@ def main():
             if not re.fullmatch(r"[1-9][0-9]*", value):
                 raise ValueError("An explicit positive decimal integer is required")
             integer[name] = int(value)
+        for name in ("web_search_max_results", "web_search_max_queries", "web_timeout_ms",
+                     "web_fetch_max_chars", "web_fetch_max_bytes"):
+            value = getattr(args, name)
+            if value is not None:
+                if not re.fullmatch(r"[1-9][0-9]*", value):
+                    raise ValueError("An explicit positive decimal integer is required")
+                integer[name] = int(value)
         patch = build_patch(purpose=args.purpose, api=args.api, base_url=args.base_url,
-                            model=args.model, api_key_env=args.api_key_env, **integer)
+                            model=args.model, api_key_env=args.api_key_env,
+                            web_profile="disabled" if args.web_profile is None else args.web_profile,
+                            **integer)
         sha = publish_private(args.output, patch)
     except (OSError, ValueError):
         parser.exit(2, "Profile rendering refused; inputs/output must satisfy the documented contract\n")

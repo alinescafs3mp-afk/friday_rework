@@ -16,11 +16,32 @@ import stat
 import sys
 from urllib.parse import urlsplit
 
+try:
+    from tools.web_profile import hermes_web_config, research_policy
+except ModuleNotFoundError:  # Direct script invocation from outside the repository.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from web_profile import hermes_web_config, research_policy
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class SafeParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(2, "Profile rendering refused; see --help for explicit inputs and private output rules\n")
+
+
+class Once(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error("Repeated input")
+        setattr(namespace, self.dest, values)
+
+
 def build_config(*, base_url, model, key_env, context, max_input,
-                 main_output, summary_output, margin, template_overhead):
+                 main_output, summary_output, margin, template_overhead,
+                 web_profile="disabled", web_extract_char_limit=None, web_extract_timeout=None):
+    web = hermes_web_config(web_profile, extract_char_limit=web_extract_char_limit,
+                            extract_timeout=web_extract_timeout)
     values = (context, max_input, main_output, summary_output, margin, template_overhead)
     if any(type(v) is not int or v <= 0 for v in values):
         raise ValueError("Every capacity/reservation must be an explicit positive integer")
@@ -60,7 +81,7 @@ def build_config(*, base_url, model, key_env, context, max_input,
     auxiliary["title_generation"].update(enabled=False, model_upgrade_enabled=False)
     auxiliary["background_review"]["enabled"] = False
     auxiliary["transient_retries"] = 0
-    return {
+    config = {
         "model": {"provider": provider, "default": model, "base_url": base_url,
                   "api_mode": "chat_completions", "context_length": context},
         "providers": {"friday-local": {
@@ -88,6 +109,12 @@ def build_config(*, base_url, model, key_env, context, max_input,
         "delegation": {"provider": provider, "model": model, "api_mode": "chat_completions",
                        "fallback_providers": []},
     }
+    if web:
+        config.update(web)
+        # Native additive environment prose survives personality selection.
+        # Leave SOUL, display.personality and agent.system_prompt untouched.
+        config["agent"]["environment_hint"] = research_policy()
+    return config
 
 
 def read_owned_file(path, *, private=False):
@@ -107,7 +134,7 @@ def read_owned_file(path, *, private=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = SafeParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--hermes-source", type=Path, default=ROOT / ".donors/hermes")
     for name in ("base-url", "model", "key-env"):
@@ -115,13 +142,22 @@ def main():
     for name in ("context", "max-input", "main-output", "summary-output", "margin", "template-overhead"):
         parser.add_argument("--" + name, required=True, type=int)
     parser.add_argument("--expected-config-sha256", help="Required to replace an existing owned config")
+    parser.add_argument("--web-profile", action=Once,
+                        help="disabled (default), exa-paid, or exa-keyless; retrieval only")
+    parser.add_argument("--web-extract-char-limit", type=int, action=Once)
+    parser.add_argument("--web-extract-timeout", type=int, action=Once)
     args = parser.parse_args()
     home = args.home.absolute()
     if home.resolve() != home or not home.is_relative_to(ROOT / ".runtime"):
         parser.error("Test home must be a real path beneath this workspace's .runtime")
-    config = build_config(**{k: getattr(args, k) for k in (
-        "base_url", "model", "key_env", "context", "max_input", "main_output",
-        "summary_output", "margin", "template_overhead")})
+    args.web_profile = "disabled" if args.web_profile is None else args.web_profile
+    try:
+        config = build_config(**{k: getattr(args, k) for k in (
+            "base_url", "model", "key_env", "context", "max_input", "main_output",
+            "summary_output", "margin", "template_overhead", "web_profile",
+            "web_extract_char_limit", "web_extract_timeout")})
+    except ValueError:
+        parser.error("Invalid explicit profile")
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
     if home.stat().st_uid != os.getuid() or home.stat().st_mode & 0o077:
         parser.error("Test home must be owner-private")
