@@ -120,6 +120,21 @@ cannot borrow process, project, global-root or another user's credentials.
 Ordinary user resolution also requires its existing current native capability;
 an operator's receipt cannot activate a user or expand the accepted SAFE tools.
 
+For Friday homes, native managed-scope selection excludes both ambient
+`HERMES_MANAGED_DIR` and the system managed directory for config and secrets.
+The protected home remains the native config source; unmarked donor homes keep
+the native managed layer. Runtime inference references must match the protected
+product contract and cannot name web, channel or dashboard credentials.
+
+Native main, auxiliary (sync/async), rebuild and delegation paths retain the
+admitted route through SDK request construction. The Friday SDK subclass checks
+the serialized model, URL, Authorization and Host after extension merging, and
+disables redirects. SDK copies retain that boundary. Config aliases and per-call
+extensions cannot replace route fields or authentication. Non-authority header
+overrides are limited to Accept, Accept-Language, User-Agent, X-Request-ID,
+X-Correlation-ID, traceparent and tracestate. Capacity and reasoning bodies remain
+supported. No global SDK monkeypatch or alternate routing service is installed.
+
 Gateway configuration admits only declared channels and owned tokens before
 native weak-token diagnostics. The native Telegram adapter checks its actual
 initialized bot identity after `getMe` and before starting message consumption.
