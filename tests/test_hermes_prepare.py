@@ -196,6 +196,24 @@ class PrepareTests(unittest.TestCase):
                     M['main']()
         self.assertFalse(self.dest.with_name(self.dest.name + '.source.json').exists())
 
+    def test_success_serialization_expiry_cannot_print_success(self):
+        budget = M['preparation_budget'](10)
+        namespace = M['main'].__globals__
+        dumps = json.dumps
+        def slow_success(*args, **kwargs):
+            result = dumps(*args, **kwargs)
+            if isinstance(args[0], dict) and 'receipt' in args[0]:
+                budget.deadline = time.monotonic() - 1
+            return result
+        argv = ['hermes_prepare', '--repository', str(self.repo), '--donor', str(self.donor),
+                '--destination', str(self.dest)]
+        with patch.dict(namespace, preparation_budget=lambda _: budget):
+            with patch.object(sys, 'argv', argv), patch.object(json, 'dumps', slow_success):
+                with patch('builtins.print') as output:
+                    with self.assertRaisesRegex(M['Refused'], 'source_preparation_deadline'):
+                        M['main']()
+                    output.assert_not_called()
+
     def test_symlinked_donor_input_refused(self):
         alias = self.root / 'alias'; alias.symlink_to(self.donor, target_is_directory=True)
         with self.assertRaisesRegex(M['Refused'], 'canonical_donor_required'):

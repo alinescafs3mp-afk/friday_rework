@@ -293,9 +293,10 @@ def main():
         stream.write(serialized)
         stream.flush()
         os.fsync(stream.fileno())
+    success = json.dumps({"status": result["status"], "receipt": str(receipt),
+                          "files": len(result["files"]), "overlays": len(result["layers"])})
     budget.remaining()
-    print(json.dumps({"status": result["status"], "receipt": str(receipt),
-                      "files": len(result["files"]), "overlays": len(result["layers"])}))
+    print(success)
 
 
 if __name__ == "__main__":
