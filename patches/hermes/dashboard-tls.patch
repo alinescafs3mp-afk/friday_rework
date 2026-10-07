@@ -1,0 +1,325 @@
+diff --git a/gateway/host_rendezvous.py b/gateway/host_rendezvous.py
+--- a/gateway/host_rendezvous.py
++++ b/gateway/host_rendezvous.py
+@@ -321,7 +321,12 @@
+     request = urllib.request.Request(
+         f"http://{host}:{record.port}{HOST_IDENTITY_PATH}", headers=headers)
+     try:
+-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 — fixed http scheme
++        if record.friday_owner is not None:
++            from hermes_cli.friday_dashboard_tls import client_open
++            response_context = client_open(record, HOST_IDENTITY_PATH, headers=headers, timeout=timeout)
++        else:
++            response_context = urllib.request.urlopen(request, timeout=timeout)  # noqa: S310
++        with response_context as response:
+             if response.status != 200:
+                 return None
+             payload = json.loads(response.read(65536).decode("utf-8", "replace"))
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1000,7 +1000,7 @@
+
+     "dashboard": {
+         # Visual theme: "default" | "midnight" | "ember" | "mono" | "cyberpunk" | "rose"
+-        "theme": "default",
++        "theme": "default", "tls": None,  # Optional owned direct-TLS file paths.
+         # Process-isolation rollout controls. Read via the raw config loader, so tui_gateway.server
+         # also owns explicit defaults.
+         "turn_isolation": False,
+diff --git a/hermes_cli/friday_dashboard_owner.py b/hermes_cli/friday_dashboard_owner.py
+--- a/hermes_cli/friday_dashboard_owner.py
++++ b/hermes_cli/friday_dashboard_owner.py
+@@ -95,9 +95,19 @@
+     dash = contract['native_dashboard']; operator = dash['operator']
+     require(contract['profile'] == 'default' and operator['provider'] == 'basic'
+             and operator['org_id'] == '' and bool(operator['user_id']))
+-    return {'home': str(home), 'profile': contract['profile'],
++    from hermes_cli.friday_dashboard_tls import declared_settings
++    tls = declared_settings(home, dash)
++    value = {'home': str(home), 'profile': contract['profile'],
+             'source': source_identity(home, source=source), 'operator': operator,
+             'host': dash['host'], 'port': dash['port'], 'public_url': dash['public_url']}
++    if tls is not None:
++        from hermes_cli.friday_dashboard_tls import files
++        marker = json.loads(read_owned(Path(home) / 'FRIDAY-INSTALL.json', private=True))
++        tls_bytes = files(home, dash['tls'])
++        require(marker.get('tls_files') == {path: sha(tls_bytes[key])
++                for key, path in dash['tls'].items()})
++        value['tls'] = tls[0]
++    return value
+
+
+ def enabled():
+@@ -167,6 +177,7 @@
+                 and hmac.compare_digest(provider._secret, settings['secret']))
+         require(basic._verify_password(plaintext, provider._password_hash) if plaintext
+                 else hmac.compare_digest(provider._password_hash, settings['password_hash']))
++    require(dash.get('tls') == value.get('tls', {}).get('files'))
+     value['authBinding'] = hmac.new(settings['secret'],
+         ('friday-dashboard-v1\0' + material + '\0' + json.dumps(value, sort_keys=True)).encode(),
+         hashlib.sha256).hexdigest()
+diff --git a/hermes_cli/friday_dashboard_tls.py b/hermes_cli/friday_dashboard_tls.py
+new file mode 100644
+--- /dev/null
++++ b/hermes_cli/friday_dashboard_tls.py
+@@ -0,0 +1,150 @@
++"""Owned native Uvicorn TLS and verified same-host clients; no certificate issuer."""
++from __future__ import annotations
++
++import hashlib
++import ipaddress
++import os
++from pathlib import Path
++import ssl
++from urllib.parse import urlsplit
++import urllib.request
++
++FILES = {'certfile': 'dashboard-tls/server.pem', 'keyfile': 'dashboard-tls/server.key',
++         'cafile': 'dashboard-tls/ca.pem'}
++
++
++def require(ok, reason='friday_dashboard_tls_unproved'):
++    if not ok:
++        raise ValueError(reason)
++
++
++def validate(value, host, port, public_url):
++    require(isinstance(value, dict) and value == FILES, 'explicit_owned_dashboard_tls_files_required')
++    bind = ipaddress.ip_address(host)
++    public = urlsplit(public_url)
++    require(not bind.is_unspecified and not bind.is_multicast and public.scheme == 'https'
++            and public.hostname and public.port == port and public.path in ('', '/')
++            and not public.query and not public.fragment and public.username is None
++            and public.password is None, 'explicit_dashboard_tls_authority_required')
++    return dict(value)
++
++
++def files(home, value):
++    from hermes_cli.friday_dashboard_owner import read_owned
++    home = Path(home)
++    folder = home / 'dashboard-tls'
++    require(home.resolve() == home and folder.resolve() == folder)
++    owner_uid = getattr(os, 'getuid', None)
++    require(callable(owner_uid))
++    for directory in (home, folder):
++        info = directory.stat()
++        require(directory.is_dir() and info.st_uid == owner_uid() and not info.st_mode & 0o077)
++    return {name: read_owned(home / path, private=True) for name, path in value.items()}
++
++
++def handshake(server, client, hostname):
++    """Verify key/chain/expiry/SAN with OpenSSL using only in-memory BIOs."""
++    si, so, ci, co = (ssl.MemoryBIO() for _ in range(4))
++    peer = server.wrap_bio(si, so, server_side=True)
++    caller = client.wrap_bio(ci, co, server_hostname=hostname)
++    done = [False, False]
++    for _ in range(16):
++        for index, endpoint in enumerate((caller, peer)):
++            if not done[index]:
++                try:
++                    endpoint.do_handshake()
++                    done[index] = True
++                except ssl.SSLWantReadError:
++                    pass
++        if co.pending:
++            si.write(co.read())
++        if so.pending:
++            ci.write(so.read())
++        if all(done):
++            return
++    raise ValueError('dashboard_tls_local_chain_check_incomplete')
++
++
++def checked(home, value, host, port, public_url):
++    value = validate(value, host, port, public_url)
++    before = files(home, value)
++    server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++    server.minimum_version = ssl.TLSVersion.TLSv1_2
++    server.load_cert_chain(str(Path(home) / value['certfile']), str(Path(home) / value['keyfile']), password='')
++    # Only this explicitly owned CA bundle; no ambient trust/proxy/SSL switches.
++    client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
++    client.minimum_version = ssl.TLSVersion.TLSv1_2
++    # Both identities must be explicit SANs, never a legacy Common Name.
++    client.hostname_checks_common_name = False
++    client.load_verify_locations(cadata=before['cafile'].decode('ascii'))
++    require(client.check_hostname and client.verify_mode == ssl.CERT_REQUIRED)
++    for hostname in {host, urlsplit(public_url).hostname}:
++        handshake(server, client, hostname)
++    require(files(home, value) == before, 'dashboard_tls_files_changed')
++    binding = {'files': value, 'cert_sha256': hashlib.sha256(before['certfile']).hexdigest(),
++               'ca_sha256': hashlib.sha256(before['cafile']).hexdigest()}
++    return binding, client
++
++
++def declared_settings(home, dash):
++    if 'tls' not in dash:
++        return None
++    return checked(home, dash['tls'], dash['host'], dash['port'], dash['public_url'])
++
++
++def server_options(app, host, port):
++    identity = getattr(app.state, 'friday_dashboard_owner', None)
++    if identity is None or 'tls' not in identity:
++        return {}
++    home = Path(identity['home'])
++    binding, _ = checked(home, identity['tls']['files'], host, port, identity['public_url'])
++    require(binding == identity['tls'])
++    return {'ssl_certfile': str(home / FILES['certfile']),
++            'ssl_keyfile': str(home / FILES['keyfile']),
++            'ssl_version': ssl.PROTOCOL_TLS_SERVER, 'ssl_keyfile_password': '', 'proxy_headers': False,
++            'forwarded_allow_ips': ''}
++
++
++def request_allowed(request, identity):
++    if identity is None or 'tls' not in identity:
++        return True
++    public = urlsplit(identity['public_url'])
++    origin = request.headers.get('origin')
++    return (request.headers.get('host', '').lower() == public.netloc.lower()
++            and (not origin or origin == identity['public_url'])
++            and request.url.scheme in ('https', 'wss'))
++
++
++class NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        raise ValueError('dashboard_identity_redirect_refused')
++
++
++def client_open(record, path, *, headers, timeout, data=None, method=None):
++    """Dial the actual guest; validate its certificate before any role token."""
++    from gateway import host_rendezvous as hr
++    from hermes_cli.friday_dashboard_owner import check_attachment
++    check_attachment(record)
++    identity = record.friday_owner
++    require(path in (hr.HOST_IDENTITY_PATH, '/api/dashboard/agent-plugins/activate'))
++    host = hr.dial_host(record)
++    scheme = 'http'
++    handlers = [urllib.request.ProxyHandler({}), NoRedirect()]
++    if 'tls' in identity:
++        binding, context = checked(Path(identity['home']), identity['tls']['files'],
++                                   identity['host'], identity['port'], identity['public_url'])
++        require(binding == identity['tls'] and host == identity['host'])
++        scheme = 'https'
++        handlers.append(urllib.request.HTTPSHandler(context=context))
++    target = '[' + host + ']' if ':' in host else host
++    request_headers = dict(headers)
++    request_headers['Host'] = urlsplit(identity['public_url']).netloc
++    request = urllib.request.Request(f'{scheme}://{target}:{record.port}{path}',
++                                    data=data, headers=request_headers, method=method)
++    return urllib.request.build_opener(*handlers).open(request, timeout=timeout)
++
++
++def public_url(identity, profile=''):
++    from urllib.parse import quote
++    url = identity['public_url']
++    return url + ('/?profile=' + quote(profile, safe='') if profile else '')
+diff --git a/hermes_cli/main_dashboard.py b/hermes_cli/main_dashboard.py
+--- a/hermes_cli/main_dashboard.py
++++ b/hermes_cli/main_dashboard.py
+@@ -931,7 +931,9 @@
+     except Exception:
+         profile = "default"
+     wanted = getattr(args, "open_profile", "") or profile
+-    url = f"http://{hr.dial_host(record)}:{record.port}/?profile={wanted}"
++    from hermes_cli.friday_dashboard_tls import public_url
++    url = (public_url(record.friday_owner, wanted) if record.friday_owner else
++           f'http://{hr.dial_host(record)}:{record.port}/?profile={wanted}')
+
+     kind = "backend" if headless_backend else "dashboard"
+     print(f"Hermes {kind} already running on this host: PID {record.pid}, port {record.port}.")
+diff --git a/hermes_cli/plugins_activation.py b/hermes_cli/plugins_activation.py
+--- a/hermes_cli/plugins_activation.py
++++ b/hermes_cli/plugins_activation.py
+@@ -198,7 +198,16 @@
+             f"http://{hr.dial_host(record)}:{record.port}/api/dashboard/agent-plugins/activate",
+             data=json.dumps({"name": name, "home": str(home)}).encode("utf-8"), method="POST",
+             headers={"Content-Type": "application/json", "X-Hermes-Session-Token": token})
+-        with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310 — loopback http
++        if record.friday_owner is not None:
++            if hr.probe_owner(record) is None:
++                return None
++            from hermes_cli.friday_dashboard_tls import client_open
++            response_context = client_open(record, '/api/dashboard/agent-plugins/activate',
++                headers={'Content-Type': 'application/json', 'X-Hermes-Session-Token': token},
++                data=request.data, method='POST', timeout=60)
++        else:
++            response_context = urllib.request.urlopen(request, timeout=60)  # noqa: S310
++        with response_context as response:
+             return json.loads(response.read().decode("utf-8"))
+     except Exception:
+         logger.debug("serve backend activation for %r failed", name, exc_info=True)
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -644,6 +644,9 @@
+ async def host_header_middleware(request: Request, call_next):
+     """Reject requests whose Host header doesn't match the bound interface (DNS rebinding, GHSA-ppp5-vxwm-4cf7)."""
+     # app.state.bound_host is set by start_server() at listen time.
++    from hermes_cli.friday_dashboard_tls import request_allowed
++    if not request_allowed(request, getattr(app.state, 'friday_dashboard_owner', None)):
++        return JSONResponse(status_code=400, content={'detail': 'Invalid Dashboard authority or Origin'})
+     bound_host = getattr(app.state, "bound_host", None)
+     if bound_host and not _is_accepted_host(
+         request.headers.get("host", ""), bound_host, getattr(app.state, "trusted_public_hosts", frozenset())
+@@ -1260,15 +1263,18 @@
+         served_app = wrap_asgi_with_ws_tracking(app, app.state.ssh_isolated_clients)
+         ping_interval, ping_timeout = TUNNEL_WS_PING_INTERVAL_S, TUNNEL_WS_PING_TIMEOUT_S
+
++    from hermes_cli.friday_dashboard_tls import server_options
++    tls_options = server_options(app, host, port)
+     config = uvicorn.Config(
+         served_app, host=host, port=port, log_level="warning",
+         # Off by default so _ws_client_is_allowed sees the real peer, not
+         # X-Forwarded-For. Gated mode runs behind a TLS terminator and needs
+         # X-Forwarded-Proto for cookie Secure flags.
+-        proxy_headers=bool(app.state.auth_required),
++        proxy_headers=tls_options.pop('proxy_headers', bool(app.state.auth_required)),
+         # Loopback-only unless the operator trusts a bounded upstream proxy, so
+         # spoofed X-Forwarded-* from arbitrary callers is never honoured.
+-        forwarded_allow_ips=_dashboard_forwarded_allow_ips(_dash_cfg),
++        forwarded_allow_ips=tls_options.pop('forwarded_allow_ips', _dashboard_forwarded_allow_ips(_dash_cfg)),
++        **tls_options,
+         ws_ping_interval=ping_interval,
+         ws_ping_timeout=ping_timeout,
+         ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
+@@ -1499,7 +1505,10 @@
+         # a piped stdout otherwise surfaces this minutes after the sentinel.
+         print(f"  Hermes backend listening on {host}:{actual_port}", flush=True)
+     else:
+-        print(f"  Hermes Web UI → http://{host}:{actual_port}")
++        from hermes_cli.friday_dashboard_tls import public_url
++        identity = getattr(app.state, 'friday_dashboard_owner', None)
++        shown = public_url(identity) if identity else f'http://{host}:{actual_port}'
++        print(f'  Hermes Web UI → {shown}')
+     _maybe_open_browser(host, actual_port, open_browser, initial_profile)
+
+     if start_mcp_discovery_after_bind:
+diff --git a/hermes_cli/web_server_chat.py b/hermes_cli/web_server_chat.py
+--- a/hermes_cli/web_server_chat.py
++++ b/hermes_cli/web_server_chat.py
+@@ -173,6 +173,9 @@
+     trusted — the credential check is the real auth boundary there.
+     """
+     from hermes_cli.web_server import _is_accepted_host, app
++    from hermes_cli.friday_dashboard_tls import request_allowed
++    if not request_allowed(ws, getattr(app.state, 'friday_dashboard_owner', None)):
++        return 'friday_tls_authority_or_origin_mismatch'
+     bound_host = getattr(app.state, "bound_host", None)
+     if not bound_host:
+         return None
+diff --git a/hermes_cli/web_server_lifecycle.py b/hermes_cli/web_server_lifecycle.py
+--- a/hermes_cli/web_server_lifecycle.py
++++ b/hermes_cli/web_server_lifecycle.py
+@@ -237,7 +237,10 @@
+         return
+
+     _display_host = host if host not in ("0.0.0.0", "::") else "127.0.0.1"
+-    _open_url = f"http://{_display_host}:{actual_port}"
++    from hermes_cli.web_server import app
++    from hermes_cli.friday_dashboard_tls import public_url
++    identity = getattr(app.state, 'friday_dashboard_owner', None)
++    _open_url = public_url(identity) if identity else f'http://{_display_host}:{actual_port}'
+     if initial_profile:
+         from urllib.parse import quote
+         _open_url += f"/?profile={quote(initial_profile)}"

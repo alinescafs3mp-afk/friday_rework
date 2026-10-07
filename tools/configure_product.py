@@ -47,7 +47,7 @@ def _text(value, label, *, empty=False):
 
 
 def _dashboard(value):
-    _exact(value, {'host', 'port', 'public_url', 'operator'}, 'dashboard')
+    _exact(value, {'host', 'port', 'public_url', 'operator'} | ({'tls'} if isinstance(value, dict) and 'tls' in value else set()), 'dashboard')
     host = _text(value['host'], 'dashboard_host')
     try:
         ipaddress.ip_address(host)
@@ -76,6 +76,9 @@ def _dashboard(value):
     if p.scheme != 'https' and (p.hostname not in ('localhost', '127.0.0.1', '::1')
                                or not ipaddress.ip_address(host).is_loopback):
         raise ValueError('remote_dashboard_https_required')
+    if 'tls' in value:
+        from hermes_cli.friday_dashboard_tls import validate
+        validate(value['tls'], host, value['port'], public)
     operator = _exact(value['operator'], {'provider', 'user_id', 'org_id'}, 'operator')
     # Native BasicAuth mints provider=basic, user_id=username, org_id="".
     # An OAuth installation needs its own reviewed explicit native settings.
@@ -195,6 +198,8 @@ def compose_product(spec):
 
     # The protected template has settings/persona only: no receiving/admin
     # authority, worker receipt, keys, history, memory files or owner skills.
+    if 'tls' in dashboard:
+        config['dashboard']['tls'] = copy.deepcopy(dashboard['tls'])
     ordinary = copy.deepcopy(config)
     ordinary.pop('dashboard'); ordinary.pop('gateway'); ordinary.pop('platforms')
     ordinary['toolsets'] = list(USER_TOOLSETS)
@@ -222,7 +227,8 @@ def compose_product(spec):
         'native_dashboard': {'host': dashboard['host'], 'port': dashboard['port'],
             'public_url': config['dashboard']['public_url'], 'auth_required': True,
             'operator': dashboard['operator'], 'insecure': False,
-            'desktop_ssh_exemption_allowed': False},
+            'desktop_ssh_exemption_allowed': False,
+            **({'tls': copy.deepcopy(dashboard['tls'])} if 'tls' in dashboard else {})},
         'soul_sha256': hashlib.sha256(soul).hexdigest(),
         'ordinary_scope': sorted(scope.SAFE),
         'remaining': ['Trusted plugin installation and exact patched native source verification',

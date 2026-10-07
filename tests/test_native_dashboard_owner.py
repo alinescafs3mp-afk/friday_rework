@@ -368,7 +368,7 @@ def test_actual_native_probe_private_ipc_and_basic_state_through_real_asgi_gate(
         response = asyncio.run(exercise())
         assert response.status_code == 200
         return Answer(response)
-    monkeypatch.setattr(urllib.request, 'urlopen', request)
+    monkeypatch.setattr(urllib.request.OpenerDirector, 'open', lambda self, *a, **kw: request(*a, **kw))
     payload = owner.hr.probe_owner(record)
     owner.boundary.check_attachment(record, payload)
     expected = proof(owner) | {'ok': True}

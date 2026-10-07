@@ -196,3 +196,59 @@ profile/installer checks, 75 Dashboard ownership checks and all eleven complete
 native source checks. Password checks use synthetic private profiles and the
 real native provider without sockets. Independent review and actual browser,
 credential, runtime and complete product journeys remain required.
+
+## Direct TLS for the owner LAN
+
+The `dashboard-tls` overlay follows the complete preceding fifteen layers and
+uses the existing Uvicorn listener, native Basic login, host lock and ownership
+proof. It adds no proxy, certificate issuer, listener or supervisor. The normal
+product `dashboard` object accepts an optional `tls` object:
+
+```json
+{"certfile":"dashboard-tls/server.pem", "keyfile":"dashboard-tls/server.key", "cafile":"dashboard-tls/ca.pem"}
+```
+
+For the declared VMware route, select guest bind `192.168.12.128`, port `9119`,
+and `https://<owner VMware host LAN IP>:9119` as `public_url`. The actual host
+address is still a deployment input. The owner configures TCP host 9119 to guest
+192.168.12.128:9119. The guest DHCP address must remain consistent with this
+configuration; the unrelated listener on 8443 is never touched. No wildcard
+bind, HTTP on LAN or certificate verification bypass is supported by this mode.
+
+Normal installation additionally requires `dashboard_tls`, mapping each of the
+three TLS keys to the existing `{path, sha256}` input-pin shape. Supply files
+named `server.pem`, `server.key`, `ca.pem` in one real, private operator input
+directory outside the fresh product home. All files must be owned, regular,
+single-link and private; symlinks and public permissions refuse. The installer
+copies these exact pinned bytes once into the product's private `dashboard-tls`
+directory, then the actual native profile/start consumer loads those paths.
+Existing or partial TLS destinations refuse adoption; originals remain intact.
+The installer does not generate certificates, read an unrelated credential home
+or install browser/system trust. Rendering configuration never validates a live
+certificate or grants readiness.
+
+Provide an unencrypted PEM key and a valid server chain signed by the supplied
+CA bundle. The certificate must include **both** the public host IP/hostname
+and the literal guest bind IP in its SAN. Native identity clients dial the guest
+with normal hostname verification against that guest IP, while sending the
+exact public HTTP Host. A bounded in-memory OpenSSL handshake checks key/chain,
+expiry and both identities before startup; it is not a LAN/browser test. The
+client uses only the explicit CA and ignores ambient proxy variables. Redirects
+refuse before another request can receive a role token. The original nonce/HMAC,
+source/profile/incarnation/token proof remains mandatory after HTTPS.
+
+Direct TLS disables forwarded-header interpretation. HTTP and WebSocket guards
+require the exact public authority including port, HTTPS/WSS and, when supplied,
+the exact public Origin. Native Basic/session/CSRF policy remains unchanged.
+Existing protected loopback HTTP and externally terminated HTTPS profiles without
+`tls` retain their original transport. CLI attachment, browser links and native
+plugin notification choose the declared public/guest routes consistently.
+Plugin activation remains subject to the existing native authentication and
+Friday route allowlist; transport configuration does not authorize that route.
+
+The owner must trust the appropriate CA in the intended browser separately and
+verify the real NAT route, authenticated browser use, actual startup/reattachment,
+service/PM ownership and complete product journeys after independent review.
+Whole-product `start` retains its existing A0/kernel/web admission refusal.
+No service, network, firewall, VMware, trust-store or model effect is performed
+by this source candidate.
