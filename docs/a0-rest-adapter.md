@@ -49,10 +49,15 @@ reuse remains **NOT_RUN**, requiring separate actual acceptance.
 
 Use `A0Controller(associations, {'a0': WorkerBinding(adapter,
 adapter.emergency_stop), ...})` with the same existing Associations/PluginState
-and preparation journal. Its two small overrides correct the shared Controller's
+and preparation journal. Its A0 overrides correct the shared Controller's
 assumption that preparation is harmless: cancellation must stop an active
-bootstrap even before a context exists; persistence failures still attempt native
-stop. Shared Controller, DSH adapter, host and registration are unchanged. Wiring
+bootstrap even before a context exists. Every checked start/reconcile failure,
+including an unreadable preparation journal, changed brief/input declaration or
+lost UNKNOWN-write acknowledgement, attempts the existing exact native stop.
+One last checked association stays in memory solely for stop if the next state
+read fails for that same task/principal. A new process needs its owner's verified
+association/native receipt; it cannot invent ownership from an unreadable store.
+Shared Controller, DSH adapter, host and registration are unchanged. Wiring
 this candidate into the actual host belongs to Astra.
 
 `A0Deployment` supplies pinned Docker/daemon paths, unix socket, immutable image,
@@ -91,6 +96,14 @@ References are `FRIDAY_LLM_API_KEY` / `FRIDAY_EMBEDDINGS_API_KEY`. Existing auth
 runtime identity and generated state are preserved. Keys never enter Docker Env
 or secret hashes. Keep the returned KeyMaterial only in private memory; after
 confirmed cessation its cleanup removes exactly the introduced unchanged fields.
+Unique key binding uses the same `python-dotenv` parser as the intact donor,
+including quoted/export/valueless assignments. Duplicate, changed, partial or
+malformed binding refuses reads/effects and cleanup without deleting foreign
+state. Cleanup is idempotent only when both introduced names are absent.
+The native API helper receives the original admitted values through private
+stdin, checks the actual bounded/no-follow `.env` before initialization/request
+and after response, and redacts those original values after JSON decoding.
+Keys never enter command arguments, request bodies, receipts or evidence.
 A new process must reconstruct it from the private scoped source and current
 receipt under its existing owner, without copying/swapping logins or budgets.
 Same-boot monotonic evidence must show this transaction preceded UI startup.
@@ -112,6 +125,25 @@ with an intercepted opener, and produced config against the accepted schema
 consumer. Native API/model/container/kernel/gateway-down effects are NOT_RUN.
 Mocks exercise identity/cap/deadline refusal; they do not establish live caps.
 
+The repair controls are in `tests/test_a0_adapter_recovery.py`; run both A0 test
+files and the unchanged `tests/test_controller.py` for the relevant offline gate.
+Worker-visible selected input is checked again after the native identity callback
+and before the dependent task POST. Missing/replaced/mutable input stops without
+uploading over uncertain state or repeating bootstrap. This verifies a bounded
+handoff snapshot, not an immutable upload lease against later worker writes.
+Recovery validates the exact expected artifact set/order, unique references and
+logical names, preparation/task origin, completeness, metadata and retained bytes
+before reporting completion. Corrupt old manifests require reconciliation;
+there is no automatic migration or replay.
+
+The exact original independent 71-test harness is retained privately. Its one
+duplicate-key redaction scenario calls `ready()` outside an `assertRaises`; the
+fixed guard now refuses there before its old response assertion. Its literal run
+records that error rather than being reported green. The new corresponding
+control preserves the original secret-absence assertion and explicitly checks
+early refusal, no mocked HTTP call, unchanged cleanup state, legitimate redaction
+through the actual donor loader, escaped JSON secrets and mid-call mutation.
+
 The result's private `runtime_recipe.py` is a one-shot PREPARED command:
 
 ```sh
@@ -122,6 +154,10 @@ Its input must be published by Astra after source review and a separate current
 bounded live grant. It references the existing exclusive lock, exact committed
 candidate/source pins, actual existing Hermes state/association and native
 deployment/grant; no secret values. Astra must first close these prerequisites:
+
+The earlier a267 candidate's private recipe and live inputs remain immutable;
+their source pins are obsolete for this repair. The current owner must review
+and pin the repaired commit before preparing any separately admitted execution.
 
 1. Review the complete package and wire the A0 Controller binding under the same
    host owner; verify source/image/donor and complete Git stage provenance.

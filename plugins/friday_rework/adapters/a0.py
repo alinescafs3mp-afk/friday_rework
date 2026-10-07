@@ -72,6 +72,9 @@ class A0Adapter:
         require(config.key_material.path == boundary.config.state_dir / ".env"
                 and config.key_material.prepared_monotonic == boundary.grant.keys_prepared_monotonic,
                 "foreign_key_material")
+        require(getattr(boundary, "key_material", None) in (None, config.key_material),
+                "foreign_key_material")
+        boundary.key_material = config.key_material
 
     def _row(self, association):
         _validate_store({"schema_version": 1, "jobs": {association["existing_task_id"]: dict(association)}})
@@ -128,13 +131,14 @@ class A0Adapter:
     def _outputs(self, row):
         values = self.config.expected_files(row)
         require(isinstance(values, tuple) and 0 < len(values) <= 16, "expected_files_required")
-        names = set()
+        names, labels = set(), set()
         for v in values:
             require(isinstance(v, ExpectedFile) and isinstance(v.logical_name, str)
                     and 0 < len(v.logical_name) <= 512 and isinstance(v.media_type, str)
                     and 0 < len(v.media_type) <= 256, "invalid_expected_file")
             name = self._path(row, v.worker_path)
-            require(name not in names, "duplicate_basename"); names.add(name)
+            require(name not in names and v.logical_name not in labels, "duplicate_basename")
+            names.add(name); labels.add(v.logical_name)
         return values
 
     def _request(self, association, method, path, payload):
@@ -146,6 +150,7 @@ class A0Adapter:
         require(len(paths) <= 16 and len(set(paths)) == len(paths)
                 and len({PurePosixPath(p).name for p in paths}) == len(paths), "duplicate_basename")
         row, _ = self._row(association)
+        self.config.key_material.ready()
         before = {p: self.boundary.file(row, p, self.config.max_file_bytes, self._remaining(row)) for p in paths}
         values = self._request(row, "POST", "/api/api_files_get", {"paths": list(paths)})
         require(isinstance(values, dict) and set(values) == {PurePosixPath(p).name for p in paths}, "missing_or_extra_files")
@@ -233,13 +238,21 @@ class A0Adapter:
         return row, root, receipt
 
     def submit(self, association, brief, inputs, prepared, on_native_observed):
-        row, root, receipt = self._prepared(association, prepared)
+        row, root = self._row(association)
         try:
+            row, root, receipt = self._prepared(row, prepared)
             self._remaining(row); self._brief(row, brief)
             require(row["submission_observation"] in {"UNKNOWN", "OBSERVED"}, "submission_not_reserved")
             require(receipt["inputs"] == [asdict(v) for v, _ in self._inputs(row, inputs)], "inputs_changed")
             require(not (root / "task-post-intent.json").exists(), "task_requires_reconciliation")
             on_native_observed(self._obs(row, prepared.reference, root / "a0-prepared.json", "running"))
+            # The bootstrap receipt proves past transfer only. Check the actual
+            # worker-visible selected bytes again at the dependent handoff.
+            if inputs:
+                actual = self._verified_files(row, tuple(v.worker_path for v in inputs))
+                require(all(len(actual[v.worker_path]) == v.size_bytes
+                            and hashlib.sha256(actual[v.worker_path]).hexdigest() == v.sha256
+                            for v in inputs), "uploaded_input_missing_or_changed")
             _write(root / "task-post-intent.json", {"context_id": prepared.reference,
                    "brief_sha256": row["brief_sha256"], "deadline_unix": row["deadline_unix"],
                    "container_id": self.boundary.grant.container_id, "invocation_id": self.boundary.grant.invocation_id})
@@ -270,6 +283,7 @@ class A0Adapter:
             for artifact in staged: read_staged(staging_root=self.config.staging_root,
                                               artifact=artifact, max_bytes=self.config.max_file_bytes)
             _write(root / "a0-result.json", {"artifacts": [asdict(v) for v in staged],
+                   "identity": _identity(row), "outputs": receipt["outputs"],
                    "context_id": prepared.reference, "stop_confirmed": True,
                    "goal_verification": "NOT_RUN", "delivery": "NOT_RUN"})
             return self._obs(row, prepared.reference, root / "a0-result.json", "completed")
@@ -279,13 +293,31 @@ class A0Adapter:
             self.inflight = False
 
     def artifacts(self, association, prepared):
-        row, root, _ = self._prepared(association, prepared)
+        row, root, receipt = self._prepared(association, prepared)
         result = _json(root / "a0-result.json")
-        require(result.get("context_id") == prepared.reference and result.get("stop_confirmed") is True,
+        require(set(result) == {"artifacts", "identity", "outputs", "context_id", "stop_confirmed",
+                                "goal_verification", "delivery"}
+                and result.get("identity") == _identity(row)
+                and result.get("outputs") == receipt["outputs"]
+                and result.get("goal_verification") == result.get("delivery") == "NOT_RUN"
+                and result.get("context_id") == prepared.reference and result.get("stop_confirmed") is True,
                 "result_requires_reconciliation")
-        items = tuple(StagedArtifact(**v) for v in result["artifacts"])
-        for item in items: read_staged(staging_root=self.config.staging_root,
-                                     artifact=item, max_bytes=self.config.max_file_bytes)
+        values = result["artifacts"]
+        fields = set(StagedArtifact.__dataclass_fields__)
+        require(isinstance(values, list) and len(values) == len(receipt["outputs"])
+                and all(isinstance(v, dict) and set(v) == fields for v in values), "incomplete_result_manifest")
+        items = tuple(StagedArtifact(**v) for v in values)
+        require(len({v.reference for v in items}) == len(items)
+                and len({v.logical_name for v in items}) == len(items), "duplicate_result_artifact")
+        total = 0
+        for item, expected in zip(items, receipt["outputs"]):
+            require(item.logical_name == expected["logical_name"] and item.media_type == expected["media_type"]
+                    and item.origin_reference == str(root / "worker-response.json")
+                    and item.complete is True and item.verification == "verified"
+                    and type(item.size_bytes) is int and 0 <= item.size_bytes <= self.config.max_file_bytes,
+                    "foreign_or_incomplete_result_artifact")
+            total += item.size_bytes; require(total <= self.config.max_file_bytes, "outputs_too_large")
+            read_staged(staging_root=self.config.staging_root, artifact=item, max_bytes=self.config.max_file_bytes)
         return items
 
     def observe(self, association, prepared):
@@ -333,14 +365,48 @@ class A0Controller(Controller):
     The shared Controller assumes prepare is harmless. Host integration must use
     this subclass for A0 until that assumption is corrected by its owner.
     """
+    def _checked_row(self, task_id, owner):
+        try:
+            row = self.associations.get(task_id, owner)
+        except BaseException as error:
+            # A state read can fail after bootstrap, before shared start's try.
+            # Only the same last verified task/principal is eligible for stop.
+            prior = getattr(self, "_last_a0_row", None)
+            if prior and prior["existing_task_id"] == task_id and prior["owner"] == owner:
+                self._stop_on_error(prior, error)
+            raise
+        if row["worker_kind"] == "a0":
+            import copy
+            self._last_a0_row = copy.deepcopy(row)
+        return row
+
+    def start(self, task_id, owner, brief, inputs):
+        row = self._checked_row(task_id, owner)
+        try:
+            return super().start(task_id, owner, brief, inputs)
+        except BaseException as error:
+            # Even NOT_SUBMITTED can own an effectful model bootstrap. Covers
+            # brief/input/journal failures and a committed UNKNOWN whose write
+            # acknowledgement failed, using this last checked association.
+            if row["worker_kind"] == "a0": self._stop_on_error(row, error)
+            raise
+
     def prepare(self, task_id, owner, brief, inputs):
-        row = self.associations.get(task_id, owner)
+        row = self._checked_row(task_id, owner)
         try:
             result = super().prepare(task_id, owner, brief, inputs)
             current = self.associations.get(task_id, owner)
             if current["worker_kind"] == "a0" and self._intent(current):
                 raise A0Error("retained_stop_or_deadline")
             return result
+        except BaseException as error:
+            if row["worker_kind"] == "a0": self._stop_on_error(row, error)
+            raise
+
+    def reconcile(self, task_id, owner):
+        row = self._checked_row(task_id, owner)
+        try:
+            return super().reconcile(task_id, owner)
         except BaseException as error:
             if row["worker_kind"] == "a0": self._stop_on_error(row, error)
             raise

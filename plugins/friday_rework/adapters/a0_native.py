@@ -45,14 +45,40 @@ def decode_file(value, limit):
 
 # Body and effective native key never enter argv or a transport error. Only
 # bounded successful raw JSON crosses stdout; the host rejects duplicate fields.
-API_SCRIPT = '''import base64,contextlib,io,json,sys,urllib.request
+API_SCRIPT = '''import base64,contextlib,io,json,sys,urllib.request,os,stat
 try:
  v=json.load(sys.stdin)
  assert v['path'] in ('/api/api_message','/api/api_log_get','/api/api_files_get')
  assert v['method'] in ('GET','POST')
  with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
   from helpers import dotenv,runtime,settings
+  from dotenv.parser import parse_stream
+  expected=v['admitted_keys']
+  assert set(expected)=={'API_KEY_OPENAI','API_KEY_OTHER'}
+  assert all(isinstance(x,str) and x for x in expected.values())
+  def checked_keys():
+   fd=os.open(dotenv.get_dotenv_file_path(),os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+   try:
+    before=os.fstat(fd)
+    assert stat.S_ISREG(before.st_mode) and before.st_nlink==1 and stat.S_IMODE(before.st_mode)==0o600 and before.st_size<=1048576
+    data=b''
+    while True:
+     part=os.read(fd,min(65536,1048577-len(data)))
+     if not part:break
+     data+=part
+     assert len(data)<=1048576
+    after=os.fstat(fd)
+    named=os.stat(dotenv.get_dotenv_file_path(),follow_symlinks=False)
+    identity=lambda s:(s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns,s.st_nlink,s.st_mode)
+    assert identity(before)==identity(after)==identity(named)
+    bindings=list(parse_stream(io.StringIO(data.decode('utf-8'))))
+    assert not any(b.error for b in bindings)
+    assert all([b.value for b in bindings if b.key==name]==[value] for name,value in expected.items())
+   finally:os.close(fd)
+  checked_keys()
   runtime.initialize();dotenv.load_dotenv()
+  checked_keys()
+  assert all(os.getenv(name)==value for name,value in expected.items())
   key=settings.get_settings()['mcp_server_token']
  class NoRedirect(urllib.request.HTTPRedirectHandler):
   def redirect_request(self,*args,**kwargs): raise ValueError('redirect_refused')
@@ -68,9 +94,23 @@ try:
   raw=response.read(v['max_bytes']+1)
   assert len(raw)<=v['max_bytes']
  # Redact actual private keys if a worker echoed them in its response.
- import os
- for secret in (key,os.getenv('API_KEY_OPENAI'),os.getenv('API_KEY_OTHER')):
-  if secret: raw=raw.replace(secret.encode(),b'[redacted]')
+ checked_keys()
+ secrets=(key,*expected.values(),os.getenv('API_KEY_OPENAI'),os.getenv('API_KEY_OTHER'))
+ def redacted(value):
+  if isinstance(value,str):
+   for secret in secrets:
+    if secret:value=value.replace(secret,'[redacted]')
+  elif isinstance(value,list):value=[redacted(x) for x in value]
+  elif isinstance(value,dict):
+   pairs=[(redacted(k),redacted(x)) for k,x in value.items()]
+   assert len({k for k,x in pairs})==len(pairs)
+   value=dict(pairs)
+  return value
+ def unique(pairs):
+  assert len(dict(pairs))==len(pairs)
+  return dict(pairs)
+ raw=json.dumps(redacted(json.loads(raw,object_pairs_hook=unique)),allow_nan=False).encode()
+ assert len(raw)<=v['max_bytes']
  print(json.dumps({'ok':True,'body':base64.b64encode(raw).decode()}))
 except BaseException:
  print('{"ok":false}')
@@ -323,7 +363,15 @@ class A0NativeBoundary:
         self._sample(obj, caps=True)
         return unit
 
+    def _keys(self):
+        material = getattr(self, "key_material", None)
+        require(material is not None and material.path == self.config.state_dir / ".env"
+                and material.prepared_monotonic == self.grant.keys_prepared_monotonic, "foreign_key_material")
+        material.ready()
+        return material
+
     def _exec(self, row, script, payload, timeout):
+        self._keys()  # Applies to native file reads as well as API calls.
         self.admit(row)
         timeout = min(timeout, self.native_left - 1, row["deadline_unix"] - self.clock() - 5)
         require(timeout > 1, "budget_exhausted")
@@ -337,8 +385,10 @@ class A0NativeBoundary:
             raise A0Error("native_call_unknown") from None
 
     def request(self, row, method, path, payload, timeout, max_bytes):
+        material = self._keys()
         value = strict_json(self._exec(row, API_SCRIPT, {"method": method, "path": path,
-                            "payload": payload, "timeout": timeout, "max_bytes": max_bytes}, timeout + 1))
+                            "payload": payload, "admitted_keys": material.admitted(),
+                            "timeout": timeout, "max_bytes": max_bytes}, timeout + 1))
         require(isinstance(value, dict) and value.get("ok") is True and set(value) == {"ok", "body"}, "api_outcome_unknown")
         return strict_json(decode_file(value["body"], max_bytes))
 

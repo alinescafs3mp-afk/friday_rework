@@ -361,6 +361,9 @@ class NativeConfigTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup); self.root = Path(temp.name).resolve()
         self.state = self.root / 'usr'; self.state.mkdir(mode=0o700)
+        env = self.state / '.env'; env.write_text('AUTH_LOGIN=fixture\n'); env.chmod(0o600)
+        self.keys = replace(prepare_keys(self.state, lambda ref: 'synthetic-secret-' + ref),
+                            prepared_monotonic=99)
         self.git = self.root / 'git'; self.git.mkdir(mode=0o700)
         docker = pinned(self.root / 'docker', b'offline-docker-fixture')
         daemon = pinned(self.root / 'daemon.service', b'offline-daemon-fixture')
@@ -410,6 +413,7 @@ class NativeConfigTests(unittest.TestCase):
             return json.dumps({'ok':True,'body':base64.b64encode(json.dumps({'context_id':'ctx','response':'READY'}).encode()).decode()}).encode()
         self.boundary = A0NativeBoundary(self.config,self.grant,supervisor=self.supervisor,runner=runner,
             clock=lambda:1000,monotonic=lambda:100)
+        self.boundary.key_material = self.keys
         self.boundary._sample = lambda obj, caps: None  # Kernel execution NOT_RUN in offline protocol controls.
         self.boundary._daemon_caps=lambda group:None
     def test_produced_config_consumed_by_native_boundary_and_argv(self):
@@ -500,7 +504,8 @@ class NativeConfigTests(unittest.TestCase):
         self.assertEqual(self.commands,[])
     def test_actual_native_http_script_auth_redaction_and_redirect_refusal(self):
         helpers=types.ModuleType('helpers')
-        helpers.dotenv=NS(load_dotenv=lambda:None);helpers.runtime=NS(initialize=lambda:None)
+        helpers.dotenv=NS(load_dotenv=lambda:os.environ.update(self.keys.admitted()),
+                          get_dotenv_file_path=lambda:str(self.keys.path));helpers.runtime=NS(initialize=lambda:None)
         helpers.settings=NS(get_settings=lambda:{'mcp_server_token':'native-synthetic-key'})
         captured=[]
         class Response:
@@ -510,9 +515,10 @@ class NativeConfigTests(unittest.TestCase):
             def read(self,limit):return b'{"response":"native-synthetic-key"}'
         class Opener:
             def open(self,req,timeout):captured.append((req,timeout));return Response()
-        payload={'method':'POST','path':'/api/api_message','payload':{'message':'fixture'},'timeout':2,'max_bytes':1024}
+        payload={'method':'POST','path':'/api/api_message','payload':{'message':'fixture'},
+                 'admitted_keys':self.keys.admitted(),'timeout':2,'max_bytes':1024}
         output=io.StringIO();ns={}
-        with patch.dict(sys.modules,{'helpers':helpers}),patch('sys.stdin',io.StringIO(json.dumps(payload))),patch('urllib.request.build_opener',return_value=Opener()),contextlib.redirect_stdout(output):
+        with patch.dict(sys.modules,{'helpers':helpers}),patch.dict(os.environ),patch('sys.stdin',io.StringIO(json.dumps(payload))),patch('urllib.request.build_opener',return_value=Opener()),contextlib.redirect_stdout(output):
             exec(compile(API_SCRIPT,'native-http','exec'),ns)
         req,timeout=captured[0]; self.assertEqual(req.get_header('X-api-key'),'native-synthetic-key')
         self.assertEqual(req.full_url,'http://127.0.0.1:5000/api/api_message');self.assertEqual(timeout,2)

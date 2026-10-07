@@ -153,6 +153,41 @@ KEY_REFERENCES = {"API_KEY_OPENAI": "FRIDAY_LLM_API_KEY",
                   "API_KEY_OTHER": "FRIDAY_EMBEDDINGS_API_KEY"}
 
 
+def key_assignments(content):
+    """Use the same parser as A0's python-dotenv, including quoted/export keys.
+
+    Values stay private. A syntax error cannot hide an overriding assignment.
+    """
+    import io
+    from dotenv.parser import parse_stream
+    try:
+        bindings = list(parse_stream(io.StringIO(content.decode("utf-8"))))
+    except (ValueError, UnicodeError):
+        raise A0Error("invalid_key_file") from None
+    require(not any(v.error for v in bindings), "invalid_key_file")
+    return {name: [v.value for v in bindings if v.key == name] for name in KEY_REFERENCES}
+
+
+def _key_bytes(path):
+    path = _regular(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
+                and before.st_nlink == 1 and stat.S_IMODE(before.st_mode) == 0o600
+                and before.st_size <= 1024**2, "unsafe_key_file")
+        chunks, size = [], 0
+        while part := os.read(fd, min(65536, 1024**2 - size + 1)):
+            size += len(part); require(size <= 1024**2, "unsafe_key_file"); chunks.append(part)
+        identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns,
+                              s.st_ctime_ns, s.st_nlink, s.st_mode)
+        require(identity(before) == identity(os.fstat(fd)) == identity(path.stat(follow_symlinks=False)),
+                "key_file_changed")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def _replace_env(path, before, content):
     """Existing owned 0600 regular file; atomic, mode-preserving replacement."""
     path = _regular(path)
@@ -177,22 +212,31 @@ class KeyMaterial:
     introduced: tuple[bytes, ...] = field(repr=False)
     prepared_monotonic: float = 0
 
+    def admitted(self):
+        """Original admitted values, in memory/stdin only; never retain/log."""
+        require(len(self.introduced) == 2, "introduced_key_changed")
+        values = key_assignments(b"".join(self.introduced))
+        require(all(len(values[name]) == 1 and isinstance(values[name][0], str)
+                    and re.fullmatch(r"[A-Za-z0-9._:/+=@-]{1,4096}", values[name][0])
+                    for name in KEY_REFERENCES), "introduced_key_changed")
+        return {name: values[name][0] for name in KEY_REFERENCES}
+
     def ready(self):
-        before = _regular(self.path).read_bytes()
-        require(stat.S_IMODE(self.path.stat().st_mode) == 0o600 and self.path.stat().st_uid == os.getuid(),
-                'unsafe_key_file')
-        require(len(self.introduced) == 2 and all(before.splitlines(keepends=True).count(line) == 1
-                for line in self.introduced), 'introduced_key_changed')
+        before = _key_bytes(self.path)
+        expected = self.admitted()
+        require(key_assignments(before) == {name: [value] for name, value in expected.items()}
+                and all(before.splitlines(keepends=True).count(line) == 1 for line in self.introduced),
+                'introduced_key_changed')
 
     def remove(self, *, cessation_confirmed):
         require(cessation_confirmed is True, "keys_require_confirmed_cessation")
-        before = _regular(self.path).read_bytes()
-        require(stat.S_IMODE(self.path.stat().st_mode) == 0o600 and self.path.stat().st_uid == os.getuid(),
-                'unsafe_key_file')
+        before = _key_bytes(self.path)
         lines = before.splitlines(keepends=True)
-        names = [line.split(b"=", 1)[0] for line in self.introduced]
-        if not any(re.search(rb"(?m)^\s*(?:export\s+)?" + name + rb"\s*=", before) for name in names):
+        expected = self.admitted()
+        assignments = key_assignments(before)
+        if all(not assignments[name] for name in expected):
             return  # Already removed after the same confirmed cessation.
+        require(assignments == {name: [value] for name, value in expected.items()}, "introduced_key_changed")
         for line in self.introduced:
             require(lines.count(line) == 1, "introduced_key_changed")
             lines.remove(line)
@@ -207,11 +251,9 @@ def prepare_keys(state_dir: Path, resolve: Callable[[str], str]):
     """
     _private(state_dir)
     path = state_dir / ".env"
-    before = _regular(path).read_bytes()
+    before = _key_bytes(path)
     require(not before or before.endswith(b"\n"), "noncanonical_key_file")
-    for name in KEY_REFERENCES:
-        require(not re.search(rb"(?m)^\s*(?:export\s+)?" + name.encode() + rb"\s*=", before),
-                "existing_key_owned_elsewhere")
+    require(all(not values for values in key_assignments(before).values()), "existing_key_owned_elsewhere")
     lines = []
     for name, reference in KEY_REFERENCES.items():
         value = resolve(reference)
