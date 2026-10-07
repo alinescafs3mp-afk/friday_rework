@@ -91,6 +91,27 @@ def record_owner(owner, installation, monkeypatch):
     return owner
 
 
+
+@pytest.fixture
+def credential_boot(record_owner, monkeypatch):
+    """Real credential startup for tests importing the native TUI server."""
+    owner = record_owner
+    from hermes_cli import friday_credential_admission as admission
+    import hermes_constants
+    monkeypatch.setattr(admission, 'SOURCE', owner.source)
+    monkeypatch.setattr(hermes_constants, '_PINNED_PROCESS_HERMES_HOME', str(owner.home))
+    values = {'FRIDAY_LOCAL_KEY': 'SYNTHETIC_LOCAL_INFERENCE',
+              'EXA_API_KEY': 'SYNTHETIC_EXA_WEB',
+              'TELEGRAM_BOT_TOKEN': '123456:synthetic-channel-token-for-fixture'}
+    dotenv = owner.home / '.env'
+    dotenv.write_text(''.join(k+'='+v+'\n' for k, v in values.items())); dotenv.chmod(0o600)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, 'environ', dict(os.environ))
+        with admission.scoped(owner.home):
+            yield owner
+    dotenv.unlink(missing_ok=True)
+
+
 def published(owner):
     owner.boundary.prepare_start(owner.ws.app, '127.0.0.1', 9119)
     owner.ws._publish_host_rendezvous('127.0.0.1', 9119)
@@ -371,8 +392,8 @@ def test_runtime_authority_config_cannot_override_declared_operator(record_owner
     with pytest.raises(ValueError): owner.boundary.expected()
 
 
-def test_native_postbind_failure_shuts_down_before_host_lock_release(record_owner, monkeypatch):
-    owner = record_owner
+def test_native_postbind_failure_shuts_down_before_host_lock_release(credential_boot, monkeypatch):
+    owner = credential_boot
     from hermes_cli import resource_limits, nous_auth_keepalive
     from tui_gateway import launch_profile_policy, server as tui_server
     monkeypatch.setattr(resource_limits, 'apply_nofile_soft_limit', lambda: None)
@@ -481,8 +502,8 @@ def test_friday_publication_does_not_unlock_from_signal_prehandler(record_owner,
 
 
 @pytest.mark.parametrize('failure', ['startup', 'shutdown'])
-def test_unknown_native_stop_retains_host_lock_until_existing_owner_reconciles(record_owner, monkeypatch, failure):
-    owner = record_owner
+def test_unknown_native_stop_retains_host_lock_until_existing_owner_reconciles(credential_boot, monkeypatch, failure):
+    owner = credential_boot
     from contextlib import nullcontext
     from hermes_cli import resource_limits, nous_auth_keepalive
     from tui_gateway import launch_profile_policy, server as tui_server
