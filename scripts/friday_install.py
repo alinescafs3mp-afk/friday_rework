@@ -322,7 +322,9 @@ def install(value, input_path, *, budget=None):
     marker = {'schema': SCHEMA, 'state': 'INSTALLED_TEMPLATE_INCOMPLETE',
               'input_sha256': input_hash, 'source_receipt_sha256': digest(budget.call(owned_file, receipt_path)),
               'home': str(home), 'source': str(source), 'runtime_ready': False,
-              'gateway_installed': False, 'remaining': gaps()}
+              'gateway_installed': False, 'remaining': gaps(),
+              'original_attempt': claim,
+              'invocation_completion': 'NOT_PROVEN_BY_OUTPUT_RECEIPT'}
     marker['profile_files'] = {name: digest(budget.call(owned_file, home / name, private=True))
                                for name in ('config.yaml', 'SOUL.md', 'FRIDAY-PROFILE.json')}
     marker['plugin_files'] = {name: sha for name, sha in value['project_files'].items()
@@ -371,7 +373,8 @@ def inspect(value, input_hash):
     for name, sha in expected_plugins.items():
         require(digest(owned_file(home / name, private=True)) == sha, 'installed_plugin_changed')
     return {'state': 'TEMPLATE_INCOMPLETE', 'ready': False, 'home': str(home),
-            'effects': 'NONE', 'remaining': gaps()}
+            'effects': 'NONE', 'remaining': gaps(),
+            'invocation_completion': 'NOT_PROVEN_BY_OUTPUT_RECEIPT'}
 
 
 def start(value, input_hash):
@@ -388,6 +391,7 @@ def main():
     parser.add_argument('--input', required=True, type=Path, help='Private pinned JSON, no credential values')
     args = parser.parse_args(); os.umask(0o077)
     sys.path.insert(0, str(ROOT))
+    from scripts.dsh_prepare import StopUnconfirmed
     try:
         raw = owned_file(args.input, private=True)
         value = json.loads(raw, object_pairs_hook=unique); sha = digest(raw)
@@ -408,6 +412,11 @@ def main():
         budget.check()
         print(payload, flush=True)
         budget.check()
+    except StopUnconfirmed:
+        # Fixed text only: neither argv, stderr nor a chained error is safe to
+        # print. Keep uncertain process custody distinct from a normal refusal.
+        parser.exit(3, 'STOP_UNCONFIRMED: owned command cessation is unconfirmed; '
+                       'do not retry or release ownership before reconciliation\n')
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         # Native errors/inputs can contain credentials: print no exception body.
         parser.exit(2, 'Friday entry refused: pinned inputs, owned fresh installation and admitted native dependencies required\n')

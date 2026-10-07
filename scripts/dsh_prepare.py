@@ -15,6 +15,10 @@ import sys
 import time
 
 
+class StopUnconfirmed(RuntimeError):
+    """An owned command was signalled but its cessation was not observed."""
+
+
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -59,11 +63,11 @@ def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None):
                 pass
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise RuntimeError('STOP_UNCONFIRMED: original cleanup budget exhausted')
+                raise StopUnconfirmed('STOP_UNCONFIRMED: original cleanup budget exhausted')
             try:
                 out, err = process.communicate(timeout=remaining)
             except subprocess.TimeoutExpired as exc:
-                raise RuntimeError('STOP_UNCONFIRMED: contained command not reaped') from exc
+                raise StopUnconfirmed('STOP_UNCONFIRMED: contained command not reaped') from exc
         else:
             os.killpg(process.pid, signal.SIGTERM)
             try:

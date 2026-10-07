@@ -193,3 +193,84 @@ def test_command_return_after_original_deadline_is_refused(install_input, tmp_pa
     monkeypatch.setattr(dsh_prepare, 'run', late)
     with pytest.raises(ValueError, match='budget_exhausted'):
         runner.run(['/not-executed'], tmp_path)
+
+
+@pytest.mark.parametrize('stage', ['probe', 'compose'])
+@pytest.mark.parametrize('cause', ['unreaped', 'cleanup_budget_exhausted'])
+def test_actual_cli_preserves_unknown_cessation_and_existing_claim(
+        install_input, tmp_path, monkeypatch, capsys, stage, cause):
+    from types import SimpleNamespace
+    import subprocess
+    from scripts import dsh_prepare
+    path = tmp_path / 'input.json'; entry.publish(path, install_input)
+    starts = []; killed = []; waits = []
+    now = time.monotonic()
+    class Process:
+        pid = 98765
+        returncode = 0
+        def __init__(self): self.number = len(starts)
+        def communicate(self, timeout):
+            waits.append(timeout)
+            if stage == 'compose' and self.number == 1:
+                return 'FRIDAY_PID_NAMESPACE_OK', ''
+            if cause == 'cleanup_budget_exhausted':
+                monkeypatch.setattr(dsh_prepare, 'time', SimpleNamespace(monotonic=lambda: now + 8000))
+            raise subprocess.TimeoutExpired('PRIVATE_PROCESS_CANARY', timeout)
+    def spawn(*a, **kw):
+        starts.append(True); return Process()
+    monkeypatch.setattr(dsh_prepare.subprocess, 'Popen', spawn)
+    monkeypatch.setattr(dsh_prepare.os, 'killpg', lambda *a: killed.append(a))
+    monkeypatch.setattr('sys.argv', ['friday', 'install', '--input', str(path)])
+    with pytest.raises(SystemExit) as exc: entry.main()
+    out = capsys.readouterr()
+    assert exc.value.code == 3 and not out.out
+    assert out.err.startswith('STOP_UNCONFIRMED:') and 'do not retry' in out.err
+    assert 'PRIVATE_PROCESS_CANARY' not in out.err and 'Traceback' not in out.err
+    assert len(starts) == (1 if stage == 'probe' else 2)
+    assert killed == [(98765, dsh_prepare.signal.SIGKILL)]
+    assert len(waits) == len(starts) + (cause == 'unreaped')
+    home = Path(install_input['home'])
+    if stage == 'probe': assert not home.exists()
+    else:
+        claim = entry.read_json(home / entry.MARKER)
+        assert claim['state'] == 'PARTIAL'
+        assert claim['input_sha256'] == entry.digest(path.read_bytes())
+        assert not (home / (entry.MARKER + '.completed')).exists()
+
+
+def test_untrusted_error_text_cannot_impersonate_stop_status(install_input, tmp_path, monkeypatch, capsys):
+    path = tmp_path / 'input.json'; entry.publish(path, install_input)
+    def fail(*a, **kw): raise RuntimeError('STOP_UNCONFIRMED: PRIVATE_ERROR_CANARY')
+    monkeypatch.setattr(custody.Containment, 'probe', fail)
+    monkeypatch.setattr('sys.argv', ['friday', 'install', '--input', str(path)])
+    with pytest.raises(SystemExit) as exc: entry.main()
+    out = capsys.readouterr()
+    assert exc.value.code == 2 and not out.out
+    assert 'STOP_UNCONFIRMED' not in out.err and 'PRIVATE_ERROR_CANARY' not in out.err
+
+
+def test_late_final_output_keeps_attempt_provenance_and_readonly_idempotence(install_input, tmp_path, monkeypatch):
+    from test_native_installer import test_whole_finite_composition_and_completed_idempotence_with_native_config as fixture
+    from scripts import dsh_prepare
+    original_install = entry.install; original_replace = entry.os.replace
+    budget = AdmissionClock(1800); home = Path(install_input['home'])
+    def install(value, path): return original_install(value, path, budget=budget)
+    def replace(src, dst, *a, **kw):
+        out = original_replace(src, dst, *a, **kw)
+        if Path(dst) == home / entry.MARKER: budget.expired = True
+        return out
+    monkeypatch.setattr(entry, 'install', install); monkeypatch.setattr(entry.os, 'replace', replace)
+    with pytest.raises(ValueError, match='budget_exhausted'): fixture(install_input, tmp_path, monkeypatch)
+    marker = entry.read_json(home / entry.MARKER)
+    claim = marker['original_attempt']
+    assert claim['state'] == 'PARTIAL' and claim['deadline_mono'] == budget.deadline
+    assert claim['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    assert claim['input_sha256'] == entry.digest((tmp_path / 'input.json').read_bytes())
+    assert marker['invocation_completion'] == 'NOT_PROVEN_BY_OUTPUT_RECEIPT'
+    before = (home / entry.MARKER).read_bytes()
+    def no_execution(*a, **kw): raise AssertionError('read-only inspection executed a command')
+    monkeypatch.setattr(dsh_prepare, 'run', no_execution)
+    out = original_install(install_input, tmp_path / 'input.json')
+    assert out['effects'] == 'NONE' and out['ready'] is False
+    assert out['invocation_completion'] == 'NOT_PROVEN_BY_OUTPUT_RECEIPT'
+    assert (home / entry.MARKER).read_bytes() == before

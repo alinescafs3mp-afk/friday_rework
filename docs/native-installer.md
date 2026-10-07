@@ -29,11 +29,14 @@ Inputs missing that reviewed preparer are refused. This branch does not merge
 or copy the concurrently reviewed preparer.
 
 A fresh private home is claimed exclusively before effects. Existing foreign
-homes/config/plugins are refused. An interrupted install retains its PARTIAL
-claim and work and requires reconciliation; it is never silently replayed,
-deleted or adopted. Completed installation with identical input may be inspected
-idempotently; it does not rerun PM or copy user history. The one install receipt
-is provenance of this output, not a task database or an admission authority.
+homes/config/plugins are refused. An interrupted install retains its work;
+a PARTIAL claim requires reconciliation and is never silently replayed or
+deleted. An admitted final filesystem operation may publish the complete
+template before the invocation then exceeds its deadline. That receipt retains
+the original claim, deadline and boot ID as provenance; it cannot prove a
+successful invocation exit. Identical complete output may be inspected
+idempotently: every byte is checked again, without PM, build or runtime effects.
+The receipt describes output, not a task database or an admission authority.
 
 The future install order is complete source preparation; native PM
 `install --tools-only`; `install --extra all --extra telegram --extra web --extra exa`;
@@ -52,6 +55,9 @@ before expiry is detected; that invocation fails and never grants runtime or
 successful completion. Incomplete claims/work remain for explicit reconciliation.
 There is no reset or per-phase cleanup allowance. Every command reserves cleanup
 inside this same deadline; unconfirmed closure is `STOP_UNCONFIRMED`.
+The CLI preserves this typed condition with fixed, secret-free stderr and exit
+code 3. Ordinary refusals use exit code 2. An unconfirmed stop never authorizes
+a retry or release of process ownership.
 
 Normal installer packaging now requires the distribution's **bubblewrap** OS
 package at `/usr/bin/bwrap` and working unprivileged PID namespaces. Supply the
