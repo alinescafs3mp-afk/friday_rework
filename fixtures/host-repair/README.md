@@ -37,14 +37,22 @@ If the worker needs to run the existing unittest command, expose the same checks
 read-only in its assigned disposable repository. The worker's reported PASS,
 test edits or process exit alone do not certify the owner's goal.
 
-The operator check in `tests/test_host_repair_fixture.py` uses the existing
-bwrap isolation and ordinary Python unittest. `isolated_check` parses the
+The portable operator check in `fixtures/host-repair/check.py` uses the existing
+bwrap isolation and ordinary Python unittest. The original test module explicitly
+imports its compatible `isolated_check` and `_isolated_unittest` exports. `isolated_check` parses the
 finite fixture grammar without executing candidate code on the host, then
 mounts the checked candidate at `/job/calculator.py` and the unchanged owner
 tests at `/owner/test_calculator.py`, both read-only. It exposes `/usr`, isolated
 `/proc`, `/dev` and temporary `/tmp`; no host home, user bus or network is
 available. Limits are two CPU affinity entries, 1 GiB address space per process,
-3 CPU seconds per isolated check and a 5-second wall timeout. All checks run
+3 CPU seconds per isolated check and a 5-second wall timeout. A quarter second of the wall budget is reserved for forced cleanup; a timed out
+check never reports acceptance. Forced teardown records start-time identities in
+this launcher's existing descendant tree, kills its process group, reaps the
+launcher and confirms the recorded descendants ceased within the remaining wall
+budget. Missing teardown evidence returns `cleanup_unconfirmed` with acceptance
+false; no global kill or extra supervisor process is used. Captured stdout and stderr use regular temporary
+files under the same 64 KiB file limit, with a full-boundary output classified as
+`output_limit`. All checks run
 sequentially; no host cgroup or native unit is changed. This is a finite fixture
 check, not a new worker, store or orchestration protocol.
 
@@ -57,12 +65,39 @@ python3 -B -m unittest discover -s tests -p test_host_repair_fixture.py -v
 For an actual returned output, the parent first uses the existing `stage_file`
 and `read_staged` helpers to retain exact bounded bytes under its allowed private
 artifact directory. It then applies `isolated_check` to that stable, owner-held
-copy; it never imports returned code directly on the host. The source grammar
-check requires the same immutable staged bytes at the subprocess mount. Check
+copy; it never imports returned code directly on the host. The checker reads a single-link, current-user-owned regular candidate through
+no-follow descriptors for every path component, with a 64 KiB limit and identity/
+size/mtime/ctime comparison before and after reading. It parses the captured bytes
+and mounts only private mode-0400 copies of those bytes and the pinned owner tests.
+Replacing the caller file after reading cannot change what executes. The private
+checker directory is a trusted owner boundary, not protection against a hostile
+process already running with the same host UID. Check
 the pinned owner test hash before and after execution. A PASS requires the
 actual original unittest run to complete successfully with all three assertions;
 retain exit status and stdout/stderr as evidence. Missing output or refused
 source shape cannot be relabelled PASS.
+
+Run the portable CLI with one candidate path (relative paths are allowed; `..` and
+symlinks are refused):
+
+```sh
+python3 -I -S -B fixtures/host-repair/check.py /absolute/staged/calculator.py
+```
+
+It emits one bounded JSON object: `accepted`, `executed`, actual `child_returncode` (`null`
+when no child started), helper `returncode`, `status`, elapsed seconds, artifact and owner SHA-256,
+complete captured `stdout`/`stderr`, lossless base64 copies, and cleanup status.
+A preflight source-contract refusal uses code 2. CLI exit is 0 only for acceptance,
+124 on timeout, otherwise 1. The actual child code is retained separately, including
+negative signal codes. Acceptance requires grammar admission, original unittest
+completion, unchanged owner/snapshot bytes and confirmed cleanup. `_isolated_unittest`
+remains an internal compatibility probe for isolation tests; its observations never
+claim acceptance because the grammar is bypassed. No stale output is reused.
+
+The trusted CLI does not accept a command, test override, interpreter override or
+other execution profile. It is Linux/bwrap dependent and proves only this arithmetic
+fixture. It does not prove Telegram origin/delivery, general project safety, a live
+host execution route, or the absence of same-UID interference with checker internals.
 
 ## Native input and output contract
 

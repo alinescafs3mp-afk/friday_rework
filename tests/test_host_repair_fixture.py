@@ -4,14 +4,11 @@ Returned Python executes only in bwrap with the owner's original tests mounted
 read-only. File receipt fixtures are synthetic; actual native admission remains
 the parent's responsibility. No host/adapter/route candidate is selected here.
 """
-import ast
 import copy
 import hashlib
 import importlib.util
 import os
 from pathlib import Path
-import resource
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -39,66 +36,14 @@ from friday_fixture_inputs.artifacts import ArtifactError, stage_file, read_stag
 from friday_fixture_inputs import artifacts
 
 
-def isolated_check(candidate):
-    """Check this finite arithmetic fixture without executing host-side code.
-
-    The owner accepts one plain add(a,b) function returning a binary arithmetic
-    expression on its two arguments. Imports, calls, decorators and module
-    effects cannot forge unittest completion. This deliberately narrow fixture
-    grammar is not a general-purpose Python acceptance policy.
-    """
-    source = Path(candidate).read_bytes()
-    try:
-        tree = ast.parse(source)
-        expected = ast.parse(CORRECTION)
-        # Allow the original subtraction and either operand order too; the
-        # immutable behavioral tests, rather than AST shape, determine PASS.
-        for operator in (ast.Add(), ast.Sub()):
-            for names in (("a", "b"), ("b", "a")):
-                value = expected.body[0].body[0].value
-                value.op = operator
-                value.left.id, value.right.id = names
-                if ast.dump(tree) == ast.dump(expected):
-                    return _isolated_unittest(candidate)
-    except (SyntaxError, ValueError):
-        pass
-    return subprocess.CompletedProcess([], 2, b"", b"fixture_source_contract_refused\n")
-
-
-def _isolated_unittest(candidate):
-    """Use an ordinary unittest process; never import candidate into this host.
-
-    This finite fixture check is not a worker launcher or a general code judge.
-    The parent must first validate/stage returned bytes using existing helpers.
-    Exit zero without the original unittest completion is not goal evidence.
-    """
-    assert hashlib.sha256(GOLDEN.read_bytes()).hexdigest() == GOLDEN_SHA
-    command = [
-        "/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--new-session",
-        "--cap-drop", "ALL", "--clearenv", "--setenv", "PATH", "/usr/bin",
-        "--setenv", "HOME", "/tmp", "--setenv", "LANG", "C.UTF-8",
-        "--ro-bind", "/usr", "/usr", "--symlink", "usr/lib", "/lib",
-        "--symlink", "usr/lib64", "/lib64", "--symlink", "usr/bin", "/bin",
-        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-        "--tmpfs", "/job", "--tmpfs", "/owner",
-        "--ro-bind", str(Path(candidate).resolve()), "/job/calculator.py",
-        "--ro-bind", str(GOLDEN), "/owner/test_calculator.py",
-        "--chdir", "/job", "/usr/bin/python3", "-I", "-S", "-B", "-c",
-        "import sys,unittest; sys.path[:0]=['/owner','/job']; "
-        "r=unittest.TextTestRunner(verbosity=2).run("
-        "unittest.defaultTestLoader.loadTestsFromName('test_calculator')); "
-        "sys.exit(not r.wasSuccessful())",
-    ]
-
-    def limits():
-        os.sched_setaffinity(0, sorted(os.sched_getaffinity(0))[:2])
-        resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
-        resource.setrlimit(resource.RLIMIT_CPU, (3, 3))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (65536, 65536))
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-
-    return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                          timeout=5, check=False, preexec_fn=limits)
+# Explicitly load the portable trusted checker; never import a candidate here.
+checker_spec = importlib.util.spec_from_file_location(
+    "friday_host_repair_checker", FIXTURE / "check.py")
+checker = importlib.util.module_from_spec(checker_spec)
+sys.modules[checker_spec.name] = checker
+checker_spec.loader.exec_module(checker)
+isolated_check = checker.isolated_check
+_isolated_unittest = checker._isolated_unittest
 
 
 class HostRepairFixtureTests(unittest.TestCase):
