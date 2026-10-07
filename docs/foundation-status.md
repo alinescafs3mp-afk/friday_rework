@@ -1,5 +1,19 @@
 # Foundation checkpoint — 2026-10-08
 
+Preflight repair, 02:39 MSK: the normal continuation now performs its two
+completed-PM checks with a read-only root mount in the existing PID boundary
+and retains their private diagnostics. It requests no nested sandbox and has
+no writable fallback. All 141 affected checks passed; independent review also
+accepted nine additional controls and one actual isolated native run. That run
+read its owned canary, refused both writing it and creating a new file with
+`EROFS`, checked private device I/O and proved namespace-init completion.
+Parent/monitor exit and release of the exclusive slot were verified.
+
+This proves the changed boundary, not installed-PM compatibility or a complete
+installation. The prior failed launch remains stopped. Its source allowlist and
+original clock are unchanged; the new containment helper cannot be rebound into
+that attempt. Cold startup and all seven product journeys remain unaccepted.
+
 Installer checkpoint, 02:28 MSK: the normal installation completed the
 Hermes export, native PM tools and Python dependencies, frontend build,
 product profile, plugin placement and TLS-file placement. It then stopped
