@@ -24,7 +24,10 @@ def prepared(tmp_path):
     root = tmp_path / "source";root.mkdir()
     files = ["run_agent.py","agent/agent_init.py","agent/prompt_builder.py","agent/system_prompt.py",
              "agent/secret_scope.py","hermes_cli/runtime_provider.py","tools/web_tools.py",
-             "tools/web_result_cache.py","plugins/web/exa/provider.py","plugins/web/keyless_mcp.py","hermes_cli/config_defaults.py"]
+             "tools/web_result_cache.py","plugins/web/exa/provider.py","plugins/web/keyless_mcp.py","hermes_cli/config_defaults.py",
+             "agent/session_persistence.py","agent/tool_executor.py","tools/web_tools_truncate.py",
+             "tools/tool_result_storage.py","hermes_logging.py","agent/redact.py","agent/agent_runtime_helpers.py",
+             "agent/stream_delivery.py"]
     source_files = {}
     for rel in files:
         p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text("# synthetic source pin\n");source_files[rel]=pin(p)["sha256"]
@@ -41,8 +44,11 @@ def prepared(tmp_path):
 
 
 class FakeBoundary:
-    def __init__(self):self.admits=0;self.settles=0;self.quiet=True
+    def __init__(self):self.admits=0;self.settles=0;self.quiet=True;self.consumed=False
     def admit(self, *args):self.admits+=1;return {"FRIDAY_FIXTURE_KEY":"SYNTHETIC_SCOPED_CREDENTIAL"}
+    def consume(self,*args):
+        if self.consumed:raise Refused('original_admission_consumed')
+        self.consumed=True
     def settle(self, *args):self.settles+=1;return self.quiet
 
 
@@ -132,8 +138,10 @@ def test_original_clocks_boot_no_budget_reset(prepared,mono,wall,boot):
 def test_terminal_text_cannot_selfdeclare_acceptance(prepared):
     n=FakeNative();b=FakeBoundary()
     n.run=lambda prompt:{"completed":False,"messages":[],"final_response":"PASS all journeys"}
-    record=execute(prepared,n,b)
+    with pytest.raises(Refused):execute(prepared,n,b)
+    record=M['recover'](*prepared)
     assert record["model_completed"] is False and record["journey_acceptance"]=="NOT_CLAIMED"
+    assert record['status']=='FAILED_OR_UNCERTAIN'
 
 
 def test_existing_native_boundary_and_private_inherited_lease(prepared,tmp_path,monkeypatch):
@@ -147,6 +155,7 @@ def test_existing_native_boundary_and_private_inherited_lease(prepared,tmp_path,
     try:
         fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);s=os.fstat(fd)
         boundary=M["ExistingBoundary"](current_association=lambda:copy.deepcopy(row),supervisor=Supervisor(),lock_fd=fd,
+            associations=None, association_owner=None,
             lock_pin={"device":s.st_dev,"inode":s.st_ino,"path":str(p)},scoped_credentials=lambda p:{"FRIDAY_FIXTURE_KEY":"synthetic"},
             verify_network_admission=lambda p,t:True,confirm_remote_quiescence=lambda p,t:True)
         assert boundary.admit(plan,task,75)=={"FRIDAY_FIXTURE_KEY":"synthetic"}
@@ -170,6 +179,7 @@ def test_native_deadline_cannot_extend_or_guess_original(prepared,value):
                                invocation_id='fixture',control_group=group,unit='fixture.service'),
                                _command=lambda a,t:SimpleNamespace(returncode=0,stdout=value))
     boundary=M['ExistingBoundary'](current_association=lambda:row,supervisor=supervisor,lock_fd=-1,lock_pin={},
+        associations=None, association_owner=None,
         scoped_credentials=lambda p:pytest.fail('credentials before native deadline proof'),verify_network_admission=lambda p,t:False,
         confirm_remote_quiescence=lambda p,t:False)
     with pytest.raises(Refused):boundary.admit(plan,task,75)

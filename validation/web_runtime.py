@@ -7,12 +7,14 @@ the file is inert. There is deliberately no command that can self-authorize.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout, redirect_stderr
 import copy
 from dataclasses import dataclass
 import hashlib
 import ipaddress
+import io
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -21,6 +23,7 @@ import runpy
 import stat
 import sys
 import time
+import threading
 from urllib.parse import urlsplit
 
 
@@ -156,7 +159,9 @@ def verify_plan(plan, task):
     mandatory = {"run_agent.py", "agent/agent_init.py", "agent/prompt_builder.py", "agent/system_prompt.py",
                  "agent/secret_scope.py", "hermes_cli/runtime_provider.py", "tools/web_tools.py",
                  "tools/web_result_cache.py", "plugins/web/exa/provider.py", "plugins/web/keyless_mcp.py",
-                 "hermes_cli/config_defaults.py"}
+                 "hermes_cli/config_defaults.py", "agent/session_persistence.py", "agent/tool_executor.py",
+                 "tools/web_tools_truncate.py", "tools/tool_result_storage.py", "hermes_logging.py",
+                 "agent/redact.py", "agent/agent_runtime_helpers.py", "agent/stream_delivery.py"}
     _require(mandatory <= set(plan["source_files"]), "native_candidate_pins_incomplete")
     for rel, digest in plan["source_files"].items():
         p = root / rel
@@ -192,6 +197,36 @@ def _clean_environment(home):
 
 class Native:
     """Pinned Hermes mechanisms, lazy imports after environment admission."""
+    def observe(self, callback):
+        self.observer = callback
+
+    def _tool_complete(self, call_id, name, args, result):
+        try:
+            self.observer({"messages": [
+                {"role": "assistant", "tool_calls": [{"id": call_id, "function": {
+                    "name": name, "arguments": json.dumps(args, ensure_ascii=False)}}]},
+                {"role": "tool", "tool_call_id": call_id, "name": name, "content": result}]})
+        except Exception:
+            # Native callbacks swallow Exception. Retain the failure and ask
+            # its existing interrupt mechanism to stop; never report success.
+            self.observation_failed = True
+            self.agent.interrupt("observation_persistence_failed")
+            raise
+
+    def partial(self):
+        agent = getattr(self, "agent", None)
+        text = getattr(agent, "_current_streamed_assistant_text", "")
+        # Incomplete SDK streams can end halfway through a known credential.
+        # Withhold any matching suffix; never publish its raw prefix.
+        for secret in getattr(self, "secrets", ()):
+            for form in (secret, json.dumps(secret, ensure_ascii=False)[1:-1],
+                         json.dumps(secret, ensure_ascii=True)[1:-1]):
+                for size in range(min(len(text), len(form)-1), 0, -1):
+                    if text.endswith(form[:size]):
+                        text = text[:-size] + "[REDACTED_PARTIAL]"
+                        break
+        return {"messages": getattr(agent, "_session_messages", []), "partial_response": text}
+
     def open(self, plan, secrets, remaining):
         source = Path(plan["source"])
         self.old_path = list(sys.path)
@@ -212,7 +247,6 @@ class Native:
         from hermes_cli.config import load_config
         from hermes_cli.runtime_provider import resolve_runtime_provider
         from run_agent import AIAgent
-        from hermes_state import SessionDB
         config = load_config()
         model = config["model"]
         _require(model["provider"] == "custom:friday-local" and model["base_url"].rstrip("/") == plan["inference_endpoint"].rstrip("/"), "profile_inference_route_mismatch")
@@ -235,14 +269,37 @@ class Native:
         runtime = resolve_runtime_provider(requested=model["provider"], target_model=model["default"])
         _require(runtime["base_url"].rstrip("/") == plan["inference_endpoint"].rstrip("/")
                  and runtime["api_mode"] == "chat_completions", "native_runtime_route_mismatch")
-        self.db = SessionDB(Path(home) / "state.db")
+        # Supported native no-store mode: no SQLite, WAL, transcript divert or
+        # trajectory. The driver retains only bounded redacted observations.
+        # Long web_extract pages still spill with cache_enabled=False. Scrub at
+        # that actual native persistence seam BEFORE it sees content or URL.
+        from tools import web_tools_truncate
+        self.spill_module = web_tools_truncate
+        self.old_spill = web_tools_truncate._store_full_text
+        self.secrets = tuple(secrets.values()) + (runtime["api_key"],)
+        # Native 4xx request dumps invoke redact_sensitive_text(force=True)
+        # even when verbose logging and trajectories are disabled. Use its
+        # supported profile-scoped exact-value registry for arbitrary secrets,
+        # including their JSON-escaped representations, before any SDK call.
+        from agent.redact import register_vault_redaction_value, clear_vault_redaction_values
+        self.clear_redactions = clear_vault_redaction_values
+        for form in _secret_forms(self.secrets):
+            register_vault_redaction_value(form)
+        web_tools_truncate._store_full_text = lambda url, content: self.old_spill(
+            _redact(url, self.secrets), _redact(content, self.secrets))
+        from tools import tool_result_storage
+        self.result_storage = tool_result_storage
+        self.old_result_spill = tool_result_storage._write_to_spillover
+        tool_result_storage._write_to_spillover = lambda content, filename: self.old_result_spill(
+            _redact(content, self.secrets), _redact(filename, self.secrets))
         self.agent = AIAgent(model=model["default"], base_url=runtime["base_url"], api_key=runtime["api_key"],
             provider=runtime["provider"], api_mode=runtime["api_mode"], requested_provider=model["provider"],
             max_iterations=plan["max_iterations"], enabled_toolsets=["web"], skip_context_files=True,
             load_soul_identity=True, skip_memory=True, skip_background_review=True, quiet_mode=True,
-            session_db=self.db, session_id=plan["task_id"], run_budget_seconds=remaining,
+            session_db=None, save_trajectories=False, verbose_logging=False,
+            tool_complete_callback=self._tool_complete,
+            session_id=plan["task_id"], run_budget_seconds=remaining,
             fallback_model={}, cwd=plan["workspace"])
-        self.secrets = tuple(secrets.values()) + (runtime["api_key"],)
         self.rendered_prompt = self.agent._build_system_prompt()
         _require(policy in self.rendered_prompt, "native_rendered_research_policy_missing")
         _require(_read(plan["soul"]).decode().strip() in self.rendered_prompt, "native_rendered_soul_missing")
@@ -254,7 +311,8 @@ class Native:
         return self
 
     def run(self, prompt):
-        return self.agent.run_conversation(prompt)
+        result = self.agent.run_conversation(prompt)
+        return {**result, "partial_response": self.partial()["partial_response"]}
 
     def close(self):
         # Close every acquired native object even after partial construction.
@@ -264,30 +322,91 @@ class Native:
             if value is not None:
                 try: value.close()
                 except Exception: errors.append(name)
+        if hasattr(self, "clear_redactions"):
+            try: self.clear_redactions()
+            except Exception: errors.append("redaction_scope")
         if getattr(self, "tokens", []):
             from agent.secret_scope import reset_secret_scope, reset_multiplex_context
             for name, token in reversed(self.tokens):
-                (reset_secret_scope if name == "scope" else reset_multiplex_context)(token)
+                try: (reset_secret_scope if name == "scope" else reset_multiplex_context)(token)
+                except Exception: errors.append("secret_scope")
         if hasattr(self, "old_path"):
             sys.path[:] = self.old_path
+        if hasattr(self, "old_spill"):
+            self.spill_module._store_full_text = self.old_spill
+        if hasattr(self, "old_result_spill"):
+            self.result_storage._write_to_spillover = self.old_result_spill
         _require(not errors, "native_cleanup_unconfirmed")
+
+
+def _secret_forms(secret_values):
+    forms = {value for value in secret_values if value}
+    # Tool JSON may itself be a string inside the SDK request JSON and debug
+    # dump. Cover those actual nested serialization boundaries explicitly.
+    for _ in range(3):
+        forms |= {json.dumps(value, ensure_ascii=ascii_only)[1:-1]
+                  for value in tuple(forms) for ascii_only in (False, True)}
+    return sorted(forms, key=len, reverse=True)
+
+
+def _redact(text, secret_values):
+    for form in _secret_forms(secret_values):
+        text = text.replace(form, "[REDACTED]")
+    return text
+
+
+@contextmanager
+def _native_output_policy():
+    """Dedicated-process policy: native logs/console have no persistence grant.
+
+    Disable before imports/construction, including exception logs and close.
+    Observations have their own redacted sink. Avoid buffering raw output.
+    """
+    class Discard(io.TextIOBase):
+        def write(self, text): return len(text)
+    previous = logging.root.manager.disable
+    logging.disable(sys.maxsize)
+    try:
+        with redirect_stdout(Discard()), redirect_stderr(Discard()):
+            yield
+    finally:
+        logging.disable(previous)
+
+
+def _bounded_public(value, secret_values):
+    """Redact before truncating, with one aggregate character budget."""
+    def public(value):
+        budget = 64 * 1024
+        nodes = 1024
+        truncated = False
+        def clean(item, depth=0):
+            nonlocal budget, nodes, truncated
+            nodes -= 1
+            if depth > 8 or nodes < 0:
+                truncated = True
+                return "[TRUNCATED]"
+            if isinstance(item, str):
+                item = _redact(item, secret_values)
+                allowed = min(16384, budget)
+                if len(item) > allowed:
+                    item = item[:allowed] + "[TRUNCATED]"; truncated = True
+                budget = max(0, budget - len(item))
+                return item
+            if isinstance(item, dict):
+                truncated = truncated or len(item) > 32
+                return {_redact(k, secret_values)[:256]:clean(v, depth+1) for k,v in list(item.items())[:32]}
+            if isinstance(item, list):
+                truncated = truncated or len(item) > 32
+                return [clean(v, depth+1) for v in item[:32]]
+            return item
+        value = clean(value)
+        value["observation_truncated"] = truncated
+        return value
+    return public(value)
 
 
 def _observation(result, secret_values):
     """Bounded public observations only. No thinking, raw prompt or exceptions."""
-    def public(value):
-        _require(len(json.dumps(value, ensure_ascii=False).encode()) <= 1024 * 1024, "native_observation_too_large")
-        def clean(item):
-            if isinstance(item, str):
-                for secret in secret_values:
-                    if secret:
-                        for form in (secret, json.dumps(secret, ensure_ascii=False)[1:-1]):
-                            item = item.replace(form, "[REDACTED]")
-                return item
-            if isinstance(item, dict):return {clean(k):clean(v) for k,v in item.items()}
-            if isinstance(item, list):return [clean(v) for v in item]
-            return item
-        return clean(value)
     messages = result.get("messages", [])
     tool_calls = [m.get("tool_calls") for m in messages if m.get("tool_calls")]
     # Tool messages are observed source data; no inference that the model used
@@ -295,11 +414,14 @@ def _observation(result, secret_values):
     tool_sources = [m for m in messages if m.get("role") == "tool"]
     _require(all(c.get("function", {}).get("name") in {"web_search", "web_extract"}
                  for batch in tool_calls for c in batch), "unexpected_tool_in_observation")
-    return public({"model_completed": result.get("completed"), "api_calls": result.get("api_calls"),
-                   "tool_calls": tool_calls, "tool_source_observations": tool_sources,
-                   "final_response": result.get("final_response", ""),
-                   "uncertainty": "Interpret source availability, accuracy and application independently",
-                   "status": "OBSERVED_REQUIRES_INDEPENDENT_CHECK", "journey_acceptance": "NOT_CLAIMED"})
+    value = _bounded_public({"final_response": result.get("final_response", ""),
+                             "partial_response": result.get("partial_response", ""),
+                             "tool_calls": tool_calls, "tool_source_observations": tool_sources}, secret_values)
+    value.update(model_completed=result.get("completed") if type(result.get("completed")) is bool else None,
+                 api_calls=result.get("api_calls") if type(result.get("api_calls")) is int else None,
+                 uncertainty="Interpret source availability, accuracy and application independently",
+                 status="OBSERVED_REQUIRES_INDEPENDENT_CHECK", journey_acceptance="NOT_CLAIMED")
+    return value
 
 
 class ExistingBoundary:
@@ -310,9 +432,11 @@ class ExistingBoundary:
     production of this complete admission is NOT IMPLEMENTED/NOT ACCEPTED.
     The existing offline card permits testing these seams with synthetic state.
     """
-    def __init__(self, *, current_association, supervisor, lock_fd, lock_pin,
+    def __init__(self, *, current_association, associations, association_owner, supervisor, lock_fd, lock_pin,
                  scoped_credentials, verify_network_admission, confirm_remote_quiescence):
         self.current_association = current_association
+        self.associations = associations
+        self.association_owner = association_owner
         self.supervisor = supervisor
         self.lock_fd = lock_fd
         self.lock_pin = lock_pin
@@ -379,6 +503,23 @@ class ExistingBoundary:
         self.row = row
         return self.scoped_credentials(plan)
 
+    def consume(self, plan, task):
+        """Use the original Association's one-way submission transition.
+
+        The supervised wrapper is already active; the original research
+        submission must still be NOT_SUBMITTED. No other worker's submitted row
+        can authorize this run. An uncertain save/ack never permits execution.
+        """
+        _require(self.current_association() == self.row
+                 and self.associations.get(task.task_id, self.association_owner) == self.row,
+                 "original_association_changed_before_consume")
+        consumed = self.associations.begin_submission(task.task_id, self.association_owner)
+        expected = {**self.row, "submission_observation": "UNKNOWN"}
+        _require(self.row.get("submission_observation") == "NOT_SUBMITTED"
+                 and consumed == expected and self.current_association() == consumed,
+                 "original_admission_consumption_unconfirmed")
+        self.row = consumed
+
     def settle(self, plan, task):
         # The driver is still the supervised MainPID while this runs, so it
         # cannot attest its own terminal cgroup. Native object close plus remote
@@ -393,7 +534,9 @@ def execute(plan, task, boundary, *, native=None, mono=time.monotonic, wall=time
     boundary.admit must independently prove the exact supervised current process,
     original durable admission/deadline, retained exclusive lock, clean runtime
     and reviewed web/model egress. It must return only native scoped credentials.
-    No implementation of that live admission producer is claimed in this package.
+    boundary.consume MUST durably consume the original admission before effects,
+    using the existing association's begin_submission transition. No live
+    admission producer is claimed in this package.
     boundary.settle must reconcile remote inference. After this driver exits,
     the parent must observe the entire cgroup quiescent before releasing its
     lease. Neither agent.close nor an in-process callback proves cgroup stop.
@@ -401,23 +544,57 @@ def execute(plan, task, boundary, *, native=None, mono=time.monotonic, wall=time
     verify_plan(plan, task)
     remaining = task.remaining(mono=mono, wall=wall, boot=boot)
     secrets = boundary.admit(plan, task, remaining)
+    # A failed write/ack remains consumed or unknown; never guess it is unused.
+    boundary.consume(plan, task)
     obj = native if native is not None else Native()
     record = {"task_id": task.task_id, "mode": plan["mode"], "input": PROMPTS[plan["mode"]],
-              "plan_sha256": task.plan_sha256, "status": "STARTED", "journey_acceptance": "NOT_CLAIMED",
+              "plan_sha256": task.plan_sha256, "status": "RUNNING_OR_UNCERTAIN", "journey_acceptance": "NOT_CLAIMED",
               "original_admission":{"accepted_monotonic":task.accepted_monotonic,"accepted_wall":task.accepted_wall,
                   "budget_seconds":task.budget_seconds,"boot_id":task.boot_id}}
     failure = None
-    with _clean_environment(Path(plan["profile"]["path"]).parent):
+    capture_lock = threading.RLock()
+    def capture(result, *, partial=False):
+        with capture_lock:
+            observed = _observation(result, (*secrets.values(), *getattr(obj, "secrets", ())))
+            if partial:
+                for key in ("tool_calls", "tool_source_observations"):
+                    observed[key] = (record.get(key, []) + observed[key])[:32]
+                if not observed['final_response']:
+                    observed['final_response'] = record.get('final_response', '')
+            else:
+                for key in ("tool_calls", "tool_source_observations"):
+                    if not observed[key]:observed[key] = record.get(key, [])
+            if not observed['partial_response']:
+                observed['partial_response'] = record.get('partial_response', '')
+            bounded = _bounded_public({key: observed[key] for key in (
+                'final_response', 'partial_response', 'tool_calls', 'tool_source_observations')},
+                (*secrets.values(), *getattr(obj, 'secrets', ())))
+            bounded['observation_truncated'] |= observed['observation_truncated'] or record.get('observation_truncated', False)
+            observed.update(bounded)
+            observed["status"] = "RUNNING_OR_UNCERTAIN"
+            record.update(observed)
+            _publish(Path(plan["output"]) / "partial-observation.json", record, replace=True)
+    with _clean_environment(Path(plan["profile"]["path"]).parent), _native_output_policy():
         try:
             _require(isinstance(secrets, dict) and all(isinstance(k, str) and isinstance(v, str) and v for k, v in secrets.items()), "native_scoped_credentials_required")
+            _publish(Path(plan["output"]) / "partial-observation.json", record, replace=True)
             verify_plan(plan, task)  # recheck after bounded native admission I/O
+            if hasattr(obj, "observe"):
+                obj.observe(lambda result: capture(result, partial=True))
             obj.open(plan, secrets, task.remaining(mono=mono, wall=wall, boot=boot))
             record["native_input_observation"] = getattr(obj,"observation_metadata",{})
+            _publish(Path(plan["output"]) / "partial-observation.json", record, replace=True)
             result = obj.run(PROMPTS[plan["mode"]])
+            # Store returned evidence BEFORE deadline/stop classification.
+            capture(result)
+            _require(not getattr(obj, "observation_failed", False), "native_observation_persistence_failed")
             task.remaining(mono=mono, wall=wall, boot=boot)
-            record.update(_observation(result, (*secrets.values(), *getattr(obj, "secrets", ()))))
-        except Exception as exc:
+            _require(result.get("completed") is True, "native_run_not_completed")
+        except BaseException as exc:
             failure = exc
+            if hasattr(obj, "partial") and not record.get("final_response"):
+                try: capture(obj.partial(), partial=True)
+                except Exception: pass  # retain the last durable partial, no retry
             record.update(status="FAILED_OR_UNCERTAIN", error=type(exc).__name__)
         finally:
             try: obj.close()
@@ -428,11 +605,61 @@ def execute(plan, task, boundary, *, native=None, mono=time.monotonic, wall=time
                 record["owned_boundary"] = "REMOTE_SETTLED_PARENT_CGROUP_OBSERVATION_REQUIRED"
             except Exception as exc:
                 failure = failure or exc;record.update(status="STOP_UNCONFIRMED", owned_boundary="UNCONFIRMED")
-    path = Path(plan["output"]) / "observation.json"
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        json.dump(record, handle, ensure_ascii=False, indent=2);handle.write("\n");handle.flush();os.fsync(handle.fileno())
-    fd = os.open(path.parent, os.O_DIRECTORY);os.fsync(fd);os.close(fd)
+    # Recovery can return the stored final/partial evidence even if final
+    # publication fails. It has no execution, admission or fresh budget path.
+    if failure is None:
+        record['status'] = 'OBSERVED_REQUIRES_INDEPENDENT_CHECK'
+    _publish(Path(plan["output"]) / "partial-observation.json", record, replace=True)
+    _publish(Path(plan["output"]) / "observation.json", record)
     if failure is not None:
         raise Refused(record["status"]) from None
     return record
+
+
+def _publish(path, record, *, replace=False):
+    destination = path
+    if replace:
+        path = path.with_suffix(".pending")
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(record, handle, ensure_ascii=False, indent=2);handle.write("\n");handle.flush();os.fsync(handle.fileno())
+        if replace:
+            os.replace(path, destination)
+    finally:
+        if replace and path.exists():
+            path.unlink()
+    fd = os.open(path.parent, os.O_DIRECTORY);os.fsync(fd);os.close(fd)
+
+
+def recover(plan, task):
+    """Read-only redelivery of stored evidence, including after deadline/reboot.
+
+    The trusted caller still owns delivery/identity. This is not admission,
+    remote settlement, cgroup cleanup or a renewed original clock.
+    """
+    encoded = json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    _require(hashlib.sha256(encoded).hexdigest() == task.plan_sha256
+             and plan["task_id"] == task.task_id, "original_plan_mismatch")
+    directory = Path(plan["output"])
+    _require(directory.is_absolute() and directory.resolve() == directory
+             and directory.stat().st_uid == os.getuid() and not directory.stat().st_mode & 0o077,
+             "unsafe_recovery_directory")
+    for name in ("observation.json", "partial-observation.json"):
+        try:
+            fd = os.open(directory / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as handle:
+                st = os.fstat(handle.fileno())
+                _require(stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
+                         and not st.st_mode & 0o077, "unsafe_recovery_file")
+                data = handle.read(1024 * 1024 + 1)
+                _require(len(data) <= 1024 * 1024, "recovery_record_too_large")
+                record = json.loads(data)
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+        _require(record["task_id"] == task.task_id and record["plan_sha256"] == task.plan_sha256
+                 and record["original_admission"] == {
+                     "accepted_monotonic": task.accepted_monotonic, "accepted_wall": task.accepted_wall,
+                     "budget_seconds": task.budget_seconds, "boot_id": task.boot_id}, "recovery_identity_mismatch")
+        return record
+    raise Refused("no_stored_observation_admission_remains_consumed_or_unknown")

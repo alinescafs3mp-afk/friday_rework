@@ -163,7 +163,7 @@ immutable and must not be retried or have its protected receipt enlarged.
 `validation/web_runtime.py` is an inert, source-only preparation for a **new**
 parent-authorized ordinary/explicit research task. It uses the real Hermes
 `AIAgent`, native local runtime resolver, in-memory profile secret scope, native
-SessionDB and web tools. It adds no scheduler, service launcher, task database or
+web tools with the supported `session_db=None` mode. It adds no scheduler, service launcher, task database or
 authorization command. The small `validation_profile` delta takes task names
 from the pinned native defaults and pins every model-capable auxiliary row to the
 same explicit configured local route. Models and capacities remain renderer
@@ -181,6 +181,17 @@ original boot/monotonic/wall clocks, a native RuntimeMax deadline that cannot ex
 the original task, the already held inherited exclusive-lock FD and a separately
 reviewed original network admission. It never acquires a free lease or creates one.
 
+Before `Native.open`, the driver consumes the **original research admission**
+through the existing `Associations.begin_submission` transition from
+`NOT_SUBMITTED` to `UNKNOWN`. `ExistingBoundary` requires that association store
+and its original owner, and compares the exact original row before and after the
+durable transition. The already supervised wrapper is distinct from the research
+submission it is about to execute: an already submitted worker row is refused.
+No controller or association schema is changed. A crash, lost acknowledgment or
+failed publication never clears consumption, even if all output files are removed.
+The missing trusted producer must supply this original row; the driver cannot
+create or retrofit it.
+
 **The complete trusted live admission producer is missing and NOT ACCEPTED.**
 The historical smoke/preflight records do not provide it. The parent still needs
 an exact new scope and current reviewed egress (local inference separately from
@@ -191,9 +202,34 @@ lease. An in-process `agent.close` or callback cannot attest the driver's own
 terminal cgroup. Refusal/uncertain stop must retain the original budget, process
 identity, partial observations and ownership; no automatic retry.
 
-The one private observation keeps input, effective native metadata, tool calls,
-source responses, final response and uncertainty separate, redacts scoped secrets,
-and never accepts a model's claim of success. Real native SDK/stream/relay/tool
+The private `partial-observation.json` is atomically replaced and fsynced before
+execution, at native tool-complete callbacks, on native return and after cleanup.
+Returned observations are stored before checking the original deadline; failures,
+incomplete model turns and unknown cleanup remain failed/uncertain. Text is
+redacted before truncation (64 Ki characters in aggregate, 16 Ki per field, bounded
+collections/depth). `observation.json` remains an exclusive final publication.
+`recover(plan, task)` reads these retained observations with the original identity,
+even after expiry/reboot or a failed final publication. It does not admit, settle,
+execute or reset any budget. An interrupted capture may leave only the preceding
+durable partial; it remains uncertain. Native complete tool callbacks provide
+incremental source evidence; available visible streamed text is captured on return
+or exception, not durably after every token.
+
+No native SQLite transcript or trajectory is enabled. During the dedicated run,
+native console output is discarded and logging is suppressed, including native
+construction and cleanup; only the redacted observation sink is public. Actual
+native full-page and tool-result spill writers receive redacted text and filenames
+before writing. Native API-error request dumps use the existing profile-scoped
+exact-value redaction registry, including escaped credential forms. These scoped
+bindings are restored at close. This policy requires the new private profile and
+dedicated process; it is not suitable for a concurrent gateway. Pinned persistence,
+redaction, spill and logging sources are mandatory inputs. Offline regressions scan
+every actual profile/workspace/output artifact and captured console for synthetic
+credential echoes on success, SDK failure, deadline and uncertain remote stop.
+
+Observations keep input, effective native metadata, tool calls, source responses,
+final response and uncertainty separate, and never accept a model's claim of
+success. Real native SDK/stream/relay/tool
 execution with **synthetic** HTTP/model responses is an offline control, not proof
 of autonomous research, provider availability or normal product startup. Known
 provider registration and denied optional metadata probes are recorded fixture
