@@ -697,7 +697,12 @@ def resume_harness(request, request_path, *, prepared=None):
     def execute(phase, command, cwd, timeout=1800):
         try:
             budget.call(resume_pins_unchanged, request, claim, budget)
-            return custody.run(command, cwd, timeout=timeout)[0]
+            # Completed PM/profile verification needs no host writes. Use the
+            # existing namespace itself, never a nested sandbox or weaker
+            # fallback, and keep its private diagnostic output on the host.
+            options = ({'read_only': True, 'log': evidence / phase}
+                       if phase in ('pm_python', 'completed_native_check') else {})
+            return custody.run(command, cwd, timeout=timeout, **options)[0]
         except (OSError, ValueError, RuntimeError) as exc:
             diagnostic = safe_diagnostic(exc, phase)
             exc.friday_diagnostic = diagnostic; exc.friday_attempt = claim

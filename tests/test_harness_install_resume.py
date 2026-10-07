@@ -158,6 +158,22 @@ def test_explicit_resume_runs_only_remaining_normal_path_once_and_retains_raw_ev
     phases = [c[3] for c in calls if len(c) > 3 and c[2].endswith('dsh_prepare.py')]
     assert phases == ['check', 'build', 'smoke']
     assert len(calls) == 6 and calls[-1][3] == 'prepare'
+
+
+def test_completed_preflight_is_read_only_with_private_native_logs(attempt, monkeypatch):
+    request, path, _, home, *_ = attempt
+    prepare_synthetic_completion(attempt, monkeypatch)
+    original = custody.Containment.run
+    options = []
+    def observed(self, command, cwd, **kw):
+        options.append(kw)
+        return original(self, command, cwd, **kw)
+    monkeypatch.setattr(custody.Containment, 'run', observed)
+    entry.resume_harness(request, path)
+    for phase, call in zip(('pm_python', 'completed_native_check'), options[:2]):
+        assert call['read_only'] is True
+        assert call['log'] == home / 'preparation/harness-resume' / phase
+    assert all('read_only' not in call and 'log' not in call for call in options[2:])
     assert '--deadline' not in calls[0]  # original budget is carried by containment
     assert str(claim['deadline_mono']) in calls[1]
     before = snapshot(home)

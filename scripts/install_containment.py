@@ -57,14 +57,19 @@ def checked_binary(pin):
     return str(path)
 
 
-def argv(binary, command):
+def argv(binary, command, *, read_only=False):
     # Keep current installation filesystem/network semantics. This boundary
     # supplies process lifetime custody, not a new filesystem or network grant.
     # The finite command is namespace PID 1. Bubblewrap therefore waits for
     # namespace-init exit, after the kernel has drained its descendants, rather
     # than returning the application-status event while its reaper still exits.
+    if type(read_only) is not bool:
+        raise ValueError('explicit_read_only_boolean_required')
+    # Mount protection belongs to this same native boundary. Nesting another
+    # bwrap would request another user namespace and can be refused by the OS.
     return [binary, '--unshare-pid', '--die-with-parent', '--new-session', '--as-pid-1',
-            '--bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--', *command]
+            '--ro-bind' if read_only else '--bind', '/', '/',
+            '--dev', '/dev', '--proc', '/proc', '--', *command]
 
 
 def namespace_exit(data, observation):
@@ -87,7 +92,7 @@ class Containment:
         self.pin, self.budget, self.env = pin, budget, env
         self.binary = budget.call(checked_binary, pin)
 
-    def run(self, command, cwd, *, timeout=1800):
+    def run(self, command, cwd, *, timeout=1800, read_only=False, log=None):
         from scripts.dsh_prepare import run, CommandFailed, StopUnconfirmed, safe_observation
         self.budget.call(checked_binary, self.pin)
         # Reserve cleanup *inside* the original deadline; no fresh grace clock.
@@ -95,11 +100,12 @@ class Containment:
         reader, writer = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
         failure = None; result = None; observation = {}; data = b''
         try:
-            args = argv(self.binary, command)
+            args = argv(self.binary, command, read_only=read_only)
             args[1:1] = ['--json-status-fd', str(writer)]
             try:
+                logging = {'log': log} if log is not None else {}
                 result = run(args, cwd, timeout=limit, env=self.env,
-                             deadline=self.budget.deadline, pass_fds=(writer,))
+                             deadline=self.budget.deadline, pass_fds=(writer,), **logging)
                 observation = result[1]
             except BaseException as exc:
                 failure = exc

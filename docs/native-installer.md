@@ -135,6 +135,12 @@ Failure or a crash after consumption requires reconciliation; calling the same
 command again does not retry it. Preflight checks the complete Hermes export,
 installed PM Python, profile/config/personality, plugin/TLS bytes, native
 compiler freshness receipts, and the previous Harness source/toolchain identity.
+The two completed-PM checks use a read-only root mount in the existing native
+PID boundary, with private device/proc mounts and the same original deadline.
+They do not start a nested sandbox or fall back to writable execution. Their
+raw command diagnostics are retained in the private continuation evidence.
+Changing this containment helper does not broaden the two-file resume
+allowlist or grant replay of any previously refused operation.
 Only the remaining normal build, smoke, keyless staging, A0 inventory and final
 template marker path executes. `original_attempt` retains the original claim;
 the final marker identifies the current input without granting runtime readiness.

@@ -62,6 +62,49 @@ def test_finite_command_is_namespace_init():
     assert args[args.index('--') + 1:] == ['/reviewed/native', 'install']
 
 
+def test_read_only_uses_same_native_boundary_and_original_deadline(monkeypatch, tmp_path):
+    monkeypatch.setattr(custody, 'checked_binary', lambda pin: '/usr/bin/bwrap')
+    budget = custody.Budget(30)
+    calls = []
+    def returned(args, cwd, **kwargs):
+        calls.append((args, kwargs))
+        native_status(kwargs, 0)
+        return 'checked', metadata()
+    monkeypatch.setattr(dsh_prepare, 'run', returned)
+    result, proof = custody.Containment({}, budget, {}).run(
+        ['/reviewed/python', '-B', 'verify'], tmp_path, timeout=5,
+        read_only=True, log=tmp_path / 'private-preflight')
+    args, options = calls[0]
+    assert args.count('/usr/bin/bwrap') == 1
+    assert '--ro-bind' in args and '--bind' not in args
+    assert all(flag in args for flag in ('--as-pid-1', '--unshare-pid', '--die-with-parent'))
+    assert args[args.index('--') + 1:] == ['/reviewed/python', '-B', 'verify']
+    assert options['deadline'] == budget.deadline and options['timeout'] == 5
+    assert options['log'] == tmp_path / 'private-preflight'
+    assert result == 'checked' and proof['namespace_init_exit_verified'] is True
+
+
+@pytest.mark.parametrize('flag', [None, 0, 1, 'false', 'true'])
+def test_read_only_mode_does_not_accept_ambiguous_values(flag):
+    with pytest.raises(ValueError, match='explicit_read_only_boolean_required'):
+        custody.argv('/usr/bin/bwrap', ['/not-run'], read_only=flag)
+
+
+def test_read_only_refusal_never_retries_writable(monkeypatch, tmp_path):
+    monkeypatch.setattr(custody, 'checked_binary', lambda pin: '/usr/bin/bwrap')
+    calls = []
+    def refused(args, cwd, **kwargs):
+        calls.append(args)
+        native_status(kwargs, 1)
+        raise dsh_prepare.CommandFailed(metadata(1))
+    monkeypatch.setattr(dsh_prepare, 'run', refused)
+    with pytest.raises(dsh_prepare.CommandFailed) as failure:
+        custody.Containment({}, custody.Budget(30), {}).run(
+            ['/not-run'], tmp_path, read_only=True)
+    assert len(calls) == 1 and '--ro-bind' in calls[0]
+    assert failure.value.observation['namespace_init_exit_verified'] is True
+
+
 @pytest.mark.parametrize('wire', [b'', b'{"exit-code":0}\n', b'{"child-pid":123}\n',
     b'{"child-pid":123}\n{"exit-code":1}\n', b'{"child-pid":true}\n{"exit-code":0}\n',
     b'{"child-pid":123}\n{"exit-code":false}\n', b'garbage', b'x'*4097])
