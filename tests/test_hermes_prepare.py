@@ -3,10 +3,13 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shlex
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 M = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/hermes_prepare.py'))
 sha = M['sha']
@@ -139,9 +142,59 @@ class PrepareTests(unittest.TestCase):
 
     def test_dirty_owner_source_is_preserved_and_refused(self):
         (self.donor / 'base.txt').write_text('owner change\n')
-        self.refuse('dirty_donor_refused')
+        self.refuse('donor_blob_changed')
         self.assertEqual((self.donor / 'base.txt').read_text(), 'owner change\n')
         self.assertFalse(self.dest.exists())
+
+    def test_repository_clean_filter_is_never_executed(self):
+        marker = self.root / 'filter-executed'
+        command = self.root / 'clean-filter.sh'
+        command.write_text('#!/bin/sh\nprintf executed > ' + shlex.quote(str(marker)) + '\ncat\n')
+        command.chmod(0o700)
+        (self.donor / '.git/info/attributes').write_text('base.txt filter=fixture\n')
+        self.git('config', 'filter.fixture.clean', shlex.quote(str(command)))
+        target = self.donor / 'base.txt'
+        changed = target.stat().st_mtime_ns + 10_000_000_000
+        os.utime(target, ns=(changed, changed))
+        result = self.prepare()
+        self.assertEqual(result['status'], 'SOURCE_COMPOSED_NOT_RUNTIME_ACCEPTED')
+        self.assertFalse(marker.exists())
+
+    def test_staged_donor_change_refused_without_export(self):
+        (self.donor / 'untouched.txt').write_text('owner staged edit\n')
+        self.git('add', 'untouched.txt')
+        self.refuse('dirty_donor_refused')
+        self.assertFalse(self.dest.exists())
+        self.assertEqual((self.donor / 'untouched.txt').read_text(), 'owner staged edit\n')
+
+    def test_final_read_expiry_cannot_return_success(self):
+        budget = M['preparation_budget'](10)
+        namespace = M['_compose'].__globals__
+        original = namespace['regular']
+        def last_read(path):
+            result = original(path)
+            if path == self.dest / 'untouched.txt':
+                budget.deadline = time.monotonic() - 1
+            return result
+        with patch.dict(namespace, regular=last_read):
+            with self.assertRaisesRegex(M['Refused'], 'source_preparation_deadline'):
+                M['_compose'](self.repo, self.donor, self.dest, budget)
+
+    def test_receipt_serialization_keeps_original_deadline(self):
+        budget = M['preparation_budget'](10)
+        namespace = M['main'].__globals__
+        dumps = json.dumps
+        def slow_serialization(*args, **kwargs):
+            result = dumps(*args, **kwargs)
+            budget.deadline = time.monotonic() - 1
+            return result
+        argv = ['hermes_prepare', '--repository', str(self.repo), '--donor', str(self.donor),
+                '--destination', str(self.dest)]
+        with patch.dict(namespace, preparation_budget=lambda _: budget):
+            with patch.object(sys, 'argv', argv), patch.object(json, 'dumps', slow_serialization):
+                with self.assertRaisesRegex(M['Refused'], 'source_preparation_deadline'):
+                    M['main']()
+        self.assertFalse(self.dest.with_name(self.dest.name + '.source.json').exists())
 
     def test_symlinked_donor_input_refused(self):
         alias = self.root / 'alias'; alias.symlink_to(self.donor, target_is_directory=True)

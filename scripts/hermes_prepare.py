@@ -102,8 +102,6 @@ def source_identity(repository, donor, budget):
                 "donor_identity_changed")
     require(git(donor, ["remote", "get-url", "origin"], budget).decode().strip()
             == source["clone_url"], "unexpected_donor_origin")
-    require(not git(donor, ["status", "--porcelain=v1", "--untracked-files=no"], budget),
-            "dirty_donor_refused")
     entries = {}
     for record in git(donor, ["ls-tree", "-rz", source["commit"]], budget).split(b"\0"):
         if not record:
@@ -113,6 +111,20 @@ def source_identity(repository, donor, budget):
         require(kind == "blob" and mode in {"100644", "100755"}, "unsupported_source_entry")
         entries[relative(name.decode("utf-8"))] = (mode, oid)
     require(entries, "empty_donor")
+    index = {}
+    for record in git(donor, ["ls-files", "--stage", "-z"], budget).split(b"\0"):
+        if not record:
+            continue
+        header, name = record.split(b"\t", 1)
+        mode, oid, stage = header.decode("ascii").split()
+        path = relative(name.decode("utf-8"))
+        require(stage == "0" and path not in index, "dirty_donor_refused")
+        index[path] = (mode, oid)
+    require(index == entries, "dirty_donor_refused")
+    # `git status` refreshes the index through repository-local clean filters.
+    # Read only index metadata and verify the working bytes ourselves instead.
+    for name, (mode, oid) in entries.items():
+        source_bytes(donor, name, mode, oid, budget)
     return source, lock_sha, entries
 
 
@@ -177,23 +189,29 @@ def overlay_layers(repository, commit, budget):
     return [(key, layers[key]) for key in ordered]
 
 
+def source_bytes(donor, name, mode, oid, budget):
+    budget.remaining()
+    data, actual_mode = regular(donor / name)
+    require(bool(actual_mode & 0o111) == (mode == "100755"), "donor_mode_changed")
+    def blob(value):
+        return hashlib.sha1(b"blob " + str(len(value)).encode() + b"\0" + value).hexdigest()
+    if blob(data) != oid:
+        # Only a declared CRLF checkout with the exact canonical Git blob can
+        # differ; never invoke arbitrary clean filters or accept changed bytes.
+        attrs = git(donor, ["check-attr", "-z", "eol", "--", name], budget).split(b"\0")
+        canonical = data.replace(b"\r\n", b"\n")
+        require(attrs[:3] == [name.encode(), b"eol", b"crlf"]
+                and b"\n" not in data.replace(b"\r\n", b"") and blob(canonical) == oid,
+                "donor_blob_changed")
+        data = canonical
+    budget.remaining()
+    return data
+
+
 def export_source(donor, destination, entries, budget):
     expected = {}
     for name, (mode, oid) in entries.items():
-        budget.remaining()
-        data, actual_mode = regular(donor / name)
-        require(bool(actual_mode & 0o111) == (mode == "100755"), "donor_mode_changed")
-        def blob(value):
-            return hashlib.sha1(b"blob " + str(len(value)).encode() + b"\0" + value).hexdigest()
-        if blob(data) != oid:
-            # Export canonical Git bytes, including explicitly declared CRLF
-            # checkouts. Never accept an arbitrary filter or a changed blob.
-            attrs = git(donor, ["check-attr", "-z", "eol", "--", name], budget).split(b"\0")
-            canonical = data.replace(b"\r\n", b"\n")
-            require(attrs[:3] == [name.encode(), b"eol", b"crlf"]
-                    and b"\n" not in data.replace(b"\r\n", b"") and blob(canonical) == oid,
-                    "donor_blob_changed")
-            data = canonical
+        data = source_bytes(donor, name, mode, oid, budget)
         target = destination / name
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         budget.remaining()
@@ -204,9 +222,16 @@ def export_source(donor, destination, entries, budget):
     return expected
 
 
-def compose(repository, donor, destination, *, seconds=120):
+def preparation_budget(seconds):
     require(type(seconds) in (int, float) and 0 < seconds <= 1800, "invalid_preparation_budget")
-    budget = Budget(time.monotonic() + seconds)
+    return Budget(time.monotonic() + seconds)
+
+
+def compose(repository, donor, destination, *, seconds=120):
+    return _compose(repository, donor, destination, preparation_budget(seconds))
+
+
+def _compose(repository, donor, destination, budget):
     repository, donor, destination = map(Path, (repository, donor, destination))
     require(repository.is_absolute() and repository.resolve() == repository, "canonical_bundle_required")
     require(destination.is_absolute() and destination.parent.resolve() == destination.parent,
@@ -243,6 +268,7 @@ def compose(repository, donor, destination, *, seconds=120):
         data, mode = regular(destination / name)
         require(sha(data) == pin["sha256"] and len(data) == pin["bytes"]
                 and bool(mode & 0o111) == (pin["mode"] == "100755"), "composed_file_changed")
+    budget.remaining()
     return {"schema": "friday.hermes-source.v1", "status": "SOURCE_COMPOSED_NOT_RUNTIME_ACCEPTED",
             "commit": source["commit"], "base_tree": source["tree"], "sources_lock_sha256": lock_sha,
             "source_file_count": len(entries), "layers": applied, "files": expected,
@@ -257,14 +283,17 @@ def main():
     parser.add_argument("--seconds", default=120, type=int)
     args = parser.parse_args()
     os.umask(0o077)
+    budget = preparation_budget(args.seconds)
     receipt = args.destination.with_name(args.destination.name + ".source.json")
     require(not receipt.exists() and not receipt.is_symlink(), "fresh_receipt_required")
-    result = compose(args.repository, args.donor, args.destination, seconds=args.seconds)
+    result = _compose(args.repository, args.donor, args.destination, budget)
+    serialized = json.dumps(result, indent=2, sort_keys=True) + "\n"
+    budget.remaining()
     with receipt.open("x") as stream:
-        json.dump(result, stream, indent=2, sort_keys=True)
-        stream.write("\n")
+        stream.write(serialized)
         stream.flush()
         os.fsync(stream.fileno())
+    budget.remaining()
     print(json.dumps({"status": result["status"], "receipt": str(receipt),
                       "files": len(result["files"]), "overlays": len(result["layers"])}))
 
