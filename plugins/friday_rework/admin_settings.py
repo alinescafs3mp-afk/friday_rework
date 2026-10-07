@@ -195,7 +195,7 @@ def edit(profile, home, body, verify):
                 candidate["agent"]["disabled_toolsets"] = disabled
                 changed = ["platform_toolsets", "agent.disabled_toolsets"]
             else:
-                from agent.skill_utils import ESSENTIAL_SKILLS
+                from agent.skill_utils import ESSENTIAL_SKILLS, _normalize_string_set, is_disabled_entry
                 from tools.skills_tool import _skill_catalog
                 catalog = _skill_catalog(skip_disabled=True)
                 selected = next(row for row in catalog if row.get("load_name") == values["name"])
@@ -206,10 +206,10 @@ def edit(profile, home, body, verify):
                 def enable_one(names):
                     if not isinstance(names, list) or any(not isinstance(n, str) for n in names):
                         raise ValueError("invalid_native_skill_policy")
-                    result = [n for n in names if n not in (selected["name"], values["name"])]
+                    result = [n for n in names if not is_disabled_entry(selected, _normalize_string_set([n]))]
                     # Expand a broad declared-name disable before enabling one
                     # duplicate, so its peers retain their prior policy.
-                    if selected["name"] in names:
+                    if selected["name"] in _normalize_string_set(names) - ESSENTIAL_SKILLS:
                         result.extend(row["load_name"] for row in catalog
                             if row["name"] == selected["name"] and row.get("load_name")
                             and row["load_name"] != values["name"])
@@ -256,8 +256,8 @@ def edit(profile, home, body, verify):
             config._canonicalize_config(config._deep_merge(copy.deepcopy(config.DEFAULT_CONFIG), candidate))))
         _local_inference(effective)
         if kind == "skill" and values["enabled"]:
-            # Native catalog reads raw policy; managed denials remain authority
-            # even when their paths are not among this raw edit's changed keys.
+            # Match the catalog's normalized display/load names and essential
+            # exemptions, including managed denials outside this edit's keys.
             skill_policy = effective.get("skills") or {}
             denials = [skill_policy.get("disabled", [])]
             platforms = skill_policy.get("platform_disabled", {})
@@ -267,7 +267,7 @@ def edit(profile, home, body, verify):
             for names in denials:
                 if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
                     raise ValueError("invalid_native_skill_policy")
-                if any(name in names for name in (selected["name"], values["name"])):
+                if is_disabled_entry(selected, _normalize_string_set(names) - ESSENTIAL_SKILLS):
                     raise PermissionError("effective_native_skill_denied")
         verify()
         if private_config(path) != sha:

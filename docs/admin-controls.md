@@ -120,7 +120,10 @@ Current administrator authority is checked inside the locked mutation.
 
 Skill enable checks the effective global and platform denials. The native skill
 catalog also reads the existing managed overlay, so its policy applies outside
-the WebUI. Native essential-skill and duplicate-name semantics remain intact.
+the WebUI. Typed edits use the native deny-name normalization and display/load
+matching, preserving essential-skill exemptions and disabled duplicate peers.
+The reader retains its prior tolerance for nonmapping `skills` sections while
+applying managed policy; enabling cannot acknowledge a remaining effective deny.
 Delegation config inherits the validated local parent route or names a declared
 local route; remote, undeclared, command and fallback routes are refused before
 config persistence. This validates configuration; it does not establish live
