@@ -1,5 +1,23 @@
 # Foundation checkpoint — 2026-10-07
 
+Source checkpoint, 16:56 MSK: the complete pinned Hermes source preparer,
+configurable bounded continuation, and native scope health repairs are now in
+this source branch. The exact 12-overlay Hermes composition passed all 11 native
+source checks. Independent reviews accepted the preparer’s filter/deadline
+boundaries and the native repairs, with 6 and 29 fresh controls respectively;
+the preparer also has 19 real Git fixture checks. These are source checks, not
+installation or release acceptance.
+
+The separate administrative/onboarding/profile/installer integration contains
+14 overlays. Its current native gate passes 10 of 11 checks and reports six code
+health findings. Independent installer review also found a fresh-process import
+defect and late completion after the original installation budget. Repairs are
+in progress; those candidates are not represented as complete by this source
+checkpoint. Native Dashboard ownership/auth integration, A0 execution admission,
+both workers’ real mid-task web access, normal startup and all six mandatory
+product journeys remain required. Old Friday stays off; no Telegram cutover or
+A0 runtime start is included.
+
 The isolated repository is established. Hermes is checked out at the exact commit/tree in `sources.lock.json`, and its own package manager installed the Telegram dependency set and required tools into isolated runtime storage. The full Harness and A0 donor sources have also been verified. No Telegram consumer has been started, and no product acceptance is claimed.
 
 Read-only inventory confirmed an existing systemd supervisor and a local OpenAI-compatible chat route. Its actual served model is `dispatcher`, with a 40,960-token context, six configured running requests and a planned initial limit of one model job. Configuration capacity is not measured throughput. The embedding route is separate. Credentials, concrete private routes, receipts and machine inventories remain outside Git.
