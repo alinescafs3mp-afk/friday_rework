@@ -143,14 +143,24 @@ class Onboarding:
     def __init__(self, administration):
         self.admin = administration
 
+    def _verify_operator(self, profile, session):
+        # Retained ordinary authority cannot be promoted by changing the home,
+        # even when a caller supplies a valid operator Session. Check the native
+        # context before _verify_session enters the launch authority home. An
+        # engaged process with no current user still permits its dashboard.
+        if scope._CURRENT.get() is not None:
+            raise PermissionError('operator_source_scope_required')
+        self.admin._verify_session(profile, session)
+
     @contextmanager
-    def transaction(self, profile, expected_config_sha256):
+    def transaction(self, profile, expected_config_sha256, session=None):
         """Same protected native association and process config mutation locks.
 
         Product-admin generic config writers are denied by the native middleware.
         Supported onboarding/user writers share this admission lock; external
         operator edits still require the explicit file CAS on the next action.
         """
+        self._verify_operator(profile, session)
         from hermes_cli import config as native
         with self.admin.scope(profile) as root:
             scope._private(root, directory=True)
@@ -160,6 +170,7 @@ class Onboarding:
             ProductAccess.require_transport(profile)
             state = self.admin._state(); access = ProductAccess(state); store = access.store
             with store._locked(), native.config_write_transaction(root / 'config.yaml'):
+                self._verify_operator(profile, session)
                 path = root / 'config.yaml'
                 if digest(path) != expected_config_sha256:
                     raise ValueError('onboarding_config_conflict_reload')
@@ -204,13 +215,13 @@ class Onboarding:
                 'state': 'DISABLED_SETUP_PENDING', 'recoverable': True, 'config_sha256': digest(root / 'config.yaml')})
         return result
 
-    def prepare(self, profile, *, expected_config_sha256, template, platform,
+    def prepare(self, profile, *, session=None, expected_config_sha256, template, platform,
                 transport_profile, account_id, user_id, runtime_profile):
         if transport_profile != profile: raise PermissionError('receiving_transport_authority_required')
         key = principal_id(platform, transport_profile, account_id, user_id)
         profile_name(runtime_profile)
         if runtime_profile == 'default': raise ValueError('exclusive_new_profile_required')
-        with self.transaction(profile, expected_config_sha256) as (root, access, config):
+        with self.transaction(profile, expected_config_sha256, session) as (root, access, config):
             state = access.state
             settings = config['plugins']['entries']['friday_rework']['settings']
             plans = settings.get('onboarding', {}).get('templates', {})
@@ -245,6 +256,7 @@ class Onboarding:
                    and r.get('user_id') == user_id for r in routes):
                 raise ValueError('conflicting_native_route')
             # Disabled tombstone is persisted FIRST, before any route/home setup.
+            self._verify_operator(profile, session)
             user = access._write_user_locked(key, dict(platform=platform, transport_profile=profile,
                 account_id=account_id, user_id=user_id, enabled=False, role='user'))
             isolation['bindings'].append(binding)
@@ -255,27 +267,35 @@ class Onboarding:
             from hermes_cli.config import atomic_config_write
             if digest(root / 'config.yaml') != expected_config_sha256:
                 raise ValueError('onboarding_config_conflict_reload')
+            self._verify_operator(profile, session)
             atomic_config_write(root / 'config.yaml', config)
             # Never publish the user capability marker for incomplete setup.
-            scope.provision_new_home(root, binding, {}, publish=False)
+            self._verify_operator(profile, session)
+            scope.provision_new_home(root, binding, {}, publish=False,
+                verify=lambda: self._verify_operator(profile, session))
             if runtime.get('enabled') is True:
                 for field in ('workspace_root', 'staging_root'):
                     directory = Path(runtime[field])
                     if not directory.is_relative_to(home) or directory.resolve() != directory:
                         raise PermissionError('worker_setup_directory_outside_private_home')
+                    self._verify_operator(profile, session)
                     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             # Explicit per-profile settings, no owner/ambient secrets or history.
-            with scope.authority(home):
+            from hermes_cli.config import config_write_transaction
+            with scope.authority(home), config_write_transaction(home / 'config.yaml'):
+                self._verify_operator(profile, session)
                 native_config['terminal'] = {'cwd': str(home / 'workspace')}
                 atomic_config_write(home / 'config.yaml', native_config)
             soul = (RESOURCE / 'SOUL.md').read_bytes()
             if hashlib.sha256(soul).hexdigest() != SOUL_SHA256: raise ValueError('reviewed_friday_soul_changed')
+            self._verify_operator(profile, session)
             _new_file(home / 'SOUL.md', soul)
             st = scope._private(home, directory=True)
             receipt = dict(schema='friday.onboarding.v1', binding_sha256=scope._fingerprint(binding),
                 config_sha256=digest(home / 'config.yaml'), soul_sha256=digest(home / 'SOUL.md'),
                 required_secrets=names, directory_identity=[st.st_dev, st.st_ino], template=template,
                 authorization_home=str(root))
+            self._verify_operator(profile, session)
             _new_file(home / scope.ONBOARDING, (json.dumps(receipt, sort_keys=True) + '\n').encode())
             return dict(state='DISABLED_INCOMPLETE', enabled=False, principal_id=key,
                         runtime_profile=runtime_profile, generation=user['generation'],
@@ -303,10 +323,10 @@ class Onboarding:
             raise PermissionError('prepared_home_changed')
         return home, binding, row, proof
 
-    def credentials(self, profile, *, expected_config_sha256, generation, platform,
+    def credentials(self, profile, *, session=None, expected_config_sha256, generation, platform,
                     transport_profile, account_id, user_id, name, value):
         if transport_profile != profile: raise PermissionError('receiving_transport_authority_required')
-        with self.transaction(profile, expected_config_sha256) as (root, access, _):
+        with self.transaction(profile, expected_config_sha256, session) as (root, access, _):
             state = access.state
             home, binding, row, proof = self._prepared(root, state, platform, transport_profile, account_id, user_id, generation)
             if row['enabled'] or (home / scope.MARKER).exists() or name not in proof['required_secrets']:
@@ -315,23 +335,28 @@ class Onboarding:
                 raise ValueError('invalid_scoped_credential')
             path = home / '.env'
             if path.exists() or path.is_symlink(): scope._private(path)
-            from hermes_cli.config import save_env_value_secure
+            from hermes_cli.config import save_env_value_secure, config_write_transaction, _env_write_lock
             from agent.secret_scope import load_env_file, set_secret_scope, reset_secret_scope, get_secret
-            with scope.authority(home):
-                # Empty local scope prevents the native lifecycle from borrowing
-                # the process's current provider credential during capture.
-                token = set_secret_scope(load_env_file(path), profile_home=str(home))
-                try: save_env_value_secure(name, value)
-                finally: reset_secret_scope(token)
-                scope._private(path)
-                local = load_env_file(path)
-                token = set_secret_scope(local, profile_home=str(home))
-                try:
-                    if get_secret(name) != value: raise RuntimeError('scoped_secret_write_unconfirmed')
-                finally: reset_secret_scope(token)
+            with config_write_transaction(home / 'config.yaml'), _env_write_lock(path):
+                self._verify_operator(profile, session)
+                self._prepared(root, state, platform, transport_profile, account_id, user_id, generation)
+                with scope.authority(home):
+                    # Empty local scope prevents the native lifecycle from borrowing
+                    # the process's current provider credential during capture.
+                    token = set_secret_scope(load_env_file(path), profile_home=str(home))
+                    try:
+                        self._verify_operator(profile, session)
+                        save_env_value_secure(name, value)
+                    finally: reset_secret_scope(token)
+                    scope._private(path)
+                    local = load_env_file(path)
+                    token = set_secret_scope(local, profile_home=str(home))
+                    try:
+                        if get_secret(name) != value: raise RuntimeError('scoped_secret_write_unconfirmed')
+                    finally: reset_secret_scope(token)
             return {'state': 'DISABLED_SETUP_PENDING', 'recorded': True, 'enabled': False}
 
-    def prepare_worker(self, profile, *, expected_config_sha256, generation, platform,
+    def prepare_worker(self, profile, *, session=None, expected_config_sha256, generation, platform,
                        transport_profile, account_id, user_id, worker, runtime, a0_network=None):
         """Operator-only source/config preparation for one disabled own profile.
 
@@ -340,12 +365,13 @@ class Onboarding:
         """
         if transport_profile != profile: raise PermissionError('receiving_transport_authority_required')
         from .worker_provision import prepare_inputs, pin
-        with self.transaction(profile, expected_config_sha256) as (root, access, _):
+        with self.transaction(profile, expected_config_sha256, session) as (root, access, _):
             home, binding, row, proof = self._prepared(root, access.state, platform, transport_profile, account_id, user_id, generation)
             if row['enabled'] or (home / scope.MARKER).exists():
                 raise PermissionError('disabled_fresh_worker_setup_required')
             from hermes_cli.config import require_readable_config_before_write, config_write_transaction
             with scope.authority(home), config_write_transaction(home / 'config.yaml'):
+                self._verify_operator(profile, session)
                 if digest(home / 'config.yaml') != proof['config_sha256']:
                     raise PermissionError('prepared_home_changed')
                 config = require_readable_config_before_write(home / 'config.yaml')
@@ -354,17 +380,21 @@ class Onboarding:
                 c, directory, files, names, unobserved = prepare_inputs(home, binding['runtime_profile'], worker, runtime, config, a0_network=a0_network)
                 if directory.exists() or directory.is_symlink():
                     raise FileExistsError('existing_worker_preparation_not_adopted')
+                self._verify_operator(profile, session)
                 parent = directory.parent
                 if parent.exists(): scope._private(parent, directory=True)
                 else: parent.mkdir(mode=0o700)
                 directory.mkdir(mode=0o700)
                 for name in ('jobs', 'staging', 'cache', 'inputs'):
                     (directory / name).mkdir(mode=0o700)
-                for path, data in files.items(): _new_file(path, data)
+                for path, data in files.items():
+                    self._verify_operator(profile, session)
+                    _new_file(path, data)
                 candidate = dict(runtime=c, inputs=[pin(p) for p in files],
                     principal_binding_sha256=scope._fingerprint(binding), generation=generation,
                     state='PREPARED_RUNTIME_UNOBSERVED', unobserved=unobserved)
                 path = directory / 'runtime-input.json'
+                self._verify_operator(profile, session)
                 _new_file(path, (json.dumps(candidate, sort_keys=True, indent=2) + '\n').encode())
                 # Same existing protected scoped credential capture, no key copy.
                 # No new receipt/schema or activation marker is produced.
@@ -375,9 +405,11 @@ class Onboarding:
                 import secrets
                 temporary = home / (scope.ONBOARDING + '.worker-' + secrets.token_hex(8))
                 try:
+                    self._verify_operator(profile, session)
                     _new_file(temporary, (json.dumps(updated, sort_keys=True) + '\n').encode())
                     if digest(home / scope.ONBOARDING) != previous_sha:
                         raise PermissionError('prepared_home_changed')
+                    self._verify_operator(profile, session)
                     os.replace(temporary, home / scope.ONBOARDING); _sync_directory(home)
                 finally:
                     if temporary.exists(): temporary.unlink()
@@ -385,7 +417,7 @@ class Onboarding:
                     'worker': worker, 'preparation': pin(path), 'runtime': c,
                     'required_names': updated['required_secrets'], 'unobserved': unobserved}
 
-    def configure_worker(self, profile, *, expected_config_sha256, generation, platform,
+    def configure_worker(self, profile, *, session=None, expected_config_sha256, generation, platform,
                          transport_profile, account_id, user_id, worker, preparation, runtime_receipt):
         """Attach independently supplied evidence via the original host checker.
 
@@ -395,7 +427,7 @@ class Onboarding:
         from .worker_provision import preparation as read_preparation, own_runtime
         from .host_runtime import check_runtime, HostUnavailable
         from hermes_cli.config import atomic_config_write, require_readable_config_before_write, config_write_transaction
-        with self.transaction(profile, expected_config_sha256) as (root, access, _):
+        with self.transaction(profile, expected_config_sha256, session) as (root, access, _):
             home, binding, row, proof = self._prepared(root, access.state, platform, transport_profile, account_id, user_id, generation)
             if row['enabled'] or (home / scope.MARKER).exists():
                 raise PermissionError('disabled_fresh_worker_setup_required')
@@ -413,6 +445,7 @@ class Onboarding:
             if not PairingStore().is_approved(platform, user_id):
                 return {'state': 'DISABLED_NATIVE_GRANT_MISSING', 'enabled': False}
             with scope.authority(home), config_write_transaction(home / 'config.yaml'):
+                self._verify_operator(profile, session)
                 if digest(home / 'config.yaml') != proof['config_sha256']:
                     raise PermissionError('prepared_home_changed')
                 config = require_readable_config_before_write(home / 'config.yaml')
@@ -424,56 +457,66 @@ class Onboarding:
                     return {'state': 'DISABLED_WORKER_RUNTIME_UNVERIFIED', 'enabled': False}
                 config['plugins']['entries']['friday_rework']['settings']['runtime'] = c
                 prepared = prepare_admin_config_edit(home, config)
+                self._verify_operator(profile, session)
                 atomic_config_write(home / 'config.yaml', config)
+                self._verify_operator(profile, session)
                 finish_admin_config_edit(home, prepared)
             return {'state': 'CONFIGURED_NATIVE_ACTIVATION_REQUIRED', 'enabled': False,
                     'runtime_acceptance': 'SOURCE_CONTRACT_CHECKED_LIVE_NOT_RUN'}
 
-    def activate(self, profile, *, expected_config_sha256, generation, platform,
+    def activate(self, profile, *, session=None, expected_config_sha256, generation, platform,
                  transport_profile, account_id, user_id):
         if transport_profile != profile: raise PermissionError('receiving_transport_authority_required')
-        with self.transaction(profile, expected_config_sha256) as (root, access, _):
+        with self.transaction(profile, expected_config_sha256, session) as (root, access, _):
             state = access.state
             home, binding, row, proof = self._prepared(root, state, platform, transport_profile, account_id, user_id, generation)
             # No repeated enabled action can revive a revoked retained grant.
             if row['enabled']: raise ValueError('already_enabled_reload')
-            from agent.secret_scope import load_env_file
-            path = home / '.env'
-            if not path.exists() and not path.is_symlink():
-                return {'state': 'DISABLED_SCOPED_KEYS_MISSING', 'enabled': False}
-            scope._private(path)
-            if any(not load_env_file(path).get(k) for k in proof['required_secrets']):
-                return {'state': 'DISABLED_SCOPED_KEYS_MISSING', 'enabled': False}
-            scope.check_onboarding_home(root, home, binding)
-            from gateway.pairing import PairingStore
-            if not PairingStore().is_approved(platform, user_id):
-                return {'state': 'DISABLED_NATIVE_GRANT_MISSING', 'enabled': False}
-            from hermes_cli.config import load_config_readonly
-            with scope.authority(home):
-                runtime = load_config_readonly()['plugins']['entries']['friday_rework']['settings']['runtime']
-                if runtime.get('enabled') is True:
-                    if 'a0' in runtime:
-                        return {'state': 'DISABLED_A0_RECONCILIATION_REQUIRED', 'enabled': False}
-                    from .host_runtime import check_runtime, HostUnavailable
-                    from hermes_cli.plugins_state import PluginState
-                    try:
-                        check_runtime(runtime, Associations(PluginState('friday_rework')))
-                    except (HostUnavailable, OSError, ValueError):
-                        return {'state': 'DISABLED_WORKER_RUNTIME_UNVERIFIED', 'enabled': False}
-            marker = {'schema': 'friday.user-home.v1', 'principal': principal_id(*(binding[k] for k in IDENTITY)),
-                      'profile': binding['runtime_profile'], 'binding_sha256': scope._fingerprint(binding),
-                      'onboarding_sha256': digest(home / scope.ONBOARDING)}
-            path = home / scope.MARKER
-            if path.exists() or path.is_symlink():
+            from hermes_cli.config import config_write_transaction
+            with config_write_transaction(home / 'config.yaml'):
+                self._verify_operator(profile, session)
+                # Recheck the proof after acquiring the target config lock.
+                home, binding, row, proof = self._prepared(root, state, platform, transport_profile, account_id, user_id, generation)
+                from agent.secret_scope import load_env_file
+                path = home / '.env'
+                if not path.exists() and not path.is_symlink():
+                    return {'state': 'DISABLED_SCOPED_KEYS_MISSING', 'enabled': False}
                 scope._private(path)
-                if json.loads(path.read_text()) != marker: raise PermissionError('foreign_home_marker')
-            else: _new_file(path, (json.dumps(marker, sort_keys=True) + '\n').encode())
-            confirmed = access._write_user_locked(principal_id(platform, profile, account_id, user_id),
-                dict(platform=platform, transport_profile=profile, account_id=account_id,
-                     user_id=user_id, enabled=True, role='user'))
-            return {'state': 'ADMITTED_NEXT_NATIVE_REQUEST', 'enabled': True,
-                    'generation': confirmed['generation'], 'runtime_profile': binding['runtime_profile'],
-                    'worker_execution': 'SOURCE_RUNTIME_VERIFIED_LIVE_NOT_RUN' if runtime.get('enabled') is True else 'DISABLED_EXPLICIT_INSTALLATION_INPUT'}
+                if any(not load_env_file(path).get(k) for k in proof['required_secrets']):
+                    return {'state': 'DISABLED_SCOPED_KEYS_MISSING', 'enabled': False}
+                scope.check_onboarding_home(root, home, binding)
+                from gateway.pairing import PairingStore
+                if not PairingStore().is_approved(platform, user_id):
+                    return {'state': 'DISABLED_NATIVE_GRANT_MISSING', 'enabled': False}
+                from hermes_cli.config import load_config_readonly
+                with scope.authority(home):
+                    runtime = load_config_readonly()['plugins']['entries']['friday_rework']['settings']['runtime']
+                    if runtime.get('enabled') is True:
+                        if 'a0' in runtime:
+                            return {'state': 'DISABLED_A0_RECONCILIATION_REQUIRED', 'enabled': False}
+                        from .host_runtime import check_runtime, HostUnavailable
+                        from hermes_cli.plugins_state import PluginState
+                        try:
+                            check_runtime(runtime, Associations(PluginState('friday_rework')))
+                        except (HostUnavailable, OSError, ValueError):
+                            return {'state': 'DISABLED_WORKER_RUNTIME_UNVERIFIED', 'enabled': False}
+                marker = {'schema': 'friday.user-home.v1', 'principal': principal_id(*(binding[k] for k in IDENTITY)),
+                          'profile': binding['runtime_profile'], 'binding_sha256': scope._fingerprint(binding),
+                          'onboarding_sha256': digest(home / scope.ONBOARDING)}
+                path = home / scope.MARKER
+                if path.exists() or path.is_symlink():
+                    scope._private(path)
+                    if json.loads(path.read_text()) != marker: raise PermissionError('foreign_home_marker')
+                else:
+                    self._verify_operator(profile, session)
+                    _new_file(path, (json.dumps(marker, sort_keys=True) + '\n').encode())
+                self._verify_operator(profile, session)
+                confirmed = access._write_user_locked(principal_id(platform, profile, account_id, user_id),
+                    dict(platform=platform, transport_profile=profile, account_id=account_id,
+                         user_id=user_id, enabled=True, role='user'))
+                return {'state': 'ADMITTED_NEXT_NATIVE_REQUEST', 'enabled': True,
+                        'generation': confirmed['generation'], 'runtime_profile': binding['runtime_profile'],
+                        'worker_execution': 'SOURCE_RUNTIME_VERIFIED_LIVE_NOT_RUN' if runtime.get('enabled') is True else 'DISABLED_EXPLICIT_INSTALLATION_INPUT'}
 
 
 def prepare_admin_config_edit(home, candidate):

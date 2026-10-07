@@ -263,10 +263,26 @@ def test_retained_search_dispatch_cannot_use_replacement_capability(users,name):
         assert _parse_tool_call(agent,ToolCall(id='search-again',name=name,arguments=json.dumps(args))).parse_error=='product_user_scope_refused'
 
 @pytest.mark.parametrize('boundary',['active_reconcile','result_delivery'])
-def test_retained_generation_refuses_before_active_or_delivery_effect(wired,boundary):
+def test_retained_generation_refuses_before_active_or_delivery_effect(wired,boundary,monkeypatch):
     w=wired;u=w.users
     response=w.invoke('friday_work',w.args);assert response['accepted']
     row=w.host.store.snapshot()[response['reference']]
+    # The UNKNOWN metadata below is deliberately synthetic. Retained authority
+    # must fail before observation in the test body; real manager unload still
+    # owes exact-owned cleanup. Keep the actual supervisor parser/stop path but
+    # supply its native command boundary with an explicit missing-unit record.
+    observations=[]
+    supervisor=importlib.import_module(w.package+'.supervision')
+    def missing_owned_unit(arguments, timeout):
+        assert w.host._closed, 'native observation reached before unload'
+        unit=row['supervisor']['unit']
+        assert arguments==['show',unit,'--property='+','.join(supervisor.NativeSupervisor.properties)]
+        observations.append(arguments)
+        fields=dict(LoadState='not-found',Transient='no',Description=unit,InvocationID='',
+            ActiveState='inactive',SubState='dead',Result='success',MainPID='0',ControlGroup='',
+            KillMode='control-group',SendSIGKILL='yes')
+        return SimpleNamespace(returncode=0,stdout='\n'.join(k+'='+v for k,v in fields.items()))
+    monkeypatch.setattr(supervisor.NativeSupervisor,'_command',staticmethod(missing_owned_unit))
     if boundary=='active_reconcile':
         # Existing native state transition records uncertainty only; no external
         # submission is performed in this isolated metadata fixture.
@@ -288,5 +304,5 @@ def test_retained_generation_refuses_before_active_or_delivery_effect(wired,boun
                     with pytest.raises(scope.ScopeDenied):delivery.send(None)
                 finally:delivery.close()
             assert w.host.store.snapshot()[row['existing_task_id']]==before
-            assert len(w.scheduled)==1
+            assert len(w.scheduled)==1 and not observations
     finally:scope._CURRENT.reset(token)

@@ -212,19 +212,19 @@ def onboarding_templates(profile: str):
 
 
 @router.post("/onboarding/prepare")
-def onboarding_prepare(body: OnboardingPrepare, profile: str):
-    return call(_admin.onboarding_prepare, profile, **body.model_dump())
+def onboarding_prepare(body: OnboardingPrepare, profile: str, session=Depends(require_admin)):
+    return call(_admin.onboarding_prepare, profile, session=session, **body.model_dump())
 
 
 @router.put("/onboarding/credentials")
-def onboarding_credentials(body: OnboardingCredential, profile: str):
+def onboarding_credentials(body: OnboardingCredential, profile: str, session=Depends(require_admin)):
     values = body.model_dump(); values["value"] = body.value.get_secret_value()
-    return call(_admin.onboarding_credentials, profile, **values)
+    return call(_admin.onboarding_credentials, profile, session=session, **values)
 
 
 @router.post("/onboarding/activate")
-def onboarding_activate(body: OnboardingActivate, profile: str):
-    return call(_admin.onboarding_activate, profile, **body.model_dump())
+def onboarding_activate(body: OnboardingActivate, profile: str, session=Depends(require_admin)):
+    return call(_admin.onboarding_activate, profile, session=session, **body.model_dump())
 
 
 class WorkerPrepare(OnboardingActivate):
@@ -240,10 +240,10 @@ class WorkerConfigure(OnboardingActivate):
 
 
 @router.post('/onboarding/worker/prepare')
-def onboarding_worker_prepare(body: WorkerPrepare, profile: str):
-    return call(_admin.onboarding_worker_prepare, profile, **body.model_dump())
+def onboarding_worker_prepare(body: WorkerPrepare, profile: str, session=Depends(require_admin)):
+    return call(_admin.onboarding_worker_prepare, profile, session=session, **body.model_dump())
 
 
 @router.post('/onboarding/worker/configure')
-def onboarding_worker_configure(body: WorkerConfigure, profile: str):
-    return call(_admin.onboarding_worker_configure, profile, **body.model_dump())
+def onboarding_worker_configure(body: WorkerConfigure, profile: str, session=Depends(require_admin)):
+    return call(_admin.onboarding_worker_configure, profile, session=session, **body.model_dump())

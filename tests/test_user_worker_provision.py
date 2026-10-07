@@ -72,7 +72,7 @@ def inputs(env, uid='1', worker='dsh'):
 
 def worker_prepare(env,uid='1',worker='dsh',runtime=None,network=None,**changes):
     c,n=inputs(env,uid,worker)
-    return env.admin.onboarding_worker_prepare('default',**(dict(expected_config_sha256=cas(env),generation=row(env,uid)['generation'],
+    return env.admin.onboarding_worker_prepare('default',**(dict(session=env.operator,expected_config_sha256=cas(env),generation=row(env,uid)['generation'],
         **ident(uid),worker=worker,runtime=c if runtime is None else runtime,a0_network=n if network is None else network)|changes))
 
 
@@ -89,7 +89,7 @@ def reviewed(env,prepared):
 
 
 def configure(env,prepared,receipt,uid='1',**changes):
-    return env.admin.onboarding_worker_configure('default',**(dict(expected_config_sha256=cas(env),generation=row(env,uid)['generation'],
+    return env.admin.onboarding_worker_configure('default',**(dict(session=env.operator,expected_config_sha256=cas(env),generation=row(env,uid)['generation'],
         **ident(uid),worker='dsh',preparation=prepared['preparation'],runtime_receipt=receipt)|changes))
 
 
@@ -215,8 +215,8 @@ def test_a0_own_native_settings_prepared_current_live_reconciliation_stays_block
     assert v['/etc/searxng/settings.yml']['use_default_settings']['engines']['keep_only']==['google']
     assert {'FRIDAY_LLM_API_KEY','FRIDAY_EMBEDDINGS_API_KEY','EXA_API_KEY'}<=set(p['required_names'])
     for n in p['required_names']:
-        env.setup.credentials('default',expected_config_sha256=cas(env),generation=row(env)['generation'],**ident(),name=n,value='synthetic-'+n)
-    result=env.admin.onboarding_worker_configure('default',expected_config_sha256=cas(env),generation=row(env)['generation'],**ident(),
+        env.setup.credentials('default',session=env.operator,expected_config_sha256=cas(env),generation=row(env)['generation'],**ident(),name=n,value='synthetic-'+n)
+    result=env.admin.onboarding_worker_configure('default',session=env.operator,expected_config_sha256=cas(env),generation=row(env)['generation'],**ident(),
         worker='a0',preparation=p['preparation'],runtime_receipt=p['runtime']['runtime_receipt'])
     assert result['state']=='DISABLED_A0_RECONCILIATION_REQUIRED';assert not row(env)['enabled']
     prepare(env,'2');other=worker_prepare(env,'2',worker='a0')

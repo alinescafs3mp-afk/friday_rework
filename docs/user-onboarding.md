@@ -13,6 +13,22 @@ CSRF/origin handling and profile restrictions. Channel-admin roles do not grant
 Dashboard authority. API schemas reject extra fields and noninteger generations.
 No new user, history, task or administrative database is introduced.
 
+Every mutating onboarding entry (prepare, credentials, activate, worker prepare
+and worker configure) carries the native verified dashboard Session through
+Administration into the shared transaction. Direct native callers must supply
+that same operator actor; omission is denied. A retained ordinary user scope,
+including a revoked one, is rejected before any authority-home override even if
+an operator Session is supplied. The existing operator/provider/organization and
+expiry policy is checked at admission, after the actual native mutation locks,
+and before committing effects. Target config and credential writes use the native
+config/environment locks. The existing native new-home primitive accepts the
+retained verification callback at its first config-lock boundary, before even
+its initial empty config is written. An interrupted multi-file preparation can remain
+incomplete and disabled; it is never automatically adopted or replayed. This is
+an internal native boundary as well as an HTTP boundary, not evidence of arbitrary
+ordinary Python access or a remote unauthenticated exploit.
+
+
 A product principal is the exact platform, receiving transport profile, configured
 account and user ID. Chat, topic, session and display name never replace it.
 Two users in one chat route independently; the same user ID on another platform
