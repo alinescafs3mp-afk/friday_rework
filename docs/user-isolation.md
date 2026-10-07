@@ -19,8 +19,39 @@ load/mutation/frozen prompt, history readers, native cwd/context files, agent
 turn/API admission, registry, Tool Search, sequential/concurrent/inline tools,
 and slash/quick/plugin command admission recheck it. Loss of execution context,
 changed/disabled identities, copied capabilities, foreign profiles or changed
-bindings refuse. Revocation is latched on the retained capability; enable does
-not restart an old task, clear stop intent or reset a budget.
+bindings refuse. Each admitted capability captures the user's durable native
+PluginState generation. An enabled-to-disabled transition or product-role
+change advances that generation under the existing cross-process write lock.
+Later enable cannot revive idle memory, cached agents, copied contexts or
+prepared dispatches, even when they did not check during disable. It does not
+restart an old task, clear stop intent or reset a budget. No-op updates and
+unrelated principals preserve their existing generations.
+
+All Friday `product_access.v1` writes through native PluginState derive the
+generation from the committed state; supplied stale generations cannot reset
+it. Omitted users retain disabled tombstones, preventing delete/recreate from
+reusing an old generation. Legacy six-field rows remain administratively
+readable, but cannot mint retained authority until an explicit authoritative
+native update assigns a generation. Missing or invalid retained generations
+fail closed; deployment must reconcile existing jobs before that migration.
+No extra user store, history mirror or task manager is added.
+
+Scoped jobs retain the original principal and admission generation in their
+existing association binding. Duplicate admission, actual start, active
+reconciliation, A0 capability attachment and ordinary result access check that
+retained authority. A fresh event cannot relabel an old job after re-enable.
+Legacy ordinary jobs without that evidence fail closed for continuation/result
+access, keeping their original rows, inputs, deadlines and stop intent for lead
+reconciliation. Native administrative read-all and exact-owned stop remain
+separate; no automatic task-budget reset or replay is introduced.
+
+`tool_call` uses the actual advertised `calls` envelope and Hermes normalizer,
+including legacy and tolerated JSON argument forms. The entire list is checked
+before native expansion, then each real parser/dispatch rechecks the current
+user and the retained agent. A mixed forbidden/nested/malformed batch cannot
+execute its allowed prefix. Own deferred `friday_work` remains useful through
+the original WorkerHost and native ingress/association boundary; source fixtures
+queue an owned coding admission and close its coroutine before worker execution.
 
 ## Explicit native setup
 

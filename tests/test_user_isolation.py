@@ -39,7 +39,7 @@ def users(tmp_path, monkeypatch):
     bindings = [dict(platform='telegram', transport_profile='default', account_id='bot-A',
                      user_id=uid, runtime_profile='user-' + uid,
                      tools=['memory', 'session_search', 'read_file', 'write_file', 'web_search',
-                            'web_extract', 'friday_work']) for uid in ('1', '2')]
+                            'web_extract', 'friday_work', 'friday_result']) for uid in ('1', '2')]
     settings = {'product_access': {'enabled': True, 'accounts': [dict(platform='telegram',
         transport_profile='default', account_id='bot-A', runtime_profiles=['user-1', 'user-2'])]},
         'user_isolation': {'enabled': True, 'bindings': bindings},
@@ -350,6 +350,15 @@ def test_product_channel_role_cannot_acquire_admin_read_all(users):
     from hermes_cli.dashboard_auth.base import Session
     from hermes_cli.friday_product_access import session_allowed
     users.access('1',role='admin')
+    # A changed product role revokes the old admission, without granting signed
+    # Dashboard authority. Check the independently authorized new event.
+    from gateway.session import SessionSource
+    from gateway.session_identity import RoutingIdentity
+    from gateway.config import Platform
+    fresh = SessionSource(Platform.TELEGRAM, 'shared-chat', user_id='1', profile='user-1')
+    fresh._identity = RoutingIdentity('default', 'user-1', users.root, users.homes[0])
+    assert users.gateway._principal_authorized(fresh, allow_adapter_delegation=True)
+    users.sources[0] = fresh
     token=Session(user_id='owner',provider='basic',org_id='',expires_at=int(time.time())+300,
                   email='',display_name='',access_token='synthetic',refresh_token='')
     assert session_allowed(token)

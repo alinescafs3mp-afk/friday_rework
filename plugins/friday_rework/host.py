@@ -90,6 +90,8 @@ class WorkerHost:
             address = association_address(correlation, ingress)
             old = self.store.snapshot().get(address)
             if old is not None:
+                from hermes_cli.friday_user_scope import check_retained_job
+                check_retained_job(old)
                 # Exact duplicate is read-only: no budget reset, preparation,
                 # new scheduler task, cache restaging or implicit continuation.
                 binding = old.get("host", {}).get("binding", {})
@@ -110,6 +112,11 @@ class WorkerHost:
                 raise HostUnavailable("runtime_profile_mismatch")
             route = delivery_route(ingress)
             owner = owner_from_ingress(correlation, ingress)
+            host_binding = {"correlation": correlation, "ingress": ingress,
+                            "brief": vars(brief), "runtime": runtime}
+            if scope is not None:
+                host_binding["user_authority"] = {"principal_id": scope.key,
+                                                  "generation": scope.admission_generation}
             acceptance = None
             if brief.worker == 'a0':
                 acceptance = {'accepted_unix': self.store.clock(), 'accepted_monotonic_ns': time.monotonic_ns(),
@@ -121,8 +128,7 @@ class WorkerHost:
                 budget_seconds=runtime["budget_seconds"],
                 deadline_unix=(acceptance['accepted_unix'] if acceptance else self.store.clock()) + runtime["budget_seconds"],
                 acceptance=acceptance,
-                host_binding={"correlation": correlation, "ingress": ingress,
-                              "brief": vars(brief), "runtime": runtime})
+                host_binding=host_binding)
             if not fresh:
                 return json.dumps(status(row))
             self._owned[address] = copy.deepcopy(row)
@@ -170,6 +176,8 @@ class WorkerHost:
         if self._closed or task_id not in self._a0_admissions:
             raise HostUnavailable('a0_attachment_requires_current_owner')
         row = self.store.get(task_id, owner)
+        from hermes_cli.friday_user_scope import check_retained_job
+        check_retained_job(row)
         runtime = row['host']['binding']['runtime']
         if row['worker_kind'] != 'a0' or self.ctx.get_config('runtime') != runtime:
             raise HostUnavailable('foreign_a0_runtime_binding')
@@ -244,6 +252,8 @@ class WorkerHost:
 
     def _start(self, row):
         row = self._remember(self.store.get(row["existing_task_id"], row["owner"]))
+        from hermes_cli.friday_user_scope import check_retained_job
+        check_retained_job(row)
         controller = self._controller(row)
         if self._closed or row["stop_intent"]:
             return self._stop(row, row["stop_intent"] or "cancel")
@@ -282,6 +292,8 @@ class WorkerHost:
             if row["stop_intent"] or self.store.clock() >= row["deadline_unix"]:
                 return self._stop(row, row["stop_intent"] or "cancel")
             return row  # Restart/status never prepares or launches.
+        from hermes_cli.friday_user_scope import check_retained_job
+        check_retained_job(row)
         return self._settle(row, self._controller(row).reconcile(row["existing_task_id"], row["owner"]))
 
     def _stop(self, row, intent):

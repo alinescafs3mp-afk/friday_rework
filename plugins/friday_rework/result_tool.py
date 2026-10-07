@@ -24,6 +24,8 @@ async def notify_finished(host, row):
     An accepted bool means scheduled only. Until an authenticated parent reads
     the retained result, notification consumption stays unproved. No retry loop.
     """
+    from hermes_cli.friday_user_scope import check_retained_job
+    check_retained_job(row)
     if host.ctx.get_config("results") != {"enabled": True} or host._closed:
         return
     def reserve():
@@ -63,7 +65,11 @@ def owned_result(host, reference, kwargs):
         raise AssociationError("invalid_result_reference")
     owner = bound_owner(session_id=kwargs.get("session_id"))
     call = _call.get()
-    if (call is None or call != tuple(kwargs.get(k) for k in CALL_FIELDS)
+    # Native registry handlers receive task/session IDs; the supported execution
+    # middleware carries the complete verified correlation in _call. Compare
+    # every supplied ID, never invent omitted IDs from arguments/environment.
+    if (call is None or call[:2] != (kwargs.get("task_id"), kwargs.get("session_id"))
+            or any(k in kwargs and kwargs[k] != call[i] for i, k in enumerate(CALL_FIELDS))
             or call[0] != call[1] or call[1] != owner["id"]):
         raise AssociationError("unproved_result_call")
     row = host.store.snapshot().get(reference)
@@ -78,10 +84,11 @@ def owned_result(host, reference, kwargs):
             or owner["chat_type"] != binding["ingress"]["chat_type"]
             or any(owner[k] != original[k] for k in ("user_id", "chat_id", "thread_id"))):
         raise AssociationError("foreign_result_owner")
-    from hermes_cli.friday_user_scope import current
+    from hermes_cli.friday_user_scope import current, check_retained_job
     scope = current()
     if scope is not None:
         scope.require_owner(owner, binding["ingress"])
+    check_retained_job(row)
     # A native notification/new message in the SAME session can inspect it.
     # A /new replacement session cannot inherit this access by matching chat.
     return row
@@ -167,8 +174,10 @@ class ResultTool:
             return json.dumps({"accepted": False, "error": "result_unavailable"})
 
     async def deliver(self, row, *, retry=False):
+        from hermes_cli.friday_user_scope import check_retained_job
         for artifact in row["result"]["artifacts"]:
             current = self.host.store.get(row["existing_task_id"], row["owner"])
+            check_retained_job(current)
             attempts = current["result"]["deliveries"][artifact["reference"]]
             if attempts and attempts[-1]["state"] in {"DELIVERED", "UNKNOWN"}:
                 continue  # Never duplicate a delivered or uncertain native send.

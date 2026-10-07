@@ -167,7 +167,8 @@ def validate_host_record(row):
         if not isinstance(host, dict) or set(host) != expected_host:
             raise ValueError()
         binding = host["binding"]
-        if not isinstance(binding, dict) or set(binding) != {"correlation", "ingress", "brief", "runtime"}:
+        fields = {"correlation", "ingress", "brief", "runtime"}
+        if not isinstance(binding, dict) or set(binding) not in (fields, fields | {"user_authority"}):
             raise ValueError()
         call = binding["correlation"]
         if not isinstance(call, dict) or set(call) != set(CALL_FIELDS):
@@ -177,6 +178,14 @@ def validate_host_record(row):
         if call["task_id"] != call["session_id"]:
             raise ValueError()
         ingress = _snapshot(binding["ingress"])
+        if "user_authority" in binding:
+            authority = binding["user_authority"]
+            from hermes_cli.friday_product_access import principal_id
+            if (not isinstance(authority, dict) or set(authority) != {"principal_id", "generation"}
+                    or type(authority["generation"]) is not int or authority["generation"] < 1
+                    or authority["principal_id"] != principal_id(ingress["platform"], ingress["transport_profile"],
+                        ingress["message"]["bot_id"], ingress["message"]["user_id"])):
+                raise ValueError()
         brief = parse_brief(binding["brief"])
         runtime = validate_runtime(binding["runtime"])
         if row['worker_kind'] == 'a0':

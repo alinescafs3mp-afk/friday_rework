@@ -42,6 +42,7 @@ class ProductAccess:
             validate_access(document)
             self.store.state_set(KEY, document)
             _sync_directory(self.state.data_dir)
-            if current_access(self.state)["users"].get(key) != row:
+            confirmed = current_access(self.state)["users"].get(key)
+            if not confirmed or any(confirmed.get(k) != v for k, v in row.items()):
                 raise RuntimeError("product_access_write_unconfirmed")
-        return {"principal_id": key, **row}
+        return {"principal_id": key, **confirmed}
