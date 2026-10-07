@@ -1,6 +1,6 @@
 # Friday_rework
 
-Separate Hermes-based Friday implementation. Foundation preparation only; no product acceptance or deployment is claimed.
+Separate Hermes-based Friday implementation. Integration is under validation; no product acceptance or deployment is claimed.
 
 Composition: pinned Hermes host, intact DeepSeek Harness coding worker, intact dedicated Agent Zero engineering worker, and verified Friday personality/Telegram deltas. Production inference uses explicitly configured existing local endpoints, with no automatic cloud fallback.
 
