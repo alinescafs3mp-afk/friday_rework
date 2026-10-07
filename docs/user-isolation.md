@@ -121,6 +121,18 @@ exact retained ingress account/user/runtime, preserving the original native
 identity, inputs, budgets, stop and output checks. No new worker/queue/database
 or unsupervised alternative terminal is created.
 
+An authenticated native event may leave `SessionSource.profile` unset while
+its pinned `RoutingIdentity` names the runtime profile. The native ingress
+receipt keeps the serialized source profile (empty in that case); the existing
+association owner keeps the runtime profile. Ambient-call ownership checks
+the former and retained-job ownership checks the latter, while both retain
+the same account, transport, user, native home and original grant generation.
+Neither an implicit source profile nor the receiving `default` profile grants
+another runtime. Original receipts, owners, deadlines and stop intents are
+never rewritten to make the join pass. Source tests cover admission, original
+start, duplicate, result inspection, notification and document delivery with
+synthetic native-effect boundaries; they do not establish live acceptance.
+
 ## Required joins and remaining acceptance
 
 The independent integrator must compose the minimal `host.py` insertion after
