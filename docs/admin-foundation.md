@@ -16,6 +16,8 @@ In the product administration profile unaudited native data/config/files/env-rev
 
 Product administration refuses all unaudited WebSocket surfaces before accept, including native RPC, console, PTY, events, audio and display. The approved plugin uses authenticated HTTP and remains functional. RPC dispatch also refuses retained WS transports before invoking or queueing a handler; local stdio TUI and non-product deployments keep their native contract. This restriction intentionally removes those native Dashboard features from the product-admin deployment until their operations are audited. The original WS credential verifier still verifies signatures and once-only tickets. Verified organization is carried unchanged from sessions and newly minted native tickets; missing organization remains unknown and cannot impersonate an explicitly organization-less operator.
 
+Retained WebSocket connections also recheck current product policy before and after each receive and before each outbound frame. Activation closes the existing unaudited stream through the native disconnect path; revocation stays latched for that connection even if configuration later changes again. This prevents new commands and protected output after revocation; it does not establish cancellation of previously admitted product jobs.
+
 ## Explicit native policy
 
 Configure protected native Dashboard authentication first. These are plugin settings under `plugins.entries.friday_rework.settings`; they contain identity metadata, not passwords, tokens or a second set of credentials:
