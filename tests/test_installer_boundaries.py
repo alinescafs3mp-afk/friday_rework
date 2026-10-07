@@ -23,7 +23,7 @@ def test_required_namespace_refuses_before_home_claim(install_input, tmp_path, m
     from scripts import dsh_prepare
     def refuse(*a, **k): raise RuntimeError('required unshare PID capability absent')
     monkeypatch.setattr(dsh_prepare, 'run', refuse)
-    with pytest.raises(RuntimeError, match='capability absent'):
+    with pytest.raises(dsh_prepare.StopUnconfirmed, match='namespace init exit not established'):
         entry.install(install_input, path)
     assert not Path(install_input['home']).exists()
 

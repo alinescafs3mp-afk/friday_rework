@@ -94,6 +94,14 @@ Failure-receipt publication can fail; that never converts uncertain custody to
 a normal refusal. Native helper exit 3 remains `STOP_UNCONFIRMED` even after its
 wrapper is reaped, because external native units can have separate lifetimes.
 
+Finite installer commands run as the bubblewrap PID namespace's PID 1. On a
+normal monitor exit, bubblewrap has waited for that init and the kernel has
+drained its descendants. This changes command signal handling and orphan
+reaping compared with bubblewrap's separate init, so actual preparer/PM
+compatibility is required before runtime acceptance. A monitor timeout, signal,
+missing status or internal exit 3 remains `STOP_UNCONFIRMED`; pipe EOF and
+reaping only the monitor are insufficient to release custody.
+
 `reconcile` is read-only. It verifies an exact original PARTIAL claim, the same
 boot, original input bytes and any bound failure receipt, and reports the
 remaining original clock (including exhaustion). It reads no referenced TLS
