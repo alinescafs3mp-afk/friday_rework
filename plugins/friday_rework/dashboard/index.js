@@ -11,7 +11,7 @@
     const [offset, setOffset] = R.useState(0), [filters, setFilters] = R.useState({});
     const [data, setData] = R.useState(null), [error, setError] = R.useState("");
     const [session, setSession] = R.useState(null), [busy, setBusy] = R.useState(false);
-    const [control, setControl] = R.useState(null), [edit, setEdit] = R.useState({kind: "model", slot: "main", route: "0", web: "exa-paid", timeout: "30", chars: "15000", name: "", enabled: true, key: "agent.max_iterations", value: "30"});
+    const [control, setControl] = R.useState(null), [edit, setEdit] = R.useState({kind: "model", slot: "main", route: "0", web: "exa-paid", timeout: "30", chars: "15000", name: "", enabled: true, key: "agent.max_turns", value: "30"});
     R.useEffect(() => { let active = true;
       fetchJSON(base + "/profiles").then(p => { if (active) { setProfiles(p); setProfile(p[0] || ""); } })
         .catch(() => { if (active) setError("Administrator access or native configuration unavailable."); });
@@ -88,7 +88,7 @@
         if (edit.kind === "model") values = {slot: edit.slot, ...data.typed_options.local_routes[Number(edit.route)]};
         else if (edit.kind === "web") values = {profile: edit.web, extract_timeout: Number(edit.timeout), extract_char_limit: Number(edit.chars)};
         else if (["toolset", "skill"].includes(edit.kind)) values = {name: edit.name, enabled: edit.enabled};
-        else values = {key: edit.key, value: edit.key === "gateway.streaming" ? edit.enabled : Number(edit.value)};
+        else values = {key: edit.key, value: edit.key === "streaming.enabled" ? edit.enabled : Number(edit.value)};
         setControl(await fetchJSON(base + "/settings?" + new URLSearchParams({profile}), {
           method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({kind: edit.kind, expected_sha256: data.config_sha256, values})}));
         setData(await fetchJSON(base + "/effective?" + new URLSearchParams({profile})));
@@ -158,7 +158,7 @@
             ...data.typed_options.local_routes.map((r, i) => h("option", {key: i, value: String(i)}, `${r.provider} / ${r.model} / ${r.base_url}`)))) : null,
         edit.kind === "web" ? h("div", null, select("web", data.typed_options.web_backends), number("timeout"), number("chars")) : null,
         ["toolset", "skill"].includes(edit.kind) ? h("div", null, select("name", ["", ...data.typed_options[edit.kind === "toolset" ? "toolsets" : "skills"]]), enabled()) : null,
-        edit.kind === "operational" ? h("div", null, select("key", data.typed_options.operational), edit.key === "gateway.streaming" ? enabled() : number("value")) : null,
+        edit.kind === "operational" ? h("div", null, select("key", data.typed_options.operational), edit.key === "streaming.enabled" ? enabled() : number("value")) : null,
         button("Save operational settings", saveSettings),
         h("p", null, "Saved settings apply through the next native session or reload. Existing worker bindings and original deadlines remain fixed.")) : null,
       h("p", null, "Control needs the owning gateway and a valid native administrator session. Lost responses remain unknown. Channel roles do not grant Dashboard access."));

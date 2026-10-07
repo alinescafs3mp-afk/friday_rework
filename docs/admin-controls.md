@@ -3,7 +3,7 @@
 This package prepares source/offline connections, without installation or live
 product acceptance. Apply the exact `patches/hermes/admin-controls.patch` after
 the published b44be05 composition, then install the trusted native Friday plugin
-through the normal installation workflow. Its manifest binds the four changed
+through the normal installation workflow. Its manifest binds the six changed
 native files. Older unpatched hosts retain ordinary workers and refuse the
 unavailable administrative control capability.
 
@@ -49,7 +49,12 @@ and availability are verified when acting.
 
 The settings API accepts current raw config SHA, a known kind and closed field
 schema. Writes use native raw reads, managed-key refusals, the native cross-process
-config/cache locks and `atomic_config_write`, then reread persisted data. Private
+config/cache locks and `atomic_config_write`, then reread persisted data. Native
+write/replace and administrative transactions share the existing reentrant file
+lock implementation; the raw revision is rechecked immediately before commit.
+An unrelated intervening native write causes refusal instead of replacement.
+Arbitrary editors outside these native operations do not participate in the lock.
+Private
 ownership/mode, hardlink/symlink, stale SHA and session revocation/expiry are
 checked. Existing unexpanded config/secret references survive; responses use
 native structural/text masking. There is no credential reveal route.
@@ -62,13 +67,21 @@ native structural/text masking. There is no credential reveal route.
 - Web uses explicit Exa paid/keyless, bounded extraction, no provider rescue and
   no cache. It grants neither worker egress nor keys; mandatory retrieval cannot
   be disabled as a settings shortcut.
-- Toolsets use native names and explicitly configured platform lists. Installed
-  skills toggle native `skills.disabled`. No path/installation/inline shell/env
-  input is accepted.
-- Operational changes expose bounded `agent.max_iterations` and boolean
-  `gateway.streaming`.
+- Toolsets resolve native composites and disabled-set subtraction, including
+  actual mandatory search/extract availability. Installed skills use native
+  declared/load names, categories and duplicates; essential skills cannot be
+  disabled. Enabling a duplicate preserves its peers' global/platform exclusions.
+  No path/installation/inline shell/env input is accepted.
+- Operational changes expose bounded `agent.max_turns` and boolean
+  `streaming.enabled`, preserving the native streaming map and its precedence.
 - Schedules use actual native cron list/get/pause/resume and exact existing ID,
-  retaining native scope. This does not stop/resume a running worker.
+  retaining native scope and rechecking authority inside the locked mutation.
+  This does not stop/resume a running worker.
+
+Effective model validation includes native defaults, environment expansion and
+managed overrides; only raw references are saved. The temporary local profile
+renderer explicitly routes every pinned donor auxiliary role locally. Existing
+request/output guards and active execution budgets remain unchanged.
 
 Responses say `PERSISTED_NEXT_NATIVE_SESSION_OR_RELOAD`, never claim a live reload
 or alter active worker grants. The UI uses typed actual JSON APIs and rereads

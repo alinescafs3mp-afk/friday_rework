@@ -302,7 +302,7 @@ class Administration:
             from .admin_settings import options, private_config
             cfg = load_config_readonly()
             return {"profile": profile, "settings": {k: cfg.get(k) for k in
-                ("model", "auxiliary", "gateway", "platform_toolsets", "skills", "web", "plugins")},
+                ("model", "auxiliary", "agent", "streaming", "gateway", "platform_toolsets", "skills", "web", "plugins")},
                 "changes_available": True, "typed_options": options(cfg, home),
                 "config_sha256": private_config(home / "config.yaml"),
                 "runtime_application": "PERSISTED_NEXT_NATIVE_SESSION_OR_RELOAD",
@@ -334,4 +334,4 @@ class Administration:
         from .admin_settings import schedules
         if action is not None: self._verify_session(profile, session)
         with self.scope(profile):
-            return schedules(action, job_id)
+            return schedules(action, job_id, lambda: self._verify_session(profile, session))

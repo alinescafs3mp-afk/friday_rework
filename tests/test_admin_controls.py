@@ -42,8 +42,8 @@ def body(env, kind, **values):
 
 
 @pytest.mark.parametrize("kind,values,path,expected", [
-    ("operational", {"key": "agent.max_iterations", "value": 17}, ("agent", "max_iterations"), 17),
-    ("operational", {"key": "gateway.streaming", "value": True}, ("gateway", "streaming"), True),
+    ("operational", {"key": "agent.max_turns", "value": 17}, ("agent", "max_turns"), 17),
+    ("operational", {"key": "streaming.enabled", "value": True}, ("streaming", "enabled"), True),
     ("web", {"profile": "exa-keyless", "extract_timeout": 8, "extract_char_limit": 7000}, ("web", "extract_timeout"), 8),
     ("toolset", {"name": "terminal", "enabled": True}, ("platform_toolsets", "telegram"), ["web", "terminal"]),
     ("model", {"slot": "main", "provider": "custom:friday-local", "model": "fixture-local", "base_url": "http://127.0.0.1:8001/v1"}, ("model", "default"), "fixture-local"),
@@ -81,8 +81,8 @@ def test_public_or_unproved_model_endpoint_refused(value):
 
 @pytest.mark.parametrize("kind,values", [
     ("operational", {"key": "env.ANY_KEY", "value": "LEAK"}),
-    ("operational", {"key": "agent.max_iterations", "value": True}),
-    ("operational", {"key": "gateway.streaming", "value": "false"}),
+    ("operational", {"key": "agent.max_turns", "value": True}),
+    ("operational", {"key": "streaming.enabled", "value": "false"}),
     ("web", {"profile": "disabled", "extract_timeout": 30, "extract_char_limit": 15000}),
     ("web", {"profile": "exa-paid", "extract_timeout": 0, "extract_char_limit": 15000}),
     ("toolset", {"name": "web", "enabled": False}),
@@ -118,18 +118,18 @@ def test_enabled_cloud_fallback_config_is_not_written(env):
     env.cfg["auxiliary"]["compression"]["provider"] = "openrouter"; env.save()
     before = (env.home / "config.yaml").read_bytes()
     with pytest.raises(ValueError, match="explicit_local"):
-        env.admin.write_settings("default", body(env, "operational", key="agent.max_iterations", value=20), session())
+        env.admin.write_settings("default", body(env, "operational", key="agent.max_turns", value=20), session())
     assert (env.home / "config.yaml").read_bytes() == before
 
 
 def test_private_config_symlink_or_permissions_refused(env):
     local_config(env); path = env.home / "config.yaml"
     path.chmod(0o644)
-    with pytest.raises(PermissionError): env.admin.write_settings("default", body(env, "operational", key="agent.max_iterations", value=20), session())
+    with pytest.raises(PermissionError): env.admin.write_settings("default", body(env, "operational", key="agent.max_turns", value=20), session())
     path.chmod(0o600)
     alternate = env.home / "config-copy.yaml"; alternate.write_bytes(path.read_bytes()); alternate.chmod(0o600)
     path.unlink(); path.symlink_to(alternate)
-    with pytest.raises(PermissionError): env.admin.write_settings("default", body(env, "operational", key="agent.max_iterations", value=20), session())
+    with pytest.raises(PermissionError): env.admin.write_settings("default", body(env, "operational", key="agent.max_turns", value=20), session())
 
 
 def test_native_remote_context_refuses_owning_gateway_callback():
@@ -143,7 +143,7 @@ def test_native_remote_context_refuses_owning_gateway_callback():
 @pytest.mark.parametrize("who", [session(uid="ordinary"), session(org_id="foreign"), session(expires_at=1), None])
 def test_foreign_ordinary_expired_operator_cannot_write(env, who):
     local_config(env); before = (env.home / "config.yaml").read_bytes()
-    with pytest.raises(PermissionError): env.admin.write_settings("default", body(env, "operational", key="agent.max_iterations", value=12), who)
+    with pytest.raises(PermissionError): env.admin.write_settings("default", body(env, "operational", key="agent.max_turns", value=12), who)
     assert (env.home / "config.yaml").read_bytes() == before
 
 
@@ -160,7 +160,7 @@ def test_native_signed_auth_actual_asgi_settings_and_task_unknown(env):
             root = "/api/plugins/friday_rework"
             owner = {"Authorization": "Bearer " + provider._mint_session("owner").access_token}
             ordinary = {"Authorization": "Bearer " + provider._mint_session("ordinary").access_token}
-            b = body(env, "operational", key="agent.max_iterations", value=15)
+            b = body(env, "operational", key="agent.max_turns", value=15)
             assert (await client.put(root + "/settings?profile=default", json=b, headers=ordinary)).status_code == 403
             assert (await client.put(root + "/settings?profile=foreign", json=b, headers=owner)).status_code == 403
             result = await client.put(root + "/settings?profile=default", json=b, headers=owner)
@@ -191,7 +191,7 @@ def test_native_schedule_pause_resume_retains_job_original_scope(env):
     ("cancel_task", "", {}, {"action": "cancel"}),
     ("pause_task", "", {}, {"action": "pause"}),
     ("check_task", "", {}, {"action": "status"}),
-    ("settings", "operational", {"value": "19"}, {"key": "agent.max_iterations", "value": 19}),
+    ("settings", "operational", {"value": "19"}, {"key": "agent.max_turns", "value": 19}),
     ("settings", "web", {"web": "exa-keyless", "timeout": "7", "chars": "9000"}, {"profile": "exa-keyless", "extract_timeout": 7, "extract_char_limit": 9000}),
     ("settings", "model", {}, {"slot": "main", "provider": "custom:friday-local", "model": "fixture-local", "base_url": "http://127.0.0.1:8001/v1"}),
     ("schedule", "", {}, {"action": "pause"}),

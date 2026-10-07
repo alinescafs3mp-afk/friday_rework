@@ -38,6 +38,8 @@ def private_config(path):
 
 def options(cfg, home):
     from toolsets import get_toolset_names
+    from tools.skills_tool import _find_all_skills
+    from agent.skill_utils import ESSENTIAL_SKILLS
     routes = []
     for name, provider in (cfg.get("providers") or {}).items():
         if not isinstance(provider, dict) or provider.get("transport") != "chat_completions":
@@ -51,14 +53,13 @@ def options(cfg, home):
         for model in provider.get("models") or {}:
             if isinstance(model, str) and 0 < len(model) <= 256 and not any(ord(c) <= 32 for c in model):
                 routes.append({"provider": "custom:" + name, "model": model, "base_url": endpoint})
-    skills = []
-    root = home / "skills"
-    if root.is_dir() and not root.is_symlink():
-        skills = [p.name for p in root.iterdir() if p.is_dir() and not p.is_symlink()
-                  and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", p.name) and (p / "SKILL.md").is_file()][:256]
+    # Use the same resolved load names as skill_view, including categorized
+    # skills and same-tier duplicate names. Directory names are not identities.
+    skills = [row["name"] for row in _find_all_skills(skip_disabled=True)]
     return {"local_routes": routes, "toolsets": get_toolset_names(), "skills": skills,
+            "required_skills": sorted(ESSENTIAL_SKILLS),
             "web_backends": ["exa-paid", "exa-keyless"],
-            "operational": ["agent.max_iterations", "gateway.streaming"],
+            "operational": ["agent.max_turns", "streaming.enabled"],
             "model_slots": ["main", *[k for k, v in (cfg.get("auxiliary") or {}).items() if isinstance(v, dict)]]}
 
 
@@ -85,13 +86,12 @@ def _local_inference(cfg):
 
 def edit(profile, home, body, verify):
     from hermes_cli import config, managed_scope
-    from hermes_cli.plugins_state import _locked_plugin_state
     path = home / "config.yaml"
     if config.is_managed():
         raise PermissionError("managed_native_config")
     # The existing native cross-process config writer lock and cache lock cover
     # raw read/CAS/merge/write. Do not materialize expanded secrets or defaults.
-    with _locked_plugin_state(path, lock_deadline=__import__("time").monotonic() + 2), config._CONFIG_LOCK:
+    with config.config_write_transaction(path):
         verify()
         sha = private_config(path)
         if body["expected_sha256"] != sha:
@@ -143,6 +143,8 @@ def edit(profile, home, body, verify):
             if values["name"] not in allowed["toolsets" if kind == "toolset" else "skills"]:
                 raise ValueError("native_capability_not_installed")
             if kind == "toolset":
+                from model_tools import _select_tool_names
+                from toolsets import resolve_toolset
                 if values == {"name": "web", "enabled": False}:
                     raise ValueError("mandatory_retrieval_required")
                 # Native gateway reader uses platform_toolsets; change only
@@ -154,21 +156,61 @@ def edit(profile, home, body, verify):
                     if not isinstance(names, list) or "web" not in names:
                         raise ValueError("mandatory_retrieval_required")
                     sets[platform] = list(dict.fromkeys([*names, values["name"]])) if values["enabled"] else [n for n in names if n != values["name"]]
-                changed = ["platform_toolsets"]
+                disabled = candidate.setdefault("agent", {}).get("disabled_toolsets", [])
+                if not isinstance(disabled, list): raise ValueError("invalid_native_toolset_policy")
+                disabled = [name for name in disabled if name != values["name"]] if values["enabled"] else list(dict.fromkeys([*disabled, values["name"]]))
+                target_tools = set(resolve_toolset(values["name"]))
+                for names in sets.values():
+                    selected = _select_tool_names(names, disabled, True)
+                    if not {"web_search", "web_extract"} <= selected:
+                        raise ValueError("mandatory_retrieval_required")
+                    if (values["enabled"] and not target_tools <= selected
+                            or not values["enabled"] and target_tools & selected):
+                        raise ValueError("conflicting_native_toolset_policy")
+                candidate["agent"]["disabled_toolsets"] = disabled
+                changed = ["platform_toolsets", "agent.disabled_toolsets"]
             else:
+                from agent.skill_utils import ESSENTIAL_SKILLS
+                from tools.skills_tool import _skill_catalog
+                catalog = _skill_catalog(skip_disabled=True)
+                selected = next(row for row in catalog if row.get("load_name") == values["name"])
+                if not values["enabled"] and selected["name"] in ESSENTIAL_SKILLS:
+                    raise ValueError("native_required_skill_cannot_be_disabled")
                 disabled = candidate.setdefault("skills", {}).get("disabled", [])
                 if not isinstance(disabled, list): raise ValueError("invalid_native_skill_policy")
-                candidate["skills"]["disabled"] = [n for n in disabled if n != values["name"]] if values["enabled"] else list(dict.fromkeys([*disabled, values["name"]]))
+                def enable_one(names):
+                    if not isinstance(names, list) or any(not isinstance(n, str) for n in names):
+                        raise ValueError("invalid_native_skill_policy")
+                    result = [n for n in names if n not in (selected["name"], values["name"])]
+                    # Expand a broad declared-name disable before enabling one
+                    # duplicate, so its peers retain their prior policy.
+                    if selected["name"] in names:
+                        result.extend(row["load_name"] for row in catalog
+                            if row["name"] == selected["name"] and row.get("load_name")
+                            and row["load_name"] != values["name"])
+                    return list(dict.fromkeys(result))
+                candidate["skills"]["disabled"] = enable_one(disabled) if values["enabled"] else list(dict.fromkeys([*disabled, values["name"]]))
                 changed = ["skills.disabled"]
+                if values["enabled"]:
+                    platform_disabled = candidate["skills"].get("platform_disabled", {})
+                    if not isinstance(platform_disabled, dict): raise ValueError("invalid_native_skill_policy")
+                    for platform, names in platform_disabled.items():
+                        platform_disabled[platform] = enable_one(names)
+                    if platform_disabled: changed.append("skills.platform_disabled")
         elif kind == "operational":
             if set(values) != {"key", "value"} or values["key"] not in allowed["operational"]:
                 raise ValueError("invalid_operational_setting")
             key, value = values["key"], values["value"]
-            if (key == "agent.max_iterations" and (type(value) is not int or not 1 <= value <= 200)
-                    or key == "gateway.streaming" and type(value) is not bool):
+            if (key == "agent.max_turns" and (type(value) is not int or not 1 <= value <= 200)
+                    or key == "streaming.enabled" and type(value) is not bool):
                 raise ValueError("invalid_operational_value")
-            group, field = key.split(".")
-            candidate.setdefault(group, {})[field] = value; changed = [key]
+            target = candidate
+            segments = key.split(".")
+            for group in segments[:-1]:
+                if group in target and not isinstance(target[group], dict):
+                    raise ValueError("invalid_native_operational_mapping")
+                target = target.setdefault(group, {})
+            target[segments[-1]] = value; changed = [key]
         else:
             raise ValueError("unsupported_typed_setting")
         def leaves(value, prefix):
@@ -183,7 +225,14 @@ def edit(profile, home, body, verify):
         if any(managed_scope.is_key_managed(key) for key in managed_paths):
             raise PermissionError("administrator_managed_key")
         _local_inference(candidate)
+        # Validate the complete native effective candidate, including default
+        # auxiliary roles and managed precedence, without persisting expansion.
+        effective, _ = config._merge_managed_overlay(config._expand_env_vars(
+            config._canonicalize_config(config._deep_merge(copy.deepcopy(config.DEFAULT_CONFIG), candidate))))
+        _local_inference(effective)
         verify()
+        if private_config(path) != sha:
+            raise ValueError("native_config_changed_reload_required")
         config.atomic_config_write(path, candidate)
         reread = config.require_readable_config_before_write(path)
         if reread != candidate:
@@ -193,7 +242,7 @@ def edit(profile, home, body, verify):
             "active_worker_binding": "UNCHANGED_ORIGINAL_BUDGET", "observed_live_reload": False}
 
 
-def schedules(action=None, job_id=None):
+def schedules(action=None, job_id=None, verify=None):
     from cron.jobs import get_job, list_jobs, pause_job, resume_job
     if action is None:
         return [{k: row.get(k) for k in ("id", "name", "schedule", "enabled", "state", "next_run_at", "paused_reason")}
@@ -202,7 +251,10 @@ def schedules(action=None, job_id=None):
         raise ValueError("exact_native_schedule_required")
     if action not in ("pause", "resume"):
         raise ValueError("invalid_schedule_control")
-    row = pause_job(job_id, reason="Verified Friday Dashboard administrator") if action == "pause" else resume_job(job_id)
+    if not callable(verify):
+        raise PermissionError("verified_admin_required")
+    verify()
+    row = pause_job(job_id, reason="Verified Friday Dashboard administrator", before_write=verify) if action == "pause" else resume_job(job_id, before_write=verify)
     current = get_job(job_id)
     if row is None or current is None or bool(current.get("enabled")) != (action == "resume"):
         raise RuntimeError("native_schedule_write_unconfirmed")
