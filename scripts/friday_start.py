@@ -230,6 +230,22 @@ def gateway_observation(home, budget):
         and live.get("friday_owner") == generation,
         "native_gateway_generation_unproved",
     )
+    # Generation validation and the native identify exchange can outlive an
+    # incarnation. Reconcile the retained native owner after that exchange.
+    observed = budget.call(hr.read_record, hr.ROLE_GATEWAY, include_stale=True)
+    require(observed == record, "native_gateway_owner_changed_during_probe")
+    current_props = budget.call(
+        gw._read_systemd_unit_properties,
+        system=False,
+        properties=("ActiveState", "SubState", "MainPID", "InvocationID"),
+    )
+    require(current_props == props, "native_gateway_unit_changed_during_probe")
+    require(
+        budget.call(hr.liveness_is_proven, record)
+        and budget.call(hr.record_token_is_consistent, record),
+        "native_gateway_incarnation_changed_during_probe",
+    )
+    budget.check()
     return record
 
 

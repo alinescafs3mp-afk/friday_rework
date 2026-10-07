@@ -29,3 +29,26 @@ Continue current ownership/readiness/stop repairs, then connect web connectivity
 The existing task register is the live authority. Repository documentation distinguishes planned, implemented, connected and verified work; this scope document creates no new task register, dispatcher or scheduler.
 
 See [the dated donor inventory and integration sequence](donor-capabilities.md) for all useful capabilities, native equivalents, proposed optional surfaces and the four distinct implementation stages.
+
+## Immediate runtime acceptance target
+
+Owner clarification, 2026-10-07: the next acceptance target is a normally
+installed and authenticated Friday candidate completing real user journeys.
+Preserve the architecture and native capabilities; prioritize closing runtime
+connections over expanding contracts or fixture infrastructure.
+
+The remaining connected path includes trusted Harness web admission in the
+ordinary Hermes host; A0 capability/service/network admission, scheduling and
+warm reuse; a shared result consumer for both workers; repository seeding,
+continuation and mixed coding/engineering handoff; executed goal verification,
+artifact selection and real Telegram delivery. The same installed product must
+exercise two-user WebUI administration, identity bindings, all-chat visibility,
+isolation, stop, settings, revoke and stale-credential rejection. Autonomous
+web must affect actual conversation, explicit research and both worker paths.
+
+Record source presence, configuration, wiring, offline verification, live
+execution and release acceptance separately. Temporary restrictions on ordinary
+users' native memory, skills, delegation or useful tools remain unresolved
+product gaps. Donor capabilities, Friday personality and Telegram behavior are
+not accepted exclusions. Stopped legacy services remain stopped; their model
+endpoints are only the temporary test deployment profile.

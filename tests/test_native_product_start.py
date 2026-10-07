@@ -663,7 +663,7 @@ def test_normal_native_discovery_loads_installed_plugin_without_http_activation(
         reset_hermes_home_override(token)
 
 
-def test_prerequisites_current_native_base_refuses_absent_credential_join(native_home, monkeypatch):
+def test_prerequisites_refuses_absent_credential_join(native_home, monkeypatch):
     from hermes_cli import source_build
     from pm import environments, paths
 
@@ -673,7 +673,9 @@ def test_prerequisites_current_native_base_refuses_absent_credential_join(native
     monkeypatch.setattr(environments, "owning_home_root", lambda source: None)
     monkeypatch.setattr(source_build, "source_product_current", lambda *a: True)
     monkeypatch.setattr(start, "snapshot", lambda home, budget: {})
-    # Actual import into the exact sixteen-layer native base remains absent.
+    # The complete composition contains this dependency; remove it explicitly
+    # to retain the missing-overlay negative control after integration.
+    monkeypatch.setitem(os.sys.modules, "hermes_cli.friday_credential_admission", None)
     with pytest.raises(ValueError, match="native_credential_admission_join_required"):
         start.prerequisites({"home": str(f.home)}, Budget(30))
     assert not f.unit.exists()
