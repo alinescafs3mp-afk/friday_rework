@@ -25,6 +25,19 @@ for (const [typed, plain] of [
   ["let body: { error?: string; login_url?: string } = {};", "let body = {};"],
   ["new Promise<T>", "new Promise"],
 ]) {assert(client.includes(typed), "Pinned native client annotation changed: " + typed); client = client.replace(typed, plain);}
+// Bounded WHATWG Headers subset used by this native client: case-insensitive
+// has/set and iteration. Node's lazy Undici/Wasm HTTP stack is never imported.
+class OfflineHeaders {
+  constructor(init) {this.values=new Map();for (const [k,v] of Object.entries(init || {})) this.set(k,v);}
+  has(key) {return this.values.has(key.toLowerCase());}
+  set(key,value) {this.values.set(key.toLowerCase(),String(value));}
+  [Symbol.iterator]() {return this.values[Symbol.iterator]();}
+}
+const Module = require("node:module"), originalLoad = Module._load;
+Module._load = function(name, ...args) {
+  if (/^(node:)?(net|http|https|http2|dns|tls|dgram|child_process|worker_threads)$/.test(name)) throw Error("OFFLINE_EFFECT_REFUSED");
+  return originalLoad.call(this,name,...args);
+};
 const requests = [], states = [], pageStates = [], counts = [];
 let cursor = 0, effects = [], tree, Component;
 const React = {
@@ -37,7 +50,7 @@ const React = {
 };
 const context = {
   window: {__HERMES_SESSION_TOKEN__: input.token || "", location: {assign: () => {throw Error("Unexpected login redirect");}}},
-  Headers, URLSearchParams, Promise, console: {warn: () => {}, log: () => {}},
+  Headers: OfflineHeaders, URLSearchParams, Promise, console: {warn: () => {}, log: () => {}},
   BASE: "", dashboardServingProfile: () => "default", clearDashboardTokenReloadAttempt: () => {},
   attemptDashboardTokenReloadOnce: () => false,
   apiErrorFromNetworkFailure: e => e,
@@ -49,6 +62,11 @@ const context = {
     let data;
     if (path.endsWith("/profiles")) data = ["default"];
     else if (path.endsWith("/users")) data = input.users || {accounts: [], users: []};
+    else if (path.endsWith("/onboarding")) data = {templates: ["approved-local"], pending: [], config_sha256: "a".repeat(64)};
+    else if (path.endsWith("/onboarding/prepare")) data = {state: "DISABLED_INCOMPLETE", enabled: false,
+      generation: 1, config_sha256: "b".repeat(64), required_names: ["LOCAL_KEY", "EXA_API_KEY"]};
+    else if (path.endsWith("/onboarding/credentials")) data = {state: "DISABLED_SETUP_PENDING", enabled: false, recorded: true};
+    else if (path.endsWith("/onboarding/activate")) data = {state: "ADMITTED_NEXT_NATIVE_REQUEST", enabled: true};
     else if (path.endsWith("/pairing")) data = input.pending || {pending: []};
     else if (path.endsWith("/pairing/approve")) data = {recorded: true};
     else if (path.endsWith("/conversations")) data = input.conversations;
@@ -77,20 +95,41 @@ const click = async label => {render(); const node = find(tree, label); assert(n
   assert(!node.props.disabled, "Disabled button " + label); await node.props.onClick(); await tick(); render();};
 (async () => {
   render(); await tick(); render(); render();
-  if (input.action === "messages") {
-    await click("conversations"); await click("Load current native state");
-    await click("session-1");
-    const observe = () => {const row = states.find(s => s && s.session_id === "session-1" && s.messages);
-      assert(row); pageStates.push(row.page.state); counts.push(row.messages.length);};
-    observe(); await click("Next messages"); observe();
-    assert(find(tree, "Next messages").props.disabled);
-    await click("Previous messages"); observe();
-    assert(find(tree, "Previous messages").props.disabled);
-  } else if (input.action === "approve") {
-    await click("pairing"); await click("Load current native state"); await click("Approve native access");
-  } else {
-    await click("Load current native state");
-    await click({disable: "Disable", enable: "Enable", role: "Channel admin role"}[input.action]);
+  const observations = [];
+  await click("onboarding"); await click("Load current native state");
+  function inputs(node, output = []) {
+    if (!node || typeof node !== "object") return output;
+    if (node.tag === "input" || node.tag === "select") output.push(node);
+    for (const child of node.children || []) inputs(child, output);
+    return output;
   }
-  process.stdout.write(JSON.stringify({requests, page_states: pageStates, message_counts: counts}));
+  function setField(value, next) {
+    render(); const field = inputs(tree).find(x => x.props.value === value && x.props.onChange);
+    assert(field, "Missing field " + value); field.props.onChange({target: {value: next}});render();
+  }
+  setField("", "bot-A");setField("", "1");setField("", "user-1");setField("", "approved-local");
+  await click("Prepare disabled profile");
+  const prepare = requests.find(r => r.url.includes("/onboarding/prepare"));
+  assert(prepare);const body = JSON.parse(prepare.body);
+  assert.deepEqual(body, {platform: "telegram", transport_profile: "default", account_id: "bot-A", user_id: "1",
+    expected_config_sha256: "a".repeat(64), runtime_profile: "user-1", template: "approved-local"});
+  observations.push("EXACT_PRINCIPAL_PROFILE_TEMPLATE_CAS");
+  assert(find(tree,"Prepare disabled profile").props.disabled); observations.push("NO_DUPLICATE_PREPARE");
+  const keyInput=inputs(tree).find(x => x.props.type === "password");assert(keyInput && keyInput.props.autoComplete === "new-password");
+  observations.push("SECRET_CAPTURE_PASSWORD_INPUT");
+  keyInput.props.onChange({target:{value:"synthetic-native-key-canary"}});render();
+  await click("Store scoped key");
+  const capture = requests.find(r => r.url.includes("/onboarding/credentials"));assert(capture && capture.method === "PUT");
+  const secretBody = JSON.parse(capture.body); assert.equal(secretBody.generation,1);assert.equal(secretBody.expected_config_sha256,"b".repeat(64));
+  assert.equal(secretBody.name,"LOCAL_KEY");assert.equal(secretBody.value,"synthetic-native-key-canary");
+  assert(!("runtime_profile" in secretBody) && !("template" in secretBody)); observations.push("SCOPED_SECRET_EXACT_NATIVE_API");
+  assert.equal(inputs(tree).find(x => x.props.type === "password").props.value, "");observations.push("SECRET_CLEARED_AFTER_CAPTURE");
+  await click("Activate complete profile");
+  const activation = requests.find(r => r.url.includes("/onboarding/activate"));assert(activation && activation.method === "POST");
+  const activateBody=JSON.parse(activation.body);assert.equal(activateBody.generation,1);assert.equal(activateBody.expected_config_sha256,"b".repeat(64));
+  assert(!("value" in activateBody));observations.push("ACTIVATION_ORIGINAL_GENERATION_CURRENT_CAS");
+  assert(find(tree,"Activate complete profile").props.disabled);observations.push("NO_REPEAT_ENABLED_ACTIVATION");
+  for (const request of requests) {assert.equal(request.credentials,"include");assert.equal(request.headers["x-hermes-session-token"],input.token);}
+  observations.push("EXACT_NATIVE_AUTHENTICATED_FETCH_CLIENT");
+  process.stdout.write(JSON.stringify({observations, request_methods: requests.map(r => r.method), count: observations.length, source_fixture: true, browser_live: "NOT_RUN"}));
 })().catch(e => {process.stderr.write(String(e.stack)); process.exitCode = 1;});
