@@ -54,8 +54,11 @@ class DshWebInputs:
             rows = json.loads(content)
             if not isinstance(rows, list):
                 raise ValueError()
+            # Cordis indexes inserted entries immediately: a later direct patch
+            # can replace Exa's config, including its URL or inline credential.
+            # Include that entry in the exact rendered web configuration check.
             selected = [r for r in rows if isinstance(r, dict) and
-                        (r.get('id') in {'web', 'web-fetch-http', 'tool-web'} or 'insert' in r)]
+                        (r.get('id') in {'web', 'web-search-exa', 'web-fetch-http', 'tool-web'} or 'insert' in r)]
             tool = next(r['config'] for r in selected if r.get('id') == 'tool-web')
             fetch = next(r['config'] for r in selected if r.get('id') == 'web-fetch-http')
             expected = dsh_web_patch(self.profile,
@@ -95,8 +98,10 @@ def a0_web_files(profile, *, timeout_seconds=15):
             'use_default_settings': {'engines': {'keep_only': ['google']}},
             'general': {'debug': False, 'instance_name': 'Friday worker research'},
             'search': {'safe_search': 0, 'formats': ['json']},
+            # Leave protected secret provisioning to the native installation.
+            # An empty override is accepted by SearXNG and is not a start guard.
             'server': {'bind_address': '127.0.0.1', 'port': 55510,
-                       'limiter': False, 'image_proxy': False, 'secret_key': ''},
+                       'limiter': False, 'image_proxy': False},
             'outgoing': {'request_timeout': timeout_seconds, 'max_request_timeout': timeout_seconds},
             'engines': [{'name': 'google', 'engine': 'google', 'shortcut': 'g', 'disabled': False}],
         },

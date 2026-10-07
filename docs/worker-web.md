@@ -79,8 +79,13 @@ Google engine and bounded native document-query configuration. SearXNG's
 documented `keep_only` setting retains the full defaults while excluding other
 engines; there is no automatic vendor/model fallback. This profile requires no
 external search API key. The service still needs a separately protected native
-`SEARXNG_SECRET`; the emitted empty `server.secret_key` is intentionally unusable
-without that installation input. Do not insert a shared or placeholder secret.
+`SEARXNG_SECRET`; the template leaves `server.secret_key` unset rather than
+overriding the native default with an empty value. Empty secrets are accepted
+by the observed native settings validator, so an empty value is **not** a
+fail-closed startup mechanism. The normal installation must explicitly refuse
+missing, empty or default secrets and verify the protected effective value
+before admission. This source template does not provide that installation
+check or grant startup. Do not insert a shared or placeholder secret.
 The native service source/version in the built image must be observed before
 accepting its effective settings. See the official
 [SearXNG settings](https://docs.searxng.org/admin/settings/settings.html) and

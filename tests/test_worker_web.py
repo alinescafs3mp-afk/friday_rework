@@ -138,6 +138,32 @@ class WorkerWeb(unittest.TestCase):
         adapter=DshAdapter(config,supervisor=self.f.sup)
         with self.assertRaisesRegex(AdapterError,'web_inputs_missing'):adapter._pins()
 
+    def test_direct_exa_entry_overrides_refuse_before_key_resolution_or_launch(self):
+        baseline = copy.deepcopy(self.rows)
+        overrides = [
+            {'config': {'apiKey': 'SYNTHETIC_FOREIGN_INLINE'}},
+            {'config': {'baseURL': 'https://outside-approved.invalid'}},
+            {'config': {'apiKeyEnv': 'FOREIGN_KEY'}},
+            {'disabled': True},
+            {'config': {}},
+            {'group': True, 'config': []},
+        ]
+        for override in overrides:
+            for before_insert in (False, True):
+                with self.subTest(override=override, before_insert=before_insert):
+                    row = {'id': 'web-search-exa', **override}
+                    self.rows = ([row] + copy.deepcopy(baseline) if before_insert
+                                 else copy.deepcopy(baseline) + [row])
+                    keys = []
+                    self.install(environment=lambda: keys.append('resolved'))
+                    with patch('subprocess.run') as run:
+                        with self.assertRaisesRegex((WorkerWebError, AdapterError), 'worker_web_patch_mismatch'):
+                            self.f.prep()
+                    run.assert_not_called()
+                    self.assertEqual(keys, [])
+        self.rows = baseline
+        self.assertIs(self.web.checked_patch(json.dumps(self.rows)), self.web)
+
     def test_key_rotation_during_current_network_check_refuses_launch(self):
         grant={'LOCAL_TEST_KEY':'SYNTHETIC_LOCAL','EXA_API_KEY':'SYNTHETIC_EXA'};count=[0]
         def check(row,web):
@@ -154,6 +180,7 @@ class WorkerWeb(unittest.TestCase):
         self.assertEqual([r['engine'] for r in config['engines']],['google'])
         self.assertEqual(config['server']['bind_address'],'127.0.0.1')
         self.assertEqual(config['server']['port'],55510)
+        self.assertNotIn('secret_key', config['server'])
         self.assertEqual(files['/a0/usr/plugins/_document_query/config.json']['fetch_retries'],1)
         self.assertNotIn('model',json.dumps(files));self.assertNotIn('API_KEY',json.dumps(files))
         with self.assertRaises(WorkerWebError):a0_web_files('auto')
