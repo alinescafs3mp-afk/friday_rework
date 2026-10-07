@@ -73,7 +73,8 @@ fallback, new service manager or independent lifetime budget. This namespace
 adds lifetime custody; it does not change the original filesystem/network grant.
 The namespace uses `--dev /dev` for bubblewrap's private standard devices;
 it never binds host hardware devices. A root bind alone is mounted without
-device access and made Git's `/dev/null` open fail in the first normal attempt.
+device access. An isolated reproduction made Git's `/dev/null` open fail; this
+is consistent with the first attempt, whose raw child stderr was not retained.
 The required pre-claim probe now verifies read/write access to `/dev/null` as
 well as the distinct PID namespace, so that defect refuses before home creation.
 The host verifies the root-owned binary and exact SHA before planning/admission

@@ -1,5 +1,20 @@
 # Foundation checkpoint — 2026-10-08
 
+Installer checkpoint, 01:23 MSK: the independently reviewed repair now uses
+private standard devices, explicit cold imports, bounded failure diagnostics
+and native bubblewrap init-exit evidence. One isolated **real source-preparation**
+run completed in 3.602 seconds: 17,632 exported files, all twenty overlays and
+matching native init completion; every receipt file hash was checked. The
+process exited and released its execution slot. No dependency installation,
+build, service, model or messaging effects ran in this trial.
+
+The earlier normal installation failed during source preparation and retains
+its original PARTIAL claim. Independent retrospective observation established
+cessation; the original installation deadline is now exhausted. Read-only
+reconciliation does not authorize replay or reset that deadline. The normal
+continuation path is still being implemented. Native PM/build compatibility,
+authenticated cold start and all seven user journeys remain unaccepted.
+
 The source now composes twenty pinned Hermes layers. The ordinary profile can
 select intact Harness and A0 workers while retaining each worker's admission,
 original budget and the existing single execution owner. Native credential
