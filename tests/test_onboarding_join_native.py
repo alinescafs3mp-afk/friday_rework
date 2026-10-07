@@ -61,6 +61,18 @@ def wired(users, monkeypatch, request):
         package=manager._plugins['friday_rework'].module.__name__
         admission=importlib.import_module(package+'.admission')
         result=importlib.import_module(package+'.result_tool')
+        supervision=importlib.import_module(package+'.supervision')
+        def absent_fixture_unit(arguments, timeout):
+            # This fixture closes scheduled coroutines before execution. Its
+            # metadata-only UNKNOWN row must not query the real user manager
+            # when the native host reconciles during PluginManager unload.
+            units={r['supervisor']['unit'] for r in host.store.snapshot().values()}
+            assert arguments[0]=='show' and arguments[1] in units and timeout==3
+            fields=dict(LoadState='not-found',Transient='no',Description=arguments[1],
+                InvocationID='',ActiveState='inactive',SubState='dead',Result='success',
+                MainPID='0',ControlGroup='',KillMode='control-group',SendSIGKILL='yes')
+            return SimpleNamespace(returncode=0,stdout='\n'.join(k+'='+v for k,v in fields.items()))
+        monkeypatch.setattr(supervision.NativeSupervisor,'_command',staticmethod(absent_fixture_unit))
         assert admission.native_call_scope in manager._middleware['tool_execution']
         fields=dict(PLATFORM='telegram',CHAT_ID='shared-chat',CHAT_TYPE='group',THREAD_ID='same-topic',USER_ID='1',
             KEY='independent-key',ID='independent-session',MESSAGE_ID='independent-message',PROFILE=source_profile)
