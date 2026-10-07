@@ -1,5 +1,28 @@
 # Foundation checkpoint — 2026-10-07
 
+Current checkpoint, 23:22 MSK: the ordinary Hermes factory now supplies the
+current Harness web admission probe; A0 profile, SearXNG service and network
+source are joined with the normal installer and the shared result consumer.
+The joined candidate passed 318 distinct affected checks. Independent review
+ran 84 checks, found a Node 26 DNS callback incompatibility, and verified its
+repair with six callback controls; the changed area also passed its 55-case
+recheck. Repeated checks are not added to the distinct producer total.
+
+| Capability | Source/configuration/wiring | Offline verification | Live execution | Release acceptance |
+|---|---|---|---|---|
+| Harness web admission | Connected to ordinary factory; explicit protected network inputs | Verified, including native Node callback repair | Current joined path not run | Pending |
+| A0 profiles, web services and shared results | Integrated source; actual capability, startup and warm reuse still required | Scoped components verified | Current native network/service admission not run | Pending |
+| Authenticated installer and administrative UI | Complete 19-layer native source; credential and worker readiness dependencies remain | Existing exact source gates retained | Normal cold start and two-user administration not run | Pending |
+| Telegram, continuation and mixed worker delivery | Existing host/result paths retained; repository seeding, handoff and executed goal verification incomplete | Existing component evidence only | Complete journeys not run | Pending |
+
+The native credential contract still needs the separate A0 service/embedding
+names; that join and explicit keyless Hermes/Harness profiles are in active
+implementation. The A0 launcher retains temporary test inference routes;
+general endpoint/IPv6 network support remains an unresolved deployment gap.
+No ordinary capability is accepted as an exclusion. All seven requested live
+journeys remain required. Old Friday stays stopped. Earlier checkpoints below
+retain their original scope and are not current readiness claims.
+
 Source checkpoint, 16:56 MSK: the complete pinned Hermes source preparer,
 configurable bounded continuation, and native scope health repairs are now in
 this source branch. The exact 12-overlay Hermes composition passed all 11 native
