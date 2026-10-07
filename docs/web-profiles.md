@@ -247,8 +247,14 @@ native console output is discarded and logging is suppressed, including native
 construction and cleanup; only the redacted observation sink is public. Actual
 native full-page and tool-result spill writers receive redacted text and filenames
 before writing. Native API-error request dumps use the existing profile-scoped
-exact-value redaction registry, including escaped credential forms. These scoped
-bindings, including the native request-debug JSON sink, are restored at close. This policy requires the new private profile and
+exact-value redaction registry, including escaped credential forms. Before its
+sequential replacements, the dedicated driver conceals the union of overlapping
+credentials for the authenticated profile. Otherwise an earlier full replacement
+can leave an interior fragment that the later JSON sink can no longer recognize.
+Foreign profiles retain their native registry behavior. These scoped bindings,
+including the registry hook and native request-debug JSON sink, are restored at
+close, also after failed construction; an unexpectedly replaced registry hook
+causes an explicit cleanup failure instead of being overwritten. This policy requires the new private profile and
 dedicated process; it is not suitable for a concurrent gateway. Pinned persistence,
 redaction, spill and logging sources are mandatory inputs. Offline regressions scan
 every actual profile/workspace/output artifact and captured console for synthetic

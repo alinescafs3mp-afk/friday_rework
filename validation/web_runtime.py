@@ -326,6 +326,21 @@ class Native:
         # including their JSON-escaped representations, before any SDK call.
         from agent.redact import register_vault_redaction_value, clear_vault_redaction_values
         self.clear_redactions = clear_vault_redaction_values
+        # The native exact registry uses sequential replacement. A full match
+        # can consume the beginning of an overlapping credential before the
+        # later JSON sink sees it. Conceal their union at that earlier boundary.
+        # The supervised donor process is dedicated, and the hook applies only
+        # to this authenticated profile; native policy for other homes remains.
+        from agent import redact as native_redact
+        self.redact_module = native_redact
+        self.old_registered_redact = native_redact.redact_registered_vault_values
+        original_registered_redact = self.old_registered_redact
+        def redact_before_native_registry(text):
+            if isinstance(text, str) and str(get_hermes_home().resolve()) == home:
+                text = _redact(text, self.secrets)
+            return original_registered_redact(text)
+        self.registered_redactor = redact_before_native_registry
+        native_redact.redact_registered_vault_values = self.registered_redactor
         for form in _secret_forms(self.secrets):
             register_vault_redaction_value(form)
         web_tools_truncate._store_full_text = lambda url, content: self.old_spill(
@@ -378,6 +393,12 @@ class Native:
             if value is not None:
                 try: value.close()
                 except Exception: errors.append(name)
+        if hasattr(self, "old_registered_redact"):
+            if self.redact_module.redact_registered_vault_values is self.registered_redactor:
+                self.redact_module.redact_registered_vault_values = self.old_registered_redact
+                del self.old_registered_redact
+            else:
+                errors.append("native_redaction_hook_ownership")
         if hasattr(self, "clear_redactions"):
             try: self.clear_redactions()
             except Exception: errors.append("redaction_scope")

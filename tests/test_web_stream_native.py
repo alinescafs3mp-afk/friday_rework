@@ -29,7 +29,7 @@ build = runpy.run_path(str(Q/'tools/configure_local_test.py'))['build_config']
     + [('explicit','retry_4xx','local-local-SYNTHETIC_CREDENTIAL_123456789','local-'),
        ('explicit','retry_4xx','sk-sk-sk-SYNTHETIC_CREDENTIAL_123456789','sk-'),
        ('explicit','escaped_stream','JSON"\\яяJSON"\\яя_SYNTHETIC_CREDENTIAL_123456789','JSON"\\яя')])
-def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,mode,variant,credential,overlap_prefix):
+def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,mode,variant,credential,overlap_prefix,construction_failure=False):
     case=variant
     marker='SYNTHETIC_QUOTE"SLASH\\UNICODEя' if variant=='escaped_stream' else 'SYNTHETIC_SCOPED_CREDENTIAL'
     marker=credential or marker
@@ -38,6 +38,7 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     from tools import web_tools as wt
     from tools import web_tools_truncate, tool_result_storage
     from agent import redact, agent_runtime_helpers
+    old_registered_redact=redact.redact_registered_vault_values
     old_debug_write=agent_runtime_helpers.atomic_json_write
     old_spills=(web_tools_truncate._store_full_text,tool_result_storage._write_to_spillover)
     old_logging=logging.root.manager.disable
@@ -186,9 +187,27 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
             except Exception as exc:
                 self.open_failure = type(exc).__name__ + ': ' + str(exc).replace(marker,'[REDACTED]')
                 raise
+            # Actual native profile dispatch must retain foreign registries.
+            from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+            assert marker not in redact.redact_registered_vault_values(marker)
+            token=set_hermes_home_override(tmp_path/'foreign-profile')
+            try:
+                foreign='UNRELATED_FOREIGN_PROFILE_CREDENTIAL'
+                redact.register_vault_redaction_value(foreign)
+                assert redact.redact_registered_vault_values(marker)==marker
+                assert foreign not in redact.redact_registered_vault_values(foreign)
+            finally:
+                redact.clear_vault_redaction_values()
+                reset_hermes_home_override(token)
+            assert marker not in redact.redact_registered_vault_values(marker)
             assert 'FRIDAY_SYNTHETIC_SOUL_NATIVE_DRIVER' in self.rendered_prompt
             assert self.agent._session_db is None and self.agent.save_trajectories is False
             return self
+    if construction_failure:
+        def failed_init(*args, **kwargs):
+            assert redact.redact_registered_vault_values is not old_registered_redact
+            raise RuntimeError('synthetic construction failure after hook installation')
+        monkeypatch.setattr(run_agent.AIAgent, '__init__', failed_init)
     parsed_deltas=[];resets=[]
     original_reset=run_agent.AIAgent._reset_stream_delivery_tracking
     def observed_reset(agent):
@@ -214,6 +233,15 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     with pytest.raises(M['Refused']):
         M['execute'](plan,task,boundary,native=obj,mono=lambda:110.,wall=lambda:1010.,boot='fixture-boot')
     result=M['recover'](plan,task)
+    assert redact.redact_registered_vault_values is old_registered_redact
+    if construction_failure:
+        from agent.secret_scope import current_secret_scope
+        assert result['status']=='FAILED_OR_UNCERTAIN' and boundary.settles==1
+        assert current_secret_scope() is None and str(home) not in redact._VAULT_REDACTION_VALUES
+        assert agent_runtime_helpers.atomic_json_write is old_debug_write
+        assert (web_tools_truncate._store_full_text,tool_result_storage._write_to_spillover)==old_spills
+        assert not api and not transport
+        return
     (tmp_path/'callback-diagnostic.json').write_text(json.dumps({'callback_error':getattr(obj,'callback_error',None),'stream_callbacks':obj.stream_callbacks,'api_calls':len(api),'secret_lengths':[len(v) for v in obj.secrets],'native_diagnostic':getattr(obj,'native_diagnostic',{})},indent=2)+'\n')
     assert result['status']=='FAILED_OR_UNCERTAIN'
     assert len(result['tool_source_observations'])>=2 and len(transport)==2

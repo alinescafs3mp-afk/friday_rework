@@ -30,6 +30,7 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     from tools import web_tools as wt
     from tools import web_tools_truncate, tool_result_storage
     from agent import redact
+    old_registered_redact=redact.redact_registered_vault_values
     old_spills=(web_tools_truncate._store_full_text,tool_result_storage._write_to_spillover)
     old_logging=logging.root.manager.disable
     from agent import web_search_registry as registry
@@ -151,6 +152,7 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     from agent.secret_scope import current_secret_scope
     assert current_secret_scope() is None  # restored original scope, no credential retention
     assert str(home) not in redact._VAULT_REDACTION_VALUES
+    assert redact.redact_registered_vault_values is old_registered_redact
     assert (web_tools_truncate._store_full_text,tool_result_storage._write_to_spillover)==old_spills
     assert logging.root.manager.disable==old_logging
     assert not (home/'state.db').exists()
@@ -167,7 +169,7 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     if variant=='settle':assert result['status']=='STOP_UNCONFIRMED' and result['final_response']
     if variant=='sdk_failure':
         dumps=list((home/'sessions').glob('request_dump_*.json'))
-        assert dumps and any('redacted-vault-secret' in p.read_text() for p in dumps)
+        assert dumps and any('[REDACTED]' in p.read_text() for p in dumps)
     captured=capsys.readouterr()
     assert marker not in captured.out+captured.err
     artifacts={str(p.relative_to(tmp_path)):pin(p)['sha256'] for p in tmp_path.rglob('*') if p.is_file()}
