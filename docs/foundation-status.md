@@ -1,27 +1,34 @@
-# Foundation checkpoint — 2026-10-07
+# Foundation checkpoint — 2026-10-08
 
-Current checkpoint, 23:22 MSK: the ordinary Hermes factory now supplies the
-current Harness web admission probe; A0 profile, SearXNG service and network
-source are joined with the normal installer and the shared result consumer.
-The joined candidate passed 318 distinct affected checks. Independent review
-ran 84 checks, found a Node 26 DNS callback incompatibility, and verified its
-repair with six callback controls; the changed area also passed its 55-case
-recheck. Repeated checks are not added to the distinct producer total.
+The source now composes twenty pinned Hermes layers. The ordinary profile can
+select intact Harness and A0 workers while retaining each worker's admission,
+original budget and the existing single execution owner. Native credential
+admission consumes the same mixed profile and keeps inference, web and A0
+service credentials separate. This does not grant A0 execution or warm reuse.
 
 | Capability | Source/configuration/wiring | Offline verification | Live execution | Release acceptance |
 |---|---|---|---|---|
-| Harness web admission | Connected to ordinary factory; explicit protected network inputs | Verified, including native Node callback repair | Current joined path not run | Pending |
-| A0 profiles, web services and shared results | Integrated source; actual capability, startup and warm reuse still required | Scoped components verified | Current native network/service admission not run | Pending |
-| Authenticated installer and administrative UI | Complete 19-layer native source; credential and worker readiness dependencies remain | Existing exact source gates retained | Normal cold start and two-user administration not run | Pending |
-| Telegram, continuation and mixed worker delivery | Existing host/result paths retained; repository seeding, handoff and executed goal verification incomplete | Existing component evidence only | Complete journeys not run | Pending |
+| Hermes/Harness keyless web | Explicit native provider plus intact Harness ctx.web; fixed outgoing search and passive metadata handling | Changed integration: 128 passing checks; three separate native Harness search/fetch/refusal controls used synthetic external bytes | Earlier exact provider call refused; useful search on this revision not proven | Pending |
+| Both-worker profile and shared result path | Connected to host, onboarding, health and native credential consumer; no fallback between workers | Both tiers and credential-domain mutations checked against the actual native consumer | A0 capability/service/network/start admission and mixed execution not run | Pending |
+| Authenticated installer and administrative UI | Complete twenty-layer source; actual native Python executable accepted by the bounded installer plan | Bootstrap identity/size/change controls and prior installer gates retained | Normal installation, authenticated cold start and two-user administration remain unaccepted | Pending |
+| Telegram, continuation and delivery | Existing host/result paths retained; continuation and repository handoff under implementation | Component evidence only | Real Telegram, executed goal verification and mixed delivery not proven | Pending |
 
-The native credential contract still needs the separate A0 service/embedding
-names; that join and explicit keyless Hermes/Harness profiles are in active
-implementation. The A0 launcher retains temporary test inference routes;
-general endpoint/IPv6 network support remains an unresolved deployment gap.
-No ordinary capability is accepted as an exclusion. All seven requested live
-journeys remain required. Old Friday stays stopped. Earlier checkpoints below
-retain their original scope and are not current readiness claims.
+The native Python executable is hashed incrementally under its own 256 MiB
+limit; ordinary document inputs keep their 64 MiB limit. A real 110 MiB native
+Python passed the installer plan. A plan does not establish installation.
+The review also corrected source-count truncation reporting and boolean RPC-ID
+acceptance. The provider's observed hosted schema requires an objective, while
+its public source differs; this candidate sends only the existing validated
+query as that objective and ignores passive per-text metadata. No remote
+instructions or tools are registered from provider replies.
+
+Hermes DNS/header deadline enforcement and extraction-thread settlement still
+need live closure. A0 current capability and service admission remain required;
+its retained safeguard stop is not bypassed. All seven owner-requested vertical
+journeys remain mandatory. Ordinary-user capability restrictions remain open
+product gaps. Legacy endpoints/capacities are temporary configurable test inputs,
+and old Friday remains stopped. Earlier checkpoints below retain their original
+scope and are not current readiness claims.
 
 Source checkpoint, 16:56 MSK: the complete pinned Hermes source preparer,
 configurable bounded continuation, and native scope health repairs are now in
