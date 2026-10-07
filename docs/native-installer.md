@@ -324,3 +324,18 @@ The seventeenth overlay adds `read_user_config_effective_readonly` to the native
 effective-config module. It reuses the same normalization pipeline and refuses
 malformed/non-mapping input without default recovery, cache publication, home
 seeding or `.good` backup writes. The ordinary native loader is unchanged.
+
+The running gateway must answer the existing native `identify` control verb with
+its PID/start identity and the exact Friday source receipt, plugin files and
+protected configuration captured before the control server starts. The native
+consumer revalidates those inputs for each identification; changing them cannot
+adopt another generation into an already running process. Upstream Git SHA and
+a retained `gateway_state.json` alone are insufficient. Missing live proof, a
+stale/foreign status, or changed configuration refuses attachment without retry.
+Every interruption after a new gateway service handoff retains
+`STOP_UNCONFIRMED`, including interruption at the Dashboard foreground transfer.
+
+Worker health preserves administrator/scope admission failures. Inside an
+already authorized profile, missing or malformed configuration produces a
+redacted unverified row while the other authorized profiles remain inspectable.
+This diagnostic never grants worker readiness or clears the A0 acceptance stops.

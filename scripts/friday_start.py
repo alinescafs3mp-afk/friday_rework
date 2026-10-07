@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -173,8 +174,11 @@ def gateway_preflight(home, profile, budget):
 
 def gateway_observation(home, budget):
     from gateway import host_rendezvous as hr
+    from gateway.control_socket import CONTROL_PROTOCOL_VERSION, identify_gateway
+    from gateway.status import normalize_updated_at, runtime_status_is_stale
     from hermes_cli import gateway as gw
-    from scripts.friday_install import require
+    from hermes_cli.friday_gateway_owner import expected as expected_gateway
+    from scripts.friday_install import read_json, require
     from scripts.friday_native import host_owner
 
     record = budget.call(hr.read_record, hr.ROLE_GATEWAY, include_stale=True)
@@ -190,15 +194,41 @@ def gateway_observation(home, budget):
         properties=("ActiveState", "SubState", "MainPID", "InvocationID"),
     )
     state = budget.call(gw._read_gateway_runtime_status)
+    source = budget.call(read_json, home / "hermes-agent.source.json")
+    updated = normalize_updated_at(state.get("updated_at")) if isinstance(state, dict) else None
     require(
         props.get("ActiveState") == "active"
         and props.get("SubState") == "running"
         and props.get("MainPID") == str(record.pid)
         and re.fullmatch("[0-9a-f]{32}", props.get("InvocationID", "")) is not None
         and isinstance(state, dict)
+        and type(state.get("pid")) is int
         and state.get("pid") == record.pid
-        and state.get("gateway_state") == "running",
+        and state.get("gateway_state") == "running"
+        and state.get("kind") == "hermes-gateway"
+        and type(state.get("start_time")) is int
+        and state.get("start_time") == record.start_time
+        and state.get("hermes_home") == str(home)
+        and isinstance(source.get("commit"), str)
+        and re.fullmatch("[0-9a-f]{40}", source["commit"]) is not None
+        and state.get("code_sha") == source["commit"]
+        and not runtime_status_is_stale(state)
+        and updated is not None
+        and datetime.fromisoformat(updated) <= datetime.now(timezone.utc),
         "native_gateway_start_not_observed",
+    )
+    generation = budget.call(expected_gateway, home)
+    live = budget.call(identify_gateway, home, timeout=min(5.0, budget.check()))
+    require(
+        isinstance(live, dict)
+        and live.get("protocol") == CONTROL_PROTOCOL_VERSION
+        and live.get("kind") == "hermes-gateway"
+        and live.get("pid") == record.pid
+        and live.get("start_time") == record.start_time
+        and live.get("hermes_home") == str(home)
+        and live.get("code_sha") == source["commit"]
+        and live.get("friday_owner") == generation,
+        "native_gateway_generation_unproved",
     )
     return record
 
@@ -292,7 +322,7 @@ def launch(value, budget, *, pins):
         budget.check()
         os.execve(argv["dashboard"][0], argv["dashboard"], env)
         raise RuntimeError("native_foreground_transfer_not_observed")
-    except (OSError, ValueError, RuntimeError) as exc:
+    except BaseException as exc:
         # The checked gateway is now a native service owner. Never label a
         # failed Dashboard handoff as cessation or silently start it again.
         raise StopUnconfirmed(

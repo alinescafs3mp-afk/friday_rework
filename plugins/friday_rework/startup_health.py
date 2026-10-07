@@ -1,6 +1,17 @@
 """Read-only native worker admission observations; never a readiness grant."""
 
 
+def _runtime_settings(config):
+    value = config
+    for key in ("plugins", "entries", "friday_rework", "settings", "runtime"):
+        if not isinstance(value, dict):
+            raise ValueError("worker_config_invalid")
+        value = value.get(key, {})
+    if not isinstance(value, dict):
+        raise ValueError("worker_config_invalid")
+    return value
+
+
 def worker_health():
     """Authoritative existing runtime checks in each administrator-owned scope.
 
@@ -11,6 +22,7 @@ def worker_health():
     from hermes_cli.config_effective import read_user_config_effective_readonly
     from hermes_cli.friday_dashboard_owner import read_owned
     from hermes_cli.plugins_state import PluginState
+    from hermes_yaml import YAMLError
 
     from .admin import Administration
     from .associations import Associations
@@ -19,16 +31,24 @@ def worker_health():
     admin = Administration()
     rows = []
     for profile in admin.profiles():
+        # Admission failures remain fatal; a corrupt admitted profile's config
+        # must not hide the remaining administrator-owned profiles.
         with admin.scope(profile) as home:
-            read_owned(home / "config.yaml", private=True)
-            cfg = read_user_config_effective_readonly(home / "config.yaml")
-            runtime = (
-                cfg.get("plugins", {})
-                .get("entries", {})
-                .get("friday_rework", {})
-                .get("settings", {})
-                .get("runtime", {})
-            )
+            try:
+                read_owned(home / "config.yaml", private=True)
+                cfg = read_user_config_effective_readonly(home / "config.yaml")
+                runtime = _runtime_settings(cfg)
+            except (OSError, ValueError, TypeError, YAMLError):
+                rows.append(
+                    {
+                        "profile": profile,
+                        "worker": None,
+                        "deployment_verified": False,
+                        "blocker": "worker_config_unavailable",
+                        "execution": "NOT_OBSERVED",
+                    }
+                )
+                continue
             kind = "a0" if "a0" in runtime else ("dsh" if "dsh" in runtime else None)
             if runtime.get("enabled") is not True:
                 rows.append(

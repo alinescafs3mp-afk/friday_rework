@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,6 +37,9 @@ def native_home(tmp_path, monkeypatch):
     home.mkdir(mode=0o700)
     source = home / "hermes-agent"
     source.mkdir()
+    receipt = home / "hermes-agent.source.json"
+    receipt.write_text(json.dumps({"commit": "781334eea4b9225a3e194faf0c241d9afe218634"}))
+    receipt.chmod(0o600)
     launcher = source / ".hermes/bin/hermes"
     launcher.parent.mkdir(parents=True)
     launcher.write_text("synthetic intercepted native launcher")
@@ -83,6 +87,18 @@ def native_home(tmp_path, monkeypatch):
 
 
 def observe(env, monkeypatch, *, state="running", mainpid="45678", invocation="a" * 32):
+    from gateway import control_socket
+    from hermes_cli import friday_gateway_owner
+
+    generation = {"home": str(env.home), "source": {"receipt": "synthetic-source"},
+                  "configuration": "synthetic-configuration"}
+    monkeypatch.setattr(friday_gateway_owner, "expected", lambda home: generation)
+    monkeypatch.setattr(control_socket, "identify_gateway", lambda home, **kw: {
+        "protocol": control_socket.CONTROL_PROTOCOL_VERSION, "kind": "hermes-gateway",
+        "pid": env.record.pid, "start_time": env.record.start_time,
+        "hermes_home": str(env.home), "friday_owner": generation,
+        "code_sha": "781334eea4b9225a3e194faf0c241d9afe218634",
+    })
     monkeypatch.setattr(env.hr, "read_record", lambda *a, **kw: env.record)
     monkeypatch.setattr(env.hr, "liveness_is_proven", lambda r: True)
     monkeypatch.setattr(env.hr, "record_token_is_consistent", lambda r: True)
@@ -97,7 +113,12 @@ def observe(env, monkeypatch, *, state="running", mainpid="45678", invocation="a
         },
     )
     monkeypatch.setattr(
-        env.gw, "_read_gateway_runtime_status", lambda: {"pid": 45678, "gateway_state": state}
+        env.gw, "_read_gateway_runtime_status", lambda: {
+            "pid": 45678, "gateway_state": state, "kind": "hermes-gateway",
+            "start_time": env.record.start_time, "hermes_home": str(env.home),
+            "code_sha": "781334eea4b9225a3e194faf0c241d9afe218634",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
     )
 
 
@@ -296,8 +317,11 @@ def launch_fixture(native_home, monkeypatch):
 
 def test_supported_native_service_then_dashboard_argv_and_original_clock(launch_fixture):
     f = launch_fixture
-    with pytest.raises(SystemExit, match="synthetic-transfer"):
+    # Interception returns control rather than transferring the actual process;
+    # even SystemExit must preserve the already-owned gateway's unknown stop.
+    with pytest.raises(StopUnconfirmed) as caught:
         start.launch(f.value, f.budget, pins=f.pins)
+    assert isinstance(caught.value.__cause__, SystemExit)
     assert f.calls[:3] == ["namespace-probe", f.argv["gateway_install"], f.argv["gateway_start"]]
     assert f.calls[-1][2] == f.argv["dashboard"]
     assert f.calls[-1][3]["HERMES_HOME"] == str(f.env.home)
@@ -309,8 +333,9 @@ def test_valid_owned_service_reattaches_without_second_start(launch_fixture, mon
     f = launch_fixture
     f.env.unit.write_text(f.env.expected)
     observe(f.env, monkeypatch)
-    with pytest.raises(SystemExit):
+    with pytest.raises(StopUnconfirmed) as caught:
         start.launch(f.value, f.budget, pins=f.pins)
+    assert isinstance(caught.value.__cause__, SystemExit)
     assert all("gateway" not in call for call in f.calls if isinstance(call, list))
 
 
