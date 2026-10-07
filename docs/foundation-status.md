@@ -1,19 +1,33 @@
 # Foundation checkpoint — 2026-10-08
 
-Installer checkpoint, 01:23 MSK: the independently reviewed repair now uses
-private standard devices, explicit cold imports, bounded failure diagnostics
-and native bubblewrap init-exit evidence. One isolated **real source-preparation**
-run completed in 3.602 seconds: 17,632 exported files, all twenty overlays and
-matching native init completion; every receipt file hash was checked. The
-process exited and released its execution slot. No dependency installation,
-build, service, model or messaging effects ran in this trial.
+Installer checkpoint, 02:28 MSK: the normal installation completed the
+Hermes export, native PM tools and Python dependencies, frontend build,
+product profile, plugin placement and TLS-file placement. It then stopped
+during the pinned Harness package installation. The complete installation,
+authenticated cold start and all seven user journeys remain **unaccepted**.
 
-The earlier normal installation failed during source preparation and retains
-its original PARTIAL claim. Independent retrospective observation established
-cessation; the original installation deadline is now exhausted. Read-only
-reconciliation does not authorize replay or reset that deadline. The normal
-continuation path is still being implemented. Native PM/build compatibility,
-authenticated cold start and all seven user journeys remain unaccepted.
+The Harness failure was traced to the pinned package manager's WebAssembly
+parser exhausting its virtual-memory reservation under the existing limit.
+A real read-only registry query succeeded with Node's supported inline bounds
+checks; the Node/package-manager pins, TLS and resource limits stayed intact.
+The preparer now supplies that fixed option. An explicit `resume-harness`
+command preserves the original boot, deadline, source/settings and failure
+history, revalidates completed work and consumes a continuation only once.
+The final source gate passed 229 checks; independent review reran 51 changed
+checks, which overlap that total.
+
+One independently admitted continuation launcher ran at 02:26 MSK. Its added
+read-only preflight was refused by the OS because it requested a nested
+namespace. The PM preflight, actual resume consumption and resumed build did
+not run. Native namespace completion and subsequent parent/monitor absence
+were verified; the execution lock was released and the original installation
+claim/failure stayed unchanged. This failed launch is stopped, with no replay
+or new deadline. The source repair is accepted; runtime completion is not.
+
+The earlier source-preparation attempt also remains retained with its expired
+original deadline. Neither installation history is deleted or silently adopted.
+Sol is implementing whole-operation web execution and stop handling through
+Hermes' existing process registry; it is not yet installed or accepted.
 
 The source now composes twenty pinned Hermes layers. The ordinary profile can
 select intact Harness and A0 workers while retaining each worker's admission,
@@ -25,7 +39,7 @@ service credentials separate. This does not grant A0 execution or warm reuse.
 |---|---|---|---|---|
 | Hermes/Harness keyless web | Explicit native provider plus intact Harness ctx.web; fixed outgoing search and passive metadata handling | Changed integration: 128 passing checks; three separate native Harness search/fetch/refusal controls used synthetic external bytes | Earlier exact provider call refused; useful search on this revision not proven | Pending |
 | Both-worker profile and shared result path | Connected to host, onboarding, health and native credential consumer; no fallback between workers | Both tiers and credential-domain mutations checked against the actual native consumer | A0 capability/service/network/start admission and mixed execution not run | Pending |
-| Authenticated installer and administrative UI | Complete twenty-layer source; actual native Python executable accepted by the bounded installer plan | Bootstrap identity/size/change controls and prior installer gates retained | Normal installation, authenticated cold start and two-user administration remain unaccepted | Pending |
+| Authenticated installer and administrative UI | Complete twenty-layer source; actual native Python executable accepted by the bounded installer plan | Bootstrap identity/size/change controls and prior installer gates retained | Actual Hermes source/dependencies/frontend/profile/TLS prepared; Harness installation failed, added continuation preflight refused; cold start and two-user administration unaccepted | Pending |
 | Telegram, continuation and delivery | Existing host/result paths retained; continuation and repository handoff under implementation | Component evidence only | Real Telegram, executed goal verification and mixed delivery not proven | Pending |
 
 The native Python executable is hashed incrementally under its own 256 MiB
