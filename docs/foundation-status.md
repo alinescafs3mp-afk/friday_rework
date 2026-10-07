@@ -29,3 +29,7 @@ The temporary profile renderer and adapted actual Friday SOUL passed independent
 An isolated systemd deadline fixture stopped both its parent and a detached child while no gateway was responsible for cancellation. Its unit and processes were cleaned up. The corresponding complete worker/gateway deadline acceptance scenario remains unrun.
 
 Donor integration, real tools, persona behavior, cancellation, delivery, privacy and complete release gates remain unaccepted.
+
+## Mandatory scope clarification, 2026-10-07
+
+Autonomous web retrieval, web access during both Harness and A0 work, and the product administrative WebUI are mandatory. They are planned for integration and are not connected or verified as complete product journeys. Hermes provides candidate search/extract/browser and Dashboard components; current worker network/test restrictions and product-wide user authorization still require integration. [The owner scope](mandatory-web-admin.md) and [AC053–AC058](../validation/acceptance-web-admin.json) are cumulative with the existing gates. No donor update, guard change, legacy restart or release acceptance follows from this clarification.
