@@ -6,7 +6,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, SecretStr
 from hermes_cli.friday_product_access import admin_policy, session_allowed
 
 # The dashboard importer loads api.py by file location, outside the agent plugin
@@ -33,6 +33,8 @@ def require_admin(request: Request):
         allowed = False
     if not allowed:
         raise HTTPException(403, "product_admin_required")
+
+    return request.state.session
 
 
 router = APIRouter(dependencies=[Depends(require_admin)])
@@ -68,6 +70,23 @@ class PairApproval(BaseModel):
     transport_profile: str = Field(min_length=1, max_length=64)
     account_id: str = Field(min_length=1, max_length=512)
     request_id: str = Field(min_length=1, max_length=128)
+
+
+class TaskControl(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["status", "pause", "cancel"]
+
+
+class SettingsChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    kind: Literal["model", "web", "toolset", "skill", "operational"]
+    values: dict = Field(max_length=8)
+
+
+class ScheduleChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["pause", "resume"]
 
 
 @router.get("/profiles")
@@ -113,6 +132,26 @@ def tasks(profile: str):
     return call(_admin.tasks, profile)
 
 
+@router.post("/tasks/{task_id}/control")
+def task_control(task_id: str, body: TaskControl, profile: str, session=Depends(require_admin)):
+    return call(_admin.control, profile, session, task_id, body.action)
+
+
+@router.put("/settings")
+def settings_change(body: SettingsChange, profile: str, session=Depends(require_admin)):
+    return call(_admin.write_settings, profile, body.model_dump(), session)
+
+
+@router.get("/schedules")
+def schedules(profile: str):
+    return call(_admin.schedules, profile)
+
+
+@router.post("/schedules/{job_id}/control")
+def schedule_control(job_id: str, body: ScheduleChange, profile: str, session=Depends(require_admin)):
+    return call(_admin.schedules, profile, body.action, job_id, session)
+
+
 @router.get("/attachments/{task_id}/{index}")
 def attachment(task_id: str, index: int, profile: str):
     try:
@@ -142,3 +181,47 @@ def input_attachment(task_id: str, index: int, profile: str):
     return Response(payload, media_type="application/octet-stream", headers={
         "Content-Disposition": "attachment; filename=friday-input.bin",
         "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
+
+
+class OnboardingIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    platform: str = Field(min_length=1, max_length=64)
+    transport_profile: str = Field(min_length=1, max_length=64)
+    account_id: str = Field(min_length=1, max_length=512)
+    user_id: str = Field(min_length=1, max_length=512)
+    expected_config_sha256: str = Field(pattern="^[0-9a-f]{64}$")
+
+
+class OnboardingPrepare(OnboardingIdentity):
+    template: str = Field(min_length=1, max_length=64)
+    runtime_profile: str = Field(pattern="^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+class OnboardingActivate(OnboardingIdentity):
+    generation: StrictInt = Field(ge=1)
+
+
+class OnboardingCredential(OnboardingActivate):
+    name: str = Field(pattern="^[A-Z][A-Z0-9_]{0,127}$")
+    value: SecretStr
+
+
+@router.get("/onboarding")
+def onboarding_templates(profile: str):
+    return call(_admin.onboarding_templates, profile)
+
+
+@router.post("/onboarding/prepare")
+def onboarding_prepare(body: OnboardingPrepare, profile: str):
+    return call(_admin.onboarding_prepare, profile, **body.model_dump())
+
+
+@router.put("/onboarding/credentials")
+def onboarding_credentials(body: OnboardingCredential, profile: str):
+    values = body.model_dump(); values["value"] = body.value.get_secret_value()
+    return call(_admin.onboarding_credentials, profile, **values)
+
+
+@router.post("/onboarding/activate")
+def onboarding_activate(body: OnboardingActivate, profile: str):
+    return call(_admin.onboarding_activate, profile, **body.model_dump())

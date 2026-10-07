@@ -15,6 +15,10 @@ import sys
 import time
 
 
+class StopUnconfirmed(RuntimeError):
+    """An owned command was signalled but its cessation was not observed."""
+
+
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -34,8 +38,8 @@ def clean_environment(donor):
     return env
 
 
-def run(argv, donor, *, timeout=60, log=None, env=None):
-    """Run a finite owned command; timeout stops its whole process group."""
+def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None):
+    """Bound one group; callers needing detached-tree custody use a PID namespace."""
     if argv[0] == "git":
         argv = ["git", "-c", "core.hooksPath=" + os.devnull,
                 "-c", "protocol.file.allow=never", "-c", "protocol.ext.allow=never",
@@ -49,12 +53,28 @@ def run(argv, donor, *, timeout=60, log=None, env=None):
         out, err = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            out, err = process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            out, err = process.communicate(timeout=5)
+        if deadline is not None:
+            # Installer namespace cleanup consumes the same original budget.
+            # Kill namespace owner immediately; Linux closes all descendant
+            # sessions when its PID-namespace init dies (including setsid).
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StopUnconfirmed('STOP_UNCONFIRMED: original cleanup budget exhausted')
+            try:
+                out, err = process.communicate(timeout=remaining)
+            except subprocess.TimeoutExpired as exc:
+                raise StopUnconfirmed('STOP_UNCONFIRMED: contained command not reaped') from exc
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                out, err = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                out, err = process.communicate(timeout=5)
     observation = {"argv": argv, "returncode": process.returncode,
                    "elapsed_seconds": round(time.monotonic() - start, 3),
                    "timeout": timed_out, "stdout_sha256": hashlib.sha256(out.encode()).hexdigest(),

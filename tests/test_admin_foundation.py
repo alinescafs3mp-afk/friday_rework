@@ -38,6 +38,8 @@ def env(tmp_path, monkeypatch):
     home = tmp_path / "home"; home.mkdir(mode=0o700)
     satellite = home / "profiles/satellite"; satellite.mkdir(parents=True, mode=0o700)
     monkeypatch.setenv("HERMES_HOME", str(home))
+    import hermes_constants
+    monkeypatch.setattr(hermes_constants, '_PINNED_PROCESS_HERMES_HOME', str(home))
     # Empty synthetic env; no real profile/environment is inherited by an auth test.
     for key in ("GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS", "TELEGRAM_ALLOWED_USERS",
                 "TELEGRAM_ALLOW_ALL_USERS", "TELEGRAM_GROUP_ALLOWED_CHATS", "TELEGRAM_GROUP_ALLOWED_USERS"):
@@ -279,7 +281,8 @@ def test_task_projection_uses_actual_native_association_and_no_cancel_mutation(e
     native_sessions(env)
     joined = env.admin.conversation("default", "session-1")["tasks"]
     assert len(joined) == 1 and joined[0]["existing_task_id"] == "owned-task"
-    assert joined[0]["stop_available"] is False and joined[0]["goal_verification"] == "NOT_RUN"
+    assert joined[0]["stop_available"] is True and joined[0]["goal_verification"] == "NOT_RUN"
+    assert joined[0]["stop_reason"] == "VERIFY_CURRENT_ADMIN_AND_OWNING_GATEWAY_ON_ACTION"
     assert env.admin.conversation("default", "session-2")["tasks"] == []
     assert store.get("owned-task", owner) == row
 

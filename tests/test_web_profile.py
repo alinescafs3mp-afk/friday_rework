@@ -161,7 +161,7 @@ class WebProfiles(unittest.TestCase):
                 dsh_args += ["--" + key.replace("_", "-"), str(value)]
             dsh_args += ["--output", str(output)]
             hermes_args = [sys.executable, "-B", str(ROOT / "tools/configure_local_test.py"),
-                           "--home", str(ROOT / ".runtime/uncreated-web-negative")]
+                           "--home", str(Path(root) / "uncreated-web-negative")]
             for key, value in HERMES_INPUT.items():
                 hermes_args += ["--" + key.replace("_", "-"), str(value)]
             for argv in (dsh_args, hermes_args):
@@ -172,7 +172,7 @@ class WebProfiles(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertNotIn(b"SECRET_CANARY", result.stdout + result.stderr)
             self.assertFalse(output.exists())
-            self.assertFalse((ROOT / ".runtime/uncreated-web-negative").exists())
+            self.assertFalse((Path(root) / "uncreated-web-negative").exists())
 
     def test_dsh_enabled_cli_publishes_reference_only_profile(self):
         with tempfile.TemporaryDirectory() as root:
