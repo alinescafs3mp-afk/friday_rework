@@ -35,6 +35,8 @@
          self._gateway_control_names: Set[str] = set()  # Retired controls must never become agent input.
          self._retired_native_controls: Dict[object, tuple] = {}  # Metadata only, scoped to this manager's lifetime.
          self._system_prompt_sections: Dict[str, PluginSystemPromptSection] = {}
+diff --git a/hermes_cli/plugins_gateway_control.py b/hermes_cli/plugins_gateway_control.py
+new file mode 100644
 --- /dev/null
 +++ b/hermes_cli/plugins_gateway_control.py
 @@ -0,0 +1,70 @@
@@ -120,17 +122,99 @@
      "register_platform_handler": "the handler factory receives the platform's native SDK client",
 --- a/cron/jobs.py
 +++ b/cron/jobs.py
-@@ -2107,7 +2107,8 @@
+@@ -283,15 +283,17 @@
+
+
+ @contextlib.contextmanager
+-def _jobs_lock():
++def _jobs_lock(*, strict: bool = False):
+     """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
+     threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
+     otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
+     reuse the held lock. Without a flock backend, or on flock timeout (logged loudly), it
+     degrades to in-process-only locking: a briefly torn cross-process write beats a dead
+-    scheduler."""
++    scheduler. ``strict=True`` administrative callers refuse degraded locks."""
+     depth = getattr(_jobs_lock_state, "depth", 0)
+     if depth:
++        if strict and not getattr(_jobs_lock_state, "cross_process", False):
++            raise RuntimeError("strict_cron_lock_unavailable")
+         _jobs_lock_state.depth = depth + 1
+         try:
+             yield
+@@ -307,12 +309,19 @@
+         # See #80703.
+         _jobs_lock_state.load_stamp = None
+         lock_fd = None
++        _jobs_lock_state.cross_process = False
+         try:
+             try:
+                 ensure_dirs()
+                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8-sig")
+                 lock_fd.seek(0)
+-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
++                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
++                _jobs_lock_state.cross_process = acquired is True
++                if strict and acquired is not True:
++                    if acquired is False:
++                        raise TimeoutError("strict_cron_lock_timeout")
++                    raise RuntimeError("strict_cron_lock_unavailable")
++                if acquired is False:
+                     logger.error(
+                         "Timed out after %.0fs waiting for the cron "
+                         "jobs lock (%s) — another process is holding "
+@@ -323,15 +332,20 @@
+                         lock_fd.close()
+                     lock_fd = None
+             except (OSError, IOError) as e:
++                if strict:
++                    raise
+                 # A locking failure must never take down cron writes — in-process lock still held.
+                 logger.warning("jobs.json cross-process lock unavailable (%s); "
+                                "proceeding with in-process lock only", e)
+-            try:
+-                yield
+-            finally:
+-                if lock_fd is not None:
++            yield
++        finally:
++            if lock_fd is not None:
++                if _jobs_lock_state.cross_process:
+                     _release_flock(lock_fd)
+-        finally:
++                else:
++                    with contextlib.suppress(OSError):
++                        lock_fd.close()
++            _jobs_lock_state.cross_process = False
+             _jobs_lock_state.depth = 0
+             _jobs_lock_state.load_stamp = None
+
+@@ -1624,11 +1638,11 @@
+
+
+ def _with_job(
+-    job_id: Any, fn: Callable[[List[Dict[str, Any]], int, Dict[str, Any]], Any], missing: Any = None
++    job_id: Any, fn: Callable[[List[Dict[str, Any]], int, Dict[str, Any]], Any], missing: Any = None, *, strict_lock: bool = False
+ ) -> Any:
+     """Run ``fn(jobs, i, job)`` on the first match under ``_jobs_lock()``; ``fn`` saves. *missing*
+     if none."""
+-    with _jobs_lock():
++    with _jobs_lock(strict=strict_lock):
+         jobs = load_jobs()
+         for i, job in enumerate(jobs):
+             if job.get("id") == job_id:
+@@ -2107,7 +2121,9 @@
      updated["next_run_at"] = next_run
 
 
 -def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 +def update_job(job_id: str, updates: Dict[str, Any], *,
-+               before_write: Optional[Callable[[], None]] = None) -> Optional[Dict[str, Any]]:
++               before_write: Optional[Callable[[], None]] = None,
++               strict_lock: bool = False) -> Optional[Dict[str, Any]]:
      """Update a job by ID, refreshing derived schedule fields when needed."""
      # ``id`` is a path component under OUTPUT_DIR — changing it would leak path-escape values.
      bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
-@@ -2142,6 +2143,10 @@
+@@ -2142,14 +2158,20 @@
              updated.pop("pending_slot", None)
          _fill_missing_next_run(updated)
          _reject_terminal_activation(job, updated, job_id)
@@ -141,17 +225,21 @@
          jobs[i] = updated
          save_jobs(jobs)
          return _normalize_job_record(updated)
-@@ -2149,7 +2154,8 @@
-     return _with_job(job_id, apply)
 
-
+-    return _with_job(job_id, apply)
+-
+-
 -def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
++    return _with_job(job_id, apply, strict_lock=strict_lock)
++
++
 +def pause_job(job_id: str, reason: Optional[str] = None, *,
-+              before_write: Optional[Callable[[], None]] = None) -> Optional[Dict[str, Any]]:
++              before_write: Optional[Callable[[], None]] = None,
++               strict_lock: bool = False) -> Optional[Dict[str, Any]]:
      """Pause a job without deleting it. Accepts a job ID or name."""
      job = resolve_job_ref(job_id)
      if not job:
-@@ -2159,10 +2165,11 @@
+@@ -2159,10 +2181,12 @@
          "state": "paused",
          "paused_at": _hermes_now().isoformat(),
          "paused_reason": reason,
@@ -159,20 +247,21 @@
 -
 -
 -def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
-+    }, before_write=before_write)
++    }, before_write=before_write, strict_lock=strict_lock)
 +
 +
 +def resume_job(job_id: str, *,
-+               before_write: Optional[Callable[[], None]] = None) -> Optional[Dict[str, Any]]:
++               before_write: Optional[Callable[[], None]] = None,
++               strict_lock: bool = False) -> Optional[Dict[str, Any]]:
      """Resume a paused job. Accepts a job ID or name.
 
      A recurring job paused across one of its slots must not lose that slot silently: the stored
-@@ -2199,7 +2206,7 @@
+@@ -2199,7 +2223,7 @@
          "paused_at": None,
          "paused_reason": None,
          "next_run_at": next_run_at,
 -    })
-+    }, before_write=before_write)
++    }, before_write=before_write, strict_lock=strict_lock)
 
 
  def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -211,3 +300,84 @@
      config_path: Path, data: Dict[str, Any], *, allow_omissions: bool,
      extra_content_on_create: Optional[str] = None,
  ) -> None:
+@@ -2520,35 +2544,36 @@
+             return
+
+         config_path = get_config_path()
+-        _refuse_failed_read(config_path, config)
+-        config = _strip_managed_keys_for_save(config)
+-
+-        ensure_hermes_home()
+-        # Explicit user paths come from the RAW dict BEFORE normalisation (which may inject
+-        # agent.max_turns) so _strip_default_values keeps exactly what the user set. The
+-        # fail-closed read is the single authority here: ``read_raw_config()`` is cached and
+-        # swallows transient stat/open errors into ``{}``, and a ``{}`` at this point makes the
+-        # strip pass drop every user section whose value matches a default (#113301).
+-        _raw_for_paths = require_readable_config_before_write(config_path)
+-        if merge_existing and _raw_for_paths:
+-            config = _merge_partial_save(_raw_for_paths, config)
+-
+-        current_normalized = _canonicalize_config(config)
+-        normalized = current_normalized
+-        if _raw_for_paths:
+-            normalized = _preserve_env_ref_templates(
+-                normalized, _canonicalize_config(_raw_for_paths),
+-                _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)))
+-
+-        if strip_defaults:
+-            # ``_strip_default_values`` always preserves ``_config_version`` itself.
+-            effective_preserve_keys = _explicit_config_paths(_raw_for_paths) | set(preserve_keys or ())
+-            normalized = _strip_default_values(normalized, DEFAULT_CONFIG, preserve_keys=effective_preserve_keys)
+-
+-        atomic_config_replace(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized))
+-        _secure_file(config_path)
+-        _RAW_CONFIG_CACHE.pop(str(config_path), None)
+-        _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
++        with config_write_transaction(config_path):
++            _refuse_failed_read(config_path, config)
++            config = _strip_managed_keys_for_save(config)
++
++            ensure_hermes_home()
++            # Explicit user paths come from the RAW dict BEFORE normalisation (which may inject
++            # agent.max_turns) so _strip_default_values keeps exactly what the user set. The
++            # fail-closed read is the single authority here: ``read_raw_config()`` is cached and
++            # swallows transient stat/open errors into ``{}``, and a ``{}`` at this point makes the
++            # strip pass drop every user section whose value matches a default (#113301).
++            _raw_for_paths = require_readable_config_before_write(config_path)
++            if merge_existing and _raw_for_paths:
++                config = _merge_partial_save(_raw_for_paths, config)
++
++            current_normalized = _canonicalize_config(config)
++            normalized = current_normalized
++            if _raw_for_paths:
++                normalized = _preserve_env_ref_templates(
++                    normalized, _canonicalize_config(_raw_for_paths),
++                    _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)))
++
++            if strip_defaults:
++                # ``_strip_default_values`` always preserves ``_config_version`` itself.
++                effective_preserve_keys = _explicit_config_paths(_raw_for_paths) | set(preserve_keys or ())
++                normalized = _strip_default_values(normalized, DEFAULT_CONFIG, preserve_keys=effective_preserve_keys)
++
++            atomic_config_replace(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized))
++            _secure_file(config_path)
++            _RAW_CONFIG_CACHE.pop(str(config_path), None)
++            _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+     from hermes_cli.observability.shared_metrics_disabled import record_config_saved
+     record_config_saved(_raw_for_paths, current_normalized)
+
+--- a/agent/skill_utils.py
++++ b/agent/skill_utils.py
+@@ -261,7 +261,11 @@
+ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
+     """Disabled skill names from config.yaml: global list ∪ platform list
+     (*platform* defaults to ``HERMES_PLATFORM`` / ``HERMES_SESSION_PLATFORM``)."""
+-    skills_cfg = _skills_cfg()
++    # Use the same administrator overlay as effective native configuration.
++    # Read-only merge; never mutate or persist the shared raw cache.
++    from hermes_cli.config import _merge_managed_overlay
++    effective, _ = _merge_managed_overlay(_load_raw_config())
++    skills_cfg = effective.get("skills")
+     if skills_cfg is None:
+         return set()
+     from gateway.session_context import get_session_env

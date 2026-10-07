@@ -84,6 +84,31 @@ def _local_inference(cfg):
             raise ValueError("protected_native_credential_reference_required")
 
 
+    # Validate the native delegation bundle before a future toolset enable as
+    # well as while enabled. Empty routing inherits the validated parent.
+    delegation = cfg.get("delegation") or {}
+    if not isinstance(delegation, dict):
+        raise ValueError("invalid_native_delegation_config")
+    if any(delegation.get(key) for key in ("fallback_providers", "fallback_chain", "fallback_model", "command", "args")):
+        raise ValueError("delegation_fallback_or_command_refused")
+    parent = cfg.get("model") or {}
+    provider_name = delegation.get("provider") or parent.get("provider")
+    if not isinstance(provider_name, str) or not provider_name.startswith("custom:"):
+        raise ValueError("explicit_local_delegation_required")
+    provider = (cfg.get("providers") or {}).get(provider_name.split(":", 1)[1])
+    if not isinstance(provider, dict) or provider.get("transport") != "chat_completions" or provider.get("command"):
+        raise ValueError("local_delegation_provider_required")
+    endpoint = local_endpoint(provider.get("api"))
+    if delegation.get("base_url") and local_endpoint(delegation["base_url"]) != endpoint:
+        raise ValueError("declared_local_delegation_required")
+    if delegation.get("api_mode") not in (None, "", "chat_completions"):
+        raise ValueError("local_delegation_transport_required")
+    if (delegation.get("model") or parent.get("default")) not in (provider.get("models") or {}):
+        raise ValueError("declared_local_delegation_model_required")
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", provider.get("key_env", "")):
+        raise ValueError("protected_native_credential_reference_required")
+
+
 def edit(profile, home, body, verify):
     from hermes_cli import config, managed_scope
     path = home / "config.yaml"
@@ -230,6 +255,20 @@ def edit(profile, home, body, verify):
         effective, _ = config._merge_managed_overlay(config._expand_env_vars(
             config._canonicalize_config(config._deep_merge(copy.deepcopy(config.DEFAULT_CONFIG), candidate))))
         _local_inference(effective)
+        if kind == "skill" and values["enabled"]:
+            # Native catalog reads raw policy; managed denials remain authority
+            # even when their paths are not among this raw edit's changed keys.
+            skill_policy = effective.get("skills") or {}
+            denials = [skill_policy.get("disabled", [])]
+            platforms = skill_policy.get("platform_disabled", {})
+            if not isinstance(platforms, dict):
+                raise ValueError("invalid_native_skill_policy")
+            denials.extend(platforms.values())
+            for names in denials:
+                if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+                    raise ValueError("invalid_native_skill_policy")
+                if any(name in names for name in (selected["name"], values["name"])):
+                    raise PermissionError("effective_native_skill_denied")
         verify()
         if private_config(path) != sha:
             raise ValueError("native_config_changed_reload_required")
@@ -254,7 +293,7 @@ def schedules(action=None, job_id=None, verify=None):
     if not callable(verify):
         raise PermissionError("verified_admin_required")
     verify()
-    row = pause_job(job_id, reason="Verified Friday Dashboard administrator", before_write=verify) if action == "pause" else resume_job(job_id, before_write=verify)
+    row = pause_job(job_id, reason="Verified Friday Dashboard administrator", before_write=verify, strict_lock=True) if action == "pause" else resume_job(job_id, before_write=verify, strict_lock=True)
     current = get_job(job_id)
     if row is None or current is None or bool(current.get("enabled")) != (action == "resume"):
         raise RuntimeError("native_schedule_write_unconfirmed")

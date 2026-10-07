@@ -105,3 +105,23 @@ required. Ordinary cross-user recall/memory/files/tools isolation is a linked
 prerequisite; profile routing alone does not provide it. Both intact workers need
 mid-task web retrieval. All six journeys in `mandatory-web-admin.md` remain
 mandatory and NOT_RUN here. Historical stopped trials stay stopped.
+
+
+The native configuration transaction now spans `save_config`'s raw read, merge
+and commit. Plugin settings use that same path, preserving unrelated concurrent
+administrative edits. Complete-state replacement APIs still mean an intentional
+replacement; callers computing changes must hold the transaction across their
+read and write.
+
+Administrative schedule writes require the actual native cross-process lock;
+timeout, missing backend or a nested degraded lock refuse before mutation. The
+ordinary scheduler keeps its existing fallback behavior and API defaults.
+Current administrator authority is checked inside the locked mutation.
+
+Skill enable checks the effective global and platform denials. The native skill
+catalog also reads the existing managed overlay, so its policy applies outside
+the WebUI. Native essential-skill and duplicate-name semantics remain intact.
+Delegation config inherits the validated local parent route or names a declared
+local route; remote, undeclared, command and fallback routes are refused before
+config persistence. This validates configuration; it does not establish live
+worker execution or final product acceptance.
