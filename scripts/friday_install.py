@@ -80,6 +80,43 @@ def pin(value):
     return canonical(value['path'])
 
 
+def bootstrap_pin(value):
+    """Hash the protected PM Python as a bounded executable, not JSON/source.
+
+    The native standalone Python can exceed the 64 MiB document limit. Read
+    this explicitly typed input in chunks; all other input limits stay intact.
+    """
+    require(isinstance(value, dict) and set(value) == {'path', 'sha256'}
+            and isinstance(value['sha256'], str)
+            and re.fullmatch('[0-9a-f]{64}', value['sha256']), 'exact_input_pin_required')
+    path = canonical(value['path'])
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        limit = 256 * 1024**2
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
+                and before.st_nlink == 1 and not before.st_mode & 0o022
+                and bool(before.st_mode & 0o111) and 0 < before.st_size <= limit,
+                'owned_protected_bootstrap_executable_required')
+        hasher = hashlib.sha256(); total = 0
+        while True:
+            block = os.read(fd, min(1024**2, limit - total + 1))
+            if not block:
+                break
+            total += len(block)
+            require(total <= limit, 'bootstrap_executable_too_large')
+            hasher.update(block)
+        after, named = os.fstat(fd), path.lstat()
+        fields = ('st_dev', 'st_ino', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_uid', 'st_nlink')
+        require(total == before.st_size and all(
+            getattr(before, k) == getattr(after, k) == getattr(named, k) for k in fields),
+            'bootstrap_executable_changed')
+        require(hasher.hexdigest() == value['sha256'], 'input_pin_changed')
+    finally:
+        os.close(fd)
+    return path
+
+
 def directory(path):
     p = canonical(str(path)); info = p.stat()
     require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
@@ -96,7 +133,8 @@ def spec_checked(value):
             and not ROOT.is_relative_to(home), 'separate_product_home_required')
     require(type(value['seconds']) is int and 30 <= value['seconds'] <= 7200,
             'finite_install_budget_required')
-    for key in ('bootstrap_python', 'hermes_prepare', 'sources_lock'):
+    bootstrap_pin(value['bootstrap_python'])
+    for key in ('hermes_prepare', 'sources_lock'):
         pin(value[key])
     for key in ('hermes_donor', 'dsh_donor', 'a0_donor'):
         canonical(value[key])
@@ -395,9 +433,9 @@ def install(value, input_path, *, budget=None):
 
 def gaps():
     return ['A0 portable image/toolchain preparation is absent; fixed deployment needs separately admitted kernel/resources',
-            'Current product compiler refuses an A0 useful-web runtime and cannot configure both workers',
+            'Both-worker configuration is available; A0 useful-web runtime admission and mixed live execution remain unverified',
             'Native Dashboard boundary requires independent source review and actual authenticated startup/attach acceptance',
-            'Protected credential provisioning, actual account ownership, PM/build realization and all six live journeys require independent acceptance']
+            'Protected credential provisioning, actual account ownership, PM/build realization and all seven live journeys require independent acceptance']
 
 
 def inspect(value, input_hash):

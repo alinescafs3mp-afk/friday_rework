@@ -28,7 +28,7 @@ function envelope(body) {
 export function sources(text,config) {
   // Reuse Hermes native Exa formatted-text mapping. No instruction/system
   // fields are projected. URL is attribution; native fetch validates DNS/SSRF.
-  const out=[];let left=config.maxOutputChars;
+  const out=[];let left=config.maxOutputChars,truncated=text.length>config.maxOutputChars;
   for (const block of text.split('\n---\n')) {
     let title='',url='',lines=[],highlight=false;
     for (const raw of block.split(/\r?\n/)) {
@@ -40,14 +40,16 @@ export function sources(text,config) {
     }
     let u;try {u=new URL(url);}catch {continue;}
     if (u.protocol !== 'https:' || u.username || u.password || u.port || url.length>1024) continue;
-    if (out.length>=config.maxResults || left<url.length) break;
+    if (out.length>=config.maxResults || left<url.length) {truncated=true;break;}
     left-=url.length;
+    if(title.length>Math.min(256,left)) truncated=true;
     title=title.slice(0,Math.min(256,left));left-=title.length;
     const prefix='Untrusted web search evidence: ';
+    if((prefix+lines.join(' ')).length>left) truncated=true;
     const snippet=(prefix+lines.join(' ')).slice(0,Math.max(0,left));left-=snippet.length;
     out.push({url,title,snippet});
   }
-  return {sources:out,truncated:text.length>config.maxOutputChars};
+  return {sources:out,truncated};
 }
 export class KeylessSearchProvider {
   id='exa';

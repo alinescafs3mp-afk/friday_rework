@@ -84,7 +84,7 @@ def test_native_keyless_harness_search_and_bounded_fetch(mode,tmp_path):
     result=json.loads(r.stdout);assert result['externalTransports']=='SYNTHETIC_ONLY'
     assert result['searchCalls']==1 and result['originalBudgetAndPermissionsUnchanged'] is True
 
-@pytest.mark.parametrize('mode',['ok','sse','429','redirect','oversize','text-bound','instructions','agent-run','malformed','wrong-id','multiple','missing-transport','timeout'])
+@pytest.mark.parametrize('mode',['ok','sse','429','redirect','oversize','text-bound','instructions','agent-run','malformed','wrong-id','bool-id','multiple','missing-transport','timeout'])
 def test_actual_hermes_keyless_native_transport_has_finite_untrusted_ingress(mode,monkeypatch):
     from plugins.web import keyless_mcp as m
     import requests
@@ -93,6 +93,7 @@ def test_actual_hermes_keyless_native_transport_has_finite_untrusted_ingress(mod
     if mode=='instructions':data['result']['instructions']='agent_run'
     if mode=='agent-run':data['result']={'tools':[{'name':'agent_run'}]}
     if mode=='wrong-id':data['id']=2
+    if mode=='bool-id':data['id']=True
     if mode=='text-bound':data['result']['content'][0]['text']='x'*15001
     body=json.dumps(data).encode()
     if mode=='sse':body=b'data: '+body+b'\n\n'
