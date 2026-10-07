@@ -46,15 +46,15 @@ def require(condition, reason):
 
 
 def safe_diagnostic(exc, phase):
-    from scripts.dsh_prepare import CommandFailed, StopUnconfirmed
+    from scripts.dsh_prepare import CommandFailed, StopUnconfirmed, safe_observation
     result = {'phase': phase, 'reason': 'native_operation_failed'}
     if isinstance(exc, StopUnconfirmed):
         result.update(reason='stop_unconfirmed', cessation='UNCONFIRMED')
         if hasattr(exc, 'observation'):
-            result.update(exc.observation)
+            result.update(safe_observation(exc.observation))
             result.update(reason='stop_unconfirmed', cessation='UNCONFIRMED')
     elif isinstance(exc, CommandFailed):
-        result.update(exc.observation)
+        result.update(safe_observation(exc.observation))
         result['cessation'] = 'REAPED' if exc.observation['reaped'] else 'UNCONFIRMED'
     elif isinstance(exc, Refused):
         result['reason'] = exc.reason

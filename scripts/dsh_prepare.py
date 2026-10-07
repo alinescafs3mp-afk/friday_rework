@@ -19,14 +19,21 @@ class StopUnconfirmed(RuntimeError):
     """An owned command was signalled but its cessation was not observed."""
 
 
+SAFE_OBSERVATION_FIELDS = ('returncode', 'elapsed_seconds', 'timeout', 'stdout_sha256',
+                           'stderr_sha256', 'stdout_bytes', 'stderr_bytes', 'pid',
+                           'starttime_ticks', 'reaped', 'reason',
+                           'namespace_init_exit_verified')
+
+
+def safe_observation(observation):
+    return {key: observation[key] for key in SAFE_OBSERVATION_FIELDS if key in observation}
+
+
 class CommandFailed(RuntimeError):
     """Reaped command failure; never carry argv, environment or raw output."""
 
     def __init__(self, observation):
-        keys = ('returncode', 'elapsed_seconds', 'timeout', 'stdout_sha256',
-                'stderr_sha256', 'stdout_bytes', 'stderr_bytes', 'pid',
-                'starttime_ticks', 'reaped', 'reason')
-        self.observation = {k: observation[k] for k in keys}
+        self.observation = safe_observation(observation)
         super().__init__('command_timeout' if observation['timeout'] else 'command_nonzero_exit')
 
 

@@ -29,7 +29,7 @@ def test_uncertain_monitor_never_releases_family(monkeypatch, tmp_path, code, ti
     monkeypatch.setattr(dsh_prepare, 'run', failed)
     with pytest.raises(dsh_prepare.StopUnconfirmed) as stopped:
         custody.Containment({}, custody.Budget(30), {}).run(['unused'], tmp_path)
-    assert stopped.value.observation is observation
+    assert stopped.value.observation == observation
 
 
 def test_ordinary_nonzero_retains_real_diagnostic(monkeypatch, tmp_path):
@@ -87,3 +87,24 @@ def test_native_barrier_allows_real_result_and_closes_descriptor(monkeypatch, tm
     result, observed = custody.Containment({}, custody.Budget(30), {}).run(['unused'], tmp_path)
     assert result == 'result' and observed['namespace_init_exit_verified'] is True
     with pytest.raises(OSError): os.fstat(fds[0])
+
+
+@pytest.mark.parametrize('wire', [b'', b'{"child-pid":123}\n{"exit-code":1}\n'])
+def test_successful_monitor_with_invalid_status_redacts_failure_receipt(monkeypatch, tmp_path, wire):
+    from scripts.friday_install import safe_diagnostic
+    monkeypatch.setattr(custody, 'checked_binary', lambda pin: '/usr/bin/bwrap')
+    private = 'PRIVATE_ARGV_OR_OUTPUT_CANARY'
+    def returned(*args, **kwargs):
+        os.write(kwargs['pass_fds'][0], wire)
+        return private, dict(metadata(), argv=[private], stdout=private, env={'KEY': private})
+    monkeypatch.setattr(dsh_prepare, 'run', returned)
+    with pytest.raises(dsh_prepare.StopUnconfirmed) as stopped:
+        custody.Containment({}, custody.Budget(30), {}).run([private], tmp_path)
+    assert private not in json.dumps(stopped.value.observation)
+    # Even an accidentally enriched exception must not expose extra metadata.
+    stopped.value.observation.update(argv=[private], stderr=private)
+    receipt = safe_diagnostic(stopped.value, 'compose')
+    assert private not in json.dumps(receipt)
+    assert receipt['reason'] == 'stop_unconfirmed'
+    assert receipt['cessation'] == 'UNCONFIRMED'
+    assert receipt['returncode'] == 0 and receipt['reaped'] is True

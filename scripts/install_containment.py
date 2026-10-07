@@ -88,7 +88,7 @@ class Containment:
         self.binary = budget.call(checked_binary, pin)
 
     def run(self, command, cwd, *, timeout=1800):
-        from scripts.dsh_prepare import run, CommandFailed, StopUnconfirmed
+        from scripts.dsh_prepare import run, CommandFailed, StopUnconfirmed, safe_observation
         self.budget.call(checked_binary, self.pin)
         # Reserve cleanup *inside* the original deadline; no fresh grace clock.
         limit = min(timeout, self.budget.check(reserve=1))
@@ -120,7 +120,7 @@ class Containment:
         known = namespace_exit(data, observation)
         if not known or observation.get('returncode') == 3:
             stopped = StopUnconfirmed('STOP_UNCONFIRMED: namespace init exit not established')
-            if observation: stopped.observation = observation
+            if observation: stopped.observation = safe_observation(observation)
             raise stopped from failure
         observation['namespace_init_exit_verified'] = True
         if failure is not None: raise failure
