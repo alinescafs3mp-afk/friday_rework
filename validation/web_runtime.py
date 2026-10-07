@@ -396,63 +396,103 @@ class Native:
         _require(not errors, "native_cleanup_unconfirmed")
 
 
-def _secret_forms(secret_values):
-    forms = {value for value in secret_values if value}
+def _secret_form_prefixes(secret_values):
+    # Eight actual credential characters are meaningful partial evidence. A
+    # generic type prefix (sk-, local-, friday-) or an incidental letter is not.
+    # Apply escaping to both the value and that prefix, so JSON backslashes do
+    # not count as additional credential characters.
+    forms = {value: len(value[:8]) for value in secret_values if value}
     # Tool JSON may itself be a string inside the SDK request JSON and debug
     # dump. Cover those actual nested serialization boundaries explicitly.
     for _ in range(3):
-        forms |= {json.dumps(value, ensure_ascii=ascii_only)[1:-1]
-                  for value in tuple(forms) for ascii_only in (False, True)}
-    return sorted(forms, key=len, reverse=True)
+        for value, length in tuple(forms.items()):
+            for ascii_only in (False, True):
+                escaped = json.dumps(value, ensure_ascii=ascii_only)[1:-1]
+                prefix = json.dumps(value[:length], ensure_ascii=ascii_only)[1:-1]
+                forms[escaped] = min(forms.get(escaped, len(prefix)), len(prefix))
+    return forms
+
+
+def _secret_forms(secret_values):
+    return sorted(_secret_form_prefixes(secret_values), key=len, reverse=True)
 
 
 class _SecretPrefixRedactor:
-    """Linear streaming trie: withhold EVERY known secret prefix, even on reset.
+    """Bounded streaming trie with an explicit partial-credential threshold.
 
-    A mismatch terminates a redacted prefix rather than releasing its bytes.
-    This deliberately over-redacts benign text sharing a credential prefix.
-    State holds only a trie node, never an expanding raw stream or secret tail.
-    JSON-escaped forms cover the same three nested boundaries as native dumps.
+    Full credentials (even short ones) and prefixes of >=8 original characters
+    are concealed, including on mismatch/reset. Short incidental matches are
+    retained until disambiguated and rendered literally in snapshots. At an
+    artificial truncation boundary even a short pending prefix is concealed.
+    Only the short undecided prefix is buffered; significant secret tails use
+    trie state alone. Escaping follows the three actual JSON boundaries.
     """
     def __init__(self, secret_values):
         values = tuple(set(secret_values))
         _require(len(values) <= 8 and sum(map(len, values)) <= 8192, "secret_redaction_limit")
-        forms = _secret_forms(values)
+        forms = _secret_form_prefixes(values)
         _require(len(forms) <= 64 and sum(map(len, forms)) <= 65536, "secret_redaction_limit")
         self.root = {}
-        for form in forms:
+        for form, threshold in forms.items():
             node = self.root
-            for ch in form:
+            for index, ch in enumerate(form, 1):
                 node = node.setdefault(ch, {})
+                if index >= threshold:
+                    node[""] = True
             node[None] = True
         self.node = self.root
         self.complete = False
+        self.pending = []
 
-    def tail(self):
+    def tail(self, *, truncated=False):
         if self.node is self.root:
             return ""
-        return "[REDACTED]" if self.complete else "[REDACTED_PARTIAL]"
+        if self.complete:
+            return "[REDACTED]"
+        if "" in self.node or truncated:
+            return "[REDACTED_PARTIAL]"
+        return "".join(self.pending)
+
+    def _reset(self):
+        self.node, self.complete = self.root, False
+        self.pending = []
 
     def feed(self, text):
         result = []
         for ch in text:
-            if ch not in self.node and self.node is not self.root:
-                result.append(self.tail())
-                self.node, self.complete = self.root, False
-            if ch in self.node:
-                self.node = self.node[ch]
-                self.complete = self.complete or None in self.node
-                if len(self.node) == 1 and None in self.node:
-                    result.append("[REDACTED]")
-                    self.node, self.complete = self.root, False
-            else:
-                result.append(ch)
+            retry = [ch]
+            while retry:
+                ch = retry.pop()
+                if ch not in self.node and self.node is not self.root:
+                    if self.complete or "" in self.node:
+                        result.append(self.tail())
+                    else:
+                        # Release only the first disambiguated character and
+                        # rescan the short suffix: overlapping starts must not
+                        # cause a complete credential to pass through unchanged.
+                        result.append(self.pending[0])
+                        retry.extend(reversed(self.pending[1:] + [ch]))
+                        self._reset()
+                        continue
+                    self._reset()
+                if ch in self.node:
+                    self.node = self.node[ch]
+                    self.complete = self.complete or None in self.node
+                    if self.complete or "" in self.node:
+                        self.pending = []
+                    else:
+                        self.pending.append(ch)
+                    if None in self.node and all(k in (None, "") for k in self.node):
+                        result.append("[REDACTED]")
+                        self._reset()
+                else:
+                    result.append(ch)
         return "".join(result)
 
 
-def _redact(text, secret_values):
+def _redact(text, secret_values, *, truncated=False):
     scrubber = _SecretPrefixRedactor(secret_values)
-    return scrubber.feed(text) + scrubber.tail()
+    return scrubber.feed(text) + scrubber.tail(truncated=truncated)
 
 
 @contextmanager
@@ -489,15 +529,26 @@ def _bounded_public(value, secret_values):
                 allowed = min(16384, budget)
                 if len(item) > allowed:
                     truncated = True
-                item = _redact(item[:allowed], secret_values)
+                item = _redact(item[:allowed], secret_values, truncated=len(item) > allowed)
                 if len(item) > allowed:
                     item = item[:allowed] + "[TRUNCATED]"; truncated = True
                 budget = max(0, budget - len(item))
                 return item
             if isinstance(item, dict):
                 truncated = truncated or len(item) > 32
-                return {(k if depth == 0 else _redact(k[:256], secret_values)):clean(v, depth+1)
-                        for k,v in list(item.items())[:32]}
+                result = {}
+                for k, v in list(item.items())[:32]:
+                    truncated = truncated or len(k) > 256
+                    key = _redact(k[:256], secret_values, truncated=len(k) > 256)
+                    # Concealing secret-bearing keys must not silently discard
+                    # their values when distinct keys map to the same marker.
+                    unique = key
+                    suffix = 2
+                    while unique in result:
+                        unique = key + f"[KEY_{suffix}]"
+                        suffix += 1
+                    result[unique] = clean(v, depth+1)
+                return result
             if isinstance(item, list):
                 truncated = truncated or len(item) > 32
                 return [clean(v, depth+1) for v in item[:32]]

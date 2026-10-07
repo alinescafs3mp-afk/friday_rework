@@ -4,6 +4,7 @@ This is not a model/provider run or acceptance of autonomous research. Known
 web provider registration and API responses are fixture seams, explicitly so.
 """
 import json
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -19,10 +20,16 @@ Q = Path(__file__).resolve().parents[1]
 build = runpy.run_path(str(Q/'tools/configure_local_test.py'))['build_config']
 
 
-@pytest.mark.parametrize('mode,variant', [('explicit',v) for v in ('partial_stream','escaped_stream','retry_4xx','callback_failure')])
-def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,mode,variant):
+@pytest.mark.parametrize('mode,variant,credential',
+    [('explicit',v,None) for v in ('partial_stream','escaped_stream','retry_4xx','callback_failure')]
+    + [('explicit','retry_4xx',key) for key in (
+        'sk-synthetic_credential_only_1234567890', 'a1234567-89ab-4cde-8012-3456789abcde',
+        'local-synthetic_credential_only', 'friday-synthetic_credential_only')]
+    + [('explicit','escaped_stream','sk-synthetic_"escape\\unitя')])
+def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,mode,variant,credential):
     case=variant
     marker='SYNTHETIC_QUOTE"SLASH\\UNICODEя' if variant=='escaped_stream' else 'SYNTHETIC_SCOPED_CREDENTIAL'
+    marker=credential or marker
     if variant=='escaped_sdk_failure':variant='sdk_failure'
     from tools import web_tools as wt
     from tools import web_tools_truncate, tool_result_storage
@@ -203,6 +210,13 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
     (tmp_path/'callback-diagnostic.json').write_text(json.dumps({'callback_error':getattr(obj,'callback_error',None),'stream_callbacks':obj.stream_callbacks,'api_calls':len(api),'secret_lengths':[len(v) for v in obj.secrets],'native_diagnostic':getattr(obj,'native_diagnostic',{})},indent=2)+'\n')
     assert result['status']=='FAILED_OR_UNCERTAIN'
     assert len(result['tool_source_observations'])>=2 and len(transport)==2
+    url='https://urllib3.readthedocs.io/en/stable/reference/urllib3.util.html'
+    assert url in result['tool_source_observations'][0]['content']
+    calls=[c for batch in result['tool_calls'] for c in batch]
+    assert {c['function']['name'] for c in calls}=={'web_search','web_extract'}
+    assert {c['id'] for c in calls} >= {c['tool_call_id'] for c in result['tool_source_observations']}
+    assert all(c['role']=='tool' for c in result['tool_source_observations'])
+    assert any(json.loads(c['function']['arguments']).get('urls')==[url] for c in calls)
     assert result['journey_acceptance']=='NOT_CLAIMED' and boundary.settles==1
     assert any(d['consumer_attached'] for d in parsed_deltas)
     assert obj.agent.stream_delta_callback is None and obj.agent._stream_callback is None
@@ -229,9 +243,18 @@ def test_real_native_agent_reaches_web_and_cleanup(tmp_path,monkeypatch,capsys,m
         spills=list((home/'cache/web').glob('*.md'))
         assert spills, 'Exercise actual native full-text persistence, not only small responses'
         assert any('[REDACTED]' in p.read_text() for p in spills)
+        expected_name='urllib3.readthedocs.io-'+hashlib.sha256(url.encode()).hexdigest()[:10]+'.md'
+        expected_page=('# Retry\ntotal, allowed_methods, status_forcelist, respect_retry_after_header: synthetic official-text fixture'
+                       '\n[REDACTED]\n'+('synthetic page body\n'*2000)+'[REDACTED]')
+        assert any(p.name==expected_name and p.read_text()==expected_page for p in spills)
     if variant=='retry_4xx':
         dumps=list((home/'sessions').glob('request_dump_*.json'))
         assert dumps and any('[REDACTED_PARTIAL]' in p.read_text() for p in dumps)
+        assert all(url in p.read_text() for p in dumps)
+        for p in dumps:
+            body=json.loads(p.read_text())['request']['body']
+            assert 'messages' in body
+            assert any(m['role']=='tool' and m.get('tool_call_id')=='call0' for m in body['messages'])
         assert any(r['had_visible_text'] and r['cleared'] for r in resets)
     captured=capsys.readouterr()
     assert marker not in captured.out+captured.err

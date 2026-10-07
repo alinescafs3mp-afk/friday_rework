@@ -221,12 +221,19 @@ with no timer or new thread. Caps are 64 Ki input characters, 16 Ki retained tex
 4,096 callbacks and 256 stream publications within the original remaining deadline.
 Crossing a cap or failing persistence requests native interruption and prevents
 success. Native continuation/retry policy and request/iteration budgets are unchanged.
-A streaming trie conceals full and incomplete known-secret prefixes, including
-nested JSON-escaped forms across chunks; incomplete prefixes are never released
-on mismatch/reset. This conservatively obscures benign text sharing those prefixes.
-Credential/trie sizes are capped before native execution; no growing raw text tail
-is stored by the observer. Tool/final observations and spill/debug sinks use the
-same prefix policy so partial native stubs cannot escape through a later 4xx dump.
+A streaming trie conceals full credentials of any length and incomplete known-secret
+prefixes containing at least eight original credential characters. Escaping does
+not count as additional characters; the same threshold follows three nested JSON
+serialization boundaries and all chunk splits. Meaningful prefixes stay concealed
+on mismatch/reset. Shorter incidental matches (including `s`, `sk-`, `local-` and
+`friday-`) are preserved literally, including at natural end of text; they alone
+are not evidence of a credential. At artificial input truncation even a one-character
+pending match is concealed and the observation is marked truncated. No policy can
+distinguish ordinary text identical to a known full credential or its meaningful
+prefix; those exact spans remain redacted. Schema, tool names and nonsecret URLs
+otherwise remain intact. The capped trie buffers only the short undecided prefix,
+never a growing raw stream. Tool/final observations and spill/debug sinks use the
+same policy so meaningful partial native stubs cannot escape through a later 4xx dump.
 
 No native SQLite transcript or trajectory is enabled. During the dedicated run,
 native console output is discarded and logging is suppressed, including native
