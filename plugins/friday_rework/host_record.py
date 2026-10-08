@@ -66,10 +66,14 @@ def validate_a0_record(row):
     from .adapters.dsh import _identity
     a = row['host']['a0']
     required = {'schema', 'acceptance', 'expected_files', 'launch', 'grant', 'key_cleanup', 'capability'}
-    if (not isinstance(a, dict) or set(a) not in (required, required | {'observations'})
-            or a['schema'] != 'friday.a0.host.v2'):
+    if (not isinstance(a, dict) or not required <= set(a) <= required | {'observations', 'route'}
+            or a['schema'] not in {'friday.a0.host.v2','friday.a0.host.v3'}
+            or a['schema']=='friday.a0.host.v3' and 'route' not in a
+            or a['schema']=='friday.a0.host.v2' and a.get('route') is not None):
         raise ValueError()
     validate_acceptance(a['acceptance'])
+    if a.get('route') is not None:
+        validate_a0_route(row, a['route'])
     if (a['acceptance']['accepted_unix'] != row['created_at_unix']
             or type(row['budget_seconds']) is not int
             or row['deadline_unix'] != row['created_at_unix'] + row['budget_seconds']
@@ -151,6 +155,140 @@ def validate_a0_record(row):
                 or not g.container_cgroup.endswith('/docker-'+g.container_id+'.scope')
                 or g.network_verified is not True):
             raise ValueError()
+
+
+def validate_a0_route(row, route):
+    """Validate recorded custody, without reopening launch files or minting it.
+
+    Absence on old rows is preserved. Hashes bind evidence; they do not by
+    themselves authorize a daemon stop or manufacture native observations.
+    """
+    from .adapters.dsh import _identity
+    from .host_runtime import _pin
+    a = row['host']['a0']; native = row['host']['binding']['runtime']['a0']
+    keys = {'schema', 'association', 'acceptance', 'request', 'request_sha256',
+            'stop_source', 'stop_launcher', 'daemon_limits', 'pending', 'daemon',
+            'network', 'samples', 'request_published', 'daemon_attempted',
+            'network_attempted', 'network_removed', 'docker', 'settlement'}
+    if (not isinstance(route, dict) or set(route) != keys
+            or route['schema'] != 'friday.a0.host-route.v1'
+            or route['association'] != _identity(row) or route['acceptance'] != a['acceptance']
+            or route['pending'] not in {None, 'request', 'daemon', 'sample', 'network'}):
+        raise ValueError('invalid_a0_route')
+    for key in ('request_published', 'daemon_attempted', 'network_attempted', 'network_removed'):
+        if type(route[key]) is not bool: raise ValueError('invalid_a0_route')
+    if route['docker'] != native['docker']:raise ValueError('invalid_a0_route_docker')
+    for key, name, original in [('stop_source', 'a0-route-stop.py', 'runtime'),
+                                ('stop_launcher', 'a0-route-launcher.py', 'launcher')]:
+        _pin(route[key])
+        if (route[key]['path'] != str(Path(row['workspace_reference'])/name)
+                or route[key]['sha256'] != native[original]['sha256']):
+            raise ValueError('invalid_a0_route_stop_source')
+    request = route['request']
+    compact = lambda v: hashlib.sha256(json.dumps(v, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+    request_keys = {'schema', 'owner', 'nonce', 'accepted_unix', 'deadline_unix',
+                    'original_budget_seconds', 'accepted_monotonic_ns', 'launcher_sha256',
+                    'policy_sha256', 'tools', 'endpoints', 'host'}
+    if (not isinstance(request, dict) or set(request) != request_keys | ({'web'} if 'web' in native else set())
+            or request['schema'] != 'friday.a0.local-route-request.v1'
+            or request['owner'] != native['owner_slot'] + ':' + row['existing_task_id'] + '#1'
+            or not isinstance(request['nonce'], str) or not re.fullmatch('[0-9a-f]{32}', request['nonce'])
+            or request['accepted_unix'] != row['created_at_unix']
+            or request['deadline_unix'] != row['deadline_unix']
+            or request['original_budget_seconds'] != row['budget_seconds']
+            or request['accepted_monotonic_ns'] != a['acceptance']['accepted_monotonic_ns']
+            or request['launcher_sha256'] != native['launcher']['sha256']
+            or request['host'] != {'association_sha256': compact(_identity(row)),
+                                   'boot_id': a['acceptance']['boot_id'],
+                                   'deployment_sha256': compact(native.get('deployment'))}
+            or route['request_sha256'] != hashlib.sha256((json.dumps(request, sort_keys=True, separators=(',', ':'), allow_nan=False)+'\n').encode()).hexdigest()
+            or not isinstance(request['tools'],dict)
+            or set(request['tools']) != {'dockerd', 'rootlesskit', 'slirp4netns', 'nft', 'nsenter'}
+            or any(not isinstance(v,str) or not re.fullmatch('[0-9a-f]{64}',v) for v in request['tools'].values())
+            or not isinstance(request['policy_sha256'],str) or not re.fullmatch('[0-9a-f]{64}',request['policy_sha256'])):
+        raise ValueError('invalid_a0_route_request')
+    limits = route['daemon_limits']
+    if (not isinstance(limits,dict) or set(limits) != {'runtime_seconds', 'start_seconds', 'stop_seconds', 'admitted_remaining_seconds'}
+            or any(type(v) not in (int,float) or not math.isfinite(v) or v <= 0 for v in limits.values())
+            or limits['admitted_remaining_seconds'] > row['budget_seconds']-25
+            or limits['runtime_seconds'] > 120 or limits['start_seconds'] > 45 or limits['stop_seconds'] > 20
+            or sum(limits[k] for k in ('runtime_seconds','start_seconds','stop_seconds')) + 5 > limits['admitted_remaining_seconds']):
+        raise ValueError('invalid_a0_route_deadline')
+    daemon = route['daemon']
+    group = '/user.slice/user-1000.slice/user@1000.service/app.slice/friday-rework-docker.service'
+    if daemon is not None:
+        if not route['daemon_attempted'] or not isinstance(daemon,dict) or set(daemon) != {'receipt'}:
+            raise ValueError('invalid_a0_route_daemon')
+        g = daemon['receipt'];context=g['context']
+        if (g['request'] != request or g['schema'] != 'friday.a0.local-route-guard.v1'
+                or g['status'] != 'GUARDED_BEFORE_DOCKERD'
+                or g['policy_sha256'] != request['policy_sha256']
+                or context['request_sha256'] != route['request_sha256']
+                or not re.fullmatch('[0-9a-f]{32}',context['invocation_id'])
+                or context['parent_pid'] != context['parent']['pid']):
+            raise ValueError('invalid_a0_route_daemon')
+        for process in (g['daemon'],context['parent']):
+            if (set(process) != {'pid','start','ppid','cgroup','boot'}
+                    or type(process['pid']) is not int or process['pid'] <= 0
+                    or type(process['ppid']) is not int or process['ppid'] <= 0
+                    or not isinstance(process['start'],str) or not process['start'].isdecimal()
+                    or process['cgroup'] != '0::'+group+'/dockerd'
+                    or process['boot'] != a['acceptance']['boot_id']):
+                raise ValueError('invalid_a0_route_process')
+        for field in ('namespaces',):
+            ns=g[field]
+            if (not isinstance(ns,dict) or set(ns) != {'user','mnt','net'}
+                    or any(not isinstance(v,list) or len(v)!=2 or any(type(x)is not int or x<=0 for x in v) for v in ns.values())):
+                raise ValueError('invalid_a0_route_namespace')
+    samples = route['samples']
+    if not isinstance(samples,list) or samples and daemon is None:raise ValueError('invalid_a0_route_samples')
+    for sample in samples:
+        if (not isinstance(sample,dict) or set(sample) != {'group','populated','processes'}
+                or sample['group'] != group or type(sample['populated']) is not bool
+                or not isinstance(sample['processes'],list)):
+            raise ValueError('invalid_a0_route_sample')
+        for p in sample['processes']:
+            if (set(p) != {'pid','start_ticks','state'} or type(p['pid']) is not int or p['pid']<=0
+                    or type(p['start_ticks']) is not int or p['start_ticks']<=0
+                    or not isinstance(p['state'],str) or len(p['state'])!=1):
+                raise ValueError('invalid_a0_route_sample')
+    n=route['network']
+    if n is not None:
+        if (not route['network_attempted'] or daemon is None
+                or n['owner'] != request['owner'] or n['nonce'] != request['nonce']
+                or n['name'] != 'frw-a0-local-'+request['nonce'][:12]
+                or n['bridge'] != 'br-frwa0local' or n['endpoints'] != request['endpoints']
+                or n['request_sha256'] != route['request_sha256']
+                or n['invocation_id'] != daemon['receipt']['context']['invocation_id']
+                or n['namespaces'] != daemon['receipt']['namespaces']
+                or not re.fullmatch('[0-9a-f]{64}',n['id'])):
+            raise ValueError('invalid_a0_route_network')
+        if (n['launcher_sha256'] != request['launcher_sha256']
+                or n['policy_sha256'] != request['policy_sha256']
+                or n['labels'] != {'friday.rework.owner':request['owner'],'friday.rework.route':request['nonce']}
+                or n.get('web') != request.get('web')
+                or not re.fullmatch('[0-9a-f]{64}',n['guard_receipt_sha256'])):
+            raise ValueError('invalid_a0_route_network')
+    settlement=route['settlement']
+    if settlement is not None:
+        if (not isinstance(settlement,dict) or set(settlement) != {'status','request_removed','guard_removed','network_removed','daemon_checks'}
+                or settlement['status'] != 'STOP_CONFIRMED' or route['pending'] is not None
+                or any(settlement[k] is not True for k in ('request_removed','guard_removed','network_removed'))
+                or not isinstance(settlement['daemon_checks'],list)
+                or route['daemon_attempted'] and (daemon is None or not samples or len(settlement['daemon_checks']) < len(samples)+1)
+                or any(x.get('confirmed') is not True for x in settlement['daemon_checks'])):
+            raise ValueError('invalid_a0_route_cessation')
+        expected=[]
+        if daemon is not None:
+            g=daemon['receipt']
+            expected=[*samples,{'group':group,'populated':True,'processes':[
+                {'pid':p['pid'],'start_ticks':int(p['start']),'state':'S'}
+                for p in (g['daemon'],g['context']['parent'])]}]
+        if len(settlement['daemon_checks']) != len(expected):raise ValueError('invalid_a0_route_cessation')
+        for check,before in zip(settlement['daemon_checks'],expected):
+            if (set(check) != {'confirmed','before','survivors','after'} or check['before'] != before
+                    or check['survivors'] != [] or check['after'] != {'group':group,'populated':False,'processes':[]}):
+                raise ValueError('invalid_a0_route_cessation')
 
 
 def validate_host_record(row):
@@ -239,10 +377,13 @@ def validate_host_record(row):
             if not isinstance(quiet, dict) or set(quiet) != {"kind", "at_unix", "observation"}:
                 raise ValueError()
             _number(quiet["at_unix"])
+            route = host.get('a0', {}).get('route')
+            if route is not None and route['settlement'] is None:
+                raise ValueError('a0_route_cessation_missing')
             if quiet["kind"] == "never_submitted":
                 if (quiet["observation"] is not None or row["submission_observation"] != "NOT_SUBMITTED"
                         or row["stop_intent"] is None
-                        or row['worker_kind'] == 'a0' and host['a0']['launch'] is not None):
+                        or row['worker_kind'] == 'a0' and (host['a0']['launch'] is not None or route is not None)):
                     raise ValueError()
             elif quiet["kind"] == "native":
                 if row['worker_kind'] == 'a0':
@@ -287,6 +428,10 @@ def validate_host_record(row):
                     raise ValueError()
                 observed=UnitObservation(**v['unit'])
                 if not observed.quiescent or observed.unit != row['supervisor']['unit']:
+                    raise ValueError()
+            elif quiet['kind'] == 'a0_route':
+                if (row['worker_kind'] != 'a0' or route is None or host['a0']['launch'] is not None
+                        or row['native'] is not None or quiet['observation'] != {'route_sha256': digest(route)}):
                     raise ValueError()
             else:
                 raise ValueError()

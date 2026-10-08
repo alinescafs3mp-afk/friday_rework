@@ -347,11 +347,12 @@ class Associations:
                 if brief.worker == 'a0':
                     if acceptance is None:
                         raise AssociationError('original_acceptance_missing')
-                    row['host']['a0'] = {'schema': 'friday.a0.host.v2',
+                    row['host']['a0'] = {'schema': 'friday.a0.host.v3',
                         'acceptance': copy.deepcopy(acceptance),
                         'expected_files': copy.deepcopy(host_binding['runtime']['a0']['expected_files']),
                         'launch': None, 'grant': None, 'key_cleanup': 'NOT_PREPARED', 'capability': None,
                         'observations': {'pending': False, 'samples': []}}
+                    row['host']['a0']['route'] = None
             data["jobs"][task_id] = row
             self._save(data)
             return copy.deepcopy(row), True
@@ -428,6 +429,41 @@ class Associations:
             elif target[field] is not None and target[field] != value:
                 raise AssociationError('a0_retention_conflict')
             target[field] = copy.deepcopy(value)
+            self._save(data)
+            return copy.deepcopy(row)
+
+    def retain_a0_route(self, task_id, owner, value):
+        """One-shot route custody in this row, before every native submission.
+
+        No old record is migrated. Immutable observations cannot be replaced;
+        interrupted submissions remain pending until exact-owned stop succeeds.
+        """
+        from .host_record import validate_a0_route
+        with self._locked() as data:
+            row = self._owned(data, task_id, owner)
+            a = row['host']['a0']
+            if 'route' not in a:
+                raise AssociationError('legacy_a0_route_requires_reconciliation')
+            validate_a0_route(row, value)
+            old = a['route']
+            if old is None:
+                if (row['stop_intent'] or a['capability'] is not None or a['launch'] is not None
+                        or row['preparation_reserved'] or row['host']['inputs'] is None
+                        or row['host']['quiescence'] is not None):
+                    raise AssociationError('a0_route_not_admitted')
+            else:
+                for key in ('association', 'acceptance', 'request', 'request_sha256',
+                            'stop_source', 'stop_launcher', 'daemon_limits', 'docker'):
+                    if value[key] != old[key]:
+                        raise AssociationError('a0_route_identity_changed')
+                for key in ('daemon', 'network', 'settlement'):
+                    if old[key] is not None and value[key] != old[key]:
+                        raise AssociationError('a0_route_observation_changed')
+                if (value['samples'][:len(old['samples'])] != old['samples']
+                        or any(old[key] and not value[key] for key in
+                               ('request_published', 'daemon_attempted', 'network_attempted', 'network_removed'))):
+                    raise AssociationError('a0_route_history_changed')
+            a['route'] = copy.deepcopy(value)
             self._save(data)
             return copy.deepcopy(row)
 

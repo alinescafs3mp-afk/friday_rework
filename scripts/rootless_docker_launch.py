@@ -261,7 +261,7 @@ def checked_policy(text, web=None):
 def checked_request(value, now=None):
     keys = {'schema', 'owner', 'nonce', 'accepted_unix', 'deadline_unix', 'original_budget_seconds', 'accepted_monotonic_ns',
             'launcher_sha256', 'policy_sha256', 'tools', 'endpoints'}
-    require(isinstance(value, dict) and set(value) in (keys, keys | {'web'})
+    require(isinstance(value, dict) and keys <= set(value) <= keys | {'web', 'host'}
             and value['schema'] == 'friday.a0.local-route-request.v1', 'route_request_shape')
     require(isinstance(value['owner'], str) and re.fullmatch(r'(astra|sol):[A-Za-z0-9][A-Za-z0-9._-]{0,95}#[1-9][0-9]*', value['owner'])
             and re.fullmatch(r'[0-9a-f]{32}', value['nonce']), 'route_owner_changed')
@@ -276,6 +276,12 @@ def checked_request(value, now=None):
             and value['accepted_monotonic_ns'] <= time.monotonic_ns()
             < value['accepted_monotonic_ns'] + (value['original_budget_seconds'] - 25)*10**9, 'route_monotonic_budget_changed')
     if 'web' in value: checked_web(value['web'])
+    if 'host' in value:
+        host = value['host']
+        require(isinstance(host,dict) and set(host) == {'association_sha256','boot_id','deployment_sha256'}
+                and host['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+                and all(isinstance(host[k],str) and re.fullmatch('[0-9a-f]{64}',host[k])
+                        for k in ('association_sha256','deployment_sha256')), 'route_host_binding_changed')
     require(value['endpoints'] == ENDPOINTS and value['policy_sha256'] == policy_hash(value.get('web')), 'route_policy_changed')
     require(re.fullmatch(r'[0-9a-f]{64}', value['launcher_sha256'])
             and isinstance(value['tools'], dict) and set(value['tools']) == {'dockerd', 'rootlesskit', 'slirp4netns', 'nft', 'nsenter'}

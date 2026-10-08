@@ -12,6 +12,7 @@ from dataclasses import asdict, replace
 import time
 import json
 import logging
+import re
 from pathlib import Path
 
 from .admission import _snapshot, delivery_route
@@ -159,11 +160,14 @@ class WorkerHost:
                 return json.dumps(self.produce_a0_capability(address, owner))
             self.ctx.schedule_gateway_work(self._run(row), route=route, name="friday:" + address)
             return json.dumps(status(row))
-        except (ValueError, RuntimeError, OSError, TypeError, KeyError):
+        except (ValueError, RuntimeError, OSError, TypeError, KeyError) as error:
             # Any admitted partial setup remains reserved and non-replayable.
             # Explicit stop can withdraw an unsubmitted row. Never claim queued
             # execution when scheduling or input verification failed.
             answer = {"accepted": False, "error": "worker_not_available"}
+            # Boundary exceptions use categorical, secret-free codes only.
+            if brief.worker == 'a0' and re.fullmatch('[a-z][a-z0-9_]{0,95}', str(error)):
+                answer['reason'] = str(error)
             if row is not None:
                 answer["reference"] = row["existing_task_id"]
             return json.dumps(answer)
@@ -186,8 +190,15 @@ class WorkerHost:
         dispatch. The producer observes native state before attaching once.
         """
         row, session = self._a0_producer_session(task_id, owner)
-        pin = session.produce_capability(row)
-        return self.attach_a0_capability(task_id, owner, pin)
+        try:
+            pin = session.produce_capability(row)
+            return self.attach_a0_capability(task_id, owner, pin)
+        except BaseException as error:
+            if session.route is not None:
+                try:self._stop(row, self.store.get(task_id,owner)['stop_intent'] or 'cancel')
+                except BaseException as stop_error:
+                    error.add_note('owned route STOP_UNCONFIRMED: '+type(stop_error).__name__)
+            raise
 
     def attach_a0_capability(self, task_id, owner, pin):
         """Host/operator-only entry; never exported as a worker/model tool.
@@ -245,7 +256,8 @@ class WorkerHost:
             terminal = {"state": observation.state, "evidence_reference": observation.evidence_reference,
                         "at_unix": self.store.clock()}
         if (row["submission_observation"] == "NOT_SUBMITTED" and row["stop_intent"]
-                and (row['worker_kind'] != 'a0' or row['host']['a0']['launch'] is None)):
+                and (row['worker_kind'] != 'a0' or (row['host']['a0']['launch'] is None
+                     and row['host']['a0'].get('route') is None))):
             quiet = {"kind": "never_submitted", "observation": None, "at_unix": self.store.clock()}
         elif terminal is not None and row['worker_kind'] == 'a0':
             binding = self._controller(row).bindings['a0']
@@ -298,9 +310,10 @@ class WorkerHost:
         if row["host"]["terminal"] is not None and row["host"]["quiescence"] is not None:
             return row
         if row["submission_observation"] == "NOT_SUBMITTED":
-            if row['worker_kind'] == 'a0' and row['host']['a0']['launch'] is not None:
+            if row['worker_kind'] == 'a0' and (row['host']['a0']['launch'] is not None
+                                              or row['host']['a0'].get('route') is not None):
                 session = self._controller(row).bindings['a0'].adapter
-                if session.preparing and not row['stop_intent'] and self.store.clock() < row['deadline_unix']:
+                if (session.preparing or session.route_preparing) and not row['stop_intent'] and self.store.clock() < row['deadline_unix']:
                     return row
                 return self._stop(row,row['stop_intent'] or 'cancel')
             if row["stop_intent"] or self.store.clock() >= row["deadline_unix"]:
@@ -320,8 +333,11 @@ class WorkerHost:
             if Path(self.store.state.data_dir) != self._state_directory:
                 raise HostUnavailable("foreign_runtime_home")
             row = self._remember(self.store.request_stop(row["existing_task_id"], row["owner"], intent))
+            if row['host']['terminal'] is not None and row['host']['quiescence'] is not None:
+                return row
             if (row["submission_observation"] == "NOT_SUBMITTED"
-                    and (row['worker_kind'] != 'a0' or row['host']['a0']['launch'] is None)):
+                    and (row['worker_kind'] != 'a0' or (row['host']['a0']['launch'] is None
+                         and row['host']['a0'].get('route') is None))):
                 return self._settle(row, NativeObservation("", "", "association:" + row["existing_task_id"] + "#stop_intent",
                                                          row["elapsed_seconds"], "stopped"))
             principal = {k: row["owner"][k] for k in PRINCIPAL}

@@ -518,6 +518,9 @@ def current_network(association, acceptance, *, owner_slot, launcher_sha256,
             and request['deadline_unix'] == clock['deadline_unix']
             and request['original_budget_seconds'] == clock['original_budget_seconds']
             and request['accepted_monotonic_ns'] == clock['accepted_monotonic_ns'], 'foreign_host_route_clock')
+    if 'host' in request:
+        require(request['host']=={'association_sha256':digest(binding),'boot_id':acceptance['boot_id'],
+                                  'deployment_sha256':digest(deployment)}, 'foreign_host_route_binding')
     # Stable original bytes supply observations, never caller-configured IDs.
     guard_bytes = launcher['stable_bytes'](launcher['GUARD'], os.getuid())
     guard = launcher['private_json'](launcher['GUARD'], os.getuid())
@@ -549,6 +552,289 @@ def current_network(association, acceptance, *, owner_slot, launcher_sha256,
     launcher['observe_guard'](n, budget=lambda: remaining(clock))
     remaining(clock)
     return n
+
+
+def _route_unit(launcher, runner, timeout):
+    """The existing dedicated unit, never a new supervisor or runtime override."""
+    names = ('ActiveState', 'InvocationID', 'MainPID', 'ControlGroup', 'FragmentPath',
+             'DropInPaths', 'Restart', 'KillMode', 'SendSIGKILL', 'DelegateSubgroup',
+             'MemoryMax', 'TasksMax', 'CPUQuotaPerSecUSec', 'RuntimeMaxUSec',
+             'TimeoutStartUSec', 'TimeoutStopUSec', 'ActiveEnterTimestampMonotonic')
+    raw = runner(['/usr/bin/systemctl', '--user', 'show', DAEMON,
+                  '--property='+','.join(names)], timeout)
+    pairs = [x.split('=',1) for x in raw.splitlines()]
+    fields = dict(pairs)
+    require(len(fields)==len(pairs) and set(fields)==set(names), 'route_native_unit_unknown')
+    expected = {'DropInPaths':'', 'Restart':'no', 'KillMode':'control-group', 'SendSIGKILL':'yes',
+                'DelegateSubgroup':'dockerd', 'MemoryMax':str(20*1024**3),
+                'TasksMax':'2048', 'CPUQuotaPerSecUSec':'8s'}
+    require(all(fields[k]==v for k,v in expected.items()), 'route_native_boundary_changed')
+    require(fields['FragmentPath'] in {str(launcher['ROOT']/'supervisor'/DAEMON),str(launcher['INSTALLED_UNIT'])},
+            'route_native_registration_changed')
+    require(fields['MainPID'].isdecimal() and fields['ControlGroup'] in ('',launcher['SERVICE_GROUP'])
+            and fields['ActiveEnterTimestampMonotonic'].isdecimal(), 'route_native_unit_unknown')
+    return fields
+
+
+def _route_limits(fields, left):
+    # An infinite daemon lifetime cannot be patched over by a host coroutine.
+    # Qualification/configuration of the existing unit is an operator action.
+    from plugins.friday_rework.adapters.a0_native import _duration
+    try:
+        limits = dict(zip(('runtime_seconds','start_seconds','stop_seconds'),
+                         (_duration(fields[k]) for k in ('RuntimeMaxUSec','TimeoutStartUSec','TimeoutStopUSec'))))
+    except RuntimeError:
+        raise RuntimeErrorBoundary('a0_route_native_deadline_unavailable') from None
+    require(0 < limits['runtime_seconds'] <= STARTUP_SECONDS
+            and 0 < limits['start_seconds'] <= 45 and 0 < limits['stop_seconds'] <= 20
+            and sum(limits.values())+5 <= left, 'a0_route_native_deadline_unavailable')
+    return {**limits, 'admitted_remaining_seconds':left}
+
+
+def _exclusive_bytes(path, data):
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    try:
+        require(os.write(fd,data)==len(data), 'route_short_write');os.fsync(fd)
+    finally:os.close(fd)
+    sync_dir(Path(path).parent)
+
+
+def _route_launcher(route):
+    """Recorded checked code for stop, independent of mutable launch sources."""
+    p=private(route['stop_launcher']['path'])
+    require(sha(p)==route['stop_launcher']['sha256'], 'route_stop_launcher_changed')
+    scope={'__file__':str(p),'__name__':'frw_owned_route_stop_launcher'}
+    exec(compile(p.read_bytes(),str(p),'exec'),scope)
+    return scope
+
+
+def _route_descriptor(route, launcher):
+    r=route['request'];g=route['daemon']['receipt']
+    n={'schema':'friday.a0.local-network.v1','owner':r['owner'],'nonce':r['nonce'],
+       'name':'frw-a0-local-'+r['nonce'][:12], 'bridge':launcher['BRIDGE'],
+       'endpoints':r['endpoints'], 'launcher_sha256':r['launcher_sha256'],
+       'policy_sha256':r['policy_sha256'],'request_sha256':route['request_sha256'],
+       'guard_receipt_sha256':hashlib.sha256(launcher['stable_bytes'](launcher['GUARD'],os.getuid())).hexdigest(),
+       'invocation_id':g['context']['invocation_id'],'namespaces':g['namespaces'],
+       'labels':{'friday.rework.owner':r['owner'],'friday.rework.route':r['nonce']}}
+    if 'web' in r:n['web']=r['web']
+    return n
+
+
+def _route_guard(route, launcher, fields):
+    """Recover only this submitted request's real immutable native identity."""
+    require(launcher['stable_bytes'](launcher['REQUEST'],os.getuid()) ==
+            (launcher['canonical'](route['request'])+'\n').encode(), 'route_request_changed')
+    g=launcher['private_json'](launcher['GUARD'],os.getuid())
+    require(g['schema']=='friday.a0.local-route-guard.v1' and g['status']=='GUARDED_BEFORE_DOCKERD'
+            and g['request']==route['request'] and g['policy_sha256']==route['request']['policy_sha256']
+            and g['context']['request_sha256']==route['request_sha256']
+            and g['context']['invocation_id']==fields['InvocationID']
+            and g['context']['parent_pid']==int(fields['MainPID'])
+            and g['daemon']['boot']==g['context']['parent']['boot']==route['acceptance']['boot_id'],
+            'route_daemon_owner_unknown')
+    for p in (g['daemon'],g['context']['parent']):
+        require(launcher['proc_identity'](p['pid'])==p
+                and p['cgroup']=='0::'+launcher['SERVICE_GROUP']+'/dockerd', 'route_process_identity_changed')
+    require(launcher['Path']('/proc',str(g['daemon']['pid']),'exe').resolve()==launcher['tool_paths']()['dockerd'],
+            'route_daemon_executable_changed')
+    with launcher['namespaces'](g['daemon']['pid']) as (ns,_):
+        require(ns==g['namespaces'] and all(ns[k]!=g['context']['host_namespaces'][k] for k in ns),
+                'route_daemon_namespace_changed')
+    return {'receipt':g}
+
+
+def prepare_route(association, acceptance, native, *, retain, budget):
+    """Real fresh preparation for the reserved row, before current_network.
+
+    Persist each submission intent first. Existing daemon native deadlines must
+    already cover startup, work and stop without the gateway. The current
+    unbounded development unit is therefore refused, without changing it.
+    """
+    binding=host_identity(association)
+    require(acceptance['accepted_unix']==binding['created_at_unix'], 'foreign_host_route_clock')
+    launcher=checked_launcher(native['launcher']['sha256'])
+    require(sha(DOCKER)==native['docker']['sha256'], 'docker_binary_changed')
+    launcher['checked_unit_registration']()
+    worker=native_supervisor().observe(binding)
+    require(worker.missing and worker.quiescent, 'prior_worker_unit_blocks_route')
+    # Same native runtime lock; no second capacity mechanism or ownership store.
+    locker=Runtime.__new__(Runtime)
+    with locker.locked():
+        fields=_route_unit(launcher,Runtime._command,min(5,budget()))
+        require(fields['ActiveState'] in ('inactive','failed') and fields['MainPID']=='0'
+                and cgroup_snapshot(launcher['SERVICE_GROUP'])['populated'] is False,
+                'foreign_or_active_daemon_blocks_route')
+        for p in (launcher['REQUEST'],launcher['GUARD'],launcher['STATE']/'rootlesskit/child_pid'):
+            require(not p.exists() and not p.is_symlink(), 'prior_or_uncertain_route_blocks_start')
+        limits=_route_limits(fields,budget())
+        web=web_module().route_web(native['web']) if 'web' in native else None
+        endpoints=LOCAL_ENDPOINTS if 'deployment' not in native else profile_module().network_endpoints(native['deployment'])
+        require(endpoints==launcher['ENDPOINTS'], 'a0_route_configured_endpoint_policy_unavailable')
+        tools={}
+        for name,path in launcher['tool_paths']().items():
+            info=path.lstat()
+            require(path.resolve()==path and stat.S_ISREG(info.st_mode) and not info.st_mode&0o022
+                    and info.st_mode&0o111, 'route_tool_changed')
+            tools[name]=sha(path);budget()
+        request={'schema':'friday.a0.local-route-request.v1',
+                 'owner':native['owner_slot']+':'+binding['existing_task_id']+'#1', 'nonce':secrets.token_hex(16),
+                 'accepted_unix':binding['created_at_unix'], 'deadline_unix':binding['deadline_unix'],
+                 'original_budget_seconds':binding['budget_seconds'],
+                 'accepted_monotonic_ns':acceptance['accepted_monotonic_ns'],
+                 'launcher_sha256':native['launcher']['sha256'], 'policy_sha256':launcher['policy_hash'](web),
+                 'tools':tools,'endpoints':endpoints,
+                 'host':{'association_sha256':digest(binding),'boot_id':acceptance['boot_id'],
+                         'deployment_sha256':digest(native.get('deployment'))}}
+        if web is not None:request['web']=web
+        launcher['checked_request'](request)
+        root=private(binding['workspace_reference'],directory=True)
+        stops={}
+        for key,name,source in [('stop_source','a0-route-stop.py','runtime'),
+                                 ('stop_launcher','a0-route-launcher.py','launcher')]:
+            source_path=Path(native[source]['path']);data=source_path.read_bytes()
+            require(hashlib.sha256(data).hexdigest()==native[source]['sha256'], 'route_stop_source_changed')
+            path=root/name;_exclusive_bytes(path,data);path.chmod(0o400);sync_dir(root)
+            stops[key]={'path':str(path),'sha256':native[source]['sha256']}
+        raw=(launcher['canonical'](request)+'\n').encode()
+        route={'schema':'friday.a0.host-route.v1','association':binding,'acceptance':acceptance,
+               'request':request,'request_sha256':hashlib.sha256(raw).hexdigest(), **stops,
+               'daemon_limits':limits,'docker':native['docker'],'pending':'request','daemon':None,'network':None,'samples':[],
+               'request_published':False,'daemon_attempted':False,'network_attempted':False,'settlement':None}
+        route['network_removed']=False
+        retain(route);budget()
+        launcher['owned_directory'](launcher['REQUEST'].parent)
+        _exclusive_bytes(launcher['REQUEST'],raw)
+        route['request_published']=True;route['pending']=None;retain(route);budget()
+        # Reobserve all admission inputs before the one daemon start. No
+        # set-property, reload, unit replacement or borrowed historical permit.
+        fields=_route_unit(launcher,Runtime._command,min(5,budget()))
+        require(fields['ActiveState'] in ('inactive','failed') and fields['MainPID']=='0'
+                and cgroup_snapshot(launcher['SERVICE_GROUP'])['populated'] is False,
+                'foreign_or_active_daemon_blocks_route')
+        rechecked=_route_limits(fields,budget())
+        require(all(rechecked[k]==limits[k] for k in ('runtime_seconds','start_seconds','stop_seconds')),
+                'route_native_deadline_changed')
+        launcher['request_checked'](os.getuid());budget()
+        route['daemon_attempted']=True;route['pending']='daemon';retain(route);budget()
+        Runtime._command(['/usr/bin/systemctl','--user','start',DAEMON],min(5,budget()))
+        fields=_route_unit(launcher,Runtime._command,min(5,budget()))
+        require(fields['ActiveState']=='active' and re.fullmatch('[0-9a-f]{32}',fields['InvocationID']),
+                'route_daemon_start_unknown')
+        started=int(fields['ActiveEnterTimestampMonotonic'])/1e6
+        require(acceptance['accepted_monotonic_ns']/1e9 <= started <= time.monotonic()
+                and started+limits['runtime_seconds']+limits['stop_seconds'] <=
+                acceptance['accepted_monotonic_ns']/1e9+binding['budget_seconds']-25,
+                'route_native_deadline_changed')
+        route['daemon']=_route_guard(route,launcher,fields);route['pending']='sample';retain(route)
+        route['samples'].append(cgroup_snapshot(launcher['SERVICE_GROUP']))
+        route['pending']=None;retain(route);budget()
+        n=_route_descriptor(route,launcher)
+        launcher['observe_guard'](n,budget=budget)
+        require(not Runtime._command([str(DOCKER),'--host',SOCKET,'ps','-aq'],min(5,budget())).strip(),
+                'foreign_container_blocks_route')
+        # Both a historical bridge and an ambiguous earlier attempt refuse.
+        raw=Runtime._command([str(DOCKER),'--host',SOCKET,'network','ls','--format={{json .}}'],min(5,budget()))
+        listing=[launcher['exact_json'](line) for line in raw.splitlines()]
+        require(len({x.get('Name') for x in listing})==len(listing)
+                and all((x.get('Name'),x.get('Driver')) in {('bridge','bridge'),('host','host'),('none','null')}
+                        for x in listing), 'prior_docker_network_requires_reconciliation')
+        route['network_attempted']=True;route['pending']='network';retain(route);budget()
+        argv=[str(DOCKER),'--host',SOCKET,'network','create','--driver=bridge',
+              '--opt=com.docker.network.bridge.name='+n['bridge'],
+              '--opt=com.docker.network.bridge.enable_icc=false',
+              '--label=friday.rework.owner='+n['owner'],'--label=friday.rework.route='+n['nonce'],n['name']]
+        cid=Runtime._command(argv,min(5,budget())).strip()
+        require(re.fullmatch('[0-9a-f]{64}',cid), 'route_bridge_submission_unknown')
+        n['id']=cid
+        xs=launcher['exact_json'](Runtime._command([str(DOCKER),'--host',SOCKET,'network','inspect',cid],min(5,budget())))
+        require(isinstance(xs,list) and len(xs)==1, 'route_bridge_submission_unknown')
+        network_checked(n,xs[0]);launcher['observe_guard'](n,budget=budget)
+        route['network']=n;route['pending']=None;retain(route);budget()
+        return route
+
+
+def stop_route(route, *, retain, container_id=None):
+    """Exact recorded custody only; no work clock, launch validation or restart.
+
+    Missing immutable daemon evidence remains unknown even after its independent
+    native timeout. An uncertain network create can be reconciled once by this
+    current request's name/nonce under the recorded daemon, never resubmitted.
+    """
+    if route['settlement'] is not None:return route
+    route=json.loads(json.dumps(route));l=_route_launcher(route)
+    require(Path('/proc/sys/kernel/random/boot_id').read_text().strip()==route['acceptance']['boot_id'],
+            'STOP_UNCONFIRMED; original route boot changed')
+    require(str(DOCKER)==route['docker']['path'] and sha(DOCKER)==route['docker']['sha256'], 'docker_binary_changed')
+    request_bytes=(l['canonical'](route['request'])+'\n').encode()
+    checks=[];network_removed=not route['network_attempted'] or route['network_removed']
+    history_incomplete=route['pending']=='sample'
+    if route['daemon_attempted']:
+        fields=_route_unit(l,Runtime._command,3)
+        if route['daemon'] is None:
+            # Only an actual private original guard can resolve a lost start ACK.
+            route['daemon']=_route_guard(route,l,fields);route['pending']='sample';retain(route)
+        g=route['daemon']['receipt'];inv=g['context']['invocation_id']
+        require(fields['InvocationID']==inv, 'STOP_UNCONFIRMED; daemon invocation changed')
+        live=fields['ActiveState'] not in ('inactive','failed') or fields['MainPID']!='0'
+        if live:
+            require(_route_guard(route,l,fields)==route['daemon'], 'STOP_UNCONFIRMED; daemon identity changed')
+            sample=cgroup_snapshot(l['SERVICE_GROUP']);route['samples'].append(sample);retain(route)
+            if route['network_attempted'] and not route['network_removed']:
+                n=route['network'] or _route_descriptor(route,l)
+                target=n.get('id',n['name'])
+                xs=l['exact_json'](Runtime._command([str(DOCKER),'--host',SOCKET,'network','inspect',target],3))
+                require(isinstance(xs,list) and len(xs)==1, 'STOP_UNCONFIRMED; network outcome unknown')
+                if 'id' not in n:n['id']=xs[0].get('Id')
+                network_checked(n,xs[0],container_id=container_id)
+                if xs[0]['Containers']:
+                    # Only the recorded already-stopped worker endpoint. Keep
+                    # all container/results/source bytes; do not remove it.
+                    objs=l['exact_json'](Runtime._command([str(DOCKER),'--host',SOCKET,'inspect',container_id],3))
+                    require(isinstance(objs,list) and len(objs)==1 and objs[0].get('Id')==container_id
+                            and objs[0].get('State',{}).get('Running') is False
+                            and objs[0].get('State',{}).get('Pid')==0,
+                            'STOP_UNCONFIRMED; network worker not stopped')
+                    Runtime._command([str(DOCKER),'--host',SOCKET,'network','disconnect',n['id'],container_id],3)
+                    xs=l['exact_json'](Runtime._command([str(DOCKER),'--host',SOCKET,'network','inspect',n['id']],3))
+                    require(isinstance(xs,list) and len(xs)==1, 'STOP_UNCONFIRMED; network disconnect unknown')
+                    network_checked(n,xs[0])
+                if route['network'] is None:route['network']=n;retain(route)
+                Runtime._command([str(DOCKER),'--host',SOCKET,'network','rm',n['id']],3)
+                # Docker's actual successful immutable-ID removal is the ACK;
+                # a lost response stays uncertain rather than being retried.
+                network_removed=True
+                route['network_removed']=True;retain(route)
+            require(not Runtime._command([str(DOCKER),'--host',SOCKET,'ps','-q'],3).strip(),
+                    'STOP_UNCONFIRMED; foreign running container')
+            latest=_route_unit(l,Runtime._command,3)
+            require(latest['InvocationID']==inv and _route_guard(route,l,latest)==route['daemon'],
+                    'STOP_UNCONFIRMED; daemon changed before stop')
+            Runtime._command(['/usr/bin/systemctl','--user','stop',DAEMON],20)
+            fields=_route_unit(l,Runtime._command,3)
+        require(fields['InvocationID']==inv and fields['ActiveState'] in ('inactive','failed')
+                and fields['MainPID']=='0', 'STOP_UNCONFIRMED; daemon stop unknown')
+        # Cgroup disappearance alone cannot erase a surviving sampled process.
+        identity_sample={'group':l['SERVICE_GROUP'],'populated':True,
+                         'processes':[{'pid':p['pid'],'start_ticks':int(p['start']),'state':'S'}
+                                      for p in (g['daemon'],g['context']['parent'])]}
+        checks=[cessation(s) for s in [*route['samples'],identity_sample]]
+        require(not history_incomplete and route['samples'] and all(x['confirmed'] for x in checks),
+                'STOP_UNCONFIRMED; daemon descendants or interrupted history')
+    require(network_removed, 'STOP_UNCONFIRMED; retained bridge needs reconciliation')
+    # Keep exact route receipts if any native outcome remains uncertain.
+    for path,expected in [(l['REQUEST'],request_bytes),
+                           (l['GUARD'],None if route['daemon'] is None else route['daemon']['receipt'])]:
+        if path.exists() or path.is_symlink():
+            data=l['stable_bytes'](path,os.getuid())
+            require((data==expected if isinstance(expected,bytes) else expected is not None and l['exact_json'](data.decode())==expected),
+                    'STOP_UNCONFIRMED; foreign route receipt')
+            path.unlink();sync_dir(path.parent)
+    route['pending']=None
+    route['settlement']={'status':'STOP_CONFIRMED','request_removed':True,'guard_removed':True,
+                         'network_removed':True,'daemon_checks':checks}
+    retain(route)
+    return route
 
 
 def plan(accepted_unix, deadline_unix, *, assignment, generation, owner_slot,

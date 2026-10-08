@@ -329,7 +329,8 @@ def a0_binding(value, associations, row):
 class A0HostSession:
     """One association's cached ownership, original KeyMaterial and boundary.
 
-    Construction/recovery are pure. Only Controller.prepare calls launch.
+    Construction/recovery are pure. The fresh host producer prepares the route;
+    only Controller.prepare creates and starts the worker container.
     A restarted session has stop-only authority and never recovers secrets.
     """
     def __init__(self, config, store, row):
@@ -361,6 +362,10 @@ class A0HostSession:
         self.preparing = False
         self.plan = copy.deepcopy((row['host']['a0']['launch'] or {}).get('plan'))
         self.grant = copy.deepcopy(row['host']['a0']['grant'])
+        self.route = copy.deepcopy(row['host']['a0'].get('route'))
+        self.route_preparing = False
+        self.route_only_confirmed = False
+        self.route_module = None
 
     def _same(self, row):
         from .adapters.dsh import _identity
@@ -552,13 +557,40 @@ class A0HostSession:
             raise HostUnavailable('a0_runtime_native_pin_mismatch')
         return p
 
-    def produce_capability(self, row):
-        """One current native observation for this fresh, input-retained row.
+    def _retain_route(self, row, route):
+        # Preserve actual native IDs before fallible metadata I/O. A lost ACK
+        # may not turn either a submitted operation or its stop into a retry.
+        self.route = copy.deepcopy(route)
+        return self.store.retain_a0_route(row['existing_task_id'], row['owner'], route)
 
-        This creates only evidence files. The existing route owner must already
-        have prepared the exact request/guard/bridge under these original
-        clocks. Unknown or missing preparation is refused without native start,
-        network creation, implicit retry, keys or worker admission.
+    def _route_module(self):
+        if self.route_module is None:
+            import types
+            pin = _pin(self.route['stop_source'])
+            m = types.ModuleType('frw_recorded_a0_route_stop');m.__file__=str(pin.path)
+            exec(compile(pin.read(),str(pin.path),'exec'),m.__dict__)
+            self.route_module=m
+        return self.route_module
+
+    def _stop_route(self, row):
+        if self.route is None:return
+        m=self._route_module()
+        def retain_stop(value):
+            try:self._retain_route(row,value)
+            except BaseException:
+                # Stop authority is the cached checked native identity. Damaged
+                # storage cannot withhold cleanup; it still cannot release a row.
+                pass
+        self.route=m.stop_route(self.route,retain=retain_stop,
+                               container_id=None if self.created is None else self.created['container_id'])
+        if self.route_preparing:
+            raise HostUnavailable('STOP_UNCONFIRMED; route preparation in flight')
+
+    def produce_capability(self, row):
+        """One real per-row preparation followed by the existing current probes.
+
+        Native pre-container deadline admission precedes request/daemon/bridge
+        effects; source completion never establishes deployment qualification.
         """
         from .adapters.dsh import _identity
         from .host_record import digest
@@ -567,7 +599,8 @@ class A0HostSession:
         if (self.capability_attempted or a['capability'] is not None or a['launch'] is not None
                 or row['host']['inputs'] is None or row['preparation_reserved']
                 or row['submission_observation'] != 'NOT_SUBMITTED'
-                or row['host']['terminal'] is not None or row['host']['quiescence'] is not None):
+                or row['host']['terminal'] is not None or row['host']['quiescence'] is not None
+                or a.get('route') is not None):
             raise HostUnavailable('a0_capability_production_not_admitted')
         self.capability_attempted = True
         check_a0_runtime(self.config, self.store)
@@ -578,9 +611,18 @@ class A0HostSession:
         if (str(m.LAUNCHER) != native['launcher']['path'] or str(m.DOCKER) != native['docker']['path']
                 or str(m.PROJECT/'.runtime/rootless-docker/supervisor/friday-rework-docker.service') != native['daemon_unit']['path']):
             raise HostUnavailable('a0_runtime_native_pin_mismatch')
+        self.route_preparing=True
+        try:
+            m.prepare_route(_identity(row), a['acceptance'], native,
+                retain=lambda value:self._retain_route(row,value),budget=lambda:self._startup_left(row))
+        finally:
+            self.route_preparing=False
         network = m.current_network(_identity(row), a['acceptance'],
             owner_slot=native['owner_slot'], launcher_sha256=native['launcher']['sha256'],
             docker_sha256=native['docker']['sha256'], deployment=native.get('deployment'), web=native.get('web'))
+        if self.route is not None and (self.route['pending'] is not None
+                or self.route['network'] != network or self.route['settlement'] is not None):
+            raise HostUnavailable('a0_route_custody_changed')
         plan = self._plan(m, self._current(row), network)
         runtime = m.Runtime(plan, budget=lambda: self._startup_left(row))
         # Same current route consumer used by native preparation/API admission;
@@ -747,6 +789,15 @@ class A0HostSession:
         self._same(row);self.cancelled=True
         self.startup_active=False # Owned stop is never withheld by an expired launch budget.
         from .adapters.a0_native import A0NativeBoundary, NativeGrant
+        if self.route is not None and self.plan is None:
+            # A0 has not created a container, but the route may own effects.
+            # Even a missing worker unit says nothing about daemon custody.
+            self._stop_route(row)
+            unit=NativeSupervisor().observe(row)
+            if not unit.missing or not unit.quiescent:
+                raise HostUnavailable('STOP_UNCONFIRMED; unexpected pre-container worker')
+            self.unit=unit;self.route_only_confirmed=True;self.native_cessation=True
+            return unit
         if self.boundary is None:
             if self.grant is not None:
                 self.boundary=self._boundary(row,stop_only=True)
@@ -774,6 +825,7 @@ class A0HostSession:
             if self.observation_pending or not self.retained_samples:
                 raise HostUnavailable('STOP_UNCONFIRMED; retained observations incomplete')
             self.native_cessation=True
+        self._stop_route(row)
         if self.keys is None:
             if self.key_cleanup != 'REMOVED' and (not self.no_create_confirmed or self.key_preparation_attempted):
                 self.key_cleanup='RECONCILIATION_REQUIRED'
@@ -788,6 +840,10 @@ class A0HostSession:
         from dataclasses import asdict
         from .host_record import digest
         if not self.native_cessation or self.unit is None:return None
+        if self.route is not None and self.route['settlement'] is None:return None
+        if self.route_only_confirmed:
+            return {'kind':'a0_route','at_unix':self.store.clock(),
+                    'observation':{'route_sha256':digest(self.route)}}
         if self.no_create_confirmed:
             return {'kind':'a0_no_create','at_unix':self.store.clock(),'observation':{
                 'unit':asdict(self.unit),'plan_sha256':self.runtime.p['identity'],
