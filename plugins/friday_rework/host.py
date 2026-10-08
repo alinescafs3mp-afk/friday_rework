@@ -190,6 +190,10 @@ class WorkerHost:
         dispatch. The producer observes native state before attaching once.
         """
         row, session = self._a0_producer_session(task_id, owner)
+        # A repeated producer call owns no new submission. Reject it before
+        # the cleanup boundary of the original in-flight or attached route.
+        if session.capability_attempted:
+            raise HostUnavailable('a0_capability_production_not_admitted')
         try:
             pin = session.produce_capability(row)
             return self.attach_a0_capability(task_id, owner, pin)

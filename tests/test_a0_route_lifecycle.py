@@ -186,6 +186,9 @@ async def test_actual_ordinary_preparation_precedes_current_probe_and_single_dis
     invoke(setup,proof,args=s.args)
     with pytest.raises(Exception):s.host_producer(row['existing_task_id'],row['owner'])
     assert len(s.schedules)==st.start_count==st.create_count==1
+    assert current(setup,row)['stop_intent'] is None
+    assert current(setup,row)['host']['a0']['route']['settlement'] is None
+    assert st.daemon_stops==st.network_removals==0 and st.active and st.network_exists
     stopped=setup.host._stop(row,'pause')
     assert stopped['stop_intent']=='pause' and stopped['host']['quiescence']['kind']=='a0_route'
     assert stopped['host']['terminal']['state']=='stopped'
