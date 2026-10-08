@@ -1,5 +1,27 @@
 # Foundation checkpoint — 2026-10-08
 
+Credential installation, 03:20 MSK: ordinary native completion now accepts
+explicit protected JSON/dotenv references and writes exactly the selected
+credentials through Hermes' existing credential lifecycle and receiving-profile
+scope. Planning reads no secret contents. Existing credential or lock files
+refuse before writes; a partial installation retains its files and cannot
+silently replay. Public errors remain fixed and per-phase logs stay private.
+
+Independent review found and closed a native lock-alias truncation defect before
+any real keys were used. The final changed-area and dependency gate passed 98
+checks; nine additional independent controls passed. The earlier 243-check
+baseline is reused only for unchanged integration. This proves synthetic native
+storage, read-back and password login, not actual provider authentication or a
+cold product start. No real credentials were read in this source task.
+
+A separately admitted native keyless search completed at 02:54 MSK and retained
+two useful Python documentation results, with actual namespace completion and
+execution-slot release verified. It is one provider execution, not an autonomous
+conversation or worker journey. Whole-operation web custody remains unaccepted:
+independent review of the private process-registry integration found incorrect
+stop/reset behavior and provider/cache parity gaps. Those changes are under
+repair and are not included in this published candidate.
+
 Preflight repair, 02:39 MSK: the normal continuation now performs its two
 completed-PM checks with a read-only root mount in the existing PID boundary
 and retains their private diagnostics. It requests no nested sandbox and has
@@ -51,9 +73,9 @@ service credentials separate. This does not grant A0 execution or warm reuse.
 
 | Capability | Source/configuration/wiring | Offline verification | Live execution | Release acceptance |
 |---|---|---|---|---|
-| Hermes/Harness keyless web | Explicit native provider plus intact Harness ctx.web; fixed outgoing search and passive metadata handling | Changed integration: 128 passing checks; three separate native Harness search/fetch/refusal controls used synthetic external bytes | Earlier exact provider call refused; useful search on this revision not proven | Pending |
+| Hermes/Harness keyless web | Explicit native provider plus intact Harness ctx.web; fixed outgoing search and passive metadata handling | Changed integration: 128 passing checks; three separate native Harness search/fetch/refusal controls used synthetic external bytes | One independently admitted native keyless search returned two useful official documentation results; conversation and worker application unproven | Pending |
 | Both-worker profile and shared result path | Connected to host, onboarding, health and native credential consumer; no fallback between workers | Both tiers and credential-domain mutations checked against the actual native consumer | A0 capability/service/network/start admission and mixed execution not run | Pending |
-| Authenticated installer and administrative UI | Complete twenty-layer source; actual native Python executable accepted by the bounded installer plan | Bootstrap identity/size/change controls and prior installer gates retained | Actual Hermes source/dependencies/frontend/profile/TLS prepared; Harness installation failed, added continuation preflight refused; cold start and two-user administration unaccepted | Pending |
+| Authenticated installer and administrative UI | Complete twenty-layer source; selected native credential provisioning connected to ordinary completion | Final credential/dependency gate 98 PASS plus 9 independent controls; unchanged installer evidence retained | Actual Hermes source/dependencies/frontend/profile/TLS prepared; prior Harness installation and continuation remain stopped; real credential provisioning, cold start and two-user administration unaccepted | Pending |
 | Telegram, continuation and delivery | Existing host/result paths retained; continuation and repository handoff under implementation | Component evidence only | Real Telegram, executed goal verification and mixed delivery not proven | Pending |
 
 The native Python executable is hashed incrementally under its own 256 MiB
