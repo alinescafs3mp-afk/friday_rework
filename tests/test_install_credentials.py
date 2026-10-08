@@ -89,6 +89,16 @@ def test_dotenv_selection_does_not_expand_or_import_unselected_values(prepared):
         assert owned_values(home)==values
 
 
+def test_json_source_names_preserve_case_and_only_selected_values(prepared):
+    home,bundle,values,source,refs=prepared
+    source.write_text(json.dumps({'selected_'+key.lower():value for key,value in values.items()}))
+    for name,row in refs.items():row['name']='selected_'+name.lower()
+    with native_home(home):
+        creds.provision(refs,bundle,home,Budget(30))
+        from hermes_cli.friday_credential_admission import owned_values
+        assert owned_values(home)==values
+
+
 @pytest.mark.parametrize('name', ['.env', 'auth.json'])
 def test_existing_native_credentials_never_replaced(prepared,name):
     home,bundle,values,source,refs=prepared

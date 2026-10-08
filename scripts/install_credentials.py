@@ -17,14 +17,14 @@ def references(value):
     require(isinstance(value, dict) and 0 < len(value) <= 64,
             'explicit_credential_references_required')
     for target, source in value.items():
-        require(isinstance(target, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,127}', target),
+        require(isinstance(target, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,127}', target),
                 'credential_reference_name_invalid')
         require(isinstance(source, dict) and set(source) == {'path', 'format', 'name'},
                 'credential_reference_fields_invalid')
         require(isinstance(source['path'], str), 'credential_source_path_invalid')
         canonical(source['path'])
         require(source['format'] in ('dotenv', 'json') and isinstance(source['name'], str)
-                and re.fullmatch(r'[A-Z][A-Z0-9_]{0,127}', source['name']),
+                and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,127}', source['name']),
                 'credential_source_selection_invalid')
     return value
 
