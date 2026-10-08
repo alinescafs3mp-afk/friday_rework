@@ -145,7 +145,11 @@ def test_normal_pending_cannot_activate_or_publish_blocking_marker(normal_env):
 
 
 def test_old_valid_same_template_home_keeps_its_original_contract(normal_env):
-    e=normal_env;legacy_prepare(e);secrets(e);grant(e);assert activate(e)['enabled']
+    e=normal_env;legacy_prepare(e)
+    for name in json.loads((home(e)/scope.ONBOARDING).read_text())['required_secrets']:
+        e.setup.credentials('default',session=e.operator,expected_config_sha256=cas(e),
+            generation=row(e)['generation'],**ident(),name=name,value='synthetic-legacy-key')
+    grant(e);assert activate(e)['enabled']
     h=home(e);p=h/scope.ONBOARDING;marker=h/scope.MARKER
     # Exact historical unextended receipt shape, synthetic existing home.
     old=json.loads(p.read_text());assert 'required_workers' not in old
