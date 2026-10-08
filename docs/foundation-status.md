@@ -1,6 +1,28 @@
 # Foundation checkpoint — 2026-10-08
 
-Current checkpoint, 12:34 MSK: ordinary-user onboarding now prepares both
+Current checkpoint, 14:53 MSK: disabled own-profile setup and the normal
+both-worker installer now create the initial A0 qualification probe through
+the existing route, native runtime and custody path. The operator no longer
+has to attach another user's probe. Qualification consumes the exact profile,
+access generation, protected configuration and original installation clock.
+
+Independent review closed three bootstrap defects: the installer recognizes
+its own protected intermediate state; failed descendant observations remain
+uncertain even after a later successful sample; and startup waits within the
+original deadline for the exact invocation and container. Uncertain cleanup
+cannot remove credentials, retire custody or enable access. A retained failed
+attempt stays inspectable and cannot silently replay.
+
+The final affected source gate passed 647 distinct checks. Independent review
+and two additional installer controls passed; both controls also passed from
+the merged checkout. Native transport replies in these controls are explicit
+offline fixtures. They do not establish installed A0 or product acceptance.
+The journal prerequisite still blocks native A0 admission. The owner has now
+reported successful installation of the protected browser profile; actual
+sandbox verification remains pending. All seven installed user journeys and
+all four autonomous-web contexts remain unaccepted; old Friday stays stopped.
+
+Earlier checkpoint, 12:34 MSK: ordinary-user onboarding now prepares both
 private worker environments through the existing administrative flow. The
 owning host consumes qualification evidence for that exact user, receiving
 account, profile and access generation before activation. Operator receipts

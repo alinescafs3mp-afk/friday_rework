@@ -71,11 +71,11 @@ const context = {
       if (input.uncertain) throw Error("Explicit offline transport uncertainty");
       data = input.worker_state || {state:"DISABLED_SETUP_PENDING",enabled:false,can_prepare_workers:false,
         can_qualify_workers:!!input.normal_qualified,can_activate:false,required_workers:["dsh","a0"],
-        worker_execution:"PENDING_OWN_A0_NATIVE_PROBE_AND_QUALIFICATION",workers:{
+        worker_execution:"PENDING_OWN_A0_NATIVE_PREREQUISITES_AND_QUALIFICATION",workers:{
           dsh:{state:"PREPARED_RUNTIME_UNOBSERVED"},a0:{state:"PREPARED_RUNTIME_UNOBSERVED"}}};
     } else if (path.endsWith("/onboarding/workers/state")) data = input.worker_state || {
       state:"DISABLED_SETUP_PENDING",enabled:false,can_prepare_workers:false,can_qualify_workers:!!input.normal_qualified,
-      can_activate:false,required_workers:["dsh","a0"],worker_execution:"PENDING_OWN_A0_NATIVE_PROBE_AND_QUALIFICATION",
+      can_activate:false,required_workers:["dsh","a0"],worker_execution:"PENDING_OWN_A0_NATIVE_PREREQUISITES_AND_QUALIFICATION",
       workers:{dsh:{state:"PREPARED_RUNTIME_UNOBSERVED"},a0:{state:"PREPARED_RUNTIME_UNOBSERVED"}}};
     else if (path.endsWith("/onboarding/workers/qualify")) data = {state:"CONFIGURED_NATIVE_ACTIVATION_REQUIRED",
       enabled:false,can_activate:true,can_prepare_workers:false,can_qualify_workers:false,
@@ -155,20 +155,20 @@ const click = async label => {render(); const node = find(tree, label); assert(n
     assert(find(tree,"Prepare required workers").props.disabled);
     assert(find(tree,"Activate complete profile").props.disabled);
     if (input.uncertain) {
-      assert(text(tree).includes("unconfirmed"));assert(find(tree,"Check required workers").props.disabled);
+      assert(text(tree).includes("unconfirmed"));assert(find(tree,"Prepare and check required workers").props.disabled);
       observations.push("UNCERTAINTY_NO_RESUBMISSION");
     }
     await click("Inspect worker setup");
-    assert(text(tree).includes("Engineering worker needs an admitted host probe and qualification"));
+    assert(text(tree).includes("Workers need the host's native prerequisites and qualification"));
     observations.push("AUTHORITATIVE_WORKER_STATE_PRESERVED_AND_RENDERED");
     if (input.normal_qualified) {
-      await click("Check required workers");
+      await click("Prepare and check required workers");
       assert(!find(tree,"Activate complete profile").props.disabled);
       assert(text(tree).includes("Both workers qualified; useful live journeys unverified"));
       observations.push("QUALIFIED_REQUIRED_WORKERS_ENABLE_ACTIVATION");
       await click("Activate complete profile");assert(find(tree,"Activate complete profile").props.disabled);
     } else {assert(find(tree,"Activate complete profile").props.disabled);
-      assert(find(tree,"Check required workers").props.disabled);}
+      assert(find(tree,"Prepare and check required workers").props.disabled);}
     for (const r of requests) {assert.equal(r.credentials,"include");assert.equal(r.headers["x-hermes-session-token"],input.token);}
     process.stdout.write(JSON.stringify({observations,requests,count:observations.length,source_fixture:true,browser_live:"NOT_RUN"}));return;
   }

@@ -23,6 +23,7 @@ from test_admin_repair import basic_app
 from hermes_cli import friday_user_scope as scope
 from hermes_cli.config import require_readable_config_before_write
 from friday_admin_controls import user_worker_join as join, host_runtime as hr
+from friday_admin_controls import a0_bootstrap as bootstrap
 from tools.configure_product import compose_product
 from plugins.friday_rework.adapters.a0_profile import legacy_profile
 
@@ -38,6 +39,21 @@ def prepare(e,uid='1',**changes):
 def normal_env(env):
     d,_=inputs(env);a,_=inputs(env,worker='a0')
     deployment=legacy_profile()
+    # Native interfaces below are explicitly offline. The retained stop source
+    # is an executable fixture, never an installed service/permission receipt.
+    source=Path(a['a0']['runtime']['path'])
+    source.write_text('''# EXPLICIT OFFLINE NATIVE STOP FIXTURE, NOT LIVE ACCEPTANCE
+def stop_route(route, *, retain, container_id=None):
+    route['settlement']={'status':'STOP_CONFIRMED','request_removed':True,
+        'guard_removed':True,'network_removed':True,'daemon_checks':[{'confirmed':True,'fixture':True}]}
+    retain(route)
+    return route
+''')
+    a['a0']['runtime']=pin(source)
+    project=source.parent/'fixture-native-project'
+    daemon=project/'.runtime/rootless-docker/supervisor/friday-rework-docker.service'
+    daemon.parent.mkdir(mode=0o700,parents=True);daemon.write_text('EXPLICIT OFFLINE SERVICE');daemon.chmod(0o600)
+    a['a0']['daemon_unit']=pin(daemon)
     for kind,c in (('dsh',d),('a0',a)):
         base=env.home/'workers'/kind
         c.update(runtime_home=str(env.home),runtime_profile='default',workspace_root=str(base/'jobs'),
@@ -64,6 +80,8 @@ def action(e,name,uid='1',**changes):
 
 def pending(e,uid='1'):
     p=prepare(e,uid);r=action(e,'prepare',uid);secrets(e,uid);grant(e,uid)
+    e.setup.credentials('default',session=e.operator,expected_config_sha256=cas(e),
+        generation=row(e,uid)['generation'],**ident(uid),name='SEARXNG_SECRET',value='synthetic-web-secret-'+('x'*32))
     assert r['required_workers']==['dsh','a0'] and not r['can_activate']
     return p,r
 
@@ -79,15 +97,77 @@ def fixture_native(e,monkeypatch,uid='1',bad=None):
         monkeypatch.setattr(a0,name,path)
     prepared={k:json.loads((h/'workers'/k/'runtime-input.json').read_text())['runtime'] for k in ('dsh','a0')}
     c=prepared['a0'];a=c['a0'];now=time.time()
-    native.write_text(json.dumps({'association_binding':{'owner':{'profile':'user-'+uid,'bot_id':'bot-A','user_id':uid},
+    plan_template={'association_binding':{'owner':{'profile':'user-'+uid,'bot_id':'bot-A','user_id':uid},
         'workspace_reference':str(h/'workers/a0/jobs/native-fixture')},'deployment':a['deployment'],'web':a['web'],
         'git_metadata':a['git_metadata'],'network':{'id':'f'*64,'launcher_sha256':a['launcher']['sha256'],
             'policy_sha256':a['policy']['sha256']},'code_sha256':a['runtime']['sha256'],
         'docker_sha256':a['docker']['sha256'],'daemon_unit_sha256':a['daemon_unit']['sha256'],
-        'accepted_unix':now-1,'deadline_unix':now+300}));native.chmod(0o600)
+        'accepted_unix':now-1,'deadline_unix':now+300,'owner_slot':a['owner_slot'],'mode':'runtime'}
     m=SimpleNamespace(validate=lambda p,**kw:p,remaining=lambda p: 300,
-        probe_report_checked=a0.probe_report_checked,MEMORY=2*1024**3,PIDS=128)
+        probe_report_checked=a0.probe_report_checked,MEMORY=a0.MEMORY,PIDS=a0.PIDS,
+        RuntimeStopUnconfirmed=a0.RuntimeStopUnconfirmed)
     monkeypatch.setattr(hr,'a0_runtime_module',lambda c:m)
+    from friday_admin_controls import a0_bootstrap as bootstrap
+    monkeypatch.setattr(bootstrap,'a0_runtime_module',lambda c:m)
+    m.PROJECT=Path(a['daemon_unit']['path']).parents[3];m.DAEMON='friday-rework-docker.service'
+    m.DOCKER=Path(a['docker']['path']);m.LAUNCHER=Path(a['launcher']['path'])
+    m.private=a0.private;m.write_json=a0.write_json;m.sha=a0.sha;m.HEALTH_SCRIPT=a0.HEALTH_SCRIPT
+    m.effect_calls=[];m.owned_running=False
+    def preflight(*args,**kw):m.effect_calls.append('READONLY_PREFLIGHT');kw['budget']()
+    m.route_preflight=preflight
+    def route(identity,acceptance,native,*,retain,budget):
+        m.effect_calls.append('ROUTE')
+        budget();path=Path(identity['workspace_reference'])/'recorded-stop.py'
+        path.write_bytes(Path(native['runtime']['path']).read_bytes());path.chmod(0o400)
+        v={'association':identity,'acceptance':acceptance,'pending':None,
+           'network':dict(plan_template['network']), 'settlement':None,'stop_source':pin(path)}
+        retain(v);return v
+    m.prepare_route=route;m.current_network=lambda *a,**kw:dict(plan_template['network'])
+    def plan(accepted,deadline,**kw):
+        return dict(plan_template,association_binding=kw['association_binding'],
+            accepted_unix=accepted,deadline_unix=deadline,accepted_monotonic_ns=kw['accepted_monotonic_ns'],
+            boot_id=kw['boot_id'],original_budget_seconds=kw['original_budget_seconds'])
+    m.plan=plan
+    class NativeRuntimeFixture:
+        def __init__(self,p,*,budget):
+            self.p=p;self.budget=budget;self.known=None;self.create_attempted=False
+            self.root=Path(p['association_binding']['workspace_reference'])/'native-fixture';self.receipt_path=self.root/'native.json'
+            if self.receipt_path.exists():self.known=json.loads(self.receipt_path.read_text())
+            self.supervisor=SimpleNamespace(observe=lambda row:SimpleNamespace(missing=False,
+                quiescent=not m.owned_running,invocation_id='b'*32))
+        def start(self,path,sha,*,before_ui,on_created):
+            m.effect_calls.append('START')
+            self.root.mkdir(mode=0o700);usr=self.root/'usr';usr.mkdir(mode=0o700)
+            (usr/'.env').write_text('');(usr/'.env').chmod(0o600);(usr/'web').mkdir(mode=0o700)
+            before_ui(usr);self.create_attempted=True
+            self.known={'container_id':'e'*64,'invocation_id':'b'*32,'observations':[],'plan_sha256':a0.digest(self.p)}
+            m.owned_running=True
+            on_created(self.known);a0.write_json(self.receipt_path,self.known)
+        def receipt(self):return self.known
+        def locked(self):
+            from contextlib import nullcontext
+            return nullcontext()
+        def inspect(self,r,**kw):return {'State':{'Running':m.owned_running,'Pid':77 if m.owned_running else 0}}
+        def association(self,r):return r
+        def snapshot_container(self,obj):return {'group':'/user.slice/OFFLINE','populated':True,
+            'processes':[{'pid':77,'start_ticks':1}]}
+        def docker(self,*args,**kw):return json.dumps({'http':200,'gitinfo_present':True,'native_error_present':False})
+        def stop(self):
+            m.effect_calls.append('STOP');m.owned_running=False
+            return {'status':'STOP_CONFIRMED','container_id':'e'*64,
+                'native_container_stopped':True,'descendant_checks':[{'confirmed':True,'fixture':True}]}
+        def retire_initial_probe(self):
+            assert not m.owned_running;m.effect_calls.append('RETIRE_STOPPED_PROBE')
+            return {'status':'INITIAL_PROBE_RETIRED','container_id':'e'*64,
+                'host_state_retained':True,'image_retained':True,'volumes_removed':False}
+        def probe(self):return probe(a['deployment'])
+        def observe(self):return {'running':m.owned_running,'unit_quiescent':not m.owned_running,
+            'caps':{'memory.max':str(m.MEMORY),'memory.swap.max':'0','pids.max':str(m.PIDS),'cpu.max':'200000 100000'}}
+        def check_web(self,cid):return {'status':'CURRENT_NATIVE_WEB_SERVICE_CHECKED','version':a['web']['version'],
+            'processes':[dict(name=n,pid=i+1,start=1,statename='RUNNING') for i,n in enumerate(('run_ui','run_searxng'))]}
+        def check_network(self,**kw):return {'status':'CURRENT_LOCAL_NETWORK_CHECKED','id':'f'*64}
+    m.Runtime=NativeRuntimeFixture
+    e.native_fixture=m
     calls=[]
     def dsh(c,h,folder,budget):
         calls.append('dsh');d=c['dsh'];prefix=hashlib.sha256(str(folder).encode()).hexdigest()[:24]
@@ -105,7 +185,7 @@ def fixture_native(e,monkeypatch,uid='1',bad=None):
         if bad=='dsh-envelope':v['smoke'][0]['observation']['resource_envelope']['memory_bytes']=1
         if bad=='source':Path(d['cli']['path']).write_text('changed source')
         return v
-    def a0obs(c,ref,budget):
+    def a0obs(c,ref,budget,*,probe_owner=None):
         calls.append('a0');v={'plan':ref,'container_id':'e'*64,'invocation_id':'b'*32,
             'native_probe':probe(c['a0']['deployment']),
             'web':{'status':'CURRENT_NATIVE_WEB_SERVICE_CHECKED','version':c['a0']['web']['version'],
@@ -182,7 +262,7 @@ def test_no_own_a0_producer_is_explicit_pending_no_claim_or_observer(normal_env,
     e=normal_env;pending(e)
     from scripts import worker_qualification as q
     monkeypatch.setattr(q,'dsh_observe',lambda *a:pytest.fail('native IO before owning A0 prerequisite'))
-    r=action(e,'qualify');assert r['state']=='DISABLED_OWN_A0_NATIVE_PROBE_REQUIRED'
+    r=action(e,'qualify');assert r['state']=='DISABLED_OWN_A0_NATIVE_PREREQUISITES_PENDING'
     assert not (home(e)/join.FOLDER).exists()
     assert action(e,'qualify')['state']==r['state']  # Inspection only, no retry/claim.
     assert not row(e)['enabled'] and not (home(e)/scope.MARKER).exists()
@@ -190,12 +270,12 @@ def test_no_own_a0_producer_is_explicit_pending_no_claim_or_observer(normal_env,
 
 def test_actual_own_producer_both_consumers_and_native_admission_join(normal_env,monkeypatch):
     e=normal_env;pending(e);calls,_=fixture_native(e,monkeypatch)
-    r=action(e,'qualify');assert calls==['dsh','a0'] and r['can_activate']
+    r=action(e,'qualify');assert calls==['a0','dsh'] and r['can_activate']
     assert not r['enabled'] and all(x['qualified'] for x in r['workers'].values())
     config=require_readable_config_before_write(home(e)/'config.yaml')
     assert set(hr.configured_runtimes(config['plugins']['entries']['friday_rework']['settings']['runtime']))=={'dsh','a0'}
     assert not (home(e)/'FRIDAY-INSTALL.json').exists()
-    assert action(e,'qualify')['can_activate'] and calls==['dsh','a0']
+    assert action(e,'qualify')['can_activate'] and calls==['a0','dsh']
     assert activate(e)['enabled'] and admitted(e)[0]
 
 
@@ -214,7 +294,9 @@ def test_changed_native_evidence_cancel_keys_or_original_deadline_never_enables_
 
 @pytest.mark.parametrize('bad',['user','profile','bot','workspace'])
 def test_foreign_native_probe_refuses_before_claim(normal_env,monkeypatch,bad):
-    e=normal_env;pending(e);calls,path=fixture_native(e,monkeypatch);p=json.loads(path.read_text())
+    e=normal_env;pending(e);calls,path=fixture_native(e,monkeypatch)
+    p={'association_binding':{'owner':{'user_id':'1','profile':'user-1','bot_id':'bot-A'},
+        'workspace_reference':str(home(e)/'workers/a0/jobs/EXPLICIT_OFFLINE_PRIOR')}}
     if bad=='workspace':p['association_binding']['workspace_reference']=str(e.home/'foreign')
     else:p['association_binding']['owner'][{'user':'user_id','profile':'profile','bot':'bot_id'}[bad]]='foreign'
     path.write_text(json.dumps(p))
@@ -238,7 +320,7 @@ def test_bare_hash_foreign_missing_changed_or_expired_proof_refused_at_activatio
         p=h/'workers/dsh/inputs/web-policy.json';v=json.loads(p.read_text());v['expires_unix']=time.time()-1;p.write_text(json.dumps(v))
     try:r=activate(e);assert not r['enabled']
     except (ValueError,PermissionError,KeyError,RuntimeError):pass
-    assert not row(e)['enabled'] and not (h/scope.MARKER).exists() and calls==['dsh','a0']
+    assert not row(e)['enabled'] and not (h/scope.MARKER).exists() and calls==['a0','dsh']
 
 
 @pytest.mark.parametrize('bad',['session','cas','generation','transport','account'])
@@ -281,7 +363,7 @@ def test_actual_signed_router_normal_prepare_pending_and_no_opaque_inputs(normal
             r=await c.post(url,json=body,headers=headers);assert r.status_code==200,r.text
             assert r.json()['required_workers']==['dsh','a0'] and not r.json()['can_activate']
             r=await c.post(url.replace('/prepare?','/state?'),json=body,headers=headers)
-            assert r.status_code==200 and r.json()['worker_execution']=='PENDING_OWN_A0_NATIVE_PROBE_AND_QUALIFICATION'
+            assert r.status_code==200 and r.json()['worker_execution']=='PENDING_OWN_A0_NATIVE_PREREQUISITES_AND_QUALIFICATION'
     asyncio.run(run())
 
 

@@ -144,10 +144,17 @@ inspection. Its own producer and the shared result consumer must qualify both
 workers before configuration/activation; an opaque own-file hash is insufficient.
 The Dashboard calls these operations without runtime JSON or receipt assembly,
 renders readiness and refuses complete activation with disabled workers.
-An absent admitted own-profile A0 probe stays pending before any native observer
-or qualification claim. Producing that exact probe through the existing native
-A0 owner remains a separate live prerequisite; this source change does not
-launch it, release a historical stop or grant a kernel run/per-job capability.
+Protected setup now produces the initial own-profile probe through the existing
+native A0 planner/route/Runtime, observes it and confirms complete native cleanup
+before publishing readiness. Missing native prerequisites remain pending before
+launch; historical stops and actual kernel/network/service admission are intact.
+This source candidate has only offline observations, no installed runtime
+acceptance or per-job capability. The normal installer reuses this same producer
+inside its own original clock, without borrowing an operator success for users.
+Its retained bootstrap/plan inventory is checked separately from immutable
+deployment inputs. Historical sampling uncertainty stays unresolved after a
+later good sample; bounded startup waiting retains the exact native invocation
+and original clock, without another create/start attempt.
 The original WorkerHost retains one selected runtime per profile; these APIs
 add no second worker manager, task store, queue or automatic launch. Actual
 installation and independent/live acceptance remain required.

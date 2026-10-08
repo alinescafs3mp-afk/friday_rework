@@ -296,13 +296,11 @@ def main():
         package.__path__.append(str(ROOT / package.__name__))
     scripts.__path__.append(str(source / 'scripts'))
     if args.phase in ('start','qualify'):
-        if args.a0_plan is not None:
+        if args.a0_plan is not None or args.phase == 'qualify':
             result = budget.call(qualify,value,digest(owned_file(args.input,private=True)),
-                {'path':str(args.a0_plan),'sha256':args.a0_plan_sha256},budget)
+                None if args.a0_plan is None else {'path':str(args.a0_plan),'sha256':args.a0_plan_sha256},budget)
             if args.phase == 'qualify':
                 print(json.dumps(result,sort_keys=True));budget.check();return
-        elif args.phase == 'qualify':
-            raise ValueError('current_a0_probe_plan_required')
         if 'worker_install' in value:
             from scripts.worker_install import installed_product
             value = dict(value, product=budget.call(installed_product, value, home))

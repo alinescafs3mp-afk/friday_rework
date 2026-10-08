@@ -1,7 +1,7 @@
 """Normal private-profile provisioning through existing observers and consumers.
 
-Preparation declares inputs, never readiness. Qualification observes an already
-owned A0 probe; it cannot create a route, grant, job, container or install marker.
+Preparation declares inputs, never readiness. Protected qualification invokes
+the distinct initial A0 native probe owner, without granting ordinary jobs.
 One durable original attempt prevents automatic resubmission after uncertainty.
 """
 import copy
@@ -183,23 +183,31 @@ def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=N
     sources()
     folder = home / FOLDER
     if folder.exists() or folder.is_symlink(): raise HostUnavailable('qualification_attempt_requires_inspection')
-    # Missing/revoked probe is pending BEFORE any original claim or native IO.
-    plan = checked_plan(home, binding, runtimes)
     for p in (home / '.env', home / scope.ONBOARDING): scope._private(p)
     verify()
     seconds = min(300, *(c['budget_seconds'] for c in runtimes.values()))
     budget = Budget(seconds, started=accepted_monotonic); boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
     claim = {'boot_id':boot, 'started_mono':budget.deadline-seconds, 'deadline_mono':budget.deadline, 'budget_seconds':seconds}
+    from .a0_bootstrap import InitialProbe, own_probe, checked_custody
+    # A copied live/per-job plan is not authority to adopt an existing probe.
+    probe = InitialProbe(runtimes['a0'], binding, generation, prepared, budget, verify, original_seconds=seconds)
     credentials = {n: pin(home / n)['sha256'] if (home / n).exists() else None for n in ('.env','auth.json')}
-    original = {'schema':'friday.user-worker-qualification.v1','home':str(home),
-        'profile':binding['runtime_profile'],'binding_sha256':scope._fingerprint(binding),'generation':generation,
-        'original_attempt':claim,'preparations':prepared,'credentials':credentials,'plan':plan}
-    verify(); folder.mkdir(mode=0o700)
-    _new_file(home / INTENT, (json.dumps(original,sort_keys=True)+'\n').encode())
     try:
+        with own_probe(probe) as plan:
+            checked_plan(home, binding, runtimes)
+            original = {'schema':'friday.user-worker-qualification.v1','home':str(home),
+                'profile':binding['runtime_profile'],'binding_sha256':scope._fingerprint(binding),'generation':generation,
+                'original_attempt':claim,'preparations':prepared,'credentials':credentials,'plan':plan,
+                'bootstrap_original':pin(home / 'workers/a0/bootstrap/original.json'),'binding':binding}
+            verify(); folder.mkdir(mode=0o700)
+            _new_file(home / INTENT, (json.dumps(original,sort_keys=True)+'\n').encode())
+            a0 = budget.call(a0_observe, runtimes['a0'], plan, budget, probe_owner=probe)
+            verify()
+        custody = checked_custody(home, binding, generation, prepared, plan)
+        # Native cessation precedes Harness observations/readiness publication;
+        # both observations still consume the SAME original setup deadline.
         scratch = folder / 'dsh-probe'; scratch.mkdir(mode=0o700)
         dsh = budget.call(dsh_observe, runtimes['dsh'], home, scratch, budget)
-        verify(); a0 = budget.call(a0_observe, runtimes['a0'], plan, budget)
         verify()
         for kind, ref in prepared.items(): preparation(home,binding['runtime_profile'],kind,ref)
         budget.call(sources)
@@ -208,7 +216,7 @@ def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=N
         obs = {'dsh': dsh, 'a0': a0}
         for kind,c in runtimes.items(): obs[kind]['runtime_sha256']=digest({k:v for k,v in c.items() if k!='runtime_receipt'})
         proof = {'schema':'friday.worker-deployment-observation.v1','home':str(home),'profile':binding['runtime_profile'],
-            'original':pin(home / INTENT),'workers':obs,'credentials':credentials,
+            'original':pin(home / INTENT),'workers':obs,'credentials':credentials,'bootstrap_custody':custody,
             'effects':'OBSERVATION_ONLY','per_job_authority':'NOT_GRANTED',
             'observed':{'boot_id':boot,'monotonic':time.monotonic(),'unix':time.time()}}
         from .host_runtime import deployment_observations
@@ -222,7 +230,7 @@ def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=N
     except BaseException as exc:
         from scripts.dsh_prepare import StopUnconfirmed
         failure={'state':'STOP_UNCONFIRMED' if isinstance(exc,StopUnconfirmed) else 'REFUSED_OR_UNCERTAIN',
-            'original_attempt':claim,'retry_authorized':False,'a0_probe_cleanup':'ORIGINAL_NATIVE_OWNER'}
+            'original_attempt':claim,'retry_authorized':False,'a0_probe_cleanup':'OWN_INITIAL_PROBE_CUSTODY'}
         try: _new_file(folder / 'failure.json',(json.dumps(failure,sort_keys=True)+'\n').encode())
         except OSError: pass
         raise
@@ -279,4 +287,9 @@ def deployment_health(c, *, binding=None, generation=None):
         raise HostUnavailable('user_worker_receipt_not_produced')
     if kind=='a0' and proof['workers'][kind]['plan']!=original['plan']:
         raise HostUnavailable('user_worker_native_plan_changed')
+    from .a0_bootstrap import checked_custody
+    custody = checked_custody(home,original['binding'],original['generation'],original['preparations'],original['plan'])
+    if (proof.get('bootstrap_custody')!=custody or custody['original']!=original['bootstrap_original']
+            or scope._fingerprint(original['binding'])!=original['binding_sha256']):
+        raise HostUnavailable('user_worker_bootstrap_custody_changed')
     return deployment_observations(c,proof,claim,folder)

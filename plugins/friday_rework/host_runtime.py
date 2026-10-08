@@ -432,6 +432,15 @@ def deployment_health(config):
         if (sha is None and present) or (sha is not None and not present):
             raise HostUnavailable('qualified_credentials_changed')
         if sha is not None: _pin({'path':str(path),'sha256':sha}).read()
+    if 'bootstrap_custody' in proof:
+        from .a0_bootstrap import checked_custody
+        native_original = json.loads(_pin(proof['bootstrap_custody']['original']).read())
+        custody = checked_custody(home,native_original['binding'],native_original['generation'],
+                                 native_original['preparations'],proof['workers']['a0']['plan'])
+        if (custody != proof['bootstrap_custody'] or native_original['binding'].get('operation')!='installation'
+                or native_original.get('inherited_attempt')!=marker['original_attempt']
+                or native_original['config']!={'path':str(home/'config.yaml'),'sha256':before['files']['config.yaml']}):
+            raise HostUnavailable('installed_bootstrap_custody_changed')
     return deployment_observations(c, proof, marker['original_attempt'], home / 'preparation/worker-qualification')
 
 

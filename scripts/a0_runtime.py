@@ -648,6 +648,43 @@ def _route_guard(route, launcher, fields):
     return {'receipt':g}
 
 
+def route_preflight(association, acceptance, native, *, budget):
+    """Read-only initial-probe admission, before claiming any setup attempt.
+
+    These are the same existing route prerequisites. Preparation repeats them
+    under its native runtime lock immediately before effects; this inspection
+    neither starts a daemon nor turns installed source into a runtime grant.
+    """
+    binding = host_identity(association)
+    require(acceptance['accepted_unix'] == binding['created_at_unix']
+            and acceptance['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            'foreign_host_route_clock')
+    require(type(acceptance['accepted_monotonic_ns']) is int
+            and 0 < acceptance['accepted_monotonic_ns'] <= time.monotonic_ns()
+            < acceptance['accepted_monotonic_ns'] + binding['budget_seconds']*10**9
+            and binding['created_at_unix'] <= time.time() < binding['deadline_unix'],
+            'foreign_host_route_clock')
+    launcher = checked_launcher(native['launcher']['sha256'])
+    require(sha(DOCKER) == native['docker']['sha256'], 'docker_binary_changed')
+    launcher['checked_unit_registration']()
+    worker = native_supervisor().observe(binding)
+    require(worker.missing and worker.quiescent, 'prior_worker_unit_blocks_route')
+    fields = _route_unit(launcher, Runtime._command, min(5, budget()))
+    require(fields['ActiveState'] in ('inactive', 'failed') and fields['MainPID'] == '0'
+            and cgroup_snapshot(launcher['SERVICE_GROUP'])['populated'] is False,
+            'foreign_or_active_daemon_blocks_route')
+    for path in (launcher['REQUEST'], launcher['GUARD'], launcher['STATE'] / 'rootlesskit/child_pid'):
+        require(not path.exists() and not path.is_symlink(), 'prior_or_uncertain_route_blocks_start')
+    _route_limits(fields, budget())
+    endpoints = LOCAL_ENDPOINTS if 'deployment' not in native else profile_module().network_endpoints(native['deployment'])
+    require(endpoints == launcher['ENDPOINTS'], 'a0_route_configured_endpoint_policy_unavailable')
+    for path in launcher['tool_paths']().values():
+        info = path.lstat()
+        require(path.resolve() == path and stat.S_ISREG(info.st_mode)
+                and not info.st_mode & 0o022 and info.st_mode & 0o111, 'route_tool_changed')
+        sha(path); budget()
+
+
 def prepare_route(association, acceptance, native, *, retain, budget):
     """Real fresh preparation for the reserved row, before current_network.
 
@@ -1471,6 +1508,40 @@ class Runtime:
             return self._stop_native(from_stop_post=from_stop_post)
         finally:
             self.budget = work_budget
+
+    def retire_initial_probe(self):
+        """Exact stopped setup object only; keep host state, receipts and image.
+
+        The existing route producer refuses every retained container. A bounded
+        initial probe has no user job/writable artifacts in its container layer,
+        so its acknowledged retirement is necessary before declaring capacity
+        available. No force, volumes, image removal or ordinary job cleanup.
+        Lost removal ACK remains unknown and is never automatically retried.
+        """
+        require(self.p.get('association_binding',{}).get('owner',{}).get('session_key')
+                == 'own-profile-initial-probe', 'ordinary_job_retirement_refused')
+        work_budget = self.budget; self.budget = None
+        try:
+            with self.locked():
+                r = self.receipt(); obj = self.inspect(r,stop_owned=True)
+                unit = self.supervisor.observe(self.association(r))
+                require(obj['State']['Running'] is False and obj['State']['Pid'] == 0
+                        and unit.quiescent and (unit.missing or unit.invocation_id==r['invocation_id']),
+                        'initial_probe_not_stopped')
+                stopped = json.loads(private(self.directory/'stop.json').read_text())
+                require(stopped.get('status')=='STOP_CONFIRMED'
+                        and stopped.get('current_sampling') != 'UNKNOWN'
+                        and stopped.get('container_id')==r['container_id']
+                        and stopped.get('native_container_stopped') is True
+                        and r['observations'] and all(cessation(s)['confirmed'] for s in r['observations']),
+                        'initial_probe_cessation_unconfirmed')
+                ack = self.docker('rm',r['container_id'],timeout=5).strip()
+                require(ack==r['container_id'], 'initial_probe_retirement_unknown')
+                result = {'status':'INITIAL_PROBE_RETIRED','container_id':r['container_id'],
+                          'host_state_retained':True,'image_retained':True,'volumes_removed':False}
+                write_json(self.directory/'retirement.json',result)
+                return result
+        finally:self.budget = work_budget
 
     def _stop_native(self, *, from_stop_post=False):
         checked = None

@@ -118,26 +118,47 @@ Capture the requested scoped keys and approve native channel access as before.
 **Inspect worker setup** displays authoritative pending/qualified/uncertain states;
 it does not execute a probe. There is no background polling or automatic replay.
 
-**Check required workers** invokes one bounded owning-host qualification action:
-the existing DSH no-model smoke/DNS/TLS observer and the existing A0 native
-probe/resource/web/route observer. Their shared result consumer verifies exact
-own-profile preparations, source pins, credentials, binding/generation and the
-original attempt before attaching both runtime receipts under the existing
-configuration locks. Only then is **Activate complete profile** available. This
-does not establish useful live journeys or grant an A0 per-job capability.
+**Prepare and check required workers** explicitly invokes protected host setup.
+It uses the existing native A0 planner, route producer, Docker boundary and
+supervisor to create the fixed own-user `workers/a0/probe-plan.json`. The initial
+probe is a distinct operation: ordinary jobs still require `check_a0_runtime`.
+It submits no model message. The existing A0 native profile/token/resource/web/
+route observer consumes the exact live plan; the host then confirms container,
+route/daemon/descendant cessation, retires only its stopped probe container
+(without forcing/removing images or volumes), and removes the introduced native secrets.
+Private host state and exact receipts are retained.
+Harness smoke/DNS/TLS observations and the shared result consumer must also pass
+before both private runtime receipts can be attached. All steps inherit the
+single setup entry deadline (at most 300 seconds and both worker budgets).
+Only then is **Activate complete profile** available. Useful installed journeys
+and ordinary per-job authority remain separate acceptance boundaries.
 
-An independently admitted owning-host A0 producer must first supply a still-live, exact own-user
-association plan at `<user home>/workers/a0/probe-plan.json`. The plan must retain
-its own original native clock and actual supervisor/route/container identity.
-This join neither launches that probe nor constructs its association, route,
-kernel grant or credentials. If it is absent, the result is
-`DISABLED_OWN_A0_NATIVE_PROBE_REQUIRED`, with no qualification claim or native IO.
-The current per-job A0 producer checks profile readiness before starting, so it
-cannot bootstrap this disabled new profile. This package supplies the protected
-observer/consumer join, not that separately admitted bootstrap producer.
-Providing that producer is a remaining prerequisite, not an action for the
-product user to assemble manually. Operator-home install qualification
-and arbitrary `ready:true` reports never substitute for it.
+Missing native registration, finite deadline/resource enforcement, existing
+route custody or required scoped keys leaves
+`DISABLED_OWN_A0_NATIVE_PREREQUISITES_PENDING` before a native launch claim.
+Read-only native admission inspection may identify unavailable prerequisites;
+it does not install/start anything. An existing plan, partial attempt, uncertain
+start/cleanup or changed identity requires exact-owner reconciliation, without
+resubmission or a fresh clock. No operator JSON, copied readiness report, previous
+user's capability or source hash can supply kernel/network authority. The
+reviewed service, network and kernel prerequisites must actually be admitted by
+their existing mechanisms. Current historical journal/kernel stops remain in
+force; source fixtures do not release them.
+
+Normal installation's explicit `qualify` phase uses this same producer when no
+existing independently owned probe is supplied. It binds the installed operator,
+single receiving account and exact preparation, while keeping its short native
+phase inside the original installer deadline. An ambiguous multi-account owner
+stays pending. Installation does not qualify another user's private profile.
+Installation inspection recognizes only the protected `bootstrap/original.json`,
+`bootstrap/state.json` and matching `probe-plan.json`, with their exact original
+owner, preparation and plan binding. Other additions remain refused. An
+interrupted descendant sample stays historically uncertain even if a later
+cleanup sample succeeds. Startup and the observer's second native Runtime
+retain history under the same initial owner: stop is attempted, but retirement, key removal and
+readiness remain blocked. Initial startup may wait for Docker to become running
+only while the exact submitted native invocation remains current and within
+the original deadline; terminal/replaced ownership never replays start.
 
 Supported normal APIs are `POST /onboarding/workers/{prepare,qualify,state}` under
 `/api/plugins/friday_rework`. They take only the existing principal, receiving

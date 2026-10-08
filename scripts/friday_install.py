@@ -851,7 +851,7 @@ def start(value, input_hash, *, budget=None, input_path=None, plan_ref=None, pha
     marker = budget.call(read_json,home / MARKER) if 'worker_install' in value else {}
     pending = marker.get('worker_state') == 'BOTH_CONFIGURED_QUALIFICATION_PENDING'
     if phase == 'qualify' or (pending and plan_ref is not None):
-        require(pending and plan_ref is not None, 'pending_qualification_and_current_a0_plan_required')
+        require(pending, 'pending_qualification_and_current_a0_plan_required')
         require(marker['original_attempt']['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                 'original_install_boot_changed')
         # Native observation inherits the original installation clock. No new

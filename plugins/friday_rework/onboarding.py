@@ -482,7 +482,9 @@ class Onboarding:
             attempted=folder.exists() or folder.is_symlink()
             result['can_prepare_workers']=not present and not partial and not attempted
             result['can_activate']=all(x['qualified'] for x in result['workers'].values())
-            result['can_qualify_workers']=len(present)==2 and not partial and not attempted and (home / join.PLAN).is_file()
+            bootstrap=home / 'workers/a0/bootstrap'
+            probe_attempted=bootstrap.exists() or bootstrap.is_symlink() or (home / join.PLAN).exists() or (home / join.PLAN).is_symlink()
+            result['can_qualify_workers']=len(present)==2 and not partial and not attempted and not probe_attempted
             if result['can_activate']:
                 result['worker_execution']='OWN_DEPLOYMENTS_QUALIFIED_LIVE_JOURNEYS_NOT_RUN'
                 from gateway.pairing import PairingStore
@@ -494,8 +496,8 @@ class Onboarding:
                 except (OSError,ValueError,PermissionError):
                     result['can_activate']=False
                     result['worker_execution']='QUALIFIED_WORKERS_NATIVE_ACCESS_PENDING'
-            elif attempted or partial: result['worker_execution']='QUALIFICATION_OR_SETUP_REQUIRES_RECONCILIATION_NO_REPLAY'
-            elif len(present)==2: result['worker_execution']='PENDING_OWN_A0_NATIVE_PROBE_AND_QUALIFICATION'
+            elif attempted or partial or probe_attempted: result['worker_execution']='QUALIFICATION_OR_SETUP_REQUIRES_RECONCILIATION_NO_REPLAY'
+            elif len(present)==2: result['worker_execution']='PENDING_OWN_A0_NATIVE_PREREQUISITES_AND_QUALIFICATION'
         return result
 
     def workers_state(self, profile, *, session=None, expected_config_sha256, generation, platform,
@@ -542,9 +544,10 @@ class Onboarding:
 
     def qualify_workers(self, profile, *, session=None, expected_config_sha256, generation, platform,
                         transport_profile, account_id, user_id):
-        """Explicit bounded native observation and protected BOTH-worker attach.
+        """Protected initial A0 owner, bounded observations and BOTH-worker attach.
 
-        No native launch/retry. An absent owning-host A0 probe stays pending.
+        Ordinary handlers cannot call this owning setup operation. Missing
+        native prerequisites stay pending; partial attempts never auto-replay.
         """
         import time
         accepted_monotonic=time.monotonic()
@@ -581,8 +584,9 @@ class Onboarding:
                 try: runtimes=join.qualify(home,binding,generation,prepared,verify=verify,
                     accepted_monotonic=accepted_monotonic)
                 except HostUnavailable as exc:
-                    if str(exc)=='own_a0_native_probe_required':
-                        return {'state':'DISABLED_OWN_A0_NATIVE_PROBE_REQUIRED','enabled':False,
+                    from .a0_bootstrap import PrerequisitePending
+                    if isinstance(exc,PrerequisitePending):
+                        return {'state':'DISABLED_OWN_A0_NATIVE_PREREQUISITES_PENDING','enabled':False,
                             **self._worker_summary(home,binding,generation,proof,config)}
                     raise
                 for c in runtimes.values():

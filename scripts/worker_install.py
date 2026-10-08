@@ -290,7 +290,12 @@ def installed_files(home):
     files = set()
     for kind in ('dsh','a0'):
         worker = root / kind; directory(worker)
-        require({p.name for p in worker.iterdir()} == {'jobs','staging','cache','inputs','runtime-input.json','runtime-receipt.json'},
+        names = {p.name for p in worker.iterdir()}
+        extra = set()
+        if kind == 'a0' and names & {'bootstrap', 'probe-plan.json'}:
+            from plugins.friday_rework.a0_bootstrap import installed_inventory
+            extra = installed_inventory(home)
+        require(names == {'jobs','staging','cache','inputs','runtime-input.json','runtime-receipt.json'} | extra,
                 'installed_worker_layout_changed')
         for name in ('jobs','staging','cache','inputs'): directory(worker / name)
         for name in ('runtime-input.json','runtime-receipt.json'):

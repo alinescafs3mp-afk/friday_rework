@@ -125,7 +125,7 @@ def checked_product(value, home, product, marker):
     return product
 
 
-def a0_observe(runtime, plan_ref, budget):
+def a0_observe(runtime, plan_ref, budget, *, probe_owner=None):
     """Observe an existing exact native plan; no create/start/route or grant."""
     from plugins.friday_rework.host_runtime import a0_runtime_module, a0_deployment_contract
     a0_deployment_contract(runtime)
@@ -152,6 +152,8 @@ def a0_observe(runtime, plan_ref, budget):
                 'foreign_a0_qualification_home')
     m.remaining(plan)
     boundary = budget.call(m.Runtime, plan, budget=budget.check)
+    if probe_owner is not None:
+        budget.call(probe_owner.track_runtime, boundary)
     # Exact recorded native ID, pinned plan, live supervisor and current route.
     # Read-only probes use the existing bounded control runner and native locks.
     with boundary.locked():
@@ -280,7 +282,9 @@ def qualify(value, input_hash, plan_ref, budget):
 
     Interrupted publication is fail-closed and cannot be automatically replayed.
     The existing config write transaction is held through observation/publication.
-    The native A0 probe remains under its original owner, not this installer.
+    An explicit existing probe retains its original owner. The ordinary path
+    uses the same protected initial producer as user setup and settles its
+    native custody before publishing qualified receipts.
     """
     from scripts.friday_install import inspect, MARKER, directory
     from scripts.dsh_prepare import StopUnconfirmed
@@ -302,6 +306,9 @@ def qualify(value, input_hash, plan_ref, budget):
     with config_write_transaction(home / 'config.yaml'):
         # No live probes before the unchanged installed ownership is checked.
         budget.call(inspect, value, input_hash)
+        from plugins.friday_rework.a0_bootstrap import installation_probe, own_probe, checked_custody
+        probe_owner = None if plan_ref is not None else installation_probe(product,home,claim,budget,
+            verify=lambda:budget.call(inspect,value,input_hash))
         folder.mkdir(mode=0o700); directory(folder)
         files = dict(marker['profile_files'])
         files.update({p:h for p,h in marker['worker_files'].items() if p.endswith('/runtime-receipt.json')})
@@ -314,10 +321,17 @@ def qualify(value, input_hash, plan_ref, budget):
         publish(home / ORIGINAL, {'marker': marker, 'files': files}, budget=budget)
         credentials = {name: digest(owned_file(home / name, private=True))
             if (home / name).exists() or (home / name).is_symlink() else None for name in ('.env','auth.json')}
-        scratch = folder / 'dsh-probe'; scratch.mkdir(mode=0o700)
-        dsh = budget.call(dsh_observe, product['runtime']['workers']['dsh'], home, scratch, budget)
+        custody = None
         try:
-            a0 = budget.call(a0_observe, product['runtime']['workers']['a0'], plan_ref, budget)
+            if probe_owner is not None:
+                with own_probe(probe_owner) as plan_ref:
+                    a0 = budget.call(a0_observe, product['runtime']['workers']['a0'], plan_ref, budget, probe_owner=probe_owner)
+                    budget.call(inspect,value,input_hash)
+                custody = checked_custody(home,probe_owner.binding,1,probe_owner.preparations,plan_ref)
+            scratch = folder / 'dsh-probe'; scratch.mkdir(mode=0o700)
+            dsh = budget.call(dsh_observe, product['runtime']['workers']['dsh'], home, scratch, budget)
+            if probe_owner is None:
+                a0 = budget.call(a0_observe, product['runtime']['workers']['a0'], plan_ref, budget)
         except StopUnconfirmed:
             # This finite private record grants no retry or fresh cleanup time.
             # Preserve the typed condition even if evidence storage fails.
@@ -340,6 +354,11 @@ def qualify(value, input_hash, plan_ref, budget):
             'input_sha256':input_hash,'original':{'path':str(home / ORIGINAL),'sha256':digest(owned_file(home / ORIGINAL,private=True))},
             'workers':observed,'credentials':credentials,'effects':'OBSERVATION_ONLY','per_job_authority':'NOT_GRANTED',
             'observed':{'boot_id':claim['boot_id'],'monotonic':time.monotonic(),'unix':time.time()}}
+        if custody is not None: proof['bootstrap_custody'] = custody
+        # Whole native observation validation precedes ready receipt publication.
+        from plugins.friday_rework.host_runtime import deployment_observations
+        for runtime in product['runtime']['workers'].values():
+            budget.call(deployment_observations,runtime,proof,claim,folder)
         publish(home / PROOF, proof, budget=budget)
         ref = {'path':str(home / PROOF),'sha256':digest(owned_file(home / PROOF,private=True))}
         for kind, runtime in product['runtime']['workers'].items():
