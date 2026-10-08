@@ -194,8 +194,8 @@ def complete(value, home, receipt, *, budget=None):
         if path.is_dir():
             os.chmod(path, 0o700)
     stage_worker_runtime(value, home)
-    from scripts.a0_prepare import service_plan, install_service
-    if service_plan(value, home)['required']:
+    from scripts.a0_prepare import service_required, install_service
+    if service_required(value):
         require(budget is not None, 'original_a0_install_budget_required')
         budget.call(install_service, value, home, budget)
     bundle = profile_write(home, value['product'])

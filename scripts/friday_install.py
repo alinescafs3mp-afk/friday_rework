@@ -543,8 +543,8 @@ def finish_install(value, input_hash, home, donors, source, receipt, receipt_pat
                                for name in ('config.yaml', 'SOUL.md', 'FRIDAY-PROFILE.json')}
     marker['plugin_files'] = {name: sha for name, sha in value['project_files'].items()
                               if name.startswith('plugins/friday_rework/')}
-    from scripts.a0_prepare import service_plan, service_receipt_checked
-    if service_plan(value, home)['required']:
+    from scripts.a0_prepare import service_required, service_receipt_checked
+    if service_required(value):
         budget.call(service_receipt_checked, value, home, original_attempt=claim)
         marker['a0_service_receipt_sha256'] = digest(budget.call(
             owned_file, home / 'preparation/a0-service.receipt.json', private=True))
@@ -682,8 +682,8 @@ def completed_profile_checked(value, home, bundle, budget):
     for key, name in value['product']['dashboard'].get('tls', {}).items():
         require(digest(budget.call(owned_file, home / name, private=True)) == value['dashboard_tls'][key]['sha256'],
                 'installed_dashboard_tls_changed')
-    from scripts.a0_prepare import service_plan, service_receipt_checked
-    if service_plan(value, home)['required']:
+    from scripts.a0_prepare import service_required, service_receipt_checked
+    if service_required(value):
         budget.call(service_receipt_checked, value, home, original_attempt=read_json(home / MARKER))
 
 
@@ -789,8 +789,8 @@ def inspect(value, input_hash):
     require(marker.get('plugin_files') == expected_plugins, 'installed_plugin_inventory_changed')
     for name, sha in expected_plugins.items():
         require(digest(owned_file(home / name, private=True)) == sha, 'installed_plugin_changed')
-    from scripts.a0_prepare import service_plan, service_receipt_checked
-    if service_plan(value, home)['required']:
+    from scripts.a0_prepare import service_required, service_receipt_checked
+    if service_required(value):
         path = home / 'preparation/a0-service.receipt.json'
         require(digest(owned_file(path, private=True)) == marker.get('a0_service_receipt_sha256'),
                 'a0_service_receipt_changed')

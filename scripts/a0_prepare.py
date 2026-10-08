@@ -256,6 +256,12 @@ def service_sources(project_files, *, root=ROOT):
     return payload
 
 
+def service_required(value):
+    """An A0 effect belongs only to an explicitly enabled receiving runtime."""
+    runtime = value['product'].get('runtime', {})
+    return runtime.get('enabled') is True and ('a0' in runtime or 'a0' in runtime.get('workers', {}))
+
+
 def service_plan(value, home):
     """Explicit normal-install phase; no native IO or registration while planning."""
     from scripts.friday_install import require, digest, owned_file
@@ -264,8 +270,7 @@ def service_plan(value, home):
     from scripts import rootless_docker_launch as launcher
     # These remain the existing deployment. No path, endpoint, capacity or
     # source-pin override is accepted from the operational install document.
-    required = value['product']['runtime'].get('enabled') is True and (
-        'a0' in value['product']['runtime'] or 'a0' in value['product']['runtime'].get('workers', {}))
+    required = service_required(value)
     if required:
         from plugins.friday_rework.host_runtime import configured_runtimes
         selected = configured_runtimes(value['product']['runtime'])['a0']
