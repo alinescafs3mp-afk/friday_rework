@@ -358,6 +358,10 @@ class A0HostSession:
         self.retained_samples = copy.deepcopy([] if observations is None else observations['samples'])
         self.key_preparation_attempted = False
         self.capability_attempted = False
+        # Only the current producer owns cleanup for this attempt. A concurrent
+        # duplicate must fail before entering that producer's cleanup boundary.
+        from threading import Lock
+        self.capability_lock = Lock()
         self.key_cleanup = row['host']['a0']['key_cleanup']
         self.preparing = False
         self.plan = copy.deepcopy((row['host']['a0']['launch'] or {}).get('plan'))

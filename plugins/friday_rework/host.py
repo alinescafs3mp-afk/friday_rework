@@ -190,19 +190,34 @@ class WorkerHost:
         dispatch. The producer observes native state before attaching once.
         """
         row, session = self._a0_producer_session(task_id, owner)
-        # A repeated producer call owns no new submission. Reject it before
-        # the cleanup boundary of the original in-flight or attached route.
-        if session.capability_attempted:
+        # Keep the check and the entire producer/cleanup boundary under the
+        # same nonblocking custody lock. A loser cannot stop the winner.
+        if not session.capability_lock.acquire(blocking=False):
             raise HostUnavailable('a0_capability_production_not_admitted')
         try:
-            pin = session.produce_capability(row)
-            return self.attach_a0_capability(task_id, owner, pin)
-        except BaseException as error:
-            if session.route is not None:
-                try:self._stop(row, self.store.get(task_id,owner)['stop_intent'] or 'cancel')
-                except BaseException as stop_error:
-                    error.add_note('owned route STOP_UNCONFIRMED: '+type(stop_error).__name__)
-            raise
+            if session.capability_attempted:
+                raise HostUnavailable('a0_capability_production_not_admitted')
+            try:
+                pin = session.produce_capability(row)
+                return self.attach_a0_capability(task_id, owner, pin)
+            except BaseException as error:
+                if session.route is not None:
+                    try:
+                        self._stop(row, self.store.get(task_id,owner)['stop_intent'] or 'cancel')
+                    except BaseException as stop_error:
+                        # Reading stop intent or acquiring the store lock can
+                        # fail before _stop_bounded reaches its own fallback.
+                        # Cached checked custody still permits exact-owned stop;
+                        # failed persistence never permits releasing the row.
+                        if not any(note.startswith('owned execution STOP_')
+                                   for note in getattr(stop_error, '__notes__', ())):
+                            self._stop_on_error(row, stop_error)
+                        for note in getattr(stop_error, '__notes__', ()):
+                            error.add_note(note)
+                        error.add_note('owned route settlement failed: '+type(stop_error).__name__)
+                raise
+        finally:
+            session.capability_lock.release()
 
     def attach_a0_capability(self, task_id, owner, pin):
         """Host/operator-only entry; never exported as a worker/model tool.

@@ -337,3 +337,73 @@ async def test_retained_route_immutables_and_cessation_validator_refuse_fabricat
     result=setup.host._stop(row,'cancel')
     bad=copy.deepcopy(result);bad['host']['a0']['route']['settlement']=None
     with pytest.raises(Exception):setup.record.validate_host_record(bad)
+
+
+@pytest.mark.asyncio
+async def test_interleaved_duplicate_cannot_acquire_winner_cleanup(setup, tmp_path, monkeypatch):
+    proof = await ingress(setup)
+    s = configure_a0(setup, proof, tmp_path, monkeypatch, native_launcher=True)
+    states = ordinary(setup, s, monkeypatch)
+    original_current = s.hr.A0HostSession._current
+    interleaving = []
+    def contend(session, row):
+        if not interleaving:
+            interleaving.append('entered')
+            with pytest.raises(s.hr.HostUnavailable, match='a0_capability_production_not_admitted'):
+                s.host_producer(row['existing_task_id'], row['owner'])
+            interleaving.append('loser_refused')
+        return original_current(session, row)
+    monkeypatch.setattr(s.hr.A0HostSession, '_current', contend)
+    answer = invoke(setup, proof, args=s.args)
+    assert answer['accepted']
+    st = states[0]
+    row = setup.host.store.get(answer['reference'], setup.record.owner_from_ingress(CALL, proof))
+    assert interleaving == ['entered', 'loser_refused']
+    assert len(s.schedules) == st.start_count == st.create_count == 1
+    assert row['stop_intent'] is None and row['host']['a0']['route']['settlement'] is None
+    assert st.daemon_stops == st.network_removals == 0 and st.active and st.network_exists
+    assert not s.session.capability_lock.locked()
+    with pytest.raises(s.hr.HostUnavailable, match='a0_capability_production_not_admitted'):
+        s.host_producer(row['existing_task_id'], row['owner'])
+    assert not s.session.capability_lock.locked()
+    assert current(setup, row)['stop_intent'] is None and st.daemon_stops == st.network_removals == 0
+    setup.host._stop(row, 'pause')
+    assert not st.active and not st.network_exists
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('boundary', ['daemon', 'bridge'])
+@pytest.mark.parametrize('failure', ['read', 'lock'])
+async def test_damaged_store_cannot_withhold_cached_producer_cleanup(setup, tmp_path, monkeypatch, boundary, failure):
+    from contextlib import contextmanager
+    proof = await ingress(setup)
+    s = configure_a0(setup, proof, tmp_path, monkeypatch, native_launcher=True)
+    original_get, original_budget = setup.host.store.state_get, setup.host.store.lock_budget
+    def damage(st, session, row):
+        def fail(*args, **kwargs):
+            raise OSError('fixture_store_unavailable')
+        @contextmanager
+        def blocked():
+            fail()
+            yield
+        def inject():
+            monkeypatch.setattr(setup.host.store, 'state_get' if failure == 'read' else 'lock_budget',
+                                fail if failure == 'read' else blocked)
+        setattr(st, 'after_start' if boundary == 'daemon' else 'after_create', inject)
+    states = ordinary(setup, s, monkeypatch, fault=damage)
+    answer = invoke(setup, proof, args=s.args)
+    st = states[0]
+    assert not answer['accepted'] and not st.active and not st.network_exists
+    assert st.start_count == st.daemon_stops == 1
+    assert st.create_count == st.network_removals == (1 if boundary == 'bridge' else 0)
+    assert not s.session.capability_lock.locked()
+    assert s.session.route['settlement']['status'] == 'STOP_CONFIRMED'
+    # Cached actual stop is distinct from damaged durable settlement; no claim
+    # of released capacity, and no launch retry after restoring our fixture.
+    monkeypatch.setattr(setup.host.store, 'state_get', original_get)
+    monkeypatch.setattr(setup.host.store, 'lock_budget', original_budget)
+    row = setup.host.store.get(answer['reference'], setup.record.owner_from_ingress(CALL, proof))
+    assert row['host']['quiescence'] is None and row['host']['a0']['route']['settlement'] is None
+    with pytest.raises(s.hr.HostUnavailable, match='a0_capability_production_not_admitted'):
+        s.host_producer(row['existing_task_id'], row['owner'])
+    assert st.start_count == 1 and len(s.schedules) == 0
