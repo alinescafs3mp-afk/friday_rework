@@ -39,7 +39,9 @@ to loosen guards. Future provider access requires the parent's authorized donor/
 host-mediated integration and actual complete-journey acceptance.
 
 The ordinary `handle` path calls the trusted `WorkerHost.produce_a0_capability`
-after retaining the row and verifying input bytes. `A0HostSession` then observes
+after retaining the row and verifying input bytes. `A0HostSession` first calls
+the existing runtime's `prepare_route` under the original stop/budget callback.
+It then observes
 the pinned launcher's exact original request, current unit/invocation, daemon
 PID/start/executable, held and reopened namespace identities, and nft semantic
 readback. It inspects the expected bridge, obtains its actual immutable Docker
@@ -60,18 +62,40 @@ explicitly invalid; this candidate does not rewrite historical records.
 
 The retained A0 artifacts now use the shared [result consumer](result-consumer.md)
 for list, inspect, assessment and delivery; the join has offline verification.
-**The producer's source path exists; production route preparation and live
-qualification remain missing/NOT_RUN.** The existing launcher consumes one
-private route request bound to the exact row's original acceptance clocks.
-No ordinary host operation currently publishes that fresh request, starts its
-guarded daemon, or creates and cleans up its owned bridge after reservation.
-The producer observes an already prepared exact route and refuses missing or
-historical state; it never starts/restarts a daemon, modifies nft, creates a
-network, invents admission, resets a clock or adopts a different owner.
-`startup_health` retains its A0 refusal. A sufficient independently reviewed
-preparation/cleanup path, current native positive/negative/deadline/stop gates,
-worker web and complete user journeys are still required. This source change
-is not runtime acceptance or permission to repeat an earlier stopped phase.
+**Per-row preparation/cleanup is a source candidate; qualification remains
+NOT_RUN and `startup_health` retains its A0 refusal.** Preparation checks the
+registered pinned dedicated unit, no active/foreign daemon or worker unit,
+no old request/guard/rootless namespace, and the existing nonblocking runtime
+lock. Before publishing or starting anything, the existing unit must report a
+finite native RuntimeMax of at most the existing 120-second cap, bounded start
+and stop timeouts, and the same unchanged resource/kill boundary. Their sum plus
+the native submission allowance must fit the original remaining work time
+with the existing 25-second cleanup reserve. The checked active-enter monotonic
+timestamp must also fit that original deadline. The daemon's own native unit
+therefore supplies pre-container expiry even if the gateway disappears.
+
+The pinned development unit source does not declare RuntimeMax. An effective
+unit reporting infinity is refused with `a0_route_native_deadline_unavailable`
+before route publication or daemon start; actual native properties were NOT_RUN
+in this source assignment.
+This implementation does not set properties, replace/reload a unit, borrow a
+historical permit or supply a coroutine as deadline proof. Qualification of an
+actual supported native admission primitive remains an operator/integration
+dependency, followed by independent gateway-down/deadline/stop controls.
+
+For an admitted existing boundary, the host publishes one private exclusive
+request with the real row's owner/nonce, original wall/monotonic/boot clocks,
+association and deployment hashes, exact launcher/tools and separated endpoint
+policy. Unsupported configured endpoint policy is refused; legacy addresses and
+40960 capacities remain temporary test profile data. The existing launcher
+still performs its native pre-dockerd policy checks. The runtime starts that
+dedicated daemon once, retains its actual guard/invocation/PID-start/namespaces
+and descendant sample, then creates one exact named/labelled bridge and retains
+its immutable ID. The unchanged current-network/check-network/attach-once/
+scheduler/result consumers follow. No keys, UI or model admission precedes them.
+Independent source review and current native positive/negative/deadline/stop
+gates, worker web and complete user journeys are still required. This source
+change is not runtime acceptance or permission to repeat an earlier stopped phase.
 Offline proof inputs and native interfaces are explicitly fabricated controls;
 they never constitute production evidence or an enabled deployment.
 
@@ -90,7 +114,9 @@ ID are distinct fields. Actual create labels, unit Description/name and native
 mapping use the association identity; no identity is fabricated from an intended
 launch. Generation remains the single non-replayable attempt.
 
-`host.a0` v2 extends the existing locked document with acceptance, fixed output
+New `host.a0` v3 rows retain required route custody in the same locked document;
+v2 records remain readable without migration and cannot acquire new route
+custody. Deleting the route field from a v3 row is invalid. Acceptance, fixed output
 selection, once-only current capability, one-way launch/created/key-timestamp/grant metadata and separate key
 cleanup state. No second task store, scheduler, supervisor, queue or secret store
 is added. The complete runtime plan and exact serialized plan pin are validated
@@ -98,6 +124,26 @@ when the row is read. One cached controller/session wins concurrent construction
 construction itself cannot launch. Input staging retains original ingress byte
 checks and remaps only worker paths to indexed A0 upload names. Aggregate
 input/output bounds honor the smaller configured file/total limit.
+
+Route intent is durable before request publication, daemon start, sampling or
+bridge create. Immutable observations and descendant history cannot be replaced.
+Lost start/create acknowledgements may reconcile only the actually submitted
+original request/guard and exact owned name/nonce/ID, never retry or adopt an old
+route. An absent guard, interrupted sample, changed invocation, foreign network
+member or remaining sampled process leaves STOP_UNCONFIRMED and capacity held.
+Even an expired native daemon with a retained unremoved bridge needs explicit
+reconciliation; stop never restarts it to erase evidence.
+
+Pre-container stop is separate from never_submitted: cancel/pause, producer,
+proof, attach or scheduler failure and restarted/expired rows use the same owned
+route cleanup. It removes only the checked owned network/endpoint and stops only
+the recorded exact daemon invocation, proving its cgroup and every retained
+PID-start ceased before removing the exact request/guard. Private checked copies
+of the original runtime/launcher retain stop authority after launch-only source
+or policy drift. The Docker executable pin and native ownership still apply;
+labels/hashes alone cannot create that authority. Cached actual ownership can
+attempt stop after metadata damage, but cannot release a damaged store. All
+quiescence variants require route cessation when route custody exists.
 
 ## Launch, keys and cessation
 

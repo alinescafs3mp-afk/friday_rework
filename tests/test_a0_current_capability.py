@@ -118,6 +118,10 @@ def route_fixture(setup, s, row, monkeypatch):
 def automatic(setup, s, monkeypatch, *, fault=None):
     """Synthetic native preparation only after the actual reservation exists."""
     original = s.hr.A0HostSession.produce_capability
+    # This module isolates the unchanged observation/attachment consumer.
+    # The actual preparation/ownership native I/O is exercised separately by
+    # test_a0_route_lifecycle, not fabricated as production readiness here.
+    monkeypatch.setattr(s.module,'prepare_route',lambda *args,**kwargs:None)
     states = []
     def produce(session,row):
         if not states:
@@ -213,6 +217,7 @@ async def test_real_missing_production_route_is_a_reserved_failure_not_queue_suc
     def absent(sha):
         l=loader(sha);l['REQUEST']=tmp_path/'ABSENT-original-route';return l
     monkeypatch.setattr(s.module,'checked_launcher',absent)
+    monkeypatch.setattr(s.module,'prepare_route',lambda *args,**kwargs:None)
     answer=invoke(setup,proof,args=s.args)
     assert answer['accepted'] is False and answer['reference']
     row=setup.host.store.get(answer['reference'],setup.record.owner_from_ingress(CALL,proof))
