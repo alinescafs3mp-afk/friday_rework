@@ -279,7 +279,7 @@ def test_a0_service_secret_drift_cannot_be_cleaned_as_own_original(tmp_path):
 def test_normal_install_ships_pinned_helpers_without_touching_live_launcher(tmp_path,monkeypatch):
     from scripts import friday_native
     source=tmp_path/'source'; source.mkdir(mode=0o700)
-    names=['scripts/a0_runtime.py','scripts/rootless_docker_launch.py','plugins/friday_rework/adapters/a0_profile.py','plugins/friday_rework/adapters/a0_web.py']
+    names=['scripts/a0_runtime.py','scripts/rootless_docker_launch.py','plugins/friday_rework/adapters/a0_profile.py','plugins/friday_rework/adapters/a0_web.py','scripts/friday-rework-docker.service']
     pins={}
     for name in names:
         p=source/name;p.parent.mkdir(mode=0o700,parents=True,exist_ok=True);p.write_bytes((ROOT/name).read_bytes());p.chmod(0o600);pins[name]=hashlib.sha256(p.read_bytes()).hexdigest()

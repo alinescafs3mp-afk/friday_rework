@@ -1,5 +1,40 @@
 # Foundation checkpoint — 2026-10-08
 
+Current checkpoint, 05:29 MSK: per-task A0 route preparation, trusted capability
+production, retained pre-container custody and cleanup are integrated. The final
+affected source gate passed 424 checks, with 11 additional independent controls
+for damaged metadata, foreign ownership and concurrent/reentrant requests.
+The accepted repair keeps the winning request's cleanup authority exclusive and
+attempts checked cached cleanup even when the association store cannot be read.
+These are source/offline results; A0 runtime admission remains closed.
+
+The ordinary registered Hermes `web_search` path also completed one real native
+service execution at 04:58 MSK, returned official Python documentation and
+confirmed natural exit and removal of its recorded cgroup. The call used the
+native keyless profile with its cache and provider failover intact. This proves
+that specific search and cessation, not autonomous conversation, delegated
+research or failure/hostile-source user journeys.
+
+The ordinary installer now stages and registers the existing dedicated A0
+service with pinned launcher/unit sources and a finite native lifetime. It
+retains the original installation clock and refuses active, foreign or
+unreconciled state; an uncertain link or reload result cannot be replayed.
+Independent source review passed 23 additional controls. After integration,
+all 923 affected checks passed in the original two bounded groups, with exact
+source and import verification. The earlier combined run exceeded its single
+run limit and is retained as an unsuccessful harness run.
+
+Actual installation and A0 runtime admission remain pending. The old dedicated
+unit is still linked, inactive and configured with infinite RuntimeMax; its
+owned registration, source files and retained runtime state must be reconciled
+before fresh installation. No service replacement or start has occurred. The
+G6 prerequisite trial failed on a journal-read timeout before creating settings
+or starting work; its processes and original owner lock are now confirmed
+closed. All seven installed user journeys, authenticated cold start and release
+acceptance remain unaccepted.
+
+Earlier dated observations below retain their original scope.
+
 Declared A0 installation, 03:52 MSK: normal profile compilation and the actual
 native credential consumer now require A0's embedding and service keys whenever
 an A0 deployment is declared, including before worker execution is enabled.
@@ -13,9 +48,9 @@ dependency, with no change to source guards or donor code. These are source and
 synthetic credential checks. Actual installation, provider authentication and
 all seven installed user journeys remain unaccepted.
 
-The trusted current A0 producer and native web stop repair are separate private
-candidates under review. Ordinary per-task A0 route preparation is still missing;
-source presence or a current-route reader does not establish a runnable A0.
+The trusted A0 producer, per-task route preparation and native web stop repair
+have since passed source review and are integrated. Their runtime qualification
+and the complete user journeys remain separate requirements.
 
 Credential installation, 03:20 MSK: ordinary native completion now accepts
 explicit protected JSON/dotenv references and writes exactly the selected
@@ -34,10 +69,9 @@ cold product start. No real credentials were read in this source task.
 A separately admitted native keyless search completed at 02:54 MSK and retained
 two useful Python documentation results, with actual namespace completion and
 execution-slot release verified. It is one provider execution, not an autonomous
-conversation or worker journey. Whole-operation web custody remains unaccepted:
-independent review of the private process-registry integration found incorrect
-stop/reset behavior and provider/cache parity gaps. Those changes are under
-repair and are not included in this published candidate.
+conversation or worker journey. The subsequently repaired process-registry
+stop/reset and provider/cache integration passed independent source review and
+is included. Live whole-operation stop/reset qualification remains unaccepted.
 
 Preflight repair, 02:39 MSK: the normal continuation now performs its two
 completed-PM checks with a read-only root mount in the existing PID boundary
@@ -79,10 +113,10 @@ or new deadline. The source repair is accepted; runtime completion is not.
 
 The earlier source-preparation attempt also remains retained with its expired
 original deadline. Neither installation history is deleted or silently adopted.
-Sol is implementing whole-operation web execution and stop handling through
-Hermes' existing process registry; it is not yet installed or accepted.
+Whole-operation web execution and stop handling use Hermes' existing process
+registry. Source acceptance does not establish installed runtime acceptance.
 
-The source now composes twenty pinned Hermes layers. The ordinary profile can
+The source now composes twenty-one pinned Hermes layers. The ordinary profile can
 select intact Harness and A0 workers while retaining each worker's admission,
 original budget and the existing single execution owner. Native credential
 admission consumes the same mixed profile and keeps inference, web and A0
@@ -90,9 +124,9 @@ service credentials separate. This does not grant A0 execution or warm reuse.
 
 | Capability | Source/configuration/wiring | Offline verification | Live execution | Release acceptance |
 |---|---|---|---|---|
-| Hermes/Harness keyless web | Explicit native provider plus intact Harness ctx.web; fixed outgoing search and passive metadata handling | Changed integration: 128 passing checks; three separate native Harness search/fetch/refusal controls used synthetic external bytes | One independently admitted native keyless search returned two useful official documentation results; conversation and worker application unproven | Pending |
-| Both-worker profile and shared result path | Connected to host, onboarding, health and native credential consumer; no fallback between workers | Both tiers and credential-domain mutations checked against the actual native consumer | A0 capability/service/network/start admission and mixed execution not run | Pending |
-| Authenticated installer and administrative UI | Complete twenty-layer source; selected native credential provisioning connected to ordinary completion | Final credential/dependency gate 98 PASS plus 9 independent controls; unchanged installer evidence retained | Actual Hermes source/dependencies/frontend/profile/TLS prepared; prior Harness installation and continuation remain stopped; real credential provisioning, cold start and two-user administration unaccepted | Pending |
+| Hermes/Harness keyless web | Native provider, intact Harness ctx.web and checked process-registry integration | Source checks and independent stop/provider/cache controls accepted; Harness controls used synthetic external bytes | Registered native search and natural cessation observed; autonomous conversation and worker application unproven | Pending |
+| Both-worker profile and shared result path | Host/onboarding/health/credentials/result consumers connected; trusted A0 producer and per-row route preparation integrated; no worker fallback | Affected A0 gate 424 PASS and 11 independent controls; earlier unchanged joins retained | A0 current service/network/start admission and mixed execution not run | Pending |
+| Authenticated installer and administrative UI | Complete twenty-one-layer source; selected native credential provisioning connected to ordinary completion | Credential gates accepted; unchanged installer evidence retained | Earlier Hermes source/dependencies/frontend/profile/TLS prepared; prior installation attempts stopped; real credential provisioning, cold start and two-user administration unaccepted | Pending |
 | Telegram, continuation and delivery | Existing host/result paths retained; continuation and repository handoff under implementation | Component evidence only | Real Telegram, executed goal verification and mixed delivery not proven | Pending |
 
 The native Python executable is hashed incrementally under its own 256 MiB

@@ -21,7 +21,7 @@ CGROUP_ROOT = Path('/sys/fs/cgroup')
 SELF_CGROUP = Path('/proc/self/cgroup')
 SERVICE_GROUP = '/user.slice/user-1000.slice/user@1000.service/app.slice/friday-rework-docker.service'
 UID = 1000
-UNIT_SHA256 = '4a53c16a6ff07e9203f2e297dadfaae2f7a67a469b64196c06b586f213219d6d'
+UNIT_SHA256 = '53e6d86ff912f4ad0761362bc5e7937d2131e48892469236be09db6b49bcd0ba'
 CONFIG_SHA256 = '4a423b2c8869a9fc5281b42141940301eed066866d64a6c55e9581ab507d45fb'
 SCRIPT_SHA256 = '200203633806081a401e60aefdf68a8fa73fc7dc80aa854c52a69d47710a3488'
 INSTALLED_UNIT = Path('/home/jericho/.config/systemd/user/friday-rework-docker.service')
@@ -552,6 +552,33 @@ def checked_unit_registration():
         checked_source(INSTALLED_UNIT, UNIT_SHA256)
 
 
+def checked_native_service_limits():
+    """A pinned file cannot prove the user manager reloaded its finite limits."""
+    names = ('RuntimeMaxUSec', 'TimeoutStartUSec', 'TimeoutStopUSec', 'Restart',
+             'KillMode', 'SendSIGKILL', 'DelegateSubgroup', 'MemoryMax', 'TasksMax',
+             'CPUQuotaPerSecUSec', 'DropInPaths', 'MainPID', 'InvocationID', 'ControlGroup')
+    raw = native_call(['/usr/bin/systemctl', '--user', 'show', 'friday-rework-docker.service',
+                       '--property=' + ','.join(names)])
+    pairs = [line.split('=', 1) for line in raw.splitlines()]
+    fields = dict(pairs)
+    require(len(pairs) == len(fields) and set(fields) == set(names), 'launch_native_limits_unknown')
+    expected = {'Restart': 'no', 'KillMode': 'control-group', 'SendSIGKILL': 'yes',
+                'DelegateSubgroup': 'dockerd', 'MemoryMax': str(20 * 1024**3),
+                'TasksMax': '2048', 'CPUQuotaPerSecUSec': '8s', 'DropInPaths': '',
+                'MainPID': str(os.getpid()), 'ControlGroup': SERVICE_GROUP}
+    require(all(fields[k] == v for k, v in expected.items())
+            and re.fullmatch(r'[0-9a-f]{32}', fields['InvocationID']), 'launch_native_boundary_changed')
+    scales = {'us': 1e-6, 'ms': .001, 's': 1, 'min': 60, 'h': 3600}
+    for name, seconds in zip(names[:3], (120, 45, 20)):
+        value = fields[name]
+        require(re.fullmatch(r'(?:[0-9]+(?:\.[0-9]+)?(?:us|ms|s|min|h) ?)+', value),
+                'launch_finite_native_deadline_required')
+        actual = sum(float(n) * scales[u] for n, u in
+                     re.findall(r'([0-9]+(?:\.[0-9]+)?)(us|ms|min|s|h)', value))
+        require(actual == seconds, 'launch_finite_native_deadline_changed')
+    return fields
+
+
 def prepare_memory():
     """One bounded pre-exec check/write. A failed postcondition prevents exec."""
     require(os.getuid() == UID and os.geteuid() == UID, 'wrong_launch_uid')
@@ -607,6 +634,7 @@ def main():
     binary = runtime / 'docker-29.8.2'
     script = binary / 'docker-rootless-extras/dockerd-rootless.sh'
     checked_unit_registration()
+    checked_native_service_limits()
     checked_source(ROOT / 'config/daemon.json', CONFIG_SHA256)
     checked_source(script, SCRIPT_SHA256)
     request = request_checked(UID) if REQUEST.exists() or REQUEST.is_symlink() else None

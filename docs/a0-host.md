@@ -62,7 +62,7 @@ explicitly invalid; this candidate does not rewrite historical records.
 
 The retained A0 artifacts now use the shared [result consumer](result-consumer.md)
 for list, inspect, assessment and delivery; the join has offline verification.
-**Per-row preparation/cleanup is a source candidate; qualification remains
+**Per-row preparation/cleanup passed independent source review; qualification remains
 NOT_RUN and `startup_health` retains its A0 refusal.** Preparation checks the
 registered pinned dedicated unit, no active/foreign daemon or worker unit,
 no old request/guard/rootless namespace, and the existing nonblocking runtime
@@ -224,10 +224,10 @@ output can reconcile after restart; expired/cancelled work still follows stop
 intent. Worker response, model completion and exit status do not prove goal or
 delivery.
 
-The later `results.py`/`result_tool.py` restaging/fixture/assessment/delivery join
-is explicitly outside this package. Those files and native overlays are unchanged.
-Fixture candidate c3f7bdd remains PARTIAL and unaccepted. This core cannot claim
-FRW-014 engineering acceptance, full result delivery or release readiness.
+The shared `results.py`/`result_tool.py` restaging, assessment and delivery join
+is integrated and verified offline; see [result consumer](result-consumer.md).
+Executed goal verification, warm reuse and live engineering/delivery remain
+unaccepted. This core does not establish FRW-014 or release readiness.
 
 ## Verification
 

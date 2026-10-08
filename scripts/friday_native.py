@@ -194,6 +194,10 @@ def complete(value, home, receipt, *, budget=None):
         if path.is_dir():
             os.chmod(path, 0o700)
     stage_worker_runtime(value, home)
+    from scripts.a0_prepare import service_required, install_service
+    if service_required(value):
+        require(budget is not None, 'original_a0_install_budget_required')
+        budget.call(install_service, value, home, budget)
     bundle = profile_write(home, value['product'])
     if 'credential_sources' in value:
         require(budget is not None, 'original_credential_budget_required')
@@ -208,14 +212,8 @@ def stage_worker_runtime(value, home):
     from scripts.friday_install import directory,require,owned_file,digest
     destination = home / 'worker-runtime-source'
     require(not destination.exists() and not destination.is_symlink(), 'existing_worker_source_not_adopted')
-    names = ('scripts/a0_runtime.py','scripts/rootless_docker_launch.py',
-             'plugins/friday_rework/adapters/a0_profile.py','plugins/friday_rework/adapters/a0_web.py')
-    payload = {}
-    for name in names:
-        require(name in value['project_files'], 'worker_runtime_source_not_pinned')
-        data = owned_file(ROOT/name)
-        require(digest(data)==value['project_files'][name], 'worker_runtime_source_changed')
-        payload[name]=data
+    from scripts.a0_prepare import service_sources
+    payload = service_sources(value['project_files'], root=ROOT)
     destination.mkdir(mode=0o700);directory(destination)
     for name,data in payload.items():
         path=destination/name;path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
