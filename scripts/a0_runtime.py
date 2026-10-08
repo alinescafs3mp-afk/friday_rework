@@ -185,20 +185,46 @@ def metadata_descriptor(value):
     return p
 
 
-def git_metadata_snapshot(source):
+def metadata_budget(budget, maximum=10):
+    """Use the caller's original stop/clock check for each bounded read."""
+    if budget is None:
+        return maximum
+    left = budget()
+    require(type(left) in (int, float) and math.isfinite(left) and left > 0,
+            'git_metadata_budget_exhausted')
+    return min(maximum, left)
+
+
+def metadata_sha(path, budget):
+    if budget is None:
+        return sha(path)
+    h = hashlib.sha256()
+    metadata_budget(budget)
+    with open(path, 'rb') as stream:
+        while block := stream.read(1024 * 1024):
+            metadata_budget(budget)
+            h.update(block)
+    metadata_budget(budget)
+    return h.hexdigest()
+
+
+def git_metadata_snapshot(source, *, budget=None):
     """Read-only proof of authentic objects and a self-contained clone.
 
     Parent stages/reviews the clone separately. This function never clones,
     fetches, edits configuration or manufactures history. Files are all pinned;
     later admission refuses any drift. Stop uses the recorded mount identity.
     """
+    metadata_budget(budget)
     source = metadata_descriptor({'source': str(source), 'manifest_sha256': '0' * 64})
     for p in (RUNTIME, RUNTIME / 'git-metadata', source.parent.parent, source.parent):
         private(p, directory=True)
     require(source.is_dir() and source.resolve() == source, 'git_metadata_pointer_or_missing')
     records = {}; total = 0
     for base, dirs, names in os.walk(source, followlinks=False):
+        metadata_budget(budget)
         for name in dirs + names:
+            metadata_budget(budget)
             p = Path(base) / name; s = p.lstat(); rel = p.relative_to(source).as_posix()
             require(s.st_uid == os.getuid() and not s.st_mode & 0o022
                     and (stat.S_ISDIR(s.st_mode) or stat.S_ISREG(s.st_mode))
@@ -210,7 +236,7 @@ def git_metadata_snapshot(source):
                 total += s.st_size
                 require(s.st_nlink == 1 and total <= 512 * 1024**2 and len(records) < 4096,
                         'git_metadata_sharing_or_size')
-                records[rel] = {'sha256': sha(p), 'size': s.st_size}
+                records[rel] = {'sha256': metadata_sha(p, budget), 'size': s.st_size}
     require(source.lstat().st_uid == os.getuid() and not source.lstat().st_mode & 0o022,
             'unsafe_git_metadata_file')
     require((source / 'HEAD').read_text() == DONOR + '\n' and 'index' in records
@@ -229,10 +255,15 @@ def git_metadata_snapshot(source):
            'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
            'GIT_OPTIONAL_LOCKS': '0'}
     def git(*args):
-        r = subprocess.run(['/usr/bin/git', '--no-optional-locks', '--git-dir=' + str(source),
-                            '--work-tree=' + str(source.parent), '-c', 'core.fsmonitor=false',
-                            '-c', 'core.hooksPath=/dev/null', *args], env=env,
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+        timeout = metadata_budget(budget)
+        try:
+            r = subprocess.run(['/usr/bin/git', '--no-optional-locks', '--git-dir=' + str(source),
+                                '--work-tree=' + str(source.parent), '-c', 'core.fsmonitor=false',
+                                '-c', 'core.hooksPath=/dev/null', *args], env=env,
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            raise RuntimeErrorBoundary('git_metadata_read_failed') from None
+        metadata_budget(budget)
         require(r.returncode == 0, 'git_metadata_objects_invalid')
         if args[0] == 'for-each-ref':
             require(not r.stderr, 'git_metadata_refs_changed')
@@ -257,6 +288,7 @@ def git_metadata_snapshot(source):
     # (which may write objects/index). NUL records preserve unusual filenames.
     entries = []; paths = []
     for row in git('ls-tree', '-r', '--full-tree', '-z', DONOR_TREE).split('\0')[:-1]:
+        metadata_budget(budget)
         header, path = row.split('\t', 1)
         mode, kind, oid = header.split(' ')
         entries.append(f'{mode} {oid} 0\t{path}\0'); paths.append(path)
@@ -268,6 +300,7 @@ def git_metadata_snapshot(source):
                        r'  dev: [0-9]+\tino: [0-9]+\n  uid: [0-9]+\tgid: [0-9]+\n'
                        r'  size: [0-9]+\tflags: 0\n')
     for path in paths:
+        metadata_budget(budget)
         prefix = path + '\0'
         require(debug.startswith(prefix, offset), 'git_metadata_index_flags_changed')
         match = stats.match(debug, offset + len(prefix))
@@ -276,16 +309,19 @@ def git_metadata_snapshot(source):
     require(offset == len(debug), 'git_metadata_index_flags_changed')
     git('fsck', '--full', '--no-reflogs')
     # Git reads must leave every observed file intact (including the index).
-    require(all(sha(source / n) == r['sha256'] for n, r in records.items()), 'git_metadata_read_drift')
+    require(all(metadata_sha(source / n, budget) == r['sha256'] for n, r in records.items()), 'git_metadata_read_drift')
+    metadata_budget(budget)
     return {'donor': DONOR, 'tree': DONOR_TREE, 'files': records}
 
 
-def check_git_metadata(value):
+def check_git_metadata(value, *, budget=None):
+    metadata_budget(budget)
     source = metadata_descriptor(value)
     manifest = private(source.parent.parent / 'metadata.json')
     data = manifest.read_bytes()
     require(hashlib.sha256(data).hexdigest() == value['manifest_sha256'], 'git_metadata_manifest_changed')
-    require(json.loads(data) == git_metadata_snapshot(source), 'git_metadata_manifest_mismatch')
+    require(json.loads(data) == git_metadata_snapshot(source, budget=budget), 'git_metadata_manifest_mismatch')
+    metadata_budget(budget)
 
 
 def probe_config_checked(cfg, configured, expected, preset_name='Default'):
@@ -613,7 +649,8 @@ def host_identity(value):
     return json.loads(json.dumps(value, allow_nan=False))
 
 
-def validate(p, *, check_files=True):
+def validate(p, *, check_files=True, budget=None):
+    metadata_budget(budget)
     pins = None if check_files else {k: p[k] for k in ['code_sha256', 'docker_sha256', 'daemon_unit_sha256']}
     expected = plan(p['accepted_unix'], p['deadline_unix'], assignment=p['assignment'],
                     generation=p['generation'], owner_slot=p['owner_slot'],
@@ -624,7 +661,8 @@ def validate(p, *, check_files=True):
                     accepted_monotonic_ns=p.get('accepted_monotonic_ns'), boot_id=p.get('boot_id'), deployment=p.get('deployment'), web=p.get('web'))
     require(p == expected, 'plan_identity_or_boundary_changed')
     if check_files and 'git_metadata' in p:
-        check_git_metadata(p['git_metadata'])
+        check_git_metadata(p['git_metadata'], **({} if budget is None else {'budget': budget}))
+    metadata_budget(budget)
     return p
 
 
@@ -788,11 +826,14 @@ def native_supervisor():
 
 class Runtime:
     """Single native boundary wrapper; no scheduler, daemon or message replay."""
-    def __init__(self, p, *, runner=None, supervisor=None, stopping=False):
-        self.p = validate(p, check_files=not stopping)
+    def __init__(self, p, *, runner=None, supervisor=None, stopping=False, budget=None):
+        # Stop-only reconstruction must remain available after the work clock.
+        validation_budget = None if stopping else budget
+        self.p = validate(p, check_files=not stopping, budget=validation_budget)
         # A corrected host wrapper may stop an old reviewed plan, but an
         # unverified executable must never receive an effectful control call.
         require(sha(DOCKER) == p['docker_sha256'], 'docker_binary_changed')
+        metadata_budget(validation_budget)
         self.runner = runner or self._command
         self.supervisor = supervisor or native_supervisor()
         self.directory = RUNTIME / p['identity']
@@ -874,6 +915,9 @@ class Runtime:
         xs = json.loads(self.docker('network', 'inspect', n['id'], **limits))
         require(isinstance(xs, list) and len(xs) == 1, 'local_network_unknown')
         network_checked(n, xs[0], container_id=container_id)
+        # Docker readback may race daemon/request/namespace replacement. Check
+        # the same pinned guard again before publishing current readiness.
+        namespace['observe_guard'](n, **({} if budget is None else {'budget': budget}))
         return {'status': 'CURRENT_LOCAL_NETWORK_CHECKED', 'id': n['id']}
 
     def check_web(self, container_id):

@@ -32,7 +32,7 @@ def configure_a0(setup,proof,tmp_path,monkeypatch,*,native_launcher=False):
     m.PROJECT=root;m.RUNTIME=runtime_root;m.DOCKER=docker;m.LAUNCHER=launcher
     # Native Git inventory, kernel route/namespace readback, PID/cgroup samples
     # are explicitly fake interfaces; produced plan/create/unit schema is real.
-    m.check_git_metadata=lambda x:None
+    m.check_git_metadata=lambda x, **kwargs:None
     state=NS(calls=[],running=False,unit_started=False,obj=None,posts=[],checks=0,session=None,
              before_task=None,bootstrap_hook=None,create_hook=None,cleanup_uncertain=False)
     class Supervisor:

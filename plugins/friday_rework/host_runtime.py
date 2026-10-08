@@ -582,7 +582,7 @@ class A0HostSession:
             owner_slot=native['owner_slot'], launcher_sha256=native['launcher']['sha256'],
             docker_sha256=native['docker']['sha256'], deployment=native.get('deployment'), web=native.get('web'))
         plan = self._plan(m, self._current(row), network)
-        runtime = m.Runtime(plan)
+        runtime = m.Runtime(plan, budget=lambda: self._startup_left(row))
         # Same current route consumer used by native preparation/API admission;
         # this object performs no start and acquires no worker cleanup custody.
         observed = runtime.check_network(budget=lambda: self._startup_left(row))

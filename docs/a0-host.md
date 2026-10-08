@@ -76,6 +76,12 @@ Offline proof inputs and native interfaces are explicitly fabricated controls;
 they never constitute production evidence or an enabled deployment.
 
 The host samples wall time, monotonic nanoseconds and boot once before claim.
+The producer passes that same stop/deadline check through Runtime construction
+and the existing Git metadata reader. Each read-only Git command uses the
+remaining time, with checks between commands and file-hash chunks. Stop-only
+reconstruction remains available after the work deadline. Final Docker network
+readback is followed by another guard/namespace/daemon observation before the
+producer may publish current-route evidence.
 The store persists that triple and the exact original wall deadline; claim
 rejects future acceptance/current-boot mismatch. Duplicate admission returns the
 original row. Runtime remaining time uses both original clocks and current boot.
