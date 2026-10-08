@@ -5,6 +5,17 @@
   const {React: R, fetchJSON, authedFetch} = sdk;
   const h = R.createElement;
   const base = "/api/plugins/friday_rework";
+  const workerLabels = {
+    NOT_PREPARED: "Not prepared", PREPARED_RUNTIME_UNOBSERVED: "Prepared; execution not checked",
+    RECONCILIATION_REQUIRED: "Setup needs reconciliation",
+    OWN_DEPLOYMENT_QUALIFIED_JOURNEYS_NOT_RUN: "Deployment qualified; useful live journeys unverified",
+    BOTH_REQUIRED_WORKERS_PENDING: "Required workers are not ready",
+    PENDING_OWN_A0_NATIVE_PROBE_AND_QUALIFICATION: "Engineering worker needs an admitted host probe and qualification",
+    QUALIFICATION_OR_SETUP_REQUIRES_RECONCILIATION_NO_REPLAY: "Setup needs inspection; automatic restart is blocked",
+    OWN_DEPLOYMENTS_QUALIFIED_LIVE_JOURNEYS_NOT_RUN: "Both workers qualified; useful live journeys unverified",
+    QUALIFIED_WORKERS_NATIVE_ACCESS_PENDING: "Workers qualified; native user access remains pending",
+  };
+  const workerLabel = value => workerLabels[value] || value;
   function Console() {
     const [profiles, setProfiles] = R.useState([]), [profile, setProfile] = R.useState("");
     const [view, setView] = R.useState("users"), [query, setQuery] = R.useState("");
@@ -69,8 +80,12 @@
           method: action === "credentials" ? "PUT" : "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
         if (action === "prepare") { setPrepared(result); setSecretName((result.required_names || [])[0] || "");
           setProfiles(await fetchJSON(base + "/profiles")); }
-        else setPrepared({...prepared, state: result.state, enabled: result.enabled});
-      } catch (_) { setError("Setup write unconfirmed or refused. Inspect current native state before any further action."); }
+        else setPrepared({...prepared, ...result, setup_uncertain: false});
+      } catch (_) {
+        setError("Setup write unconfirmed or refused. Inspect current native state before any further action.");
+        if (prepared) setPrepared({...prepared, setup_uncertain: true, can_prepare_workers: false,
+          can_qualify_workers: false, can_activate: false});
+      }
       finally { setSecretValue(""); setBusy(false); }
     }
     async function open(row, messageOffset = 0) {
@@ -150,7 +165,7 @@
       control ? h("pre", {role: "status"}, JSON.stringify(control, null, 2)) : null,
       ["users", "pairing"].includes(view) ? h("p", null, "Select the receiving account profile for user access and pairing. Execution profiles do not own these controls.") : null,
       view === "onboarding" && data ? h("div", {"aria-label": "New private Friday profile"},
-        h("p", null, "Prepare a new private profile, capture its scoped keys, approve native channel access, then activate. Incomplete setup stays disabled."),
+        h("p", null, "Prepare a private profile and its required workers, capture scoped keys and approve native channel access. Check both workers before activation. Incomplete or uncertain setup stays disabled."),
         ...["platform", "account_id", "user_id", "runtime_profile"].map(k => h("label", {key: k}, k + " ",
           h("input", {value: setup[k], disabled: busy || !!prepared, maxLength: k.includes("profile") ? 64 : 512,
             onChange: e => setSetup({...setup, [k]: e.target.value})}))),
@@ -166,12 +181,22 @@
           }) : null))) : null,
         prepared ? h("div", null,
           h("p", {role: "status"}, prepared.state),
+          prepared.worker_execution ? h("p", {role: "status"}, workerLabel(prepared.worker_execution)) : null,
+          prepared.workers ? h("ul", null, ...Object.entries(prepared.workers).map(([name, status]) =>
+            h("li", {key: name}, (name === "dsh" ? "Harness" : "A0") + ": " + workerLabel(status.state)))) : null,
+          (prepared.required_workers || []).length ? h("div", null,
+            button("Prepare required workers", () => onboard("workers/prepare"),
+              {disabled: busy || prepared.enabled || prepared.setup_uncertain || !prepared.can_prepare_workers}),
+            button("Check required workers", () => onboard("workers/qualify"),
+              {disabled: busy || prepared.enabled || prepared.setup_uncertain || !prepared.can_qualify_workers}),
+            button("Inspect worker setup", () => onboard("workers/state"), {disabled: busy || prepared.enabled})) : null,
           h("select", {value: secretName, disabled: busy || prepared.enabled, onChange: e => setSecretName(e.target.value)},
             ...(prepared.required_names || []).map(n => h("option", {key: n, value: n}, n))),
           h("input", {type: "password", autoComplete: "new-password", value: secretValue, disabled: busy || prepared.enabled,
             "aria-label": "New profile scoped key", onChange: e => setSecretValue(e.target.value)}),
-          button("Store scoped key", () => onboard("credentials"), {disabled: busy || prepared.enabled || !secretName || !secretValue}),
-          button("Activate complete profile", () => onboard("activate"), {disabled: busy || prepared.enabled})) : null) : null,
+          button("Store scoped key", () => onboard("credentials"), {disabled: busy || prepared.enabled || prepared.setup_uncertain || !secretName || !secretValue}),
+          button("Activate complete profile", () => onboard("activate"), {disabled: busy || prepared.enabled || prepared.setup_uncertain ||
+            ((prepared.required_workers || []).length > 0 && !prepared.can_activate)})) : null) : null,
       view === "users" && data ? h("ul", null, ...data.users.map(renderUser)) : null,
       view === "pairing" && data ? h("ul", null, ...data.pending.map(row => h("li", {key: row.request_id || row.user_id},
         `${row.platform} / ${row.user_id} `, button("Approve native access", () => approve(row), {disabled: busy || !row.request_id})))) : null,

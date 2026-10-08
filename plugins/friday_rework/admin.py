@@ -154,6 +154,18 @@ class Administration:
         from .onboarding import Onboarding
         return Onboarding(self).configure_worker(profile, session=session, **values)
 
+    def onboarding_workers_prepare(self, profile, *, session=None, **values):
+        from .onboarding import Onboarding
+        return Onboarding(self).prepare_workers(profile, session=session, **values)
+
+    def onboarding_workers_qualify(self, profile, *, session=None, **values):
+        from .onboarding import Onboarding
+        return Onboarding(self).qualify_workers(profile, session=session, **values)
+
+    def onboarding_workers_state(self, profile, *, session=None, **values):
+        from .onboarding import Onboarding
+        return Onboarding(self).workers_state(profile, session=session, **values)
+
     def onboarding_activate(self, profile, *, session=None, **values):
         from .onboarding import Onboarding
         return Onboarding(self).activate(profile, session=session, **values)

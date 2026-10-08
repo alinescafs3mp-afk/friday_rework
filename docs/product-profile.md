@@ -136,8 +136,18 @@ an independently supplied own receipt. For Harness it calls the original
 `check_runtime`, preserves original source/web/budget checks, then updates
 native configuration and its existing onboarding proof. The user remains
 disabled until the original scoped-key/native-grant/activation checks pass.
-A0 configuration remains `DISABLED_A0_RECONCILIATION_REQUIRED`; rendering
-settings cannot release the existing stop or grant a current job capability.
+A0 manual/legacy configuration remains `DISABLED_A0_RECONCILIATION_REQUIRED`.
+Normal onboarding now uses installed declarations through
+`/onboarding/workers/prepare`, owning-profile native observation through
+`/onboarding/workers/qualify`, and explicit `/onboarding/workers/state`
+inspection. Its own producer and the shared result consumer must qualify both
+workers before configuration/activation; an opaque own-file hash is insufficient.
+The Dashboard calls these operations without runtime JSON or receipt assembly,
+renders readiness and refuses complete activation with disabled workers.
+An absent admitted own-profile A0 probe stays pending before any native observer
+or qualification claim. Producing that exact probe through the existing native
+A0 owner remains a separate live prerequisite; this source change does not
+launch it, release a historical stop or grant a kernel run/per-job capability.
 The original WorkerHost retains one selected runtime per profile; these APIs
 add no second worker manager, task store, queue or automatic launch. Actual
 installation and independent/live acceptance remain required.
@@ -190,7 +200,7 @@ platforms have token-scope checks here; actual account proof remains unaccepted.
 These are source and offline consumer results. Product admission still requires
 its native grants. Independent review, canonical installer integration, portable
 runtime preparation, real authenticated cold startup, channel exclusivity,
-useful autonomous web for both intact workers, full administration and all six
+useful autonomous web for both intact workers, full administration and all seven
 live product journeys remain required. The separate stopped A0 work is not
 restarted by this overlay.
 

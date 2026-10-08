@@ -40,7 +40,7 @@ def own_runtime(home, profile, worker, runtime):
     return c, root
 
 
-def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None):
+def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None, declared_files=None):
     """Return an explicit plan before any write; never read/copy readiness."""
     from .onboarding import validate_template
     from hermes_cli import friday_user_scope as scope
@@ -49,7 +49,10 @@ def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None):
                        'required_secrets': [config['providers']['friday-local']['key_env'],
                            *([] if config['web']['keyless_fallback'] else ['EXA_API_KEY'])]})
     c, root = own_runtime(home, profile, worker, runtime)
-    files = {}; names = []; unobserved = ['native execution', 'model', 'network', 'runtime receipt', 'independent review']
+    files = dict(declared_files or {}); names = []; unobserved = ['native execution', 'model', 'network', 'runtime receipt', 'independent review']
+    for path, raw in files.items():
+        if not path.is_relative_to(root / 'inputs') or path.resolve() != path or not isinstance(raw, bytes):
+            raise HostUnavailable('foreign_declared_worker_input')
     if worker == 'dsh':
         if a0_network is not None:
             raise HostUnavailable('unexpected_a0_inputs')
@@ -71,7 +74,16 @@ def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None):
         from .worker_web import DshWebInputs
         # Read every pinned source/web input; no shared receipt or key is read.
         for p in (d['node'], d['cli'], *d['native_files']): _pin(p).read()
-        web = DshWebInputs(*(_pin(d['web'][k]) for k in ('resolver', 'trust_bundle', 'egress_evidence', 'research_policy')), profile=d['web']['profile'])
+        def declared_pin(ref):
+            checked = _pin(ref)
+            if checked.path not in files: return checked
+            raw = files[checked.path]
+            if hashlib.sha256(raw).hexdigest() != checked.sha256:
+                raise HostUnavailable('declared_worker_input_changed')
+            # Byte-only future declaration, used solely by the trusted planner.
+            from types import SimpleNamespace
+            return SimpleNamespace(path=checked.path, sha256=checked.sha256, read=lambda: raw)
+        web = DshWebInputs(*(declared_pin(d['web'][k]) for k in ('resolver', 'trust_bundle', 'egress_evidence', 'research_policy')), profile=d['web']['profile'])
         web.checked_patch(data)
         names = [d['key_name'], *([] if d['web']['profile'] == 'exa-keyless' else ['EXA_API_KEY'])]
     else:

@@ -180,9 +180,11 @@ def test_each_account_old_job_cannot_revive_and_owned_stop_survives(wired, monke
         user_id=old_source.user_id, chat_type=old_source.chat_type,
         thread_id=old_source.thread_id, profile=old_source.profile)
     new_source._identity = replace(old_source._identity)
-    assert w.users.gateway._principal_authorized(new_source, allow_adapter_delegation=True)
     token = scope._CURRENT.set(None)
     try:
+        # A new ingress is admitted outside the revoked task's retained scope.
+        # Its fresh grant must not revive any old object or original job below.
+        assert w.users.gateway._principal_authorized(new_source, allow_adapter_delegation=True)
         with scope.scoped_source(new_source) as fresh:
             assert fresh.admission_generation > old_cap.admission_generation
             assert not w.invoke('friday_work', w.args)['accepted']

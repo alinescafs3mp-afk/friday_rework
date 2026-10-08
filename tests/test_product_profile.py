@@ -105,7 +105,8 @@ def test_ambient_keys_and_input_data_never_adopted(monkeypatch):
     bundle = compose_product(spec)
     assert spec == before and 'AMBIENT_OWNER_CANARY' not in json.dumps(bundle)
     ordinary = template(bundle)
-    assert set(ordinary) == {'config','tools','required_secrets'}
+    assert set(ordinary) == {'config','tools','required_secrets','worker_inputs'}
+    assert ordinary['worker_inputs'] == {'required':['dsh','a0'],'workers':{}}
     assert not any(k in ordinary['config'] for k in ('dashboard','gateway','secrets'))
     assert ordinary['config']['plugins']['entries']['friday_rework']['settings'] == {
         'runtime': {'enabled': False}, 'results': {'enabled': True}}

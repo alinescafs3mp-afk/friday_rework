@@ -213,7 +213,17 @@ are retained as private preparation inputs, never installed into the worker.
 The original native A0 key references are added to the same onboarding proof's
 required names, so credential capture uses the existing protected writer. No
 secret is read or copied during worker preparation. A0 live reconciliation and
-per-job capability remain blocked and separate; kernel120 is not granted.
+per-job capability remain separate; kernel120 is not granted by this source.
+The normal installed template now carries protected worker declarations. Its
+Dashboard preparation derives both private inputs without borrowing operator
+receipts, credentials or writable homes. Original web expiry is retained.
+Own-profile qualification reuses native observers and their exact common result
+consumer, then attaches both checked receipts under the existing Session,
+generation and config-CAS locks. Missing own A0 producer/plan remains explicit
+pending without native IO or a new claim. A partial attempt requires factual
+reconciliation and cannot be automatically rerun. Neither disabled worker is an
+accepted shortcut for normal-profile admission. See `user-onboarding.md` for the
+normal Dashboard/API progression and remaining native prerequisite.
 
 The returned `PREPARED_RUNTIME_UNOBSERVED` state has `enabled=false`. Partial
 writes stay disabled and are not adopted on retry. For Harness, configuration
@@ -234,6 +244,6 @@ Fixtures use actual native onboarding, grants, config, protected scopes,
 PluginManager/middleware/WorkerHost/result admission and synthetic source/key/
 review receipts. Worker scheduling is intercepted before execution. They are
 not independent review, live acceptance or a runtime readiness producer. Both
-workers' useful autonomous web, full authenticated admin and all six product
+workers' useful autonomous web, full authenticated admin and all seven product
 journeys still require their mandatory actual checks. Direct ordinary
 skill/cron/terminal remains a separate explicit policy gap.

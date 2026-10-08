@@ -202,6 +202,9 @@ def check_runtime(value, associations):
         raise HostUnavailable("runtime_not_verified")
     for pin in receipt["evidence"]:
         _pin(pin).read()
+    if (Path(config['runtime_home']) / 'workers/qualification').exists():
+        from .user_worker_join import deployment_health as own_health
+        own_health(config)
     return config
 
 
@@ -315,6 +318,9 @@ def check_a0_runtime(value, associations):
             or receipt['source_pins'] != actual or not isinstance(receipt['evidence'],list) or not receipt['evidence']):
         raise HostUnavailable('a0_readiness_not_verified')
     for p in receipt['evidence']: _pin(p).read()
+    if (Path(c['runtime_home']) / 'workers/qualification').exists():
+        from .user_worker_join import deployment_health as own_health
+        own_health(c)
     # Reusable reviewed deployment evidence; this grants no per-job effects.
     # The producer attaches the exact freshly reserved row below.
     return c
@@ -377,6 +383,10 @@ def deployment_health(config):
         if (policy['boot_id'] != Path('/proc/sys/kernel/random/boot_id').read_text().strip()
                 or policy['net_namespace'] != [ns.st_dev,ns.st_ino]):
             raise HostUnavailable('worker_web_namespace_changed')
+    from hermes_cli import friday_user_scope as scope
+    if (home / scope.ONBOARDING).exists():
+        from .user_worker_join import deployment_health as user_health
+        return user_health(c)
     marker_path = home / 'FRIDAY-INSTALL.json'
     marker = json.loads(PinnedFile(marker_path,hashlib.sha256(marker_path.read_bytes()).hexdigest()).read())
     ref = marker.get('worker_qualification')
@@ -422,6 +432,17 @@ def deployment_health(config):
         if (sha is None and present) or (sha is not None and not present):
             raise HostUnavailable('qualified_credentials_changed')
         if sha is not None: _pin({'path':str(path),'sha256':sha}).read()
+    return deployment_observations(c, proof, marker['original_attempt'], home / 'preparation/worker-qualification')
+
+
+def deployment_observations(c, proof, original_attempt, folder):
+    """Shared exact native result consumer for install and own-profile setup."""
+    from .worker_web import checked_network_observation, web_policy
+    import time
+    home = Path(c['runtime_home']); kind = 'a0' if 'a0' in c else 'dsh'
+    if kind == 'dsh':
+        web = _dsh_web(c['dsh'])
+        policy = web_policy(web,str(home),c['runtime_profile'],time.time())
     obs = proof['workers'][kind]
     if kind == 'dsh':
         if (obs['policy_sha256'] != web.egress_evidence.sha256
@@ -432,7 +453,7 @@ def deployment_health(config):
         urls = [('https://mcp.exa.ai/' if web.profile == 'exa-keyless' else 'https://api.exa.ai/'),*policy['document_probes']]
         checked_network_observation(json.dumps(obs['network']),urls)
         executions = [r['observation'] for r in obs['smoke']] + [obs['network_execution']]
-        prefix = hashlib.sha256(str(home / 'preparation/worker-qualification/dsh-probe').encode()).hexdigest()[:24]
+        prefix = hashlib.sha256(str(folder / 'dsh-probe').encode()).hexdigest()[:24]
         for index, execution in enumerate(executions, 1):
             envelope = execution.get('resource_envelope', {})
             if (execution.get('returncode') != 0 or execution.get('reaped') is not True
@@ -442,7 +463,7 @@ def deployment_health(config):
                     or any(envelope[k] != c['dsh'][k] for k in ('memory_bytes','cpu_percent','tasks'))
                     or envelope['boot_id'] != proof['observed']['boot_id']
                     or type(envelope['deadline']) not in (int,float)
-                    or not 0 < envelope['deadline'] <= marker['original_attempt']['deadline_mono']):
+                    or not 0 < envelope['deadline'] <= original_attempt['deadline_mono']):
                 raise HostUnavailable('worker_native_resources_unverified')
     else:
         from .adapters.a0_web import checked_web

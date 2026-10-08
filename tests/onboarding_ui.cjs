@@ -62,9 +62,25 @@ const context = {
     let data;
     if (path.endsWith("/profiles")) data = requests.some(r => r.url.includes("/onboarding/prepare")) ? ["default", "user-1"] : ["default"];
     else if (path.endsWith("/users")) data = input.users || {accounts: [], users: []};
-    else if (path.endsWith("/onboarding")) data = {templates: ["approved-local"], pending: [], config_sha256: "a".repeat(64)};
+    else if (path.endsWith("/onboarding")) data = {templates: [input.normal_join ? "friday-local" : "approved-local"], pending: [], config_sha256: "a".repeat(64)};
     else if (path.endsWith("/onboarding/prepare")) data = {state: "DISABLED_INCOMPLETE", enabled: false,
-      generation: 1, config_sha256: "b".repeat(64), required_names: ["LOCAL_KEY", "EXA_API_KEY"]};
+      generation: 1, config_sha256: input.config_sha256 || "b".repeat(64), required_names: ["LOCAL_KEY", "EXA_API_KEY"],
+      ...(input.normal_join ? {required_workers:["dsh","a0"],can_prepare_workers:true,can_activate:false,
+        can_qualify_workers:false,workers:{dsh:{state:"NOT_PREPARED"},a0:{state:"NOT_PREPARED"}}} : {})};
+    else if (path.endsWith("/onboarding/workers/prepare")) {
+      if (input.uncertain) throw Error("Explicit offline transport uncertainty");
+      data = input.worker_state || {state:"DISABLED_SETUP_PENDING",enabled:false,can_prepare_workers:false,
+        can_qualify_workers:!!input.normal_qualified,can_activate:false,required_workers:["dsh","a0"],
+        worker_execution:"PENDING_OWN_A0_NATIVE_PROBE_AND_QUALIFICATION",workers:{
+          dsh:{state:"PREPARED_RUNTIME_UNOBSERVED"},a0:{state:"PREPARED_RUNTIME_UNOBSERVED"}}};
+    } else if (path.endsWith("/onboarding/workers/state")) data = input.worker_state || {
+      state:"DISABLED_SETUP_PENDING",enabled:false,can_prepare_workers:false,can_qualify_workers:!!input.normal_qualified,
+      can_activate:false,required_workers:["dsh","a0"],worker_execution:"PENDING_OWN_A0_NATIVE_PROBE_AND_QUALIFICATION",
+      workers:{dsh:{state:"PREPARED_RUNTIME_UNOBSERVED"},a0:{state:"PREPARED_RUNTIME_UNOBSERVED"}}};
+    else if (path.endsWith("/onboarding/workers/qualify")) data = {state:"CONFIGURED_NATIVE_ACTIVATION_REQUIRED",
+      enabled:false,can_activate:true,can_prepare_workers:false,can_qualify_workers:false,
+      worker_execution:"OWN_DEPLOYMENTS_QUALIFIED_LIVE_JOURNEYS_NOT_RUN",workers:{
+        dsh:{state:"OWN_DEPLOYMENT_QUALIFIED_JOURNEYS_NOT_RUN"},a0:{state:"OWN_DEPLOYMENT_QUALIFIED_JOURNEYS_NOT_RUN"}}};
     else if (path.endsWith("/onboarding/credentials")) data = {state: "DISABLED_SETUP_PENDING", enabled: false, recorded: true};
     else if (path.endsWith("/onboarding/activate")) data = {state: "ADMITTED_NEXT_NATIVE_REQUEST", enabled: true};
     else if (path.endsWith("/effective")) data = {config_sha256: "c".repeat(64), typed_options: {
@@ -111,12 +127,12 @@ const click = async label => {render(); const node = find(tree, label); assert(n
     render(); const field = inputs(tree).find(x => x.props.value === value && x.props.onChange);
     assert(field, "Missing field " + value); field.props.onChange({target: {value: next}});render();
   }
-  setField("", "bot-A");setField("", "1");setField("", "user-1");setField("", "approved-local");
+  setField("", "bot-A");setField("", "1");setField("", "user-1");setField("", input.normal_join ? "friday-local" : "approved-local");
   await click("Prepare disabled profile");
   const prepare = requests.find(r => r.url.includes("/onboarding/prepare"));
   assert(prepare);const body = JSON.parse(prepare.body);
   assert.deepEqual(body, {platform: "telegram", transport_profile: "default", account_id: "bot-A", user_id: "1",
-    expected_config_sha256: "a".repeat(64), runtime_profile: "user-1", template: "approved-local"});
+    expected_config_sha256: "a".repeat(64), runtime_profile: "user-1", template: input.normal_join ? "friday-local" : "approved-local"});
   observations.push("EXACT_PRINCIPAL_PROFILE_TEMPLATE_CAS");
   assert(find(tree,"Prepare disabled profile").props.disabled); observations.push("NO_DUPLICATE_PREPARE");
   const keyInput=inputs(tree).find(x => x.props.type === "password");assert(keyInput && keyInput.props.autoComplete === "new-password");
@@ -124,13 +140,41 @@ const click = async label => {render(); const node = find(tree, label); assert(n
   keyInput.props.onChange({target:{value:"synthetic-native-key-canary"}});render();
   await click("Store scoped key");
   const capture = requests.find(r => r.url.includes("/onboarding/credentials"));assert(capture && capture.method === "PUT");
-  const secretBody = JSON.parse(capture.body); assert.equal(secretBody.generation,1);assert.equal(secretBody.expected_config_sha256,"b".repeat(64));
+  const secretBody = JSON.parse(capture.body); assert.equal(secretBody.generation,1);assert.equal(secretBody.expected_config_sha256,input.config_sha256 || "b".repeat(64));
   assert.equal(secretBody.name,"LOCAL_KEY");assert.equal(secretBody.value,"synthetic-native-key-canary");
   assert(!("runtime_profile" in secretBody) && !("template" in secretBody)); observations.push("SCOPED_SECRET_EXACT_NATIVE_API");
   assert.equal(inputs(tree).find(x => x.props.type === "password").props.value, "");observations.push("SECRET_CLEARED_AFTER_CAPTURE");
+  if (input.normal_join) {
+    assert(find(tree,"Activate complete profile").props.disabled);
+    observations.push("NORMAL_DISABLED_WORKERS_CANNOT_ACTIVATE");
+    await click("Prepare required workers");
+    const request=requests.find(r=>r.url.includes("/onboarding/workers/prepare"));assert(request);
+    assert.deepEqual(Object.keys(JSON.parse(request.body)).sort(),
+      ["platform","transport_profile","account_id","user_id","expected_config_sha256","generation"].sort());
+    observations.push("NORMAL_INSTALLED_INPUTS_NO_OPAQUE_RUNTIME_OR_RECEIPT");
+    assert(find(tree,"Prepare required workers").props.disabled);
+    assert(find(tree,"Activate complete profile").props.disabled);
+    if (input.uncertain) {
+      assert(text(tree).includes("unconfirmed"));assert(find(tree,"Check required workers").props.disabled);
+      observations.push("UNCERTAINTY_NO_RESUBMISSION");
+    }
+    await click("Inspect worker setup");
+    assert(text(tree).includes("Engineering worker needs an admitted host probe and qualification"));
+    observations.push("AUTHORITATIVE_WORKER_STATE_PRESERVED_AND_RENDERED");
+    if (input.normal_qualified) {
+      await click("Check required workers");
+      assert(!find(tree,"Activate complete profile").props.disabled);
+      assert(text(tree).includes("Both workers qualified; useful live journeys unverified"));
+      observations.push("QUALIFIED_REQUIRED_WORKERS_ENABLE_ACTIVATION");
+      await click("Activate complete profile");assert(find(tree,"Activate complete profile").props.disabled);
+    } else {assert(find(tree,"Activate complete profile").props.disabled);
+      assert(find(tree,"Check required workers").props.disabled);}
+    for (const r of requests) {assert.equal(r.credentials,"include");assert.equal(r.headers["x-hermes-session-token"],input.token);}
+    process.stdout.write(JSON.stringify({observations,requests,count:observations.length,source_fixture:true,browser_live:"NOT_RUN"}));return;
+  }
   await click("Activate complete profile");
   const activation = requests.find(r => r.url.includes("/onboarding/activate"));assert(activation && activation.method === "POST");
-  const activateBody=JSON.parse(activation.body);assert.equal(activateBody.generation,1);assert.equal(activateBody.expected_config_sha256,"b".repeat(64));
+  const activateBody=JSON.parse(activation.body);assert.equal(activateBody.generation,1);assert.equal(activateBody.expected_config_sha256,input.config_sha256 || "b".repeat(64));
   assert(!("value" in activateBody));observations.push("ACTIVATION_ORIGINAL_GENERATION_CURRENT_CAS");
   assert(find(tree,"Activate complete profile").props.disabled);observations.push("NO_REPEAT_ENABLED_ACTIVATION");
   render();const productProfile=inputs(tree).find(x => x.tag==="select" && x.props.value==="default");

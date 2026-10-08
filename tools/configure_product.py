@@ -235,6 +235,10 @@ def compose_product(spec):
             or any(inference['key_env'] in names for names in channel_names.values())):
         raise ValueError('separate_scoped_credential_references_required')
     template = {'config': ordinary, 'tools': sorted(scope.SAFE), 'required_secrets': required}
+    # Installation-owned declarations only: never propagate owner readiness,
+    # profile identity, receipts, keys or per-job capabilities into a user.
+    from plugins.friday_rework.user_worker_join import installation_inputs
+    template['worker_inputs'] = installation_inputs(runtime)
     validate_template(template)
     settings['onboarding'] = {'templates': {'friday-local': template}}
     soul = (ROOT / 'config/SOUL.md').read_bytes()
@@ -260,7 +264,7 @@ def compose_product(spec):
             'Native named-provider credential pool takes priority; fresh scoped pool/credential ownership must be verified',
             'Native worker runtime receipts and scoped key readiness not checked by rendering',
             'Ordinary users use accepted SAFE tools; direct skill/cron/terminal expansion requires separate policy review',
-            'Fresh user template worker runtime disabled until profile-specific reviewed runtime input',
+            'Fresh user remains disabled until both own-profile worker deployments are qualified',
             'Independent review and mandatory live journeys not run'],
     }}
 

@@ -252,3 +252,18 @@ def onboarding_worker_prepare(body: WorkerPrepare, profile: str, session=Depends
 @router.post('/onboarding/worker/configure')
 def onboarding_worker_configure(body: WorkerConfigure, profile: str, session=Depends(require_admin)):
     return call(_admin.onboarding_worker_configure, profile, session=session, **body.model_dump())
+
+
+@router.post('/onboarding/workers/prepare')
+def onboarding_workers_prepare(body: OnboardingActivate, profile: str, session=Depends(require_admin)):
+    return call(_admin.onboarding_workers_prepare, profile, session=session, **body.model_dump())
+
+
+@router.post('/onboarding/workers/qualify')
+def onboarding_workers_qualify(body: OnboardingActivate, profile: str, session=Depends(require_admin)):
+    return call(_admin.onboarding_workers_qualify, profile, session=session, **body.model_dump())
+
+
+@router.post('/onboarding/workers/state')
+def onboarding_workers_state(body: OnboardingActivate, profile: str, session=Depends(require_admin)):
+    return call(_admin.onboarding_workers_state, profile, session=session, **body.model_dump())

@@ -1,7 +1,7 @@
 # Protected native user onboarding
 
 This is a source/offline component awaiting independent review and joined
-installation. It does not establish the six mandatory live journeys or complete
+installation. It does not establish the seven mandatory live journeys or complete
 ordinary capabilities. Astra owns integration of the separate admin-controls
 candidate and the final installation. The intact donor catalogue remains required.
 
@@ -101,12 +101,53 @@ reviewed eight ordinary capability names are admitted by the existing user scope
 other required native skills/browser/provider surfaces remain unaccepted, with no
 catalogue deletion or waiver.
 
-The existing worker runtime setting is retained explicitly. A disabled or missing
-worker runtime is reported as requiring its existing readiness hooks, never as a
-working Harness/A0 job. Enabled worker configuration must be installation-owned
-and scoped to the new profile through the existing runtime receipts and checks.
+The normal `friday-local` template retains installation-owned worker source,
+model, web and resource declarations in `worker_inputs`. It carries no operator
+receipt, credential, writable home, per-job capability or qualification clock.
+Both workers are required. A disabled or missing runtime cannot publish the user
+admission marker; preparation remains possible until actual completion.
+The protected fresh preparation receipt fixes this requirement. Historical valid
+homes with an older receipt retain their original contract even if a template
+later has the same name; this path does not adopt or migrate them.
+
+In Dashboard → onboarding, prepare the private profile, then **Prepare required
+workers**. The host derives both exact private roots, the Harness patch, A0 native
+files and own web-policy declaration from that approved configuration. The policy
+retains its original expiry, namespace and boot; it is not a network observation.
+Capture the requested scoped keys and approve native channel access as before.
+**Inspect worker setup** displays authoritative pending/qualified/uncertain states;
+it does not execute a probe. There is no background polling or automatic replay.
+
+**Check required workers** invokes one bounded owning-host qualification action:
+the existing DSH no-model smoke/DNS/TLS observer and the existing A0 native
+probe/resource/web/route observer. Their shared result consumer verifies exact
+own-profile preparations, source pins, credentials, binding/generation and the
+original attempt before attaching both runtime receipts under the existing
+configuration locks. Only then is **Activate complete profile** available. This
+does not establish useful live journeys or grant an A0 per-job capability.
+
+An independently admitted owning-host A0 producer must first supply a still-live, exact own-user
+association plan at `<user home>/workers/a0/probe-plan.json`. The plan must retain
+its own original native clock and actual supervisor/route/container identity.
+This join neither launches that probe nor constructs its association, route,
+kernel grant or credentials. If it is absent, the result is
+`DISABLED_OWN_A0_NATIVE_PROBE_REQUIRED`, with no qualification claim or native IO.
+The current per-job A0 producer checks profile readiness before starting, so it
+cannot bootstrap this disabled new profile. This package supplies the protected
+observer/consumer join, not that separately admitted bootstrap producer.
+Providing that producer is a remaining prerequisite, not an action for the
+product user to assemble manually. Operator-home install qualification
+and arbitrary `ready:true` reports never substitute for it.
+
+Supported normal APIs are `POST /onboarding/workers/{prepare,qualify,state}` under
+`/api/plugins/friday_rework`. They take only the existing principal, receiving
+profile, generation and configuration CAS; runtime JSON and receipt paths are
+not accepted. All effects reverify the native administrator Session under the
+existing locks. Partial setup or qualification requires inspection/reconciliation
+and cannot reset a deadline or submit again. Existing private-home contracts are
+preserved; they are not silently converted into normal qualified users.
 Both intact workers, autonomous mid-task web, remaining ordinary capabilities,
-primary/secondary onboarding joins and all six live journeys still require joined
+primary/secondary onboarding joins and all seven live journeys still require joined
 installation and acceptance. This component does not move that assembly work to
 the product user. A0 G3 cleanup is CLOSED by its owner reconciliation; its original native report
 remains failed and the product kernel run is not granted. No A0 effect is authorized here.
@@ -132,4 +173,4 @@ independent review, installation and all live acceptance.
 
 Managed home settings use the existing native cross-process config transaction. Admin edits validate the complete resulting template, then reseal its exact config receipt and home marker; interrupted proof publication leaves native admission closed. Pending setups stay disabled. Direct enable and repeated native pairing approval require the same complete managed proof, including the receipt digest, Friday SOUL and protected scoped credentials. Removing the receipt cannot downgrade a managed home to legacy readiness. Existing job budgets, cancellation records and access generations remain authoritative.
 
-The joined offline producer gate composes current admin-controls before onboarding. It executes actual native sources with synthetic SDK/HTTP boundaries, never a model/provider or receiving-service run. Independent whole-candidate review, installation, supported secondary receiving-home compound CAS, both workers' useful autonomous web, and all six live journeys remain required.
+The joined offline producer gate composes current admin-controls before onboarding. It executes actual native sources with synthetic SDK/HTTP boundaries, never a model/provider or receiving-service run. Independent whole-candidate review, installation, supported secondary receiving-home compound CAS, both workers' useful autonomous web, and all seven live journeys remain required.
