@@ -445,3 +445,16 @@ Worker health preserves administrator/scope admission failures. Inside an
 already authorized profile, missing or malformed configuration produces a
 redacted unverified row while the other authorized profiles remain inspectable.
 This diagnostic never grants worker readiness or clears the A0 acceptance stops.
+
+### Dedicated A0 service source and registration
+
+The ordinary completion now stages the tracked dedicated unit together with its
+pinned launcher/runtime helpers and, only for explicitly configured A0, registers
+an absent owned service through the existing A0 preparer. The effect plan records
+one native link and one whole-user-manager reload, with no enable/start. Original
+installation containment/clock and the existing A0 runtime lock remain mandatory.
+An existing deployment is refused for owner reconciliation rather than replaced.
+See [the service installation contract](a0-preparation.md#dedicated-service-in-the-ordinary-installer)
+for exact source pins, native lifetime/resource controls, uncertainty and retained
+failure semantics. Source/receipt checks do not qualify actual A0 runtime or
+remove the startup-health refusal.

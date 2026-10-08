@@ -194,6 +194,7 @@ def spec_checked(value):
                 'scripts/dsh_prepare.py', 'plugins/friday_rework/adapters/dsh_keyless_web.mjs', 'scripts/a0_prepare.py', 'scripts/install_containment.py',
                 'scripts/friday_start.py', 'scripts/install_credentials.py',
                 'scripts/a0_runtime.py', 'scripts/rootless_docker_launch.py',
+                'scripts/friday-rework-docker.service',
                 'tools/configure_product.py', 'tools/configure_local_test.py',
                 'tools/web_profile.py', 'config/SOUL.md', 'config/RESEARCH.md'}
     required.update(str(p.relative_to(ROOT)) for p in (ROOT / 'plugins/friday_rework').rglob('*')
@@ -206,6 +207,8 @@ def spec_checked(value):
                 and '..' not in Path(name).parts and isinstance(expected, str)
                 and re.fullmatch('[0-9a-f]{64}', expected), 'invalid_project_inventory')
         require(digest(owned_file(ROOT / name)) == expected, 'project_source_changed')
+    from scripts.a0_prepare import service_sources
+    service_sources(files, root=ROOT)
     product = value['product']
     require(isinstance(product, dict) and product.get('profile') == 'default',
             'native_default_receiving_home_required')
@@ -299,7 +302,9 @@ def commands(value):
     checked_binary(value['containment'])
     python = value['bootstrap_python']['path']; helper = str(ROOT / 'scripts/friday_native.py')
     launcher = str(source / '.hermes/bin/hermes')
+    from scripts.a0_prepare import service_plan
     return {
+        'a0_service_effect_plan': service_plan(value, home),
         'compose': [python, '-B', value['hermes_prepare']['path'], '--repository', str(ROOT),
                     '--donor', value['hermes_donor'], '--destination', str(source),
                     '--seconds', str(min(120, value['seconds']))],
@@ -538,6 +543,11 @@ def finish_install(value, input_hash, home, donors, source, receipt, receipt_pat
                                for name in ('config.yaml', 'SOUL.md', 'FRIDAY-PROFILE.json')}
     marker['plugin_files'] = {name: sha for name, sha in value['project_files'].items()
                               if name.startswith('plugins/friday_rework/')}
+    from scripts.a0_prepare import service_plan, service_receipt_checked
+    if service_plan(value, home)['required']:
+        budget.call(service_receipt_checked, value, home, original_attempt=claim)
+        marker['a0_service_receipt_sha256'] = digest(budget.call(
+            owned_file, home / 'preparation/a0-service.receipt.json', private=True))
     pending = home / (MARKER + '.completed')
     publish(pending, marker, budget=budget)
     require(budget.call(read_json, home / MARKER) == claim, 'install_claim_changed')
@@ -554,7 +564,7 @@ def finish_install(value, input_hash, home, donors, source, receipt, receipt_pat
 
 
 def gaps():
-    return ['A0 portable image/toolchain preparation is absent; fixed deployment needs separately admitted kernel/resources',
+    return ['A0 portable image/toolchain preparation is absent; fixed deployment needs separately admitted kernel/resources; finite inactive service registration is not runtime qualification',
             'Both-worker configuration is available; A0 useful-web runtime admission and mixed live execution remain unverified',
             'Native Dashboard boundary requires independent source review and actual authenticated startup/attach acceptance',
             'Protected credential provisioning, actual account ownership, PM/build realization and all seven live journeys require independent acceptance']
@@ -672,6 +682,9 @@ def completed_profile_checked(value, home, bundle, budget):
     for key, name in value['product']['dashboard'].get('tls', {}).items():
         require(digest(budget.call(owned_file, home / name, private=True)) == value['dashboard_tls'][key]['sha256'],
                 'installed_dashboard_tls_changed')
+    from scripts.a0_prepare import service_plan, service_receipt_checked
+    if service_plan(value, home)['required']:
+        budget.call(service_receipt_checked, value, home, original_attempt=read_json(home / MARKER))
 
 
 def resume_harness(request, request_path, *, prepared=None):
@@ -776,6 +789,12 @@ def inspect(value, input_hash):
     require(marker.get('plugin_files') == expected_plugins, 'installed_plugin_inventory_changed')
     for name, sha in expected_plugins.items():
         require(digest(owned_file(home / name, private=True)) == sha, 'installed_plugin_changed')
+    from scripts.a0_prepare import service_plan, service_receipt_checked
+    if service_plan(value, home)['required']:
+        path = home / 'preparation/a0-service.receipt.json'
+        require(digest(owned_file(path, private=True)) == marker.get('a0_service_receipt_sha256'),
+                'a0_service_receipt_changed')
+        service_receipt_checked(value, home, original_attempt=marker['original_attempt'])
     return {'state': 'TEMPLATE_INCOMPLETE', 'ready': False, 'home': str(home),
             'effects': 'NONE', 'remaining': gaps(),
             'invocation_completion': 'NOT_PROVEN_BY_OUTPUT_RECEIPT'}

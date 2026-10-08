@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import configparser
 import hashlib
 import json
 import os
@@ -19,6 +21,10 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT = ROOT.parent.parent if ROOT.parent.name == ".worktrees" else ROOT
 UPSTREAM = "https://github.com/agent0ai/agent-zero.git"
+SERVICE_SOURCE = 'scripts/friday-rework-docker.service'
+SERVICE_FILES = ('scripts/a0_runtime.py', 'scripts/rootless_docker_launch.py',
+                 'plugins/friday_rework/adapters/a0_profile.py',
+                 'plugins/friday_rework/adapters/a0_web.py', SERVICE_SOURCE)
 
 
 class Refusal(RuntimeError):
@@ -215,6 +221,248 @@ def inventory(path, pin, source_lock_sha, source, files):
         ],
         "effects": "source fetch/checkout only when absent; existing checkout checks read-only"
     }
+
+
+def service_sources(project_files, *, root=ROOT):
+    """One byte inventory for staging, registration and the launch consumer."""
+    from scripts.friday_install import require, owned_file, digest
+    payload = {}
+    for name in SERVICE_FILES:
+        require(name in project_files, 'worker_runtime_source_not_pinned')
+        data = owned_file(root / name)
+        require(digest(data) == project_files[name], 'worker_runtime_source_changed')
+        payload[name] = data
+    tree = ast.parse(payload['scripts/rootless_docker_launch.py'])
+    unit_pin = [ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == 'UNIT_SHA256' for t in n.targets)]
+    require(unit_pin == [digest(payload[SERVICE_SOURCE])], 'a0_service_launcher_unit_pin_mismatch')
+    unit = configparser.ConfigParser(interpolation=None, strict=True)
+    unit.optionxform = str
+    unit.read_string(payload[SERVICE_SOURCE].decode())
+    require(not unit.defaults() and set(unit.sections()) == {'Unit', 'Service', 'Install'},
+            'a0_service_template_shape')
+    expected = {'Type': 'notify', 'NotifyAccess': 'all', 'Restart': 'no',
+                'RuntimeMaxSec': '120s', 'TimeoutStartSec': '45s', 'TimeoutStopSec': '20s',
+                'KillMode': 'control-group', 'SendSIGKILL': 'yes', 'Delegate': 'yes',
+                'DelegateSubgroup': 'dockerd', 'TasksMax': '2048', 'MemoryHigh': '12G',
+                'MemoryMax': '20G', 'CPUQuota': '800%', 'LimitNOFILE': '65535', 'UMask': '0077',
+                'ExecStart': '/usr/bin/python3 /home/jericho/jericho/Friday_rework/.runtime/rootless-docker/launch.py'}
+    require(dict(unit['Service']) == expected, 'a0_service_native_boundary_changed')
+    require(dict(unit['Unit']) == {
+        'Description': 'Friday rework dedicated rootless Docker development runtime',
+        'Documentation': 'https://docs.docker.com/engine/security/rootless/',
+        'Requires': 'dbus.socket', 'After': 'dbus.socket'}
+        and dict(unit['Install']) == {'WantedBy': 'default.target'}, 'a0_service_template_changed')
+    return payload
+
+
+def service_plan(value, home):
+    """Explicit normal-install phase; no native IO or registration while planning."""
+    from scripts.friday_install import require, digest, owned_file
+    payload = service_sources(value['project_files'])
+    from scripts import a0_runtime as runtime
+    from scripts import rootless_docker_launch as launcher
+    # These remain the existing deployment. No path, endpoint, capacity or
+    # source-pin override is accepted from the operational install document.
+    required = value['product']['runtime'].get('enabled') is True and (
+        'a0' in value['product']['runtime'] or 'a0' in value['product']['runtime'].get('workers', {}))
+    if required:
+        from plugins.friday_rework.host_runtime import configured_runtimes
+        selected = configured_runtimes(value['product']['runtime'])['a0']
+        config = selected['a0']
+        require(config['docker']['path'] == str(runtime.DOCKER)
+                and digest(owned_file(runtime.DOCKER)) == config['docker']['sha256'],
+                'a0_service_docker_pin_changed')
+        profile = runtime.profile_module()
+        require(config.get('deployment') is not None, 'explicit_a0_service_deployment_required')
+        deployment = profile.checked_profile(config['deployment'])
+        require(value['product'].get('a0_deployment') == deployment,
+                'a0_service_product_deployment_mismatch')
+        require(profile.network_endpoints(deployment) == launcher.ENDPOINTS,
+                'a0_service_deployment_route_unsupported')
+        # This is a ceiling/readiness check, never a fresh per-job clock. The
+        # unchanged route consumer must check actual remaining time again.
+        require(selected['budget_seconds'] >= 120 + 45 + 20 + 5 + 25,
+                'a0_service_job_budget_insufficient')
+        for key, path, name in (
+            ('runtime', home / 'worker-runtime-source/scripts/a0_runtime.py', 'scripts/a0_runtime.py'),
+            ('launcher', runtime.LAUNCHER, 'scripts/rootless_docker_launch.py'),
+            ('daemon_unit', launcher.ROOT / 'supervisor' / runtime.DAEMON, SERVICE_SOURCE)):
+            require(config[key] == {'path': str(path), 'sha256': digest(payload[name])},
+                    'a0_service_config_source_mismatch')
+    return {'schema': 'friday.a0.service-install-plan.v1', 'required': required,
+            'home': str(home), 'unit': runtime.DAEMON,
+            'launcher': str(runtime.LAUNCHER),
+            'unit_source': str(launcher.ROOT / 'supervisor' / runtime.DAEMON),
+            'registration': str(launcher.INSTALLED_UNIT),
+            'source_files': {n: digest(b) for n, b in payload.items()},
+            'native_limits': {'runtime_seconds': 120, 'start_seconds': 45, 'stop_seconds': 20},
+            'link_argv': ['/usr/bin/systemctl', '--user', '--no-reload', 'link',
+                          str(launcher.ROOT / 'supervisor' / runtime.DAEMON)],
+            'reload_argv': ['/usr/bin/systemctl', '--user', 'daemon-reload'],
+            'whole_user_manager_reload': True, 'enable': False, 'start': False,
+            'existing_state_policy': 'REFUSE_RECONCILE_NO_OVERWRITE_NO_ADOPTION',
+            'runtime_acceptance': 'NOT_ACCEPTED'}
+
+
+def service_receipt_checked(value, home, *, original_attempt):
+    """Verify shipped/registered bytes and a historical receipt, not live health."""
+    from scripts.friday_install import require, owned_file, read_json, digest
+    from scripts import rootless_docker_launch as launcher
+    plan = service_plan(value, home)
+    receipt = read_json(home / 'preparation/a0-service.receipt.json')
+    require(receipt.get('schema') == 'friday.a0.service-install-receipt.v1'
+            and receipt.get('state') == 'REGISTERED_INACTIVE_NATIVE_START_NOT_RUN'
+            and receipt.get('plan') == plan and receipt.get('original_attempt') == original_attempt
+            and receipt.get('resume_allowed') is False
+            and receipt.get('runtime_acceptance') == 'NOT_ACCEPTED', 'a0_service_receipt_changed')
+    require(not (home / 'preparation/a0-service.failure.json').exists()
+            and not (home / 'preparation/a0-service.failure.json').is_symlink(),
+            'a0_service_attempt_requires_reconciliation')
+    for name, data in service_sources(value['project_files']).items():
+        require(owned_file(home / 'worker-runtime-source' / name) == data, 'staged_a0_service_source_changed')
+    require(digest(owned_file(plan['launcher'])) == plan['source_files']['scripts/rootless_docker_launch.py'],
+            'a0_install_published_source_changed')
+    launcher.checked_unit_registration()
+    return receipt
+
+
+def install_service(value, home, budget):
+    """One original install attempt, under its existing namespace and runtime lock.
+
+    A failed/lost link or whole-user reload acknowledgement is retained; a
+    second call cannot replay it. This publishes no request and starts nothing.
+    """
+    from scripts.friday_install import (require, directory, owned_file, digest,
+                                        read_json, publish, partial_claim, MARKER)
+    from scripts.dsh_prepare import run, StopUnconfirmed, safe_observation
+    from scripts import a0_runtime as runtime
+    from scripts import rootless_docker_launch as launcher
+    plan = budget.call(service_plan, value, home)
+    if not plan['required']:
+        return {'state': 'A0_NOT_CONFIGURED_SOURCE_STAGED', 'runtime_acceptance': 'NOT_ACCEPTED'}
+    budget.check(reserve=35)
+    directory(home)
+    claim = read_json(home / MARKER)
+    require(claim == partial_claim(claim['input_sha256'], budget), 'fresh_install_claim_required')
+    payload = service_sources(value['project_files'])
+    stage = home / 'worker-runtime-source'
+    for name, data in payload.items():
+        require(owned_file(stage / name) == data, 'staged_a0_service_source_changed')
+    evidence = home / 'preparation'
+    evidence.mkdir(mode=0o700, exist_ok=True); directory(evidence)
+    intent = evidence / 'a0-service.intent.json'
+    require(not intent.exists() and not intent.is_symlink(), 'a0_service_attempt_requires_reconciliation')
+    names = ('Id', 'LoadState', 'ActiveState', 'SubState', 'MainPID', 'ControlPID',
+             'InvocationID', 'ControlGroup', 'FragmentPath', 'DropInPaths', 'Restart',
+             'KillMode', 'SendSIGKILL', 'DelegateSubgroup', 'MemoryMax', 'TasksMax',
+             'CPUQuotaPerSecUSec', 'RuntimeMaxUSec', 'TimeoutStartUSec', 'TimeoutStopUSec')
+    def command(argv, phase):
+        out, observation = run(argv, runtime.PROJECT, timeout=min(10, budget.check(reserve=1)),
+                               deadline=budget.deadline, env=runtime.ENV,
+                               log=evidence / ('a0-service-' + phase))
+        budget.check()
+        return out, safe_observation(observation)
+    def observe(phase):
+        raw, receipt = command(['/usr/bin/systemctl', '--user', 'show', runtime.DAEMON,
+                                '--property=' + ','.join(names)], phase)
+        pairs = [line.split('=', 1) for line in raw.splitlines()]
+        fields = dict(pairs)
+        require(len(pairs) == len(fields) and set(fields) == set(names), 'a0_install_unit_observation_unknown')
+        require(fields['Id'] == runtime.DAEMON and fields['ActiveState'] == 'inactive'
+                and fields['SubState'] == 'dead' and fields['MainPID'] == fields['ControlPID'] == '0'
+                and not fields['InvocationID'] and not fields['ControlGroup']
+                and not fields['DropInPaths'], 'active_or_unreconciled_a0_service')
+        return fields, receipt
+    def quiet_paths():
+        boundary = Path(os.path.commonpath((launcher.ROOT, launcher.INSTALLED_UNIT.parent)))
+        require(boundary != Path('/'), 'a0_install_directory_boundary_changed')
+        for parent in (launcher.ROOT / 'supervisor', launcher.ROOT / 'config', launcher.INSTALLED_UNIT.parent):
+            while True:
+                launcher.owned_directory(parent)
+                if parent == boundary: break
+                require(parent.is_relative_to(boundary), 'a0_install_directory_boundary_changed')
+                parent = parent.parent
+        launcher.checked_source(launcher.ROOT / 'config/daemon.json', launcher.CONFIG_SHA256)
+        launcher.checked_source(launcher.ROOT.parent / 'docker-29.8.2/docker-rootless-extras/dockerd-rootless.sh',
+                                launcher.SCRIPT_SHA256)
+        # Do not infer namespace cessation from an inactive service or PID 0.
+        # Any retained state, including child_pid, must first be reconciled by
+        # the existing owner. No namespace/process adoption or cleanup here.
+        for p in (launcher.REQUEST, launcher.GUARD, launcher.STATE / 'rootlesskit'):
+            require(not p.exists() and not p.is_symlink(), 'a0_install_retained_route_or_namespace')
+        if launcher.STATE.exists() or launcher.STATE.is_symlink():
+            launcher.owned_directory(launcher.STATE)
+            require(not any(launcher.STATE.iterdir()), 'a0_install_retained_route_or_namespace')
+    def published_sources():
+        require(digest(owned_file(runtime.LAUNCHER)) == plan['source_files']['scripts/rootless_docker_launch.py']
+                and digest(owned_file(plan['unit_source'])) == plan['source_files'][SERVICE_SOURCE],
+                'a0_install_published_source_changed')
+    with runtime.Runtime.locked(None):
+        quiet_paths()
+        before, before_command = observe('before')
+        require(before['LoadState'] == 'not-found' and not before['FragmentPath'],
+                'existing_a0_service_requires_reconciliation')
+        target = launcher.ROOT / 'supervisor' / runtime.DAEMON
+        for p in (runtime.LAUNCHER, target, launcher.INSTALLED_UNIT):
+            require(not p.exists() and not p.is_symlink(), 'existing_a0_service_source_requires_reconciliation')
+        record = {'schema': 'friday.a0.service-install-intent.v1', 'plan': plan,
+                  'original_attempt': claim, 'before': before, 'before_command': before_command,
+                  'resume_allowed': False, 'cessation': 'NO_START_SUBMITTED'}
+        publish(intent, record, budget=budget)
+        try:
+            def exclusive(path, data):
+                budget.check()
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+                with os.fdopen(fd, 'wb') as stream:
+                    stream.write(data); stream.flush(); os.fsync(stream.fileno())
+                runtime.sync_dir(path.parent); budget.check()
+            quiet_paths()
+            current, _ = observe('before-publication')
+            require(current == before, 'a0_install_unit_changed_before_publication')
+            exclusive(runtime.LAUNCHER, payload['scripts/rootless_docker_launch.py'])
+            exclusive(target, payload[SERVICE_SOURCE])
+            published_sources()
+            quiet_paths()
+            current, _ = observe('before-link')
+            require(current == before and not launcher.INSTALLED_UNIT.exists()
+                    and not launcher.INSTALLED_UNIT.is_symlink(), 'a0_install_registration_changed')
+            publish(evidence / 'a0-service.link-intent.json', record, budget=budget)
+            _, link = command(plan['link_argv'], 'link')
+            launcher.checked_unit_registration()
+            published_sources()
+            publish(evidence / 'a0-service.link-receipt.json', link, budget=budget)
+            quiet_paths()
+            publish(evidence / 'a0-service.reload-intent.json', record, budget=budget)
+            _, reload = command(plan['reload_argv'], 'reload')
+            launcher.checked_unit_registration()
+            published_sources()
+            after, after_command = observe('after')
+            require(after['LoadState'] == 'loaded' and after['FragmentPath'] in (str(target), str(launcher.INSTALLED_UNIT)),
+                    'a0_install_registered_unit_unknown')
+            expected = {'Restart': 'no', 'KillMode': 'control-group', 'SendSIGKILL': 'yes',
+                        'DelegateSubgroup': 'dockerd', 'MemoryMax': str(20 * 1024**3),
+                        'TasksMax': '2048', 'CPUQuotaPerSecUSec': '8s'}
+            require(all(after[k] == v for k, v in expected.items()), 'a0_install_effective_native_limits_changed')
+            from plugins.friday_rework.adapters.a0_native import _duration
+            require([_duration(after[k]) for k in ('RuntimeMaxUSec', 'TimeoutStartUSec', 'TimeoutStopUSec')]
+                    == [120, 45, 20], 'a0_install_effective_native_limits_changed')
+            quiet_paths()
+            published_sources()
+            result = {**record, 'schema': 'friday.a0.service-install-receipt.v1',
+                      'state': 'REGISTERED_INACTIVE_NATIVE_START_NOT_RUN', 'after': after,
+                      'link': link, 'reload': reload, 'after_command': after_command,
+                      'runtime_acceptance': 'NOT_ACCEPTED'}
+            publish(evidence / 'a0-service.receipt.json', result, budget=budget)
+            return result
+        except BaseException as exc:
+            failure = {**record, 'state': 'STOP_UNCONFIRMED_REGISTRATION_REQUIRES_RECONCILIATION',
+                       'failure_type': type(exc).__name__, 'resume_allowed': False}
+            # Preserve exact uncertain effects even if the original clock ran
+            # out. This finite evidence write grants no execution or replay.
+            try: publish(evidence / 'a0-service.failure.json', failure)
+            except (OSError, ValueError): pass
+            raise StopUnconfirmed('STOP_UNCONFIRMED: A0 registration/reload requires reconciliation') from exc
 
 
 def main(argv=None):

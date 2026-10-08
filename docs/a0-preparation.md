@@ -94,3 +94,59 @@ source. They prove clean repeat/check does not rewrite the index; wrong commit,
 tree and origin refuse; changed tracked bytes (including assume-unchanged), staged
 changes, missing files, mode changes, untracked source and a competing writer
 refuse. They are preparation checks; they do not certify A0 runtime behavior.
+
+## Dedicated service in the ordinary installer
+
+The tracked `scripts/friday-rework-docker.service` ships the existing dedicated
+Docker unit with `RuntimeMaxSec=120s`, start/stop limits of 45s/20s, and the
+unchanged 20GiB/8CPU/2048-task, delegation and whole-cgroup kill controls.
+`rootless_docker_launch.py` pins these exact unit bytes and checks its own current native invocation, PID/cgroup, finite effective deadlines and resource/kill controls before delegation writes or daemon exec. A changed or infinite cached unit refuses even if the on-disk template SHA matches. The normal installer
+requires both files in its reviewed `project_files`, checks the template and its
+launcher pin together, and stages the unit alongside the complete runtime and
+profile/web helpers in `<product-home>/worker-runtime-source`.
+
+For an explicitly enabled A0 runtime, `friday_native.complete` then calls the
+existing A0 preparer with the *same* original installation budget, inside the
+existing finite installation namespace. It holds the existing A0 `runtime.lock`;
+there is no second service, manager, owner store or clock. The runtime config
+must point to its staged runtime source, the fixed dedicated launcher and unit,
+and their exact new source hashes. The deployment must be explicit and equal to
+the product deployment. The present narrow route supports only its declared
+legacy local endpoint pair, which remains temporary test profile data. Other
+valid configurable profiles refuse with `a0_service_deployment_route_unsupported`
+before effects; they are not silently rewritten. A job budget shorter than 215s
+cannot contain this 120+45+20+5s boundary and the existing 25s cleanup reserve.
+The unchanged route consumer must still verify actual remaining original job time
+and effective native limits before publishing a request. Planning is no proof of
+native enforcement or production readiness.
+
+`friday_install plan` exposes `a0_service_effect_plan`. Registration is absent-only:
+active/failed/foreign/previously loaded units, old source/registration files,
+requests, guards, retained RootlessKit state, changed config/script bytes or an
+unreconciled prior installation intent refuse. The preparer neither overwrites
+nor adopts them. In particular, the currently retained old deployment needs
+separate owner reconciliation; this source package grants no migration or replay
+of old installer/G5 attempts.
+
+An eligible fresh registration publishes exact private launcher/unit files,
+uses supported `systemctl --user --no-reload link <owned-unit>`, and explicitly
+performs one `systemctl --user daemon-reload`. This reload affects the whole user
+manager. It does not enable the service, start a daemon, publish a route request,
+read credentials or run A0. Commands and cleanup consume the original remaining
+install budget; bounded stdout/stderr observations remain in the install's
+`preparation` directory. Intent is durable before each effect. Lost link/reload
+acknowledgement, late budget exhaustion or source/native readback drift retain
+`STOP_UNCONFIRMED_REGISTRATION_REQUIRES_RECONCILIATION`; no automatic rollback,
+repeat link/reload, service restart or broad kill follows. The retained intent
+blocks a second call. The final receipt binds the original claim and exact source
+inventory, and requires a loaded, inactive service with the expected effective
+finite native limits. Later install completion/check verifies staged and registered
+source bytes and the receipt; it does not interpret a historical inactive receipt
+as current runtime health.
+
+Offline controls use real files, exclusive publication, locks, SHA consumers,
+original budget and receipt checking, with explicit fake native manager replies.
+Actual registration/reload, supported OS property behavior, gateway-down stop,
+container/network cleanup, warm reuse, credentials and all seven installed
+journeys/four web contexts require independent native qualification. The existing
+startup-health A0 refusal remains in place.
