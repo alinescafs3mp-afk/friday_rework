@@ -81,10 +81,9 @@ settlement counts zero. Approved managed endpoint readers use native profile
 scope, and parent SearchMemo transfers sweep expired entries without renewing
 TTL or replacing a held single-flight lock.
 
-These changes are source proposals awaiting Astra's independent acceptance.
-The ordinary unbound CLI/direct-call, custom-provider, protocol-cap and later
-approval-clock gaps above remain product gaps; this repair does not accept them
-as exclusions or claim installed runtime parity.
+The source changes have passed Astra's independent acceptance. The ordinary
+unbound CLI/direct-call, custom-provider, protocol-cap and later approval-clock
+gaps above remain product gaps; they are not accepted exclusions.
 
 The follow-up ordinary-stop closure includes retained caller custody together
 with every authorized fallback run. Detached delegations are interrupted before
@@ -93,3 +92,22 @@ carry only the durable conversation ID. An unknown receipt still retains the
 session and owner. Concurrent settlement between a bulk-stop snapshot and its
 native kill call contributes zero; a newly settled handle contributes one, and
 unknown custody contributes zero without turning pending status into success.
+
+On 2026-10-08, the prepared native21 source from repository commit
+`5ffd614c99c5542c967d6c8f5b651cf1d99a5863` completed one real registered
+`web_search` call using an empty explicit credential scope and the native free
+Exa/keyless profile with cache and provider failover retained. The ordinary
+ProcessRegistry launched the actual transient user service, verified its native
+policy and clock, consumed a successful result linking to the official Python
+asyncio documentation, and observed exit zero plus removal of the recorded
+cgroup. The complete launcher took 3.75 seconds; separate observations confirmed
+that the launcher, wrapper and service process had ended and the exclusive
+execution lock was released. Active service observations showed a 1 GiB memory
+limit, 64 tasks and RuntimeMax within the original call deadline. No model or
+Telegram credentials were used.
+
+This is live evidence for that registered search and its natural cessation. It
+does not establish a normally installed candidate, autonomous model decisions,
+delegated DSH/A0 research, extraction, outage/hostile-source behavior, explicit
+stop, gateway loss or restart recovery. Those complete runtime journeys remain
+required; existing offline controls and this observation do not replace them.
