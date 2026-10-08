@@ -600,7 +600,7 @@ def test_ordinary_stop_retains_unknown_for_every_lane(native_child,monkeypatch,l
     r._is_user_authorized_for_source=lambda *a:True
     reply=asyncio.run(command_body(GatewayRunner,'_handle_stop_command')(r,event))
     assert isinstance(reply,EphemeralReply) and 'pending' in str(reply).lower() and 'unconfirmed' in str(reply).lower()
-    assert calls==(['fallback-one','fallback-two'] if lane=='fallback' else ['route'])
+    assert calls==(['route','fallback-one','fallback-two'] if lane=='fallback' else ['route'])
 
 
 @pytest.mark.parametrize('phase',['intent','popen','identity-checkpoint','payload'])
@@ -834,3 +834,199 @@ def test_gateway_retained_custody_resolves_native_owner_home(native_child,monkey
     assert receipt['status']=='STOP_UNCONFIRMED' and s.id in f.registry._running
     assert seen==([] if owner=='missing' else [str(f.home)])
     assert GatewayRunner._session_web_pending(runner,'route') is True
+
+
+def closure_gateway(native_child, monkeypatch):
+    """Actual native gateway/store and delegation selectors, private fixture home."""
+    from gateway.run import GatewayRunner
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionSource
+    from gateway.platforms.event import MessageEvent
+    import tools.async_delegation as ad
+    monkeypatch.setattr('gateway.run._write_runtime_status_quiet', lambda **kw: None)
+    runner = GatewayRunner(config=GatewayConfig())
+    monkeypatch.setattr(runner, '_persist_active_agents', lambda: None)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id='closure-chat',
+                           user_id='closure-user', chat_type='dm')
+    entry = runner.session_store.get_or_create_session(source)
+    stopped = []
+    monkeypatch.setattr(ad, '_records', {})
+    def delegation(name, key, sid=''):
+        ad._records[name] = {'delegation_id': name, 'status': 'running',
+                            'session_key': key, 'origin_ui_session_id': '',
+                            'parent_session_id': sid,
+                            'interrupt_fn': lambda: stopped.append(name)}
+    def child(key, sid):
+        call = native_child.call()
+        call.session_key, call.session_id = key, sid
+        with call.turn.lock: native_child.registry.spawn_web(call)
+        return call
+    return SimpleNamespace(runner=runner, source=source, entry=entry,
+                           event=MessageEvent(text='/stop', source=source),
+                           stopped=stopped, delegation=delegation, child=child)
+
+
+@pytest.mark.parametrize('lane', ['pending', 'running', 'idle', 'fallback', 'busy'])
+@pytest.mark.parametrize('unknown', [True, False])
+def test_stop_combines_native_web_custody_and_background_targets(native_child, monkeypatch, lane, unknown):
+    from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
+    f = native_child; g = closure_gateway(f, monkeypatch); r = g.runner
+    key, sid = g.entry.session_key, g.entry.session_id
+    call = g.child(key, sid)
+    agent = SimpleNamespace(session_id=sid, interrupt=lambda *a, **kw: None)
+    if lane == 'pending': r._running_agents[key] = _AGENT_PENDING_SENTINEL
+    elif lane in ('running', 'busy'): r._running_agents[key] = agent
+    g.delegation('own-key', key)
+    g.delegation('own-durable', 'legacy-other-key', sid)
+    g.delegation('unrelated', 'other-chat', 'other-durable')
+    fallback = key + ':fallback'
+    if lane == 'fallback':
+        r._running_agents[fallback] = SimpleNamespace(session_id='fallback-durable', interrupt=lambda *a, **kw: None)
+        g.delegation('fallback', fallback)
+    r._running_agents['agent:main:telegram:dm:other-chat'] = object()
+    monkeypatch.setattr(r, '_is_user_authorized_for_source', lambda *a, **kw: True)
+    if unknown: monkeypatch.setattr(f.registry, '_web_command', lambda *a, **kw: SimpleNamespace(returncode=1))
+    if lane == 'busy':
+        reply = asyncio.run(r._busy_stop_command(g.event, key, g.source))
+    else:
+        reply = asyncio.run(command_body(GatewayRunner, '_handle_stop_command')(r, g.event))
+    # Exercise real interrupt_for_session against separate routing/durable records.
+    assert sorted(g.stopped) == sorted(['own-key', 'own-durable'] + (['fallback'] if lane == 'fallback' else []))
+    assert 'unrelated' not in g.stopped
+    assert r.session_store._entries[key].session_id == sid
+    assert 'agent:main:telegram:dm:other-chat' in r._running_agents
+    if unknown:
+        assert 'pending' in str(reply).lower() and 'unconfirmed' in str(reply).lower()
+        assert call.session.id in f.registry._running and not call.session.web_settled
+        assert call.session.process.poll() is None and r._session_web_pending(key)
+        if lane in ('pending', 'running', 'busy'): assert key in r._running_agents
+    else:
+        assert 'stopped' in str(reply).lower() and 'pending' not in str(reply).lower()
+        assert call.session.web_settled and call.session.process.poll() is not None
+        assert not f.registry._running
+        assert key not in r._running_agents
+    if lane == 'fallback': assert fallback not in r._running_agents
+
+
+@pytest.mark.parametrize('own_unknown,fallback_unknown', [(True, True), (True, False), (False, True), (False, False)])
+def test_fallback_stop_aggregates_caller_and_every_authorized_target(native_child, monkeypatch, own_unknown, fallback_unknown):
+    from gateway.run import GatewayRunner
+    f = native_child; g = closure_gateway(f, monkeypatch); r = g.runner
+    key, sid = g.entry.session_key, g.entry.session_id
+    own = g.child(key, sid)
+    first_key, second_key = key + ':first', key + ':second'
+    first = g.child(first_key, 'first-durable')
+    second = g.child(second_key, 'second-durable')
+    for target, durable in [(first_key, 'first-durable'), (second_key, 'second-durable')]:
+        r._running_agents[target] = SimpleNamespace(session_id=durable, interrupt=lambda *a, **kw: None)
+        g.delegation(target, target)
+    g.delegation('own', key)
+    monkeypatch.setattr(r, '_is_user_authorized_for_source', lambda *a, **kw: True)
+    actual = f.registry._web_command; attempts = []
+    def command(argv, timeout):
+        session = next(s for s in f.registry._running.values() if s.systemd_unit == argv[3])
+        attempts.append(session.id)
+        if (session is own.session and own_unknown) or (session is first.session and fallback_unknown):
+            return SimpleNamespace(returncode=1)
+        return actual(argv, timeout)
+    monkeypatch.setattr(f.registry, '_web_command', command)
+    reply = asyncio.run(command_body(GatewayRunner, '_handle_stop_command')(r, g.event))
+    assert set(attempts) == {own.session.id, first.session.id, second.session.id}
+    assert sorted(g.stopped) == sorted(['own', first_key, second_key])
+    assert second.session.web_settled and second_key not in r._running_agents
+    assert (first_key in r._running_agents) == fallback_unknown
+    assert ('pending' in str(reply).lower()) == (own_unknown or fallback_unknown)
+    assert own.session.web_settled == (not own_unknown)
+    assert r.session_store._entries[key].session_id == sid
+
+
+def test_unauthorized_fallback_does_not_touch_foreign_run_or_delegation(native_child, monkeypatch):
+    from gateway.run import GatewayRunner
+    f = native_child; g = closure_gateway(f, monkeypatch); r = g.runner
+    key, sid = g.entry.session_key, g.entry.session_id
+    own = g.child(key, sid); other_key = key + ':foreign'
+    other = g.child(other_key, 'foreign-durable')
+    r._running_agents[other_key] = SimpleNamespace(session_id='foreign-durable', interrupt=lambda *a, **kw: None)
+    g.delegation('own', key); g.delegation('foreign', other_key)
+    monkeypatch.setattr(r, '_is_user_authorized_for_source', lambda *a, **kw: False)
+    reply = asyncio.run(command_body(GatewayRunner, '_handle_stop_command')(r, g.event))
+    assert 'stopped' in str(reply).lower() and g.stopped == ['own']
+    assert own.session.web_settled and not other.session.web_settled
+    assert other.session.process.poll() is None and other_key in r._running_agents
+
+
+@pytest.mark.parametrize('surface', ['registry', 'rpc', 'cli'])
+def test_bulk_stop_counts_concurrently_settled_native_receipt_zero(native_child, monkeypatch, surface, capsys):
+    f = native_child; call = f.call()
+    with call.turn.lock: f.registry.spawn_web(call)
+    original = f.registry.kill_process; observed = []; competed = []
+    context = contextvars.copy_context()
+    def after_snapshot(sid, **kw):
+        # A real competing native stop completes after actual kill_all snapshot.
+        thread = threading.Thread(target=lambda: context.run(lambda: competed.append(original(sid, **kw))),
+                                  name='competing-native-stop')
+        thread.start(); thread.join(timeout=4); assert not thread.is_alive()
+        receipt = original(sid, **kw); observed.append(receipt); return receipt
+    monkeypatch.setattr(f.registry, 'kill_process', after_snapshot)
+    if surface == 'rpc':
+        from tui_gateway.methods_tools import _stop_processes
+        result = _stop_processes({}); assert result['status'] == 'QUIESCENT' and result['killed'] == 0
+    elif surface == 'cli':
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+        CLICommandsMixin._handle_stop_command(SimpleNamespace())
+        output = capsys.readouterr().out.lower()
+        assert 'unconfirmed' not in output
+    else: assert f.registry.kill_all(source='process.stop') == 0
+    assert len(competed) == len(observed) == 1 and competed[0]['newly_settled'] is True
+    assert observed[0] == {'status': 'QUIESCENT', 'session_id': call.session.id,
+                           'returncode': call.session.exit_code}
+    assert call.session.web_settled and call.session.web_stop_requested
+    assert f.registry.kill_all(source='process.stop') == 0 and not f.registry._running
+
+
+def test_bulk_stop_mixes_new_concurrent_legacy_and_unknown_native_receipts(native_child, monkeypatch):
+    f = native_child; calls = [f.call() for _ in range(3)]
+    for call in calls:
+        with call.turn.lock: f.registry.spawn_web(call)
+    raced, fresh, unknown = calls
+    legacy = ProcessSession(id='legacy-closure', command='ordinary', owner_task_id='owned-task')
+    f.registry._running[legacy.id] = legacy
+    actual_command = f.registry._web_command
+    monkeypatch.setattr(f.registry, '_web_command', lambda argv, timeout:
+                        SimpleNamespace(returncode=1) if argv[3] == unknown.session.systemd_unit
+                        else actual_command(argv, timeout))
+    original = f.registry.kill_process; receipts = {}
+    def kill(sid, **kw):
+        if sid == legacy.id:
+            legacy.exited = True; return {'status': 'killed'}
+        if sid == raced.session.id: assert original(sid, **kw)['newly_settled'] is True
+        receipts[sid] = original(sid, **kw); return receipts[sid]
+    monkeypatch.setattr(f.registry, 'kill_process', kill)
+    assert f.registry.kill_all(source='process.stop') == 2  # one fresh web + one legacy
+    assert 'newly_settled' not in receipts[raced.session.id]
+    assert receipts[fresh.session.id]['newly_settled'] is True
+    assert receipts[unknown.session.id]['status'] == 'STOP_UNCONFIRMED'
+    assert unknown.session.id in f.registry._running and not unknown.session.web_settled
+    assert f.registry.kill_all(source='process.stop') == 0
+
+
+@pytest.mark.parametrize('lane', ['idle', 'busy'])
+def test_unknown_web_keeps_native_background_interrupt_errors_and_other_attempts(native_child, monkeypatch, caplog, lane):
+    from gateway.run import GatewayRunner
+    import tools.async_delegation as ad
+    f = native_child; g = closure_gateway(f, monkeypatch); r = g.runner
+    key, sid = g.entry.session_key, g.entry.session_id
+    call = g.child(key, sid)
+    if lane == 'busy': r._running_agents[key] = SimpleNamespace(session_id=sid, interrupt=lambda *a, **kw: None)
+    g.delegation('broken', key); g.delegation('working', key)
+    import logging
+    caplog.set_level(logging.DEBUG, logger=ad.logger.name)
+    def broken(): raise RuntimeError('fixture-owned-interrupt-failure')
+    ad._records['broken']['interrupt_fn'] = broken
+    monkeypatch.setattr(f.registry, '_web_command', lambda *a, **kw: SimpleNamespace(returncode=1))
+    if lane == 'busy': reply = asyncio.run(r._busy_stop_command(g.event, key, g.source))
+    else: reply = asyncio.run(command_body(GatewayRunner, '_handle_stop_command')(r, g.event))
+    assert 'pending' in str(reply).lower() and 'unconfirmed' in str(reply).lower()
+    assert g.stopped == ['working'] and 'fixture-owned-interrupt-failure' in caplog.text
+    assert ad._records['broken']['status'] == 'running' and call.session.id in f.registry._running
+    assert r.session_store._entries[key].session_id == sid

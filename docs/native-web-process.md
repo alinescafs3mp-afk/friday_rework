@@ -85,3 +85,11 @@ These changes are source proposals awaiting Astra's independent acceptance.
 The ordinary unbound CLI/direct-call, custom-provider, protocol-cap and later
 approval-clock gaps above remain product gaps; this repair does not accept them
 as exclusions or claim installed runtime parity.
+
+The follow-up ordinary-stop closure includes retained caller custody together
+with every authorized fallback run. Detached delegations are interrupted before
+web cessation is observed, including pending sessions whose older delegations
+carry only the durable conversation ID. An unknown receipt still retains the
+session and owner. Concurrent settlement between a bulk-stop snapshot and its
+native kill call contributes zero; a newly settled handle contributes one, and
+unknown custody contributes zero without turning pending status into success.
