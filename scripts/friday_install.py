@@ -173,7 +173,10 @@ def directory(path):
 def spec_checked(value):
     fields = {'home', 'bootstrap_python', 'hermes_donor', 'hermes_prepare',
               'sources_lock', 'dsh_donor', 'a0_donor', 'product', 'project_files', 'seconds', 'containment'}
-    require(isinstance(value, dict) and set(value) == fields | ({'dashboard_tls'} if 'dashboard_tls' in value else set()), 'explicit_install_fields_required')
+    require(isinstance(value, dict) and set(value) == fields | (set(value) & {'dashboard_tls', 'credential_sources'}), 'explicit_install_fields_required')
+    if 'credential_sources' in value:
+        from scripts.install_credentials import references
+        references(value['credential_sources'])
     home = canonical(value['home']); directory(home.parent)
     require(home != Path.home() / '.hermes' and home != ROOT
             and not ROOT.is_relative_to(home), 'separate_product_home_required')
@@ -189,7 +192,7 @@ def spec_checked(value):
     require(isinstance(files, dict) and files, 'reviewed_project_inventory_required')
     required = {'scripts/friday_install.py', 'scripts/friday_native.py',
                 'scripts/dsh_prepare.py', 'plugins/friday_rework/adapters/dsh_keyless_web.mjs', 'scripts/a0_prepare.py', 'scripts/install_containment.py',
-                'scripts/friday_start.py',
+                'scripts/friday_start.py', 'scripts/install_credentials.py',
                 'scripts/a0_runtime.py', 'scripts/rootless_docker_launch.py',
                 'tools/configure_product.py', 'tools/configure_local_test.py',
                 'tools/web_profile.py', 'config/SOUL.md', 'config/RESEARCH.md'}
@@ -482,7 +485,8 @@ def install(value, input_path, *, budget=None):
     publish(home / MARKER, claim, budget=budget)
     def execute(phase, command, cwd, timeout=1800):
         try:
-            return containment.run(command, cwd, timeout=timeout)[0]
+            return containment.run(command, cwd, timeout=timeout,
+                                   log=home / 'preparation/native-install' / phase)[0]
         except (OSError, ValueError, RuntimeError) as exc:
             diagnostic = safe_diagnostic(exc, phase)
             exc.friday_diagnostic = diagnostic

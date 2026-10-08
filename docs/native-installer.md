@@ -21,6 +21,31 @@ the `default` receiving profile. Model, endpoint, capacity, output reservations,
 web limits, Dashboard public authority and operator are actual supplied inputs.
 No secrets belong in this JSON, command arguments or preparation receipts.
 
+The optional `credential_sources` map supplies explicit protected references
+for a normal installation. Each target environment name selects exactly
+`{"path":"/private/operator-input.json","format":"json","name":"SOURCE_NAME"}`;
+`format: dotenv` is also supported. The map must cover exactly the installed
+profile's inference, selected web provider, worker services, Dashboard and channel
+names. Source contents are never hashed into receipts or copied wholesale.
+Planning validates only reference syntax; it does not read secrets. Omitting this
+map retains the incomplete template behavior and cannot authorize startup.
+
+During the same finite native completion, after profile creation, the installer
+reads owner-only regular source files without dotenv interpolation and writes
+only selected values using Hermes `save_env_value_secure`, its credential
+lifecycle and existing reentrant `.env` lock. The complete batch uses the
+receiving home's native secret scope; it does not populate ambient credentials
+or invent a second store. Existing `.env` or credential-pool files refuse before
+writing. Native read-back must match exactly, with protected file permissions.
+Malformed, missing, duplicate or extra selections, a foreign operator and source
+read/write failures refuse without printing values. A partial save remains in
+the incomplete installation for reconciliation, with no automatic replay or
+rollback of native credential state. The original installation deadline bounds
+this work. Saved values prove storage only: provider authentication, channel
+ownership, worker admission and actual cold start still require their real checks.
+Private per-phase native logs retain installation failures; public errors remain
+fixed diagnostics rather than foreign exception bodies.
+
 The parent integrates its final reviewed `scripts/hermes_prepare.py` and supplies
 its exact pin. The installer invokes that actual stable CLI, consumes its complete
 source receipt and checks all exported/overlaid file bytes, modes, commit/tree

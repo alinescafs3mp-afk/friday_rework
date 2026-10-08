@@ -146,7 +146,7 @@ def stage_dashboard_tls(value, home):
     checked(home, dash['tls'], dash['host'], dash['port'], dash['public_url'])
 
 
-def complete(value, home, receipt):
+def complete(value, home, receipt, *, budget=None):
     from scripts.friday_install import require, owned_file, digest, publish
     from hermes_constants import get_hermes_home
     require(get_hermes_home() == home, 'foreign_native_home')
@@ -195,6 +195,10 @@ def complete(value, home, receipt):
             os.chmod(path, 0o700)
     stage_worker_runtime(value, home)
     bundle = profile_write(home, value['product'])
+    if 'credential_sources' in value:
+        require(budget is not None, 'original_credential_budget_required')
+        from scripts.install_credentials import provision
+        budget.call(provision, value['credential_sources'], bundle, home, budget)
     return native_profile_check(bundle, home)
 
 
@@ -264,7 +268,12 @@ def main():
         except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             parser.exit(2, 'Friday native start refused: mandatory native admission is incomplete\n')
         raise RuntimeError('native foreground ownership was not transferred')
-    result = budget.call(complete, value, home, receipt)
+    try:
+        result = budget.call(complete, value, home, receipt, budget=budget)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        from scripts.friday_install import safe_diagnostic, diagnostic_text
+        parser.exit(2, 'Friday native install refused: ' +
+                    diagnostic_text(safe_diagnostic(exc, 'native_completion')) + '\n')
     payload = json.dumps(result, sort_keys=True)
     budget.check()
     print(payload, flush=True)
