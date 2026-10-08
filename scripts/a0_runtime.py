@@ -423,6 +423,25 @@ def local_network(value, owner, deployment=None, web=None):
     return json.loads(json.dumps(value))
 
 
+def checked_launcher(expected_sha256):
+    # Load only exact reviewed bytes, no import-path fallback or helper service.
+    before = LAUNCHER.lstat()
+    require(LAUNCHER.resolve() == LAUNCHER and stat.S_ISREG(before.st_mode)
+            and before.st_uid == os.getuid() and before.st_nlink == 1
+            and not before.st_mode & 0o022 and before.st_size <= 128*1024, 'local_launcher_identity_changed')
+    fd = os.open(LAUNCHER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        source = os.read(fd, 128*1024 + 1)
+        after = os.fstat(fd); named = LAUNCHER.lstat()
+        key = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_mode)
+        require(key(before) == key(after) == key(named)
+                and hashlib.sha256(source).hexdigest() == expected_sha256, 'local_launcher_pin_changed')
+    finally: os.close(fd)
+    namespace = {'__file__': str(LAUNCHER), '__name__': 'frw_checked_local_launcher'}
+    exec(compile(source, str(LAUNCHER), 'exec'), namespace)
+    return namespace
+
+
 def network_checked(value, obj, *, container_id=None):
     require(isinstance(obj, dict) and obj.get('Id') == value['id'] and obj.get('Name') == value['name']
             and obj.get('Driver') == 'bridge' and obj.get('Scope') == 'local'
@@ -438,6 +457,62 @@ def network_checked(value, obj, *, container_id=None):
         require(isinstance(member, dict) and re.fullmatch(r'[0-9a-f]{64}', member.get('EndpointID', '')),
                 'local_endpoint_unknown')
     return obj
+
+
+def current_network(association, acceptance, *, owner_slot, launcher_sha256,
+                    docker_sha256, deployment=None, web=None):
+    """Observe an already prepared, exact current route; never create/adopt it.
+
+    The request must have been prepared by its existing native owner after the
+    durable reservation. Missing preparation is a blocker, not a reason to
+    start a daemon, create a bridge, reset time or reuse a historical route.
+    """
+    binding = host_identity(association)
+    require(owner_slot in {'astra', 'sol'} and isinstance(acceptance, dict)
+            and set(acceptance) == {'accepted_unix', 'accepted_monotonic_ns', 'boot_id'}
+            and acceptance['accepted_unix'] == binding['created_at_unix'], 'foreign_host_route_clock')
+    clock = {'association_binding': binding, 'accepted_unix': binding['created_at_unix'],
+             'deadline_unix': binding['deadline_unix'], 'original_budget_seconds': binding['budget_seconds'],
+             'accepted_monotonic_ns': acceptance['accepted_monotonic_ns'], 'boot_id': acceptance['boot_id']}
+    remaining(clock)
+    owner = f"{owner_slot}:{binding['existing_task_id']}#1"
+    launcher = checked_launcher(launcher_sha256)
+    request = launcher['request_checked'](os.getuid())
+    require(request['owner'] == owner and request['accepted_unix'] == clock['accepted_unix']
+            and request['deadline_unix'] == clock['deadline_unix']
+            and request['original_budget_seconds'] == clock['original_budget_seconds']
+            and request['accepted_monotonic_ns'] == clock['accepted_monotonic_ns'], 'foreign_host_route_clock')
+    # Stable original bytes supply observations, never caller-configured IDs.
+    guard_bytes = launcher['stable_bytes'](launcher['GUARD'], os.getuid())
+    guard = launcher['private_json'](launcher['GUARD'], os.getuid())
+    require(guard == launcher['exact_json'](guard_bytes.decode()), 'guard_receipt_changed')
+    n = {'schema': 'friday.a0.local-network.v1', 'owner': owner, 'nonce': request['nonce'],
+         'name': 'frw-a0-local-' + request['nonce'][:12], 'bridge': launcher['BRIDGE'],
+         'endpoints': request['endpoints'], 'launcher_sha256': launcher_sha256,
+         'policy_sha256': request['policy_sha256'],
+         'request_sha256': hashlib.sha256(launcher['stable_bytes'](launcher['REQUEST'], os.getuid())).hexdigest(),
+         'guard_receipt_sha256': hashlib.sha256(guard_bytes).hexdigest(),
+         'invocation_id': guard['context']['invocation_id'], 'namespaces': guard['namespaces'],
+         'labels': {'friday.rework.owner': owner, 'friday.rework.route': request['nonce']}}
+    if web is not None:
+        n['web'] = web_module().route_web(web)
+    require(request.get('web') == n.get('web'), 'guard_web_permission_changed')
+    # observe_guard reopens held namespace FDs and checks the actual unit,
+    # daemon PID/start/executable and nft semantic readback before Docker use.
+    launcher['observe_guard'](n, budget=lambda: remaining(clock))
+    require(sha(DOCKER) == docker_sha256, 'docker_binary_changed')
+    xs = launcher['exact_json'](Runtime._command(
+        [str(DOCKER), '--host', SOCKET, 'network', 'inspect', n['name']],
+        timeout=min(5, remaining(clock))))
+    require(isinstance(xs, list) and len(xs) == 1, 'local_network_unknown')
+    require(isinstance(xs[0], dict), 'local_network_unknown')
+    n['id'] = xs[0].get('Id')
+    n = local_network(n, owner, deployment, web)
+    network_checked(n, xs[0])
+    # A successful inspect cannot conceal a concurrent namespace/daemon swap.
+    launcher['observe_guard'](n, budget=lambda: remaining(clock))
+    remaining(clock)
+    return n
 
 
 def plan(accepted_unix, deadline_unix, *, assignment, generation, owner_slot,
@@ -776,27 +851,16 @@ class Runtime:
             self.check_network(container_id=r['container_id'])
         return obj
 
-    def check_network(self, *, container_id=None):
+    def check_network(self, *, container_id=None, budget=None):
         if self.p['network'] == 'none': return None
         n = self.p['network']; local_network(n, self.p['owner'], self.p.get('deployment'), self.p.get('web'))
-        # Load only exact reviewed bytes, no import-path fallback or helper service.
-        before = LAUNCHER.lstat()
-        require(LAUNCHER.resolve() == LAUNCHER and stat.S_ISREG(before.st_mode)
-                and before.st_uid == os.getuid() and before.st_nlink == 1
-                and not before.st_mode & 0o022 and before.st_size <= 128*1024, 'local_launcher_identity_changed')
-        fd = os.open(LAUNCHER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        try:
-            source = os.read(fd, 128*1024 + 1)
-            after = os.fstat(fd); named = LAUNCHER.lstat()
-            key = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_mode)
-            require(key(before) == key(after) == key(named)
-                    and hashlib.sha256(source).hexdigest() == n['launcher_sha256'], 'local_launcher_pin_changed')
-        finally: os.close(fd)
-        namespace = {'__file__': str(LAUNCHER), '__name__': 'frw_checked_local_launcher'}
-        exec(compile(source, str(LAUNCHER), 'exec'), namespace)
+        namespace = checked_launcher(n['launcher_sha256'])
         # Current native unit, live PID-start/boot, owned held namespace FDs and
         # nft semantic readback are all checked here; a boolean is insufficient.
-        namespace['observe_guard'](n)
+        if budget is None:
+            namespace['observe_guard'](n)
+        else:
+            namespace['observe_guard'](n, budget=budget)
         request = namespace['request_checked'](os.getuid())
         require(request['accepted_unix'] == self.p['accepted_unix']
                 and request['deadline_unix'] == self.p['deadline_unix']
@@ -806,7 +870,8 @@ class Runtime:
                     and request['accepted_monotonic_ns'] == self.p['accepted_monotonic_ns']
                     and self.p['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                     'foreign_host_route_clock')
-        xs = json.loads(self.docker('network', 'inspect', n['id']))
+        limits = {} if budget is None else {'timeout': min(5, budget())}
+        xs = json.loads(self.docker('network', 'inspect', n['id'], **limits))
         require(isinstance(xs, list) and len(xs) == 1, 'local_network_unknown')
         network_checked(n, xs[0], container_id=container_id)
         return {'status': 'CURRENT_LOCAL_NETWORK_CHECKED', 'id': n['id']}

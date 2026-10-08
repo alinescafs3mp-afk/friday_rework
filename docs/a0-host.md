@@ -38,8 +38,15 @@ is the currently reviewed boundary, not a permanent web exclusion or permission
 to loosen guards. Future provider access requires the parent's authorized donor/
 host-mediated integration and actual complete-journey acceptance.
 
-The trusted producer calls `WorkerHost.attach_a0_capability(task_id, owner, pin)`
-only after `handle` has retained the row and verified inputs. It reads that exact
+The ordinary `handle` path calls the trusted `WorkerHost.produce_a0_capability`
+after retaining the row and verifying input bytes. `A0HostSession` then observes
+the pinned launcher's exact original request, current unit/invocation, daemon
+PID/start/executable, held and reopened namespace identities, and nft semantic
+readback. It inspects the expected bridge, obtains its actual immutable Docker
+ID, refuses foreign members, and repeats the existing `Runtime.check_network`
+consumer with the same original clocks. Only successful native observations
+produce the private, once-written evidence and capability files. The producer
+then calls `WorkerHost.attach_a0_capability(task_id, owner, pin)`. It reads that exact
 row from the EXISTING Associations store; clocks cannot be predicted or changed.
 The attachment validates under the existing admission lock, persists once, then
 calls existing `schedule_gateway_work`. Duplicate same attachment does not
@@ -53,8 +60,18 @@ explicitly invalid; this candidate does not rewrite historical records.
 
 The retained A0 artifacts now use the shared [result consumer](result-consumer.md)
 for list, inspect, assessment and delivery; the join has offline verification.
-**The authorized production producer, current native gates,
-worker web path and administrative complete journeys remain missing/NOT_RUN.**
+**The producer's source path exists; production route preparation and live
+qualification remain missing/NOT_RUN.** The existing launcher consumes one
+private route request bound to the exact row's original acceptance clocks.
+No ordinary host operation currently publishes that fresh request, starts its
+guarded daemon, or creates and cleans up its owned bridge after reservation.
+The producer observes an already prepared exact route and refuses missing or
+historical state; it never starts/restarts a daemon, modifies nft, creates a
+network, invents admission, resets a clock or adopts a different owner.
+`startup_health` retains its A0 refusal. A sufficient independently reviewed
+preparation/cleanup path, current native positive/negative/deadline/stop gates,
+worker web and complete user journeys are still required. This source change
+is not runtime acceptance or permission to repeat an earlier stopped phase.
 Offline proof inputs and native interfaces are explicitly fabricated controls;
 they never constitute production evidence or an enabled deployment.
 

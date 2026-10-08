@@ -8,7 +8,7 @@ from test_host_native import setup,isolated,native,offline_boundary,ingress,invo
 
 SOURCE=Path(__file__).resolve().parents[1]
 
-def configure_a0(setup,proof,tmp_path,monkeypatch):
+def configure_a0(setup,proof,tmp_path,monkeypatch,*,native_launcher=False):
     package=setup.module.__package__
     import sys
     hr=sys.modules[package+'.host_runtime']
@@ -24,7 +24,7 @@ def configure_a0(setup,proof,tmp_path,monkeypatch):
     docker=root/'docker';docker.write_bytes(b'OFFLINE EXECUTABLE PIN; NEVER EXECUTED')
     daemon=root/'.runtime/rootless-docker/supervisor/friday-rework-docker.service'
     daemon.parent.mkdir(parents=True);daemon.write_bytes(b'OFFLINE UNIT PIN; NEVER INSTALLED')
-    launcher=root/'launch.py';launcher.write_bytes(b'# explicit offline native guard fixture\n')
+    launcher=root/'launch.py';launcher.write_bytes((SOURCE/'scripts/rootless_docker_launch.py').read_bytes() if native_launcher else b'# explicit offline native guard fixture\n')
     policy=root/'reviewed-policy.json';policy.write_text('{"scope":"offline fixture only"}')
     git=runtime_root/'git-metadata'/('a'*64)/'repo/.git';git.mkdir(parents=True)
     spec=importlib.util.spec_from_file_location('a0_bound_fixture',SOURCE/'scripts/a0_runtime.py')
@@ -91,6 +91,7 @@ def configure_a0(setup,proof,tmp_path,monkeypatch):
         assert self.p['accepted_monotonic_ns']==setup.host.store.get(address,identity['owner'])['host']['a0']['acceptance']['accepted_monotonic_ns']
         assert self.p['association_binding']['existing_task_id']==address
         return {'status':'EXPLICIT_FAKE_CURRENT_LOCAL_NETWORK_CHECKED','id':self.p['network']['id']}
+    state.real_check_network=m.Runtime.check_network
     monkeypatch.setattr(m.Runtime,'check_network',route)
     monkeypatch.setattr(m.Runtime,'snapshot_container',lambda self,obj:{'group':'/user.slice/offline/docker-'+obj['Id']+'.scope','populated':True,'processes':[{'pid':777777,'start_ticks':'1'}]})
     monkeypatch.setattr(m,'cessation',lambda sample:{'confirmed':not state.running,'fixture':True})
@@ -161,6 +162,12 @@ def configure_a0(setup,proof,tmp_path,monkeypatch):
         'source_pins':source_pins,'evidence':[pin(evidence)]}))
     runtime['runtime_receipt']=pin(receipt);setup.configure(runtime)
     state.runtime=runtime;state.args=args;state.capability=capability;state.module=m;state.native=an;state.a0=aa;state.hr=hr;state.evidence=evidence
+    # Existing attachment/recovery controls reserve without a prepared native
+    # route. New current-producer controls restore this real bound entrypoint.
+    state.host_producer = setup.host.produce_a0_capability
+    def unprepared(*args, **kwargs):
+        raise hr.HostUnavailable('EXPLICIT_OFFLINE_ROUTE_NOT_PREPARED')
+    monkeypatch.setattr(setup.host, 'produce_a0_capability', unprepared)
     def produce(row):
         from importlib import import_module
         exact=import_module(package+'.adapters.dsh')._identity(row)

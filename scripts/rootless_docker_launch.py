@@ -324,18 +324,23 @@ def namespaces(pid):
         for fd in fds.values(): os.close(fd)
 
 
-def native_call(argv, *, data=None, fds=()):
-    r = subprocess.run(argv, input=data, capture_output=True, text=True, timeout=5,
-                       env={'PATH': '/usr/bin:/usr/sbin', 'LC_ALL': 'C', 'HOME': '/home/jericho',
-                            'XDG_RUNTIME_DIR': '/run/user/1000',
-                            'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/1000/bus'}, pass_fds=fds, check=False)
+def native_call(argv, *, data=None, fds=(), timeout=5):
+    require(type(timeout) in (int, float) and 0 < timeout <= 5, 'route_probe_budget_invalid')
+    try:
+        r = subprocess.run(argv, input=data, capture_output=True, text=True, timeout=timeout,
+                           env={'PATH': '/usr/bin:/usr/sbin', 'LC_ALL': 'C', 'HOME': '/home/jericho',
+                                'XDG_RUNTIME_DIR': '/run/user/1000',
+                                'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/1000/bus'}, pass_fds=fds, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError('route_native_check_failed') from None
     require(r.returncode == 0 and len(r.stdout.encode()) <= 1024*1024, 'route_native_check_failed')
     return r.stdout
 
 
-def unit_identity():
+def unit_identity(*, timeout=None):
     raw = native_call(['/usr/bin/systemctl', '--user', 'show', 'friday-rework-docker.service',
-                       '--property=InvocationID,MainPID,ControlGroup,DropInPaths,Restart'])
+                       '--property=InvocationID,MainPID,ControlGroup,DropInPaths,Restart'],
+                      **({} if timeout is None else {'timeout': timeout}))
     fields = dict(x.split('=', 1) for x in raw.splitlines())
     require(set(fields) == {'InvocationID', 'MainPID', 'ControlGroup', 'DropInPaths', 'Restart'}
             and re.fullmatch(r'[0-9a-f]{32}', fields['InvocationID'])
@@ -443,9 +448,12 @@ def child_route():
     os.execve(str(binary), [str(binary), '--config-file=' + str(ROOT / 'config/daemon.json')], env)
 
 
-def observe_guard(descriptor):
+def observe_guard(descriptor, *, budget=None):
     """Bounded current check through held FDs, never enter host/foreign namespaces."""
-    request = request_checked(UID); unit = unit_identity()
+    # The producer supplies its original clock; no new probe budget is minted.
+    def unit_now():
+        return unit_identity() if budget is None else unit_identity(timeout=min(5, budget()))
+    request = request_checked(UID); unit = unit_now()
     require(descriptor.get('web') == request.get('web'), 'guard_web_permission_changed')
     receipt = private_json(GUARD, UID)
     require(receipt['schema'] == 'friday.a0.local-route-guard.v1'
@@ -469,7 +477,8 @@ def observe_guard(descriptor):
         argv = [str(NSENTER), '--no-fork', '--setuid=0', '--setgid=0',
                 *['--' + {'mnt': 'mount'}.get(k, k) + '=/proc/self/fd/' + str(fds[k]) for k in ('user', 'mnt', 'net')],
                 '--', str(NFT), '--json', '--numeric-priority', 'list', 'table', 'inet', 'frw_a0_local']
-        checked_policy(native_call(argv, fds=tuple(fds.values())), request.get('web'))
+        call_limits = {} if budget is None else {'timeout': min(5, budget())}
+        checked_policy(native_call(argv, fds=tuple(fds.values()), **call_limits), request.get('web'))
         # Held FDs preserve the inspected namespace, not the daemon's current
         # membership. Reopen through /proc after readback before admitting it.
         with namespaces(daemon['pid']) as (current_ns, _):
@@ -477,7 +486,7 @@ def observe_guard(descriptor):
                     'guard_namespace_changed_during_readback')
             require(proc_identity(daemon['pid']) == daemon and proc_identity(parent['pid']) == parent
                     and Path('/proc', str(daemon['pid']), 'exe').resolve() == tool_paths()['dockerd']
-                    and unit_identity() == unit and request_checked(UID) == request
+                    and unit_now() == unit and request_checked(UID) == request
                     and hashlib.sha256(stable_bytes(GUARD, UID)).hexdigest() == descriptor['guard_receipt_sha256'],
                     'guard_drift_during_readback')
     return {'status': 'CURRENT_GUARD_CHECKED', 'nonce': request['nonce'], 'policy_sha256': policy_hash(request.get('web'))}

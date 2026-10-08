@@ -2,7 +2,7 @@
 
 No deployment defaults, environment routing, dynamic imports or model grants.
 An operator's pinned readiness receipt binds this config to actual reviewed
-runtime evidence. This code cannot manufacture that evidence or enable A0.
+runtime evidence. Per-row A0 evidence is produced only by current native checks.
 """
 from __future__ import annotations
 
@@ -356,6 +356,7 @@ class A0HostSession:
                                     or (row['host']['a0']['grant'] is not None and not observations['samples']))
         self.retained_samples = copy.deepcopy([] if observations is None else observations['samples'])
         self.key_preparation_attempted = False
+        self.capability_attempted = False
         self.key_cleanup = row['host']['a0']['key_cleanup']
         self.preparing = False
         self.plan = copy.deepcopy((row['host']['a0']['launch'] or {}).get('plan'))
@@ -537,6 +538,73 @@ class A0HostSession:
                 else tuple('http://' + x['ip'] + ':' + str(x['port']) + '/v1' for x in n['endpoints']),
                 policy, a.get('deployment')), web=a.get('web'))
 
+    def _plan(self, m, row, network):
+        from .adapters.dsh import _identity
+        a = row['host']['a0']['acceptance']
+        p=m.plan(row['created_at_unix'],row['deadline_unix'],assignment=row['existing_task_id'],generation=1,
+            owner_slot=self.config['a0']['owner_slot'],original_budget_seconds=row['budget_seconds'],git_metadata=self.config['a0']['git_metadata'],
+            network=network,deployment=self.config['a0'].get('deployment'),web=self.config['a0'].get('web'),association_binding=_identity(row),accepted_monotonic_ns=a['accepted_monotonic_ns'],boot_id=a['boot_id'])
+        if (str(m.DOCKER) != self.config['a0']['docker']['path']
+                or p['docker_sha256'] != self.config['a0']['docker']['sha256']
+                or str(m.PROJECT/'.runtime/rootless-docker/supervisor/friday-rework-docker.service') != self.config['a0']['daemon_unit']['path']
+                or p['daemon_unit_sha256'] != self.config['a0']['daemon_unit']['sha256']
+                or str(m.LAUNCHER) != self.config['a0']['launcher']['path']):
+            raise HostUnavailable('a0_runtime_native_pin_mismatch')
+        return p
+
+    def produce_capability(self, row):
+        """One current native observation for this fresh, input-retained row.
+
+        This creates only evidence files. The existing route owner must already
+        have prepared the exact request/guard/bridge under these original
+        clocks. Unknown or missing preparation is refused without native start,
+        network creation, implicit retry, keys or worker admission.
+        """
+        from .adapters.dsh import _identity
+        from .host_record import digest
+        row = self._current(row)
+        a = row['host']['a0']
+        if (self.capability_attempted or a['capability'] is not None or a['launch'] is not None
+                or row['host']['inputs'] is None or row['preparation_reserved']
+                or row['submission_observation'] != 'NOT_SUBMITTED'
+                or row['host']['terminal'] is not None or row['host']['quiescence'] is not None):
+            raise HostUnavailable('a0_capability_production_not_admitted')
+        self.capability_attempted = True
+        check_a0_runtime(self.config, self.store)
+        self._startup_left(row)
+        m = self._module()
+        native = self.config['a0']
+        # Check configured paths before invoking even read-only native probes.
+        if (str(m.LAUNCHER) != native['launcher']['path'] or str(m.DOCKER) != native['docker']['path']
+                or str(m.PROJECT/'.runtime/rootless-docker/supervisor/friday-rework-docker.service') != native['daemon_unit']['path']):
+            raise HostUnavailable('a0_runtime_native_pin_mismatch')
+        network = m.current_network(_identity(row), a['acceptance'],
+            owner_slot=native['owner_slot'], launcher_sha256=native['launcher']['sha256'],
+            docker_sha256=native['docker']['sha256'], deployment=native.get('deployment'), web=native.get('web'))
+        plan = self._plan(m, self._current(row), network)
+        runtime = m.Runtime(plan)
+        # Same current route consumer used by native preparation/API admission;
+        # this object performs no start and acquires no worker cleanup custody.
+        observed = runtime.check_network(budget=lambda: self._startup_left(row))
+        if observed != {'status': 'CURRENT_LOCAL_NETWORK_CHECKED', 'id': network['id']}:
+            raise HostUnavailable('current_live_a0_readiness_missing')
+        self._startup_left(row)
+        row = self._current(row)
+        root = private_directory(row['workspace_reference'])
+        proof = {'schema': 'friday.a0.host-current-route.v2', 'accepted': True,
+                 'association_sha256': digest(_identity(row)), 'acceptance_sha256': digest(a['acceptance']),
+                 'network_sha256': digest(network), 'runtime_source_sha256': native['runtime']['sha256'],
+                 'checks': {'namespace_recheck': True, 'current_route': True}}
+        proof_path = root/'a0-current-route.json'
+        m.write_json(proof_path, proof)
+        proof_pin = {'path': str(proof_path), 'sha256': hashlib.sha256(proof_path.read_bytes()).hexdigest()}
+        capability = {'schema': 'friday.a0.host-capability.v2', 'association': _identity(row),
+                      'acceptance': a['acceptance'], 'network': network, 'live_evidence': [proof_pin]}
+        path = root/'a0-capability.json'
+        m.write_json(path, capability)
+        self._current(row)
+        return {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+
     def _launch(self, row):
         from dataclasses import asdict
         from .adapters.dsh import _identity
@@ -549,15 +617,7 @@ class A0HostSession:
         if row['host']['a0']['launch'] is not None or self.launching:
             raise HostUnavailable('a0_launch_requires_reconciliation')
         m = self._module();cap=self._capability(row);a=row['host']['a0']['acceptance']
-        p=m.plan(row['created_at_unix'],row['deadline_unix'],assignment=row['existing_task_id'],generation=1,
-            owner_slot=self.config['a0']['owner_slot'],original_budget_seconds=row['budget_seconds'],git_metadata=self.config['a0']['git_metadata'],
-            network=cap['network'],deployment=self.config['a0'].get('deployment'),web=self.config['a0'].get('web'),association_binding=_identity(row),accepted_monotonic_ns=a['accepted_monotonic_ns'],boot_id=a['boot_id'])
-        if (str(m.DOCKER) != self.config['a0']['docker']['path']
-                or p['docker_sha256'] != self.config['a0']['docker']['sha256']
-                or str(m.PROJECT/'.runtime/rootless-docker/supervisor/friday-rework-docker.service') != self.config['a0']['daemon_unit']['path']
-                or p['daemon_unit_sha256'] != self.config['a0']['daemon_unit']['sha256']
-                or str(m.LAUNCHER) != self.config['a0']['launcher']['path']):
-            raise HostUnavailable('a0_runtime_native_pin_mismatch')
+        p = self._plan(m, row, cap['network'])
         self.plan=p
         plan_path=Path(row['workspace_reference'])/'a0-plan.json';m.write_json(plan_path,p)
         self.runtime=m.Runtime(p)
