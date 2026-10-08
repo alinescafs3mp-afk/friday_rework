@@ -253,6 +253,16 @@ def installed_product(value, home):
                 and pin(runtime['runtime_receipt']) and pending.get('ready') is False
                 and pending.get('runtime_sha256') == record_digest({k:v for k,v in runtime.items() if k != 'runtime_receipt'}),
                 'install_pending_receipt_not_qualification')
+        expected_evidence = ([str(home / 'preparation/harness' / ('dsh-' + phase + '.json'))
+                              for phase in ('source', 'toolchain', 'build', 'smoke')]
+                             if worker == 'dsh' else [str(home / 'preparation/a0.json')])
+        evidence = pending['evidence']
+        require(isinstance(evidence, list) and len(evidence) == len(expected_evidence)
+                and all(isinstance(row, dict) and row.get('path') == expected
+                        for row, expected in zip(evidence, expected_evidence)),
+                'original_worker_preparation_evidence_required')
+        for row in evidence:
+            pin(row)
         rows[worker] = runtime
     product['runtime'] = {'enabled': True, 'workers': rows}
     from plugins.friday_rework.host_runtime import configured_runtimes

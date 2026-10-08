@@ -198,7 +198,7 @@ def spec_checked(value):
                 'tools/configure_product.py', 'tools/configure_local_test.py',
                 'tools/web_profile.py', 'config/SOUL.md', 'config/RESEARCH.md'}
     if 'worker_install' in value:
-        required.add('scripts/worker_install.py')
+        required.update({'scripts/worker_install.py', 'tools/render_dsh_local.py'})
     required.update(str(p.relative_to(ROOT)) for p in (ROOT / 'plugins/friday_rework').rglob('*')
                     if p.is_file())
     required.update(str(p.relative_to(ROOT)) for p in (ROOT / 'patches/hermes').rglob('*')

@@ -308,10 +308,24 @@ def test_normal_plan_declares_conditional_a0_registration_without_any_native_eff
     assert not s.calls and not s.metadata_calls and not (s.home/'workers').exists()
 
 
-def test_new_helper_source_is_mandatory_and_pinned_before_effect(normal):
-    s=normal;del s.value['project_files']['scripts/worker_install.py']
+@pytest.mark.parametrize('name', ['scripts/worker_install.py', 'tools/render_dsh_local.py'])
+def test_new_helper_source_is_mandatory_and_pinned_before_effect(normal, name):
+    s=normal;del s.value['project_files'][name]
     with pytest.raises(ValueError,match='complete_installer_plugin_inventory_required'):entry.spec_checked(s.value)
     assert not s.calls
+
+
+@pytest.mark.parametrize('worker, index', [('dsh', 0), ('dsh', 1), ('dsh', 2), ('dsh', 3), ('a0', 0)])
+@pytest.mark.parametrize('mutation', ['changed', 'missing'])
+def test_installed_original_preparation_evidence_remains_pinned(normal, worker, index, mutation):
+    s=normal;materialized(s)
+    evidence=entry.read_json(s.home/'workers'/worker/'runtime-receipt.json')['evidence']
+    path=Path(evidence[index]['path'])
+    if mutation=='changed':path.write_text('{}\n')
+    else:path.unlink()
+    before=list(s.calls)
+    with pytest.raises((OSError, ValueError)):workers.installed_product(s.value,s.home)
+    assert s.calls==before
 
 
 def test_parent_waits_for_preparer_outputs_and_retains_partial_without_replay(normal,monkeypatch):
