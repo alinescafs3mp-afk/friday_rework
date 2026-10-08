@@ -571,3 +571,266 @@ def test_paid_extract_echo_is_redacted_before_native_cache_and_spill(native_chil
     assert any(p.suffix=='.md' for p in files)
     assert key not in json.dumps(result)
     assert all(key.encode() not in p.read_bytes() for p in files if p.is_file())
+
+# Independent review R01-R07: real native consumers and launch interleavings.
+def command_body(cls, name):
+    method=getattr(cls,name)
+    while hasattr(method,'__wrapped__'):method=method.__wrapped__
+    return method
+
+
+@pytest.mark.parametrize('lane',['pending','running','fallback','idle'])
+def test_ordinary_stop_retains_unknown_for_every_lane(native_child,monkeypatch,lane):
+    from gateway.run import GatewayRunner,_AGENT_PENDING_SENTINEL
+    from gateway.session import SessionSource
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.platforms.base import EphemeralReply
+    source=SessionSource(platform=Platform.TELEGRAM,chat_id='chat',user_id='user',chat_type='dm')
+    event=MessageEvent(text='/stop',source=source)
+    r=SimpleNamespace();entry=SimpleNamespace(session_key='route',session_id='durable')
+    async def entry_for(*a):return entry
+    r.async_session_store=SimpleNamespace(get_or_create_session=entry_for)
+    r._running_agents={'route':_AGENT_PENDING_SENTINEL if lane=='pending' else object()} if lane in ('pending','running') else {}
+    calls=[]
+    async def stop(key,*a,**k):calls.append(key);return {'status':'STOP_UNCONFIRMED'}
+    r._interrupt_and_clear_session=stop;r._settle_session_web_custody=stop
+    r._same_chat_runs=lambda *a:[];r._sibling_thread_run_keys=lambda *a:[]
+    r._chat_scoped_run_keys=lambda *a:['fallback-one','fallback-two'] if lane=='fallback' else []
+    r._is_user_authorized_for_source=lambda *a:True
+    reply=asyncio.run(command_body(GatewayRunner,'_handle_stop_command')(r,event))
+    assert isinstance(reply,EphemeralReply) and 'pending' in str(reply).lower() and 'unconfirmed' in str(reply).lower()
+    assert calls==(['fallback-one','fallback-two'] if lane=='fallback' else ['route'])
+
+
+@pytest.mark.parametrize('phase',['intent','popen','identity-checkpoint','payload'])
+@pytest.mark.parametrize('surface',['registry','rpc','cli'])
+def test_native_stop_latches_before_launch_and_stdin(native_child,monkeypatch,phase,surface,capsys):
+    f=native_child;c=f.call();stops=[]
+    def stop():
+        if surface=='registry':stops.append(f.registry.kill_process(c.session.id))
+        elif surface=='rpc':
+            from tui_gateway.methods_tools import _stop_processes
+            stops.append(_stop_processes({}))
+        else:
+            from hermes_cli.cli_commands_mixin import CLICommandsMixin
+            CLICommandsMixin._handle_stop_command(SimpleNamespace())
+            stops.append(f.registry.web_custody_receipt())
+        assert c.stopped.is_set() and c.session.web_stop_requested
+    if phase in ('intent','identity-checkpoint'):
+        original=f.registry._web_checkpoint
+        def checkpoint(s):
+            original(s)
+            if (s.process is None if phase=='intent' else bool(s.web_invocation)) and not stops:stop()
+        monkeypatch.setattr(f.registry,'_web_checkpoint',checkpoint)
+    elif phase=='popen':
+        original=subprocess.Popen
+        def launch(*a,**kw):
+            p=original(*a,**kw);stop();return p
+        monkeypatch.setattr(subprocess,'Popen',launch)
+    else:
+        original=f.registry.web_exchange
+        def exchange(s,payload,call):stop();return original(s,payload,call)
+        monkeypatch.setattr(f.registry,'web_exchange',exchange)
+    result=dispatch(c,'web_search',{'query':'input never released'})
+    assert result.get('error') and stops and not f.rows()
+    before=len(f.children);assert dispatch(c,'web_search',{'query':'second launch'}).get('error') and len(f.children)==before
+    if phase=='intent':
+        assert not f.children and c.session.id in f.registry._running and c.session.web_unconfirmed
+        rows=json.loads((f.home/'processes.json').read_text());assert rows[0]['web_stop_requested'] is True
+    else:
+        assert f.children and c.session.web_settled and not f.registry._running
+
+
+@pytest.mark.parametrize('command',['/new','/reset'])
+def test_ordinary_reset_preserves_durable_session_and_owner_on_unknown(native_child,command):
+    from gateway.run import GatewayRunner
+    from gateway.platforms.event import MessageEvent
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    r=object.__new__(GatewayRunner);r._session_key_for_source=lambda *a:'route'
+    touched=[]
+    async def unknown(*a):return {'status':'STOP_UNCONFIRMED'}
+    r._settle_session_web_custody=unknown
+    for name in ['_invalidate_session_run_generation','_release_running_agent_state','_evict_cached_agent','_clear_conversation_scope']:
+        setattr(r,name,lambda *a,**kw:touched.append((a,kw)))
+    event=MessageEvent(text=command,source=SessionSource(platform=Platform.TELEGRAM,chat_id='chat',user_id='user'))
+    reply=asyncio.run(command_body(GatewayRunner,'_handle_reset_command')(r,event))
+    assert 'pending' in str(reply).lower() and not touched
+
+
+def test_routing_key_durable_identity_and_recovery_are_distinct(native_child,monkeypatch):
+    from tools.approval_context import set_current_session_key,reset_current_session_key
+    f=native_child;token=set_current_session_key('agent:profile:telegram:dm:chat')
+    try:c=make_web_call(SimpleNamespace(session_id='durable-conversation'),time.monotonic()+15,'owned-task','owned-call')
+    finally:reset_current_session_key(token)
+    with c.turn.lock:f.registry.spawn_web(c)
+    s=c.session
+    assert s.session_key=='agent:profile:telegram:dm:chat' and s.parent_session_id==c.session_id=='durable-conversation'
+    assert f.registry.has_active_for_session(s.session_key)
+    other=ProcessRegistry();assert other.recover_from_checkpoint()==1
+    recovered=other.get(s.id);assert recovered.session_key==s.session_key and recovered.parent_session_id==s.parent_session_id
+    receipt=f.registry.stop_web_for_session(s.session_key,parent_session_id=s.parent_session_id,profile_home=str(f.home))
+    assert receipt['status']=='QUIESCENT' and receipt['newly_settled']==1
+    assert not f.registry.has_active_for_session(s.session_key)
+
+
+def test_idle_recovered_scope_stops_only_matching_profile_and_conversation(native_child,monkeypatch):
+    f=native_child
+    for sid,key,home,parent in [('same','route',str(f.home),'durable'),('sibling','other',str(f.home),'other-durable'),('otherprofile','route',str(f.home/'other'),'durable')]:
+        f.registry._running[sid]=ProcessSession(id=sid,command='native web child',web_custody=True,cwd=home,session_key=key,parent_session_id=parent)
+    called=[]
+    def settle(s,**kw):
+        assert s.web_stop_requested;called.append(s.id);return {'status':'STOP_UNCONFIRMED','session_id':s.id}
+    monkeypatch.setattr(f.registry,'settle_web',settle)
+    receipt=f.registry.stop_web_for_session('route',parent_session_id='durable',profile_home=str(f.home))
+    assert receipt['status']=='STOP_UNCONFIRMED' and called==['same']
+    assert not f.registry._running['sibling'].web_stop_requested and not f.registry._running['otherprofile'].web_stop_requested
+
+
+def test_approved_gateway_endpoints_consume_scope_and_exclude_ambient(native_child,monkeypatch):
+    from agent.secret_scope import set_secret_scope,reset_secret_scope,set_multiplex_context,reset_multiplex_context
+    from tools.managed_tool_gateway import build_vendor_gateway_url
+    f=native_child
+    monkeypatch.setenv('FIRECRAWL_GATEWAY_URL','https://sibling.invalid')
+    for scope,expected in [({'FIRECRAWL_GATEWAY_URL':'https://approved.invalid/'},'https://approved.invalid'),({'TOOL_GATEWAY_DOMAIN':'approved.invalid','TOOL_GATEWAY_SCHEME':'http'},'http://firecrawl-gateway.approved.invalid'),({},'https://firecrawl-gateway.nousresearch.com')]:
+        st=set_secret_scope(scope,profile_home=f.home);mt=set_multiplex_context(True)
+        try:assert build_vendor_gateway_url('firecrawl')==expected
+        finally:reset_multiplex_context(mt);reset_secret_scope(st)
+
+
+def test_parent_transfer_prunes_expired_queries_profiles_and_preserves_ttl(native_child,monkeypatch):
+    from tools.web_result_cache import SearchMemo
+    from hermes_constants import set_hermes_home_override,reset_hermes_home_override
+    f=native_child;m=SearchMemo();m.store('exa','expired',5,{'success':True});m.store('exa','live',5,{'success':True})
+    key=m._key('exa','expired',5);m._store[key]=(time.monotonic()-1,m._store[key][1])
+    token=set_hermes_home_override(f.home/'other')
+    try:m.store('exa','other-profile-expired',5,{'success':True});other=m._key('exa','other-profile-expired',5);m._store[other]=(time.monotonic()-1,m._store[other][1])
+    finally:reset_hermes_home_override(token)
+    rows=m.export_query('live',5);expiry=rows[0][1]
+    assert key not in m._store and other not in m._store and len(m._store)==1
+    m.import_query(rows,'live',5);assert m.export_query('live',5)[0][1]==expiry
+    m._store[key]=(time.monotonic()-1,{'success':True});m.import_query([], 'new',5);assert key not in m._store
+
+
+def test_kill_all_counts_real_web_settlement_once_and_mixed_legacy(native_child,monkeypatch):
+    f=native_child;c=f.call()
+    with c.turn.lock:f.registry.spawn_web(c)
+    original=f.registry.kill_process;legacy=ProcessSession(id='legacy',command='ordinary',owner_task_id='owned-task');f.registry._running[legacy.id]=legacy
+    def kill(sid,**kw):
+        if sid=='legacy':legacy.exited=True;return {'status':'killed'}
+        return original(sid,**kw)
+    monkeypatch.setattr(f.registry,'kill_process',kill)
+    assert f.registry.kill_all(source='process.stop')==2
+    assert c.session.web_settled and c.stopped.is_set()
+    assert f.registry.kill_all(source='process.stop')==0
+
+
+def test_actual_idle_gateway_stop_and_reset_reconcile_retained_web_owner(native_child,monkeypatch):
+    from gateway.run import GatewayRunner
+    from gateway.config import GatewayConfig,Platform
+    from gateway.session import SessionSource
+    from gateway.platforms.event import MessageEvent
+    f=native_child
+    monkeypatch.setattr('gateway.run._write_runtime_status_quiet',lambda **kw:None)
+    monkeypatch.setattr('gateway.status.publish_runtime_status',lambda **kw:0)
+    monkeypatch.setattr('gateway.status.write_runtime_status',lambda **kw:True)
+    runner=GatewayRunner(config=GatewayConfig())
+    monkeypatch.setattr(runner,'_persist_active_agents',lambda:None)
+    source=SessionSource(platform=Platform.TELEGRAM,chat_id='actual-chat',user_id='actual-user',chat_type='dm')
+    entry=runner.session_store.get_or_create_session(source)
+    c=f.call();c.session_key=entry.session_key;c.session_id=entry.session_id
+    with c.turn.lock:f.registry.spawn_web(c)
+    s=c.session;sid=entry.session_id
+    command=f.registry._web_command
+    monkeypatch.setattr(f.registry,'_web_command',lambda *a,**kw:SimpleNamespace(returncode=1))
+    stop=command_body(GatewayRunner,'_handle_stop_command');reset=command_body(GatewayRunner,'_handle_reset_command')
+    reply=asyncio.run(stop(runner,MessageEvent(text='/stop',source=source)))
+    assert 'pending' in str(reply).lower() and s.id in f.registry._running
+    assert runner._session_web_pending(entry.session_key)
+    assert runner._release_running_agent_state(entry.session_key) is False
+    reply=asyncio.run(reset(runner,MessageEvent(text='/new',source=source)))
+    assert 'pending' in str(reply).lower() and runner.session_store._entries[entry.session_key].session_id==sid
+    monkeypatch.setattr(f.registry,'_web_command',command)
+    reply=asyncio.run(stop(runner,MessageEvent(text='/stop',source=source)))
+    assert 'stopped' in str(reply).lower() and not f.registry._running and s.web_settled
+    receipt=asyncio.run(runner._settle_session_web_custody(entry.session_key))
+    assert receipt['status']=='QUIESCENT' and receipt['newly_settled']==0
+    # After positive custody reconciliation, use the actual ordinary reset body
+    # and real SessionStore. Notice/observer hooks have no bearing on custody.
+    async def observer(*a,**kw):return None
+    monkeypatch.setattr(runner,'_fire_session_reset_hooks',observer)
+    monkeypatch.setattr(runner,'_reset_notice_session_info',lambda *a:'')
+    monkeypatch.setattr(runner,'_telegram_topic_new_header',lambda *a:None)
+    monkeypatch.setattr(runner,'_is_telegram_topic_lane',lambda *a:False)
+    reply=asyncio.run(reset(runner,MessageEvent(text='/new',source=source)))
+    assert 'pending' not in str(reply).lower()
+    assert runner.session_store._entries[entry.session_key].session_id!=sid
+
+
+def test_approved_endpoints_survive_actual_scoped_child_transfer(native_child,monkeypatch):
+    from agent.secret_scope import set_secret_scope,reset_secret_scope
+    f=native_child;token=set_secret_scope({'FIRECRAWL_GATEWAY_URL':'https://approved-fire.invalid','PERPLEXITY_GATEWAY_URL':'https://approved-search.invalid'},profile_home=f.home)
+    monkeypatch.setenv('FIRECRAWL_GATEWAY_URL','https://ambient.invalid')
+    try:result=dispatch(f.call(),'web_search',{'query':'managed endpoint transfer'})
+    finally:reset_secret_scope(token)
+    assert result['success']
+    row=next(r for r in f.rows() if r['kind']=='http')
+    assert row['firecrawl_origin']=='https://approved-fire.invalid' and row['perplexity_origin']=='https://approved-search.invalid'
+    assert all('FIRECRAWL_GATEWAY_URL' not in row['env'] for row in f.plans)
+
+
+def test_native_process_stop_rpc_success_count_is_one_then_zero(native_child):
+    from tui_gateway.methods_tools import _stop_processes
+    f=native_child;c=f.call()
+    with c.turn.lock:f.registry.spawn_web(c)
+    result=_stop_processes({});assert result['status']=='QUIESCENT' and result['killed']==1
+    assert c.session.web_settled and c.session.web_stop_requested
+    result=_stop_processes({});assert result['status']=='QUIESCENT' and result['killed']==0
+
+
+@pytest.mark.parametrize('surface',['rpc','cli'])
+def test_native_operator_stop_during_actual_web_call_observes_cessation(native_child,surface,capsys):
+    f=native_child;c=f.call();results=[];ctx=contextvars.copy_context()
+    thread=threading.Thread(target=lambda:ctx.run(lambda:results.append(dispatch(c,'web_search',{'query':'headers-slow'}))))
+    thread.start()
+    try:
+        until=time.monotonic()+6
+        while time.monotonic()<until and not any(r['kind']=='http' for r in f.rows()):time.sleep(.01)
+        assert any(r['kind']=='http' for r in f.rows())
+        if surface=='rpc':
+            from tui_gateway.methods_tools import _stop_processes
+            receipt=_stop_processes({});assert receipt['status']=='QUIESCENT' and receipt['killed']==1
+        else:
+            from hermes_cli.cli_commands_mixin import CLICommandsMixin
+            CLICommandsMixin._handle_stop_command(SimpleNamespace())
+            assert 'unconfirmed' not in capsys.readouterr().out.lower()
+        thread.join(timeout=4)
+        assert not thread.is_alive() and c.stopped.is_set() and c.session.web_settled
+        assert results and results[0].get('error')=='web_native_boundary_refused'
+        assert all(r['namespace_init_exit_verified'] for r in f.receipts) and not f.registry._running
+    finally:
+        c.stop();thread.join(timeout=4)
+        assert not thread.is_alive()
+
+
+@pytest.mark.parametrize('owner',['named','default','missing'])
+def test_gateway_retained_custody_resolves_native_owner_home(native_child,monkeypatch,owner):
+    from gateway.run import GatewayRunner
+    f=native_child;s=ProcessSession(id='retained',command='native web child',web_custody=True,cwd=str(f.home),session_key='route',parent_session_id='durable')
+    f.registry._running[s.id]=s;seen=[]
+    def settle(session,**kw):
+        from hermes_constants import get_hermes_home
+        seen.append(str(get_hermes_home()));return {'status':'STOP_UNCONFIRMED','session_id':session.id}
+    monkeypatch.setattr(f.registry,'settle_web',settle)
+    monkeypatch.setattr('agent.secret_scope.is_multiplex_active',lambda:True)
+    store=SimpleNamespace(_entries={'route':SimpleNamespace(session_id='durable')},
+                          _profile_home_for_key=lambda key:f.home if owner=='named' else None,
+                          _named_profile_for_key=lambda key:None if owner=='default' else 'named',
+                          _routing_home=f.home)
+    runner=SimpleNamespace(config=SimpleNamespace(multiplex_profiles=True),session_store=store,
+                           _peek_session_state=lambda key:None,_cached_agent_for=lambda key:None)
+    receipt=asyncio.run(GatewayRunner._settle_session_web_custody(runner,'route'))
+    assert receipt['status']=='STOP_UNCONFIRMED' and s.id in f.registry._running
+    assert seen==([] if owner=='missing' else [str(f.home)])
+    assert GatewayRunner._session_web_pending(runner,'route') is True

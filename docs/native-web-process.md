@@ -67,3 +67,21 @@ fixture child cessation, not actual service/cgroup or provider acceptance.
 Host service timers, gateway-down behavior, restart recovery across a real
 process outage and installed live providers require separate runtime review and
 qualification. Existing live/owner gates remain mandatory.
+
+The source repair for independent review R01–R07 propagates retained custody
+through ordinary, pending, chat/thread fallback and idle gateway stop paths.
+Reset checks the same native handles before changing the durable conversation
+or releasing its owner. Native process/CLI stop latches the existing call events
+before settlement, including intent, Popen and checkpoint interleavings; the
+checkpoint also retains that stop intent. Web handles carry the native routing
+session key separately from the durable parent conversation ID. Recovered
+handles are selected by profile and those identities, never by a global stop.
+A successful web settlement counts once in native bulk-stop results; unknown
+settlement counts zero. Approved managed endpoint readers use native profile
+scope, and parent SearchMemo transfers sweep expired entries without renewing
+TTL or replacing a held single-flight lock.
+
+These changes are source proposals awaiting Astra's independent acceptance.
+The ordinary unbound CLI/direct-call, custom-provider, protocol-cap and later
+approval-clock gaps above remain product gaps; this repair does not accept them
+as exclusions or claim installed runtime parity.
