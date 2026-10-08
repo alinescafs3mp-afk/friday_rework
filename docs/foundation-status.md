@@ -1,6 +1,27 @@
 # Foundation checkpoint — 2026-10-08
 
-Current checkpoint, 09:27 MSK: the ordinary installer now has a
+Current checkpoint, 12:34 MSK: ordinary-user onboarding now prepares both
+private worker environments through the existing administrative flow. The
+owning host consumes qualification evidence for that exact user, receiving
+account, profile and access generation before activation. Operator receipts
+cannot qualify another user; incomplete or uncertain setup stays disabled
+without silently replaying its attempt.
+
+The final affected source gate passed all 468 checks. Independent review also
+corrected six order-sensitive test cases: fresh intake now enters Hermes'
+receiving-account authorization scope, while the old revoked worker context
+still refuses access. Production admission was not loosened. These checks use
+isolated native fixtures and are not live product acceptance.
+
+A fresh disabled profile still needs the trusted initial A0 probe producer;
+that remaining normal-start join is in implementation. The corrupted journal
+prerequisite still blocks native A0 admission. The protected Chromium sandbox
+setup is independently reviewed but requires authenticated root installation.
+No new native trial, browser setup, normal installation or product journey ran
+in this source package. All seven installed journeys and all four autonomous
+web contexts remain unaccepted; old Friday stays stopped.
+
+Earlier checkpoint, 09:27 MSK: the ordinary installer now has a
 single worker-deployment qualification transition. It observes the configured
 Harness smoke/DNS/TLS boundary and an already owned, admitted A0 runtime, then
 binds their evidence to the original installation, profile and protected

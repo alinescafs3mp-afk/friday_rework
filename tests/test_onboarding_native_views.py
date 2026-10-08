@@ -160,7 +160,17 @@ def test_each_account_old_job_cannot_revive_and_owned_stop_survives(wired, monke
     from hermes_cli.friday_product_access import KEY, current_access
     from hermes_cli.plugin_command_context import _command_context
     from gateway.session import SessionSource
+    from gateway.run import GatewayRunner
+    from agent import secret_scope
     w = wired
+    # Real multiplexed ingress reads the receiving account's own allowlist.
+    # Do not grant admission from the revoked worker's secret/profile context.
+    monkeypatch.setattr(secret_scope, '_MULTIPLEX_ACTIVE', True)
+    receiving = w.users.sources[0]._identity.authorization_home
+    receiving_env = receiving / '.env'
+    receiving_env.write_text('GATEWAY_ALLOWED_USERS=1\n')
+    receiving_env.chmod(0o600)
+    intake = object.__new__(GatewayRunner)  # No listener or gateway startup.
     observations = offline_execution(w, monkeypatch)
     response, original = admitted(w)
     old_cap = scope.current()
@@ -184,7 +194,8 @@ def test_each_account_old_job_cannot_revive_and_owned_stop_survives(wired, monke
     try:
         # A new ingress is admitted outside the revoked task's retained scope.
         # Its fresh grant must not revive any old object or original job below.
-        assert w.users.gateway._principal_authorized(new_source, allow_adapter_delegation=True)
+        assert not w.users.gateway._principal_authorized(new_source, allow_adapter_delegation=True)
+        assert intake._is_user_authorized_for_source(new_source, allow_adapter_delegation=True)
         with scope.scoped_source(new_source) as fresh:
             assert fresh.admission_generation > old_cap.admission_generation
             assert not w.invoke('friday_work', w.args)['accepted']
