@@ -252,17 +252,9 @@ class DshNetworkCheck:
         try:
             r = subprocess.run(argv,env=self.adapter._environment(),stdin=subprocess.DEVNULL,
                                capture_output=True,timeout=min(5,left),check=False)
-            v = json.loads(r.stdout)
-            if (r.returncode != 0 or len(r.stdout)>16000 or r.stderr
-                    or not isinstance(v,dict) or set(v) != {'schema','rows'}
-                    or v['schema'] != 'friday.dsh-web-observation.v1' or len(v['rows']) != len(urls)):
+            if r.returncode != 0 or r.stderr:
                 raise ValueError()
-            for url, observation in zip(urls,v['rows']):
-                if (set(observation) != {'url','address','status','tls'} or observation['url'] != url
-                        or not ipaddress.ip_address(observation['address']).is_global
-                        or observation['tls'] is not True or type(observation['status']) is not int
-                        or not 200 <= observation['status'] < 500):
-                    raise ValueError()
+            v = checked_network_observation(r.stdout, urls)
         except (OSError,subprocess.TimeoutExpired,ValueError,TypeError,KeyError):
             raise WorkerWebError('worker_web_native_dns_tls_refused') from None
         after, _ = current()
@@ -270,6 +262,24 @@ class DshNetworkCheck:
                 or web_policy(web,self.config['runtime_home'],self.config['runtime_profile'],self.store.clock()) != policy):
             raise WorkerWebError('worker_web_changed_during_probe')
         return {'identity':_identity(after),'policy_sha256':web.egress_evidence.sha256,'observation':v}
+
+
+def checked_network_observation(raw, urls):
+    """The same actual native DNS/TLS result check for jobs and installation."""
+    import ipaddress
+    try:
+        v = json.loads(raw)
+        if (len(raw) > 16000 or not isinstance(v, dict) or set(v) != {'schema','rows'}
+                or v['schema'] != 'friday.dsh-web-observation.v1' or len(v['rows']) != len(urls)):
+            raise ValueError()
+        for url, row in zip(urls,v['rows']):
+            if (set(row) != {'url','address','status','tls'} or row['url'] != url
+                    or not ipaddress.ip_address(row['address']).is_global or row['tls'] is not True
+                    or type(row['status']) is not int or not 200 <= row['status'] < 500):
+                raise ValueError()
+    except (ValueError,TypeError,KeyError,UnicodeError):
+        raise WorkerWebError('worker_web_native_dns_tls_refused') from None
+    return v
 
 
 def keyless_source():

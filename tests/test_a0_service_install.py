@@ -23,14 +23,14 @@ def service(install_input, tmp_path, monkeypatch):
     value = copy.deepcopy(install_input)
     home = Path(value['home']); home.mkdir(mode=0o700)
     deploy = tmp_path / 'deployment'; deploy.mkdir(mode=0o700)
-    root = deploy / 'rootless-docker'; root.mkdir(mode=0o700)
+    root = deploy / '.runtime/rootless-docker'; root.parent.mkdir(mode=0o700); root.mkdir(mode=0o700)
     for name in ('supervisor', 'config'): (root / name).mkdir(mode=0o700)
     registered = deploy / 'systemd'; registered.mkdir(mode=0o700)
     state = deploy / 'state'; state.mkdir(mode=0o700)
     custody = deploy / 'runtime'; custody.mkdir(mode=0o700)
     docker = deploy / 'docker'; docker.write_text('SYNTHETIC DOCKER PIN; NEVER EXECUTED\n'); docker.chmod(0o700)
     config = root / 'config/daemon.json'; config.write_text('synthetic daemon input\n'); config.chmod(0o600)
-    script = deploy / 'docker-29.8.2/docker-rootless-extras/dockerd-rootless.sh'
+    script = deploy / '.runtime/docker-29.8.2/docker-rootless-extras/dockerd-rootless.sh'
     script.parent.mkdir(mode=0o700, parents=True); script.write_text('NEVER EXECUTED\n'); script.chmod(0o700)
     # Git worktrees may be group-writable; the native loader intentionally
     # accepts only protected source. Copy the exact reviewed bytes inside the

@@ -1121,6 +1121,7 @@ class Runtime:
         require(sha(DOCKER) == p['docker_sha256'], 'docker_binary_changed')
         metadata_budget(validation_budget)
         self.runner = runner or self._command
+        self.budget = validation_budget
         self.supervisor = supervisor or native_supervisor()
         self.directory = RUNTIME / p['identity']
         self.receipt_path = self.directory / 'native.json'
@@ -1138,6 +1139,8 @@ class Runtime:
         return r.stdout
 
     def docker(self, *args, timeout=10):
+        if getattr(self,'budget',None) is not None:
+            timeout = min(timeout, metadata_budget(self.budget))
         return self.runner([str(DOCKER), '--host', SOCKET, *args], timeout)
 
     @contextmanager
@@ -1179,6 +1182,7 @@ class Runtime:
         return obj
 
     def check_network(self, *, container_id=None, budget=None):
+        budget = getattr(self,'budget',None) if budget is None else budget
         if self.p['network'] == 'none': return None
         n = self.p['network']; local_network(n, self.p['owner'], self.p.get('deployment'), self.p.get('web'))
         namespace = checked_launcher(n['launcher_sha256'])
@@ -1405,6 +1409,17 @@ class Runtime:
         return snapshot
 
     def _stop(self, r):
+        # The inherited work deadline bounds probes, never revokes the existing
+        # stop-only authority. Keep original finite cleanup/ownership checks;
+        # restore the expired work clock afterwards, without granting a retry.
+        work_budget = getattr(self, 'budget', None)
+        self.budget = None
+        try:
+            return self._stop_checked(r)
+        finally:
+            self.budget = work_budget
+
+    def _stop_checked(self, r):
         obj = self.inspect(r, stop_owned=True)
         initial = None
         sampling_error = None
@@ -1441,6 +1456,14 @@ class Runtime:
         return result
 
     def stop(self, *, from_stop_post=False):
+        work_budget = getattr(self, 'budget', None)
+        self.budget = None
+        try:
+            return self._stop_native(from_stop_post=from_stop_post)
+        finally:
+            self.budget = work_budget
+
+    def _stop_native(self, *, from_stop_post=False):
         checked = None
         try:
             with self.locked():
@@ -1491,7 +1514,8 @@ class Runtime:
 
     def _probe(self):
         with self.locked():
-            validate(self.p); seconds = min(15, remaining(self.p))
+            budget = getattr(self,'budget',None)
+            validate(self.p,budget=budget); seconds = min(15,remaining(self.p),metadata_budget(budget,15))
             r = self.receipt(); obj = self.inspect(r)
             require(obj['State']['Running'] and self.p['mode'] == 'runtime', 'runtime_not_running')
             unit = self.supervisor.observe(self.association(r))

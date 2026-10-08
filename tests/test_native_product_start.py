@@ -416,11 +416,24 @@ def test_worker_health_uses_original_native_receipt_checker_without_effects(
     from hermes_cli import config_effective as config
     from plugins.friday_rework import admin, host_runtime
 
+    # Config selection validates the full real shape before invoking the
+    # receipt consumer. IO below is intercepted, never the shape validator.
+    pinned = {"path": str(tmp_path / "synthetic-unexecuted"), "sha256": "0" * 64}
     runtime = {
-        "enabled": configured,
-        "dsh": {"web": {"profile": "exa-paid"}},
-        "runtime_receipt": {"path": "synthetic", "sha256": "0" * 64},
-    }
+        "enabled": True, "runtime_profile": "default", "runtime_home": str(tmp_path),
+        "workspace_root": str(tmp_path / "jobs"), "staging_root": str(tmp_path / "stage"),
+        "cache_roots": [str(tmp_path / "cache")], "budget_seconds": 60,
+        "max_file_bytes": 1024, "max_total_bytes": 4096,
+        "dsh": {"payload_root": str(tmp_path / "payload"),
+                "toolchain_root": str(tmp_path / "toolchain"),
+                "node": pinned, "cli": pinned, "patch": pinned, "native_files": [pinned],
+                "key_name": "SYNTHETIC_LOCAL_KEY", "profile": "headless",
+                "memory_bytes": 2 * 1024**3, "cpu_percent": 200, "tasks": 64,
+                "shutdown_seconds": 2, "tmp_bytes": 64 * 1024**2,
+                "web": {"profile": "exa-paid", **{k: pinned for k in
+                        ("resolver", "trust_bundle", "egress_evidence", "research_policy")}}},
+        "runtime_receipt": pinned,
+    } if configured else {"enabled": False}
 
     config_path = tmp_path / "config.yaml"
     config_path.write_text("{}")

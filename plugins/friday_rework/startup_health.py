@@ -26,7 +26,7 @@ def worker_health():
 
     from .admin import Administration
     from .associations import Associations
-    from .host_runtime import HostUnavailable, check_runtime, configured_runtimes
+    from .host_runtime import HostUnavailable, check_runtime, configured_runtimes, deployment_health
 
     admin = Administration()
     rows = []
@@ -63,10 +63,11 @@ def worker_health():
                 try:
                     checked = check_runtime(selected, Associations(PluginState("friday_rework")))
                     if kind == "a0":
-                        # Selection does not grant current native A0 admission.
-                        raise HostUnavailable("a0_useful_web_runtime_contract_unavailable")
-                    if checked["dsh"].get("web", {}).get("profile") not in ("exa-paid", "exa-keyless"):
+                        deployment_health(checked)
+                    elif checked["dsh"].get("web", {}).get("profile") not in ("exa-paid", "exa-keyless"):
                         raise HostUnavailable("mandatory_worker_web_contract_required")
+                    elif (home / 'FRIDAY-INSTALL.json').exists():
+                        deployment_health(checked)
                 except (OSError, ValueError, RuntimeError, KeyError, TypeError):
                     rows.append({"profile": profile, "worker": kind, "deployment_verified": False,
                                  "blocker": "worker_runtime_or_web_unverified", "execution": "NOT_OBSERVED"})

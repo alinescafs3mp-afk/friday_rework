@@ -326,6 +326,152 @@ def a0_binding(value, associations, row):
     return WorkerBinding(session, session.emergency_stop)
 
 
+def a0_runtime_module(config):
+    """Load the exact configured native code and unchanged profile/web helpers."""
+    import types
+    pin = _pin(config['a0']['runtime']); data = pin.read()
+    m = types.ModuleType('frw_pinned_a0_runtime'); m.__file__ = str(pin.path)
+    exec(compile(data,str(pin.path),'exec'),m.__dict__)
+    for name, filename in [('PROFILE_SOURCE','a0_profile.py'), ('WEB_SOURCE','a0_web.py')]:
+        if hashlib.sha256(getattr(m,name).read_bytes()).digest() != hashlib.sha256(
+                (Path(__file__).parent / 'adapters' / filename).read_bytes()).digest():
+            raise HostUnavailable('a0_runtime_profile_source_mismatch' if name == 'PROFILE_SOURCE'
+                                  else 'a0_runtime_web_source_mismatch')
+    return m
+
+
+def a0_deployment_contract(config):
+    """Reusable mandatory configuration; no current row, route or grant."""
+    from .adapters.a0_profile import profile_templates, endpoint_urls
+    from .adapters.a0_web import service_files, checked_web
+    from .adapters.a0_config import LocalNetwork
+    c = validate_a0_runtime(config); a = c['a0']
+    if 'deployment' not in a or 'web' not in a:
+        raise HostUnavailable('a0_useful_web_runtime_contract_unavailable')
+    checked_web(a['web'])
+    for name in ('runtime','launcher','docker','daemon_unit','policy'): _pin(a[name]).read()
+    path = Path(c['runtime_home']) / 'workers/a0/inputs/a0-native-files.json'
+    actual = json.loads(PinnedFile(path,hashlib.sha256(path.read_bytes()).hexdigest()).read())
+    expected = {**profile_templates(a['deployment']), **service_files(a['web'])}
+    if actual != expected:
+        raise HostUnavailable('a0_deployment_inputs_changed')
+    # Route declaration validation is reusable; actual guard/namespace/network
+    # and web processes remain mandatory in A0HostSession for every fresh row.
+    LocalNetwork('friday-deployment-check',tuple(endpoint_urls(a['deployment'])),
+                 _pin(a['policy']),a['deployment']).checked()
+    return c
+
+
+def deployment_health(config):
+    """Ordinary producer evidence, distinct from live job admission/acceptance."""
+    from .host_record import digest
+    from .worker_web import web_policy, checked_network_observation
+    import time
+    c = validate_runtime(config); home = Path(c['runtime_home'])
+    if 'a0' in c: a0_deployment_contract(c)
+    else:
+        web = _dsh_web(c['dsh'])
+        if web is None: raise HostUnavailable('mandatory_worker_web_contract_required')
+        policy = web_policy(web,str(home),c['runtime_profile'],time.time())
+        ns = Path('/proc/self/ns/net').stat()
+        if (policy['boot_id'] != Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+                or policy['net_namespace'] != [ns.st_dev,ns.st_ino]):
+            raise HostUnavailable('worker_web_namespace_changed')
+    marker_path = home / 'FRIDAY-INSTALL.json'
+    marker = json.loads(PinnedFile(marker_path,hashlib.sha256(marker_path.read_bytes()).hexdigest()).read())
+    ref = marker.get('worker_qualification')
+    if (marker.get('home') != str(home) or marker.get('worker_state') != 'BOTH_DEPLOYMENTS_QUALIFIED'
+            or not isinstance(ref,dict) or ref.get('path') != str(home / 'preparation/worker-qualification/observation.json')):
+        raise HostUnavailable('ordinary_worker_qualification_missing')
+    proof = json.loads(_pin(ref).read()); kind = 'a0' if 'a0' in c else 'dsh'
+    receipt = json.loads(_pin(c['runtime_receipt']).read())
+    if (proof.get('schema') != 'friday.worker-deployment-observation.v1' or proof.get('home') != str(home)
+            or proof.get('profile') != c['runtime_profile'] or proof.get('input_sha256') != marker['input_sha256']
+            or proof.get('effects') != 'OBSERVATION_ONLY' or proof.get('per_job_authority') != 'NOT_GRANTED'
+            or set(proof.get('workers',{})) != {'dsh','a0'} or receipt['evidence'][-1] != ref
+            or proof['workers'][kind]['runtime_sha256'] != digest({k:v for k,v in c.items() if k != 'runtime_receipt'})):
+        raise HostUnavailable('worker_deployment_observation_changed')
+    archive = proof['original']
+    if archive.get('path') != str(home / 'preparation/worker-qualification/original.json'):
+        raise HostUnavailable('foreign_original_worker_archive')
+    before = json.loads(_pin(archive).read())
+    if (before['marker']['original_attempt'] != marker['original_attempt']
+            or before['marker']['input_sha256'] != marker['input_sha256']
+            or before['marker']['home'] != str(home)
+            or proof['observed']['boot_id'] != marker['original_attempt']['boot_id']
+            or not 0 < proof['observed']['monotonic'] <= marker['original_attempt']['deadline_mono']):
+        raise HostUnavailable('original_worker_ownership_changed')
+    # Archive paths come from the exact original profile/worker inventory.
+    expected = dict(before['marker']['profile_files'])
+    expected.update({p:h for p,h in before['marker']['worker_files'].items() if p.endswith('/runtime-receipt.json')})
+    if before['files'] != expected or set(before['marker']['profile_files']) != {'config.yaml','SOUL.md','FRIDAY-PROFILE.json'}:
+        raise HostUnavailable('original_worker_archive_incomplete')
+    for name, sha in before['files'].items():
+        _pin({'path':str(home / 'preparation/worker-qualification/original' / name),'sha256':sha}).read()
+    for inventory in ('profile_files','worker_files'):
+        for name, sha in marker[inventory].items():
+            if name.startswith('/') or '..' in Path(name).parts:
+                raise HostUnavailable('foreign_installed_worker_file')
+            _pin({'path':str(home / name),'sha256':sha}).read()
+    if set(proof['credentials']) != {'.env','auth.json'}:
+        raise HostUnavailable('qualified_credentials_incomplete')
+    for name, sha in proof['credentials'].items():
+        if name not in ('.env','auth.json'): raise HostUnavailable('foreign_qualified_credential_store')
+        path = home / name
+        present = path.exists() or path.is_symlink()
+        if (sha is None and present) or (sha is not None and not present):
+            raise HostUnavailable('qualified_credentials_changed')
+        if sha is not None: _pin({'path':str(path),'sha256':sha}).read()
+    obs = proof['workers'][kind]
+    if kind == 'dsh':
+        if (obs['policy_sha256'] != web.egress_evidence.sha256
+                or [r['kind'] for r in obs['smoke']] != ['version','help','headless-config','headless-help']
+                or any(r['observation'].get('returncode') != 0 or r['observation'].get('reaped') is not True
+                       or r['observation'].get('timeout') is not False for r in obs['smoke'])):
+            raise HostUnavailable('worker_native_smoke_unverified')
+        urls = [('https://mcp.exa.ai/' if web.profile == 'exa-keyless' else 'https://api.exa.ai/'),*policy['document_probes']]
+        checked_network_observation(json.dumps(obs['network']),urls)
+    else:
+        from .adapters.a0_web import checked_web
+        m = a0_runtime_module(c)
+        plan = json.loads(_pin(obs['plan']).read())
+        m.validate(plan,check_files=False)
+        if (plan.get('deployment') != c['a0']['deployment'] or plan.get('web') != c['a0']['web']
+                or plan.get('git_metadata') != c['a0']['git_metadata'] or plan['network'] == 'none'
+                or plan['code_sha256'] != c['a0']['runtime']['sha256']
+                or plan['docker_sha256'] != c['a0']['docker']['sha256']
+                or plan['daemon_unit_sha256'] != c['a0']['daemon_unit']['sha256']
+                or plan['network']['launcher_sha256'] != c['a0']['launcher']['sha256']
+                or plan['network']['policy_sha256'] != c['a0']['policy']['sha256']
+                or obs['route'].get('id') != plan['network']['id']
+                or not plan['accepted_unix'] <= proof['observed']['unix'] < plan['deadline_unix']):
+            raise HostUnavailable('qualified_native_plan_changed')
+        m.probe_report_checked(obs['native_probe'],c['a0']['deployment'])
+        checked_web(c['a0']['web'])
+        if (obs['web'].get('status') != 'CURRENT_NATIVE_WEB_SERVICE_CHECKED'
+                or obs['web'].get('version') != c['a0']['web']['version']
+                or obs['route'].get('status') != 'CURRENT_LOCAL_NETWORK_CHECKED'
+                or not re.fullmatch('[0-9a-f]{64}',obs['container_id'])
+                or not re.fullmatch('[0-9a-f]{32}',obs['invocation_id'])
+                or obs['native_resources'].get('running') is not True
+                or obs['native_resources'].get('unit_quiescent') is not False
+                or obs['native_resources'].get('caps') != {'memory.max':str(m.MEMORY),
+                    'memory.swap.max':'0','pids.max':str(m.PIDS),
+                    'cpu.max':obs['native_resources'].get('caps',{}).get('cpu.max')}):
+            raise HostUnavailable('worker_native_web_unverified')
+        quota,period = obs['native_resources']['caps']['cpu.max'].split()
+        if not quota.isdecimal() or not period.isdecimal() or int(period)<=0 or int(quota)!=2*int(period):
+            raise HostUnavailable('worker_native_resources_unverified')
+        processes = obs['web'].get('processes')
+        if (not isinstance(processes,list) or len(processes)!=2
+                or {p.get('name') for p in processes}!={'run_ui','run_searxng'}
+                or any(set(p)!={'name','pid','start','statename'} or p['statename']!='RUNNING'
+                       or type(p['pid']) is not int or p['pid']<=0 or type(p['start']) is not int
+                       or p['start']<=0 for p in processes)):
+            raise HostUnavailable('worker_native_web_processes_unverified')
+    return c
+
+
 class A0HostSession:
     """One association's cached ownership, original KeyMaterial and boundary.
 
@@ -396,17 +542,7 @@ class A0HostSession:
         return r
 
     def _module(self):
-        import types
-        pin = _pin(self.config['a0']['runtime']); data = pin.read()
-        m = types.ModuleType('frw_pinned_a0_runtime');m.__file__=str(pin.path)
-        exec(compile(data,str(pin.path),'exec'),m.__dict__)
-        actual_profile = Path(__file__).parent / 'adapters/a0_profile.py'
-        if hashlib.sha256(m.PROFILE_SOURCE.read_bytes()).hexdigest() != hashlib.sha256(actual_profile.read_bytes()).hexdigest():
-            raise HostUnavailable('a0_runtime_profile_source_mismatch')
-        actual_web = Path(__file__).parent / 'adapters/a0_web.py'
-        if hashlib.sha256(m.WEB_SOURCE.read_bytes()).hexdigest() != hashlib.sha256(actual_web.read_bytes()).hexdigest():
-            raise HostUnavailable('a0_runtime_web_source_mismatch')
-        return m
+        return a0_runtime_module(self.config)
 
     def _capability(self, row, pin=None):
         from .adapters.a0_native import strict_json

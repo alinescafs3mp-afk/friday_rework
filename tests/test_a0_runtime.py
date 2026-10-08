@@ -14,6 +14,7 @@ import time
 from types import SimpleNamespace, ModuleType
 import unittest
 from unittest.mock import patch
+import pytest
 
 SPEC = importlib.util.spec_from_file_location('a0_runtime', Path(__file__).parents[1] / 'scripts/a0_runtime.py')
 a0 = importlib.util.module_from_spec(SPEC)
@@ -21,6 +22,31 @@ sys.modules[SPEC.name] = a0
 SPEC.loader.exec_module(a0)
 CID = 'a' * 64
 INV = 'b' * 32
+
+
+def protected_native_files(root):
+    """Exact source helpers and explicit unexecuted OS-interface fixtures."""
+    source = Path(__file__).resolve().parents[1]
+    root.mkdir(mode=0o700)
+    unit = root / '.runtime/rootless-docker/supervisor/friday-rework-docker.service'
+    unit.parent.mkdir(parents=True)
+    unit.write_bytes(b'OFFLINE UNIT PIN; NEVER INSTALLED'); unit.chmod(0o400)
+    files = {'PROJECT': root}
+    for name, relative in [('DOCKER', None), ('LAUNCHER', 'scripts/rootless_docker_launch.py'),
+                           ('PROFILE_SOURCE', 'plugins/friday_rework/adapters/a0_profile.py'),
+                           ('WEB_SOURCE', 'plugins/friday_rework/adapters/a0_web.py')]:
+        path = root / name.lower()
+        path.write_bytes((source / relative).read_bytes() if relative else b'OFFLINE DOCKER PIN; NEVER EXECUTED')
+        path.chmod(0o400); files[name] = path
+    return files
+
+
+@pytest.fixture(autouse=True)
+def offline_native_files(tmp_path, monkeypatch):
+    # Unit retirement and writable development files cannot supply trusted
+    # runtime inputs. Use protected exact helpers with intercepted native IO.
+    for name, path in protected_native_files(tmp_path / 'offline-native').items():
+        monkeypatch.setattr(a0, name, path)
 
 
 def obj(p, *, running=False):

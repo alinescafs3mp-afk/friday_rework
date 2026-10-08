@@ -30,6 +30,9 @@ def configure_a0(setup,proof,tmp_path,monkeypatch,*,native_launcher=False):
     spec=importlib.util.spec_from_file_location('a0_bound_fixture',SOURCE/'scripts/a0_runtime.py')
     m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
     m.PROJECT=root;m.RUNTIME=runtime_root;m.DOCKER=docker;m.LAUNCHER=launcher
+    for name, filename in [('PROFILE_SOURCE','a0_profile.py'), ('WEB_SOURCE','a0_web.py')]:
+        path=root/filename;path.write_bytes((SOURCE/'plugins/friday_rework/adapters'/filename).read_bytes())
+        path.chmod(0o400);setattr(m,name,path)
     # Native Git inventory, kernel route/namespace readback, PID/cgroup samples
     # are explicitly fake interfaces; produced plan/create/unit schema is real.
     m.check_git_metadata=lambda x, **kwargs:None

@@ -1,8 +1,8 @@
 """Ordinary-install wiring from native preparer outputs; never a live grant.
 
 The existing per-worker input format and admission consumers own configuration.
-Pending receipts deliberately fail those unchanged consumers. No qualification
-producer, scheduler, credential reader or native execution is introduced here.
+Pending receipts deliberately fail the admission consumers. A separate fixed
+native observation transition can qualify deployment, never per-job authority.
 """
 from __future__ import annotations
 
@@ -240,17 +240,22 @@ def installed_product(value, home):
     """Read the original generated package; never regenerate or adopt a receipt."""
     from plugins.friday_rework.worker_provision import preparation
     product = copy.deepcopy(value['product']); rows = {}
+    marker_path = home / 'FRIDAY-INSTALL.json'
+    marker = read_json(marker_path) if marker_path.exists() else {}
+    qualified = marker.get('worker_state') == 'BOTH_DEPLOYMENTS_QUALIFIED'
     for worker in ('dsh', 'a0'):
         path = home / 'workers' / worker / 'runtime-input.json'
         ref = {'path': str(path), 'sha256': digest(owned_file(path, private=True))}
-        prepared, runtime = preparation(home, product['profile'], worker, ref)
-        pending = read_json(runtime['runtime_receipt']['path'])
+        prepared, runtime = preparation(home, product['profile'], worker, ref,
+                                        private_check=lambda p: owned_file(p,private=True))
+        from scripts.worker_qualification import original_receipt
+        pending = original_receipt(home, worker, runtime, marker)
         from plugins.friday_rework.host_record import digest as record_digest
         fields = {'schema', 'ready', 'runtime_sha256', 'evidence'} | (
             {'adapter_sha256', 'web_source_pins'} if worker == 'dsh' else {'source_pins'})
         require(isinstance(pending, dict) and set(pending) == fields
                 and pending.get('schema') == 'friday-rework.' + ('dsh-runtime.v1' if worker == 'dsh' else 'a0-runtime.v2')
-                and pin(runtime['runtime_receipt']) and pending.get('ready') is False
+                and pending.get('ready') is False
                 and pending.get('runtime_sha256') == record_digest({k:v for k,v in runtime.items() if k != 'runtime_receipt'}),
                 'install_pending_receipt_not_qualification')
         expected_evidence = ([str(home / 'preparation/harness' / ('dsh-' + phase + '.json'))
@@ -267,4 +272,30 @@ def installed_product(value, home):
     product['runtime'] = {'enabled': True, 'workers': rows}
     from plugins.friday_rework.host_runtime import configured_runtimes
     configured_runtimes(product['runtime'])
+    if qualified:
+        from scripts.worker_qualification import checked_product
+        return checked_product(value,home,product,marker)
     return product
+
+
+def installed_files(home):
+    """Pin deployment inputs, leaving native job/staging/cache contents owned.
+
+    Mutable job output is checked by its existing per-row adapter/controller.
+    It is never adopted as deployment evidence or added to the install marker.
+    """
+    from scripts.friday_install import directory
+    root = home / 'workers'; directory(root)
+    require({p.name for p in root.iterdir()} == {'dsh','a0'}, 'installed_worker_roots_changed')
+    files = set()
+    for kind in ('dsh','a0'):
+        worker = root / kind; directory(worker)
+        require({p.name for p in worker.iterdir()} == {'jobs','staging','cache','inputs','runtime-input.json','runtime-receipt.json'},
+                'installed_worker_layout_changed')
+        for name in ('jobs','staging','cache','inputs'): directory(worker / name)
+        for name in ('runtime-input.json','runtime-receipt.json'):
+            files.add(str((worker / name).relative_to(home)))
+        for path in (worker / 'inputs').rglob('*'):
+            require(path.resolve() == path and not path.is_symlink(), 'installed_worker_input_path_changed')
+            if path.is_file(): files.add(str(path.relative_to(home)))
+    return files

@@ -198,7 +198,7 @@ def spec_checked(value):
                 'tools/configure_product.py', 'tools/configure_local_test.py',
                 'tools/web_profile.py', 'config/SOUL.md', 'config/RESEARCH.md'}
     if 'worker_install' in value:
-        required.update({'scripts/worker_install.py', 'tools/render_dsh_local.py'})
+        required.update({'scripts/worker_install.py','scripts/worker_qualification.py', 'tools/render_dsh_local.py'})
     required.update(str(p.relative_to(ROOT)) for p in (ROOT / 'plugins/friday_rework').rglob('*')
                     if p.is_file())
     required.update(str(p.relative_to(ROOT)) for p in (ROOT / 'patches/hermes').rglob('*')
@@ -821,7 +821,8 @@ def inspect(value, input_hash):
     effective = value
     if 'worker_install' in value:
         files = marker.get('worker_files')
-        actual = {str(p.relative_to(home)) for p in (home / 'workers').rglob('*') if p.is_file()}
+        from scripts.worker_install import installed_files
+        actual = installed_files(home)
         require(isinstance(files, dict) and set(files) == actual
                 and all(digest(owned_file(home / p, private=True)) == h for p, h in files.items()),
                 'installed_worker_inputs_changed')
@@ -833,15 +834,31 @@ def inspect(value, input_hash):
         require(digest(owned_file(path, private=True)) == marker.get('a0_service_receipt_sha256'),
                 'a0_service_receipt_changed')
         service_receipt_checked(effective, home, original_attempt=marker['original_attempt'])
-    return {'state': 'TEMPLATE_INCOMPLETE', 'ready': False, 'home': str(home),
-            'effects': 'NONE', 'remaining': gaps(),
+    qualified = marker.get('worker_state') == 'BOTH_DEPLOYMENTS_QUALIFIED'
+    return {'state': 'DEPLOYMENTS_QUALIFIED' if qualified else 'TEMPLATE_INCOMPLETE', 'ready': False, 'home': str(home),
+            'effects': 'NONE', 'remaining': (['Fresh per-job native route/deadline/credentials and stop admission',
+                'Current authenticated native Dashboard and receiving gateway ownership',
+                'Independent acceptance and mandatory live journeys'] if qualified else gaps()),
+            'per_job_authority': 'NOT_GRANTED',
             'invocation_completion': 'NOT_PROVEN_BY_OUTPUT_RECEIPT'}
 
 
-def start(value, input_hash, *, budget=None, input_path=None):
+def start(value, input_hash, *, budget=None, input_path=None, plan_ref=None, phase='start'):
     from scripts.install_containment import Budget, Containment
     budget = budget or Budget(value.get('seconds'))
     budget.call(inspect, value, input_hash)
+    home = Path(value['home'])
+    marker = budget.call(read_json,home / MARKER) if 'worker_install' in value else {}
+    pending = marker.get('worker_state') == 'BOTH_CONFIGURED_QUALIFICATION_PENDING'
+    if phase == 'qualify' or (pending and plan_ref is not None):
+        require(pending and plan_ref is not None, 'pending_qualification_and_current_a0_plan_required')
+        require(marker['original_attempt']['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                'original_install_boot_changed')
+        # Native observation inherits the original installation clock. No new
+        # startup invocation can revive an expired or partially qualified home.
+        budget = Budget(value['seconds'],deadline=marker['original_attempt']['deadline_mono'])
+    elif pending:
+        raise ValueError('ordinary_worker_qualification_required')
     # A source/rendered status cannot stand in for any configured runtime.
     effective = value
     if 'worker_install' in value:
@@ -860,8 +877,11 @@ def start(value, input_hash, *, budget=None, input_path=None):
     # Re-exec the existing internal completion helper in the exact selected PM
     # generation. It revalidates all bytes and gates before any service effect.
     budget.call(inspect, value, input_hash)
-    argv = [selected, '-B', str(ROOT / 'scripts/friday_native.py'), 'start',
+    argv = [selected, '-B', str(ROOT / 'scripts/friday_native.py'), phase,
             '--input', str(input_path), '--deadline', str(budget.deadline)]
+    if plan_ref is not None:
+        pin(plan_ref)
+        argv += ['--a0-plan',plan_ref['path'],'--a0-plan-sha256',plan_ref['sha256']]
     budget.check()
     os.execve(selected, argv, clean_environment(home))
 
@@ -869,13 +889,19 @@ def start(value, input_hash, *, budget=None, input_path=None):
 def main():
     started = time.monotonic()  # before parser/input IO; never reset on dispatch
     parser = SafeParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'reconcile', 'resume-harness'))
+    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'qualify', 'reconcile', 'resume-harness'))
     parser.add_argument('--input', required=True, type=Path, help='Private pinned JSON, no credential values')
+    parser.add_argument('--a0-plan', type=Path, help='Existing owned live native probe plan; never a readiness report')
+    parser.add_argument('--a0-plan-sha256')
     args = parser.parse_args(); os.umask(0o077)
     sys.path.insert(0, str(ROOT))
     from scripts.dsh_prepare import StopUnconfirmed
     try:
         raw = owned_file(args.input, private=True)
+        require((args.a0_plan is None) == (args.a0_plan_sha256 is None)
+                and (args.a0_plan is None or args.phase in ('start','qualify')),
+                'qualification_plan_arguments_required')
+        plan_ref = None if args.a0_plan is None else {'path':str(args.a0_plan),'sha256':args.a0_plan_sha256}
         value = json.loads(raw, object_pairs_hook=unique); sha = digest(raw)
         from scripts.install_containment import Budget
         require(isinstance(value, dict), 'explicit_install_fields_required')
@@ -898,7 +924,7 @@ def main():
             from scripts.friday_native import dashboard_source_check
             result = dashboard_source_check(Path(value['home']))
         else:
-            result = start(value, sha, budget=budget, input_path=args.input)
+            result = start(value, sha, budget=budget, input_path=args.input,plan_ref=plan_ref,phase=args.phase)
         payload = json.dumps(result, sort_keys=True, indent=2)
         budget.check()
         print(payload, flush=True)

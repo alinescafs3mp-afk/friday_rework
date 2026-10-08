@@ -32,6 +32,11 @@ def prerequisites(value, budget):
         and owning_home_root(source) in (None, home),
         "native_start_generation_mismatch",
     )
+    if 'worker_install' in value:
+        from hermes_cli.config_effective import read_user_config_effective_readonly
+        configured = budget.call(read_user_config_effective_readonly,home / 'config.yaml')
+        require(configured['plugins']['entries']['friday_rework']['settings']['runtime'] == value['product']['runtime'],
+                'native_start_runtime_generation_changed')
     require(
         source_product_current(source, "tui", source / "ui-tui/dist")
         and source_product_current(source, "web", source / "hermes_cli/web_dist"),

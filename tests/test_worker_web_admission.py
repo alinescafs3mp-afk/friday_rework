@@ -246,8 +246,11 @@ def test_missing_default_or_injected_a0_secret_refuses_before_write(tmp_path,val
     base.remove(cessation_confirmed=True)
 
 
-def test_a0_web_plan_binds_image_service_source_and_route_permission(tmp_path):
+def test_a0_web_plan_binds_image_service_source_and_route_permission(tmp_path,monkeypatch):
     from test_original_route import network
+    from test_a0_runtime import protected_native_files
+    for name,path in protected_native_files(tmp_path/'unexecuted-native').items():
+        monkeypatch.setattr(a0,name,path)
     n=network();w=spec_web();n['web']=route_web(w);n['policy_sha256']=guard.policy_hash(n['web'])
     with patch.object(a0,'RUNTIME',tmp_path):
         now=time.time();p=a0.plan(now,now+1800,assignment='fixture',generation=1,owner_slot='astra',original_budget_seconds=1800,network=n,web=w)

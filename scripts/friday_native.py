@@ -51,6 +51,20 @@ def profile_write(home, spec):
     return bundle
 
 
+def qualify(value, input_hash, plan_ref, budget):
+    """Ordinary completion helper in the installation's actual PM generation."""
+    from hermes_constants import get_hermes_home
+    from pm.paths import repo_root
+    from pm.environments import project_python, owning_home_root
+    from scripts.friday_install import require
+    from scripts.worker_qualification import qualify as transition
+    home = Path(value['home']); source = home / 'hermes-agent'
+    require(get_hermes_home() == home and repo_root() == source
+            and Path(sys.executable) == project_python(source)
+            and owning_home_root(source) in (None,home), 'native_pm_qualification_owner_mismatch')
+    return budget.call(transition,value,input_hash,plan_ref,budget)
+
+
 def dashboard_source_check(home):
     """Installed actual native consumer; reads source/stamp, never credentials."""
     from types import ModuleType
@@ -245,16 +259,21 @@ def stage_worker_runtime(value, home):
 def main():
     started = time.monotonic()
     parser = SafeParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('phase', choices=('install', 'start'))
+    parser.add_argument('phase', choices=('install', 'start', 'qualify'))
     parser.add_argument('--input', required=True, type=Path)
     parser.add_argument('--deadline', required=True, type=float, help='Inherited original monotonic deadline')
+    parser.add_argument('--a0-plan',type=Path)
+    parser.add_argument('--a0-plan-sha256')
     args = parser.parse_args()
     # Validate stdlib-only ownership and pins before importing installed code.
     sys.path.insert(0, str(ROOT))
-    from scripts.friday_install import spec_checked, read_json, composition_checked, directory
+    from scripts.friday_install import spec_checked, read_json, composition_checked, directory, require
     value = read_json(args.input)
     from scripts.install_containment import Budget
     budget = Budget(value.get('seconds'), started=started, deadline=args.deadline)
+    require((args.a0_plan is None) == (args.a0_plan_sha256 is None)
+            and (args.a0_plan is None or args.phase in ('start','qualify')),
+            'qualification_plan_arguments_required')
     home, donors = budget.call(spec_checked, value); budget.call(directory, home)
     from scripts.friday_install import MARKER, digest, owned_file, require, partial_claim
     if args.phase == 'install':
@@ -276,7 +295,14 @@ def main():
                 'native_package_provenance_required')
         package.__path__.append(str(ROOT / package.__name__))
     scripts.__path__.append(str(source / 'scripts'))
-    if args.phase == 'start':
+    if args.phase in ('start','qualify'):
+        if args.a0_plan is not None:
+            result = budget.call(qualify,value,digest(owned_file(args.input,private=True)),
+                {'path':str(args.a0_plan),'sha256':args.a0_plan_sha256},budget)
+            if args.phase == 'qualify':
+                print(json.dumps(result,sort_keys=True));budget.check();return
+        elif args.phase == 'qualify':
+            raise ValueError('current_a0_probe_plan_required')
         if 'worker_install' in value:
             from scripts.worker_install import installed_product
             value = dict(value, product=budget.call(installed_product, value, home))

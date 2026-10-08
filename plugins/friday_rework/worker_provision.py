@@ -9,12 +9,12 @@ import hashlib
 import json
 from pathlib import Path
 
-from hermes_cli import friday_user_scope as scope
 from .host_runtime import HostUnavailable, validate_runtime, _pin
 from .host_record import digest
 
 
 def pin(path):
+    from hermes_cli import friday_user_scope as scope
     scope._private(path)
     return {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
 
@@ -43,6 +43,7 @@ def own_runtime(home, profile, worker, runtime):
 def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None):
     """Return an explicit plan before any write; never read/copy readiness."""
     from .onboarding import validate_template
+    from hermes_cli import friday_user_scope as scope
     # Validate the actual profile, including local routes and accepted SAFE tools.
     validate_template({'config': config, 'tools': sorted(scope.SAFE),
                        'required_secrets': [config['providers']['friday-local']['key_env'],
@@ -105,11 +106,14 @@ def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None):
     return c, root, files, names, unobserved
 
 
-def preparation(home, profile, worker, reference):
+def preparation(home, profile, worker, reference, *, private_check=None):
     """Read exact private preparation bytes and recheck original ownership."""
     p = _pin(reference); expected = home / 'workers' / worker / 'runtime-input.json'
     if p.path != expected: raise HostUnavailable('foreign_worker_preparation')
-    scope._private(p.path)
+    if private_check is None:
+        from hermes_cli import friday_user_scope as scope
+        private_check = scope._private
+    private_check(p.path)
     v = json.loads(p.read())
     if (not isinstance(v, dict) or set(v) != {'runtime', 'inputs', 'principal_binding_sha256', 'generation', 'state', 'unobserved'}
             or v['state'] != 'PREPARED_RUNTIME_UNOBSERVED'):
@@ -118,5 +122,5 @@ def preparation(home, profile, worker, reference):
     for f in v['inputs']:
         q = _pin(f)
         if not q.path.is_relative_to(root / 'inputs'): raise HostUnavailable('foreign_worker_inputs')
-        scope._private(q.path); q.read()
+        private_check(q.path); q.read()
     return v, c

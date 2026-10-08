@@ -308,7 +308,7 @@ def test_normal_plan_declares_conditional_a0_registration_without_any_native_eff
     assert not s.calls and not s.metadata_calls and not (s.home/'workers').exists()
 
 
-@pytest.mark.parametrize('name', ['scripts/worker_install.py', 'tools/render_dsh_local.py'])
+@pytest.mark.parametrize('name', ['scripts/worker_install.py', 'scripts/worker_qualification.py', 'tools/render_dsh_local.py'])
 def test_new_helper_source_is_mandatory_and_pinned_before_effect(normal, name):
     s=normal;del s.value['project_files'][name]
     with pytest.raises(ValueError,match='complete_installer_plugin_inventory_required'):entry.spec_checked(s.value)

@@ -507,16 +507,17 @@ have **`ready:false`** and bind the checked preparation/source facts; they are
 pending declarations, not runtime qualification or opaque attestations. Both
 unchanged `host_runtime` consumers reject them. Source/configuration/wiring,
 deployment qualification, current execution and release remain separate.
-There is no new ready-receipt producer or automatic source-to-runtime grant.
 A0 retains `capability:null` until the existing fresh per-job admission produces
-its actual capability; the current `startup_health` A0 refusal remains intact.
+its actual capability. Deployment qualification uses the checked native
+observation transition below; rendering and preparation cannot qualify it.
 Root owns independent source review, real normal-installer qualification,
 trusted deployment evidence, the current native boundary and full live journeys.
 
 The final incomplete marker pins every generated worker input/receipt together
 with the profile, source and original attempt. Read-only inspection rechecks
-these bytes and the original pending state; it never regenerates or adopts a
-replacement. Missing prerequisites, wrong/stale source paths, foreign roots,
+these deployment bytes and the immutable original pending evidence. Native
+job/staging/cache contents remain under their existing per-row owners; they
+are not installation inputs. Inspection never regenerates or adopts a receipt. Missing prerequisites, wrong/stale source paths, foreign roots,
 changed evidence and original deadline exhaustion refuse. A partial or lost
 completion retains its files without replay, rollback or a fresh clock.
 The narrow historical `resume-harness` procedure does not apply to this new
@@ -529,3 +530,65 @@ cannot count as ordinary two-worker installation or runtime acceptance. Normal
 operator installation must use the two-worker declaration above; it never
 silently omits one worker. This source task performs no live installation,
 service/container/kernel/network/model/channel effect or native qualification.
+
+## Ordinary deployment qualification and startup
+
+After a fresh complete normal installation, use the same pinned private input:
+
+```sh
+<bootstrap-python> -B scripts/friday_install.py qualify --input <original-input.json> \
+  --a0-plan <existing-owned-native-plan.json> --a0-plan-sha256 <actual-sha256>
+<bootstrap-python> -B scripts/friday_install.py check --input <original-input.json>
+<bootstrap-python> -B scripts/friday_install.py start --input <original-input.json>
+```
+
+The public entry selects the actual installed PM Python and re-execs the
+existing native completion helper. `start` can perform the same transition
+when given the two explicit A0 plan arguments; an unqualified start without
+these arguments refuses. A qualified start reuses the observed deployment
+and still runs all existing native startup/credential/auth/host checks.
+
+The plan argument is an already authorized, currently running bounded A0
+probe owned by the existing native runtime. It is not an evidence label and
+this command does not create/start an A0 environment or mint its capability.
+The producer validates the exact plan, source/helper/Docker/unit/profile/web
+image and Git metadata, then invokes the existing Runtime inspectors: native
+identity, current guarded route, native no-model provider/token probe, actual
+cgroup caps, native SearXNG/source/process checks and repeated identity.
+An inactive/missing/expired/foreign probe refuses. The original native owner
+retains stop/cleanup; existing observer failure cleanup remains authoritative.
+Retain the exact plan after cleanup as reusable deployment evidence.
+
+DSH runs the four no-model native smoke commands and existing DNS/TLS probe
+in its actual adapter bubblewrap boundary, using pinned Node/CLI/build,
+protected resolver/CA/current operator web policy and no credential values.
+Every client inherits the remaining original install deadline. Bubblewrap
+namespace-init exit must be observed, including on failure. Qualification
+checks the original install boot/deadline and cannot revive expired or
+partially installed G1/G2 homes. A0's own original native deadline also applies.
+
+The existing native config write transaction spans this finite transition.
+Original marker/profile/pending receipt bytes are archived privately first;
+original runtime-inputs, preparation reports, source pins and install clock
+remain unchanged. A single bound observation is published, receipts/config
+are atomically replaced, and the install marker commits last. A partial/lost
+publication refuses startup and automatic replay and retains the archive for
+lead reconciliation. No rollback, clock reset or runtime receipt editing by
+hand is an admission procedure.
+
+Inspection and startup consume that exact transaction, including original
+archives, native plan, worker/source/profile and credential-store pins.
+The native health consumer verifies mandatory A0 deployment/web inputs and
+observations instead of unconditionally rejecting A0. Deployment readiness
+does not reserve a row, acquire a model/kernel/network grant or produce an
+A0 capability: the unchanged A0HostSession current route, keys, native web,
+identity, deadline and stop checks remain mandatory for every job. Mutable
+job artifacts/caches are checked by the existing controller, not pinned by
+the deployment marker. Policy/source/credential drift requires an explicitly
+reviewed correction; qualification never adopts it silently.
+
+`DEPLOYMENTS_QUALIFIED` still reports `ready:false` for product/release
+acceptance. Current Dashboard/gateway ownership, independent review and all
+mandatory live journeys remain separate. The source tests use actual private
+Git/compiler/profile/consumer code with synthetic native interfaces; they
+prove no live installation, native qualification, model or network success.
