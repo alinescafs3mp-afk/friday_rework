@@ -1,5 +1,22 @@
 # Foundation checkpoint — 2026-10-08
 
+Declared A0 installation, 03:52 MSK: normal profile compilation and the actual
+native credential consumer now require A0's embedding and service keys whenever
+an A0 deployment is declared, including before worker execution is enabled.
+The normal installation can therefore prepare its selected protected credentials
+without first granting worker execution. Runtime admission remains unchanged.
+
+The affected source gate passed 236 distinct checks; 17 independent source
+controls passed. Initial fixture failures were retained and resolved by correcting
+permissions of two new owned checkout files and selecting an existing real YAML
+dependency, with no change to source guards or donor code. These are source and
+synthetic credential checks. Actual installation, provider authentication and
+all seven installed user journeys remain unaccepted.
+
+The trusted current A0 producer and native web stop repair are separate private
+candidates under review. Ordinary per-task A0 route preparation is still missing;
+source presence or a current-route reader does not establish a runnable A0.
+
 Credential installation, 03:20 MSK: ordinary native completion now accepts
 explicit protected JSON/dotenv references and writes exactly the selected
 credentials through Hermes' existing credential lifecycle and receiving-profile
