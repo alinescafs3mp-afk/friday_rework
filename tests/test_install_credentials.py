@@ -72,7 +72,7 @@ def test_bad_selection_refuses_before_native_writes(prepared, kind):
         elif kind == 'secret': values['HERMES_DASHBOARD_BASIC_AUTH_SECRET']='short'
         if kind == 'duplicate': source.write_text('{"DUP":"first","DUP":"second"}')
         else: source.write_text(json.dumps(values))
-    with native_home(home), pytest.raises(ValueError,match='native_credential_provisioning_failed'):
+    with native_home(home), pytest.raises(ValueError):
         creds.provision(refs,bundle,home,Budget(30))
     assert not (home/'.env').exists() and not (home/'auth.json').exists()
 
@@ -128,8 +128,19 @@ def test_original_deadline_is_checked_before_secret_read(prepared,monkeypatch):
     home,bundle,values,source,refs=prepared
     budget=Budget(30);budget.deadline=0
     monkeypatch.setattr(friday_install,'owned_file',lambda *a,**k:pytest.fail('read after original deadline'))
-    with native_home(home),pytest.raises(ValueError):creds.provision(refs,bundle,home,budget)
+    with native_home(home),pytest.raises(ValueError,match='original_install_budget_exhausted'):
+        creds.provision(refs,bundle,home,budget)
     assert not (home/'.env').exists()
+
+
+def test_native_uncertain_stop_keeps_its_type(prepared,monkeypatch):
+    from hermes_cli import config
+    from scripts.dsh_prepare import StopUnconfirmed
+    home,bundle,values,source,refs=prepared
+    def uncertain(*args):raise StopUnconfirmed('synthetic uncertain custody')
+    monkeypatch.setattr(config,'save_env_value_secure',uncertain)
+    with native_home(home),pytest.raises(StopUnconfirmed):
+        creds.provision(refs,bundle,home,Budget(30))
 
 
 def test_install_reference_validation_does_not_read_secret_file(install_input,monkeypatch):

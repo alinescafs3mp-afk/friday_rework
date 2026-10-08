@@ -79,8 +79,15 @@ def load_selected(sources, bundle, budget):
 
 def provision(sources, bundle, home, budget):
     from scripts.friday_install import Refused
+    from scripts.dsh_prepare import StopUnconfirmed
     try:
         return _provision(sources, bundle, home, budget)
+    except (StopUnconfirmed, Refused):
+        raise
+    except ValueError as exc:
+        if exc.args == ('original_install_budget_exhausted',):
+            raise
+        raise Refused('native_credential_provisioning_failed') from None
     except Exception:
         # Native/file errors must not expose source contents, paths or keys in
         # completion's stderr. Preserve the partial home for reconciliation.

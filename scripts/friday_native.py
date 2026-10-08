@@ -268,8 +268,11 @@ def main():
         except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             parser.exit(2, 'Friday native start refused: mandatory native admission is incomplete\n')
         raise RuntimeError('native foreground ownership was not transferred')
+    from scripts.dsh_prepare import StopUnconfirmed
     try:
         result = budget.call(complete, value, home, receipt, budget=budget)
+    except StopUnconfirmed:
+        parser.exit(3, 'STOP_UNCONFIRMED: native install ownership requires reconciliation; do not retry\n')
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
         from scripts.friday_install import safe_diagnostic, diagnostic_text
         parser.exit(2, 'Friday native install refused: ' +
