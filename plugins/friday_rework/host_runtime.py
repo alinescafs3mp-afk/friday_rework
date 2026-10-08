@@ -431,6 +431,19 @@ def deployment_health(config):
             raise HostUnavailable('worker_native_smoke_unverified')
         urls = [('https://mcp.exa.ai/' if web.profile == 'exa-keyless' else 'https://api.exa.ai/'),*policy['document_probes']]
         checked_network_observation(json.dumps(obs['network']),urls)
+        executions = [r['observation'] for r in obs['smoke']] + [obs['network_execution']]
+        prefix = hashlib.sha256(str(home / 'preparation/worker-qualification/dsh-probe').encode()).hexdigest()[:24]
+        for index, execution in enumerate(executions, 1):
+            envelope = execution.get('resource_envelope', {})
+            if (execution.get('returncode') != 0 or execution.get('reaped') is not True
+                    or execution.get('timeout') is not False
+                    or set(envelope) != {'unit','memory_bytes','cpu_percent','tasks','boot_id','deadline'}
+                    or envelope['unit'] != 'friday-qualify-dsh-' + prefix + '-' + str(index) + '.scope'
+                    or any(envelope[k] != c['dsh'][k] for k in ('memory_bytes','cpu_percent','tasks'))
+                    or envelope['boot_id'] != proof['observed']['boot_id']
+                    or type(envelope['deadline']) not in (int,float)
+                    or not 0 < envelope['deadline'] <= marker['original_attempt']['deadline_mono']):
+                raise HostUnavailable('worker_native_resources_unverified')
     else:
         from .adapters.a0_web import checked_web
         m = a0_runtime_module(c)

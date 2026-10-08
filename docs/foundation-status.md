@@ -1,6 +1,31 @@
 # Foundation checkpoint — 2026-10-08
 
-Current checkpoint, 05:29 MSK: per-task A0 route preparation, trusted capability
+Current checkpoint, 09:27 MSK: the ordinary installer now has a
+single worker-deployment qualification transition. It observes the configured
+Harness smoke/DNS/TLS boundary and an already owned, admitted A0 runtime, then
+binds their evidence to the original installation, profile and protected
+credential generation. It cannot create per-job authority, start A0, reset an
+expired installation or silently repeat a partial transition.
+
+Independent review closed two defects before integration: Harness observations
+now use native foreground scopes and check effective memory, swap, CPU and task
+limits before execution; uncertain A0 cleanup remains typed `STOP_UNCONFIRMED`
+through the public CLI, even when diagnostic persistence fails. All 688 affected
+source checks passed across bounded groups; 24 independent repair controls
+passed. Earlier fixture failures remain recorded. These checks used synthetic
+native interfaces and do not prove actual worker qualification.
+
+The previous inactive dedicated A0 registration and its owned files were retired
+with cessation verified; retained Docker data and execution metadata were
+preserved. Fresh native admission is still closed: the journal prerequisite
+refused a corrupted archive. No A0 restart, journal bypass or kernel grant was
+performed. Browser prerequisite execution is also pending its separate custody
+repair. Actual both-worker installation, authenticated cold start, all seven
+installed user journeys and all four autonomous-web contexts remain unaccepted.
+Old Friday services stay stopped; legacy inference endpoints and capacities
+remain configurable temporary test inputs, with no automatic cloud fallback.
+
+Earlier checkpoint, 05:29 MSK: per-task A0 route preparation, trusted capability
 production, retained pre-container custody and cleanup are integrated. The final
 affected source gate passed 424 checks, with 11 additional independent controls
 for damaged metadata, foreign ownership and concurrent/reentrant requests.

@@ -557,11 +557,21 @@ identity, current guarded route, native no-model provider/token probe, actual
 cgroup caps, native SearXNG/source/process checks and repeated identity.
 An inactive/missing/expired/foreign probe refuses. The original native owner
 retains stop/cleanup; existing observer failure cleanup remains authoritative.
+If either native or container cleanup is uncertain, the original error remains
+as the cause of a typed custody failure. Qualification records a private
+`STOP_UNCONFIRMED` diagnostic and the public native entry returns exit 3;
+observer exit is never treated as proof of cessation or permission to replay.
 Retain the exact plan after cleanup as reusable deployment evidence.
 
 DSH runs the four no-model native smoke commands and existing DNS/TLS probe
 in its actual adapter bubblewrap boundary, using pinned Node/CLI/build,
 protected resolver/CA/current operator web policy and no credential values.
+Each foreground client first joins an ordinary systemd scope with the declared
+memory, CPU and task caps and zero swap. A fixed guard checks the actual cgroup
+and original deadline before entering bubblewrap. The same PID executes the
+namespace boundary after scope admission: a queued scope cannot later launch
+a replacement command after the owned client has died. This uses native scope
+and resource control, without a new process manager or job store.
 Every client inherits the remaining original install deadline. Bubblewrap
 namespace-init exit must be observed, including on failure. Qualification
 checks the original install boot/deadline and cannot revive expired or

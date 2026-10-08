@@ -82,6 +82,10 @@ class RuntimeErrorBoundary(RuntimeError):
     """Categorical errors only; captured native error text is never printed."""
 
 
+class RuntimeStopUnconfirmed(RuntimeErrorBoundary):
+    """Exact owned cleanup was attempted but native cessation is unconfirmed."""
+
+
 def require(ok, code):
     if not ok:
         raise RuntimeErrorBoundary(code)
@@ -1384,15 +1388,20 @@ class Runtime:
         invocation/owner immediately before stop; no foreign/replaced fallback.
         Receipt/cgroup failure cannot prevent requesting native stop.
         """
+        uncertain = False
         try:
             self.supervisor.stop(self.association(checked))
         except BaseException as error:
+            uncertain = True
             original.add_note('STOP_UNCONFIRMED; native cleanup: ' + type(error).__name__)
         try:
             with self.locked():
                 self._stop(checked)
         except BaseException as error:
+            uncertain = True
             original.add_note('STOP_UNCONFIRMED; container/cgroup/receipt cleanup: ' + type(error).__name__)
+        if uncertain:
+            raise RuntimeStopUnconfirmed('STOP_UNCONFIRMED: exact A0 ownership requires reconciliation') from original
 
     def snapshot_container(self, obj):
         pid = obj['State']['Pid']

@@ -66,7 +66,10 @@ def installed(normal,monkeypatch):
     doc(s.home/entry.MARKER,marker);s.product=product;s.marker=marker;s.native=[];s.bad=None
     def dsh_io(argv,cwd,**kw):
         s.native.append(('dsh',list(argv)))
-        assert argv[0]=='/usr/bin/bwrap' and '--unshare-pid' in argv and '--as-pid-1' in argv
+        assert argv[0]=='/usr/bin/systemd-run' and '--scope' in argv
+        assert '/usr/bin/bwrap' in argv and '--unshare-pid' in argv and '--as-pid-1' in argv
+        assert all(any(x.startswith('--property='+p+'=') for x in argv)
+                   for p in ('MemoryMax','MemorySwapMax','CPUQuota','TasksMax','RuntimeMaxSec'))
         assert kw['deadline']==s.budget.deadline and kw['timeout']<=5
         assert 'EXA_API_KEY' not in kw['env'] and 'FRIDAY_LLM_API_KEY' not in kw['env']
         fd=argv[argv.index('--json-status-fd')+1]
@@ -75,8 +78,14 @@ def installed(normal,monkeypatch):
         if s.bad=='network':out='{"schema":"ready"}'
         return out,{'returncode':0,'timeout':False,'reaped':True}
     monkeypatch.setattr(dsh_prepare,'run',dsh_io)
-    from test_original_route import network
-    n=network(owner='sol:qualification-fixture#1')
+    from scripts import rootless_docker_launch as launcher
+    n={'schema':'friday.a0.local-network.v1','owner':'sol:qualification-fixture#1',
+       'nonce':'c'*32,'name':'frw-a0-local-'+'c'*12,'id':'f'*64,'bridge':launcher.BRIDGE,
+       'labels':{'friday.rework.owner':'sol:qualification-fixture#1','friday.rework.route':'c'*32},
+       'endpoints':copy.deepcopy(launcher.ENDPOINTS),'launcher_sha256':'d'*64,
+       'policy_sha256':launcher.policy_hash(),'request_sha256':'e'*64,
+       'guard_receipt_sha256':'a'*64,'invocation_id':'b'*32,
+       'namespaces':{'user':[4,501],'mnt':[4,502],'net':[4,503]}}
     n.update(launcher_sha256=product['runtime']['workers']['a0']['a0']['launcher']['sha256'],
              policy_sha256=product['runtime']['workers']['a0']['a0']['policy']['sha256'])
     n['web']=a0.web_module().route_web(s.value['worker_install']['a0']['web'])
@@ -327,3 +336,56 @@ def test_public_entry_forwards_exact_plan_and_original_deadline_without_new_inst
     with native_scope(s.home),pytest.raises(RuntimeError,match='SYNTHETIC EXEC'):
         entry.start(s.value,h,budget=s.budget,input_path=source,plan_ref=s.plan_ref,phase='qualify')
     assert not s.native
+
+
+@pytest.mark.parametrize('bad', [None, 'memory', 'swap', 'cpu', 'tasks', 'unit', 'boot', 'expired', 'late'])
+def test_scope_guard_checks_actual_caps_and_original_deadline_before_exec(bad):
+    from pathlib import PurePosixPath
+    import builtins
+    guard = {'unit': 'friday-qualify-dsh-fixture.scope', 'memory_bytes': 1024,
+             'cpu_percent': 200, 'tasks': 64, 'boot_id': 'fixture-boot', 'deadline': 10.0}
+    group = '/user.slice/' + guard['unit']
+    rows = {'/proc/sys/kernel/random/boot_id': 'fixture-boot', '/proc/self/cgroup': '0::' + group,
+            '/sys/fs/cgroup'+group+'/memory.max': '1024', '/sys/fs/cgroup'+group+'/memory.swap.max': '0',
+            '/sys/fs/cgroup'+group+'/cpu.max': '200000 100000', '/sys/fs/cgroup'+group+'/pids.max': '64'}
+    changes = {'memory': ('memory.max', 'max'), 'swap': ('memory.swap.max', 'max'),
+               'cpu': ('cpu.max', 'max 100000'), 'tasks': ('pids.max', 'max')}
+    if bad in changes:
+        leaf, value = changes[bad]; rows['/sys/fs/cgroup'+group+'/'+leaf] = value
+    if bad == 'unit': rows['/proc/self/cgroup'] = '0::/foreign.scope'
+    if bad == 'boot': rows['/proc/sys/kernel/random/boot_id'] = 'other-boot'
+    ticks = iter([11.0,11.0] if bad == 'expired' else [1.0,11.0] if bad == 'late' else [1.0,2.0])
+    class FakePath(PurePosixPath):
+        def read_text(self): return rows[str(self)]
+        def resolve(self): return self
+    class Executed(Exception): pass
+    calls=[]
+    def execute(*args): calls.append(args); raise Executed()
+    modules={'json':json, 'os':NS(environ={'PATH':'/usr/bin:/bin'},execve=execute),
+             'sys':NS(argv=['guard',json.dumps(guard),'/usr/bin/bwrap','--fixture']),
+             'time':NS(monotonic=lambda:next(ticks)), 'pathlib':NS(Path=FakePath)}
+    context={'__builtins__':dict(vars(builtins),__import__=lambda name,*args:modules[name])}
+    with pytest.raises(Executed if bad is None else AssertionError):
+        exec(compile(q.DSH_SCOPE_GUARD,'scope-guard','exec'),context)
+    assert len(calls)==(1 if bad is None else 0)
+
+
+@pytest.mark.parametrize('phase',['probe','observe'])
+def test_uncertain_a0_cleanup_reaches_public_custody_signal(installed,monkeypatch,phase):
+    s=installed;Base=a0.Runtime
+    class Boundary(Base):
+        def probe(self):
+            if phase=='probe': raise a0.RuntimeStopUnconfirmed('STOP_UNCONFIRMED')
+            return super().probe()
+        def observe(self):
+            if phase=='observe': raise a0.RuntimeStopUnconfirmed('STOP_UNCONFIRMED')
+            return super().observe()
+    monkeypatch.setattr(a0,'Runtime',Boundary)
+    with pytest.raises(dsh_prepare.StopUnconfirmed): transition(s)
+    failure=entry.read_json(s.home/q.FOLDER/'failure.json')
+    assert failure['state']=='STOP_UNCONFIRMED' and failure['retry_authorized'] is False
+    assert failure['original_attempt']==s.marker['original_attempt']
+    assert entry.read_json(s.home/entry.MARKER)==s.marker
+    before=list(s.native)
+    with pytest.raises(ValueError,match='partial_qualification'):transition(s)
+    assert s.native==before

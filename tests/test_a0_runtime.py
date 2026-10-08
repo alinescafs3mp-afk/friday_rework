@@ -357,14 +357,14 @@ class Controls(unittest.TestCase):
                 self.actual_caps(), \
                 patch.object(self.sup, 'stop', side_effect=RuntimeError('native stop uncertain')) as stop, \
                 patch.object(a0, 'cessation', return_value={'confirmed': True}), \
-                self.assertRaises(PermissionError) as ctx:
+                self.assertRaises(a0.RuntimeStopUnconfirmed) as ctx:
             fixture_read = Path.read_text
             def swap_read(path, *args, **kwargs):
                 if path.name == 'memory.swap.max': raise original
                 return fixture_read(path, *args, **kwargs)
             with patch.object(Path, 'read_text', swap_read):
                 self.runtime.observe()
-        self.assertIs(ctx.exception, original)
+        self.assertIs(ctx.exception.__cause__, original)
         self.assertTrue(any('STOP_UNCONFIRMED' in x for x in original.__notes__))
         self.assertEqual(stop.call_count, 1)
         self.assertFalse(self.container['State']['Running'])
@@ -441,9 +441,9 @@ class Controls(unittest.TestCase):
             with self.runtime.locked(): pass
             return old_stop(association)
         self.sup.stop = native_stop
-        with patch.object(a0, 'write_json', side_effect=failwrite), self.assertRaises(OSError) as ctx:
+        with patch.object(a0, 'write_json', side_effect=failwrite), self.assertRaises(a0.RuntimeStopUnconfirmed) as ctx:
             self.runtime.stop()
-        self.assertIs(ctx.exception, original)
+        self.assertIs(ctx.exception.__cause__, original)
         self.assertEqual(len(self.sup.stops), 1)
         self.assertFalse(self.container['State']['Running'])
 
