@@ -226,7 +226,7 @@ def compose_product(spec):
     web_names = ['EXA_API_KEY'] if web['profile'] == 'exa-paid' else []
     service_names = []
     required = [inference['key_env'], *web_names]
-    if 'a0' in runtime or 'a0' in runtime.get('workers', {}):
+    if 'a0_deployment' in spec or 'a0' in runtime or 'a0' in runtime.get('workers', {}):
         if inference['key_env'] != 'FRIDAY_LLM_API_KEY':
             raise ValueError('a0_scoped_inference_key_required')
         service_names = ['FRIDAY_EMBEDDINGS_API_KEY','SEARXNG_SECRET']

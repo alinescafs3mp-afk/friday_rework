@@ -27,6 +27,10 @@ for a normal installation. Each target environment name selects exactly
 `format: dotenv` is also supported. The map must cover exactly the installed
 profile's inference, selected web provider, worker services, Dashboard and channel
 names. Source contents are never hashed into receipts or copied wholesale.
+An explicitly declared A0 deployment includes its embedding and search-service
+keys even while worker execution remains disabled pending admission. This lets
+the ordinary installation prepare its required credentials without activating
+A0 or importing unrelated source keys.
 Planning validates only reference syntax; it does not read secrets. Omitting this
 map retains the incomplete template behavior and cannot authorize startup.
 
