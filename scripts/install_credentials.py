@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 import re
+import stat
 
 
 def references(value):
@@ -101,18 +103,44 @@ def _provision(sources, bundle, home, budget):
     from hermes_cli.config import (get_env_path, _env_write_lock,
                                    require_env_writable, save_env_value_secure)
     from hermes_cli.friday_credential_admission import owned_values
+    from hermes_cli.auth import _auth_file_path
     from agent.secret_scope import (set_secret_scope, reset_secret_scope,
                                     set_multiplex_context, reset_multiplex_context)
-    require(get_hermes_home() == home and get_env_path() == home / '.env',
+    require(get_hermes_home() == home and get_env_path() == home / '.env'
+            and _auth_file_path() == home / 'auth.json',
             'credential_receiving_home_mismatch')
     selected = load_selected(sources, bundle, budget)
     for name in selected:
         budget.call(require_env_writable, name, 'set')
     env = home / '.env'
+    # Native locks stamp their PID and therefore write even before a credential
+    # is saved. Refuse all pre-existing state before entering either native
+    # lock; reserve only these same native paths in this fresh private home.
+    for name in ('.env', 'auth.json', '.env.lock', 'auth.lock'):
+        p = home / name
+        require(not p.exists() and not p.is_symlink(), 'existing_credentials_not_replaced')
+    identities = {}
+    for name in ('.env.lock', 'auth.lock'):
+        p = home / name
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.fsync(fd)
+            identities[name] = os.fstat(fd)
+        finally:
+            os.close(fd)
+    def locks_unchanged():
+        for name, before in identities.items():
+            after = (home / name).lstat()
+            require(stat.S_ISREG(after.st_mode) and after.st_nlink == 1
+                    and after.st_uid == os.getuid() and not after.st_mode & 0o077
+                    and (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino),
+                    'native_credential_lock_changed')
+    locks_unchanged()
     # Reuse the native reentrant lock for the complete batch. Never overwrite
     # an operator's existing file or a previous partially provisioned attempt.
     with _env_write_lock(env):
         budget.check()
+        locks_unchanged()
         require(not env.exists() and not env.is_symlink(), 'existing_credentials_not_replaced')
         for name in ('auth.json',):
             require(not (home / name).exists() and not (home / name).is_symlink(),
@@ -121,7 +149,9 @@ def _provision(sources, bundle, home, budget):
         multiplex = set_multiplex_context(True)
         try:
             for name, value in selected.items():
+                locks_unchanged()
                 result = budget.call(save_env_value_secure, name, value)
+                locks_unchanged()
                 require(result.get('success') is True, 'native_credential_save_failed')
             require(budget.call(owned_values, home) == selected,
                     'native_credential_roundtrip_failed')
@@ -129,5 +159,6 @@ def _provision(sources, bundle, home, budget):
             reset_multiplex_context(multiplex)
             reset_secret_scope(scoped)
     budget.check()
+    locks_unchanged()
     return {'state': 'STORED_IN_NATIVE_PROFILE', 'ready': False,
             'stored_names': sorted(selected), 'provider_authentication_checked': False}

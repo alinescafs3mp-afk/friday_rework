@@ -35,8 +35,12 @@ reads owner-only regular source files without dotenv interpolation and writes
 only selected values using Hermes `save_env_value_secure`, its credential
 lifecycle and existing reentrant `.env` lock. The complete batch uses the
 receiving home's native secret scope; it does not populate ambient credentials
-or invent a second store. Existing `.env` or credential-pool files refuse before
-writing. Native read-back must match exactly, with protected file permissions.
+or invent a second store. Existing `.env`, credential-pool and either native
+lock path refuse before writes. The fresh installer reserves the same native
+`.env.lock` and `auth.lock` files exclusively as private regular files and checks
+their owner, link count and inode around the batch; it never follows or adopts a
+pre-existing lock alias. A partial refusal retains its owned files for
+reconciliation. Native read-back must match exactly, with protected permissions.
 Malformed, missing, duplicate or extra selections, a foreign operator and source
 read/write failures refuse without printing values. A partial save remains in
 the incomplete installation for reconciliation, with no automatic replay or

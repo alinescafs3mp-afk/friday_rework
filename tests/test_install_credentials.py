@@ -107,6 +107,39 @@ def test_existing_native_credentials_never_replaced(prepared,name):
     assert target.read_text()=='owner value'
 
 
+@pytest.mark.parametrize('name', ['.env.lock', 'auth.lock'])
+@pytest.mark.parametrize('kind', ['symlink', 'dangling', 'hardlink', 'regular'])
+def test_native_lock_custody_refuses_before_foreign_bytes_change(prepared,name,kind):
+    home,bundle,values,source,refs=prepared
+    target=home/name;foreign=home.parent/'foreign';original=b'FOREIGN OWNER BYTES\n'
+    if kind != 'dangling':foreign.write_bytes(original)
+    if kind in ('symlink','dangling'):target.symlink_to(foreign)
+    elif kind == 'hardlink':os.link(foreign,target)
+    else:target.write_bytes(original)
+    with native_home(home),pytest.raises(ValueError):creds.provision(refs,bundle,home,Budget(30))
+    assert not (home/'.env').exists() and not (home/'auth.json').exists()
+    if kind != 'dangling':assert foreign.read_bytes()==original
+    else:assert not foreign.exists()
+    if kind == 'regular':assert target.read_bytes()==original
+
+
+def test_registered_provider_uses_only_own_reserved_native_locks(tmp_path):
+    from hermes_cli.friday_credential_admission import owned_values
+    from plugins.dashboard_auth.basic import hash_password
+    spec=inputs();spec['inference']['key_env']='OPENAI_API_KEY'
+    home=tmp_path/'product';home.mkdir(mode=0o700)
+    with native_home(home):bundle=native.profile_write(home,spec)
+    values={n:'fixture-valid-key-'+n for n in creds.required_names(bundle)}
+    values.update(HERMES_DASHBOARD_BASIC_AUTH_USERNAME=spec['dashboard']['operator']['user_id'],
+                  HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH=hash_password('fixture password'))
+    source=tmp_path/'selected.json';source.write_text(json.dumps(values));source.chmod(0o600)
+    refs={n:{'path':str(source),'format':'json','name':n} for n in values}
+    with native_home(home):
+        creds.provision(refs,bundle,home,Budget(30));assert owned_values(home)==values
+    assert (home/'auth.json').exists()
+    assert all((home/n).stat().st_mode&0o777==0o600 for n in ('.env.lock','auth.lock','auth.json'))
+
+
 def test_partial_native_save_is_retained_and_cannot_replay(prepared,monkeypatch):
     from hermes_cli import config
     home,bundle,values,source,refs=prepared;save=config.save_env_value_secure;calls=[]
