@@ -1,0 +1,1397 @@
+diff --git a/agent/interrupt_control.py b/agent/interrupt_control.py
+--- a/agent/interrupt_control.py
++++ b/agent/interrupt_control.py
+@@ -197,6 +197,9 @@
+             # signal instead of targeting the caller thread.
+             self._interrupt_thread_signal_pending = True
+         _ic_signal_tool_workers(self, True, reason=tool_interrupt_reason)
++        web_turn = getattr(self, "_web_turn", None)
++        if web_turn is not None:
++            self._web_stop_receipt = web_turn.stop()
+         # Propagate interrupt to any running child agents (subagent delegation)
+         with self._active_children_lock:
+             children_copy = list(self._active_children)
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -935,8 +935,12 @@
+         authorization_gate = _ConcurrentToolAuthorizationGate()
+         worker_tid: list[int] = []
+ 
++    from agent.web_call_context import make_web_call, bind_web_call
++    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
++    web_call = make_web_call(agent, deadline, effective_task_id, tool_call_id, authorization_gate)
++
+     def _run() -> _ManagedToolResult:
+-        with _registered_tool_worker(agent) as tid:
++        with _registered_tool_worker(agent) as tid, bind_web_call(web_call):
+             worker_tid.append(tid)
+             return _run_agent_tool_execution_middleware(agent, authorization_gate=authorization_gate, **kwargs)
+ 
+@@ -945,7 +949,6 @@
+     if prepared is None:
+         executor = DaemonThreadPoolExecutor(max_workers=1)
+         future = executor.submit(propagate_context_to_thread(_run))
+-    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+     started = time.monotonic()
+     abandoned = False
+     try:
+@@ -976,6 +979,10 @@
+             result_cls, outcome = _ToolTimeoutResult, dict(
+                 duration_ms=int(timeout_s * 1000), status="timeout", error_type="tool_timeout", error_message=message,
+             )
++        web_receipt = web_call.stop()
++        if web_receipt["status"] != "QUIESCENT":
++            message = "STOP_UNCONFIRMED: native web child remains owned"
++            outcome.update(status="error", error_type="stop_unconfirmed", error_message=message)
+         abandoned = True
+         if prepared is not None:
+             # A timed-out shell may still be unwinding. Never release a later
+@@ -1317,6 +1324,7 @@
+         self.gate = _StartOrderGate(_start_order_gate_timeout(timeout_s))
+         self.authorization_gate = _ConcurrentToolAuthorizationGate()
+         self.timed_out_indices: set[int] = set()
++        self.web_calls = {}
+ 
+     def _dispatch_worker(self, index: int, ref: _ToolCallRef, scope_block, start_gate: _WorkerStartOnce) -> Optional[_ToolOutcome]:
+         """Run one call through the middleware and synthesize its slot outcome; ``None`` when
+@@ -1375,7 +1383,8 @@
+     def run_worker(self, index: int, start_order: int) -> None:
+         """Worker function executed in a thread."""
+         agent, pc = self.agent, self.parsed_calls[index]
+-        with _registered_tool_worker(agent) as _worker_tid:
++        from agent.web_call_context import bind_web_call
++        with _registered_tool_worker(agent) as _worker_tid, bind_web_call(self.web_calls[index]):
+             # An interrupt may have fanned out before our registration; apply it to our tid.
+             if agent._interrupt_requested:
+                 _interrupt_worker_tids(agent, [_worker_tid], reason=getattr(agent, "_tool_interrupt_reason", None))
+@@ -1463,6 +1472,12 @@
+                     )
+                 continue
+             for f in not_done:
++                index = future_to_index[f]
++                receipt = self.web_calls[index].stop()
++                if receipt["status"] != "QUIESCENT":
++                    ref = self.parsed_calls[index].ref(self.effective_task_id)
++                    self.results[index] = _ToolOutcome(ref, '{"error":"STOP_UNCONFIRMED"}',
++                                                      time.time()-_conc_start, True, True)
+                 f.cancel()
+             # Release gate-parked workers BEFORE interrupt fan-out so none later
+             # dispatches a tool the turn already reported as timed out / interrupted.
+@@ -1482,6 +1497,10 @@
+         if not runnable:
+             return
+         deadline = time.monotonic() + self.timeout_s if self.timeout_s is not None else None
++        from agent.web_call_context import make_web_call
++        self.web_calls = {i:make_web_call(self.agent, deadline, self.effective_task_id,
++                          _pairing_tool_call_id(self.parsed_calls[i].tool_call),self.authorization_gate)
++                          for i in runnable}
+         max_workers = _max_workers_for_tool_batch([(i, None, self.parsed_calls[i].name) for i in runnable])
+         # Daemon workers: the stdlib pool's atexit join would let one wedged tool block exit.
+         from tools.daemon_pool import DaemonThreadPoolExecutor
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -630,6 +630,13 @@
+     # stamp, which can predate admission by minutes), frozen so every request this turn
+     # sends identical bytes. Distinct from note_turn_start's _inflight_turn_started, a
+     # tripwire slot cleared at persist.
++    from agent.web_call_context import WebTurn
++    previous_web = getattr(agent, "_web_turn", None)
++    if previous_web is not None and previous_web.calls:
++        receipt = previous_web.stop()
++        if receipt["status"] != "QUIESCENT":
++            raise RuntimeError("STOP_UNCONFIRMED")
++    agent._web_turn = WebTurn()
+     agent._current_turn_timestamp = time.time()
+ 
+     # Pre-turn connection health check: clean up dead TCP connections.
+@@ -652,6 +659,10 @@
+     # Wall-clock run budget: stamped only when configured (one wrap-up notice per run).
+     agent._run_budget_started_at = (
+         time.time() if getattr(agent, "run_budget_seconds", None) else None
++    )
++    agent._web_run_deadline = (
++        time.monotonic() + max(0, agent.run_budget_seconds - (time.time()-agent._run_budget_started_at))
++        if agent._run_budget_started_at is not None else None
+     )
+     # Reset the streaming context / think scrubbers at the top of each turn.
+     for name in ("_stream_context_scrubber", "_stream_think_scrubber"):
+diff --git a/agent/web_call_context.py b/agent/web_call_context.py
+new file mode 100644
+--- /dev/null
++++ b/agent/web_call_context.py
+@@ -0,0 +1,129 @@
++"""Original native call clocks and a sticky per-turn web launch/stop fence."""
++from contextlib import contextmanager
++from contextvars import ContextVar
++import math
++import threading
++import time
++
++_current = ContextVar('native_web_call', default=None)
++_child_deadline = ContextVar('native_web_child_deadline', default=None)
++
++
++class WebTurn:
++    def __init__(self):
++        self.lock = threading.RLock()
++        self.stopped = threading.Event()
++        self.calls = set()
++        self.receipt = {'status': 'QUIESCENT', 'sessions': []}
++
++    def stop(self):
++        # Admission sees the latch even while launch holds the lock. Neither a
++        # reused thread id nor clear_interrupt() can clear this turn's intent.
++        self.stopped.set()
++        if not self.lock.acquire(timeout=2):
++            self.receipt = {'status': 'STOP_UNCONFIRMED', 'reason': 'web_launch_unsettled'}
++            return self.receipt
++        try:
++            receipts = [call.stop() for call in list(self.calls)]
++            self.receipt = {'status': 'QUIESCENT' if all(r['status']=='QUIESCENT' for r in receipts)
++                            else 'STOP_UNCONFIRMED', 'sessions': receipts}
++            return self.receipt
++        finally:
++            self.lock.release()
++
++
++class WebCall:
++    def __init__(self, turn, deadline, task_id, session_id, call_id, authorization_gate=None, run_deadline=None):
++        self.turn = turn
++        self.base_deadline = deadline
++        self.run_deadline = run_deadline
++        self.authorization_gate = authorization_gate
++        self.task_id, self.session_id, self.call_id = task_id, session_id, call_id
++        self.turn_id = ""
++        self.session_key = session_id
++        self.stopped = threading.Event()
++        self.session = None
++        self.registry = None
++        self.receipt = {'status': 'QUIESCENT', 'session_id': None}
++        with turn.lock:
++            turn.calls.add(self)
++
++    def deadline(self):
++        value = self.base_deadline
++        if value is not None and self.authorization_gate is not None:
++            value += self.authorization_gate.excluded_seconds()
++        if self.run_deadline is not None:
++            value = min(value, self.run_deadline) if value is not None else self.run_deadline
++        if value is None or not math.isfinite(value):
++            raise RuntimeError('web_original_deadline_required')
++        return value
++
++    def check(self):
++        from tools.interrupt import is_interrupted
++        if self.stopped.is_set() or self.turn.stopped.is_set() or is_interrupted():
++            raise RuntimeError('web_call_stopped')
++        if time.monotonic() >= self.deadline():
++            raise TimeoutError('web_original_deadline')
++
++    def stop(self):
++        self.stopped.set()
++        if not self.turn.lock.acquire(timeout=2):
++            self.receipt = {'status':'STOP_UNCONFIRMED','reason':'web_launch_unsettled'}
++            return self.receipt
++        try:
++            if self.session is not None:
++                self.receipt = self.registry.settle_web(self.session, stop=True)
++            if self.receipt['status'] == 'QUIESCENT':
++                self.turn.calls.discard(self)
++            return self.receipt
++        finally:
++            self.turn.lock.release()
++
++
++def make_web_call(agent, deadline, task_id, call_id, authorization_gate=None):
++    # Installed at turn start; partial callers lazily get a turn before submit.
++    turn = getattr(agent, '_web_turn', None)
++    if turn is None:
++        turn = agent._web_turn = WebTurn()
++    if getattr(agent, '_interrupt_requested', False):
++        turn.stopped.set()
++    call = WebCall(turn, deadline, task_id, getattr(agent,'session_id','') or '', call_id,
++                   authorization_gate, getattr(agent,'_web_run_deadline',None))
++    from tools.approval_context import get_current_session_key
++    call.session_key = get_current_session_key(default='') or call.session_id
++    call.turn_id = getattr(agent,'_current_turn_id','') or ''
++    return call
++
++
++@contextmanager
++def bind_web_call(call):
++    token = _current.set(call)
++    try:
++        yield
++    finally:
++        _current.reset(token)
++        with call.turn.lock:
++            if call.session is None:
++                call.turn.calls.discard(call)
++
++
++def current_web_call():
++    call = _current.get()
++    if call is None:
++        raise RuntimeError('web_caller_context_required')
++    call.check()
++    return call
++
++
++def check_web_deadline():
++    """Redispatch gate inside the trusted child, including copied asyncio contexts."""
++    deadline = _child_deadline.get()
++    if deadline is not None and time.monotonic() >= deadline:
++        raise TimeoutError('web_original_deadline')
++
++
++def child_deadline(deadline):
++    if type(deadline) not in (float,int) or not math.isfinite(deadline):
++        raise RuntimeError('web_original_deadline_required')
++    _child_deadline.set(deadline)
++    check_web_deadline()
+diff --git a/gateway/run_agent_cache.py b/gateway/run_agent_cache.py
+--- a/gateway/run_agent_cache.py
++++ b/gateway/run_agent_cache.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import importlib
+ import logging
+ import threading
+@@ -257,6 +258,35 @@
+         # ordinary drift and still evicts.
+         return getattr(agent, "_nous_model_switch", None) == (config_model, agent.model)
+ 
++    def _session_web_pending(self, session_key: str) -> bool:
++        """Keep the existing owner slot/cache while native web custody is retained."""
++        from tools.process_registry import process_registry
++        from hermes_constants import get_hermes_home
++        from agent.secret_scope import is_multiplex_active
++        state = self._peek_session_state(session_key)
++        agent = state.turn.agent if state else None
++        if agent is None:
++            agent = self._cached_agent_for(session_key)
++        turn = getattr(agent, '_web_turn', None)
++        if turn is not None and turn.calls:
++            return True
++        if process_registry.web_custody_receipt()['status'] == 'QUIESCENT':
++            return False
++        store = getattr(self, 'session_store', None)
++        entry = store._entries.get(session_key) if store is not None else None
++        sid = str(getattr(agent, 'session_id', '') or getattr(entry, 'session_id', '') or '')
++        home = get_hermes_home()
++        if is_multiplex_active() and getattr(getattr(self, 'config', None), 'multiplex_profiles', False):
++            try:
++                home = store._profile_home_for_key(session_key)
++                if home is None and store._named_profile_for_key(session_key) is None:
++                    home = store._routing_home
++                if home is None:raise RuntimeError('web_owner_profile_required')
++            except Exception:
++                return True
++        return process_registry.has_web_custody_for_session(
++            session_key, parent_session_id=sid, profile_home=str(home))
++
+     def _release_running_agent_state(
+         self, session_key: str, *, run_generation: Optional[int] = None
+     ) -> bool:
+@@ -267,6 +297,8 @@
+         if not session_key or (
+             run_generation is not None and not self._is_session_run_current(session_key, run_generation)
+         ):
++            return False
++        if self._session_web_pending(session_key):
+             return False
+         state = self._peek_session_state(session_key)
+         if state is not None:
+@@ -295,6 +327,8 @@
+         from generations OLDER than the current one: a hung evicted turn's finalizer may never run,
+         and each such generation would otherwise pin its token (and its ``_SessionLease``) forever.
+         Identity-checked + idempotent, so a live successor's token is never affected."""
++        if self._session_web_pending(session_key):
++            return
+         self._release_running_agent_state(session_key, run_generation=run_generation)
+         self._evict_cached_agent(session_key)
+         state = self._peek_session_state(session_key)
+@@ -481,10 +515,52 @@
+             ).start()
+         return _generation_at_interrupt
+ 
++    async def _settle_session_web_custody(self, session_key: str) -> dict:
++        from gateway.run import _AGENT_PENDING_SENTINEL
++        from tools.process_registry import process_registry
++        from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
++        from agent.secret_scope import is_multiplex_active
++        state = self._peek_session_state(session_key)
++        agent = state.turn.agent if state else None
++        if agent is None or agent is _AGENT_PENDING_SENTINEL:
++            agent = self._cached_agent_for(session_key)
++        if getattr(agent, '_web_turn', None) is None and process_registry.web_custody_receipt()['status'] == 'QUIESCENT':
++            return {'status': 'QUIESCENT', 'sessions': [], 'newly_settled': 0}
++        store = self.session_store
++        entry = store._entries.get(session_key) if store is not None else None
++        sid = str(getattr(agent, 'session_id', '') or getattr(entry, 'session_id', '') or '')
++        home = get_hermes_home()
++        if is_multiplex_active() and getattr(getattr(self, 'config', None), 'multiplex_profiles', False):
++            try:
++                home = store._profile_home_for_key(session_key)
++                if home is None and store._named_profile_for_key(session_key) is None:
++                    home = store._routing_home
++                if home is None:raise RuntimeError('web_owner_profile_required')
++            except Exception:
++                return {'status': 'STOP_UNCONFIRMED', 'sessions': [], 'newly_settled': 0}
++        def settle():
++            token = set_hermes_home_override(home)
++            try:
++                turn = getattr(agent, '_web_turn', None)
++                turn_receipt = turn.stop() if turn is not None else {'status': 'QUIESCENT', 'sessions': []}
++                registry_receipt = process_registry.stop_web_for_session(
++                    session_key, parent_session_id=sid, profile_home=str(home))
++                receipts = [*turn_receipt.get('sessions', []), *registry_receipt['sessions']]
++                settled = {r['session_id'] for r in receipts if r.get('newly_settled')}
++                receipt = {'status': 'STOP_UNCONFIRMED' if any(r.get('status') == 'STOP_UNCONFIRMED'
++                        for r in (turn_receipt, registry_receipt)) else 'QUIESCENT',
++                        'sessions': receipts, 'newly_settled': len(settled)}
++                if agent is not None and agent is not _AGENT_PENDING_SENTINEL:
++                    agent._web_stop_receipt = receipt
++                return receipt
++            finally:
++                reset_hermes_home_override(token)
++        return await asyncio.to_thread(settle)
++
+     async def _interrupt_and_clear_session(
+         self, session_key: str, source: SessionSource, *, interrupt_reason: str,
+         invalidation_reason: str, release_running_state: bool = True,
+-    ) -> None:
++    ) -> dict | None:
+         """Interrupt the current run and clear queued session state consistently."""
+         if not session_key:
+             return
+@@ -494,13 +570,20 @@
+             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
+         )
+         from gateway.run import _AGENT_PENDING_SENTINEL
+-        # The turn's hard interrupt reaches only its in-turn children; background delegations were
+-        # detached at dispatch and would otherwise run to completion and wake the session later.
+-        # Each interrupted unit still returns as a completion (status=interrupted, partial output).
++        # Detached delegations are independent stop targets. Signal them before
++        # observing web cessation, even when that observation remains unknown.
++        # Pending/retained sessions also need their durable legacy selector.
+         from tools.async_delegation import interrupt_for_session
++        store = getattr(self, "session_store", None)
++        entry = getattr(store, "_entries", {}).get(session_key)
+         interrupt_for_session(
+             session_key=session_key, reason=invalidation_reason,
+-            parent_session_id=str(getattr(running_agent, "session_id", "") or ""))
++            parent_session_id=str(getattr(running_agent, "session_id", "")
++                                  or getattr(entry, "session_id", "") or ""))
++        web_receipt = await self._settle_session_web_custody(session_key)
++        prior = getattr(running_agent, '_web_stop_receipt', None)
++        if web_receipt['status'] == 'STOP_UNCONFIRMED' or (isinstance(prior, dict) and prior.get('status') == 'STOP_UNCONFIRMED'):
++            return dict(web_receipt, status='STOP_UNCONFIRMED')
+         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+             # Plugins holding a per-turn external resource (an outbound RPC blocked on a tool result
+             # the loop will never consume) learn the turn is gone. Fires for /stop and the /new
+@@ -546,10 +629,14 @@
+                 adapter._pending_messages[session_key] = wake
+         if state is not None:
+             state.persistent.pending_command_text = None
++        web_receipt = getattr(running_agent, "_web_stop_receipt", None)
++        if isinstance(web_receipt, dict) and web_receipt.get("status") == "STOP_UNCONFIRMED":
++            return web_receipt  # Keep ownership; no replacement after unknown cessation.
+         if release_running_state:
+             # Guarded release: a message that arrived during the awaits above may already run as
+             # the successor generation — the displaced /stop tail must not wipe its slot.
+             self._drop_turn_slot(session_key, run_generation=_generation_at_interrupt)
++        return web_receipt
+ 
+     async def _refresh_agent_cache_message_count(self, session_key: str, session_id: Optional[str]) -> None:
+         """Re-baseline a cached agent's stored message_count after THIS turn — the coherence guard
+@@ -776,6 +863,8 @@
+         leak class as #25315).
+         """
+         from gateway.run import _AGENT_PENDING_SENTINEL
++        if self._session_web_pending(session_key):
++            return
+         # Prompt-stability state rides the agent-cache lifecycle: a fresh agent must re-render its
+         # session-context bytes (the pin) and re-see the current voice-channel state once.
+         state = self._peek_session_state(session_key)
+diff --git a/gateway/run_busy.py b/gateway/run_busy.py
+--- a/gateway/run_busy.py
++++ b/gateway/run_busy.py
+@@ -1021,9 +1021,11 @@
+     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
+         # Hard-kill: a soft interrupt can't reach a truly hung executor thread.
+         from gateway.run import _INTERRUPT_REASON_STOP
+-        await self._interrupt_and_clear_session(
++        receipt = await self._interrupt_and_clear_session(
+             quick_key, source, interrupt_reason=_INTERRUPT_REASON_STOP, invalidation_reason="stop_command",
+         )
++        if isinstance(receipt, dict) and receipt.get("status") == "STOP_UNCONFIRMED":
++            return EphemeralReply("Stop pending: native web process cessation is unconfirmed.")
+         logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
+         return EphemeralReply(t("gateway.stop.stopped"))
+ 
+@@ -1034,9 +1036,11 @@
+         from gateway.run import _INTERRUPT_REASON_RESET
+         # Interrupt the agent first, then clear the adapter's pending queue so the stale "/reset" text
+         # doesn't get re-processed as a user message after the interrupt completes. See #2170.
+-        await self._interrupt_and_clear_session(
++        receipt = await self._interrupt_and_clear_session(
+             quick_key, source, interrupt_reason=_INTERRUPT_REASON_RESET, invalidation_reason="new_command",
+         )
++        if isinstance(receipt, dict) and receipt.get("status") == "STOP_UNCONFIRMED":
++            return EphemeralReply("Reset pending: native web process cessation is unconfirmed.")
+         return await self._handle_reset_command(event)
+ 
+     async def _busy_queue_command(self, event: MessageEvent, quick_key: str, source):
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -430,17 +430,21 @@
+         session_entry = await self.async_session_store.get_or_create_session(source)
+         session_key = session_entry.session_key
+ 
+-        async def _stop(key: str, invalidation_reason: str) -> None:
+-            await self._interrupt_and_clear_session(
++        async def _stop(key: str, invalidation_reason: str) -> dict | None:
++            return await self._interrupt_and_clear_session(
+                 key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
+                 invalidation_reason=invalidation_reason)
+         agent = self._running_agents.get(session_key)
+         if agent is _AGENT_PENDING_SENTINEL:  # force-clean the sentinel so the session is unlocked
+-            await _stop(session_key, "stop_command_pending")
++            receipt = await _stop(session_key, "stop_command_pending")
++            if receipt and receipt.get("status") == "STOP_UNCONFIRMED":
++                return EphemeralReply("Stop pending: native web process cessation is unconfirmed.")
+             logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
+             return EphemeralReply(t("gateway.stop.stopped_pending"))
+         if agent:  # force-clean the session lock so a truly hung agent doesn't keep it forever
+-            await _stop(session_key, "stop_command_handler")
++            receipt = await _stop(session_key, "stop_command_handler")
++            if receipt and receipt.get("status") == "STOP_UNCONFIRMED":
++                return EphemeralReply("Stop pending: native web process cessation is unconfirmed.")
+             return EphemeralReply(t("gateway.stop.stopped"))
+ 
+         # No run under the caller's own key: a live turn in THIS chat may still carry a differently
+@@ -459,18 +463,26 @@
+             if fallback_keys == sibling_keys
+             else "stop_command_chat_scope"
+         )
++        # The caller can retain a web handle without a running-agent slot.
++        # Include that custody and its detached delegations in the same stop,
++        # then attempt every authorized fallback before deciding the reply.
++        from tools.async_delegation import interrupt_for_session
++        background_stopped = interrupt_for_session(
++            session_key=session_key, reason="stop_command",
++            parent_session_id=str(getattr(session_entry, "session_id", "") or ""))
++        receipt = await self._settle_session_web_custody(session_key)
+         if fallback_keys and self._is_user_authorized_for_source(source):
+-            for fallback_key in fallback_keys:
+-                await _stop(fallback_key, reason)
++            receipts = [receipt] + [await _stop(fallback_key, reason) for fallback_key in fallback_keys]
++            if any(r and r.get('status') == 'STOP_UNCONFIRMED' for r in receipts):
++                return EphemeralReply("Stop pending: native web process cessation is unconfirmed.")
+             logger.info("STOP (%s) by %s — interrupted %d run(s): %s",
+                         reason, session_key, len(fallback_keys), ", ".join(fallback_keys))
+             return EphemeralReply(t("gateway.stop.stopped"))
+ 
+-        # No running agent anywhere for this scope. Background delegations the session dispatched in an
+-        # earlier turn still count as "active": stop them; each returns as an interrupted completion.
+-        from tools.async_delegation import interrupt_for_session
+-        if interrupt_for_session(session_key=session_key, reason="stop_command",
+-                                 parent_session_id=str(getattr(session_entry, "session_id", "") or "")):
++        if receipt['status'] == 'STOP_UNCONFIRMED':
++            return EphemeralReply("Stop pending: native web process cessation is unconfirmed.")
++        # Native background interruption remains useful with no running turn.
++        if background_stopped or receipt.get('newly_settled'):
+             return EphemeralReply(t("gateway.stop.stopped"))
+         # A platform status indicator can still be stuck —
+         # e.g. Slack's persistent assistant.threads.setStatus survives a gateway restart or a turn
+diff --git a/gateway/slash_commands_session.py b/gateway/slash_commands_session.py
+--- a/gateway/slash_commands_session.py
++++ b/gateway/slash_commands_session.py
+@@ -159,6 +159,9 @@
+         """Handle /new or /reset command."""
+         source = event.source
+         session_key = self._session_key_for_source(source)
++        receipt = await self._settle_session_web_custody(session_key)
++        if receipt['status'] == 'STOP_UNCONFIRMED':
++            return EphemeralReply("Reset pending: native web process cessation is unconfirmed.")
+         self._invalidate_session_run_generation(session_key, reason="session_reset")
+         # Evict the running-agent slot now that the generation is bumped: the in-flight run's own
+         # guarded release (old generation) returns False and would leave a zombie slot that silently
+diff --git a/hermes_cli/cli_commands_mixin.py b/hermes_cli/cli_commands_mixin.py
+--- a/hermes_cli/cli_commands_mixin.py
++++ b/hermes_cli/cli_commands_mixin.py
+@@ -923,7 +923,12 @@
+             return print(f"  {_t('stop.none_running')}")
+         if running:
+             print(f"  {_t('stop.stopping', count=len(running))}")
+-            print(f"  {_t('stop.stopped', count=process_registry.kill_all(source='cli.stop'))}")
++            killed = process_registry.kill_all(source='cli.stop')
++            receipt = process_registry.web_custody_receipt()
++            if receipt['status'] == 'STOP_UNCONFIRMED':
++                print('  Stop pending: native web process cessation is unconfirmed.')
++            else:
++                print(f"  {_t('stop.stopped', count=killed)}")
+         if n_async:
+             from tools.async_delegation import interrupt_all
+             print(f"  {_t('stop.interrupted_delegations', count=interrupt_all(reason='/stop'))}")
+diff --git a/plugins/web/keyless_mcp.py b/plugins/web/keyless_mcp.py
+--- a/plugins/web/keyless_mcp.py
++++ b/plugins/web/keyless_mcp.py
+@@ -84,6 +84,8 @@
+ def _per_url(urls: List[str], fetch: Callable[[str], Dict[str, Any]], vendor: str, catch: Any = Exception, hint: bool = False) -> List[Dict[str, Any]]:
+     """Per-URL extract loop: a ``catch`` failure becomes an error entry (``hint`` adds the ``hermes tools`` hint)."""
+     def _one(url: str) -> Dict[str, Any]:
++        from agent.web_call_context import check_web_deadline
++        check_web_deadline()
+         try:
+             return fetch(url)
+         except catch as exc:  # noqa: BLE001 — per-URL error entry
+@@ -190,7 +192,11 @@
+     :class:`KeylessMCPError` on transport failures, non-2xx, JSON-RPC and tool errors."""
+     import requests
+     import time
++    from agent.web_call_context import check_web_deadline, _child_deadline
++    check_web_deadline()
++    deadline = _child_deadline.get()
+     if url != EXA_MCP_URL:
++        if deadline is not None:timeout=min(timeout,max(.001,deadline-time.monotonic()))
+         import requests
+         payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}
+         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "User-Agent": "hermes-agent"}
+@@ -230,7 +236,7 @@
+     wire_arguments = {**arguments, "objective": arguments["query"]} if tool == "web_search_exa" else arguments
+     payload = {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":wire_arguments}}
+     headers = {"Content-Type":"application/json","Accept":"application/json, text/event-stream","Accept-Encoding":"identity"}
+-    deadline = time.monotonic() + timeout
++    deadline = min(time.monotonic() + timeout, deadline) if deadline is not None else time.monotonic()+timeout
+     try:
+         with requests.Session() as session:
+             session.trust_env = False
+diff --git a/tools/managed_tool_gateway.py b/tools/managed_tool_gateway.py
+--- a/tools/managed_tool_gateway.py
++++ b/tools/managed_tool_gateway.py
+@@ -10,6 +10,7 @@
+ from typing import Callable, Optional
+ 
+ from hermes_constants import get_hermes_home
++from agent.secret_scope import get_secret_str
+ from tools.tool_backend_helpers import managed_nous_tools_enabled
+ 
+ logger = logging.getLogger(__name__)
+@@ -148,7 +149,7 @@
+ 
+ def get_tool_gateway_scheme() -> str:
+     """Return configured shared gateway URL scheme."""
+-    scheme = os.getenv("TOOL_GATEWAY_SCHEME", "").strip().lower() or _DEFAULT_TOOL_GATEWAY_SCHEME
++    scheme = get_secret_str("TOOL_GATEWAY_SCHEME", "").strip().lower() or _DEFAULT_TOOL_GATEWAY_SCHEME
+     if scheme not in {"http", "https"}:
+         raise ValueError("TOOL_GATEWAY_SCHEME must be 'http' or 'https'")
+     return scheme
+@@ -156,9 +157,9 @@
+ 
+ def build_vendor_gateway_url(vendor: str) -> str:
+     """Return the gateway origin for a specific vendor."""
+-    if explicit_vendor_url := os.getenv(f"{vendor.upper().replace('-', '_')}_GATEWAY_URL", "").strip().rstrip("/"):
++    if explicit_vendor_url := get_secret_str(f"{vendor.upper().replace('-', '_')}_GATEWAY_URL", "").strip().rstrip("/"):
+         return explicit_vendor_url
+-    shared_domain = os.getenv("TOOL_GATEWAY_DOMAIN", "").strip().strip("/") or _DEFAULT_TOOL_GATEWAY_DOMAIN
++    shared_domain = get_secret_str("TOOL_GATEWAY_DOMAIN", "").strip().strip("/") or _DEFAULT_TOOL_GATEWAY_DOMAIN
+     return f"{get_tool_gateway_scheme()}://{vendor}-gateway.{shared_domain}"
+ 
+ 
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -35,6 +35,7 @@
+ from tools.process_registry_notifications import format_process_notification
+ from tools.process_registry_checkpoint import ProcessCheckpointMixin
+ from tools.process_registry_termination import ProcessTerminationMixin
++from tools.process_registry_web import WebProcessMixin
+ from tools.process_registry_results import load_completed_results, save_completed_result
+ from tools.process_registry_env_log import log_delta_command
+ 
+@@ -560,6 +561,18 @@
+     detached: bool = False                      # Recovered from checkpoint (no pipe)
+     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
+     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
++    web_tool_call_id: str = ""
++    web_turn_id: str = ""
++    web_custody: bool = False
++    web_invocation: str = ""
++    web_cgroup: str = ""
++    web_cgroup_identity: list = field(default_factory=list)
++    web_deadline: float = 0.0
++    web_boot_id: str = ""
++    web_unconfirmed: bool = True
++    web_settled: bool = False
++    web_stop_requested: bool = False
++    web_settle_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+     wsl_chain: bool = False                     # spawned via wsl[.exe]: the host PID is the short-lived
+                                                 # launcher; Linux-side workers outlive it (#120546)
+     handoff_note: str = ""                      # why a subagent handed this process to its parent (rides the notice)
+@@ -651,11 +664,12 @@
+ _CHECKPOINT_FIELDS = (
+     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "wsl_chain", "cwd",
+     "started_at", "task_id", "owner_task_id", "session_key",
++    "web_tool_call_id", "web_turn_id", "web_custody", "web_invocation", "web_cgroup", "web_cgroup_identity", "web_deadline", "web_boot_id", "web_unconfirmed", "web_stop_requested",
+     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
+     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
+     "heartbeat_seconds", "persist_on_release")
+ _CHECKPOINT_DEFAULTS = {
+-    f.name: ([] if f.name == "watch_patterns" else f.default)
++    f.name: ([] if f.name in ("watch_patterns", "web_cgroup_identity") else f.default)
+     for f in ProcessSession.__dataclass_fields__.values()
+     if f.name in _CHECKPOINT_FIELDS
+ }
+@@ -696,7 +710,7 @@
+     return False
+ 
+ 
+-class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
++class ProcessRegistry(WebProcessMixin, ProcessTerminationMixin, ProcessCheckpointMixin):
+     """In-memory registry of running and finished background processes.
+     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
+     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
+@@ -1024,7 +1038,7 @@
+         A completion is not queued here: recovery has no waitable handle, so it
+         never collected an exit status.
+         """
+-        if session is None or session.exited or not session.detached or session.pid_scope != "host":
++        if session is None or session.web_custody or session.exited or not session.detached or session.pid_scope != "host":
+             return session
+         fate = self._detached_host_fate(session.pid, session.host_start_time)
+         if fate == "running":
+@@ -1958,6 +1972,8 @@
+         """
+         if session is None or session.exited:
+             return
++        if session.web_custody:
++            return  # Wrapper exit cannot finish a strict whole-cgroup web handle.
+         proc = getattr(session, "process", None)
+         if proc is None:
+             return
+@@ -2168,6 +2184,9 @@
+         session = self.get(session_id)
+         if session is None:
+             return _not_found(session_id)
++        if session.web_custody:
++            self._latch_web_stop(session)
++            return self.settle_web(session, stop=True)
+         if session.exited:
+             # A double-forked descendant may still be alive in the systemd scope even
+             # though the main process exited — stop the scope to reap survivors.
+@@ -2563,7 +2582,9 @@
+             ]
+         results = [self.kill_process(s.id, source=source, consume_output=consume_output) for s in targets]
+         return sum(
+-            r.get("status") in {"killed", "already_exited"} and "scope_stop_failed" not in r
++            (r.get("status") in {"killed", "already_exited"}
++             or (r.get("status") == "QUIESCENT" and bool(r.get("newly_settled"))))
++            and "scope_stop_failed" not in r
+             for r in results)
+ 
+     # ----- Cleanup / Pruning -----
+diff --git a/tools/process_registry_checkpoint.py b/tools/process_registry_checkpoint.py
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -66,6 +66,18 @@
+         unresolved_scope_entries: List[Dict[str, Any]] = []
+         for entry in entries:
+             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
++            if entry.get("web_custody"):
++                # Adopt intent even with no PID, or with a dead/reused wrapper.
++                # Never infer cgroup cessation from a failed gateway's pipes.
++                session = ProcessSession(id=entry["session_id"],
++                    **{f:entry.get(f,_CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}, detached=True)
++                session.web_unconfirmed = True
++                session._scope_stop_pending = True
++                with self._lock:
++                    if session.id not in self._running:
++                        self._running[session.id] = session
++                        recovered += 1
++                continue
+             if not pid:
+                 continue
+             # The registry is process-global, so every profile's checkpoint carries every live
+diff --git a/tools/process_registry_web.py b/tools/process_registry_web.py
+new file mode 100644
+--- /dev/null
++++ b/tools/process_registry_web.py
+@@ -0,0 +1,336 @@
++"""Trusted foreground web children owned by the existing ProcessRegistry.
++
++A mandatory transient user service supplies whole-cgroup stop and a hard clock
++while the caller is down. No bare-process fallback. Trusted input is withheld
++until the existing registry checkpoint, unit identity and clock are checked.
++"""
++import json
++import math
++import os
++from pathlib import Path
++import re
++import select
++import shutil
++import subprocess
++import time
++
++_SETTLE_RESERVE = 4.0
++_START_RESERVE = 3.0
++_MAX_RESULT = 2_000_000
++_PROPERTIES = ('Id','Description','InvocationID','ActiveState','SubState','MainPID',
++               'ExecMainPID','ExecMainCode','ExecMainStatus','ControlGroup',
++               'KillMode','SendSIGKILL','Restart','RuntimeMaxUSec','TimeoutStopUSec',
++               'ActiveEnterTimestampMonotonic','RemainAfterExit','ExitType',
++               'NoNewPrivileges','ProtectControlGroups','Delegate','RuntimeRandomizedExtraUSec')
++
++
++def _usec(value):
++    """systemctl show formats microsecond D-Bus properties as time spans."""
++    from decimal import Decimal
++    scales={'us':1,'ms':1000,'s':1000000,'min':60000000,'h':3600000000,'d':86400000000}
++    if re.fullmatch(r'[0-9]+',value):return int(value)
++    total=Decimal(0)
++    parts=value.split()
++    if not parts:raise ValueError('invalid_systemd_timespan')
++    for part in parts:
++        match=re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)(us|ms|s|min|h|d)',part)
++        if not match:raise ValueError('invalid_systemd_timespan')
++        total+=Decimal(match[1])*scales[match[2]]
++    if total!=int(total):raise ValueError('nonintegral_systemd_timespan')
++    return int(total)
++
++
++class WebProcessMixin:
++    def _latch_web_stop(self, session):
++        # Intent precedes any observation/lock. In-progress Popen/checkpoint and
++        # stdin writers observe the same call fence; recovery retains the bit.
++        session.web_stop_requested = True
++        for event in getattr(session, 'web_stop_events', ()):
++            event.set()
++
++    def has_web_custody_for_session(self, session_key, *, parent_session_id='', profile_home):
++        with self._lock:
++            return any(s.web_custody and not s.web_settled and s.cwd == str(profile_home)
++                       and (s.session_key == session_key
++                            or (parent_session_id and s.parent_session_id == parent_session_id))
++                       for s in self._running.values())
++
++    def stop_web_for_session(self, session_key, *, parent_session_id='', profile_home):
++        """Stop retained native handles in this profile and conversation only."""
++        with self._lock:
++            targets = [s for s in self._running.values()
++                       if s.web_custody and not s.web_settled and s.cwd == str(profile_home)
++                       and (s.session_key == session_key
++                            or (parent_session_id and s.parent_session_id == parent_session_id))]
++        # Latch the entire fan-out before the first potentially slow settlement.
++        for session in targets:
++            self._latch_web_stop(session)
++        receipts = [self.settle_web(s, stop=True) for s in targets]
++        return {'status': 'QUIESCENT' if all(r['status'] == 'QUIESCENT' for r in receipts)
++                else 'STOP_UNCONFIRMED', 'sessions': receipts,
++                'newly_settled': sum(bool(r.get('newly_settled')) for r in receipts)}
++
++    def web_custody_receipt(self):
++        """Read the existing handles after a stop; counts do not prove cessation."""
++        with self._lock:
++            retained=[s.id for s in self._running.values() if s.web_custody and not s.web_settled]
++        return {'status':'STOP_UNCONFIRMED' if retained else 'QUIESCENT','sessions':retained}
++
++    def _web_command(self, argv, timeout):
++        from tools.process_registry import systemd_user_bus_env
++        if timeout <= 0:
++            raise TimeoutError('web_original_deadline')
++        return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
++                              stderr=subprocess.PIPE, env=systemd_user_bus_env({'PATH':os.defpath,'LANG':'C.UTF-8'}),
++                              timeout=min(timeout,2.5 if 'stop' in argv else 1.0), check=False)
++
++    def _web_show(self, session, timeout=1.0):
++        binary = shutil.which('systemctl')
++        if not binary:
++            raise RuntimeError('web_systemd_required')
++        result = self._web_command([binary,'--user','show',session.systemd_unit,
++                                   '--property='+','.join(_PROPERTIES)],timeout)
++        if result.returncode:
++            raise RuntimeError('web_unit_observation_failed')
++        data = dict(line.split('=',1) for line in result.stdout.decode().splitlines() if '=' in line)
++        if data.get('Id') != session.systemd_unit or data.get('Description') != 'Hermes web '+session.id:
++            raise RuntimeError('web_unit_identity_changed')
++        if not re.fullmatch('[0-9a-f]{32}',data.get('InvocationID','')):
++            raise RuntimeError('web_invocation_required')
++        if session.web_invocation and data['InvocationID'] != session.web_invocation:
++            raise RuntimeError('web_invocation_changed')
++        if (data.get('KillMode')!='control-group' or data.get('SendSIGKILL')!='yes'
++                or data.get('Restart')!='no' or data.get('RemainAfterExit')!='no'
++                or data.get('ExitType')!='main' or data.get('NoNewPrivileges')!='yes'
++                or data.get('ProtectControlGroups')!='yes' or data.get('Delegate')!='no'
++                or _usec(data.get('RuntimeRandomizedExtraUSec',''))!=0):
++            raise RuntimeError('web_unit_policy_changed')
++        return data
++
++    def _web_populated(self, session):
++        # Retain the original cgroup path; disappearance proves the recorded
++        # cgroup was removed, not merely that the wrapper PID went away.
++        path = Path('/sys/fs/cgroup')/session.web_cgroup.lstrip('/')
++        if (not session.web_cgroup or '..' in Path(session.web_cgroup).parts
++                or path.resolve()!=path):
++            raise RuntimeError('web_cgroup_required')
++        try:
++            st=path.stat()
++            if session.web_cgroup_identity and [st.st_dev,st.st_ino]!=session.web_cgroup_identity:
++                raise RuntimeError('web_cgroup_identity_changed')
++            text = (path/'cgroup.events').read_text()
++        except FileNotFoundError:
++            return False
++        data = dict(line.split() for line in text.splitlines())
++        if data.get('populated') not in ('0','1'):
++            raise RuntimeError('web_cgroup_observation_failed')
++        return data['populated']=='1'
++
++    def _web_capture_cgroup(self, session):
++        group=Path('/sys/fs/cgroup')/session.web_cgroup.lstrip('/')
++        if group.resolve()!=group or '..' in group.parts:raise RuntimeError('web_cgroup_required')
++        st=group.stat()
++        session.web_cgroup_identity=[st.st_dev,st.st_ino]
++        if not self._web_populated(session):raise RuntimeError('web_cgroup_not_populated')
++
++    def _web_checkpoint(self, session):
++        from tools.process_registry import _checkpoint_path
++        self._write_checkpoint()
++        rows = json.loads(_checkpoint_path().read_text())
++        row = next((r for r in rows if r.get('session_id')==session.id),None)
++        if row is None or any(row.get(k)!=getattr(session,k) for k in
++                             ('systemd_unit','task_id','owner_task_id','session_key',
++                              'web_custody','web_invocation','web_cgroup','web_cgroup_identity','web_deadline','web_boot_id',
++                              'web_tool_call_id','web_turn_id','parent_session_id','web_stop_requested')):
++            raise RuntimeError('web_checkpoint_required')
++
++    def spawn_web(self, call):
++        from tools.process_registry import systemd_user_bus_env
++        from hermes_constants import get_hermes_home
++        import sys
++        call.check()
++        deadline = call.deadline()
++        remaining = deadline-time.monotonic()
++        if remaining <= _SETTLE_RESERVE+_START_RESERVE+1:
++            raise TimeoutError('web_insufficient_settlement_budget')
++        binary = shutil.which('systemd-run')
++        if not binary or not shutil.which('systemctl'):
++            raise RuntimeError('web_systemd_required')
++        session = self._new_session('native web child',call.task_id,call.task_id,call.session_key,
++                                    str(get_hermes_home()),
++                                    web_custody=True,web_deadline=deadline,
++                                    web_boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip())
++        session.systemd_unit = 'hermes-worker-web-'+session.id+'.service'
++        session.parent_session_id = call.session_id
++        session.web_tool_call_id=call.call_id or "";session.web_turn_id=call.turn_id
++        session.web_stop_events=(call.stopped,call.turn.stopped)
++        with self._lock:
++            if any(s.web_custody and s.web_unconfirmed
++                   and (s.session_key==call.session_key or s.cwd==str(get_hermes_home()))
++                   for s in self._running.values()):
++                raise RuntimeError('STOP_UNCONFIRMED')
++            self._running[session.id] = session
++        # Intent is in the registry before launch. A failed Popen or observation
++        # is retained there for exact-unit reconciliation, never auto-replayed.
++        call.registry,call.session = self,session
++        self._web_checkpoint(session)
++        call.check()  # Stop during intent/checkpoint must fence Popen too.
++        if session.web_stop_requested:raise RuntimeError("web_call_stopped")
++        entry = str(Path(__file__).with_name('web_process_child.py'))
++        env = systemd_user_bus_env({'PATH':os.defpath,'HOME':str(get_hermes_home()),
++                                   'HERMES_HOME':str(get_hermes_home()),'LANG':'C.UTF-8',
++                                   'PYTHONDONTWRITEBYTECODE':'1','PYTHONUNBUFFERED':'1'})
++        argv=[binary,'--user','--pipe','--wait','--quiet','--expand-environment=no',
++              '--unit='+session.systemd_unit,'--description=Hermes web '+session.id,
++              '--property=Type=exec','--property=RemainAfterExit=no','--property=ExitType=main',
++              '--property=Restart=no','--property=RuntimeRandomizedExtraSec=0',
++              '--property=TimeoutStartSec=3s','--property=NoNewPrivileges=yes',
++              '--property=ProtectControlGroups=yes','--property=Delegate=no',
++              '--property=KillMode=control-group','--property=SendSIGKILL=yes',
++              '--property=TimeoutStopSec=1s','--property=RuntimeMaxSec='+str(math.floor((remaining-_SETTLE_RESERVE-_START_RESERVE)*1_000_000))+'us',
++              '--property=MemoryMax=1G','--property=TasksMax=64',
++              '--property=WorkingDirectory='+str(get_hermes_home()),
++              '--','/usr/bin/env','-i',*[k+'='+v for k,v in env.items()
++                                        if k not in ('DBUS_SESSION_BUS_ADDRESS','XDG_RUNTIME_DIR')],
++              sys.executable,'-I','-B',entry]
++        proc=subprocess.Popen(argv,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
++                              env=env,cwd=session.cwd,start_new_session=True)
++        session.process,session.pid=proc,proc.pid
++        session.host_start_time=self._safe_host_start_time(proc.pid)
++        self._web_checkpoint(session)
++        # One finite startup observation window, always inside the original
++        # deadline. No work is released until the manager acknowledges identity.
++        until=min(deadline-_SETTLE_RESERVE,time.monotonic()+3)
++        while True:
++            call.check()
++            try:
++                data=self._web_show(session,min(1,until-time.monotonic()))
++                entered=int(data['ActiveEnterTimestampMonotonic'])/1_000_000
++                if entered>0 and int(data.get('MainPID','0'))>0 and data.get('ControlGroup'):
++                    break
++            except (RuntimeError,ValueError):
++                pass
++            if proc.poll() is not None or time.monotonic()>=until:
++                raise RuntimeError('web_native_boundary_not_ready')
++            call.stopped.wait(.02)
++        session.web_invocation=data['InvocationID'];session.web_cgroup=data['ControlGroup']
++        # Services only accept RuntimeMaxSec at creation on systemd 259. Use a
++        # conservative startup allowance, then check the ACTUAL activation
++        # origin. Reject a late launch before input instead of pretending a
++        # runtime property update can move an already-armed timer.
++        runtime = _usec(data.get('RuntimeMaxUSec',''))
++        if (entered + runtime/1_000_000 > deadline-_SETTLE_RESERVE+.000001
++                or _usec(data.get('TimeoutStopUSec','')) > 1_000_000
++                or data.get('ControlGroup')!=session.web_cgroup):
++            raise RuntimeError('web_hard_deadline_unverified')
++        self._web_capture_cgroup(session)
++        call.check()
++        if session.web_stop_requested:raise RuntimeError("web_call_stopped")
++        session.web_unconfirmed=False
++        self._web_checkpoint(session)
++        call.check()
++        return session
++
++    def web_exchange(self, session, payload, call):
++        encoded=json.dumps(payload,ensure_ascii=True,allow_nan=False).encode()+b'\n'
++        if len(encoded)>65536:
++            raise RuntimeError('web_input_too_large')
++        proc=session.process
++        os.set_blocking(proc.stdin.fileno(),False);os.set_blocking(proc.stdout.fileno(),False)
++        offset=0;raw=bytearray()
++        while True:
++            call.check()
++            remaining=session.web_deadline-_SETTLE_RESERVE-time.monotonic()
++            if remaining<=0:
++                raise TimeoutError('web_original_deadline')
++            rd,wr,_=select.select([proc.stdout], [proc.stdin] if offset<len(encoded) else [],[],min(.05,remaining))
++            if wr:
++                from tools.interrupt import run_if_not_interrupted
++                def write_input():
++                    nonlocal offset
++                    if session.web_stop_requested or call.stopped.is_set() or call.turn.stopped.is_set():raise RuntimeError('web_call_stopped')
++                    offset+=os.write(proc.stdin.fileno(),encoded[offset:])
++                    if offset==len(encoded):proc.stdin.close()
++                with call.turn.lock:
++                    call.check()
++                    if not run_if_not_interrupted(write_input):raise RuntimeError('web_call_stopped')
++            if rd:
++                part=os.read(proc.stdout.fileno(),8192)
++                if not part:
++                    raise RuntimeError('web_result_incomplete')
++                raw.extend(part)
++                if len(raw)>_MAX_RESULT:raise RuntimeError('web_result_too_large')
++                if b'\n' in raw:
++                    result=json.loads(raw)
++                    if set(result)!= {'result'} or not isinstance(result['result'],str):
++                        raise RuntimeError('web_result_invalid')
++                    return result['result']
++
++    def settle_web(self, session, *, stop=False):
++        # Serialize exactly this existing handle. Parent EOF, systemctl rc and
++        # Future cancellation are not observations of whole-boundary cessation.
++        if stop:self._latch_web_stop(session)
++        if not session.web_settle_lock.acquire(timeout=1):
++            return {'status':'STOP_UNCONFIRMED','session_id':session.id,'reason':'web_settlement_in_progress'}
++        try:
++            if session.web_settled:
++                return {'status':'QUIESCENT','session_id':session.id,'returncode':session.exit_code}
++            session.web_unconfirmed=True
++            try:
++                if Path('/proc/sys/kernel/random/boot_id').read_text().strip()!=session.web_boot_id:
++                    raise RuntimeError('web_boot_changed')
++                until=min(session.web_deadline,time.monotonic()+3)
++                proc=session.process
++                wrapper_gone=(proc.poll() is not None if proc is not None
++                              else self._detached_host_fate(session.pid,session.host_start_time) in ('gone','reused'))
++                already_gone=bool(session.web_invocation and session.web_cgroup_identity
++                                  and wrapper_gone and not self._web_populated(session))
++                if not session.web_invocation:
++                    # No input was released; acquire the recorded unique intent
++                    # using its exact owner description, never guess a PID group.
++                    data=self._web_show(session,min(1,until-time.monotonic()))
++                    session.web_invocation=data['InvocationID'];session.web_cgroup=data.get('ControlGroup','')
++                natural=False
++                proc=session.process
++                if not already_gone and not stop and proc is not None:
++                    # --wait propagates the real service exit; its complete wait
++                    # also includes native control-group teardown. Do not stop a
++                    # child between result publication and actual exit zero.
++                    while proc.poll() is None:
++                        if any(event.is_set() for event in getattr(session,'web_stop_events',())):
++                            stop=True
++                            break
++                        if time.monotonic()>=until:raise TimeoutError('web_settlement_deadline')
++                        time.sleep(.01)
++                    if not stop:
++                        rc=proc.wait(timeout=max(.001,until-time.monotonic()))
++                        natural=rc==0
++                if (stop or proc is None) and not already_gone:
++                    self._web_show(session,min(1,until-time.monotonic()))
++                    result=self._web_command([shutil.which('systemctl'),'--user','stop',session.systemd_unit],
++                                             until-time.monotonic())
++                    if result.returncode:raise RuntimeError('web_stop_failed')
++                if self._web_populated(session):raise RuntimeError('web_cgroup_still_populated')
++                proc=session.process
++                if proc is not None:
++                    rc=proc.wait(timeout=max(.001,until-time.monotonic()))
++                    if already_gone and not stop:natural=rc==0
++                else:
++                    if self._detached_host_fate(session.pid,session.host_start_time) not in ('gone','reused'):
++                        raise RuntimeError('web_wrapper_still_running')
++                    rc=None
++                session.web_settled=True;session.web_unconfirmed=False;session._scope_stop_pending=False
++                session.mark_exited(rc,reason='killed' if stop else 'exited',source='native_web_settlement')
++                self._completion_consumed.add(session.id)
++                self._move_to_finished(session)
++                return {'status':'QUIESCENT','session_id':session.id,'returncode':rc,
++                        'native_child_exit_zero':natural,'original_deadline':session.web_deadline,
++                        'newly_settled':True}
++            except Exception:
++                session._scope_stop_pending=True
++                self._write_checkpoint()
++                return {'status':'STOP_UNCONFIRMED','session_id':session.id,
++                        'unit':session.systemd_unit,'original_deadline':session.web_deadline}
++
++        finally:
++            session.web_settle_lock.release()
+diff --git a/tools/web_process.py b/tools/web_process.py
+new file mode 100644
+--- /dev/null
++++ b/tools/web_process.py
+@@ -0,0 +1,104 @@
++"""Ordinary registered web handlers, using the caller-owned native child."""
++import json
++import os
++import time
++
++
++def _scope_payload(home):
++    from agent.secret_scope import current_secret_scope, current_secret_scope_home
++    from tools.web_tools import _web_requires_env
++    bound=current_secret_scope()
++    if bound is None:raise RuntimeError('web_profile_scope_required')
++    if current_secret_scope_home()!=str(home):
++        raise RuntimeError('web_profile_scope_mismatch')
++    names=set(_web_requires_env())|{'SEARXNG_URL','BRAVE_SEARCH_API_KEY','XAI_API_KEY','XAI_BASE_URL'}
++    # Existing per-provider declarations; no sibling dotenv or complete profile
++    # secret dump, and never model/bot/login credentials in the subprocess env.
++    from agent.web_search_registry import list_providers
++    for provider in list_providers():
++        names.update(getattr(provider,'requires_env',()) or ())
++        key=getattr(provider,'KEY_ENV',None)
++        if isinstance(key,str):names.add(key)
++    return {name:value for name in names if (value:=bound.get(name)) is not None}
++
++
++def run_web(name,args,**kw):
++    from agent.web_call_context import current_web_call
++    from tools.process_registry import process_registry
++    from hermes_constants import get_hermes_home
++    from hermes_cli.friday_user_scope import current
++    from dataclasses import asdict
++    call=None
++    lock=None
++    lock_held=False
++    try:
++        call=current_web_call()
++        if kw.get('task_id')!=call.task_id or (kw.get('session_id') or '')!=call.session_id:
++            raise RuntimeError('web_caller_identity_mismatch')
++        home=get_hermes_home();cap=current()
++        authority=None
++        if cap is not None:
++            authority=asdict(cap)
++            for key in ('authorization_home','home'):authority[key]=str(authority[key])
++        payload={'tool':name,'args':args,'home':str(home),'deadline':call.deadline(),
++                 'secrets':_scope_payload(home),'authority':authority,
++                 'options':{'PARALLEL_SEARCH_MODE':os.getenv('PARALLEL_SEARCH_MODE','agentic')},
++                 'task_id':call.task_id,'session_id':call.session_id,'session_key':call.session_key,'call_id':call.call_id}
++        # Keep the donor's SearchMemo and single-flight across per-call execs.
++        # Safety/provider gates still run INSIDE the child before every cache hit.
++        from tools.web_result_cache import search_memo
++        if name=='web_search':
++            lock=search_memo.flight_lock('__native_web_call__',args.get('query',''),args.get('limit',5))
++            remaining=call.deadline()-time.monotonic()-2
++            if remaining<=0 or not lock.acquire(timeout=remaining):raise TimeoutError('web_cache_wait_deadline')
++            lock_held=True
++            payload['search_memo']=search_memo.export_query(args.get('query',''),args.get('limit',5))
++        with call.turn.lock:
++            call.check()
++            session=process_registry.spawn_web(call)
++            call.check()
++        payload['deadline']=session.web_deadline
++        raw=process_registry.web_exchange(session,payload,call)
++        receipt=process_registry.settle_web(session)
++        call.receipt=receipt
++        if receipt['status']!='QUIESCENT':
++            receipt=call.stop()
++            call.turn.stopped.set()
++            if receipt['status']!='QUIESCENT':
++                return json.dumps({'error':'STOP_UNCONFIRMED','native_process_id':session.id})
++            raise RuntimeError('web_result_settlement_failed')
++        with call.turn.lock:call.turn.calls.discard(call)
++        if not receipt.get('native_child_exit_zero'):
++            raise RuntimeError('web_native_child_failed')
++        current()  # Recheck the retained active principal/generation before publication.
++        result=json.loads(raw)
++        if set(result)!= {'value','search_memo'} or not isinstance(result['value'],str):
++            raise RuntimeError('web_result_invalid')
++        if name=='web_search':
++            search_memo.import_query(result['search_memo'],args.get('query',''),args.get('limit',5))
++        call.check()
++        return result['value']
++    except Exception as exc:
++        if call is not None:
++            receipt=call.stop()
++            if receipt['status']!='QUIESCENT':
++                call.turn.stopped.set()
++                return json.dumps({'error':'STOP_UNCONFIRMED','native_process_id':getattr(call.session,'id',None)})
++        # Native/provider bodies format their errors themselves. Parent boundary
++        # exceptions are fixed categories, never argv/input/key/traceback dumps.
++        return json.dumps({'error':'web_timeout' if isinstance(exc,TimeoutError) else 'web_native_boundary_refused',
++                           'detail':str(exc) if str(exc) in ('web_caller_context_required','web_original_deadline_required',
++                             'web_call_stopped','web_systemd_required','web_profile_scope_mismatch','web_profile_scope_required',
++                             'web_hard_deadline_unavailable','web_hard_deadline_unverified') else type(exc).__name__})
++    finally:
++        if lock_held:lock.release()
++
++
++def search_handler(args,**kw):
++    return run_web('web_search',args,**kw)
++
++
++async def extract_handler(args,**kw):
++    # Synchronous foreground adapter; donor async extract runs in the owned
++    # process. registry.dispatch/run_async owns the caller's usual async bridge.
++    return run_web('web_extract',args,**kw)
+diff --git a/tools/web_process_child.py b/tools/web_process_child.py
+new file mode 100644
+--- /dev/null
++++ b/tools/web_process_child.py
+@@ -0,0 +1,99 @@
++"""Fixed trusted entrypoint. Model parameters are stdin data, never executable code."""
++import sys
++from pathlib import Path
++sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
++
++
++def redacted_response_text(original, response):
++    from agent.redact import redact_sensitive_text
++    return redact_sensitive_text(original(response),force=True)
++
++
++def main():
++    import asyncio
++    import contextlib
++    import json
++    import os
++    # Nothing from the donor/profile is imported until trusted input arrives.
++    line=sys.stdin.buffer.readline(65537)
++    if not line.endswith(b'\n') or len(line)>65536:raise RuntimeError('web_input_invalid')
++    data=json.loads(line)
++    if data.get('tool') not in ('web_search','web_extract') or not isinstance(data.get('args'),dict):
++        raise RuntimeError('web_input_invalid')
++    if data.get('home')!=os.environ.get('HERMES_HOME'):raise RuntimeError('web_home_mismatch')
++    mode=data.get('options',{}).get('PARALLEL_SEARCH_MODE','agentic')
++    if mode not in ('fast','one-shot','agentic'):mode='agentic'
++    os.environ['PARALLEL_SEARCH_MODE']=mode
++    from agent.web_call_context import child_deadline
++    child_deadline(data['deadline'])
++    from agent.secret_scope import set_secret_scope,set_multiplex_active
++    from hermes_constants import get_hermes_home
++    set_multiplex_active(True)
++    set_secret_scope(data['secrets'],profile_home=data['home'])
++    from agent.redact import register_vault_redaction_value
++    for name,value in data['secrets'].items():
++        if name.endswith(('_KEY','_TOKEN','_SECRET')):
++            for raw in (value,value.strip()):
++                register_vault_redaction_value(raw)
++                for ascii_only in (True,False):
++                    register_vault_redaction_value(json.dumps(raw,ensure_ascii=ascii_only)[1:-1])
++    from hermes_cli import friday_user_scope as users
++    cap=data.get('authority')
++    if cap is not None:
++        cap=dict(cap)
++        for key in ('authorization_home','home'):cap[key]=Path(cap[key])
++        for key in ('principal','directory_identity'):cap[key]=tuple(cap[key])
++        cap=users.UserScope(**cap);cap.check();users._CURRENT.set(cap)
++    elif users.policy(get_hermes_home()) is not None:
++        raise RuntimeError('web_user_scope_required')
++    from gateway.session_context import set_current_session_id
++    set_current_session_id(data['session_id'])
++    from tools.approval_context import set_current_session_key
++    set_current_session_key(data['session_key'])
++    args=data['args'];users.guard_tool(data['tool'],args)
++    # Normal plugin selection, SSRF, provider bodies, truncation, extract cache
++    # and spills remain native. Their console/debug text is never the protocol.
++    output=sys.stdout
++    with open(os.devnull,'w') as discard, contextlib.redirect_stdout(discard),contextlib.redirect_stderr(discard):
++        from agent.redact import redact_sensitive_text
++        # Use the native redactor before cache/spill and lossy keyless parsing,
++        # scoped to this dedicated child. Donor provider/extract bodies remain
++        # intact; a provider echo cannot become a persistent raw credential.
++        from tools import web_result_cache, web_tools_truncate
++        original_cache=web_result_cache.extract_cache_put
++        original_spill=web_tools_truncate._store_full_text
++        web_result_cache.extract_cache_put=lambda url,content,title='',**kw:original_cache(
++            url,redact_sensitive_text(content,force=True),redact_sensitive_text(title,force=True),**kw)
++        web_tools_truncate._store_full_text=lambda url,content:original_spill(url,redact_sensitive_text(content,force=True))
++        from plugins.web import keyless_mcp
++        original_text=keyless_mcp._response_text
++        keyless_mcp._response_text=lambda response: redacted_response_text(original_text,response)
++        from tools.web_result_cache import search_memo
++        if data['tool']=='web_search':
++            search_memo.import_query(data.get('search_memo',[]),args.get('query',''),args.get('limit',5))
++        from tools import web_tools
++        if data['tool']=='web_search':
++            value=web_tools.web_search_tool(args.get('query',''),limit=args.get('limit',5))
++            memo=search_memo.export_query(args.get('query',''),args.get('limit',5))
++        else:
++            value=asyncio.run(web_tools.web_extract_tool(
++                args.get('urls',[])[:5] if isinstance(args.get('urls'),list) else [],'markdown',
++                char_limit=args.get('char_limit')))
++            memo=[]
++        from agent.web_call_context import check_web_deadline
++        check_web_deadline()
++        from agent.redact import redact_sensitive_text
++        value=redact_sensitive_text(value,force=True)
++        memo=json.loads(redact_sensitive_text(json.dumps(memo,ensure_ascii=True),force=True))
++        users.current()
++    body=json.dumps({'result':json.dumps({'value':value,'search_memo':memo},ensure_ascii=True)},ensure_ascii=True)
++    if len(body.encode())>2_000_000:raise RuntimeError('web_result_too_large')
++    output.write(body+'\n');output.flush()
++
++
++if __name__=='__main__':
++    try:
++        main()
++    except BaseException:
++        # Unit ExecMainStatus is the outcome, no secret-bearing tracebacks.
++        raise SystemExit(1)
+diff --git a/tools/web_result_cache.py b/tools/web_result_cache.py
+--- a/tools/web_result_cache.py
++++ b/tools/web_result_cache.py
+@@ -89,7 +89,8 @@
+ 
+     @staticmethod
+     def _key(provider: str, query: str, limit: int) -> tuple:
+-        return (provider, normalize_query(query), bucket_limit(limit))
++        from hermes_constants import get_hermes_home
++        return (str(get_hermes_home()), provider, normalize_query(query), bucket_limit(limit))
+ 
+     def lookup(self, provider: str, query: str, limit: int) -> Optional[dict]:
+         if not cache_enabled():
+@@ -110,8 +111,7 @@
+         key = self._key(provider, query, limit)
+         with self._store_lock:
+             now = time.monotonic()  # opportunistic expiry sweep bounds memory
+-            for k in [k for k, (exp, _) in self._store.items() if now >= exp]:
+-                del self._store[k]
++            self._expire(now)
+             self._store[key] = (now + ttl_seconds(), _deep_copy(response))
+ 
+     def flight_lock(self, provider: str, query: str, limit: int) -> threading.Lock:
+@@ -128,6 +128,38 @@
+                     self._key_locks = {k: v for k, v in self._key_locks.items() if v.locked()}
+                 lock = self._key_locks[key] = threading.Lock()
+             return lock
++
++    def export_query(self, query: str, limit: int) -> list:
++        from hermes_constants import get_hermes_home
++        home, normalized, bucket = str(get_hermes_home()), normalize_query(query), bucket_limit(limit)
++        now = time.monotonic()
++        with self._store_lock:
++            self._expire(now)
++            return [[list(key), expiry, _deep_copy(value)] for key, (expiry,value) in self._store.items()
++                    if key[0]==home and key[2:]==(normalized,bucket) and expiry>now]
++
++    def import_query(self, rows, query: str, limit: int) -> None:
++        import math
++        from hermes_constants import get_hermes_home
++        home, normalized, bucket = str(get_hermes_home()), normalize_query(query), bucket_limit(limit)
++        if not isinstance(rows,list) or len(rows)>32:
++            raise ValueError("invalid_web_cache_transfer")
++        checked=[]
++        for key, expiry, value in rows:
++            if (not isinstance(key,list) or len(key)!=4 or key[0]!=home or key[2:]!=[normalized,bucket]
++                    or not isinstance(key[1],str) or type(expiry) not in (int,float)
++                    or not math.isfinite(expiry) or not isinstance(value,dict)):
++                raise ValueError("invalid_web_cache_transfer")
++            if time.monotonic()<expiry: checked.append((tuple(key),expiry,_deep_copy(value)))
++        with self._store_lock:
++            self._expire(time.monotonic())
++            for key,expiry,value in checked:
++                self._store[key]=(expiry,value)
++
++    def _expire(self, now) -> None:
++        # Called under the native store lock, including per-process transfers.
++        for key in [key for key, (expiry, _) in self._store.items() if now >= expiry]:
++            del self._store[key]
+ 
+     def clear(self) -> None:
+         """Drop all cached entries (tests; config changes)."""
+diff --git a/tools/web_tools.py b/tools/web_tools.py
+--- a/tools/web_tools.py
++++ b/tools/web_tools.py
+@@ -556,18 +556,17 @@
+     }
+ }
+ 
++from tools.web_process import search_handler, extract_handler
++
+ registry.register(
+     name="web_search", toolset="web", schema=WEB_SEARCH_SCHEMA,
+-    handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
++    handler=search_handler,
+     check_fn=check_web_api_key, requires_env=_web_requires_env(), emoji="🔍",
+     max_result_size_chars=100_000,
+ )
+ registry.register(
+     name="web_extract", toolset="web", schema=WEB_EXTRACT_SCHEMA,
+-    handler=lambda args, **kw: web_extract_tool(
+-        args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown",
+-        char_limit=args.get("char_limit"),
+-    ),
++    handler=extract_handler,
+     check_fn=check_web_api_key, requires_env=_web_requires_env(), is_async=True, emoji="📄",
+     max_result_size_chars=100_000,
+ )
+diff --git a/tools/web_tools_extract.py b/tools/web_tools_extract.py
+--- a/tools/web_tools_extract.py
++++ b/tools/web_tools_extract.py
+@@ -207,6 +207,8 @@
+     from tools.website_policy import check_website_access as _check_site
+     cached_results, fetch_urls, fetch_positions = {}, [], []
+     for position, url in enumerate(safe_urls):
++        from agent.web_call_context import check_web_deadline
++        check_web_deadline()
+         try:
+             _policy_block = _check_site(url)
+         except Exception:  # noqa: BLE001 — policy errors fail open like dispatch
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -259,10 +259,16 @@
+         return _ok(rid, {"available": False, "percent": None, "plugged": None, "category": "dim"})
+ 
+ 
++def _stop_processes(params):
++    registry = _tools_mod("tools.process_registry").process_registry
++    killed = registry.kill_all(source="process.stop")
++    return dict(registry.web_custody_receipt(), killed=killed)
++
++
+ # One-expression handlers: name → (fail_code, payload builder(params)).
+ _SIMPLE_RPCS = {
+     # Session-scoped view of the background process registry (desktop status stack).
+-    "process.stop": (5010, lambda params: {"killed": _tools_mod("tools.process_registry").process_registry.kill_all(source="process.stop")}),
++    "process.stop": (5010, _stop_processes),
+     # Re-read ``~/.hermes/.env`` (CLI ``/reload`` parity); built agents keep their pool, ``/new`` resolves fresh.
+     "reload.env": (5015, lambda params: {"updated": int(_tools_mod("hermes_cli.config").reload_env())}),
+     "plugins.list": (5032, lambda params: {"plugins": [
