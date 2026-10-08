@@ -458,3 +458,74 @@ See [the service installation contract](a0-preparation.md#dedicated-service-in-t
 for exact source pins, native lifetime/resource controls, uncertainty and retained
 failure semantics. Source/receipt checks do not qualify actual A0 runtime or
 remove the startup-health refusal.
+
+## Ordinary preparation of both intact workers
+
+The normal two-worker path requires an explicit top-level `worker_install`
+object with exactly `dsh` and `a0`. The supplied `product.runtime` must be
+`{"enabled":false}`: installed paths and pins are derived from this invocation's
+native outputs, rather than copied from an old profile. `product.a0_deployment`
+remains the existing explicit local deployment schema. Its legacy endpoints and
+capacities remain a named **TEMPORARY TEST** profile, never production defaults.
+No developer home, donor dotenv, credential value or existing user state is
+imported. Existing `credential_sources` supplies protected references separately.
+
+Each worker declares `budget_seconds`, `max_file_bytes` and `max_total_bytes`.
+DSH additionally declares `toolchain_root`, the existing resource fields
+`memory_bytes`, `cpu_percent`, `tasks`, `shutdown_seconds`, `tmp_bytes`, and
+`web={resolver,trust_bundle,egress_evidence}` (each an exact protected input pin).
+Node's path/hash comes from native toolchain output and must belong to the
+explicit toolchain root. CLI/native build pins come from the exact native build
+inventory and successful four-case smoke output. The existing local renderer
+uses the actual compiled model, endpoint, capacity and scoped key name; it does
+not invent resource/model defaults or a cloud fallback.
+
+A0 additionally declares `docker`, `policy`, `git_metadata`, `expected_files`,
+`owner_slot`, `network={name,endpoints,policy}` and the existing complete native
+`web` declaration. The network policy must be the same explicit pinned policy;
+metadata must pass the existing actual metadata check. The deployment and web
+source/image declarations remain unqualified until their real checks run.
+The staged accepted runtime source, existing fixed launcher/unit paths and pins
+are derived from the checked service source inventory. The existing finite
+120/45/20 service registration boundary, fresh absent-only policy and lost-ack
+refusal remain unchanged; registration never enables or starts a service.
+
+The parent runs Harness source/toolchain/build/smoke and A0 inventory before
+native completion in this mode. Completion checks all four source identities,
+the current source bytes/index, generated inventory, CLI and Node pins; it also
+checks current A0 source/metadata. After the existing service installation,
+it uses the actual profile compiler's authority-free input template and existing
+`worker_provision.prepare_inputs` to create private `workers/{dsh,a0}` jobs,
+staging, cache and inputs. Both runtime rows are then installed into the same
+normal profile, preserving Associations supervision and shared product state.
+The keyless extra source is staged only after full tracked-source checking and
+included in exact native pins. No second manager, queue or account store exists.
+
+The existing `runtime-input.json` preparation format and a pinned
+`runtime-receipt.json` are published for each worker. These receipts explicitly
+have **`ready:false`** and bind the checked preparation/source facts; they are
+pending declarations, not runtime qualification or opaque attestations. Both
+unchanged `host_runtime` consumers reject them. Source/configuration/wiring,
+deployment qualification, current execution and release remain separate.
+There is no new ready-receipt producer or automatic source-to-runtime grant.
+A0 retains `capability:null` until the existing fresh per-job admission produces
+its actual capability; the current `startup_health` A0 refusal remains intact.
+Root owns independent source review, real normal-installer qualification,
+trusted deployment evidence, the current native boundary and full live journeys.
+
+The final incomplete marker pins every generated worker input/receipt together
+with the profile, source and original attempt. Read-only inspection rechecks
+these bytes and the original pending state; it never regenerates or adopts a
+replacement. Missing prerequisites, wrong/stale source paths, foreign roots,
+changed evidence and original deadline exhaustion refuse. A partial or lost
+completion retains its files without replay, rollback or a fresh clock.
+The narrow historical `resume-harness` procedure does not apply to this new
+ordering and explicitly refuses a normal-worker partial install. Reconciliation
+and a separately reviewed permitted continuation remain the lead's responsibility.
+
+Omitting `worker_install` preserves the prior explicit-config/template path for
+compatibility. A disabled legacy template does not prepare either worker and
+cannot count as ordinary two-worker installation or runtime acceptance. Normal
+operator installation must use the two-worker declaration above; it never
+silently omits one worker. This source task performs no live installation,
+service/container/kernel/network/model/channel effect or native qualification.

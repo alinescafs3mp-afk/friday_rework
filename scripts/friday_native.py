@@ -194,11 +194,24 @@ def complete(value, home, receipt, *, budget=None):
         if path.is_dir():
             os.chmod(path, 0o700)
     stage_worker_runtime(value, home)
+    effective = value
+    if 'worker_install' in value:
+        require(budget is not None, 'original_worker_install_budget_required')
+        from scripts.worker_install import prepared_product, materialize
+        product, evidence = budget.call(prepared_product, value, home, budget)
+        effective = dict(value, product=product)
     from scripts.a0_prepare import service_required, install_service
-    if service_required(value):
+    if service_required(effective):
         require(budget is not None, 'original_a0_install_budget_required')
-        budget.call(install_service, value, home, budget)
-    bundle = profile_write(home, value['product'])
+        budget.call(install_service, effective, home, budget)
+    if 'worker_install' in value:
+        if product['web']['profile'] == 'exa-keyless':
+            from scripts.friday_install import stage_keyless_provider
+            keyless = budget.call(stage_keyless_provider, Path(value['dsh_donor']))
+            product['runtime']['workers']['dsh']['dsh']['native_files'].append(
+                {k:keyless[k] for k in ('path', 'sha256')})
+        effective['product'] = budget.call(materialize, value, home, product, evidence, budget)
+    bundle = profile_write(home, effective['product'])
     if 'credential_sources' in value:
         require(budget is not None, 'original_credential_budget_required')
         from scripts.install_credentials import provision
@@ -220,6 +233,13 @@ def stage_worker_runtime(value, home):
         fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400)
         with os.fdopen(fd,'wb') as stream:
             stream.write(data);stream.flush();os.fsync(stream.fileno())
+    if 'worker_install' in value:
+        research = owned_file(ROOT / 'config/RESEARCH.md')
+        require(digest(research) == value['project_files']['config/RESEARCH.md'], 'worker_research_source_changed')
+        (destination / 'config').mkdir(mode=0o700)
+        fd=os.open(destination / 'config/RESEARCH.md',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400)
+        with os.fdopen(fd,'wb') as stream:
+            stream.write(research);stream.flush();os.fsync(stream.fileno())
     return destination
 
 def main():
@@ -257,6 +277,9 @@ def main():
         package.__path__.append(str(ROOT / package.__name__))
     scripts.__path__.append(str(source / 'scripts'))
     if args.phase == 'start':
+        if 'worker_install' in value:
+            from scripts.worker_install import installed_product
+            value = dict(value, product=budget.call(installed_product, value, home))
         from scripts.friday_start import start
         from scripts.dsh_prepare import StopUnconfirmed
         try:

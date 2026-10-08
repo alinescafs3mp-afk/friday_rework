@@ -27,6 +27,17 @@ spec=importlib.util.spec_from_file_location('candidate_web_guard',ROOT/'scripts/
 guard=importlib.util.module_from_spec(spec);spec.loader.exec_module(guard)
 
 
+@pytest.fixture(autouse=True)
+def protected_current_sources(tmp_path, monkeypatch):
+    """Stage actual current source bytes, never bypass private-source predicates."""
+    for name, filename in (('PROFILE_SOURCE', 'a0_profile.py'), ('WEB_SOURCE', 'a0_web.py')):
+        data = (ROOT / 'plugins/friday_rework/adapters' / filename).read_bytes()
+        target = tmp_path / filename; target.write_bytes(data); target.chmod(0o600)
+        assert hashlib.sha256(target.read_bytes()).digest() == hashlib.sha256(data).digest()
+        monkeypatch.setattr(a0, name, target)
+        if hasattr(guard, name): monkeypatch.setattr(guard, name, target)
+
+
 def spec_web():
     return {'profile':'searxng-google','timeout_seconds':15,'dns':['1.1.1.1'],'version':'synthetic-pinned',
             'image':'sha256:'+'c'*64,'source_pins':{

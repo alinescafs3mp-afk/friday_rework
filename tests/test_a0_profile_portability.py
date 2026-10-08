@@ -32,6 +32,18 @@ install_input = installer_fixtures.install_input
 Q = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture(autouse=True)
+def protected_current_sources(tmp_path, monkeypatch):
+    """Exact protected fixture inputs; retain both native source loader checks."""
+    from test_a0_runtime import a0
+    for name, filename in (('PROFILE_SOURCE', 'a0_profile.py'), ('WEB_SOURCE', 'a0_web.py')):
+        source = Q / 'plugins/friday_rework/adapters' / filename
+        data = source.read_bytes(); target = tmp_path / filename
+        target.write_bytes(data); target.chmod(0o600)
+        assert hashlib.sha256(target.read_bytes()).digest() == hashlib.sha256(data).digest()
+        for module in (runtime, a0): monkeypatch.setattr(module, name, target)
+
+
 def future():
     # Explicitly synthetic: no assertion that these endpoints/models exist.
     return dict(

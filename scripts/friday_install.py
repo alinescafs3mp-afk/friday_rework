@@ -173,7 +173,7 @@ def directory(path):
 def spec_checked(value):
     fields = {'home', 'bootstrap_python', 'hermes_donor', 'hermes_prepare',
               'sources_lock', 'dsh_donor', 'a0_donor', 'product', 'project_files', 'seconds', 'containment'}
-    require(isinstance(value, dict) and set(value) == fields | (set(value) & {'dashboard_tls', 'credential_sources'}), 'explicit_install_fields_required')
+    require(isinstance(value, dict) and set(value) == fields | (set(value) & {'dashboard_tls', 'credential_sources', 'worker_install'}), 'explicit_install_fields_required')
     if 'credential_sources' in value:
         from scripts.install_credentials import references
         references(value['credential_sources'])
@@ -197,6 +197,8 @@ def spec_checked(value):
                 'scripts/friday-rework-docker.service',
                 'tools/configure_product.py', 'tools/configure_local_test.py',
                 'tools/web_profile.py', 'config/SOUL.md', 'config/RESEARCH.md'}
+    if 'worker_install' in value:
+        required.add('scripts/worker_install.py')
     required.update(str(p.relative_to(ROOT)) for p in (ROOT / 'plugins/friday_rework').rglob('*')
                     if p.is_file())
     required.update(str(p.relative_to(ROOT)) for p in (ROOT / 'patches/hermes').rglob('*')
@@ -247,6 +249,9 @@ def spec_checked(value):
                 and chat['context_length'] == selected['context']
                 and chat['max_output_tokens'] == selected['main_output']
                 and selected['key_env'] == 'FRIDAY_LLM_API_KEY', 'a0_product_inference_profile_mismatch')
+    if 'worker_install' in value:
+        from scripts.worker_install import settings
+        settings(value)
     build_config(**product['inference'])
     require(product['web'].get('profile') in ('exa-paid','exa-keyless')
             and set(product['web']) == {'profile', 'extract_char_limit', 'extract_timeout'}
@@ -303,8 +308,14 @@ def commands(value):
     python = value['bootstrap_python']['path']; helper = str(ROOT / 'scripts/friday_native.py')
     launcher = str(source / '.hermes/bin/hermes')
     from scripts.a0_prepare import service_plan
+    planned = value
+    if 'worker_install' in value:
+        from scripts.worker_install import declared_a0
+        product = dict(value['product'], runtime=declared_a0(value, home))
+        planned = dict(value, product=product)
     return {
-        'a0_service_effect_plan': service_plan(value, home),
+        'worker_preparation_mode': 'BOTH_WORKERS_REQUIRED' if 'worker_install' in value else 'LEGACY_EXPLICIT_TEMPLATE',
+        'a0_service_effect_plan': service_plan(planned, home),
         'compose': [python, '-B', value['hermes_prepare']['path'], '--repository', str(ROOT),
                     '--donor', value['hermes_donor'], '--destination', str(source),
                     '--seconds', str(min(120, value['seconds']))],
@@ -515,23 +526,35 @@ def install(value, input_path, *, budget=None):
     expression = 'from pm.environments import project_python; from pathlib import Path; print(project_python(Path.cwd()))'
     selected = execute('pm_python', [value['bootstrap_python']['path'], '-B', '-c', expression], source, 15)
     require(Path(selected).is_absolute() and Path(selected).is_file(), 'native_pm_python_missing')
+    def prepare_harness():
+        for phase, command in zip(('source', 'toolchain', 'build', 'smoke'), argv['harness']):
+            execute('harness_' + phase, command, ROOT)
+    if 'worker_install' in value:
+        prepare_harness()
+        execute('a0_inventory', argv['a0_inventory'], ROOT, 120)
     execute('native_completion', [selected, '-B', str(ROOT / 'scripts/friday_native.py'), 'install',
              '--input', str(input_path), '--deadline', str(budget.deadline)], source)
-    for phase, command in zip(('source', 'toolchain', 'build', 'smoke'), argv['harness']):
-        execute('harness_' + phase, command, ROOT)
+    if 'worker_install' not in value:
+        prepare_harness()
     return finish_install(value, input_hash, home, donors, source, receipt, receipt_path, claim, budget, execute, argv)
 
 
 def finish_install(value, input_hash, home, donors, source, receipt, receipt_path, claim, budget, execute, argv):
     """The same remaining completion path for fresh and explicitly resumed installs."""
-    if value['product']['web']['profile'] == 'exa-keyless':
-        budget.call(stage_keyless_provider, Path(value['dsh_donor']))
-    execute('a0_inventory', argv['a0_inventory'], ROOT, 120)
+    if 'worker_install' not in value:
+        if value['product']['web']['profile'] == 'exa-keyless':
+            budget.call(stage_keyless_provider, Path(value['dsh_donor']))
+        execute('a0_inventory', argv['a0_inventory'], ROOT, 120)
+    effective = value
+    if 'worker_install' in value:
+        from scripts.worker_install import installed_product
+        effective = dict(value, product=budget.call(installed_product, value, home))
     budget.call(composition_checked, value, source, receipt, donors['hermes'])
     marker = {'schema': SCHEMA, 'state': 'INSTALLED_TEMPLATE_INCOMPLETE',
               'input_sha256': input_hash, 'source_receipt_sha256': digest(budget.call(owned_file, receipt_path)),
               'home': str(home), 'source': str(source), 'runtime_ready': False,
               'gateway_installed': False, 'remaining': gaps(),
+              'worker_preparation_mode': 'BOTH_WORKERS_REQUIRED' if 'worker_install' in value else 'LEGACY_EXPLICIT_TEMPLATE',
               'original_attempt': claim,
               'invocation_completion': 'NOT_PROVEN_BY_OUTPUT_RECEIPT'}
     if 'tls' in value['product']['dashboard']:
@@ -544,10 +567,14 @@ def finish_install(value, input_hash, home, donors, source, receipt, receipt_pat
     marker['plugin_files'] = {name: sha for name, sha in value['project_files'].items()
                               if name.startswith('plugins/friday_rework/')}
     from scripts.a0_prepare import service_required, service_receipt_checked
-    if service_required(value):
-        budget.call(service_receipt_checked, value, home, original_attempt=claim)
+    if service_required(effective):
+        budget.call(service_receipt_checked, effective, home, original_attempt=claim)
         marker['a0_service_receipt_sha256'] = digest(budget.call(
             owned_file, home / 'preparation/a0-service.receipt.json', private=True))
+    if 'worker_install' in value:
+        marker['worker_files'] = {str(p.relative_to(home)): digest(budget.call(owned_file, p, private=True))
+                                  for p in sorted((home / 'workers').rglob('*')) if p.is_file()}
+        marker['worker_state'] = 'BOTH_CONFIGURED_QUALIFICATION_PENDING'
     pending = home / (MARKER + '.completed')
     publish(pending, marker, budget=budget)
     require(budget.call(read_json, home / MARKER) == claim, 'install_claim_changed')
@@ -583,6 +610,8 @@ def resume_inputs(request):
     old, value, claim, failure = (read_json(paths[name]) for name in
         ('original_input', 'current_input', 'original_claim', 'original_failure'))
     require(all(isinstance(v, dict) for v in (old, value, claim, failure)), 'invalid_resume_input_shape')
+    require('worker_install' not in old and 'worker_install' not in value,
+            'normal_worker_partial_requires_reconciliation')
     home = canonical(old['home']); directory(home)
     require(paths['original_claim'] == home / MARKER
             and paths['original_failure'] == home / FAILURE,
@@ -789,12 +818,21 @@ def inspect(value, input_hash):
     require(marker.get('plugin_files') == expected_plugins, 'installed_plugin_inventory_changed')
     for name, sha in expected_plugins.items():
         require(digest(owned_file(home / name, private=True)) == sha, 'installed_plugin_changed')
+    effective = value
+    if 'worker_install' in value:
+        files = marker.get('worker_files')
+        actual = {str(p.relative_to(home)) for p in (home / 'workers').rglob('*') if p.is_file()}
+        require(isinstance(files, dict) and set(files) == actual
+                and all(digest(owned_file(home / p, private=True)) == h for p, h in files.items()),
+                'installed_worker_inputs_changed')
+        from scripts.worker_install import installed_product
+        effective = dict(value, product=installed_product(value, home))
     from scripts.a0_prepare import service_required, service_receipt_checked
-    if service_required(value):
+    if service_required(effective):
         path = home / 'preparation/a0-service.receipt.json'
         require(digest(owned_file(path, private=True)) == marker.get('a0_service_receipt_sha256'),
                 'a0_service_receipt_changed')
-        service_receipt_checked(value, home, original_attempt=marker['original_attempt'])
+        service_receipt_checked(effective, home, original_attempt=marker['original_attempt'])
     return {'state': 'TEMPLATE_INCOMPLETE', 'ready': False, 'home': str(home),
             'effects': 'NONE', 'remaining': gaps(),
             'invocation_completion': 'NOT_PROVEN_BY_OUTPUT_RECEIPT'}
@@ -805,7 +843,11 @@ def start(value, input_hash, *, budget=None, input_path=None):
     budget = budget or Budget(value.get('seconds'))
     budget.call(inspect, value, input_hash)
     # A source/rendered status cannot stand in for any configured runtime.
-    require(value['product']['runtime'].get('enabled') is True,
+    effective = value
+    if 'worker_install' in value:
+        from scripts.worker_install import installed_product
+        effective = dict(value, product=budget.call(installed_product, value, Path(value['home'])))
+    require(effective['product']['runtime'].get('enabled') is True,
             'mandatory_a0_web_kernel_and_final_native_dashboard_owner_not_admitted')
     require(input_path is not None, 'original_start_input_required')
     require(digest(budget.call(owned_file, input_path, private=True)) == input_hash,

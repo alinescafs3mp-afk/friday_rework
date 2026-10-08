@@ -32,6 +32,14 @@ def service(install_input, tmp_path, monkeypatch):
     config = root / 'config/daemon.json'; config.write_text('synthetic daemon input\n'); config.chmod(0o600)
     script = deploy / 'docker-29.8.2/docker-rootless-extras/dockerd-rootless.sh'
     script.parent.mkdir(mode=0o700, parents=True); script.write_text('NEVER EXECUTED\n'); script.chmod(0o700)
+    # Git worktrees may be group-writable; the native loader intentionally
+    # accepts only protected source. Copy the exact reviewed bytes inside the
+    # private fixture rather than bypassing that loader or changing a checkout.
+    profile_source = deploy / 'a0_profile.py'
+    raw = (entry.ROOT / 'plugins/friday_rework/adapters/a0_profile.py').read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == value['project_files']['plugins/friday_rework/adapters/a0_profile.py']
+    profile_source.write_bytes(raw); profile_source.chmod(0o600)
+    monkeypatch.setattr(runtime, 'PROFILE_SOURCE', profile_source)
     monkeypatch.setattr(runtime, 'PROJECT', deploy)
     monkeypatch.setattr(runtime, 'RUNTIME', custody)
     monkeypatch.setattr(runtime, 'LAUNCHER', root / 'launch.py')
