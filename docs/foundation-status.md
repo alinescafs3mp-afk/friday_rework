@@ -1,5 +1,7 @@
 # Foundation checkpoint — 2026-10-09
 
+09.10.2026, срез incremental-08: exact joined source прошёл независимое source review; J1/R1/R2 закрыты для bounded build. Первые `finite_birth.so`/`gnu_arm_shim.so` действительно собраны (3223a686/39c0dfdd), 347 inputs до/после, обе compiler exit0, без загрузки. Полные изменённые исходники, path-only relocations и все изменённые JSON maps учтены в [аналитическом пакете](../analysis/2026-10-09/incremental-08/README.md). Статический ELF не закрывает ABI/provider/kernel/F6. Live и установленный продукт 7 journeys / 4 web UNACCEPTED; исходные бюджеты, G20 consumed/closed, A0/TS/UC1/browser stops и old product OFF сохранены.
+
 09.10.2026: сохранён [исходный срез F4 native/F5 bootstrap](../analysis/2026-10-09/incremental-07/README.md). F4 реализует native birth/exec в том же caller, F5 — GNU shim и TraceCustody bootstrap. Independent source review требует R1/R2 failure-flow ремонта; root review F5 нашёл J1: три устаревших вложенных SHA из 76. Это законченные непринятые исходники и результаты анализа. Final join/build/ABI/F6 отсутствуют в срезе. Все 7 journeys и 4 web UNACCEPTED, прежняя Friday OFF, G20 CLOSED без retry. Исходные ресурсы, сценарии и stop-границы сохранены.
 
 Current analysis update: 9 October, 22:10 MSK. The first daily publication is

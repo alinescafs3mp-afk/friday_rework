@@ -27,3 +27,5 @@ See `docs/mandatory-web-admin.md` and `validation/acceptance-web-admin.json` for
 [Caller bootstrap failures and contract corrections](analysis/2026-10-09/incremental-06/README.md) adds the next completed source-analysis block after the verified daily commit `00c3b825260792b834e7f2aecf19eaabaa02935d`, including explicit late upstream-service carryover. F4/F5 remain unclosed; active successors and runtime acceptance are outside this cut.
 
 Промежуточный [срез исходников F4 native/F5 bootstrap от 09.10.2026](analysis/2026-10-09/incremental-07/README.md) сохраняет полный изменённый код и три открытых source findings R1/R2/J1. Обе реализации не приняты; final build/F6 NOT_RUN, продуктовая приёмка не меняется.
+
+09.10.2026: [incremental-08](analysis/2026-10-09/incremental-08/README.md) сохраняет объединённый исходник с независимо закрытыми J1/R1/R2 и первые две DSO-сборки PASS без загрузки. Полные изменённые тела и внутренние pin-map delta опубликованы для анализа; ABI/F6 и установленный продукт (7 journeys / 4 web) остаются UNACCEPTED.

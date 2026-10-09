@@ -1,0 +1,5 @@
+Эта подборка не устанавливает новую лицензию проекта. Существующие notices в авторских исходниках сохранены. Полные донорские исходники, заголовки и бинарники не копируются.
+
+GNU coreutils 9.7: [timeout.c](https://github.com/coreutils/coreutils/blob/v9.7/src/timeout.c), [GNU GPL-3.0-or-later](https://github.com/coreutils/coreutils/blob/v9.7/COPYING). Linux 7.0: [fork.c](https://github.com/torvalds/linux/blob/v7.0/kernel/fork.c), [GPL-2.0-only и notices отдельных файлов](https://github.com/torvalds/linux/blob/v7.0/COPYING). CPython 3.14.7: [posixmodule.c](https://github.com/python/cpython/blob/v3.14.7/Modules/posixmodule.c), [PSF License Version 2 и исторические notices](https://github.com/python/cpython/blob/v3.14.7/LICENSE). GNU shim — авторская обвязка динамических API, без копии timeout.c.
+
+Версии, сохранённые SHA и дата наблюдений 09.10.2026 указаны в [upstream-source-references.json](upstream-source-references.json). Это ссылки на ранее изученные источники; сеть при подготовке не использовалась. Прежние [notices](../incremental-06/THIRD_PARTY_NOTICES.md) сохраняются. Совпадение исходников с установленными бинарниками и runtime-приёмка не заявлены.
