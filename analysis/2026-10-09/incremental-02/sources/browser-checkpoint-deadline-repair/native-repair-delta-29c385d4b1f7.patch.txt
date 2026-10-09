@@ -1,0 +1,712 @@
+--- original/native/agent/web_call_context.py
++++ repaired/native/agent/web_call_context.py
+@@ -20,7 +20,9 @@
+         # Admission sees the latch even while launch holds the lock. Neither a
+         # reused thread id nor clear_interrupt() can clear this turn's intent.
+         self.stopped.set()
+-        if not self.lock.acquire(timeout=2):
++        ceiling = getattr(self, 'browser_deadline', None)
++        timeout = max(0.0, min(2.0, ceiling-time.monotonic())) if ceiling is not None else 2.0
++        if not self.lock.acquire(timeout=timeout):
+             self.receipt = {'status': 'STOP_UNCONFIRMED', 'reason': 'web_launch_unsettled'}
+             return self.receipt
+         try:
+@@ -67,7 +69,13 @@
+ 
+     def stop(self):
+         self.stopped.set()
+-        if not self.turn.lock.acquire(timeout=2):
++        ceiling = self.deadline()
++        owner = getattr(self, 'browser_owner', None)
++        if owner is not None:
++            ceiling = min(ceiling, owner.original_deadline)
++        if self.session is not None and getattr(self.session, 'browser_custody', False):
++            ceiling = min(ceiling, self.session.web_deadline, self.session.browser_client_deadline)
++        if not self.turn.lock.acquire(timeout=max(0.0, min(2.0, ceiling-time.monotonic()))):
+             self.receipt = {'status':'STOP_UNCONFIRMED','reason':'web_launch_unsettled'}
+             return self.receipt
+         try:
+--- original/native/tests/hermes_cli/test_friday_browser_runtime.py
++++ repaired/native/tests/hermes_cli/test_friday_browser_runtime.py
+@@ -340,13 +340,19 @@
+     # Dedicated test_browser_owner_join.py checks the real association methods;
+     # these older mechanics controls still prove only retained client behavior.
+     from tools import browser_tool_owner as owner_module, process_registry as registry_module
+-    injected_owner = SimpleNamespace(check=lambda: 110.0, require_route_task=lambda value: None)
++    from contextlib import nullcontext
++    injected_owner = SimpleNamespace(check=lambda: 110.0, original_deadline=110.0,
++        fence=lambda deadline=None: nullcontext(110.0), require_route_task=lambda value: None)
++    monkeypatch.setattr(owner_module, 'time', timer)
+     monkeypatch.setattr(owner_module, 'current_browser_owner', lambda: injected_owner)
+-    monkeypatch.setattr(owner_module, 'bind_browser_session', lambda *args: injected_owner)
++    def injected_bind(key, info):
++        info['_friday_execution_owner'] = injected_owner
++        return injected_owner
++    monkeypatch.setattr(owner_module, 'bind_browser_session', injected_bind)
+     class RegistryDouble:
+         def prepare_browser_client(self, owner, key, info, custody):
+             assert owner is injected_owner and info.get('_friday_direct_client') is None
+-            record = info.setdefault('_friday_registry_session', SimpleNamespace(process=None, stopped=False))
++            record = info.setdefault('_friday_registry_session', SimpleNamespace(process=None, stopped=False, web_deadline=110.0, browser_client_deadline=custody['deadline']))
+             record.custody = custody
+             return record
+         def retain_browser_client(self, record, info, custody, proc):
+@@ -450,8 +456,9 @@
+     if stage == 'fence':
+         original = m.session._check_session_authority
+         def delayed(key, info):
+-            original(key, info)
++            owner = original(key, info)
+             m.clock.now = 111.0
++            return owner
+         monkeypatch.setattr(m.session, '_check_session_authority', delayed)
+         with pytest.raises(runtime.BrowserPolicyError, match='deadline_exhausted'):
+             m.session.run_fenced_pair(m.info, lambda: m.session._dispatch_browser_command(
+--- original/native/tests/tools/test_browser_owner_join.py
++++ repaired/native/tests/tools/test_browser_owner_join.py
+@@ -407,6 +407,35 @@
+     assert info['_friday_direct_client']['proc'] is original
+ 
+ 
++@pytest.mark.parametrize('corruption', ['missing', 'relaxed_to_owner_deadline'])
++def test_checkpoint_command_deadline_corruption_keeps_original_client(native_owner, registry, monkeypatch, corruption):
++    info, custody, session = _prepare_unit_only(native_owner, registry, monkeypatch)
++    # A valid retained owner limit does not replace a tighter command limit.
++    custody['deadline'] = session.browser_client_deadline = 104.0
++    assert session.web_deadline == 110.0
++    original_writer = registry._write_checkpoint
++
++    def corrupt_writer():
++        original_writer()
++        rows = json.loads(registry.checkpoint.read_text())
++        if corruption == 'missing':
++            rows[0].pop('browser_client_deadline')
++        else:
++            rows[0]['browser_client_deadline'] = session.web_deadline
++        registry.checkpoint.write_text(json.dumps(rows))
++
++    monkeypatch.setattr(registry, '_write_checkpoint', corrupt_writer)
++    proc = SimpleNamespace(pid=12345678, returncode=None)
++    custody.update(proc=proc, pid=proc.pid)
++    with pytest.raises(RuntimeError, match='web_checkpoint_required'):
++        registry.retain_browser_client(session, info, custody, proc)
++    assert registry._running[session.id] is session and session.process is proc
++    assert session.browser_client_custody is custody
++    assert info['_friday_direct_client']['proc'] is proc
++    assert session.browser_client_deadline == custody['deadline'] == 104.0
++    assert not session.browser_client_wait_confirmed and not session.web_settled
++
++
+ @pytest.mark.asyncio
+ async def test_async_http_backend_keeps_context_owner_and_vetted_ip(native_owner, monkeypatch):
+     n = native_owner
+@@ -421,3 +450,192 @@
+     # Real asyncio.to_thread context propagation; no socket/subprocess/browser.
+     assert await backend.connect_tcp('example.test', 443, timeout=999) == 'unit-async-stream'
+     assert dialed == [('8.8.8.8', 443, 10.0)]
++
++
++@pytest.fixture
++def joined_client(native_owner, registry, monkeypatch):
++    """Existing native join, private files and fake Popen; no execution grant."""
++    from tools import browser_tool as bt, browser_tool_session as sessions
++    from tools import browser_tool_lifecycle as lifecycle
++    from hermes_cli import browser_runtime as runtime
++    n = native_owner
++    monkeypatch.setattr(sessions, 'time', SimpleNamespace(monotonic=lambda: n.clock.now))
++    monkeypatch.setattr(runtime, 'time', SimpleNamespace(monotonic=lambda: n.clock.now))
++    monkeypatch.setattr(processes, 'process_registry', registry)
++    monkeypatch.setattr(runtime, 'local_policy', lambda: {})
++    monkeypatch.setattr(runtime, 'check_managed_execution', lambda deadline: None)
++    monkeypatch.setattr(registry, 'require_browser_execution', lambda owner: None)
++    key = n.owner.task_key(); info = _info(n)
++    info.update(session_key=key, _friday_execution_owner=n.owner)
++    monkeypatch.setattr(bt, '_active_sessions', {key: info})
++    monkeypatch.setattr(bt, '_cleanup_lock', threading.Lock())
++    monkeypatch.setattr(lifecycle, '_stop_retained_managed_daemon', lambda info: None)
++    return SimpleNamespace(n=n, registry=registry, sessions=sessions, bt=bt,
++                           lifecycle=lifecycle, runtime=runtime, key=key, info=info)
++
++
++def _unequal_calls(n, current_deadline):
++    # The original fixture's common run=110 could conceal deadline drift.
++    n.agent._web_run_deadline = n.call.run_deadline = 200.0
++    n.call.base_deadline = 110.0
++    call = calls.make_web_call(n.agent, current_deadline, 'task-A', 'call-B')
++    call.session_key = n.call.session_key
++    return call
++
++
++@pytest.mark.parametrize('current,command,expected', [(120., 130., 110.), (105., 130., 105.), (120., 104., 104.)])
++def test_unequal_original_current_run_and_command_join(joined_client, monkeypatch, current, command, expected):
++    j = joined_client; n = j.n
++    second = _unequal_calls(n, current)
++    proc = SimpleNamespace(pid=12345678, returncode=None)
++    monkeypatch.setattr(j.sessions.subprocess, 'Popen', lambda *a, **kw: proc)
++    with calls.bind_web_call(second):
++        assert second.run_deadline == 200.0 and n.owner.original_deadline == 110.0
++        assert j.sessions._session_command_deadline(j.key, j.info, command) == expected
++        returned = j.sessions._popen_agent_browser(['unit-only'], {'HOME': str(n.home)},
++            str(n.tmp), 'join', deadline=command, managed_required=True, task_id=j.key, session_info=j.info)
++        custody = j.info['_friday_direct_client']; record = j.info['_friday_registry_session']
++        assert returned is proc and custody['proc'] is proc and record.process is proc
++        assert custody['deadline'] == record.browser_client_deadline == expected
++        assert record.web_deadline == 110.0
++        assert json.loads(record.browser_identity)['original_deadline'] == 110.0
++        assert json.loads(j.registry.checkpoint.read_text())[0]['browser_client_deadline'] == expected
++
++
++@pytest.mark.parametrize('wait_succeeds', [False, True])
++def test_expired_original_clock_allows_only_zero_wait_and_retains_handle(joined_client, monkeypatch, wait_succeeds):
++    j = joined_client; n = j.n; waits = []
++    proc = SimpleNamespace(pid=12345678, returncode=None, kill=lambda: None)
++    def wait(timeout):
++        waits.append(timeout)
++        if not wait_succeeds:
++            raise j.sessions.subprocess.TimeoutExpired('unit-only', timeout)
++        proc.returncode = -9
++        return -9
++    proc.wait = wait
++    monkeypatch.setattr(j.sessions.subprocess, 'Popen', lambda *a, **kw: proc)
++    second = _unequal_calls(n, 120.)
++    with calls.bind_web_call(second):
++        j.sessions._popen_agent_browser(['unit-only'], {'HOME': str(n.home)}, str(n.tmp), 'expired',
++            deadline=130., managed_required=True, task_id=j.key, session_info=j.info)
++        record = j.info['_friday_registry_session']; n.clock.now = 110.0
++        failure = TimeoutError('original owner expired')
++        j.sessions._stop_failed_managed_client(proc, j.key, j.info, 110., failure)
++        assert waits == [0.0]  # No fresh one-second grace under run=200/current=120.
++        assert record.process is proc and record.browser_client_custody['proc'] is proc
++        assert record.web_stop_requested and not record.web_settled
++        assert j.info['_friday_stop_unconfirmed']
++        if not wait_succeeds:
++            assert j.info['_friday_direct_client']['proc'] is proc
++        else:
++            assert j.info['_friday_client_diagnostics']['handle_id'] == id(proc)
++
++
++def test_launch_stop_original_inverted_interleaving_is_bounded(joined_client, monkeypatch):
++    """Separate finite guard required; old cleanup->turn bytes fail this schedule.
++
++    Pause the real owner's call precheck before its turn acquisition, after the
++    launcher has passed the initial slot check. Stop owns the actual turn while
++    entering the actual registry/lifecycle cleanup path. Fixed launch has not
++    acquired cleanup yet, so stop can finish and launch must refuse.
++    """
++    import inspect
++    j = joined_client; n = j.n
++    custody = {'output_paths': (), 'deadline': 110.0}
++    record = j.registry.prepare_browser_client(n.owner, j.key, j.info, custody)
++    armed = threading.Event(); prechecked = threading.Event(); turn_held = threading.Event()
++    release = threading.Event(); outcomes = []; created = []
++    original_slot = j.sessions._require_managed_client_slot
++    def slot(*args):
++        original_slot(*args)
++        armed.set()
++    monkeypatch.setattr(j.sessions, '_require_managed_client_slot', slot)
++    original_current = calls.current_web_call
++    def paused_current():
++        call = original_current()
++        frame = inspect.currentframe().f_back
++        if (threading.current_thread().name == 'browser-launch-control' and armed.is_set()
++                and frame.f_code.co_name == 'check' and frame.f_globals.get('__name__') == owners.__name__
++                and not prechecked.is_set()):
++            prechecked.set()
++            assert release.wait(2), 'control release missing'
++        return call
++    monkeypatch.setattr(calls, 'current_web_call', paused_current)
++    monkeypatch.setattr(j.sessions.subprocess, 'Popen', lambda *a, **kw: created.append(a))
++    context = contextvars.copy_context()
++    def launch():
++        try:
++            context.run(j.sessions._popen_agent_browser, ['unit-only'], {'HOME': str(n.home)},
++                str(n.tmp), 'race', deadline=110., managed_required=True, task_id=j.key, session_info=j.info)
++        except (PermissionError, RuntimeError, TimeoutError) as exc:
++            outcomes.append(('launch-refused', type(exc).__name__))
++    def stop():
++        with n.call.turn.lock:
++            turn_held.set()
++            outcomes.append(('stop', n.call.stop()['status']))
++    launcher = threading.Thread(target=launch, name='browser-launch-control')
++    stopper = threading.Thread(target=stop, name='browser-stop-control')
++    launcher.start()
++    try:
++        assert prechecked.wait(2), 'launch did not reach actual pre-turn seam'
++        stopper.start()
++        assert turn_held.wait(2), 'stop did not retain actual turn fence'
++    finally:
++        release.set()
++    launcher.join(3); stopper.join(3)
++    assert not launcher.is_alive() and not stopper.is_alive(), 'cleanup/turn ABBA cycle'
++    assert ('stop', 'STOP_UNCONFIRMED') in outcomes
++    assert any(item[0] == 'launch-refused' for item in outcomes)
++    assert not created and record.web_stop_requested and j.registry._running[record.id] is record
++
++
++def test_stop_during_returned_popen_keeps_exact_handle_and_intent(joined_client, monkeypatch):
++    j = joined_client; n = j.n
++    proc = SimpleNamespace(pid=12345678, returncode=None)
++    def returned(*a, **kw):
++        # A syscall may return after stop intent; publication must still happen
++        # under both existing locks before stop can settle the boundary.
++        assert n.call.turn.lock._is_owned() and j.bt._cleanup_lock.locked()
++        n.call.stopped.set()
++        return proc
++    monkeypatch.setattr(j.sessions.subprocess, 'Popen', returned)
++    def fail_checkpoint(record):
++        if record.process is not None:
++            raise OSError('post-return checkpoint failure')
++        return web.WebProcessMixin._web_checkpoint(j.registry, record)
++    monkeypatch.setattr(j.registry, '_web_checkpoint', fail_checkpoint)
++    with pytest.raises(OSError, match='post-return'):
++        j.sessions._popen_agent_browser(['unit-only'], {'HOME': str(n.home)}, str(n.tmp), 'custody',
++            deadline=110., managed_required=True, task_id=j.key, session_info=j.info)
++    record = j.info['_friday_registry_session']
++    assert record.process is proc and j.info['_friday_direct_client']['proc'] is proc
++    assert n.call.stopped.is_set() and not record.web_settled
++
++
++def test_outer_wait_uses_first_owner_not_later_call_or_run(joined_client, monkeypatch):
++    j = joined_client; n = j.n; waits = []
++    monkeypatch.setattr(j.sessions, '_browser_in_sandbox', lambda: False)
++    monkeypatch.setattr(j.sessions, '_prepare_session_socket_dir', lambda *a, **k: str(n.tmp))
++    monkeypatch.setattr(j.sessions, '_agent_browser_command_env',
++        lambda *a, **k: {'HOME': str(n.home), 'AGENT_BROWSER_CONFIG': 'unit-only'})
++    monkeypatch.setattr(j.sessions, '_apply_chromium_sandbox_args', lambda env: None)
++    monkeypatch.setattr(j.lifecycle, '_retain_managed_daemon_identity', lambda *a: None)
++    proc = SimpleNamespace(pid=12345678, returncode=None, kill=lambda: None)
++    def wait(timeout):
++        waits.append(timeout)
++        if len(waits) == 1:
++            n.clock.now = 110.01
++            raise j.sessions.subprocess.TimeoutExpired('unit-only', timeout)
++        proc.returncode = -9
++        return -9
++    proc.wait = wait
++    monkeypatch.setattr(j.sessions.subprocess, 'Popen', lambda *a, **kw: proc)
++    second = _unequal_calls(n, 120.)
++    with calls.bind_web_call(second):
++        n.clock.now = 109.9
++        with pytest.raises((PermissionError, RuntimeError, TimeoutError)):
++            j.sessions._spawn_and_collect(j.key, j.info, ['unit-only', 'snapshot'],
++                'snapshot', 'chrome', 30., deadline=130.)
++    assert waits == [pytest.approx(.1), 0.0]
++    assert j.info['_friday_registry_session'].process is proc
++    assert j.info['_friday_stop_unconfirmed']
+--- original/native/tools/browser_tool_lifecycle.py
++++ repaired/native/tools/browser_tool_lifecycle.py
+@@ -758,7 +758,9 @@
+     must still release the cloud session and the local Chromium.
+     """
+     if session_info.get('_friday_managed'):
+-        with _bt._cleanup_lock:
++        # Sticky intent precedes even an expired/nonblocking lock attempt.
++        session_info['_friday_stop_unconfirmed'] = True
++        with _session._managed_cleanup_lock(session_info):
+             session_info['_friday_stop_unconfirmed'] = True
+         # A signal, absent PID file, dead/zombie leader or best-effort tree kill
+         # cannot prove an owned cgroup and every listener ceased. No compatible
+@@ -811,6 +813,13 @@
+ 
+     Janitor last resort after repeated cleanup failures (#100738).
+     """
++    original = _bt._active_sessions.get(task_id)
++    if original and original.get('_friday_managed'):
++        with _session._managed_cleanup_lock(original):
++            if _bt._active_sessions.get(task_id) is not original:
++                raise RuntimeError('browser_original_session_custody_changed')
++        _release_session_resources(task_id, original, _client_reconciled=_client_reconciled)
++        return
+     with _bt._cleanup_lock:
+         session_info = _bt._active_sessions.get(task_id)
+     if session_info and session_info.get('_friday_managed'):
+@@ -827,6 +836,13 @@
+ 
+ def _cleanup_single_browser_session(task_id: str) -> None:
+     """Reap a single browser session by its exact session key."""
++    original = _bt._active_sessions.get(task_id)
++    if original and original.get('_friday_managed'):
++        with _session._managed_cleanup_lock(original):
++            if _bt._active_sessions.get(task_id) is not original:
++                raise RuntimeError('browser_original_session_custody_changed')
++        _release_session_resources(task_id, original)
++        return
+     with _bt._cleanup_lock:
+         retained = _bt._active_sessions.get(task_id)
+     if retained and retained.get('_friday_managed'):
+--- original/native/tools/browser_tool_owner.py
++++ repaired/native/tools/browser_tool_owner.py
+@@ -4,6 +4,7 @@
+ objects, the actual UserScope and its original deadline; it creates no job,
+ clock, process manager, network service or authority from configuration.
+ """
++from contextlib import contextmanager
+ from dataclasses import dataclass
+ import math
+ from pathlib import Path
+@@ -37,6 +38,19 @@
+     return value
+ 
+ 
++@contextmanager
++def browser_lock(lock, deadline):
++    """Bound an existing lock by an already retained ceiling; never renew it."""
++    if type(deadline) not in (int, float) or not math.isfinite(deadline):
++        raise BrowserOwnerRefused('browser_original_owner_deadline_required')
++    if not lock.acquire(timeout=max(0.0, min(2.0, deadline - time.monotonic()))):
++        raise BrowserOwnerRefused('browser_owner_lock_unsettled')
++    try:
++        yield
++    finally:
++        lock.release()
++
++
+ @dataclass(frozen=True)
+ class BrowserOwner:
+     call: object
+@@ -57,7 +71,8 @@
+                 or _call_identity(actual)[:4] != self.call_identity[:4]
+                 or actual.turn is not self.call.turn):
+             raise BrowserOwnerRefused('browser_native_owner_changed')
+-        with self.call.turn.lock:
++        with browser_lock(self.call.turn.lock, min(self.original_deadline, actual.deadline(),
++                getattr(self.call.turn, 'browser_deadline', self.original_deadline))):
+             if (self.call not in self.call.turn.calls or actual not in self.call.turn.calls
+                     or self.call.stopped.is_set() or self.call.turn.stopped.is_set()):
+                 raise BrowserOwnerRefused('browser_original_owner_stopped')
+@@ -72,6 +87,19 @@
+         if Path('/proc/sys/kernel/random/boot_id').read_text().strip() != self.boot_id:
+             raise BrowserOwnerRefused('browser_original_boot_changed')
+         return _finite_deadline(min(self.original_deadline, actual.deadline()))
++
++    @contextmanager
++    def fence(self, deadline=None):
++        """Launch/publication lock order is turn -> cleanup -> registry.
++
++        Stop uses the same turn fence. Hold it until the returned child and its
++        checkpoint custody have been published, including error paths.
++        """
++        ceiling = self.original_deadline if deadline is None else min(self.original_deadline, deadline)
++        ceiling = min(ceiling, getattr(self.call.turn, 'browser_deadline', ceiling))
++        with browser_lock(self.call.turn.lock, ceiling):
++            ceiling = min(ceiling, self.check())
++            yield ceiling
+ 
+     def task_key(self):
+         self.check()
+@@ -112,7 +140,8 @@
+         # Operator/no-principal is not an ambient network grant. Its native job
+         # producer is a concrete separate gap, not a manufactured UserScope.
+         cap = current(required=True)
+-        with call.turn.lock:
++        with browser_lock(call.turn.lock, min(call.deadline(),
++                getattr(call.turn, 'browser_deadline', call.deadline()))):
+             if call not in call.turn.calls:
+                 raise BrowserOwnerRefused('browser_actual_native_turn_membership_required')
+             call.check()
+@@ -120,6 +149,8 @@
+                                     _finite_deadline(call.deadline()),
+                                     Path('/proc/sys/kernel/random/boot_id').read_text().strip())
+             call.browser_owner = retained
++            call.turn.browser_deadline = min(getattr(call.turn, 'browser_deadline', retained.original_deadline),
++                                             retained.original_deadline)
+     if type(retained) is not BrowserOwner:
+         raise BrowserOwnerRefused('browser_original_owner_object_required')
+     retained.check()
+--- original/native/tools/browser_tool_session.py
++++ repaired/native/tools/browser_tool_session.py
+@@ -4,6 +4,7 @@
+ Split out of ``tools/browser_tool.py``. Facade-owned state is read through ``_bt`` (``tools.browser_tool``, resolved per call) — no import cycle.
+ """
+ 
++from contextlib import nullcontext
+ import base64
+ import json
+ import logging
+@@ -251,10 +252,8 @@
+     managed = managed_required or local_policy() is not None
+     if managed:
+         check_managed_execution(deadline)
+-        from tools.browser_tool_owner import current_browser_owner
+-        deadline = min(check_command_deadline(deadline), current_browser_owner().check())
+-        _check_session_authority(task_id, session_info)
+-        with _bt._cleanup_lock:
++        deadline = _session_command_deadline(task_id, session_info, deadline)
++        with _managed_cleanup_lock(session_info, deadline):
+             _require_managed_client_slot(task_id, session_info)
+     fds = []
+     try:
+@@ -291,16 +290,22 @@
+                                   for slot in ('stdout', 'stderr')),
+             'wait_confirmed': False, 'errors': [],
+         }
+-        with _bt._cleanup_lock:
++        from tools.browser_tool_owner import current_browser_owner
++        from tools.process_registry import process_registry
++        owner = current_browser_owner()
++        # Never acquire the turn fence while holding cleanup. Stop takes this
++        # same order, and cannot settle between intent and child publication.
++        with owner.fence(deadline), _managed_cleanup_lock(session_info, deadline):
+             _require_managed_client_slot(task_id, session_info)
++            deadline = _session_command_deadline(task_id, session_info, deadline)
++            custody['deadline'] = deadline
+             check_managed_execution(deadline)
+-            from tools.browser_tool_owner import current_browser_owner
+-            from tools.process_registry import process_registry
+-            owner = current_browser_owner()
+             registry_session = process_registry.prepare_browser_client(owner, task_id, session_info, custody)
+             custody['registry_session'] = registry_session
+             session_info['_friday_direct_client'] = custody
+             try:
++                owner.check()  # Stop during intent/checkpoint fences creation.
++                check_command_deadline(custody['deadline'])
+                 proc = subprocess.Popen(argv, stdout=fds[0], stderr=fds[1], stdin=stdin, env=env, **_popen_extra)
+             except BaseException:
+                 # Popen did not return an owned child. Existing unresolved
+@@ -344,7 +349,7 @@
+ 
+ def _confirm_managed_client_wait(task_id, session_info, proc, returncode):
+     """Record only the result of an actual wait on this exact original child."""
+-    with _bt._cleanup_lock:
++    with _managed_cleanup_lock(session_info):
+         custody = session_info.get('_friday_direct_client')
+         if (_bt._active_sessions.get(task_id) is not session_info or not custody
+                 or custody['task_id'] != task_id or custody['proc'] is not proc
+@@ -363,7 +368,7 @@
+ 
+ def _release_waited_managed_client(task_id, session_info, *, diagnostic=False):
+     """No process/cgroup claim: release direct-child custody only after wait."""
+-    with _bt._cleanup_lock:
++    with _managed_cleanup_lock(session_info):
+         custody = session_info.get('_friday_direct_client')
+         if custody is None:
+             return
+@@ -387,7 +392,7 @@
+     new budget. Kill failure cannot skip wait. Every failure retains the exact
+     original Popen and its diagnostic paths for a later same-owner invocation.
+     """
+-    with _bt._cleanup_lock:
++    with _managed_cleanup_lock(session_info):
+         custody = session_info.get('_friday_direct_client')
+         if custody is None:
+             return None
+@@ -407,7 +412,7 @@
+         except BaseException as exc:
+             custody['errors'].append('client_stop: ' + type(exc).__name__ + ': ' + str(exc))
+         try:
+-            returncode = proc.wait(timeout=max(0.0, min(1.0, custody['deadline'] - time.monotonic())))
++            returncode = proc.wait(timeout=max(0.0, min(1.0, _retained_session_deadline(session_info) - time.monotonic())))
+             _confirm_managed_client_wait(task_id, session_info, proc, returncode)
+         except BaseException as exc:
+             custody['errors'].append('client_wait: ' + type(exc).__name__ + ': ' + str(exc))
+@@ -525,14 +530,14 @@
+     return _create_cloud_session_or_fallback(task_id, provider)
+ 
+ 
+-def _check_session_authority(task_id: str, session_info: Dict[str, Any]) -> None:
++def _check_session_authority(task_id: str, session_info: Dict[str, Any]):
+     from hermes_cli.friday_user_scope import check_browser, browser_revoked
+     policy_refused = False
+     try:
+         check_browser(session_info)
+         if session_info.get('_friday_managed'):
+             from tools.browser_tool_owner import bind_browser_session
+-            bind_browser_session(task_id, session_info)
++            retained = bind_browser_session(task_id, session_info)
+         if session_info.get('_friday_managed'):
+             from hermes_cli.browser_runtime import local_policy
+             try:
+@@ -541,6 +546,7 @@
+             except PermissionError:
+                 policy_refused = True
+                 raise
++            return retained
+     except (PermissionError, RuntimeError, TimeoutError) as refusal:
+         # A foreign caller may not stop a valid owner's browser. A revoked or
+         # changed retained policy must stop, but stop failure never masks refusal.
+@@ -553,6 +559,35 @@
+                 session_info['_friday_stop_error'] = str(stop_error)
+                 refusal.add_note('STOP_UNCONFIRMED: ' + str(stop_error))
+         raise
++
++
++def _retained_session_deadline(session_info, deadline=None):
++    """Pure retained ceilings for stop/error paths; no ambient caller or grant."""
++    import math
++    owner = session_info.get('_friday_execution_owner')
++    custody = session_info.get('_friday_direct_client')
++    registry = session_info.get('_friday_registry_session')
++    values = [deadline] if deadline is not None else []
++    if owner is not None:
++        values.append(owner.original_deadline)
++    if custody is not None:
++        values.append(custody['deadline'])
++    if registry is not None:
++        values.extend((registry.web_deadline, registry.browser_client_deadline))
++    if not values or any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
++        raise PermissionError('browser_retained_deadline_required')
++    return min(values)
++
++
++def _managed_cleanup_lock(session_info, deadline=None):
++    from tools.browser_tool_owner import browser_lock
++    return browser_lock(_bt._cleanup_lock, _retained_session_deadline(session_info, deadline))
++
++
++def _session_command_deadline(task_id, session_info, deadline):
++    from hermes_cli.browser_runtime import check_command_deadline
++    owner = _check_session_authority(task_id, session_info)
++    return check_command_deadline(min(check_command_deadline(deadline), owner.check()))
+ 
+ 
+ def _get_session_info(task_id: Optional[str] = None, *, deadline=None) -> Dict[str, Any]:
+@@ -609,10 +644,19 @@
+     from hermes_cli.friday_user_scope import capture_browser
+     capture_browser(session_info)
+ 
+-    with _bt._cleanup_lock:
++    from tools.browser_tool_owner import current_browser_owner
++    owner = current_browser_owner() if managed else None
++    if managed:
++        deadline = min(deadline, owner.check())
++    fence = owner.fence(deadline) if managed else nullcontext()
++    lock = _managed_cleanup_lock(session_info, deadline) if managed else _bt._cleanup_lock
++    with fence, lock:
+         if task_id in _bt._active_sessions:  # created concurrently during the network call — don't leak ours
+             from hermes_cli.friday_user_scope import check_browser
+             check_browser(_bt._active_sessions[task_id])
++            if managed:
++                from tools.browser_tool_owner import bind_browser_session
++                bind_browser_session(task_id, _bt._active_sessions[task_id])
+             return _bt._active_sessions[task_id]
+         session_info = dict(session_info)
+         session_info.setdefault("session_key", task_id)
+@@ -961,7 +1005,7 @@
+     managed = bool(session_info.get('_friday_managed')) or local_policy() is not None
+     if managed:
+         check_managed_execution(deadline)
+-        deadline = check_command_deadline(deadline)
++        deadline = _session_command_deadline(task_id, session_info, deadline)
+     if managed and _browser_in_sandbox():
+         raise PermissionError('managed_browser_host_placement_required')
+     task_socket_dir = _prepare_session_socket_dir(session_info["session_name"], deadline=deadline, managed_required=managed)
+@@ -1011,15 +1055,17 @@
+         # example fd cleanup) leaves the exact child in existing custody.
+         custody = session_info.get('_friday_direct_client') if managed else None
+         if custody and custody.get('output_tag') == output_tag and custody.get('proc') is not None:
+-            _stop_failed_managed_client(custody['proc'], task_id, session_info, deadline, failure)
++            _stop_failed_managed_client(custody['proc'], task_id, session_info, custody['deadline'], failure)
+         elif managed and not previously_launched and isinstance(failure, OSError):
+             session_info.pop('_friday_launch_attempted', None)
+         raise
+ 
++    if managed:
++        deadline = min(deadline, session_info['_friday_direct_client']['deadline'])
+     try:
+         if managed:
+             while True:
+-                _check_session_authority(task_id, session_info)
++                deadline = min(deadline, _session_command_deadline(task_id, session_info, deadline))
+                 check_managed_execution(deadline)
+                 _lifecycle._retain_managed_daemon_identity(session_info, task_socket_dir)
+                 from tools.interrupt import is_interrupted
+@@ -1082,13 +1128,14 @@
+             # and actually waited for this same child before raising refusal.
+             diagnostic = session_info.get('_friday_client_diagnostics', {})
+             if (not diagnostic.get('wait_confirmed') or diagnostic.get('handle_id') != id(proc)
+-                    or diagnostic.get('pid') != proc.pid or diagnostic.get('deadline') != deadline):
++                    or diagnostic.get('pid') != proc.pid or diagnostic.get('deadline') < deadline):
+                 raise RuntimeError('browser_original_client_custody_changed')
+             diagnostic['failure'] = type(failure).__name__ + ': ' + str(failure)
+             errors.extend(diagnostic['errors'])
+         else:
+-            if custody['proc'] is not proc or custody['deadline'] != deadline:
++            if custody['proc'] is not proc or custody['deadline'] < deadline:
+                 raise RuntimeError('browser_original_client_custody_changed')
++            custody['deadline'] = min(custody['deadline'], deadline)
+             custody['failure'] = type(failure).__name__ + ': ' + str(failure)
+             reconciled = _reconcile_managed_client(task_id, session_info)
+             errors.extend(reconciled['errors'])
+@@ -1114,12 +1161,12 @@
+     from hermes_cli.browser_runtime import local_policy
+     if session_info.get('_friday_managed') or local_policy() is not None:
+         from hermes_cli.browser_runtime import check_managed_execution
+-        _check_session_authority(session_info.get('session_key', ''), session_info)
++        deadline = _session_command_deadline(session_info.get('session_key', ''), session_info, deadline)
+         check_managed_execution(deadline)
+         result = fn()
+         if not result.get('success', True) and result.get('custody') == 'STOP_UNCONFIRMED':
+             return result  # Preserve refusal and custody; no output can be accepted.
+-        _check_session_authority(session_info.get('session_key', ''), session_info)
++        deadline = _session_command_deadline(session_info.get('session_key', ''), session_info, deadline)
+         check_managed_execution(deadline)
+         return result
+     if not _shares_bot_desktop_browser(session_info):
+@@ -1277,6 +1324,8 @@
+         except Exception as e:
+             _bt.logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
+             return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
++        if managed:
++            deadline = _session_command_deadline(task_id, session_info, deadline)
+         remaining = deadline - time.monotonic() if managed else timeout
+         if remaining <= 0:
+             return {'success': False, 'error': 'Browser command budget exhausted'}
+--- original/native/tools/process_registry.py
++++ repaired/native/tools/process_registry.py
+@@ -569,6 +569,7 @@
+     browser_task_key: str = ""
+     browser_session_name: str = ""
+     browser_output_paths: list = field(default_factory=list)
++    browser_client_deadline: float = 0.0  # Current command ceiling, never the owner identity clock.
+     browser_client_wait_confirmed: bool = False
+     browser_client_returncode: Optional[int] = None
+     browser_stop_error: str = ""
+@@ -673,7 +674,7 @@
+     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "wsl_chain", "cwd",
+     "started_at", "task_id", "owner_task_id", "session_key",
+     "browser_custody", "browser_identity", "browser_task_key", "browser_session_name",
+-    "browser_output_paths", "browser_client_wait_confirmed", "browser_client_returncode", "browser_stop_error",
++    "browser_output_paths", "browser_client_deadline", "browser_client_wait_confirmed", "browser_client_returncode", "browser_stop_error",
+     "web_tool_call_id", "web_turn_id", "web_custody", "web_invocation", "web_cgroup", "web_cgroup_identity", "web_deadline", "web_boot_id", "web_unconfirmed", "web_stop_requested",
+     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
+     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
+--- original/native/tools/process_registry_web.py
++++ repaired/native/tools/process_registry_web.py
+@@ -65,8 +65,8 @@
+         self.require_browser_execution(owner)
+         from tools.browser_tool_owner import bind_browser_session
+         retained = bind_browser_session(task_key, session_info)
+-        with owner.call.turn.lock:
+-            retained.check()
++        with owner.fence(custody.get('deadline', retained.original_deadline)):
++            custody['deadline'] = min(custody.get('deadline', retained.original_deadline), retained.check())
+             session = session_info.get('_friday_registry_session')
+             if session is None:
+                 session = self._new_session('native browser', retained.call_identity[0],
+@@ -102,6 +102,8 @@
+             session.browser_client_wait_confirmed = False
+             session.browser_client_returncode = None
+             session.browser_client_custody = custody
++            session.browser_client_deadline = custody['deadline']
++            owner.call.turn.browser_deadline = min(owner.call.turn.browser_deadline, custody['deadline'])
+             self._web_checkpoint(session)
+             retained.check()
+             if session.web_stop_requested:
+@@ -152,7 +154,7 @@
+         self._latch_web_stop(session)
+         session.web_unconfirmed = True
+         session._scope_stop_pending = True
+-        if not session.web_settle_lock.acquire(timeout=max(0, min(1, session.web_deadline-time.monotonic()))):
++        if not session.web_settle_lock.acquire(timeout=max(0, min(1, min(session.web_deadline, session.browser_client_deadline)-time.monotonic()))):
+             return {'status':'STOP_UNCONFIRMED','session_id':session.id,'reason':'browser_settlement_in_progress'}
+         try:
+             try:
+@@ -280,7 +282,7 @@
+                               'web_custody','web_invocation','web_cgroup','web_cgroup_identity','web_deadline','web_boot_id',
+                               'web_tool_call_id','web_turn_id','parent_session_id','web_stop_requested',
+                               'browser_custody','browser_identity','browser_task_key','browser_session_name',
+-                              'browser_output_paths','browser_client_wait_confirmed','browser_client_returncode','browser_stop_error')):
++                              'browser_output_paths','browser_client_deadline','browser_client_wait_confirmed','browser_client_returncode','browser_stop_error')):
+             raise RuntimeError('web_checkpoint_required')
+ 
+     def spawn_web(self, call):

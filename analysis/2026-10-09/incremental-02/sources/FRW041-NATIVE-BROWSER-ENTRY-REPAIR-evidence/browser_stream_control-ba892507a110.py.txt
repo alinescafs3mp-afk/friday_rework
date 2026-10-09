@@ -1,0 +1,158 @@
+"""Backend-only stream control source; no native execution admission or stop.
+
+The owner turn lock protects the retained ceiling and secret publication. Once
+published, the immutable Rust listener may already exist: a shorter ceiling
+permanently refuses this capability. It does NOT close a previously issued
+socket or listener; authoritative native cancellation is a separate producer.
+"""
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+import hashlib
+import json
+import math
+import secrets
+import time
+
+from tools.browser_tool_owner import (
+    BrowserOwner, BrowserOwnerRefused, bind_browser_session, browser_lock,
+)
+
+
+def _binding(owner):
+    return hashlib.sha256(json.dumps(owner.identity(), sort_keys=True,
+                                    separators=(',', ':')).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class StreamControl:
+    owner: object = field(repr=False)
+    session: str
+    binding: str
+    original_deadline: float
+    token: str = field(repr=False)
+    # Only these monotone custody fields change, under the existing turn lock.
+    # The retained object, original bound, owner, session and token never change.
+    _retained_deadline: float = field(init=False, repr=False, compare=False)
+    _published_deadline: object = field(default=None, init=False, repr=False, compare=False)
+    _refused: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        if type(self.original_deadline) not in (int, float) or not math.isfinite(self.original_deadline):
+            raise BrowserOwnerRefused('browser_stream_original_deadline_required')
+        object.__setattr__(self, '_retained_deadline', self.original_deadline)
+
+    def _identity(self, owner, session):
+        if (type(owner) is not BrowserOwner or owner is not self.owner
+                or session != self.session or _binding(owner) != self.binding):
+            raise BrowserOwnerRefused('browser_stream_original_owner_changed')
+
+    @contextmanager
+    def _fenced(self, owner, session):
+        self._identity(owner, session)
+        # BrowserOwner.fence/check already use this same reentrant turn lock.
+        # The outer lock also protects a terminal clock failure before fence yields.
+        with browser_lock(owner.call.turn.lock, self._retained_deadline):
+            self._identity(owner, session)
+            if self._refused:
+                raise BrowserOwnerRefused('browser_stream_control_permanently_refused')
+            try:
+                with owner.fence(self._retained_deadline) as ceiling:
+                    if type(ceiling) not in (int, float) or not math.isfinite(ceiling):
+                        object.__setattr__(self, '_refused', True)
+                        raise BrowserOwnerRefused('browser_stream_original_deadline_required')
+                    ceiling = min(self.original_deadline, self._retained_deadline, ceiling)
+                    object.__setattr__(self, '_retained_deadline', ceiling)
+                    if time.monotonic() >= ceiling:
+                        object.__setattr__(self, '_refused', True)
+                        raise BrowserOwnerRefused('browser_stream_original_deadline_exhausted')
+                    if self._published_deadline is not None and ceiling < self._published_deadline:
+                        object.__setattr__(self, '_refused', True)
+                        raise BrowserOwnerRefused('browser_stream_published_deadline_shortened_stop_required')
+                    yield ceiling
+            except (BrowserOwnerRefused, TimeoutError) as error:
+                if str(error) in ('browser_original_owner_deadline_exhausted',
+                                  'web_original_deadline'):
+                    # A clock error can precede native identity checks. Attribute
+                    # it before latching; an expired foreign caller cannot poison.
+                    with owner._clock_refusal_fence() as ceiling:
+                        object.__setattr__(self, '_retained_deadline',
+                                           min(self._retained_deadline, ceiling))
+                        object.__setattr__(self, '_refused', True)
+                raise
+
+    def check(self, owner, session):
+        with self._fenced(owner, session) as ceiling:
+            return ceiling
+
+    def launch_environment(self, owner, session, existing_env):
+        with self._fenced(owner, session):
+            env = dict(existing_env)
+            # Mapping conversion can take time or re-enter trusted backend code.
+            # Recheck under the same fence immediately before publication.
+            ceiling = self.check(owner, session)
+            value = {'schema': 1, 'session': self.session, 'binding': self.binding,
+                     'token': self.token, 'boot_id': owner.boot_id,
+                     'deadline_monotonic': ceiling}
+            env['AGENT_BROWSER_FRIDAY_CONTROL_REQUIRED'] = '1'
+            env['AGENT_BROWSER_FRIDAY_STREAM_CONTROL'] = json.dumps(value, separators=(',', ':'))
+            object.__setattr__(self, '_published_deadline', ceiling)
+            return env
+
+    def headers(self, owner, session):
+        with self._fenced(owner, session) as ceiling:
+            # Headers also publish the secret. Treat any publication as potentially
+            # consumed; no retry is permission to replace an immutable listener.
+            headers = {'Authorization': 'Bearer ' + self.token, 'X-Friday-Owner': self.binding}
+            object.__setattr__(self, '_published_deadline', ceiling)
+            return headers
+
+
+def stream_control(task_id, session_info):
+    """Retain exactly one control under the original owner's existing turn fence.
+
+    No require_browser_execution bypass, clock renewal or replacement token.
+    Publication and native launch/custody still need an enclosing owner fence
+    in the eventual managed launch integration. No integration is supplied here.
+    """
+    try:
+        owner = bind_browser_session(task_id, session_info)
+    except (BrowserOwnerRefused, TimeoutError) as error:
+        if str(error) in ('browser_original_owner_deadline_exhausted', 'web_original_deadline'):
+            retained = session_info.get('_friday_stream_control')
+            owner = session_info.get('_friday_execution_owner')
+            session = session_info.get('session_name')
+            if type(retained) is StreamControl and type(owner) is BrowserOwner:
+                retained._identity(owner, session)
+                with owner._clock_refusal_fence() as ceiling:
+                    from hermes_cli.friday_user_scope import browser_task_key, check_browser
+                    # Exact original dictionary/session and principal-scoped route
+                    # still have to match. An unchecked WebCall grants nothing.
+                    check_browser(session_info)
+                    if task_id != browser_task_key(owner.call_identity[0]):
+                        raise BrowserOwnerRefused('browser_original_task_key_required')
+                    if session_info.get('_friday_stream_control') is not retained:
+                        raise BrowserOwnerRefused('browser_stream_original_control_required')
+                    retained._identity(session_info.get('_friday_execution_owner'),
+                                       session_info.get('session_name'))
+                    object.__setattr__(retained, '_retained_deadline',
+                                       min(retained._retained_deadline, ceiling))
+                    object.__setattr__(retained, '_refused', True)
+        raise
+    session = session_info.get('session_name')
+    if type(session) is not str or not session or len(session) > 512:
+        raise BrowserOwnerRefused('browser_stream_actual_daemon_session_required')
+    # Retained controls must see even a fence failure (e.g. an exhausted caller)
+    # under the same lock, so they cannot be silently revived by the next caller.
+    with browser_lock(owner.call.turn.lock, owner.original_deadline):
+        retained = session_info.get('_friday_stream_control')
+        if retained is None:
+            with owner.fence() as ceiling:
+                retained = StreamControl(owner, session, _binding(owner),
+                                         min(owner.original_deadline, ceiling), secrets.token_hex(32))
+                retained.check(owner, session)
+                session_info['_friday_stream_control'] = retained
+                return retained
+        if type(retained) is not StreamControl:
+            raise BrowserOwnerRefused('browser_stream_original_control_required')
+        retained.check(owner, session)
+        return retained

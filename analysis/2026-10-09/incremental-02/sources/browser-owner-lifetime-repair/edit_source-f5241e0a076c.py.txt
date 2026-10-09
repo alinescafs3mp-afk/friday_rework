@@ -1,0 +1,183 @@
+from pathlib import Path
+p=Path(__file__).parent/'source/native'
+def edit(rel,fn):
+ q=p/rel; q.write_text(fn(q.read_text()))
+def replace(s,a,b,n=1):
+ assert s.count(a)==n,(a[:100],s.count(a)); return s.replace(a,b)
+
+def owner(s):
+ s=s.replace('from dataclasses import dataclass','from contextlib import contextmanager\nfrom dataclasses import dataclass')
+ pos=s.index('\n\n@dataclass')
+ s=s[:pos]+'''
+
+@contextmanager
+def browser_lock(lock, deadline):
+    """Bound an existing lock by an already retained ceiling; never renew it."""
+    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+        raise BrowserOwnerRefused('browser_original_owner_deadline_required')
+    if not lock.acquire(timeout=max(0.0, min(2.0, deadline - time.monotonic()))):
+        raise BrowserOwnerRefused('browser_owner_lock_unsettled')
+    try:
+        yield
+    finally:
+        lock.release()
+'''+s[pos:]
+ s=replace(s,'        with self.call.turn.lock:', '        with browser_lock(self.call.turn.lock, min(self.original_deadline, actual.deadline())):')
+ s=replace(s,'        with call.turn.lock:', '        with browser_lock(call.turn.lock, call.deadline()):')
+ pos=s.index('    def task_key(self):')
+ s=s[:pos]+'''    @contextmanager
+    def fence(self, deadline=None):
+        """Launch/publication lock order is turn -> cleanup -> registry.
+
+        Stop uses the same turn fence. Hold it until the returned child and its
+        checkpoint custody have been published, including error paths.
+        """
+        ceiling = self.original_deadline if deadline is None else min(self.original_deadline, deadline)
+        with browser_lock(self.call.turn.lock, ceiling):
+            ceiling = min(ceiling, self.check())
+            yield ceiling
+
+'''+s[pos:]
+ return s
+edit('tools/browser_tool_owner.py',owner)
+
+def session(s):
+ s=s.replace('import base64','from contextlib import nullcontext\nimport base64')
+ s=replace(s,'''        from tools.browser_tool_owner import current_browser_owner
+        deadline = min(check_command_deadline(deadline), current_browser_owner().check())
+        _check_session_authority(task_id, session_info)
+        with _bt._cleanup_lock:''','''        deadline = _session_command_deadline(task_id, session_info, deadline)
+        with _managed_cleanup_lock(session_info, deadline):''')
+ a='''        with _bt._cleanup_lock:
+            _require_managed_client_slot(task_id, session_info)
+            check_managed_execution(deadline)
+            from tools.browser_tool_owner import current_browser_owner
+            from tools.process_registry import process_registry
+            owner = current_browser_owner()
+'''
+ b='''        from tools.browser_tool_owner import current_browser_owner
+        from tools.process_registry import process_registry
+        owner = current_browser_owner()
+        # Never acquire the turn fence while holding cleanup. Stop takes this
+        # same order, and cannot settle between intent and child publication.
+        with owner.fence(deadline), _managed_cleanup_lock(session_info, deadline):
+            _require_managed_client_slot(task_id, session_info)
+            deadline = _session_command_deadline(task_id, session_info, deadline)
+            custody['deadline'] = deadline
+            check_managed_execution(deadline)
+'''
+ s=replace(s,a,b)
+ s=replace(s,"            session_info['_friday_direct_client'] = custody\n            try:","            session_info['_friday_direct_client'] = custody\n            try:\n                owner.check()  # Stop during intent/checkpoint fences creation.\n                check_command_deadline(custody['deadline'])")
+ # Publication failure before Popen retains the registry intent; exact returned handles retained unchanged.
+ for fn in ['_confirm_managed_client_wait','_release_waited_managed_client','_reconcile_managed_client']:
+  start=s.index('def '+fn); end=s.find('\n\ndef ',start+1)
+  block=s[start:end]; block=replace(block,'with _bt._cleanup_lock:', 'with _managed_cleanup_lock(session_info):')
+  s=s[:start]+block+s[end:]
+ s=replace(s,"custody['deadline'] - time.monotonic()", "_retained_session_deadline(session_info) - time.monotonic()")
+ s=replace(s,'def _check_session_authority(task_id: str, session_info: Dict[str, Any]) -> None:', 'def _check_session_authority(task_id: str, session_info: Dict[str, Any]):')
+ s=replace(s,'''            bind_browser_session(task_id, session_info)
+        if session_info.get('_friday_managed'):''','''            retained = bind_browser_session(task_id, session_info)
+        if session_info.get('_friday_managed'):''')
+ s=replace(s,'''                policy_refused = True
+                raise
+    except''','''                policy_refused = True
+                raise
+            return retained
+    except''')
+ pos=s.index('\ndef _get_session_info(')
+ s=s[:pos]+'''
+def _retained_session_deadline(session_info, deadline=None):
+    """Pure retained ceilings for stop/error paths; no ambient caller or grant."""
+    import math
+    owner = session_info.get('_friday_execution_owner')
+    custody = session_info.get('_friday_direct_client')
+    registry = session_info.get('_friday_registry_session')
+    values = [deadline] if deadline is not None else []
+    if owner is not None:
+        values.append(owner.original_deadline)
+    if custody is not None:
+        values.append(custody['deadline'])
+    if registry is not None:
+        values.extend((registry.web_deadline, registry.browser_client_deadline))
+    if not values or any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+        raise PermissionError('browser_retained_deadline_required')
+    return min(values)
+
+
+def _managed_cleanup_lock(session_info, deadline=None):
+    from tools.browser_tool_owner import browser_lock
+    return browser_lock(_bt._cleanup_lock, _retained_session_deadline(session_info, deadline))
+
+
+def _session_command_deadline(task_id, session_info, deadline):
+    from hermes_cli.browser_runtime import check_command_deadline
+    owner = _check_session_authority(task_id, session_info)
+    return check_command_deadline(min(check_command_deadline(deadline), owner.check()))
+
+''' +s[pos:]
+ # The publication branch is the second actual inverted site.
+ s=replace(s,'''    with _bt._cleanup_lock:
+        if task_id in _bt._active_sessions:''','''    from tools.browser_tool_owner import current_browser_owner
+    owner = current_browser_owner() if managed else None
+    fence = owner.fence(deadline) if managed else nullcontext()
+    lock = _managed_cleanup_lock(session_info, deadline) if managed else _bt._cleanup_lock
+    with fence, lock:
+        if task_id in _bt._active_sessions:''')
+ s=replace(s,'''            check_browser(_bt._active_sessions[task_id])
+            return _bt._active_sessions[task_id]''','''            check_browser(_bt._active_sessions[task_id])
+            if managed:
+                from tools.browser_tool_owner import bind_browser_session
+                bind_browser_session(task_id, _bt._active_sessions[task_id])
+            return _bt._active_sessions[task_id]''')
+ s=replace(s,'        deadline = check_command_deadline(deadline)\n    if managed and', '        deadline = _session_command_deadline(task_id, session_info, deadline)\n    if managed and')
+ s=replace(s,'''                _check_session_authority(task_id, session_info)
+                check_managed_execution(deadline)''','''                deadline = min(deadline, _session_command_deadline(task_id, session_info, deadline))
+                check_managed_execution(deadline)''')
+ # Pass the actual publication ceiling on failures too, even if tightened inside Popen.
+ s=replace(s,"_stop_failed_managed_client(custody['proc'], task_id, session_info, deadline, failure)","_stop_failed_managed_client(custody['proc'], task_id, session_info, custody['deadline'], failure)")
+ s=replace(s,'''    try:
+        if managed:
+            while True:''','''    if managed:
+        deadline = min(deadline, session_info['_friday_direct_client']['deadline'])
+    try:
+        if managed:
+            while True:''')
+ # A dynamically tightened caller does not invalidate original-handle identity on cleanup.
+ s=replace(s,"diagnostic.get('deadline') != deadline", "diagnostic.get('deadline') < deadline")
+ s=replace(s,"custody['deadline'] != deadline", "custody['deadline'] < deadline")
+ s=replace(s,"            custody['failure'] = type(failure).__name__ + ': ' + str(failure)","            custody['deadline'] = min(custody['deadline'], deadline)\n            custody['failure'] = type(failure).__name__ + ': ' + str(failure)")
+ s=replace(s,"        remaining = deadline - time.monotonic() if managed else timeout", "        if managed:\n            deadline = _session_command_deadline(task_id, session_info, deadline)\n        remaining = deadline - time.monotonic() if managed else timeout")
+ s=replace(s,"        _check_session_authority(session_info.get('session_key', ''), session_info)\n        check_managed_execution(deadline)","        deadline = _session_command_deadline(session_info.get('session_key', ''), session_info, deadline)\n        check_managed_execution(deadline)",2)
+ return s
+edit('tools/browser_tool_session.py',session)
+
+def registry(s):
+ s=replace(s,'        with owner.call.turn.lock:', '        with owner.fence(custody.get(\'deadline\', retained.original_deadline)):')
+ s=replace(s,'            retained.check()\n            session =',"            custody['deadline'] = min(custody.get('deadline', retained.original_deadline), retained.check())\n            session =")
+ s=replace(s,"            session.browser_client_custody = custody", "            session.browser_client_custody = custody\n            session.browser_client_deadline = custody['deadline']")
+ s=replace(s,'session.web_deadline-time.monotonic()', 'min(session.web_deadline, session.browser_client_deadline)-time.monotonic()')
+ return s
+edit('tools/process_registry_web.py',registry)
+edit('tools/process_registry.py',lambda s: replace(replace(s,'    browser_client_wait_confirmed: bool = False','    browser_client_deadline: float = 0.0  # Current command ceiling, never the owner identity clock.\n    browser_client_wait_confirmed: bool = False'),'    "browser_output_paths", "browser_client_wait_confirmed",','    "browser_output_paths", "browser_client_deadline", "browser_client_wait_confirmed",'))
+
+def life(s):
+ s=replace(s,"    if session_info.get('_friday_managed'):\n        with _bt._cleanup_lock:\n            session_info['_friday_stop_unconfirmed'] = True", "    if session_info.get('_friday_managed'):\n        # Sticky intent precedes even an expired/nonblocking lock attempt.\n        session_info['_friday_stop_unconfirmed'] = True\n        with _session._managed_cleanup_lock(session_info):\n            session_info['_friday_stop_unconfirmed'] = True")
+ return s
+edit('tools/browser_tool_lifecycle.py',life)
+
+def calls(s):
+ s=replace(s,'        if not self.turn.lock.acquire(timeout=2):', '''        ceiling = self.deadline()
+        owner = getattr(self, 'browser_owner', None)
+        if owner is not None:
+            ceiling = min(ceiling, owner.original_deadline)
+        if self.session is not None and getattr(self.session, 'browser_custody', False):
+            ceiling = min(ceiling, self.session.web_deadline, self.session.browser_client_deadline)
+        if not self.turn.lock.acquire(timeout=max(0.0, min(2.0, ceiling-time.monotonic()))):''')
+ # Turn stop bounds initial fence by all retained browser owner clocks, no new grace.
+ s=replace(s,'        if not self.lock.acquire(timeout=2):','''        browser_ceilings = [call.browser_owner.original_deadline for call in tuple(self.calls)
+                            if getattr(call, 'browser_owner', None) is not None]
+        timeout = max(0.0, min(2.0, min(browser_ceilings)-time.monotonic())) if browser_ceilings else 2.0
+        if not self.lock.acquire(timeout=timeout):''')
+ return s
+edit('agent/web_call_context.py',calls)
+print('source edit complete')

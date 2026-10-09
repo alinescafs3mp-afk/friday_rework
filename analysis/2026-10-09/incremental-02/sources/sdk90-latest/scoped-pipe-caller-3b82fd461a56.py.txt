@@ -1,0 +1,131 @@
+"""Finite qualification fixture only; NOT_RUN, never a runtime grant.
+
+Node/libuv pipes may be socketpairs. This caller constructs real CLOEXEC OS
+pipes/null as the Python donor does. It alone drains and waits for its owned
+primitive child. All effects still require the original outer unit and budget.
+"""
+import json
+import os
+import selectors
+import socket
+import stat
+import subprocess
+import sys
+import time
+
+LIMIT = 8192
+WALL = 2.0  # Same per-fixture budget as the retained Node test, including cleanup.
+
+
+def describe(fd):
+    s = os.fstat(fd)
+    return {'dev': s.st_dev, 'ino': s.st_ino, 'uid': s.st_uid,
+            'type': stat.S_IFMT(s.st_mode), 'rdev': s.st_rdev}
+
+
+def main():
+    deadline = time.monotonic() + WALL
+    request = json.loads(sys.stdin.buffer.read(65537))
+    argv = request['argv']
+    if (type(argv) is not list or not argv or not os.path.isabs(argv[0]) or
+            any(type(v) is not str or '\0' in v for v in argv)):
+        raise ValueError('exact launcher argv required')
+    mode = request['stdin']
+    if mode not in ('null', 'regular', 'socket'):
+        raise ValueError('unknown standard descriptor fixture')
+    owned = []
+    proc = None
+    selector = None
+    buffers = {'stdout': bytearray(), 'stderr': bytearray()}
+    evidence = {}
+    error = None
+    try:
+        extra = request.get('extra')
+        pass_fds = ()
+        if extra is not None:
+            # The payload checks this exact object at FD3. No guessed remapping.
+            fd = os.open(extra, os.O_RDONLY | os.O_CLOEXEC); owned.append(fd)
+            if fd != 3:
+                raise ValueError('fixture FD3 is not available')
+            evidence['extra'] = describe(fd)
+            pass_fds = (fd,)
+        if mode == 'socket':
+            left, right = socket.socketpair()
+            try:
+                infd = left.detach(); peer = right.detach()
+            finally:
+                left.close(); right.close()
+            owned.extend([infd, peer])
+            if not stat.S_ISSOCK(os.fstat(infd).st_mode):
+                raise ValueError('socket negative fixture is not a socket')
+        else:
+            infd = os.open('/dev/null' if mode == 'null' else request['file'], os.O_RDONLY | os.O_CLOEXEC)
+            owned.append(infd)
+            st = os.fstat(infd)
+            if mode == 'null' and not (stat.S_ISCHR(st.st_mode) and st.st_rdev == os.stat('/dev/null').st_rdev):
+                raise ValueError('not the owned null input')
+            if mode == 'regular' and not stat.S_ISREG(st.st_mode):
+                raise ValueError('regular negative fixture is not regular')
+        evidence['stdin'] = describe(infd)
+        pipes = {}
+        for name in ('stdout', 'stderr'):
+            readfd, writefd = os.pipe2(os.O_CLOEXEC)
+            owned.extend([readfd, writefd])
+            a, b = describe(readfd), describe(writefd)
+            if (a != b or a['type'] != stat.S_IFIFO or a['uid'] != os.getuid() or
+                    os.get_inheritable(readfd) or os.get_inheritable(writefd)):
+                raise ValueError('fresh owned FIFO endpoints required')
+            evidence[name] = a
+            pipes[name] = (readfd, writefd)
+        proc = subprocess.Popen(argv, stdin=infd, stdout=pipes['stdout'][1],
+            stderr=pipes['stderr'][1], close_fds=True, pass_fds=pass_fds)
+        # Close every caller-side writer/input copy immediately. This helper is
+        # the sole reader and sole waiter; no competing communicate/reaper.
+        readers = {v[0] for v in pipes.values()}
+        for fd in list(owned):
+            if fd not in readers:
+                os.close(fd); owned.remove(fd)
+        selector = selectors.DefaultSelector()
+        for name, (readfd, unused) in pipes.items():
+            os.set_blocking(readfd, False)
+            selector.register(readfd, selectors.EVENT_READ, name)
+        work_deadline = deadline - 0.2  # Cleanup reserve inside the same 2s.
+        while selector.get_map():
+            remaining = work_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('primitive drain exceeded original fixture budget')
+            for key, unused in selector.select(remaining):
+                chunk = os.read(key.fd, min(4096, LIMIT + 1 - sum(map(len, buffers.values()))))
+                if not chunk:
+                    selector.unregister(key.fd)
+                    os.close(key.fd); owned.remove(key.fd)
+                else:
+                    buffers[key.data].extend(chunk)
+                    if sum(map(len, buffers.values())) > LIMIT:
+                        raise ValueError('primitive output exceeded 8192 bytes')
+        proc.wait(timeout=max(0.001, work_deadline - time.monotonic()))
+    except Exception as exc:
+        error = type(exc).__name__ + ':' + str(exc)
+    finally:
+        if selector is not None:
+            selector.close()
+        for fd in owned:
+            os.close(fd)
+        if proc is not None and proc.returncode is None:
+            # Only this owned Popen is stopped. Outer whole-unit cleanup remains
+            # mandatory; a helper timeout never proves descendant cessation.
+            proc.kill()
+            try:
+                proc.wait(timeout=max(0.001, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                error = (error or '') + ';STOP_UNCONFIRMED'
+    record = {'status': None if proc is None else proc.returncode,
+              'stdout': buffers['stdout'].decode('utf-8', errors='strict'),
+              'stderr': buffers['stderr'].decode('utf-8', errors='strict'),
+              'error': error, 'stdio': evidence, 'sole_drainer': 'scoped-pipe-caller',
+              'descendant_cessation': 'NOT_PROVEN_REQUIRES_ORIGINAL_OUTER_UNIT'}
+    print(json.dumps(record))
+
+
+if __name__ == '__main__':
+    main()

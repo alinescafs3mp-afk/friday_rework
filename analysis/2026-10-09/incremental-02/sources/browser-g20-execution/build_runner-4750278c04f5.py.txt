@@ -1,0 +1,264 @@
+"""Generate a specialized minimal-delta existing runner; source only."""
+from pathlib import Path
+import ast,difflib,json
+O=Path(__file__).resolve().parent;W=O.parent
+installer=(W/'browser-installer-offline-preparation/run.py').read_text();tree=ast.parse(installer)
+names=['require','string_path','canonical','writable','fd_path','path_ok','check_path','check_fd','fd_wrapper','guarded_mkfifo','forbidden']
+functions='\n\n'.join(ast.get_source_segment(installer,n) for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names)
+fence='''"""Specialized offline fixture fence, derived from installer private path/FD fence.
+SOURCE ONLY. Trusted reviewed tests; not a hostile-code operating-system sandbox.
+"""
+import os,sys,json,time,stat,socket,signal,threading,_thread,_posixsubprocess,resource
+RAW={name:getattr(os,name) for name in ('open','close','read','write','stat','fstat','readlink','getcwd','getpid','getppid','getpgrp','getuid','geteuid','getgid','_exit','fsync','fchmod','ftruncate','writev','pwrite','pwritev','mkfifo','mkdir','listdir','fspath')}
+MONOTONIC=time.monotonic
+FSENC=sys.getfilesystemencoding()
+WRITE_FLAGS=os.O_WRONLY|os.O_RDWR|os.O_CREAT|os.O_TRUNC|os.O_APPEND
+state=None
+WRITABLE=()
+READABLE=set()
+stdout_ids={}
+STATE_LOCK=threading.RLock()
+LOCAL=threading.local()
+SOCKET_CLASS=socket.socket
+SOCKET_BIND=SOCKET_CLASS.bind
+SOCKET_CLOSE=SOCKET_CLASS.close
+SOCKET_SEND=SOCKET_CLASS.send
+SOCKET_RECV=SOCKET_CLASS.recv
+SOCKET_PAIR=socket.socketpair
+SIGNAL=signal.signal
+THREAD_START=threading.Thread.start
+THREAD_JOINABLE=_thread.start_joinable_thread
+DENIAL_FD=None
+BASE=''
+SITE=''
+STDLIB=''
+IPV6={}
+PAIRS={}
+THREADS=[]
+COUNTS={'ipv6':0,'socketpair':0,'pair_wrapping_events':0,'threads':0,'self_send':0,'self_recv':0,'sigint_handlers':0}
+ASYNC_NAMES={'native':'test_legacy_public_api_and_async_signature_preserved_without_policy','owner':'test_async_http_backend_keeps_context_owner_and_vetted_ip'}
+def node_name():
+ return (state.get('current_node') or '').split('::')[-1].split('[')[0]
+def async_active():
+ return node_name()==ASYNC_NAMES.get(state['phase'])
+def stack_has(path,name):
+ frame=sys._getframe(1)
+ while frame:
+  if frame.f_code.co_filename==path and frame.f_code.co_name==name:return True
+  frame=frame.f_back
+ return False
+
+def deny(event):
+ state['denied']={'event':event,'monotonic':MONOTONIC(),'node':state.get('current_node'),'counts':dict(COUNTS)}
+ try:
+  data=(json.dumps(state,indent=2)+'\\n').encode()
+  while data:
+   count=RAW['write'](DENIAL_FD,data);data=data[count:]
+  RAW['fsync'](DENIAL_FD)
+  RAW['write'](2,('OFFLINE_EFFECT_DENIED '+event+'\\n').encode())
+ finally:RAW['_exit'](125)
+
+'''+functions+'''
+
+# Pure validation shared with the source negative controls; no effect in predicate.
+def ipv6_request_allowed(family,kind,proto,provenance,count):
+ return family==socket.AF_INET6 and kind==socket.SOCK_STREAM and proto==0 and provenance and count==0
+def ipv6_bind_allowed(address,registered,bound):
+ return registered and not bound and address==('::1',0)
+def pair_request_allowed(family,kind,proto,active,provenance,count):
+ return family==socket.AF_UNIX and kind==socket.SOCK_STREAM and proto==0 and active and provenance and count==0
+
+def read_ok(path,dir_fd=None):
+ if isinstance(path,int):return
+ try:
+  text=string_path(path)
+  if not text.startswith('/'):
+   base=RAW['getcwd']() if dir_fd is None else fd_path(dir_fd)[0]
+   text=base+'/'+text
+  resolved=canonical(text)
+  allowed=resolved in READABLE or writable(resolved) or resolved=='/dev/null'
+ except BaseException:allowed=False
+ if not allowed:deny('open:outside_pinned_or_private_read_roots')
+
+def guarded_open(path,flags,mode=0o777,*,dir_fd=None):
+ if flags&WRITE_FLAGS:check_path('os.open',path,dir_fd)
+ else:read_ok(path,dir_fd)
+ previous=getattr(LOCAL,'checked_open',None);LOCAL.checked_open=(string_path(path),flags)
+ try:return RAW['open'](path,flags,mode,dir_fd=dir_fd)
+ finally:LOCAL.checked_open=previous
+
+def guarded_bind(obj,address):
+ entry=IPV6.get(id(obj))
+ if not ipv6_bind_allowed(address,entry is not None,entry['bound'] if entry else False):deny('socket.bind:only_original_urllib3_ipv6_probe')
+ if not stack_has(SITE+'/urllib3/util/connection.py','_has_ipv6'):deny('socket.bind:foreign_caller')
+ entry['bound']=True
+ return SOCKET_BIND(obj,address)
+
+def guarded_close(obj):
+ result=SOCKET_CLOSE(obj)
+ if id(obj) in IPV6:IPV6[id(obj)]['closed']=True
+ if id(obj) in PAIRS:PAIRS[id(obj)]['closed']=True
+ return result
+
+def guarded_socketpair(family=None,type=socket.SOCK_STREAM,proto=0):
+ family=socket.AF_UNIX if family is None else family
+ if not pair_request_allowed(family,type,proto,async_active(),stack_has(STDLIB+'/asyncio/selector_events.py','_make_self_pipe'),COUNTS['socketpair']):deny('socketpair:outside_exact_asyncio_self_pipe')
+ COUNTS['socketpair']+=1;LOCAL.in_pair=True
+ try:pair=SOCKET_PAIR(family,type,proto)
+ finally:LOCAL.in_pair=False
+ for obj in pair:PAIRS[id(obj)]={'object':obj,'closed':False}
+ return pair
+
+def guarded_send(obj,data,*args,**kwargs):
+ if id(obj) not in PAIRS or data!=b'\\0' or args or kwargs or not stack_has(STDLIB+'/asyncio/selector_events.py','_write_to_self'):deny('socket.send:outside_own_self_pipe')
+ COUNTS['self_send']+=1
+ if COUNTS['self_send']>16:deny('socket.send:self_pipe_budget')
+ return SOCKET_SEND(obj,data)
+def guarded_recv(obj,size,*args,**kwargs):
+ if id(obj) not in PAIRS or size!=4096 or args or kwargs or not stack_has(STDLIB+'/asyncio/selector_events.py','_read_from_self'):deny('socket.recv:outside_own_self_pipe')
+ COUNTS['self_recv']+=1
+ if COUNTS['self_recv']>32:deny('socket.recv:self_pipe_budget')
+ return SOCKET_RECV(obj,size)
+
+def guarded_thread_start(obj):
+ target=getattr(obj,'_target',None);code=getattr(target,'__code__',None)
+ path=code.co_filename if code else '';name=code.co_name if code else ''
+ race=node_name()=='test_launch_stop_original_inverted_interleaving_is_bounded'
+ allowed=(state['phase']=='owner' and ((race and obj.name in ('browser-launch-control','browser-stop-control') and path==BASE+'/native/tests/tools/test_browser_owner_join.py' and name in ('launch','stop')) or (async_active() and (path==STDLIB+'/concurrent/futures/thread.py' and name=='_worker' or path==STDLIB+'/asyncio/base_events.py' and name=='_do_shutdown'))))
+ key=(path,name)
+ if not allowed or any(row[1]==key for row in THREADS) or COUNTS['threads']>=4:deny('thread.start:outside_four_required_threads')
+ COUNTS['threads']+=1;THREADS.append((obj,key));LOCAL.thread_start=obj
+ try:return THREAD_START(obj)
+ finally:LOCAL.thread_start=None
+
+def guarded_joinable(function,*args,**kwargs):
+ obj=getattr(LOCAL,'thread_start',None)
+ if obj is None or getattr(function,'__self__',None) is not obj:deny('_thread:outside_guarded_Thread_start')
+ return THREAD_JOINABLE(function,*args,**kwargs)
+
+def guarded_signal(sig,handler):
+ if sig!=signal.SIGINT or not async_active() or not stack_has(STDLIB+'/asyncio/runners.py','run'):deny('signal.signal:outside_asyncio_own_SIGINT_handler')
+ COUNTS['sigint_handlers']+=1
+ if COUNTS['sigint_handlers']>2:deny('signal.signal:handler_budget')
+ return SIGNAL(sig,handler)
+
+PROCESS_EVENTS={'subprocess.Popen','os.system','os.fork','os.forkpty','os.posix_spawn','os.exec','pty.spawn','os.kill','os.killpg','os.pidfd_open','signal.pthread_kill','signal.pidfd_send_signal','ctypes.dlopen','ctypes.dlsym'}
+def audit(event,args):
+ if event in PROCESS_EVENTS:deny(event)
+ if event=='open':
+  path,mode,flags=args
+  checked=getattr(LOCAL,'checked_open',None)
+  if checked and not isinstance(path,int) and string_path(path)==checked[0] and flags==checked[1]:return
+  if flags&WRITE_FLAGS:check_path('open',path)
+  else:read_ok(path)
+ elif event in ('os.mkdir','os.remove','os.rmdir'):check_path(event,args[0],args[-1],False)
+ elif event=='os.chmod':check_path(event,args[0],args[2])
+ elif event in ('os.chown','os.setxattr','os.removexattr'):deny(event)
+ elif event=='os.utime':check_path(event,args[0],args[-1])
+ elif event=='os.truncate':check_path(event,args[0])
+ elif event in ('os.rename','os.link'):
+  check_path(event+':source',args[0],args[2],False);check_path(event+':destination',args[1],args[3],False)
+ elif event=='os.symlink':check_path(event,args[1],args[2],False)
+ elif event=='socket.__new__':
+  obj,family,kind,proto=args
+  if getattr(LOCAL,'in_pair',False):
+   if (family,kind,proto)!=(socket.AF_UNIX,socket.SOCK_STREAM,0):deny('socketpair:unexpected_native_family')
+   COUNTS['pair_wrapping_events']+=1
+   if COUNTS['pair_wrapping_events']>4:deny('socketpair:excess_native_objects')
+  elif ipv6_request_allowed(family,kind,proto,stack_has(SITE+'/urllib3/util/connection.py','_has_ipv6'),COUNTS['ipv6']):
+   COUNTS['ipv6']+=1;IPV6[id(obj)]={'object':obj,'bound':False,'closed':False}
+  else:deny(event)
+ elif event=='socket.bind':
+  obj,address=args
+  if id(obj) not in IPV6 or address!=('::1',0) or not IPV6[id(obj)]['bound']:deny('socket.bind:unguarded')
+ elif event.startswith('socket.'):deny(event)
+
+def install(shared,write_roots,read_paths,denial_fd,base,site,stdlib):
+ global state,WRITABLE,READABLE,DENIAL_FD,BASE,SITE,STDLIB,stdout_ids
+ state=shared;WRITABLE=tuple(write_roots);READABLE=set(read_paths);DENIAL_FD=denial_fd;BASE=base;SITE=site;STDLIB=stdlib
+ stdout_ids={fd:(RAW['fstat'](fd).st_dev,RAW['fstat'](fd).st_ino,RAW['fstat'](fd).st_mode) for fd in (1,2)}
+ os.open=guarded_open
+ for name in ('fsync','fchmod','ftruncate','pwrite','pwritev'):setattr(os,name,fd_wrapper(name))
+ for name in ('write','writev'):setattr(os,name,fd_wrapper(name,stdout=True))
+ os.mkfifo=guarded_mkfifo
+ for name in ('kill','killpg','pidfd_open','fork','forkpty','posix_spawn','posix_spawnp','system','mknod','chown','fchown','lchown','sendfile','splice','copy_file_range','setuid','seteuid','setgid','setegid','setresuid','setresgid','setgroups','chroot','unshare','setns','sched_setaffinity'):
+  if hasattr(os,name):setattr(os,name,forbidden('os.'+name))
+ for name in ('pthread_kill','pidfd_send_signal','setitimer','alarm','pause','raise_signal'):
+  if hasattr(signal,name):setattr(signal,name,forbidden('signal.'+name))
+ signal.signal=guarded_signal
+ resource.setrlimit=forbidden('resource.setrlimit')
+ _posixsubprocess.fork_exec=forbidden('_posixsubprocess.fork_exec')
+ _thread.start_new_thread=forbidden('_thread.start_new_thread')
+ _thread.start_joinable_thread=guarded_joinable;threading._start_joinable_thread=guarded_joinable;threading.Thread.start=guarded_thread_start
+ for name in ('listen','connect','connect_ex','accept','sendall','sendto','sendmsg','recv_into','recvfrom','recvfrom_into','recvmsg','recvmsg_into','sendfile','makefile','dup'):
+  if hasattr(SOCKET_CLASS,name):setattr(SOCKET_CLASS,name,forbidden('socket.'+name))
+ SOCKET_CLASS.bind=guarded_bind;SOCKET_CLASS.close=guarded_close;SOCKET_CLASS.send=guarded_send;SOCKET_CLASS.recv=guarded_recv
+ socket.socketpair=guarded_socketpair
+ sys.addaudithook(audit)
+
+def closed_primitives():
+ return {'counts':dict(COUNTS),'unclosed_ipv6':[key for key,row in IPV6.items() if not row['closed'] and row['object'].fileno()!=-1],'unclosed_self_pipe':[key for key,row in PAIRS.items() if not row['closed']],'live_threads':[obj.name for obj,key in THREADS if obj.is_alive()],'all_thread_count':len(threading.enumerate())}
+'''
+(O/'private_effect_fence.py').write_text(fence)
+# Preserve old phase lifecycle and capture; replace the former all-socket denial
+# with only the three proven primitives, guarded private IO and explicit plugin.
+old=(W/'browser-host-focused-tests/run.py').read_text()
+run=old.replace("('native','project')","('native','project','owner')").replace("O/'clock.json'","O/'runtime-clock.json'")
+run=run.replace("phase=sys.argv[1]; OUT=O/phase; N=O/'source/native'; Q=O/'source/project'", "phase=sys.argv[1]; OUT=O/phase; N=O/'source/native'; Q=O/'source/project'\nsys.path.insert(0,str(O))\nimport private_effect_fence as fence\nREAL_MONOTONIC=time.monotonic")
+run=run.replace("('input-pins.json','selected-pins.json','launch-pins.json')", "('input-pins.json','selected-pins.json','launch-pins.json','runtime-flat-pins.json')")
+start=run.index('def audit(event,args):');end=run.index('# Explicit installed dependency path',start)
+run=run[:start]+'''# Root admission is fresh and independent from this source preparation.
+admission=json.loads((O/'runtime-admission.json').read_text())
+assert admission['source_package_sha256']==sha(O/'execution-package-pins.json')
+assert admission['effect_proposal_sha256']==sha(O/'effect-admission-proposal.json')
+assert admission['changed_execution_boundary_approved'] is True
+assert admission['production_browser_grant'] is False
+assert c['budget_seconds']==900 and c['deadline_monotonic']-c['started_monotonic']==900
+assert c['boot_id']==Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+assert 0<=REAL_MONOTONIC()-c['started_monotonic']<840
+parent=os.getppid();parent_argv=Path('/proc/'+str(parent)+'/cmdline').read_bytes().split(b'\\0')[:-1]
+assert os.readlink('/proc/'+str(parent)+'/exe')=='/usr/bin/gnutimeout'
+assert parent_argv[1:]==[b'--signal=KILL',b'--verbose',b'120s',b'<PROJECT>/.runtime/hermes-telegram-test/env/bin/python',b'-I',b'-B',b'-S',str(O/'run.py').encode(),phase.encode()]
+assert sha('/proc/'+str(parent)+'/exe')=='1ba715580334044dbd32873bddd7f8a19687cda1cf5e9f44be7266af6c048766'
+backend=json.loads((OUT/'backend-start.json').read_text());assert parent==backend['pid'] and os.getpgrp()==backend['pid']
+save('module-origins.json',{})
+DENIAL_FD=os.open(OUT/'denied-effect.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+''' +run[end:]
+run=run.replace("# Existing corpus integration path:",'''stdlib=Path('<PROJECT>/.runtime/hermes-telegram-test/tools/python-3.14.7+20260901-linux-x64/lib/python3.14')
+# All inherited credentials/plugin selectors were removed by launch's exact env.
+read_paths={str(Path(p).resolve()) for p in pins}
+read_paths.update(str(p.resolve()) for p in (O/'runtime-clock.json',O/'runtime-admission.json',O/'execution-package-pins.json',O/'effect-admission-proposal.json'))
+fence.install(state,[str(OUT)],read_paths,DENIAL_FD,str(O/'source'),str(site),str(stdlib))
+# Existing corpus integration path:''')
+run=run.replace(" def pytest_deselected(self,items):state['deselected'].extend(i.nodeid for i in items)"," def pytest_deselected(self,items):\n  state['deselected'].extend(i.nodeid for i in items);raise RuntimeError('DESELECTION_FORBIDDEN')")
+run=run.replace(" def pytest_runtest_logstart(self,nodeid,location):state['current_node']=nodeid", " def pytest_runtest_logstart(self,nodeid,location):state['current_node']=nodeid\n def pytest_runtest_logfinish(self,nodeid,location):state['current_node']=None")
+run=run.replace("test=N/'tests/hermes_cli/test_friday_browser_runtime.py' if phase=='native' else Q/'tests/test_browser_native_host.py'", "test={'native':N/'tests/hermes_cli/test_friday_browser_runtime.py','project':Q/'tests/test_browser_native_host.py','owner':N/'tests/tools/test_browser_owner_join.py'}[phase]")
+run=run.replace("args=['-q',", "args=['-q','--capture=sys','-p','no:faulthandler',")
+run=run.replace("save('pytest-arguments.json'", "if phase=='owner':args+=['-p','pytest_asyncio.plugin','--asyncio-mode=strict','-o','asyncio_default_fixture_loop_scope=function','-o','asyncio_default_test_loop_scope=function']\nsave('pytest-arguments.json'")
+run=run.replace("'pytest_asyncio_required':False", "'pytest_asyncio_required':phase=='owner'").replace("Both exact suites define synchronous pytest tests; asyncio.run remains real with socket fence active.","Complete suites unchanged; owner has one real async test, explicit pinned plugin, real asyncio self-pipe and bounded real threads.")
+run=run.replace("snapshot();assert time.monotonic()<c['deadline_monotonic']", "snapshot();state['primitive_cessation']=fence.closed_primitives();save('primitive-cessation.json',state['primitive_cessation']);assert not any(state['primitive_cessation'][k] for k in ('unclosed_ipv6','unclosed_self_pipe','live_threads'));assert state['primitive_cessation']['all_thread_count']==1;assert REAL_MONOTONIC()<c['deadline_monotonic']")
+(O/'run.py').write_text(run)
+launch=(W/'browser-host-focused-tests/launch.py').read_text().replace("('native','project')","('native','project','owner')").replace("O/'clock.json'","O/'runtime-clock.json'").replace("('input-pins.json','selected-pins.json','launch-pins.json')","('input-pins.json','selected-pins.json','launch-pins.json','runtime-flat-pins.json')")
+launch=launch.replace("assert not (OUT/'backend-start.json').exists(),'NO_RETRY'",'''assert not (OUT/'backend-start.json').exists(),'NO_RETRY'
+admission=json.loads((O/'runtime-admission.json').read_text())
+assert admission['changed_execution_boundary_approved'] is True and admission['production_browser_grant'] is False
+assert c['budget_seconds']==900 and c['deadline_monotonic']-c['started_monotonic']==900
+assert c['boot_id']==Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+prior={'native':None,'project':'native','owner':'project'}[phase]
+if prior:
+ stop=json.loads((O/prior/'cessation.json').read_text());assert stop['closed'] and stop['backend_terminal_exit']==0
+ assert not (O/prior/'pytest-progress.json').exists() or json.loads((O/prior/'pytest-progress.json').read_text())['exit_code']==0
+assert not any((OUT/'results').iterdir())
+# This launcher is the same finite backend, with one own group for root cessation.
+if os.getsid(0)!=os.getpid():os.setsid()
+assert os.getpid()==os.getpgrp()==os.getsid(0)''')
+launch=launch.replace("assert os.environ.get('PYTEST_DISABLE_PLUGIN_AUTOLOAD')=='1'",'''os.environ.clear()
+os.environ.update(PATH='/usr/bin:/bin',LANG='C.UTF-8',LC_ALL='C.UTF-8',PYTEST_DISABLE_PLUGIN_AUTOLOAD='1',PYTHONDONTWRITEBYTECODE='1',HOME=str(OUT/'home'),TMPDIR=str(OUT/'tmp'),HERMES_HOME=str(OUT/'hermes'),XDG_CACHE_HOME=str(OUT/'xdg/cache'),XDG_CONFIG_HOME=str(OUT/'xdg/config'),XDG_DATA_HOME=str(OUT/'xdg/data'),XDG_STATE_HOME=str(OUT/'xdg/state'),XDG_RUNTIME_DIR=str(OUT/'xdg/run'))
+os.chdir(OUT)''')
+(O/'launch.py').write_text(launch)
+cessation=(W/'browser-host-focused-tests/cessation.py').read_text().replace("O/'clock.json'","O/'runtime-clock.json'").replace("('input-pins.json','selected-pins.json','launch-pins.json')","('input-pins.json','selected-pins.json','launch-pins.json','runtime-flat-pins.json')")
+(O/'cessation.py').write_text(cessation)
+for n in ('run.py','launch.py','cessation.py'):
+ (O/(n+'.delta.patch')).write_text(''.join(difflib.unified_diff((W/'browser-host-focused-tests'/n).read_text().splitlines(True),(O/n).read_text().splitlines(True),fromfile='browser-host-focused-tests/'+n,tofile='browser-owner-controls-preparation/'+n)))
+for p in (O/'run.py',O/'launch.py',O/'cessation.py',O/'private_effect_fence.py'):compile(ast.parse(p.read_text()),str(p),'exec',dont_inherit=True)
+print('runner sources compiled without execution')

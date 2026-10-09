@@ -1,0 +1,186 @@
+"""Reviewer-owned data/AST verification only; never import or execute candidate code."""
+from pathlib import Path
+import ast
+import hashlib
+import json
+import re
+import stat
+
+W = Path('<ASTRA_WORK>')
+OUT = W / 'browser-owner-lifetime-review'
+REPAIR = W / 'browser-owner-lifetime-repair'
+SOURCE = REPAIR / 'source'
+PRIOR = Path('<SOL_WORK>/FRW041-BROWSER-OWNER-NETWORK-JOIN-source')
+observations = []
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+def check_file(path, expected, size=None):
+    path = Path(path)
+    data = path.read_bytes()
+    actual = sha(data)
+    assert actual == expected, (str(path), actual, expected)
+    if size is not None:
+        assert len(data) == size, str(path)
+    observations.append({'path': str(path), 'sha256': actual, 'bytes': len(data),
+                         'mode': oct(stat.S_IMODE(path.stat().st_mode))})
+    return data
+
+def write(name, data):
+    path = OUT / name
+    with path.open('x') as stream:
+        stream.write(json.dumps(data, indent=2) + '\n')
+    path.chmod(0o400)
+
+result = json.loads(check_file(REPAIR / 'result.json', '8178e02cf416603598e04161a05e55dc37dcf79368ff99f4d31e33455a295f44'))
+check_file(W / 'browser-owner-network-join-review/result.json', '779e3963d41535a91d74381001d65d0248482e018c90d06d54b90a6882f9a51c')
+check_file('<LOCAL_HOME>/.jericho/runtime/subagent-lifecycle/state/astra/contracts/FRW041-BROWSER-OWNER-LIFETIME-REVIEW__1.md',
+           '7b845c36b10343307c9f6eaa89fd598c9a17ff653ca13bb36fd9d51edd90718f')
+
+def check_refs(value):
+    if isinstance(value, dict):
+        if {'path', 'sha256'} <= value.keys():
+            check_file(value['path'], value['sha256'], value.get('bytes'))
+        for nested in value.values():
+            check_refs(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            check_refs(nested)
+
+check_refs(result)
+pins = json.loads(check_file(SOURCE / 'source-pins.json', '7b68707f24288c7e39578a03bf1ae754059810802240284123def9120b0b0ac8'))
+old_pins = json.loads(check_file(PRIOR / 'source-pins.json', pins['base_pins_sha256']))
+graph = json.loads((REPAIR / 'verified-input-refs.json').read_text())
+for reference in graph:
+    check_file(reference['path'], reference['expected'])
+for rel, pin in pins['files'].items():
+    check_file(SOURCE / rel, pin['sha256'], pin['bytes'])
+for ref in json.loads((REPAIR / 'baseline-inputs.json').read_text()):
+    path = Path(ref['path'])
+    assert path.exists() == ref['exists'], str(path)
+    assert sha(path.read_bytes() if path.exists() else b'') == ref['sha256'], str(path)
+
+compiled = []
+test_definitions = []
+changed = []
+unchanged = []
+symbol_deltas = []
+trees = {}
+for rel, pin in pins['files'].items():
+    if rel.endswith('.py'):
+        data = (SOURCE / rel).read_bytes()
+        tree = ast.parse(data, filename=rel)
+        compile(tree, rel, 'exec', dont_inherit=True)  # compilation only; result never executed
+        trees[rel] = tree
+        compiled.append(rel)
+        test_definitions.extend({'path': rel, 'name': node.name, 'line': node.lineno}
+            for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith('test_'))
+    if rel in old_pins['files']:
+        previous = check_file(PRIOR / rel, old_pins['files'][rel]['sha256'], old_pins['files'][rel]['bytes'])
+        if sha(previous) == pin['sha256']:
+            unchanged.append(rel)
+        else:
+            changed.append(rel)
+            if rel.endswith('.py'):
+                before = ast.parse(previous, filename=rel)
+                before_nodes = {n.name: ast.dump(n, include_attributes=False) for n in before.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+                after_nodes = {n.name: ast.dump(n, include_attributes=False) for n in trees[rel].body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+                symbol_deltas.append({'path': rel, 'changed': sorted(k for k in set(before_nodes) | set(after_nodes) if before_nodes.get(k) != after_nodes.get(k))})
+
+def reconstruct(group):
+    patch = (SOURCE / (group + '.patch')).read_bytes().splitlines(keepends=True)
+    base = Path(pins['baseline_' + group])
+    items = []
+    index = 0
+    while index < len(patch):
+        assert patch[index].startswith(b'diff --git '), (group, index)
+        end = index + 1
+        while end < len(patch) and not patch[end].startswith(b'diff --git '):
+            end += 1
+        section = patch[index:end]
+        old_header = next(i for i, line in enumerate(section) if line.startswith(b'--- '))
+        old_name = section[old_header][4:].strip().decode()
+        new_name = section[old_header + 1][4:].strip().decode()
+        assert new_name.startswith('b/')
+        rel = new_name[2:]
+        assert old_name in ('/dev/null', 'a/' + rel)
+        before = b'' if old_name == '/dev/null' else (base / rel).read_bytes()
+        if old_name == '/dev/null':
+            assert not (base / rel).exists(), rel
+        lines = before.splitlines(keepends=True)
+        output = []
+        cursor = 0
+        j = old_header + 2
+        while j < len(section):
+            match = re.fullmatch(rb'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[^\n]*\n', section[j])
+            assert match, (group, rel, j, section[j])
+            old_start, old_count, new_start, new_count = (int(match[k] or b'1') for k in range(1,5))
+            start = old_start - 1 if old_count else old_start
+            assert cursor <= start <= len(lines)
+            output.extend(lines[cursor:start]); cursor = start
+            assert len(output) == (new_start - 1 if new_count else new_start)
+            consumed = produced = 0
+            j += 1
+            while consumed < old_count or produced < new_count:
+                line = section[j]
+                sign, payload = line[:1], line[1:]
+                assert sign in (b' ', b'-', b'+'), (group, rel, line)
+                if sign in (b' ', b'-'):
+                    assert cursor < len(lines) and lines[cursor] == payload, (group, rel, cursor)
+                    cursor += 1; consumed += 1
+                if sign in (b' ', b'+'):
+                    output.append(payload); produced += 1
+                j += 1
+            assert consumed == old_count and produced == new_count
+        output.extend(lines[cursor:])
+        after = b''.join(output)
+        assert after == (SOURCE / group / rel).read_bytes(), (group, rel)
+        items.append({'group': group, 'path': rel, 'before_sha256': sha(before), 'sha256': sha(after), 'bytes': len(after), 'exact': True})
+        index = end
+    expected = {rel[len(group) + 1:] for rel in pins['files'] if rel.startswith(group + '/')}
+    assert {item['path'] for item in items} == expected, (group, expected)
+    return items
+
+reconstruction = reconstruct('native') + reconstruct('project')
+manifest = json.loads((SOURCE / 'project/patches/hermes/browser-native-host-manifest.json').read_text())
+assert manifest['patch_sha256'] == sha((SOURCE / 'native.patch').read_bytes())
+assert (SOURCE / 'native.patch').read_bytes() == (SOURCE / 'project/patches/hermes/browser-native-host.patch').read_bytes()
+manifest_files = {item['path']: item for item in manifest['files']}
+assert set(manifest_files) == {item['path'] for item in reconstruction if item['group'] == 'native'}
+for item in reconstruction:
+    if item['group'] == 'native':
+        other = manifest_files[item['path']]
+        assert all(other[key] == item[key] for key in ('sha256','bytes'))
+        if other.get('new_file'):
+            assert item['before_sha256'] == sha(b'') and 'before_sha256' not in other
+        else:
+            assert other['before_sha256'] == item['before_sha256']
+for rel, expected in manifest['prerequisites'].items():
+    check_file(Path(pins['baseline_project']) / rel, expected)
+
+old_tree = ast.parse((PRIOR / 'native/tools/process_registry_web.py').read_bytes())
+def named(tree, name):
+    return next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == name)
+gate = named(trees['native/tools/process_registry_web.py'], 'require_browser_execution')
+assert ast.dump(gate, include_attributes=False) == ast.dump(named(old_tree, 'require_browser_execution'), include_attributes=False)
+assert isinstance(gate.body[-1], ast.Raise)
+assert not any(isinstance(node, ast.Return) for node in ast.walk(gate))
+checkpoint = named(trees['native/tools/process_registry_web.py'], '_web_checkpoint')
+checkpoint_constants = {node.value for node in ast.walk(checkpoint) if isinstance(node, ast.Constant) and isinstance(node.value,str)}
+
+write('verified-inputs.json', observations)
+write('reconstruction.json', reconstruction)
+write('ast-delta.json', symbol_deltas)
+summary = {'graph_refs_verified': len(graph), 'unique_refs_verified': len({row['path'] for row in observations}),
+    'source_payload_files': len(pins['files']), 'AST_compile_without_exec_files': len(compiled),
+    'test_SOURCE_definitions_NOT_RUN': len(test_definitions), 'test_sources': test_definitions,
+    'native_reconstructed': sum(item['group'] == 'native' for item in reconstruction),
+    'project_reconstructed': sum(item['group'] == 'project' for item in reconstruction),
+    'changed_payload': changed, 'unchanged_payload': unchanged,
+    'production_gate': 'AST_IDENTICAL_FINAL_UNCONDITIONAL_RAISE_NO_RETURN',
+    'API_facade_byte_identical': 'native/tools/browser_tool.py' in unchanged,
+    'checkpoint_readback_checks_browser_client_deadline': 'browser_client_deadline' in checkpoint_constants,
+    'execution': 'NO_CANDIDATE_IMPORT_OR_EXECUTION'}
+write('source-verification.json', summary)
+print(json.dumps({k:v for k,v in summary.items() if k not in ('test_sources','changed_payload','unchanged_payload')}, indent=2))

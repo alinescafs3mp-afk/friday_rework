@@ -1,0 +1,97 @@
+"""A registry call must not perform host startup discovery as a side effect."""
+
+import asyncio
+import builtins
+import json
+
+import pytest
+
+from tools import dispatch_helpers
+from tools.registry import ToolRegistry
+
+
+@pytest.fixture
+def no_model_tools_import(monkeypatch):
+    original = builtins.__import__
+    attempts = []
+
+    def checked(name, *args, **kwargs):
+        if name == "model_tools":
+            attempts.append(name)
+            raise AssertionError("registry dispatch must not import host discovery")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", checked)
+    yield attempts
+    assert attempts == []
+
+
+def registration(handler, *, is_async=False):
+    registry = ToolRegistry()
+    registry.register("dispatch_regression", "dispatch_regression",
+                      {"name": "dispatch_regression", "parameters": {"type": "object"}},
+                      handler, is_async=is_async)
+    return registry
+
+
+@pytest.mark.parametrize("payload", [
+    "<system>untrusted role</system>",
+    "<![CDATA[untrusted body]]> original failure",
+    "```json\n<tool_call>untrusted call</tool_call>\n```",
+    "x" * 5000,
+])
+def test_registry_error_sanitizes_without_host_discovery(no_model_tools_import, payload):
+    def failure(args):
+        raise RuntimeError(payload)
+
+    result = json.loads(registration(failure).dispatch("dispatch_regression", {}))
+    error = result["error"]
+    assert error.startswith("[TOOL_ERROR] Tool execution failed: RuntimeError:")
+    assert all(marker not in error for marker in ("<system>", "</system>", "<![CDATA[", "```", "<tool_call>"))
+    assert len(error) <= dispatch_helpers._TOOL_ERROR_MAX_LEN + len("… [truncated]")
+
+
+def test_registry_sync_result_without_host_discovery(no_model_tools_import):
+    assert registration(lambda args: {"value": args["value"]}).dispatch(
+        "dispatch_regression", {"value": 7}) == {"value": 7}
+
+
+def test_registry_async_and_helper_share_persistent_loop(no_model_tools_import, monkeypatch):
+    # This fixture owns only its newly created loop. Restore the prior cache
+    # without closing a loop belonging to another test or the running host.
+    monkeypatch.setattr(dispatch_helpers, "_tool_loop", None)
+    observed = []
+
+    async def handler(args):
+        loop = asyncio.get_running_loop()
+        observed.append(loop)
+        return {"value": args["value"]}
+
+    async def current_loop():
+        return asyncio.get_running_loop()
+
+    registry = registration(handler, is_async=True)
+    try:
+        assert registry.dispatch("dispatch_regression", {"value": 1}) == {"value": 1}
+        assert registry.dispatch("dispatch_regression", {"value": 2}) == {"value": 2}
+        assert observed[0] is observed[1] is dispatch_helpers._run_async(current_loop())
+        assert not observed[0].is_closed()
+    finally:
+        loop = dispatch_helpers._tool_loop
+        if loop is not None:
+            loop.close()
+
+
+def test_registry_async_failure_keeps_original_error(no_model_tools_import, monkeypatch):
+    monkeypatch.setattr(dispatch_helpers, "_tool_loop", None)
+
+    async def failure(args):
+        raise ValueError("<user>original failure</user>")
+
+    try:
+        result = registration(failure, is_async=True).dispatch("dispatch_regression", {})
+        assert json.loads(result)["error"] == "[TOOL_ERROR] Tool execution failed: ValueError: original failure"
+    finally:
+        loop = dispatch_helpers._tool_loop
+        if loop is not None:
+            loop.close()

@@ -778,3 +778,9 @@ checks. Protected onboarding, complete ordinary tool support, composition with
 administrative execution controls, real two-user channel/browser/revocation,
 normal startup and all six complete journeys remain unaccepted. See
 [ordinary-user isolation and its explicit gaps](user-isolation.md).
+
+## Intermediate process and source publication — 2026-10-09
+
+[The second analysis snapshot](../analysis/2026-10-09/incremental-02/README.md) publishes 1,803 inert files, including 349 historical result summaries, 40 design/control plans, selected source snapshots and component notices. Its work log and timeline retain failed runs, original budgets, missing measurements and subsequent repair decisions. Source presence, wiring, offline checks, live execution and product acceptance remain separate. No product installation or execution follows from this publication.
+
+This is a partial reporting cut after the first intermediate commit `572c6d8c19a2b7261ab0c63f5c760c87108378f1`. The daily baseline remains `3bf8b315254da4346cfda67cf951dc0f0ae0cc49`; later work and the remaining metadata inventory still need reconciliation at the daily checkpoint. Current follow-up review identified exceptional process-custody and transform/worker-evidence gaps in the TS owner candidate, plus defects in callback measurement qualification. Repairs are in progress. All seven installed user journeys and all four web contexts remain unaccepted.

@@ -1,0 +1,527 @@
+--- a/cli/src/native/daemon.rs
++++ b/cli/src/native/daemon.rs
+@@ -17,6 +17,10 @@
+ use super::stream::StreamServer;
+ 
+ pub async fn run_daemon(session: &str) {
++    if let Err(error) = super::stream::validate_friday_control(session) {
++        let _ = writeln!(std::io::stderr(), "{}", error);
++        process::exit(1);
++    }
+     let socket_dir = get_daemon_socket_dir();
+     if !socket_dir.exists() {
+         let _ = fs::create_dir_all(&socket_dir);
+--- /dev/null
++++ b/cli/src/native/stream/control.rs
+@@ -0,0 +1,192 @@
++//! Narrow Friday authentication for the existing automatic stream server.
++//! This is NOT a Chromium egress or original-job cgroup admission producer.
++use serde::Deserialize;
++use std::time::Duration;
++
++#[derive(Clone)]
++pub(super) enum StreamPolicy {
++    Donor,
++    Friday(OwnerControl),
++}
++
++#[derive(Clone, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(super) struct OwnerControl {
++    schema: u8,
++    session: String,
++    binding: String,
++    token: String,
++    boot_id: String,
++    deadline_monotonic: f64,
++}
++
++fn lower_hex64(value: &str) -> bool {
++    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++
++// The issuer is the retained BrowserOwner, never page content or a request body.
++// Its secret is kept only in the launch environment and backend-only headers.
++impl StreamPolicy {
++    pub(super) fn from_env(session: &str) -> Result<Self, String> {
++        let required = std::env::var_os("AGENT_BROWSER_FRIDAY_CONTROL_REQUIRED");
++        let record = std::env::var_os("AGENT_BROWSER_FRIDAY_STREAM_CONTROL");
++        match (required, record) {
++            (None, None) => Ok(Self::Donor),
++            (Some(required), Some(record)) if required == "1" => {
++                let record = record.to_str().ok_or("Friday stream control malformed")?;
++                let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
++                    .map_err(|_| "Friday stream boot identity unavailable")?;
++                Self::parse(record, session, boot_id.trim(), monotonic_seconds()?)
++            }
++            _ => Err("Friday stream control missing or malformed".into()),
++        }
++    }
++
++    fn parse(record: &str, session: &str, boot_id: &str, now: f64) -> Result<Self, String> {
++        if record.len() > 2048 {
++            return Err("Friday stream control malformed".into());
++        }
++        let control: OwnerControl = serde_json::from_str(record)
++            .map_err(|_| "Friday stream control malformed")?;
++        if control.schema != 1 || control.session != session || session.is_empty()
++            || control.boot_id != boot_id || !lower_hex64(&control.binding)
++            || !lower_hex64(&control.token) || !control.deadline_monotonic.is_finite()
++            || !now.is_finite() || control.deadline_monotonic <= now
++            || control.deadline_monotonic - now > 7.0 * 86400.0 {
++            return Err("Friday stream owner identity or deadline mismatch".into());
++        }
++        Ok(Self::Friday(control))
++    }
++
++    pub(super) fn io_timeout(&self) -> Result<Duration, String> {
++        Ok(self.remaining()?.unwrap_or(Duration::from_secs(5)).min(Duration::from_secs(5)))
++    }
++
++    pub(super) fn remaining(&self) -> Result<Option<Duration>, String> {
++        match self {
++            Self::Donor => Ok(None),
++            Self::Friday(control) => {
++                let remaining = control.deadline_monotonic - monotonic_seconds()?;
++                if !remaining.is_finite() || remaining <= 0.0 {
++                    return Err("Friday stream original deadline exhausted".into());
++                }
++                Ok(Some(Duration::from_secs_f64(remaining)))
++            }
++        }
++    }
++
++    pub(super) fn is_friday(&self) -> bool { matches!(self, Self::Friday(_)) }
++
++    pub(super) fn authorize(&self, request: &str) -> bool {
++        if !self.is_friday() { return true; }
++        if self.remaining().is_err() { return false; }
++        self.authorize_fields(request)
++    }
++
++    fn authorize_fields(&self, request: &str) -> bool {
++        let Self::Friday(control) = self else { return true; };
++        if request.len() > 8192 || !request.is_ascii() || !request.contains("\r\n\r\n") {
++            return false;
++        }
++        let mut lines = request.split("\r\n");
++        let Some(first) = lines.next() else { return false; };
++        let parts: Vec<_> = first.split(' ').collect();
++        // The donor-wide discovery/spawn/chat/command relay are not scoped to
++        // this owner. The existing native CLI APIs remain intact.
++        if parts.len() != 3 || parts[0] != "GET" || parts[2] != "HTTP/1.1"
++            || !matches!(parts[1], "/" | "/api/tabs") { return false; }
++        let mut auth = None;
++        let mut binding = None;
++        for line in lines {
++            if line.is_empty() { break; }
++            if line.starts_with(' ') || line.starts_with('\t') { return false; }
++            let Some((name,value)) = line.split_once(':') else { return false; };
++            if name.eq_ignore_ascii_case("origin") { return false; }
++            if name.eq_ignore_ascii_case("authorization") {
++                if auth.is_some() { return false; }
++                auth = Some(value.trim());
++            }
++            if name.eq_ignore_ascii_case("x-friday-owner") {
++                if binding.is_some() { return false; }
++                binding = Some(value.trim());
++            }
++        }
++        let expected = format!("Bearer {}", control.token);
++        constant_match(auth.unwrap_or(""), &expected)
++            && constant_match(binding.unwrap_or(""), &control.binding)
++    }
++}
++
++fn constant_match(actual: &str, expected: &str) -> bool {
++    if actual.len() != expected.len() { return false; }
++    actual.bytes().zip(expected.bytes()).fold(0u8, |diff,(a,b)| diff | (a ^ b)) == 0
++}
++
++#[cfg(target_os = "linux")]
++fn monotonic_seconds() -> Result<f64, String> {
++    let mut value = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
++        return Err("Friday stream original clock unavailable".into());
++    }
++    Ok(value.tv_sec as f64 + value.tv_nsec as f64 / 1_000_000_000.0)
++}
++
++#[cfg(not(target_os = "linux"))]
++fn monotonic_seconds() -> Result<f64, String> {
++    Err("Friday stream owner clock unsupported".into())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn record() -> String {
++        serde_json::json!({"schema":1,"session":"own","binding":"a".repeat(64),
++            "token":"b".repeat(64),"boot_id":"boot","deadline_monotonic":120.0}).to_string()
++    }
++    fn gate() -> StreamPolicy { StreamPolicy::parse(&record(),"own","boot",100.0).unwrap() }
++    fn request(method: &str,path: &str,extra: &str) -> String {
++        format!("{} {} HTTP/1.1\r\nAuthorization: Bearer {}\r\nX-Friday-Owner: {}\r\n{}\r\n",
++            method,path,"b".repeat(64),"a".repeat(64),extra)
++    }
++    #[test]
++    fn original_owner_session_boot_and_expiry_are_not_renewed() {
++        assert!(StreamPolicy::parse(&record(),"own","boot",100.0).is_ok());
++        assert!(StreamPolicy::parse(&record(),"foreign","boot",100.0).is_err());
++        assert!(StreamPolicy::parse(&record(),"own","other",100.0).is_err());
++        assert!(StreamPolicy::parse(&record(),"own","boot",120.0).is_err());
++    }
++    #[test]
++    fn principal_backend_requires_both_exact_secret_and_owner_binding() {
++        let p=gate();
++        assert!(p.authorize_fields(&request("GET","/api/tabs","")));
++        assert!(p.authorize_fields(&request("GET","/","Upgrade: websocket\r\n")));
++        assert!(!p.authorize_fields("GET /api/tabs HTTP/1.1\r\n\r\n"));
++        assert!(!p.authorize_fields(&request("GET","/api/tabs","").replace("Bearer b","Bearer c")));
++        assert!(!p.authorize_fields(&request("GET","/api/tabs","").replace("Owner: a","Owner: d")));
++    }
++    #[test]
++    fn no_origin_duplicate_smuggling_query_or_global_routes() {
++        let p=gate();
++        for extra in ["Origin: http://localhost\r\n","Origin: file://\r\n",
++            "Authorization: Bearer other\r\n","X-Friday-Owner: other\r\n"," folded: x\r\n"] {
++            assert!(!p.authorize_fields(&request("GET","/",extra)));
++        }
++        for path in ["/api/sessions","/api/chat","/api/models","/api/command","/?token=x","/api/tabs?x=1"] {
++            assert!(!p.authorize_fields(&request("GET",path,"")));
++            assert!(!p.authorize_fields(&request("POST",path,"")));
++        }
++    }
++    #[test]
++    fn malformed_and_partial_control_headers_fail_closed() {
++        assert!(!gate().authorize_fields("GET / HTTP/1.1\r\nAuthorization: Bearer "));
++        assert!(!gate().authorize_fields(&request("GET","/","").replace("HTTP/1.1","HTTP/1.0")));
++        assert!(StreamPolicy::parse("{}","own","boot",100.0).is_err());
++        assert!(StreamPolicy::parse(&record().replace("120.0","null"),"own","boot",100.0).is_err());
++    }
++    #[test]
++    fn unmanaged_donor_behavior_is_unchanged() {
++        assert!(StreamPolicy::Donor.authorize_fields("GET /api/sessions HTTP/1.1\r\n\r\n"));
++        assert!(!StreamPolicy::Donor.is_friday());
++        assert!(StreamPolicy::Donor.remaining().unwrap().is_none());
++    }
++}
+--- /dev/null
++++ b/cli/src/native/stream/handshake.rs
+@@ -0,0 +1,85 @@
++//! Bounded framing for the existing stream listener, not a new proxy/server.
++use std::pin::Pin;
++use std::task::{Context, Poll};
++use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
++use tokio::net::TcpStream;
++
++pub(super) async fn read_owner_head(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
++    let mut head = Vec::with_capacity(512);
++    while head.len() < 4096 {
++        let byte = stream.read_u8().await.map_err(|_| "Friday stream header incomplete")?;
++        head.push(byte);
++        if head.ends_with(b"\r\n\r\n") { return Ok(head); }
++    }
++    Err("Friday stream header too large".into())
++}
++
++// The full validated header was consumed once for authentication. Give those
++// exact bytes to the existing Tungstenite handshake; body bytes stay in the TCP
++// socket. No second connection, relay task, payload parser or manager is added.
++pub(super) struct StreamIo {
++    socket: TcpStream,
++    head: Vec<u8>,
++    offset: usize,
++}
++
++impl StreamIo {
++    pub(super) fn new(socket: TcpStream, head: Vec<u8>) -> Self {
++        Self { socket, head, offset: 0 }
++    }
++}
++
++impl AsyncRead for StreamIo {
++    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, out: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
++        let this = self.get_mut();
++        if this.offset < this.head.len() {
++            let count = out.remaining().min(this.head.len() - this.offset);
++            out.put_slice(&this.head[this.offset..this.offset+count]);
++            this.offset += count;
++            return Poll::Ready(Ok(()));
++        }
++        Pin::new(&mut this.socket).poll_read(cx,out)
++    }
++}
++
++impl AsyncWrite for StreamIo {
++    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
++        Pin::new(&mut self.get_mut().socket).poll_write(cx,buf)
++    }
++    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
++        Pin::new(&mut self.get_mut().socket).poll_flush(cx)
++    }
++    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
++        Pin::new(&mut self.get_mut().socket).poll_shutdown(cx)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use tokio::io::{AsyncReadExt,AsyncWriteExt};
++    #[tokio::test]
++    async fn segmented_headers_are_read_once_and_original_body_is_preserved() {
++        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let mut client=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
++        let (mut socket,_)=listener.accept().await.unwrap();
++        client.write_all(b"GET / HTTP/1.1\r\nAuth").await.unwrap();
++        let writer=tokio::spawn(async move {
++            client.write_all(b"orization: fixture\r\n\r\nbody").await.unwrap();
++            client.shutdown().await.unwrap();
++        });
++        let head=tokio::time::timeout(std::time::Duration::from_secs(1),read_owner_head(&mut socket)).await.unwrap().unwrap();
++        assert_eq!(head,b"GET / HTTP/1.1\r\nAuthorization: fixture\r\n\r\n");
++        let mut io=StreamIo::new(socket,head.clone());let mut all=Vec::new();io.read_to_end(&mut all).await.unwrap();
++        assert_eq!(all,[head,b"body".to_vec()].concat());writer.await.unwrap();
++    }
++    #[tokio::test]
++    async fn oversized_or_closed_headers_do_not_become_authenticated_input() {
++        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let mut client=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
++        let (mut socket,_)=listener.accept().await.unwrap();
++        client.write_all(&vec![b'x';4096]).await.unwrap();
++        assert!(read_owner_head(&mut socket).await.is_err());
++        client.shutdown().await.unwrap();
++    }
++}
+--- a/cli/src/native/stream/mod.rs
++++ b/cli/src/native/stream/mod.rs
+@@ -1,4 +1,7 @@
+ mod cdp_loop;
++mod control;
++mod handshake;
++use control::StreamPolicy;
+ pub(crate) mod chat;
+ mod dashboard;
+ mod discovery;
+@@ -160,6 +163,8 @@
+         session_id: String,
+         allow_port_fallback: bool,
+     ) -> Result<(Self, Arc<RwLock<Option<Arc<CdpClient>>>>), String> {
++        // Validate immutable owner control BEFORE opening an automatic listener.
++        let policy = StreamPolicy::from_env(&session_id)?;
+         let addr = format!("127.0.0.1:{}", preferred_port);
+         let listener = match TcpListener::bind(&addr).await {
+             Ok(l) => l,
+@@ -221,6 +226,7 @@
+                 recording_clone,
+                 accept_shutdown_rx,
+                 session_name_clone,
++                policy,
+             )
+             .await;
+         });
+@@ -484,3 +490,8 @@
+         assert_eq!(meta.page_scale_factor, 1.0);
+     }
+ }
++
++/// Managed daemon validation before socket/profile effects.
++pub(crate) fn validate_friday_control(session: &str) -> Result<(), String> {
++    StreamPolicy::from_env(session).map(|_| ())
++}
+--- a/cli/src/native/stream/websocket.rs
++++ b/cli/src/native/stream/websocket.rs
+@@ -11,6 +11,9 @@
+ 
+ use super::http::handle_http_request;
+ use super::{is_allowed_origin, timestamp_ms};
++use super::control::StreamPolicy;
++use super::handshake::{read_owner_head, StreamIo};
++use tokio::io::AsyncWriteExt;
+ 
+ #[allow(clippy::too_many_arguments)]
+ pub(super) async fn accept_loop(
+@@ -29,10 +32,22 @@
+     recording: Arc<Mutex<bool>>,
+     mut shutdown_rx: watch::Receiver<bool>,
+     session_name: String,
++    policy: StreamPolicy,
+ ) {
+     let session_name: Arc<str> = Arc::from(session_name);
++    // This listener and each authenticated WS retain the same absolute clock.
++    let remaining = policy.remaining();
++    let expiry = async {
++        match remaining {
++            Ok(Some(left)) => tokio::time::sleep(left).await,
++            Ok(None) => std::future::pending::<()>().await,
++            Err(_) => {},
++        }
++    };
++    tokio::pin!(expiry);
+     loop {
+         tokio::select! {
++            _ = &mut expiry => break,
+             changed = shutdown_rx.changed() => {
+                 if changed.is_err() || *shutdown_rx.borrow() {
+                     break;
+@@ -56,6 +71,7 @@
+                 let rec = recording.clone();
+                 let shutdown_rx = shutdown_rx.clone();
+                 let sn = session_name.clone();
++                let policy = policy.clone();
+ 
+                 tokio::spawn(async move {
+                     handle_connection(
+@@ -75,6 +91,7 @@
+                         rec,
+                         shutdown_rx,
+                         sn,
++                        policy,
+                     )
+                     .await;
+                 });
+@@ -113,18 +130,30 @@
+     recording: Arc<Mutex<bool>>,
+     shutdown_rx: watch::Receiver<bool>,
+     session_name: Arc<str>,
++    policy: StreamPolicy,
+ ) {
++    let mut stream = stream;
+     let mut buf = [0u8; 4096];
+-    let n = match stream.peek(&mut buf).await {
+-        Ok(n) => n,
+-        Err(_) => return,
++    let managed_head = if policy.is_friday() {
++        let Ok(limit) = policy.io_timeout() else { return; };
++        match tokio::time::timeout(limit, read_owner_head(&mut stream)).await {
++            Ok(Ok(head)) => head,
++            _ => return,
++        }
++    } else { Vec::new() };
++    let n = if policy.is_friday() {
++        buf[..managed_head.len()].copy_from_slice(&managed_head);
++        managed_head.len()
++    } else {
++        match stream.peek(&mut buf).await { Ok(n) => n, Err(_) => return }
+     };
+     let request = String::from_utf8_lossy(&buf[..n]);
+-
++    // WS callback revalidates these same full headers before any frame/input.
++    if !policy.authorize(&request) { return; }
+     if is_websocket_upgrade(&request) {
+         let frame_rx = frame_tx.subscribe();
+         handle_ws_client(
+-            stream,
++            StreamIo::new(stream, managed_head),
+             addr,
+             frame_rx,
+             client_count,
+@@ -139,16 +168,35 @@
+             last_frame,
+             recording,
+             shutdown_rx,
++            policy,
+         )
+         .await;
+     } else {
+-        handle_http_request(stream, &buf[..n], &last_tabs, &last_engine, &session_name).await;
++        if policy.is_friday() {
++            // No global donor relay/discovery/spawn/chat handlers in this route.
++            let Ok(limit) = policy.io_timeout() else { return; };
++            let work = async {
++                let body = if request.starts_with("GET /api/tabs HTTP/1.1\r\n") {
++                    serde_json::to_vec(&*last_tabs.read().await).ok()
++                } else { None };
++                let (status, body) = match body {
++                    Some(body) => ("200 OK", body),
++                    None => ("404 Not Found", Vec::new()),
++                };
++                let header = format!("HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", status, body.len());
++                let _ = stream.write_all(header.as_bytes()).await;
++                let _ = stream.write_all(&body).await;
++            };
++            let _ = tokio::time::timeout(limit, work).await;
++        } else {
++            handle_http_request(stream, &buf[..n], &last_tabs, &last_engine, &session_name).await;
++        }
+     }
+ }
+ 
+ #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+ async fn handle_ws_client(
+-    stream: tokio::net::TcpStream,
++    stream: StreamIo,
+     _addr: SocketAddr,
+     mut frame_rx: broadcast::Receiver<String>,
+     client_count: Arc<Mutex<usize>>,
+@@ -163,6 +211,7 @@
+     last_frame: Arc<RwLock<Option<String>>>,
+     recording: Arc<Mutex<bool>>,
+     mut shutdown_rx: watch::Receiver<bool>,
++    policy: StreamPolicy,
+ ) {
+     let callback =
+         |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+@@ -172,7 +221,17 @@
+                 .get("origin")
+                 .and_then(|v| v.to_str().ok())
+                 .map(|s| s.to_string());
+-            if !is_allowed_origin(origin.as_deref()) {
++            let mut head = format!("{} {} HTTP/1.1\r\n", req.method(), req.uri());
++            for (name, value) in req.headers() {
++                let Ok(value) = value.to_str() else {
++                    let mut reject = tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(None);
++                    *reject.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
++                    return Err(reject);
++                };
++                head.push_str(&format!("{}: {}\r\n",name,value));
++            }
++            head.push_str("\r\n");
++            if !policy.authorize(&head) || !is_allowed_origin(origin.as_deref()) {
+                 let mut reject =
+                     tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some(
+                         "Origin not allowed".to_string(),
+@@ -183,9 +242,15 @@
+             Ok(resp)
+         };
+ 
+-    let ws_stream = match tokio_tungstenite::accept_hdr_async(stream, callback).await {
+-        Ok(ws) => ws,
+-        Err(_) => return,
++    let handshake = tokio_tungstenite::accept_hdr_async(stream, callback);
++    let ws_stream = if policy.is_friday() {
++        let Ok(limit) = policy.io_timeout() else { return; };
++        match tokio::time::timeout(limit, handshake).await {
++            Ok(Ok(ws)) => ws,
++            _ => return,
++        }
++    } else {
++        match handshake.await { Ok(ws) => ws, Err(_) => return }
+     };
+ 
+     {
+@@ -193,6 +258,9 @@
+         *count += 1;
+     }
+ 
++    // Bound the entire authenticated session, including blocked sends and CDP input.
++    // Dropping its future drops its original WS handles; this is not whole-job stop.
++    let session_work = async {
+     let (mut ws_tx, mut ws_rx) = ws_stream.split();
+ 
+     {
+@@ -268,6 +336,13 @@
+         }
+     }
+ 
++    };
++    match policy.remaining() {
++        Ok(Some(left)) => { let _ = tokio::time::timeout(left, session_work).await; }
++        Ok(None) => session_work.await,
++        Err(_) => {},
++    }
++
+     {
+         let mut count = client_count.lock().await;
+         *count = count.saturating_sub(1);

@@ -1,0 +1,443 @@
+diff --git a/patches/hermes/dispatch-helpers.patch b/patches/hermes/dispatch-helpers.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/hermes/dispatch-helpers.patch
+@@ -0,0 +1,383 @@
++diff --git a/model_tools.py b/model_tools.py
++--- a/model_tools.py
+++++ b/model_tools.py
++@@ -61,89 +61,10 @@
++         return True
++ 
++ 
++-# --- Async bridging (single source of truth; registry.dispatch uses it too) ---
++-# Loops are persistent (never asyncio.run per call): cached httpx/AsyncOpenAI
++-# clients stay bound to a live loop, so their GC cleanup can't hit "Event loop
++-# is closed". Main thread shares one loop; worker threads own thread-local loops.
++-
++-_tool_loop = None          # persistent loop for the main (CLI) thread
++-_tool_loop_lock = threading.Lock()
++-_worker_thread_local = threading.local()  # per-worker-thread persistent loops
++-
++-
++-def _get_tool_loop():
++-    """Long-lived event loop for async tool handlers on the main thread."""
++-    global _tool_loop
++-    with _tool_loop_lock:
++-        if _tool_loop is None or _tool_loop.is_closed():
++-            _tool_loop = asyncio.new_event_loop()
++-        return _tool_loop
++-
++-
++-def _get_worker_loop():
++-    """Persistent event loop for the current worker thread (thread-local)."""
++-    loop = getattr(_worker_thread_local, 'loop', None)
++-    if loop is None or loop.is_closed():
++-        loop = asyncio.new_event_loop()
++-        asyncio.set_event_loop(loop)
++-        _worker_thread_local.loop = loop
++-    return loop
++-
++-
++-def _run_async(coro):
++-    """Run a coroutine from sync code; safe under a running loop (gateway/RL env)."""
++-    try:
++-        loop = asyncio.get_running_loop()
++-    except RuntimeError:
++-        loop = None
++-    if loop and loop.is_running():
++-        # Inside a running loop: run in a fresh thread whose loop we keep a
++-        # reference to, so on timeout we can cancel the task inside it
++-        # (ThreadPoolExecutor.cancel() is a no-op on a running worker).
++-        import concurrent.futures
++-        worker_loop: Optional[asyncio.AbstractEventLoop] = None
++-        loop_ready = threading.Event()
++-
++-        def _run_in_worker():
++-            nonlocal worker_loop
++-            worker_loop = asyncio.new_event_loop()
++-            loop_ready.set()
++-            try:
++-                asyncio.set_event_loop(worker_loop)
++-                return worker_loop.run_until_complete(coro)
++-            finally:
++-                try:  # drain tasks still pending after an external cancel
++-                    pending = asyncio.all_tasks(worker_loop)
++-                    for t in pending:
++-                        t.cancel()
++-                    if pending:
++-                        worker_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
++-                except Exception:
++-                    pass
++-                worker_loop.close()
++-
++-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
++-        # Carry profile + approval/sudo context so get_hermes_home() resolves correctly.
++-        from tools.thread_context import propagate_context_to_thread
++-        future = pool.submit(propagate_context_to_thread(_run_in_worker))
++-        try:
++-            return future.result(timeout=300)
++-        except concurrent.futures.TimeoutError:
++-            # Cancel inside the worker's own loop so the thread can wind down.
++-            if loop_ready.wait(timeout=1.0) and worker_loop is not None:
++-                try:
++-                    for t in asyncio.all_tasks(worker_loop):
++-                        worker_loop.call_soon_threadsafe(t.cancel)
++-                except RuntimeError:
++-                    pass  # loop already closed
++-            raise
++-        finally:
++-            pool.shutdown(wait=False)  # never block the caller on a stuck coroutine
++-
++-    if threading.current_thread() is not threading.main_thread():
++-        return _get_worker_loop().run_until_complete(coro)
++-    return _get_tool_loop().run_until_complete(coro)
++-
+++from tools.dispatch_helpers import (
+++    _get_tool_loop, _get_worker_loop, _run_async, _sanitize_tool_error,
+++    _TOOL_ERROR_STRIP_RES, _tool_loop_lock, _worker_thread_local,
+++)
++ 
++ # --- Tool discovery (importing each tools/*.py triggers registry.register) ---
++ discover_builtin_tools()
++@@ -621,30 +542,6 @@
++ _READ_SEARCH_TOOLS = {"read_file", "search_files"}
++ 
++ 
++-# --- Tool error sanitization --------------------------------------------------
++-# Defense-in-depth: strip role tags / CDATA / code fences from exception text the
++-# model will read, and cap length (cap shared with tools/registry.py so text never
++-# passes two different caps with two different markers).
++-_TOOL_ERROR_STRIP_RES = (
++-    re.compile(r'</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>', re.IGNORECASE),
++-    re.compile(r'^\s*```(?:json|xml|html|markdown)?\s*', re.MULTILINE),
++-    re.compile(r'\s*```\s*$', re.MULTILINE),
++-    re.compile(r'<!\[CDATA\[.*?\]\]>', re.DOTALL),
++-)
++-
++-
++-def _sanitize_tool_error(error_msg: str) -> str:
++-    """Strip structural framing tokens from a tool error before the model sees it."""
++-    if not error_msg:
++-        return "[TOOL_ERROR] "
++-    sanitized = error_msg
++-    for pattern in _TOOL_ERROR_STRIP_RES:
++-        sanitized = pattern.sub("", sanitized)
++-    if len(sanitized) > _TOOL_ERROR_MAX_LEN:
++-        sanitized = sanitized[:_TOOL_ERROR_MAX_LEN - 3] + "..."
++-    return f"[TOOL_ERROR] {sanitized}"
++-
++-
++ @dataclass(frozen=True)
++ class _CallIds:
++     """Identity fields of one tool call, threaded through hooks and middleware."""
++diff --git a/tools/registry.py b/tools/registry.py
++--- a/tools/registry.py
+++++ b/tools/registry.py
++@@ -23,7 +23,7 @@
++ logger = logging.getLogger(__name__)
++ 
++ # Cap on a tool error body; only trims runaway interpolated exceptions (static msgs are ~115 chars).
++-_MAX_TOOL_ERROR_CHARS = 2048
+++from tools.dispatch_helpers import _TOOL_ERROR_MAX_LEN as _MAX_TOOL_ERROR_CHARS
++ _TOOL_ERROR_TRUNCATION_MARKER = "… [truncated]"
++ # Logs keep more of the body than the model sees, but still a bounded amount.
++ _MAX_LOGGED_ERROR_CHARS = 8192
++@@ -908,7 +908,7 @@
++             # plugin handler is not broken by every field the dispatcher injects (#68318).
++             kwargs = _kwargs_accepted_by(entry.handler, kwargs)
++             if entry.is_async:
++-                from model_tools import _run_async
+++                from tools.dispatch_helpers import _run_async
++                 result = _run_async(entry.handler(args, **kwargs))
++             else:
++                 result = entry.handler(args, **kwargs)
++@@ -919,7 +919,7 @@
++             # Sanitize so framing tokens/CDATA/fences in exception text aren't structural noise.
++             raw = f"Tool execution failed: {type(e).__name__}: {e}"
++             try:
++-                from model_tools import _sanitize_tool_error
+++                from tools.dispatch_helpers import _sanitize_tool_error
++                 sanitized = _sanitize_tool_error(raw)
++             except Exception:
++                 sanitized = raw  # defensive: never let the sanitizer block error propagation
++diff --git a/tools/dispatch_helpers.py b/tools/dispatch_helpers.py
++new file mode 100644
++--- /dev/null
+++++ b/tools/dispatch_helpers.py
++@@ -0,0 +1,117 @@
+++"""Shared tool dispatch mechanics; importing this module performs no tool discovery."""
+++
+++import asyncio
+++import re
+++import threading
+++from typing import Optional
+++
+++_TOOL_ERROR_MAX_LEN = 2048
+++
+++# --- Async bridging (single source of truth; registry.dispatch uses it too) ---
+++# Loops are persistent (never asyncio.run per call): cached httpx/AsyncOpenAI
+++# clients stay bound to a live loop, so their GC cleanup can't hit "Event loop
+++# is closed". Main thread shares one loop; worker threads own thread-local loops.
+++
+++_tool_loop = None          # persistent loop for the main (CLI) thread
+++_tool_loop_lock = threading.Lock()
+++_worker_thread_local = threading.local()  # per-worker-thread persistent loops
+++
+++
+++def _get_tool_loop():
+++    """Long-lived event loop for async tool handlers on the main thread."""
+++    global _tool_loop
+++    with _tool_loop_lock:
+++        if _tool_loop is None or _tool_loop.is_closed():
+++            _tool_loop = asyncio.new_event_loop()
+++        return _tool_loop
+++
+++
+++def _get_worker_loop():
+++    """Persistent event loop for the current worker thread (thread-local)."""
+++    loop = getattr(_worker_thread_local, 'loop', None)
+++    if loop is None or loop.is_closed():
+++        loop = asyncio.new_event_loop()
+++        asyncio.set_event_loop(loop)
+++        _worker_thread_local.loop = loop
+++    return loop
+++
+++
+++def _run_async(coro):
+++    """Run a coroutine from sync code; safe under a running loop (gateway/RL env)."""
+++    try:
+++        loop = asyncio.get_running_loop()
+++    except RuntimeError:
+++        loop = None
+++    if loop and loop.is_running():
+++        # Inside a running loop: run in a fresh thread whose loop we keep a
+++        # reference to, so on timeout we can cancel the task inside it
+++        # (ThreadPoolExecutor.cancel() is a no-op on a running worker).
+++        import concurrent.futures
+++        worker_loop: Optional[asyncio.AbstractEventLoop] = None
+++        loop_ready = threading.Event()
+++
+++        def _run_in_worker():
+++            nonlocal worker_loop
+++            worker_loop = asyncio.new_event_loop()
+++            loop_ready.set()
+++            try:
+++                asyncio.set_event_loop(worker_loop)
+++                return worker_loop.run_until_complete(coro)
+++            finally:
+++                try:  # drain tasks still pending after an external cancel
+++                    pending = asyncio.all_tasks(worker_loop)
+++                    for t in pending:
+++                        t.cancel()
+++                    if pending:
+++                        worker_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+++                except Exception:
+++                    pass
+++                worker_loop.close()
+++
+++        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+++        # Carry profile + approval/sudo context so get_hermes_home() resolves correctly.
+++        from tools.thread_context import propagate_context_to_thread
+++        future = pool.submit(propagate_context_to_thread(_run_in_worker))
+++        try:
+++            return future.result(timeout=300)
+++        except concurrent.futures.TimeoutError:
+++            # Cancel inside the worker's own loop so the thread can wind down.
+++            if loop_ready.wait(timeout=1.0) and worker_loop is not None:
+++                try:
+++                    for t in asyncio.all_tasks(worker_loop):
+++                        worker_loop.call_soon_threadsafe(t.cancel)
+++                except RuntimeError:
+++                    pass  # loop already closed
+++            raise
+++        finally:
+++            pool.shutdown(wait=False)  # never block the caller on a stuck coroutine
+++
+++    if threading.current_thread() is not threading.main_thread():
+++        return _get_worker_loop().run_until_complete(coro)
+++    return _get_tool_loop().run_until_complete(coro)
+++
+++
+++# --- Tool error sanitization --------------------------------------------------
+++# Defense-in-depth: strip role tags / CDATA / code fences from exception text the
+++# model will read, and cap length (cap shared with tools/registry.py so text never
+++# passes two different caps with two different markers).
+++_TOOL_ERROR_STRIP_RES = (
+++    re.compile(r'</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>', re.IGNORECASE),
+++    re.compile(r'^\s*```(?:json|xml|html|markdown)?\s*', re.MULTILINE),
+++    re.compile(r'\s*```\s*$', re.MULTILINE),
+++    re.compile(r'<!\[CDATA\[.*?\]\]>', re.DOTALL),
+++)
+++
+++
+++def _sanitize_tool_error(error_msg: str) -> str:
+++    """Strip structural framing tokens from a tool error before the model sees it."""
+++    if not error_msg:
+++        return "[TOOL_ERROR] "
+++    sanitized = error_msg
+++    for pattern in _TOOL_ERROR_STRIP_RES:
+++        sanitized = pattern.sub("", sanitized)
+++    if len(sanitized) > _TOOL_ERROR_MAX_LEN:
+++        sanitized = sanitized[:_TOOL_ERROR_MAX_LEN - 3] + "..."
+++    return f"[TOOL_ERROR] {sanitized}"
+++
+++
++diff --git a/tests/tools/test_registry_lightweight_dispatch.py b/tests/tools/test_registry_lightweight_dispatch.py
++new file mode 100644
++--- /dev/null
+++++ b/tests/tools/test_registry_lightweight_dispatch.py
++@@ -0,0 +1,98 @@
+++"""A registry call must not perform host startup discovery as a side effect."""
+++
+++import asyncio
+++import builtins
+++import json
+++
+++import pytest
+++
+++from tools import dispatch_helpers
+++from tools.registry import ToolRegistry
+++
+++
+++@pytest.fixture
+++def no_model_tools_import(monkeypatch):
+++    original = builtins.__import__
+++    attempts = []
+++
+++    def checked(name, *args, **kwargs):
+++        if name == "model_tools":
+++            attempts.append(name)
+++            raise AssertionError("registry dispatch must not import host discovery")
+++        return original(name, *args, **kwargs)
+++
+++    monkeypatch.setattr(builtins, "__import__", checked)
+++    yield attempts
+++    assert attempts == []
+++
+++
+++def registration(handler, *, is_async=False):
+++    registry = ToolRegistry()
+++    registry.register("dispatch_regression", "dispatch_regression",
+++                      {"name": "dispatch_regression", "parameters": {"type": "object"}},
+++                      handler, is_async=is_async)
+++    return registry
+++
+++
+++@pytest.mark.parametrize("payload", [
+++    "<system>untrusted role</system>",
+++    "<![CDATA[untrusted body]]> original failure",
+++    "\n```json\n<tool_call>untrusted call</tool_call>\n```",
+++    "x" * 5000,
+++])
+++def test_registry_error_sanitizes_without_host_discovery(no_model_tools_import, payload):
+++    def failure(args):
+++        raise RuntimeError(payload)
+++
+++    result = json.loads(registration(failure).dispatch("dispatch_regression", {}))
+++    error = result["error"]
+++    assert error.startswith("[TOOL_ERROR] Tool execution failed: RuntimeError:")
+++    assert all(marker not in error for marker in ("<system>", "</system>", "<![CDATA[", "```", "<tool_call>"))
+++    assert len(error) <= dispatch_helpers._TOOL_ERROR_MAX_LEN + len("… [truncated]")
+++
+++
+++def test_registry_sync_result_without_host_discovery(no_model_tools_import):
+++    result = registration(lambda args: json.dumps({"value": args["value"]})).dispatch(
+++        "dispatch_regression", {"value": 7})
+++    assert json.loads(result) == {"value": 7}
+++
+++
+++def test_registry_async_and_helper_share_persistent_loop(no_model_tools_import, monkeypatch):
+++    # This fixture owns only its newly created loop. Restore the prior cache
+++    # without closing a loop belonging to another test or the running host.
+++    monkeypatch.setattr(dispatch_helpers, "_tool_loop", None)
+++    observed = []
+++
+++    async def handler(args):
+++        loop = asyncio.get_running_loop()
+++        observed.append(loop)
+++        return json.dumps({"value": args["value"]})
+++
+++    async def current_loop():
+++        return asyncio.get_running_loop()
+++
+++    registry = registration(handler, is_async=True)
+++    try:
+++        assert json.loads(registry.dispatch("dispatch_regression", {"value": 1})) == {"value": 1}
+++        assert json.loads(registry.dispatch("dispatch_regression", {"value": 2})) == {"value": 2}
+++        assert observed[0] is observed[1] is dispatch_helpers._run_async(current_loop())
+++        assert not observed[0].is_closed()
+++    finally:
+++        loop = dispatch_helpers._tool_loop
+++        if loop is not None:
+++            loop.close()
+++
+++
+++def test_registry_async_failure_keeps_original_error(no_model_tools_import, monkeypatch):
+++    monkeypatch.setattr(dispatch_helpers, "_tool_loop", None)
+++
+++    async def failure(args):
+++        raise ValueError("<user>original failure</user>")
+++
+++    try:
+++        result = registration(failure, is_async=True).dispatch("dispatch_regression", {})
+++        assert json.loads(result)["error"] == "[TOOL_ERROR] Tool execution failed: ValueError: original failure"
+++    finally:
+++        loop = dispatch_helpers._tool_loop
+++        if loop is not None:
+++            loop.close()
+diff --git a/patches/hermes/dispatch-helpers-manifest.json b/patches/hermes/dispatch-helpers-manifest.json
+new file mode 100644
+--- /dev/null
++++ b/patches/hermes/dispatch-helpers-manifest.json
+@@ -0,0 +1,50 @@
++{
++  "schema_version": 1,
++  "base_commit": "781334eea4b9225a3e194faf0c241d9afe218634",
++  "prerequisite_patch": "patches/hermes/user-isolation.patch",
++  "prerequisite_patch_sha256": "0f6308243fa7adb266f0509109e1abcba9d465eb44d2871dcd8cee1edb1afc13",
++  "patch": "patches/hermes/dispatch-helpers.patch",
++  "patch_sha256": "70693d0f3bc15e9788d866fcc413dc09c03920e9ebafe7f649c65f67c6500ad2",
++  "files": [
++    {
++      "path": "model_tools.py",
++      "before_sha256": "63cae1170882a0b7a8e22d3ce22c4319450014017fecdd48f2a19f44c7ada1eb",
++      "sha256": "ecb306630b15ec2ae3cd4957d762c2c66b35df3d8bada6e42a0aace97c6e2a5a",
++      "bytes": 46267,
++      "mode": "100644",
++      "new_file": false
++    },
++    {
++      "path": "tools/registry.py",
++      "before_sha256": "3c57d0994eaf68bd7d9cbfc4d6d315a15be8737a671b7b982a78d6d17d09451e",
++      "sha256": "655d54182dc838dd8d16d9ab0f383026555d76b8535cb5421211b98e18eeb8b4",
++      "bytes": 51897,
++      "mode": "100644",
++      "new_file": false
++    },
++    {
++      "path": "tools/dispatch_helpers.py",
++      "before_sha256": null,
++      "sha256": "c9c2187f870ba0c1e13f779bc11a49c8a1e45967a83f762a3b969a10db60227d",
++      "bytes": 4808,
++      "mode": "100644",
++      "new_file": true
++    },
++    {
++      "path": "tests/tools/test_registry_lightweight_dispatch.py",
++      "before_sha256": null,
++      "sha256": "d8174e14cd68a3e65383c80c47b5811a64c9c46fed933f6baaf27e74bf5f1c20",
++      "bytes": 3603,
++      "mode": "100644",
++      "new_file": true
++    }
++  ],
++  "scope": "Shared original async bridging and error sanitization without registry-to-host-discovery import. Full host discovery/hook/tool implementation remains unchanged.",
++  "qualification": "NOT_RUN; source-only Sol fixture correction F1/F2. Independent final review, finite async admission, compatibility and full gates required.",
++  "repair_assignment": "FRW041-REGISTRY-RUNTIME-JOIN-SOL#1",
++  "prior_patch_sha256": "55a92062db3c88ae1010dd5e8498061ad54dbbe63cc3188d6cfaa0b61b484f93",
++  "fixture_findings_closed_at_source": [
++    "F1",
++    "F2"
++  ]
++}

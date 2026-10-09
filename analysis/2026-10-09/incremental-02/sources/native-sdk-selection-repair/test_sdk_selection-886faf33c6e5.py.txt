@@ -1,0 +1,226 @@
+"""Authored offline controls; execution is NOT authorized by this assignment.
+
+Only temporary synthetic packages are staged. No package manager, build, Node,
+native launcher, network, service, SDK import or admission is used by these tests.
+Root must separately admit their execution and the real installed qualification.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import tempfile
+import types
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class SDKSelection(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.api = runpy.run_path(str(ROOT / 'candidate/project/scripts/dsh_prepare.py'))
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='sdk-closure-')
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.donor = self.base / 'donor'
+        self.donor.mkdir()
+        for name in ('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'LICENSE', 'THIRD_PARTY_NOTICES.md'):
+            (self.donor / name).write_text('fixture\n')
+        self.package('', 'fixture-root', devDependencies={'irrelevant-uninstalled': '1'})
+        self.provider = self.package('packages/sandbox/sandbox-local', '@deepseek-ai/dsh-sandbox-local')
+        self.cordis = self.package('vendor/cordis', '@deepseek-ai/cordis')
+        self.native = self.package('native/system/packages/entry', '@deepseek-ai/node-addon-system')
+        self.seam = self.package('packages/sandbox/sandbox', '@deepseek-ai/dsh-sandbox')
+        for parent, package in ((self.provider, self.cordis), (self.provider, self.native),
+                                (self.provider, self.seam)):
+            self.dependency(parent, package)
+        for arch in ('x64', 'arm64'):
+            native = self.package('native/system/packages/linux-' + arch,
+                                  '@deepseek-ai/node-addon-system-linux-' + arch,
+                                  os=['linux'], cpu=[arch])
+            self.dependency(self.native, native, 'optionalDependencies')
+            (native / 'bin').mkdir()
+            (native / 'bin/landlock-run').write_bytes(b'fixture-not-executable\n')
+        for package, names in ((self.provider, ('index.ts', 'host-control.ts', 'profiles.ts')),
+                               (self.seam, ('index.ts',)), (self.native, ('index.ts', 'main.c'))):
+            (package / 'src').mkdir(exist_ok=True)
+            for name in names:
+                (package / 'src' / name).write_text('fixture source\n')
+
+    def package(self, relative, name, **fields):
+        package = self.donor / relative
+        package.mkdir(parents=True, exist_ok=True)
+        (package / 'package.json').write_text(json.dumps({
+            'name': name, 'version': '1.0.0', 'type': 'module',
+            'exports': {'.': './lib/index.js'}, **fields}))
+        (package / 'lib').mkdir(exist_ok=True)
+        (package / 'lib/index.js').write_text('export const fixture = true\n')
+        (package / 'LICENSE').write_text('fixture notice\n')
+        return package
+
+    def dependency(self, parent, target, section='dependencies'):
+        manifest = json.loads((parent / 'package.json').read_text())
+        name = json.loads((target / 'package.json').read_text())['name']
+        manifest.setdefault(section, {})[name] = '1.0.0'
+        (parent / 'package.json').write_text(json.dumps(manifest))
+        link = parent / 'node_modules' / name
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(os.path.relpath(target, link.parent))
+        return link
+
+    def stage(self, name='stage'):
+        return self.api['stage_host_control_sdk'](self.donor, self.base / name)
+
+    def test_complete_packages_and_pnpm_topology_without_full_donor(self):
+        peer = self.package('node_modules/.pnpm/peer@1/node_modules/peer', 'peer')
+        transitive = self.package('node_modules/.pnpm/transitive@1/node_modules/transitive', 'transitive')
+        self.dependency(self.provider, peer, 'peerDependencies')
+        self.dependency(peer, transitive)
+        self.dependency(transitive, peer)  # Cycles must terminate without dropping edges.
+        (transitive / 'runtime-data.json').write_text('{"data":true}')
+        (transitive / 'internal-alias.js').symlink_to('lib/index.js')
+        unrelated = self.donor / 'node_modules/unrelated'
+        unrelated.parent.mkdir(exist_ok=True)
+        unrelated.symlink_to('missing')  # Historical optional Codex defect is out of this graph.
+        graph, files, links = self.stage()
+        stage = self.base / 'stage'
+        rel = str((transitive / 'runtime-data.json').relative_to(self.donor))
+        self.assertIn(rel, files)
+        self.assertEqual((stage / rel).read_bytes(), (self.donor / rel).read_bytes())
+        self.assertFalse(os.path.lexists(stage / 'node_modules/unrelated'))
+        self.assertTrue(os.path.lexists(unrelated))
+        self.assertEqual(len(graph['packages']), 8)
+        self.assertIn('native/system/packages/linux-arm64', graph['packages'])
+        self.assertIn('native/system/packages/linux-x64', graph['packages'])
+        for rel, link in links.items():
+            self.assertEqual(os.readlink(stage / rel), link)
+            self.assertTrue((stage / rel).resolve(strict=True).is_relative_to(stage))
+
+    def test_actual_selection_preserves_source_import_and_resolution_paths(self):
+        node = self.base / 'node-fixture'
+        node.write_bytes(b'not a real Node binary')
+        build = self.api['host_control_build_selection'](self.donor, {
+            'node_executable': str(node), 'node_sha256': hashlib.sha256(node.read_bytes()).hexdigest()},
+            self.base / 'stage')
+        self.assertFalse(build['runtimeGrant'])
+        self.assertNotEqual(build['root'], str(self.donor))
+        self.assertEqual(build['imports']['provider'], 'packages/sandbox/sandbox-local/lib/index.js')
+        self.assertEqual(len(build['sourcePins']), 6)
+        self.assertTrue(set(build['sourcePins']) <= set(build['files']))
+        self.assertIn(build['launcher'], build['files'])
+        self.assertEqual(set(build['resolutionFiles']),
+                         {p for p in build['files'] if p == 'package.json' or p.endswith('/package.json')})
+        self.assertTrue(set(build['sdkClosure']['manifestPins']) <= set(build['resolutionFiles']))
+        self.assertLess(len(json.dumps(build).encode()), self.api['SDK_MAX_MAP'])
+
+    def test_absent_optionals_are_explicit_but_required_missing_refuses(self):
+        manifest = json.loads((self.provider / 'package.json').read_text())
+        manifest['optionalDependencies'] = {'missing-optional': '1'}
+        manifest['peerDependencies'] = {'missing-peer': '1'}
+        manifest['peerDependenciesMeta'] = {'missing-peer': {'optional': True}}
+        (self.provider / 'package.json').write_text(json.dumps(manifest))
+        graph, _, _ = self.stage()
+        self.assertEqual({p['name'] for p in graph['optionalAbsent']}, {'missing-optional', 'missing-peer'})
+        self.assertTrue(all(p['searched'] for p in graph['optionalAbsent']))
+        manifest['dependencies']['missing-required'] = '1'
+        (self.provider / 'package.json').write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'required_dependency_missing'):
+            self.stage('refused')
+
+    def test_dangling_optional_link_is_never_an_absent_optional(self):
+        target = self.package('packages/test/optional', 'optional')
+        link = self.dependency(self.provider, target, 'optionalDependencies')
+        link.unlink()
+        link.symlink_to('missing')
+        with self.assertRaises(FileNotFoundError):
+            self.stage()
+
+    def test_external_git_and_absolute_links_refuse(self):
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (outside / 'package.json').write_text('{"name":"bad","version":"1"}')
+        target = self.package('packages/test/bad', 'bad')
+        link = self.dependency(self.provider, target)
+        hidden = self.donor / '.git/bad'
+        hidden.mkdir(parents=True)
+        (hidden / 'package.json').write_text('{"name":"bad","version":"1"}')
+        for index, replacement in enumerate((outside, hidden, target)):
+            with self.subTest(target=replacement):
+                link.unlink()
+                link.symlink_to(str(replacement))
+                with self.assertRaises(ValueError):
+                    self.stage('refused-' + str(index))
+
+    def test_internal_asset_link_must_survive_inside_selected_stage(self):
+        (self.donor / 'unselected.bin').write_bytes(b'unselected')
+        (self.provider / 'unselected').symlink_to('../../../unselected.bin')
+        with self.assertRaises(FileNotFoundError):
+            self.stage()
+
+    def test_new_destination_and_unchanged_inventory_bounds(self):
+        occupied = self.base / 'occupied'
+        occupied.mkdir()
+        (occupied / 'keep').write_bytes(b'unchanged')
+        with self.assertRaisesRegex(ValueError, 'new_external_stage_required'):
+            self.stage('occupied')
+        self.assertEqual((occupied / 'keep').read_bytes(), b'unchanged')
+        globals_ = self.api['stage_host_control_sdk'].__globals__
+        for key, value in (('SDK_MAX_FILES', 1), ('SDK_MAX_BYTES', 1), ('SDK_MAX_MAP', 65537)):
+            with self.subTest(bound=key), patch.dict(globals_, {key: value}):
+                with self.assertRaisesRegex(ValueError, 'bound'):
+                    self.stage(key)
+                self.assertFalse((self.base / key).exists())
+
+    def test_duplicate_metadata_and_package_name_substitution_refuse(self):
+        manifest = self.cordis / 'package.json'
+        original = manifest.read_bytes()
+        manifest.write_text('{"name":"a","name":"b","version":"1"}')
+        with self.assertRaisesRegex(ValueError, 'duplicate_manifest_key'):
+            self.stage('duplicate')
+        value = json.loads(original)
+        value['name'] = 'substituted-package'
+        manifest.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'dependency_identity_mismatch'):
+            self.stage('substitution')
+
+    def test_manifest_change_after_graph_derivation_never_publishes_selection(self):
+        original = self.api['sdk_dependency_closure']
+        globals_ = self.api['stage_host_control_sdk'].__globals__
+        def changed(root):
+            result = original(root)
+            (self.provider / 'package.json').write_text((self.provider / 'package.json').read_text() + ' ')
+            return result
+        with patch.dict(globals_, sdk_dependency_closure=changed):
+            with self.assertRaisesRegex(ValueError, 'dependency_manifest_changed'):
+                self.stage()
+
+    def test_facade_requires_staged_selection_and_exact_graph_metadata(self):
+        node = self.base / 'node-fixture'
+        node.write_bytes(b'not executed')
+        build = self.api['host_control_build_selection'](self.donor, {
+            'node_executable': str(node), 'node_sha256': hashlib.sha256(node.read_bytes()).hexdigest()},
+            self.base / 'stage')
+        facade = runpy.run_path(str(ROOT / 'candidate/caller/owner-helper/provider_facade.py'))
+        owner = types.SimpleNamespace(h=types.SimpleNamespace(SPEC={
+            'host_control_preparation': {'source_pins': build['sourcePins']}}))
+        bound = facade['BoundPreparation'](owner)
+        bound.guard = lambda: None  # File-selection controls only; no runtime custody claim.
+        self.assertEqual(bound.verify_installation(build), self.base / 'stage')
+        with self.assertRaisesRegex(facade['PreparationRefusal'], 'SDK_STAGED_CLOSURE_REQUIRED'):
+            bound.verify_installation({key: value for key, value in build.items() if key != 'sdkClosure'})
+        foreign = dict(build, sdkClosure=dict(build['sdkClosure'], sourceRoot=build['root']))
+        with self.assertRaisesRegex(facade['PreparationRefusal'], 'SDK_STAGED_CLOSURE_REQUIRED'):
+            bound.verify_installation(foreign)
+        changed = dict(build, files=dict(build['files']))
+        first_manifest = next(iter(build['sdkClosure']['manifestPins']))
+        changed['files'][first_manifest] = '0' * 64
+        with self.assertRaisesRegex(facade['PreparationRefusal'], 'SDK_GRAPH_METADATA_DRIFT'):
+            bound.verify_installation(changed)
+
+
+if __name__ == '__main__':
+    unittest.main()

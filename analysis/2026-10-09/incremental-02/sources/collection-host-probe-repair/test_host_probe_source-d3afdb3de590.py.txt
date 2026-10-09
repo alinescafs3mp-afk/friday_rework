@@ -1,0 +1,142 @@
+"""SOURCE ONLY: separately admit any execution of these pure boundary checks.
+
+The guards are parsed, never imported or initialized. Only their actual pure
+path policy functions are extracted into a controlled namespace. No host probe,
+credential, descriptor, write, socket, subprocess or native operation occurs.
+These controls do not replace the separately owned actual 38 guard controls.
+"""
+import ast
+import os
+from pathlib import Path
+from types import SimpleNamespace
+import unittest
+
+
+SOURCE = Path(__file__).resolve().parent
+PUBLIC_HOST_READS = {'/proc/1/cgroup', '/proc/version'}
+EXISTING_PUBLIC_READS = {
+    '/dev/null', '/etc/localtime', '/proc/self/status', '/proc/self/cgroup',
+    '/proc/self/mountinfo', '/proc/meminfo', '/proc/cpuinfo',
+    '/proc/sys/kernel/random/boot_id', '/proc/pressure/cpu', '/proc/pressure/io',
+    '/proc/pressure/memory', '/sys/fs/cgroup/cpu.max', '/sys/fs/cgroup/memory.max',
+    '/sys/fs/cgroup/cpuset.cpus.effective'}
+FORBIDDEN_READS = (
+    '/proc/1/environ', '/proc/1/cmdline', '/proc/1/mem', '/proc/1/status',
+    '/proc/2/cgroup', '/proc/self/environ', '/proc/self/cmdline',
+    '/proc/version_signature', '/proc/sys/kernel/version', '/proc/1/cgroup-extra',
+    '/proc/version/extra', '/etc/shadow', '<USER_HOME>/auth.json',
+    '<USER_HOME>/credentials.json', '<USER_HOME>/.env')
+
+
+class Refused(Exception):
+    pass
+
+
+class ProbeRefusal(Exception):
+    pass
+
+
+def guard_tree(entry):
+    return ast.parse((SOURCE / entry).read_bytes(), filename=entry)
+
+
+def literal_public_reads(tree):
+    assignments = [node for node in tree.body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == 'read_files'
+                           for target in node.targets)]
+    assert len(assignments) == 2
+    value = assignments[0].value
+    assert isinstance(value, ast.BinOp) and isinstance(value.op, ast.BitOr)
+    assert isinstance(value.right, ast.Set)
+    return ast.literal_eval(value.right)
+
+
+def isolated_policy(entry):
+    tree = guard_tree(entry)
+    names = {'allowed', 'credential', 'readable', 'check_open'}
+    body = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    assert {node.name for node in body} == names
+    def deny(reason):
+        raise Refused(reason)
+    namespace = {
+        'R': Path('/synthetic-owned-run'), 'pathlib': __import__('pathlib'),
+        # No realpath/stat/open function exists in this fake OS namespace.
+        'os': SimpleNamespace(O_WRONLY=os.O_WRONLY, O_RDWR=os.O_RDWR,
+                              O_CREAT=os.O_CREAT, O_TRUNC=os.O_TRUNC,
+                              O_APPEND=os.O_APPEND,
+                              path=SimpleNamespace(isdir=lambda path: False)),
+        'read_files': literal_public_reads(tree),
+        'read_roots': ('/synthetic-pinned-runtime',),
+        'own': lambda path: path,
+        'path_manifest': {},
+        'path_api': {'failure_only_open': lambda *args: None, 'ProbeRefusal': ProbeRefusal},
+        'deny': deny, 'deny_unreviewed_file_read': lambda target: deny('UNREVIEWED_FILE_READ'),
+        'check_fd': lambda *args: (_ for _ in ()).throw(AssertionError('unexpected FD route')),
+        'record': lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('unexpected archive receipt')),
+    }
+    # Execute only the four extracted function definitions, never the guard body.
+    exec(compile(ast.Module(body=body, type_ignores=[]), entry, 'exec'), namespace)
+    return namespace
+
+
+class PublicHostProbeSourceTests(unittest.TestCase):
+    def test_literal_allowlist_adds_only_two_public_names(self):
+        for entry in ('guard.py', 'native_guard.py'):
+            with self.subTest(entry=entry):
+                self.assertEqual(literal_public_reads(guard_tree(entry)),
+                                 EXISTING_PUBLIC_READS | PUBLIC_HOST_READS)
+
+    def test_both_guards_have_identical_policy(self):
+        left = guard_tree('guard.py')
+        right = guard_tree('native_guard.py')
+        names = {'own', 'allowed', 'credential', 'readable', 'check_fd', 'check_open',
+                 'audit', 'guarded_open', 'guarded_read', 'guarded_write'}
+        def functions(tree):
+            return {node.name: ast.dump(node, include_attributes=False) for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name in names}
+        self.assertEqual(set(functions(left)), names)
+        self.assertEqual(functions(left), functions(right))
+
+    def test_real_read_routes_pass_pure_policy(self):
+        for entry in ('guard.py', 'native_guard.py'):
+            policy = isolated_policy(entry)
+            for path in PUBLIC_HOST_READS | {'/proc/self/mountinfo'}:
+                with self.subTest(entry=entry, path=path):
+                    self.assertTrue(policy['readable'](path))
+                    self.assertIsNone(policy['check_open'](path, os.O_RDONLY))
+
+    def test_adjacent_host_and_credential_reads_refuse(self):
+        for entry in ('guard.py', 'native_guard.py'):
+            policy = isolated_policy(entry)
+            for path in FORBIDDEN_READS:
+                with self.subTest(entry=entry, path=path):
+                    self.assertFalse(policy['readable'](path))
+                    expected = ('FOREIGN_CREDENTIAL_READ' if Path(path).name in
+                                ('.env', 'auth.json', 'credentials.json') else 'UNREVIEWED_FILE_READ')
+                    with self.assertRaisesRegex(Refused, '^' + expected + '$'):
+                        policy['check_open'](path, os.O_RDONLY)
+
+    def test_public_read_names_never_grant_write(self):
+        for entry in ('guard.py', 'native_guard.py'):
+            policy = isolated_policy(entry)
+            for path in PUBLIC_HOST_READS | {'/proc/self/mountinfo'}:
+                for flags in (os.O_WRONLY, os.O_RDWR, os.O_CREAT, os.O_TRUNC,
+                              os.O_APPEND, os.O_WRONLY | os.O_CREAT | os.O_TRUNC):
+                    with self.subTest(entry=entry, path=path, flags=flags):
+                        with self.assertRaisesRegex(Refused, '^OUTSIDE_WRITE$'):
+                            policy['check_open'](path, flags)
+
+    def test_public_probe_delta_does_not_grant_host_prefix(self):
+        for entry in ('guard.py', 'native_guard.py'):
+            policy = isolated_policy(entry)
+            for path in ('/proc', '/proc/1', '/proc/self', '/sys', '<USER_HOME>'):
+                with self.subTest(entry=entry, path=path):
+                    # Directories remain the existing metadata-anchor rule in
+                    # production; this fake path is a file, so prefixes refuse.
+                    self.assertFalse(policy['readable'](path))
+                    with self.assertRaisesRegex(Refused, '^UNREVIEWED_FILE_READ$'):
+                        policy['check_open'](path, os.O_RDONLY)
+
+
+if __name__ == '__main__':
+    unittest.main()

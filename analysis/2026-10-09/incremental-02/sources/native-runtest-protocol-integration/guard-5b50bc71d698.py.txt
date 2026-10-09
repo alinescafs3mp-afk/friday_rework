@@ -1,0 +1,360 @@
+"""Finite trusted-corpus instrumentation. SOURCE CANDIDATE: execution NOT admitted.
+Not an OS sandbox against hostile Python/native code or a same-UID racing writer.
+Only a separately reviewed owner invocation may supply an execution clock/root.
+"""
+import os, sys, time, signal, resource, fcntl, json, pathlib, stat, re
+SOURCE = pathlib.Path(__file__).resolve().parent
+# The timeout already encloses this interpreter/startup and all following effects.
+import runpy, hashlib
+runtime_match = re.fullmatch(r'--runtest-file=(f[0-9]{3})', sys.argv[4]) if len(sys.argv) == 7 and sys.argv[5] == '--external-deadline' else None
+runtest_file = runtime_match[1] if runtime_match else None
+collect_only = len(sys.argv) == 7 and sys.argv[4:6] == ['--collect-only', '--external-deadline']
+if not collect_only and runtest_file is None and (len(sys.argv) != 6 or sys.argv[4] != '--external-deadline'):
+    raise SystemExit('EXACT_TIMEOUT_GUARD_ARGUMENTS_REQUIRED')
+name = sys.argv[1]
+R = pathlib.Path(sys.argv[2]).resolve(strict=True)
+entry = pathlib.Path(__file__).name
+selection = sys.argv[3]
+api = runpy.run_path(str(SOURCE / 'admission.py'))
+clock, phase, clock_sha = api['verify'](SOURCE, R, name, entry, selection, collect_only, runtest_file)
+path_api = runpy.run_path(str(SOURCE / 'import_path_readiness.py'))
+path_manifest = path_api['load'](SOURCE)
+external_deadline = float(sys.argv[6] if collect_only or runtest_file else sys.argv[5])
+now = time.monotonic()
+if not now < external_deadline < clock['deadline_monotonic']:
+    raise SystemExit('EXTERNAL_DEADLINE_INVALID_OR_EXPIRED')
+if external_deadline - now > phase['outer_wall_seconds']:
+    raise SystemExit('EXTERNAL_WALL_TOO_LARGE')
+# Observe the actual installed timeout parent and exact start identity BEFORE writes.
+def process_identity(pid):
+    raw = pathlib.Path('/proc/' + str(pid) + '/stat').read_text()
+    fields = raw[raw.rfind(')') + 2:].split()
+    return {'pid': pid, 'ppid': int(fields[1]), 'pgid': int(fields[2]),
+            'sid': int(fields[3]), 'start_ticks': int(fields[19]), 'exe': os.readlink('/proc/' + str(pid) + '/exe')}
+contour = {'guard': process_identity(os.getpid()), 'timeout': process_identity(os.getppid()),
+           'boot_id': clock['boot_id'], 'external_deadline_monotonic': external_deadline,
+           'original_deadline_monotonic': clock['deadline_monotonic'],
+           'identity': api['identity'](clock, phase), 'phase_clock_sha256': clock_sha}
+expected_timeout = str(pathlib.Path('/usr/bin/gnutimeout').resolve())
+if (contour['timeout']['exe'] != expected_timeout or
+    contour['timeout']['pgid'] != contour['timeout']['pid'] or
+    contour['guard']['pgid'] != contour['timeout']['pgid']):
+    raise SystemExit('ACTUAL_TIMEOUT_GROUP_MISMATCH')
+if runtest_file and (contour['timeout']['sid'] != contour['timeout']['pid'] or
+                     contour['guard']['sid'] != contour['timeout']['sid']):
+    raise SystemExit('ACTUAL_DONOR_SESSION_MISMATCH')
+remaining = clock['deadline_monotonic'] - time.monotonic()
+if remaining <= 0:
+    raise SystemExit('ORIGINAL_ASSIGNMENT_EXPIRED')
+os.umask(0o077)
+cpus = sorted(os.sched_getaffinity(0))[:2]
+if len(cpus) != 2:
+    raise SystemExit('TWO_CPUS_UNAVAILABLE')
+os.sched_setaffinity(0, cpus)
+resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))
+resource.setrlimit(resource.RLIMIT_CPU, (600, 600))
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+# Preopened private append receipt, not an assertion of any external effect absence.
+receipt = os.open(R / (name + '-attempts.ndjson'), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+_raw_write, _hard_exit = os.write, os._exit
+started = time.monotonic()
+attempt_count = 0
+
+def record(kind, **values):
+    _raw_write(receipt, (json.dumps({'kind': kind, 'monotonic': time.monotonic(), 'identity': contour['identity'], **values}) + '\n').encode())
+
+def terminate(code, reason):
+    # No exception crosses into pytest/product handlers. A receipt failure still exits.
+    try:
+        record('termination_intent', reason=reason, exit_code=code,
+               attempt_log_scope='instrumented routes only; no syscall/effect census')
+    finally:
+        _hard_exit(code)
+
+def deny(reason):
+    global attempt_count
+    attempt_count += 1
+    terminate(125, reason)
+
+def deny_unreviewed_file_read(target):
+    # target is the canonical path already checked by check_open. Capture only
+    # bounded frame metadata; never inspect locals, format traceback/source, or
+    # open another path. Diagnostic failures must still reach the same hard exit.
+    try:
+        frames = []
+        frame = sys._getframe(1)
+        try:
+            for _ in range(16):
+                if frame is None:
+                    break
+                code = frame.f_code
+                frames.append({'filename': code.co_filename[:4096],
+                               'function': code.co_name[:256],
+                               'line': frame.f_lineno,
+                               'filename_truncated': len(code.co_filename) > 4096,
+                               'function_truncated': len(code.co_name) > 256})
+                frame = frame.f_back
+            record('read_refusal_diagnostic', reason='UNREVIEWED_FILE_READ',
+                   canonical_path=target, frames=frames,
+                   frame_order='innermost_first', frame_limit=16,
+                   outer_frames_omitted=frame is not None)
+        finally:
+            del frame
+    finally:
+        deny('UNREVIEWED_FILE_READ')
+
+# Fractional remaining ORIGINAL deadline; no ceil/reset or catchable alarm.
+# Python signal dispatch can be delayed by native code. The separately reviewed
+# installed timeout invocation is REQUIRED as the independent SIGKILL wall cap.
+signal.signal(signal.SIGALRM, lambda *args: terminate(124, 'FINITE_WALL_LIMIT'))
+inner_wall = float(clock['guard_wall_seconds'])
+if not 0 < inner_wall <= 600:
+    terminate(125, 'INVALID_INNER_WALL_LIMIT')
+signal.setitimer(signal.ITIMER_REAL, min(inner_wall, remaining))
+lock = os.open('<LOCAL_HOME>/.jericho/runtime/friday-quality-ui-exclusive.lock', os.O_RDONLY | os.O_NOFOLLOW)
+st = os.fstat(lock)
+if (st.st_dev, st.st_ino, st.st_uid, st.st_gid, st.st_nlink, st.st_size, stat.S_IMODE(st.st_mode)) != (2050, 9044963, 1000, 1000, 1, 0, 0o664):
+    terminate(125, 'QUALITY_LOCK_IDENTITY_MISMATCH')
+fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+record('resources', affinity=sorted(os.sched_getaffinity(0)),
+       as_limit=resource.getrlimit(resource.RLIMIT_AS), cpu_limit=resource.getrlimit(resource.RLIMIT_CPU),
+       lock_identity=[st.st_dev, st.st_ino], original_deadline=clock['deadline_monotonic'],
+       pid=os.getpid(), process_group=os.getpgrp(),
+       observed_effects='UNMEASURED; owner must independently reconcile after reap')
+# Persist exact timeout/guard PID/start/PGID before any synthetic FD opening.
+with (R / 'native-contour.json').open('x') as f:
+    f.write(json.dumps(contour, indent=2) + '\n'); f.flush(); os.fsync(f.fileno())
+contour_dir = os.open(R, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try: os.fsync(contour_dir)
+finally: os.close(contour_dir)
+record('native_contour', contour=contour)
+synthetic_fds = {}
+if phase['requires_synthetic_descriptors']:
+    synthetic_fds = runpy.run_path(str(SOURCE / 'descriptor_canary_setup.py'))['prepare'](
+        R, clock, clock_sha, contour['identity'])
+os.environ.clear()
+os.environ.update(PATH='/usr/bin:/bin', LANG='C.UTF-8', HOME=str(R / 'fixtures'),
+                  HERMES_HOME=str(R / 'fixtures'), TMPDIR=str(R / 'tmp'),
+                  PYTHONDONTWRITEBYTECODE='1', PYTEST_DISABLE_PLUGIN_AUTOLOAD='1',
+                  FRIDAY_FIXTURE_EVIDENCE=str(R), FRIDAY_GUARD_SOURCE=str(SOURCE))
+if runtest_file:
+    os.environ.pop('PYTEST_DISABLE_PLUGIN_AUTOLOAD', None)
+sys.dont_write_bytecode = True
+os.chdir(R)
+# argv[2] was the private run root, not a test argument.
+sys.argv[:] = [sys.argv[0], name, selection, *(['--collect-only'] if collect_only else ['--runtest-file='+runtest_file] if runtest_file else [])]
+
+def own(p, fd=None):
+    if isinstance(p, int):
+        return os.path.realpath('/proc/self/fd/' + str(p))
+    p = os.fsdecode(p)
+    if not os.path.isabs(p):
+        if fd not in (None, -1, -100):
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise NotADirectoryError(fd)
+            # Keep the directory descriptor anchor, including renamed directories.
+            p = '/proc/self/fd/' + str(fd) + '/' + p
+        else:
+            p = os.path.join(os.getcwd(), p)
+    return os.path.realpath(p)
+
+def allowed(p):
+    return p == str(R) or p.startswith(str(R) + '/')
+
+def credential(p):
+    return pathlib.Path(p).name in ('.env', 'auth.json', 'credentials.json') and not allowed(p)
+
+# A trusted corpus admission is narrower than arbitrary host reads. In addition
+# to private fixtures, only pinned candidate/runtime trees and public metadata
+# are read routes. Unknown foreign files abort even without a credential basename.
+TEST_ENV = pathlib.Path('<PROJECT>/.runtime/hermes-telegram-test/env')
+STDLIB = (TEST_ENV / 'bin/python').resolve().parent.parent / 'lib/python3.14'
+read_roots = tuple(str(p.resolve()) for p in (SOURCE,
+    pathlib.Path('<SOL_WORK>/FRW026-ORDINARY-SKILLS-FINAL-GATE-project'),
+    pathlib.Path('<SOL_WORK>/FRW026-ORDINARY-SKILLS-FINAL-GATE-native'),
+    TEST_ENV / 'lib/python3.14/site-packages', STDLIB,
+    pathlib.Path('/usr/share/zoneinfo'), pathlib.Path('/etc/ssl/certs')))
+read_files = (set(json.loads((SOURCE / 'runtime-pins.json').read_text())) |
+              set(json.loads((SOURCE / 'ancillary-pins.json').read_text()))) | {
+    '/dev/null', '/etc/localtime', '/proc/self/status', '/proc/self/cgroup',
+    # Exact public host probes used by the pinned donor runtime detector.
+    '/proc/1/cgroup', '/proc/version',
+    # Exact public CPU counters read by pinned psutil Linux module initialization.
+    '/proc/stat',
+    '/proc/self/mountinfo', '/proc/meminfo', '/proc/cpuinfo',
+    '/proc/sys/kernel/random/boot_id', '/proc/pressure/cpu', '/proc/pressure/io',
+    '/proc/pressure/memory', '/sys/fs/cgroup/cpu.max', '/sys/fs/cgroup/memory.max',
+    '/sys/fs/cgroup/cpuset.cpus.effective'}
+read_files = {os.path.realpath(p) for p in read_files}
+
+def readable(p):
+    # Product traversal may anchor root/ancestor directory descriptors read-only.
+    return allowed(p) or p in read_files or os.path.isdir(p) or any(
+        p == root or p.startswith(root + '/') for root in read_roots)
+
+def fd_identity(fd):
+    s = os.fstat(fd)
+    return (s.st_dev, s.st_ino, s.st_mode, fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE)
+
+# Only actual preexisting stdout/stderr PIPE identities and our subsequently
+# created pipes are retained. An arbitrary pipe/socket FD is never blanket-safe.
+pipe_fds = {}
+for fd in (1, 2):
+    if stat.S_ISFIFO(os.fstat(fd).st_mode):
+        pipe_fds[fd] = fd_identity(fd)
+
+def check_fd(fd, writing=False, mutation=False):
+    identity = fd_identity(fd)
+    if pipe_fds.get(fd) == identity and not mutation:
+        if (writing and identity[-1] != os.O_RDONLY) or (not writing and identity[-1] != os.O_WRONLY):
+            return
+    p = own(fd)
+    if p == path_manifest['declared_absent_path']:
+        deny('DECLARED_LEAF_DESCRIPTOR_REFUSED')
+    if not stat.S_ISREG(identity[2]) and not stat.S_ISDIR(identity[2]):
+        deny('UNOWNED_DESCRIPTOR')
+    if writing and not allowed(p):
+        deny('OUTSIDE_DESCRIPTOR_WRITE')
+    if credential(p):
+        deny('FOREIGN_CREDENTIAL_DESCRIPTOR')
+    if not writing and not readable(p):
+        deny('UNREVIEWED_DESCRIPTOR_READ')
+
+def check_open(p, flags):
+    writing = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
+    if isinstance(p, int):
+        check_fd(p, writing)
+        return
+    target = own(p)
+    try:
+        path_api['failure_only_open'](path_manifest, p, flags, target)
+    except FileNotFoundError as error:
+        record('absent_import_probe_enoent', path=path_manifest['declared_absent_path'],
+               errno=error.errno, exception='FileNotFoundError', metadata_only=True, content_open=False)
+        raise
+    except path_api['ProbeRefusal'] as error:
+        deny('ABSENT_IMPORT_PROBE_REFUSED:' + str(error))
+    if writing and not allowed(target):
+        deny('OUTSIDE_WRITE')
+    if credential(target):
+        deny('FOREIGN_CREDENTIAL_READ')
+    # /dev/null is the only admitted special read path; special writes are not.
+    if not writing and not readable(target):
+        deny_unreviewed_file_read(target)
+
+def audit(event, args):
+    if event.startswith('socket.') or event in ('subprocess.Popen', 'os.system', 'os.posix_spawn', 'os.fork', 'os.forkpty', 'os.exec'):
+        deny('OFFLINE_EFFECT:' + event)
+    if event == 'open':
+        # Builtin/Path/IO and FD paths: relative is checked exactly like absolute.
+        check_open(args[0], args[2] or 0)
+    if event in ('os.mkdir', 'os.remove', 'os.rmdir', 'os.chmod', 'os.chown', 'os.utime'):
+        p = args[0]
+        if isinstance(p, int):
+            check_fd(p, True, True)
+        elif not allowed(own(p, args[-1])):
+            deny('OUTSIDE_MUTATION:' + event)
+    if event == 'os.truncate':
+        if isinstance(args[0], int):
+            check_fd(args[0], True, True)
+        elif not allowed(own(args[0])):
+            deny('OUTSIDE_TRUNCATE')
+    if event in ('os.rename', 'os.link'):
+        for p, fd in ((args[0], args[2]), (args[1], args[3])):
+            if not allowed(own(p, fd)):
+                deny('OUTSIDE_MUTATION:' + event)
+    if event == 'os.symlink' and not allowed(own(args[1], args[2])):
+        deny('OUTSIDE_SYMLINK_DESTINATION')
+    if event == 'ctypes.dlopen' and args[0] is not None:
+        deny('NATIVE_LIBRARY_LOAD')
+sys.addaudithook(audit)
+if runtest_file:
+    os.setsid = lambda *a, **k: deny('RUNTEST_SESSION_ESCAPE')
+    os.setpgid = lambda *a, **k: deny('RUNTEST_PROCESS_GROUP_ESCAPE')
+orig_open = os.open
+
+def guarded_open(p, flags, mode=0o777, *, dir_fd=None):
+    # Audit open does not carry dir_fd. Translate ONLY a relative dir_fd path
+    # to its descriptor-anchored absolute /proc path before the actual call.
+    # Do not replace it with realpath: keep final O_NOFOLLOW / O_EXCL semantics.
+    if not os.path.isabs(os.fsdecode(p)) and dir_fd not in (None, -1, -100):
+        if not stat.S_ISDIR(os.fstat(dir_fd).st_mode):
+            raise NotADirectoryError(dir_fd)
+        p = '/proc/self/fd/' + str(dir_fd) + '/' + os.fsdecode(p)
+        dir_fd = None
+    check_open(p, flags)
+    return orig_open(p, flags, mode, dir_fd=dir_fd)
+os.open = guarded_open
+orig_read, orig_write = os.read, os.write
+
+def guarded_read(fd, n):
+    check_fd(fd)
+    return orig_read(fd, n)
+
+def guarded_write(fd, data):
+    check_fd(fd, True)
+    return orig_write(fd, data)
+os.read, os.write = guarded_read, guarded_write
+# Actual FD mutation routes (independent of audit-event aliases).
+for opname in ('ftruncate', 'fchmod', 'fchown'):
+    original = getattr(os, opname)
+    def fd_mutation(fd, *args, _original=original):
+        check_fd(fd, True, True)
+        return _original(fd, *args)
+    setattr(os, opname, fd_mutation)
+for opname in ('pipe', 'pipe2'):
+    original = getattr(os, opname)
+    def pipe(*args, _original=original):
+        pair = _original(*args)
+        for fd in pair:
+            pipe_fds[fd] = fd_identity(fd)
+        return pair
+    setattr(os, opname, pipe)
+orig_dup = os.dup
+
+def dup(fd):
+    result = orig_dup(fd)
+    if pipe_fds.get(fd) == fd_identity(fd):
+        pipe_fds[result] = fd_identity(result)
+    return result
+os.dup = dup
+# ctypes' admitted donor renameat2 route is instrumented before product import.
+import ctypes
+orig_cdll = ctypes.CDLL
+class Library:
+    def __init__(self, *args, **kw):
+        if (args and args[0] is not None) or kw.get('name') is not None:
+            deny('NATIVE_LIBRARY')
+        self.lib = orig_cdll(*args, **kw)
+    def __getattr__(self, name):
+        if name != 'renameat2':
+            deny('NATIVE_SYMBOL:' + name)
+        fn = getattr(self.lib, name)
+        class Rename:
+            def __call__(self, a, b, c, d, e):
+                if not allowed(own(b, a)) or not allowed(own(d, c)):
+                    deny('OUTSIDE_NATIVE_RENAME')
+                return fn(a, b, c, d, e)
+            def __setattr__(self, n, v):
+                setattr(fn, n, v)
+        return Rename()
+ctypes.CDLL = Library
+# No wrapper-local canary call or forged actual-children/key/socket counters.
+import _posixsubprocess, multiprocessing.process
+_posixsubprocess.fork_exec = lambda *a, **k: deny('OFFLINE_EFFECT:direct_fork_exec')
+multiprocessing.process.BaseProcess.start = lambda *a, **k: deny('OFFLINE_EFFECT:multiprocessing_start')
+import runpy
+try:
+    runpy.run_path(str(SOURCE / 'controls.py'), run_name='__main__')
+finally:
+    # Hard abort has no Python finally; OS exit closes FDs. Independent owner
+    # observes actual reaping/lock availability; neither is asserted here.
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    os.close(lock)
+    record('normal_finally', elapsed_seconds=time.monotonic() - started,
+           instrumented_attempt_count=attempt_count,
+           lock_unlock_call_returned=True, lock_fd_close_returned=True,
+           owner_post_reap_observation='PENDING; no global lock-release claim',
+           maxrss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    for fd in synthetic_fds.values(): os.close(fd)
+    os.close(receipt)

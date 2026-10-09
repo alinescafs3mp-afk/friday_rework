@@ -1,0 +1,147 @@
+"""Focused inert controls. NOT RUN; no namespace/network/process qualification.
+
+Future source driver executes only selected functions against inert objects.
+Real descriptor, namespace, DNS/TLS/model and outside-CDP checks are separate.
+"""
+import ast
+import ipaddress
+from pathlib import Path
+from types import SimpleNamespace as NS
+
+import pytest
+
+SOURCE = Path(__file__).resolve().parents[1] / 'owner-helper/private_network.py'
+
+
+def selected(*names, **env):
+    tree = ast.parse(SOURCE.read_text())
+    members = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names]
+    assert len(members) == len(names)
+    values = dict(ipaddress=ipaddress, **env)
+    exec(compile(ast.Module(body=members, type_ignores=[]), str(SOURCE), 'exec'), values)
+    return values
+
+
+def api(**env):
+    return selected('NetworkRefusal', 'require', 'resolver_bytes', 'NetworkAttachment', **env)
+
+
+@pytest.mark.parametrize('server', ['192.168.12.2', '2001:4860:4860::8888'])
+def test_explicit_uplink_dns_sanitized_and_preserved(server):
+    content, servers = api()['resolver_bytes'](('search secret.local\nnameserver ' + server + '\noptions unsafe\n').encode())
+    assert content == ('nameserver ' + server + '\n').encode()
+    assert servers == [server]
+
+
+@pytest.mark.parametrize('server', ['127.0.0.53', '127.1.2.3', '::1', '::ffff:127.0.0.1',
+    '0.0.0.0', '::', '224.0.0.1', '169.254.1.2', 'fe80::1', 'fe80::1%eth0',
+    '10.0.2.2', '10.0.2.3', 'fd00::2', 'fd00::3', 'localhost', '192.168.12.2 extra'])
+def test_dns_host_alias_and_mapped_local_dns_refused(server):
+    values = api()
+    with pytest.raises((values['NetworkRefusal'], ValueError)):
+        values['resolver_bytes'](('nameserver ' + server + '\n').encode())
+
+
+@pytest.mark.parametrize('data', [b'', b'options edns0\n', b'x' * 8193,
+    b'nameserver 192.168.12.2\nnameserver 192.168.12.2\n',
+    b'nameserver 1.1.1.1\nnameserver 2.2.2.2\nnameserver 3.3.3.3\nnameserver 4.4.4.4\n'])
+def test_missing_oversized_duplicate_dns_is_not_fallback(data):
+    values = api()
+    with pytest.raises(values['NetworkRefusal']): values['resolver_bytes'](data)
+
+
+def attachment(values):
+    obj = values['NetworkAttachment'].__new__(values['NetworkAttachment'])
+    obj.failed = obj.closed = obj.released = False
+    obj.donor_proc = None
+    obj.session = NS(process=None, runtest_stop_requested=False)
+    obj.closed_fds = []
+    obj._close = obj.closed_fds.append
+    obj.current = lambda: None
+    obj.cleanup_errors = []
+    return obj
+
+
+def test_spawn_closes_only_parent_barrier_reader():
+    values = api(); obj = attachment(values); proc = NS(returncode=None)
+    obj.session.process = proc
+    obj.donor_spawned(proc)
+    assert obj.donor_proc is proc and obj.closed_fds == ['block_read']
+
+
+@pytest.mark.parametrize('retained_after_exception', [False, True])
+@pytest.mark.parametrize('persistence_failure', [False, True])
+def test_abort_stops_exact_monitor_but_never_releases_unreaped_barrier(retained_after_exception, persistence_failure):
+    values = api(); obj = attachment(values); calls = []
+    proc = NS(returncode=None); obj.session.process = proc
+    if not retained_after_exception: obj.donor_proc = proc
+    def persist():
+        calls.append('persist')
+        if persistence_failure: raise OSError('fixture')
+    obj.owner = NS(persist_stop=persist)
+    obj.registry = NS(stop_runtest=lambda session, source: calls.append(('stop', session, source)))
+    obj._stop_helper = lambda: calls.append('helper')
+    obj.abort()
+    assert obj.donor_proc is proc and obj.failed and obj.session.runtest_stop_requested
+    assert obj.closed_fds == [] and not obj.closed
+    assert calls[0] == 'persist' and calls[1][0] == 'stop' and calls[2] == 'helper'
+    assert obj.cleanup_errors == (['OSError'] if persistence_failure else [])
+
+
+def test_abort_after_actual_donor_reap_closes_barrier():
+    values = api(); obj = attachment(values)
+    obj.session.process = NS(returncode=125)
+    obj.owner = NS(persist_stop=lambda: None)
+    obj.registry = NS(stop_runtest=lambda *args, **kwargs: None)
+    obj._stop_helper = lambda: None
+    obj.abort()
+    assert obj.closed and obj.closed_fds == ['block_read', 'block_write']
+
+
+@pytest.mark.parametrize('records,helper_exit,passes', [([b'1', b''], False, True),
+    ([b''], False, False), ([b'0'], False, False), ([b'11'], False, False),
+    ([b'1', b''], True, False)])
+def test_mature_ready_marker_and_eof_before_barrier(records, helper_exit, passes):
+    chunks = iter(records)
+    values = api(time=NS(monotonic=lambda: 1.0),
+        select=NS(select=lambda *args: ([8, 9] if helper_exit else [8], [], [])),
+        os=NS(read=lambda fd, amount: next(chunks)))
+    obj = attachment(values); obj.ready_read = 8; obj.pidfd = 9; obj.startup_end = 2
+    if passes:
+        obj._ready(); assert obj.closed_fds == ['ready_read']
+    else:
+        with pytest.raises(values['NetworkRefusal']): obj._ready()
+        assert obj.closed_fds == []
+
+
+def test_original_fileowner_gate_precedes_network_status_import_and_allocation():
+    tree = ast.parse((SOURCE.parent / 'runtest_outer.py').read_text())
+    owner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'FileOwner')
+    method = next(node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == 'prepare_donor_private_network')
+    call = method.body[1].value
+    assert isinstance(call, ast.Call) and call.func.attr == 'require_supported_containment'
+    gate = next(node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == 'require_supported_containment')
+    assert isinstance(gate.body[1], ast.Raise)
+
+
+def test_helper_has_one_retained_popen_pidfd_and_no_donor_waiter_or_numeric_signal():
+    tree = ast.parse(SOURCE.read_text())
+    obj = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'NetworkAttachment')
+    start = next(node for node in obj.body if isinstance(node, ast.FunctionDef) and node.name == '_start_helper')
+    calls = [node for node in ast.walk(start) if isinstance(node, ast.Call)]
+    popens = [node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == 'Popen']
+    pidfds = [node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == 'pidfd_open']
+    assert len(popens) == len(pidfds) == 1 and popens[0].lineno < pidfds[0].lineno
+    assert not any(isinstance(node.func, ast.Attribute) and node.func.attr in ('poll', 'wait', 'communicate') and
+        popens[0].lineno < node.lineno < pidfds[0].lineno for node in calls)
+    stops = next(node for node in obj.body if isinstance(node, ast.FunctionDef) and node.name == '_stop_helper')
+    assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and
+        node.func.attr in ('kill', 'killpg', 'communicate') for node in ast.walk(stops))
+
+
+def test_missing_root_status_hook_refuses_before_network_constructor():
+    values = api()
+    method = selected('prepare_network_status', require=values['require'], NetworkAttachment=lambda *args:
+        (_ for _ in ()).throw(AssertionError('allocation forbidden')))
+    with pytest.raises(values['NetworkRefusal'], match='HOOK_UNBOUND'):
+        method['prepare_network_status'](None, None, None, None, [], None, {})

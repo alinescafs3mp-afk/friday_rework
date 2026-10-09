@@ -1,0 +1,156 @@
+"""Pure receipt/plan rules. No launch, clock creation, grant, or candidate import.
+SOURCE ONLY. A receipt census is not containment or product acceptance.
+"""
+import hashlib
+import json
+import math
+
+SCOPE = 'FINITE_EXACT_DONOR_FILE_RUNTEST_ONLY'
+
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def unit_for(plan, unit_id, selection):
+    require(plan.get('schema') == 1, 'RUNTEST_PLAN_SCHEMA')
+    matches = [u for u in plan['units'] if u['unit_id'] == unit_id and u['selection'] == selection]
+    require(len(matches) == 1, 'EXACT_RUNTEST_FILE_REQUIRED')
+    return matches[0]
+
+
+def logical_key(identity):
+    # Rootdir changes the display prefix, not an item path or its parameter ID.
+    # Keep the complete suffix (including arbitrary parameter text).
+    nodeid = identity['nodeid']
+    require('::' in nodeid, 'ITEM_NODE_SUFFIX_REQUIRED')
+    return identity['path'], nodeid[nodeid.index('::'):]
+
+
+def expected_map(unit):
+    result = {}
+    for row in unit['expected']:
+        key = logical_key(row['collection_identity'])
+        require(key not in result, 'DUPLICATE_EXPECTED_IDENTITY')
+        result[key] = row
+    return result
+
+
+def bind_item(unit, actual, definition):
+    require(set(actual) == {'path', 'object_path', 'kind', 'type', 'nodeid', 'source_relative_path'} and
+            all(isinstance(v, str) for v in actual.values()) and actual['object_path'] == actual['path'],
+            'ACTUAL_ITEM_IDENTITY_SCHEMA')
+    row = expected_map(unit).get(logical_key(actual))
+    require(row is not None, 'FOREIGN_RUNTIME_ITEM')
+    require(actual['path'] == unit['file']['path'] and actual['kind'] == 'function', 'RUNTIME_FILE_IDENTITY')
+    require(definition == row['definition'], 'RUNTIME_DEFINITION_DRIFT')
+    return {'actual': actual, 'collection_identity': row['collection_identity'], 'definition': definition}
+
+
+def validate_admission(clock, plan, unit_id, selection, entry, plan_sha):
+    require(clock.get('scope') == SCOPE and clock.get('runtest_file') == unit_id and
+            clock.get('collect_only') is False and 'canary' not in clock and
+            'synthetic_fixture_parent' not in clock, 'OLD_COLLECTION_OR_CANARY_GRANT_REFUSED')
+    require(clock.get('runtime_plan_sha256') == plan_sha and
+            clock.get('independent_runtime_review') == 'PASS' and
+            clock.get('execution_authorized') is True, 'NO_SEPARATE_REVIEWED_RUNTEST_ADMISSION')
+    unit = unit_for(plan, unit_id, selection)
+    require(unit['entry'] == entry, 'RUNTEST_ENTRY_MISMATCH')
+    for key in ('start_monotonic', 'deadline_monotonic', 'original_budget_seconds'):
+        v = clock.get(key)
+        require(type(v) in (int, float) and math.isfinite(v) and v > 0, 'FINITE_ORIGINAL_RUNTEST_CLOCK')
+    require(clock['deadline_monotonic'] == clock['start_monotonic'] + clock['original_budget_seconds'],
+            'ORIGINAL_RUNTEST_DEADLINE_RESET')
+    # This source package declares unresolved containment; a changed reviewed
+    # source/plan is required. A clock alone can never waive those source gaps.
+    require(plan.get('runtime_custody_integrated') is True, 'RUNTEST_CUSTODY_SOURCE_NOT_READY')
+    require(not plan.get('unresolved_effect_boundaries'), 'RUNTEST_EFFECT_SOURCE_NOT_READY')
+    return unit
+
+
+def census(unit, events, identity, clock_sha, terminal_exit, result=None):
+    """Reconcile actual durable event prefixes, including hard-exit partial runs.
+
+    Every report is bound at makereport to an actual Item; a log callback alone
+    cannot invent a report. No missing call is synthesized after setup skip/fail.
+    """
+    expected = expected_map(unit)
+    selected = {}; dropped = {}; reports = {}; started = set(); finished = set()
+    session_finished = False; collection_finished = False
+    for number, event in enumerate(events):
+        require(type(event.get('sequence')) is int and event.get('sequence') == number and event.get('identity') == identity and
+                event.get('phase_clock_sha256') == clock_sha, 'FOREIGN_OR_GAPPED_RUNTIME_EVENT')
+        kind = event.get('kind')
+        if kind == 'collection':
+            require(not collection_finished and not selected and not reports, 'DUPLICATE_OR_LATE_COLLECTION')
+            for disposition, target in [('selected', selected), ('deselected', dropped)]:
+                for binding in event[disposition]:
+                    key = logical_key(binding['actual'])
+                    require(key not in selected and key not in dropped and key in expected, 'FOREIGN_OR_DUPLICATE_COLLECTION_ITEM')
+                    require(binding == bind_item(unit, binding['actual'], binding['definition']), 'COLLECTION_BINDING_DRIFT')
+                    target[key] = binding
+            require(set(selected) | set(dropped) == set(expected), 'RUNTIME_COLLECTION_CENSUS_DRIFT')
+            collection_finished = True
+        elif kind in ('item_start', 'report', 'item_finish'):
+            require(collection_finished and not session_finished, 'RUNTIME_EVENT_OUTSIDE_SESSION')
+            binding = event['binding']; key = logical_key(binding['actual'])
+            require(key in selected and binding == selected[key], 'RUNTIME_ITEM_BINDING_DRIFT')
+            if kind == 'item_start':
+                require(key not in started and not started - finished, 'DUPLICATE_OR_CONCURRENT_ITEM_START')
+                started.add(key)
+            elif kind == 'item_finish':
+                require(key in started and key not in finished, 'FOREIGN_OR_DUPLICATE_ITEM_FINISH')
+                require([r['when'] for r in reports.get(key, [])] in (['setup', 'call', 'teardown'], ['setup', 'teardown']),
+                        'INCOMPLETE_FINISHED_ITEM')
+                finished.add(key)
+            else:
+                require(key in started and key not in finished, 'REPORT_WITHOUT_ACTIVE_ITEM')
+                row = event['report']; phases = reports.setdefault(key, [])
+                require(row.get('nodeid') == binding['actual']['nodeid'] and
+                        (row.get('wasxfail') is None or isinstance(row['wasxfail'], str)), 'REPORT_NODEID_OR_XFAIL_DRIFT')
+                require(row['when'] in ('setup', 'call', 'teardown') and row['outcome'] in ('passed', 'failed', 'skipped'), 'UNKNOWN_RUNTIME_PHASE_OR_OUTCOME')
+                require(type(row['duration']) in (int, float) and math.isfinite(row['duration']) and row['duration'] >= 0, 'INVALID_PHASE_DURATION')
+                prior = [r['when'] for r in phases]
+                legal = (row['when'] == 'setup' and not prior or
+                         row['when'] == 'call' and prior == ['setup'] and phases[0]['outcome'] == 'passed' or
+                         row['when'] == 'teardown' and (prior == ['setup', 'call'] or
+                             prior == ['setup'] and phases[0]['outcome'] != 'passed'))
+                require(legal, 'MISSING_DUPLICATE_OR_REORDERED_PHASE')
+                phases.append(row)
+        elif kind == 'session_finish':
+            require(not session_finished and event['exit'] in range(6) and
+                    (collection_finished or event['exit'] in (2, 3, 4, 5)), 'INVALID_SESSION_FINISH')
+            require(event['exit'] == terminal_exit, 'SESSION_BACKEND_EXIT_MISMATCH')
+            session_finished = True
+        else:
+            raise ValueError('UNKNOWN_RUNTIME_EVENT')
+    if result is not None:
+        require(result.get('runtime_events') == events and result.get('identity') == identity and
+                result.get('phase_clock_sha256') == clock_sha and result.get('exit') == terminal_exit,
+                'RESULT_PROGRESS_OR_BACKEND_MISMATCH')
+    buckets = {k: [] for k in ('passed', 'failed', 'skipped', 'xfailed', 'xpassed', 'not_started', 'interrupted', 'deselected')}
+    for key, ref in expected.items():
+        binding = selected.get(key) or dropped.get(key) or ref
+        phases = reports.get(key, [])
+        if key in dropped: bucket = 'deselected'
+        elif key not in started: bucket = 'not_started'
+        elif key not in finished: bucket = 'interrupted'
+        elif any(p['outcome'] == 'failed' for p in phases): bucket = 'failed'
+        elif any(p['outcome'] == 'skipped' and p.get('wasxfail') is not None for p in phases): bucket = 'xfailed'
+        elif any(p.get('wasxfail') is not None and p['outcome'] == 'passed' for p in phases): bucket = 'xpassed'
+        elif any(p['outcome'] == 'skipped' for p in phases): bucket = 'skipped'
+        else: bucket = 'passed'
+        buckets[bucket].append({'binding': binding, 'phases': phases})
+    complete = collection_finished and session_finished and not buckets['interrupted'] and not buckets['not_started']
+    if terminal_exit == 0:
+        require(not buckets['failed'], 'EXIT_ZERO_WITH_FAILED_PHASE')
+        require(complete, 'EXIT_ZERO_WITH_INCOMPLETE_CENSUS')
+    status = ('RUNTEST_PRODUCT_FAIL' if terminal_exit == 1 and complete and buckets['failed'] else
+              'RUNTEST_REPORTED' if terminal_exit in (0, 5) and complete else 'RUNTEST_PARTIAL_STOP')
+    return {'status': status, 'partition': buckets, 'selected_count': len(selected),
+            'required_count': len(expected),
+            'failure_observed': [selected[k] for k, phases in reports.items() if any(p['outcome']=='failed' for p in phases)],
+            'collection_finished': collection_finished,
+            'session_finished': session_finished, 'runtime_or_product_accepted': False,
+            'whole_contour_cessation': 'REQUIRES_INDEPENDENT_OWNER_OBSERVATION'}

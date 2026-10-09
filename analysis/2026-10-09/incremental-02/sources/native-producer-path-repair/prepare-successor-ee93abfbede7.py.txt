@@ -1,0 +1,314 @@
+"""One-shot source/data preparation only; delivered modules are never imported."""
+import ast
+import datetime
+import difflib
+import hashlib
+import json
+import os
+from pathlib import Path
+import resource
+import stat
+import subprocess
+
+os.sched_setaffinity(0, {0, 1})
+resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))
+W = Path('<ASTRA_WORK>')
+OLD = W / 'native-producer-controls-repair'
+P = W / 'native-producer-path-repair'
+OLDQUAL = W / 'native-admission-producer-qualification'
+QUAL = W / 'native-admission-producer-qualification-g2'
+TASK = 'FRW041-NATIVE-PRODUCER-PATH-REPAIR#1'
+OLDTASK = 'FRW041-NATIVE-PRODUCER-CONTROLS-REPAIR#1'
+TZ = datetime.timezone(datetime.timedelta(hours=3))
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def data(value):
+    return (json.dumps(value, indent=2) + '\n').encode()
+
+
+def put(path, value):
+    assert path.is_relative_to(P)
+    with path.open('xb') as stream:
+        stream.write(value if isinstance(value, bytes) else data(value))
+    path.chmod(0o400)
+
+
+def ref(path):
+    raw = path.read_bytes()
+    s = path.lstat()
+    return dict(path=str(path), sha256=sha(raw), bytes=len(raw),
+                mode=stat.S_IMODE(s.st_mode), uid=s.st_uid, nlink=s.st_nlink)
+
+
+def snapshot(root):
+    rows = {}
+    for path in [root, *sorted(root.rglob('*'))]:
+        s = path.lstat()
+        assert stat.S_ISREG(s.st_mode) or stat.S_ISDIR(s.st_mode)
+        row = dict(mode=s.st_mode, uid=s.st_uid, gid=s.st_gid, nlink=s.st_nlink,
+                   device=s.st_dev, inode=s.st_ino)
+        if stat.S_ISREG(s.st_mode):
+            raw = path.read_bytes()
+            row.update(sha256=sha(raw), size=len(raw), mtime_ns=s.st_mtime_ns)
+        rows[str(path)] = row
+    return rows
+
+
+def functions(raw):
+    return {n.name: ast.dump(n, include_attributes=False)
+            for n in ast.parse(raw).body if isinstance(n, ast.FunctionDef)}
+
+
+expected_refs = {
+    OLD / 'result.json': 'b7cba391d0406e4083b82d9f9fbe412f6794b7c3f24672855f9246d77e4a8874',
+    OLD / 'PUBLICATION-MANIFEST.json': '7a18ec0ae365fbad6d1840da132e66dc2ca657b0117207c52ed209fa40c36b7c',
+    OLDQUAL / 'result.json': 'ccf20e4f2b8b0c81817ba32d8709215fe988eb839b02ea44baca0b65f88b731f',
+    W / 'NATIVE-PRODUCER-CONTROLS-SOURCE-REVIEW.json': '1ceff20eca3635b6d869bb8e46f55acb8ea2388c0aa9aed08039a97e6e14683c',
+}
+for path, expected in expected_refs.items():
+    assert sha(path.read_bytes()) == expected, path
+assert not QUAL.exists() and not QUAL.is_symlink()
+assert set(p.name for p in P.iterdir()) == {'TASK.txt', 'prepare-successor.py'}
+before = dict(source=snapshot(OLD), qualification=snapshot(OLDQUAL))
+previous = json.loads((OLD / 'PUBLICATION-MANIFEST.json').read_bytes())
+for pin in previous['refs'].values():
+    assert ref(Path(pin['path'])) == pin
+
+for directory in ('candidate', 'source-copy', 'runner-source'):
+    (P / directory).mkdir(mode=0o700)
+changes = []
+
+
+def replace(raw, old, new):
+    assert old != new and old in raw
+    return raw.replace(old, new)
+
+
+def save_successor(relative, replacements):
+    old = (OLD / relative).read_bytes()
+    new = old
+    deltas = []
+    for a, b in replacements:
+        a, b = a.encode(), b.encode()
+        count = new.count(a)
+        new = replace(new, a, b)
+        deltas.append(dict(before=a.decode(), after=b.decode(), occurrences=count))
+    put(P / relative, new)
+    if new != old:
+        changes.append(dict(relative=relative, before=ref(OLD / relative),
+                            after=ref(P / relative), exact_replacements=deltas))
+    return new
+
+
+predicate_before = "type(value) is str and value.startswith('/') and str(PurePosixPath(value)) == value"
+predicate_after = "type(value) is str and value.startswith('/') and not value.startswith('//') and str(PurePosixPath(value)) == value"
+assert (OLD / 'candidate/produce_native_inputs.py').read_text().count(predicate_before) == 1
+for leaf in sorted((OLD / 'candidate').iterdir()):
+    if leaf.name == 'package-pins.json':
+        continue
+    replacements = []
+    if leaf.name == 'produce_native_inputs.py':
+        replacements = [(predicate_before, predicate_after)]
+    elif leaf.name == 'ROOT-RECIPE.md':
+        replacements = [(str(OLD), str(P))]
+    elif leaf.name == 'PRODUCER-REVIEW.template.json':
+        replacements = [(OLDTASK, TASK)]
+    save_successor('candidate/' + leaf.name, replacements)
+pins = {path.name: dict(size=len(path.read_bytes()), sha256=sha(path.read_bytes()))
+        for path in sorted((P / 'candidate').iterdir())}
+assert len(pins) == 7
+put(P / 'candidate/package-pins.json', pins)
+package = sha((P / 'candidate/package-pins.json').read_bytes())
+oldpackage = previous['source_package_sha256']
+assert package != oldpackage
+changes.append(dict(relative='candidate/package-pins.json', before=ref(OLD / 'candidate/package-pins.json'),
+                    after=ref(P / 'candidate/package-pins.json'), regeneration='Sorted seven-leaf size/SHA map'))
+for path in sorted((P / 'candidate').iterdir()):
+    put(P / 'source-copy' / path.name, path.read_bytes())
+
+save_successor('stage_offline_gate.py', [(str(OLD), str(P)), (str(OLDQUAL), str(QUAL)),
+                                        (OLDTASK, TASK), (oldpackage, package)])
+save_successor('runner-source/run.py', [(str(OLD), str(P)), (str(OLDQUAL), str(QUAL)),
+                                       (oldpackage, package)])
+save_successor('owner-check.py', [(str(OLD), str(P)), (OLDQUAL.name, QUAL.name), (OLDTASK, TASK)])
+owner_sha = sha((P / 'owner-check.py').read_bytes())
+save_successor('owner-caller.js', [(str(OLDQUAL), str(QUAL)),
+                                  (sha((OLD / 'owner-check.py').read_bytes()), owner_sha)])
+for relative in ('consumer-input-pins.json', 'runner-runtime-pins.json', 'case-inventory.json'):
+    save_successor(relative, [])
+plan_raw = (OLD / 'RUN-PLAN.json').read_text()
+for a, b in [(str(OLD), str(P)), (str(OLDQUAL), str(QUAL)), (OLDTASK, TASK),
+             (oldpackage, package),
+             (sha((OLD / 'owner-check.py').read_bytes()), owner_sha),
+             (sha((OLD / 'owner-caller.js').read_bytes()), sha((P / 'owner-caller.js').read_bytes()))]:
+    plan_raw = replace(plan_raw, a, b)
+plan = json.loads(plan_raw)
+plan['future_controls']['generation'] = 2
+plan['future_controls']['qualification_root'] = str(QUAL)
+plan['future_controls']['external_binding']['clock_required_fields']['generation'] = 2
+plan['future_controls']['external_binding']['reuse_existing_store_bundle'] = False
+plan['future_controls']['actual_tests'] = 'NOT_RUN_ON_NEW_BYTES'
+plan['future_controls']['preconditions'].append(
+    'Fresh g2 offline qualification only after exact independent successor review and separate runtime admission; '
+    'new original180 clock remains external. Do not reuse any g1 clock, output, review or store bundle.')
+put(P / 'RUN-PLAN.json', plan)
+changes.append(dict(relative='RUN-PLAN.json', before=ref(OLD / 'RUN-PLAN.json'), after=ref(P / 'RUN-PLAN.json'),
+                    regeneration='Same inert plan with successor path/task/package/owner/caller SHA bindings, external g2 and no store-bundle reuse.'))
+
+# Static-only verification: never evaluate a delivered module or test body.
+syntax = []
+for path in [*sorted((P / 'candidate').glob('*.py')), P / 'stage_offline_gate.py',
+             P / 'runner-source/run.py', P / 'owner-check.py']:
+    tree = ast.parse(path.read_bytes(), filename=str(path))
+    compile(tree, str(path), 'exec')
+    syntax.append(str(path))
+js = subprocess.run(['/usr/bin/node', '--check', '--input-type=module'],
+                    input=(P / 'owner-caller.js').read_bytes(), capture_output=True, timeout=10)
+assert js.returncode == 0, js.stderr.decode()
+oldproducer = functions((OLD / 'candidate/produce_native_inputs.py').read_bytes())
+newproducer = functions((P / 'candidate/produce_native_inputs.py').read_bytes())
+assert oldproducer.keys() == newproducer.keys()
+assert [k for k in oldproducer if oldproducer[k] != newproducer[k]] == ['clean_path']
+assert functions((OLD / 'runner-source/run.py').read_bytes()) == functions((P / 'runner-source/run.py').read_bytes())
+assert (OLD / 'candidate/test_native_input_producer.py').read_bytes() == (P / 'candidate/test_native_input_producer.py').read_bytes()
+assert (OLD / 'candidate/qualification_contract.py').read_bytes() == (P / 'candidate/qualification_contract.py').read_bytes()
+assert (OLD / 'candidate/consumer-pins.json').read_bytes() == (P / 'candidate/consumer-pins.json').read_bytes()
+pure = functions((P / 'candidate/qualification_contract.py').read_bytes())
+owner = functions((P / 'owner-check.py').read_bytes())
+assert all(owner[name] == value for name, value in pure.items())
+cases = {}
+for node in ast.parse((P / 'candidate/test_native_input_producer.py').read_bytes()).body:
+    if isinstance(node, ast.FunctionDef) and node.name.startswith('test_'):
+        count = 1
+        for decorator in node.decorator_list:
+            if isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Attribute) and decorator.func.attr == 'parametrize':
+                assert isinstance(decorator.args[1], (ast.List, ast.Tuple))
+                count *= len(decorator.args[1].elts)
+        cases[node.name] = count
+assert sum(cases.values()) == 112
+assert cases == json.loads((P / 'case-inventory.json').read_bytes())['definitions']
+consumer_inputs = json.loads((P / 'consumer-input-pins.json').read_bytes())
+runtime_inputs = json.loads((P / 'runner-runtime-pins.json').read_bytes())['pins']
+assert len(consumer_inputs) == 48 and len(runtime_inputs) == 2 and not set(consumer_inputs) & set(runtime_inputs)
+future_inputs = dict(consumer_inputs, **runtime_inputs)
+for directory in ('candidate', 'source-copy'):
+    for path in (P / directory).iterdir():
+        raw = path.read_bytes()
+        future_inputs[str(path)] = dict(size=len(raw), sha256=sha(raw))
+        assert raw == (P / ('source-copy' if directory == 'candidate' else 'candidate') / path.name).read_bytes()
+for name, source in [('run.py', P / 'runner-source/run.py'), ('owner-check.py', P / 'owner-check.py')]:
+    raw = source.read_bytes()
+    future_inputs[str(QUAL / 'output' / name)] = dict(size=len(raw), sha256=sha(raw))
+assert len(future_inputs) == 68
+put(P / 'future-input-binding-plan.json', dict(state='INERT_EXPECTED_MAP_NOT_STAGED_NOT_RUNTIME_EVIDENCE',
+    qualification_root=str(QUAL), leaf_count=68, inputs=future_inputs,
+    qualification_contract='Actual stager must regenerate exact input-pins bytes after fresh no-adoption staging; no output copied.'))
+
+all_rels = [str(path.relative_to(P)) for directory in ('candidate', 'source-copy', 'runner-source')
+            for path in sorted((P / directory).iterdir())]
+all_rels += ['stage_offline_gate.py', 'owner-check.py', 'owner-caller.js', 'RUN-PLAN.json']
+diff = ''.join(line for relative in all_rels for line in difflib.unified_diff(
+    (OLD / relative).read_text().splitlines(keepends=True), (P / relative).read_text().splitlines(keepends=True),
+    fromfile=str(OLD / relative), tofile=str(P / relative)))
+put(P / 'successor.diff', diff.encode())
+put(P / 'binding-deltas.json', dict(state='DETERMINISTIC_SOURCE_BINDINGS_NOT_EXECUTION', changes=changes,
+    source_copy='Every candidate leaf copied byte-for-byte to source-copy; both eight-leaf maps pinned.',
+    implementation_change='Only clean_path requires not value.startswith(\'//\'); every other producer function unchanged.'))
+after = dict(source=snapshot(OLD), qualification=snapshot(OLDQUAL))
+assert before == after
+for path, expected in expected_refs.items():
+    assert sha(path.read_bytes()) == expected
+assert not QUAL.exists() and not QUAL.is_symlink()
+put(P / 'predecessor-preservation.json', dict(state='EXACT_SNAPSHOT_UNCHANGED', before=before,
+    after_identical=True, pinned_context=[ref(path) for path in expected_refs],
+    native_originals='Untouched, not re-probed; consumed identity remains unusable.'))
+lexical = [
+    dict(source='candidate/produce_native_inputs.py:clean_path', conclusion='Defect fixed by direct rejection of // prefix; existing canonical text equality, absolute/type and parent-traversal predicates retained.'),
+    dict(source='candidate/produce_native_inputs.py:parent_fd/verified_ref/prepare/publish', conclusion='Caller-controlled paths pass through clean_path, including parent_fd read paths. No duplicate PurePosixPath equality predicate elsewhere.'),
+    dict(source='candidate/produce_native_inputs.py:pin_rows', conclusion='Leaf names forbid every slash; same defect absent.'),
+    dict(source='stage_offline_gate.py:read', conclusion='Path must equal strict filesystem resolution and retain safe ancestors; // spelling fails resolved-path equality. Leaf membership separately enforced. Unchanged.'),
+    dict(source='runner-source/run.py:canonical/path_ok/writable', conclusion='Canonicalizer deliberately removes empty slash components and returns one / prefix before exact private-root containment; no PurePosixPath lexical acceptance dependency. All functions unchanged.'),
+    dict(source='owner-check.py:read_bytes/runtime_bindings', conclusion='Reads pinned publication/ref paths and exact runtime aliases; no lexical clean-path validator or duplicate predicate. Only task/path constants rebound.'),
+]
+evidence = dict(state='AUTHOR_STATIC_SOURCE_CHECKS_ONLY_NOT_ACCEPTANCE',
+    python_syntax=dict(mode='AST_PARSE_AND_COMPILE_NO_EXEC', files=syntax),
+    javascript_syntax=dict(command=['/usr/bin/node', '--check', '--input-type=module'], exit_code=js.returncode),
+    producer_changed_functions=['clean_path'], all_other_producer_functions_unchanged=True,
+    runner_all_functions_AST_unchanged=True, owner_source_deltas='Exact path/task replacement only; see binding-deltas.json',
+    owner_pure_functions_AST_equal=list(pure), original_test_file_byte_identical=True,
+    test_sha256=sha((P / 'candidate/test_native_input_producer.py').read_bytes()),
+    exact_failed_case_preserved='test_foreign_path_syntax_refuses[//tmp/x]',
+    source_cases=112, source_test_definitions=len(cases), actual_collection='NOT_RUN_ON_NEW_BYTES',
+    real_consumer32_string_map_and_connected_prepare_positive='Original functions and tests byte-identical; no new runtime assertion made.',
+    consumer_pins_and_external48_and_runtime2_pin_maps='BYTE_IDENTICAL_PREDECESSOR; previous runtime before/after evidence not transferred to new bytes.',
+    candidate_source_copy_byte_equality=True, future_input_count=68, source_package_sha256=package,
+    predecessor_publication_refs_reverified=len(previous['refs']), predecessor_snapshot_unchanged=True,
+    lexical_path_inspection=lexical,
+    candidate_imports='NOT_RUN', tests='NOT_RUN', owner_caller='NOT_RUN', staging='NOT_RUN',
+    runtime_clock_or_grant='NOT_CREATED', allocation='NOT_CREATED', lock_acquisition='NOT_RUN',
+    producer_prepare='NOT_RUN', native_root_service_model_effects='NOT_RUN', children=0,
+    resources=dict(affinity=sorted(os.sched_getaffinity(0)), address_space_limit=list(resource.getrlimit(resource.RLIMIT_AS)),
+                   aggregate_usage='Source tooling only; not independently metered.'))
+put(P / 'static-evidence.json', evidence)
+for directory in ('candidate', 'source-copy', 'runner-source'):
+    (P / directory).chmod(0o500)
+(P / 'prepare-successor.py').chmod(0o400)
+publication_refs = {}
+for path in sorted(P.rglob('*')):
+    if path.is_file():
+        key = 'runner' if path == P / 'runner-source/run.py' else str(path.relative_to(P))
+        publication_refs[key] = ref(path)
+        assert publication_refs[key]['mode'] == 0o400
+        assert publication_refs[key]['uid'] == 1000 and publication_refs[key]['nlink'] == 1
+publication = dict(state='SOURCE_ONLY_FINAL_INDEPENDENT_REVIEW_REQUIRED', source_task=TASK,
+    source_package_sha256=package, native_source_package_sha256=previous['native_source_package_sha256'],
+    runtime_grant=False, source_accept=False, source_cases=112,
+    actual_collection='UNOBSERVED', actual_tests='NOT_RUN', candidate_imports='NOT_RUN',
+    consumer_calls='NOT_RUN', producer_preflight='NOT_RUN', grant_clock_publication='NOT_RUN',
+    renderer_executed=False, native_executed=False, owner_caller_executed=False,
+    original_source_budget_seconds=1200, resources=dict(CPU=2, memory_bytes=2 << 30, children=0),
+    native_source_leaves=32, future_offline_input_leaves=68, independent_review_required=True,
+    current_original_native_clock_admission_parent='IMMUTABLE_UNTOUCHED; parent CLOSED per authoritative TASK, not reprobed',
+    predecessor_publication=ref(OLD / 'PUBLICATION-MANIFEST.json'), refs=publication_refs)
+put(P / 'PUBLICATION-MANIFEST.json', publication)
+for pin in publication_refs.values():
+    assert ref(Path(pin['path'])) == pin
+accepted = datetime.datetime.fromisoformat('2026-10-09T04:09:37.294+00:00')
+completed = datetime.datetime.now(TZ)
+elapsed = (completed - accepted).total_seconds()
+assert elapsed < 1200
+result = dict(assignment='FRW041-NATIVE-PRODUCER-PATH-REPAIR', generation=1, owner_scope='goal',
+    state='SOURCE_SUCCESSOR_READY_INDEPENDENT_REVIEW_AND_FRESH112_QUALIFICATION_REQUIRED',
+    source_accept=False, runtime_grant=False,
+    predecessor=ref(OLD / 'result.json'), failed_qualification=ref(OLDQUAL / 'result.json'),
+    source_package_sha256=package,
+    changed_source=dict(predicate_before=predicate_before, predicate_after=predicate_after,
+                        implementation_functions=['clean_path'], deterministic_deltas=ref(P / 'binding-deltas.json')),
+    refs={name: ref(P / relative) for name, relative in {
+        'publication':'PUBLICATION-MANIFEST.json', 'package':'candidate/package-pins.json',
+        'producer':'candidate/produce_native_inputs.py', 'diff':'successor.diff',
+        'run_plan':'RUN-PLAN.json', 'future_input_bindings':'future-input-binding-plan.json',
+        'static_evidence':'static-evidence.json', 'preservation':'predecessor-preservation.json',
+        'stager':'stage_offline_gate.py', 'runner':'runner-source/run.py',
+        'owner_checker':'owner-check.py', 'owner_caller':'owner-caller.js'}.items()},
+    validation=evidence,
+    future=dict(qualification_root=str(QUAL), generation=2, staging='NOT_RUN',
+                actual112='NOT_RUN_ON_NEW_BYTES', original_seconds=180, CPU=2, memory_bytes=2 << 30,
+                cpu_seconds=60, GNU_timeout_seconds=70, owner_utility_timeout_seconds=20,
+                input_leaves=68, actual_closure_required=True, clock_or_grant_created=False),
+    preserved=dict(old_source_and_qualification='SNAPSHOT_IDENTICAL', native_originals='UNTOUCHED',
+        consumed_native_identity='INTENTIONALLY_UNUSABLE', stopped_native_build='NOT_RUN_NOT_RESTARTED',
+        all7journeys4web='UNACCEPTED', OldFridayOFF_Pandora_A0_FRW013_ordinary_stops='UNCHANGED'),
+    timing=dict(accepted_at_moscow=accepted.astimezone(TZ).isoformat(), completed_at_moscow=completed.isoformat(),
+                elapsed_seconds=round(elapsed, 3), original_budget_seconds=1200, budget_reset=False),
+    remaining=['Independent root review of exact successor publication.',
+               'Separate fresh g2 staging/admission and actual112 qualification with all68 integrity, original180 and observed physical closure.',
+               'Current consumed native identity and stopped build remain separate; no native retry authorized.'])
+put(P / 'result.json', result)
+print(json.dumps(dict(state=result['state'], result=ref(P / 'result.json'),
+                      publication=ref(P / 'PUBLICATION-MANIFEST.json'), package=package,
+                      elapsed_seconds=result['timing']['elapsed_seconds'])))

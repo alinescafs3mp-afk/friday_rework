@@ -1,0 +1,431 @@
+"""Finite current-image witness. Import is inert; run_root is owner-only.
+
+Only an anonymous inherited AF_UNIX/SOCK_SEQPACKET channel is accepted.
+Authentication uses per-packet SCM_CREDENTIALS, NOT socketpair SO_PEERCRED.
+No caller-selected manager PID, path, unit, command, duration, or control.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import resource
+import select
+import signal
+import socket
+import struct
+import subprocess
+import time
+
+ASSIGNMENT = 'FRW011-A0-DEPENDENCY-DROPIN-G6'
+VERSION = 1
+MAX_SAMPLES = 35
+MAX_PACKET = 16384
+NS = 10**9
+FD = 8
+EXE = '/usr/lib/systemd/systemd'
+UNIT = '<REDACTED_EMAIL>'
+ROOT_SHOW = ['/usr/bin/systemctl', '--system', 'show', '--all', '--no-pager',
+             '--property=Id,ActiveState,MainPID,InvocationID', '--', UNIT]
+ROOT_ENV = {'PATH': '/usr/bin:/bin', 'HOME': '/root', 'LC_ALL': 'C',
+            'SYSTEMD_PAGER': 'cat', 'SYSTEMD_COLORS': '0',
+            'DBUS_SYSTEM_BUS_ADDRESS': 'unix:path=/run/dbus/system_bus_socket'}
+AXES = ('monotonic_ns', 'boottime_ns')
+SESSION_KEYS = {'version', 'assignment', 'manifest_sha256', 'nonce', 'boot_id',
+                'accepted_monotonic_ns', 'accepted_boottime_ns', 'accepted_realtime_ns',
+                'observation_deadline_ns', 'whole_deadline_ns'}
+
+
+class WitnessRefused(RuntimeError):
+    pass
+
+
+def need(ok, why):
+    if not ok:
+        raise WitnessRefused(why)
+
+
+def clocks():
+    return {'monotonic_ns': time.monotonic_ns(),
+            'boottime_ns': time.clock_gettime_ns(time.CLOCK_BOOTTIME),
+            'realtime_ns': time.time_ns()}
+
+
+def pairs(items):
+    result = {}
+    for k, v in items:
+        need(k not in result, 'duplicate field')
+        result[k] = v
+    return result
+
+
+def validate_session(s, manifest, now):
+    need(type(s) is dict and set(s) == SESSION_KEYS, 'session schema')
+    need(type(s['version']) is int and s['version'] == VERSION and
+         s['assignment'] == ASSIGNMENT and s['manifest_sha256'] == manifest,
+         'session authority binding')
+    need(re.fullmatch('[0-9a-f]{64}', s['nonce']) is not None and
+         re.fullmatch('[0-9a-f]{64}', manifest) is not None and
+         re.fullmatch('[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}', s['boot_id']) is not None,
+         'session identifiers')
+    for k in ('accepted_monotonic_ns', 'accepted_boottime_ns', 'accepted_realtime_ns',
+              'observation_deadline_ns', 'whole_deadline_ns'):
+        need(type(s[k]) is int and s[k] > 0, 'clock integer')
+    need(s['observation_deadline_ns'] == s['accepted_monotonic_ns'] + 22*NS and
+         s['whole_deadline_ns'] == s['accepted_monotonic_ns'] + 120*NS,
+         'original deadline binding')
+    need(all(0 <= now[k] - s['accepted_'+k] < 22*NS for k in AXES),
+         'original observation deadline')
+    return s
+
+
+def session_from_receipt(r):
+    return {'version': VERSION, 'assignment': r['assignment'],
+            'manifest_sha256': r['manifest_sha256'], 'nonce': r['attempt_token'],
+            'boot_id': r['boot_id'],
+            **{k: r[k] for k in ('accepted_monotonic_ns', 'accepted_boottime_ns',
+                                 'accepted_realtime_ns', 'whole_deadline_ns')},
+            'observation_deadline_ns': r['accepted_monotonic_ns'] + 22*NS}
+
+
+def validate_receipt_binding(r):
+    b = r.get('manager_witness')
+    need(type(b) is dict and set(b) == {'version', 'fd', 'producer_pid', 'next_sequence',
+                                      'preflight_sha256'}, 'witness receipt schema')
+    need(b['version'] == VERSION and type(b['version']) is int and
+         b['fd'] == FD and type(b['fd']) is int and
+         type(b['producer_pid']) is int and b['producer_pid'] > 1 and
+         type(b['next_sequence']) is int and b['next_sequence'] == 2 and
+         re.fullmatch('[0-9a-f]{64}', b['preflight_sha256']) is not None,
+         'witness receipt binding')
+    need(r['assignment'] == ASSIGNMENT, 'old assignment remains closed')
+
+
+def boundary(seq):
+    need(type(seq) is int and 1 <= seq <= MAX_SAMPLES, 'observation budget')
+    return 'preflight' if seq == 1 else 'verify.%d.%s' % ((seq-2)//2, 'before' if seq%2 == 0 else 'after')
+
+
+def packet(raw, anc, flags):
+    """Kernel ancillary metadata is a separate input; JSON cannot authenticate."""
+    need(0 < len(raw) <= MAX_PACKET and not flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC),
+         'empty/truncated/oversized packet')
+    need(len(anc) == 1 and anc[0][:2] == (socket.SOL_SOCKET, socket.SCM_CREDENTIALS)
+         and len(anc[0][2]) == struct.calcsize('3i'), 'kernel credentials required')
+    pid, uid, gid = struct.unpack('3i', anc[0][2])
+    need(pid > 1 and uid >= 0 and gid >= 0, 'invalid credentials')
+    data = json.loads(raw, object_pairs_hook=pairs)
+    need(type(data) is dict, 'packet object')
+    return data, (pid, uid, gid)
+
+
+def encode(data):
+    raw = json.dumps(data, sort_keys=True, separators=(',', ':')).encode()
+    need(len(raw) <= MAX_PACKET, 'outgoing packet bound')
+    return raw
+
+
+def inherited(fd):
+    s = socket.socket(fileno=fd)
+    need(s.family == socket.AF_UNIX and s.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+         == socket.SOCK_SEQPACKET, 'inherited channel type')
+    # SO_PASSCRED can cause Linux to autobind a socketpair endpoint while
+    # sending (unix_seqpacket_sendmsg -> unix_dgram_sendmsg). Such a kernel
+    # abstract address is not a caller-selected path or an authentication
+    # identity. Do not reject the already-used pair during the driver handoff.
+    for name in (s.getsockname(), s.getpeername()):
+        need(name in ('', b'') or (isinstance(name, bytes) and name.startswith(b'\0')),
+             'filesystem-named witness channel refused')
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    os.set_inheritable(fd, False)
+    return s
+
+
+class Channel:
+    def __init__(self, sock):
+        self.sock = sock
+
+    def send(self, obj, timeout):
+        self.sock.settimeout(timeout)
+        raw = encode(obj)
+        need(self.sock.send(raw) == len(raw), 'short packet send')
+
+    def recv(self, timeout):
+        self.sock.settimeout(timeout)
+        raw, anc, flags, address = self.sock.recvmsg(MAX_PACKET, socket.CMSG_SPACE(struct.calcsize('3i')))
+        # Close unsolicited kernel-installed descriptors before rejecting them.
+        for level, kind, value in anc:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                for offset in range(0, len(value)-len(value)%struct.calcsize('i'), struct.calcsize('i')):
+                    os.close(struct.unpack('i', value[offset:offset+struct.calcsize('i')])[0])
+        if not raw and not anc and not flags:
+            raise EOFError('original consumer closed channel')
+        return packet(raw, anc, flags)
+
+    def close(self):
+        self.sock.close()
+
+
+def valid_observation(o, s, pinned=None):
+    need(type(o) is dict and set(o) == {'root_before', 'root_after', 'process_before',
+         'process_after', 'uids_before', 'uids_after', 'exe', 'proc_owner_uid', 'boot_id',
+         'pidfd_alive', 'started', 'finished'}, 'observation schema')
+    root = o['root_before']
+    need(root == o['root_after'] and type(root) is dict and
+         set(root) == {'Id', 'ActiveState', 'MainPID', 'InvocationID'} and
+         root['Id'] == UNIT and root['ActiveState'] == 'active' and
+         re.fullmatch('[1-9][0-9]*', root['MainPID']) is not None and
+         int(root['MainPID']) > 1 and
+         re.fullmatch('[0-9a-f]{32}', root['InvocationID']) is not None and
+         root['InvocationID'] != '0'*32, 'current root manager tuple')
+    first, last = o['process_before'], o['process_after']
+    for p in (first, last):
+        need(type(p) is dict and type(p.get('pid')) is int and
+             p['pid'] == int(root['MainPID']) and type(p.get('starttime_ticks')) is int and
+             p['starttime_ticks'] > 0 and p.get('state') not in ('Z', 'X', 'x', None),
+             'current manager process identity')
+    need(first['starttime_ticks'] == last['starttime_ticks'] and
+         o['uids_before'] == o['uids_after'] == [1000]*4 and
+         all(type(v) is int for v in o['uids_before']+o['uids_after']) and
+         o['exe'] == EXE and o['boot_id'] == s['boot_id'] and o['pidfd_alive'] is True,
+         'current executable/UID/liveness/boot mismatch')
+    identity = {'pid': last['pid'], 'starttime_ticks': last['starttime_ticks'],
+                'invocation_id': root['InvocationID']}
+    need(pinned is None or identity == pinned, 'original manager changed')
+    return identity
+
+
+class Client:
+    def __init__(self, session, channel, producer_pid=None, next_sequence=1,
+                 pinned=None, clock=clocks, nonce=lambda: os.urandom(32).hex()):
+        self.s, self.channel, self.producer_pid = dict(session), channel, producer_pid
+        self.seq, self.pinned, self.clock, self.nonce = next_sequence, pinned, clock, nonce
+        self.failed, self.records = False, []
+
+    @classmethod
+    def from_receipt(cls, r):
+        validate_receipt_binding(r)
+        return cls(session_from_receipt(r), Channel(inherited(FD)),
+                   r['manager_witness']['producer_pid'], 2, r['user_manager'])
+
+    def observe(self):
+        need(not self.failed, 'witness channel permanently refused')
+        try:
+            now = self.clock()
+            validate_session(self.s, self.s['manifest_sha256'], now)
+            req = {'session': self.s, 'sequence': self.seq, 'boundary': boundary(self.seq),
+                   'challenge': self.nonce(), 'sent': now,
+                   'deadline_ns': min(now['monotonic_ns'] + 500_000_000,
+                                      self.s['observation_deadline_ns'])}
+            self.seq += 1  # Consumed before any send: never retry an uncertain request.
+            self.channel.send(req, max(0.000001, (req['deadline_ns']-now['monotonic_ns'])/NS))
+            remaining = (req['deadline_ns']-self.clock()['monotonic_ns'])/NS
+            need(remaining > 0, 'request expired before reply')
+            response, cred = self.channel.recv(remaining)
+            end = self.clock()
+            validate_session(self.s, self.s['manifest_sha256'], end)
+            need(cred[1:] == (0, 0) and (self.producer_pid is None or cred[0] == self.producer_pid),
+                 'actual privileged producer mismatch')
+            need(type(response) is dict and set(response) == {'request', 'producer_pid', 'observation'} and
+                 response['request'] == req and response['producer_pid'] == cred[0],
+                 'replayed/mismatched response')
+            need(end['monotonic_ns'] < req['deadline_ns'] and
+                 all(0 <= end[k]-now[k] < 500_000_000 for k in AXES), 'late reply')
+            o = response['observation']
+            identity = valid_observation(o, self.s, self.pinned)
+            for k in AXES:
+                need(now[k] <= o['started'][k] <= o['finished'][k] <= end[k],
+                     'stale/future observation clocks')
+            if req['sequence'] == 1:
+                need(o['proc_owner_uid'] == 1000 and type(o['proc_owner_uid']) is int,
+                     'original preflight proc directory owner')
+            self.producer_pid, self.pinned = cred[0], identity
+            self.records.append(response)
+            return o
+        except BaseException:
+            self.failed = True
+            self.channel.close()
+            raise
+
+    def receipt_binding(self):
+        need(self.seq == 2 and len(self.records) == 1 and not self.failed, 'preflight incomplete')
+        return {'version': VERSION, 'fd': FD, 'producer_pid': self.producer_pid,
+                'next_sequence': 2, 'preflight_sha256': hashlib.sha256(encode(self.records[0])).hexdigest()}
+
+
+class Engine:
+    """Pure protocol state machine. Backend is synthetic in source tests."""
+    def __init__(self, manifest, backend, producer_pid, clock=clocks, expected_session=None):
+        self.manifest, self.backend, self.producer_pid, self.clock = manifest, backend, producer_pid, clock
+        self.s, self.seq, self.pinned, self.failed = None, 1, None, False
+        self.expected_session = expected_session
+
+    def handle(self, req, credentials):
+        need(not self.failed, 'witness closed')
+        try:
+            need(type(req) is dict and set(req) == {'session', 'sequence', 'boundary', 'challenge',
+                                                  'sent', 'deadline_ns'}, 'request schema')
+            now = self.clock()
+            validate_session(req['session'], self.manifest, now)
+            need(self.expected_session is None or req['session'] == self.expected_session,
+                 'owner command original session binding')
+            need(self.s is None or req['session'] == self.s, 'session cannot be renewed')
+            need(req['sequence'] == self.seq and type(req['sequence']) is int and
+                 req['boundary'] == boundary(self.seq), 'sequence/boundary mismatch')
+            need(re.fullmatch('[0-9a-f]{64}', req['challenge']) is not None, 'challenge')
+            need(type(req['sent']) is dict and set(req['sent']) == {*AXES, 'realtime_ns'} and
+                 all(type(x) is int and x > 0 for x in req['sent'].values()), 'request clock schema')
+            need(type(req['deadline_ns']) is int and req['deadline_ns'] ==
+                 min(req['sent']['monotonic_ns']+500_000_000, req['session']['observation_deadline_ns']) and
+                 now['monotonic_ns'] < req['deadline_ns'] and
+                 all(0 <= now[k]-req['sent'][k] < 500_000_000 for k in AXES), 'request freshness')
+            self.backend.authenticate_consumer(credentials, self.seq)
+            self.s = dict(req['session'])
+            seq = self.seq
+            self.seq += 1
+            observed = self.backend.observe(self.s, self.pinned, req['deadline_ns'])
+            identity = valid_observation(observed, self.s, self.pinned)
+            need(seq != 1 or observed['proc_owner_uid'] == 1000, 'preflight proc owner')
+            now = self.clock()
+            validate_session(self.s, self.manifest, now)
+            need(now['monotonic_ns'] < req['deadline_ns'] and
+                 all(0 <= now[k]-req['sent'][k] < 500_000_000 for k in AXES), 'observation expired')
+            self.pinned = identity
+            return {'request': req, 'producer_pid': self.producer_pid, 'observation': observed}
+        except BaseException:
+            self.failed = True
+            raise
+
+
+def read_small(path):
+    with open(path, 'rb') as f:
+        raw = f.read(65537)
+    need(len(raw) <= 65536, 'proc read bound')
+    return raw.decode()
+
+
+def process(pid):
+    raw = read_small('/proc/%d/stat' % pid)
+    fields = raw[raw.rfind(')')+2:].split()
+    uid = [int(v) for v in read_small('/proc/%d/status' % pid).split('Uid:', 1)[1].splitlines()[0].split()]
+    return {'pid': pid, 'starttime_ticks': int(fields[19]), 'parent_pid': int(fields[1]),
+            'state': fields[0]}, uid
+
+
+def alive(fd):
+    poll = select.poll()
+    poll.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    return not poll.poll(0)
+
+
+class NativeReads:
+    """Only called by separately owner-executed run_root; never source-tested live."""
+    def __init__(self):
+        self.parent_pid = self.parent_fd = self.consumer_pid = self.consumer_fd = self.manager_fd = None
+        self.parent_start = None
+
+    def authenticate_consumer(self, cred, seq):
+        pid, uid, gid = cred
+        need(uid == gid == 1000, 'consumer credentials')
+        if seq == 1:
+            info, uids = process(pid)  # Kernel-derived sender, never a requested target.
+            self.parent_fd = os.pidfd_open(pid)
+            again, uids2 = process(pid)
+            need(info == again and uids == uids2 == [1000]*4 and alive(self.parent_fd), 'parent pin')
+            self.parent_pid, self.parent_start = pid, info['starttime_ticks']
+        else:
+            need(pid == self.parent_pid, 'only original parent may consume witness')
+            info,uids=process(pid)
+            need(info['starttime_ticks']==self.parent_start and uids==[1000]*4,
+                 'original parent PID reused/credentials changed')
+        need(alive(self.parent_fd), 'original parent lost')
+
+    def root_tuple(self, deadline):
+        timeout = min(0.15, (deadline-time.monotonic_ns())/NS)
+        need(timeout > 0, 'root read deadline')
+        # Fixed root-owned client, sanitized environment, no auto-start/control verb.
+        with subprocess.Popen(ROOT_SHOW, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, env=ROOT_ENV, close_fds=True) as p:
+            try:
+                out, err = p.communicate(timeout=timeout)
+            except BaseException:
+                p.kill()  # Only this owned query child; never manager/payload/unit.
+                p.communicate()
+                raise
+            need(p.returncode == 0 and not err and len(out) <= 4096, 'root tuple read refused')
+        return pairs(line.split('=', 1) for line in out.decode().splitlines())
+
+    def observe(self, session, pinned, deadline):
+        begin = clocks()
+        boot = read_small('/proc/sys/kernel/random/boot_id').strip()
+        root = self.root_tuple(deadline)
+        need(set(root) == {'Id', 'ActiveState', 'MainPID', 'InvocationID'} and root['Id'] == UNIT
+             and root['ActiveState'] == 'active' and re.fullmatch('[1-9][0-9]*', root['MainPID'])
+             and int(root['MainPID']) > 1, 'root tuple before selecting manager')
+        pid = int(root['MainPID'])
+        if pinned is not None:
+            need(pid == pinned['pid'] and root['InvocationID'] == pinned['invocation_id'],
+                 'never follow a replacement manager')
+        first, uid = process(pid)
+        if self.manager_fd is None:
+            self.manager_fd = os.pidfd_open(pid)
+        need(alive(self.manager_fd), 'manager pidfd exited')
+        exe = os.readlink('/proc/%d/exe' % pid)  # Exactly ONE per request; denial terminates.
+        owner = os.stat('/proc/%d' % pid).st_uid
+        last, last_uid = process(pid)
+        root_after = self.root_tuple(deadline)
+        need(read_small('/proc/sys/kernel/random/boot_id').strip() == boot, 'boot changed')
+        return {'root_before': root, 'root_after': root_after, 'process_before': first,
+                'process_after': last, 'uids_before': uid, 'uids_after': last_uid,
+                'exe': exe, 'proc_owner_uid': owner, 'boot_id': boot,
+                'pidfd_alive': alive(self.manager_fd), 'started': begin, 'finished': clocks()}
+
+    def close(self):
+        for fd in (self.parent_fd, self.consumer_fd, self.manager_fd):
+            if fd is not None:
+                os.close(fd)
+
+
+def run_root(manifest, expected_session):
+    need(os.getresuid() == (0, 0, 0) and os.getresgid() == (0, 0, 0), 'owner root credentials required')
+    validate_session(expected_session, manifest, clocks())
+    resource.setrlimit(resource.RLIMIT_AS, (128*1024**2, 128*1024**2))
+    resource.setrlimit(resource.RLIMIT_CPU, (4, 4))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    allowed = os.sched_getaffinity(0)
+    need({0, 1} <= allowed, 'canonical CPUs unavailable')
+    os.sched_setaffinity(0, {0, 1})
+    def expired(signum, frame):
+        raise WitnessRefused('finite witness local alarm')
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL,
+                     min((expected_session['accepted_'+k]+22*NS-clocks()[k])/NS for k in AXES))
+    channel, reads = Channel(inherited(0)), NativeReads()
+    engine = Engine(manifest, reads, os.getpid(), expected_session=expected_session)
+    try:
+        while engine.seq <= MAX_SAMPLES:
+            validate_session(expected_session, manifest, clocks())
+            # 200ms slices are local finite fd/deadline checks, no model polling.
+            if engine.s is not None:
+                validate_session(engine.s, manifest, clocks())
+                need(alive(reads.parent_fd), 'original parent lost')
+                if reads.consumer_fd is not None:
+                    need(alive(reads.consumer_fd), 'driver lost')
+            try:
+                req, cred = channel.recv(0.2)
+            except socket.timeout:
+                continue
+            except EOFError:
+                return  # no in-flight observation; fixed root resources/target unchanged
+            response = engine.handle(req, cred)
+            budget = (req['deadline_ns']-time.monotonic_ns())/NS
+            need(budget > 0, 'reply deadline')
+            channel.send(response, budget)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        channel.close()
+        reads.close()
+
+
+if __name__ == '__main__':
+    raise SystemExit('SOURCE_ONLY: root entry requires reviewed hash-pinned owner loader and inherited stdin socket')

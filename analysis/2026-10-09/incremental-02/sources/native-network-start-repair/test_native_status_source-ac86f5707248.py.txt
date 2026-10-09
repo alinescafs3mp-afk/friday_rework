@@ -1,0 +1,391 @@
+"""Finite source controls; NO live status/kernel claim. All NOT_RUN in publication."""
+from pathlib import Path
+from types import SimpleNamespace as NS
+from unittest.mock import Mock
+import copy
+import ctypes
+import fcntl
+import hashlib
+import math
+import os
+import select
+import stat
+import struct
+import time
+import json
+import ast
+import pytest
+
+PATH = Path(__file__).resolve().parents[1] / 'owner-helper/native_status.py'
+tree = ast.parse(PATH.read_text())
+# Exact source definitions; no candidate top-level import or effectful constructor.
+selected = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef, ast.Assign))]
+env = dict(Path=Path, ctypes=ctypes, fcntl=fcntl, hashlib=hashlib, json=json, math=math, os=os,
+           select=select, stat=stat, struct=struct, time=time)
+exec(compile(ast.Module(body=selected, type_ignores=[]), str(PATH), 'exec'), env)
+class Globals:
+    def __getattr__(self, name):
+        try: return env[name]
+        except KeyError: raise AttributeError(name) from None
+    def __setattr__(self, name, value): env[name] = value
+    def __delattr__(self, name): del env[name]
+a = Globals()
+START = b'{ "child-pid": 11, "mnt-namespace": 202, "pid-namespace": 201 }\n'
+EXIT = b'{ "exit-code": 5 }\n'
+
+
+def test_native_exact_jsonl_fragmented_positive():
+    reader = a.NativeRecords()
+    for part in [START[:2], START[2:-1], START[-1:], EXIT[:5], EXIT[5:]]:
+        reader.feed(part)
+    reader.finish()
+    assert reader.start['child-pid'] == 11 and reader.exit == 5 and reader.eof
+    assert reader.total == len(START + EXIT)
+
+
+@pytest.mark.parametrize('data', [b'no-json\n', b'[]\n', b'{}\n', b'\n', b'{"child-pid":true}\n',
+    b'{"child-pid":11,"child-pid":12}\n', b'{"child-pid":NaN}\n', b'{"child-pid":-1}\n',
+    b'{"child-pid":11}\n', b'{"exit-code":0}\n', START+START, START+EXIT+EXIT,
+    START+b'{"exit-code":true}\n', START+b'{"exit-code":256}\n', START+b'{"unknown":0}\n',
+    START+EXIT+START, b'x' * (a.MAX_RECORD+1), b'x' * (a.MAX_STATUS+1), b'\xff\n'])
+def test_native_malformed_duplicate_oversize_unknown_refuses(data):
+    with pytest.raises(a.StatusRefusal): a.NativeRecords().feed(data)
+
+
+@pytest.mark.parametrize('data', [b'', START, START+EXIT[:-1], START+b'{'])
+def test_native_truncated_or_missing_end_refuses(data):
+    reader = a.NativeRecords(); reader.feed(data)
+    with pytest.raises(a.StatusRefusal): reader.finish()
+
+
+def test_native_after_eof_cannot_promote():
+    reader = a.NativeRecords(); reader.feed(START+EXIT); reader.finish()
+    with pytest.raises(a.StatusRefusal): reader.feed(b'{}\n')
+
+
+def preparation():
+    semantic = ['/env', '-i', '/python', 'invocation.py']
+    profile = [a.BWRAP, '--unshare-user', '--unshare-pid', '--clearenv', '--die-with-parent',
+               '--ro-bind', '/runtime', '/runtime', '--json-status-fd', '9', '--',
+               '/runtime/launcher', '--scoped-v1', '--', *semantic]
+    return semantic, dict(capability='host-control-v1', state='UNQUALIFIED_SOURCE_PREPARATION',
+                         runtimeGrant=False, semanticArgv=semantic[:], statusFd=9, argv=profile)
+
+
+def test_provider_positive_preserves_exact_profile_and_semantics():
+    semantic, value = preparation()
+    assert a.provider_argv(value, semantic, 9) == value['argv']
+
+
+@pytest.mark.parametrize('cut', ['promotion', 'wrongfd', 'executable', 'foreignsemantic', 'argsfd',
+                                'doublefd', 'pidns', 'as_pid1', 'syncfd'])
+def test_provider_status_or_inheritance_overrides_refuse(cut):
+    semantic, value = preparation()
+    if cut == 'promotion': value['runtimeGrant'] = True
+    elif cut == 'wrongfd': value['statusFd'] = 7
+    elif cut == 'executable': value['argv'][0] = '/foreign/bwrap'
+    elif cut == 'foreignsemantic': value['argv'][-1] = 'other'
+    else:
+        add = {'argsfd':['--args','6'], 'doublefd':['--json-status-fd','9'],
+               'pidns':['--pidns','8'], 'as_pid1':['--as-pid-1'], 'syncfd':['--sync-fd','7']}[cut]
+        value['argv'][1:1] = add
+    with pytest.raises(a.StatusRefusal): a.provider_argv(value, semantic, 9)
+
+
+def model():
+    item = object.__new__(a.StatusCustody)
+    item.network = None
+    session = NS(runtest_stop_requested=False, runtest_persistence_error='', runtest_pidfd_error='',
+                 runtest_deadline=200, runtest_boot_id='boot', runtest_outer=dict(control_group='/unit',
+                 cgroup_inode=[3,4], boot_id='boot'), process=None, _runtest_pidfd=41)
+    owner = NS(parent=Path('/model'), pre={'reserve_seconds':10}, phase={'outer':60}, spec={'tasks_max':64}, stop_requested=lambda: False, require_current=Mock())
+    item.session, item.owner = session, owner
+    item.registry = NS(spawn_runtest=Mock())
+    item.failed = item.closed = item.spawned = False
+    item.deadline = 200
+    item.startup_end = 105
+    item.read_fd, item.write_fd, item.events = 8, 9, None
+    item.records = a.NativeRecords(); item.argv = ['/exact/bwrap']; item.proc = None
+    item.observed = {'state':'OBSERVED_NOT_QUALIFIED'}
+    item.pipe_identity=[1,2]
+    item._pipe_endpoint=lambda fd,writing:None  # explicit inert FD model; real method covered below
+    return item
+
+
+@pytest.mark.parametrize('cut', ['cancel', 'persistence', 'pidfd', 'ownerstop', 'late'])
+def test_original_deadline_and_sticky_failure_fence(cut, monkeypatch):
+    item = model(); monkeypatch.setattr(a.time, 'monotonic', lambda: 100)
+    if cut == 'cancel': item.session.runtest_stop_requested = True
+    elif cut == 'persistence': item.session.runtest_persistence_error = 'IOError'
+    elif cut == 'pidfd': item.session.runtest_pidfd_error = 'pidfd failure'
+    elif cut == 'ownerstop': item.owner.stop_requested = lambda: True
+    elif cut == 'late': monkeypatch.setattr(a.time, 'monotonic', lambda: 190)
+    with pytest.raises(a.StatusRefusal): item._current()
+    item.owner.require_current.assert_not_called()
+
+
+def test_exact_fd_handoff_retains_registry_sole_handle(monkeypatch):
+    item = model(); monkeypatch.setattr(a.time, 'monotonic', lambda: 100)
+    closed=[]; monkeypatch.setattr(a.os, 'close', closed.append)
+    proc = NS(args=item.argv)
+    item.registry.spawn_runtest.return_value = proc
+    kwargs=dict(close_fds=True, stdout='donor_stdout', stderr='donor_stderr', stdin='donor_stdin')
+    assert item.spawn(kwargs) is proc
+    args, kw = item.registry.spawn_runtest.call_args
+    assert args[0] is item.session and args[1] is item.argv
+    assert args[2] == dict(kwargs, pass_fds=(9,)) and kw == {'native_owner':item.owner}
+    assert closed == [9] and item.read_fd == 8 and kwargs.get('pass_fds') is None
+    with pytest.raises(a.StatusRefusal): item.spawn(kwargs)
+
+
+@pytest.mark.parametrize('failure', ['before_handle', 'after_handle'])
+def test_spawn_failure_retains_existing_handle_closes_both_fds(failure, monkeypatch):
+    item=model(); monkeypatch.setattr(a.time, 'monotonic', lambda: 100)
+    closed=[]; monkeypatch.setattr(a.os, 'close', closed.append)
+    proc=object()
+    def launch(*args, **kw):
+        if failure == 'after_handle': item.session.process = proc
+        raise OSError('source cut')
+    item.registry.spawn_runtest.side_effect=launch
+    with pytest.raises(OSError): item.spawn(dict(close_fds=True))
+    assert set(closed)=={8,9} and len(closed)==2 and item.closed
+    assert item.session.runtest_stop_requested
+    assert item.session.process is (proc if failure=='after_handle' else None)
+
+
+@pytest.mark.parametrize('override', [{'pass_fds':(50,)}, {'shell':True}, {'preexec_fn':object()},
+                                     {'executable':'/other'}, {'close_fds':False}])
+def test_unrelated_fd_and_exec_override_refused(override, monkeypatch):
+    item=model(); monkeypatch.setattr(a.time, 'monotonic', lambda: 100)
+    monkeypatch.setattr(a.os, 'close', lambda fd: None)
+    with pytest.raises(a.StatusRefusal): item.spawn(dict(close_fds=True) | override)
+    item.registry.spawn_runtest.assert_not_called()
+    assert item.session.runtest_stop_requested and item.closed
+
+
+def join_model(monkeypatch):
+    item=model(); item.records.feed(START)
+    item.semantic=['/env', '-i', '/python', '-P', '-s', '-B', '/source/invocation.py', '/run', 'unit', 'guard.py', '@native', '--runtest-file=f000']
+    monkeypatch.setattr(a.time,'monotonic',lambda:100)
+    ns = {name:[5, 200+i] for i,name in enumerate(a.NS_NAMES)}
+    ns['pid']=[5,201]; ns['mnt']=[5,202]
+    def row(pid, ppid, inner, pgid, sid):
+        return dict(pid=pid,ppid=ppid,start_ticks=50+pid,pgid=pgid,sid=sid,
+                    namespaces=copy.deepcopy(ns), cgroup=['0::/unit'],
+                    vectors=dict(NSpid=[pid,inner],NSpgid=[pgid,2],NSsid=[sid,2]),
+                    exe='/timeout' if pid==12 else '/python',cmdline=[])
+    rows={10:row(10,1,10,10,10),11:row(11,10,1,10,10),
+          12:row(12,11,2,12,12),13:row(13,12,3,12,12)}
+    rows[10]['namespaces']['pid']=[5,100]
+    contour=dict(pid_namespace=[5,201],external_deadline_monotonic=150.0,timeout=dict(pid=2,ppid=1,pgid=2,sid=2,start_ticks=62,exe='/timeout'),
+                 guard=dict(pid=3,ppid=2,pgid=2,sid=2,start_ticks=63,exe='/python'))
+    expected_timeout,expected_guard=a.expected_lineage(item.semantic,contour,60)
+    rows[12]['cmdline']=[os.fsencode(v) for v in expected_timeout]
+    rows[13]['cmdline']=[os.fsencode(v) for v in expected_guard]
+    class P:
+        def __init__(self, value): self.value=str(value)
+        def __truediv__(self, other): return P(self.value+'/'+str(other))
+        def stat(self): return NS(st_dev=5,st_ino=100) if self.value=='/proc/self/ns/pid' else NS(st_dev=3,st_ino=4)
+        def resolve(self, **kw): return '/timeout'
+        @property
+        def parent(self): return P(self.value.rsplit('/',1)[0])
+        def __str__(self): return self.value
+    monkeypatch.setattr(a,'Path',P)
+    monkeypatch.setattr(a,'read_bounded',lambda p,n: b'boot\n' if str(p)=='/proc/sys/kernel/random/boot_id' else b'10\n11\n12\n13\n')
+    monkeypatch.setattr(a,'identity',lambda pid: copy.deepcopy(rows[pid]))
+    return item,rows,contour
+
+
+def test_live_join_uses_host_census_not_inner_numeric_targets(monkeypatch):
+    item,rows,contour=join_model(monkeypatch)
+    result=item._join_live(rows[10],contour,'/python')
+    assert result['timeout_host']['pid']==12 and contour['timeout']['pid']==2
+    assert result['guard_host']['pid']==13 and result['sandbox_child']['pid']==11
+    assert item.session.process is None  # mapping cannot mutate registry custody
+
+
+@pytest.mark.parametrize('cut', ['child_parent','child_domain','status_ns','contour_ns','reuse',
+                                 'foreign_cgroup','guard_parent','sid','guard_exe','inner_pid',
+                                 'timeout_cmdline','guard_cmdline'])
+def test_live_join_foreign_birth_namespace_cgroup_tree_refuses(cut, monkeypatch):
+    item,rows,contour=join_model(monkeypatch)
+    if cut=='child_parent': rows[11]['ppid']=99
+    elif cut=='child_domain': rows[11]['vectors']['NSpid']=[11,2]
+    elif cut=='status_ns': item.records.start['mnt-namespace']=999
+    elif cut=='contour_ns': contour['pid_namespace']=[5,999]
+    elif cut=='reuse': rows[12]['start_ticks']+=1
+    elif cut=='foreign_cgroup': rows[13]['cgroup']=['0::/foreign']
+    elif cut=='guard_parent': rows[13]['ppid']=11
+    elif cut=='sid': rows[12]['vectors']['NSsid']=[12,99]
+    elif cut=='guard_exe': rows[13]['exe']='/foreign'
+    elif cut=='inner_pid': contour['guard']['pid']=13
+    elif cut=='timeout_cmdline': rows[12]['cmdline']=[b'forged']
+    elif cut=='guard_cmdline': rows[13]['cmdline']=[b'forged']
+    with pytest.raises(a.StatusRefusal): item._join_live(rows[10],contour,'/python')
+
+
+@pytest.mark.parametrize('cut', ['good','exit_mismatch','leaked_writer','truncated','late','unowned'])
+def test_donor_post_communicate_tail_and_failure_close(cut, monkeypatch):
+    item=model(); item.write_fd=None; item.records.feed(START)
+    proc=NS(returncode=5); item.proc=item.session.process=proc
+    monkeypatch.setattr(a.time,'monotonic',lambda: 195 if cut=='late' else 100)
+    if cut=='exit_mismatch': proc.returncode=0
+    data=iter([EXIT[:-1] if cut=='truncated' else EXIT,b''])
+    monkeypatch.setattr(a.os,'read',lambda fd,n: next(data))
+    monkeypatch.setattr(a.select,'select',lambda r,w,e,t: ([] if cut=='leaked_writer' else r,[],[]))
+    closed=[];monkeypatch.setattr(a.os,'close',closed.append)
+    if cut=='good': assert item.finish(proc)['state']=='NATIVE_STATUS_COMPLETE_NOT_CESSATION'
+    else:
+        with pytest.raises(a.StatusRefusal): item.finish(object() if cut=='unowned' else proc)
+        assert item.session.runtest_stop_requested
+    assert closed==[8] and item.closed
+
+
+def test_no_waiter_signaller_or_subprocess_and_gate_retained():
+    tree=ast.parse(PATH.read_text())
+    calls=[n for n in ast.walk(tree) if isinstance(n,ast.Call)]
+    assert not any(isinstance(n.func,ast.Attribute) and n.func.attr in
+                   ('Popen','communicate','wait','waitpid','kill','killpg','pidfd_send_signal') for n in calls)
+    outer=ast.parse(PATH.with_name('runtest_outer.py').read_text())
+    cls=next(n for n in outer.body if isinstance(n,ast.ClassDef) and n.name=='FileOwner')
+    bridge=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='prepare_donor_status')
+    assert ast.unparse(bridge.body[1])=='self.require_supported_containment()'
+    gate=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='require_supported_containment')
+    assert isinstance(gate.body[-1],ast.Raise)
+
+
+@pytest.mark.parametrize('cut', ['good','provider_failure','inheritable','wrong_pipe','pipe_failure'])
+def test_constructor_fd_ownership_and_failure_cuts(cut, monkeypatch):
+    model_item=model(); closed=[]
+    monkeypatch.setattr(a.time,'monotonic',lambda:100)
+    monkeypatch.setattr(a.os,'close',closed.append)
+    monkeypatch.setattr(a,'ContourEvent',lambda run:NS(close=lambda:closed.append(7)))
+    def make_pipe(flags):
+        assert flags == a.os.O_CLOEXEC | a.os.O_NONBLOCK
+        if cut=='pipe_failure': raise OSError('pipe failure')
+        return 8,9
+    monkeypatch.setattr(a.os,'pipe2',make_pipe)
+    monkeypatch.setattr(a.os,'set_blocking',lambda fd,value:None)
+    monkeypatch.setattr(a.os,'fstat',lambda fd:NS(st_mode=stat.S_IFREG if cut=='wrong_pipe' else stat.S_IFIFO,
+                                               st_dev=1,st_ino=2))
+    monkeypatch.setattr(a.os,'get_inheritable',lambda fd:cut=='inheritable')
+    monkeypatch.setattr(a,'Path',lambda path:NS(read_bytes=lambda:b'owned source fixture') if path==a.BWRAP else Path(path))
+    monkeypatch.setattr(a,'BWRAP_SHA256',hashlib.sha256(b'owned source fixture').hexdigest())
+    semantic,prepared=preparation()
+    def provider(argv,fd):
+        assert argv==semantic and fd==9
+        if cut=='provider_failure': raise ValueError('provider failed')
+        return prepared
+    if cut=='good':
+        item=a.StatusCustody(model_item.owner,model_item.session,model_item.registry,'/model/run',semantic,provider,startup_end=105)
+        assert item.pipe_identity==[1,2] and not closed
+        item.close()
+    else:
+        with pytest.raises((a.StatusRefusal,OSError,ValueError)):
+            a.StatusCustody(model_item.owner,model_item.session,model_item.registry,'/model/run',semantic,provider,startup_end=105)
+        assert model_item.session.runtest_stop_requested
+    assert sorted(closed)==([7] if cut=='pipe_failure' else [7,8,9])
+
+
+@pytest.mark.parametrize('cut',['good','overflow','foreign_watch','truncated','oversize','duplicate'])
+def test_owned_contour_notification_bounds(cut, monkeypatch):
+    event=object.__new__(a.ContourEvent)
+    event.fd,event.watch,event.ready,event.total=8,1,False,0
+    name=b'native-contour.json\0'
+    data=struct.pack('iIII',1,8,0,len(name))+name
+    if cut=='overflow': data=struct.pack('iIII',-1,0x4000,0,0)
+    elif cut=='foreign_watch': data=struct.pack('iIII',2,8,0,len(name))+name
+    elif cut=='truncated': data=data[:-1]
+    elif cut=='oversize': event.total=65536
+    elif cut=='duplicate': event.ready=True
+    monkeypatch.setattr(a.os,'read',lambda fd,n:data)
+    if cut=='good': event.consume(); assert event.ready
+    else:
+        with pytest.raises(a.StatusRefusal):event.consume()
+
+
+def test_close_error_latches_stop_and_still_closes_other_fds(monkeypatch):
+    item=model(); closed=[]
+    def close(fd):
+        closed.append(fd)
+        if fd==8:raise OSError('close uncertain')
+    monkeypatch.setattr(a.os,'close',close)
+    with pytest.raises(a.StatusRefusal,match='CLOSE_UNCONFIRMED'):item.close()
+    assert closed==[8,9] and item.closed and item.failed and item.session.runtest_stop_requested
+
+
+def test_invocation_runtime_sid_joins_same_exec_without_fork():
+    tree=ast.parse(PATH.parents[1].joinpath('producer/invocation.py').read_text())
+    main=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='main')
+    sid=next(n for n in ast.walk(main) if isinstance(n,ast.If) and 'os.getsid(0)' in ast.unparse(n.test))
+    assert ast.unparse(sid.test)=='runtest_file is not None and os.getsid(0) != os.getpid()'
+    calls=[n for n in ast.walk(main) if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute)]
+    assert sum(n.func.attr=='execv' for n in calls)==1
+    assert sum(n.func.attr=='setsid' for n in calls)==1
+    assert not any(n.func.attr in ('Popen','fork','spawn','kill') for n in calls)
+
+
+@pytest.mark.parametrize('cut',['good','foreign_inode','foreign_type','foreign_access','inheritable','foreign_uid'])
+def test_endpoint_substitution_refused_before_read_or_pass(cut,monkeypatch):
+    item=model()
+    monkeypatch.setattr(a.os,'fstat',lambda fd:NS(st_mode=stat.S_IFREG if cut=='foreign_type' else stat.S_IFIFO,
+        st_uid=99 if cut=='foreign_uid' else 1000,st_dev=1,st_ino=3 if cut=='foreign_inode' else 2))
+    monkeypatch.setattr(a.os,'getuid',lambda:1000)
+    monkeypatch.setattr(a.os,'get_inheritable',lambda fd:cut=='inheritable')
+    monkeypatch.setattr(a.fcntl,'fcntl',lambda fd,op:os.O_WRONLY if cut=='foreign_access' else os.O_RDONLY)
+    if cut=='good':a.StatusCustody._pipe_endpoint(item,8,False)
+    else:
+        with pytest.raises(a.StatusRefusal):a.StatusCustody._pipe_endpoint(item,8,False)
+
+
+@pytest.mark.parametrize('cut',['good','late','unowned','foreign_contour','exit_before_join'])
+def test_synchronous_startup_reader_retains_observation_only(cut,monkeypatch):
+    item=model(); item.write_fd=None;item.startup_end=105;item.session.host_start_time=50
+    proc=NS(pid=10,args=item.argv,returncode=None);item.proc=item.session.process=proc
+    item.events=NS(fd=7,path='/model/contour',ready=False,close=Mock())
+    item.events.require_current=Mock()
+    item.events.read_contour=lambda current:json.dumps({'identity':'foreign' if cut=='foreign_contour' else 'bound'}).encode()
+    item.events.consume=lambda:setattr(item.events,'ready',True)
+    item._join_live=Mock(return_value={'timeout_host':{'pid':12}})
+    monitor=dict(pid=10,start_ticks=50,ppid=1,pgid=10,sid=10,exe=a.BWRAP,
+                 cmdline=[os.fsencode(v) for v in item.argv],namespaces={},cgroup=[])
+    monkeypatch.setattr(a,'identity',lambda pid:monitor.copy())
+    monkeypatch.setattr(a,'read_bounded',lambda path,n:json.dumps({'identity':'foreign' if cut=='foreign_contour' else 'bound'}).encode())
+    monkeypatch.setattr(a.os,'read',lambda fd,n:START+EXIT if cut=='exit_before_join' else START)
+    monkeypatch.setattr(a.select,'select',lambda r,w,e,t:(r,[],[]))
+    monkeypatch.setattr(a.time,'monotonic',lambda:110 if cut=='late' else 100)
+    closed=[];monkeypatch.setattr(a.os,'close',closed.append)
+    if cut=='good':
+        result=item.startup(proc,{'identity':'bound'},'/python')
+        assert result['state']=='OBSERVED_NOT_QUALIFIED' and result['runtimeGrant'] is False
+        assert result['native_start']['child-pid']==11 and not closed
+    else:
+        with pytest.raises(a.StatusRefusal):item.startup(object() if cut=='unowned' else proc,{'identity':'bound'},'/python')
+        assert item.session.runtest_stop_requested and closed==[8]
+        item._join_live.assert_not_called()
+
+
+@pytest.mark.parametrize('cut',['status_error','checkpoint_error','persistence_error'])
+def test_status_failure_keeps_donor_output_and_attempts_original_stop_checkpoint(cut):
+    tree=ast.parse(PATH.with_name('owner_observer.py').read_text())
+    run=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='run_donor_file')
+    capture=next(n for n in run.body if isinstance(n,ast.FunctionDef) and n.name=='capture')
+    events=[]; proc=NS(pid=10,returncode=5)
+    session=NS(process=proc,id='owned',runtest_persistence_error='',runtest_pidfd_error='',
+               append_output=lambda value:events.append(('output',value)))
+    status=NS(finish=Mock(side_effect=a.StatusRefusal('bad tail')))
+    registry=NS(release_runtest_pidfd=lambda *args:events.append(('release',)),
+                stop_runtest=Mock(side_effect=OSError('checkpoint') if cut=='checkpoint_error' else None))
+    receipts=[]
+    def put(path,value):
+        receipts.append(value)
+        if cut=='persistence_error':raise OSError('persistence')
+    env_capture=dict(require=a.require,session=session,holder={'status':status},registry=registry,
+                     parent=Path('/source-model'),put=put)
+    exec(compile(ast.Module(body=[capture],type_ignores=[]),str(PATH.with_name('owner_observer.py')),'exec'),env_capture)
+    with pytest.raises(OSError if cut=='persistence_error' else a.StatusRefusal):
+        env_capture['capture'](proc,'original donor transcript',None,[])
+    assert events==[('output','original donor transcript'),('release',)]
+    registry.stop_runtest.assert_called_once_with(session,source='native_status_failure')
+    assert receipts[0]['output']=='original donor transcript' and receipts[0]['native_status_error']=='StatusRefusal'
+    assert env_capture['holder']['proc'] is proc

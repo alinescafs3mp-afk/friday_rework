@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""Bounded source-only inventory. Never imports, compiles or executes candidates."""
+import ast
+import collections
+import datetime
+import hashlib
+import json
+import os
+import pathlib
+import resource
+import time
+
+OUT = pathlib.Path(__file__).parent
+S = pathlib.Path('<SOL_WORK>')
+PAIR = S / 'FRW026-COLLECTION-RECEIPT-INTEGRATION-source'
+P = PAIR / 'producer'
+ROOTS = {k: S / ('FRW026-ORDINARY-SKILLS-FINAL-GATE-' + k) for k in ('project', 'native')}
+CLOCK = json.loads((OUT / 'clock.json').read_text())
+resource.setrlimit(resource.RLIMIT_AS, (CLOCK['memory_bytes'], CLOCK['memory_bytes']))
+os.sched_setaffinity(0, sorted(os.sched_getaffinity(0))[:CLOCK['cpu']])
+assert time.monotonic() < CLOCK['deadline_monotonic']
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+def ref(path):
+    p = pathlib.Path(path)
+    return {'path': str(p), 'sha256': sha(p.read_bytes())}
+
+EXPECTED_REFS = {
+    PAIR / 'PAIR.json': '17b567842c58e96ad38455a6bb4a2fbe575d5889851f81db813424107aa310a5',
+    P / 'source-pins.json': '86bad92f547a9f26a4f9c2fd643ae5876eb619f6083eb60e4e6ddb703b94639b',
+    P / 'gate-plan.json': '14273ce2945352a75003a5e8b0066033fa9c1b4605b320c0a2bb2db2b4aef15a',
+    OUT.parent / 'ordinary-skills-preprocessing-source-map.json': '1523a918e058258a6761a31364df822e1c739a2c4a8a7d4f048ac9d931f97239',
+}
+for path, expected in EXPECTED_REFS.items():
+    assert ref(path)['sha256'] == expected, str(path)
+plan = json.loads((P / 'gate-plan.json').read_text())
+assert len(plan['project']) == 17 and len(plan['native']) == 53
+corpus = json.loads((P / 'corpus-pins.json').read_text())
+runtime = json.loads((P / 'runtime-pins.json').read_text())
+ancillary = json.loads((P / 'ancillary-pins.json').read_text())
+sourcepins = json.loads((P / 'source-pins.json').read_text())
+pins = {str(P / r): h for r, h in sourcepins.items()}
+pins.update({p: v['sha256'] for p, v in runtime.items()})
+pins.update(ancillary)
+for group, root in ROOTS.items():
+    pins.update({str(root / r): h for r, h in corpus[group].items()})
+selected = plan['project'] + plan['native']
+files = {}
+trees = {}
+unresolved = []
+
+def expr(node):
+    return ast.unparse(node)
+
+def target_module(module):
+    if not module:
+        return None
+    candidates = [ROOTS['project'] / 'tests' / (module.replace('.', '/') + '.py'),
+                  ROOTS['native'] / (module.replace('.', '/') + '.py'),
+                  ROOTS['project'] / (module.replace('.', '/') + '.py')]
+    candidates += [p.with_suffix('') / '__init__.py' for p in candidates]
+    return next((str(p) for p in candidates if str(p) in pins), None)
+
+def location(node, qualified):
+    return {'qualified_name': qualified, 'line': node.lineno, 'end_line': node.end_lineno}
+
+def walk_scoped(node):
+    yield node
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)) and child is not node:
+            continue
+        yield from walk_scoped(child)
+
+def parse_file(path, role):
+    if path in files:
+        return files[path]
+    assert time.monotonic() < CLOCK['deadline_monotonic']
+    data = pathlib.Path(path).read_bytes()
+    digest = sha(data)
+    assert pins.get(path) == digest, 'UNPINNED_OR_DRIFT:' + path
+    text = data.decode('utf-8')
+    tree = ast.parse(text, filename=path)
+    trees[path] = tree
+    result = {'path': path, 'sha256': digest, 'role': role, 'imports': [], 'classes': [],
+              'definitions': [], 'module_declarations': [], 'dynamic_fixture_lookups': []}
+    files[path] = result
+
+    def process(nodes, scope='', enclosing_class=None, lexical_conditions=()):
+        for node in nodes:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                row = {'line': node.lineno, 'scope': scope or '<module>', 'statement': expr(node)}
+                if isinstance(node, ast.ImportFrom):
+                    row['module'] = node.module
+                    row['level'] = node.level
+                    row['aliases'] = {a.asname or a.name: a.name for a in node.names}
+                    row['source_candidate'] = target_module(node.module) if node.level == 0 else None
+                else:
+                    row['aliases'] = {a.asname or a.name.split('.')[0]: a.name for a in node.names}
+                result['imports'].append(row)
+            elif isinstance(node, ast.ClassDef):
+                q = scope + ('.' if scope else '') + node.name
+                row = location(node, q)
+                row.update(bases=[expr(b) for b in node.bases], decorators=[expr(d) for d in node.decorator_list],
+                           lexical_conditions=list(lexical_conditions), declarations=[])
+                for n in node.body:
+                    if isinstance(n, (ast.Assign, ast.AnnAssign)) and any(s in expr(n) for s in ('pytestmark', '__test__')):
+                        row['declarations'].append({'line': n.lineno, 'source': expr(n)})
+                result['classes'].append(row)
+                process(node.body, q, q, lexical_conditions)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                q = scope + ('.' if scope else '') + node.name
+                decorators = [expr(d) for d in node.decorator_list]
+                fixtures = [d for d in node.decorator_list if expr(d).split('(')[0].split('.')[-1] == 'fixture']
+                is_test = node.name.startswith('test') and '<locals>' not in scope
+                kind = 'fixture' if fixtures else 'test_definition' if is_test else 'lifecycle' if node.name.startswith(('setup_', 'teardown_')) or node.name in ('setUp','tearDown','setUpClass','tearDownClass','setUpModule','tearDownModule') else 'helper'
+                row = location(node, q)
+                args = [a.arg for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs if a.arg not in ('self', 'cls')]
+                row.update(kind=kind, async_function=isinstance(node, ast.AsyncFunctionDef),
+                           arguments=args, decorators=decorators, enclosing_class=enclosing_class,
+                           lexical_conditions=list(lexical_conditions),
+                           source_span_sha256=sha(ast.get_source_segment(text, node).encode()),
+                           calls=[], skip_calls=[], effect_signals=[], parametrize=[],
+                           signature=expr(node.args))
+                for d in node.decorator_list:
+                    if isinstance(d, ast.Call) and expr(d.func).endswith('.parametrize'):
+                        row['parametrize'].append({'line': d.lineno, 'source': expr(d),
+                            'argument_names': expr(d.args[0]) if d.args else None,
+                            'values_expression': expr(d.args[1]) if len(d.args) > 1 else None})
+                if fixtures:
+                    d = fixtures[0]
+                    opts = {k.arg: expr(k.value) for k in d.keywords} if isinstance(d, ast.Call) else {}
+                    row['fixture'] = {'name': node.name, 'options': opts, 'dependencies': args,
+                                      'autouse_literal': opts.get('autouse') == 'True', 'scope_expression': opts.get('scope', "'function'")}
+                    if 'name' in opts:
+                        try: row['fixture']['name'] = ast.literal_eval(opts['name'])
+                        except (ValueError, SyntaxError): row['fixture']['name_dynamic'] = opts['name']
+                calls = set()
+                for n in walk_scoped(node):
+                    if not isinstance(n, ast.Call):
+                        continue
+                    call = expr(n.func)
+                    calls.add(call)
+                    if call.endswith(('.skip', '.importorskip')):
+                        row['skip_calls'].append({'line': n.lineno, 'source': expr(n)})
+                    signals = []
+                    if any(v in call for v in ('subprocess.', 'multiprocessing.', 'mp.get_context', '.Process', '.Pool', 'os.fork', 'os.system', 'os.popen', 'Popen', 'create_subprocess')):
+                        signals.append('process_call_candidate')
+                    if any(v in call for v in ('socket', 'HTTPServer', 'TCPServer', 'serve_forever', 'requests.', 'httpx.', 'urllib.request')):
+                        signals.append('network_or_http_call_candidate')
+                    if call.endswith('getfixturevalue'):
+                        value = expr(n.args[0]) if n.args else None
+                        result['dynamic_fixture_lookups'].append({'qualified_name': q, 'line': n.lineno, 'name_expression': value})
+                    if signals:
+                        row['effect_signals'].append({'line': n.lineno, 'call': expr(n), 'signals': signals})
+                row['calls'] = sorted(calls)
+                result['definitions'].append(row)
+                # Nested fixture factories are retained for installed pytest/asyncio.
+                process(node.body, q + '.<locals>', enclosing_class, lexical_conditions)
+            else:
+                if not scope and isinstance(node, (ast.Assign, ast.AnnAssign, ast.Expr)):
+                    s = expr(node)
+                    if any(v in s for v in ('pytestmark', '__test__', 'pytest.skip(', 'pytest.importorskip(', 'pytest_plugins')):
+                        result['module_declarations'].append({'line': node.lineno, 'source': s,
+                                                             'conditions': list(lexical_conditions)})
+                if isinstance(node, ast.If):
+                    process(node.body, scope, enclosing_class, lexical_conditions + (expr(node.test),))
+                    process(node.orelse, scope, enclosing_class, lexical_conditions + ('not (' + expr(node.test) + ')',))
+                elif isinstance(node, (ast.With, ast.AsyncWith, ast.For, ast.AsyncFor, ast.While, ast.Try)):
+                    for field in ('body', 'orelse', 'finalbody'):
+                        process(getattr(node, field, []), scope, enclosing_class, lexical_conditions)
+                    for handler in getattr(node, 'handlers', []):
+                        process(handler.body, scope, enclosing_class, lexical_conditions)
+    process(tree.body)
+    return result
+
+for path in selected:
+    parse_file(path, 'selected_' + ('project' if path in plan['project'] else 'native'))
+
+# Follow only explicitly imported test-support modules, not the product/import graph.
+queue = list(files)
+while queue:
+    path = queue.pop(0)
+    for imp in files[path]['imports']:
+        module = imp.get('module') or ''
+        target = imp.get('source_candidate')
+        if target and (module.startswith('test_') or module.startswith('tests.')) and target not in files:
+            if 'FRW013' in target:
+                unresolved.append({'kind': 'PROHIBITED_UNINSPECTED', 'path': target})
+                continue
+            parse_file(target, 'explicit_test_support')
+            queue.append(target)
+
+# Only the pinned installed builtin fixture modules and explicit asyncio plugin.
+builtin_names = ['tmpdir.py', 'monkeypatch.py', 'capture.py', 'recwarn.py', 'logging.py',
+                 'fixtures.py', 'python.py', 'runner.py', 'junitxml.py', 'doctest.py', 'compat.py', 'scope.py', 'unittest.py']
+for path in sorted(pins):
+    if ('/site-packages/_pytest/' in path and pathlib.Path(path).name in builtin_names) or path.endswith('/pytest_asyncio/plugin.py'):
+        parse_file(path, 'pinned_installed_fixture_runtime')
+
+fixture_defs = {}
+for path, f in files.items():
+    for d in f['definitions']:
+        if d['kind'] == 'fixture':
+            fixture_defs.setdefault(d['fixture']['name'], []).append({'path': path, 'sha256': f['sha256'],
+                'qualified_name': d['qualified_name'], 'line': d['line'], 'end_line': d['end_line'],
+                **d['fixture']})
+
+def fixture_in_module(path, name, enclosing_class=None, seen=None):
+    seen = set() if seen is None else seen
+    key = (path, name, enclosing_class)
+    if key in seen:
+        return []
+    seen.add(key)
+    f = files[path]
+    local = [r for r in fixture_defs.get(name, []) if r['path'] == path and
+             ('<locals>' not in r['qualified_name']) and
+             ('.' not in r['qualified_name'] or (enclosing_class and r['qualified_name'].startswith(enclosing_class + '.')))]
+    if local:
+        return local
+    for imp in f['imports']:
+        if imp['scope'] != '<module>' or name not in imp['aliases']:
+            continue
+        source = imp.get('source_candidate')
+        if source in files:
+            refs = fixture_in_module(source, imp['aliases'][name], None, seen)
+            if refs:
+                return refs
+    return [r for r in fixture_defs.get(name, []) if files[r['path']]['role'] == 'pinned_installed_fixture_runtime']
+
+for path in selected:
+    f = files[path]
+    f['fixture_candidates_by_test'] = {}
+    autouse = [d for d in f['definitions'] if d['kind'] == 'fixture' and d['fixture']['autouse_literal'] and '<locals>' not in d['qualified_name']]
+    f['imported_test_alias_candidates'] = []
+    for imp in f['imports']:
+        source = imp.get('source_candidate')
+        if imp['scope'] == '<module>' and source in files:
+            for alias, original in imp['aliases'].items():
+                if alias.startswith(('test', 'Test')) or alias == '*':
+                    f['imported_test_alias_candidates'].append({'alias': alias, 'original': original,
+                        'source_candidate': source, 'source_sha256': files[source]['sha256'], 'line': imp['line']})
+    for d in f['definitions']:
+        if d['kind'] != 'test_definition':
+            continue
+        parameter_names = set()
+        indirect_names = set()
+        for p in d['parametrize']:
+            try:
+                names = ast.literal_eval(p['argument_names'])
+                names = set(v.strip() for v in names.split(',')) if isinstance(names, str) else set(names)
+                de = ast.parse(p['source'], mode='eval').body
+                indirect_node = next((k.value for k in de.keywords if k.arg=='indirect'), None)
+                indirect = ast.literal_eval(indirect_node) if indirect_node is not None else False
+                indirect_set = names if indirect is True else set(indirect) if isinstance(indirect, (list,tuple)) else set()
+                indirect_names.update(indirect_set)
+                parameter_names.update(names - indirect_set)
+            except (ValueError, SyntaxError, TypeError):
+                unresolved.append({'path': path, 'definition': d['qualified_name'], 'kind': 'DYNAMIC_PARAMETRIZE_NAMES'})
+        patch_count = 0
+        for de in d['decorators']:
+            de = ast.parse(de, mode='eval').body
+            if not isinstance(de, ast.Call):
+                continue
+            fn = expr(de.func)
+            if fn not in ('patch', 'patch.object', 'mock.patch', 'mock.patch.object'):
+                continue
+            default_new = 2 if fn.endswith('.object') else 1
+            if len(de.args) <= default_new and not any(k.arg == 'new' for k in de.keywords):
+                patch_count += 1
+        d['mock_injected_argument_candidates'] = d['arguments'][:patch_count]
+        names = [a for a in d['arguments'][patch_count:] if a not in parameter_names]
+        d['direct_parametrize_argument_candidates'] = sorted(parameter_names)
+        d['indirect_parametrize_argument_candidates'] = sorted(indirect_names)
+        names.append('event_loop_policy')
+        names += [a['fixture']['name'] for a in autouse if not a['enclosing_class'] or a['enclosing_class'] == d['enclosing_class']]
+        resolved = {}
+        pending = list(dict.fromkeys(names))
+        while pending:
+            name = pending.pop(0)
+            if name in resolved:
+                continue
+            refs = fixture_in_module(path, name, d['enclosing_class'])
+            if name == 'request':
+                rp = next(p for p in files if p.endswith('/_pytest/fixtures.py'))
+                refs = [{'path': rp, 'sha256': files[rp]['sha256'], 'qualified_name': 'FixtureRequest (intrinsic, not @fixture)',
+                         'dependencies': [], 'intrinsic': True}]
+            resolved[name] = refs
+            if not refs:
+                unresolved.append({'path': path, 'definition': d['qualified_name'], 'kind': 'STATIC_FIXTURE_ORIGIN_UNRESOLVED', 'name': name})
+            for r in refs:
+                pending.extend(dep for dep in r['dependencies'] if dep not in resolved)
+        f['fixture_candidates_by_test'][d['qualified_name']] = resolved
+
+# Preserve name-generating primary sources without inventing actual generated identities.
+python_path = next(p for p in files if p.endswith('/_pytest/python.py'))
+fixtures_path = next(p for p in files if p.endswith('/_pytest/fixtures.py'))
+asyncio_path = next(p for p in files if p.endswith('/pytest_asyncio/plugin.py'))
+unittest_path = next(p for p in files if p.endswith('/_pytest/unittest.py'))
+dynamic_runtime = {
+    'asyncio_runner_fixture': {'name_pattern': '_{scope}_scoped_runner', 'possible_scopes': ['function', 'class', 'module', 'package', 'session'],
+        'origin': ref(asyncio_path), 'factory': '_create_scoped_runner_fixture', 'factory_line': 794,
+        'registration_line': 827, 'dependencies': ['event_loop_policy', 'request'],
+        'condition': 'Generated plugin factories; selected scope/test class decided by actual asyncio collection metadata.',
+        'producer_pipe_policy': {'origin': ref(P/'controls.py'), 'lines': [47,51,55,59,63,64,65,66]}},
+    'intrinsic_request': {'origin':ref(fixtures_path), 'qualified_name':'FixtureRequest',
+        'line': next(c['line'] for c in files[fixtures_path]['classes'] if c['qualified_name']=='FixtureRequest'),
+        'condition':'Special intrinsic request object; not an ordinary @fixture definition.'},
+    'direct_parameter': {'origin':ref(python_path), 'function':'get_direct_param_fixture_func',
+        'line':next(d['line'] for d in files[python_path]['definitions'] if d['qualified_name']=='get_direct_param_fixture_func'),
+        'additional_origin':'The exact selected test file and its @pytest.mark.parametrize declaration.',
+        'condition':'Direct parameter fixture definitions are synthesized at collection; indirect=True or a per-name indirect list must be interpreted from the preserved decorator.'},
+    'xunit_names': {'origin':ref(python_path), 'patterns':['_xunit_setup_module_fixture_{module.__name__}',
+        '_xunit_setup_function_fixture_{module.__name__}', '_xunit_setup_class_fixture_{class.__qualname__}',
+        '_xunit_setup_method_fixture_{class.__qualname__}'], 'dependencies':['request'],
+        'condition':'Only when actual collected object exposes the corresponding non-fixture setup/teardown method. Also cite that exact setup/teardown source.'},
+    'unittest_names': {'origin':ref(unittest_path), 'patterns':['_unittest_setUpClass_fixture_{cls.__qualname__}',
+        '_unittest_setup_method_fixture_{cls.__qualname__}', '_unittest_skip_fixture_{cls.__qualname__}'],
+        'factory_lines':[150,207,187], 'dependencies':['request'],
+        'condition':'UnitTestCase subclasses use nofuncargs=True; plugin creates class setup/cleanup fixture even when setUpClass is inherited from unittest.TestCase. Skip/setup_method variants depend on actual class attributes. Selected class declarations and setUp/tearDown sources are catalogued.'},
+}
+
+# Deduplicate fixture references, retaining full exact origins once in the index.
+file_ids = {path: 'f'+str(i) for i,path in enumerate(files)}
+definition_index = {}
+for path,f in files.items():
+    f['id'] = file_ids[path]
+    for d in f['definitions']:
+        d['id'] = f['id'] + '::' + d['qualified_name'] + ':' + str(d['line'])
+        definition_index[(path,d['qualified_name'])] = d['id']
+for path,f in files.items():
+    if 'fixture_candidates_by_test' in f:
+        for q,byname in f['fixture_candidates_by_test'].items():
+            for name,rs in byname.items():
+                byname[name] = [definition_index.get((r['path'], r['qualified_name']),
+                    file_ids[r['path']]+'::'+r['qualified_name']) for r in rs]
+    # Main fixture/test definitions retain executable-call names for useful source tracing.
+    # Runtime helper internals not relevant to fixture identity are omitted.
+    if f['role'] == 'pinned_installed_fixture_runtime':
+        keep = {'get_direct_param_fixture_func','getfuncargnames','num_mock_patch_args','_create_scoped_runner_fixture',
+                '_unused_port','register_fixture','getfixturemarker'}
+        f['definitions'] = [d for d in f['definitions'] if d['kind']=='fixture' or d['qualified_name'] in keep or 'xunit_setup_' in d['qualified_name'] or 'unittest_setup_' in d['qualified_name'] or 'unittest_skip_fixture' in d['qualified_name']]
+        f['imports'] = []
+        f['classes'] = [c for c in f['classes'] if c['qualified_name'] in ('FixtureRequest','SubRequest','Scope','UnitTestCase','TestCaseFunction')]
+        f['dynamic_fixture_lookups'] = []
+    elif f['role']=='explicit_test_support':
+        f['definitions'] = [d for d in f['definitions'] if d['kind']!='test_definition']
+    for d in f['definitions']:
+        for key in ('skip_calls','effect_signals','parametrize','lexical_conditions','mock_injected_argument_candidates','direct_parametrize_argument_candidates','indirect_parametrize_argument_candidates','decorators'):
+            if key in d and not d[key]:d.pop(key)
+        if d['kind']=='helper' and not d.get('effect_signals'):
+            d.pop('calls',None)
+
+special = []
+stopped = {'test_writable_state_db_keeps_locks_across_second_open', 'test_concurrent_bump_view_preserves_all_updates'}
+for path in selected:
+    f=files[path]
+    for d in f['definitions']:
+        if d['kind']!='test_definition':continue
+        q=d['qualified_name']; fixtures=f['fixture_candidates_by_test'][q]
+        scope=None
+        if q.split('.')[-1] in stopped:
+            scope='STOP_REQUIRED_NOT_RUN_NO_REROUTE'
+        elif {'served_repo','served_repo_missing_support'} & set(fixtures):
+            scope='REAL_LOOPBACK_HTTP_AND_OPTIONAL_GIT_PROCESS_FIXTURE_REQUIRED_NOT_RUN'
+        elif q.startswith('TestInlineShellExpansion.') and path.endswith('/test_skill_commands.py'):
+            scope='REAL_INLINE_BASH_PROCESS_REQUIRED_NOT_RUN'
+        elif q.startswith('TestTemplateVarSubstitution.') and path.endswith('/test_skill_commands.py'):
+            scope='TEMPLATE_SUBSTITUTION_ORDINARY_SOURCE_CONTROL_NOT_RUN'
+        if scope:
+            special.append({'definition_id':d['id'],'path':path,'sha256':f['sha256'],'qualified_name':q,'line':d['line'],
+                            'scope':scope,'fixture_names_from_static_candidates':list(fixtures)})
+
+source_notes = {
+    'default_scope':'ORDINARY_SOURCE_CANDIDATE_ONLY: temporary-file/in-process tests unless a special source case or effect signal applies. This is not a transitive effect proof or execution admission.',
+    'special_cases':special,
+    'http_fixture_distinction':[
+        {'name':'served_repo','origin':ref(ROOTS['native']/'tests/tools/test_skill_bundle_provenance.py'),'line':39,
+         'effects':'Actual git init/add/commit subprocesses at lines64-70, loopback ThreadingHTTPServer at72, serving thread, server.shutdown/thread.join cleanup at80-81.'},
+        {'name':'served_repo_missing_support','origin':ref(ROOTS['native']/'tests/tools/test_skill_bundle_provenance.py'),'line':420,
+         'effects':'Actual loopback ThreadingHTTPServer at440 and serving thread, shutdown/join cleanup. No git subprocess in this fixture body.'}],
+    'collection_time_symlink_probe':{'origin':ref(ROOTS['native']/'tests/tools/test_skills_guard.py'),'function':'_can_symlink','line':9,
+        'meaning':'Two skipif decorator expressions call this tempfile/symlink probe during module import. AST inspection does not execute it; future collection guard must own its temporary writes.'},
+    'in_process_http_controls':[
+        {'origin':ref(ROOTS['project']/'tests/test_user_onboarding.py'),'qualified_name':'test_native_signed_dashboard_middleware_ordinary_foreign_and_prepare_flow.<locals>.scenario','line':351},
+        {'origin':ref(ROOTS['project']/'tests/test_onboarding_authority.py'),'qualified_name':'request.<locals>.run','line':68}],
+    'in_process_http_meaning':'httpx.AsyncClient with explicit ASGITransport(app=app) is source evidence of in-process HTTP controls; not the real listening server fixtures above.',
+    'completed_process_constructor':'subprocess.CompletedProcess in offline_execution.launch is a return-value object under a monkeypatched subprocess.run. It is not evidence of a launched process.',
+    'missing_preprocessing':{'path':str(ROOTS['native']/'tests/agent/test_skill_preprocessing.py'),'exists_at_inspection':(ROOTS['native']/'tests/agent/test_skill_preprocessing.py').exists(),
+        'meaning':'Exact missing filename preserved. Selected skill_commands template/inline-shell definitions remain mandatory and are catalogued; no synthetic replacement file or acceptance.'},
+    'producer_filter_rules':{'origin':ref(P/'controls.py'),'line':159,'order':['platforms marker checked against windows/posix/linux; Windows-only adds skip',
+        'foreign inspect.getsourcefile(item.obj) compared to item.path: imported test alias dropped',
+        'two exact stopped native definitions dropped', 'served_repo/served_repo_missing_support closure dropped', 'all others retained for collect-only'],
+        'inline_shell':'The two inline shell tests remain in exact selection; NOT_RUN and not silently excluded.'},
+    'owner_join_contract':{'origin':ref(PAIR/'owner-helper/owner_observer.py'),'line':303,
+        'meaning':'Actual schema2 module receipts, kept/dropped rows, every fixture origin hash, platforms/skips and ordered selected module disposition must be independently reconciled. This catalog sets none of those review flags.'},
+}
+assert source_notes['missing_preprocessing']['exists_at_inspection'] is False
+
+# The same static fixture closure is reused by many definitions. Keep it once.
+fixture_candidate_sets={}
+candidate_lookup={}
+for path in selected:
+    for q,rs in files[path]['fixture_candidates_by_test'].items():
+        key=json.dumps(rs,sort_keys=True,separators=(',',':'))
+        if key not in candidate_lookup:
+            cid='fc'+str(len(fixture_candidate_sets))
+            candidate_lookup[key]=cid
+            fixture_candidate_sets[cid]=rs
+        files[path]['fixture_candidates_by_test'][q]=candidate_lookup[key]
+
+catalog = {
+    'state': 'SOURCE_ONLY_READINESS_EVIDENCE_NO_COLLECTION_OR_EXECUTION_ACCEPTANCE',
+    'assignment': CLOCK['assignment'], 'generation': CLOCK['generation'],
+    'original_clock': CLOCK, 'original_clock_ref': ref(OUT / 'clock.json'),
+    'source_refs': [ref(p) for p in EXPECTED_REFS] + [ref(P / n) for n in ('controls.py', 'corpus-pins.json', 'runtime-pins.json', 'ancillary-pins.json')] +
+        [ref(PAIR / 'owner-helper' / n) for n in ('receipt-schema.json', 'owner_observer.py')],
+    'selected_order': {'project': plan['project'], 'native': plan['native']},
+    'counts_are_source_definitions_not_collected_items': True,
+    'selection_file_counts': {'project': 17, 'native': 53},
+    'original_corpus_declared_files': {k: len(corpus[k]) for k in ROOTS},
+    'missing_selected_path': plan['missing'],
+    'files': list(files.values()), 'fixture_name_index': fixture_defs,
+    'fixture_candidate_sets':fixture_candidate_sets,
+    'dynamic_fixture_source_rules': dynamic_runtime,
+    'source_scope_notes':source_notes,
+    'resource_observation':{'affinity_cpus':sorted(os.sched_getaffinity(0)), 'address_space_limit_bytes':resource.getrlimit(resource.RLIMIT_AS)[0],
+        'source_reader_peak_rss_kib':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,'candidate_child_processes_started':0},
+    'join_instructions': ['Match actual collector identity.object_path and kind, never derive file identity by splitting nodeid.',
+        'Join actual item definition/originalname/class ancestry to exact file and qualified definition; AST count is not a receipt.',
+        'fixture_candidates_by_test maps qualified definition to fixture_candidate_sets id; each name there references exact definition ids. Dereference file path/hash and line. Intrinsic request uses dynamic_fixture_source_rules.',
+        'For direct parameters cite both selected definition and pinned _pytest/python.py; for injected asyncio runners cite pinned plugin.py.',
+        'Preserve every actual fixture, skipped/empty selected module receipt, and every deselected row; source candidates alone cannot close unresolved metadata.'],
+    'unresolved': unresolved + [
+        {'kind':'ACTUAL_COLLECTION_NOT_OBSERVED','detail':'Actual collector object_path/kind/nodeid, module outcomes, aliases/wrappers and parametrized item identities are deliberately unresolved until real collection.'},
+        {'kind':'ACTUAL_FIXTURE_CLOSURE_NOT_OBSERVED','detail':'Static candidates plus pinned dynamic-generation rules supplied. Actual fixture rows and direct/indirect/plugin names must be matched, including any unexpected names.'}],
+    'limitations': ['AST definitions are not collected items; no counts, runtime identity, review flags or approval are inferred.',
+        'Fixture candidates are source lookup evidence, not observed fixture closure. Match actual fixture names and pinned origins after collection.',
+        'Parameter ids, indirect parametrization, aliases/wrappers, custom collectors and dynamic fixture injection require actual metadata.',
+        'Effect signals are conservative textual AST call evidence; a mocked call or transitive product effect requires contextual reading.',
+        'No conftest is loaded by the producer. Explicit imports of support fixtures remain relevant. Canonical native fullparity is not established.',
+        'FRW013STOP remains entirely uninspected; A0 kernel120 ungranted; all seven journeys/four web and oldFridayOFF/Pandora remain mandatory.'],
+    'finished_msk': datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3))).isoformat(),
+    'elapsed_seconds_original_clock': time.monotonic() - CLOCK['started_monotonic'],
+    'execution_performed': False,
+}
+(OUT / 'source-catalog.json').write_text(json.dumps(catalog, separators=(',', ':'), ensure_ascii=False) + '\n')
+print(json.dumps({'files':len(files), 'selected':len(selected), 'source_test_definitions':sum(d['kind']=='test_definition' for p in selected for d in files[p]['definitions']),
+    'fixture_definitions':sum(len(v) for v in fixture_defs.values()), 'unresolved':len(unresolved),
+    'catalog_bytes': (OUT / 'source-catalog.json').stat().st_size, 'elapsed': catalog['elapsed_seconds_original_clock']}, indent=2))

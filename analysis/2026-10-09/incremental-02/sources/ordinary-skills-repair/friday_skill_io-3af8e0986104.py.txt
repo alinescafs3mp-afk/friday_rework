@@ -1,0 +1,650 @@
+"""Bounded descriptor I/O for native skills under the existing UserScope.
+
+No identity or skill store is introduced. The native tree, usage and ledger
+formats are retained. A transaction stages the native tree in memory and
+publishes it with one same-parent Linux renameat2; unsupported hosts refuse.
+"""
+from contextlib import contextmanager
+from contextvars import ContextVar
+import ctypes
+import hashlib
+import os
+from pathlib import Path
+import stat
+import uuid
+
+from hermes_cli.friday_user_scope import current, ScopeDenied
+from hermes_cli.skill_lock import require_skill_lock
+
+MAX_FILE = 1048576
+MAX_STATE = 8 * MAX_FILE
+MAX_TREE = 32 * MAX_FILE
+MAX_ENTRIES = 4096
+MAX_DEPTH = 16
+_TX = ContextVar('friday_native_skill_transaction', default=None)
+
+
+def active():
+    return current()
+
+
+def authority_stamp():
+    cap = current(required=True)
+    return {'principal_id': cap.key, 'generation': cap.admission_generation,
+            'home': str(cap.home), 'directory_identity': list(cap.directory_identity)}
+
+
+def check_stamp(value):
+    if value != authority_stamp():
+        raise ScopeDenied()
+
+
+def _parts(path, cap):
+    p = Path(path)
+    if not p.is_absolute() or '\\' in str(p) or '\x00' in str(p) or '..' in p.parts:
+        raise ScopeDenied()
+    try:
+        parts = p.relative_to(cap.home).parts
+    except ValueError:
+        raise ScopeDenied() from None
+    if not parts or len(parts) > MAX_DEPTH:
+        raise ScopeDenied()
+    if not (parts[0] == 'skills' or parts[:2] == ('.curator_backups', 'blobs')
+            or parts[:2] == ('pending', 'skills') or parts == ('.skills.lock',)):
+        raise ScopeDenied()
+    return parts
+
+
+def _private(st, directory=False):
+    if (st.st_uid != os.getuid() or st.st_mode & 0o077
+            or (directory and not stat.S_ISDIR(st.st_mode))
+            or (not directory and (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1))):
+        raise ScopeDenied()
+
+
+def _identity(st):
+    return st.st_dev, st.st_ino
+
+
+@contextmanager
+def _directory(path, *, create=False):
+    cap = current(required=True)
+    path = Path(path)
+    if path != cap.home:
+        _parts(path, cap)
+    fds = [os.open('/', os.O_RDONLY | os.O_DIRECTORY)]
+    links = []
+    try:
+        partial = Path('/')
+        for name in path.parts[1:]:
+            partial /= name
+            parent = fds[-1]
+            try:
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            except FileNotFoundError:
+                if not create or not partial.is_relative_to(cap.home) or partial == cap.home:
+                    raise
+                cap.check()
+                os.mkdir(name, 0o700, dir_fd=parent)
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            st = os.fstat(child)
+            fds.append(child)
+            links.append((parent, name, _identity(st), partial.is_relative_to(cap.home)))
+            if partial.is_relative_to(cap.home):
+                _private(st, True)
+            if partial == cap.home and _identity(st) != cap.directory_identity:
+                raise ScopeDenied()
+        def check():
+            cap.check()
+            for parent, name, identity, private in links:
+                st = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if not stat.S_ISDIR(st.st_mode) or _identity(st) != identity:
+                    raise ScopeDenied()
+                if private:
+                    _private(st, True)
+        check()
+        yield fds[-1], check
+        check()
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError):
+        raise ScopeDenied() from None
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def _limit(path):
+    # A native20-op approval batch can contain both old/new100k-char fields.
+    cap = current(required=True)
+    if Path(path).is_relative_to(cap.home / 'pending' / 'skills'):
+        return MAX_TREE
+    return MAX_STATE if Path(path).name in {'.curator_ledger.jsonl', '.usage.json'} else MAX_FILE
+
+
+def _read_at(fd, name, limit):
+    item = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    try:
+        st = os.fstat(item)
+        _private(st)
+        if st.st_size > limit:
+            raise ScopeDenied()
+        chunks, size = [], 0
+        while True:
+            chunk = os.read(item, min(65536, limit + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk); size += len(chunk)
+            if size > limit:
+                raise ScopeDenied()
+        after = os.fstat(item)
+        if (st.st_size, st.st_mtime_ns, st.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ScopeDenied()
+        if _identity(os.stat(name, dir_fd=fd, follow_symlinks=False)) != _identity(st):
+            raise ScopeDenied()
+        return b''.join(chunks)
+    finally:
+        os.close(item)
+
+
+def _view(path):
+    cap = current(required=True)
+    parts = _parts(path, cap)
+    tx = _TX.get()
+    if tx is not None:
+        tx.check()
+    return (tx, '/'.join(parts[1:])) if tx is not None and parts[0] == 'skills' else (None, None)
+
+
+def read_bytes(path):
+    tx, rel = _view(path)
+    if tx is not None:
+        if rel not in tx.files:
+            raise FileNotFoundError(str(path))
+        return tx.files[rel]
+    try:
+        with _directory(Path(path).parent) as (fd, check):
+            data = _read_at(fd, Path(path).name, _limit(path))
+            check()
+            return data
+    except FileNotFoundError:
+        raise
+    except OSError:
+        raise ScopeDenied() from None
+
+
+def read_text(path, encoding='utf-8-sig', errors='replace'):
+    return read_bytes(path).decode(encoding, errors)
+
+
+def exists(path):
+    tx, rel = _view(path)
+    if tx is not None:
+        return rel in tx.files or rel in tx.dirs
+    try:
+        with _directory(Path(path).parent) as (fd, check):
+            st = os.stat(Path(path).name, dir_fd=fd, follow_symlinks=False)
+            _private(st, stat.S_ISDIR(st.st_mode))
+            check()
+            return True
+    except FileNotFoundError:
+        return False
+
+
+def validate_directory(path, missing_ok=False):
+    tx, rel = _view(path)
+    if tx is not None:
+        if rel not in tx.dirs and not (missing_ok and rel not in tx.files):
+            raise ScopeDenied()
+        return
+    try:
+        with _directory(path):
+            pass
+    except FileNotFoundError:
+        if not missing_ok:
+            raise
+
+
+def _names(fd):
+    # scandir's incremental iterator bounds even a malicious huge directory;
+    # listdir would allocate all names before the entry-limit check.
+    names = []
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            if len(names) >= MAX_ENTRIES:
+                raise ScopeDenied()
+            names.append(entry.name)
+    return names
+
+
+def _snapshot_fd(fd):
+    """Capture a private native tree from an already owned descriptor.
+
+    Does not grant authority or traverse home paths. Also usable during
+    cleanup after scope revocation, while the original writer fence is held.
+    """
+    files, dirs, identities, total = {}, {''}, {}, 0
+    def visit(fd, prefix, depth):
+        nonlocal total
+        if depth > MAX_DEPTH:
+            raise ScopeDenied()
+        for name in sorted(_names(fd)):
+            rel = prefix + name
+            if len(files) + len(dirs) >= MAX_ENTRIES:
+                raise ScopeDenied()
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            isdir = stat.S_ISDIR(st.st_mode)
+            _private(st, isdir)
+            identities[rel] = (_identity(st), st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode)
+            if isdir:
+                sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                try:
+                    if _identity(os.fstat(sub)) != _identity(st):
+                        raise ScopeDenied()
+                    dirs.add(rel)
+                    visit(sub, rel + '/', depth + 1)
+                finally:
+                    os.close(sub)
+            else:
+                data = _read_at(fd, name, MAX_STATE if name in {'.curator_ledger.jsonl', '.usage.json'} else MAX_FILE)
+                total += len(data)
+                if total > MAX_TREE:
+                    raise ScopeDenied()
+                files[rel] = data
+            after = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if identities[rel] != (_identity(after), after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_mode):
+                raise ScopeDenied()
+    _private(os.fstat(fd), True)
+    identity = _identity(os.fstat(fd))
+    visit(fd, '', 0)
+    return files, dirs, (identity, identities)
+
+
+def _snapshot(root):
+    entered = False
+    try:
+        with _directory(root) as (fd, check):
+            entered = True
+            result = _snapshot_fd(fd)
+            check()
+            return result
+    except FileNotFoundError:
+        if entered:
+            raise ScopeDenied() from None
+        return {}, {''}, None
+
+
+def _verify_materialized(parent, name, identity, manifest, files, dirs):
+    """Bind bytes, shape, inode identities and modes to the validated tx.
+
+    This is a consistency check within the admitted writer fence, not an
+    exclusion primitive against arbitrary same-UID host code.
+    """
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    try:
+        actual_files, actual_dirs, actual = _snapshot_fd(fd)
+        if (actual[0] != identity or actual_files != files or actual_dirs != dirs
+                or set(actual[1]) != set(manifest)
+                or any((info[0], info[-1]) != manifest[rel] for rel, info in actual[1].items())
+                or _identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != identity):
+            raise ScopeDenied()
+        return actual
+    finally:
+        os.close(fd)
+
+
+def walk_files(root):
+    tx, rel = _view(root)
+    if tx is not None:
+        prefix = rel + '/' if rel else ''
+        result = tuple(Path(root) / p[len(prefix):] for p in sorted(tx.files) if p.startswith(prefix))
+        tx.check()
+        return result
+    files, _, _ = _snapshot(Path(root))
+    current(required=True).check()
+    return tuple(Path(root) / p for p in sorted(files))
+
+
+def mkdir(path, *, exist_ok=True):
+    tx, rel = _view(path)
+    if tx is not None:
+        if rel in tx.files or (not exist_ok and rel in tx.dirs):
+            raise FileExistsError(str(path))
+        parts = rel.split('/') if rel else []
+        for n in range(1, len(parts) + 1):
+            parent = '/'.join(parts[:n])
+            if parent in tx.files:
+                raise ScopeDenied()
+            tx.dirs.add(parent)
+        return
+    with _directory(path, create=True):
+        pass
+
+
+def write_bytes(path, data):
+    if not isinstance(data, bytes) or len(data) > _limit(path):
+        raise ScopeDenied()
+    tx, rel = _view(path)
+    if tx is not None:
+        if rel in tx.dirs:
+            raise ScopeDenied()
+        mkdir(Path(path).parent)
+        tx.files[rel] = data
+        tx.bounded()
+        return
+    with _directory(Path(path).parent, create=True) as (fd, check):
+        name = Path(path).name
+        try:
+            old = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            _private(old)
+        except FileNotFoundError:
+            old = None
+        tmp = '.tmp-' + uuid.uuid4().hex
+        item = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        try:
+            with os.fdopen(item, 'wb') as stream:
+                stream.write(data); stream.flush(); os.fsync(stream.fileno())
+            check()
+            now = os.stat(name, dir_fd=fd, follow_symlinks=False) if exists(path) else None
+            if (None if old is None else _identity(old)) != (None if now is None else _identity(now)):
+                raise ScopeDenied()
+            os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+            os.fsync(fd)
+            check()
+        finally:
+            try:
+                os.unlink(tmp, dir_fd=fd)
+            except FileNotFoundError:
+                pass
+
+
+def write_text(path, content, **unused):
+    write_bytes(path, content.encode('utf-8'))
+
+
+def remove(path, *, tree=False, missing_ok=False):
+    tx, rel = _view(path)
+    if tx is not None:
+        if not rel:
+            raise ScopeDenied()
+        if tree:
+            if rel not in tx.dirs:
+                raise FileNotFoundError(str(path))
+            tx.files = {k: v for k, v in tx.files.items() if k != rel and not k.startswith(rel + '/')}
+            tx.dirs = {k for k in tx.dirs if k != rel and not k.startswith(rel + '/')}
+        elif rel in tx.files:
+            del tx.files[rel]
+        elif not missing_ok:
+            raise FileNotFoundError(str(path))
+        return
+    if tree:
+        raise ScopeDenied()  # tree deletes require atomic native transaction
+    with _directory(Path(path).parent) as (fd, check):
+        try:
+            _private(os.stat(Path(path).name, dir_fd=fd, follow_symlinks=False))
+            check()
+            os.unlink(Path(path).name, dir_fd=fd)
+            check()
+        except FileNotFoundError:
+            if not missing_ok:
+                raise
+
+
+def _erase_at(parent, name, budget=None, depth=0, *, expected=None, manifest=None, prefix=''):
+    """Reclaim captured private storage while every admitted writer is fenced.
+
+    Callers must verify the complete materialized tree first. Path-based unlink
+    is safe only inside this cooperative product ownership boundary; an
+    arbitrary same-UID host can still substitute a name at the syscall. This
+    helper does not claim security against a compromised host. Unknown entries
+    observed before reclamation are retained for explicit reconciliation.
+    """
+    from hermes_cli.skill_lock import require_skill_lock
+    # Retained transaction supplies ownership even after its authority expires.
+    tx = _TX.get()
+    if tx is None or expected is None or manifest is None:
+        raise ScopeDenied()
+    require_skill_lock(tx.cap.home, authority=False)
+    budget = [MAX_ENTRIES] if budget is None else budget
+    if depth > MAX_DEPTH:
+        raise ScopeDenied()
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    try:
+        identity = _identity(os.fstat(fd))
+        if expected is not None and identity != expected:
+            raise ScopeDenied()
+        children = _names(fd)
+        if manifest is not None:
+            wanted = {rel[len(prefix):].split('/')[0] for rel in manifest if rel.startswith(prefix)}
+            if set(children) != wanted:
+                raise ScopeDenied()
+        for child in children:
+            if budget[0] <= 0:
+                raise ScopeDenied()
+            budget[0] -= 1
+            rel = prefix + child
+            st = os.stat(child, dir_fd=fd, follow_symlinks=False)
+            child_identity = _identity(st)
+            if manifest is not None and manifest.get(rel) != child_identity:
+                raise ScopeDenied()
+            if stat.S_ISDIR(st.st_mode):
+                _erase_at(fd, child, budget, depth + 1, expected=child_identity,
+                          manifest=manifest, prefix=rel + '/')
+            else:
+                os.unlink(child, dir_fd=fd)
+        if _identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != identity:
+            raise ScopeDenied()
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=parent)
+
+
+class _Transaction:
+    def __init__(self):
+        self.cap = current(required=True)
+        require_skill_lock(self.cap.home)
+        # A failed/crashed transaction owns at most one bounded retained tree.
+        # Never adopt unknown remnants or accumulate another stage behind it.
+        with _directory(self.cap.home) as (fd, check):
+            if any(name.startswith('.skills-txn-') for name in _names(fd)):
+                raise RuntimeError('skill_tree_reconciliation_required')
+            check()
+        self.root = self.cap.home / 'skills'
+        self.files, self.dirs, self.original = _snapshot(self.root)
+        self.before = dict(self.files)
+        self.before_dirs = set(self.dirs)
+        self.abort = False
+        self.published = False
+
+    def check(self):
+        if current(required=True) is not self.cap:
+            raise ScopeDenied()
+        self.cap.check()
+
+    def bounded(self):
+        if len(self.files) + len(self.dirs) > MAX_ENTRIES or sum(map(len, self.files.values())) > MAX_TREE:
+            raise ScopeDenied()
+
+    def publish(self):
+        self.check(); self.bounded()
+        require_skill_lock(self.cap.home)
+        if self.abort or (self.files == self.before and self.dirs == self.before_dirs):
+            return
+        # Fail before effects if atomic directory exchange is unavailable.
+        libc = ctypes.CDLL(None, use_errno=True)
+        rename = getattr(libc, 'renameat2', None)
+        if rename is None:
+            raise ScopeDenied()
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        with _directory(self.cap.home) as (homefd, check):
+            stage = '.skills-txn-' + uuid.uuid4().hex
+            os.mkdir(stage, 0o700, dir_fd=homefd)
+            stage_identity = None
+            stage_manifest = {}
+            publication_conflict = False
+            try:
+                stagefd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=homefd)
+                stage_identity = _identity(os.fstat(stagefd))
+                fds = {'': stagefd}
+                try:
+                    if _names(stagefd):
+                        raise ScopeDenied()
+                    for rel in sorted(self.dirs - {''}, key=lambda s: (s.count('/'), s)):
+                        parent, _, leaf = rel.rpartition('/')
+                        os.mkdir(leaf, 0o700, dir_fd=fds[parent])
+                        fds[rel] = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fds[parent])
+                        stage_manifest[rel] = (_identity(os.fstat(fds[rel])), os.fstat(fds[rel]).st_mode)
+                    for rel, data in sorted(self.files.items()):
+                        parent, _, leaf = rel.rpartition('/')
+                        mode = self.original[1].get(rel, (0o600,))[-1] & 0o700 if self.original else 0o600
+                        item = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=fds[parent])
+                        stage_manifest[rel] = (_identity(os.fstat(item)), os.fstat(item).st_mode)
+                        with os.fdopen(item, 'wb') as stream:
+                            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+                    for fd in fds.values():
+                        os.fsync(fd)
+                finally:
+                    for fd in reversed(list(fds.values())):
+                        os.close(fd)
+                files, dirs, identity = _snapshot(self.root)
+                if identity != self.original or files != self.before or dirs != self.before_dirs:
+                    raise ScopeDenied()
+                check(); self.check()
+                if _identity(os.stat(stage, dir_fd=homefd, follow_symlinks=False)) != stage_identity:
+                    publication_conflict = True
+                    raise RuntimeError('skill_tree_staging_identity_conflict')
+                try:
+                    _verify_materialized(homefd, stage, stage_identity, stage_manifest, self.files, self.dirs)
+                except (OSError, ScopeDenied):
+                    publication_conflict = True
+                    raise RuntimeError('skill_tree_staging_content_conflict') from None
+                check(); self.check()
+                if rename(homefd, stage.encode(), homefd, b'skills', 2 if self.original else 1):
+                    raise ScopeDenied()
+                self.published = True
+                if (_identity(os.stat('skills', dir_fd=homefd, follow_symlinks=False)) != stage_identity
+                        or (self.original and _identity(os.stat(stage, dir_fd=homefd, follow_symlinks=False)) != self.original[0])):
+                    publication_conflict = True
+                    raise RuntimeError('skill_tree_publication_identity_conflict')
+                try:
+                    _verify_materialized(homefd, 'skills', stage_identity, stage_manifest, self.files, self.dirs)
+                except (OSError, ScopeDenied):
+                    publication_conflict = True
+                    raise RuntimeError('skill_tree_published_content_conflict') from None
+                os.fsync(homefd)
+                check(); self.check()
+            finally:
+                # Cleanup owns only a verified materialized tree under this
+                # same fence. Any unknown artifact is retained, and the next
+                # transaction refuses before allocating further storage.
+                try:
+                    if (not publication_conflict and stage_identity is not None
+                            and (not self.published or self.original is not None)):
+                        expected = self.original[0] if self.published and self.original else stage_identity
+                        manifest = ({rel: (info[0], info[-1]) for rel, info in self.original[1].items()}
+                                    if self.published and self.original else stage_manifest)
+                        expected_files = self.before if self.published and self.original else self.files
+                        expected_dirs = self.before_dirs if self.published and self.original else self.dirs
+                        # On failed partial construction this check retains the
+                        # bounded remnant rather than adopting partial contents.
+                        _verify_materialized(homefd, stage, expected, manifest, expected_files, expected_dirs)
+                        _erase_at(homefd, stage, expected=expected,
+                                  manifest={rel: info[0] for rel, info in manifest.items()})
+
+                except (OSError, ScopeDenied):
+                    if self.published:
+                        raise RuntimeError("skill_tree_published_cleanup_incomplete") from None
+                    raise RuntimeError("skill_tree_not_published_cleanup_incomplete") from None
+
+
+@contextmanager
+def transaction():
+    existing = _TX.get()
+    if existing is not None:
+        existing.check()
+        yield existing
+        return
+    from tools.skill_usage import skill_file_lock
+    cap = current(required=True)
+    with skill_file_lock(cap.home / 'skills' / '.locks' / 'transaction.lock'):
+        tx = _Transaction()
+        token = _TX.set(tx)
+        try:
+            yield tx
+            tx.publish()
+        finally:
+            _TX.reset(token)
+
+
+class DocumentPath:
+    """Minimal data-only path protocol for the native static scanner/linter.
+
+    No __fspath__: consumers cannot silently turn this capability into an
+    unrestricted filesystem Path. All reads and enumeration stay in this seam.
+    """
+    def __init__(self, path):
+        self.path = Path(path)
+        _parts(self.path, current(required=True))
+
+    def __str__(self):
+        return str(self.path)
+
+    def __truediv__(self, part):
+        return DocumentPath(self.path / part)
+
+    @property
+    def name(self):
+        return self.path.name
+
+    @property
+    def suffix(self):
+        return self.path.suffix
+
+    @property
+    def parts(self):
+        return self.path.parts
+
+    def relative_to(self, other):
+        return self.path.relative_to(other.path if isinstance(other, DocumentPath) else other)
+
+    def exists(self):
+        return exists(self.path)
+
+    def is_dir(self):
+        tx, rel = _view(self.path)
+        if tx is not None:
+            return rel in tx.dirs
+        if not exists(self.path):
+            return False
+        with _directory(self.path.parent) as (fd, check):
+            st = os.stat(self.name, dir_fd=fd, follow_symlinks=False)
+            _private(st, stat.S_ISDIR(st.st_mode))
+            check()
+            return stat.S_ISDIR(st.st_mode)
+
+    def is_file(self):
+        return self.exists() and not self.is_dir()
+
+    def is_symlink(self):
+        self.exists()  # refuses any redirect, including inward ones
+        return False
+
+    def read_text(self, **kwargs):
+        return read_text(self.path, **kwargs)
+
+    def read_bytes(self):
+        return read_bytes(self.path)
+
+    def stat(self):
+        from types import SimpleNamespace
+        tx, rel = _view(self.path)
+        if tx is None or rel not in tx.files:
+            raise ScopeDenied()
+        mode = tx.original[1].get(rel, (0o600,))[-1] if tx.original else 0o600
+        return SimpleNamespace(st_size=len(tx.files[rel]), st_mode=stat.S_IFREG | (mode & 0o700))
+
+    def rglob(self, pattern):
+        import fnmatch
+        return tuple(DocumentPath(p) for p in walk_files(self.path)
+                     if pattern == '*' or fnmatch.fnmatch(p.name, pattern))

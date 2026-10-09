@@ -1,0 +1,175 @@
+--- g6/run-live-unit.py
++++ candidate/run-live-unit.py
+@@ -16,6 +16,7 @@
+ import stat
+ import subprocess
+ import time
++from probe import validate_native_identity
+ 
+ ROOT = Path(__file__).resolve().parent
+ UNIT_DIRECTORY = Path('<USER_RUNTIME>/systemd/user')
+@@ -34,7 +35,7 @@
+ # retain custody, never infer real timing from offline virtual observations.
+ POST_START_WINDOW = 55
+ MIN_START_WINDOW = 20
+-SOURCE_TASK = 'FRW041-BROWSER-RENDERER-OBSERVATION-REPAIR#1'
++SOURCE_TASK = 'FRW041-BROWSER-NATIVE-INVOCATION-REPAIR#1'
+ 
+ 
+ def require(value, message):
+@@ -388,12 +389,16 @@
+         final = self.show(reserve=30)
+         require(self.show(system=True, reserve=25) == manager, 'manager_changed_at_cessation')
+         inv = cessation(final, self.unit, self.fragment, self.cgroup, self.group_closed())
+-        require(inv == first.get('InvocationID', ''), 'invocation_changed')
++        require(not inv or not first.get('InvocationID') or inv == first['InvocationID'], 'invocation_changed')
+         proof = None
+-        if self.interruption() is None and not outcome['timeout'] and outcome['returncode'] == 0 and inv and final.get('Result') == 'success':
++        if self.interruption() is None and not outcome['timeout'] and outcome['returncode'] == 0 and final.get('Result') == 'success':
+             path = self.live / 'runtime.stdout'; private(path)
+             require(path.stat().st_size < 1048576, 'probe_output_too_large')
+             proof = json.loads(path.read_text())
++            live_inv = validate_native_identity(proof.get('native_identity'), self.clock, self.cgroup,
++                    str(self.fragment), outcome['started_monotonic'], outcome['completed_monotonic'])
++            require(all(value in ('', live_inv) for value in (inv, first.get('InvocationID', ''))),
++                    'invocation_changed')
+             require(proof.get('probe') == 'BROWSER_PREREQUISITE_PASS' and proof.get('browser_closed') is True
+                     and proof.get('cgroup') == self.cgroup and proof.get('sandbox_requested') is True
+                     and proof.get('sandbox_observed') is True
+--- g6/probe.py
++++ candidate/probe.py
+@@ -4,8 +4,10 @@
+ import json
+ import os
+ from pathlib import Path
++import re
+ import socket
+ import stat
++import subprocess
+ import sys
+ import time
+ 
+@@ -23,6 +25,106 @@
+ def require(value, message):
+     if not value:
+         raise RuntimeError(message)
++
++
++def native_identity_argv(unit):
++    require(bool(re.fullmatch(r'friday-browser-prerequisite-[0-9a-f]{16}\.service', unit)),
++            'native_identity_unit')
++    path = '/org/freedesktop/systemd1/unit/' + ''.join(
++        chr(b) if 48 <= b <= 57 or 65 <= b <= 90 or 97 <= b <= 122 else '_%02x' % b
++        for b in unit.encode())
++    # GetAll with an empty interface is supported by systemd's sd-bus server.
++    # One read of the exact running unit; explicit AF_UNIX address needs no
++    # additional environment. "call" applies both no-activation/auth flags.
++    return ['/usr/bin/busctl', '--address=unix:path=<USER_RUNTIME>/bus', '--no-pager',
++            '--json=short', '--auto-start=no', '--allow-interactive-authorization=no',
++            '--timeout=4', 'call', 'org.freedesktop.systemd1', path,
++            'org.freedesktop.DBus.Properties', 'GetAll', 's', '']
++
++
++def validate_native_identity(evidence, owner, relative, fragment, start, end, pid=None):
++    require(isinstance(evidence, dict), 'native_identity_missing')
++    unit = 'friday-browser-prerequisite-' + owner['nonce'] + '.service'
++    require(evidence.get('argv') == native_identity_argv(unit)
++            and evidence.get('nonce') == owner['nonce']
++            and evidence.get('boot_id') == owner['boot_id']
++            and evidence.get('cgroup') == relative
++            and evidence.get('timeout_seconds') == 5
++            and evidence.get('timeout') is False and type(evidence.get('returncode')) is int
++            and evidence['returncode'] == 0
++            and evidence.get('client_reaped') is True and evidence.get('stderr') == '',
++            'native_identity_transport')
++    observed_pid = evidence.get('pid')
++    require(type(observed_pid) is int and observed_pid > 0
++            and (pid is None or observed_pid == pid)
++            and type(evidence.get('pid_start_time')) is int and evidence['pid_start_time'] > 0,
++            'native_identity_owner_pid')
++    a, b = evidence.get('started_monotonic'), evidence.get('completed_monotonic')
++    require(type(a) in (int, float) and type(b) in (int, float)
++            and owner['started_monotonic'] <= start <= a <= b <= end < owner['deadline_monotonic']
++            and b - a <= 5, 'native_identity_stale_or_late')
++    raw = evidence.get('stdout')
++    require(isinstance(raw, str) and len(raw.encode()) < 1048576, 'native_identity_output')
++    def pairs(items):
++        result = {}
++        for key, value in items:
++            require(key not in result, 'native_identity_duplicate')
++            result[key] = value
++        return result
++    value = json.loads(raw, object_pairs_hook=pairs,
++                       parse_constant=lambda value: require(False, 'native_identity_nonfinite'))
++    require(isinstance(value, dict) and set(value) == {'type', 'data'}
++            and value['type'] == 'a{sv}' and isinstance(value['data'], list)
++            and len(value['data']) == 1 and isinstance(value['data'][0], dict),
++            'native_identity_schema')
++    properties = value['data'][0]
++    expected = {'Id': ('s', unit), 'LoadState': ('s', 'loaded'),
++                'ActiveState': ('s', 'active'), 'SubState': ('s', 'running'),
++                'MainPID': ('u', observed_pid), 'ControlPID': ('u', 0),
++                'ControlGroup': ('s', relative), 'FragmentPath': ('s', fragment),
++                'Transient': ('b', False), 'NeedDaemonReload': ('b', False),
++                'DropInPaths': ('as', [])}
++    for key, (signature, data) in expected.items():
++        actual = properties.get(key)
++        require(isinstance(actual, dict) and set(actual) == {'type', 'data'}
++                and actual['type'] == signature and type(actual['data']) is type(data)
++                and actual['data'] == data, 'native_identity_property_' + key)
++    invocation = properties.get('InvocationID')
++    require(isinstance(invocation, dict) and set(invocation) == {'type', 'data'}
++            and invocation['type'] == 'ay' and isinstance(invocation['data'], list)
++            and len(invocation['data']) == 16
++            and all(type(x) is int and 0 <= x <= 255 for x in invocation['data'])
++            and any(invocation['data']), 'native_identity_invocation')
++    return bytes(invocation['data']).hex()
++
++
++def observe_native_identity(owner, relative):
++    started = time.monotonic()
++    require(started + 55 < owner['deadline_monotonic'], 'native_identity_budget')
++    pid, birth = os.getpid(), start_time(Path('/proc/self'))
++    argv = native_identity_argv(owner['unit'])
++    evidence = {'argv': argv, 'nonce': owner['nonce'], 'boot_id': owner['boot_id'],
++                'pid': pid, 'pid_start_time': birth, 'cgroup': relative,
++                'started_monotonic': started, 'timeout_seconds': 5}
++    try:
++        row = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
++                             stderr=subprocess.PIPE, timeout=5, close_fds=True)
++        evidence.update(returncode=row.returncode, timeout=False,
++                        stdout=row.stdout.decode(), stderr=row.stderr.decode())
++    except subprocess.TimeoutExpired as exc:
++        # run() kills and reaps this finite read client, without a retry.
++        evidence.update(returncode=None, timeout=True,
++                        stdout=(exc.stdout or b'').decode(errors='replace'),
++                        stderr=(exc.stderr or b'').decode(errors='replace'))
++    evidence.update(completed_monotonic=time.monotonic(), client_reaped=True)
++    print(json.dumps({'native_identity_observation': evidence}), file=sys.stderr, flush=True)
++    require(os.getpid() == pid and start_time(Path('/proc/self')) == birth
++            and Path('/proc/self/cgroup').read_text().strip() == '0::' + relative,
++            'native_identity_process_changed')
++    validate_native_identity(evidence, owner, relative,
++            '<USER_RUNTIME>/systemd/user/' + owner['unit'], started,
++            evidence['completed_monotonic'], pid=pid)
++    return evidence
+ 
+ 
+ def protected_install():
+@@ -215,6 +317,7 @@
+     assert version('playwright') == '1.61.0'
+     from playwright.sync_api import sync_playwright
+     installed = protected_install()
++    native_identity = observe_native_identity(owner, relative)
+     with sync_playwright() as playwright:
+         browser = playwright.chromium.launch(executable_path=EXECUTABLE, headless=True, chromium_sandbox=True, timeout=15000)
+         try:
+@@ -239,7 +342,7 @@
+             browser.close()
+         assert not browser.is_connected()
+     assert time.monotonic() < owner['deadline_monotonic'], 'original_budget_exhausted'
+-    print(json.dumps({'probe': 'BROWSER_PREREQUISITE_PASS', 'playwright': '1.61.0', 'chromium': '149.0.7827.55', 'sandbox_requested': True, 'sandbox_observed': True, 'sandbox_evidence': sandbox_evidence, 'protected_executable': EXECUTABLE, 'installed': installed, 'network_families_denied': denied, 'cgroup': relative, 'caps': caps, 'javascript': True, 'browser_closed': True, 'installed_journey_accepted': False}), flush=True)
++    print(json.dumps({'probe': 'BROWSER_PREREQUISITE_PASS', 'native_identity': native_identity, 'playwright': '1.61.0', 'chromium': '149.0.7827.55', 'sandbox_requested': True, 'sandbox_observed': True, 'sandbox_evidence': sandbox_evidence, 'protected_executable': EXECUTABLE, 'installed': installed, 'network_families_denied': denied, 'cgroup': relative, 'caps': caps, 'javascript': True, 'browser_closed': True, 'installed_journey_accepted': False}), flush=True)
+ 
+ 
+ if __name__ == '__main__':

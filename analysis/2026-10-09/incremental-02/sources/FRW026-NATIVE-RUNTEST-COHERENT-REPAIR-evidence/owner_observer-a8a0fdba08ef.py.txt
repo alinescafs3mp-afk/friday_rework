@@ -1,0 +1,989 @@
+"""Owner preparation / post-reap checks only. Never launches or stops a candidate.
+SOURCE ONLY: do not initialize/import this helper before independent admission.
+Backend ownership and fixture review are supplied by the independent actual owner.
+"""
+from pathlib import Path
+import fcntl, hashlib, json, math, os, runpy, stat, sys, time
+
+HERE = Path(__file__).resolve().parent
+SPEC = json.loads((HERE / 'input-spec.json').read_bytes())
+SOURCE = Path(SPEC['source'])
+PHASES = SPEC['phases']
+CORE = ('assignment', 'generation', 'boot_id', 'start_monotonic',
+        'deadline_monotonic', 'original_budget_seconds')
+
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read(path):
+    return json.loads(Path(path).read_bytes())
+
+
+def put(path, value, mode=0o400):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(value, f, indent=2); f.write('\n'); f.flush(); os.fsync(f.fileno())
+    fd = os.open(Path(path).parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def private(path, mode):
+    s = Path(path).lstat()
+    require(not Path(path).is_symlink() and s.st_uid == os.getuid() and
+            stat.S_IMODE(s.st_mode) == mode, 'FOREIGN_OR_MUTABLE_PATH:' + str(path))
+    return s
+
+
+def finite(value):
+    return type(value) in (int, float) and math.isfinite(value) and value > 0
+
+
+def phases_for(clock):
+    if clock.get('scope') != 'FINITE_SERIAL_DONOR_FILE_RUNTESTS':
+        return PHASES
+    plan = read(SOURCE / 'runtest-plan.json')
+    return [dict(name='runtest-'+u['unit_id'], entry=u['entry'], selection=u['selection'],
+                 scope=u['runtime_scope'], inner=u['guard_wall_seconds'], outer=u['outer_wall_seconds'],
+                 runtest_file=u['unit_id']) for u in plan['units']]
+
+
+def clock_check(clock):
+    if clock.get('scope') == 'FINITE_SERIAL_DONOR_FILE_RUNTESTS':
+        plan = read(SOURCE / 'runtest-plan.json')
+        require(all(finite(clock.get(k)) for k in CORE[3:]) and
+                clock['start_monotonic'] <= time.monotonic() < clock['deadline_monotonic'] and
+                clock['deadline_monotonic'] == clock['start_monotonic'] + clock['original_budget_seconds'],
+                'EXPIRED_OR_RESET_ORIGINAL_RUNTIME_CLOCK')
+        require(clock.get('boot_id') == Path('/proc/sys/kernel/random/boot_id').read_text().strip() and
+                isinstance(clock.get('assignment'), str) and bool(clock['assignment']) and
+                type(clock.get('generation')) is int and clock['generation'] >= 1, 'RUNTIME_OWNER_BOOT_IDENTITY')
+        require(clock.get('execution_authorized') is True and clock.get('independent_source_review') == 'PASS' and
+                clock.get('independent_runtime_review') == 'PASS' and
+                clock.get('reviewed_source_pins_sha256') == SPEC['source_pins_sha256'] and
+                clock.get('runtime_plan_sha256') == sha(SOURCE / 'runtest-plan.json') and
+                clock.get('resources') == plan['resources'], 'NO_SEPARATE_RUNTIME_COHORT_ADMISSION')
+        require(plan.get('runtime_custody_integrated') is True and not plan.get('unresolved_effect_boundaries'),
+                'RUNTIME_SOURCE_NOT_ADMISSIBLE')
+        return
+
+    require(all(finite(clock.get(k)) for k in CORE[3:]), 'INVALID_ORIGINAL_CLOCK')
+    require(clock['start_monotonic'] <= time.monotonic() < clock['deadline_monotonic'] and
+            clock['deadline_monotonic'] == clock['start_monotonic'] + clock['original_budget_seconds'] and
+            clock['original_budget_seconds'] == 900, 'EXPIRED_OR_RESET_ORIGINAL900')
+    require(clock.get('boot_id') == Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'BOOT_CHANGED')
+    require(isinstance(clock.get('assignment'), str) and clock['assignment'] and
+            type(clock.get('generation')) is int and clock['generation'] >= 1, 'OWNER_IDENTITY_REQUIRED')
+    require(clock.get('execution_authorized') is True and clock.get('independent_source_review') == 'PASS',
+            'NO_SEPARATE_EXECUTION_GRANT')
+    require(clock.get('scope') == 'FINITE_TWO_POSITIVE_CANARIES_AND_EXACT_COLLECTION_ONLY' and
+            clock.get('reviewed_source_pins_sha256') == SPEC['source_pins_sha256'], 'WRONG_COHORT_SCOPE')
+    require(clock.get('resources') == {'cpu': 2, 'memory_bytes': 2 << 30, 'children': 0, 'max_phases': 4},
+            'WRONG_RESOURCES_OR_PHASE_COUNT')
+
+
+def lock_probe():
+    fd = os.open(SPEC['canonical_lock']['path'], os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        s = os.fstat(fd)
+        require([s.st_dev, s.st_ino, s.st_uid, s.st_gid, s.st_nlink, s.st_size,
+                 stat.S_IMODE(s.st_mode)] == SPEC['canonical_lock']['identity'], 'LOCK_IDENTITY_CHANGED')
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def file_inventory(root):
+    """Frozen corpora contain regular files and directories; no symlinks at intake."""
+    found = set()
+    for base, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            p = Path(base) / name; s = p.lstat()
+            require(not stat.S_ISLNK(s.st_mode), 'UNREVIEWED_CORPUS_SYMLINK:' + str(p))
+            if stat.S_ISREG(s.st_mode):
+                found.add(str(p.relative_to(root)))
+            else:
+                require(stat.S_ISDIR(s.st_mode), 'UNREVIEWED_CORPUS_TYPE:' + str(p))
+    return found
+
+
+def lexical_input_declarations(expanded, path_api, manifest):
+    """Four observed leaf spellings, tied to the existing source-derived alias.
+    Raw evidence is never rewritten and aliases never enter the canonical map.
+    """
+    modules = ('hermes_time', 'hermes_state_ids', 'hermes_state_pidns', 'hermes_bootstrap')
+    native = SPEC['roots']['native']
+    alias = path_api['native_alias_declaration'](manifest, native)
+    require(sha(SOURCE / 'import-path-pins.json') ==
+            SPEC['native_lexical_input_basis']['import_path_pins_sha256'], 'LEXICAL_IMPORT_MANIFEST_DRIFT')
+    for rel, digest in alias['source_files'].items():
+        source = native + '/' + rel
+        require(expanded.get(source) == digest and sha(source) == digest, 'LEXICAL_SOURCE_PROVENANCE_DRIFT')
+    rows = SPEC['native_lexical_inputs']
+    require(set(rows) == set(modules), 'LEXICAL_LEAF_SET_DRIFT')
+    for module, row in rows.items():
+        require(set(row) == {'raw', 'canonical', 'sha256', 'identity'} and
+                row['raw'] == alias['raw'] + '/' + module + '.py' and
+                row['canonical'] == native + '/' + module + '.py' and
+                row['raw'] not in expanded and expanded.get(row['canonical']) == row['sha256'] and
+                type(row['sha256']) is str and len(row['sha256']) == 64 and
+                len(row['identity']) == 5 and all(type(v) is int for v in row['identity']) and
+                stat.S_ISREG(row['identity'][2]), 'LEXICAL_LEAF_DECLARATION_DRIFT')
+    return rows
+
+
+def verify_lexical_input(row, path_api, manifest):
+    """Extend the pinned alias walk to one finite no-follow regular leaf.
+    Hold all lexical directory descriptors through leaf hashing and binding
+    rechecks. This is post-reap readiness, not hostile concurrent containment.
+    """
+    alias = path_api['native_alias_declaration'](manifest, SPEC['roots']['native'])
+    leaf = row['canonical'].rsplit('/', 1)[-1]
+    require(row['raw'] == alias['raw'] + '/' + leaf and
+            row['canonical'] == alias['target'] + '/' + leaf and
+            leaf in ('hermes_time.py', 'hermes_state_ids.py', 'hermes_state_pidns.py', 'hermes_bootstrap.py'),
+            'LEXICAL_EXACT_LEAF_REQUIRED')
+    identity = path_api['identity']; handles = []
+    try:
+        # Same literal steps and identity function as import_path_readiness;
+        # retain them here because its verify_native_alias closes its handles.
+        for index, step in enumerate(alias['steps']):
+            name = '/' if index == 0 else step['path'].rsplit('/', 1)[-1]
+            fd = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         **({} if index == 0 else {'dir_fd': handles[-1]}))
+            handles.append(fd)
+            require(identity(os.fstat(fd)) == step['identity'], 'LEXICAL_COMPONENT_IDENTITY_DRIFT')
+        directories = list(handles)
+        leaf_fd = os.open(leaf, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directories[-1])
+        handles.append(leaf_fd)
+        require(identity(os.fstat(leaf_fd)) == row['identity'] and stat.S_ISREG(os.fstat(leaf_fd).st_mode),
+                'LEXICAL_LEAF_IDENTITY_DRIFT')
+        # Reopen only this checked regular descriptor, never a possibly replaced
+        # pathname or special device. The intentional proc fd link is not an
+        # input alias; its returned identity must equal the retained leaf.
+        fd = os.open('/proc/self/fd/' + str(leaf_fd), os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        handles.append(fd)
+        require(identity(os.fstat(fd)) == row['identity'], 'LEXICAL_READ_DESCRIPTOR_DRIFT')
+        h = hashlib.sha256()
+        for chunk in iter(lambda: os.read(fd, 1 << 20), b''):
+            h.update(chunk)
+        require(h.hexdigest() == row['sha256'], 'LEXICAL_LEAF_HASH_DRIFT')
+        for index, step in enumerate(alias['steps']):
+            name = '/' if index == 0 else step['path'].rsplit('/', 1)[-1]
+            current = os.stat(name, **({} if index == 0 else {'dir_fd': directories[index - 1]}),
+                              follow_symlinks=False)
+            require(identity(current) == step['identity'] and
+                    identity(os.fstat(directories[index])) == step['identity'], 'LEXICAL_COMPONENT_BINDING_DRIFT')
+        # The final '..' descriptor and the forward canonical native descriptor
+        # must still bind the same pinned regular leaf, including after hashing.
+        require(all(identity(os.stat(leaf, dir_fd=parent, follow_symlinks=False)) == row['identity']
+                    for parent in (directories[-1], directories[-5])) and
+                identity(os.fstat(fd)) == row['identity'], 'LEXICAL_LEAF_BINDING_DRIFT')
+    finally:
+        for fd in reversed(handles):
+            os.close(fd)
+
+
+def observed_input_joins(result, selection, expanded):
+    """Preserve exact canonical joins; admit only evidenced native leaf pairs."""
+    extra = set(result['inputs']) - set(expanded)
+    foreign_origins = {p for p in result.get('origins', {}).values() if p not in expanded}
+    joined = {}
+    if extra or foreign_origins:
+        require(selection == '@native', 'LEXICAL_INPUT_OUTSIDE_NATIVE')
+        path_api = runpy.run_path(str(SOURCE / 'import_path_readiness.py'))
+        manifest = path_api['load'](SOURCE)
+        rows = lexical_input_declarations(expanded, path_api, manifest)
+        by_raw = {row['raw']: (module, row) for module, row in rows.items()}
+        require(extra == foreign_origins and extra <= set(by_raw), 'UNDECLARED_LEXICAL_INPUT_OR_ORIGIN')
+        for raw in sorted(extra):
+            module, row = by_raw[raw]
+            require(result['inputs'][raw] == row['sha256'] and
+                    result['origins'].get(module) == raw and
+                    [name for name, p in result['origins'].items() if p == raw] == [module],
+                    'LEXICAL_INPUT_HASH_OR_MODULE_PROVENANCE_DRIFT')
+            verify_lexical_input(row, path_api, manifest)
+            joined[raw] = {'module': module, 'canonical': row['canonical'], 'sha256': row['sha256']}
+    for p, h in result['inputs'].items():
+        require(p in joined or expanded.get(p) == h and sha(p) == h, 'UNRESOLVED_EXTRA_INPUT:' + p)
+    for p in result.get('origins', {}).values():
+        require(p in joined or p in expanded and sha(p) == expanded[p], 'UNCLASSIFIED_OBSERVED_ORIGIN:' + p)
+    return joined
+
+
+def inputs():
+    require(SOURCE.resolve(strict=True) == SOURCE and not SOURCE.is_symlink(), 'SOURCE_PATH_CHANGED')
+    require(sha(SOURCE / 'source-pins.json') == SPEC['source_pins_sha256'], 'SOURCE_MANIFEST_CHANGED')
+    manifest = read(SOURCE / 'source-pins.json')
+    require({p.name for p in SOURCE.iterdir()} == set(manifest) | {'source-pins.json'}, 'SOURCE_INVENTORY_CHANGED')
+    expanded = {str(SOURCE / 'source-pins.json'): SPEC['source_pins_sha256']}
+    paths = {}
+    for name, expected in manifest.items():
+        require('/' not in name and name not in ('.', '..'), 'INVALID_SOURCE_NAME')
+        p = SOURCE / name
+        require(not p.is_symlink() and p.is_file(), 'SOURCE_TYPE_CHANGED:' + name)
+        expanded[str(p)] = expected
+    for raw, meta in read(SOURCE / 'runtime-pins.json').items():
+        p = Path(raw); resolved = str(p.resolve(strict=True))
+        require(resolved == meta['resolved'] and p.stat().st_size == meta['bytes'], 'RUNTIME_PATH_CHANGED:' + raw)
+        paths[raw] = {'resolved': resolved, 'symlink': str(p.readlink()) if p.is_symlink() else None}
+        expanded[raw] = meta['sha256']
+    for raw, expected in read(SOURCE / 'ancillary-pins.json').items():
+        require(not Path(raw).is_symlink(), 'UNREVIEWED_ANCILLARY_SYMLINK:' + raw)
+        expanded[raw] = expected
+    runtime_plan = read(SOURCE / 'runtest-plan.json')
+    runtime_api = runpy.run_path(str(SOURCE / 'runtest_protocol.py'))
+    for raw, expected in runtime_api['runtime_dependency_pins'](runtime_plan).items():
+        require(not Path(raw).is_symlink(), 'RUNTIME_DEPENDENCY_SYMLINK:' + raw)
+        require(raw not in expanded or expanded[raw] == expected, 'RUNTIME_DEPENDENCY_PIN_CONFLICT')
+        expanded[raw] = expected
+    site_plugins = Path(runtime_plan['runtime_plugins'][0]['path']).parent.parent
+    require({str(p) for p in site_plugins.glob('*.dist-info/entry_points.txt')} ==
+            set(runtime_plan['runtime_autoload_entrypoints']), 'RUNTIME_AUTOLOAD_INVENTORY_CHANGED')
+    corpus = read(SOURCE / 'corpus-pins.json')
+    for kind, raw in SPEC['roots'].items():
+        root = Path(raw)
+        require(root.resolve(strict=True) == root and len(corpus[kind]) == SPEC['corpus_counts'][kind], 'CORPUS_ROOT_OR_COUNT_CHANGED')
+        require(file_inventory(root) == set(corpus[kind]), 'COMPLETE_CORPUS_INVENTORY_CHANGED:' + kind)
+        expanded.update({str(root / rel): expected for rel, expected in corpus[kind].items()})
+    for rel, expected in corpus['fixed31'].items():
+        require(corpus['native'].get(rel) == expected, 'FIXED31_DRIFT:' + rel)
+    site = Path('<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages')
+    require(sorted(p.name for p in site.glob('*.pth')) == ['_virtualenv.pth', 'distutils-precedence.pth'], 'STARTUP_PTH_INVENTORY_CHANGED')
+    stdlib = Path(read(SOURCE / 'runtime-pins.json')[str(Path('<PROJECT>/.runtime/hermes-telegram-test/env/bin/python'))]['resolved']).parent.parent / 'lib/python3.14'
+    for root in (site, stdlib):
+        for name in ('sitecustomize.py', 'usercustomize.py', 'sitecustomize', 'usercustomize'):
+            require(not (root / name).exists() and not (root / name).is_symlink(), 'UNREVIEWED_STARTUP_CUSTOMIZE')
+    path_api = runpy.run_path(str(SOURCE / 'import_path_readiness.py'))
+    path_manifest = path_api['load'](SOURCE)
+    path_api['verify_snapshot'](path_manifest)
+    for ref in (SPEC['baseline_source_review'], SPEC['observer_review'], SPEC['preprocessing_map'], SPEC['prior_root_r1_review']):
+        expanded[ref['path']] = ref['sha256']
+    helper_pins = read(HERE / 'source-pins.json')
+    require({p.name for p in HERE.iterdir()} == set(helper_pins) | {'source-pins.json'}, 'HELPER_INVENTORY_CHANGED')
+    expanded[str(HERE / 'source-pins.json')] = sha(HERE / 'source-pins.json')
+    for name, expected in helper_pins.items():
+        require('/' not in name and name not in ('.', '..'), 'INVALID_HELPER_NAME')
+        p = HERE / name
+        require(not p.is_symlink() and p.is_file(), 'HELPER_PATH_CHANGED'); expanded[str(p)] = expected
+    overlay = SPEC.get('runtime_overlay', {})
+    for ref in overlay.values():
+        expanded[ref['path']] = ref['sha256']
+    for raw, expected in expanded.items():
+        require(sha(raw) == expected, 'INPUT_HASH_CHANGED:' + raw)
+    for row in lexical_input_declarations(expanded, path_api, path_manifest).values():
+        verify_lexical_input(row, path_api, path_manifest)
+    return {'hashes': expanded, 'runtime_paths': paths,
+            'corpus_counts': SPEC['corpus_counts'], 'startup_pth': ['_virtualenv.pth', 'distutils-precedence.pth']}
+
+
+def cohort(out):
+    private(out, 0o700); c = read(out / 'original-clock.json'); clock_check(c)
+    private(out / 'original-clock.json', 0o400)
+    private(out / 'input-pins.json', 0o400); private(out / 'preflight.json', 0o400)
+    pre = read(out / 'preflight.json')
+    require(sha(out / 'original-clock.json') == pre['clock_sha256'], 'ORIGINAL_CLOCK_BYTES_CHANGED')
+    require(sha(pre['admission']) == pre['admission_sha256'], 'OWNER_ADMISSION_CHANGED')
+    source_review(pre['source_review'], pre['source_review_sha256'])
+    path_api = runpy.run_path(str(SOURCE / 'import_path_readiness.py'))
+    path_api['verify_owner_startup_receipt'](SOURCE, pre['startup_observation']['path'], pre['startup_observation']['sha256'])
+    require(inputs() == read(out / 'input-pins.json'), 'FULL_INPUT_OR_PATH_DRIFT')
+    return c, pre
+
+
+def source_review(path, digest):
+    # Final review is supplied externally AFTER publication; baseline review cannot
+    # accept these changed bytes. No placeholder hash or self-issued grant.
+    require(isinstance(path, str) and Path(path).is_absolute() and
+            Path(path).resolve(strict=True) == Path(path), 'EXACT_EXTERNAL_SOURCE_REVIEW_REQUIRED')
+    private(path, 0o400)
+    require(isinstance(digest, str) and len(digest) == 64 and sha(path) == digest, 'SOURCE_REVIEW_HASH_MISMATCH')
+    review = read(path)
+    require(review.get('state') in ('INDEPENDENT_COLLECTION_RECEIPT_AND_OWNER_HELPER_SOURCE_ACCEPTED',
+                                    'INDEPENDENT_RUNTEST_PRODUCER_DONOR_REGISTRY_OWNER_SOURCE_ACCEPTED') and
+            review.get('source') == str(SOURCE) and review.get('helper') == str(HERE) and
+            review.get('source_pins_sha256') == SPEC['source_pins_sha256'] and
+            review.get('helper_pins_sha256') == sha(HERE / 'source-pins.json') and
+            review.get('helper_sha256') == sha(HERE / 'owner_observer.py') and
+            review.get('input_spec_sha256') == sha(HERE / 'input-spec.json') and
+            review.get('receipt_schema') == (3 if review.get('state') == 'INDEPENDENT_RUNTEST_PRODUCER_DONOR_REGISTRY_OWNER_SOURCE_ACCEPTED' else 2) and review.get('runtime_grant') is False and
+            review.get('import_path_pins_sha256') == sha(SOURCE / 'import-path-pins.json'), 'CHANGED_PAIR_NOT_INDEPENDENTLY_REVIEWED')
+
+
+def initialize(out, original, original_sha, admission, admission_sha):
+    """Consume an existing separately granted clock; never creates an execution budget."""
+    require(not out.exists(), 'COHORT_ALREADY_EXISTS_NO_RETRY')
+    private(original, 0o400); private(admission, 0o400)
+    require(sha(original) == original_sha and sha(admission) == admission_sha, 'OWNER_INPUT_PIN_MISMATCH')
+    require(out.resolve(strict=False) == out, 'CANONICAL_FRESH_OWNER_ROOT_REQUIRED')
+    c = read(original); clock_check(c); grant = read(admission)
+    phases = phases_for(c); runtime = c.get('scope') == 'FINITE_SERIAL_DONOR_FILE_RUNTESTS'
+    require(grant.get('state') == ('INDEPENDENT_OWNER_DONOR_FILE_RUNTEST_ADMITTED' if runtime else 'INDEPENDENT_OWNER_HELPER_AND_COLLECTION_ADMITTED') and
+            grant.get('original_clock_sha256') == original_sha and grant.get('output_root') == str(out) and
+            grant.get('helper_sha256') == sha(HERE / 'owner_observer.py') and
+            grant.get('input_spec_sha256') == sha(HERE / 'input-spec.json') and
+            grant.get('helper_pins_sha256') == sha(HERE / 'source-pins.json') and
+            grant.get('source_pins_sha256') == SPEC['source_pins_sha256'] and
+            grant.get('phases') == phases and grant.get('execution_authorized') is True,
+            'INDEPENDENT_ROOT_ADMISSION_REQUIRED')
+    source_review(grant.get('source_review'), grant.get('source_review_sha256'))
+    if runtime:
+        review = read(grant['source_review'])
+        require(review.get('state') == 'INDEPENDENT_RUNTEST_PRODUCER_DONOR_REGISTRY_OWNER_SOURCE_ACCEPTED' and
+                review.get('runtime_plan_sha256') == sha(SOURCE / 'runtest-plan.json') and
+                review.get('runtime_overlay') == SPEC['runtime_overlay'], 'RUNTEST_CHANGED_PAIR_REVIEW_REQUIRED')
+    path_api = runpy.run_path(str(SOURCE / 'import_path_readiness.py'))
+    startup_observation = path_api['verify_owner_startup_receipt'](SOURCE, grant.get('startup_observation'), grant.get('startup_observation_sha256'))
+    reserve = grant.get('reconciliation_reserve_seconds')
+    require(finite(reserve), 'REVIEWED_RECONCILIATION_RESERVE_REQUIRED')
+    out.mkdir(mode=0o700)
+    # Exclusive original byte copy, not a reset clock or helper-issued permission.
+    fd = os.open(out / 'original-clock.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, 'wb') as f:
+        f.write(original.read_bytes()); f.flush(); os.fsync(f.fileno())
+    expanded = inputs(); lock_probe(); clock_check(c)
+    require(c['deadline_monotonic'] - time.monotonic() > (phases[0]['outer'] + reserve if runtime else sum(p['outer'] + reserve for p in phases)), 'INSUFFICIENT_WHOLE_COHORT_BUDGET')
+    put(out / 'input-pins.json', expanded)
+    put(out / 'preflight.json', {'clock_sha256': original_sha, 'admission': str(admission),
+        'admission_sha256': admission_sha, 'reserve_seconds': reserve,
+        'source_review': grant['source_review'], 'source_review_sha256': grant['source_review_sha256'],
+        'startup_observation': startup_observation,
+        'canonical_lock': 'exact acquire/unlock/close returned', 'preflight_monotonic': time.monotonic(),
+        'complete_expanded_input_count': len(expanded['hashes']), 'corpus_counts': SPEC['corpus_counts'],
+        'affinity_available': sorted(os.sched_getaffinity(0)),
+        'pressure': {k: Path('/proc/pressure/' + k).read_text() for k in ('cpu', 'memory', 'io')}})
+    print(json.dumps({'prepared_cohort': str(out), 'launch_performed': False}))
+
+
+def prepare(out, index):
+    c, pre = cohort(out); phases = phases_for(c)
+    require(0 <= index < len(phases), 'EXACT_PINNED_PHASE_ONLY')
+    require(sha(pre['admission']) == pre['admission_sha256'], 'ADMISSION_CHANGED')
+    for i, p in enumerate(phases):
+        dest = out / p['name']
+        if i < index:
+            require(dest.is_dir(), 'PREVIOUS_PHASE_MISSING')
+            done = read(dest / 'cessation.json')
+            require(done['status'] in ('CANARY_PHASE_EVIDENCED', 'COLLECTION_EVIDENCED', 'RUNTEST_REPORTED', 'RUNTEST_PRODUCT_FAIL') and
+                    done['next_phase_admissible'] is True, 'PREVIOUS_PHASE_NOT_CLOSED_NO_RETRY')
+            if 'runtest_file' in p:
+                returned = read(dest / 'registry-release.json')
+                require(returned.get('status') == 'EXACT_REGISTRY_HANDLE_RETURNED' and
+                        returned.get('cessation_sha256') == sha(dest / 'cessation.json') and
+                        returned.get('next_phase_admissible') is True, 'PREVIOUS_RUNTIME_REGISTRY_NOT_RETURNED')
+        else:
+            require(not dest.exists(), 'PHASE_ALREADY_PREPARED_NO_RETRY')
+    require(c['deadline_monotonic'] - time.monotonic() > (phases[index]['outer'] + pre['reserve_seconds'] if 'runtest_file' in phases[index] else sum(p['outer'] + pre['reserve_seconds'] for p in phases[index:])),
+            'INSUFFICIENT_ORIGINAL_REMAINING_WITH_RECONCILIATION')
+    lock_probe(); phase = phases[index]; parent = out / phase['name']; parent.mkdir(mode=0o700)
+    run = parent / 'run'; run.mkdir(mode=0o700)
+    for n in ('fixtures', 'tmp', 'pytesttmp'):
+        (run / n).mkdir(mode=0o700)
+    original_core = {k: c[k] for k in CORE}
+    phase_clock = dict(c, scope=phase['scope'], entry=phase['entry'], selection=phase['selection'],
+                       run_name=phase['name'], run_root=str(run), nonce=os.urandom(16).hex(), guard_wall_seconds=phase['inner'])
+    outside = {}
+    if phase['selection'] == '@canary':
+        phase_clock.update(canary='positive', synthetic_fixture_parent=str(parent))
+        phase_clock.pop('collect_only', None)
+        for name in ('auth.json', 'synthetic-outside.txt'):
+            fd = os.open(parent / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(b'SYNTHETIC_GUARD_CANARY_ONLY\n'); f.flush(); os.fsync(f.fileno())
+            outside[name] = sha(parent / name)
+    elif 'runtest_file' in phase:
+        phase_clock.update(collect_only=False, runtest_file=phase['runtest_file'],
+                           runtime_plan_sha256=sha(SOURCE / 'runtest-plan.json'))
+        phase_clock.pop('canary', None); phase_clock.pop('synthetic_fixture_parent', None)
+    else:
+        phase_clock.update(collect_only=True)
+        phase_clock.pop('canary', None); phase_clock.pop('synthetic_fixture_parent', None)
+    require({k: phase_clock[k] for k in CORE} == original_core, 'PHASE_CLOCK_RESET')
+    put(run / 'clock.json', phase_clock)
+    template = read(SOURCE / 'clean-invocation.json')
+    argv = (template['runtest_argv_templates'][phase['selection']] if 'runtest_file' in phase else
+            template['argv_template'] if phase['selection'] == '@canary' else template['collection_argv_templates'][phase['selection']])
+    argv = [v.replace('{UNIT_ID}', phase.get('runtest_file', '')).replace('{RUN_NAME}', phase['name']).replace('{RUN}', str(run)).replace('{guard.py|native_guard.py}', phase['entry']) for v in argv]
+    put(parent / 'prelaunch.json', {'phase_index': index, 'phase_clock_sha256': sha(run / 'clock.json'),
+        'original_clock_sha256': pre['clock_sha256'], 'original_core': original_core,
+        'outside': outside, 'argv': argv, 'launch_performed': False})
+    clock_check(c)
+    require(c['deadline_monotonic'] - time.monotonic() > phase['outer'] + pre['reserve_seconds'], 'PRELAUNCH_DEADLINE_EXHAUSTED')
+    print(json.dumps({'run': str(run), 'argv': argv, 'launch_performed': False}))
+
+
+def expected_identity(c):
+    base = {k: c[k] for k in ('assignment', 'generation', 'nonce', 'entry', 'selection', 'run_name', 'run_root', 'reviewed_source_pins_sha256')}
+    if c.get('runtest_file'):
+        api = runpy.run_path(str(SOURCE / 'runtest_protocol.py')); plan = read(SOURCE / 'runtest-plan.json')
+        unit = api['unit_for'](plan, c['runtest_file'], c['selection'])
+        return base | {'collect_only': False, 'scope': c['scope'], 'unit_id': c['runtest_file'],
+                       'node': unit['file']['path'], 'operation': 'pytest_runtest_file',
+                       'runtime_plan_sha256': sha(SOURCE / 'runtest-plan.json'),
+                       'gate_plan_sha256': sha(SOURCE / 'gate-plan.json'), 'corpus_pins_sha256': sha(SOURCE / 'corpus-pins.json')}
+    if c['selection'] == '@canary':
+        p = read(SOURCE / 'canary-plan.json')['positive']
+        return base | {'canary': 'positive', 'node': p['node'], 'operation': p['entry_operation']}
+    plan = read(SOURCE / 'gate-plan.json')
+    return base | {'collect_only': True, 'scope': c['scope'], 'node': c['selection'], 'operation': 'pytest_collect_only',
+                   'gate_plan_sha256': sha(SOURCE / 'gate-plan.json'), 'corpus_pins_sha256': sha(SOURCE / 'corpus-pins.json'),
+                   'selected_file_count': len(plan[c['selection'][1:]])}
+
+
+def scan_group(contour):
+    remaining, known, errors = [], [], []
+    for p in Path('/proc').iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            raw = (p / 'stat').read_text(); fields = raw[raw.rfind(')') + 2:].split()
+            pid, born, pgid = int(p.name), int(fields[19]), int(fields[2])
+            if pgid == contour['timeout']['pgid'] or (contour['identity'].get('operation') == 'pytest_runtest_file' and
+                                                    int(fields[3]) == contour['timeout']['sid']):
+                remaining.append({'pid': pid, 'start_ticks': born, 'state': fields[0]})
+            if any(pid == v['pid'] and born == v['start_ticks'] for v in (contour['timeout'], contour['guard'])):
+                known.append(pid)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            errors.append({'path': str(p), 'error': type(e).__name__})
+    return {'remaining': remaining, 'known': known, 'errors': errors}
+
+
+def node_key(identity):
+    require(isinstance(identity, dict) and set(identity) ==
+            {'path', 'object_path', 'kind', 'type', 'nodeid', 'source_relative_path'}, 'MISSING_OR_EXTRA_NODE_IDENTITY')
+    path = identity['path']; object_path = identity['object_path']; kind = identity['kind']
+    require(isinstance(path, str) and isinstance(object_path, str) and Path(object_path).is_absolute() and
+            os.path.normpath(object_path) == object_path and Path(object_path).resolve(strict=True) == Path(path) and
+            Path(path).is_absolute() and Path(path).resolve(strict=True) == Path(path),
+            'NONCANONICAL_NODE_PATH')
+    require(kind in ('session', 'directory', 'module', 'class', 'function', 'item') and
+            isinstance(identity['type'], str) and '.' in identity['type'] and
+            isinstance(identity['nodeid'], str) and
+            identity['source_relative_path'] == os.path.relpath(path, SOURCE), 'NODE_KIND_OR_RELATIVE_PATH')
+    # Empty and colliding raw nodeids are legitimate. Never parse a file from one.
+    return object_path, kind, identity['nodeid']
+
+
+def collection_check(parent, run, c, result, contour, expected):
+    plan = read(SOURCE / 'gate-plan.json'); selected = plan[c['selection'][1:]]
+    require(result.get('receipt_schema') == 2 and result.get('collect_only') is True and
+            result.get('selection') == c['selection'] and result.get('selected') == selected and
+            result.get('missing') == ['tests/agent/test_skill_preprocessing.py'] and
+            result.get('identity') == contour['identity'] and
+            result.get('phase_clock_sha256') == sha(run / 'clock.json'), 'COLLECTION_RESULT_IDENTITY_OR_SELECTION')
+    require(result.get('exit') == 0 and result.get('reports') == [] and
+            not (run / (c['run_name'] + '-progress.ndjson')).exists(), 'RUNTIME_REPORT_OR_BAD_COLLECTION_EXIT')
+    require(not any((run / n).exists() for n in ('operation_entry.json', 'positive_assertions_complete.json',
+             'DENIAL_WAS_SWALLOWED', 'ALARM_WAS_SWALLOWED', 'LATER_TEST_EXECUTED', 'wall_entered.json')),
+            'CANARY_OR_RUNTIME_MARKER_IN_COLLECTION')
+    kept = read(run / (c['run_name'] + '-collection.json'))
+    dropped = read(run / (c['run_name'] + '-deselected.json'))
+    rows = read(run / (c['run_name'] + '-classified.json'))
+    discovered = result['discovered']; reports = result['collection_reports']
+    d_ids = result['discovered_identities']; k_ids = result['collection_identities']
+    require([v['nodeid'] for v in d_ids] == discovered and
+            [v['nodeid'] for v in k_ids] == kept == result['collection'] and
+            [v['nodeid'] for v in rows] == kept and [v['identity'] for v in rows] == k_ids,
+            'RAW_NODEID_IDENTITY_OR_CLASSIFIED_ORDER_MISMATCH')
+    dk = [node_key(v) for v in d_ids]; kk = [node_key(v) for v in k_ids]
+    xk = [node_key(v['identity']) for v in dropped]
+    require(len(set(dk)) == len(dk) and len(set(kk)) == len(kk) and len(set(xk)) == len(xk) and
+            not set(kk) & set(xk) and set(dk) == set(kk) | set(xk) and
+            [v for v in dk if v in set(kk)] == kk and [v for v in dk if v in set(xk)] == xk,
+            'COMPOUND_NODE_PARTITION_DUPLICATE_OR_ORDER')
+    by_discovered = dict(zip(dk, d_ids))
+    require(all(by_discovered[node_key(v)] == v for v in k_ids + [r['identity'] for r in dropped]),
+            'DISCOVERED_PARTITION_METADATA_CHANGED')
+    selected_set = set(selected)
+    require(len(selected_set) == len(selected) and all(v[0] in selected_set and v[1] in ('function', 'item') for v in dk),
+            'FOREIGN_DISCOVERED_NODE')
+    ancestors = {str(p) for path in selected for p in Path(path).parents}
+    report_keys = [node_key(r['identity']) for r in reports]
+    require(len(set(report_keys)) == len(report_keys), 'DUPLICATE_COLLECTOR_REPORT')
+    by_report = dict(zip(report_keys, reports)); module_reports = {}; sessions = []
+    for key, report in by_report.items():
+        path, kind, raw = key
+        require(report['nodeid'] == raw and report['outcome'] in ('passed', 'skipped') and
+                type(report['callback_count']) is int and report['callback_count'] in (0, 1),
+                'FAILED_UNBOUND_OR_DUPLICATED_COLLECTOR_REPORT')
+        require(kind in ('session', 'directory', 'module', 'class'), 'UNCLASSIFIED_COLLECTOR_KIND')
+        if kind == 'session':
+            require(path == str(SOURCE) and report['parents'] == [], 'FOREIGN_SESSION_COLLECTOR')
+            sessions.append(key)
+        elif kind == 'directory':
+            require(path in ancestors and Path(path).is_dir(), 'FOREIGN_ANCESTOR_COLLECTOR')
+        else:
+            require(path in selected_set and report['identity']['path'] == path and Path(path).is_file(), 'UNSELECTED_MODULE_OR_CLASS_COLLECTED')
+        if kind != 'directory' or report['outcome'] != 'passed':
+            require(report['callback_count'] == 1, 'REQUIRED_COLLECTREPORT_CALLBACK_MISSING')
+        children = [node_key(v) for v in report['children']]
+        require(len(set(children)) == len(children), 'COLLECTOR_CHILD_DUPLICATE')
+        if kind in ('module', 'class'):
+            require(all(v[0] == path and v[1] in ('class', 'function', 'item') for v in children),
+                    'FOREIGN_MODULE_OR_CLASS_CHILD')
+        elif kind == 'session':
+            require(all(v[0] in selected_set and v[1] == 'module' for v in children), 'FOREIGN_SESSION_CHILD')
+        else:
+            # Directory results may contain siblings pruned by Session.collect.
+            # Those objects are metadata only; no receipt or execution is inferred.
+            require(all(Path(v[0]).parent == Path(path) and v[1] in ('directory', 'module') for v in children),
+                    'FOREIGN_DIRECTORY_CHILD')
+        if kind == 'module':module_reports.setdefault(path, []).append(report)
+    require(len(sessions) == 1 and set(module_reports) == selected_set and
+            all(len(v) == 1 for v in module_reports.values()), 'SELECTED_MODULE_UNACCOUNTED_OR_DUPLICATED')
+    require(by_report[sessions[0]]['children'] == [module_reports[p][0]['identity'] for p in selected],
+            'SESSION_SELECTED_MODULE_IDENTITY_OR_ORDER')
+    made_items = [v for r in reports if r['identity']['kind'] in ('module', 'class')
+                  for v in r['children'] if v['kind'] in ('function', 'item')]
+    made_keys = [node_key(v) for v in made_items]
+    require(len(set(made_keys)) == len(made_keys) and set(made_keys) == set(dk) and
+            all(by_discovered[node_key(v)] == v for v in made_items), 'COLLECTOR_DISCOVERY_PARTITION')
+    callbacks = [node_key(v) for v in result['collection_report_callbacks']]
+    require(len(set(callbacks)) == len(callbacks) and set(callbacks) ==
+            {k for k, r in by_report.items() if r['callback_count'] == 1} and
+            all(by_report[node_key(v)]['identity'] == v for v in result['collection_report_callbacks']),
+            'COLLECTREPORT_CALLBACK_PARTITION')
+    # Parent chains come from actual objects, including successful ancestors whose
+    # collectreport callback was never emitted. Every real parent has a made receipt.
+    def chain(identity, parents):
+        key = node_key(identity); keys = [node_key(v) for v in parents]
+        require(len(set(keys)) == len(keys) and key not in keys and bool(keys) and keys[0] == sessions[0],
+                'COLLECTOR_PARENT_CHAIN_MISSING_OR_CYCLIC')
+        for index, pk in enumerate(keys):
+            require(pk in by_report and by_report[pk]['identity'] == parents[index] and
+                    by_report[pk]['parents'] == parents[:index], 'PARENT_RECEIPT_IDENTITY_OR_CHAIN_MISMATCH')
+            # Session.result contains requested modules rather than every ancestor.
+            if pk[1] != 'session':
+                child = keys[index + 1] if index + 1 < len(keys) else key
+                child_identity = parents[index + 1] if index + 1 < len(keys) else identity
+                require([v for v in by_report[pk]['children'] if node_key(v) == child] == [child_identity],
+                        'PARENT_CHILD_RECEIPT_MISMATCH')
+        if key[1] in ('class', 'function', 'item'):
+            require(any(pk[1] == 'module' and pk[0] == key[0] for pk in keys), 'NODE_WITHOUT_EXACT_MODULE_PARENT')
+    for key, report in by_report.items():
+        if key[1] != 'session':chain(report['identity'], report['parents'])
+    alias = 'Imported test alias; not a distinct test defined in the requested file. Definition remains in original dependency evidence; no count inflation.'
+    stopped = 'NOT_RUN: actual subprocess outside nochildren task boundary; native process lock second-open proof remains required.'
+    network = 'NOT_RUN: actual local HTTP server/git subprocess fixture exceeds task no network/nochildren; still required in separately authorized admission'
+    stopped_nodes = [('tests/hermes_state/test_hermes_state.py', 'test_writable_state_db_keeps_locks_across_second_open'),
+                     ('tests/tools/test_skill_usage.py', 'test_concurrent_bump_view_preserves_all_updates')]
+    for row in rows + dropped:
+        key = node_key(row['identity']); path = key[0]
+        require(row['path'] == path == row['identity']['path'] and row['nodeid'] == key[2], 'ROW_IDENTITY_PATH_OR_NODEID_MISMATCH')
+        chain(row['identity'], row['parents'])
+        definition = str(Path(row['definition']).resolve(strict=True))
+        if row in rows:
+            require(definition == path and not {'served_repo', 'served_repo_missing_support'} & set(row['fixtures']),
+                    'FOREIGN_KEPT_DEFINITION_OR_HTTP_GIT_CASE')
+        elif row['reason'] == alias:
+            require(definition != path and definition in expected, 'BAD_IMPORTED_ALIAS')
+        elif row['reason'] == stopped:
+            require(any(path.endswith(p) and row['originalname'] == n for p, n in stopped_nodes), 'BAD_STOPPED_CLASSIFICATION')
+        else:
+            require(row['reason'] == network and bool({'served_repo', 'served_repo_missing_support'} & set(row['fixtures'])),
+                    'UNREVIEWED_DESELECTION_REASON_OR_FIXTURE')
+    coverage_file = str(Path(SPEC['roots']['native']) / 'tests/agent/test_skill_commands.py')
+    require(c['selection'] != '@native' or all(any(v['path'] == coverage_file and v['nodeid'].endswith(suffix) for v in k_ids)
+            for suffix in ('TestTemplateVarSubstitution::test_substitutes_skill_dir',
+                           'TestTemplateVarSubstitution::test_disable_template_vars_via_config',
+                           'TestInlineShellExpansion::test_inline_shell_runs_in_skill_directory',
+                           'TestInlineShellExpansion::test_inline_shell_timeout_does_not_break_message')),
+            'PREPROCESSING_COVERAGE_QUIETLY_DROPPED')
+    review = read(parent / 'classification-review.json'); private(parent / 'classification-review.json', 0o400)
+    require(review.get('identity') == contour['identity'] and review.get('state') == 'INDEPENDENT_COLLECTION_METADATA_RECONCILED' and
+            review.get('classified_sha256') == sha(run / (c['run_name'] + '-classified.json')) and
+            review.get('module_reports') == module_reports and review.get('deselected') == dropped and
+            review.get('receipt_schema') == 2 and review.get('unresolved') == [], 'INDEPENDENT_CLASSIFICATION_MISSING_OR_UNRESOLVED')
+    modules = review.get('selected_modules', [])
+    require([v['path'] for v in modules] == selected, 'INDEPENDENT_MODULE_ORDER_OR_ATTRIBUTION')
+    for v in modules:
+        r = module_reports[v['path']][0]
+        disposition = ('SKIPPED_COLLECTION_NOT_RUN' if r['outcome'] == 'skipped' else
+                       'EMPTY_MODULE_COLLECTED_NO_TESTS_NOT_RUN' if not r['children'] else 'COLLECTED_ONLY_NOT_RUN')
+        require(v.get('receipt') == r and v.get('source_and_skip_inspected') is True and
+                v.get('disposition') == disposition, 'SKIPPED_EMPTY_MODULE_REVIEW_GAP')
+    drop_reviews = review.get('deselected_reviews', [])
+    require([v['metadata'] for v in drop_reviews] == dropped and
+            all(v.get('definition_inspected') is True and v.get('reason_inspected') is True for v in drop_reviews),
+            'INDEPENDENT_DESELECTION_REVIEW_GAP')
+    reviewed = review.get('kept', []); require([v['metadata'] for v in reviewed] == rows, 'INDEPENDENT_KEPT_METADATA_MISMATCH')
+    for v in drop_reviews:
+        require(set(v.get('fixture_origins', {})) == set(v['metadata']['fixtures']), 'DESELECTED_FIXTURE_REVIEW_GAP')
+    for v in reviewed:
+        require(v.get('definition_inspected') is True and v.get('platform_skip_inspected') is True and
+                v.get('disposition') in ('COLLECTED_ONLY_NOT_RUN', 'LINUX_NOT_APPLICABLE') and
+                set(v.get('fixture_origins', {})) == set(v['metadata']['fixtures']), 'FIXTURE_OR_PLATFORM_REVIEW_GAP')
+    for v in reviewed + drop_reviews:
+        for refs in v['fixture_origins'].values():
+            require(bool(refs), 'FIXTURE_ORIGIN_EMPTY')
+            for ref in refs:
+                require(expected.get(ref['path']) == ref['sha256'] and sha(ref['path']) == ref['sha256'], 'UNPINNED_FIXTURE_ORIGIN')
+        if v in reviewed and any(set(p) == {'windows'} for p in v['metadata']['platforms']):
+            require(v['disposition'] == 'LINUX_NOT_APPLICABLE' and bool(v['metadata']['skip_reasons']), 'WINDOWS_RELABELED_PASS')
+    return {'status': 'COLLECTION_EVIDENCED', 'receipt_schema': 2, 'kept_count': len(kk), 'discovered_count': len(dk),
+            'deselected': dropped, 'module_reports': module_reports, 'classification_review_sha256': sha(parent / 'classification-review.json'),
+            'scope': 'Exact collection only. All runtests NOT_RUN; native parity/protected scripts/product/live/full gate unaccepted.'}
+
+
+def observe(out, index):
+    phases = phases_for(read(out / 'original-clock.json'))
+    require(0 <= index < len(phases), 'EXACT_PHASE_ONLY'); phase = phases[index]; parent = out / phase['name']; run = parent / 'run'
+    runtime = 'runtest_file' in phase
+    require(not (parent / 'cessation.json').exists(), 'OBSERVATION_ALREADY_CLOSED_NO_RETRY')
+    original, pre = cohort(out); before = read(parent / 'prelaunch.json'); c = read(run / 'clock.json')
+    require({k: c[k] for k in CORE} == before['original_core'] == {k: original[k] for k in CORE} and
+            sha(run / 'clock.json') == before['phase_clock_sha256'], 'PHASE_CLOCK_DRIFT_OR_RESET')
+    contour = read(run / 'native-contour.json'); identity = expected_identity(c)
+    require(contour['identity'] == identity and contour['phase_clock_sha256'] == before['phase_clock_sha256'] and
+            contour['boot_id'] == c['boot_id'] and contour['original_deadline_monotonic'] == c['deadline_monotonic'], 'FOREIGN_NATIVE_CONTOUR')
+    back = read(parent / 'backend-result.json'); start = read(parent / 'backend-start.json'); raw = start['stat']; fields = raw[raw.rfind(')') + 2:].split()
+    if runtime:
+        custody = read(parent / 'runtest-custody.json')
+        require(custody['pid'] == contour['timeout']['pid'] == custody['pgid'] == custody['sid'] and
+                custody['start_ticks'] == contour['timeout']['start_ticks'] and
+                contour['timeout']['sid'] == contour['guard']['sid'] == custody['sid'] and
+                custody['boot_id'] == c['boot_id'] and custody['unit_id'] == c['runtest_file'] and
+                custody['original_deadline'] == c['deadline_monotonic'] and
+                custody['owner_task_id'] == c['assignment'] and
+                custody['phase_clock_sha256'] == before['phase_clock_sha256'] and
+                int(fields[3]) == custody['sid'], 'EXACT_RUNTEST_REGISTRY_SID_CUSTODY_REQUIRED')
+    require(int(raw.split(' ', 1)[0]) == start['pid'] and int(fields[19]) == contour['timeout']['start_ticks'] and
+            int(fields[2]) == start['pid'] == contour['timeout']['pgid'] == contour['timeout']['pid'], 'FOREIGN_BACKEND_START_OR_GROUP')
+    require(start['argv'] == before['argv'] and start['backend_handle'] == back['backend_handle'] and
+            start['native_backend_pid'] == back['native_backend_pid'] and start['boot_id'] == c['boot_id'], 'BACKEND_HANDLE_OR_COMMAND_MISMATCH')
+    require(contour['timeout']['exe'] == str(Path('/usr/bin/gnutimeout').resolve(strict=True)) and
+            contour['guard']['exe'] == read(SOURCE / 'runtime-pins.json')[str(Path('<PROJECT>/.runtime/hermes-telegram-test/env/bin/python'))]['resolved'] and
+            contour['guard']['ppid'] == contour['timeout']['pid'] and contour['guard']['pgid'] == contour['timeout']['pgid'], 'FOREIGN_GUARD_OR_TIMEOUT')
+    require(bool(start['backend_handle']) and type(start['native_backend_pid']) is int and start['native_backend_pid'] > 0,
+            'ACTUAL_OWNER_BACKEND_IDENTITY_REQUIRED')
+    # Independent owner sample BEFORE dispatch: a lower bound, never a live-PID
+    # observation or an exit timestamp. Original PID/stat bytes come from the
+    # same backend shell before exec, including when its first reply is terminal.
+    launch_path = parent / 'backend-prelaunch.json'
+    private(launch_path, 0o400); launch = read(launch_path)
+    require(start.get('owner_prelaunch_sha256') == sha(launch_path) and
+            'observed_monotonic' not in start and
+            launch.get('state') == 'OWNER_PRELAUNCH_LOWER_BOUND_RECORDED' and
+            launch.get('argv') == before['argv'] and launch.get('phase_index') == index and
+            launch.get('phase_clock_sha256') == before['phase_clock_sha256'] and
+            launch.get('original_clock_sha256') == before['original_clock_sha256'] and
+            launch.get('native_backend_pid') == start['native_backend_pid'] and
+            launch.get('boot_id') == c['boot_id'], 'OWNER_PRELAUNCH_PROVENANCE_MISMATCH')
+    lower = launch.get('prelaunch_lower_bound_monotonic')
+    require(finite(lower) and finite(contour['external_deadline_monotonic']) and
+            c['start_monotonic'] <= lower < contour['external_deadline_monotonic'] < c['deadline_monotonic'] and
+            contour['external_deadline_monotonic'] - lower <= phase['outer'] + 1, 'CONTOUR_EXTERNAL_CLOCK_MISMATCH')
+    terminal = back['tool_result']; require((type(terminal.get('exit_code')) is int if runtime else terminal.get('exit_code') == 0) and not terminal.get('session_id'), 'BACKEND_NOT_TERMINAL0_OR_REAPED')
+    attempts = [json.loads(line) for line in (run / (c['run_name'] + '-attempts.ndjson')).read_text().splitlines()]
+    require(all(a.get('identity') == identity and finite(a.get('monotonic')) and c['start_monotonic'] <= a['monotonic'] < c['deadline_monotonic'] for a in attempts), 'FOREIGN_ATTEMPT_RECEIPT')
+    guard_stopped = any(a['kind'] in ('termination_intent', 'read_refusal_diagnostic') for a in attempts)
+    require(runtime or not guard_stopped, 'GUARD_DENIAL_OR_UNKNOWN_EFFECT')
+    resources = [a for a in attempts if a['kind'] == 'resources']; normal = [a for a in attempts if a['kind'] == 'normal_finally']
+    require(len(resources) == 1 and (len(normal) <= 1 if runtime else len(normal) == 1) and resources[0]['pid'] == contour['guard']['pid'] and
+            resources[0]['process_group'] == contour['timeout']['pgid'] and len(set(resources[0]['affinity'])) == 2 and
+            all(type(v) is int and v >= 0 for v in resources[0]['affinity']) and
+            resources[0]['as_limit'] == [2 << 30, 2 << 30] and resources[0]['cpu_limit'] == [600, 600] and
+            resources[0]['lock_identity'] == SPEC['canonical_lock']['identity'][:2] and
+            resources[0]['original_deadline'] == c['deadline_monotonic'] and (True if runtime else bool(normal)) and
+            all(n['lock_unlock_call_returned'] is True and n['lock_fd_close_returned'] is True for n in normal), 'RESOURCE_OR_NORMAL_FINALLY_RECEIPT_GAP')
+    require([a['contour'] for a in attempts if a['kind'] == 'native_contour'] == [contour], 'CONTOUR_ATTEMPT_MISMATCH')
+    result_path = run / (c['run_name'] + '-results.json')
+    result = read(result_path) if result_path.exists() else {}
+    expanded = read(out / 'input-pins.json')['hashes']
+    child_expected = {p: h for p, h in expanded.items() if p.startswith(str(SOURCE) + '/') and p != str(SOURCE / 'source-pins.json') or
+                      p in read(SOURCE / 'runtime-pins.json') or p in read(SOURCE / 'ancillary-pins.json')}
+    if c['selection'] != '@canary':
+        corpus = read(SOURCE / 'corpus-pins.json')
+        for k, root in SPEC['roots'].items():
+            child_expected.update({str(Path(root) / rel): h for rel, h in corpus[k].items()})
+    require(runtime and not result or result.get('inputs_unchanged') is True and all(result['inputs'].get(p) == h for p, h in child_expected.items()), 'CHILD_INPUT_SET_INCOMPLETE_OR_DRIFTED')
+    lexical_joins = observed_input_joins(result, c['selection'], expanded) if result else {}
+    if runtime and result:
+        runtime_plan = read(SOURCE / 'runtest-plan.json')
+        for ref in runtime_plan['runtime_plugins']:
+            require(result['origins'].get(ref['module']) == ref['path'] and
+                    result['inputs'].get(ref['path']) == ref['sha256'] and
+                    result['inputs'].get(ref['entrypoint']) == ref['entrypoint_sha256'],
+                    'ACTUAL_LOADED_RUNTIME_PLUGIN_ORIGIN_GAP')
+        for module, raw in result['origins'].items():
+            if module in runtime_plan['runtime_import_origins']:
+                require(raw == runtime_plan['runtime_import_origins'][module], 'RUNTIME_DEPENDENCY_ORIGIN_DRIFT')
+    if c['selection'] == '@canary':
+        require(all(sha(parent / n) == h for n, h in before['outside'].items()), 'SYNTHETIC_OUTSIDE_CHANGED')
+        decision = None
+    elif runtime:
+        decision = runtest_check(run, c, result, contour, terminal['exit_code'], guard_stopped)
+    else:
+        decision = collection_check(parent, run, c, result, contour, expanded)
+    # Repeat expanded verification after classification so all supporting sources are bound.
+    source_review(pre['source_review'], pre['source_review_sha256'])
+    require(sha(pre['admission']) == pre['admission_sha256'], 'POST_REVIEW_ADMISSION_DRIFT')
+    require(inputs() == read(out / 'input-pins.json') and sha(out / 'original-clock.json') == pre['clock_sha256'] and
+            sha(run / 'clock.json') == before['phase_clock_sha256'], 'POST_REVIEW_INPUT_OR_CLOCK_DRIFT')
+    group = scan_group(contour); require(not any(group.values()), 'STOP_UNCONFIRMED:' + json.dumps(group))
+    lock_probe(); upper = time.monotonic(); require(0 < upper < c['deadline_monotonic'], 'CESSATION_NOT_EVIDENCED_BEFORE_ORIGINAL_DEADLINE')
+    backend_time = back.get('observed_terminal_monotonic')
+    require(backend_time is None or finite(backend_time) and backend_time <= upper, 'INVALID_BACKEND_TERMINAL_TIMESTAMP')
+    obs = {'identity': identity, 'guard_identity': contour['guard'], 'timeout_identity': contour['timeout'],
+           'lexical_input_joins': lexical_joins,
+           'backend_reaped': True, 'exit_code': terminal['exit_code'], 'exact_known_pids_absent': True,
+           'exact_group_scan_quiescent': True, 'outside_synthetic_hashes_unchanged': True,
+           'phase_clock_unchanged': True, 'all_input_pins_unchanged': True, 'canonical_lock_identity_verified': True,
+           'fresh_lock_acquire_unlock_close_returned': True, 'post_reap_cessation_upper_bound_monotonic': upper,
+           'original_deadline_cessation_evidenced': True, 'exact_kernel_terminal_time_exposed': False,
+           'timing_provenance': 'Owner sample AFTER actual backend terminal/reap, whole-group known identity scan, full hashes, classification and fresh exact lock return; upper bound only',
+           'backend_start_sha256': sha(parent / 'backend-start.json'), 'backend_result_sha256': sha(parent / 'backend-result.json')}
+    if c['selection'] == '@canary':
+        reports = result['reports']; positive = read(SOURCE / 'canary-plan.json')['positive']
+        obs.update(after_denial_sentinel_present=(run / 'DENIAL_WAS_SWALLOWED').exists(),
+            alarm_swallowed_sentinel_present=(run / 'ALARM_WAS_SWALLOWED').exists(),
+            later_sentinel_present=(run / 'LATER_TEST_EXECUTED').exists(),
+            later_sentinel_bytes=(run / 'LATER_TEST_EXECUTED').read_text() if (run / 'LATER_TEST_EXECUTED').exists() else None,
+            selected_test_call_passed=any(r['when'] == 'call' and r['outcome'] == 'passed' and r['nodeid'].endswith('::' + positive['node']) for r in reports),
+            later_test_call_passed=any(r['when'] == 'call' and r['outcome'] == 'passed' and r['nodeid'].endswith('::test_later_test_sentinel') for r in reports))
+        # Unchanged data-only oracle is used ONLY for this actual @canary identity.
+        oracle = runpy.run_path(str(SOURCE / 'canary_oracle.py'))
+        decision = oracle['evaluate'](c, positive, read(run / 'operation_entry.json'), attempts,
+            dict(obs, terminal_monotonic=upper), contour, read(run / 'positive_assertions_complete.json'), None)
+    good = decision['status'] in ('CANARY_PHASE_EVIDENCED', 'COLLECTION_EVIDENCED', 'RUNTEST_REPORTED', 'RUNTEST_PRODUCT_FAIL')
+    put(parent / 'cessation.json', {'status': decision['status'], 'next_phase_admissible': good,
+        'decision': decision, 'observation': obs, 'group_scan': group, 'phase_clock_sha256': before['phase_clock_sha256'],
+        'original_clock_sha256': pre['clock_sha256'], 'scope': phase['scope'], 'attempts': attempts,
+        'runtime_or_product_accepted': False})
+    print(json.dumps({'phase': phase['name'], 'status': decision['status'], 'launch_performed': False}))
+
+
+def runtest_check(run, clock, result, contour, exit_code, guard_stopped):
+    """Receipt evidence can fail while independent cessation still gets checked."""
+    api = runpy.run_path(str(SOURCE / 'runtest_protocol.py'))
+    plan = read(SOURCE / 'runtest-plan.json')
+    unit = api['unit_for'](plan, clock['runtest_file'], clock['selection'])
+    progress = run / (clock['run_name'] + '-progress.ndjson')
+    events = []
+    try:
+        if progress.exists():
+            data = progress.read_bytes()
+            require(not data or data.endswith(b'\n'), 'TORN_RUNTIME_PROGRESS')
+            events = [json.loads(line) for line in data.splitlines()]
+        for event in events:
+            bindings = event.get('selected', []) + event.get('deselected', [])
+            if 'binding' in event: bindings.append(event['binding'])
+            for binding in bindings: node_key(binding['actual'])
+        decision = api['census'](unit, events, contour['identity'], sha(run / 'clock.json'),
+                                 exit_code, result or None)
+        if guard_stopped:
+            decision['status'] = 'RUNTEST_CONTAINMENT_STOP'
+        decision['required_effectful_not_run'] = plan['required_not_run']
+        decision['missing_original_files'] = plan['missing']
+        return decision
+    except Exception as error:
+        return {'status': 'RUNTEST_EVIDENCE_STOP', 'reason': str(error),
+                'failure_observed': getattr(error, 'failure_observed', []),
+                'actual_event_prefix': events, 'required_identities': unit['expected'],
+                'required_effectful_not_run': plan['required_not_run'],
+                'unclassified_items': 'UNKNOWN_NOT_PASS; malformed evidence cannot allocate runtime success',
+                'runtime_or_product_accepted': False}
+
+
+def run_donor_file(out, index, registry, *, native_owner):
+    """Finite single-file dispatch through the pinned donor and EXISTING registry.
+
+    The caller owns the native backend/outer kill boundary across this call. It
+    supplies actual ownership, not a boolean approval. This function is source
+    only until runtime cohort/source/effect admission and overlays are resolved.
+    It never loops over files or retries a failed call; prepare/observe serializes.
+    """
+    original, pre = cohort(out); phases = phases_for(original)
+    require(0 <= index < len(phases) and 'runtest_file' in phases[index], 'EXACT_RUNTIME_PHASE_REQUIRED')
+    phase = phases[index]; parent = out / phase['name']; run = parent / 'run'
+    before = read(parent / 'prelaunch.json'); clock = read(run / 'clock.json')
+    template = read(SOURCE / 'clean-invocation.json')['runtest_argv_templates'][phase['selection']]
+    expected_argv = [v.replace('{UNIT_ID}', phase['runtest_file']).replace('{RUN_NAME}', phase['name']).replace('{RUN}', str(run)) for v in template]
+    require(before['argv'] == expected_argv, 'EXACT_RUNTIME_PRELAUNCH_ARGV_REQUIRED')
+    require(sha(run / 'clock.json') == before['phase_clock_sha256'] and
+            {k: clock[k] for k in CORE} == {k: original[k] for k in CORE}, 'RUNTEST_CLOCK_RESET')
+    require(native_owner['original_clock_sha256'] == pre['clock_sha256'] and
+            native_owner['phase_index'] == index and bool(native_owner['backend_handle']) and
+            type(native_owner['native_backend_pid']) is int and native_owner['native_backend_pid'] > 0,
+            'ACTUAL_NATIVE_OWNER_REQUIRED')
+    # No reused/old registry or donor module. Changed files are imported only
+    # AFTER independent final overlay integration; source pins bind their paths.
+    import inspect
+    require(sha(inspect.getsourcefile(type(registry))) == SPEC['runtime_overlay']['registry']['sha256'],
+            'RUNTIME_REGISTRY_OVERLAY_NOT_INTEGRATED')
+    donor_ref = SPEC['runtime_overlay']['runner']; require(sha(donor_ref['path']) == donor_ref['sha256'], 'DONOR_RUNNER_DRIFT')
+    donor = runpy.run_path(donor_ref['path'])
+    unit = read(SOURCE / 'runtest-plan.json')['units'][index]
+    require(unit['unit_id'] == phase['runtest_file'], 'RUNTEST_ORDER_DRIFT')
+    # All file effects stay in the original allowance, with owner reconciliation
+    # reserve. The private fixture dirs/clock were prepared by the same helper.
+    remaining = lambda: max(0.001, original['deadline_monotonic'] - time.monotonic() - pre['reserve_seconds'])
+    require(remaining() > phase['outer'] + 1, 'INSUFFICIENT_ORIGINAL_FILE_BUDGET')
+    session = registry.reserve_runtest(command=' '.join(before['argv']), cwd=unit['root'],
+        task_id=original['assignment'], session_key=native_owner['session_key'],
+        unit_id=unit['unit_id'], deadline=original['deadline_monotonic'])
+    lower = time.monotonic()
+    put(parent / 'backend-prelaunch.json', {'state': 'OWNER_PRELAUNCH_LOWER_BOUND_RECORDED',
+        'argv': before['argv'], 'phase_index': index, 'phase_clock_sha256': before['phase_clock_sha256'],
+        'original_clock_sha256': pre['clock_sha256'], 'native_backend_pid': native_owner['native_backend_pid'],
+        'boot_id': original['boot_id'], 'prelaunch_lower_bound_monotonic': lower})
+    holder = {}
+    def spawn(cmd, **kwargs):
+        require(cmd == [donor['sys'].executable, '-m', 'pytest', str(Path(unit['file']['path']))],
+                'DONOR_FILE_COMMAND_DRIFT')
+        # Reuse donor Popen lifecycle but make the existing admitted guard the
+        # real per-file interpreter. It calls pytest with donor config/conftests.
+        # Donor kwargs own stdout and a new SID. env-i in before.argv owns the
+        # clean interpreter environment, never the caller's credential env.
+        kwargs['env'] = {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'HOME': str(run / 'fixtures'),
+                         'TMPDIR': str(run / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'}
+        kwargs['stdin'] = donor['subprocess'].DEVNULL
+        kwargs['close_fds'] = True
+        # No stat, checkpoint or backend write after Popen in this callback.
+        # The donor receives the actual handle before after_spawn may fail.
+        return registry.spawn_runtest(session, before['argv'], kwargs)
+    def after_spawn(proc):
+        holder['proc'] = proc
+        registry.attach_runtest(session, proc)
+        raw = Path('/proc/' + str(proc.pid) + '/stat').read_text()
+        put(parent / 'backend-start.json', {'argv': before['argv'], 'pid': proc.pid, 'stat': raw,
+            'boot_id': original['boot_id'], 'backend_handle': native_owner['backend_handle'],
+            'native_backend_pid': native_owner['native_backend_pid'],
+            'owner_prelaunch_sha256': sha(parent / 'backend-prelaunch.json')})
+        put(parent / 'runtest-custody.json', {'session_id': session.id, 'pid': session.pid,
+            'start_ticks': session.host_start_time, 'pgid': session.runtest_pgid, 'sid': session.runtest_sid,
+            'boot_id': session.runtest_boot_id, 'unit_id': unit['unit_id'],
+            'original_deadline': session.runtest_deadline, 'owner_task_id': session.owner_task_id,
+            'phase_clock_sha256': before['phase_clock_sha256']})
+    def capture(proc, output, error, cuts):
+        require(proc is session.process, 'FOREIGN_DONOR_OUTPUT')
+        session.append_output(output)
+        holder['proc'] = proc
+        put(parent / 'runtest-drain.json', {'session_id': session.id, 'pid': proc.pid,
+            'exit_code': proc.returncode, 'output': output,
+            'primary_error': type(error).__name__ if error is not None else None,
+            'cleanup_errors': list(cuts), 'registry_persistence_error': session.runtest_persistence_error,
+            'sole_drainer': 'donor communicate', 'reaped': proc.returncode is not None,
+            'runtime_or_product_accepted': False})
+    def stop(proc, pgid):
+        require(proc is session.process and pgid == session.runtest_pgid, 'FOREIGN_DONOR_STOP')
+        # On natural exit, do not signal a historical numeric PGID. The owner
+        # scans its exact SID/PGID; any survivor retains custody for outer stop.
+        if proc.returncode is None:
+            stop_result = registry.stop_runtest(session, source='donor_file_timeout_or_abort')
+            require(stop_result['status'] == 'STOP_REQUESTED' and not stop_result['persistence_error'],
+                    'RUNTEST_STOP_DIAGNOSTIC_OR_CESSATION_UNCONFIRMED')
+    def settle(proc, pgid, temproot):
+        require(proc is session.process and pgid == session.runtest_pgid, 'FOREIGN_DONOR_SETTLEMENT')
+        require(proc.returncode is not None, 'DONOR_NOT_REAPED')
+        require(type(session.pid) is int and session.pid == proc.pid and
+                type(session.host_start_time) is int and session.host_start_time > 0 and
+                session.runtest_pgid == proc.pid and session.runtest_sid == proc.pid and
+                Path('/proc/sys/kernel/random/boot_id').read_text().strip() == session.runtest_boot_id,
+                'STOP_UNCONFIRMED_DONOR_IDENTITY_GAP')
+        remaining_group = []
+        for path in Path('/proc').iterdir():
+            if not path.name.isdigit(): continue
+            try:
+                raw = (path / 'stat').read_text(); fields = raw[raw.rfind(')') + 2:].split()
+            except FileNotFoundError: continue
+            if int(fields[2]) == session.runtest_pgid or int(fields[3]) == session.runtest_sid:
+                remaining_group.append({'pid': int(path.name), 'start_ticks': int(fields[19]), 'state': fields[0]})
+        require(not remaining_group, 'STOP_UNCONFIRMED_DONOR_SID_PGID:' + json.dumps(remaining_group))
+        require(time.monotonic() < original['deadline_monotonic'], 'DONOR_CESSATION_AFTER_DEADLINE')
+        put(parent / 'backend-result.json', {'backend_handle': native_owner['backend_handle'],
+            'native_backend_pid': native_owner['native_backend_pid'],
+            'tool_result': {'exit_code': proc.returncode}, 'observed_terminal_monotonic': time.monotonic(),
+            'donor_temproot': temproot})
+    def terminal(code):
+        require(code == holder['proc'].returncode, 'DONOR_EXIT_NORMALIZATION_DRIFT')
+    # No call to main(), discovery, duration cache, retry, parallel executor or
+    # cross-run sweep. This exact donor one-attempt primitive is reused serially.
+    donor['_run_one_file_once'](Path(unit['file']['path']), [], Path(unit['root']),
+        min(float(phase['outer']) + 1, remaining()),
+        custody={'spawn': spawn, 'after_spawn': after_spawn, 'retained_handle': lambda: session.process,
+                 'retained_pgid': lambda: session.runtest_pgid, 'capture': capture,
+                 'stop': stop, 'settle': settle, 'remaining': remaining, 'terminal': terminal,
+                 'temporary_root': lambda: str(run / 'tmp')})
+    # Retain the registry handle until observe() and actual OUTER owner custody
+    # are reconciled. A runner return or parsed console summary cannot release it.
+    return {'session_id': session.id, 'phase': phase['name'], 'observer_required': True,
+            'exit_code': holder['proc'].returncode, 'runtime_or_product_accepted': False}
+
+
+def finish_runtime_file(out, index, registry, *, outer_receipt, outer_receipt_sha256):
+    """Return the SAME existing registry handle only after both owner closures.
+
+    The separate native owner supplies an immutable actual file-boundary receipt;
+    this helper cannot manufacture, start, stop or rename that outer boundary.
+    """
+    original, pre = cohort(out); phase = phases_for(original)[index]
+    require('runtest_file' in phase, 'RUNTEST_FILE_REQUIRED')
+    parent = out / phase['name']; run = parent / 'run'; c = read(run / 'clock.json')
+    done = read(parent / 'cessation.json'); custody = read(parent / 'runtest-custody.json')
+    private(outer_receipt, 0o400)
+    require(sha(outer_receipt) == outer_receipt_sha256, 'NATIVE_OUTER_RECEIPT_PIN_MISMATCH')
+    proof = read(outer_receipt)
+    grant = read(pre['admission'])
+    require(proof.get('state') == 'INDEPENDENT_OWNED_RUNTEST_FILE_BOUNDARY_QUIESCENT' and
+            proof.get('owner_boundary') == grant.get('owner_boundary') and bool(proof.get('owner_boundary')) and
+            proof.get('original_clock_sha256') == pre['clock_sha256'] and
+            proof.get('phase_clock_sha256') == sha(run / 'clock.json') and
+            proof.get('registry_session_id') == custody['session_id'] and
+            proof.get('boot_id') == c['boot_id'] and proof.get('unknown_owned_descendants') == [] and
+            finite(proof.get('cessation_upper_monotonic')) and
+            proof['cessation_upper_monotonic'] < c['deadline_monotonic'], 'NATIVE_OUTER_CUSTODY_NOT_RECONCILED')
+    obs = done.get('observation', {})
+    require(obs.get('backend_reaped') is True and obs.get('exact_known_pids_absent') is True and
+            obs.get('exact_group_scan_quiescent') is True and obs.get('fresh_lock_acquire_unlock_close_returned') is True and
+            obs.get('original_deadline_cessation_evidenced') is True, 'INNER_CUSTODY_NOT_RECONCILED')
+    session = registry.get(custody['session_id'])
+    require(session is not None and session.owner_task_id == c['assignment'], 'EXACT_REGISTRY_HANDLE_REQUIRED')
+    upper = max(obs['post_reap_cessation_upper_bound_monotonic'], proof['cessation_upper_monotonic'])
+    registry.finish_runtest(session, owner_observation={**custody, 'backend_reaped': True,
+        'whole_group_absent': True, 'outer_custody_quiescent': True, 'cessation_upper_monotonic': upper})
+    put(parent / 'registry-release.json', {'session_id': session.id, 'outer_receipt': str(outer_receipt),
+        'outer_receipt_sha256': outer_receipt_sha256, 'cessation_sha256': sha(parent / 'cessation.json'),
+        'status': 'EXACT_REGISTRY_HANDLE_RETURNED', 'next_phase_admissible': done['next_phase_admissible'],
+        'runtime_or_product_accepted': False})
+
+
+if __name__ == '__main__':
+    # Existing owner/backend performs launches; this surface cannot dispatch a command.
+    try:
+        command = sys.argv[1]; out = Path(sys.argv[2]); require(out.is_absolute(), 'ABSOLUTE_OWNER_OUTPUT_REQUIRED')
+        if command == 'initialize' and len(sys.argv) == 7:
+            initialize(out, Path(sys.argv[3]), sys.argv[4], Path(sys.argv[5]), sys.argv[6])
+        elif command == 'prepare' and len(sys.argv) == 4:
+            prepare(out, int(sys.argv[3]))
+        elif command == 'observe' and len(sys.argv) == 4:
+            index = int(sys.argv[3])
+            try:
+                observe(out, index)
+            except Exception as error:
+                phases = phases_for(read(out / 'original-clock.json'))
+                if 0 <= index < len(phases) and (out / phases[index]['name']).is_dir() and not (out / phases[index]['name'] / 'cessation.json').exists():
+                    put(out / phases[index]['name'] / 'cessation.json', {'status': 'INCONCLUSIVE', 'next_phase_admissible': False,
+                        'reason': str(error), 'actual_owned_backend_handle': 'Retain original backend-start/backend-result; helper does not stop/retry/release custody',
+                        'observation_sample_monotonic': time.monotonic(), 'cessation_evidenced': False, 'runtime_or_product_accepted': False})
+                raise
+        else:
+            raise ValueError('EXACT_PREPARE_OBSERVE_API_ONLY')
+    except Exception as error:
+        raise SystemExit('INCONCLUSIVE_NO_RETRY: ' + str(error))

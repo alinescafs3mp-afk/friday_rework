@@ -13,3 +13,5 @@ See `docs/mandatory-web-admin.md` and `validation/acceptance-web-admin.json` for
 [Donor capabilities and integration status](docs/donor-capabilities.md) distinguish planned, implemented, connected and verified functionality, including the mandatory web and administration journeys.
 
 [Work log and intermediate analysis — 9 October](analysis/2026-10-09/incremental-01/README.md) record completed work, failed attempts, remaining gaps and next steps. This is a partial publication; the daily checkpoint is still due.
+
+[Expanded source, outcomes and process analysis](analysis/2026-10-09/incremental-02/README.md) adds 349 historical result summaries, 40 design/control plans, source snapshots and explicit remaining coverage gaps. It is an intermediate publication, not the completed daily checkpoint or a release.

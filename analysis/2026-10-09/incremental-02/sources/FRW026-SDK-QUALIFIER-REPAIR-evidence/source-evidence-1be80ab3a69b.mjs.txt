@@ -1,0 +1,76 @@
+/** NOT_RUN. Vite's real transform and environment graph seams.
+ * Node hooks alone do not observe Vitest's vm.runInThisContext evaluation.
+ * These are input/returned-transform observations, not proof of VM evaluation.
+ */
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { guardEvidence as evidence } from './guard.mjs'
+
+export function sourceEvidence() {
+  let server
+  const checked = new Map()
+  function file(id) {
+    if (typeof id !== 'string' || id.includes('\0') || id.startsWith('virtual:')) evidence.refuse('UNBOUND_VIRTUAL_TRANSFORM')
+    let raw = id.startsWith('file:') ? fileURLToPath(id) : id
+    if (raw.startsWith('/@fs/')) raw = raw.slice(4)
+    const query = raw.indexOf('?')
+    // No raw/url/worker transformations silently substitute a different corpus.
+    if (query !== -1) {
+      if (!/^\?v=[a-f0-9]+$/.test(raw.slice(query))) evidence.refuse('UNBOUND_TRANSFORM_QUERY:' + id)
+      raw = raw.slice(0, query)
+    }
+    if (!path.isAbsolute(raw)) evidence.refuse('NON_FILE_TRANSFORM:' + id)
+    const canonical = evidence.pinned(raw)
+    return { canonical, sourceSha256: evidence.rawHash(fs.readFileSync(canonical)) }
+  }
+  function observe(stage, code, id, environment) {
+    const input = file(id)
+    const row = { event: stage, id, environment, ...input, codeSha256: evidence.rawHash(code), bytes: Buffer.byteLength(code) }
+    checked.set(environment + '\0' + id, row)
+    evidence.emit(row)
+  }
+  const pre = {
+    name: 'frw-ts24-pinned-input', enforce: 'pre',
+    load(id) { file(id); return null },
+    transform(code, id) { observe('VITE_TRANSFORM_INPUT', code, id, this.environment.name); return null },
+    configureServer(value) {
+      server = value
+      // Called before requests. Patch the existing method, no alternate loader.
+      for (const [name, environment] of Object.entries(server.environments)) {
+        const original = environment.transformRequest.bind(environment)
+        environment.transformRequest = async function (url, ...args) {
+          const result = await original(url, ...args)
+          if (result) {
+            const node = await environment.moduleGraph.getModuleByUrl(url)
+            if (!node || !node.id || !node.file) evidence.refuse('UNBOUND_RETURNED_TRANSFORM:' + url)
+            observe('VITE_RETURNED_TRANSFORM', result.code, node.file, name)
+            evidence.emit({ event: 'VITE_TRANSFORM_GRAPH', environment: name, url, id: node.id,
+              file: node.file, imports: [...node.importedModules].map(m => ({ id: m.id, file: m.file, url: m.url })) })
+          }
+          return result
+        }
+      }
+    },
+  }
+  const post = {
+    name: 'frw-ts24-transformed-output', enforce: 'post',
+    transform(code, id) { observe('VITE_PLUGIN_OUTPUT', code, id, this.environment.name); return null },
+  }
+  function snapshot() {
+    if (!server) evidence.refuse('VITE_SERVER_NOT_OBSERVED')
+    const graph = []
+    for (const [name, environment] of Object.entries(server.environments)) {
+      for (const node of environment.moduleGraph.idToModuleMap.values()) {
+        if (!node.file) evidence.refuse('UNBOUND_GRAPH_FILE:' + node.id)
+        const input = file(node.file)
+        graph.push({ environment: name, id: node.id, url: node.url, ...input,
+          transformedSha256: node.transformResult ? evidence.rawHash(node.transformResult.code) : null,
+          imports: [...node.importedModules].map(m => ({ id: m.id, file: m.file, url: m.url })) })
+      }
+    }
+    evidence.emit({ event: 'VITE_FINAL_GRAPH', graph, observedTransformRows: checked.size,
+      meaning: 'Pinned inputs and returned transform graph; VM executed-module and worker payload reconciliation remains root prerequisite.' })
+  }
+  return { plugins: [pre, post], snapshot }
+}

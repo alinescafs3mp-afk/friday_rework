@@ -1,0 +1,358 @@
+"""Exact administrator staging/install procedure. Never called by source task.
+Run only as the checked ROOT-owned bootstrap copied by INSTALL-ENTRY.sh.
+Normal PID1 dependency installation; no start, enable, policy/profile relaxations.
+Failure preserves owned root artifacts and concrete identities for reconciliation.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import resource
+import signal
+import stat
+import subprocess
+import selectors
+import sys
+import time
+
+SOURCE=Path('<ASTRA_WORK>/offline-build-fixture-path-repair/candidate')
+STAGE=Path('/run/friday-offline-build-010d839888625d6d')
+UNIT='friday-native-offline-build-010d839888625d6d.service'
+LIVE=Path('<SOL_WORK>/FRW041-NATIVE-OFFLINE-BUILD-run-010d839888625d6d')
+POLICY=Path('/etc/sudoers.d/friday-offline-build-010d839888625d6d')
+FRAGMENT=Path('/run/systemd/system')/UNIT
+ENV={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','HOME':'/root'}
+JOURNAL=Path('/run/friday-offline-build-010d839888625d6d.install.json')
+BUNDLE_SHA='b59d7e69575a0cd7f30d5246a499b5f2a3ef3cee0bf5165825f44a0a259be3ea'
+
+
+def bounded_command(argv,seconds):
+    started=time.monotonic();p=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=ENV,close_fds=True)
+    out=bytearray();err=bytearray();selector=selectors.DefaultSelector()
+    try:
+        for stream,target in ((p.stdout,out),(p.stderr,err)):
+            os.set_blocking(stream.fileno(),False);selector.register(stream,selectors.EVENT_READ,target)
+        while selector.get_map():
+            remaining=started+seconds-time.monotonic();require(remaining>0,'bounded_command_timeout')
+            ready=selector.select(remaining);require(bool(ready),'bounded_command_timeout')
+            for key,_ in ready:
+                chunk=os.read(key.fileobj.fileno(),65536)
+                if not chunk:selector.unregister(key.fileobj);continue
+                key.data.extend(chunk);require(len(out)+len(err)<=1048576,'bounded_command_output')
+        remaining=started+seconds-time.monotonic();require(remaining>0,'bounded_command_timeout')
+        p.wait(timeout=remaining)
+        return subprocess.CompletedProcess(argv,p.returncode,bytes(out),bytes(err))
+    except BaseException:
+        if p.poll() is None:p.kill()
+        p.wait();raise
+    finally:
+        selector.close();p.stdout.close();p.stderr.close()
+
+
+def require(value,message):
+    if not value: raise RuntimeError(message)
+
+
+def safe_parent(path, owner):
+    """Anchor every component; never resolve a mutable symlink or FIFO."""
+    path=Path(path)
+    require(path.is_absolute() and '..' not in path.parts, 'absolute_clean_path_required')
+    fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    identities=[]
+    try:
+        for part in path.parts[1:-1]:
+            nxt=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=fd)
+            os.close(fd);fd=nxt;s=os.fstat(fd)
+            require(stat.S_ISDIR(s.st_mode) and s.st_uid in (0,owner) and not s.st_mode&0o022,
+                    'unsafe_input_ancestor')
+            identities.append((s.st_dev,s.st_ino))
+        return fd,path.name,identities
+    except BaseException:
+        os.close(fd);raise
+
+
+def read_exact(path, uid, mode=None, maximum=1048576, single_link=True):
+    parent,leaf,ancestors=safe_parent(path,uid)
+    fd=None
+    try:
+        fd=os.open(leaf,os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent)
+        a=os.fstat(fd)
+        require(stat.S_ISREG(a.st_mode) and a.st_uid==uid and (uid!=0 or a.st_gid==0)
+                and (not single_link or a.st_nlink==1) and not a.st_mode&0o022
+                and a.st_size<=maximum and (mode is None or stat.S_IMODE(a.st_mode)==mode), 'input_owner_mode_type')
+        chunks=[];remaining=a.st_size+1
+        while remaining:
+            block=os.read(fd,min(65536,remaining))
+            if not block:break
+            chunks.append(block);remaining-=len(block)
+        content=b''.join(chunks);b=os.fstat(fd);c=os.stat(leaf,dir_fd=parent,follow_symlinks=False)
+        key=lambda x:(x.st_dev,x.st_ino,x.st_size,x.st_mtime_ns,x.st_mode,x.st_uid,x.st_gid,x.st_nlink)
+        require(key(a)==key(b)==key(c) and len(content)==a.st_size, 'input_changed_or_overflow')
+        check,_,current=safe_parent(path,uid)
+        os.close(check);require(current==ancestors,'input_ancestor_replaced')
+        return content,a
+    finally:
+        if fd is not None:os.close(fd)
+        os.close(parent)
+
+def data(path,owner,mode=None,maximum=128000000,single_link=True):
+    return read_exact(path,owner,mode,maximum,single_link)
+
+
+def digest(b):return hashlib.sha256(b).hexdigest()
+
+
+def rootdir(path):
+    for q in [path,*path.parents]:
+        s=q.lstat();require(q==q.resolve(strict=True) and stat.S_ISDIR(s.st_mode)
+            and s.st_uid==s.st_gid==0 and not s.st_mode&0o022,'root_directory')
+
+
+def absent(path):
+    try:path.lstat()
+    except FileNotFoundError:return
+    raise RuntimeError('collision:'+str(path))
+
+
+def unique_json(content):
+    def pairs(rows):
+        value={}
+        for k,v in rows:require(k not in value,'duplicate_json_key');value[k]=v
+        return value
+    return json.loads(content,object_pairs_hook=pairs)
+
+
+def identity(s):return (s.st_dev,s.st_ino)
+
+
+def journal_append(value):
+    fd=os.open(JOURNAL,os.O_WRONLY|os.O_APPEND|os.O_NONBLOCK|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:
+        s=os.fstat(fd);require(list(identity(s))==BOOTSTRAP_CONTEXT['journal_identity'],'original_journal_replaced')
+        require(stat.S_ISREG(s.st_mode) and s.st_uid==s.st_gid==0 and s.st_nlink==1 and stat.S_IMODE(s.st_mode)==0o444,'journal_boundary')
+        b=(json.dumps(value,separators=(',',':'))+'\n').encode();require(len(b)<65536,'journal_record_bound')
+        require(os.write(fd,b)==len(b),'journal_short_write');os.fsync(fd)
+    finally:os.close(fd)
+
+
+def journal_inventory():
+    b,metadata=read_exact(JOURNAL,0,0o444,maximum=1048576)
+    require(list(identity(metadata))==BOOTSTRAP_CONTEXT['journal_identity'],'original_journal_replaced')
+    inventory={};pending={}
+    for line in b.splitlines():
+        row=unique_json(line);kind=row['kind'];path=row.get('path')
+        if kind=='intent':require(path not in inventory and path not in pending,'duplicate_creation');pending[path]=row
+        elif kind=='created':
+            require(path in pending,'creation_without_intent');pending.pop(path);inventory[path]=row
+        elif kind=='refused':require(path in pending,'refusal_without_intent');pending.pop(path)
+        elif kind=='removed':
+            require(path in inventory and row['identity']==inventory[path]['identity'],'removal_identity');inventory.pop(path)
+        else:require(kind in ('owner','prepared','failure'),'journal_record_kind')
+    require(not pending,'unknown_creation_retains_custody')
+    return inventory
+
+
+def tracked_create(path,b,mode):
+    path=Path(path);require(path.parent==STAGE or path in (FRAGMENT,POLICY),'fixed_creation_contour')
+    require(str(path) not in journal_inventory(),'creation_already_consumed')
+    journal_append(dict(kind='intent',path=str(path),mode=mode))
+    try:fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,mode)
+    except FileExistsError:
+        journal_append(dict(kind='refused',path=str(path)));raise
+    try:
+        s=os.fstat(fd);ident=list(identity(s))
+        journal_append(dict(kind='created',path=str(path),identity=ident,mode=mode,directory=False))
+        os.fchmod(fd,mode);os.fchown(fd,0,0)
+        view=memoryview(b)
+        while view:
+            count=os.write(fd,view);require(count>0,'root_short_write');view=view[count:]
+        os.fsync(fd)
+        parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+        try:os.fsync(parent)
+        finally:os.close(parent)
+        return ident
+    finally:os.close(fd)
+
+
+def tracked_unlink(path,directory=False):
+    path=Path(path);inventory=journal_inventory();row=inventory.get(str(path))
+    require(row is not None and row['directory']==directory,'unowned_deletion')
+    try:s=path.lstat()
+    except FileNotFoundError:
+        journal_append(dict(kind='removed',path=str(path),identity=row['identity']));return
+    require(list(identity(s))==row['identity'] and s.st_uid==s.st_gid==0
+        and (stat.S_ISDIR(s.st_mode) if directory else stat.S_ISREG(s.st_mode)) and not s.st_mode&0o022,'foreign_deletion_refused')
+    if directory:path.rmdir()
+    else:path.unlink()
+    parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:os.fsync(parent)
+    finally:os.close(parent)
+    journal_append(dict(kind='removed',path=str(path),identity=row['identity']))
+
+
+def verify_inventory():
+    inventory=journal_inventory()
+    for name,row in inventory.items():
+        path=Path(name);s=path.lstat()
+        require(list(identity(s))==row['identity'] and s.st_uid==s.st_gid==0
+                and (stat.S_ISDIR(s.st_mode) if row['directory'] else stat.S_ISREG(s.st_mode)) and not s.st_mode&0o022,'root_inventory_replaced')
+    require({str(p) for p in STAGE.iterdir()}=={name for name in inventory if Path(name).parent==STAGE},'foreign_stage_artifact')
+    return inventory
+
+
+def create(path,b,mode):return tracked_create(path,b,mode)
+
+
+def main():
+    # The literal loader owns the only custody guard, including module execution.
+    require('BOOTSTRAP_CONTEXT' in globals(),'exact_original_bootstrap_required')
+    return install(BOOTSTRAP_CONTEXT)
+
+
+def rollback(context):
+    end=context['deadline_monotonic']
+    def check(reserve=0):require(time.monotonic()+reserve<end,'original_install_budget_exhausted')
+    def run(argv,seconds):
+        check(seconds)
+        p=bounded_command(argv,seconds)
+        require(p.returncode in (0,4) and not p.stderr and len(p.stdout)<1048576,'rollback_observation_unknown')
+        check();return p.stdout.decode()
+    inventory=verify_inventory()
+    # No unit is ever started by installation. An unexpected live/foreign
+    # invocation preserves custody instead of giving rollback generic stop power.
+    text=run(['/usr/bin/systemctl','--system','--no-pager','show',UNIT,
+        '--property=Id,LoadState,ActiveState,MainPID,ControlPID,Job,InvocationID,ControlGroup,FragmentPath,DropInPaths'],3)
+    state=dict(x.split('=',1) for x in text.splitlines())
+    require(state['Id']==UNIT and state['MainPID']==state['ControlPID']=='0' and state['Job'] in ('','0')
+        and state['ActiveState']=='inactive' and not state['InvocationID'] and not state['ControlGroup'] and not state['DropInPaths']
+        and state['FragmentPath'] in ('',str(FRAGMENT)),'rollback_unit_not_pristine')
+    if str(FRAGMENT) in inventory:check();tracked_unlink(FRAGMENT)
+    run(['/usr/bin/systemctl','--system','--no-pager','daemon-reload'],5)
+    text=run(['/usr/bin/systemctl','--system','--no-pager','show',UNIT,
+        '--property=Id,LoadState,ActiveState,MainPID,ControlPID,Job,InvocationID,ControlGroup,FragmentPath'],3)
+    state=dict(x.split('=',1) for x in text.splitlines())
+    require(state['Id']==UNIT and state['LoadState']=='not-found' and state['ActiveState']=='inactive'
+        and state['MainPID']==state['ControlPID']=='0' and state['Job'] in ('','0')
+        and not state['InvocationID'] and not state['ControlGroup'] and not state['FragmentPath'],'rollback_native_absence_unknown')
+    # Root journal keeps exact created identities even if writes/validation failed.
+    inventory=journal_inventory()
+    for name in sorted(inventory):
+        if Path(name).parent==STAGE:check();tracked_unlink(Path(name))
+    inventory=journal_inventory()
+    if str(STAGE) in inventory:check();tracked_unlink(STAGE,directory=True)
+    if str(POLICY) in journal_inventory():check();tracked_unlink(POLICY)
+    require(not journal_inventory(),'rollback_inventory_not_empty');check()
+    # Only the original loader may unlink its held journal after exact validation.
+    for q in (STAGE,FRAGMENT,POLICY):
+        try:q.lstat()
+        except FileNotFoundError:continue
+        raise RuntimeError('rollback_absence_unknown')
+    check()
+
+
+def install(context):
+    require(os.getuid()==os.geteuid()==0 and len(sys.argv)==3,'root_bootstrap_review_path_required')
+    os.umask(0o077);os.sched_setaffinity(0,{0,1});resource.setrlimit(resource.RLIMIT_AS,(2147483648,2147483648))
+    rootdir(STAGE);rootdir(FRAGMENT.parent);rootdir(POLICY.parent)
+    bootstrap=Path(__file__)
+    require(bootstrap==STAGE/'bootstrap.py','root_staged_bootstrap_only')
+    own,s=data(bootstrap,0,0o444)
+    require(set(p.name for p in STAGE.iterdir())=={'bootstrap.py'},'initial_stage_collision')
+    # External final review path only selects a nonexecuted data record. The
+    # installed commands themselves expose no caller path/argv parameters.
+    review_path=Path(sys.argv[1]);b,_=data(review_path,1000,0o400);review_bytes=b
+    require(digest(b)==sys.argv[2],'exact_review_bytes_required');review=unique_json(b)
+    require(review['state']=='INDEPENDENT_OFFLINE_BUILD_SYSTEM_SERVICE_SOURCE_ACCEPTED'
+            and review['source_task']=='FRW041-OFFLINE-BUILD-FINAL-JOIN-SOL#1'
+            and review['runtime_grant'] is False,'independent_final_source_review_required')
+    b,_=data(SOURCE/'package-pins.json',1000,0o400);pins=json.loads(b)
+    require(digest(b)==review['package_pins_sha256'],'reviewed_package_drift')
+    payloads={}
+    for name,pin in pins.items():
+        require(re.fullmatch(r'[A-Za-z0-9_.-]+',name),'package_leaf_required')
+        b,_=data(SOURCE/name,1000,0o400);require(digest(b)==pin['sha256'],'source_pin_changed:'+name);payloads[name]=b
+    require(digest(own)==pins['install-system.py']['sha256'],'bootstrap_pin_changed')
+    b,_=data(SOURCE/'install-bundle.json',1000,0o400);require(digest(b)==BUNDLE_SHA,'install_bundle_changed');bundle=json.loads(b)
+    require(bundle['stage']==str(STAGE) and bundle['unit']==UNIT and bundle['fragment']==str(FRAGMENT)
+            and bundle['policy']==str(POLICY) and bundle['source']==str(SOURCE) and bundle['live']==str(LIVE),'fixed_bundle_contour')
+    require(set(bundle['root_assets'])=={'admin-control.py','preflight','start','observe','stop','cleanup','build.py','inputs.json','phase-plan.json'},'fixed_asset_inventory')
+    for p in (FRAGMENT, POLICY, Path('/etc/systemd/system')/UNIT,FRAGMENT.with_name(UNIT+'.d'),Path('/etc/systemd/system')/(UNIT+'.d')):absent(p)
+    dependency_spec=json.loads(payloads['source-pins.json'])['administrative_executables']
+    for alias,pin in dependency_spec.items():
+        q=Path(alias).resolve(strict=True);require(str(q)==pin['resolved'],'admin_dependency_alias')
+        rootdir(q.parent);b,metadata=data(q,0,maximum=20000000,single_link=False)
+        require([metadata.st_uid,metadata.st_gid,stat.S_IMODE(metadata.st_mode),metadata.st_nlink]
+            == [pin['uid'],pin['gid'],pin['mode'],pin['nlink']],'admin_dependency_boundary')
+        require(digest(b)==pin['sha256'] and len(b)==pin['size'],'admin_dependency_pin')
+    started=context['started_monotonic'];end=context['deadline_monotonic']-20
+    # Twenty of the original sixty seconds are reserved for exact rollback.
+    def run(argv,seconds=3,allowed=(0,)):
+        require(time.monotonic()+seconds<end,'admin_preparation_clock_exhausted')
+        p=bounded_command(argv,seconds)
+        require(len(p.stdout)+len(p.stderr)<1048576 and p.returncode in allowed and not p.stderr,'administration_command_failed')
+        return p.stdout.decode()
+    def manager():
+        pre=['/usr/bin/busctl','--system','--no-pager','--json=short','--auto-start=no','--allow-interactive-authorization=no','--timeout=2',
+             'call','org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus']
+        def one(text,sig):
+            x=json.loads(text);require(x['type']==sig and len(x['data'])==1,'manager_reply');return x['data'][0]
+        name=one(run(pre+['GetNameOwner','s','org.freedesktop.systemd1'],2),'s')
+        require(re.fullmatch(r':[0-9]+\.[0-9]+',name),'unique_bus_owner')
+        props=one(run(pre+['GetConnectionCredentials','s',name],2),'a{sv}')
+        require(props['ProcessID']=={'type':'u','data':1} and props['UnixUserID']=={'type':'u','data':0},'PID1_system_bus_required')
+        return dict(scope='system',pid=1,uid=0,bus_owner=name,boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                    start_ticks=int(Path('/proc/1/stat').read_text().rsplit(')',1)[1].split()[19]))
+    before=run(['/usr/bin/systemctl','--system','--no-pager','show',UNIT,'--property=Id,LoadState,ActiveState,MainPID,ControlPID,Job,FragmentPath,DropInPaths'],allowed=(0,4))
+    state=dict(x.split('=',1) for x in before.splitlines())
+    require(state['Id']==UNIT and state['LoadState']=='not-found' and state['ActiveState']=='inactive'
+            and state['MainPID']==state['ControlPID']=='0' and state['Job'] in ('','0') and not state['FragmentPath'] and not state['DropInPaths'],'existing_unit_collision')
+    owner=manager()
+    require(run(['/usr/bin/id','-u','jericho']).strip()=='1000' and run(['/usr/bin/id','-g','jericho']).strip()=='1000','payload_account_changed')
+    fragment=payloads['offline-build.service'];require(digest(fragment)==bundle['fragment_sha256'],'fragment_hash')
+    # Parse-only native validation. It does not start a service.
+    staged_fragment=STAGE/UNIT
+    create(staged_fragment,fragment,0o444)
+    run(['/usr/bin/systemd-analyze','verify','--man=no',str(staged_fragment)],5)
+    tracked_unlink(staged_fragment)
+    assets={}
+    assets['bootstrap.py']=dict(sha256=digest(own),identity=[s.st_dev,s.st_ino],mode=0o444)
+    for name,pin in bundle['root_assets'].items():
+        require(digest(payloads[name])==pin['sha256'] and pin['mode'] in (0o444,0o555),'root_asset_hash')
+        asset_identity=create(STAGE/name,payloads[name],pin['mode']);assets[name]=dict(pin,identity=asset_identity)
+    create(STAGE/'control.lock',b'',0o600)
+    create(STAGE/'observe.lock',b'',0o600)
+    fragment_id=create(FRAGMENT,fragment,0o444)
+    # visudo validates exact isolated policy before publication; whole policy
+    # parse afterward and exact user no-argument command admission checked.
+    policy=payloads['sudoers'];require(digest(policy)==bundle['policy_sha256'],'policy_hash')
+    staged_policy=STAGE/'policy.pending';create(staged_policy,policy,0o440)
+    run(['/usr/sbin/visudo','-c','-f',str(staged_policy)])
+    policy_id=create(POLICY,policy,0o440);tracked_unlink(staged_policy)
+    run(['/usr/sbin/visudo','-c'])
+    run(['/usr/bin/systemctl','--system','--no-pager','daemon-reload'],5)
+    out=run(['/usr/bin/systemctl','--system','--no-pager','show',UNIT,'--property=Id,LoadState,ActiveState,MainPID,ControlPID,Job,InvocationID,ControlGroup,FragmentPath,DropInPaths,Transient,NeedDaemonReload'])
+    loaded=dict(x.split('=',1) for x in out.splitlines())
+    require(loaded['Id']==UNIT and loaded['LoadState']=='loaded' and loaded['ActiveState']=='inactive'
+            and loaded['MainPID']==loaded['ControlPID']=='0' and loaded['Job'] in ('','0')
+            and not loaded['InvocationID'] and not loaded['ControlGroup']
+            and loaded['FragmentPath']==str(FRAGMENT) and not loaded['DropInPaths']
+            and loaded['Transient']=='no' and loaded['NeedDaemonReload']=='no','loaded_exact_ordinary_unit_required')
+    for op in ('preflight','start','observe','stop','cleanup'):
+        run(['/usr/sbin/runuser','-u','jericho','--','/usr/bin/sudo','-n','-l','--',str(STAGE/op)])
+    require(manager()==owner,'manager_changed_during_install')
+    receipt=dict(state='EXACT_ROOT_DEPENDENCIES_INSTALLED_NOT_STARTED',unit=UNIT,stage=str(STAGE),source=str(SOURCE),live=str(LIVE),
+        manager=owner,assets=assets,administrative_executables=dependency_spec,fragment_sha256=digest(fragment),fragment_identity=fragment_id,
+        policy_sha256=digest(policy),policy_identity=policy_id,
+        payloads={**{name:pin['sha256'] for name,pin in pins.items()},'package-pins.json':review['package_pins_sha256']},
+        independent_review_path=str(review_path),independent_review_sha256=digest(review_bytes),
+        installation_owner=context,journal_path=str(JOURNAL),journal_identity=list(identity(JOURNAL.lstat())),
+        loaded=loaded,installation_elapsed_seconds=time.monotonic()-started,trial_started=False)
+    create(STAGE/'receipt.json',(json.dumps(receipt,indent=2)+'\n').encode(),0o444)
+    require(time.monotonic()<end,'installation_late_unknown')
+    journal_append(dict(kind='prepared',receipt_sha256=digest((json.dumps(receipt,indent=2)+'\n').encode()),
+                        observed_monotonic=time.monotonic()))
+    return receipt
+
+
+if __name__=='__main__':main()

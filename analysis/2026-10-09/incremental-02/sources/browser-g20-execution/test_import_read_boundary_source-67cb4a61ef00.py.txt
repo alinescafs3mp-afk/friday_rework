@@ -1,0 +1,128 @@
+"""SOURCE ONLY / NOT_RUN. Pure decisions and actual wrapper AST in isolated globals.
+No guard installation, candidate import, host-file content or forbidden syscall.
+Separate copied test_import_path_source.py supplies the real private kernel probes.
+"""
+import ast
+import errno
+import os
+from pathlib import Path
+from types import SimpleNamespace
+import pytest
+
+ROOT=Path(__file__).parent
+PUBLIC={'/proc/1/cgroup','/proc/version','/proc/stat','/proc/self/mountinfo'}
+DENIED={'/proc','/proc/1','/proc/statx','/proc/stat/extra','/proc/2/cgroup',
+        '/proc/1/environ','/proc/1/cmdline','/proc/1/mem','/proc/1/stat',
+        '/proc/self/environ','/proc/self/cmdline','/proc/self/smaps','/proc/net/tcp',
+        '/proc/cpuinfo','/proc/meminfo','/proc/pressure/cpu','/etc/shadow',
+        '<USER_HOME>/auth.json','/sys/fs/cgroup/cpu.max'}
+
+class Refused(RuntimeError):pass
+
+def rejected(reason):raise Refused(reason)
+
+def functions(*names, **values):
+    tree=ast.parse((ROOT/'private_effect_fence.py').read_text())
+    nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names]
+    assert len(nodes)==len(names)
+    env={'os':os,**values}
+    exec(compile(ast.Module(body=nodes,type_ignores=[]),'<exact-fence-source>','exec'),env)
+    return SimpleNamespace(**{name:env[name] for name in names})
+
+def test_exact_four_public_files_only():
+    tree=ast.parse((ROOT/'private_effect_fence.py').read_text())
+    values=[ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign)
+            and any(isinstance(t,ast.Name) and t.id=='PUBLIC_HOST_READS' for t in n.targets)]
+    assert values==[PUBLIC]
+    api=functions('public_read_allowed',PUBLIC_READABLE=PUBLIC)
+    assert all(api.public_read_allowed(p) for p in PUBLIC)
+    assert not any(api.public_read_allowed(p) for p in DENIED)
+
+def test_self_mountinfo_never_grants_foreign_pid():
+    own='/proc/4321/mountinfo'
+    api=functions('public_read_allowed',PUBLIC_READABLE=(PUBLIC-{'/proc/self/mountinfo'})|{own})
+    assert api.public_read_allowed(own)
+    assert not api.public_read_allowed('/proc/4322/mountinfo')
+    assert not api.public_read_allowed('/proc/4321/environ')
+
+@pytest.mark.parametrize('write_flag',[os.O_WRONLY,os.O_RDWR,os.O_CREAT,os.O_TRUNC,os.O_APPEND])
+def test_public_reads_do_not_bypass_write_policy(write_flag):
+    seen=[]
+    def fail(*args,**kwargs):raise Refused('outside private write root')
+    api=functions('guarded_open',check_import_open=lambda *a:None,WRITE_FLAGS=write_flag,
+                  check_path=fail,read_ok=lambda *a:pytest.fail('write routed to read allowlist'),
+                  LOCAL=SimpleNamespace(),string_path=str,RAW={'open':lambda *a,**k:seen.append(a)})
+    for path in PUBLIC:
+        with pytest.raises(Refused):api.guarded_open(path,write_flag)
+    assert seen==[]
+
+@pytest.mark.parametrize('active,provenance,flags,path',[
+    (False,True,os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,'/ancestor'),
+    (True,False,os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,'/ancestor'),
+    (True,True,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,'/ancestor'),
+    (True,True,os.O_PATH|os.O_DIRECTORY|os.O_CLOEXEC,'/ancestor'),
+    (True,True,os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,'/ancestor/extra'),
+    (True,True,os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,99),
+])
+def test_archive_metadata_is_not_a_directory_or_descriptor_grant(active,provenance,flags,path):
+    api=functions('import_metadata_allowed',canonical=lambda p:p,string_path=str,
+                  IMPORT_ANCESTORS={'/','/ancestor'})
+    assert not api.import_metadata_allowed(path,flags,active,provenance)
+
+def test_exact_metadata_positive():
+    api=functions('import_metadata_allowed',canonical=lambda p:p,string_path=str,
+                  IMPORT_ANCESTORS={'/','/ancestor'})
+    assert api.import_metadata_allowed('/ancestor',os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,True,True)
+
+def import_wrapper(failure):
+    state={}; local=SimpleNamespace(absent_import_probe=False)
+    helper=SimpleNamespace(ARCHIVE='/exact/python314.zip',failure_only_open=failure,ProbeRefusal=Refused)
+    api=functions('check_import_open',fd_path=lambda p:('/exact/python314.zip',None),
+                  string_path=str,canonical=lambda p:p,RAW={'getcwd':lambda:'/cwd'},
+                  LOCAL=local,import_path=helper,IMPORT_MANIFEST={},state=state,deny=rejected)
+    return api,state,local
+
+def test_original_kernel_exception_propagates_and_content_open_unreachable():
+    actual=FileNotFoundError(errno.ENOENT,'missing','python314.zip')
+    def missing(*a):raise actual
+    api,state,local=import_wrapper(missing)
+    with pytest.raises(FileNotFoundError) as got:api.check_import_open('/exact/python314.zip',os.O_RDONLY)
+    assert got.value is actual
+    assert state['absent_import_enoent_count']==1
+    assert state['last_absent_import_probe']['content_open'] is False
+    assert local.absent_import_probe is False
+
+def test_helper_refusal_remains_hard_refusal_and_clears_reentrancy():
+    def refused(*a):raise Refused('DECLARED_ABSENT_LEAF_PRESENT')
+    api,state,local=import_wrapper(refused)
+    with pytest.raises(Refused,match='ABSENT_IMPORT_PROBE_REFUSED'):api.check_import_open('/exact/python314.zip',0)
+    assert not state and local.absent_import_probe is False
+
+def test_dirfd_anchor_reaches_exact_helper():
+    seen=[]
+    api,state,local=import_wrapper(lambda *a:seen.append(a))
+    api.check_import_open('python314.zip',0,42)
+    assert seen[0][1:]==('/proc/self/fd/42/python314.zip',0,'/proc/self/fd/42/python314.zip')
+    assert not state and local.absent_import_probe is False
+
+def test_builtins_audit_cannot_ignore_failure_only_archive_route():
+    tree=ast.parse((ROOT/'private_effect_fence.py').read_text())
+    audit=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='audit')
+    opening=next(n for n in audit.body if isinstance(n,ast.If) and ast.unparse(n.test)=="event == 'open'")
+    direct_calls=[n.value.func.id for n in opening.body if isinstance(n,ast.Expr)
+                  and isinstance(n.value,ast.Call) and isinstance(n.value.func,ast.Name)]
+    assert 'check_import_open' in direct_calls
+    source=ast.unparse(opening)
+    assert source.index('import_metadata_allowed')<source.index('checked =')
+    assert source.index('check_import_open')<source.index("check_path('open'")
+
+def test_process_socket_thread_and_sigint_guards_preserved():
+    prior=ROOT.parent/'browser-owner-controls-preparation/private_effect_fence.py'
+    def nodes(path):
+        return {n.name:ast.dump(n,include_attributes=False) for n in ast.parse(path.read_text()).body
+                if isinstance(n,ast.FunctionDef)}
+    old,new=nodes(prior),nodes(ROOT/'private_effect_fence.py')
+    for name in ('guarded_bind','guarded_close','guarded_socketpair','guarded_send','guarded_recv',
+                 'guarded_thread_start','guarded_joinable','guarded_signal','closed_primitives',
+                 'check_path','check_fd','path_ok','fd_path','canonical'):
+        assert new[name]==old[name],name

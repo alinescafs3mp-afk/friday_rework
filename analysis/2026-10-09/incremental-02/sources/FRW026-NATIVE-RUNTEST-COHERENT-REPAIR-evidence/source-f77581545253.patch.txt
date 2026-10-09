@@ -1,0 +1,2301 @@
+--- a/donor/scripts/run_tests_parallel.py
++++ b/donor/scripts/run_tests_parallel.py
+@@ -538,77 +538,159 @@
+     env["TMPDIR"] = temproot
+ 
+     subproc_start = time.monotonic()
+-    # launch the pytest process
+-    launch = subprocess.Popen if custody is None else custody["spawn"]
+-    proc = launch(
+-        cmd,
+-        cwd=repo_root,
+-        stdout=subprocess.PIPE,
+-        stderr=subprocess.STDOUT,
+-        text=True, encoding="utf-8", errors="replace",
+-        env=env,
+-        # POSIX: place the child at the head of its own process group so
+-        # _kill_tree can SIGKILL the group atomically.
+-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+-        # _kill_tree handles the Windows path via taskkill /F /T.
+-        start_new_session=True,
+-    )
+-
+-    # Capture the pgid NOW, before the leader can exit and be reaped. Once
+-    # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
+-    # even though grandchildren in that group are still alive — defeating
+-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
+-    pgid: int | None = None
+-    if sys.platform != "win32":
++    if custody is None:
++        # launch the pytest process
++        launch = subprocess.Popen if custody is None else custody["spawn"]
++        proc = launch(
++            cmd,
++            cwd=repo_root,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++            text=True, encoding="utf-8", errors="replace",
++            env=env,
++            # POSIX: place the child at the head of its own process group so
++            # _kill_tree can SIGKILL the group atomically.
++            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
++            # _kill_tree handles the Windows path via taskkill /F /T.
++            start_new_session=True,
++        )
++
++        # Capture the pgid NOW, before the leader can exit and be reaped. Once
++        # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
++        # even though grandchildren in that group are still alive — defeating
++        # the whole cleanup. None on Windows where the pgid concept doesn't apply.
++        pgid: int | None = None
++        if sys.platform != "win32":
++            try:
++                pgid = os.getpgid(proc.pid)
++            except (ProcessLookupError, PermissionError):
++                pgid = None
++
+         try:
+-            pgid = os.getpgid(proc.pid)
+-        except (ProcessLookupError, PermissionError):
+-            pgid = None
+-
+-    try:
+-        output, _ = proc.communicate(timeout=file_timeout)
+-        rc = proc.returncode
+-    except subprocess.TimeoutExpired:
+-        if custody is None:
+-            _kill_tree(proc, pgid=pgid)
++            output, _ = proc.communicate(timeout=file_timeout)
++            rc = proc.returncode
++        except subprocess.TimeoutExpired:
++            if custody is None:
++                _kill_tree(proc, pgid=pgid)
++            else:
++                custody["stop"](proc, pgid)
++            try:
++                output, _ = proc.communicate(timeout=10 if custody is None else custody["remaining"]())
++            except subprocess.TimeoutExpired:
++                output = "(file timeout exceeded; output unavailable)"
++            rc = 124  # de facto convention for "killed by timeout".
++            output = (
++                f"({file_timeout:.0f}s exceeded; "
++                f"{"process tree SIGKILL intent" if custody is None else "owned stop requested; independent cessation required"})\n{output}"
++            )
++        except BaseException:
++            # KeyboardInterrupt / runner crash — make sure no zombie
++            # grandchildren outlive us.
++            if custody is None:
++                _kill_tree(proc, pgid=pgid)
++            else:
++                custody["stop"](proc, pgid)
++            raise
+         else:
+-            custody["stop"](proc, pgid)
++            # Happy path: pytest exited on its own. Kill the group anyway in
++            # case it left grandchildren behind; already-dead is a no-op.
++            if custody is None:
++                _kill_tree(proc, pgid=pgid)
++            else:
++                custody["stop"](proc, pgid)
++
++            output +=  "\n"
++        finally:
++            if custody is not None:
++                # Refusal retains the exact temp root and registry handle. Never
++                # unlink evidence while a child/group may still own it.
++                custody["settle"](proc, pgid, temproot)
++            # Delete the temp root for this attempt. Nothing reads it after the
++            # subprocess exits. More than 3000 of them fill the disk of the
++            # runner over one suite. Permission fixtures leave read-only dirs
++            # behind; make them writable and retry instead of skipping them.
++            _rmtree_force(temproot)
++
++    else:
++        # Establish the sole donor drain/reap/settlement path BEFORE Popen or
++        # any fallible identity/checkpoint/backend write. No detached drainer.
++        proc = None
++        pgid = None
++        output = ""
++        rc = None
++        primary_error = None
++        cuts = []
++        settled = False
+         try:
+-            output, _ = proc.communicate(timeout=10 if custody is None else custody["remaining"]())
+-        except subprocess.TimeoutExpired:
+-            output = "(file timeout exceeded; output unavailable)"
+-        rc = 124  # de facto convention for "killed by timeout".
+-        output = (
+-            f"({file_timeout:.0f}s exceeded; "
+-            f"{"process tree SIGKILL intent" if custody is None else "owned stop requested; independent cessation required"})\n{output}"
+-        )
+-    except BaseException:
+-        # KeyboardInterrupt / runner crash — make sure no zombie
+-        # grandchildren outlive us.
+-        if custody is None:
+-            _kill_tree(proc, pgid=pgid)
++            proc = custody["spawn"](cmd, cwd=repo_root, stdout=subprocess.PIPE,
++                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
++                env=env, start_new_session=True)
++            # Registry/owner identity and diagnostic writes occur only AFTER
++            # the donor received the actual handle and entered this try/finally.
++            custody["after_spawn"](proc)
++            pgid = os.getpgid(proc.pid) if sys.platform != "win32" else None
++            output, _ = proc.communicate(timeout=file_timeout)
++            rc = proc.returncode
++        except subprocess.TimeoutExpired as error:
++            primary_error = error
++            rc = 124
++        except BaseException as error:
++            primary_error = error
++        finally:
++            if proc is None:
++                # Same already-spawned object if callback return was interrupted;
++                # never Popen again, never adopt a numeric foreign handle.
++                proc = custody["retained_handle"]()
++            if proc is not None:
++                pgid = custody["retained_pgid"]()
++                try:
++                    custody["stop"](proc, pgid)
++                except BaseException as error:
++                    cuts.append({'operation': 'stop', 'error': type(error).__name__})
++                # Even failed stop/checkpoint must reach this same donor reader.
++                # communicate after TimeoutExpired continues CPython's same
++                # retained pipe state; it is not a second competing drainer.
++                if proc.returncode is None:
++                    try:
++                        output, _ = proc.communicate(timeout=custody["remaining"]())
++                    except BaseException as error:
++                        cuts.append({'operation': 'drain_reap', 'error': type(error).__name__})
++                        partial = getattr(error, 'output', None)
++                        if partial is not None:
++                            output = partial.decode('utf-8', 'replace') if isinstance(partial, bytes) else partial
++                if not output and primary_error is not None:
++                    partial = getattr(primary_error, 'output', None)
++                    if partial is not None:
++                        output = partial.decode('utf-8', 'replace') if isinstance(partial, bytes) else partial
++                # In-memory output custody precedes fallible diagnostic writes.
++                # capture stores it in the existing registry session even when
++                # the durable receipt cannot be written; it does not read pipes.
++                try:
++                    custody["capture"](proc, output, primary_error, cuts)
++                except BaseException as error:
++                    cuts.append({'operation': 'capture', 'error': type(error).__name__})
++                try:
++                    custody["settle"](proc, pgid, temproot)
++                    settled = True
++                except BaseException as error:
++                    cuts.append({'operation': 'settle', 'error': type(error).__name__})
++                if primary_error is None and rc is None:
++                    rc = proc.returncode
++            # Failure never removes the only partial output/temp evidence. An
++            # actual outer receipt still gates registry/capacity release later.
++            if settled and primary_error is None and not cuts:
++                _rmtree_force(temproot)
++        if cuts or not settled:
++            # Actual handle/output remain in the existing session; callers may
++            # reconcile that same custody but must never replay this file.
++            failure = RuntimeError('RUNTEST_DONOR_CUSTODY_RETAINED_STOP_UNCONFIRMED:' + repr(cuts))
++            raise failure from primary_error
++        if primary_error is not None and not isinstance(primary_error, subprocess.TimeoutExpired):
++            raise primary_error
++        if isinstance(primary_error, subprocess.TimeoutExpired):
++            output = f"({file_timeout:.0f}s exceeded; owned stop requested; independent cessation required)\n{output}"
+         else:
+-            custody["stop"](proc, pgid)
+-        raise
+-    else:
+-        # Happy path: pytest exited on its own. Kill the group anyway in
+-        # case it left grandchildren behind; already-dead is a no-op.
+-        if custody is None:
+-            _kill_tree(proc, pgid=pgid)
+-        else:
+-            custody["stop"](proc, pgid)
+-
+-        output +=  "\n"
+-    finally:
+-        if custody is not None:
+-            # Refusal retains the exact temp root and registry handle. Never
+-            # unlink evidence while a child/group may still own it.
+-            custody["settle"](proc, pgid, temproot)
+-        # Delete the temp root for this attempt. Nothing reads it after the
+-        # subprocess exits. More than 3000 of them fill the disk of the
+-        # runner over one suite. Permission fixtures leave read-only dirs
+-        # behind; make them writable and retry instead of skipping them.
+-        _rmtree_force(temproot)
++            output += "\n"
+ 
+     if rc not in (0, 5) and not output.strip():
+         output = f"pytest child exited {rc} (0x{rc & 0xffffffff:08x}) with no output: {file}\n"
+--- a/donor/source-pins.json
++++ b/donor/source-pins.json
+@@ -1,5 +1,5 @@
+ {
+-  "scripts/run_tests_parallel.py": "3f779daac4a45991b8f74ea22ddc24c272dfeec6a1ee50a91ee367dc76480bb0",
+-  "tools/process_registry.py": "01fe1f02f3abc13df8cd44fb9deea7c13884593607f9a1b44a2a28deb0aa4b43",
+-  "tools/process_registry_checkpoint.py": "684a312dd48a08891592f9b8c91d82fc7b0dcd3080da395e66e97e5ffba27f5e"
++  "scripts/run_tests_parallel.py": "db79d6c3c798e5fe87ce366271ea5c2e150d741eb7d0763a484273f96861e418",
++  "tools/process_registry.py": "728bd8151b091ba9fb70f0941d016d06254e86495f9053155aebec90a0e3f4ea",
++  "tools/process_registry_checkpoint.py": "28a7d5fa97b892ac44f7bead3c3f8c1d75cf60aeb54261eb322d8c8f3a883256"
+ }
+--- a/donor/tools/process_registry.py
++++ b/donor/tools/process_registry.py
+@@ -569,6 +569,7 @@
+     runtest_launch_pending: bool = False
+     runtest_pgid: Optional[int] = None
+     runtest_sid: Optional[int] = None
++    runtest_persistence_error: str = ""
+     web_tool_call_id: str = ""
+     web_turn_id: str = ""
+     web_custody: bool = False
+@@ -670,7 +671,7 @@
+ # Session fields persisted verbatim in the crash-recovery checkpoint (plus
+ # ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
+ _CHECKPOINT_FIELDS = (
+-    "runtest_custody", "runtest_unit", "runtest_deadline", "runtest_boot_id", "runtest_stop_requested", "runtest_launch_pending", "runtest_pgid", "runtest_sid",
++    "runtest_custody", "runtest_unit", "runtest_deadline", "runtest_boot_id", "runtest_stop_requested", "runtest_launch_pending", "runtest_pgid", "runtest_sid", "runtest_persistence_error",
+     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "wsl_chain", "cwd",
+     "started_at", "task_id", "owner_task_id", "session_key",
+     "web_tool_call_id", "web_turn_id", "web_custody", "web_invocation", "web_cgroup", "web_cgroup_identity", "web_deadline", "web_boot_id", "web_unconfirmed", "web_stop_requested",
+@@ -727,6 +728,8 @@
+     _SHELL_NOISE_SUBSTRINGS = (
+         "no job control in this shell", "cannot set terminal process group",
+         "tcsetattr: Inappropriate ioctl for device")
++
++    _checkpoint_lock = threading.RLock()
+ 
+     # Class default so registries built via __new__ (tests) still restore on first drain.
+     _completions_restored = False
+@@ -1291,15 +1294,28 @@
+             proc.wait(timeout=5)
+ 
+     def _runtest_checkpoint(self, session):
+-        """Unlike the best-effort generic writer, this admission needs readback."""
+-        self._write_checkpoint()
+-        rows = json.loads(_checkpoint_path().read_text())
+-        matches = [r for r in rows if r.get('session_id') == session.id]
+-        if len(matches) != 1 or any(matches[0].get(k) != getattr(session, k) for k in
+-                ('runtest_custody', 'runtest_unit', 'runtest_deadline', 'runtest_boot_id',
+-                 'runtest_stop_requested', 'runtest_launch_pending', 'runtest_pgid', 'runtest_sid',
+-                 'task_id', 'owner_task_id', 'session_key', 'pid', 'host_start_time')):
+-            raise RuntimeError('RUNTEST_CUSTODY_CHECKPOINT_UNCONFIRMED')
++        """Strict existing checkpoint transaction, including directory durability.
++
++        Every generic writer takes this same lock before snapshotting. Readback
++        is inside that transaction, never evidence for an unordered old writer.
++        """
++        with self._checkpoint_lock:
++            try:
++                self._write_checkpoint(strict=True)
++                rows = json.loads(_checkpoint_path().read_text())
++                matches = [r for r in rows if r.get('session_id') == session.id]
++                if len(matches) != 1 or any(matches[0].get(k) != getattr(session, k) for k in
++                        ('runtest_custody', 'runtest_unit', 'runtest_deadline', 'runtest_boot_id',
++                         'runtest_stop_requested', 'runtest_launch_pending', 'runtest_pgid', 'runtest_sid',
++                         'runtest_persistence_error', 'task_id', 'owner_task_id', 'session_key', 'pid', 'host_start_time')):
++                    raise RuntimeError('RUNTEST_CUSTODY_CHECKPOINT_UNCONFIRMED')
++            except BaseException as error:
++                # A later successful diagnostic write cannot silently clear an
++                # earlier unknown custody transition or permit another launch.
++                with session._lock:
++                    session.runtest_stop_requested = True
++                    session.runtest_persistence_error = type(error).__name__
++                raise
+ 
+     def reserve_runtest(self, *, command, cwd, task_id, session_key, unit_id, deadline):
+         """Reserve in THIS registry before donor Popen. Does not grant execution.
+@@ -1322,45 +1338,70 @@
+         return session
+ 
+     def spawn_runtest(self, session, argv, popen_kwargs):
+-        """Only donor's actual Popen, under existing session/stop ownership."""
++        """Transfer the actual handle to the sole donor BEFORE fallible setup.
++
++        Reservation was durable before Popen. The caller's donor try/finally
++        already covers this callback; its retained_handle callback can recover
++        session.process if an exception interrupts return. No second Popen.
++        """
+         with session._lock:
+             if (not session.runtest_custody or not session.runtest_launch_pending or session.process is not None or
+-                session.runtest_stop_requested or time.monotonic() >= session.runtest_deadline or
++                session.runtest_stop_requested or session.runtest_persistence_error or
++                time.monotonic() >= session.runtest_deadline or
+                 Path('/proc/sys/kernel/random/boot_id').read_text().strip() != session.runtest_boot_id):
+                 raise RuntimeError('RUNTEST_SPAWN_FENCED_NO_RETRY')
+             if popen_kwargs.get('start_new_session') is not True or str(popen_kwargs.get('cwd')) != session.cwd:
+                 raise RuntimeError('EXACT_DONOR_SID_AND_CWD_REQUIRED')
+-            # Cancellation takes the same lock; intent was durable before this.
+             proc = subprocess.Popen(argv, **popen_kwargs)
+-            session.process, session.pid = proc, proc.pid
++            session.process = proc
++            session.pid = proc.pid
++            session.runtest_launch_pending = False
++            return proc
++
++    def attach_runtest(self, session, proc):
++        """Fallible identity/checkpoint setup AFTER donor has the actual handle."""
++        with session._lock:
++            if session.process is not proc or proc.pid != session.pid or session.runtest_launch_pending:
++                raise RuntimeError('FOREIGN_RUNTEST_HANDLE')
+             session.host_start_time = self._safe_host_start_time(proc.pid)
+-            session.runtest_pgid, session.runtest_sid = os.getpgid(proc.pid), os.getsid(proc.pid)
+-            session.runtest_launch_pending = False
+-            if session.runtest_pgid != proc.pid or session.runtest_sid != proc.pid or session.host_start_time is None:
++            session.runtest_pgid = os.getpgid(proc.pid)
++            session.runtest_sid = os.getsid(proc.pid)
++            if (session.runtest_pgid != proc.pid or session.runtest_sid != proc.pid or
++                    session.host_start_time is None):
+                 session.runtest_stop_requested = True
+                 raise RuntimeError('RUNTEST_NATIVE_IDENTITY_UNCONFIRMED')
+         self._runtest_checkpoint(session)
+-        return proc
+ 
+     def stop_runtest(self, session, *, source='process.kill'):
+-        # The existing identity-aware termination implementation is reused;
+-        # its pending pidfd repair is a separately reviewed dependency.
++        # Immediate in-memory intent and identity-safe termination precede ANY
++        # diagnostic I/O. Checkpoint failure must not delay the requested stop.
++        # This existing stop has a separate pidfd review prerequisite; we never
++        # weaken identity checks or turn a termination request into cessation.
+         with session._lock:
+             session.runtest_stop_requested = True
+             pending = session.runtest_launch_pending
+             pid, born = session.pid, session.host_start_time
+-        self._runtest_checkpoint(session)
++        result = {'status': 'STOP_UNCONFIRMED', 'session_id': session.id, 'source': source,
++                  'persistence_error': session.runtest_persistence_error}
+         if pending or pid is None or born is None:
+-            return {'status': 'STOP_UNCONFIRMED', 'session_id': session.id,
+-                    'reason': 'RESERVED_OR_UNCONFIRMED_SPAWN_RETAINED_NO_RETRY'}
+-        reserve = 2 * self._daemon_term_grace_seconds() + 1
+-        if session.runtest_deadline - time.monotonic() <= reserve:
+-            return {'status': 'STOP_UNCONFIRMED', 'session_id': session.id,
+-                    'reason': 'OWNER_NATIVE_HARD_DEADLINE_CUSTODY_REQUIRED'}
+-        self._terminate_host_pid(pid, born)
+-        # This is intent, NOT completion. Donor drains/waits and the owner
+-        # observes the exact whole SID/PGID plus outer scope before release.
+-        return {'status': 'STOP_REQUESTED', 'session_id': session.id, 'source': source}
++            result['reason'] = 'RESERVED_OR_UNCONFIRMED_SPAWN_RETAINED_NO_RETRY'
++        elif session.runtest_deadline - time.monotonic() <= 2 * self._daemon_term_grace_seconds() + 1:
++            result['reason'] = 'OWNER_NATIVE_HARD_DEADLINE_CUSTODY_REQUIRED'
++        else:
++            try:
++                self._terminate_host_pid(pid, born)
++                result['termination_attempted'] = True
++            except BaseException as error:
++                result['termination_error'] = type(error).__name__
++        try:
++            self._runtest_checkpoint(session)
++        except BaseException as error:
++            result['persistence_error'] = type(error).__name__
++        if result.get('termination_attempted') and not result['persistence_error']:
++            result['status'] = 'STOP_REQUESTED'
++        # Donor alone drains/waits; independent whole SID/PGID and outer
++        # closure remain mandatory before registry/capacity release.
++        return result
+ 
+     def finish_runtest(self, session, *, owner_observation):
+         """Publish only after independently reconciled backend/group closure."""
+@@ -1377,6 +1418,10 @@
+             owner_observation.get('outer_custody_quiescent') is not True or
+             not 0 < owner_observation.get('cessation_upper_monotonic', float('inf')) < session.runtest_deadline):
+             raise RuntimeError('RUNTEST_CUSTODY_RETAINED_STOP_UNCONFIRMED')
++        # A past diagnostic failure never permits a launch retry. After BOTH
++        # actual closure proofs, however, strict durable reconciliation may
++        # settle this same handle; retain the historical error in its record.
++        self._runtest_checkpoint(session)
+         self._completion_consumed.add(session.id)
+         self._finish_exited(session, proc.returncode, source='independent_runtest_owner')
+         session.runtest_custody = False
+@@ -2684,7 +2729,17 @@
+                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
+                 and not (lifecycle and s.persist_on_release)
+             ]
+-        results = [self.kill_process(s.id, source=source, consume_output=consume_output) for s in targets]
++        results = []
++        for session in targets:
++            try:
++                results.append(self.kill_process(session.id, source=source, consume_output=consume_output))
++            except BaseException as error:
++                # Attempt every already-owned target; a failed stop is retained
++                # and cannot be counted as closed or abort later cancellations.
++                session._scope_stop_pending = True
++                logger.error("Owned stop unconfirmed for %s: %s", session.id, type(error).__name__)
++                results.append({'status': 'STOP_UNCONFIRMED', 'session_id': session.id,
++                                'reason': type(error).__name__})
+         return sum(
+             (r.get("status") in {"killed", "already_exited"}
+              or (r.get("status") == "QUIESCENT" and bool(r.get("newly_settled"))))
+--- a/donor/tools/process_registry_checkpoint.py
++++ b/donor/tools/process_registry_checkpoint.py
+@@ -2,6 +2,7 @@
+ 
+ import json
+ import logging
++import os
+ import time
+ from typing import Any, Dict, List, Optional
+ 
+@@ -17,35 +18,46 @@
+ 
+     # ----- Checkpoint (crash recovery) -----
+ 
+-    def _write_checkpoint(self, extra_entries: Optional[List[Dict[str, Any]]] = None):
+-        """Write running process metadata to the checkpoint file atomically."""
++    def _write_checkpoint(self, extra_entries: Optional[List[Dict[str, Any]]] = None, *, strict=False):
++        """One ordered transaction for ALL writers of the existing checkpoint.
++
++        No snapshot can be prepared before acquiring the transaction lock and
++        later overwrite a newly acknowledged reservation. Generic callers keep
++        their best-effort return contract; critical admission propagates errors.
++        """
+         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
+-
++        from utils import atomic_json_write
+         try:
+-            with self._lock:
+-                entries = []
+-                for s in self._running.values():
+-                    if s.exited:
+-                        continue
+-                    # Backfill the start time so recovery can detect PID recycling
+-                    # even for sessions spawned before this field existed.
+-                    if s.host_start_time is None and s.pid_scope == "host" and s.pid:
+-                        s.host_start_time = self._safe_host_start_time(s.pid)
+-                    entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
+-                    # Redact inline credentials before persisting (~/.hermes/processes.json).
+-                    # Recovery uses command only for display (adoption re-validates the
+-                    # PID, never re-runs it), so masking is lossless.
+-                    # See #77484.
+-                    entry["command"] = redact_sensitive_text(s.command, code_file=True)
+-                    entry["owner_task_id"] = s.owner_task_id or s.task_id
+-                    entries.append(entry)
+-                if extra_entries:
+-                    tracked_ids = {item.get("session_id") for item in entries}
+-                    entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
+-            from utils import atomic_json_write
+-            atomic_json_write(_checkpoint_path(), entries)
+-        except Exception as e:
+-            logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
++            with self._checkpoint_lock:
++                with self._lock:
++                    entries = []
++                    for s in self._running.values():
++                        if s.exited:
++                            continue
++                        if s.host_start_time is None and s.pid_scope == "host" and s.pid:
++                            s.host_start_time = self._safe_host_start_time(s.pid)
++                        entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
++                        entry["command"] = redact_sensitive_text(s.command, code_file=True)
++                        entry["owner_task_id"] = s.owner_task_id or s.task_id
++                        entries.append(entry)
++                    if extra_entries:
++                        tracked_ids = {item.get("session_id") for item in entries}
++                        entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
++                    path = _checkpoint_path()
++                    atomic_json_write(path, entries, fsync_dir=True)
++                    # utils.fsync_directory is intentionally best-effort. This
++                    # existing critical checkpoint needs a non-swallowing call.
++                    fd = os.open(path.resolve(strict=True).parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
++                    try:
++                        os.fsync(fd)
++                    finally:
++                        os.close(fd)
++        except BaseException as error:
++            if strict:
++                raise
++            if not isinstance(error, Exception):
++                raise
++            logger.debug("Failed to write checkpoint file: %s", error, exc_info=True)
+ 
+     def recover_from_checkpoint(self) -> int:
+         """On gateway startup, probe PIDs from the checkpoint file; returns how many
+--- a/owner-helper/PROPOSAL.md
++++ b/owner-helper/PROPOSAL.md
+@@ -9,3 +9,24 @@
+ Original1200 seconds / 2CPU / 2GiB / nochildren is a source-work budget only. New pure tests and all candidate code are NOT_RUN. No runtime grant, independent acceptance or release acceptance is issued. Fresh independent source review, full startup observation, actual current38 controls and separately admitted project/native collections remain required. Old evidence cannot transfer to these bytes. Prior exact collection must never be retried or rewritten.
+ 
+ Current38 plan/oracle, original900 execution spec/four phases, exact input bounds, source/runtime pin separation, stop exclusions and limits are unchanged. FRW013 STOP; A0 kernel120 NOT_GRANTED; oldFridayOFF/Pandora; two ordinary subprocess STOP; six HTTP/git plus two inline bash NOT_RUN; all7journeys/4web UNACCEPTED.
++
++
++FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-SOL#1 source delta (not independent acceptance):
++F1 stop initiates existing identity-safe termination before diagnostic I/O; failures
++retain intent/handle and do not abort attempts for other already-owned targets.
++F2 donor try/finally precedes spawn. Actual Popen handle transfers before fallible
++identity/backend writes; one donor drain/reap/capture/settle path covers synchronous
++post-Popen failures. Unknown birth/SID/PGID cannot become a closure claim. Partial
++startup/custody evidence is retained and never replayed or deleted by the donor.
++F3 every existing checkpoint writer shares one snapshot-through-replace transaction;
++critical admission uses file fsync plus non-swallowing actual-parent directory fsync
++and strict readback. Later diagnostic success does not reopen launch. Same-handle
++settlement requires independently observed inner/outer closure and strict persistence.
++F4 session_finish is terminal. Exit5 requires actual collection with zero selected,
++no reports/started/finished items, and complete expected deselection. Contradictions
++retain validated failed report prefixes. Genuine skip/xfail/xpass behavior is preserved.
++F5 actual AnyIO/pytest-asyncio package bodies, installed idna/sniffio/typing_extensions,
++all current entrypoints and exact declared module origins join child and owner pre/post
++pins. Normal autoload/native conftests/loops remain real. Source models and38 real fault
++scenarios are NOT_RUN; they cannot prove kernel cessation/durability/autoload. Separate
++source review, native outer custody/pidfd/startup/effect prerequisites still apply.
+--- a/owner-helper/input-spec.json
++++ b/owner-helper/input-spec.json
+@@ -1,6 +1,6 @@
+ {
+-  "source": "<ASTRA_WORK>/native-runtest-protocol-integration/candidate/producer",
+-  "source_pins_sha256": "acd6326671391333be7f64cc35776c562577ae717a52442e70dfb1ccf6e3139d",
++  "source": "<SOL_WORK>/FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-evidence/candidate/producer",
++  "source_pins_sha256": "46782c50bc1c8cc60e1b915ebfed50e735126700e88d6839aa0455d963434f84",
+   "precedent_helper": {
+     "path": "<ASTRA_WORK>/ordinary-skills-gnu-timeout-integration/qualify.py",
+     "sha256": "1fc14abb0feb3670f57daf2420b9665dea462b29005aa22627b0cba222bce863"
+@@ -69,7 +69,7 @@
+       "outer": 150
+     }
+   ],
+-  "authority": "SOURCE ONLY FRW026-NATIVE-RUNTEST-PROTOCOL-INTEGRATION#1; no execution, clock/grant, stopped attempt or corpus changed.",
++  "authority": "SOURCE ONLY FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-SOL#1; original1800/2CPU2GiB/no children. No execution, runtime clock/grant or stopped-attempt reset; independent current review required.",
+   "baseline_source_review": {
+     "path": "<ASTRA_WORK>/ordinary-skills-collection-source-review.json",
+     "sha256": "deb7fa7d828b60655969f7dfc38d4ed55f58f60f913cd13f773ffda19ff393fb"
+@@ -80,7 +80,7 @@
+     "path": "<ASTRA_WORK>/collection-owner-timing-review/result.json",
+     "sha256": "9505fb201d76c2920d18c0cea6f81ac7516b446f311ce95f3c9c465b68ac76f7"
+   },
+-  "import_path_manifest": "<ASTRA_WORK>/native-runtest-protocol-integration/candidate/producer/import-path-pins.json",
++  "import_path_manifest": "<SOL_WORK>/FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-evidence/candidate/producer/import-path-pins.json",
+   "startup_observation": "REQUIRED_EXACT_CURRENT_IMPORT_MANIFEST; producer and import manifest unchanged. Independent owner decides whether prior same-manifest same-boot observation remains eligible; no runtime evidence transferred by this package.",
+   "native_lexical_inputs": {
+     "hermes_time": {
+@@ -140,19 +140,25 @@
+   },
+   "runtime_overlay": {
+     "runner": {
+-      "path": "<ASTRA_WORK>/native-runtest-protocol-integration/candidate/donor/scripts/run_tests_parallel.py",
+-      "sha256": "3f779daac4a45991b8f74ea22ddc24c272dfeec6a1ee50a91ee367dc76480bb0"
++      "path": "<SOL_WORK>/FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-evidence/candidate/donor/scripts/run_tests_parallel.py",
++      "sha256": "db79d6c3c798e5fe87ce366271ea5c2e150d741eb7d0763a484273f96861e418"
+     },
+     "registry": {
+-      "path": "<ASTRA_WORK>/native-runtest-protocol-integration/candidate/donor/tools/process_registry.py",
+-      "sha256": "01fe1f02f3abc13df8cd44fb9deea7c13884593607f9a1b44a2a28deb0aa4b43"
++      "path": "<SOL_WORK>/FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-evidence/candidate/donor/tools/process_registry.py",
++      "sha256": "728bd8151b091ba9fb70f0941d016d06254e86495f9053155aebec90a0e3f4ea"
+     },
+     "checkpoint": {
+-      "path": "<ASTRA_WORK>/native-runtest-protocol-integration/candidate/donor/tools/process_registry_checkpoint.py",
+-      "sha256": "684a312dd48a08891592f9b8c91d82fc7b0dcd3080da395e66e97e5ffba27f5e"
++      "path": "<SOL_WORK>/FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-evidence/candidate/donor/tools/process_registry_checkpoint.py",
++      "sha256": "28a7d5fa97b892ac44f7bead3c3f8c1d75cf60aeb54261eb322d8c8f3a883256"
+     }
+   },
+   "runtime_receipt_schema": 3,
+-  "runtime_plan_sha256": "b71157e966b8270e734922ecc81b6f2df140e9fc8bf5b13b9ec73d1f24ab0338",
+-  "runtime_caller": "Existing actual native owner may call run_donor_file/observe/finish_runtime_file only after independent final source/custody/effect admission. Old phase-caller.js has consumed clock and hardcoded old backend PID; not reusable execution authority."
++  "runtime_plan_sha256": "b11ba40fae872c6a03375f38eb7e29d69b2a95691bad059188a6e3a5f41d8623",
++  "runtime_caller": "Existing actual native owner may call run_donor_file/observe/finish_runtime_file only after independent final source/custody/effect admission. Old phase-caller.js has consumed clock and hardcoded old backend PID; not reusable execution authority.",
++  "pending_coherent_source_review": {
++    "state": "REQUIRED_NOT_GRANTED",
++    "assignment": "FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-SOL",
++    "generation": 1,
++    "upstream_findings": "F1-F5"
++  }
+ }
+--- a/owner-helper/negative-check-sources.json
++++ b/owner-helper/negative-check-sources.json
+@@ -137,5 +137,11 @@
+       "unchanged descriptor/foreign read/write/credential hard refusal",
+       "changed pair cannot inherit old R1 acceptance or source1200 as execution clock"
+     ]
++  },
++  "coherent_runtime_repair": {
++    "scope": "F1-F5",
++    "source_models": "../producer/test_custody_repair_source.py",
++    "real_fault_plan": "../producer/fault-qualification.json",
++    "status": "NOT_RUN; no independent or runtime acceptance"
+   }
+ }
+--- a/owner-helper/owner_observer.py
++++ b/owner-helper/owner_observer.py
+@@ -245,6 +245,15 @@
+     for raw, expected in read(SOURCE / 'ancillary-pins.json').items():
+         require(not Path(raw).is_symlink(), 'UNREVIEWED_ANCILLARY_SYMLINK:' + raw)
+         expanded[raw] = expected
++    runtime_plan = read(SOURCE / 'runtest-plan.json')
++    runtime_api = runpy.run_path(str(SOURCE / 'runtest_protocol.py'))
++    for raw, expected in runtime_api['runtime_dependency_pins'](runtime_plan).items():
++        require(not Path(raw).is_symlink(), 'RUNTIME_DEPENDENCY_SYMLINK:' + raw)
++        require(raw not in expanded or expanded[raw] == expected, 'RUNTIME_DEPENDENCY_PIN_CONFLICT')
++        expanded[raw] = expected
++    site_plugins = Path(runtime_plan['runtime_plugins'][0]['path']).parent.parent
++    require({str(p) for p in site_plugins.glob('*.dist-info/entry_points.txt')} ==
++            set(runtime_plan['runtime_autoload_entrypoints']), 'RUNTIME_AUTOLOAD_INVENTORY_CHANGED')
+     corpus = read(SOURCE / 'corpus-pins.json')
+     for kind, raw in SPEC['roots'].items():
+         root = Path(raw)
+@@ -705,6 +714,16 @@
+             child_expected.update({str(Path(root) / rel): h for rel, h in corpus[k].items()})
+     require(runtime and not result or result.get('inputs_unchanged') is True and all(result['inputs'].get(p) == h for p, h in child_expected.items()), 'CHILD_INPUT_SET_INCOMPLETE_OR_DRIFTED')
+     lexical_joins = observed_input_joins(result, c['selection'], expanded) if result else {}
++    if runtime and result:
++        runtime_plan = read(SOURCE / 'runtest-plan.json')
++        for ref in runtime_plan['runtime_plugins']:
++            require(result['origins'].get(ref['module']) == ref['path'] and
++                    result['inputs'].get(ref['path']) == ref['sha256'] and
++                    result['inputs'].get(ref['entrypoint']) == ref['entrypoint_sha256'],
++                    'ACTUAL_LOADED_RUNTIME_PLUGIN_ORIGIN_GAP')
++        for module, raw in result['origins'].items():
++            if module in runtime_plan['runtime_import_origins']:
++                require(raw == runtime_plan['runtime_import_origins'][module], 'RUNTIME_DEPENDENCY_ORIGIN_DRIFT')
+     if c['selection'] == '@canary':
+         require(all(sha(parent / n) == h for n, h in before['outside'].items()), 'SYNTHETIC_OUTSIDE_CHANGED')
+         decision = None
+@@ -775,6 +794,7 @@
+         return decision
+     except Exception as error:
+         return {'status': 'RUNTEST_EVIDENCE_STOP', 'reason': str(error),
++                'failure_observed': getattr(error, 'failure_observed', []),
+                 'actual_event_prefix': events, 'required_identities': unit['expected'],
+                 'required_effectful_not_run': plan['required_not_run'],
+                 'unclassified_items': 'UNKNOWN_NOT_PASS; malformed evidence cannot allocate runtime success',
+@@ -835,8 +855,12 @@
+                          'TMPDIR': str(run / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'}
+         kwargs['stdin'] = donor['subprocess'].DEVNULL
+         kwargs['close_fds'] = True
+-        proc = registry.spawn_runtest(session, before['argv'], kwargs)
++        # No stat, checkpoint or backend write after Popen in this callback.
++        # The donor receives the actual handle before after_spawn may fail.
++        return registry.spawn_runtest(session, before['argv'], kwargs)
++    def after_spawn(proc):
+         holder['proc'] = proc
++        registry.attach_runtest(session, proc)
+         raw = Path('/proc/' + str(proc.pid) + '/stat').read_text()
+         put(parent / 'backend-start.json', {'argv': before['argv'], 'pid': proc.pid, 'stat': raw,
+             'boot_id': original['boot_id'], 'backend_handle': native_owner['backend_handle'],
+@@ -847,16 +871,32 @@
+             'boot_id': session.runtest_boot_id, 'unit_id': unit['unit_id'],
+             'original_deadline': session.runtest_deadline, 'owner_task_id': session.owner_task_id,
+             'phase_clock_sha256': before['phase_clock_sha256']})
+-        return proc
++    def capture(proc, output, error, cuts):
++        require(proc is session.process, 'FOREIGN_DONOR_OUTPUT')
++        session.append_output(output)
++        holder['proc'] = proc
++        put(parent / 'runtest-drain.json', {'session_id': session.id, 'pid': proc.pid,
++            'exit_code': proc.returncode, 'output': output,
++            'primary_error': type(error).__name__ if error is not None else None,
++            'cleanup_errors': list(cuts), 'registry_persistence_error': session.runtest_persistence_error,
++            'sole_drainer': 'donor communicate', 'reaped': proc.returncode is not None,
++            'runtime_or_product_accepted': False})
+     def stop(proc, pgid):
+-        require(proc is holder.get('proc') and pgid == session.runtest_pgid, 'FOREIGN_DONOR_STOP')
++        require(proc is session.process and pgid == session.runtest_pgid, 'FOREIGN_DONOR_STOP')
+         # On natural exit, do not signal a historical numeric PGID. The owner
+         # scans its exact SID/PGID; any survivor retains custody for outer stop.
+         if proc.returncode is None:
+-            registry.stop_runtest(session, source='donor_file_timeout_or_abort')
++            stop_result = registry.stop_runtest(session, source='donor_file_timeout_or_abort')
++            require(stop_result['status'] == 'STOP_REQUESTED' and not stop_result['persistence_error'],
++                    'RUNTEST_STOP_DIAGNOSTIC_OR_CESSATION_UNCONFIRMED')
+     def settle(proc, pgid, temproot):
+-        require(proc is holder.get('proc') and pgid == session.runtest_pgid, 'FOREIGN_DONOR_SETTLEMENT')
++        require(proc is session.process and pgid == session.runtest_pgid, 'FOREIGN_DONOR_SETTLEMENT')
+         require(proc.returncode is not None, 'DONOR_NOT_REAPED')
++        require(type(session.pid) is int and session.pid == proc.pid and
++                type(session.host_start_time) is int and session.host_start_time > 0 and
++                session.runtest_pgid == proc.pid and session.runtest_sid == proc.pid and
++                Path('/proc/sys/kernel/random/boot_id').read_text().strip() == session.runtest_boot_id,
++                'STOP_UNCONFIRMED_DONOR_IDENTITY_GAP')
+         remaining_group = []
+         for path in Path('/proc').iterdir():
+             if not path.name.isdigit(): continue
+@@ -877,7 +917,9 @@
+     # cross-run sweep. This exact donor one-attempt primitive is reused serially.
+     donor['_run_one_file_once'](Path(unit['file']['path']), [], Path(unit['root']),
+         min(float(phase['outer']) + 1, remaining()),
+-        custody={'spawn': spawn, 'stop': stop, 'settle': settle, 'remaining': remaining, 'terminal': terminal,
++        custody={'spawn': spawn, 'after_spawn': after_spawn, 'retained_handle': lambda: session.process,
++                 'retained_pgid': lambda: session.runtest_pgid, 'capture': capture,
++                 'stop': stop, 'settle': settle, 'remaining': remaining, 'terminal': terminal,
+                  'temporary_root': lambda: str(run / 'tmp')})
+     # Retain the registry handle until observe() and actual OUTER owner custody
+     # are reconciled. A runner return or parsed console summary cannot release it.
+--- a/owner-helper/receipt-schema.json
++++ b/owner-helper/receipt-schema.json
+@@ -155,5 +155,11 @@
+     ],
+     "rechecked": "initialize and every cohort; actual launcher startup separately checked"
+   },
+-  "changed_source_review_import_path_binding": "import_path_pins_sha256 exact current bytes; runtime_grant=false"
++  "changed_source_review_import_path_binding": "import_path_pins_sha256 exact current bytes; runtime_grant=false",
++  "runtest_partial_startup": {
++    "runtest-drain.json": "Actual output, primary exception class, earlier cleanup cuts, existing session identity/reaped observation; capture persistence may fail and output remains in same ProcessSession. No closure/acceptance implied.",
++    "unknown_birth_sid_pgid": "STOP_UNCONFIRMED, no false group census or temp removal",
++    "contradictory_census": "RUNTEST_EVIDENCE_STOP retaining validated failed prefix; not next-phase admissible",
++    "runtime_plugins": "Actual loaded body/module origin and declared entrypoint/dependency sets match child and owner pre/post pins"
++  }
+ }
+--- a/owner-helper/source-pins.json
++++ b/owner-helper/source-pins.json
+@@ -1,8 +1,8 @@
+ {
+-  "PROPOSAL.md": "2fda01801995fd657c8918b33871406fec6e14de35c6118260a6aacbac8698c0",
++  "PROPOSAL.md": "87bedbfba342c00b4e820bf0fc1570ce835a4635c358d31e080441e5c8d3f92d",
+   "ROOT-RECIPE.md": "5bfe8301fa27e39d965913d3892eab14107fba8a86b5977b56b92edfe3325d2c",
+-  "input-spec.json": "4cab35174dc52b66d0ebdbe94375d58c64e282979bc5251d8ff8061b9850b536",
+-  "negative-check-sources.json": "d6878f1dd6399161b9abee8909c591155cd351e573512e658352ef0d3760bfd6",
+-  "owner_observer.py": "cbb078b485486d1bd8dee7960094e9a70a4d44d272d819ad056f2b604c4d3217",
+-  "receipt-schema.json": "6acfc88a6cdcaebf8a1bc90f3db14e5e713614cf7eeea42c701cb569bc4a7b4a"
++  "input-spec.json": "68f1c98e0eec0a0a3975089c8700e2b3237009789d6f58b4f84fbe792150b0fb",
++  "negative-check-sources.json": "41f4ade28edd05b66a8adafd1d280c704b567cc20aab8e1bd2b92d7ecf50aace",
++  "owner_observer.py": "a7fc80f3eef647f1bde5d5010b2864b631a96e9c498d64721768086c268be4ba",
++  "receipt-schema.json": "1ef75f768651803557285a317cd4674fca595088f6051c1200454d0245af0329"
+ }
+--- a/producer/PROPOSAL.md
++++ b/producer/PROPOSAL.md
+@@ -9,3 +9,24 @@
+ Original1200 seconds / 2CPU / 2GiB / nochildren is a source-work budget only. New pure tests and all candidate code are NOT_RUN. No runtime grant, independent acceptance or release acceptance is issued. Fresh independent source review, full startup observation, actual current38 controls and separately admitted project/native collections remain required. Old evidence cannot transfer to these bytes. Prior exact collection must never be retried or rewritten.
+ 
+ Current38 plan/oracle, original900 execution spec/four phases, exact input bounds, source/runtime pin separation, stop exclusions and limits are unchanged. FRW013 STOP; A0 kernel120 NOT_GRANTED; oldFridayOFF/Pandora; two ordinary subprocess STOP; six HTTP/git plus two inline bash NOT_RUN; all7journeys/4web UNACCEPTED.
++
++
++FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-SOL#1 source delta (not independent acceptance):
++F1 stop initiates existing identity-safe termination before diagnostic I/O; failures
++retain intent/handle and do not abort attempts for other already-owned targets.
++F2 donor try/finally precedes spawn. Actual Popen handle transfers before fallible
++identity/backend writes; one donor drain/reap/capture/settle path covers synchronous
++post-Popen failures. Unknown birth/SID/PGID cannot become a closure claim. Partial
++startup/custody evidence is retained and never replayed or deleted by the donor.
++F3 every existing checkpoint writer shares one snapshot-through-replace transaction;
++critical admission uses file fsync plus non-swallowing actual-parent directory fsync
++and strict readback. Later diagnostic success does not reopen launch. Same-handle
++settlement requires independently observed inner/outer closure and strict persistence.
++F4 session_finish is terminal. Exit5 requires actual collection with zero selected,
++no reports/started/finished items, and complete expected deselection. Contradictions
++retain validated failed report prefixes. Genuine skip/xfail/xpass behavior is preserved.
++F5 actual AnyIO/pytest-asyncio package bodies, installed idna/sniffio/typing_extensions,
++all current entrypoints and exact declared module origins join child and owner pre/post
++pins. Normal autoload/native conftests/loops remain real. Source models and38 real fault
++scenarios are NOT_RUN; they cannot prove kernel cessation/durability/autoload. Separate
++source review, native outer custody/pidfd/startup/effect prerequisites still apply.
+--- a/producer/admission.py
++++ b/producer/admission.py
+@@ -75,6 +75,14 @@
+     if runtest_file is not None:
+         runtime_api = runpy.run_path(str(source / 'runtest_protocol.py'))
+         runtime_unit = runtime_api['validate_admission'](clock, runtime_plan, runtest_file, selection, entry, runtime_sha)
++        for raw, expected in runtime_api['runtime_dependency_pins'](runtime_plan).items():
++            path = pathlib.Path(raw)
++            if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
++                raise SystemExit('RUNTEST_PLUGIN_DEPENDENCY_DRIFT:' + raw)
++        site = pathlib.Path(runtime_plan['runtime_plugins'][0]['path']).parent.parent
++        actual_entrypoints = {str(p) for p in site.glob('*.dist-info/entry_points.txt')}
++        if actual_entrypoints != set(runtime_plan['runtime_autoload_entrypoints']):
++            raise SystemExit('RUNTEST_AUTOLOAD_ENTRYPOINT_INVENTORY_DRIFT')
+         for ref in runtime_unit['conftests'] + ([runtime_unit['config']] if runtime_unit['config'] else []) + runtime_plan['runtime_plugins']:
+             if hashlib.sha256(pathlib.Path(ref['path']).read_bytes()).hexdigest() != ref['sha256']:
+                 raise SystemExit('RUNTEST_FIXTURE_OR_PLUGIN_DRIFT')
+--- a/producer/ancillary-pins.json
++++ b/producer/ancillary-pins.json
+@@ -675,5 +675,65 @@
+   "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/psutil/__pycache__/_common.cpython-314.pyc": "3dbc27c1d0d6871fcaebb4fc51e0c77548396c87a4a67c6ea956ce8c0c631ad2",
+   "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/psutil/__pycache__/_ntuples.cpython-314.pyc": "0a841ec5d68464af659a4c22ca639f4dfce3539b3db366ccf8d7ceb8f548b97e",
+   "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/psutil/__pycache__/_psposix.cpython-314.pyc": "2979d1af89ba4b2dd83656d75cc4a57819a66fbe8e7cd43be68db39b5bc7bd98",
+-  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/psutil/__pycache__/_pslinux.cpython-314.pyc": "ee72e8590f931ab890f7767854af1b6bcf1d555c98551b412a0fdcfc970d90a3"
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/psutil/__pycache__/_pslinux.cpython-314.pyc": "ee72e8590f931ab890f7767854af1b6bcf1d555c98551b412a0fdcfc970d90a3",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/__init__.py": "1e2b5421fcef0288d279a1d5989f6b167f24ff223adc6eacfe350bd900a17f85",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_backends/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py": "78ad23f0f2343bbcb76d7f1c501b1a7e858ff30b1747eb333fa722c8fe0c9249",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_backends/_trio.py": "8684d72fccc8f35bf8504f984ff72bd9fce1ff363598a766643de840799e4741",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_asyncio_selector_thread.py": "d8f77114cddcb34d8aa7a052a696ef9914fbabb6acade4d6e45801c44b1f941a",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_contextmanagers.py": "6089c109a6e211e4be51a3ff25dc5ad426850bbd444cf5bc1d94c720cf11b1cf",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_eventloop.py": "0726547890fd6a531f7324ec791a392334ced0896d12e97f1b2abd8aa4a3a839",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_exceptions.py": "39fccb3b86771e88354e78a96c89fbd9836d9286314b89475bd32a28378673cf",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_fileio.py": "8477f25746d70cbf91d99367227c2c7b79e64c0777e80233d5c071826030cc04",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_resources.py": "35b994e4ee545f7c44c800a7926617dbc166c1d97e7fe9f2d2d1f29b6e9ed30d",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_signals.py": "9a34c107685328d3d1954d088678a379079da563861110e23234a5250b05aee8",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_sockets.py": "1ed8e2487fb2cde865aa1fcba43dcf18869f0ee502c1df20b9e52e93930578d9",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_streams.py": "15ccc5c08803a6790ad1b3835895cca6c50961dbc00f4e24694686cc953c0cad",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_subprocesses.py": "33618273834a5c26c1fc6b44b242609dd88cd9bd154b434afe8866171ae2ecef",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_synchronization.py": "9203e4f3cf9e54e998fa90cdb3e45e45b7047a56356bb61ccee5413ec67073c0",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_tasks.py": "cbdf6f462f8017312fea4caf230aabceeb2413634c88d22d5a7b961a4ede3abe",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_tempfile.py": "8c4db0e7d151177c91a38be39237d917661caac059bdceba556470ac91836069",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_testing.py": "bbb30fa865f0a53c6a23b85c95274d037d33d861f5370db9f2ec0abf2fd17c18",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_typedattr.py": "3f8a33662927dfe0dba6861cbf28214bf14e60081b994c5ea14f3e2ffd3ba593",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/__init__.py": "ea65a1725fe919786b8195473ff4c27ccbc85c83a9f66ae810533dd1f60253f5",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_eventloop.py": "3aa5984848f44e6c0bff19e2089b77fe31c55acb8c93d4c793cb424c6b0a6a92",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_resources.py": "0eb62f90d375847e94befe7fe6e2b24af0ec9e49c65437bc14229f928d15b4df",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_sockets.py": "3a6543adf7a656f17d7392b5b6906043257a7e7e6fd17c821312c0a81386cfda",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_streams.py": "ae74b0472fbacbcd133d0b485e2b792e330c894d420964b5a0c36c9894074538",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_subprocesses.py": "72e9803c94e4b4e42dc3adc8a86d250e9c99aaefe5d44125bd01cc8b02602f4f",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_tasks.py": "9be16d138a61c5e34810b486ec0dc7ed5533de303621be49d8921ec3cf8f4baa",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_testing.py": "f5860cd805ec605bdfe0f2e3504afac91c43894781e506d8fe03a0d17fc2ea56",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/from_thread.py": "258b1b68268807f222b7a90d86d5d2b5e246b783dc43b9dcab49c8a5c7a522b8",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/functools.py": "4f8252f085eafb1d52d0b6e8da8c05f25f5fcdad8aca93b5e3b40b7b2cf8723b",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/itertools.py": "415fbd9a7442af6c81a61f20d35405bcdf9b43f6257bef12975dd84b274194c2",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/lowlevel.py": "fb9f78f3867a2b98c5ed7249847c581c82a7bc51ffb8078c865f5afc07da4872",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/pytest_plugin.py": "a5a32923f54c3507f66e2af42dfbe03295d28982681c3cd674a5154f2a079af4",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/buffered.py": "bbb8420fc48dad81dcbad1ba2b9c048b2d45f3cfa98b3823bc414cdb62aad82c",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/file.py": "ea3ba32369be409213aaa2856a6aeea57fc336c53bcb6173de898b67138bb98d",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/memory.py": "66629608ba7222d3825e6bc2413f8bf08c891cd15a07e39525bae7f3c09a328d",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/stapled.py": "983345f468f875e5df3ae292666824106f901316002801a36011dbaecfab25a4",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/text.py": "05c540189c35551bed22a9effa8d116f4a701fba7cbf096f976d711eae76d9a8",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/tls.py": "1afb3ef983a81717329fe85a9173a23ccf07f9a129f27b14ea4f6b4eb2aa240e",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/to_interpreter.py": "fe62e782b332f7b4cc47a55b5b863a6330d493d66e3dc40c3e592ec918770bd9",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/to_process.py": "8c7c3bbfa5c704d21f61ae83aa7a8a63482c468f1270e0a1f1fa35f5fa85be35",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/to_thread.py": "6d8b335b49420df4e62e75db01889cd391c47bf0e2ff451629a6e02f6bd4d13d",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/pytest_asyncio/__init__.py": "932a980c5911992375e3feafff5dbc8388ea68ef49ae13277cc0cc8b093267c4",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/__init__.py": "8514c3ed53136a3596ebdf512fa487bbdd7da5a99adcaed82e0363d2c306d3af",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/__main__.py": "e0930aeba5a3e2e2d94ca6c5fac4f72c0c4eb2be9bba283becf98e909091471c",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/cli.py": "2e01972a25e67afdfba5d824013c01e808893916539c0db33f72f37c42b8896a",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/codec.py": "71ae48bb9eb70f678b195ea6e297d06f1900378cecc50c2bd1b705a12cf35267",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/compat.py": "4ff7995ce52dd1be5381ae7a70fc9b42ef420982b41532b599d88f6fdea76bc0",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/core.py": "d9f2cb3e2f9da9c494ffb1e27e501441d395cf9c12aa8321c9656fda9bb0da0d",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/idnadata.py": "01ffa6a3c5819a48402ba4f25ca3901fcf0e5f49903432ad74bed45ad429a699",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/intranges.py": "838f6c70b4a4a89b4084b98e3836bb8551eb8928e66fad2d893b04a287097412",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/package_data.py": "335f9830c0f69a399ae75464766817ee8bed94d3e9944b286e2629b13213cd1b",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/uts46data.py": "a8d8adbfa87a4f72a8a9f9e386d8cc83eefd4c88f8d364c4826eaba258481567",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/__init__.py": "f562442655eeef296e3f462d239490f4cf4e4d07db34791a75aacad6f5c60cf3",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/_impl.py": "526505319a62b8eadc8e7b8786e62260cc5e08d59faaef6406568f7f4c64e97f",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/_tests/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/_tests/test_sniffio.py": "30c2596498d0ad48bde5100d34cf9aff9e4166ab80fe0bf8ac7535a5ebdc4c23",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/_version.py": "8957ace71c2c1de4734037b105a021cb1fed68db76b9c7c0ec2580a38403b7a4",
++  "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/typing_extensions.py": "4040ca1a1ecbee00d1385c12a93084d1c5bd46f0b774f07e5ae7e91c4f55e696"
+ }
+--- a/producer/clean-invocation.json
++++ b/producer/clean-invocation.json
+@@ -13,7 +13,7 @@
+     "<PROJECT>/.runtime/hermes-telegram-test/env/bin/python",
+     "-I",
+     "-B",
+-    "<ASTRA_WORK>/native-runtest-protocol-integration/candidate/producer/invocation.py",
++    "<SOL_WORK>/FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-evidence/candidate/producer/invocation.py",
+     "{RUN}",
+     "{RUN_NAME}",
+     "{guard.py|native_guard.py}",
+@@ -60,7 +60,7 @@
+       "<PROJECT>/.runtime/hermes-telegram-test/env/bin/python",
+       "-I",
+       "-B",
+-      "<ASTRA_WORK>/native-runtest-protocol-integration/candidate/producer/invocation.py",
++      "<SOL_WORK>/FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-evidence/candidate/producer/invocation.py",
+       "{RUN}",
+       "{RUN_NAME}",
+       "guard.py",
+@@ -79,7 +79,7 @@
+       "<PROJECT>/.runtime/hermes-telegram-test/env/bin/python",
+       "-I",
+       "-B",
+-      "<ASTRA_WORK>/native-runtest-protocol-integration/candidate/producer/invocation.py",
++      "<SOL_WORK>/FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-evidence/candidate/producer/invocation.py",
+       "{RUN}",
+       "{RUN_NAME}",
+       "native_guard.py",
+@@ -110,7 +110,7 @@
+   "collection_evidence": "Existing NAME-results.json gains exact selected/discovered/collection_reports/identity/phase-clock SHA/missing fields; existing collection/deselected/classified receipts retained. Capture records every runtest report in collection mode, including successful setup/teardown; parent requires reports=[] and progress absent. Collection results require independent actual-backend reap/contour/group/clock/source/runtime/complete-corpus/lock reconciliation; canary_oracle and old qualify.py do not accept collection.",
+   "absent_import_probe": "Exactly declared metadata-only no-follow final-leaf ENOENT; never grant archive content open. Any presence/write/drift/errors refuse. Both copies share exact helper functions.",
+   "import_path_manifest": "<ASTRA_WORK>/native-lexical-import-repair/candidate/producer/import-path-pins.json",
+-  "changed_area_tests": "Existing import-path controls retained; new test_native_lexical_source.py covers exact alias, source/identity/binding drift, symlinks, alternate spelling, wrong mode, strict startup and bounded denied-entry diagnostics. NOT_RUN; separate review and admission required.",
++  "changed_area_tests": "Existing import-path controls retained; new test_native_lexical_source.py covers exact alias, source/identity/binding drift, symlinks, alternate spelling, wrong mode, strict startup and bounded denied-entry diagnostics. NOT_RUN; separate review and admission required. Coherent F1-F5 controls: test_custody_repair_source.py exact-function inert models, new census cases in test_runtest_protocol_source.py; all NOT_RUN. fault-qualification.json declares actual38 fault scenarios requiring existing independently reviewed finite owner; no mocked PASS or grant.",
+   "native_lexical_alias": "SOURCE_ONLY_NOT_RUN: exactly NATIVE/tests/tools/../.. from three pinned selected modules; native mode after strict initial prepends only; nofollow O_PATH component identities and parent bindings including both .. hops; unchanged startup suffix, absent archive and read authority. Failed attempt raw path was not captured.",
+   "runtest_argv_templates": {
+     "@project": [
+@@ -124,7 +124,7 @@
+       "<PROJECT>/.runtime/hermes-telegram-test/env/bin/python",
+       "-I",
+       "-B",
+-      "<ASTRA_WORK>/native-runtest-protocol-integration/candidate/producer/invocation.py",
++      "<SOL_WORK>/FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-evidence/candidate/producer/invocation.py",
+       "{RUN}",
+       "{RUN_NAME}",
+       "guard.py",
+@@ -142,7 +142,7 @@
+       "<PROJECT>/.runtime/hermes-telegram-test/env/bin/python",
+       "-I",
+       "-B",
+-      "<ASTRA_WORK>/native-runtest-protocol-integration/candidate/producer/invocation.py",
++      "<SOL_WORK>/FRW026-NATIVE-RUNTEST-COHERENT-REPAIR-evidence/candidate/producer/invocation.py",
+       "{RUN}",
+       "{RUN_NAME}",
+       "native_guard.py",
+--- a/producer/controls.py
++++ b/producer/controls.py
+@@ -40,12 +40,38 @@
+    p=root/rel
+    if hashlib.sha256(p.read_bytes()).hexdigest()!=expected:raise SystemExit('CORPUS_DRIFT:'+rel)
+    pins[str(p)]=expected
++runtime_dependency_inputs = runtime_api['runtime_dependency_pins'](runtime_plan) if runtest_file else {}
++for raw, expected in runtime_dependency_inputs.items():
++ p=pathlib.Path(raw)
++ if p.is_symlink() or hashlib.sha256(p.read_bytes()).hexdigest()!=expected:
++  raise SystemExit('RUNTEST_PLUGIN_DEPENDENCY_DRIFT:'+raw)
++ pins[raw]=expected
++if runtest_file:
++ site=pathlib.Path(runtime_plan['runtime_plugins'][0]['path']).parent.parent
++ if {str(p) for p in site.glob('*.dist-info/entry_points.txt')}!=set(runtime_plan['runtime_autoload_entrypoints']):
++  raise SystemExit('RUNTEST_AUTOLOAD_ENTRYPOINT_INVENTORY_DRIFT')
++
++def verify_runtime_plugin(plugin, name):
++ if not runtest_file:return
++ for ref in runtime_plan['runtime_plugins']:
++  if name==ref['name']:
++   if (getattr(plugin,'__name__',None)!=ref['module'] or
++       getattr(plugin,'__file__',None)!=ref['path'] or
++       getattr(getattr(plugin,'__spec__',None),'origin',None)!=ref['path'] or
++       hashlib.sha256(pathlib.Path(ref['path']).read_bytes()).hexdigest()!=ref['sha256']):
++    raise ValueError('RUNTEST_LOADED_PLUGIN_ORIGIN_DRIFT:'+name)
++
+ class Origins(importlib.abc.MetaPathFinder):
+  def find_spec(self,fullname,path=None,target=None):
+   spec=importlib.machinery.PathFinder.find_spec(fullname,path,target)
++  if runtest_file and fullname in runtime_plan['runtime_import_origins']:
++   expected=runtime_plan['runtime_import_origins'][fullname]
++   if (spec is None or spec.origin!=expected or str(pathlib.Path(spec.origin).resolve(strict=True))!=expected or
++       hashlib.sha256(pathlib.Path(expected).read_bytes()).hexdigest()!=runtime_dependency_inputs[expected]):
++    raise ImportError('RUNTEST_DEPENDENCY_IMPORT_ORIGIN_DRIFT:'+fullname)
+   if spec and spec.origin and pathlib.Path(spec.origin).is_file():
+    p=pathlib.Path(spec.origin)
+-   if any(p.is_relative_to(root) for root in (Q,N,E)):pins.setdefault(str(p),hashlib.sha256(p.read_bytes()).hexdigest())
++   if str(p) in runtime_dependency_inputs or any(p.is_relative_to(root) for root in (Q,N,E)):pins.setdefault(str(p),hashlib.sha256(p.read_bytes()).hexdigest())
+   return spec
+ sys.meta_path.insert(0,Origins())
+ sys.path[:0]=[str(SOURCE)] if mode=='@canary' else [str(Q/'tests'),str(N),str(Q),str(E)]
+@@ -268,6 +294,10 @@
+     __import__('os').fsync(f.fileno())
+ class RuntimeCapture(Capture):
+  """Existing Capture extended for one canonical donor-file pytest session."""
++ def pytest_plugin_registered(self,plugin,plugin_name,manager):
++  self.manager=manager
++  verify_runtime_plugin(plugin,plugin_name)
++
+  def __init__(self):
+   self.events=[];self.bindings={};self.report_receipts={};self.delivered=set();self.discovered=[];self.dropped=[]
+   self.fd=os.open(E/(name+'-progress.ndjson'),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+@@ -362,13 +392,17 @@
+                '--basetemp',str(E/'pytesttmp'/name)]
+  if runtime_unit['config'] is not None:runtime_args+=['-c',runtime_unit['config']['path']]
+  rc=pytest.main(runtime_args,plugins=[runtime_capture])
++ for ref in runtime_plan['runtime_plugins']:
++  plugin=runtime_capture.manager.get_plugin(ref['name'])
++  if plugin is None:raise ValueError('RUNTEST_NORMAL_AUTOLOAD_PLUGIN_MISSING:'+ref['name'])
++  verify_runtime_plugin(plugin,ref['name'])
+  collection_evidence={'receipt_schema':3,'collect_only':False,'runtime_events':runtime_capture.events,
+                       'identity':contour['identity'],'phase_clock_sha256':contour['phase_clock_sha256']}
+ else:
+  rc=pytest.main(legacy_args,plugins=[pytest_asyncio_plugin,Capture()])
+ path_readiness()
+ unchanged=all(hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()==h for p,h in pins.items())
+-(E/(name+'-results.json')).write_text(json.dumps({'exit':int(rc),'elapsed':time.monotonic()-started,'collection':collected,'reports':reports,'inputs':pins,'inputs_unchanged':unchanged,'origins':{n:str(pathlib.Path(m.__file__)) for n,m in list(sys.modules.items()) if getattr(m,'__file__',None) and any(pathlib.Path(m.__file__).is_relative_to(r) for r in (C,Q,N,E))},'live':'NOT_RUN','containment':'UNACCEPTED_PENDING_INDEPENDENT_POST_REAP','effects':'UNMEASURED_OUTSIDE_INSTRUMENTED_ATTEMPT_LOG',**collection_evidence},indent=2)+'\n')
++(E/(name+'-results.json')).write_text(json.dumps({'exit':int(rc),'elapsed':time.monotonic()-started,'collection':collected,'reports':reports,'inputs':pins,'inputs_unchanged':unchanged,'origins':{n:str(pathlib.Path(m.__file__)) for n,m in list(sys.modules.items()) if getattr(m,'__file__',None) and (str(pathlib.Path(m.__file__)) in runtime_dependency_inputs or any(pathlib.Path(m.__file__).is_relative_to(r) for r in (C,Q,N,E)))},'live':'NOT_RUN','containment':'UNACCEPTED_PENDING_INDEPENDENT_POST_REAP','effects':'UNMEASURED_OUTSIDE_INSTRUMENTED_ATTEMPT_LOG',**collection_evidence},indent=2)+'\n')
+ if runtime_capture is not None:os.close(runtime_capture.fd)
+ assert unchanged,'candidate changed during controls'
+ raise SystemExit(rc)
+--- /dev/null
++++ b/producer/fault-qualification.json
+@@ -0,0 +1,529 @@
++{
++  "schema": 1,
++  "state": "NOT_RUN_REQUIRES_INDEPENDENT_EXISTING_NATIVE_OWNER",
++  "execution_authorized": false,
++  "runtime_grant": false,
++  "source_models_are_actual_kernel_evidence": false,
++  "cases": [
++    {
++      "id": "F1-write_failure",
++      "finding": "F1",
++      "cut": "write_failure",
++      "required_observations": [
++        "identity-known actual isolated owned child alive before cancellation",
++        "existing identity-safe termination attempted before diagnostic I/O",
++        "donor sole pipe reader and actual reap",
++        "handle retained on any unknown persistence or cessation"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F1-missing_checkpoint",
++      "finding": "F1",
++      "cut": "missing_checkpoint",
++      "required_observations": [
++        "identity-known actual isolated owned child alive before cancellation",
++        "existing identity-safe termination attempted before diagnostic I/O",
++        "donor sole pipe reader and actual reap",
++        "handle retained on any unknown persistence or cessation"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F1-malformed_json",
++      "finding": "F1",
++      "cut": "malformed_json",
++      "required_observations": [
++        "identity-known actual isolated owned child alive before cancellation",
++        "existing identity-safe termination attempted before diagnostic I/O",
++        "donor sole pipe reader and actual reap",
++        "handle retained on any unknown persistence or cessation"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F1-readback_mismatch",
++      "finding": "F1",
++      "cut": "readback_mismatch",
++      "required_observations": [
++        "identity-known actual isolated owned child alive before cancellation",
++        "existing identity-safe termination attempted before diagnostic I/O",
++        "donor sole pipe reader and actual reap",
++        "handle retained on any unknown persistence or cessation"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F1-multiple_owned_targets",
++      "finding": "F1",
++      "cut": "one stop failure",
++      "required_observations": [
++        "each already-owned target receives an attempted stop",
++        "failed target not counted terminal",
++        "all exact handles retained or factually closed"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F2-after_Popen_before_return",
++      "finding": "F2",
++      "cut": "after_Popen_before_return",
++      "required_observations": [
++        "one actual Popen and retained ProcessSession.process",
++        "same donor drain/reap/settle reached",
++        "partial output and exact handle retained",
++        "no launch replay, second reader or unlocked temp removal"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F2-before_birth",
++      "finding": "F2",
++      "cut": "before_birth",
++      "required_observations": [
++        "one actual Popen and retained ProcessSession.process",
++        "same donor drain/reap/settle reached",
++        "partial output and exact handle retained",
++        "no launch replay, second reader or unlocked temp removal"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F2-getpgid",
++      "finding": "F2",
++      "cut": "getpgid",
++      "required_observations": [
++        "one actual Popen and retained ProcessSession.process",
++        "same donor drain/reap/settle reached",
++        "partial output and exact handle retained",
++        "no launch replay, second reader or unlocked temp removal"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F2-getsid",
++      "finding": "F2",
++      "cut": "getsid",
++      "required_observations": [
++        "one actual Popen and retained ProcessSession.process",
++        "same donor drain/reap/settle reached",
++        "partial output and exact handle retained",
++        "no launch replay, second reader or unlocked temp removal"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F2-pid_checkpoint",
++      "finding": "F2",
++      "cut": "pid_checkpoint",
++      "required_observations": [
++        "one actual Popen and retained ProcessSession.process",
++        "same donor drain/reap/settle reached",
++        "partial output and exact handle retained",
++        "no launch replay, second reader or unlocked temp removal"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F2-proc_stat",
++      "finding": "F2",
++      "cut": "proc_stat",
++      "required_observations": [
++        "one actual Popen and retained ProcessSession.process",
++        "same donor drain/reap/settle reached",
++        "partial output and exact handle retained",
++        "no launch replay, second reader or unlocked temp removal"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F2-backend_start_write",
++      "finding": "F2",
++      "cut": "backend_start_write",
++      "required_observations": [
++        "one actual Popen and retained ProcessSession.process",
++        "same donor drain/reap/settle reached",
++        "partial output and exact handle retained",
++        "no launch replay, second reader or unlocked temp removal"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F2-runtest_custody_write",
++      "finding": "F2",
++      "cut": "runtest_custody_write",
++      "required_observations": [
++        "one actual Popen and retained ProcessSession.process",
++        "same donor drain/reap/settle reached",
++        "partial output and exact handle retained",
++        "no launch replay, second reader or unlocked temp removal"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F2-stop_diagnostic",
++      "finding": "F2",
++      "cut": "stop_diagnostic",
++      "required_observations": [
++        "actual later cleanup cuts attempted despite earlier error",
++        "original deadline and outer custody retained",
++        "STOP_UNCONFIRMED on any unobserved closure",
++        "same output evidence retained, no retry"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F2-drain_timeout",
++      "finding": "F2",
++      "cut": "drain_timeout",
++      "required_observations": [
++        "actual later cleanup cuts attempted despite earlier error",
++        "original deadline and outer custody retained",
++        "STOP_UNCONFIRMED on any unobserved closure",
++        "same output evidence retained, no retry"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F2-output_receipt_failure",
++      "finding": "F2",
++      "cut": "output_receipt_failure",
++      "required_observations": [
++        "actual later cleanup cuts attempted despite earlier error",
++        "original deadline and outer custody retained",
++        "STOP_UNCONFIRMED on any unobserved closure",
++        "same output evidence retained, no retry"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F2-settlement_failure",
++      "finding": "F2",
++      "cut": "settlement_failure",
++      "required_observations": [
++        "actual later cleanup cuts attempted despite earlier error",
++        "original deadline and outer custody retained",
++        "STOP_UNCONFIRMED on any unobserved closure",
++        "same output evidence retained, no retry"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F3-generic_old_before_reserve",
++      "finding": "F3",
++      "cut": "generic_old_before_reserve",
++      "required_observations": [
++        "controlled real writer interleaving on same checkpoint",
++        "newest acknowledged row survives old writer completion",
++        "file and actual replacement parent directory fsync return",
++        "restart recovers same intent without replay",
++        "all finite writer handles joined"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F3-generic_old_before_pid",
++      "finding": "F3",
++      "cut": "generic_old_before_pid",
++      "required_observations": [
++        "controlled real writer interleaving on same checkpoint",
++        "newest acknowledged row survives old writer completion",
++        "file and actual replacement parent directory fsync return",
++        "restart recovers same intent without replay",
++        "all finite writer handles joined"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F3-generic_old_before_stop",
++      "finding": "F3",
++      "cut": "generic_old_before_stop",
++      "required_observations": [
++        "controlled real writer interleaving on same checkpoint",
++        "newest acknowledged row survives old writer completion",
++        "file and actual replacement parent directory fsync return",
++        "restart recovers same intent without replay",
++        "all finite writer handles joined"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F3-file_fsync",
++      "finding": "F3",
++      "cut": "file_fsync",
++      "required_observations": [
++        "fault propagates to admission before effects",
++        "intent/handle remains unresolved",
++        "stop attempt independent of diagnostic success",
++        "no changed expected SHA, second store or replay"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F3-directory_open",
++      "finding": "F3",
++      "cut": "directory_open",
++      "required_observations": [
++        "fault propagates to admission before effects",
++        "intent/handle remains unresolved",
++        "stop attempt independent of diagnostic success",
++        "no changed expected SHA, second store or replay"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F3-directory_fsync",
++      "finding": "F3",
++      "cut": "directory_fsync",
++      "required_observations": [
++        "fault propagates to admission before effects",
++        "intent/handle remains unresolved",
++        "stop attempt independent of diagnostic success",
++        "no changed expected SHA, second store or replay"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F3-strict_readback",
++      "finding": "F3",
++      "cut": "strict_readback",
++      "required_observations": [
++        "fault propagates to admission before effects",
++        "intent/handle remains unresolved",
++        "stop attempt independent of diagnostic success",
++        "no changed expected SHA, second store or replay"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F3-restart_last_durable_record",
++      "finding": "F3",
++      "cut": "restart_last_durable_record",
++      "required_observations": [
++        "fault propagates to admission before effects",
++        "intent/handle remains unresolved",
++        "stop attempt independent of diagnostic success",
++        "no changed expected SHA, second store or replay"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F4-failed_call_exit5",
++      "finding": "F4",
++      "cut": "failed_call_exit5",
++      "required_observations": [
++        "actual pytest durable reports and backend exit",
++        "contradiction not next_phase_admissible",
++        "observed failed reports/partial prefix retained",
++        "genuine skip/xfail/xpass classifications preserved",
++        "runtime_or_product_accepted false"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F4-finish_then_collection",
++      "finding": "F4",
++      "cut": "finish_then_collection",
++      "required_observations": [
++        "actual pytest durable reports and backend exit",
++        "contradiction not next_phase_admissible",
++        "observed failed reports/partial prefix retained",
++        "genuine skip/xfail/xpass classifications preserved",
++        "runtime_or_product_accepted false"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F4-all_deselected_exit5",
++      "finding": "F4",
++      "cut": "all_deselected_exit5",
++      "required_observations": [
++        "actual pytest durable reports and backend exit",
++        "contradiction not next_phase_admissible",
++        "observed failed reports/partial prefix retained",
++        "genuine skip/xfail/xpass classifications preserved",
++        "runtime_or_product_accepted false"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F4-setup_skip",
++      "finding": "F4",
++      "cut": "setup_skip",
++      "required_observations": [
++        "actual pytest durable reports and backend exit",
++        "contradiction not next_phase_admissible",
++        "observed failed reports/partial prefix retained",
++        "genuine skip/xfail/xpass classifications preserved",
++        "runtime_or_product_accepted false"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F4-xfail",
++      "finding": "F4",
++      "cut": "xfail",
++      "required_observations": [
++        "actual pytest durable reports and backend exit",
++        "contradiction not next_phase_admissible",
++        "observed failed reports/partial prefix retained",
++        "genuine skip/xfail/xpass classifications preserved",
++        "runtime_or_product_accepted false"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F4-non_strict_xpass",
++      "finding": "F4",
++      "cut": "non_strict_xpass",
++      "required_observations": [
++        "actual pytest durable reports and backend exit",
++        "contradiction not next_phase_admissible",
++        "observed failed reports/partial prefix retained",
++        "genuine skip/xfail/xpass classifications preserved",
++        "runtime_or_product_accepted false"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F4-strict_xpass",
++      "finding": "F4",
++      "cut": "strict_xpass",
++      "required_observations": [
++        "actual pytest durable reports and backend exit",
++        "contradiction not next_phase_admissible",
++        "observed failed reports/partial prefix retained",
++        "genuine skip/xfail/xpass classifications preserved",
++        "runtime_or_product_accepted false"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F4-hard_exit_prefix",
++      "finding": "F4",
++      "cut": "hard_exit_prefix",
++      "required_observations": [
++        "actual pytest durable reports and backend exit",
++        "contradiction not next_phase_admissible",
++        "observed failed reports/partial prefix retained",
++        "genuine skip/xfail/xpass classifications preserved",
++        "runtime_or_product_accepted false"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F5-AnyIO_before_autoload",
++      "finding": "F5",
++      "cut": "AnyIO_before_autoload",
++      "required_observations": [
++        "actual body, dependency and entrypoint input sets in producer child and owner pre/post",
++        "drift refuses closure",
++        "actual module __file__ and __spec__.origin agree with reviewed path",
++        "normal native autoload/conftests/loops preserved"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F5-AnyIO_after_collection",
++      "finding": "F5",
++      "cut": "AnyIO_after_collection",
++      "required_observations": [
++        "actual body, dependency and entrypoint input sets in producer child and owner pre/post",
++        "drift refuses closure",
++        "actual module __file__ and __spec__.origin agree with reviewed path",
++        "normal native autoload/conftests/loops preserved"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F5-entrypoint_inventory",
++      "finding": "F5",
++      "cut": "entrypoint_inventory",
++      "required_observations": [
++        "actual body, dependency and entrypoint input sets in producer child and owner pre/post",
++        "drift refuses closure",
++        "actual module __file__ and __spec__.origin agree with reviewed path",
++        "normal native autoload/conftests/loops preserved"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F5-loaded_origin",
++      "finding": "F5",
++      "cut": "loaded_origin",
++      "required_observations": [
++        "actual body, dependency and entrypoint input sets in producer child and owner pre/post",
++        "drift refuses closure",
++        "actual module __file__ and __spec__.origin agree with reviewed path",
++        "normal native autoload/conftests/loops preserved"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    },
++    {
++      "id": "F5-normal_autoload",
++      "finding": "F5",
++      "cut": "normal_autoload",
++      "required_observations": [
++        "actual body, dependency and entrypoint input sets in producer child and owner pre/post",
++        "drift refuses closure",
++        "actual module __file__ and __spec__.origin agree with reviewed path",
++        "normal native autoload/conftests/loops preserved"
++      ],
++      "status": "NOT_RUN",
++      "basis": "Real isolated execution and reviewed existing outer custody required; models cannot satisfy this case"
++    }
++  ],
++  "prerequisites": [
++    "FINAL_DONOR_REGISTRY_OVERLAY_AND_PIDFD_REVIEW_REQUIRED",
++    "INDEPENDENT_NATIVE_OUTER_CUSTODY_MUST_COVER_RESERVATION_TO_DURABLE_PID_AND_ALL_SIDS",
++    "NATIVE_SOCKETPAIR_AND_FIXTURE_EFFECTS_NOT_ADMITTED_BY_CURRENT_GUARD",
++    "CANONICAL_STARTUP_HASHSEED_AND_NORMAL_CONFTEST_IMPORT_PATH_QUALIFICATION_REQUIRED",
++    "DONOR_PRIVATE_DISK_TEMP_ROOT_EFFECT_AND_CLEANUP_ADMISSION_REQUIRED",
++    "ALL_TEN_REQUIRED_EFFECTFUL_NOT_RUN_AND_ORDINARY_STOPS_FRW013_REMAIN_CLOSED"
++  ],
++  "original_accounting": "Only a separately authorized existing original runtime allowance may execute these; this source1800 grants no execution or clock reset. Preserve all explicit stopped attempts and ten required NOT_RUN. No generic new runner/manager/broker.",
++  "resources": {
++    "cpu": 2,
++    "memory_bytes": 2147483648,
++    "max_concurrent_files": 1,
++    "max_cpu_seconds": 600,
++    "file_retries": 0
++  }
++}
+--- a/producer/native_controls.py
++++ b/producer/native_controls.py
+@@ -40,12 +40,38 @@
+    p=root/rel
+    if hashlib.sha256(p.read_bytes()).hexdigest()!=expected:raise SystemExit('CORPUS_DRIFT:'+rel)
+    pins[str(p)]=expected
++runtime_dependency_inputs = runtime_api['runtime_dependency_pins'](runtime_plan) if runtest_file else {}
++for raw, expected in runtime_dependency_inputs.items():
++ p=pathlib.Path(raw)
++ if p.is_symlink() or hashlib.sha256(p.read_bytes()).hexdigest()!=expected:
++  raise SystemExit('RUNTEST_PLUGIN_DEPENDENCY_DRIFT:'+raw)
++ pins[raw]=expected
++if runtest_file:
++ site=pathlib.Path(runtime_plan['runtime_plugins'][0]['path']).parent.parent
++ if {str(p) for p in site.glob('*.dist-info/entry_points.txt')}!=set(runtime_plan['runtime_autoload_entrypoints']):
++  raise SystemExit('RUNTEST_AUTOLOAD_ENTRYPOINT_INVENTORY_DRIFT')
++
++def verify_runtime_plugin(plugin, name):
++ if not runtest_file:return
++ for ref in runtime_plan['runtime_plugins']:
++  if name==ref['name']:
++   if (getattr(plugin,'__name__',None)!=ref['module'] or
++       getattr(plugin,'__file__',None)!=ref['path'] or
++       getattr(getattr(plugin,'__spec__',None),'origin',None)!=ref['path'] or
++       hashlib.sha256(pathlib.Path(ref['path']).read_bytes()).hexdigest()!=ref['sha256']):
++    raise ValueError('RUNTEST_LOADED_PLUGIN_ORIGIN_DRIFT:'+name)
++
+ class Origins(importlib.abc.MetaPathFinder):
+  def find_spec(self,fullname,path=None,target=None):
+   spec=importlib.machinery.PathFinder.find_spec(fullname,path,target)
++  if runtest_file and fullname in runtime_plan['runtime_import_origins']:
++   expected=runtime_plan['runtime_import_origins'][fullname]
++   if (spec is None or spec.origin!=expected or str(pathlib.Path(spec.origin).resolve(strict=True))!=expected or
++       hashlib.sha256(pathlib.Path(expected).read_bytes()).hexdigest()!=runtime_dependency_inputs[expected]):
++    raise ImportError('RUNTEST_DEPENDENCY_IMPORT_ORIGIN_DRIFT:'+fullname)
+   if spec and spec.origin and pathlib.Path(spec.origin).is_file():
+    p=pathlib.Path(spec.origin)
+-   if any(p.is_relative_to(root) for root in (Q,N,E)):pins.setdefault(str(p),hashlib.sha256(p.read_bytes()).hexdigest())
++   if str(p) in runtime_dependency_inputs or any(p.is_relative_to(root) for root in (Q,N,E)):pins.setdefault(str(p),hashlib.sha256(p.read_bytes()).hexdigest())
+   return spec
+ sys.meta_path.insert(0,Origins())
+ sys.path[:0]=[str(SOURCE)] if mode=='@canary' else [str(Q/'tests'),str(N),str(Q),str(E)]
+@@ -268,6 +294,10 @@
+     __import__('os').fsync(f.fileno())
+ class RuntimeCapture(Capture):
+  """Existing Capture extended for one canonical donor-file pytest session."""
++ def pytest_plugin_registered(self,plugin,plugin_name,manager):
++  self.manager=manager
++  verify_runtime_plugin(plugin,plugin_name)
++
+  def __init__(self):
+   self.events=[];self.bindings={};self.report_receipts={};self.delivered=set();self.discovered=[];self.dropped=[]
+   self.fd=os.open(E/(name+'-progress.ndjson'),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+@@ -362,13 +392,17 @@
+                '--basetemp',str(E/'pytesttmp'/name)]
+  if runtime_unit['config'] is not None:runtime_args+=['-c',runtime_unit['config']['path']]
+  rc=pytest.main(runtime_args,plugins=[runtime_capture])
++ for ref in runtime_plan['runtime_plugins']:
++  plugin=runtime_capture.manager.get_plugin(ref['name'])
++  if plugin is None:raise ValueError('RUNTEST_NORMAL_AUTOLOAD_PLUGIN_MISSING:'+ref['name'])
++  verify_runtime_plugin(plugin,ref['name'])
+  collection_evidence={'receipt_schema':3,'collect_only':False,'runtime_events':runtime_capture.events,
+                       'identity':contour['identity'],'phase_clock_sha256':contour['phase_clock_sha256']}
+ else:
+  rc=pytest.main(legacy_args,plugins=[pytest_asyncio_plugin,Capture()])
+ path_readiness()
+ unchanged=all(hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()==h for p,h in pins.items())
+-(E/(name+'-results.json')).write_text(json.dumps({'exit':int(rc),'elapsed':time.monotonic()-started,'collection':collected,'reports':reports,'inputs':pins,'inputs_unchanged':unchanged,'origins':{n:str(pathlib.Path(m.__file__)) for n,m in list(sys.modules.items()) if getattr(m,'__file__',None) and any(pathlib.Path(m.__file__).is_relative_to(r) for r in (C,Q,N,E))},'live':'NOT_RUN','containment':'UNACCEPTED_PENDING_INDEPENDENT_POST_REAP','effects':'UNMEASURED_OUTSIDE_INSTRUMENTED_ATTEMPT_LOG',**collection_evidence},indent=2)+'\n')
++(E/(name+'-results.json')).write_text(json.dumps({'exit':int(rc),'elapsed':time.monotonic()-started,'collection':collected,'reports':reports,'inputs':pins,'inputs_unchanged':unchanged,'origins':{n:str(pathlib.Path(m.__file__)) for n,m in list(sys.modules.items()) if getattr(m,'__file__',None) and (str(pathlib.Path(m.__file__)) in runtime_dependency_inputs or any(pathlib.Path(m.__file__).is_relative_to(r) for r in (C,Q,N,E)))},'live':'NOT_RUN','containment':'UNACCEPTED_PENDING_INDEPENDENT_POST_REAP','effects':'UNMEASURED_OUTSIDE_INSTRUMENTED_ATTEMPT_LOG',**collection_evidence},indent=2)+'\n')
+ if runtime_capture is not None:os.close(runtime_capture.fd)
+ assert unchanged,'candidate changed during controls'
+ raise SystemExit(rc)
+--- a/producer/runtest-plan.json
++++ b/producer/runtest-plan.json
+@@ -37928,5 +37928,188 @@
+       "path": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/pytest_asyncio/plugin.py",
+       "sha256": "121cb98d74596a9e5db3269a4be7131baeeeab3754b5996a9b26c228910863aa"
+     }
+-  ]
++  ],
++  "runtime_dependency_pins": {
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/__init__.py": "1e2b5421fcef0288d279a1d5989f6b167f24ff223adc6eacfe350bd900a17f85",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_backends/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py": "78ad23f0f2343bbcb76d7f1c501b1a7e858ff30b1747eb333fa722c8fe0c9249",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_backends/_trio.py": "8684d72fccc8f35bf8504f984ff72bd9fce1ff363598a766643de840799e4741",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_asyncio_selector_thread.py": "d8f77114cddcb34d8aa7a052a696ef9914fbabb6acade4d6e45801c44b1f941a",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_contextmanagers.py": "6089c109a6e211e4be51a3ff25dc5ad426850bbd444cf5bc1d94c720cf11b1cf",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_eventloop.py": "0726547890fd6a531f7324ec791a392334ced0896d12e97f1b2abd8aa4a3a839",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_exceptions.py": "39fccb3b86771e88354e78a96c89fbd9836d9286314b89475bd32a28378673cf",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_fileio.py": "8477f25746d70cbf91d99367227c2c7b79e64c0777e80233d5c071826030cc04",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_resources.py": "35b994e4ee545f7c44c800a7926617dbc166c1d97e7fe9f2d2d1f29b6e9ed30d",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_signals.py": "9a34c107685328d3d1954d088678a379079da563861110e23234a5250b05aee8",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_sockets.py": "1ed8e2487fb2cde865aa1fcba43dcf18869f0ee502c1df20b9e52e93930578d9",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_streams.py": "15ccc5c08803a6790ad1b3835895cca6c50961dbc00f4e24694686cc953c0cad",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_subprocesses.py": "33618273834a5c26c1fc6b44b242609dd88cd9bd154b434afe8866171ae2ecef",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_synchronization.py": "9203e4f3cf9e54e998fa90cdb3e45e45b7047a56356bb61ccee5413ec67073c0",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_tasks.py": "cbdf6f462f8017312fea4caf230aabceeb2413634c88d22d5a7b961a4ede3abe",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_tempfile.py": "8c4db0e7d151177c91a38be39237d917661caac059bdceba556470ac91836069",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_testing.py": "bbb30fa865f0a53c6a23b85c95274d037d33d861f5370db9f2ec0abf2fd17c18",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_typedattr.py": "3f8a33662927dfe0dba6861cbf28214bf14e60081b994c5ea14f3e2ffd3ba593",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/__init__.py": "ea65a1725fe919786b8195473ff4c27ccbc85c83a9f66ae810533dd1f60253f5",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_eventloop.py": "3aa5984848f44e6c0bff19e2089b77fe31c55acb8c93d4c793cb424c6b0a6a92",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_resources.py": "0eb62f90d375847e94befe7fe6e2b24af0ec9e49c65437bc14229f928d15b4df",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_sockets.py": "3a6543adf7a656f17d7392b5b6906043257a7e7e6fd17c821312c0a81386cfda",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_streams.py": "ae74b0472fbacbcd133d0b485e2b792e330c894d420964b5a0c36c9894074538",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_subprocesses.py": "72e9803c94e4b4e42dc3adc8a86d250e9c99aaefe5d44125bd01cc8b02602f4f",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_tasks.py": "9be16d138a61c5e34810b486ec0dc7ed5533de303621be49d8921ec3cf8f4baa",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_testing.py": "f5860cd805ec605bdfe0f2e3504afac91c43894781e506d8fe03a0d17fc2ea56",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/from_thread.py": "258b1b68268807f222b7a90d86d5d2b5e246b783dc43b9dcab49c8a5c7a522b8",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/functools.py": "4f8252f085eafb1d52d0b6e8da8c05f25f5fcdad8aca93b5e3b40b7b2cf8723b",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/itertools.py": "415fbd9a7442af6c81a61f20d35405bcdf9b43f6257bef12975dd84b274194c2",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/lowlevel.py": "fb9f78f3867a2b98c5ed7249847c581c82a7bc51ffb8078c865f5afc07da4872",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/pytest_plugin.py": "a5a32923f54c3507f66e2af42dfbe03295d28982681c3cd674a5154f2a079af4",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/buffered.py": "bbb8420fc48dad81dcbad1ba2b9c048b2d45f3cfa98b3823bc414cdb62aad82c",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/file.py": "ea3ba32369be409213aaa2856a6aeea57fc336c53bcb6173de898b67138bb98d",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/memory.py": "66629608ba7222d3825e6bc2413f8bf08c891cd15a07e39525bae7f3c09a328d",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/stapled.py": "983345f468f875e5df3ae292666824106f901316002801a36011dbaecfab25a4",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/text.py": "05c540189c35551bed22a9effa8d116f4a701fba7cbf096f976d711eae76d9a8",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/tls.py": "1afb3ef983a81717329fe85a9173a23ccf07f9a129f27b14ea4f6b4eb2aa240e",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/to_interpreter.py": "fe62e782b332f7b4cc47a55b5b863a6330d493d66e3dc40c3e592ec918770bd9",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/to_process.py": "8c7c3bbfa5c704d21f61ae83aa7a8a63482c468f1270e0a1f1fa35f5fa85be35",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/to_thread.py": "6d8b335b49420df4e62e75db01889cd391c47bf0e2ff451629a6e02f6bd4d13d",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/pytest_asyncio/__init__.py": "932a980c5911992375e3feafff5dbc8388ea68ef49ae13277cc0cc8b093267c4",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/pytest_asyncio/plugin.py": "121cb98d74596a9e5db3269a4be7131baeeeab3754b5996a9b26c228910863aa",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/__init__.py": "8514c3ed53136a3596ebdf512fa487bbdd7da5a99adcaed82e0363d2c306d3af",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/__main__.py": "e0930aeba5a3e2e2d94ca6c5fac4f72c0c4eb2be9bba283becf98e909091471c",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/cli.py": "2e01972a25e67afdfba5d824013c01e808893916539c0db33f72f37c42b8896a",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/codec.py": "71ae48bb9eb70f678b195ea6e297d06f1900378cecc50c2bd1b705a12cf35267",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/compat.py": "4ff7995ce52dd1be5381ae7a70fc9b42ef420982b41532b599d88f6fdea76bc0",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/core.py": "d9f2cb3e2f9da9c494ffb1e27e501441d395cf9c12aa8321c9656fda9bb0da0d",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/idnadata.py": "01ffa6a3c5819a48402ba4f25ca3901fcf0e5f49903432ad74bed45ad429a699",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/intranges.py": "838f6c70b4a4a89b4084b98e3836bb8551eb8928e66fad2d893b04a287097412",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/package_data.py": "335f9830c0f69a399ae75464766817ee8bed94d3e9944b286e2629b13213cd1b",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/uts46data.py": "a8d8adbfa87a4f72a8a9f9e386d8cc83eefd4c88f8d364c4826eaba258481567",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/__init__.py": "f562442655eeef296e3f462d239490f4cf4e4d07db34791a75aacad6f5c60cf3",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/_impl.py": "526505319a62b8eadc8e7b8786e62260cc5e08d59faaef6406568f7f4c64e97f",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/_tests/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/_tests/test_sniffio.py": "30c2596498d0ad48bde5100d34cf9aff9e4166ab80fe0bf8ac7535a5ebdc4c23",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/_version.py": "8957ace71c2c1de4734037b105a021cb1fed68db76b9c7c0ec2580a38403b7a4",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/typing_extensions.py": "4040ca1a1ecbee00d1385c12a93084d1c5bd46f0b774f07e5ae7e91c4f55e696",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/annotated_doc-0.0.5.dist-info/entry_points.txt": "e8e62005c2f21425207aa2e09ef332389c4f096ce0cbbb1ee2b2cf2ad3689ccb",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio-4.14.2.dist-info/entry_points.txt": "fdde98bbaba269998d7b40b2768c22ac4f429a0ef350bda0d3cb50a684b742f7",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/browser_harness-0.1.13.dist-info/entry_points.txt": "1c9d0aaaa571fc6affc5f14da93a226ec2537c97e417d1286ad00c0196f5ee94",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/cffi-2.1.1.dist-info/entry_points.txt": "a6b6108011f8e27050fe5269bba88c8051b414697880d3b0b6fbe3a03a0b001c",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/charset_normalizer-3.5.1.dist-info/entry_points.txt": "0034932ab91767786174e5458ba0dc5041d0452d317f10c813fa44cf8c0b2170",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/debugpy-1.8.20.dist-info/entry_points.txt": "fd33ab3714fce7006bb3c021dbd8e8e217f3e3268d7c1e6728b69b081e4f568b",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/distro-1.9.0.dist-info/entry_points.txt": "dce6e3a9031b875c5e410c2c5ad81b7c33433030fe11b8204753a3ff3f2cf617",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/fastapi-0.133.1.dist-info/entry_points.txt": "1827fe59b219c72193e0c526acf1a3d5c387619a06b0d3c702f3644fa86719e0",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/httpx-0.28.1.dist-info/entry_points.txt": "da55647509b12c0d6934c812376795f3da3dd070997b3866370b32eabc8a0d20",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/httpx2-2.7.0.dist-info/entry_points.txt": "dee899a2b4509500053681da0f1b8cb2691d8eddeb5139ae073f35b4b5c57506",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna-3.19.dist-info/entry_points.txt": "ec7de718e1daa778e72c4e5eeeaed8c2bf55abc6b107b5888f9f82ff8376be1c",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/jinja2-3.1.6.dist-info/entry_points.txt": "38bf39818535783f1cb8f9629227c59e05e97818dac65eab209f0a902ff7afe2",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/jsonschema-4.26.0.dist-info/entry_points.txt": "bceeeb5f816cff1215272da99c0b4a8134b17e99e8cc0550d038c29a93319d61",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/markdown-3.10.2.dist-info/entry_points.txt": "94c1328a203f659c9f3c20650ef88197e4a253471fa1eb842a9c31c37eb5b0a4",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/markdown_it_py-4.2.0.dist-info/entry_points.txt": "4fcd65edf1d0de9965a50e3052d40ae9af20fe9eb0c506e78ca5470a4d96306e",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/mcp-2.0.0.dist-info/entry_points.txt": "8271816e8df2185d1824d5df669824020d7e090b4ac67cf1ae5039ddcf2f8980",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/openai-2.24.0.dist-info/entry_points.txt": "9006214049b3889c2c2ace6b6980083af2762d699bcf976e9445cecec63bd6ba",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/opentelemetry_api-1.39.1.dist-info/entry_points.txt": "7713ead1845b4034b097c42447e23d037f2b6db7ca406e61dae3458e9bd4e95e",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/pygments-2.21.0.dist-info/entry_points.txt": "b945f0f9784c281117e2959c0ada6e4d39cf84bde1ece104da35a2e75550b1af",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/pytest-9.1.1.dist-info/entry_points.txt": "b21b5de5a40ce6372eff650d87fe4ce166b662590a307535e179bfc6c8d2a4d6",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/pytest_asyncio-1.3.0.dist-info/entry_points.txt": "ff94ec72213eee6228a54cb536b3c21231d54c323084d6f25ef3feb2ed7e3bbc",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/python_dotenv-1.2.2.dist-info/entry_points.txt": "c91975ac26ecc1bd6741343f8194650b0e507da6f3b541a77c658b8655c535d2",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/setuptools-83.0.0.dist-info/entry_points.txt": "ce482d8697ff15af4d544f69e85293dd793d0d1d5f680711538728820b15ee30",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/tqdm-4.70.0.dist-info/entry_points.txt": "45e2421fb522dd9ca1e8cd7a1383a1b19d6853b5ad31709f6eda3206118edbd6",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/uvicorn-0.41.0.dist-info/entry_points.txt": "156d70fa191cf50830686a28bccbe6d1963bdf0fcd7327167460147c3b0d1b1c",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/watchfiles-1.2.0.dist-info/entry_points.txt": "b350e96b677f28a072fa32911165bad19dc6a11677269084a3ff62603b7a84e4",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/websockets-15.0.1.dist-info/entry_points.txt": "0e7867e1d9b912c23864c02c1e574617a0b005766b1979d1edc9cadbe5d1ef36"
++  },
++  "runtime_import_origins": {
++    "anyio": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/__init__.py",
++    "anyio._backends": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_backends/__init__.py",
++    "anyio._backends._asyncio": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_backends/_asyncio.py",
++    "anyio._backends._trio": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_backends/_trio.py",
++    "anyio._core": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/__init__.py",
++    "anyio._core._asyncio_selector_thread": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_asyncio_selector_thread.py",
++    "anyio._core._contextmanagers": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_contextmanagers.py",
++    "anyio._core._eventloop": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_eventloop.py",
++    "anyio._core._exceptions": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_exceptions.py",
++    "anyio._core._fileio": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_fileio.py",
++    "anyio._core._resources": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_resources.py",
++    "anyio._core._signals": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_signals.py",
++    "anyio._core._sockets": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_sockets.py",
++    "anyio._core._streams": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_streams.py",
++    "anyio._core._subprocesses": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_subprocesses.py",
++    "anyio._core._synchronization": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_synchronization.py",
++    "anyio._core._tasks": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_tasks.py",
++    "anyio._core._tempfile": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_tempfile.py",
++    "anyio._core._testing": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_testing.py",
++    "anyio._core._typedattr": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/_core/_typedattr.py",
++    "anyio.abc": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/__init__.py",
++    "anyio.abc._eventloop": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_eventloop.py",
++    "anyio.abc._resources": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_resources.py",
++    "anyio.abc._sockets": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_sockets.py",
++    "anyio.abc._streams": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_streams.py",
++    "anyio.abc._subprocesses": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_subprocesses.py",
++    "anyio.abc._tasks": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_tasks.py",
++    "anyio.abc._testing": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/abc/_testing.py",
++    "anyio.from_thread": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/from_thread.py",
++    "anyio.functools": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/functools.py",
++    "anyio.itertools": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/itertools.py",
++    "anyio.lowlevel": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/lowlevel.py",
++    "anyio.pytest_plugin": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/pytest_plugin.py",
++    "anyio.streams": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/__init__.py",
++    "anyio.streams.buffered": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/buffered.py",
++    "anyio.streams.file": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/file.py",
++    "anyio.streams.memory": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/memory.py",
++    "anyio.streams.stapled": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/stapled.py",
++    "anyio.streams.text": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/text.py",
++    "anyio.streams.tls": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/streams/tls.py",
++    "anyio.to_interpreter": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/to_interpreter.py",
++    "anyio.to_process": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/to_process.py",
++    "anyio.to_thread": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio/to_thread.py",
++    "pytest_asyncio": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/pytest_asyncio/__init__.py",
++    "pytest_asyncio.plugin": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/pytest_asyncio/plugin.py",
++    "idna": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/__init__.py",
++    "idna.__main__": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/__main__.py",
++    "idna.cli": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/cli.py",
++    "idna.codec": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/codec.py",
++    "idna.compat": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/compat.py",
++    "idna.core": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/core.py",
++    "idna.idnadata": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/idnadata.py",
++    "idna.intranges": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/intranges.py",
++    "idna.package_data": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/package_data.py",
++    "idna.uts46data": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna/uts46data.py",
++    "sniffio": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/__init__.py",
++    "sniffio._impl": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/_impl.py",
++    "sniffio._tests": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/_tests/__init__.py",
++    "sniffio._tests.test_sniffio": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/_tests/test_sniffio.py",
++    "sniffio._version": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/sniffio/_version.py",
++    "typing_extensions": "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/typing_extensions.py"
++  },
++  "runtime_autoload_entrypoints": {
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/annotated_doc-0.0.5.dist-info/entry_points.txt": "e8e62005c2f21425207aa2e09ef332389c4f096ce0cbbb1ee2b2cf2ad3689ccb",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/anyio-4.14.2.dist-info/entry_points.txt": "fdde98bbaba269998d7b40b2768c22ac4f429a0ef350bda0d3cb50a684b742f7",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/browser_harness-0.1.13.dist-info/entry_points.txt": "1c9d0aaaa571fc6affc5f14da93a226ec2537c97e417d1286ad00c0196f5ee94",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/cffi-2.1.1.dist-info/entry_points.txt": "a6b6108011f8e27050fe5269bba88c8051b414697880d3b0b6fbe3a03a0b001c",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/charset_normalizer-3.5.1.dist-info/entry_points.txt": "0034932ab91767786174e5458ba0dc5041d0452d317f10c813fa44cf8c0b2170",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/debugpy-1.8.20.dist-info/entry_points.txt": "fd33ab3714fce7006bb3c021dbd8e8e217f3e3268d7c1e6728b69b081e4f568b",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/distro-1.9.0.dist-info/entry_points.txt": "dce6e3a9031b875c5e410c2c5ad81b7c33433030fe11b8204753a3ff3f2cf617",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/fastapi-0.133.1.dist-info/entry_points.txt": "1827fe59b219c72193e0c526acf1a3d5c387619a06b0d3c702f3644fa86719e0",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/httpx-0.28.1.dist-info/entry_points.txt": "da55647509b12c0d6934c812376795f3da3dd070997b3866370b32eabc8a0d20",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/httpx2-2.7.0.dist-info/entry_points.txt": "dee899a2b4509500053681da0f1b8cb2691d8eddeb5139ae073f35b4b5c57506",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/idna-3.19.dist-info/entry_points.txt": "ec7de718e1daa778e72c4e5eeeaed8c2bf55abc6b107b5888f9f82ff8376be1c",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/jinja2-3.1.6.dist-info/entry_points.txt": "38bf39818535783f1cb8f9629227c59e05e97818dac65eab209f0a902ff7afe2",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/jsonschema-4.26.0.dist-info/entry_points.txt": "bceeeb5f816cff1215272da99c0b4a8134b17e99e8cc0550d038c29a93319d61",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/markdown-3.10.2.dist-info/entry_points.txt": "94c1328a203f659c9f3c20650ef88197e4a253471fa1eb842a9c31c37eb5b0a4",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/markdown_it_py-4.2.0.dist-info/entry_points.txt": "4fcd65edf1d0de9965a50e3052d40ae9af20fe9eb0c506e78ca5470a4d96306e",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/mcp-2.0.0.dist-info/entry_points.txt": "8271816e8df2185d1824d5df669824020d7e090b4ac67cf1ae5039ddcf2f8980",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/openai-2.24.0.dist-info/entry_points.txt": "9006214049b3889c2c2ace6b6980083af2762d699bcf976e9445cecec63bd6ba",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/opentelemetry_api-1.39.1.dist-info/entry_points.txt": "7713ead1845b4034b097c42447e23d037f2b6db7ca406e61dae3458e9bd4e95e",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/pygments-2.21.0.dist-info/entry_points.txt": "b945f0f9784c281117e2959c0ada6e4d39cf84bde1ece104da35a2e75550b1af",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/pytest-9.1.1.dist-info/entry_points.txt": "b21b5de5a40ce6372eff650d87fe4ce166b662590a307535e179bfc6c8d2a4d6",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/pytest_asyncio-1.3.0.dist-info/entry_points.txt": "ff94ec72213eee6228a54cb536b3c21231d54c323084d6f25ef3feb2ed7e3bbc",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/python_dotenv-1.2.2.dist-info/entry_points.txt": "c91975ac26ecc1bd6741343f8194650b0e507da6f3b541a77c658b8655c535d2",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/setuptools-83.0.0.dist-info/entry_points.txt": "ce482d8697ff15af4d544f69e85293dd793d0d1d5f680711538728820b15ee30",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/tqdm-4.70.0.dist-info/entry_points.txt": "45e2421fb522dd9ca1e8cd7a1383a1b19d6853b5ad31709f6eda3206118edbd6",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/uvicorn-0.41.0.dist-info/entry_points.txt": "156d70fa191cf50830686a28bccbe6d1963bdf0fcd7327167460147c3b0d1b1c",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/watchfiles-1.2.0.dist-info/entry_points.txt": "b350e96b677f28a072fa32911165bad19dc6a11677269084a3ff62603b7a84e4",
++    "<PROJECT>/.runtime/hermes-telegram-test/env/lib/python3.14/site-packages/websockets-15.0.1.dist-info/entry_points.txt": "0e7867e1d9b912c23864c02c1e574617a0b005766b1979d1edc9cadbe5d1ef36"
++  },
++  "runtime_dependencies_basis": "Actual installed plugin Python bodies (AnyIO,pytest-asyncio) and idna/sniffio/typing_extensions where present; all current dist-info entrypoint files. Versioned body/entrypoint declarations and actual origins required before/after normal autoload. Optional unavailable backends are not qualified."
+ }
+--- a/producer/runtest_protocol.py
++++ b/producer/runtest_protocol.py
+@@ -69,64 +69,96 @@
+     return unit
+ 
+ 
++def runtime_dependency_pins(plan):
++    """One exact plugin closure shared by admission, child and owner."""
++    pins = dict(plan['runtime_dependency_pins'])
++    require(pins and all(isinstance(p, str) and p.startswith('/') and
++            isinstance(h, str) and len(h) == 64 and all(c in '0123456789abcdef' for c in h)
++            for p, h in pins.items()), 'RUNTIME_DEPENDENCY_SCHEMA')
++    for ref in plan['runtime_plugins']:
++        require(pins.get(ref['path']) == ref['sha256'] and
++                pins.get(ref['entrypoint']) == ref['entrypoint_sha256'] and
++                plan['runtime_import_origins'].get(ref['module']) == ref['path'],
++                'RUNTIME_PLUGIN_CLOSURE_INCOMPLETE')
++    require(all(p in pins for p in plan['runtime_import_origins'].values()) and
++            all(pins.get(p) == h for p, h in plan['runtime_autoload_entrypoints'].items()),
++            'RUNTIME_ORIGIN_OR_AUTOLOAD_PIN_GAP')
++    return pins
++
++
++class CensusError(ValueError):
++    """Validated failed-phase prefix remains evidence even on contradiction."""
++    def __init__(self, message, failure_observed):
++        super().__init__(message)
++        self.failure_observed = list(failure_observed)
++
++
+ def census(unit, events, identity, clock_sha, terminal_exit, result=None):
+     """Reconcile actual durable event prefixes, including hard-exit partial runs.
+ 
+     Every report is bound at makereport to an actual Item; a log callback alone
+     cannot invent a report. No missing call is synthesized after setup skip/fail.
+     """
++    observed_failures = []
++    def check(ok, message):
++        if not ok:
++            raise CensusError(message, observed_failures)
++    check(type(terminal_exit) is int, 'INVALID_BACKEND_EXIT_TYPE')
+     expected = expected_map(unit)
+     selected = {}; dropped = {}; reports = {}; started = set(); finished = set()
+     session_finished = False; collection_finished = False
+     for number, event in enumerate(events):
+-        require(type(event.get('sequence')) is int and event.get('sequence') == number and event.get('identity') == identity and
++        check(type(event.get('sequence')) is int and event.get('sequence') == number and event.get('identity') == identity and
+                 event.get('phase_clock_sha256') == clock_sha, 'FOREIGN_OR_GAPPED_RUNTIME_EVENT')
++        check(not session_finished, 'EVENT_AFTER_SESSION_FINISH')
+         kind = event.get('kind')
+         if kind == 'collection':
+-            require(not collection_finished and not selected and not reports, 'DUPLICATE_OR_LATE_COLLECTION')
++            check(not collection_finished and not selected and not reports, 'DUPLICATE_OR_LATE_COLLECTION')
+             for disposition, target in [('selected', selected), ('deselected', dropped)]:
+                 for binding in event[disposition]:
+                     key = logical_key(binding['actual'])
+-                    require(key not in selected and key not in dropped and key in expected, 'FOREIGN_OR_DUPLICATE_COLLECTION_ITEM')
+-                    require(binding == bind_item(unit, binding['actual'], binding['definition']), 'COLLECTION_BINDING_DRIFT')
++                    check(key not in selected and key not in dropped and key in expected, 'FOREIGN_OR_DUPLICATE_COLLECTION_ITEM')
++                    check(binding == bind_item(unit, binding['actual'], binding['definition']), 'COLLECTION_BINDING_DRIFT')
+                     target[key] = binding
+-            require(set(selected) | set(dropped) == set(expected), 'RUNTIME_COLLECTION_CENSUS_DRIFT')
++            check(set(selected) | set(dropped) == set(expected), 'RUNTIME_COLLECTION_CENSUS_DRIFT')
+             collection_finished = True
+         elif kind in ('item_start', 'report', 'item_finish'):
+-            require(collection_finished and not session_finished, 'RUNTIME_EVENT_OUTSIDE_SESSION')
++            check(collection_finished and not session_finished, 'RUNTIME_EVENT_OUTSIDE_SESSION')
+             binding = event['binding']; key = logical_key(binding['actual'])
+-            require(key in selected and binding == selected[key], 'RUNTIME_ITEM_BINDING_DRIFT')
++            check(key in selected and binding == selected[key], 'RUNTIME_ITEM_BINDING_DRIFT')
+             if kind == 'item_start':
+-                require(key not in started and not started - finished, 'DUPLICATE_OR_CONCURRENT_ITEM_START')
++                check(key not in started and not started - finished, 'DUPLICATE_OR_CONCURRENT_ITEM_START')
+                 started.add(key)
+             elif kind == 'item_finish':
+-                require(key in started and key not in finished, 'FOREIGN_OR_DUPLICATE_ITEM_FINISH')
+-                require([r['when'] for r in reports.get(key, [])] in (['setup', 'call', 'teardown'], ['setup', 'teardown']),
++                check(key in started and key not in finished, 'FOREIGN_OR_DUPLICATE_ITEM_FINISH')
++                check([r['when'] for r in reports.get(key, [])] in (['setup', 'call', 'teardown'], ['setup', 'teardown']),
+                         'INCOMPLETE_FINISHED_ITEM')
+                 finished.add(key)
+             else:
+-                require(key in started and key not in finished, 'REPORT_WITHOUT_ACTIVE_ITEM')
++                check(key in started and key not in finished, 'REPORT_WITHOUT_ACTIVE_ITEM')
+                 row = event['report']; phases = reports.setdefault(key, [])
+-                require(row.get('nodeid') == binding['actual']['nodeid'] and
++                check(row.get('nodeid') == binding['actual']['nodeid'] and
+                         (row.get('wasxfail') is None or isinstance(row['wasxfail'], str)), 'REPORT_NODEID_OR_XFAIL_DRIFT')
+-                require(row['when'] in ('setup', 'call', 'teardown') and row['outcome'] in ('passed', 'failed', 'skipped'), 'UNKNOWN_RUNTIME_PHASE_OR_OUTCOME')
+-                require(type(row['duration']) in (int, float) and math.isfinite(row['duration']) and row['duration'] >= 0, 'INVALID_PHASE_DURATION')
++                check(row['when'] in ('setup', 'call', 'teardown') and row['outcome'] in ('passed', 'failed', 'skipped'), 'UNKNOWN_RUNTIME_PHASE_OR_OUTCOME')
++                check(type(row['duration']) in (int, float) and math.isfinite(row['duration']) and row['duration'] >= 0, 'INVALID_PHASE_DURATION')
+                 prior = [r['when'] for r in phases]
+                 legal = (row['when'] == 'setup' and not prior or
+                          row['when'] == 'call' and prior == ['setup'] and phases[0]['outcome'] == 'passed' or
+                          row['when'] == 'teardown' and (prior == ['setup', 'call'] or
+                              prior == ['setup'] and phases[0]['outcome'] != 'passed'))
+-                require(legal, 'MISSING_DUPLICATE_OR_REORDERED_PHASE')
++                check(legal, 'MISSING_DUPLICATE_OR_REORDERED_PHASE')
+                 phases.append(row)
++                if row['outcome'] == 'failed':
++                    observed_failures.append({'binding': binding, 'report': row})
+         elif kind == 'session_finish':
+-            require(not session_finished and event['exit'] in range(6) and
++            check(type(event['exit']) is int and event['exit'] in range(6) and
+                     (collection_finished or event['exit'] in (2, 3, 4, 5)), 'INVALID_SESSION_FINISH')
+-            require(event['exit'] == terminal_exit, 'SESSION_BACKEND_EXIT_MISMATCH')
++            check(event['exit'] == terminal_exit, 'SESSION_BACKEND_EXIT_MISMATCH')
+             session_finished = True
+         else:
+-            raise ValueError('UNKNOWN_RUNTIME_EVENT')
++            raise CensusError('UNKNOWN_RUNTIME_EVENT', observed_failures)
+     if result is not None:
+-        require(result.get('runtime_events') == events and result.get('identity') == identity and
++        check(result.get('runtime_events') == events and result.get('identity') == identity and
+                 result.get('phase_clock_sha256') == clock_sha and result.get('exit') == terminal_exit,
+                 'RESULT_PROGRESS_OR_BACKEND_MISMATCH')
+     buckets = {k: [] for k in ('passed', 'failed', 'skipped', 'xfailed', 'xpassed', 'not_started', 'interrupted', 'deselected')}
+@@ -144,8 +176,11 @@
+         buckets[bucket].append({'binding': binding, 'phases': phases})
+     complete = collection_finished and session_finished and not buckets['interrupted'] and not buckets['not_started']
+     if terminal_exit == 0:
+-        require(not buckets['failed'], 'EXIT_ZERO_WITH_FAILED_PHASE')
+-        require(complete, 'EXIT_ZERO_WITH_INCOMPLETE_CENSUS')
++        check(not buckets['failed'], 'EXIT_ZERO_WITH_FAILED_PHASE')
++        check(complete, 'EXIT_ZERO_WITH_INCOMPLETE_CENSUS')
++    if terminal_exit == 5:
++        check(collection_finished and not selected and not reports and not started and not finished and
++              set(dropped) == set(expected) and complete, 'EXIT_FIVE_WITH_SELECTED_OR_RUNTEST_EVIDENCE')
+     status = ('RUNTEST_PRODUCT_FAIL' if terminal_exit == 1 and complete and buckets['failed'] else
+               'RUNTEST_REPORTED' if terminal_exit in (0, 5) and complete else 'RUNTEST_PARTIAL_STOP')
+     return {'status': status, 'partition': buckets, 'selected_count': len(selected),
+--- a/producer/source-pins.json
++++ b/producer/source-pins.json
+@@ -1,27 +1,29 @@
+ {
+-  "PROPOSAL.md": "ad571862ef54d15d22adb8b57021b0627035dda9611abf2d56a65ea9fae2f918",
+-  "admission.py": "ecc3f68a0210ea912cea58625fa150e60dcefbd62e43c0e31e717adcc9b34a5c",
+-  "ancillary-pins.json": "07d1efed3b6e67d7e7152ab06e0474bf00f17fa55ff2f42f8e20c512c9bdd82b",
++  "PROPOSAL.md": "b2cde3b8ee3bc6296c91c24590e057d454143053c4b809266e7603381079cde6",
++  "admission.py": "b9627dd37cb0a73732b6028e57f6a672286586571011d13ca68ac9d136886ebb",
++  "ancillary-pins.json": "1a9f8ab0c0de02e6b6d48ab14c924225b9ec8325ed26c59750c2efb21cab419c",
+   "canary-plan.json": "fb60c1b1a3a1f84b7595a1c98c4a46fc0da84a6a3e727ef2f6c2fb02e1af83a1",
+   "canary_oracle.py": "439d800b361109feafcf8f36f862c1b516239f985a1fc7bb44f87d7d791101d9",
+-  "clean-invocation.json": "c3633a259ca8e0ebccbc061d634cd4e318ef8b12fb7effaa5c008b4952b074a3",
+-  "controls.py": "bbe296db07bb35c045fac9dde8500a0adc4e95c21a615dfe85911929af7bd9e4",
++  "clean-invocation.json": "ed4455764bebec1d16413d24059e794e39bb10d9b3f6becf58841354394d4b8c",
++  "controls.py": "db9ae1d5331cd7b3dbcb7dcb9f72949b19df4f52b3008ee4a1de7e0b9f9cd42b",
+   "corpus-pins.json": "82a92215d8681e4d910e0ca82a555f1ba39ef7d260f6dd26f9c99b11912dda59",
+   "descriptor_canary_setup.py": "2631e873c3ab9fcfa5f84ac81eb11f8fce4635ef575145aad1dd5505126d1881",
++  "fault-qualification.json": "6ca463a7afc2f44fbfcffffdb66f787b2a6126b51e5f3daea46ccebdac19b016",
+   "gate-plan.json": "14273ce2945352a75003a5e8b0066033fa9c1b4605b320c0a2bb2db2b4aef15a",
+   "guard.py": "4478a72464104b3ed825c3ae334f55d90e95d582bc584e5fe265cab42afe2fac",
+   "import-path-pins.json": "8722da07c7cb4b75839660a9f222affb647d6443431cd153ff521872d71207d3",
+   "import_path_readiness.py": "bf423a64bcb805342362bdd33a999aa6c00fc307b104821ee7823d4206c85117",
+   "invocation.py": "11662dc0f63673f3fb1dcebb26c89ca2571e549a23989f7add573ed913bfefa0",
+-  "native_controls.py": "bbe296db07bb35c045fac9dde8500a0adc4e95c21a615dfe85911929af7bd9e4",
++  "native_controls.py": "db9ae1d5331cd7b3dbcb7dcb9f72949b19df4f52b3008ee4a1de7e0b9f9cd42b",
+   "native_guard.py": "4cfa608e35d341423353374fa094d1c6ded1eb6b455da53b3904f7c7126468b3",
+-  "runtest-plan.json": "b71157e966b8270e734922ecc81b6f2df140e9fc8bf5b13b9ec73d1f24ab0338",
+-  "runtest_protocol.py": "b3c0ae88e6a3680cbdd359776105af3d6e63ecd3be07f3bbeb018181ff2c1c82",
++  "runtest-plan.json": "b11ba40fae872c6a03375f38eb7e29d69b2a95691bad059188a6e3a5f41d8623",
++  "runtest_protocol.py": "9a27c4a6fc769f333022d71aa7a1771e7b0ac81ba77a54cdd97055f15aaebb17",
+   "runtime-pins.json": "7d3656bc552287c1cdeaa372141a24c8c147506997bf725c99730c4253c34375",
+   "test_collector_receipt_source.py": "2637808ea7f9758954bd078c7b87829826a9078ccaca2b1261eebd79f26de650",
++  "test_custody_repair_source.py": "72f7bd8ce7f87ebf45c3f9623bcdbf4fea25e7f5b5781b0fb934d6dc43172815",
+   "test_guard_canary.py": "e118f11a8d8861419ef2a85b0ca1e9b55098c00b174f562d457696f6473cee88",
+   "test_host_probe_source.py": "a660e79b2d52ac6658f1751a5f9b2d829b8f37e90772356ff6abc949fd7cfb5d",
+   "test_import_path_source.py": "2362da3d08f531600e23c871cbd60d0feb5f49392510d2fe06d5b9bf3345bcb1",
+   "test_native_lexical_source.py": "10504cadd1fb79a16ed0c222df1b7d980d5c316fc753e8535514b7d7a065cbc3",
+-  "test_runtest_protocol_source.py": "c343aec19e6c8acf8c6bf777148a81d3b9c5ef8dfcc0edd19106d776f5ec450e"
++  "test_runtest_protocol_source.py": "734164c3bc127d440db814d5a9579de2bc18f55bd56b019c7658c6dc484c3ea5"
+ }
+--- /dev/null
++++ b/producer/test_custody_repair_source.py
+@@ -0,0 +1,280 @@
++"""Focused controls. NOT RUN; not an execution grant or containment proof.
++
++Models compile exact reviewed function bodies with explicit inert data facades.
++They exercise exception ordering and evidence rules; they cannot prove kernel
++stop, reap, power-loss durability, containment or actual plugin autoload.
++Actual fault cuts remain NOT_RUN in fault-qualification.json; a separate
++reviewed finite native owner is required for those executions.
++"""
++import json
++import ast
++import subprocess
++import os
++import sys
++import types
++from contextlib import contextmanager
++import pathlib
++import threading
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++
++@pytest.mark.parametrize('fault', ['write', 'missing', 'malformed', 'readback'])
++def test_stop_attempt_precedes_failing_checkpoint(source_overlay_model, fault):
++    registry = source_overlay_model.registry()
++    session = source_overlay_model.identity_known_session()
++    order = []
++    registry._terminate_host_pid = lambda pid, born: order.append(('terminate', pid, born))
++    def failure(_):
++        order.append(('checkpoint', fault))
++        raise OSError(fault)
++    registry._runtest_checkpoint = failure
++    outcome = registry.stop_runtest(session)
++    assert order == [('terminate', session.pid, session.host_start_time), ('checkpoint', fault)]
++    assert session.runtest_stop_requested and session.process is not None
++    assert outcome['status'] == 'STOP_UNCONFIRMED' and outcome['persistence_error'] == 'OSError'
++    assert session.id in registry._running
++
++
++def test_one_failed_stop_does_not_skip_next_owned_target(source_overlay_model):
++    registry = source_overlay_model.registry()
++    first = source_overlay_model.identity_known_session('first')
++    second = source_overlay_model.identity_known_session('second')
++    registry._running = {s.id: s for s in (first, second)}
++    attempted = []
++    def stop(session_id, **kwargs):
++        attempted.append(session_id)
++        if session_id == first.id:
++            raise OSError('diagnostic failure')
++        return {'status': 'STOP_REQUESTED'}
++    registry.kill_process = stop
++    assert registry.kill_all() == 0
++    assert attempted == [first.id, second.id] and first._scope_stop_pending
++
++
++@pytest.mark.parametrize('cut', ['return_transfer', 'birth', 'pgid', 'sid', 'checkpoint',
++                              'stat', 'backend_start', 'runtest_custody'])
++def test_post_popen_model_has_one_retained_donor_reader(source_overlay_model, monkeypatch, cut):
++    donor = source_overlay_model.donor
++    proc = Mock(pid=811, returncode=None)
++    order = []
++    def communicate(timeout):
++        order.append('communicate')
++        proc.returncode = -15
++        return 'partial original output', None
++    proc.communicate = communicate
++    def spawn(*args, **kwargs):
++        order.append('popen')
++        if cut == 'return_transfer':
++            raise OSError(cut)
++        return proc
++    def setup(p):
++        assert p is proc
++        order.append(cut)
++        raise OSError(cut)
++    saved = {}
++    def capture(p, output, error, cuts):
++        assert p is proc
++        saved.update(output=output, error=type(error).__name__, cuts=list(cuts))
++        order.append('capture')
++    custody = {'spawn': spawn, 'after_spawn': setup, 'retained_handle': lambda: proc,
++               'retained_pgid': lambda: 811, 'temporary_root': lambda: '/qualified/private/root',
++               'remaining': lambda: 1, 'stop': lambda *args: order.append('stop'),
++               'capture': capture, 'settle': lambda *args: order.append('settle'),
++               'terminal': lambda code: order.append('terminal')}
++    monkeypatch.setitem(donor, '_rmtree_force', lambda path: pytest.fail('failed-start evidence removed'))
++    with pytest.raises(OSError, match=cut):
++        donor['_run_one_file_once'](pathlib.Path('/qualified/file.py'), [],
++                                    pathlib.Path('/qualified'), 1, custody=custody)
++    assert order.count('popen') == order.count('communicate') == order.count('stop') == order.count('settle') == 1
++    assert order.index('stop') < order.index('communicate') < order.index('capture') < order.index('settle')
++    assert saved['output'] == 'partial original output' and saved['error'] == 'OSError'
++
++
++@pytest.mark.parametrize('cut', ['stop', 'capture', 'settle', 'drain_reap'])
++def test_cleanup_failure_retains_handle_and_attempts_later_cuts(source_overlay_model, monkeypatch, cut):
++    donor = source_overlay_model.donor
++    proc = Mock(pid=811, returncode=None)
++    order = []
++    def fail(operation):
++        order.append(operation)
++        if cut == operation:
++            raise OSError(cut)
++    def communicate(timeout):
++        fail('drain_reap')
++        proc.returncode = -15
++        return 'retained', None
++    proc.communicate = communicate
++    def after(p):
++        raise OSError('startup failure')
++    custody = {'spawn': lambda *args, **kwargs: proc, 'after_spawn': after,
++               'retained_handle': lambda: proc, 'retained_pgid': lambda: 811,
++               'temporary_root': lambda: '/qualified/private/root', 'remaining': lambda: 1,
++               'stop': lambda *args: fail('stop'), 'capture': lambda *args: fail('capture'),
++               'settle': lambda *args: fail('settle'), 'terminal': lambda code: None}
++    monkeypatch.setitem(donor, '_rmtree_force', lambda path: pytest.fail('unknown custody evidence removed'))
++    with pytest.raises(RuntimeError, match='STOP_UNCONFIRMED'):
++        donor['_run_one_file_once'](pathlib.Path('/qualified/file.py'), [],
++                                    pathlib.Path('/qualified'), 1, custody=custody)
++    assert order == ['stop', 'drain_reap', 'capture', 'settle']
++
++
++@pytest.mark.parametrize('fsync_cut', ['file', 'directory_open', 'directory_fsync', 'readback'])
++def test_strict_failure_fences_admission_without_losing_session(source_overlay_model, fsync_cut):
++    # This fixture injects into the REAL existing atomic writer and actual
++    # strict checkpoint path in a qualified private temporary profile.
++    registry = source_overlay_model.registry()
++    session = source_overlay_model.identity_known_session()
++    with source_overlay_model.inject_checkpoint_failure(registry, fsync_cut):
++        with pytest.raises((OSError, RuntimeError, ValueError)):
++            registry._runtest_checkpoint(session)
++    assert session.runtest_stop_requested and session.runtest_persistence_error
++    assert registry._running[session.id] is session
++    with pytest.raises(RuntimeError, match='SPAWN_FENCED'):
++        registry.spawn_runtest(session, ['no-replay'], {'start_new_session': True, 'cwd': session.cwd})
++
++
++@pytest.mark.parametrize('transition', ['reserve', 'pid', 'stop'])
++def test_generic_old_snapshot_cannot_overwrite_new_custody(source_overlay_model, transition):
++    registry = source_overlay_model.registry()
++    first = source_overlay_model.identity_known_session('old')
++    registry._running = {first.id: first}
++    entered = threading.Event(); release = threading.Event(); newer_started = threading.Event()
++    errors = []
++    def stalled_write(path, rows, **kwargs):
++        entered.set()
++        if not release.wait(1):raise RuntimeError('model barrier timeout')
++        source_overlay_model.state['rows'] = json.loads(json.dumps(rows))
++    source_overlay_model.utils.atomic_json_write = stalled_write
++    def old():
++        try:registry._write_checkpoint(strict=True)
++        except BaseException as error:errors.append(error)
++    def newer():
++        try:
++            newer_started.set()
++            session = source_overlay_model.identity_known_session('new')
++            if transition == 'pid':session.pid = 812
++            if transition == 'stop':session.runtest_stop_requested = True
++            with registry._lock:registry._running[session.id] = session
++            registry._write_checkpoint(strict=True)
++        except BaseException as error:errors.append(error)
++    older = threading.Thread(target=old); newer = threading.Thread(target=newer)
++    older.start()
++    try:
++        assert entered.wait(1)
++        newer.start(); assert newer_started.wait(1)
++    finally:
++        release.set(); older.join(2)
++        if newer.ident is not None:newer.join(2)
++    assert not older.is_alive() and not newer.is_alive() and not errors
++    rows = source_overlay_model.state['rows']
++    assert {row['session_id'] for row in rows} == {'old','new'}
++    row = next(r for r in rows if r['session_id'] == 'new')
++    assert row['runtest_custody'] and row['runtest_stop_requested'] == (transition == 'stop')
++    assert row['pid'] == (812 if transition == 'pid' else 811)
++    # These are inert calls in the MODEL, not actual file/directory durability.
++    assert source_overlay_model.state['directory_fsync_calls'] == 2
++
++
++@pytest.mark.parametrize('drift_cut', ['body', 'entrypoint', 'missing_origin', 'autoload_map'])
++def test_runtime_plugin_closure_refuses_declaration_gap(source_overlay_model, drift_cut):
++    plan = json.loads(pathlib.Path(__file__).with_name('runtest-plan.json').read_text())
++    ref = plan['runtime_plugins'][0]
++    if drift_cut == 'body':plan['runtime_dependency_pins'].pop(ref['path'])
++    elif drift_cut == 'entrypoint':plan['runtime_dependency_pins'].pop(ref['entrypoint'])
++    elif drift_cut == 'missing_origin':plan['runtime_import_origins'][ref['module']]='/unreviewed/plugin.py'
++    else:plan['runtime_autoload_entrypoints'][ref['entrypoint']]='f'*64
++    with pytest.raises(ValueError):source_overlay_model.api['runtime_dependency_pins'](plan)
++
++
++@pytest.fixture
++def source_overlay_model(monkeypatch):
++    """Exact source function bodies + declared inert facades; no live child.
++
++    This fixture is SOURCE NOT_RUN. Calling it later requires the independent
++    test owner's own reviewed boundary; it never creates a clock or grant.
++    """
++    candidate = pathlib.Path(__file__).parent.parent
++    state = {'rows': [], 'fault': None, 'directory_fsync_calls': 0}
++    class ModelPath:
++        parent = None
++        def resolve(self, strict=True):return self
++        def read_text(self):
++            if state['fault'] == 'readback':raise ValueError('readback')
++            return json.dumps(state['rows'])
++    checkpoint = ModelPath();checkpoint.parent=checkpoint
++    def open_directory(*args, **kwargs):
++        if state['fault']=='directory_open':raise OSError('directory_open')
++        return 411
++    def fsync(fd):
++        state['directory_fsync_calls'] += 1
++        if state['fault']=='directory_fsync':raise OSError('directory_fsync')
++    def atomic(path, rows, **kwargs):
++        assert kwargs['fsync_dir'] is True
++        if state['fault']=='file':raise OSError('file')
++        state['rows']=json.loads(json.dumps(rows))
++    fake_os=SimpleNamespace(open=open_directory,fsync=fsync,close=lambda fd: None,
++                            O_RDONLY=0,O_DIRECTORY=1,O_CLOEXEC=2,
++                            getpgid=lambda pid:pid,getsid=lambda pid:pid)
++    fields=('runtest_custody','runtest_unit','runtest_deadline','runtest_boot_id',
++            'runtest_stop_requested','runtest_launch_pending','runtest_pgid','runtest_sid',
++            'runtest_persistence_error','task_id','owner_task_id','session_key','pid','host_start_time','command')
++    reg_module=types.ModuleType('tools.process_registry');reg_module._checkpoint_path=lambda:checkpoint
++    reg_module._CHECKPOINT_FIELDS=fields
++    utilities=types.ModuleType('utils');utilities.atomic_json_write=atomic
++    monkeypatch.setitem(sys.modules,'tools.process_registry',reg_module)
++    monkeypatch.setitem(sys.modules,'utils',utilities)
++    def extract(path, names, namespace):
++        tree=ast.parse(path.read_bytes())
++        chosen=[node for node in ast.walk(tree) if isinstance(node,(ast.FunctionDef,ast.ClassDef)) and node.name in names]
++        for node in chosen:
++            if isinstance(node,ast.FunctionDef):node.decorator_list=[]
++        exec(compile(ast.Module(body=chosen,type_ignores=[]),str(path),'exec'),namespace)
++        return namespace
++    namespace={'json':json,'os':fake_os,'Path':lambda p:SimpleNamespace(read_text=lambda:'boot'),
++               'time':SimpleNamespace(monotonic=lambda:1),'_checkpoint_path':lambda:checkpoint,
++               'logger':Mock(),'Optional':__import__('typing').Optional,'List':__import__('typing').List,
++               'Dict':__import__('typing').Dict,'Any':__import__('typing').Any,
++               'redact_sensitive_text':lambda text,**kwargs:text}
++    names={'_runtest_checkpoint','spawn_runtest','stop_runtest','kill_all'}
++    extract(candidate/'donor/tools/process_registry.py',names,namespace)
++    extract(candidate/'donor/tools/process_registry_checkpoint.py',{'_write_checkpoint'},namespace)
++    registry_type=type('ExactSourceRegistryModel',(),{n:namespace[n] for n in names|{'_write_checkpoint'}})
++    def registry():
++        r=registry_type();r._lock=threading.Lock();r._checkpoint_lock=threading.RLock()
++        r._running={};r._finished={};r._LIFECYCLE_KILL_SOURCES=frozenset()
++        r._daemon_term_grace_seconds=lambda:1;r._safe_host_start_time=lambda pid:33
++        return r
++    current_registry=None
++    # Attach each constructed identity session to the most recent model registry.
++    real_factory=registry
++    def registry():
++        nonlocal current_registry
++        current_registry=real_factory();return current_registry
++    def session(name='owned'):
++        s=SimpleNamespace(id=name,_lock=threading.Lock(),process=Mock(),pid=811,
++          host_start_time=33,runtest_custody=True,runtest_unit='f000',runtest_deadline=1801,
++          runtest_boot_id='boot',runtest_stop_requested=False,runtest_launch_pending=False,
++          runtest_pgid=811,runtest_sid=811,runtest_persistence_error='',task_id='source-model',
++          owner_task_id='source-model',session_key='model',command='data',exited=False,
++          pid_scope='host',persist_on_release=False,_scope_stop_pending=False)
++        current_registry._running[s.id]=s
++        return s
++    @contextmanager
++    def inject(r, cut):
++        state['fault']=cut
++        try:yield
++        finally:state['fault']=None
++    donor_os=SimpleNamespace(environ={},getpgid=lambda pid:pid)
++    donor_ns={'os':donor_os,'sys':SimpleNamespace(executable='inert-python',platform='linux'),
++              'Path':pathlib.Path,'List':__import__('typing').List,'Tuple':__import__('typing').Tuple,
++              'subprocess':subprocess,'tempfile':Mock(),'time':SimpleNamespace(monotonic=lambda:1),
++              '_rmtree_force':lambda p:None,'_parse_pytest_summary':lambda text:{},
++              '_describe_interpreter_crash':lambda rc,text:None}
++    extract(candidate/'donor/scripts/run_tests_parallel.py',{'_run_one_file_once'},donor_ns)
++    api_ns={'hashlib':__import__('hashlib'),'math':__import__('math'),'json':json}
++    extract(candidate/'producer/runtest_protocol.py',{'require','runtime_dependency_pins'},api_ns)
++    return SimpleNamespace(registry=registry,identity_known_session=session,donor=donor_ns,
++                           inject_checkpoint_failure=inject,state=state,utils=utilities,api=api_ns)
+--- a/producer/test_runtest_protocol_source.py
++++ b/producer/test_runtest_protocol_source.py
+@@ -108,3 +108,53 @@
+     plan['runtime_custody_integrated']=True;plan['unresolved_effect_boundaries']=['native socketpair']
+     with pytest.raises(ValueError,match='EFFECT_SOURCE_NOT_READY'):
+         API['validate_admission'](clock,plan,'f000','@native','native_guard.py','p')
++
++
++@pytest.mark.parametrize('trace', ['failed_call_exit5','selected_exit5','finish_then_collection',
++                                  'finish_then_start','finish_then_report','finish_then_finish',
++                                  'finish_then_session','bool_backend_exit','bool_session_exit'])
++def test_contradictory_completion_is_not_admissible(trace):
++    unit, rows=events(('passed','failed','passed'),exit_code=5)
++    rc=5
++    if trace=='selected_exit5':unit,rows=events(exit_code=5)
++    elif trace.startswith('finish_then_'):
++        unit,binding=fixture()
++        rows=[{'sequence':0,'kind':'session_finish','exit':5,'identity':{'nonce':'actual'},
++               'phase_clock_sha256':'clock'}]
++        if trace=='finish_then_collection':extra={'kind':'collection','selected':[],'deselected':[binding]}
++        elif trace=='finish_then_start':extra={'kind':'item_start','binding':binding}
++        elif trace=='finish_then_report':extra={'kind':'report','binding':binding,'report':{}}
++        elif trace=='finish_then_finish':extra={'kind':'item_finish','binding':binding}
++        else:extra={'kind':'session_finish','exit':5}
++        rows.append(dict(extra,sequence=1,identity={'nonce':'actual'},phase_clock_sha256='clock'))
++    elif trace=='bool_backend_exit':rc=True
++    elif trace=='bool_session_exit':rows[-1]['exit']=True
++    with pytest.raises(ValueError) as failure:decide(unit,rows,rc)
++    if trace=='failed_call_exit5':
++        assert len(failure.value.failure_observed)==1
++        assert failure.value.failure_observed[0]['report']['outcome']=='failed'
++
++
++def test_genuine_all_deselected_exit5_is_reported_without_runtest():
++    unit,binding=fixture()
++    rows=[{'sequence':0,'kind':'collection','selected':[],'deselected':[binding],
++           'identity':{'nonce':'actual'},'phase_clock_sha256':'clock'},
++          {'sequence':1,'kind':'session_finish','exit':5,
++           'identity':{'nonce':'actual'},'phase_clock_sha256':'clock'}]
++    result=decide(unit,rows,5)
++    assert result['status']=='RUNTEST_REPORTED' and result['selected_count']==0
++    assert len(result['partition']['deselected'])==1 and not result['failure_observed']
++
++
++def test_non_strict_xpass_preserved():
++    unit,rows=events()
++    rows[3]['report']['wasxfail']='known issue'
++    result=decide(unit,rows,0)
++    assert len(result['partition']['xpassed'])==1 and result['status']=='RUNTEST_REPORTED'
++
++
++def test_strict_xpass_failure_preserved():
++    unit,rows=events(('passed','failed','passed'),exit_code=1)
++    rows[3]['report']['detail']='[XPASS(strict)] known issue'
++    result=decide(unit,rows,1)
++    assert len(result['partition']['failed'])==1 and result['status']=='RUNTEST_PRODUCT_FAIL'

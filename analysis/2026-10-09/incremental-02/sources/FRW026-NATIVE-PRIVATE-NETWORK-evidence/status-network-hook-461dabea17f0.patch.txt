@@ -1,0 +1,113 @@
+--- a/native_status.py
++++ b/native_status.py
+@@ -21,6 +21,7 @@
+ MAX_STATUS = 4096
+ MAX_RECORD = 2048
+ MAX_CONTOUR = 32768
++PRIVATE_NETWORK_HOOK_VERSION = 1
+ NS_NAMES = ('pid', 'mnt', 'ipc', 'uts', 'net', 'user', 'cgroup')
+ 
+ 
+@@ -138,7 +139,7 @@
+                ('pid', 'start_ticks', 'ppid', 'pgid', 'sid', 'namespaces', 'cgroup'))
+ 
+ 
+-def provider_argv(prepared, semantic, status_fd):
++def provider_argv(prepared, semantic, status_fd, network=None):
+     """Validate the existing provider output; keep its mounts and scoped launcher."""
+     require(type(prepared) is dict and prepared.get('capability') == 'host-control-v1' and
+             prepared.get('state') == 'UNQUALIFIED_SOURCE_PREPARATION' and
+@@ -154,6 +155,9 @@
+              '--cap-drop': 1, '--clearenv': 0, '--die-with-parent': 0,
+              '--proc': 1, '--dev': 1, '--tmpfs': 1, '--ro-bind': 2,
+              '--bind': 2, '--chdir': 1, '--json-status-fd': 1}
++    if network is not None:
++        network.validate_preparation(prepared)
++        arity.update({'--unshare-net': 0, '--block-fd': 1})
+     seen = {}; offset = 1
+     while offset < len(argv) and argv[offset] != '--':
+         flag = argv[offset]
+@@ -164,6 +168,11 @@
+             seen.get('--unshare-pid') == [[]] and seen.get('--unshare-user') == [[]] and
+             seen.get('--clearenv') == [[]] and seen.get('--die-with-parent') == [[]],
+             'STATUS_OR_NAMESPACE_OPTION_DRIFT')
++    if network is not None:
++        require(seen.get('--unshare-net') == [[]] and
++                seen.get('--block-fd') == [[str(network.block_read)]] and
++                seen.get('--ro-bind', [])[-1] == [str(network.resolver), '/etc/resolv.conf'] and
++                status_fd != network.block_read, 'OWNED_NETWORK_BARRIER_OR_DNS_MOUNT_DRIFT')
+     inner = argv[offset + 1:]
+     require(offset < len(argv) and inner and inner[0].startswith('/') and
+             len(inner) > len(semantic) and inner[-len(semantic):] == semantic and
+@@ -247,8 +256,9 @@
+     No public JSON receipt can recreate this retained object after a crash.
+     Recovered sessions remain UNBOUND and use the existing native outer cleanup.
+     """
+-    def __init__(self, owner, session, registry, run, semantic, prepare):
++    def __init__(self, owner, session, registry, run, semantic, prepare, *, network=None):
+         self.owner, self.session, self.registry = owner, session, registry
++        self.network = network
+         self.semantic = list(semantic)
+         self.read_fd = self.write_fd = None
+         self.events = None
+@@ -278,7 +288,7 @@
+                     'OWNED_CLOEXEC_PIPE_REQUIRED')
+             self.pipe_identity = [r.st_dev, r.st_ino]
+             prepared = prepare(list(self.semantic), self.write_fd)
+-            self.argv = provider_argv(prepared, self.semantic, self.write_fd)
++            self.argv = provider_argv(prepared, self.semantic, self.write_fd, self.network)
+             require(hashlib.sha256(Path(BWRAP).read_bytes()).hexdigest() == BWRAP_SHA256,
+                     'BWRAP_BINARY_DRIFT')
+             self._current()
+@@ -312,9 +322,12 @@
+                     'FOREIGN_INHERITED_DESCRIPTOR_OR_EXEC_OVERRIDE')
+             self._pipe_endpoint(self.read_fd, False)
+             self._pipe_endpoint(self.write_fd, True)
+-            exact = dict(kwargs, pass_fds=(self.write_fd,))
++            inherited = ((self.write_fd, self.network.block_read) if self.network else (self.write_fd,))
++            require(len(set(inherited)) == len(inherited), 'OWNED_DESCRIPTOR_COLLISION')
++            exact = dict(kwargs, pass_fds=inherited)
+             # The only Popen and pidfd acquisition stay in the real registry.
+             self.proc = self.registry.spawn_runtest(self.session, self.argv, exact, native_owner=self.owner)
++            if self.network is not None: self.network.donor_spawned(self.proc)
+             return self.proc
+         except BaseException:
+             self.abort()
+@@ -341,7 +354,12 @@
+             require(monitor['start_ticks'] == self.session.host_start_time and
+                     monitor['pgid'] == monitor['sid'] == proc.pid and monitor['exe'] == BWRAP and
+                     monitor['cmdline'] == [os.fsencode(v) for v in self.argv], 'HOST_MONITOR_DRIFT')
++            network_attached = self.network is None
+             while self.records.start is None or not self.events.ready:
++                if self.records.start is not None and not network_attached:
++                    require(self.records.exit is None and not self.records.eof, 'NETWORK_STATUS_ALREADY_EXITED')
++                    self.network.attach_before_payload(monitor, self.records.start)
++                    network_attached = True
+                 self._current()
+                 remaining = self.startup_end - time.monotonic()
+                 require(remaining > 0 and not self.records.eof and self.records.exit is None,
+@@ -351,7 +369,7 @@
+                 if self.read_fd in ready: self._status_ready()
+                 if self.events.fd in ready: self.events.consume()
+             self._current()
+-            require(not self.records.eof and self.records.exit is None, 'STARTUP_ALREADY_EXITED')
++            require(network_attached and not self.records.eof and self.records.exit is None, 'STARTUP_ALREADY_EXITED')
+             data = read_bounded(self.events.path, MAX_CONTOUR)
+             contour = json.loads(data, object_pairs_hook=strict_object)
+             for key, value in expected_contour.items():
+@@ -445,6 +463,7 @@
+                 require(ready, 'STATUS_WRITER_LEAK_OR_EOF_GAP')
+                 self._status_ready()
+             require(self.records.exit == proc.returncode, 'NATIVE_EXIT_DONOR_MISMATCH')
++            if self.network is not None: self.network.finish_after_donor(proc)
+             return dict(state='NATIVE_STATUS_COMPLETE_NOT_CESSATION', exit_code=self.records.exit,
+                         bytes=self.records.total, sha256=self.records.digest.hexdigest(),
+                         runtimeGrant=False)
+@@ -456,6 +475,7 @@
+             self.close()
+ 
+     def abort(self):
++        if self.network is not None: self.network.abort()
+         self.failed = True
+         self.session.runtest_stop_requested = True
+         self.close()

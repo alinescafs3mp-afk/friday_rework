@@ -1,0 +1,213 @@
+"""Independent data/hash/AST verifier; never imports/evaluates candidate code."""
+import ast
+import datetime
+import difflib
+import hashlib
+import json
+import os
+from pathlib import Path
+import resource
+import stat
+import tarfile
+
+os.sched_setaffinity(0, {0, 1})
+resource.setrlimit(resource.RLIMIT_AS, (2147483648, 2147483648))
+W = Path('<ASTRA_WORK>')
+R = W / 'offline-build-boundary-repair'
+OUT = W / 'offline-build-repair-review'
+C = R / 'candidate'
+OLD = Path('<SOL_WORK>/FRW041-NATIVE-OFFLINE-BUILD-evidence/candidate-v2')
+EXPECTED = {
+    R / 'result.json': 'cfb26345e14e85c6b22a61e78c1a13f94f79d3bf8a86e779bb5e305921c172d2',
+    C / 'package-pins.json': '8f8130d22d73b78a997231af3a6caf3c005c27eaac48f4ec3692f4ec2d203be1',
+    W / 'native-offline-build-review/result.json': '3e7b8acda79c07b16bbc3de091f9aea5503913d41bb9a79ebdbcae41009c5200',
+    W / 'native-offline-build-review/verification.json': '3fcc06f28309ba13a066d407a93b87e40efdd5ce1e0c9d2bafae5d4b3a06c56e',
+}
+
+def unique(pairs):
+    answer = {}
+    for k, v in pairs:
+        assert k not in answer, ('duplicate_json_key', k)
+        answer[k] = v
+    return answer
+
+def data(path):
+    return json.loads(path.read_bytes(), object_pairs_hook=unique)
+
+def ref(path):
+    path = Path(path)
+    a = path.lstat()
+    raw = path.read_bytes()
+    b = path.lstat()
+    assert stat.S_ISREG(a.st_mode) and a.st_nlink == 1
+    key = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_mode, s.st_uid, s.st_nlink)
+    assert key(a) == key(b) and a.st_size == len(raw)
+    return dict(path=str(path), sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw), mode=stat.S_IMODE(a.st_mode), uid=a.st_uid, nlink=a.st_nlink)
+
+def check_ref(expected):
+    actual = ref(expected['path'])
+    for key in ('sha256', 'bytes', 'mode'):
+        if key in expected:
+            value = expected[key]
+            if key == 'mode' and isinstance(value, str):
+                value = int(value, 8)
+            assert actual[key] == value, (expected['path'], key, actual[key], value)
+    return actual
+
+verified = [check_ref(dict(path=str(p), sha256=h)) for p,h in EXPECTED.items()]
+result = data(R / 'result.json')
+for key in ('final_manifest', 'verification', 'exact_source_diff', 'exact_inputs_byte_splice', 'baseline_package'):
+    verified.append(check_ref(result[key]))
+manifest = data(R / 'FINAL-MANIFEST.json')
+candidate_refs = [check_ref(x) for x in manifest['candidate_files']]
+assert {x['path'] for x in candidate_refs} == {str(p) for p in C.iterdir()}
+assert all(x['uid'] == 1000 and x['mode'] == 0o400 for x in candidate_refs)
+assert stat.S_IMODE(C.stat().st_mode) == 0o500
+pins, old_pins = data(C / 'package-pins.json'), data(OLD / 'package-pins.json')
+assert set(pins) == set(old_pins) == {p.name for p in C.iterdir()} - {'package-pins.json'}
+for name, pin in pins.items():
+    check_ref(dict(path=str(C/name), **pin))
+for name, pin in old_pins.items():
+    check_ref(dict(path=str(OLD/name), **pin))
+
+old_inputs, inputs = data(OLD/'inputs.json'), data(C/'inputs.json')
+assert {k:v for k,v in old_inputs.items() if k != 'files'} == {k:v for k,v in inputs.items() if k != 'files'}
+assert len(old_inputs['files']) == 101301 and len(inputs['files']) == 101302
+assert all(inputs['files'].get(k) == v for k,v in old_inputs['files'].items())
+added = {k:v for k,v in inputs['files'].items() if k not in old_inputs['files']}
+config = Path(inputs['build_root']) / 'cargo-offline.toml'
+assert set(added) == {str(config)}
+config_ref = check_ref(dict(path=str(config), **added[str(config)]))
+assert config_ref['sha256'] == 'c1e99b93ca8959eee8f4b31a13d5d75e70ee33a41602e9b69e5aa1f19a06323d'
+assert config_ref['bytes'] == 242 and config_ref['mode'] == 0o400 and config_ref['uid'] == 1000
+for parent in config.parents:
+    s = parent.lstat()
+    assert stat.S_ISDIR(s.st_mode) and s.st_uid in (0,1000) and not s.st_mode & 0o022
+assert config == config.resolve(strict=True)
+assert sum(x['bytes'] for x in inputs['files'].values()) == 3224017574
+splice = data(R / 'inputs.delta.json')
+before, after = (OLD/'inputs.json').read_bytes(), (C/'inputs.json').read_bytes()
+offset = splice['offset']
+deleted, inserted = splice['delete_utf8'].encode(), splice['insert_utf8'].encode()
+assert before[offset:offset+len(deleted)] == deleted
+assert before[:offset] + inserted + before[offset+len(deleted):] == after
+assert splice['added'] == added
+prior_verification = data(W/'native-offline-build-review/verification.json')
+assert prior_verification['inputs']['count'] == 101301
+assert prior_verification['inputs']['all_actual_bytes_mode_type_singlelink_verified'] is True
+
+changed = sorted(p.name for p in C.iterdir() if p.read_bytes() != (OLD/p.name).read_bytes())
+diff = ''.join(''.join(difflib.unified_diff((OLD/n).read_text().splitlines(True), (C/n).read_text().splitlines(True), fromfile='candidate-v2/'+n, tofile='candidate/'+n)) for n in changed if n != 'inputs.json')
+assert diff == (R/'source.diff').read_text(), 'source.diff does not exactly represent changed source'
+assert (C/'source-pins.json').read_bytes() == (OLD/'source-pins.json').read_bytes()
+
+bundle, old_bundle = data(C/'install-bundle.json'), data(OLD/'install-bundle.json')
+identity, old_identity = data(C/'source-identity.json'), data(OLD/'source-identity.json')
+assets = {'admin-control.py','preflight','start','observe','stop','cleanup','build.py','inputs.json','phase-plan.json'}
+assert set(bundle['root_assets']) == assets
+for name, pin in bundle['root_assets'].items():
+    assert pin['sha256'] == pins[name]['sha256']
+    assert pin['mode'] == (0o555 if name in {'preflight','start','observe','stop','cleanup'} else 0o444)
+assert bundle['fragment_sha256'] == pins['offline-build.service']['sha256']
+assert bundle['policy_sha256'] == pins['sudoers']['sha256'] == old_bundle['policy_sha256']
+assert bundle['source'] == identity['root_source'] == str(C)
+assert identity['source_task'] == 'FRW041-OFFLINE-BUILD-BOUNDARY-REPAIR#1'
+assert {k:v for k,v in identity.items() if k not in ('source_task','root_source')} == {k:v for k,v in old_identity.items() if k not in ('source_task','root_source')}
+assert {k:v for k,v in bundle.items() if k not in ('source','fragment_sha256','root_assets')} == {k:v for k,v in old_bundle.items() if k not in ('source','fragment_sha256','root_assets')}
+replacements = {str(OLD):str(C), 'FRW041-NATIVE-OFFLINE-BUILD-SOL#1':identity['source_task']}
+replacements.update({old_pins[n]['sha256']:pins[n]['sha256'] for n in pins if old_pins[n]['sha256'] != pins[n]['sha256']})
+def normalize_old(text):
+    for before, after in replacements.items():
+        text = text.replace(before, after)
+    return text
+normalized_equal = {}
+for name in ('INSTALL-ENTRY.sh','install-system.py','admin-control.py'):
+    normalized_equal[name] = normalize_old((OLD/name).read_text()) == (C/name).read_text()
+    assert normalized_equal[name], name
+assert "BUNDLE_SHA='"+pins['install-bundle.json']['sha256']+"'" in (C/'install-system.py').read_text()
+assert "hashlib.sha256(b).hexdigest()=='"+pins['install-system.py']['sha256']+"'" in (C/'INSTALL-ENTRY.sh').read_text()
+for name in ('RUNTIME-ADMISSION-SCHEMA.json','SOURCE-REVIEW-SCHEMA.json'):
+    assert normalize_old((OLD/name).read_text()) == (C/name).read_text()
+
+phase, old_phase = data(C/'phase-plan.json'), data(OLD/'phase-plan.json')
+assert all(phase[k] == v for k,v in old_phase.items())
+assert set(phase) - set(old_phase) == {'syscall_denial','cargo_config'}
+assert {k:phase['cargo_config'][k] for k in ('sha256','bytes','mode')} == added[str(config)]
+assert phase['cargo_config']['path'] == str(config)
+unit, old_unit = (C/'offline-build.service').read_text(), (OLD/'offline-build.service').read_text()
+assert unit == old_unit.replace('SystemCallFilter=~connect sendto sendmsg sendmmsg io_uring_setup io_uring_enter io_uring_register\n', 'SystemCallFilter=~connect sendto sendmsg sendmmsg io_uring_setup io_uring_enter io_uring_register\nSystemCallErrorNumber=EPERM\n')
+
+trees = {p.name: ast.parse(p.read_text(), filename=str(p)) for p in C.glob('*.py')}
+loader = (C/'INSTALL-ENTRY.sh').read_text().split("<<'ROOT_LOADER'\n",1)[1].rsplit('\nROOT_LOADER',1)[0]
+ast.parse(loader, filename='INSTALL-ENTRY.sh:ROOT_LOADER')
+old_tests = ast.parse((OLD/'test_offline_build_source.py').read_text())
+new_tests = trees['test_offline_build_source.py']
+def tests(tree):
+    return {n.name:n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name.startswith('test_')}
+def counts(tree):
+    answer = {}
+    for name, node in tests(tree).items():
+        count = 1
+        for dec in node.decorator_list:
+            if isinstance(dec,ast.Call) and isinstance(dec.func,ast.Attribute) and dec.func.attr=='parametrize':
+                assert isinstance(dec.args[1], (ast.List,ast.Tuple))
+                count *= len(dec.args[1].elts)
+        answer[name] = count
+    return answer
+old_functions, new_functions = tests(old_tests), tests(new_tests)
+assert len(old_functions) == 13 and len(new_functions) == 19
+assert all(ast.dump(node) == ast.dump(new_functions[name]) for name,node in old_functions.items())
+old_counts, new_counts = counts(old_tests), counts(new_tests)
+assert sum(old_counts.values()) == 32 and sum(new_counts.values()) == 58
+runner = (C/'run-live-unit.py').read_text()
+runner_old = normalize_old((OLD/'run-live-unit.py').read_text())
+runner_expected = runner_old.replace("    elif signature in ('u','t'):", "    elif signature=='i':valid=type(data) is int and -(2**31)<=data<2**31\n    elif signature in ('u','t'):")
+marker = "    require(typed_value(props,'SystemCallArchitectures'"
+runner_expected = runner_expected.replace(marker, "    require(typed_value(props,'SystemCallErrorNumber','i')==errno.EPERM, 'typed_syscall_EPERM_required')\n"+marker)
+assert runner == runner_expected
+calls = [n.lineno for n in ast.walk(trees['run-live-unit.py']) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id=='validate_execution_properties']
+assert sorted(calls) == [243,410]
+build_old_tree = ast.parse((OLD/'build.py').read_text())
+build_old = {n.name:n for n in build_old_tree.body if isinstance(n,ast.FunctionDef)}
+build_new = {n.name:n for n in trees['build.py'].body if isinstance(n,ast.FunctionDef)}
+assert all(ast.dump(node)==ast.dump(build_new[name]) for name,node in build_old.items() if name not in ('prepare','main'))
+assert set(build_new)-set(build_old) == {'verified_cargo_config','cargo_phase'}
+assert (C/'runtime_binding.py').read_bytes() == (OLD/'runtime_binding.py').read_bytes()
+
+semantics = data(W/'native-offline-build-review/authoritative-semantics.json')
+assert ref(W/'native-offline-build-review/authoritative-semantics.json')['sha256'] == 'b9a06f4d1b9b61bd2f06b8752c087907801e794daae57c4d7b661c6b665b5182'
+archive_ref = check_ref(semantics['local_archive'])
+authoritative = []
+for source in {x['path']:x for x in semantics['source_refs']}.values():
+    authoritative.append(check_ref(source))
+with tarfile.open(semantics['local_archive']['path'],'r:gz') as archive:
+    member = 'systemd-259.5/src/core/dbus-execute.c'
+    raw = archive.extractfile(member).read()
+    text = raw.decode()
+    expected = 'SD_BUS_PROPERTY("SystemCallErrorNumber", "i", bus_property_get_int, offsetof(ExecContext, syscall_errno), SD_BUS_VTABLE_PROPERTY_CONST)'
+    line = next(i for i,l in enumerate(text.splitlines(),1) if expected in l)
+    assert line == 1361
+    dbus = dict(archive=archive_ref, member=member, sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw), line=line, statement=expected)
+
+answer = dict(state='PASS_STATIC_SOURCE_DATA_HASH_AST_ONLY', verified_refs=verified,
+    candidate_refs=candidate_refs, changed_files=changed, exact_source_diff=True,
+    input_graph=dict(prior_count=101301, final_count=101302, final_bytes=3224017574,
+        exact_unchanged_map=True, changed_or_removed_prior_entries=0, unchanged_nonfile_fields=True,
+        added_config=config_ref, config_private_ancestor_chain=True, exact_byte_splice=True,
+        prior_3_2GB_payload_rehashed=False, reuse_basis=EXPECTED[W/'native-offline-build-review/verification.json']),
+    closure=dict(package_complete=True, root_assets=sorted(assets), bootstrap_hash=True,
+        bundle_hash=True, policy_unchanged=True, source_pins_unchanged=True,
+        normalized_source_equal=normalized_equal, native_identity_unchanged=True,
+        all_original_phase_plan_keys_unchanged=True, unit_only_change_explicit_EPERM=True,
+        runner_only_changes_source_task_signed_i_EPERM=True, typed_consumers_lines=sorted(calls)),
+    syntax=dict(parsed_files=sorted(trees), embedded_loader=True, candidate_code_imported_or_executed=False),
+    test_source=dict(old_functions=13, final_functions=19, old_functions_AST_equal=True,
+        old_expected_cases=32, final_expected_cases=58, added_expected_cases=26,
+        cases_by_function=new_counts, collected=False, run=False),
+    authoritative_refs=authoritative, systemd_dbus_signature=dbus,
+    resource=dict(affinity=sorted(os.sched_getaffinity(0)),address_space_limit=resource.getrlimit(resource.RLIMIT_AS)[0], children=0),
+    at_msk=datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3))).isoformat())
+with (OUT/'verification.json').open('x') as out:
+    json.dump(answer,out,indent=2)
+    out.write('\n')
+print(json.dumps({k:answer[k] for k in ('state','changed_files','input_graph','closure','test_source','resource')},indent=2))

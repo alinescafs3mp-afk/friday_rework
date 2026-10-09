@@ -1,0 +1,184 @@
+"""SOURCE_ONLY/NOT_RUN; passive metadata controls using the existing AST method.
+
+Fake syscall sinks establish no actual loader denial/reaping observation. The
+next separately admitted real refusal must use the existing owner/runner/fence.
+"""
+import ast
+import json
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+ROOT = Path(__file__).parent
+
+
+def functions(*names, **values):
+    tree = ast.parse((ROOT / 'diagnostics/private_effect_fence.py').read_text())
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    assert len(nodes) == len(names)
+    env = {'json': json, 'sys': sys, 'READ_GETFRAME': sys._getframe,
+        'READ_FRAME_TYPE': type(sys._getframe()), 'READ_DIAGNOSTIC_MAX_BYTES': 65536,
+        'READ_DIAGNOSTIC_PATH_CHARS': 512, 'READ_DIAGNOSTIC_MAX_WRITES': 8,
+        'LOADER_DIAGNOSTIC_MAX_SCAN': 32, 'LOADER_DIAGNOSTIC_MAX_FRAMES': 16,
+        'LOADER_DIAGNOSTIC_MAX_ARGS': 2, 'LOADER_DIAGNOSTIC_PINS': {__file__: 'a' * 64},
+        **values}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<loader-metadata-source>', 'exec'), env)
+    return SimpleNamespace(**{name: env[name] for name in names})
+
+
+def diagnostic(**values):
+    return functions('diagnostic_text', 'loader_diagnostic', 'safe_loader_diagnostic', **values)
+
+
+class Trap:
+    def __fspath__(self): pytest.fail('fspath callback')
+    def __repr__(self): pytest.fail('repr callback')
+    def __str__(self): pytest.fail('str callback')
+
+
+@pytest.mark.parametrize('argument', [None, 'lib-example.so', b'lib-example.so', 7])
+def test_exact_loader_arguments_are_bounded_data(argument):
+    got = diagnostic().safe_loader_diagnostic('ctypes.dlopen', (argument,))
+    assert got['status'] == 'AVAILABLE' and len(got['arguments']) == 1
+    assert len(json.dumps(got, ensure_ascii=True).encode('ascii')) <= 65536
+    assert got['pin_kind'] == 'PREVERIFIED_EXPECTED_NOT_REHASHED_AT_DENIAL'
+    item = got['arguments'][0]
+    if argument is None: assert item == {'kind': 'None', 'value': None}
+    elif type(argument) is int: assert item == {'kind': 'int', 'value': argument}
+    else:
+        assert item == {'kind': 'redacted_text', 'type': 'str' if type(argument) is str else 'bytes',
+                        'length': len(argument), 'value': None, 'truncated': False}
+
+
+@pytest.mark.parametrize('argument', [Trap(), {'opaque': Trap()}, True, 2 ** 1000])
+def test_loader_opaque_values_never_render(argument):
+    got = diagnostic().safe_loader_diagnostic('ctypes.dlopen', (argument,))
+    assert got['arguments'][0]['kind'] == 'not_exact_text'
+    assert got['arguments'][0]['value'] is None
+
+
+def test_loader_text_subclass_cannot_invoke_callbacks():
+    class TextTrap(str):
+        def __len__(self): pytest.fail('length callback')
+        def __getitem__(self, key): pytest.fail('slice callback')
+    got = diagnostic().safe_loader_diagnostic('ctypes.dlopen', (TextTrap('private'),))
+    assert got['arguments'][0]['kind'] == 'not_exact_text'
+
+
+@pytest.mark.parametrize('argument', ['\U0001f600' * 10000, b'\xff' * 10000])
+def test_loader_long_arguments_are_truncated(argument):
+    got = diagnostic().safe_loader_diagnostic('ctypes.dlopen', (argument,))
+    assert got['arguments'][0]['value'] is None and got['arguments'][0]['truncated']
+    assert got['arguments'][0]['length'] == len(argument) and got['arguments'][0]['kind'] == 'redacted_text'
+
+
+def test_loader_only_records_pinned_coordinates_not_locals_or_source():
+    secret_local = 'SECRET_MUST_NOT_APPEAR_IN_DIAGNOSTIC'
+    got = diagnostic().safe_loader_diagnostic('ctypes.dlsym', (42, 'symbol'))
+    assert got['frames']
+    assert all(set(row) == {'filename', 'function', 'line', 'expected_sha256'} for row in got['frames'])
+    assert all(row['expected_sha256'] == 'a' * 64 for row in got['frames'])
+    assert secret_local not in json.dumps(got) and got['unmapped_frames'] > 0
+
+
+def test_loader_scan_and_output_limits_do_not_retain_frame_objects():
+    api = diagnostic()
+    def nest(depth):
+        return nest(depth - 1) if depth else api.loader_diagnostic('ctypes.dlopen', (None,))
+    got = nest(50)
+    assert len(got['frames']) == 16 and got['frames_truncated']
+    assert json.loads(json.dumps(got)) == got
+
+
+@pytest.mark.parametrize('pins', [{}, {'x': 'invalid'}, None])
+def test_missing_pins_never_fabricate_pinned_identity(pins):
+    got = diagnostic(LOADER_DIAGNOSTIC_PINS=pins).safe_loader_diagnostic('ctypes.dlopen', (None,))
+    if got['status'] == 'AVAILABLE': assert got['frames'] == []
+    else: assert got['status'] == 'UNAVAILABLE'
+
+
+def test_diagnostic_failure_never_renders_exception_or_loads_library():
+    def broken(depth): raise RuntimeError(Trap())
+    assert diagnostic(READ_GETFRAME=broken).safe_loader_diagnostic('ctypes.dlopen', (None,)) == {
+        'schema': 'friday.offline.loader-refusal-metadata.v1', 'status': 'UNAVAILABLE'}
+
+
+class Refused(Exception): pass
+
+
+@pytest.mark.parametrize('event', ['ctypes.dlopen', 'ctypes.dlsym', 'subprocess.Popen', 'os.fork'])
+def test_audit_keeps_unconditional_denial_for_every_process_event(event):
+    seen = []; state = {}
+    def denied(value):
+        seen.append(value); raise Refused(value)
+    api = functions('audit', PROCESS_EVENTS={event}, state=state, deny=denied,
+        safe_loader_diagnostic=lambda *a: {'status': 'AVAILABLE'})
+    with pytest.raises(Refused, match=event): api.audit(event, (None,))
+    assert seen == [event]
+    assert ('loader_diagnostic' in state) is event.startswith('ctypes.')
+
+
+def test_diagnostic_or_write_failure_keeps_original_hard_exit_model():
+    seen = []
+    def write(fd, data):
+        seen.append(('write', fd)); raise OSError('sink')
+    def exit_(code):
+        seen.append(('exit', code)); raise Refused('exit')
+    api = functions('deny', state={'loader_diagnostic': {'status': 'UNAVAILABLE'}},
+        MONOTONIC=lambda: 1., COUNTS={}, RAW={'write': write, 'fsync': lambda fd: None, '_exit': exit_},
+        DENIAL_FD=7)
+    with pytest.raises(Refused): api.deny('ctypes.dlopen')
+    assert seen == [('write', 7), ('exit', 125)]
+
+
+def test_passive_diagnostic_source_has_no_loader_symbol_or_filesystem_calls():
+    tree = ast.parse((ROOT / 'diagnostics/private_effect_fence.py').read_text())
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and
+             n.name in {'loader_diagnostic', 'safe_loader_diagnostic'}]
+    call_names = {ast.unparse(n.func) for node in nodes for n in ast.walk(node) if isinstance(n, ast.Call)}
+    assert not call_names & {'open', 'os.open', 'RAW[\'open\']', 'ctypes.CDLL', 'ctypes.PyDLL',
+                              'getattr', 'repr', 'str', 'vars', 'resolve', 'stat'}
+    assert not any(isinstance(n, ast.Attribute) and n.attr in {'f_globals', 'f_locals'}
+                   for node in nodes for n in ast.walk(node))
+
+
+@pytest.mark.parametrize('event,args', [('other', (None,)), (None, (None,)),
+                                      ('ctypes.dlopen', [None])])
+def test_invalid_diagnostic_inputs_are_not_rendered(event, args):
+    assert diagnostic().safe_loader_diagnostic(event, args)['status'] == 'UNAVAILABLE'
+
+
+@pytest.mark.parametrize('fault', ['diagnostic', 'state-write'])
+def test_audit_metadata_failure_cannot_suppress_denial(fault):
+    seen = []
+    class State(dict):
+        def __setitem__(self, key, value):
+            if fault == 'state-write': raise MemoryError('sink')
+            return super().__setitem__(key, value)
+    def diagnostic_failure(*args):
+        if fault == 'diagnostic': raise MemoryError('sink')
+        return {'status': 'AVAILABLE'}
+    def deny(event): seen.append(event); raise Refused(event)
+    api = functions('audit', state=State(), PROCESS_EVENTS={'ctypes.dlopen'},
+                    safe_loader_diagnostic=diagnostic_failure, deny=deny)
+    with pytest.raises(Refused): api.audit('ctypes.dlopen', (None,))
+    assert seen == ['ctypes.dlopen']
+
+
+@pytest.mark.parametrize('argument', ['SECRET_API_KEY_DO_NOT_RECORD', b'SECRET_API_KEY_DO_NOT_RECORD',
+    '/tmp/SECRET_API_KEY_DO_NOT_RECORD/library.so', b'/tmp/SECRET_API_KEY_DO_NOT_RECORD/library.so'])
+def test_unknown_loader_text_never_copies_credentials(argument):
+    got = diagnostic().safe_loader_diagnostic('ctypes.dlopen', (argument,))
+    assert got['status'] == 'AVAILABLE'
+    assert got['arguments'][0]['value'] is None
+    assert 'SECRET_API_KEY_DO_NOT_RECORD' not in json.dumps(got)
+
+
+def test_exact_preverified_loader_path_and_pin_are_preserved():
+    path = '/qualified/lib-example.so'
+    got = diagnostic(LOADER_DIAGNOSTIC_PINS={path: 'b' * 64}).safe_loader_diagnostic('ctypes.dlopen', (path,))
+    item = got['arguments'][0]
+    assert item['value'] == path and item['preverified_sha256'] == 'b' * 64
+    assert item['truncated'] is False

@@ -1,0 +1,265 @@
+"""Deterministic byte/AST/data audit, not tests, imports or independent review."""
+import ast
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import resource
+import stat
+import time
+
+E = Path(__file__).resolve().parent
+C = E / 'candidate'
+S = E / 'source'
+W = Path('<ASTRA_WORK>')
+B = W / 'browser-platform-probe-input-repair/candidate'
+OLD = W / 'browser-owner-controls-preparation/source'
+R = Path('<PROJECT>/.worktrees/sol-registry-runtime')
+os.sched_setaffinity(0, {0, 1})
+resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))
+clock = json.loads((E / 'clock.json').read_bytes())
+cache = {}
+
+
+def digest(p):
+    p = Path(p)
+    assert time.monotonic() < clock['deadline_monotonic'] - 60
+    key = str(p)
+    if key not in cache:
+        with p.open('rb') as stream:
+            cache[key] = hashlib.file_digest(stream, 'sha256').hexdigest()
+    return cache[key]
+
+
+def read(p):
+    return json.loads(Path(p).read_bytes())
+
+
+def reconstruct(blob, root):
+    lines = blob.splitlines(True)
+    output = {}
+    pos = 0
+    while pos < len(lines):
+        assert lines[pos].startswith(b'diff --git ')
+        end = pos + 1
+        while end < len(lines) and not lines[end].startswith(b'diff --git '):
+            end += 1
+        block = lines[pos:end]
+        h = next(i for i, line in enumerate(block) if line.startswith(b'--- '))
+        old = block[h][4:].strip().decode()
+        new = block[h + 1][4:].strip().decode()
+        assert new.startswith('b/')
+        name = new[2:]
+        assert name not in output and '..' not in Path(name).parts
+        assert old in ('a/' + name, '/dev/null')
+        p = root / name
+        if old == '/dev/null':
+            assert not p.exists()
+            before = b''
+        else:
+            before = p.read_bytes()
+        original = before.splitlines(True)
+        produced = []
+        cursor = 0
+        i = h + 2
+        while i < len(block):
+            match = re.fullmatch(rb'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[^\n]*\n', block[i])
+            assert match, block[i]
+            start, count, new_start, new_count = [int(match[k] or b'1') for k in range(1, 5)]
+            offset = start - 1 if count else start
+            assert cursor <= offset <= len(original)
+            produced.extend(original[cursor:offset])
+            cursor = offset
+            assert len(produced) == (new_start - 1 if new_count else new_start)
+            consumed = added = 0
+            i += 1
+            while consumed < count or added < new_count:
+                sign, data = block[i][:1], block[i][1:]
+                assert sign in (b' ', b'-', b'+')
+                if sign in (b' ', b'-'):
+                    assert original[cursor] == data, (name, cursor)
+                    cursor += 1
+                    consumed += 1
+                if sign in (b' ', b'+'):
+                    produced.append(data)
+                    added += 1
+                i += 1
+            assert consumed == count and added == new_count
+        produced.extend(original[cursor:])
+        output[name] = b''.join(produced)
+        pos = end
+    return output
+
+
+manifest = read(R / 'patches/hermes/dispatch-helpers-manifest.json')
+patch = R / manifest['patch']
+assert digest(patch) == manifest['patch_sha256']
+rebuilt = reconstruct(patch.read_bytes(), OLD / 'native')
+assert set(rebuilt) == {r['path'] for r in manifest['files']}
+for row in manifest['files']:
+    data = rebuilt[row['path']]
+    assert hashlib.sha256(data).hexdigest() == row['sha256']
+    assert len(data) == row['bytes']
+    assert data == (E / 'production' / row['path']).read_bytes() == (S / 'native' / row['path']).read_bytes()
+
+# Check actual existing installer ordering as data, without calling/importing it.
+layers = {}
+for p in sorted((R / 'patches/hermes').glob('*.json')):
+    v = read(p)
+    name = v.get('patch') or 'patches/hermes/' + v['patch_file']
+    assert digest(R / name) == v['patch_sha256']
+    requires = dict(v.get('prerequisites', {}))
+    requires = {k if k.startswith('patches/hermes/') else 'patches/hermes/' + k: h for k, h in requires.items()}
+    if v.get('prerequisite_patch'):
+        requires[v['prerequisite_patch']] = v['prerequisite_patch_sha256']
+    layers[name] = (v, requires)
+for name, (_, requires) in layers.items():
+    for parent, h in requires.items():
+        assert layers[parent][0]['patch_sha256'] == h
+ordered = []
+while len(ordered) < len(layers):
+    ready = sorted(n for n, (_, requires) in layers.items() if n not in ordered and set(requires) <= set(ordered))
+    assert ready
+    ordered.extend(ready)
+assert ordered.index(manifest['prerequisite_patch']) < ordered.index(manifest['patch'])
+user = layers[manifest['prerequisite_patch']][0]
+user_files = {r['path']: r for r in user['files']}
+for row in manifest['files']:
+    if row['before_sha256']:
+        assert row['before_sha256'] == user_files[row['path']]['sha256']
+other_touchers = []
+for name, (v, _) in layers.items():
+    rows = v.get('files', [{'path': n} for n in v.get('expected_patched_files', {})])
+    if any(r['path'] in ['model_tools.py', 'tools/registry.py'] for r in rows):
+        other_touchers.append(name)
+assert set(other_touchers) == {manifest['patch'], manifest['prerequisite_patch']}
+
+maps = {n: read(C / n) for n in ['input-pins.json', 'selected-pins.json', 'runtime-flat-pins.json', 'launch-pins.json', 'execution-package-pins.json']}
+for name, rows in maps.items():
+    for p, h in rows.items():
+        assert digest(p) == h, (name, p)
+actual_files = {str(p) for p in S.rglob('*') if p.is_file()}
+assert actual_files == set(maps['selected-pins.json'])
+assert all(not p.is_symlink() for p in S.rglob('*'))
+assert all(stat.S_IMODE(Path(p).stat().st_mode) == 0o400 and Path(p).stat().st_nlink == 1 for p in actual_files)
+assert len(actual_files) == 17947
+old = read(B / 'selected-pins.json')
+delta = []
+for p, h in old.items():
+    rel = Path(p).relative_to(OLD)
+    new = maps['selected-pins.json'][str(S / rel)]
+    if new != h:
+        delta.append(str(rel))
+added_files = set(actual_files) - {str(S / Path(p).relative_to(OLD)) for p in old}
+assert set(delta) == {'native/model_tools.py', 'native/tools/registry.py', 'native.patch', 'source-pins.json'}
+assert added_files == {str(S / 'native/tools/dispatch_helpers.py'), str(S / 'native/tests/tools/test_registry_lightweight_dispatch.py')}
+assert (C / 'runtime-flat-pins.json').read_bytes() == (B / 'runtime-flat-pins.json').read_bytes()
+assert (C / 'private_effect_fence.py').read_bytes() == (B / 'private_effect_fence.py').read_bytes()
+assert (C / 'cessation.py').read_bytes() == (B / 'cessation.py').read_bytes()
+assert not any((C / n).exists() for n in ['runtime-clock.json', 'runtime-admission.json', 'controls', 'registry', 'native', 'project', 'owner'])
+
+overlay = read(S / 'source-pins.json')
+for group in ['native', 'project']:
+    output = reconstruct((S / (group + '.patch')).read_bytes(), Path(overlay['baseline_' + group]))
+    expected_rows = {p[len(group) + 1:]: r for p, r in overlay['files'].items() if p.startswith(group + '/')}
+    assert set(output) == set(expected_rows)
+    for p, data in output.items():
+        assert data == (S / group / p).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == expected_rows[p]['sha256']
+
+compiled = []
+for p in [p for p in C.iterdir() if p.suffix == '.py'] + [S / 'native' / r['path'] for r in manifest['files']]:
+    compile(ast.parse(p.read_text(), filename=str(p)), str(p), 'exec', dont_inherit=True)
+    compiled.append(str(p))
+expected = read(C / 'expected-suite-cases.json')
+old_expected = read(B / 'expected-suite-cases.json')
+assert all(expected[k] == v for k, v in old_expected.items())
+prod = read(E / 'production-source-verification.json')
+assert expected['registry'] == prod['source_case_counts']
+assert {k: sum(v.values()) for k, v in expected.items()} == {'controls': 21, 'native': 116, 'project': 38, 'owner': 71, 'registry': 7}
+for name in ['run.py', 'launch.py']:
+    text = (C / name).read_text()
+    assert "admission['generation']==7" in text and 'generation\']>6' not in text
+    assert 'registry_fixture_source_reviewed' not in text
+    assert str(OLD) not in text
+    assert "'FRW041-BROWSER-OWNER-CONTROLS-RUN'" in text
+    assert "c['budget_seconds']==900" in text
+    assert "assert admission['changed_execution_boundary_approved'] is True" in text
+assert str(S) in (C / 'run.py').read_text()
+assert "'registry':N/'tests/tools/test_registry_lightweight_dispatch.py'" in (C / 'run.py').read_text()
+assert "'native':'registry'" in (C / 'launch.py').read_text()
+
+# Every current reference in the active graph is exact. Historical refs remain
+# protected source-only evidence; no old source path is an active import root.
+refs_checked = []
+def verify_refs(v):
+    if isinstance(v, dict):
+        if isinstance(v.get('path'), str) and re.fullmatch(r'[0-9a-f]{64}', str(v.get('sha256', ''))):
+            p = Path(v['path'])
+            assert digest(p) == v['sha256'], p
+            if 'bytes' in v:
+                assert p.stat().st_size == v['bytes'], p
+            refs_checked.append(str(p))
+        for x in v.values():
+            verify_refs(x)
+    elif isinstance(v, list):
+        for x in v:
+            verify_refs(x)
+for name in ['effect-admission-proposal.json', 'qualification-plan.json', 'input-source-runtime-graph.json', 'registry-async-boundary-proposal.json', 'fixture-import-graph.json', 'import-read-trace.json']:
+    verify_refs(read(C / name))
+m = read(C / 'import-path-pins.json')
+assert set(m['directory_identities']) == set(m['metadata_inventories'])
+for raw, identity in m['directory_identities'].items():
+    st = Path(raw).lstat()
+    assert [st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid] == identity
+for row in read(C / 'fixture-import-graph.json'):
+    assert Path(row['path']).is_relative_to(S)
+    assert digest(row['path']) == row['sha256']
+
+run_old = ast.parse((B / 'run.py').read_text())
+run_new = ast.parse((C / 'run.py').read_text())
+func_old = {n.name: ast.dump(n, include_attributes=False) for n in run_old.body if isinstance(n, ast.FunctionDef)}
+func_new = {n.name: ast.dump(n, include_attributes=False) for n in run_new.body if isinstance(n, ast.FunctionDef)}
+assert func_old == func_new
+capture_old = next(n for n in run_old.body if isinstance(n, ast.ClassDef) and n.name == 'Capture')
+capture_new = next(n for n in run_new.body if isinstance(n, ast.ClassDef) and n.name == 'Capture')
+assert ast.dump(capture_old, include_attributes=False) == ast.dump(capture_new, include_attributes=False)
+policy = read(C / 'registry-async-boundary-proposal.json')
+assert policy['total_pairs'] == 2 and policy['total_endpoint_descriptors'] == 4
+assert policy['extra_threads'] == policy['executor_workers'] == policy['SIGINT_handler_changes'] == policy['processes'] == 0
+assert not policy['runtime_grant'] and not policy['controls_run']
+names = ast.literal_eval(next(n.value for n in ast.parse((C / 'private_effect_fence.py').read_text()).body
+                       if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'ASYNC_NAMES' for t in n.targets)))
+assert 'registry' not in names
+assert all(node.rsplit('::', 1)[-1] not in set.union(*names.values()) for node in policy['exact_nodes'])
+
+report = {'state': 'DETERMINISTIC_SOURCE_HASH_AST_JOIN_CHECKS_PASS_NOT_RUNTIME_ACCEPTANCE',
+          'assignment': 'FRW041-REGISTRY-RUNTIME-JOIN-SOL#1', 'distinct_files_hashed': len(cache),
+          'flat_map_entries_checked': {n: len(v) for n, v in maps.items()},
+          'current_source_inventory_exact': True, 'old_source_files_retained': len(old),
+          'source_changed_paths': delta, 'source_added_paths': sorted(added_files),
+          'production_patch_reconstructed_files': len(rebuilt), 'all_native_project_overlay_reconstruction_exact': True,
+          'installer_layers_data_verified': len(layers), 'actual_existing_dag_order': ordered,
+          'only_current_user_isolation_then_dispatch_touch_model_registry': True,
+          'changed_python_AST_compile_not_exec': compiled,
+          'unchanged_run_functions_AST': sorted(func_old), 'unchanged_Capture_AST': True,
+          'nested_current_refs_verified': len(refs_checked), 'stale_current_refs': [],
+          'full_original_suite_counts_preserved_source_only': {k: sum(v.values()) for k, v in expected.items()},
+          'guard_runtime_map_cessation_byte_identical': True, 'metadata_directory_identities_actual': True,
+          'runtime_clock_admission_phase_dirs_created': False,
+          'known_gate_blocker': policy['known_gate_blocker'],
+          'imports_collection_tests_native': 'NOT_RUN', 'independent_review': 'REQUIRED', 'runtime_grant': False,
+          'own_utilities_corrected': ['python command unavailable: used actual /usr/bin/python3',
+             'source package membership excludes its self manifest: actual26 plus self27',
+             'import trace includes ten exact runtime dependencies, not only corpus source',
+             'native checkpoint local variable shadowing fixed before any native call',
+             'audit regex falsely matched production_browser_grant=False on the same line; checked exact unchanged approval clause'],
+          'remaining_original_seconds': clock['deadline_monotonic'] - time.monotonic()}
+out = E / 'source-audit.json'
+fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, 'w') as stream:
+    json.dump(report, stream, ensure_ascii=False, indent=2)
+    stream.write('\n')
+os.chmod(out, 0o400)
+print(json.dumps({k: report[k] for k in ['state', 'distinct_files_hashed', 'flat_map_entries_checked', 'nested_current_refs_verified', 'remaining_original_seconds']}))

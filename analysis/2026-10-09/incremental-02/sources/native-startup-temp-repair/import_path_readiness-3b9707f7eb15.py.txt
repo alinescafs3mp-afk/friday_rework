@@ -1,0 +1,347 @@
+"""SOURCE ONLY. Finite metadata readiness and failure-only absent-leaf probe.
+No archive bytes are opened. This does not grant execution or hostile-code safety.
+Full isolated startup needs an independently observed receipt before owner use.
+"""
+import errno, hashlib, json, os, pathlib, re, stat, sys
+
+ARCHIVE = '<PROJECT>/.runtime/hermes-telegram-test/tools/python-3.14.7+20260901-linux-x64/lib/python314.zip'
+INTERPRETER = '<PROJECT>/.runtime/hermes-telegram-test/env/bin/python'
+_open, _close, _stat, _fstat = os.open, os.close, os.stat, os.fstat
+
+
+class ProbeRefusal(RuntimeError):
+    pass
+
+
+def require(ok, reason):
+    if not ok:
+        raise ProbeRefusal(reason)
+
+
+def identity(s):
+    return [s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid]
+
+
+def load(source):
+    m = json.loads((pathlib.Path(source) / 'import-path-pins.json').read_bytes())
+    require(m.get('schema') == 1 and m.get('declared_absent_path') == ARCHIVE and
+            m.get('interpreter', {}).get('path') == INTERPRETER and
+            m.get('runtime_read_authority_expanded') is False, 'ABSENT_DECLARATION_MISMATCH')
+    parent = pathlib.Path(ARCHIVE).parent
+    expected = list(reversed(parent.parents)) + [parent]
+    require([a['path'] for a in m['ancestors']] == [str(p) for p in expected] and
+            all(len(a['identity']) == 5 and all(type(v) is int for v in a['identity']) and
+                stat.S_ISDIR(a['identity'][2]) for a in m['ancestors']), 'EXACT_ANCESTOR_CHAIN_REQUIRED')
+    expected_startup = [ARCHIVE, str(parent / 'python3.14'), str(parent / 'python3.14/lib-dynload'),
+                        str(pathlib.Path(INTERPRETER).parent.parent / 'lib/python3.14/site-packages')]
+    require(m['startup_expected'] == expected_startup and
+            m['interpreter']['sha256'] == '8dfa9757a52b9c3edf1dedaaa2a7a8c40ea4beb058f20e90bdd47b48f3b1b176',
+            'FINITE_STARTUP_DECLARATION_REQUIRED')
+    site = pathlib.Path(expected_startup[-1]); stdlib = pathlib.Path(expected_startup[1])
+    require(set(m['startup_files']) == {str(stdlib / 'site.py'), str(pathlib.Path(INTERPRETER).parent.parent / 'pyvenv.cfg'),
+                str(site / '_virtualenv.pth'), str(site / 'distutils-precedence.pth'),
+                str(site / '_virtualenv.py'), str(site / '_distutils_hack/__init__.py')} and
+            set(m['causal_files']) == {str(stdlib / 'importlib/metadata/__init__.py'), str(stdlib / 'zipfile/__init__.py'),
+                str(stdlib / 'zipfile/_path/__init__.py'), str(site / 'pydantic/plugin/_loader.py'),
+                str(site / 'pydantic/plugin/_schema_validator.py')} and
+            m['pth_inventory'] == ['_virtualenv.pth', 'distutils-precedence.pth'], 'FULL_STARTUP_CAUSAL_PINS_REQUIRED')
+    require(set(m['directory_identities']) == set(m['metadata_inventories']) and
+            all(raw in m['directory_identities'] for raw in expected_startup[1:]), 'FINITE_METADATA_ROOTS_REQUIRED')
+    validate_distribution_metadata(m)
+    return m
+
+
+def absent_leaf(m):
+    """Always raises: SAME kernel final-leaf ENOENT, or an explicit refusal.
+    O_PATH|DIRECTORY|NOFOLLOW descriptors reach each exact ancestor; only final
+    no-follow stat can produce the approved missing-leaf exception. Never stat
+    then return permission. Even appearance after stat cannot open content.
+    """
+    handles = []
+    try:
+        for index, row in enumerate(m['ancestors']):
+            path = row['path']
+            try:
+                # CPython's open audit event omits dir_fd. Keep the descriptor
+                # anchor in the absolute /proc path so the unchanged guard can
+                # check the real ancestor instead of an unrelated cwd/name.
+                reached = '/' if index == 0 else '/proc/self/fd/' + str(handles[-1]) + '/' + pathlib.Path(path).name
+                fd = _open(reached, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                handles.append(fd)
+                require(identity(_fstat(fd)) == row['identity'], 'ABSENT_ANCESTOR_IDENTITY_DRIFT')
+            except OSError as error:
+                raise ProbeRefusal('ABSENT_ANCESTOR_ERROR:' + str(error.errno)) from error
+        try:
+            _stat(pathlib.Path(m['declared_absent_path']).name,
+                  dir_fd=handles[-1], follow_symlinks=False)
+        except FileNotFoundError as error:
+            require(error.errno == errno.ENOENT and error.filename == pathlib.Path(m['declared_absent_path']).name and
+                    error.filename2 is None, 'NOT_GENUINE_FINAL_LEAF_ENOENT')
+            # Keep each parent->child binding current, including rename/replacement
+            # while an O_PATH descriptor still reaches the former directory.
+            for index, row in enumerate(m['ancestors']):
+                try:
+                    current = _stat('/' if index == 0 else pathlib.Path(row['path']).name,
+                                    **({} if index == 0 else {'dir_fd': handles[index - 1]}),
+                                    follow_symlinks=False)
+                    require(identity(current) == row['identity'] and
+                            identity(_fstat(handles[index])) == row['identity'],
+                            'ABSENT_ANCESTOR_BINDING_DRIFT')
+                except OSError as changed:
+                    raise ProbeRefusal('ABSENT_ANCESTOR_RECHECK_ERROR:' + str(changed.errno)) from changed
+            # Bare raise preserves the exact kernel exception; no original open.
+            raise
+        except OSError as error:
+            raise ProbeRefusal('ABSENT_LEAF_UNKNOWN:' + str(error.errno)) from error
+        raise ProbeRefusal('DECLARED_ABSENT_LEAF_PRESENT')
+    finally:
+        for fd in reversed(handles):
+            _close(fd)
+
+
+def failure_only_open(m, path, flags, canonical):
+    if isinstance(path, int):
+        require(canonical != ARCHIVE, 'DECLARED_LEAF_DESCRIPTOR_REFUSED')
+        return
+    raw = os.fsdecode(path)
+    lexical = os.path.abspath(raw)
+    proc = re.fullmatch(r'/proc/self/fd/([0-9]+)/([^/]+)', lexical)
+    anchored = False
+    if proc and proc[2] == pathlib.Path(ARCHIVE).name:
+        fd = int(proc[1])
+        anchored = (os.readlink('/proc/self/fd/' + str(fd)) == str(pathlib.Path(ARCHIVE).parent) and
+                    identity(_fstat(fd)) == m['ancestors'][-1]['identity'])
+    # Check exact lexical name BEFORE canonical symlink resolution can hide a
+    # present/dangling leaf. Canonical aliases are refused, never generalized.
+    if lexical != ARCHIVE and canonical != ARCHIVE and not anchored:
+        return
+    require(lexical == ARCHIVE or anchored, 'DECLARED_LEAF_ALIAS_REFUSED')
+    require(not flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND),
+            'DECLARED_LEAF_WRITE_REFUSED')
+    absent_leaf(m)  # Cannot return; original content-open is unreachable.
+
+
+METADATA_QUERIES = {'entry_points.txt': 'entry_points', 'METADATA': 'metadata',
+    'PKG-INFO': 'metadata', 'RECORD': '_read_files_distinfo',
+    'installed-files.txt': '_read_files_egginfo_installed',
+    'SOURCES.txt': '_read_files_egginfo_sources', 'requires.txt': '_read_egg_info_reqs',
+    'direct_url.json': '_load_json', 'top_level.txt': '_top_level_declared'}
+
+
+def validate_distribution_metadata(m):
+    d = m['distribution_metadata_probes']
+    require(d['schema'] == 1 and d['queries'] == METADATA_QUERIES and
+            d['read_authority_expanded'] is False and
+            d['caller_source'] == str(pathlib.Path(m['startup_expected'][1]) / 'importlib/metadata/__init__.py') and
+            d['caller_source'] in m['causal_files'], 'EXACT_METADATA_DECLARATION_REQUIRED')
+    roots = {str(pathlib.Path(base) / name): item
+             for base, inventory in m['metadata_inventories'].items() for name, item in inventory.items()}
+    require(set(roots) == set(d['roots']), 'EXACT_DISTRIBUTION_INVENTORY_REQUIRED')
+    absent, present = {}, {}
+    for raw, item in roots.items():
+        root = pathlib.Path(raw); chain = d['roots'][raw]
+        require([r['path'] for r in chain] == [str(p) for p in [*reversed(root.parents), root]] and
+                all(len(r['identity']) == 5 and all(type(v) is int for v in r['identity']) and
+                    stat.S_ISDIR(r['identity'][2]) for r in chain) and
+                chain[-1]['identity'] == item['identity'], 'EXACT_METADATA_ANCESTORS_REQUIRED')
+        for filename in METADATA_QUERIES:
+            path = str(root / filename)
+            if path in item['files']: present[path] = item['files'][path]
+            else: absent[path] = raw
+    require(absent == d['absent'] and present == d['present'], 'EXACT_METADATA_QUERY_PARTITION_REQUIRED')
+
+
+def distribution_metadata_caller(m, path):
+    """Exact live runtime code/globals and self/path/query; no filename-only grant."""
+    d = m['distribution_metadata_probes']; module = sys.modules.get('importlib.metadata')
+    if module is None or getattr(module, '__file__', None) != d['caller_source']: return False
+    cls = module.PathDistribution; read = cls.read_text
+    if read.__code__.co_filename != d['caller_source'] or read.__globals__ is not module.__dict__: return False
+    frame = sys._getframe(1)
+    try:
+        # check_import_open -> helper -> pathlib open/read_text -> PathDistribution.read_text
+        for _ in range(10):
+            if frame is None: return False
+            if frame.f_code is read.__code__ and frame.f_globals is module.__dict__: break
+            frame = frame.f_back
+        else: return False
+        obj = frame.f_locals.get('self'); filename = frame.f_locals.get('filename')
+        if (type(obj) is not cls or type(filename) is not str or filename not in METADATA_QUERIES or
+                type(obj._path) is not pathlib.PosixPath or str(obj._path / filename) != path): return False
+        caller = frame.f_back; method = METADATA_QUERIES[filename]
+        function = (getattr(module, method) if method == '_top_level_declared'
+                    else getattr(module.Distribution, method))
+        if type(function) is property: function = function.fget
+        return (caller is not None and caller.f_code is function.__code__ and
+                caller.f_globals is module.__dict__ and function.__globals__ is module.__dict__ and
+                function.__code__.co_filename == d['caller_source'] and
+                caller.f_locals.get('dist' if method == '_top_level_declared' else 'self') is obj)
+    finally:
+        del frame
+
+
+def failure_only_metadata_open(m, path, flags, canonical):
+    d = m['distribution_metadata_probes']
+    if isinstance(path, int):
+        require(canonical not in d['absent'], 'METADATA_DESCRIPTOR_REFUSED')
+        return
+    raw = os.fsdecode(path)
+    if raw not in d['absent'] and canonical not in d['absent']: return
+    # Only the exact absolute runtime-produced path is needed; no aliases/dirfd/relative spellings.
+    require(raw in d['absent'] and raw == canonical, 'METADATA_PATH_ALIAS_REFUSED')
+    require(flags in (os.O_RDONLY, os.O_RDONLY | os.O_CLOEXEC), 'METADATA_FLAGS_REFUSED')
+    require(distribution_metadata_caller(m, raw), 'METADATA_FOREIGN_CALLER')
+    absent_leaf({'declared_absent_path': raw, 'ancestors': d['roots'][d['absent'][raw]]})
+
+
+def verify_distribution_metadata_absence(m):
+    """Post-effect check: a leaf appearing after a negative syscall refuses acceptance."""
+    d = m['distribution_metadata_probes']
+    for path, root in d['absent'].items():
+        try:
+            absent_leaf({'declared_absent_path': path, 'ancestors': d['roots'][root]})
+        except FileNotFoundError as error:
+            require(error.errno == errno.ENOENT, 'METADATA_ABSENCE_NOT_ENOENT')
+
+
+def verify_distribution_metadata_inventory(m):
+    for base, inventory in m['metadata_inventories'].items():
+        require(identity(pathlib.Path(base).lstat()) == m['directory_identities'][base] and
+                sorted(n for n in os.listdir(base) if n.endswith(('.dist-info', '.egg-info'))) == sorted(inventory),
+                'METADATA_SEARCH_INVENTORY_DRIFT')
+        for name, item in inventory.items():
+            root = pathlib.Path(base) / name
+            require(identity(root.lstat()) == item['identity'], 'METADATA_ROOT_IDENTITY_DRIFT')
+            paths = list(root.rglob('*'))
+            require(not any(p.is_symlink() for p in paths) and
+                    {str(p) for p in paths if p.is_file()} == set(item['files']),
+                    'METADATA_FILE_INVENTORY_DRIFT')
+
+
+def verify_snapshot(m):
+    try:
+        absent_leaf(m)
+    except FileNotFoundError as error:
+        require(error.errno == errno.ENOENT, 'ABSENCE_NOT_ENOENT')
+    for raw, expected in m['startup_files'].items() | m['causal_files'].items():
+        p = pathlib.Path(raw)
+        require(not p.is_symlink() and hashlib.sha256(p.read_bytes()).hexdigest() == expected,
+                'STARTUP_OR_CAUSAL_SOURCE_DRIFT:' + raw)
+    for raw, expected in m['directory_identities'].items():
+        p = pathlib.Path(raw)
+        require(not p.is_symlink() and identity(p.lstat()) == expected and
+                os.access(p, os.R_OK | os.X_OK), 'SEARCH_DIRECTORY_DRIFT:' + raw)
+        # Actually enumerate, so permission/ENOTDIR is not merely predicted.
+        names = sorted(os.listdir(p))
+        found = [n for n in names if n.endswith(('.dist-info', '.egg-info'))]
+        require(found == sorted(m['metadata_inventories'][raw]), 'METADATA_INVENTORY_DRIFT:' + raw)
+        for name, item in m['metadata_inventories'][raw].items():
+            root = p / name
+            require(not root.is_symlink() and identity(root.lstat()) == item['identity'],
+                    'METADATA_IDENTITY_DRIFT:' + str(root))
+            files = [root] if root.is_file() else sorted(root.rglob('*'))
+            require(not any(f.is_symlink() for f in files), 'METADATA_SYMLINK')
+            require({str(f) for f in files if f.is_file()} == set(item['files']), 'METADATA_FILE_INVENTORY_DRIFT')
+            for file, digest in item['files'].items():
+                require(hashlib.sha256(pathlib.Path(file).read_bytes()).hexdigest() == digest,
+                        'METADATA_FILE_DRIFT:' + file)
+    site = pathlib.Path(m['startup_expected'][-1])
+    require(sorted(p.name for p in site.glob('*.pth')) == m['pth_inventory'], 'PTH_INVENTORY_DRIFT')
+    for raw in (m['startup_expected'][1], m['startup_expected'][-1]):
+        for name in ('sitecustomize.py', 'usercustomize.py', 'sitecustomize', 'usercustomize'):
+            p = pathlib.Path(raw) / name
+            require(not p.exists() and not p.is_symlink(), 'UNREVIEWED_CUSTOMIZE')
+    require(m['pydantic_entrypoints'] == [], 'NEW_PYDANTIC_IMPLEMENTATION_NEEDS_REVIEW')
+
+
+def startup_flags(*, runtime=False):
+    if type(runtime) is not bool:
+        raise ProbeRefusal('EXACT_STARTUP_PROFILE_REQUIRED')
+    if runtime:
+        return {'isolated': 0, 'ignore_environment': 0, 'safe_path': 1,
+                'no_site': 0, 'no_user_site': 1, 'dont_write_bytecode': 1,
+                'hash_randomization': 0, 'utf8_mode': 1}
+    # Preserve the prior isolated receipt contract for canary/collection.
+    return {'isolated': 1, 'no_site': 0, 'no_user_site': 1, 'dont_write_bytecode': 1}
+
+
+def verify_startup(m, *, runtime=False):
+    expected = startup_flags(runtime=runtime)
+    require(sys.executable == INTERPRETER and
+            all(getattr(sys.flags, name, None) == value for name, value in expected.items()) and
+            list(sys.path) == m['startup_expected'],
+            'ACTUAL_DONOR_STARTUP_PROFILE_PATH_MISMATCH' if runtime else 'ACTUAL_ISOLATED_STARTUP_PATH_MISMATCH')
+    if runtime:
+        # Observed BEFORE conftest can mutate environ; flags describe actual
+        # interpreter initialization. An env string alone cannot prove seed0.
+        require(os.environ.get('PYTHONHASHSEED') == '0' and
+                os.environ.get('PYTHONUTF8') == '1' and
+                os.environ.get('TZ') == 'UTC' and
+                os.environ.get('LANG') == os.environ.get('LC_ALL') == 'C.UTF-8',
+                'DONOR_PRE_START_ENVIRONMENT_MISMATCH')
+    for name, key in [('_virtualenv', '_virtualenv.py'), ('_distutils_hack', '_distutils_hack/__init__.py')]:
+        module = sys.modules.get(name)
+        path = getattr(module, '__file__', None)
+        require(path in m['startup_files'] and path.endswith(key), 'ACTUAL_PTH_SHIM_MISSING_OR_FOREIGN')
+
+
+def verify_paths(m, paths, mode, source, run, project, native, initial=False):
+    prefix = [str(source)] if mode == '@canary' else [str(project / 'tests'), str(native), str(project), str(run)]
+    expected = prefix + m['startup_expected']
+    if initial:
+        require(list(paths) == expected, 'POST_PREPEND_PATH_MISMATCH')
+    else:
+        require(list(paths)[-4:] == m['startup_expected'], 'STARTUP_PATH_REMOVED_OR_REORDERED')
+        allowed = set(m['directory_identities']) | {str(source), str(run)}
+        require(all(type(p) is str and (p == ARCHIVE or p in allowed) for p in paths),
+                'UNDECLARED_PYTEST_SEARCH_ENTRY')
+    for raw in paths:
+        if raw == ARCHIVE:
+            try:
+                absent_leaf(m)
+            except FileNotFoundError:
+                pass
+        else:
+            p = pathlib.Path(raw)
+            require(not p.is_symlink() and p.is_dir() and os.access(p, os.R_OK | os.X_OK),
+                    'SEARCH_ENTRY_NOT_ENUMERABLE_DIRECTORY')
+            if raw in m['directory_identities']:
+                require(identity(p.lstat()) == m['directory_identities'][raw], 'SEARCH_ENTRY_IDENTITY_DRIFT')
+
+
+def verify_owner_startup_receipt(source, path, digest, *, runtime=False):
+    p = pathlib.Path(path)
+    require(p.is_absolute() and not p.is_symlink() and p.resolve(strict=True) == p,
+            'EXACT_STARTUP_RECEIPT_REQUIRED')
+    st = p.lstat()
+    require(stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and st.st_nlink == 1 and
+            stat.S_IMODE(st.st_mode) == 0o400, 'IMMUTABLE_STARTUP_RECEIPT_REQUIRED')
+    b = p.read_bytes()
+    require(hashlib.sha256(b).hexdigest() == digest, 'STARTUP_RECEIPT_HASH_DRIFT')
+    r = json.loads(b); m = load(source)
+    expected_state = ('INDEPENDENT_DONOR_CLEAN_STARTUP_OBSERVED' if runtime else
+                      'INDEPENDENT_FULL_ISOLATED_STARTUP_OBSERVED')
+    require(r.get('state') == expected_state and
+            r.get('interpreter_sha256') == m['interpreter']['sha256'] and
+            r.get('import_path_pins_sha256') == hashlib.sha256((pathlib.Path(source) / 'import-path-pins.json').read_bytes()).hexdigest() and
+            r.get('sys_path') == m['startup_expected'] and
+            r.get('boot_id') == pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip() and
+            r.get('flags') == startup_flags(runtime=runtime) and
+            r.get('actual_shims') == {name: next(k for k in m['startup_files'] if k.endswith(suffix)) for name, suffix in
+                                    [('_virtualenv', '_virtualenv.py'), ('_distutils_hack', '_distutils_hack/__init__.py')]} and
+            r.get('candidate_imported') is False and r.get('backend_terminal_reaped') is True,
+            'FULL_STARTUP_OBSERVATION_NOT_EVIDENCED')
+    if runtime:
+        # The independent observer must capture its actual clean pre-exec env,
+        # argv flags, same-boot reap and unimported candidate; old -I receipts
+        # cannot be relabelled as evidence for the new startup boundary.
+        root = r.get('probe_temporary_root'); home = r.get('probe_home')
+        require(type(root) is str and type(home) is str and
+                pathlib.Path(root).is_absolute() and pathlib.Path(home).is_absolute() and
+                r.get('interpreter_flags_argv') == ['-P', '-s', '-B'] and
+                r.get('pre_interpreter_environment') == {
+                    'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
+                    'TZ': 'UTC', 'HOME': home, 'TMPDIR': root,
+                    'PYTEST_DEBUG_TEMPROOT': root, 'PYTHONHASHSEED': '0', 'PYTHONUTF8': '1',
+                    'PYTHONDONTWRITEBYTECODE': '1'}, 'DONOR_STARTUP_OBSERVATION_NOT_EVIDENCED')
+    return {'path': str(p), 'sha256': digest}

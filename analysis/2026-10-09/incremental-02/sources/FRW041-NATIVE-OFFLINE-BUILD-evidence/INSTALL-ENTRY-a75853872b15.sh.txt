@@ -1,0 +1,340 @@
+#!/usr/bin/bash
+# Reviewed ordinary administrator install, original whole-operation 60 seconds.
+# Arguments are an exact source review record path and its SHA256; never a runtime grant.
+set -euo pipefail
+[[ "$#" == 2 && "$UID" == 1000 && -t 1 ]] || exit 2
+install_started="$(/usr/bin/python3 -I -B -c 'import time; print(time.monotonic())')"
+exec /usr/bin/sudo -- /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 HOME=/root /usr/bin/python3 -I -B - "$1" "$2" "$install_started" <<'ROOT_LOADER'
+import os,sys,time,json,stat,signal,resource,hashlib,math
+from pathlib import Path
+SOURCE=Path('<SOL_WORK>/FRW041-NATIVE-OFFLINE-BUILD-evidence/candidate-v2')
+STAGE=Path('/run/friday-offline-build-010d839888625d6d')
+JOURNAL=Path('/run/friday-offline-build-010d839888625d6d.install.json')
+FRAGMENT=Path('/run/systemd/system/friday-native-offline-build-010d839888625d6d.service')
+POLICY=Path('/etc/sudoers.d/friday-offline-build-010d839888625d6d')
+def require(value,message):
+    if not value:raise RuntimeError(message)
+def unique_json(b):return json.loads(b)
+def safe_parent(path, owner):
+    """Anchor every component; never resolve a mutable symlink or FIFO."""
+    path=Path(path)
+    require(path.is_absolute() and '..' not in path.parts, 'absolute_clean_path_required')
+    fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    identities=[]
+    try:
+        for part in path.parts[1:-1]:
+            nxt=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=fd)
+            os.close(fd);fd=nxt;s=os.fstat(fd)
+            require(stat.S_ISDIR(s.st_mode) and s.st_uid in (0,owner) and not s.st_mode&0o022,
+                    'unsafe_input_ancestor')
+            identities.append((s.st_dev,s.st_ino))
+        return fd,path.name,identities
+    except BaseException:
+        os.close(fd);raise
+
+
+def read_exact(path, uid, mode=None, maximum=1048576, single_link=True):
+    parent,leaf,ancestors=safe_parent(path,uid)
+    fd=None
+    try:
+        fd=os.open(leaf,os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent)
+        a=os.fstat(fd)
+        require(stat.S_ISREG(a.st_mode) and a.st_uid==uid and (uid!=0 or a.st_gid==0)
+                and (not single_link or a.st_nlink==1) and not a.st_mode&0o022
+                and a.st_size<=maximum and (mode is None or stat.S_IMODE(a.st_mode)==mode), 'input_owner_mode_type')
+        chunks=[];remaining=a.st_size+1
+        while remaining:
+            block=os.read(fd,min(65536,remaining))
+            if not block:break
+            chunks.append(block);remaining-=len(block)
+        content=b''.join(chunks);b=os.fstat(fd);c=os.stat(leaf,dir_fd=parent,follow_symlinks=False)
+        key=lambda x:(x.st_dev,x.st_ino,x.st_size,x.st_mtime_ns,x.st_mode,x.st_uid,x.st_gid,x.st_nlink)
+        require(key(a)==key(b)==key(c) and len(content)==a.st_size, 'input_changed_or_overflow')
+        check,_,current=safe_parent(path,uid)
+        os.close(check);require(current==ancestors,'input_ancestor_replaced')
+        return content,a
+    finally:
+        if fd is not None:os.close(fd)
+        os.close(parent)
+
+def identity(s):return (s.st_dev,s.st_ino)
+
+
+def journal_append(value):
+    fd=os.open(JOURNAL,os.O_WRONLY|os.O_APPEND|os.O_NONBLOCK|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:
+        s=os.fstat(fd);require(list(identity(s))==BOOTSTRAP_CONTEXT['journal_identity'],'original_journal_replaced')
+        require(stat.S_ISREG(s.st_mode) and s.st_uid==s.st_gid==0 and s.st_nlink==1 and stat.S_IMODE(s.st_mode)==0o444,'journal_boundary')
+        b=(json.dumps(value,separators=(',',':'))+'\n').encode();require(len(b)<65536,'journal_record_bound')
+        require(os.write(fd,b)==len(b),'journal_short_write');os.fsync(fd)
+    finally:os.close(fd)
+
+
+def journal_inventory():
+    b,metadata=read_exact(JOURNAL,0,0o444,maximum=1048576)
+    require(list(identity(metadata))==BOOTSTRAP_CONTEXT['journal_identity'],'original_journal_replaced')
+    inventory={};pending={}
+    for line in b.splitlines():
+        row=unique_json(line);kind=row['kind'];path=row.get('path')
+        if kind=='intent':require(path not in inventory and path not in pending,'duplicate_creation');pending[path]=row
+        elif kind=='created':
+            require(path in pending,'creation_without_intent');pending.pop(path);inventory[path]=row
+        elif kind=='refused':require(path in pending,'refusal_without_intent');pending.pop(path)
+        elif kind=='removed':
+            require(path in inventory and row['identity']==inventory[path]['identity'],'removal_identity');inventory.pop(path)
+        else:require(kind in ('owner','prepared','failure'),'journal_record_kind')
+    require(not pending,'unknown_creation_retains_custody')
+    return inventory
+
+
+def tracked_create(path,b,mode):
+    path=Path(path);require(path.parent==STAGE or path in (FRAGMENT,POLICY),'fixed_creation_contour')
+    require(str(path) not in journal_inventory(),'creation_already_consumed')
+    journal_append(dict(kind='intent',path=str(path),mode=mode))
+    try:fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,mode)
+    except FileExistsError:
+        journal_append(dict(kind='refused',path=str(path)));raise
+    try:
+        s=os.fstat(fd);ident=list(identity(s))
+        journal_append(dict(kind='created',path=str(path),identity=ident,mode=mode,directory=False))
+        os.fchmod(fd,mode);os.fchown(fd,0,0)
+        view=memoryview(b)
+        while view:
+            count=os.write(fd,view);require(count>0,'root_short_write');view=view[count:]
+        os.fsync(fd)
+        parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+        try:os.fsync(parent)
+        finally:os.close(parent)
+        return ident
+    finally:os.close(fd)
+
+
+def tracked_unlink(path,directory=False):
+    path=Path(path);inventory=journal_inventory();row=inventory.get(str(path))
+    require(row is not None and row['directory']==directory,'unowned_deletion')
+    try:s=path.lstat()
+    except FileNotFoundError:
+        journal_append(dict(kind='removed',path=str(path),identity=row['identity']));return
+    require(list(identity(s))==row['identity'] and s.st_uid==s.st_gid==0
+        and (stat.S_ISDIR(s.st_mode) if directory else stat.S_ISREG(s.st_mode)) and not s.st_mode&0o022,'foreign_deletion_refused')
+    if directory:path.rmdir()
+    else:path.unlink()
+    parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:os.fsync(parent)
+    finally:os.close(parent)
+    journal_append(dict(kind='removed',path=str(path),identity=row['identity']))
+
+
+def verify_inventory():
+    inventory=journal_inventory()
+    for name,row in inventory.items():
+        path=Path(name);s=path.lstat()
+        require(list(identity(s))==row['identity'] and s.st_uid==s.st_gid==0
+                and (stat.S_ISDIR(s.st_mode) if row['directory'] else stat.S_ISREG(s.st_mode)) and not s.st_mode&0o022,'root_inventory_replaced')
+    require({str(p) for p in STAGE.iterdir()}=={name for name in inventory if Path(name).parent==STAGE},'foreign_stage_artifact')
+    return inventory
+
+
+
+def best_effort_report(value):
+    # A diagnostic failure can never change the already secured custody state.
+    try:
+        content=(json.dumps(value,separators=(',',':'))+'\n').encode()
+        require(len(content)<=1048576,'diagnostic_bound')
+        os.set_blocking(1,False)
+        os.write(1,content)
+    except BaseException:pass
+
+
+def retain_custody(context,error,cleanup_error):
+    # One original foreground root process; no new owner, effect, grace or retry.
+    # Journal absence/replacement is uncertainty, never a release predicate.
+    try:
+        try:
+            signal.setitimer(signal.ITIMER_REAL,0)
+            for sig in (signal.SIGALRM,signal.SIGINT,signal.SIGTERM,signal.SIGHUP):
+                signal.signal(sig,lambda *_:None)
+        except BaseException:pass
+        try:
+            best_effort_report(dict(state='STOP_UNCONFIRMED',owner=context,
+                error=repr(error),cleanup_error=repr(cleanup_error),journal=str(JOURNAL),automatic_retry=False))
+        except BaseException:pass
+    finally:
+        while True:
+            try:signal.pause()
+            except BaseException:pass
+
+
+def arm(context,reserve):
+    remaining=context['deadline_monotonic']-reserve-time.monotonic()
+    require(remaining>0,'original_install_budget_exhausted')
+    signal.setitimer(signal.ITIMER_REAL,remaining)
+
+
+def check_time(context):
+    require(time.monotonic()<context['deadline_monotonic'],'original_install_budget_exhausted')
+
+
+def root_run_fd():
+    fd=os.open('/run',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:
+        s=os.fstat(fd)
+        require(stat.S_ISDIR(s.st_mode) and s.st_uid==s.st_gid==0 and not s.st_mode&0o022,'root_run_boundary')
+        require(identity(s)==identity(Path('/run').lstat()),'root_run_replaced')
+        return fd
+    except BaseException:
+        os.close(fd);raise
+
+
+def prepare_stage(parent_fd):
+    # /run is held and root-only writable. O_EXCL mkdir is never adoption.
+    journal_append(dict(kind='intent',path=str(STAGE),mode=0o755))
+    try:os.mkdir(STAGE.name,0o700,dir_fd=parent_fd)
+    except FileExistsError:
+        journal_append(dict(kind='refused',path=str(STAGE)));raise
+    fd=os.open(STAGE.name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent_fd)
+    try:
+        initial=os.fstat(fd);named=os.stat(STAGE.name,dir_fd=parent_fd,follow_symlinks=False)
+        require(identity(initial)==identity(named) and stat.S_ISDIR(initial.st_mode)
+                and initial.st_uid==initial.st_gid==0 and not initial.st_mode&0o077,'stage_creation_boundary')
+        # Identity reaches stable storage BEFORE any permission change.
+        journal_append(dict(kind='created',path=str(STAGE),identity=list(identity(initial)),directory=True,mode=0o755))
+        os.fsync(parent_fd)
+        os.fchmod(fd,0o755);os.fsync(fd)
+        current=os.fstat(fd);named=os.stat(STAGE.name,dir_fd=parent_fd,follow_symlinks=False)
+        require(identity(initial)==identity(current)==identity(named)
+                and current.st_uid==current.st_gid==named.st_uid==named.st_gid==0
+                and stat.S_IMODE(current.st_mode)==stat.S_IMODE(named.st_mode)==0o755,'stage_mode_identity_unknown')
+        os.fsync(parent_fd)
+    finally:os.close(fd)
+
+
+def create_owner_journal(context,state,parent_fd):
+    # Latch BEFORE the first potentially successful creation, including a signal
+    # between the open syscall and Python's fd assignment. Unknown fd => retain.
+    state['possible_effect']=True
+    try:
+        fd=os.open(JOURNAL.name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,0o400,dir_fd=parent_fd)
+    except FileExistsError:
+        state['possible_effect']=False
+        raise
+    state['journal_fd']=fd
+    s=os.fstat(fd)
+    require(stat.S_ISREG(s.st_mode) and s.st_uid==s.st_gid==0 and s.st_nlink==1,'new_journal_boundary')
+    context['journal_identity']=list(identity(s))
+    require(identity(s)==identity(os.stat(JOURNAL.name,dir_fd=parent_fd,follow_symlinks=False)),'journal_creation_replaced')
+    b=(json.dumps(dict(kind='owner',**context))+'\n').encode()
+    require(os.write(fd,b)==len(b),'owner_record_short');os.fsync(fd)
+    os.fsync(parent_fd)
+    os.fchmod(fd,0o444);os.fsync(fd)
+    state['journal_ready']=True
+
+
+def loader_rollback(context):
+    check_time(context);inv=journal_inventory()
+    require(set(inv)<={str(STAGE),str(STAGE/'bootstrap.py')},'loader_inventory')
+    if str(STAGE/'bootstrap.py') in inv:check_time(context);tracked_unlink(STAGE/'bootstrap.py')
+    if str(STAGE) in inv:check_time(context);tracked_unlink(STAGE,directory=True)
+    require(not journal_inventory(),'loader_cleanup_unknown');check_time(context)
+
+
+def remove_owner_journal(context,state,parent_fd):
+    # Held fd remains custody until unlink + parent fsync + absence are confirmed.
+    check_time(context)
+    fd=state['journal_fd'];require(fd is not None,'journal_creation_unknown')
+    own=os.fstat(fd);current=os.stat(JOURNAL.name,dir_fd=parent_fd,follow_symlinks=False)
+    require(list(identity(own))==context['journal_identity']==list(identity(current))
+            and stat.S_ISREG(current.st_mode) and current.st_uid==current.st_gid==0 and current.st_nlink==1,'journal_cleanup_identity_unknown')
+    os.unlink(JOURNAL.name,dir_fd=parent_fd);os.fsync(parent_fd)
+    try:os.stat(JOURNAL.name,dir_fd=parent_fd,follow_symlinks=False)
+    except FileNotFoundError:pass
+    else:raise RuntimeError('journal_cleanup_absence_unknown')
+    check_time(context)
+
+
+def bootstrap_install(context,state,parent_fd):
+    prepare_stage(parent_fd)
+    b,_=read_exact(SOURCE/'install-system.py',1000,0o400,maximum=2000000)
+    require(hashlib.sha256(b).hexdigest()=='77bdbc4985648f0d71b0f97f9aeb0a7235f9905cce8612e8cccda907e17cb310','reviewed_bootstrap_hash')
+    tracked_create(STAGE/'bootstrap.py',b,0o444)
+    # Both compile and imports execute INSIDE original_owner's single guard.
+    scope=dict(__name__='root_bootstrap',__file__=str(STAGE/'bootstrap.py'),BOOTSTRAP_CONTEXT=context)
+    exec(compile(b,str(STAGE/'bootstrap.py'),'exec'),scope)
+    state['rollback']=scope['rollback']
+    return scope['main']()
+
+
+def confirm_prepared(context,receipt):
+    require(receipt['state']=='EXACT_ROOT_DEPENDENCIES_INSTALLED_NOT_STARTED'
+            and receipt['installation_owner']==context and receipt['trial_started'] is False,'prepared_handoff_unknown')
+    b,_=read_exact(STAGE/'receipt.json',0,0o444)
+    require(json.loads(b)==receipt,'prepared_receipt_changed')
+    journal,_=read_exact(JOURNAL,0,0o444)
+    last=json.loads(journal.splitlines()[-1])
+    require(last['kind']=='prepared' and last['receipt_sha256']==hashlib.sha256(b).hexdigest(),'prepared_journal_unknown')
+    verify_inventory()
+    stage=STAGE.lstat()
+    require(stat.S_IMODE(stage.st_mode)==0o755,'prepared_stage_mode')
+    require(time.monotonic()<context['deadline_monotonic']-20,'prepared_handoff_late')
+
+
+def original_owner(context):
+    global BOOTSTRAP_CONTEXT
+    BOOTSTRAP_CONTEXT=context
+    state=dict(possible_effect=False,journal_ready=False,journal_fd=None,rollback=None,prepared=False,closed=False)
+    parent_fd=None;error=None;cleanup_error=None
+    try:
+        arm(context,20)
+        parent_fd=root_run_fd()
+        create_owner_journal(context,state,parent_fd)
+        receipt=bootstrap_install(context,state,parent_fd)
+        confirm_prepared(context,receipt)
+        state['prepared']=True
+        best_effort_report(receipt)
+        return receipt
+    except BaseException as problem:
+        error=problem
+        if state['possible_effect'] and not state['prepared']:
+            try:
+                arm(context,0)
+                if state['journal_ready']:
+                    journal_append(dict(kind='failure',error=repr(problem),observed_monotonic=time.monotonic()))
+                    if state['rollback'] is None:loader_rollback(context)
+                    else:state['rollback'](context)
+                    require(not journal_inventory(),'rollback_inventory_not_empty')
+                remove_owner_journal(context,state,parent_fd)
+                state['closed']=True
+            except BaseException as failure:cleanup_error=failure
+        raise
+    finally:
+        # The disarm/report paths cannot skip the mandatory retention branch.
+        try:signal.setitimer(signal.ITIMER_REAL,0)
+        finally:
+            if state['possible_effect'] and not (state['closed'] or state['prepared']):
+                retain_custody(context,error,cleanup_error)
+            try:
+                if state['closed']:
+                    best_effort_report(dict(state='INSTALL_REFUSED_ROLLED_BACK',owner=context,closed=True))
+            finally:
+                if state['journal_fd'] is not None:os.close(state['journal_fd'])
+                if parent_fd is not None:os.close(parent_fd)
+
+
+def expired(*_):raise RuntimeError('original_install_clock_exhausted')
+
+
+def loader_main():
+    require(os.getuid()==os.geteuid()==0 and len(sys.argv)==4 and os.isatty(1),'interactive_exact_root_install_required')
+    os.umask(0o077);os.sched_setaffinity(0,{0,1});resource.setrlimit(resource.RLIMIT_AS,(2147483648,2147483648))
+    started=float(sys.argv[3]);now=time.monotonic()
+    require(math.isfinite(started) and started<=now<started+60,'original_whole_install_clock')
+    sys.argv=sys.argv[:3]
+    context=dict(pid=os.getpid(),start_ticks=int(Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19]),
+        boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),started_monotonic=started,deadline_monotonic=started+60)
+    for sig in (signal.SIGALRM,signal.SIGINT,signal.SIGTERM,signal.SIGHUP):signal.signal(sig,expired)
+    return original_owner(context)
+
+
+if __name__=='__main__':loader_main()
+
+ROOT_LOADER

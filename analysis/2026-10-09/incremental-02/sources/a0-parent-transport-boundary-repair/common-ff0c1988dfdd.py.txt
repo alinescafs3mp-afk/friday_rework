@@ -1,0 +1,554 @@
+#!/usr/bin/python3
+"""Fixed source-only native probe protocol. Import has no side effects."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import signal
+import stat
+import subprocess
+import time
+
+ROOT = Path(__file__).resolve().parent
+PREP = Path('<ASTRA_WORK>/a0-native-dependency-probe')
+EVIDENCE = ROOT / 'native-evidence'
+PREFIX = 'frw011a0ndp20261007g4r61c'
+ROLES = ('outer-bound', 'dependent-bound', 'dependent-late', 'outer-negative',
+         'dependent-negative', 'outer-timeout', 'dependent-timeout', 'sentinel')
+NAMES = {r: PREFIX + '-' + r + '.service' for r in ROLES}
+LOCK = Path('<LOCAL_HOME>/.jericho/runtime/friday-quality-ui-exclusive.lock')
+ENV = {'PATH': '/usr/bin:/bin', 'HOME': '<LOCAL_HOME>', 'XDG_RUNTIME_DIR': '<USER_RUNTIME>',
+       'DBUS_SESSION_BUS_ADDRESS': 'unix:path=<USER_RUNTIME>/bus', 'LC_ALL': 'C',
+       'PYTHONDONTWRITEBYTECODE': '1', 'SYSTEMD_PAGER': 'cat', 'SYSTEMD_COLORS': '0'}
+PROPS = ('Id Type LoadState ActiveState SubState InvocationID MainPID ControlPID ControlGroup '
+         'ExecStart ExecCondition ExecStopPost Transient FragmentPath DropInPaths BindsTo After '
+         'RuntimeMaxUSec RuntimeRandomizedExtraUSec TimeoutStartUSec TimeoutStopUSec '
+         'TimeoutStartFailureMode TimeoutStopFailureMode KillMode SendSIGKILL FinalKillSignal '
+         'Restart NotifyAccess Result ExecMainStatus ExecMainStartTimestampMonotonic '
+         'ExecMainExitTimestampMonotonic ActiveEnterTimestampMonotonic ActiveExitTimestampMonotonic '
+         'InactiveEnterTimestampMonotonic InactiveExitTimestampMonotonic Job JobTimeoutUSec JobRunningTimeoutUSec '
+         'CollectMode MemoryMax CPUQuotaPerSecUSec CPUAffinity TasksMax NoNewPrivileges').split()
+SOURCES = ('common.py', 'payload.py', 'observer.py', 'driver.py', 'recipe.json', 'witness.py', 'owner_launcher.py', 'parent_integration.py', 'dropins.py')
+
+class Refused(RuntimeError):
+    pass
+
+
+def require(test, message):
+    if not test:
+        raise Refused(message)
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def json_pairs(pairs):
+    obj = {}
+    for key, value in pairs:
+        require(key not in obj, 'duplicate JSON key: ' + key)
+        obj[key] = value
+    return obj
+
+
+def private_bytes(path, mode=0o600):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        s = os.fstat(fd)
+        require(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and
+                s.st_nlink == 1 and stat.S_IMODE(s.st_mode) == mode, 'private file metadata')
+        require(s.st_size <= 1024 * 1024, 'private file too large')
+        raw = os.read(fd, 1024 * 1024 + 1)
+        require(len(raw) == s.st_size, 'file changed during read')
+        return raw
+    finally:
+        os.close(fd)
+
+
+def read_json(path):
+    return json.loads(private_bytes(path), object_pairs_hook=json_pairs)
+
+
+def write_once(path, obj):
+    raw = obj if isinstance(obj, bytes) else (json.dumps(obj, sort_keys=True) + '\n').encode()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def clocks():
+    return {'monotonic_ns': time.monotonic_ns(),
+            'boottime_ns': time.clock_gettime_ns(time.CLOCK_BOOTTIME),
+            'realtime_ns': time.time_ns()}
+
+
+def within(r, seconds, now=None):
+    now = clocks() if now is None else now
+    return all(0 <= now[k] - r['accepted_' + k] < seconds * 10**9
+               for k in ('monotonic_ns', 'boottime_ns'))
+
+
+def remaining(r, seconds):
+    now = clocks()
+    return max(0, min(seconds - (now[k] - r['accepted_' + k]) / 1e9
+                      for k in ('monotonic_ns', 'boottime_ns')))
+
+
+def validate_receipt(r, *, now=None, boot=None, verify_sources=True):
+    require(type(r.get('execution_authorized')) is bool and r['execution_authorized'], 'no authorization')
+    require(r.get('authorization_scope') == 'HARMLESS_NATIVE_DEPENDENCY_PROBE_ONLY', 'scope')
+    require(r.get('prefix') == PREFIX and type(r.get('generation')) is int and r['generation'] == 1, 'prefix/generation')
+    require(isinstance(r.get('assignment'), str) and r['assignment'] not in
+            ('FRW011-A0-NATIVE-DEPENDENCY-DRIVER', 'SEPARATE_NATIVE_ASSIGNMENT_REQUIRED', ''), 'separate assignment')
+    require(r.get('boot_id') == (boot or Path('/proc/sys/kernel/random/boot_id').read_text().strip()), 'boot')
+    require(re.fullmatch('[0-9a-f]{64}', r.get('attempt_token', '')) is not None, 'original token')
+    for key in ('accepted_monotonic_ns', 'accepted_boottime_ns', 'accepted_realtime_ns'):
+        require(type(r.get(key)) is int and r[key] > 0, 'original clock integer')
+    a = r['accepted_monotonic_ns']
+    require(r.get('submit_cutoff_ns') == a + 35_000_000_000, 'submit clock reset')
+    require(r.get('driver_deadline_ns') == a + 110_000_000_000, 'driver clock reset')
+    require(r.get('whole_deadline_ns') == a + 120_000_000_000, 'whole clock reset')
+    require(within(r, 110, now), 'original receipt expired/future')
+    require(r.get('canonical_lock') == {'path': str(LOCK), 'inode': 9044963, 'mode': 0o664,
+                                       'uid': 1000, 'gid': 1000, 'nlink': 1}, 'lock binding')
+    require(r.get('parent_retains_canonical_lock_on_unknown') is True, 'parent lock retention acknowledgement')
+    require(r.get('unit_names_first_use_in_boot') is True, 'exact unit names require first-use parent attestation')
+    holder = r.get('canonical_lock_holder', {})
+    require(holder.get('fd') == 9 and type(holder.get('pid')) is int and holder['pid'] > 1 and
+            type(holder.get('starttime_ticks')) is int and holder['starttime_ticks'] > 0, 'parent lock-holder receipt')
+    from witness import validate_receipt_binding
+    validate_receipt_binding(r)
+    manager = r.get('user_manager', {})
+    require(type(manager) is dict and set(manager) == {'pid', 'starttime_ticks', 'invocation_id'},
+            'original user manager receipt')
+    require(type(manager['pid']) is int and manager['pid'] > 1 and
+            type(manager['starttime_ticks']) is int and manager['starttime_ticks'] > 0 and
+            isinstance(manager['invocation_id'], str) and
+            re.fullmatch('[0-9a-f]{32}', manager['invocation_id']) is not None and
+            manager['invocation_id'] != '0' * 32, 'original user manager identity')
+    if verify_sources:
+        manifest = json.loads((ROOT / 'manifest.json').read_text(), object_pairs_hook=json_pairs)
+        require(r.get('manifest_sha256') == digest(ROOT / 'manifest.json'), 'manifest pin')
+        require(set(manifest['files']) == set(SOURCES), 'source coverage')
+        for name in SOURCES:
+            require(digest(ROOT / name) == manifest['files'][name], 'source drift ' + name)
+        for name, pin in {'recipe.json': '4797d4d751f21bb14d81fc2a8d7b289282bd062ec843a6dc79478c91e3f554d4', 'payload.py': 'fcc6c88060bc53649960a5df7b095792f6b15acf1942217b3a5dc323839db101', 'build_recipe.py': 'add1b7cd98f378fa7a4ab3d0434f605c18c3bac2cbef9355e8449617e2c9272b'}.items():
+            require(digest(PREP / name) == pin, 'immutable prep drift ' + name)
+        require(digest(PREP / 'result.json') == 'f2d13ea94ca9cdec381cf16b0742478c6e5bb21f479e28af91e5d61318acf8b1', 'prep result drift')
+    from dropins import verify_receipt_binding
+    verify_receipt_binding(r.get('dropin_admission'), r, NAMES)
+    return r
+
+
+def receipt():
+    return validate_receipt(read_json(EVIDENCE / 'receipt.json'))
+
+
+def identity(pid):
+    raw = Path('/proc/%d/stat' % pid).read_text()
+    fields = raw[raw.rfind(')') + 2:].split()
+    status = Path('/proc/%d/status' % pid).read_text()
+    ignored = next(line.split()[1] for line in status.splitlines() if line.startswith('SigIgn:'))
+    return {'pid': pid, 'starttime_ticks': int(fields[19]), 'parent_pid': int(fields[1]),
+            'process_group': int(fields[2]), 'session_id': int(fields[3]), 'ignored_signals': int(ignored, 16),
+            'state': fields[0], 'cgroup': Path('/proc/%d/cgroup' % pid).read_text()}
+
+
+def same_process(record):
+    try:
+        current = identity(record['pid'])
+        return current['starttime_ticks'] == record['starttime_ticks']
+    except FileNotFoundError:
+        return False
+    # Permission failures are unknown, never mistaken for death.
+
+
+def own_cgroup(role, record):
+    return any(line.startswith('0::/') and line.removeprefix('0::').endswith('/' + NAMES[role])
+               for line in record['cgroup'].splitlines())
+
+
+def emit(role, event, extra=None):
+    require(role in ROLES, 'unknown role')
+    item = {'role': role, 'event': event, **clocks(),
+            'invocation_id': os.environ.get('INVOCATION_ID'), **identity(os.getpid())}
+    r=read_json(EVIDENCE/'receipt.json')
+    item['session_binding']={k:r[k] for k in ('assignment','generation','attempt_token','manifest_sha256','boot_id','accepted_monotonic_ns','accepted_boottime_ns')}
+    if extra:
+        item.update(extra)
+    # One emitter per PID, immutable boot/monotonic identity, private directory.
+    # Publish only a fully flushed record; observers never parse a partial JSON.
+    stem = '%s.%s.%d.%d' % (role, event, os.getpid(), item['monotonic_ns'])
+    pending, final = EVIDENCE / ('.' + stem + '.pending'), EVIDENCE / (stem + '.json')
+    require(not final.exists(), 'duplicate event identity')
+    write_once(pending, item)
+    os.rename(pending, final)
+    return item
+
+
+def show_argv(roles=ROLES):
+    require(roles and len(set(roles)) == len(roles) and all(r in ROLES for r in roles), 'show role allowlist')
+    return ['/usr/bin/systemctl', '--user', 'show', '--all', '--no-pager', '--property=' + ','.join(PROPS), '--'] + [NAMES[r] for r in roles]
+
+
+# Complete reviewed argv forms. Option spelling/order and every operand matter;
+# a verb-like unit name never makes an unrecognized command a read.
+MANAGER_SHOW = ['/usr/bin/systemctl', '--system', 'show', '--all', '--no-pager',
+                '--property=Id,ActiveState,MainPID,InvocationID', '--', '<REDACTED_EMAIL>']
+PREFLIGHT_MANAGER = ['/usr/bin/systemctl', '--system', 'show', '<REDACTED_EMAIL>',
+                     '--property=MainPID,InvocationID,ActiveState', '--no-pager']
+PREFLIGHT_UNITS = ['/usr/bin/systemctl', '--user', 'show', '--no-pager',
+                   '--property=Id,LoadState,ActiveState,SubState,InvocationID,MainPID,ControlPID,ControlGroup',
+                   *NAMES.values()]
+UNIT_PATH_ARGV = ['/usr/bin/systemctl', '--user', 'show', '--property=UnitPath', '--value', '--no-pager']
+JOBS_ARGV = ['/usr/bin/systemctl', '--user', 'list-jobs', '--all', '--no-legend', '--plain', '--no-pager']
+RELOAD_ARGV = ['/usr/bin/systemctl', '--user', '--no-ask-password', 'daemon-reload']
+JOURNAL_FIELDS = ('__CURSOR', '__MONOTONIC_TIMESTAMP', '__REALTIME_TIMESTAMP',
+                  '__SEQNUM', '__SEQNUM_ID', '_BOOT_ID', '_PID', '_UID', '_EXE', '_COMM',
+                  'USER_UNIT', 'JOB_ID', 'JOB_TYPE', 'JOB_RESULT', 'MESSAGE_ID')
+
+
+def history_argv(original):
+    boot = original['boot_id'].replace('-', '')
+    require(re.fullmatch('[0-9a-f]{32}', boot) is not None, 'exact original boot')
+    return ['/usr/bin/journalctl', '--user', '--boot='+boot, '--quiet', '--no-pager',
+            '--output=json', '--output-fields=USER_UNIT', '--lines=1',
+            *['USER_UNIT='+NAMES[role] for role in ROLES]]
+
+
+def journal_read_allowed(argv, original, now):
+    # Two time values are the only variable tokens. Canonical integer seconds
+    # range over at most 25 values in the original22s window, never new anchors.
+    require(within(original,22,now), 'original journal window')
+    require(len(argv) == 14 and type(original.get('accepted_realtime_ns')) is int,
+            'finite journal query shape')
+    require(re.fullmatch(r'--since=@[1-9][0-9]{0,11}',argv[7]) is not None and
+            re.fullmatch(r'--until=@[1-9][0-9]{0,11}',argv[8]) is not None,
+            'canonical journal time values')
+    since, until = int(argv[7][9:]), int(argv[8][9:])
+    floor = original['accepted_realtime_ns']//10**9-1
+    ceiling = min(original['accepted_realtime_ns']//10**9+23, now['realtime_ns']//10**9+1)
+    require(floor <= since <= until <= ceiling, 'journal time outside original finite range')
+    manager = original['user_manager']
+    require(type(manager['pid']) is int and manager['pid'] > 1, 'exact manager PID')
+    expected = ['/usr/bin/journalctl', '--quiet', '--no-pager', '--output=json',
+                '--output-fields='+','.join(JOURNAL_FIELDS), '--lines=+65',
+                '--boot='+original['boot_id'].replace('-', ''), '--since=@%d'%since, '--until=@%d'%until,
+                'USER_UNIT='+NAMES['dependent-late'], '_PID='+str(manager['pid']),
+                '_UID=1000', '_EXE=/usr/lib/systemd/systemd', '_COMM=systemd']
+    require(argv == expected, 'exact journal boot/unit/manager/fields/options')
+    return True
+
+
+def parse_show(text, roles=ROLES):
+    blocks = {}
+    for block in text.strip().split('\n\n'):
+        if not block.strip():
+            continue
+        pairs = [line.split('=', 1) for line in block.splitlines() if '=' in line]
+        item = json_pairs(pairs)
+        require(item.get('Id') in [NAMES[r] for r in roles], 'unexpected manager name')
+        require(item['Id'] not in blocks, 'duplicate manager block')
+        blocks[item['Id']] = item
+    require(set(blocks) == {NAMES[r] for r in roles}, 'incomplete manager response')
+    return {r: blocks[NAMES[r]] for r in roles}
+
+
+def absent(p):
+    return (p.get('LoadState') == 'not-found' and p.get('ActiveState') == 'inactive'
+            and p.get('InvocationID') in ('', '0' * 32)
+            and all(p.get(k) == '0' for k in ('MainPID', 'ControlPID'))
+            and p.get('Job') in ('', '0')
+            and all(p.get(k) == '' for k in ('ControlGroup', 'FragmentPath', 'DropInPaths')))
+
+
+def call(argv, timeout, *, expected='read', popen=None):
+    require(popen is None and PARENT_TRANSPORT is not None, 'all ordinary native clients require original parent custody')
+    return PARENT_TRANSPORT.call(argv, timeout, expected=expected)
+
+
+def cgroup_sample(role, value):
+    require(value.startswith('/') and '..' not in Path(value).parts and value.endswith('/' + NAMES[role]), 'cgroup scope')
+    path = Path('/sys/fs/cgroup') / value.lstrip('/')
+    result = {'path': value, **clocks(), 'exists': path.exists(), 'pids': []}
+    if not result['exists']:
+        return result
+    result['events'] = (path / 'cgroup.events').read_text()
+    files = [path / 'cgroup.procs'] + list(path.rglob('*/cgroup.procs'))
+    for f in files:
+        try:
+            pids = [int(x) for x in f.read_text().split()]
+        except FileNotFoundError:
+            continue
+        for pid in pids:
+            try:
+                result['pids'].append(identity(pid))
+            except FileNotFoundError:
+                result.setdefault('vanished_during_sample', []).append(pid)
+    return result
+
+
+def bounded_journal_call(argv, timeout, *, popen=None):
+    require(argv and argv[0] == '/usr/bin/journalctl', 'journal client scope')
+    return call(argv,timeout,popen=popen)
+
+
+def _bounded_capture(argv, timeout, *, popen, absolute):
+    """Existing common capture, finite stream and reap budget (64KiB total).
+
+    All ordinary clients share it. Last100ms is reserved inside this call's
+    original deadline; unknown reaping remains in the owner's Popen inventory.
+    No unbounded wait/communicate exists on exception or timeout.
+    """
+    require(timeout > 0.12, 'no capture/reap reserve')
+    begin = clocks()
+    deadline = {a:absolute['deadline_'+a] for a in ('monotonic_ns','boottime_ns')}
+    def left():
+        now=clocks()
+        return min((deadline[a]-now[a])/1e9 for a in deadline)
+    limit, used = 65536, 0
+    output = {'stdout':bytearray(),'stderr':bytearray()}
+    timed_out = overflow = False
+    p = popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
+              stderr=subprocess.PIPE,env=ENV,close_fds=True)
+    try:
+        with selectors.DefaultSelector() as selector:
+            for name,stream in (('stdout',p.stdout),('stderr',p.stderr)):
+                os.set_blocking(stream.fileno(),False)
+                selector.register(stream,selectors.EVENT_READ,name)
+            while selector.get_map():
+                budget=left()-0.1
+                if budget <= 0:
+                    timed_out=True; break
+                for key,_ in selector.select(budget):
+                    chunk=os.read(key.fileobj.fileno(),min(4096,limit-used+1))
+                    if not chunk:
+                        selector.unregister(key.fileobj); continue
+                    if used+len(chunk)>limit:
+                        overflow=True; break
+                    output[key.data].extend(chunk); used+=len(chunk)
+                if overflow: break
+        if not (timed_out or overflow):
+            try:
+                p.wait(timeout=max(0,left()-0.1))
+            except subprocess.TimeoutExpired:
+                timed_out=True
+        if p.poll() is None:
+            p.kill()
+        if p.returncode is None and left()>0:
+            try: p.wait(timeout=left())
+            except subprocess.TimeoutExpired: timed_out=True
+        return {'argv':argv,'started':begin,'finished':clocks(),'returncode':p.returncode,
+                'timed_out':timed_out,'output_truncated':overflow,'client_reaped':p.returncode is not None,
+                **{k:bytes(v).decode('utf-8','strict') for k,v in output.items()}}
+    finally:
+        try:
+            if p.poll() is None: p.kill()
+            if p.returncode is None and left()>0: p.wait(timeout=left())
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            p.stdout.close(); p.stderr.close()
+
+
+def bounded_capture_call(argv, timeout, *, expected='read', popen=None):
+    return call(argv,timeout,expected=expected,popen=popen)
+
+
+# A one-shot anonymous-pipe exec latch, not a request/reply broker. The same
+# Popen PID is owned, starttime-pinned and pidfd-pinned before native exec.
+EXEC_LATCH = "import os,sys,select,time\nf=int(sys.argv[1]);m=int(sys.argv[2]);b=int(sys.argv[3])\ndef left():\n return min((m-time.monotonic_ns())/1e9,(b-time.clock_gettime_ns(time.CLOCK_BOOTTIME))/1e9)\nt=left()\nif t<=0 or not select.select([f],[],[],t)[0] or os.read(f,1)!=b'1':\n raise SystemExit(125)\nos.close(f)\nif left()<=0: raise SystemExit(125)\nos.execv(sys.argv[4],sys.argv[4:])\n"
+PARENT_TRANSPORT = None
+
+
+def install_parent_transport(owner):
+    global PARENT_TRANSPORT
+    require(PARENT_TRANSPORT is None and owner.parent_pid == os.getpid(), 'single original transport owner')
+    PARENT_TRANSPORT = owner
+
+
+class ParentTransport:
+    """Finite in-process custody, independent of Driver JSON and booleans.
+
+    Every attempted native call is recorded before Popen; dispatch waits for
+    actual Popen/starttime/pidfd registration. A failed/denied/late call latches
+    uncertainty forever, even if its child is subsequently reaped. Only exact
+    read clients and the two reviewed reloads remain after closing Driver.
+    """
+    def __init__(self, original, start_argv, clock=clocks, popen=subprocess.Popen):
+        import copy
+        self.original = copy.deepcopy(original)
+        self.start_argv = tuple(tuple(a) for a in start_argv)
+        self.clock, self.popen = clock, popen
+        self.parent_pid = os.getpid()
+        self.parent_identity = identity(self.parent_pid)
+        self.records = []
+        self.phase = 'admission'
+        self.uncertain = False
+        self.driver_started = self.driver_returned = False
+        self.reload_count = 0
+        self.journal_reads = 0
+        self.starts = {}
+        self.busy = False
+        self.current = None
+        self.closed_at = None
+
+    def left(self, seconds):
+        now = self.clock()
+        require(within(self.original, seconds, now), 'original transport clock expired/future')
+        return min(seconds-(now[k]-self.original['accepted_'+k])/1e9
+                   for k in ('monotonic_ns','boottime_ns'))
+
+    def begin_driver(self):
+        self.left(5)
+        require(self.phase == 'admission' and not self.uncertain and not self.busy,
+                'driver entry refuses open/unknown admission')
+        self.phase = 'driver'
+        self.driver_started = True
+
+    def close_driver(self):
+        # Called in the owner's finally, after the synchronous callable has
+        # returned/unwound. There is no detached Driver actor or FD9 duplicate.
+        require(self.phase == 'driver' and self.driver_started, 'single driver closure')
+        self.phase = 'cleanup'
+        self.closed_at = self.clock()
+        if self.busy or not within(self.original,110,self.closed_at):
+            self.uncertain = True
+        self.driver_returned = True
+
+    def refuse_setup(self):
+        require(self.phase == 'admission' and not self.driver_started, 'setup refusal phase')
+        self.phase = 'setup_refused'
+        self.uncertain = True  # fail closed; original parent custody is retained
+
+    def classify(self, argv, expected):
+        require(type(argv) is list and all(type(a) is str for a in argv), 'exact argv')
+        require(expected in ('read','start','reload'), 'caller expected effect class')
+        require(not self.uncertain and not self.busy, 'uncertain/reentrant native transport')
+        if expected == 'start':
+            require(tuple(argv) in self.start_argv, 'exact approved start argv')
+            require(self.phase == 'driver' and not self.driver_returned, 'future submitter closed')
+            self.left(35)
+            key = tuple(argv)
+            count = self.starts.get(key,0)
+            maximum = 2 if '--unit='+NAMES['outer-bound'] in argv else 1
+            require(count < maximum, 'native start replay')
+            self.starts[key] = count+1
+            return 'start', 35
+        if expected == 'reload':
+            require(argv == RELOAD_ARGV, 'exact approved reload argv')
+            require((self.phase,self.reload_count) in (('admission',0),('cleanup_reload',1)),
+                    'unexpected/repeated reload')
+            self.reload_count += 1
+            return 'reload', 5 if self.phase == 'admission' else 120
+        require(self.phase in ('admission','driver','cleanup','cleanup_reload','closed'), 'closed native lane')
+        fixed = [show_argv(), *[show_argv((role,)) for role in ROLES], MANAGER_SHOW, JOBS_ARGV]
+        if self.phase == 'admission':
+            fixed += [PREFLIGHT_MANAGER, PREFLIGHT_UNITS, UNIT_PATH_ARGV, history_argv(self.original)]
+        if argv not in fixed:
+            require(self.phase == 'driver' and argv and argv[0] == '/usr/bin/journalctl',
+                    'complete approved read argv required')
+            require(self.journal_reads < 8, 'finite journal read count')
+            journal_read_allowed(argv,self.original,self.clock())
+            self.journal_reads += 1
+            return 'read', 22
+        return 'read', 5 if self.phase == 'admission' else (108 if self.phase == 'driver' else 120)
+
+    def spawn(self, argv, **kwargs):
+        r = self.current
+        require(r is not None and r['argv'] == argv and r['process'] is None, 'registered single Popen')
+        rd, wr = os.pipe2(os.O_CLOEXEC)
+        try:
+            p = self.popen(['/usr/bin/python3','-I','-S','-B','-c',EXEC_LATCH,
+                            str(rd),str(r['deadline_monotonic_ns']),str(r['deadline_boottime_ns']),*argv],
+                           pass_fds=(rd,), **kwargs)
+            r['process'] = p  # Custody survives identity/read/dispatch exceptions.
+            r['pidfd'] = os.pidfd_open(p.pid)
+            ident = identity(p.pid)
+            require(ident['parent_pid'] == self.parent_pid and ident['state'] not in ('Z','X'), 'owned native client identity')
+            r['identity'] = ident
+            r['registered_at'] = self.clock()
+            require(all(r['registered_at'][a] < r['deadline_'+a] for a in ('monotonic_ns','boottime_ns')), 'late native registration')
+            r['dispatch_attempted'] = True
+            require(os.write(wr,b'1') == 1, 'native dispatch latch write')
+            return p
+        finally:
+            os.close(rd)
+            os.close(wr)
+
+    def call(self, argv, timeout, *, expected='read'):
+        kind, seconds = self.classify(argv, expected)
+        left = min(float(timeout), self.left(seconds))
+        require(left > 0.12 and self.parent_pid == os.getpid() and
+                identity(self.parent_pid)['starttime_ticks'] == self.parent_identity['starttime_ticks'],
+                'native call needs finite capture/reap reserve and original parent')
+        at = self.clock()
+        r = {'sequence':len(self.records),'argv':list(argv),'kind':kind,'expected':expected,'phase':self.phase,
+             'started':at,'process':None,'pidfd':None,'identity':None,
+             'dispatch_attempted':False,'reaped':False,'uncertain':True,
+             **{'deadline_'+a:min(at[a]+int(left*1e9),self.original['accepted_'+a]+seconds*10**9)
+                for a in ('monotonic_ns','boottime_ns')}}
+        self.records.append(r)
+        self.current, self.busy = r, True
+        try:
+            result = _bounded_capture(argv,left,popen=self.spawn,absolute=r)
+            p = r['process']
+            require(p is not None and r['identity'] is not None and r['dispatch_attempted'], 'native custody absent')
+            # Never consume result['client_reaped'] as proof; use owned Popen.
+            r['reaped'] = p.returncode is not None
+            r['returncode'] = p.returncode
+            allowed = (0,)  # every denied transport remains unknown, including read clients
+            r['finished'] = self.clock()
+            require(r['reaped'] and result['returncode'] == p.returncode and p.returncode in allowed and
+                    not result['timed_out'] and not result['output_truncated'] and not result['stderr'] and
+                    all(r['finished'][a] < r['deadline_'+a] for a in ('monotonic_ns','boottime_ns')),
+                    'denied/unknown/late native transport')
+            r['capture'] = result
+            if hasattr(self,'native_observer'): self.native_observer(result)
+            r['uncertain'] = False
+            return result
+        finally:
+            p = r['process']
+            if p is not None:
+                # A capture exception may occur after Popen but before returning.
+                # Finite finalization never fabricates a reap or clears uncertainty.
+                try:
+                    if p.poll() is None:
+                        p.kill()
+                    budget = min((r['deadline_'+a]-self.clock()[a])/1e9 for a in ('monotonic_ns','boottime_ns'))
+                    if p.returncode is None and budget > 0:
+                        p.wait(timeout=budget)
+                except BaseException:
+                    pass
+                r['reaped'] = p.returncode is not None
+                r['returncode'] = p.returncode
+                if r['reaped'] and r['pidfd'] is not None:
+                    os.close(r['pidfd']); r['pidfd'] = None
+            if r['uncertain'] or not r['reaped']:
+                self.uncertain = True
+            final=self.clock()
+            if not all(final[a]<r['deadline_'+a] for a in ('monotonic_ns','boottime_ns')):
+                r['uncertain']=True; self.uncertain=True
+            self.current, self.busy = None, False
+
+    def inventory(self):
+        return [{k:v for k,v in r.items() if k not in ('process','pidfd')} for r in self.records]
+
+    def confirm_closed(self):
+        self.left(120)
+        require(self.driver_returned and self.closed_at is not None and
+                within(self.original,110,self.closed_at) and
+                self.phase in ('cleanup','cleanup_reload','closed') and
+                not self.uncertain and not self.busy and bool(self.records), 'submission inventory unknown/open')
+        for r in self.records:
+            require(not r['uncertain'] and r['reaped'] and r['process'] is not None and
+                    r['process'].returncode == r['returncode'] and r['identity'] is not None and
+                    r['dispatch_attempted'], 'actual native client not reaped/registered')
+        return self.inventory()
+
+if __name__ == '__main__':
+    raise SystemExit('INERT_LIBRARY_NO_ENTRY')

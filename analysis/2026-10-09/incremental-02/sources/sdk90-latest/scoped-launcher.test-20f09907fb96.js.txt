@@ -1,0 +1,114 @@
+/** Real owned binary checks proposed for a separately admitted original unit.
+ * NOT_RUN in the source task. Unsupported ABI/binary is a failure, never PASS.
+ */
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import net from 'node:net';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { launcherPath, grantArgs, scopedGrantArgs, probeScoped } from '@deepseek-ai/node-addon-system/landlock-run';
+
+assert.equal(process.platform, 'linux', 'strong qualification requires the actual Linux route');
+const launcher = launcherPath();
+assert.equal(probeScoped(launcher, { timeoutMs: 1000 }), 'ipc-scopes');
+// Bound by the independent qualification input map; no ambient Python fallback.
+const python = process.env.FRIDAY_SCOPED_PYTHON;
+const pythonSha = process.env.FRIDAY_SCOPED_PYTHON_SHA256;
+assert.ok(python && path.isAbsolute(python) && /^[a-f0-9]{64}$/.test(pythonSha ?? ''));
+assert.equal(crypto.createHash('sha256').update(fs.readFileSync(fs.realpathSync(python))).digest('hex'), pythonSha);
+const pipeCaller = fileURLToPath(new URL('./scoped-pipe-caller.py', import.meta.url));
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scoped-launcher-'));
+function run(script, scoped = true, descriptors = { stdin: 'null' }) {
+  const argv = [launcher,
+    ...(scoped ? scopedGrantArgs : grantArgs)({ readOnly: ['/'], readWrite: [dir, '/dev/null'] }),
+    '--', process.execPath, '-e', script,
+  ];
+  const caller = spawnSync(python, ['-I', '-B', pipeCaller], {
+    input: JSON.stringify({ argv, ...descriptors }), timeout: 2000,
+    killSignal: 'SIGKILL', encoding: 'utf8', maxBuffer: 32768,
+    stdio: ['pipe', 'pipe', 'pipe'], // These terminate at the trusted caller only.
+  });
+  assert.ifError(caller.error);
+  assert.equal(caller.status, 0, caller.stderr);
+  const result = JSON.parse(caller.stdout);
+  assert.equal(result.error, null, result.error);
+  assert.equal(result.sole_drainer, 'scoped-pipe-caller');
+  assert.equal(result.stdio.stdout.type, 0o010000); // Actual FIFO, not Node socket.
+  assert.equal(result.stdio.stderr.type, 0o010000);
+  assert.equal(result.stdio.stdin.type, descriptors.stdin === 'null' ? 0o020000 :
+    descriptors.stdin === 'socket' ? 0o140000 : 0o100000);
+  return result;
+}
+try {
+  const self = run('process.kill(process.pid, 0); process.stdout.write("SELF_OK");');
+  assert.equal(self.status, 0, self.stderr);
+  assert.equal(self.stdout, 'SELF_OK');
+  const parentSignal = `try { process.kill(${process.pid}, 0); process.exit(42) } catch(e) { if(e.code !== 'EPERM') throw e; process.stdout.write('DENIED') }`;
+  assert.equal(run(parentSignal).stdout, 'DENIED');
+  assert.equal(run(parentSignal, false).status, 42, 'unscoped mutant must reach the outside process');
+
+  // Same-domain UNIX sockets stay functional; no blanket socket prohibition.
+  const inDomain = run(`const net = require('node:net'); const name='\\0ll-scope-'+process.pid;
+    const server=net.createServer(s=>{s.end('OK');});
+    server.listen(name,()=>{ const c=net.createConnection(name); let data='';
+      c.on('data',d=>data+=d); c.on('end',()=>{if(data!=='OK')process.exitCode=1;server.close();}); });`);
+  assert.equal(inDomain.status, 0, inDomain.stderr);
+
+  // A reachable outside-domain abstract socket is denied; the unscoped
+  // control really connects, so fixture failure cannot manufacture a green.
+  const outsideName = '\0ll-outside-' + process.pid;
+  const server = net.createServer(socket => socket.destroy());
+  await new Promise((resolve, reject) => {
+    server.once('error', reject); server.listen(outsideName, resolve);
+  });
+  try {
+    const script = `const c=require('node:net').createConnection(${JSON.stringify(outsideName)});
+      c.on('connect',()=>{process.stdout.write('CONNECTED');c.destroy();});
+      c.on('error',e=>{if(e.code!=='EACCES'&&e.code!=='EPERM')process.exitCode=1;else process.stdout.write('DENIED');});`;
+    assert.equal(run(script).stdout, 'DENIED');
+    assert.equal(run(script, false).stdout, 'CONNECTED');
+  } finally { await new Promise(resolve => server.close(resolve)); }
+
+  // A regular/control object in stdin cannot survive as a standard descriptor.
+  const file = path.join(dir, 'retained-descriptor');
+  fs.writeFileSync(file, 'PRIVATE_FD');
+  const fd = fs.openSync(file, 'r');
+  try {
+    const deniedStdin = run('process.stdout.write("PAYLOAD_RAN")', true, { stdin: 'regular', file });
+    assert.equal(deniedStdin.status, 125);
+    assert.match(deniedStdin.stderr, /scoped standard descriptor/);
+    assert.doesNotMatch(deniedStdin.stdout, /PAYLOAD_RAN/);
+    const inode = fs.fstatSync(fd).ino;
+    assert.ok(Number.isSafeInteger(inode), 'fixture inode must have an exact JS representation');
+    const extra = run(`const fs=require('node:fs');try{if(fs.fstatSync(3).ino===${inode})process.exit(42)}catch(e){if(e.code!=='EBADF')throw e}`, true, { stdin: 'null', extra: file });
+    assert.equal(extra.stdio.extra.ino, inode, 'actual inherited object must be the owned fixture');
+    assert.equal(extra.stdio.extra.type, 0o100000);
+    assert.equal(extra.status, 0, extra.stderr);
+  } finally { fs.closeSync(fd); }
+
+  const socketStdin = run('process.stdout.write("PAYLOAD_RAN")', true, { stdin: 'socket' });
+  assert.equal(socketStdin.status, 125);
+  assert.match(socketStdin.stderr, /scoped standard descriptor/);
+  assert.doesNotMatch(socketStdin.stdout, /PAYLOAD_RAN/);
+  // Preserve the original Node/libuv topology as an explicit negative.
+  const socketOutput = spawnSync(launcher, [
+    ...scopedGrantArgs({ readOnly: ['/'], readWrite: [dir, '/dev/null'] }),
+    '--', process.execPath, '-e', 'process.stdout.write("PAYLOAD_RAN")',
+  ], { timeout: 2000, killSignal: 'SIGKILL', encoding: 'utf8', maxBuffer: 8192,
+       stdio: ['ignore', 'pipe', 'pipe'] });
+  assert.ifError(socketOutput.error);
+  assert.equal(socketOutput.status, 125);
+  assert.match(socketOutput.stderr, /scoped standard descriptor/);
+  assert.doesNotMatch(socketOutput.stdout, /PAYLOAD_RAN/);
+
+  const bad = spawnSync(launcher, ['--probe-scoped', '--scope-ipc'], {
+    timeout: 1000, killSignal: 'SIGKILL', encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  assert.equal(bad.status, 125);
+  assert.match(bad.stderr, /usage error/);
+} finally { fs.rmSync(dir, { recursive: true }); }
+// These checks cover only scoped primitives. They never produce host-control
+// QUALIFIED or waive bwrap, socket aliases, TCP, FD relay, cgroups or full gates.

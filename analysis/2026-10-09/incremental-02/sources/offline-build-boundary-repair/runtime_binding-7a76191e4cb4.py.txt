@@ -1,0 +1,133 @@
+"""Exact existing typed identity and anchored byte-read helpers; source only."""
+import hashlib,json,os,re,stat
+from pathlib import Path
+
+def require(value, message):
+    if not value:
+        raise RuntimeError(message)
+
+def native_identity_argv(unit, bus_owner):
+    require(bool(re.fullmatch(r'friday-native-offline-build-[0-9a-f]{16}\.service', unit)),
+            'native_identity_unit')
+    require(isinstance(bus_owner,str) and re.fullmatch(r':[0-9]+\.[0-9]+',bus_owner),'native_manager_unique_owner')
+    path = '/org/freedesktop/systemd1/unit/' + ''.join(
+        chr(b) if 48 <= b <= 57 or 65 <= b <= 90 or 97 <= b <= 122 else '_%02x' % b
+        for b in unit.encode())
+    # GetAll with an empty interface is supported by systemd's sd-bus server.
+    # One read of the exact running unit; explicit AF_UNIX address needs no
+    # additional environment. "call" applies both no-activation/auth flags.
+    return ['/usr/bin/busctl', '--address=unix:path=/run/dbus/system_bus_socket', '--no-pager',
+            '--json=short', '--auto-start=no', '--allow-interactive-authorization=no',
+            '--timeout=4', 'call', bus_owner, path,
+            'org.freedesktop.DBus.Properties', 'GetAll', 's', '']
+
+def validate_native_identity(evidence, owner, relative, fragment, start, end, pid=None):
+    require(isinstance(evidence, dict), 'native_identity_missing')
+    unit = 'friday-native-offline-build-' + owner['nonce'] + '.service'
+    require(relative == '/system.slice/' + unit and fragment == '/run/systemd/system/' + unit, 'system_manager_contour_required')
+    require(evidence.get('manager_scope') == 'system' and evidence.get('manager_identity') == owner.get('manager_identity')
+            and manager_identity_valid(evidence.get('manager_identity'))
+            and evidence.get('argv') == native_identity_argv(unit, owner['manager_identity']['bus_owner'])
+            and evidence.get('nonce') == owner['nonce']
+            and evidence.get('boot_id') == owner['boot_id']
+            and evidence.get('cgroup') == relative
+            and evidence.get('timeout_seconds') == 5
+            and evidence.get('timeout') is False and type(evidence.get('returncode')) is int
+            and evidence['returncode'] == 0
+            and evidence.get('client_reaped') is True and evidence.get('stderr') == '',
+            'native_identity_transport')
+    observed_pid = evidence.get('pid')
+    require(type(observed_pid) is int and observed_pid > 0
+            and (pid is None or observed_pid == pid)
+            and type(evidence.get('pid_start_time')) is int and evidence['pid_start_time'] > 0,
+            'native_identity_owner_pid')
+    a, b = evidence.get('started_monotonic'), evidence.get('completed_monotonic')
+    require(type(a) in (int, float) and type(b) in (int, float)
+            and owner['started_monotonic'] <= start <= a <= b <= end < owner['deadline_monotonic']
+            and b - a <= 5, 'native_identity_stale_or_late')
+    raw = evidence.get('stdout')
+    require(isinstance(raw, str) and len(raw.encode()) < 1048576, 'native_identity_output')
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            require(key not in result, 'native_identity_duplicate')
+            result[key] = value
+        return result
+    value = json.loads(raw, object_pairs_hook=pairs,
+                       parse_constant=lambda value: require(False, 'native_identity_nonfinite'))
+    require(isinstance(value, dict) and set(value) == {'type', 'data'}
+            and value['type'] == 'a{sv}' and isinstance(value['data'], list)
+            and len(value['data']) == 1 and isinstance(value['data'][0], dict),
+            'native_identity_schema')
+    properties = value['data'][0]
+    expected = {'Id': ('s', unit), 'LoadState': ('s', 'loaded'),
+                'ActiveState': ('s', 'active'), 'SubState': ('s', 'running'),
+                'MainPID': ('u', observed_pid), 'ControlPID': ('u', 0),
+                'ControlGroup': ('s', relative), 'FragmentPath': ('s', fragment),
+                'Transient': ('b', False), 'NeedDaemonReload': ('b', False),
+                'DropInPaths': ('as', [])}
+    for key, (signature, data) in expected.items():
+        actual = properties.get(key)
+        require(isinstance(actual, dict) and set(actual) == {'type', 'data'}
+                and actual['type'] == signature and type(actual['data']) is type(data)
+                and actual['data'] == data, 'native_identity_property_' + key)
+    invocation = properties.get('InvocationID')
+    require(isinstance(invocation, dict) and set(invocation) == {'type', 'data'}
+            and invocation['type'] == 'ay' and isinstance(invocation['data'], list)
+            and len(invocation['data']) == 16
+            and all(type(x) is int and 0 <= x <= 255 for x in invocation['data'])
+            and any(invocation['data']), 'native_identity_invocation')
+    return bytes(invocation['data']).hex()
+
+def manager_identity_valid(value):
+    require(isinstance(value, dict) and set(value) == {'scope', 'pid', 'start_ticks', 'boot_id', 'bus_owner', 'uid'}
+            and value['scope'] == 'system' and type(value['pid']) is int and value['pid'] == 1
+            and type(value['uid']) is int and value['uid'] == 0
+            and type(value['start_ticks']) is int and value['start_ticks'] > 0
+            and bool(re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', value['boot_id']))
+            and bool(re.fullmatch(r':[0-9]+\.[0-9]+', value['bus_owner'])), 'manager_identity')
+    return True
+
+def start_time(proc):
+    return int((proc / 'stat').read_text().rsplit(')', 1)[1].split()[19])
+
+def safe_parent(path, owner):
+    """Anchor every component; never resolve a mutable symlink or FIFO."""
+    path=Path(path)
+    require(path.is_absolute() and '..' not in path.parts, 'absolute_clean_path_required')
+    fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    identities=[]
+    try:
+        for part in path.parts[1:-1]:
+            nxt=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=fd)
+            os.close(fd);fd=nxt;s=os.fstat(fd)
+            require(stat.S_ISDIR(s.st_mode) and s.st_uid in (0,owner) and not s.st_mode&0o022,
+                    'unsafe_input_ancestor')
+            identities.append((s.st_dev,s.st_ino))
+        return fd,path.name,identities
+    except BaseException:
+        os.close(fd);raise
+
+def read_exact(path, uid, mode=None, maximum=1048576, single_link=True):
+    parent,leaf,ancestors=safe_parent(path,uid)
+    fd=None
+    try:
+        fd=os.open(leaf,os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent)
+        a=os.fstat(fd)
+        require(stat.S_ISREG(a.st_mode) and a.st_uid==uid and (uid!=0 or a.st_gid==0)
+                and (not single_link or a.st_nlink==1) and not a.st_mode&0o022
+                and a.st_size<=maximum and (mode is None or stat.S_IMODE(a.st_mode)==mode), 'input_owner_mode_type')
+        chunks=[];remaining=a.st_size+1
+        while remaining:
+            block=os.read(fd,min(65536,remaining))
+            if not block:break
+            chunks.append(block);remaining-=len(block)
+        content=b''.join(chunks);b=os.fstat(fd);c=os.stat(leaf,dir_fd=parent,follow_symlinks=False)
+        key=lambda x:(x.st_dev,x.st_ino,x.st_size,x.st_mtime_ns,x.st_mode,x.st_uid,x.st_gid,x.st_nlink)
+        require(key(a)==key(b)==key(c) and len(content)==a.st_size, 'input_changed_or_overflow')
+        check,_,current=safe_parent(path,uid)
+        os.close(check);require(current==ancestors,'input_ancestor_replaced')
+        return content,a
+    finally:
+        if fd is not None:os.close(fd)
+        os.close(parent)

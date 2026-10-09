@@ -1,0 +1,324 @@
+"""FileOwner's finite binding to the installed Harness SDK; never an admission.
+
+No composer is implemented here. The private Node entry invokes the real builtin
+LocalSandboxProvider.prepareHostControl. Its process is reaped before the donor
+registry may create the separate worker Popen. All effects remain behind the
+unchanged FileOwner containment/admission gate and an exact final build selection.
+"""
+from pathlib import Path
+import hashlib
+import json
+import os
+import runpy
+import stat
+import time
+
+PIN = '5badb15009ae1756c3afe0ae0cef1faafc290ccc'
+MAX_REQUEST = 32768
+MAX_RESPONSE = 65536
+MAX_MAP = 8 << 20
+MAX_FILES = 100000
+MAX_BYTES = 2 << 30
+
+
+class PreparationRefusal(RuntimeError):
+    pass
+
+
+def require(ok, reason):
+    if not ok:
+        raise PreparationRefusal(reason)
+
+
+def strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, 'SDK_DUPLICATE_KEY')
+        result[key] = value
+    return result
+
+
+def decode(data, maximum):
+    require(type(data) is bytes and 0 < len(data) <= maximum, 'SDK_JSON_SIZE')
+    try:
+        return json.loads(data.decode('utf-8'), object_pairs_hook=strict_object,
+            parse_constant=lambda _: (_ for _ in ()).throw(PreparationRefusal('SDK_NONFINITE')))
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise PreparationRefusal('SDK_MALFORMED_JSON') from error
+
+
+def read_exact(path, digest, maximum):
+    path = Path(path)
+    require(path.is_absolute() and path == path.resolve(), 'SDK_NONCANONICAL_INPUT')
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_size <= maximum, 'SDK_NONREGULAR_OR_OVERSIZE')
+        data = bytearray()
+        while len(data) <= maximum:
+            part = os.read(fd, min(65536, maximum + 1 - len(data)))
+            if not part: break
+            data.extend(part)
+        after = os.fstat(fd)
+        require(len(data) <= maximum and
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) and
+                hashlib.sha256(data).hexdigest() == digest, 'SDK_PIN_DRIFT')
+        return bytes(data)
+    finally:
+        os.close(fd)
+
+
+def file_pin(path, digest, current, maximum=MAX_BYTES):
+    path = Path(path)
+    require(path.is_absolute() and path == path.resolve(), 'SDK_NONCANONICAL_FILE')
+    current()
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_size <= maximum, 'SDK_FILE_BOUND')
+        hasher = hashlib.sha256(); size = 0
+        while True:
+            current()
+            part = os.read(fd, 65536)
+            if not part: break
+            size += len(part)
+            require(size <= maximum, 'SDK_FILE_BOUND')
+            hasher.update(part)
+        after = os.fstat(fd)
+        require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) and
+                hasher.hexdigest() == digest, 'SDK_RUNTIME_DRIFT')
+        return size
+    finally:
+        os.close(fd)
+
+
+def read_kernel(path, maximum, *, dir_fd=None):
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        data = bytearray()
+        while len(data) <= maximum:
+            part = os.read(fd, min(8192, maximum + 1 - len(data)))
+            if not part: break
+            data.extend(part)
+        require(len(data) <= maximum, 'SDK_KERNEL_RECORD_OVERFLOW')
+        return data.decode('ascii')
+    finally:
+        os.close(fd)
+
+
+def validate_prepared(value, semantic, status_fd, policy):
+    expected = {'capability', 'state', 'semanticArgv', 'argv', 'requiredCapabilities',
+                'statusFd', 'missing', 'runtimeGrant'}
+    require(type(value) is dict, 'SDK_RESULT_OBJECT_REQUIRED')
+    if 'privateNetwork' in policy:
+        expected.add('network')
+        require(value.get('network') == policy['privateNetwork'], 'SDK_NETWORK_POLICY_CHANGED')
+    require(type(value) is dict and set(value) == expected and
+            value['capability'] == 'host-control-v1' and
+            value['state'] == 'UNQUALIFIED_SOURCE_PREPARATION' and
+            value['runtimeGrant'] is False and value['semanticArgv'] == semantic and
+            type(value['statusFd']) is int and value['statusFd'] == status_fd and
+            value['requiredCapabilities'] == policy['requiredCapabilities'], 'SDK_FOREIGN_OR_PROMOTED_OUTPUT')
+    require(type(value['argv']) is list and 0 < len(value['argv']) <= 2048 and
+            all(type(v) is str and '\0' not in v for v in value['argv']) and
+            type(value['missing']) is list and value['missing'] and
+            all(type(v) is str and v for v in value['missing']), 'SDK_RESULT_SHAPE')
+    return value
+
+
+class BoundPreparation:
+    """A single invocation bound to this original owner, not caller authority."""
+    def __init__(self, owner):
+        self.owner = owner
+        self.used = False
+        self.process = None
+        self.custody = None
+        self.fence_error = False
+
+    def guard(self):
+        owner = self.owner
+        require(self.custody is owner._status_custody and self.custody is not None,
+                'SDK_FOREIGN_STATUS_CUSTODY')
+        self.custody._current()
+        require(not owner.stop_requested() and time.monotonic() < self.custody.startup_end,
+                'SDK_CANCELLED_OR_LATE')
+
+    def fence(self):
+        self.owner._stop_pending = True
+        try:
+            self.owner.persist_stop()
+        except BaseException:
+            self.fence_error = True
+
+    def retain(self, process):
+        self.process = process
+        self.owner._sdk_preparation_process = process
+
+    def started(self, process):
+        require(process is self.process, 'SDK_CUSTODY_HANDLE_CHANGED')
+        # Keep exact same-cgroup custody; any error here still reaches command
+        # kill/reap. PID is never repurposed as a donor worker identity.
+        proc = Path('/proc', str(process.pid))
+        birth = read_kernel(proc / 'stat', 8192).rsplit(')', 1)[1].split()
+        require(read_kernel(proc / 'cgroup', 8192).splitlines() ==
+                ['0::' + self.owner.binding['control_group']], 'SDK_OUTSIDE_ORIGINAL_UNIT')
+        self.owner.h.put(self.owner.control / 'sdk-preparation-start.json', {
+            'phase': self.owner.intent_identity(), 'pid': process.pid,
+            'start_ticks': int(birth[19]), 'role': 'FINITE_SDK_PREPARATION_NOT_REGISTRY_WORKER',
+            'runtimeGrant': False})
+
+    def record(self, process, observation):
+        require(process is self.process, 'SDK_CUSTODY_HANDLE_CHANGED')
+        self.owner.h.put(self.owner.control / 'sdk-preparation-end.json', {
+            'phase': self.owner.intent_identity(), 'pid': process.pid,
+            'role': 'FINITE_SDK_PREPARATION_NOT_REGISTRY_WORKER', **observation,
+            'stop_persistence_failed': self.fence_error, 'runtimeGrant': False})
+        group = Path('/sys/fs/cgroup') / self.owner.binding['control_group'].lstrip('/')
+        group_fd = os.open(group, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            identity = os.fstat(group_fd)
+            require([identity.st_dev, identity.st_ino] == self.owner.binding['cgroup_inode'],
+                    'SDK_ORIGINAL_CGROUP_REPLACED')
+            members = read_kernel('cgroup.procs', 65536, dir_fd=group_fd).split()
+        finally:
+            os.close(group_fd)
+        if (process.returncode is None or self.fence_error or
+                members != [str(os.getpid())]):
+            self.fence()
+            raise PreparationRefusal('STOP_UNCONFIRMED: SDK custody, residual child or stop persistence')
+
+    def verify_installation(self, build):
+        self.guard()
+        require(type(build) is dict and build.get('schema') == 1 and
+                build.get('state') == 'BUILT_SOURCE_SELECTION_NOT_ADMISSION' and
+                build.get('donorCommit') == PIN and build.get('runtimeGrant') is False and
+                build.get('profile') == 'builtin-linux-host-control-v1', 'SDK_BUILD_SELECTION_REQUIRED')
+        root = Path(build['root'])
+        require(root.is_absolute() and root == root.resolve(), 'SDK_ROOT_ALIAS')
+        files, links = build['files'], build['links']
+        require(type(files) is dict and type(links) is dict and
+                0 < len(files) + len(links) <= MAX_FILES, 'SDK_CLOSED_INVENTORY_REQUIRED')
+        # Module evaluation is byte-pinned by the synchronous Node load hook.
+        # Rehash resolution metadata and selected source/entry/binary here, not
+        # an entire intact donor on each five-second startup. Full-map immutability
+        # and import-closure qualification remain required before runtime admission.
+        metadata = build['resolutionFiles']
+        require(type(metadata) is list and len(metadata) == len(set(metadata)) and
+                set(metadata) == {name for name in files if name.endswith('/package.json') or name == 'package.json'},
+                'SDK_RESOLUTION_INVENTORY_REQUIRED')
+        for rel in metadata:
+            require(not Path(rel).is_absolute() and '..' not in Path(rel).parts and '.git' not in Path(rel).parts,
+                    'SDK_MAP_PATH_ESCAPE')
+            file_pin(root / rel, files[rel], self.guard, MAX_MAP)
+        for rel, target in links.items():
+            self.guard()
+            require(not Path(rel).is_absolute() and '..' not in Path(rel).parts and '.git' not in Path(rel).parts,
+                    'SDK_LINK_PATH_ESCAPE')
+            path = root / rel
+            require(path.is_symlink() and os.readlink(path) == target and
+                    path.resolve(strict=True).is_relative_to(root) and
+                    '.git' not in path.resolve().relative_to(root).parts, 'SDK_LINK_DRIFT')
+        expected_sources = self.owner.h.SPEC['host_control_preparation']['source_pins']
+        require(build['sourcePins'] == expected_sources and expected_sources,
+                'SDK_SOURCE_BUILD_SELECTION_DRIFT')
+        for rel, digest in expected_sources.items():
+            require(files.get(rel) == digest, 'SDK_SOURCE_PIN_NOT_IN_INSTALLATION')
+            file_pin(root / rel, digest, self.guard, MAX_MAP)
+        for key in ('provider', 'cordis', 'landlock'):
+            rel = build['imports'][key]
+            require(rel in files and '.git' not in Path(rel).parts, 'SDK_IMPORT_NOT_PINNED')
+        require(build['imports']['provider'] == 'packages/sandbox/sandbox-local/lib/index.js',
+                'SDK_WRONG_PROVIDER_ENTRY')
+        require(build['launcher'] in files and build['launcher'].endswith('/bin/landlock-run'),
+                'SDK_LAUNCHER_NOT_PINNED')
+        for key in ('node', 'entry', 'commandHelper'):
+            ref = build[key]
+            file_pin(ref['path'], ref['sha256'], self.guard)
+        return root
+
+    def __call__(self, semantic, status_fd, *, privateNetwork=None):
+        require(not self.used, 'SDK_PREPARATION_ALREADY_CONSUMED')
+        self.used = True  # Failure cannot be retried under a reset preparation.
+        owner = self.owner
+        self.custody = getattr(owner, '_status_custody', None)
+        try:
+            self.guard()
+            owner.require_current(self.custody.session.runtest_outer)
+            require(type(semantic) is list and semantic == self.custody.semantic and
+                    0 < len(semantic) <= 256 and all(type(v) is str and '\0' not in v for v in semantic),
+                    'SDK_EXACT_SEMANTIC_REQUIRED')
+            require(type(status_fd) is int and status_fd == self.custody.write_fd,
+                    'SDK_EXACT_OWNED_STATUS_FD_REQUIRED')
+            self.custody._pipe_endpoint(status_fd, True)
+            # SPEC and this exact phase are already pinned by the original owner
+            # grant. Neither environment nor worker/caller JSON selects a policy.
+            selection = owner.h.SPEC['host_control_preparation']
+            require(selection['state'] == 'BOUND_SOURCE_SELECTION_NOT_ADMISSION', 'SDK_BUILD_MAP_UNBOUND')
+            phase = owner.spec['provider_preparation']
+            require(phase['phase_identity'] == owner.intent_identity() and
+                    phase['build_selection'] == selection['build_selection'], 'SDK_PHASE_BUILD_MISMATCH')
+            ref = selection['build_selection']
+            build = decode(read_exact(ref['path'], ref['sha256'], MAX_MAP), MAX_MAP)
+            root = self.verify_installation(build)
+            policy = phase['policy']
+            policy_fields = {'capability', 'mode', 'workspaceRoot', 'temporaryRoot',
+                             'readOnly', 'readWrite', 'protectedPaths', 'requiredCapabilities'}
+            require(type(policy) is dict and policy_fields <= set(policy) and
+                    set(policy) <= policy_fields | {'sessionId'} and
+                    policy.get('capability') == 'host-control-v1', 'SDK_OWNER_POLICY_REQUIRED')
+            # This passes any owner-held network policy unchanged to the actual
+            # native API. Its schema/composition belongs to the network package.
+            policy = dict(policy, statusFd=status_fd)
+            if privateNetwork is not None:
+                network = getattr(owner, '_network_attachment', None)
+                require(network is not None and network.owner is owner and
+                        network.session is self.custody.session and
+                        type(privateNetwork) is dict and set(privateNetwork) ==
+                        {'driver', 'barrierProtocol', 'blockFd', 'resolverFd', 'resolverSha256', 'nameservers'} and
+                        privateNetwork['driver'] == 'slirp4netns-1.3.3-frw-private-loopback' and
+                        privateNetwork['barrierProtocol'] == 'frw-success-byte-1-v1' and
+                        privateNetwork == network.policy(), 'SDK_UNOWNED_NETWORK_POLICY')
+                # Existing network attachment owns barrier/sealed resolver FDs
+                # and route policy; the retired resolverSource path is refused.
+                # The SDK command only receives the numeric descriptor; it
+                # inherits neither barrier/resolver FDs nor the status writer.
+                policy['privateNetwork'] = dict(privateNetwork)
+            else:
+                require(getattr(owner, '_network_attachment', None) is None,
+                        'SDK_OWNER_NETWORK_POLICY_OMITTED')
+            request = {'schema': 1, 'phase': owner.intent_identity(), 'buildSelection': dict(ref),
+                       'semanticArgv': list(semantic), 'policy': policy, 'runtimeGrant': False}
+            raw = json.dumps(request, allow_nan=False, separators=(',', ':')).encode()
+            require(0 < len(raw) <= MAX_REQUEST, 'SDK_REQUEST_OVERFLOW')
+            runner = runpy.run_path(build['commandHelper']['path'])['run']
+            self.guard()
+            owner.require_current(self.custody.session.runtest_outer)
+            output, observed = runner([build['node']['path'], '--no-addons', '--disable-wasm-trap-handler',
+                build['entry']['path']], owner.control / 'profile',
+                timeout=min(3.0, self.custody.startup_end - time.monotonic() - 0.25),
+                deadline=min(self.custody.startup_end, owner.deadline - owner.pre['reserve_seconds']),
+                env={'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'},
+                owned_preparation=self, input_bytes=raw)
+            self.guard()
+            require(observed['reaped'] is True and observed['runtimeGrant'] is False,
+                    'SDK_UNREAPED_RESULT')
+            result = decode(output, MAX_RESPONSE)
+            require(type(result) is dict and set(result) == {'schema', 'phase', 'preparation', 'runtimeGrant'} and
+                    result['schema'] == 1 and result['phase'] == owner.intent_identity() and
+                    result['runtimeGrant'] is False, 'SDK_FOREIGN_PHASE_RESPONSE')
+            # Revalidate selection and metadata after the finite command.
+            self.verify_installation(build)
+            self.custody._pipe_endpoint(status_fd, True)
+            owner.require_current(self.custody.session.runtest_outer)
+            self.guard()
+            return validate_prepared(result['preparation'], semantic, status_fd, policy)
+        except BaseException:
+            self.fence()
+            raise
+
+
+def bind(owner):
+    """Pure wiring; loading does not grant authority or execute a process."""
+    return BoundPreparation(owner)

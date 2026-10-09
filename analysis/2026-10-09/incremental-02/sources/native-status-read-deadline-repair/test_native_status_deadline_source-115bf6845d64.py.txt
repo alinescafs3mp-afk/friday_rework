@@ -1,0 +1,367 @@
+"""Source predicates with inert descriptors/clocks; never actual FD/kernel proof."""
+from pathlib import Path
+from types import SimpleNamespace as NS
+from unittest.mock import Mock
+import ast
+import copy
+import ctypes
+import fcntl
+import hashlib
+import json
+import math
+import os
+import select
+import stat
+import struct
+import time
+import pytest
+
+PATH = Path(__file__).resolve().parents[1] / 'owner-helper/native_status.py'
+tree = ast.parse(PATH.read_text())
+selected = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef, ast.Assign))]
+env = dict(Path=Path, ctypes=ctypes, fcntl=fcntl, hashlib=hashlib, json=json, math=math,
+           os=os, select=select, stat=stat, struct=struct, time=time)
+exec(compile(ast.Module(body=selected, type_ignores=[]), str(PATH), 'exec'), env)
+class Globals:
+    def __getattr__(self, name):
+        try: return env[name]
+        except KeyError: raise AttributeError(name) from None
+    def __setattr__(self, name, value): env[name] = value
+    def __delattr__(self, name): del env[name]
+a = Globals()
+START = b'{"child-pid":11,"mnt-namespace":202,"pid-namespace":201}\n'
+
+
+def metadata(ino, mode, uid=1000, size=0):
+    return NS(st_dev=1, st_ino=ino, st_mode=mode, st_uid=uid, st_gid=uid,
+              st_size=size, st_nlink=1, st_mtime_ns=10, st_ctime_ns=11)
+
+
+def contour_model(monkeypatch):
+    data = b'{"identity":"bound"}'
+    event = object.__new__(a.ContourEvent)
+    event.fd, event.path, event.ready = 50, Path('/run/native-contour.json'), True
+    objects = {40: metadata(1, stat.S_IFDIR | 0o755, 0),
+               41: metadata(2, stat.S_IFDIR | 0o700),
+               42: metadata(3, stat.S_IFREG | 0o600, size=len(data))}
+    objects[43] = objects[42]
+    names = {'/': objects[40], 'run': objects[41], event.path.name: objects[42]}
+    event.handles = [40, 41]
+    event.directories = [(name, fd, event._directory_identity(objects[fd]))
+                         for name, fd in [('/', 40), ('run', 41)]]
+    event.leaf_fd = event.read_fd = None
+    opened, closed, reads = [], [], []
+    def opening(path, flags, **kw):
+        opened.append((str(path), flags, kw))
+        if str(path) == event.path.name:
+            assert flags == os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
+            assert kw == {'dir_fd': 41}
+            return 42
+        assert str(path) == '/proc/self/fd/42' and not kw
+        assert flags == os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC
+        return 43
+    chunks = [data[:7], data[7:], b'']
+    def reading(fd, maximum):
+        reads.append((fd, maximum))
+        assert fd == 43 and 0 < maximum <= 8192
+        return chunks.pop(0)
+    monkeypatch.setattr(a.os, 'open', opening)
+    monkeypatch.setattr(a.os, 'close', closed.append)
+    monkeypatch.setattr(a.os, 'fstat', lambda fd: objects[fd])
+    monkeypatch.setattr(a.os, 'stat', lambda name, **kw: names[str(name)])
+    monkeypatch.setattr(a.os, 'getuid', lambda: 1000)
+    monkeypatch.setattr(a.os, 'get_inheritable', lambda fd: False)
+    monkeypatch.setattr(a.os, 'read', reading)
+    monkeypatch.setattr(a.fcntl, 'fcntl', lambda fd, op: os.O_NONBLOCK)
+    return NS(event=event, data=data, objects=objects, names=names, opened=opened,
+              closed=closed, reads=reads, chunks=chunks, opening=opening, reading=reading)
+
+
+@pytest.mark.parametrize('cut', ['good', 'fifo', 'socket', 'character', 'block', 'directory',
+                                 'symlink', 'owner', 'writable', 'hardlink', 'device',
+                                 'empty', 'oversize', 'reopen_identity', 'inheritable', 'blocking', 'write_access'])
+def test_contour_only_checked_regular_owned_fd_reaches_read(cut, monkeypatch):
+    m = contour_model(monkeypatch)
+    obj = m.objects[42]
+    kinds = {'fifo': stat.S_IFIFO, 'socket': stat.S_IFSOCK, 'character': stat.S_IFCHR,
+             'block': stat.S_IFBLK, 'directory': stat.S_IFDIR, 'symlink': stat.S_IFLNK}
+    if cut in kinds: obj.st_mode = kinds[cut] | 0o600
+    elif cut == 'owner': obj.st_uid = 99
+    elif cut == 'writable': obj.st_mode |= 0o020
+    elif cut == 'hardlink': obj.st_nlink = 2
+    elif cut == 'device': obj.st_dev = 2
+    elif cut == 'empty': obj.st_size = 0
+    elif cut == 'oversize': obj.st_size = a.MAX_CONTOUR + 1
+    elif cut == 'reopen_identity':
+        m.objects[43] = copy.copy(obj); m.objects[43].st_ino = 99
+    elif cut == 'inheritable': monkeypatch.setattr(a.os, 'get_inheritable', lambda fd: True)
+    elif cut == 'blocking': monkeypatch.setattr(a.fcntl, 'fcntl', lambda fd, op: os.O_RDONLY)
+    elif cut == 'write_access': monkeypatch.setattr(a.fcntl, 'fcntl', lambda fd, op: os.O_NONBLOCK | os.O_WRONLY)
+    if cut == 'good':
+        assert m.event.read_contour(lambda: None) == m.data
+        m.event.require_current()
+        assert len(m.opened) == 2 and len(m.reads) == 3
+    else:
+        with pytest.raises(a.StatusRefusal): m.event.read_contour(lambda: None)
+        assert not m.reads
+        if cut not in ('reopen_identity', 'inheritable', 'blocking', 'write_access'):
+            assert len(m.opened) == 1  # No data-open on any special/unowned object.
+    m.event.close(); m.event.close()
+    assert m.closed == [50, *reversed([40, 41, *([42, 43] if len(m.opened) == 2 else [42])])]
+
+
+@pytest.mark.parametrize('cut', ['before_reopen', 'name_during_read', 'ancestor_name',
+                                 'ancestor_fd', 'rewrite', 'unlink', 'short', 'grow',
+                                 'late_read', 'cancel_read', 'final_binding'])
+def test_contour_mutation_deadline_and_cancel_refuse(cut, monkeypatch):
+    m = contour_model(monkeypatch); state = {'late': False, 'cancel': False}
+    def replace_name():
+        replacement = copy.copy(m.objects[42]); replacement.st_ino = 99
+        m.names[m.event.path.name] = replacement
+    def opening(path, flags, **kw):
+        fd = m.opening(path, flags, **kw)
+        if cut == 'before_reopen' and fd == 42: replace_name()
+        return fd
+    def reading(fd, maximum):
+        part = m.reading(fd, maximum)
+        if len(m.reads) == 1:
+            if cut == 'name_during_read': replace_name()
+            elif cut == 'ancestor_name':
+                m.names['run'] = copy.copy(m.objects[41]); m.names['run'].st_ino = 99
+            elif cut == 'ancestor_fd': m.objects[41].st_ino = 99
+            elif cut == 'rewrite': m.objects[42].st_mtime_ns += 1
+            elif cut == 'unlink': m.objects[42].st_nlink = 0
+            elif cut == 'late_read': state['late'] = True
+            elif cut == 'cancel_read': state['cancel'] = True
+        return part
+    monkeypatch.setattr(a.os, 'open', opening)
+    monkeypatch.setattr(a.os, 'read', reading)
+    if cut == 'short': m.chunks[:] = [m.data[:-1], b'']
+    elif cut == 'grow': m.chunks[:] = [m.data + b'x', b'']
+    def current():
+        a.require(not state['late'] and not state['cancel'], 'SOURCE_DEADLINE_OR_CANCEL')
+    if cut == 'final_binding':
+        assert m.event.read_contour(current) == m.data
+        replace_name()
+        with pytest.raises(a.StatusRefusal): m.event.require_current()
+    else:
+        with pytest.raises(a.StatusRefusal): m.event.read_contour(current)
+    m.event.close()
+    assert set(m.closed) == {50, 40, 41, 42} | ({43} if len(m.opened) == 2 else set())
+
+
+@pytest.mark.parametrize('cut', ['read_open', 'read_io', 'eagain', 'close_io'])
+def test_contour_io_failure_retains_cleanup_of_all_owned_descriptors(cut, monkeypatch):
+    m = contour_model(monkeypatch)
+    def opening(path, flags, **kw):
+        if cut == 'read_open' and str(path).startswith('/proc/'):
+            raise OSError('source reopen failure')
+        return m.opening(path, flags, **kw)
+    monkeypatch.setattr(a.os, 'open', opening)
+    if cut in ('read_io', 'eagain'):
+        def failed_read(fd, count):
+            raise BlockingIOError('source eagain') if cut == 'eagain' else OSError('source read failure')
+        monkeypatch.setattr(a.os, 'read', failed_read)
+    if cut == 'close_io':
+        assert m.event.read_contour(lambda: None) == m.data
+        def close(fd):
+            m.closed.append(fd)
+            if fd == 43: raise OSError('source close uncertainty')
+        monkeypatch.setattr(a.os, 'close', close)
+        with pytest.raises(OSError): m.event.close()
+    else:
+        with pytest.raises(OSError): m.event.read_contour(lambda: None)
+        m.event.close()
+    assert m.closed == ([50, 42, 41, 40] if cut == 'read_open' else [50, 43, 42, 41, 40])
+    m.event.close()
+    assert len(m.closed) == len(set(m.closed))
+
+
+def custody_model(monkeypatch):
+    item = object.__new__(a.StatusCustody)
+    item.session = NS(runtest_stop_requested=False, runtest_persistence_error='',
+                      runtest_pidfd_error='', runtest_deadline=200, runtest_boot_id='boot',
+                      runtest_outer={}, process=None, _runtest_pidfd=41, host_start_time=50)
+    item.owner = NS(parent=Path('/model'), pre={'reserve_seconds':10}, stop_requested=lambda:False,
+                    require_current=Mock(), phase={'outer':60}, spec={'tasks_max':64})
+    item.registry = NS(spawn_runtest=Mock())
+    item.failed = item.closed = item.spawned = False
+    item.deadline, item.startup_end = 200, 105
+    item.read_fd, item.write_fd, item.events = 8, 9, None
+    item.records, item.argv, item.proc, item.observed = a.NativeRecords(), ['/exact/bwrap'], None, None
+    item.pipe_identity = [1, 2]
+    item._pipe_endpoint = lambda fd, writing: None
+    state = {'now':100}; closed = []
+    monkeypatch.setattr(a.time, 'monotonic', lambda:state['now'])
+    monkeypatch.setattr(a.os, 'close', closed.append)
+    return item, state, closed
+
+
+@pytest.mark.parametrize('cut', ['good', 'select', 'status', 'event', 'contour', 'join',
+                                 'final_birth', 'owner', 'binding', 'event_close'])
+def test_startup_crossing_original_subdeadline_never_accepts(cut, monkeypatch):
+    item, clock, closed = custody_model(monkeypatch); item.write_fd = None
+    proc = NS(pid=10, args=item.argv, returncode=None); item.proc = item.session.process = proc
+    def cross(stage):
+        if cut == stage: clock['now'] = 105
+    monitor = dict(pid=10, start_ticks=50, ppid=1, pgid=10, sid=10, exe=a.BWRAP,
+                   cmdline=[os.fsencode(v) for v in item.argv], namespaces={}, cgroup=[])
+    seen = []
+    def identity(pid):
+        seen.append(pid)
+        if len(seen) == 2: cross('final_birth')
+        return monitor.copy()
+    monkeypatch.setattr(a, 'identity', identity)
+    def selecting(*args): cross('select'); return ([8, 7], [], [])
+    monkeypatch.setattr(a.select, 'select', selecting)
+    def status(): item.records.feed(START); cross('status')
+    item._status_ready = status
+    item.events = NS(fd=7, ready=False)
+    def consume(): item.events.ready=True; cross('event')
+    def reading(current): cross('contour'); return b'{"identity":"bound"}'
+    item.events.consume, item.events.read_contour = consume, reading
+    item.events.require_current = lambda:cross('binding')
+    item.events.close = lambda:cross('event_close')
+    def join(*args): cross('join'); return {'timeout_host':{'pid':12}}
+    item._join_live = Mock(side_effect=join)
+    item.owner.require_current.side_effect = lambda outer:cross('owner')
+    if cut == 'good':
+        result = item.startup(proc, {'identity':'bound'}, '/python')
+        assert result['state']=='OBSERVED_NOT_QUALIFIED' and not result['runtimeGrant']
+        assert not item.session.runtest_stop_requested and not closed
+    else:
+        with pytest.raises(a.StatusRefusal, match='STARTUP_DEADLINE'):
+            item.startup(proc, {'identity':'bound'}, '/python')
+        assert item.observed is None and item.session.runtest_stop_requested and closed==[8]
+    assert item.startup_end == 105 and item.deadline == item.session.runtest_deadline == 200
+
+
+@pytest.mark.parametrize('cut', ['entry', 'endpoint', 'registry', 'writer_close', 'writer_close_error'])
+def test_spawn_crossing_or_close_error_keeps_registry_custody(cut, monkeypatch):
+    item, clock, closed = custody_model(monkeypatch)
+    proc = NS(args=item.argv)
+    if cut == 'entry': clock['now'] = 105
+    elif cut == 'endpoint': item._pipe_endpoint = lambda fd, writing:clock.update(now=105)
+    def launch(*args, **kw):
+        item.session.process = proc
+        if cut == 'registry': clock['now'] = 105
+        return proc
+    item.registry.spawn_runtest.side_effect = launch
+    def close(fd):
+        closed.append(fd)
+        if fd == 9 and cut == 'writer_close': clock['now'] = 105
+        if fd == 9 and cut == 'writer_close_error': raise OSError('source writer close uncertainty')
+    monkeypatch.setattr(a.os, 'close', close)
+    with pytest.raises(a.StatusRefusal): item.spawn({'close_fds':True})
+    assert sorted(closed)==[8,9] and item.closed and item.failed and item.session.runtest_stop_requested
+    assert item.session.process is (None if cut in ('entry','endpoint') else proc)
+    assert item.registry.spawn_runtest.call_count == (0 if cut in ('entry','endpoint') else 1)
+    assert item.deadline==200 and item.startup_end==105
+
+
+@pytest.mark.parametrize('cut', ['prepare', 'owner', 'event', 'binary', 'wrong_run'])
+def test_preparation_spends_same_startup_allowance_and_aborts(cut, monkeypatch):
+    model, clock, closed = custody_model(monkeypatch)
+    semantic = ['/env','-i','/python','invocation.py']
+    if cut == 'owner': model.owner.require_current.side_effect=lambda outer:clock.update(now=105)
+    def event(run):
+        if cut == 'event': clock['now']=105
+        return NS(close=lambda:closed.append(7))
+    monkeypatch.setattr(a, 'ContourEvent', event)
+    monkeypatch.setattr(a.os, 'pipe2', lambda flags:(8,9))
+    monkeypatch.setattr(a.os, 'set_blocking', lambda *args:None)
+    monkeypatch.setattr(a.os, 'fstat', lambda fd:NS(st_mode=stat.S_IFIFO, st_dev=1, st_ino=2))
+    monkeypatch.setattr(a.os, 'get_inheritable', lambda fd:False)
+    def read_binary():
+        if cut == 'binary': clock['now']=105
+        return b'source fixture'
+    monkeypatch.setattr(a, 'Path', lambda p:NS(read_bytes=read_binary) if p==a.BWRAP else Path(p))
+    monkeypatch.setattr(a, 'BWRAP_SHA256', hashlib.sha256(b'source fixture').hexdigest())
+    monkeypatch.setattr(a, 'provider_argv', lambda *args:['source argv'])
+    def prepare(argv, fd):
+        if cut == 'prepare': clock['now']=105
+        return {}
+    with pytest.raises(a.StatusRefusal):
+        a.StatusCustody(model.owner, model.session, model.registry,
+                        '/foreign/run' if cut=='wrong_run' else '/model/run', semantic, prepare)
+    assert model.session.runtest_stop_requested and model.owner._status_custody.closed
+    assert model.owner._status_custody.startup_end == 105
+    assert sorted(closed) == ([] if cut in ('owner','wrong_run') else [7] if cut=='event' else [7,8,9])
+    model.registry.spawn_runtest.assert_not_called()
+
+
+def test_finish_retains_outer_deadline_after_startup_allowance(monkeypatch):
+    item, clock, closed = custody_model(monkeypatch); clock['now']=110; item.write_fd=None
+    item.records.feed(START); item.observed={'state':'OBSERVED_NOT_QUALIFIED'}
+    proc=NS(returncode=0); item.proc=item.session.process=proc
+    data=iter([b'{"exit-code":0}\n',b''])
+    monkeypatch.setattr(a.os,'read',lambda *args:next(data))
+    monkeypatch.setattr(a.select,'select',lambda r,w,e,t:(r,[],[]))
+    assert item.finish(proc)['state']=='NATIVE_STATUS_COMPLETE_NOT_CESSATION'
+    assert closed==[8] and not item.session.runtest_stop_requested
+
+
+def test_startup_deadline_has_one_assignment_no_reset():
+    assignments=[n for n in ast.walk(tree) if isinstance(n,ast.Assign) and
+                 any(isinstance(t,ast.Attribute) and t.attr=='startup_end' for t in n.targets)]
+    assert len(assignments)==1
+    assert ast.unparse(assignments[0].value)=="min(self.deadline - owner.pre['reserve_seconds'], time.monotonic() + 5.0)"
+
+
+@pytest.mark.parametrize('cut', ['good', 'ancestor_type', 'ancestor_owner', 'ancestor_writable',
+                                 'private_mode', 'current_binding', 'already_present', 'watch_error'])
+def test_inotify_watches_retained_private_ancestry_and_closes_partial_acquisition(cut, monkeypatch):
+    objects = {40:metadata(1,stat.S_IFDIR | 0o755,0),
+               41:metadata(2,stat.S_IFDIR | 0o700),
+               42:metadata(3,stat.S_IFDIR | 0o700)}
+    by_name={'/':40,'owned':41,'run':42}
+    if cut=='ancestor_type':objects[41].st_mode=stat.S_IFLNK | 0o777
+    elif cut=='ancestor_owner':objects[41].st_uid=99
+    elif cut=='ancestor_writable':objects[41].st_mode|=0o020
+    elif cut=='private_mode':objects[42].st_mode=stat.S_IFDIR | 0o755
+    opened=[];closed=[]
+    def opening(name,flags,**kw):
+        fd=by_name[str(name)]; opened.append(fd)
+        assert flags==os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        assert kw==({} if fd==40 else {'dir_fd':fd-1})
+        return fd
+    def status(name,**kw):
+        assert kw['follow_symlinks'] is False
+        if str(name)=='native-contour.json':
+            if cut=='already_present':return metadata(4,stat.S_IFREG | 0o600)
+            raise FileNotFoundError('absent fixture')
+        obj=objects[by_name[str(name)]]
+        if cut=='current_binding' and str(name)=='run':
+            obj=copy.copy(obj);obj.st_ino=99
+        return obj
+    libc=NS(inotify_init1=Mock(return_value=50),
+            inotify_add_watch=Mock(return_value=-1 if cut=='watch_error' else 1))
+    monkeypatch.setattr(a.ctypes,'CDLL',lambda *args,**kw:libc)
+    monkeypatch.setattr(a.os,'open',opening)
+    monkeypatch.setattr(a.os,'fstat',lambda fd:objects[fd])
+    monkeypatch.setattr(a.os,'stat',status)
+    monkeypatch.setattr(a.os,'getuid',lambda:1000)
+    monkeypatch.setattr(a.os,'close',closed.append)
+    if cut=='good':
+        event=a.ContourEvent('/owned/run')
+        libc.inotify_add_watch.assert_called_once_with(50,b'/proc/self/fd/42',0x8 | 0x400 | 0x800)
+        assert not closed
+        event.close()
+    else:
+        with pytest.raises(a.StatusRefusal):a.ContourEvent('/owned/run')
+    assert closed==([50] if cut in ('good','watch_error') else [])+list(reversed(opened))
+
+
+@pytest.mark.parametrize('extra', [0, 1])
+def test_contour_exact_byte_ceiling_and_one_byte_growth(extra, monkeypatch):
+    m=contour_model(monkeypatch)
+    data=b'x' * (a.MAX_CONTOUR + extra)
+    m.objects[42].st_size=a.MAX_CONTOUR
+    m.chunks[:]=[data[i:i+8192] for i in range(0,len(data),8192)]+[b'']
+    if extra:
+        with pytest.raises(a.StatusRefusal,match='CONTOUR_OVERSIZE'):
+            m.event.read_contour(lambda:None)
+    else:
+        assert m.event.read_contour(lambda:None)==data
+    m.event.close()
+    assert m.closed==[50,43,42,41,40]

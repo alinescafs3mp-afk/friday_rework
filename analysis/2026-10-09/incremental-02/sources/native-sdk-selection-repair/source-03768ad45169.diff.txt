@@ -1,0 +1,385 @@
+--- a/caller/owner-helper/provider_facade.py
++++ b/caller/owner-helper/provider_facade.py
+@@ -197,6 +197,14 @@
+                 build.get('profile') == 'builtin-linux-host-control-v1', 'SDK_BUILD_SELECTION_REQUIRED')
+         root = Path(build['root'])
+         require(root.is_absolute() and root == root.resolve(), 'SDK_ROOT_ALIAS')
++        closure = build.get('sdkClosure')
++        require(type(closure) is dict and
++                closure.get('method') == 'STAGED_INSTALLED_RUNTIME_DEPENDENCY_CLOSURE_V1' and
++                closure.get('sourceRoot') != str(root) and
++                closure.get('roots') == ['packages/sandbox/sandbox-local', 'vendor/cordis',
++                                         'native/system/packages/entry'] and
++                closure.get('pathMapping') == 'same-relative-path-and-sha256' and
++                closure.get('runtimeGrant') is False, 'SDK_STAGED_CLOSURE_REQUIRED')
+         files, links = build['files'], build['links']
+         require(type(files) is dict and type(links) is dict and
+                 0 < len(files) + len(links) <= MAX_FILES, 'SDK_CLOSED_INVENTORY_REQUIRED')
+@@ -208,6 +216,9 @@
+         require(type(metadata) is list and len(metadata) == len(set(metadata)) and
+                 set(metadata) == {name for name in files if name.endswith('/package.json') or name == 'package.json'},
+                 'SDK_RESOLUTION_INVENTORY_REQUIRED')
++        require(type(closure.get('manifestPins')) is dict and closure['manifestPins'] and
++                all(name in metadata and files.get(name) == digest
++                    for name, digest in closure['manifestPins'].items()), 'SDK_GRAPH_METADATA_DRIFT')
+         for rel in metadata:
+             require(not Path(rel).is_absolute() and '..' not in Path(rel).parts and '.git' not in Path(rel).parts,
+                     'SDK_MAP_PATH_ESCAPE')
+--- a/caller/owner-helper/source-pins.json
++++ b/caller/owner-helper/source-pins.json
+@@ -6,7 +6,7 @@
+   "native_status.py": "845005379d988a02fc4c286b6b17f94c7366c6cbcd04274a66dcf666c7ac88fa",
+   "negative-check-sources.json": "2add0ee846e5d30144d06dde6cf0d122e6392f0efb05d6ce34a45907c9ee453d",
+   "owner_observer.py": "248c47477a3dfc94fbe8c73a6b26aa2844ce375fcbb57d9ee01e1990f7f93211",
+-  "provider_facade.py": "51741e087f3d45971ce93008293882ea97c48e7f263fd3cafcaff4892dfbd3ac",
++  "provider_facade.py": "333bb5736ac5617068f2313800219641fb00878b0025fee26c5af9b3e103f7d2",
+   "receipt-schema.json": "3e56e7d5810403a48071f2a69bafc6f29f937024cfac3e2ab50a482b2cb5fad2",
+   "runtest_outer.py": "bb8c6a475892cacbe25bfc6d98377b92ead65d4ad9fdf0bacc42a88bcfcf1eda"
+ }
+--- a/project/scripts/dsh_host_control_prepare.mjs
++++ b/project/scripts/dsh_host_control_prepare.mjs
+@@ -79,6 +79,9 @@
+     build.donorCommit === '5badb15009ae1756c3afe0ae0cef1faafc290ccc' &&
+     process.execPath === build.node.path && fileURLToPath(import.meta.url) === build.entry.path &&
+     fs.realpathSync(build.root) === build.root)
++  check(build.sdkClosure?.method === 'STAGED_INSTALLED_RUNTIME_DEPENDENCY_CLOSURE_V1' &&
++    build.sdkClosure.sourceRoot !== build.root && build.sdkClosure.runtimeGrant === false &&
++    build.sdkClosure.pathMapping === 'same-relative-path-and-sha256')
+   pinnedFile(build.node.path, build.node.sha256, 256 << 20)
+   pinnedFile(build.entry.path, build.entry.sha256, MAX_MODULE)
+   const root = build.root
+--- a/project/scripts/dsh_prepare.py
++++ b/project/scripts/dsh_prepare.py
+@@ -404,7 +404,260 @@
+             "files": files}
+ 
+ 
+-def host_control_build_selection(donor, toolchain):
++SDK_SELECTION_KIND = 'STAGED_INSTALLED_RUNTIME_DEPENDENCY_CLOSURE_V1'
++SDK_ROOTS = ('packages/sandbox/sandbox-local', 'vendor/cordis',
++             'native/system/packages/entry')
++SDK_MAX_FILES = 100000
++SDK_MAX_MAP = 8 << 20
++SDK_MAX_BYTES = 2 << 30
++
++
++def sdk_walk_error(error):
++    """An unreadable package subtree is never an empty dependency closure."""
++    raise error
++
++
++def sdk_relative(root, path):
++    """Accept only existing objects within the selected installation."""
++    rel = path.relative_to(root)
++    resolved = path.resolve(strict=True)
++    if (not rel.parts or '.git' in rel.parts or not resolved.is_relative_to(root) or
++            '.git' in resolved.relative_to(root).parts):
++        raise ValueError('host_control_external_installation_object')
++    return str(rel)
++
++
++def sdk_manifest(path):
++    """Bound the metadata bytes used to derive the installed graph."""
++    if path != path.resolve(strict=True):
++        raise ValueError('host_control_package_manifest_alias')
++    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
++    try:
++        before = os.fstat(fd)
++        if not stat.S_ISREG(before.st_mode) or before.st_size > SDK_MAX_MAP:
++            raise ValueError('host_control_package_manifest_bound')
++        with os.fdopen(os.dup(fd), 'rb') as source:
++            raw = source.read(SDK_MAX_MAP + 1)
++        after = os.fstat(fd)
++        identity = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
++        if len(raw) != before.st_size or identity(before) != identity(after):
++            raise ValueError('host_control_package_manifest_changed')
++    finally:
++        os.close(fd)
++    def unique(pairs):
++        result = {}
++        for key, value in pairs:
++            if key in result:
++                raise ValueError('host_control_duplicate_manifest_key')
++            result[key] = value
++        return result
++    def nonfinite(_):
++        raise ValueError('host_control_nonfinite_manifest')
++    value = json.loads(raw, object_pairs_hook=unique, parse_constant=nonfinite)
++    if type(value) is not dict or type(value.get('name')) is not str or type(value.get('version')) is not str:
++        raise ValueError('host_control_package_identity_required')
++    return value, hashlib.sha256(raw).hexdigest()
++
++
++def sdk_dependency_closure(donor):
++    """Read pnpm's installed graph, never solve or install dependencies.
++
++    Keep every installed dependency, peer and optional dependency, including
++    foreign-platform packages. Missing mandatory entries and dangling links
++    refuse. Absent optional entries are recorded, never inferred from names or
++    silently treated as a successful module load. Actual Node qualification of
++    this finite SDK path is still required on the resulting immutable stage.
++    """
++    donor = Path(donor)
++    pending = [donor / rel for rel in SDK_ROOTS]
++    packages, edges, absent, manifests = {}, [], [], {}
++    while pending:
++        package = pending.pop(0)
++        rel = sdk_relative(donor, package)
++        if package != package.resolve() or package == donor:
++            raise ValueError('host_control_noncanonical_package')
++        if rel in packages:
++            continue
++        manifest = package / 'package.json'
++        value, manifest_hash = sdk_manifest(manifest)
++        packages[rel] = {'name': value['name'], 'version': value['version']}
++        manifests[str(manifest.relative_to(donor))] = manifest_hash
++        if len(packages) > 4096:
++            raise ValueError('host_control_package_count_bound')
++        for section in ('dependencies', 'peerDependencies', 'optionalDependencies'):
++            dependencies = value.get(section, {})
++            if type(dependencies) is not dict:
++                raise ValueError('host_control_dependency_manifest_shape')
++            for name, version in sorted(dependencies.items()):
++                if not re.fullmatch(r'(?:@[a-z0-9._~-]+/)?[a-z0-9._~-]+', name) or name in ('.', '..'):
++                    raise ValueError('host_control_dependency_name')
++                if type(version) is not str or not version:
++                    raise ValueError('host_control_dependency_version')
++                optional = section == 'optionalDependencies' or (section == 'peerDependencies' and
++                    value.get('peerDependenciesMeta', {}).get(name, {}).get('optional') is True)
++                parent, found, searched = package, None, []
++                while parent.is_relative_to(donor):
++                    if parent.name != 'node_modules':
++                        possible = parent / 'node_modules' / name
++                        searched.append(str(possible.relative_to(donor)))
++                        if os.path.lexists(possible):
++                            found = possible
++                            break
++                    if parent == donor:
++                        break
++                    parent = parent.parent
++                edge = {'from': rel, 'section': section, 'name': name, 'declared': version}
++                if found is None:
++                    if not optional:
++                        raise ValueError('host_control_required_dependency_missing:' + name)
++                    absent.append({**edge, 'searched': searched, 'state': 'OPTIONAL_NOT_INSTALLED'})
++                    continue
++                # Preserve pnpm's actual physical paths and link text. A linked
++                # ancestor would need a separate mapping; never flatten it here.
++                if found.parent != found.parent.resolve():
++                    raise ValueError('host_control_dependency_ancestor_alias')
++                via = sdk_relative(donor, found)
++                target = found.resolve(strict=True)
++                target_rel = sdk_relative(donor, target)
++                target_manifest, _ = sdk_manifest(target / 'package.json')
++                if target_manifest['name'] != name:
++                    raise ValueError('host_control_dependency_identity_mismatch')
++                edges.append({**edge, 'via': via, 'target': target_rel,
++                              'link': os.readlink(found) if found.is_symlink() else None})
++                pending.append(target)
++                if len(edges) + len(absent) > SDK_MAX_FILES:
++                    raise ValueError('host_control_dependency_edge_bound')
++    return {'method': SDK_SELECTION_KIND, 'sourceRoot': str(donor),
++            'roots': list(SDK_ROOTS), 'packages': packages, 'edges': edges,
++            'optionalAbsent': absent, 'manifestPins': manifests,
++            'pathMapping': 'same-relative-path-and-sha256', 'runtimeGrant': False}
++
++
++def stage_host_control_sdk(donor, destination):
++    """Copy a closed SDK view after the ordinary full donor build.
++
++    No donor file is pruned or modified. Package bodies are copied completely;
++    only their node_modules graphs are selected by installed dependency edges.
++    Source, bundled lib, package metadata, native assets and notices travel
++    together. The destination must be new and is never promoted on failure.
++    """
++    donor, destination = Path(donor), Path(destination)
++    if (donor != donor.resolve() or not destination.is_absolute() or
++            destination.parent != destination.parent.resolve() or
++            destination.is_relative_to(donor) or donor.is_relative_to(destination) or
++            os.path.lexists(destination)):
++        raise ValueError('host_control_new_external_stage_required')
++    closure = sdk_dependency_closure(donor)
++    selected, links = set(), {}
++    for rel in closure['packages']:
++        package = donor / rel
++        for directory, dirs, names in os.walk(package, followlinks=False, onerror=sdk_walk_error):
++            if '.git' in dirs or '.git' in names:
++                raise ValueError('host_control_git_in_package_body')
++            dirs[:] = [name for name in dirs if
++                       not (name == 'node_modules' and Path(directory) == package)]
++            for name in [*dirs, *names]:
++                source = Path(directory) / name
++                source_rel = sdk_relative(donor, source)
++                if source.is_symlink():
++                    links[source_rel] = os.readlink(source)
++                elif source.is_file():
++                    selected.add(source_rel)
++                elif not source.is_dir():
++                    raise ValueError('host_control_special_installation_file')
++                if len(selected) + len(links) > SDK_MAX_FILES:
++                    raise ValueError('host_control_installation_file_bound')
++    for edge in closure['edges']:
++        if edge['link'] is not None:
++            links[edge['via']] = edge['link']
++    # Node consults package scopes above a package; pin those too. The root
++    # manifest supplies scope, not a request to include root devDependencies.
++    for rel in list(selected):
++        parent = (donor / rel).parent
++        while parent.is_relative_to(donor):
++            metadata = parent / 'package.json'
++            if os.path.lexists(metadata):
++                if metadata.is_symlink() or not metadata.is_file():
++                    raise ValueError('host_control_resolution_metadata_alias')
++                selected.add(sdk_relative(donor, metadata))
++            if parent == donor:
++                break
++            parent = parent.parent
++    selected.update(('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'LICENSE', 'THIRD_PARTY_NOTICES.md'))
++    if len(selected) + len(links) > SDK_MAX_FILES:
++        raise ValueError('host_control_installation_file_bound')
++    expected_sizes = {rel: (donor / rel).stat().st_size for rel in selected}
++    total = sum(expected_sizes.values())
++    if total > SDK_MAX_BYTES:
++        raise ValueError('host_control_installation_byte_bound')
++    # Reject before allocating/copying a tree whose finite map cannot fit.
++    estimate = {'files': {rel: '0' * 64 for rel in selected}, 'links': links,
++                'sdkClosure': closure}
++    if len(json.dumps(estimate, sort_keys=True, indent=2).encode()) > SDK_MAX_MAP - 65536:
++        raise ValueError('host_control_selection_map_bound')
++    destination.mkdir(mode=0o700)
++    copied = {}
++    for rel in sorted(selected):
++        source = donor / rel
++        if source != source.resolve() or not source.is_file():
++            raise ValueError('host_control_source_alias_or_special')
++        target = destination / rel
++        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
++        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
++        try:
++            before = os.fstat(fd)
++            if not stat.S_ISREG(before.st_mode):
++                raise ValueError('host_control_special_installation_file')
++            if before.st_size != expected_sizes[rel]:
++                raise ValueError('host_control_source_changed_during_stage')
++            hasher, size = hashlib.sha256(), 0
++            with target.open('xb') as output:
++                while True:
++                    block = os.read(fd, 65536)
++                    if not block:
++                        break
++                    size += len(block)
++                    if size > before.st_size:
++                        raise ValueError('host_control_source_changed_during_stage')
++                    output.write(block)
++                    hasher.update(block)
++                os.fchmod(output.fileno(), stat.S_IMODE(before.st_mode) & 0o777)
++            after = os.fstat(fd)
++            identity = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
++            if size != before.st_size or identity(before) != identity(after):
++                raise ValueError('host_control_source_changed_during_stage')
++            copied[rel] = hasher.hexdigest()
++        finally:
++            os.close(fd)
++    for rel, expected in closure['manifestPins'].items():
++        if copied.get(rel) != expected:
++            raise ValueError('host_control_dependency_manifest_changed')
++    for rel, link in sorted(links.items()):
++        source = donor / rel
++        if not source.is_symlink() or os.readlink(source) != link or os.path.isabs(link):
++            raise ValueError('host_control_link_changed_or_absolute')
++        sdk_relative(donor, source)
++        target = destination / rel
++        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
++        target.symlink_to(link)
++    for rel in links:
++        sdk_relative(destination, destination / rel)
++    # A metadata race or ancestor fallback must not change a declared absence.
++    for absent in closure['optionalAbsent']:
++        if any(os.path.lexists(destination / rel) or os.path.lexists(donor / rel)
++               for rel in absent['searched']):
++            raise ValueError('host_control_optional_dependency_changed')
++    rebuilt = sdk_dependency_closure(destination)
++    if any(rebuilt[key] != closure[key] for key in
++           ('roots', 'packages', 'edges', 'optionalAbsent', 'manifestPins', 'pathMapping')):
++        raise ValueError('host_control_staged_dependency_graph_changed')
++    closure['copiedFiles'] = len(copied)
++    closure['copiedBytes'] = total
++    closure['copiedLinks'] = len(links)
++    return closure, copied, links
++
++
++def host_control_build_selection(donor, toolchain, sdk_root):
+     """Select exact built SDK/launcher bytes; this is never a runtime admission.
+ 
+     Called by the existing preparer after its source/build checks. The FileOwner
+@@ -417,9 +670,11 @@
+     machine = {'x86_64': 'x64', 'aarch64': 'arm64'}.get(os.uname().machine)
+     if machine is None:
+         raise ValueError('host_control_platform_not_selected')
++    closure, copied, copied_links = stage_host_control_sdk(donor, sdk_root)
++    donor = Path(sdk_root)
+     files, links = {}, {}
+     total = 0
+-    for directory, dirs, names in os.walk(donor, followlinks=False):
++    for directory, dirs, names in os.walk(donor, followlinks=False, onerror=sdk_walk_error):
+         if Path(directory) == donor and '.git' in dirs:
+             dirs.remove('.git')
+         for name in [*dirs, *names]:
+@@ -432,7 +687,7 @@
+                 links[rel] = os.readlink(path)
+             elif path.is_file():
+                 total += path.stat().st_size
+-                if total > 2 << 30:
++                if total > SDK_MAX_BYTES:
+                     raise ValueError('host_control_installation_byte_bound')
+                 # Stream installed files; do not allocate the whole tree in RAM.
+                 h = hashlib.sha256()
+@@ -442,8 +697,10 @@
+                 files[rel] = h.hexdigest()
+             elif not path.is_dir():
+                 raise ValueError('host_control_special_installation_file')
+-            if len(files) + len(links) > 100000:
++            if len(files) + len(links) > SDK_MAX_FILES:
+                 raise ValueError('host_control_installation_file_bound')
++    if files != copied or links != copied_links:
++        raise ValueError('host_control_stage_copy_drift')
+     imports = {
+         'provider': 'packages/sandbox/sandbox-local/lib/index.js',
+         'cordis': 'vendor/cordis/lib/index.js',
+@@ -471,7 +728,7 @@
+         'entry': {'path': str(entry), 'sha256': digest(entry)},
+         'commandHelper': {'path': str(Path(__file__).resolve()), 'sha256': digest(__file__)},
+         'imports': imports, 'launcher': launcher, 'sourcePins': {n: files[n] for n in source_names},
+-        'files': files, 'links': links,
++        'files': files, 'links': links, 'sdkClosure': closure,
+         'resolutionFiles': sorted(n for n in files if n == 'package.json' or n.endswith('/package.json')),
+         'runtimeGrant': False}
+ 
+@@ -484,7 +741,7 @@
+     parser.add_argument("--evidence", type=Path, required=True)
+     parser.add_argument("--build-timeout", type=int, default=900)
+     parser.add_argument("--host-control-selection", type=Path,
+-                        help="Write source/build selection only; never admission or a worker run")
++                        help="Stage the SDK closure in new evidence/host-control-sdk and write its selection; never admission")
+     args = parser.parse_args()
+     if args.host_control_selection is not None and args.action not in ('build', 'check'):
+         raise ValueError('host_control_selection_requires_existing_build_or_check')
+@@ -531,13 +788,13 @@
+         (evidence / "dsh-build-inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
+         result["workspace_build_identity"] = {key: inventory[key] for key in ("file_count", "sha256")}
+     if args.host_control_selection is not None:
+-        selection = host_control_build_selection(donor, result['toolchain'])
++        destination = args.host_control_selection.absolute()
++        if destination.parent != evidence or os.path.lexists(destination):
++            raise ValueError('host_control_selection_must_be_new_owned_evidence')
++        selection = host_control_build_selection(donor, result['toolchain'], evidence / 'host-control-sdk')
+         encoded = json.dumps(selection, sort_keys=True, indent=2).encode() + b'\n'
+-        if len(encoded) > 8 << 20:
++        if len(encoded) > SDK_MAX_MAP:
+             raise ValueError('host_control_selection_map_bound')
+-        destination = args.host_control_selection.absolute()
+-        if destination.parent != evidence or destination.is_symlink():
+-            raise ValueError('host_control_selection_must_be_new_owned_evidence')
+         fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+         with os.fdopen(fd, 'wb') as output:
+             output.write(encoded)

@@ -1,0 +1,423 @@
+"""Exact unused-install removal. Loaded from hash-checked memory; never a service.
+The consumed runtime grant and original clocks are evidence, never authorization.
+Only the literal, independently reviewed owner entry may call main().
+"""
+import base64
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import resource
+import selectors
+import signal
+import stat
+import subprocess
+import time
+
+
+def require(ok, message):
+    if not ok:
+        raise RuntimeError(message)
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+class Recovery:
+    def __init__(self, snapshot, started, read_exact, approval_bytes):
+        self.s = snapshot
+        self.started = started
+        self.deadline = started + 60
+        self.read = read_exact
+        self.approval = approval_bytes
+        self.fd = None
+        self.locks = []
+        self.child = None
+        self.possible_child = False
+        self.effects = []
+        self.complete = False
+        self.archive = {}
+        self.archive_hash = hashlib.sha256()
+        self.client_identities = []
+        self.receipt = self.s['receipt']
+        self.stage = Path(self.receipt['stage'])
+        self.journal = Path(self.receipt['journal_path'])
+        self.fragment = Path('/run/systemd/system') / self.s['unit']
+        self.policy = Path('/etc/sudoers.d/friday-offline-build-010d839888625d6d')
+        self.recovery = Path(self.s['recovery_path'])
+        self.owner = dict(pid=os.getpid(), start_ticks=self.birth(os.getpid()),
+                          boot_id=self.s['manager']['boot_id'], started_monotonic=started,
+                          deadline_monotonic=self.deadline, cleanup_only=True)
+        self.check(40)
+        # Trusted installed module: no main or Control constructor is invoked.
+        pin = self.s['owned'][str(self.stage / 'admin-control.py')]
+        code = self.checked(pin)
+        self.a = {'__name__': 'reviewed_cleanup_primitives', '__file__': pin['path']}
+        exec(compile(code, pin['path'], 'exec'), self.a)
+        self.ordinary_append = self.a['journal_append']
+        self.a['journal_append'] = self.ledger_append
+
+    @staticmethod
+    def birth(pid):
+        return int(Path('/proc', str(pid), 'stat').read_text().rsplit(')', 1)[1].split()[19])
+
+    def check(self, reserve=0):
+        require(time.monotonic() + reserve < self.deadline - 5, 'cleanup_effect_deadline')
+
+    def checked(self, pin):
+        self.check()
+        path = Path(pin['path'])
+        b, s = self.read(path, pin['uid'], pin['mode'], maximum=128000000)
+        require([s.st_dev, s.st_ino] == pin['identity'] and s.st_gid == pin['gid']
+                and s.st_size == pin['size'] and s.st_nlink == pin['nlink']
+                and sha(b) == pin.get('sha256', pin.get('expected_sha256_from_root_receipt')),
+                'pinned_file_changed:' + str(path))
+        return b
+
+    def record(self, kind, **fields):
+        require(self.fd is not None, 'durable_recovery_not_open')
+        b = (json.dumps(dict(kind=kind, monotonic=time.monotonic(), **fields),
+                        separators=(',', ':')) + '\n').encode()
+        require(len(b) <= 1048576, 'recovery_record_bound')
+        require(os.write(self.fd, b) == len(b), 'recovery_short_write')
+        os.fsync(self.fd)
+        self.archive_hash.update(b)
+
+    def journal_identity(self):
+        s = self.journal.lstat()
+        require([s.st_dev, s.st_ino] == self.receipt['journal_identity']
+                and stat.S_ISREG(s.st_mode) and s.st_uid == s.st_gid == 0
+                and stat.S_IMODE(s.st_mode) == 0o444 and s.st_nlink == 1,
+                'installation_journal_replaced')
+
+    def ledger_append(self, row):
+        self.check()
+        self.journal_identity()
+        self.record('installation_ledger_append_intent', row=row)
+        self.ordinary_append(row)
+        self.record('installation_ledger_appended', row=row)
+
+    def run(self, argv, seconds):
+        self.check(seconds + 3)
+        start = time.monotonic()
+        if self.fd is not None:
+            self.record('client_intent', argv=argv, client_budget_seconds=seconds)
+        parent_pid = os.getpid()
+        def bind_child():
+            # The finite direct client dies if this exact root owner ceases.
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != parent_pid:
+                os._exit(125)
+        self.possible_child = True  # Fork can occur before Popen returns.
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=self.a['ENV'], close_fds=True,
+                             preexec_fn=bind_child)
+        self.child = p
+        out, err = bytearray(), bytearray()
+        selector = selectors.DefaultSelector()
+        try:
+            client_identity = dict(pid=p.pid, start_ticks=self.birth(p.pid))
+            self.client_identities.append(client_identity)
+            if self.fd is not None:
+                self.record('client_started', argv=argv, **client_identity)
+            for stream, target in ((p.stdout, out), (p.stderr, err)):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, target)
+            while selector.get_map():
+                left = start + seconds - time.monotonic()
+                require(left > 0, 'client_timeout')
+                ready = selector.select(left)
+                require(ready, 'client_timeout')
+                for key, _ in ready:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                    if chunk:
+                        key.data.extend(chunk)
+                        require(len(out) + len(err) <= 1048576, 'client_output_bound')
+                    else:
+                        selector.unregister(key.fileobj)
+            p.wait(timeout=max(0.001, start + seconds - time.monotonic()))
+            row = dict(argv=argv, pid=p.pid, returncode=p.returncode,
+                       stdout=out.decode(), stderr=err.decode(), client_reaped=True,
+                       started_monotonic=start, completed_monotonic=time.monotonic())
+            if self.fd is not None:
+                self.record('client_reaped', **row)
+            self.child = None
+            self.possible_child = False
+            self.check()
+            require(p.returncode in ((0, 4) if 'show' in argv else (0,)) and not err,
+                    'manager_client_failed')
+            return row
+        finally:
+            selector.close()
+            p.stdout.close()
+            p.stderr.close()
+            if p.poll() is not None:
+                p.wait(timeout=0)
+                self.child = None
+                self.possible_child = False
+
+    def manager(self):
+        value = self.a['Control'].manager(self)
+        require(value == self.s['manager'], 'manager_identity_changed')
+        return value
+
+    def show(self, removed=False):
+        expected = dict(self.s['unit_before'])
+        if removed:
+            expected.update(LoadState='not-found', FragmentPath='')
+        row = self.run(['/usr/bin/systemctl', '--system', '--no-pager', 'show', self.s['unit'],
+                        '--property=' + ','.join(expected)], 3)
+        pairs = [line.split('=', 1) for line in row['stdout'].splitlines()]
+        require(all(len(x) == 2 for x in pairs), 'unit_property_syntax')
+        value = dict(pairs)
+        require(len(value) == len(pairs) and value == expected, 'unit_not_exactly_unused')
+        for path in (Path(self.receipt['live']), Path('/sys/fs/cgroup/system.slice') / self.s['unit']):
+            require(not os.path.lexists(path), 'unexpected_live_or_cgroup')
+        return value
+
+    def process_check(self):
+        # Root can enumerate actual original-group and installed entry processes.
+        own_chain = {os.getpid()}
+        pid = os.getpid()
+        while pid > 1:
+            fields = Path('/proc', str(pid), 'stat').read_text().rsplit(')', 1)[1].split()
+            pid = int(fields[1])
+            own_chain.add(pid)
+        original = self.s['original_parent']
+        previous_owner = self.receipt['installation_owner']
+        for directory in Path('/proc').iterdir():
+            if not directory.name.isdigit():
+                continue
+            try:
+                fields = (directory / 'stat').read_text().rsplit(')', 1)[1].split()
+                pid = int(directory.name)
+                birth = int(fields[19])
+                require(not (pid == original['pid'] and birth == original['start_ticks']), 'original_parent_alive')
+                require(int(fields[2]) != original['pid'] and int(fields[3]) != original['pid'], 'original_group_alive')
+                require(not (pid == previous_owner['pid'] and birth == previous_owner['start_ticks']), 'installer_alive')
+                args = (directory / 'cmdline').read_bytes().split(b'\0')
+                if pid not in own_chain:
+                    require(not any(arg.startswith((str(self.stage) + '/').encode()) for arg in args),
+                            'installed_control_process_alive')
+            except FileNotFoundError:
+                continue
+
+    def inventory(self):
+        self.journal_identity()
+        actual = self.a['verify_inventory']()
+        require(set(actual) == set(self.s['owned']), 'installation_inventory_changed')
+        for path, pin in self.s['owned'].items():
+            row = actual[path]
+            require(row['identity'] == pin['identity'] and row['mode'] == pin['mode']
+                    and row['directory'] == pin['directory'], 'journal_ownership_changed')
+            if pin['directory']:
+                s = Path(path).lstat()
+                require([s.st_dev, s.st_ino] == pin['identity'] and s.st_uid == s.st_gid == 0
+                        and stat.S_ISDIR(s.st_mode) and stat.S_IMODE(s.st_mode) == pin['mode'],
+                        'stage_identity_changed')
+            else:
+                self.checked(pin)  # Root freshly hashes the 0440 policy too.
+
+    def idle_locks(self):
+        pins = [self.s['canonical_lock'], self.s['owned'][str(self.stage / 'control.lock')],
+                self.s['owned'][str(self.stage / 'observe.lock')]]
+        targets = {(os.major(p['identity'][0]), os.minor(p['identity'][0]), p['identity'][1]) for p in pins}
+        for line in Path('/proc/locks').read_text().splitlines():
+            fields = line.replace('-> ', '').split()
+            if len(fields) > 5:
+                dev = fields[5].split(':')
+                if len(dev) == 3:
+                    require((int(dev[0], 16), int(dev[1], 16), int(dev[2])) not in targets,
+                            'existing_lock_owner')
+        for pin in pins:
+            fd = os.open(pin['path'], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            self.locks.append((fd, pin))
+            self.lock_identity(fd, pin)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def lock_identity(self, fd, pin):
+        for s in (os.fstat(fd), Path(pin['path']).lstat()):
+            require([s.st_dev, s.st_ino] == pin['identity'] and s.st_uid == pin['uid']
+                    and s.st_gid == pin['gid'] and stat.S_IMODE(s.st_mode) == pin['mode']
+                    and stat.S_ISREG(s.st_mode) and s.st_nlink == 1 and s.st_size == 0,
+                    'lock_changed')
+
+    def preserve(self):
+        self.check(25)
+        self.a['root_directory'](self.recovery.parent)
+        fd = os.open(self.recovery, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                     | os.O_NONBLOCK | os.O_CLOEXEC, 0o400)
+        self.fd = fd  # O_EXCL permanently consumes this exact cleanup attempt.
+        s = os.fstat(fd)
+        self.recovery_identity = [s.st_dev, s.st_ino]
+        require(s.st_uid == s.st_gid == 0 and s.st_nlink == 1, 'recovery_owner')
+        self.record('owner', owner=self.owner, state='CLEANUP_ONLY_EVIDENCE_PRESERVED',
+                    original_trial='FAILED', original_trial_budget_seconds=1800,
+                    original_trial_elapsed_seconds=1008.6201840580034,
+                    original_grant_and_clock_unchanged=True, retry_authorized=False,
+                    archived_base64=self.archive, snapshot=self.s,
+                    cleanup_review_base64=base64.b64encode(self.approval).decode())
+        self.fsync_parent(self.recovery)
+        self.report(dict(state='CLEANUP_OWNER_RECORDED', owner=self.owner,
+                         recovery_path=str(self.recovery), recovery_identity=self.recovery_identity))
+        self.check(20)
+
+    @staticmethod
+    def report(value):
+        # Small foreground report; both operation and exit have armed deadlines.
+        b = (json.dumps(value, separators=(',', ':')) + '\n').encode()
+        require(len(b) <= 16384 and os.write(1, b) == len(b), 'owner_report_incomplete')
+
+    @staticmethod
+    def fsync_parent(path):
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def remove_owned(self, path, directory=False):
+        self.check(7)
+        pin = self.s['owned'][str(path)]
+        if not directory:
+            self.checked(pin)
+        self.record('remove_intent', path=str(path), identity=pin['identity'], directory=directory)
+        self.effects.append(str(path))  # Set before the possible effect.
+        self.a['tracked_unlink'](path, directory=directory)
+        require(not os.path.lexists(path), 'removed_path_reappeared')
+        self.record('removed', path=str(path), identity=pin['identity'])
+
+    def execute(self):
+        # Every mutable user input is copied once into hash-checked memory.
+        for name, pin in self.s['proofs'].items():
+            b = self.checked(pin)
+            self.archive[name] = base64.b64encode(b).decode()
+        for name, pin in self.s['source'].items():
+            self.checked(pin)
+        require(sha(base64.b64decode(self.archive['original_source_review'])) ==
+                self.receipt['independent_review_sha256'], 'original_source_review_changed')
+        for executable, pin in self.receipt['administrative_executables'].items():
+            if executable not in ('/usr/bin/python3', '/usr/bin/systemctl', '/usr/bin/busctl'):
+                continue
+            require(str(Path(executable).resolve(strict=True)) == pin['resolved'], 'executable_target_changed')
+            b, s = self.read(Path(pin['resolved']), 0, pin['mode'], maximum=128000000,
+                             single_link=pin['nlink'] == 1)
+            require(sha(b) == pin['sha256'] and s.st_size == pin['size']
+                    and s.st_nlink == pin['nlink'], 'administrative_executable_changed')
+        self.inventory()
+        self.process_check()
+        self.manager()
+        self.show()
+        self.idle_locks()
+        self.inventory()
+        self.manager()
+        self.show()
+        self.process_check()
+        for fd, pin in self.locks:
+            self.lock_identity(fd, pin)
+        self.preserve()
+        # No grant validator or old rollback; this is a separate cleanup owner.
+        self.remove_owned(self.fragment)
+        self.record('normal_reload_intent', manager=self.s['manager'])
+        self.run(['/usr/bin/systemctl', '--system', '--no-pager', 'daemon-reload'], 5)
+        self.manager()
+        after = self.show(removed=True)
+        self.record('not_found_verified', manager=self.s['manager'], unit=after)
+        inventory = self.a['verify_inventory']()
+        require(set(inventory) == set(self.s['owned']) - {str(self.fragment)}, 'partial_inventory_changed')
+        for path in sorted(Path(p) for p in inventory if Path(p).parent == self.stage):
+            self.remove_owned(path)
+        self.remove_owned(self.stage, directory=True)
+        self.remove_owned(self.policy)
+        require(not self.a['journal_inventory'](), 'remaining_installation_inventory')
+        self.journal_identity()
+        journal_bytes, _ = self.read(self.journal, 0, 0o444)
+        self.record('final_installation_ledger', content_base64=base64.b64encode(journal_bytes).decode(),
+                    sha256=sha(journal_bytes))
+        self.check(6)
+        self.record('journal_unlink_intent', identity=self.receipt['journal_identity'])
+        self.journal_identity()
+        self.effects.append(str(self.journal))
+        self.journal.unlink()
+        self.fsync_parent(self.journal)
+        for path in (self.fragment, self.stage, self.policy, self.journal):
+            require(not os.path.lexists(path), 'final_absence_unknown')
+        self.manager()
+        self.show(removed=True)
+        self.check()
+        self.complete = True
+        self.record('ROOT_REMOVAL_FINISHED_EXTERNAL_REAP_REQUIRED', owner=self.owner,
+                    root_assets_removed=True, root_client_reaped=False,
+                    original_trial='FAILED', runtime_acceptance=False)
+
+    def finish(self, error):
+        # No unbounded wait, generic stop, process-group kill, or retry.
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, lambda *_: os._exit(124))
+        signal.setitimer(signal.ITIMER_REAL, max(0.001, self.deadline - time.monotonic()))
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)
+        child_reaped = self.child is None and not self.possible_child
+        if self.child is not None:
+            p = self.child
+            try:
+                if p.poll() is None:
+                    p.kill()  # Only this exact direct child, never a manager or unit.
+                p.wait(timeout=max(0.001, min(2, self.deadline - time.monotonic() - 1)))
+                child_reaped = True
+            except BaseException:
+                child_reaped = False
+        if self.fd is not None:
+            try:
+                self.record('root_owner_exit_intent', owner=self.owner,
+                            state='EXACT_REMOVAL_AWAITING_EXTERNAL_REAP' if self.complete and child_reaped
+                            else 'STOP_UNCONFIRMED_RETAINED_DURABLE_CUSTODY',
+                            error=repr(error) if error else None, possible_effects=self.effects,
+                            direct_child_reaped=child_reaped, external_root_reap_required=True,
+                            observed_before_deadline=time.monotonic() < self.deadline)
+            except BaseException:
+                child_reaped = False
+        try:
+            self.report(dict(state='ROOT_EXIT_INTENT_EXTERNAL_REAP_REQUIRED', owner=self.owner,
+                             root_assets_removed=self.complete, direct_child_reaped=child_reaped,
+                             client_identities=self.client_identities,
+                             recovery_path=str(self.recovery) if self.fd is not None else None,
+                             recovery_sha256=self.archive_hash.hexdigest() if self.fd is not None else None,
+                             error=repr(error) if error else None,
+                             elapsed_seconds=time.monotonic() - self.started,
+                             observed_before_deadline=time.monotonic() < self.deadline))
+        except BaseException:
+            child_reaped = False
+        for fd, _ in reversed(self.locks):
+            os.close(fd)
+        if self.fd is not None:
+            os.close(self.fd)
+        return self.complete and child_reaped and time.monotonic() < self.deadline and error is None
+
+
+def main(snapshot_bytes, approval_bytes, started, read_exact):
+    require(os.getuid() == os.geteuid() == 0 and os.isatty(1), 'interactive_root_owner_required')
+    os.umask(0o077)
+    os.sched_setaffinity(0, {0, 1})
+    resource.setrlimit(resource.RLIMIT_AS, (2147483648, 2147483648))
+    require(started <= time.monotonic() < started + 15, 'cleanup_admission_expired')
+    def interrupted(*_):
+        raise RuntimeError('cleanup_interrupted_or_deadline')
+    for sig in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, interrupted)
+    signal.setitimer(signal.ITIMER_REAL, started + 55 - time.monotonic())
+    recovery = None
+    error = None
+    try:
+        recovery = Recovery(json.loads(snapshot_bytes), started, read_exact, approval_bytes)
+        recovery.execute()
+    except BaseException as failure:
+        error = failure
+    finally:
+        ok = recovery.finish(error) if recovery is not None else False
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    # Exit is only intent here. Astra must observe actual sudo/root-client reap.
+    raise SystemExit(0 if ok else 1)

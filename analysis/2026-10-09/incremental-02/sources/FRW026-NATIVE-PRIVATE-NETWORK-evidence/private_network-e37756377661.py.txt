@@ -1,0 +1,349 @@
+"""One slirp attachment inside the EXISTING FileOwner unit. SOURCE ONLY.
+
+StatusCustody remains the sole bwrap status reader; donor keeps its Popen/waiter.
+This object retains only the mature networking helper and its own bounded waiter.
+No daemon, hostfwd API, credential, reconnect, recovery launch or new budget.
+The original unconditional FileOwner gate precedes allocation and every effect.
+"""
+from pathlib import Path
+import fcntl
+import hashlib
+import ipaddress
+import math
+import os
+import select
+import signal
+import stat
+import subprocess
+import time
+
+NS_GET_USERNS = 0xb701
+NS_GET_NSTYPE = 0xb703
+CLONE_NEWNET = 0x40000000
+CLONE_NEWUSER = 0x10000000
+DRIVER = 'slirp4netns-1.3.3-frw-private-loopback'
+INSTALLED_SLIRP_SHA256 = '20581c54ee53ae32e908c9b318481e5a71b72a13f850ce41722e402cb524b325'
+
+
+class NetworkRefusal(RuntimeError):
+    pass
+
+
+def require(value, reason):
+    if not value:
+        raise NetworkRefusal(reason)
+
+
+def resolver_bytes(data):
+    """The explicit existing uplink configuration, not the host loopback stub."""
+    require(type(data) is bytes and len(data) <= 8192, 'DNS_SOURCE_OVERSIZE')
+    servers = []
+    for line in data.decode('ascii').splitlines():
+        fields = line.split('#', 1)[0].split()
+        if not fields or fields[0] != 'nameserver':
+            continue
+        require(len(fields) == 2 and '%' not in fields[1], 'DNS_SERVER_LITERAL_REQUIRED')
+        address = ipaddress.ip_address(fields[1])
+        require(not (address.is_loopback or address.is_unspecified or address.is_multicast or
+                     address.is_link_local or getattr(address, 'ipv4_mapped', None)) and
+                address not in ipaddress.ip_network('10.0.2.0/24') and
+                address not in ipaddress.ip_network('fd00::/64'), 'DNS_HOST_ALIAS_OR_LOCAL_ADDRESS')
+        require(str(address) == fields[1] and fields[1] not in servers, 'DNS_NONCANONICAL_OR_DUPLICATE')
+        servers.append(fields[1])
+    require(0 < len(servers) <= 3, 'EXPLICIT_UPLINK_DNS_REQUIRED')
+    return ('\n'.join('nameserver ' + value for value in servers) + '\n').encode(), servers
+
+
+def fd_object(fd):
+    obj = os.fstat(fd)
+    return [obj.st_dev, obj.st_ino]
+
+
+class NetworkAttachment:
+    """Retained once by the actual native owner; serialized receipts cannot recreate it."""
+    def __init__(self, owner, session, registry, run, status_api):
+        self.owner, self.session, self.registry, self.api = owner, session, registry, status_api
+        self.proc = self.pidfd = None
+        self.failed = self.launched = self.released = self.closed = False
+        self.block_read = self.block_write = None
+        self.ready_read = self.ready_write = self.exit_read = self.exit_write = None
+        self.netfd = self.userfd = None
+        self.block_identity = None
+        self.donor_proc = None
+        self.observation = None
+        self.deadline = session.runtest_deadline
+        self.startup_end = min(self.deadline - owner.pre['reserve_seconds'], time.monotonic() + 5.0)
+        require(getattr(owner, '_network_attachment', None) is None, 'NETWORK_ALREADY_CONSUMED')
+        owner._network_attachment = self  # retain before every allocation/exception
+        try:
+            self.current()
+            self.block_read, self.block_write = os.pipe2(os.O_CLOEXEC)
+            self.block_identity = fd_object(self.block_read)
+            self._pipe(self.block_read, False, self.block_identity)
+            self._pipe(self.block_write, True, self.block_identity)
+            self.resolver = Path(owner.control) / 'tmp' / 'private-resolv.conf'
+            require(self.resolver.parent == owner.control / 'tmp', 'FOREIGN_RESOLVER_ROOT')
+            data = self.api['read_bounded']('/run/systemd/resolve/resolv.conf', 8192)
+            contents, self.servers = resolver_bytes(data)
+            fd = os.open(self.resolver, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o400)
+            try:
+                require(os.write(fd, contents) == len(contents), 'DNS_SNAPSHOT_SHORT_WRITE')
+                os.fsync(fd)
+                self.resolver_identity = fd_object(fd)
+                self.resolver_sha = hashlib.sha256(contents).hexdigest()
+            finally:
+                os.close(fd)
+            owner.h.private(self.resolver, 0o400)
+        except BaseException:
+            self.abort()
+            raise
+
+    def current(self):
+        require(not self.failed and not self.closed and not self.owner.stop_requested() and
+                not self.session.runtest_stop_requested and not self.session.runtest_persistence_error and
+                not self.session.runtest_pidfd_error and math.isfinite(self.deadline) and
+                self.deadline == self.owner.deadline and
+                time.monotonic() < self.deadline - self.owner.pre['reserve_seconds'],
+                'NETWORK_CANCELLED_UNCERTAIN_OR_ORIGINAL_DEADLINE')
+        self.owner.require_current(self.session.runtest_outer)
+
+    def _pipe(self, fd, writing, identity):
+        require(type(fd) is int and fd >= 3, 'OWNED_PIPE_REQUIRED')
+        obj = os.fstat(fd)
+        require(stat.S_ISFIFO(obj.st_mode) and obj.st_uid == os.getuid() and fd_object(fd) == identity and
+                not os.get_inheritable(fd) and
+                fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == (os.O_WRONLY if writing else os.O_RDONLY),
+                'PIPE_IDENTITY_OR_DIRECTION_CHANGED')
+
+    def policy(self):
+        self.current()
+        self._pipe(self.block_read, False, self.block_identity)
+        self.owner.h.private(self.resolver, 0o400)
+        require(fd_object_path(self.resolver) == self.resolver_identity and
+                self.owner.h.sha(self.resolver) == self.resolver_sha, 'RESOLVER_OBJECT_CHANGED')
+        return dict(driver=DRIVER, blockFd=self.block_read, resolverSource=str(self.resolver),
+                    nameservers=list(self.servers))
+
+    def validate_preparation(self, prepared):
+        require(prepared.get('network') == self.policy(), 'PROVIDER_NETWORK_BINDING_CHANGED')
+
+    def donor_spawned(self, proc):
+        require(self.donor_proc is None and proc is self.session.process, 'FOREIGN_DONOR_MONITOR')
+        self.donor_proc = proc
+        self._close('block_read')  # child has the ONLY inherited reader
+
+    def attach_before_payload(self, monitor, native_start):
+        """Called by sole StatusCustody after native start, BEFORE contour/payload.
+
+        The native child PID is verified in live host procfs and cgroup. Namespace
+        objects are opened through a pinned proc directory and retained as FDs.
+        NS_GET_USERNS obtains the network's owning FIRST userns: bwrap deliberately
+        moves the payload into a second userns to disable further namespace creation.
+        """
+        try:
+            self.current()
+            require(not self.launched and self.donor_proc is self.session.process and
+                    self.session._runtest_pidfd is not None, 'NETWORK_ATTACHMENT_NOT_RETRYABLE')
+            self.launched = True  # consume BEFORE namespace/helper work
+            child = self.api['identity'](native_start['child-pid'])
+            require(child['ppid'] == monitor['pid'] == self.donor_proc.pid and
+                    child['vectors']['NSpid'] == [child['pid'], 1] and
+                    child['cgroup'] == monitor['cgroup'] == ['0::' + self.session.runtest_outer['control_group']],
+                    'FOREIGN_SANDBOX_INIT_OR_CGROUP')
+            require(child['namespaces']['net'][1] == native_start.get('net-namespace') and
+                    child['namespaces']['pid'][1] == native_start.get('pid-namespace') and
+                    child['namespaces']['net'] != monitor['namespaces']['net'], 'PRIVATE_NATIVE_NETNS_REQUIRED')
+            root = os.open('/proc/' + str(child['pid']), os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                self.netfd = os.open('ns/net', os.O_RDONLY | os.O_CLOEXEC, dir_fd=root)
+                require(fd_object(self.netfd) == child['namespaces']['net'] and
+                        fcntl.ioctl(self.netfd, NS_GET_NSTYPE) == CLONE_NEWNET, 'NETNS_HANDLE_CHANGED')
+                self.userfd = fcntl.ioctl(self.netfd, NS_GET_USERNS)
+                os.set_inheritable(self.userfd, False)
+                require(fcntl.ioctl(self.userfd, NS_GET_NSTYPE) == CLONE_NEWUSER and
+                        fd_object(self.userfd) != monitor['namespaces']['user'], 'OWNING_USERNS_REQUIRED')
+                again = self.api['identity'](child['pid'])
+                require(all(again[k] == child[k] for k in ('pid', 'start_ticks', 'ppid', 'cgroup')) and
+                        again['namespaces']['net'] == child['namespaces']['net'] and
+                        self.api['same_birth'](self.api['identity'](monitor['pid']), monitor),
+                        'NETWORK_TARGET_BIRTH_CHANGED')
+            finally:
+                os.close(root)
+            # --disable-userns makes a second payload userns only after first
+            # UID/GID mapping and mount setup. Initial JSON alone is not that
+            # barrier. Wait within the SAME startup bound for this real state.
+            while self.api['identity'](child['pid'])['namespaces']['user'] == fd_object(self.userfd):
+                self.current()
+                left = self.startup_end - time.monotonic()
+                require(left > 0, 'USER_NAMESPACE_SETUP_NOT_READY')
+                readable, _, _ = select.select([self.session._runtest_pidfd], [], [], min(left, 0.01))
+                require(not readable, 'MONITOR_EXITED_BEFORE_NETWORK_ATTACHMENT')
+            self._start_helper()
+            self._ready()
+            self.current()
+            # This is the only successful release. EOF also releases upstream
+            # bwrap; failure therefore retains this writer until donor reaped.
+            self._pipe(self.block_write, True, self.block_identity)
+            require(os.write(self.block_write, b'1') == 1, 'BARRIER_SHORT_WRITE')
+            self.released = True
+            self._close('block_write')
+            self.observation = dict(state='ATTACHED_SOURCE_PATH_NOT_QUALIFIED', driver=DRIVER,
+                netns=fd_object(self.netfd), owner_userns=fd_object(self.userfd),
+                helper={key: value for key, value in self.helper_identity.items() if key != 'cmdline'}, resolver_sha256=self.resolver_sha,
+                original_deadline=self.deadline, runtimeGrant=False)
+            self.owner.h.put(self.owner.control / 'private-network.json', self.observation)
+            return self.observation
+        except BaseException:
+            self.abort()
+            raise
+
+    def _start_helper(self):
+        pin = self.owner.plan.get('private_network')
+        require(type(pin) is dict and pin.get('driver') == DRIVER and
+                pin.get('path_target_sandbox_patch_sha256') == self.owner.h.NETWORK_PATCH_SHA256 and
+                type(pin.get('binary_sha256')) is str and len(pin['binary_sha256']) == 64 and
+                pin['binary_sha256'] != INSTALLED_SLIRP_SHA256, 'REVIEWED_PATH_TARGET_SLIRP_BUILD_REQUIRED')
+        binary = Path(pin['binary'])
+        require(binary.is_absolute() and not binary.is_symlink() and
+                self.owner.h.sha(binary) == pin['binary_sha256'] and
+                binary.stat().st_mode & 0o6022 == 0, 'NETWORK_BINARY_DRIFT_OR_MUTABLE')
+        self.ready_read, self.ready_write = os.pipe2(os.O_CLOEXEC)
+        self.exit_read, self.exit_write = os.pipe2(os.O_CLOEXEC)
+        argv = [str(binary), '--configure', '--disable-host-loopback', '--disable-dns',
+                '--enable-ipv6', '--enable-sandbox', '--enable-seccomp', '--mtu=1500', '--cidr=10.0.2.0/24',
+                '--netns-type=path', '--userns-path=/proc/self/fd/' + str(self.userfd),
+                '--ready-fd=' + str(self.ready_write), '--exit-fd=' + str(self.exit_read),
+                '/proc/self/fd/' + str(self.netfd), 'tap0']
+        fds = (self.userfd, self.netfd, self.ready_write, self.exit_read)
+        require(len(set(fds)) == 4 and all(fd >= 3 and not os.get_inheritable(fd) for fd in fds),
+                'EXACT_HELPER_FDS_REQUIRED')
+        self.current()
+        self.registry._require_runtest_pidfd_acquisition()  # same qualified sole CPython reaper constraint
+        # Retain Popen BEFORE fallible pidfd acquisition; never poll/reap between.
+        # No pipe drainer or thread. Helper diagnostics are deliberately discarded,
+        # and failure is reported by native exit/status, not invented stderr.
+        self.proc = subprocess.Popen(argv, close_fds=True, pass_fds=fds, shell=False,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env={'PATH': '/usr/bin:/bin', 'LANG': 'C'}, cwd='/')
+        self.pidfd = os.pidfd_open(self.proc.pid, 0)
+        require(not os.get_inheritable(self.pidfd), 'HELPER_PIDFD_MUST_NOT_LEAK')
+        self._close('ready_write'); self._close('exit_read')
+        self.helper_identity = self.api['identity'](self.proc.pid)
+        own = self.api['identity'](os.getpid())
+        require(self.helper_identity['ppid'] == os.getpid() and
+                self.helper_identity['cgroup'] == own['cgroup'] == ['0::' + self.session.runtest_outer['control_group']],
+                'HELPER_NOT_IN_ORIGINAL_UNIT')
+        self.current()
+
+    def _ready(self):
+        received = b''
+        while True:
+            self.current()
+            left = self.startup_end - time.monotonic()
+            require(left > 0, 'NETWORK_STARTUP_ORIGINAL_BOUND_EXHAUSTED')
+            ready, _, _ = select.select([self.ready_read, self.pidfd], [], [], min(left, 0.1))
+            require(self.pidfd not in ready, 'HELPER_EXITED_BEFORE_RELEASE')
+            if self.ready_read in ready:
+                chunk = os.read(self.ready_read, 2)
+                received += chunk
+                require(received in (b'', b'1'), 'MALFORMED_HELPER_READY')
+                if not chunk:
+                    require(received == b'1', 'HELPER_READY_EOF_WITHOUT_NETWORK')
+                    self._close('ready_read')
+                    return
+
+    def abort(self):
+        # Stop intent BEFORE any barrier cleanup. Numeric PID signals forbidden.
+        # Registry retains Popen even if pidfd/checkpoint raises before returning.
+        # Adopt only that exact retained monitor for cleanup fencing, never launch.
+        if self.donor_proc is None and self.session.process is not None:
+            self.donor_proc = self.session.process
+        self.failed = True
+        self.session.runtest_stop_requested = True
+        errors = list(getattr(self, 'cleanup_errors', []))  # historical cleanup uncertainty stays sticky
+        try:
+            self.owner.persist_stop()
+        except BaseException as error:
+            errors.append(type(error).__name__)
+        if self.donor_proc is not None:
+            try:
+                self.registry.stop_runtest(self.session, source='private_network_failure')
+            except BaseException as error:
+                errors.append(type(error).__name__)
+        try:
+            self._stop_helper()
+        except BaseException as error:
+            errors.append(type(error).__name__)
+        if self.donor_proc is None or self.donor_proc.returncode is not None:
+            for field in ('block_read', 'block_write'):
+                try: self._close(field)
+                except BaseException as error: errors.append(type(error).__name__)
+        # On ambiguous native death keep barrier writer/handles retained; exiting
+        # original unit triggers its existing KillMode/control-group hard stop.
+        self.cleanup_errors = errors
+        self.closed = not errors and (self.donor_proc is None or self.donor_proc.returncode is not None)
+
+    def _stop_helper(self):
+        if self.exit_write is not None:
+            self._close('exit_write')  # mature slirp poll exit-fd receives HUP
+        if self.proc is not None and self.proc.returncode is None:
+            require(self.pidfd is not None, 'HELPER_PIDFD_MISSING_NATIVE_UNIT_CLOSURE_REQUIRED')
+            try:
+                signal.pidfd_send_signal(self.pidfd, signal.SIGKILL, None, 0)
+            except ProcessLookupError:
+                pass  # same retained Popen must still be reaped exactly once
+            # Sole helper waiter; NEVER donor wait/communicate/poll here.
+            self.proc.wait(timeout=min(2.0, self.owner.control_timeout(2.0)))
+        if self.proc is None or self.proc.returncode is not None:
+            for field in ('pidfd', 'ready_read', 'ready_write', 'exit_read', 'userfd', 'netfd'):
+                self._close(field)
+
+    def finish_after_donor(self, proc):
+        require(proc is self.donor_proc is self.session.process and proc.returncode is not None,
+                'SOLE_DONOR_REAP_REQUIRED_BEFORE_NETWORK_CLOSE')
+        live_before_close = self.pidfd is not None and not select.select([self.pidfd], [], [], 0)[0]
+        try:
+            self._stop_helper()
+            self._close('block_read'); self._close('block_write')
+            self.closed = True
+            require(self.released and not self.failed and live_before_close, 'NETWORK_ENDED_EARLY_OR_UNCONFIRMED')
+            return dict(state='HELPER_REAPED_NOT_WHOLE_UNIT_CESSATION', helper_exit=self.proc.returncode,
+                        original_deadline=self.deadline, runtimeGrant=False)
+        except BaseException:
+            self.abort()
+            raise
+
+    def _close(self, name):
+        fd = getattr(self, name)
+        if fd is not None:
+            setattr(self, name, None)  # never retry a numeric FD after close error
+            os.close(fd)
+
+
+def fd_object_path(path):
+    obj = Path(path).lstat()
+    require(stat.S_ISREG(obj.st_mode) and obj.st_nlink == 1 and obj.st_uid == os.getuid(),
+            'PRIVATE_REGULAR_SINGLE_LINK_RESOLVER_REQUIRED')
+    return [obj.st_dev, obj.st_ino]
+
+
+def prepare_network_status(owner, session, registry, run, semantic, provider, status_api):
+    """Actual composition seam: no second status parser and no invented CLI.
+
+    Root must apply the small hook patch to its independently owned StatusCustody
+    and bind HOST_CONTROL_PREPARE to the existing TS provider. Unsupported status
+    revision refuses before descriptors. All gates and maps remain unqualified.
+    """
+    require(status_api.get('PRIVATE_NETWORK_HOOK_VERSION') == 1,
+            'REVIEWED_STATUS_NETWORK_BARRIER_HOOK_UNBOUND')
+    network = NetworkAttachment(owner, session, registry, run, status_api)
+    try:
+        def prepare(argv, status_fd):
+            result = provider(argv, status_fd, privateNetwork=network.policy())
+            network.validate_preparation(result)
+            return result
+        status = status_api['StatusCustody'](owner, session, registry, run, semantic, prepare, network=network)
+        return status
+    except BaseException:
+        network.abort()
+        raise

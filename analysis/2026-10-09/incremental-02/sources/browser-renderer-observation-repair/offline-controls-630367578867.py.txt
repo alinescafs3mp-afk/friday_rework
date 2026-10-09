@@ -1,0 +1,109 @@
+"""Bounded offline replay of retained real G5 records; no browser execution."""
+import ast,copy,datetime,hashlib,importlib.util,json,os,resource,signal,sys,time,unittest
+from pathlib import Path
+from unittest.mock import patch
+E=Path(__file__).resolve().parent; C=E/'candidate'; W=E.parent
+os.umask(0o077);os.sched_setaffinity(0,{0,1});resource.setrlimit(resource.RLIMIT_AS,(2*1024**3,)*2);resource.setrlimit(resource.RLIMIT_CPU,(40,)*2);signal.alarm(60)
+clock=json.loads((E/'clock.json').read_text());assert time.monotonic()+60<clock['deadline_monotonic']
+def audit(event,args):
+ if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.posix_spawn','os.posix_spawnp'):raise RuntimeError('offline_effect_denied')
+ if event=='open' and isinstance(args[0],(str,bytes,os.PathLike)) and args[2]&(os.O_WRONLY|os.O_RDWR|os.O_CREAT|os.O_TRUNC|os.O_APPEND):
+  assert Path(os.fsdecode(args[0])).resolve().is_relative_to(E),'foreign_write_denied'
+sys.addaudithook(audit)
+def load(name,path):
+ s=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);return m
+p=load('candidate_probe',C/'probe.py');old=load('old_probe',W/'browser-native-g5-source/probe.py')
+source=W/'browser-prerequisite-live-g5/exit-observation.json'
+retained=json.loads(source.read_text()); records=[json.loads(line) for line in retained['runtime_stderr'].splitlines() if line.startswith('{')]
+b=records[0]['sandbox_browser_observation'];r=records[1]['sandbox_renderer_observation']; neg=[]
+def check(b=b,r=r):return p.check_sandbox_records(b,[r],b['uid_map'],[123])
+def fake_text(path,*args,**kwargs):
+ n=str(path);record=b if str(b['pid']) in n else r
+ if n.endswith('/cgroup.procs'):return str(b['pid'])+'\n'+str(r['pid'])+'\n'
+ if n=='/proc/self/uid_map':return '0 0 4294967295\n'
+ if n=='/proc/self/status':return 'NSpid:\t123\n'
+ if n.endswith('/stat'):return str(record['pid'])+' (chrome shell) S '+'0 '*18+str(record['start_time'])+' '+'0 '*8
+ if n.endswith('/cgroup'):return '0::'+record['cgroup']+'\n'
+ if n.endswith('/status'):
+  keys={'Uid':' '.join(map(str,record['uid'])),'NSpid':' '.join(map(str,record['nspid'])),'NoNewPrivs':str(record['no_new_privs']),'Seccomp':str(record['seccomp']),'Seccomp_filters':str(record['seccomp_filters']),'CapEff':hex(record['cap_eff'])[2:],'CapPrm':hex(record['cap_prm'])[2:]}
+  return '\n'.join(k+':\t'+v for k,v in keys.items())+'\n'
+ if n.endswith('/uid_map') or n.endswith('/gid_map'):return '\n'.join(' '.join(map(str,row)) for row in record[Path(n).name])+'\n'
+ if n.endswith('/attr/apparmor/current'):return p.LABEL+'\n'
+ raise AssertionError(n)
+def fake_bytes(path):
+ rec=b if str(b['pid']) in str(path) else r
+ return ('\0'.join(rec['argv'])+'\0').encode()
+class Session:
+ infos=[{'type':'browser','id':b['pid']},{'type':'renderer','id':r['pid']}]
+ def send(self,method):assert method=='SystemInfo.getProcessInfo';return {'processInfo':self.infos}
+ def detach(self):pass
+class Browser:
+ def new_browser_cdp_session(self):return Session()
+class Tests(unittest.TestCase):
+ def test_01_original_real_g5_failure_reproduced(self):
+  with self.assertRaisesRegex(RuntimeError,'renderer_identity_invalid'):old.check_sandbox_records(b,[r],b['uid_map'],[123])
+ def test_02_retained_real_records_pass(self):check()
+ def test_03_title_never_proves_absence(self):
+  o=p.command_line_observation(r['argv']);self.assertEqual(o,{'format':'rewritten_process_title','complete':False,'unsafe_switch_absence_proven':False,'renderer_type_observed':True})
+ def test_04_browser_observation_complete(self):
+  o=p.command_line_observation(b['argv'],True);self.assertTrue(o['complete'] and o['unsafe_switch_absence_proven'])
+ def test_05_visible_unsafe_flags_rejected(self):
+  for flag in p.UNSAFE_SWITCHES:
+   for suffix in ('','=1'):
+    for argv in ([p.EXECUTABLE,'--type=renderer',flag+suffix],[p.EXECUTABLE+' --type=renderer '+flag+suffix+' --tail=x']):
+     with self.subTest(argv=argv),self.assertRaisesRegex(RuntimeError,'unsafe_browser_switch'):p.command_line_observation(argv)
+     neg.append(['unsafe_flag',argv])
+ def test_06_truncated_unsafe_prefix_rejected(self):
+  for flag in p.UNSAFE_SWITCHES:
+   with self.subTest(flag=flag),self.assertRaisesRegex(RuntimeError,'unsafe_browser_switch_prefix'):p.command_line_observation([p.EXECUTABLE+' --type=renderer '+flag[:-2]])
+ def test_07_renderer_type_complete_token_required(self):
+  for suffix in (' --type=renderer',' --type=render',' --type=rendererX --x=1',' --x=--type=renderer --y=1',' --type=gpu-process --x=1'):
+   rr=copy.deepcopy(r);rr['argv']=[p.EXECUTABLE+suffix]
+   with self.subTest(suffix=suffix),self.assertRaisesRegex(RuntimeError,'renderer_identity_invalid'):check(r=rr)
+ def test_08_browser_rewritten_refused(self):
+  with self.assertRaisesRegex(RuntimeError,'unexpected_process_title'):p.command_line_observation([p.EXECUTABLE+' --foo'],True)
+ def test_09_regular_renderer_vector_still_passes(self):
+  rr=copy.deepcopy(r);rr['argv']=[p.EXECUTABLE,'--type=renderer'];check(r=rr)
+ def test_10_security_predicates_unchanged(self):
+  cases=[('browser','label','unconfined'),('browser','executable','/tmp/browser'),('browser','uid',[0]*4),('browser','cap_eff',1),('browser','uid_map',[[1000,1000,1]]),('browser','seccomp',0),('browser','seccomp_filters',0),('renderer','no_new_privs',0),('renderer','seccomp',0),('renderer','seccomp_filters',b['seccomp_filters']),('renderer','nspid',[r['pid']]),('renderer','nspid',[999,3]),('renderer','uid_map',[[0,0,4294967295]]),('renderer','uid_map',[[1000,1000,2]]),('renderer','uid_map',[[0,1000,1]]),('renderer','gid_map',[]),('renderer','uid',[0]*4),('renderer','cap_prm',1),('renderer','cgroup','/foreign'),('renderer','argv',[p.EXECUTABLE])]
+  for who,key,value in cases:
+   bb,rr=copy.deepcopy(b),copy.deepcopy(r);(bb if who=='browser' else rr)[key]=value
+   with self.subTest(who=who,key=key),self.assertRaises(RuntimeError):check(bb,rr)
+   neg.append([who,key,value])
+  with self.assertRaisesRegex(RuntimeError,'no_renderer_observed'):p.check_sandbox_records(b,[],b['uid_map'],[123])
+ def test_11_process_record_replay(self):
+  with patch.object(Path,'read_text',fake_text),patch.object(Path,'read_bytes',fake_bytes),patch.object(p.os,'readlink',return_value=p.EXECUTABLE):
+   for record,is_browser in ((b,True),(r,False)):
+    actual=p.process_record(record['pid'],b['cgroup'],{b['pid'],r['pid']},is_browser)
+    obs=actual.pop('argv_observation');self.assertEqual(actual,record);self.assertEqual(obs['complete'],is_browser)
+ def test_12_process_reuse_refused(self):
+  with patch.object(Path,'read_text',fake_text),patch.object(Path,'read_bytes',fake_bytes),patch.object(p,'start_time',side_effect=[1,2]):
+   with self.assertRaisesRegex(RuntimeError,'process_identity_changed'):p.process_record(r['pid'],b['cgroup'],{r['pid']})
+ def test_13_foreign_pid_refused_before_read(self):
+  with patch.object(Path,'read_text',side_effect=AssertionError('forbidden read')):
+   for pid in (True,0,-1,999):
+    with self.assertRaisesRegex(RuntimeError,'pid_outside_owned_cgroup'):p.process_record(pid,b['cgroup'],{r['pid']})
+ def test_14_full_observer_retained_replay(self):
+  with patch.object(Path,'read_text',fake_text),patch.object(Path,'read_bytes',fake_bytes),patch.object(p.os,'readlink',return_value=p.EXECUTABLE):
+   evidence=p.observe_sandbox(Browser(),Path('/owned'),b['cgroup'])
+   self.assertEqual(evidence['renderers'][0]['pid'],r['pid']);self.assertFalse(evidence['renderers'][0]['argv_observation']['unsafe_switch_absence_proven'])
+ def test_15_cdp_scope_refused_before_read(self):
+  with patch.object(Path,'read_text',fake_text),patch.object(Session,'infos',[{'type':'browser','id':999}]),patch.object(p,'process_record',side_effect=AssertionError('forbidden read')):
+   with self.assertRaisesRegex(RuntimeError,'cdp_pid_outside_owned_cgroup'):p.observe_sandbox(Browser(),Path('/owned'),b['cgroup'])
+ def test_16_final_start_time_reuse_refused(self):
+  with patch.object(Path,'read_text',fake_text),patch.object(Path,'read_bytes',fake_bytes),patch.object(p.os,'readlink',return_value=p.EXECUTABLE),patch.object(p,'start_time',side_effect=[b['start_time']]*2+[r['start_time']]*2+[1]):
+   with self.assertRaisesRegex(RuntimeError,'observed_process_not_stable'):p.observe_sandbox(Browser(),Path('/owned'),b['cgroup'])
+ def test_17_driver_exact_except_task(self):
+  old=(W/'browser-native-g5-source/run-live-unit.py').read_text();new=(C/'run-live-unit.py').read_text();self.assertEqual(old.replace('FRW041-BROWSER-PROTECTED-PATH-PREPARATION#1','FRW041-BROWSER-RENDERER-OBSERVATION-REPAIR#1'),new)
+  self.assertEqual((W/'browser-native-g5-source/source-pins.json').read_bytes(),(C/'source-pins.json').read_bytes())
+ def test_18_probe_unaffected_functions_identical(self):
+  def functions(path):return {n.name:ast.dump(n) for n in ast.parse(path.read_text()).body if isinstance(n,ast.FunctionDef)}
+  aa=functions(W/'browser-native-g5-source/probe.py');bb=functions(C/'probe.py')
+  self.assertEqual(set(bb)-set(aa),{'command_line_observation'})
+  self.assertEqual({n for n in aa if aa[n]!=bb[n]},{'process_record','check_sandbox_records','observe_sandbox'})
+ def test_19_title_not_shell_argv(self):
+  rr=copy.deepcopy(r);rr['argv']=[p.EXECUTABLE+' --type=renderer --x="incomplete quote'];check(r=rr)
+  self.assertFalse(p.command_line_observation(rr['argv'])['complete'])
+started=time.monotonic();result=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests))
+report={'status':'PASS' if result.wasSuccessful() else 'FAIL','cases':result.testsRun,'failures':[(t.id(),s) for t,s in result.failures+result.errors],'elapsed_seconds':time.monotonic()-started,'negative_subcases':neg,'retained_real_g5':{'path':str(source),'sha256':hashlib.sha256(source.read_bytes()).hexdigest(),'browser_pid':b['pid'],'renderer_pid':r['pid']},'meaning':'Offline replay of retained actual records and synthetic fault controls; not a live execution or native acceptance. Rewritten title cannot prove all unsafe switches absent.','source_sha256':{f.name:hashlib.sha256(f.read_bytes()).hexdigest() for f in C.iterdir()},'resources':{'affinity':sorted(os.sched_getaffinity(0)),'address_space_bytes':resource.getrlimit(resource.RLIMIT_AS)[0],'cpu_seconds':40,'wall_alarm_seconds':60},'effects':{'browser':0,'services':0,'network':0,'policy':0,'sudo':0,'children':0},'completed_msk':datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3))).isoformat()}
+(E/'offline-controls.json').write_text(json.dumps(report,indent=2)+'\n');raise SystemExit(0 if result.wasSuccessful() else 1)

@@ -1,0 +1,233 @@
+"""Inert source controls, NOT native/kernel proof; authored, not executed here."""
+import ast
+import fcntl
+import hashlib
+import ipaddress
+import math
+from pathlib import Path
+import stat
+from types import SimpleNamespace as NS
+from unittest.mock import Mock
+import pytest
+
+SOURCE = Path(__file__).resolve().parents[1] / 'owner-helper/private_network.py'
+
+
+def load_model():
+    tree = ast.parse(SOURCE.read_text())
+    nodes = [n for n in tree.body if isinstance(n, (ast.Assign, ast.FunctionDef, ast.ClassDef))]
+    clock = {'now': 100.0}
+    os = NS(getuid=lambda:1000, get_inheritable=lambda fd:False)
+    env = dict(Path=Path, ipaddress=ipaddress, fcntl=fcntl, hashlib=hashlib, math=math,
+               stat=stat, os=os, time=NS(monotonic=lambda:clock['now']),
+               select=NS(select=Mock(return_value=([], [], []))),
+               subprocess=NS(Popen=Mock(side_effect=AssertionError('no real subprocess'))))
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), 'exec'), env)
+    obj = env['NetworkAttachment'].__new__(env['NetworkAttachment'])
+    obj.failed = obj.closed = obj.released = False
+    obj.deadline, obj.startup_end = 200.0, 105.0
+    obj.proc=NS(returncode=None); obj.pidfd=11; obj.donor_proc=NS(returncode=None)
+    obj.session=NS(process=obj.donor_proc, _runtest_pidfd=12, runtest_deadline=200.0,
+                   runtest_stop_requested=False, runtest_persistence_error='', runtest_pidfd_error='',
+                   runtest_outer={'unit':'original'})
+    obj.owner=NS(deadline=200.0, pre={'reserve_seconds':10}, stop_requested=lambda:False,
+                 require_current=Mock())
+    obj.block_write=13; obj.block_identity=[1,2]; obj._pipe=Mock(); obj._close=Mock()
+    env['os'].write=Mock(return_value=1)
+    return env, obj, clock
+
+
+@pytest.mark.parametrize('cut', ['entry', 'owner', 'stop', 'outer_mismatch', 'good'])
+def test_same_startup_anchor_fences_owner_return(cut):
+    env, obj, clock=load_model()
+    if cut=='entry': clock['now']=105
+    elif cut=='owner': obj.owner.require_current.side_effect=lambda outer:clock.update(now=105)
+    elif cut=='stop': obj.owner.stop_requested=lambda:True
+    elif cut=='outer_mismatch': obj.session.runtest_deadline=201
+    if cut=='good': obj._startup_current()
+    else:
+        with pytest.raises(env['NetworkRefusal']): obj._startup_current()
+    assert obj.startup_end==105 and obj.deadline==200
+
+
+@pytest.mark.parametrize('cut', ['entry', 'owner', 'pipe', 'helper_exit', 'donor_exit',
+                                  'select_late', 'write_error', 'short_write', 'good'])
+def test_final_release_requires_fresh_both_retained_pidfds_after_owner_check(cut):
+    env,obj,clock=load_model(); calls=[]
+    def owner(outer):
+        calls.append('owner')
+        if cut=='owner': clock['now']=105
+    obj.owner.require_current.side_effect=owner
+    def poll(fds, *args):
+        calls.append(('pidfds',list(fds)))
+        if cut=='select_late': clock['now']=105
+        return ([11] if cut=='helper_exit' else [12] if cut=='donor_exit' else [],[],[])
+    env['select'].select.side_effect=poll
+    if cut=='entry': clock['now']=105
+    if cut=='pipe': obj._pipe.side_effect=lambda *args:clock.update(now=105)
+    if cut=='write_error': env['os'].write.side_effect=OSError('inert write failure')
+    if cut=='short_write': env['os'].write.return_value=0
+    if cut=='good':
+        obj._release()
+        assert obj.released
+        env['os'].write.assert_called_once_with(13,b'1')
+        assert calls[-1]==('pidfds',[11,12])
+        obj._close.assert_called_once_with('block_write')
+    else:
+        with pytest.raises((env['NetworkRefusal'],OSError)): obj._release()
+        assert not obj.released
+        if cut not in ('write_error','short_write'): env['os'].write.assert_not_called()
+    assert obj.startup_end==105 and obj.deadline==200
+
+
+@pytest.mark.parametrize('cut', ['select_late', 'read_late', 'owner_late', 'helper_exit', 'donor_exit', 'good'])
+def test_ready_eof_does_not_skip_post_return_fences(cut):
+    env,obj,clock=load_model(); obj.ready_read=14; chunks=iter([b'1',b''])
+    def poll(*args):
+        if cut=='select_late':clock['now']=105
+        return ([14,11] if cut=='helper_exit' else [14,12] if cut=='donor_exit' else [14],[],[])
+    def read(*args):
+        chunk=next(chunks)
+        if cut=='read_late' and not chunk:clock['now']=105
+        if cut=='owner_late' and not chunk:
+            obj.owner.require_current.side_effect=lambda outer:clock.update(now=105)
+        return chunk
+    env['select'].select.side_effect=poll;env['os'].read=read
+    if cut=='good':obj._ready();obj._close.assert_called_once_with('ready_read')
+    else:
+        with pytest.raises(env['NetworkRefusal']):obj._ready()
+        obj._close.assert_not_called()
+    env['os'].write.assert_not_called()
+
+
+@pytest.mark.parametrize('cut', ['binary_hash', 'pidfd_preflight', 'good'])
+def test_helper_preflight_cannot_spend_then_renew_startup(cut):
+    env,obj,clock=load_model()
+    digest='a'*64
+    def sha(path):
+        if cut=='binary_hash':clock['now']=105
+        return digest
+    obj.owner.h=NS(NETWORK_PATCH_SHA256='b'*64,sha=sha)
+    obj.owner.plan={'private_network':{'driver':env['DRIVER'], 'path_target_sandbox_patch_sha256':'b'*64,
+                                      'binary_sha256':digest,'binary':'/reviewed/slirp'}}
+    env['Path']=lambda value:NS(is_absolute=lambda:True,is_symlink=lambda:False,
+                               stat=lambda:NS(st_mode=0o555),__str__=lambda self:'/reviewed/slirp')
+    # Any Popen attempt is a source sentinel, never an actual process.
+    env['os'].pipe2=Mock(side_effect=[(14,15),(16,17)]);env['os'].O_CLOEXEC=0
+    obj.userfd,obj.netfd=18,19
+    obj.registry=NS(_require_runtest_pidfd_acquisition=Mock())
+    if cut=='pidfd_preflight':obj.registry._require_runtest_pidfd_acquisition.side_effect=lambda:clock.update(now=105)
+    env['subprocess'].DEVNULL=-3
+    if cut=='good':
+        with pytest.raises(AssertionError,match='no real subprocess'):obj._start_helper()
+        env['subprocess'].Popen.assert_called_once()
+    else:
+        with pytest.raises(env['NetworkRefusal']):obj._start_helper()
+        env['subprocess'].Popen.assert_not_called()
+
+
+@pytest.mark.parametrize('cut', ['write_seal', 'grow_seal', 'shrink_seal', 'seal_seal',
+                                  'linked', 'wrong_inode', 'wrong_size', 'content', 'inheritable', 'good'])
+def test_resolver_requires_kernel_seals_for_all_fd_aliases(cut):
+    env,obj,clock=load_model(); data=b'nameserver 192.168.12.2\n'
+    obj.resolver_fd=20;obj.resolver_identity=[3,4];obj.resolver_size=len(data)
+    obj.resolver_sha=hashlib.sha256(data).hexdigest()
+    seals=fcntl.F_SEAL_WRITE|fcntl.F_SEAL_GROW|fcntl.F_SEAL_SHRINK|fcntl.F_SEAL_SEAL
+    removed={'write_seal':fcntl.F_SEAL_WRITE,'grow_seal':fcntl.F_SEAL_GROW,
+             'shrink_seal':fcntl.F_SEAL_SHRINK,'seal_seal':fcntl.F_SEAL_SEAL}.get(cut,0)
+    env['fcntl']=NS(F_SEAL_WRITE=fcntl.F_SEAL_WRITE,F_SEAL_GROW=fcntl.F_SEAL_GROW,
+                    F_SEAL_SHRINK=fcntl.F_SEAL_SHRINK,F_SEAL_SEAL=fcntl.F_SEAL_SEAL,
+                    F_GET_SEALS=fcntl.F_GET_SEALS,fcntl=lambda fd,op:seals & ~removed)
+    env['os'].fstat=lambda fd:NS(st_mode=stat.S_IFREG|0o777, st_uid=1000,
+        st_nlink=1 if cut=='linked' else 0,st_dev=3,st_ino=99 if cut=='wrong_inode' else 4,
+        st_size=1 if cut=='wrong_size' else len(data))
+    env['os'].get_inheritable=lambda fd:cut=='inheritable'
+    env['os'].pread=lambda *args:b'changed' if cut=='content' else data
+    if cut=='good':obj._resolver_current()
+    else:
+        with pytest.raises(env['NetworkRefusal']):obj._resolver_current()
+
+
+def test_preparation_passes_exact_anchor_without_second_clock():
+    env,obj,clock=load_model();seen=[]
+    net=NS(_startup_current=lambda:None,policy=lambda:{'source':'inert'},
+           validate_preparation=lambda result:None,abort=Mock())
+    def network(*args,**kwargs):seen.append(('network',kwargs['startup_end']));return net
+    def status(*args,**kwargs):
+        seen.append(('status',kwargs['startup_end']))
+        assert kwargs['network'] is net
+        args[-1]([],9)
+        return 'retained-status'
+    env['NetworkAttachment']=network
+    result=env['prepare_network_status'](None,None,None,None,[],lambda *args,**kwargs:{},
+        {'PRIVATE_NETWORK_HOOK_VERSION':2,'StatusCustody':status},startup_end=105)
+    assert result=='retained-status' and seen==[('network',105),('status',105)]
+
+
+def test_bwrap_consumer_refuses_eof_error_and_wrong_or_multiple_bytes_before_payload():
+    c=(SOURCE.parents[2] / 'bwrap-donor/bubblewrap.c').read_text()
+    start=c.index('/* FRW success-only barrier v1:')
+    end=c.index('if (opt_seccomp_fd != -1)',start)
+    block=c[start:end]
+    assert 'n = read (opt_block_fd, b, sizeof b);' in block
+    assert "if (n != 1 || b[0] != '1')" in block
+    assert 'TEMP_FAILURE_RETRY' not in block
+    assert block.index('die ("Invalid success-only block-fd token")') < block.index('close (opt_block_fd)')
+
+
+def test_finish_cleanup_uses_original_outer_budget_and_never_new_startup_clock():
+    tree=ast.parse(SOURCE.read_text())
+    cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='NetworkAttachment')
+    methods={n.name:n for n in cls.body if isinstance(n,ast.FunctionDef)}
+    for name in ('finish_after_donor','abort','_stop_helper'):
+        text=ast.unparse(methods[name])
+        assert 'startup_end' not in text and 'monotonic() +' not in text
+    assert "self.owner.control_timeout(2.0)" in ast.unparse(methods['_stop_helper'])
+
+
+@pytest.mark.parametrize('cut', ['exhausted', 'nonfinite', 'after_reserve'])
+def test_invalid_original_anchor_refuses_before_network_allocation(cut):
+    env,obj,clock=load_model();obj.session.process=None
+    obj.owner.persist_stop=Mock();obj.registry=NS(stop_runtest=Mock())
+    env['os'].pipe2=Mock(side_effect=AssertionError('allocation after invalid anchor'))
+    env['os'].memfd_create=Mock(side_effect=AssertionError('allocation after invalid anchor'))
+    end={'exhausted':100.0,'nonfinite':float('nan'),'after_reserve':191.0}[cut]
+    with pytest.raises(env['NetworkRefusal']):
+        env['NetworkAttachment'](obj.owner,obj.session,obj.registry,None,{},startup_end=end)
+    env['os'].pipe2.assert_not_called();env['os'].memfd_create.assert_not_called()
+    assert obj.owner._network_attachment.failed and obj.session.runtest_stop_requested
+    obj.owner.persist_stop.assert_called_once()
+
+
+@pytest.mark.parametrize('pin', ['UNBOUND', 'installed', 'wrong_digest', 'reviewed_fixture'])
+def test_status_refuses_unmodified_or_unbound_bwrap_before_donor_launch(pin):
+    source=SOURCE.parent/'native_status.py';tree=ast.parse(source.read_text())
+    names={'StatusRefusal','require','StatusCustody'}
+    nodes=[n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.ClassDef)) and n.name in names]
+    blob=b'inert reviewed build fixture';installed='a'*64;digest=hashlib.sha256(blob).hexdigest()
+    selected={'UNBOUND':'UNBOUND','installed':installed,'wrong_digest':'b'*64,'reviewed_fixture':digest}[pin]
+    env=dict(math=math,stat=stat,hashlib=hashlib,time=NS(monotonic=lambda:100.0),
+             BWRAP='/bwrap',BWRAP_SHA256=installed,INSTALLED_BWRAP_SHA256=installed,
+             BWRAP_NETWORK_SHA256=selected,NativeRecords=lambda:NS(),
+             ContourEvent=lambda run:NS(close=Mock()),provider_argv=lambda *args:['/bwrap'],
+             Path=lambda p:NS(read_bytes=lambda:blob) if p=='/bwrap' else Path(p))
+    env['os']=NS(O_CLOEXEC=1,O_NONBLOCK=2,pipe2=lambda flags:(8,9),set_blocking=lambda *args:None,
+                 fstat=lambda fd:NS(st_mode=stat.S_IFIFO,st_dev=1,st_ino=2),
+                 get_inheritable=lambda fd:False,close=Mock())
+    exec(compile(ast.Module(body=nodes,type_ignores=[]),str(source),'exec'),env)
+    owner=NS(parent=Path('/model'),pre={'reserve_seconds':10},stop_requested=lambda:False,
+             require_current=Mock())
+    session=NS(runtest_deadline=200,runtest_stop_requested=False,runtest_persistence_error='',
+               runtest_pidfd_error='',runtest_outer={})
+    registry=NS(spawn_runtest=Mock());network=NS(startup_end=105,abort=Mock())
+    if pin=='reviewed_fixture':
+        item=env['StatusCustody'](owner,session,registry,'/model/run',['semantic'],lambda *args:{},
+                                 startup_end=105,network=network)
+        item.close()
+    else:
+        with pytest.raises(env['StatusRefusal']):
+            env['StatusCustody'](owner,session,registry,'/model/run',['semantic'],lambda *args:{},
+                                 startup_end=105,network=network)
+        assert session.runtest_stop_requested
+        network.abort.assert_called_once()
+    registry.spawn_runtest.assert_not_called()

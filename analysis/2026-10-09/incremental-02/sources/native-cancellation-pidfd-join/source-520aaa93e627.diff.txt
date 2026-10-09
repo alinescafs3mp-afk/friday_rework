@@ -1,0 +1,948 @@
+--- sol/candidate/donor/source-pins.json
++++ join/candidate/donor/source-pins.json
+@@ -3,7 +3,7 @@
+   "scripts/run_tests_parallel.py": "db79d6c3c798e5fe87ce366271ea5c2e150d741eb7d0763a484273f96861e418",
+   "tests/tools/test_registry_lightweight_dispatch.py": "d8174e14cd68a3e65383c80c47b5811a64c9c46fed933f6baaf27e74bf5f1c20",
+   "tools/dispatch_helpers.py": "c9c2187f870ba0c1e13f779bc11a49c8a1e45967a83f762a3b969a10db60227d",
+-  "tools/process_registry.py": "a1b3ddbbbf333467281c3316e98dc7e36b73a182ce9531e6cbdaac37510dd785",
+-  "tools/process_registry_checkpoint.py": "28a7d5fa97b892ac44f7bead3c3f8c1d75cf60aeb54261eb322d8c8f3a883256",
++  "tools/process_registry.py": "58b53ff696859d93cfe3829b62b383a330ab376d3ebf58f4696685fd81eff9f3",
++  "tools/process_registry_checkpoint.py": "111eded59b622a8a5c0fbb516f0cf880692caaaa43136e013356fcff76e9788d",
+   "tools/registry.py": "655d54182dc838dd8d16d9ab0f383026555d76b8535cb5421211b98e18eeb8b4"
+ }
+--- sol/candidate/donor/tools/process_registry.py
++++ join/candidate/donor/tools/process_registry.py
+@@ -570,6 +570,9 @@
+     runtest_pgid: Optional[int] = None
+     runtest_sid: Optional[int] = None
+     runtest_persistence_error: str = ""
++    runtest_pidfd_error: str = ""
++    # Live descriptor only: never checkpoint an FD number or reopen a recovered PID.
++    _runtest_pidfd: Optional[int] = field(default=None, repr=False)
+     runtest_outer: Optional[dict] = None
+     runtest_outer_closed: Optional[dict] = None
+     web_tool_call_id: str = ""
+@@ -682,7 +685,7 @@
+ # Session fields persisted verbatim in the crash-recovery checkpoint (plus
+ # ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
+ _CHECKPOINT_FIELDS = (
+-    "runtest_custody", "runtest_unit", "runtest_deadline", "runtest_boot_id", "runtest_stop_requested", "runtest_launch_pending", "runtest_pgid", "runtest_sid", "runtest_persistence_error", "runtest_outer", "runtest_outer_closed",
++    "runtest_custody", "runtest_unit", "runtest_deadline", "runtest_boot_id", "runtest_stop_requested", "runtest_launch_pending", "runtest_pgid", "runtest_sid", "runtest_persistence_error", "runtest_pidfd_error", "runtest_outer", "runtest_outer_closed",
+     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "wsl_chain", "cwd",
+     "started_at", "task_id", "owner_task_id", "session_key",
+     "browser_custody", "browser_identity", "browser_task_key", "browser_session_name",
+@@ -1320,7 +1323,7 @@
+                 if len(matches) != 1 or any(matches[0].get(k) != getattr(session, k) for k in
+                         ('runtest_custody', 'runtest_unit', 'runtest_deadline', 'runtest_boot_id',
+                          'runtest_stop_requested', 'runtest_launch_pending', 'runtest_pgid', 'runtest_sid',
+-                         'runtest_persistence_error', 'runtest_outer', 'runtest_outer_closed',
++                         'runtest_persistence_error', 'runtest_pidfd_error', 'runtest_outer', 'runtest_outer_closed',
+                          'task_id', 'owner_task_id', 'session_key', 'pid', 'host_start_time')):
+                     raise RuntimeError('RUNTEST_CUSTODY_CHECKPOINT_UNCONFIRMED')
+             except BaseException as error:
+@@ -1356,72 +1359,170 @@
+         self._runtest_checkpoint(session)
+         return session
+ 
++    @staticmethod
++    def _require_runtest_pidfd_acquisition():
++        """Dedicated finite native owner only; never the general donor spawn path.
++
++        pidfd_open on a child that exited already is safe only while the zombie
++        cannot be reaped. The pinned CPython 3.14.7 HAVE_SIGACTION build resets
++        sa_flags to SA_ONSTACK (without SA_NOCLDWAIT) in PyOS_setsig. Reasserting
++        an already-default SIGCHLD therefore clears inherited no-zombie flags.
++        A lone main thread, no reaping signal handler and no wait/poll between
++        Popen and pidfd_open leave that child unreaped until the donor gets it.
++        The final interpreter/import review must establish that no hidden native
++        reaper or trace/audit callback is installed; this is not an arbitrary
++        multi-threaded registry capability or a replacement for that review.
++        """
++        import sys
++        if (not _IS_LINUX or sys.implementation.name != 'cpython' or
++                sys.version_info[:3] != (3, 14, 7) or
++                not callable(getattr(os, 'pidfd_open', None)) or
++                not callable(getattr(signal, 'pidfd_send_signal', None))):
++            raise RuntimeError('RUNTEST_PINNED_NATIVE_PIDFD_UNAVAILABLE')
++        if (threading.current_thread() is not threading.main_thread() or
++                len(list(Path('/proc/self/task').iterdir())) != 1 or
++                sys.gettrace() is not None or sys.getprofile() is not None):
++            raise RuntimeError('RUNTEST_SINGLE_MAIN_REAPER_REQUIRED')
++        if (signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL or
++                signal.getsignal(signal.SIGINT) not in (signal.SIG_DFL, signal.default_int_handler)):
++            raise RuntimeError('RUNTEST_SIGNAL_REAPER_NOT_QUALIFIED')
++        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
++        status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines())
++        child_bit = 1 << (signal.SIGCHLD - 1)
++        allowed_caught = (1 << (signal.SIGINT - 1)
++                          if signal.getsignal(signal.SIGINT) == signal.default_int_handler else 0)
++        if (signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL or
++                int(status['SigIgn'], 16) & child_bit or
++                int(status['SigCgt'], 16) != allowed_caught or
++                len(list(Path('/proc/self/task').iterdir())) != 1):
++            raise RuntimeError('RUNTEST_SIGNAL_DEFAULT_READBACK_UNCONFIRMED')
++
+     def spawn_runtest(self, session, argv, popen_kwargs, *, native_owner):
+-        """Transfer the actual handle to the sole donor BEFORE fallible setup.
+-
+-        Reservation was durable before Popen. The caller's donor try/finally
+-        already covers this callback; its retained_handle callback can recover
+-        session.process if an exception interrupts return. No second Popen.
++        """Pin the actual child before transferring it to the sole donor waiter.
++
++        Native whole-cgroup custody already exists before this callback. Retain
++        the Popen first, then acquire its pidfd with no intervening reap. Failures
++        consume the launch and leave that same handle for the donor's finally;
++        missing pidfd never authorizes numeric-PID cleanup or a second Popen.
+         """
+-        native_owner.require_current(session.runtest_outer)
++        try:
++            with session._lock:
++                if (not session.runtest_custody or session.detached or
++                        not session.runtest_launch_pending or session.process is not None or
++                        session._runtest_pidfd is not None or session.runtest_stop_requested or
++                        session.runtest_persistence_error or session.runtest_pidfd_error or
++                        time.monotonic() >= session.runtest_deadline or
++                        Path('/proc/sys/kernel/random/boot_id').read_text().strip() != session.runtest_boot_id):
++                    raise RuntimeError('RUNTEST_SPAWN_FENCED_NO_RETRY')
++                # Consume even a failed preflight/Popen attempt; recovery also
++                # fences every retained reservation, including a PID-less row.
++                session.runtest_launch_pending = False
++                native_owner.require_current(session.runtest_outer)
++                if popen_kwargs.get('start_new_session') is not True or str(popen_kwargs.get('cwd')) != session.cwd:
++                    raise RuntimeError('EXACT_DONOR_SID_AND_CWD_REQUIRED')
++                self._require_runtest_pidfd_acquisition()
++                if session.runtest_stop_requested or time.monotonic() >= session.runtest_deadline:
++                    raise RuntimeError('RUNTEST_STOPPED_BEFORE_POPEN_NO_RETRY')
++                session.process = subprocess.Popen(argv, **popen_kwargs)
++                session.pid = session.process.pid
++                session._runtest_pidfd = os.pidfd_open(session.pid, 0)
++                if os.get_inheritable(session._runtest_pidfd):
++                    raise RuntimeError('RUNTEST_PIDFD_CLOEXEC_REQUIRED')
++                if session.runtest_stop_requested or time.monotonic() >= session.runtest_deadline:
++                    raise RuntimeError('RUNTEST_STOPPED_DURING_SPAWN_NO_RETRY')
++                return session.process
++        except BaseException as error:
++            with session._lock:
++                session.runtest_stop_requested = True
++                if not session.runtest_pidfd_error:
++                    session.runtest_pidfd_error = 'spawn:' + type(error).__name__
++            # No diagnostic error can replace/lose the handle or retry launch.
++            try:
++                self._runtest_checkpoint(session)
++            except BaseException:
++                pass  # _runtest_checkpoint already retains the persistence error.
++            raise
++
++    def attach_runtest(self, session, proc):
++        """Record identity after pidfd acquisition; donor has not waited yet."""
++        try:
++            with session._lock:
++                if (session.process is not proc or proc.pid != session.pid or session.runtest_launch_pending or
++                        session._runtest_pidfd is None or session.runtest_stop_requested or session.runtest_pidfd_error):
++                    raise RuntimeError('FOREIGN_OR_UNPINNED_RUNTEST_HANDLE')
++                session.host_start_time = self._safe_host_start_time(proc.pid)
++                session.runtest_pgid = os.getpgid(proc.pid)
++                session.runtest_sid = os.getsid(proc.pid)
++                if (session.runtest_pgid != proc.pid or session.runtest_sid != proc.pid or
++                        session.host_start_time is None):
++                    raise RuntimeError('RUNTEST_NATIVE_IDENTITY_UNCONFIRMED')
++            self._runtest_checkpoint(session)
++        except BaseException:
++            # getpgid/getsid/start-tick and strict checkpoint failures all leave
++            # the acquired pidfd and actual Popen with the same donor finally.
++            session.runtest_stop_requested = True
++            raise
++
++    def stop_runtest(self, session, *, source='process.kill'):
++        # Latch before waiting for the acquisition/close lock. A stop arriving
++        # during Popen cannot be erased by its return or an attach/checkpoint.
++        session.runtest_stop_requested = True
++        result = {'status': 'STOP_UNCONFIRMED', 'session_id': session.id, 'source': source,
++                  'persistence_error': session.runtest_persistence_error,
++                  'native_whole_cgroup_closure_required': True}
+         with session._lock:
+-            if (not session.runtest_custody or not session.runtest_launch_pending or session.process is not None or
+-                session.runtest_stop_requested or session.runtest_persistence_error or
+-                time.monotonic() >= session.runtest_deadline or
+-                Path('/proc/sys/kernel/random/boot_id').read_text().strip() != session.runtest_boot_id):
+-                raise RuntimeError('RUNTEST_SPAWN_FENCED_NO_RETRY')
+-            if popen_kwargs.get('start_new_session') is not True or str(popen_kwargs.get('cwd')) != session.cwd:
+-                raise RuntimeError('EXACT_DONOR_SID_AND_CWD_REQUIRED')
+-            proc = subprocess.Popen(argv, **popen_kwargs)
+-            session.process = proc
+-            session.pid = proc.pid
+-            session.runtest_launch_pending = False
+-            return proc
+-
+-    def attach_runtest(self, session, proc):
+-        """Fallible identity/checkpoint setup AFTER donor has the actual handle."""
+-        with session._lock:
+-            if session.process is not proc or proc.pid != session.pid or session.runtest_launch_pending:
+-                raise RuntimeError('FOREIGN_RUNTEST_HANDLE')
+-            session.host_start_time = self._safe_host_start_time(proc.pid)
+-            session.runtest_pgid = os.getpgid(proc.pid)
+-            session.runtest_sid = os.getsid(proc.pid)
+-            if (session.runtest_pgid != proc.pid or session.runtest_sid != proc.pid or
+-                    session.host_start_time is None):
+-                session.runtest_stop_requested = True
+-                raise RuntimeError('RUNTEST_NATIVE_IDENTITY_UNCONFIRMED')
+-        self._runtest_checkpoint(session)
+-
+-    def stop_runtest(self, session, *, source='process.kill'):
+-        # Immediate in-memory intent and identity-safe termination precede ANY
+-        # diagnostic I/O. Checkpoint failure must not delay the requested stop.
+-        # This existing stop has a separate pidfd review prerequisite; we never
+-        # weaken identity checks or turn a termination request into cessation.
+-        with session._lock:
+-            session.runtest_stop_requested = True
+-            pending = session.runtest_launch_pending
+-            pid, born = session.pid, session.host_start_time
+-        result = {'status': 'STOP_UNCONFIRMED', 'session_id': session.id, 'source': source,
+-                  'persistence_error': session.runtest_persistence_error}
+-        if pending or pid is None or born is None:
+-            result['reason'] = 'RESERVED_OR_UNCONFIRMED_SPAWN_RETAINED_NO_RETRY'
+-        elif session.runtest_deadline - time.monotonic() <= 2 * self._daemon_term_grace_seconds() + 1:
+-            result['reason'] = 'OWNER_NATIVE_HARD_DEADLINE_CUSTODY_REQUIRED'
+-        else:
+-            try:
+-                self._terminate_host_pid(pid, born)
+-                result['termination_attempted'] = True
+-            except BaseException as error:
+-                result['termination_error'] = type(error).__name__
++            if (not session.runtest_custody or session.detached or
++                    session.process is None or session._runtest_pidfd is None):
++                result['reason'] = 'NO_LIVE_PIDFD_RETAIN_NATIVE_OWNER_NO_NUMERIC_FALLBACK'
++            else:
++                try:
++                    # Abort only this actual child; no PID/start-time TOCTOU,
++                    # descendant walk, wait/poll, grace sleep or numeric signal.
++                    # FD close uses this same lock, so it cannot be reused here.
++                    signal.pidfd_send_signal(session._runtest_pidfd, signal.SIGKILL, None, 0)
++                    result['termination_attempted'] = True
++                except ProcessLookupError:
++                    result['termination_attempted'] = True
++                    result['root_already_exited'] = True
++                except BaseException as error:
++                    result['termination_error'] = type(error).__name__
++                    if not session.runtest_pidfd_error:
++                        session.runtest_pidfd_error = 'signal:' + type(error).__name__
+         try:
+             self._runtest_checkpoint(session)
+         except BaseException as error:
+             result['persistence_error'] = type(error).__name__
++        result['persistence_error'] = session.runtest_persistence_error or result['persistence_error']
+         if result.get('termination_attempted') and not result['persistence_error']:
+             result['status'] = 'STOP_REQUESTED'
+-        # Donor alone drains/waits; independent whole SID/PGID and outer
+-        # closure remain mandatory before registry/capacity release.
++        result['pidfd_error'] = session.runtest_pidfd_error
++        # This status records only root signal intent, never tree cessation.
++        # Donor alone drains/reaps; the native owner retains all descendants and
++        # the original hard deadline, even when a root pidfd reports ESRCH.
+         return result
++
++    def release_runtest_pidfd(self, session, proc):
++        """Close once after the SOLE donor's wait, before fallible diagnostics.
++
++        Unreaped failures retain the FD until that donor later reaps or the
++        finite native owner exits (kernel closes its FDs). Recovery never owns
++        an inherited descriptor and must use actual native outer closure.
++        """
++        with session._lock:
++            if proc is not session.process or proc is None:
++                raise RuntimeError('FOREIGN_RUNTEST_REAP_HANDLE')
++            if proc.returncode is None or session._runtest_pidfd is None:
++                return
++            fd, session._runtest_pidfd = session._runtest_pidfd, None
++            try:
++                os.close(fd)
++            except BaseException as error:
++                # Linux releases the fd early even on most close errors. Never
++                # retry a numeric fd that may already identify a different file.
++                session.runtest_stop_requested = True
++                if not session.runtest_pidfd_error:
++                    session.runtest_pidfd_error = 'close:' + type(error).__name__
++                raise
+ 
+     def finish_runtest(self, session, *, native_owner, returncode=None):
+         """Settle the original durable handle, including PID-less recovery.
+@@ -1439,6 +1540,8 @@
+         if proc is not None and returncode != proc.returncode:
+             raise RuntimeError('ACTUAL_DONOR_EXIT_CHANGED')
+         proof = native_owner.closure_for(session)
++        if proc is not None:
++            self.release_runtest_pidfd(session, proc)
+         # Durable closure precedes release. Historical errors/pending flags stay.
+         session.runtest_outer_closed = dict(proof, returncode=returncode)
+         session.runtest_stop_requested = True
+--- sol/candidate/donor/tools/process_registry_checkpoint.py
++++ join/candidate/donor/tools/process_registry_checkpoint.py
+@@ -34,7 +34,10 @@
+                     for s in self._running.values():
+                         if s.exited:
+                             continue
+-                        if s.host_start_time is None and s.pid_scope == "host" and s.pid:
++                        # Runtest identity is captured only before the donor reaps.
++                        # Recovery must not fill it from a possibly recycled PID.
++                        if (not s.runtest_custody and s.host_start_time is None
++                                and s.pid_scope == "host" and s.pid):
+                             s.host_start_time = self._safe_host_start_time(s.pid)
+                         entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
+                         entry["command"] = redact_sensitive_text(s.command, code_file=True)
+--- sol/candidate/owner-helper/input-spec.json
++++ join/candidate/owner-helper/input-spec.json
+@@ -1,6 +1,6 @@
+ {
+-  "source": "<SOL_WORK>/FRW026-NATIVE-BOUNDARY-CORRECTION-evidence/candidate/producer",
+-  "source_pins_sha256": "d8dae775abb2a09c1e2ff658e265c2512ce0e34e388e9ca63e6cb337655c1037",
++  "source": "<ASTRA_WORK>/native-cancellation-pidfd-join/candidate/producer",
++  "source_pins_sha256": "907cda2bd55e59232f2b1283426d7bcae81d6034f70e2259b6d0e285ebeb386b",
+   "precedent_helper": {
+     "path": "<ASTRA_WORK>/ordinary-skills-gnu-timeout-integration/qualify.py",
+     "sha256": "1fc14abb0feb3670f57daf2420b9665dea462b29005aa22627b0cba222bce863"
+@@ -80,7 +80,7 @@
+     "path": "<ASTRA_WORK>/collection-owner-timing-review/result.json",
+     "sha256": "9505fb201d76c2920d18c0cea6f81ac7516b446f311ce95f3c9c465b68ac76f7"
+   },
+-  "import_path_manifest": "<SOL_WORK>/FRW026-NATIVE-BOUNDARY-CORRECTION-evidence/candidate/producer/import-path-pins.json",
++  "import_path_manifest": "<ASTRA_WORK>/native-cancellation-pidfd-join/candidate/producer/import-path-pins.json",
+   "startup_observation": "Fresh profile-bound independent receipt required for runtime -P -s -B; old isolated observations apply only to unchanged canary/collection profile, exact bytes and same boot.",
+   "native_lexical_inputs": {
+     "hermes_time": {
+@@ -140,20 +140,20 @@
+   },
+   "runtime_overlay": {
+     "runner": {
+-      "path": "<SOL_WORK>/FRW026-NATIVE-BOUNDARY-CORRECTION-evidence/candidate/donor/scripts/run_tests_parallel.py",
++      "path": "<ASTRA_WORK>/native-cancellation-pidfd-join/candidate/donor/scripts/run_tests_parallel.py",
+       "sha256": "db79d6c3c798e5fe87ce366271ea5c2e150d741eb7d0763a484273f96861e418"
+     },
+     "registry": {
+-      "path": "<SOL_WORK>/FRW026-NATIVE-BOUNDARY-CORRECTION-evidence/candidate/donor/tools/process_registry.py",
+-      "sha256": "a1b3ddbbbf333467281c3316e98dc7e36b73a182ce9531e6cbdaac37510dd785"
++      "path": "<ASTRA_WORK>/native-cancellation-pidfd-join/candidate/donor/tools/process_registry.py",
++      "sha256": "58b53ff696859d93cfe3829b62b383a330ab376d3ebf58f4696685fd81eff9f3"
+     },
+     "checkpoint": {
+-      "path": "<SOL_WORK>/FRW026-NATIVE-BOUNDARY-CORRECTION-evidence/candidate/donor/tools/process_registry_checkpoint.py",
+-      "sha256": "28a7d5fa97b892ac44f7bead3c3f8c1d75cf60aeb54261eb322d8c8f3a883256"
++      "path": "<ASTRA_WORK>/native-cancellation-pidfd-join/candidate/donor/tools/process_registry_checkpoint.py",
++      "sha256": "111eded59b622a8a5c0fbb516f0cf880692caaaa43136e013356fcff76e9788d"
+     }
+   },
+   "runtime_receipt_schema": 3,
+-  "runtime_plan_sha256": "5e30cf57eee71ce9e238958b556234c8ac7471504a378e076b374427e53a2c84",
++  "runtime_plan_sha256": "b2f94bc83bf1537fbf25e1a757e1630c3006104b702c76d5752dd88c76cc47b2",
+   "runtime_caller": "Existing actual native owner may call run_donor_file/observe/finish_runtime_file only after independent final source/custody/effect admission. Old phase-caller.js has consumed clock and hardcoded old backend PID; not reusable execution authority.",
+   "pending_coherent_source_review": {
+     "state": "REQUIRED_NOT_GRANTED",
+@@ -184,5 +184,16 @@
+     "native_outer_and_final_roots_bound": false,
+     "source_acceptance_or_runtime_grant": false,
+     "dependency": "Root separate pidfd merge, supported effective containment and final consumer binding/review/qualification"
++  },
++  "cancellation_pidfd_source_join": {
++    "assignment": "FRW026-NATIVE-CANCELLATION-PIDFD-JOIN#1",
++    "state": "SOURCE_ONLY_NEB2_4_PIDFD_JOIN_NEB1_UNCONDITIONALLY_BLOCKED",
++    "source_maps_bound": true,
++    "source_control_results": "ALL_NOT_RUN_ON_JOINED_BYTES",
++    "runtime_overlay_meaning": "Exact sparse SOURCE leaves only; final executable roots and imports remain unbound.",
++    "native_outer_and_final_roots_bound": false,
++    "runtime_custody_integrated": false,
++    "source_acceptance_or_runtime_grant": false,
++    "prior_native_boundary_correction_is_provenance": true
+   }
+ }
+--- sol/candidate/owner-helper/owner_observer.py
++++ join/candidate/owner-helper/owner_observer.py
+@@ -408,6 +408,7 @@
+                         prior_row.get('runtest_stop_requested') is False and
+                         prior_row.get('runtest_launch_pending') is False and
+                         prior_row.get('runtest_persistence_error') == '' and
++                        prior_row.get('runtest_pidfd_error') == '' and
+                         prior_row.get('runtest_outer_closed') is None,
+                         'PREVIOUS_RUNTIME_ORIGINAL_STOP_OR_UNCERTAINTY')
+         else:
+@@ -932,8 +933,9 @@
+         kwargs['env'] = temp_api['clean_environment'](run, clock=clock)
+         kwargs['stdin'] = donor['subprocess'].DEVNULL
+         kwargs['close_fds'] = True
+-        # No stat, checkpoint or backend write after Popen in this callback.
+-        # The donor receives the actual handle before after_spawn may fail.
++        # Registry retains the actual handle and acquires a native pidfd before
++        # return; its failure path is covered by donor retained_handle/finally.
++        # Identity/checkpoint/backend writes may still fail after transfer.
+         return registry.spawn_runtest(session, before['argv'], kwargs, native_owner=native_owner)
+     def after_spawn(proc):
+         holder['proc'] = proc
+@@ -950,12 +952,18 @@
+             'phase_clock_sha256': before['phase_clock_sha256'], 'native_outer': session.runtest_outer})
+     def capture(proc, output, error, cuts):
+         require(proc is session.process, 'FOREIGN_DONOR_OUTPUT')
+-        session.append_output(output)
+-        holder['proc'] = proc
++        # Keep output before fallible diagnostics/FD close. Root reap and local
++        # fd release do not release registry or native whole-cgroup custody.
++        try:
++            session.append_output(output)
++            holder['proc'] = proc
++        finally:
++            registry.release_runtest_pidfd(session, proc)
+         put(parent / 'runtest-drain.json', {'session_id': session.id, 'pid': proc.pid,
+             'exit_code': proc.returncode, 'output': output,
+             'primary_error': type(error).__name__ if error is not None else None,
+             'cleanup_errors': list(cuts), 'registry_persistence_error': session.runtest_persistence_error,
++            'registry_pidfd_error': session.runtest_pidfd_error,
+             'sole_drainer': 'donor communicate', 'reaped': proc.returncode is not None,
+             'runtime_or_product_accepted': False})
+     def stop(proc, pgid):
+@@ -969,6 +977,7 @@
+     def settle(proc, pgid, temproot):
+         require(temproot == str(temp_api['verify_donor_temporary_root'](clock)), 'FOREIGN_DONOR_TEMP_SETTLEMENT')
+         require(proc is session.process and pgid == session.runtest_pgid, 'FOREIGN_DONOR_SETTLEMENT')
++        require(not session.runtest_pidfd_error, 'RUNTEST_PIDFD_FAILURE_RETAINED_NO_ACCEPTANCE')
+         require(proc.returncode is not None, 'DONOR_NOT_REAPED')
+         require(type(session.pid) is int and session.pid == proc.pid and
+                 type(session.host_start_time) is int and session.host_start_time > 0 and
+@@ -1055,9 +1064,12 @@
+         returncode = drain['exit_code']
+         # The drain can retain a persistence/cleanup failure that never reached
+         # the original checkpoint. Keep the genuine result, fence continuation.
+-        drain_allows_next = (drain.get('primary_error') is None and
+-                            drain.get('cleanup_errors') == [] and
+-                            drain.get('registry_persistence_error') == '')
++        drain_allows_next = ('primary_error' in drain and drain['primary_error'] is None and
++                            type(drain.get('cleanup_errors')) is list and drain['cleanup_errors'] == [] and
++                            type(drain.get('registry_persistence_error')) is str and
++                            drain['registry_persistence_error'] == '' and
++                            type(drain.get('registry_pidfd_error')) is str and
++                            drain['registry_pidfd_error'] == '')
+     # Persist actual native closure BEFORE the checkpoint row may be removed.
+     # A crash after removal can then reconcile custody without replay or PASS.
+     prior = native_owner.closure_for(session)
+--- sol/candidate/owner-helper/runtest_outer.py
++++ join/candidate/owner-helper/runtest_outer.py
+@@ -206,17 +206,19 @@
+                   'runtest_deadline', 'runtest_boot_id', 'runtest_outer',
+                   'pid', 'host_start_time', 'runtest_pgid', 'runtest_sid',
+                   'runtest_stop_requested', 'runtest_launch_pending',
+-                  'runtest_persistence_error', 'runtest_outer_closed')
++                  'runtest_persistence_error', 'runtest_outer_closed', 'runtest_pidfd_error')
+         original_row = {key: row.get(key) for key in fields}
++        fields_complete = all(key in row for key in fields)
+         path = self.parent / 'registry-disposition.json'
+         checkpoint = self.control / 'profile/processes.json'
+         check(self.h.sha(checkpoint) == checkpoint_sha256, 'ORIGINAL_CHECKPOINT_CHANGED_BEFORE_SNAPSHOT')
+         self.disposition_reentered = path.exists() or path.is_symlink()
++        expected_record = {'schema': 1, 'identity': self.intent_identity(),
++            'checkpoint_sha256': checkpoint_sha256, 'original_row': original_row,
++            'fields_complete': fields_complete,
++            'state': 'ORIGINAL_REGISTRY_DISPOSITION_BEFORE_RECOVERY'}
+         if not self.disposition_reentered:
+-            self.h.put(path, {'schema': 1, 'identity': self.intent_identity(),
+-                'checkpoint_sha256': checkpoint_sha256, 'original_row': original_row,
+-                'fields_complete': all(key in row for key in fields),
+-                'state': 'ORIGINAL_REGISTRY_DISPOSITION_BEFORE_RECOVERY'})
++            self.h.put(path, expected_record)
+         self.h.private(path, 0o400)
+         record = self.h.read(path)
+         prior = record.get('original_row', {})
+@@ -224,7 +226,9 @@
+         check(record.get('schema') == 1 and record.get('identity') == self.intent_identity() and
+               record.get('state') == 'ORIGINAL_REGISTRY_DISPOSITION_BEFORE_RECOVERY' and
+               all(prior.get(key) == original_row[key] for key in stable) and
+-              (self.disposition_reentered or record.get('checkpoint_sha256') == checkpoint_sha256),
++              (self.disposition_reentered or
++               (record == expected_record and
++                record.get('fields_complete') is fields_complete)),
+               'ORIGINAL_REGISTRY_DISPOSITION_READBACK_FAILED')
+         check(self.h.sha(checkpoint) == checkpoint_sha256, 'ORIGINAL_CHECKPOINT_CHANGED_BEFORE_RECOVERY')
+         self.registry_disposition = record
+@@ -240,9 +244,11 @@
+                 prior.get('runtest_stop_requested') is False and
+                 prior.get('runtest_launch_pending') is False and
+                 prior.get('runtest_persistence_error') == '' and
++                prior.get('runtest_pidfd_error') == '' and
+                 prior.get('runtest_outer_closed') is None and
+                 session.runtest_launch_pending is False and
+-                session.runtest_persistence_error == '' and not self.stop_requested())
++                session.runtest_persistence_error == '' and
++                getattr(session, 'runtest_pidfd_error', None) == '' and not self.stop_requested())
+ 
+     def control_timeout(self, maximum):
+         remaining = self.deadline - time.monotonic()
+--- sol/candidate/owner-helper/source-pins.json
++++ join/candidate/owner-helper/source-pins.json
+@@ -1,9 +1,9 @@
+ {
+   "PROPOSAL.md": "e0c7fb08b9eb59bde37a9aa2da3c20da9a32fc99a26915b3c5cb6e451ea26ab0",
+   "ROOT-RECIPE.md": "e7d956e2697a95c9f384845f5b8d2b23d6a9f79f7b5d45fb2511a04dcb142aa8",
+-  "input-spec.json": "1f20733c4cd3059eab3d7b718986369294237a18b8e8c43771675c328aada677",
++  "input-spec.json": "e4ba475f9688dc891b3a0381fe1e5069dc33a7ad998dcf19297754f65337365e",
+   "negative-check-sources.json": "2add0ee846e5d30144d06dde6cf0d122e6392f0efb05d6ce34a45907c9ee453d",
+-  "owner_observer.py": "3530424ce4041a8d2145f1e9e1519c1e288201ca9d07ace4c773f9687d041c05",
++  "owner_observer.py": "3a32d6fbf44d753110f6825185d4b02dc1a33c7731850e5f54299ad29e4016ba",
+   "receipt-schema.json": "c62929f263f5216041a060906b59b3b93355963b75040c12352ea3cf35c185bd",
+-  "runtest_outer.py": "d36341137e795bab6426a7be1e06599e2ddd3868a1355b63dbf60604320b96f8"
++  "runtest_outer.py": "a1f6217640a695c58388ececedacfdde73ee87e96eed7f3b8aa6c7ad0fb22982"
+ }
+--- sol/candidate/producer/native-boundary-qualification.json
++++ join/candidate/producer/native-boundary-qualification.json
+@@ -5,7 +5,7 @@
+   "native_models_are_kernel_evidence": false,
+   "source_controls": {
+     "file": "test_native_boundary_source.py",
+-    "sha256": "03dd9393a8b95d74fa360f2ff0432c834af907f2fcbb7051011dcf2cbfa281c8",
++    "sha256": "942cea838762093e15ad6efd5d0903e1223735ff880bd2dc6991123cebd6b953",
+     "literal_cases": 43,
+     "status": "NOT_RUN"
+   },
+@@ -67,5 +67,11 @@
+     "Stable full current native/project roots, native_outer manager/dependency/startup/import/consumer bindings",
+     "Existing fault and16 startup/18 outer controls, original budgets and complete own cessation",
+     "Complete mandatory70/1785/10, four compatibility suites and all product journeys; no live acceptance here"
+-  ]
++  ],
++  "cancellation_pidfd_join_source_controls": {
++    "file": "test_cancellation_pidfd_join_source.py",
++    "sha256": "8d088da38026742e18ee0338dadfe5eb058057ea8b4c1f785cf5290afd769a35",
++    "status": "NOT_RUN",
++    "basis": "Joined exact-source healthy/negative/mutation controls only; no kernel, runtime or product acceptance."
++  }
+ }
+--- sol/candidate/producer/runtest-plan.json
++++ join/candidate/producer/runtest-plan.json
+@@ -38166,7 +38166,7 @@
+   "startup_private_temp_source_contract": {
+     "state": "SOURCE_ONLY_REAL_QUALIFICATION_REQUIRED",
+     "qualification_file": "startup-temp-qualification.json",
+-    "qualification_sha256": "c6c1a4308d3e3761a6bc465af4e1d1e2597b4179309f8a71ec08672cf1582e6d",
++    "qualification_sha256": "71e19cc700610979ead03c65c56e4c3613a33530cfe23691c265e1ae4632f54c",
+     "runtime_interpreter_flags": [
+       "-P",
+       "-s",
+--- sol/candidate/producer/source-pins.json
++++ join/candidate/producer/source-pins.json
+@@ -14,19 +14,20 @@
+   "import-path-pins.json": "8722da07c7cb4b75839660a9f222affb647d6443431cd153ff521872d71207d3",
+   "import_path_readiness.py": "3461af7d97e49f3cbd32b6e67b3a9da0197ebbaef86f1ae032347f7f09c26240",
+   "invocation.py": "73908fde85a2c51944e728728f641e36290894dfa7ca553e096f4ebb41e2288a",
+-  "native-boundary-qualification.json": "6542b470e8c079c7843416ed746581959207cc35769c6febeb97564fde81eb8f",
++  "native-boundary-qualification.json": "cff95ba7ab27170ea3ae0d7858ab0fbcb2862bd21008541d1c0dcd699ea0c95c",
+   "native_controls.py": "ecf6409918c5485a84c02cca209f91ade2c0e91abd6b5d67dfa4c5037fec9b2d",
+   "native_guard.py": "ec131999ed4562e308470338d0bacea44d5613f24917d91c48ef1cc8a796d2a2",
+-  "runtest-plan.json": "5e30cf57eee71ce9e238958b556234c8ac7471504a378e076b374427e53a2c84",
++  "runtest-plan.json": "b2f94bc83bf1537fbf25e1a757e1630c3006104b702c76d5752dd88c76cc47b2",
+   "runtest_protocol.py": "e01217bc7c1a1e42bb7460cd4a11bcea63fd178175149cf921ea0c20cca69605",
+   "runtime-pins.json": "7d3656bc552287c1cdeaa372141a24c8c147506997bf725c99730c4253c34375",
+   "startup-temp-qualification.json": "71e19cc700610979ead03c65c56e4c3613a33530cfe23691c265e1ae4632f54c",
++  "test_cancellation_pidfd_join_source.py": "8d088da38026742e18ee0338dadfe5eb058057ea8b4c1f785cf5290afd769a35",
+   "test_collector_receipt_source.py": "2637808ea7f9758954bd078c7b87829826a9078ccaca2b1261eebd79f26de650",
+-  "test_custody_repair_source.py": "0bb12de41e45216febfd16d52fc2d6592ab09bb631d538cc0d17ae8a6ef11b2a",
++  "test_custody_repair_source.py": "a462470f887575da2d4ea6c60c3dbae9f534b03e9a573ae1f4a42fd8caf99608",
+   "test_guard_canary.py": "e118f11a8d8861419ef2a85b0ca1e9b55098c00b174f562d457696f6473cee88",
+   "test_host_probe_source.py": "a660e79b2d52ac6658f1751a5f9b2d829b8f37e90772356ff6abc949fd7cfb5d",
+   "test_import_path_source.py": "2362da3d08f531600e23c871cbd60d0feb5f49392510d2fe06d5b9bf3345bcb1",
+-  "test_native_boundary_source.py": "03dd9393a8b95d74fa360f2ff0432c834af907f2fcbb7051011dcf2cbfa281c8",
++  "test_native_boundary_source.py": "942cea838762093e15ad6efd5d0903e1223735ff880bd2dc6991123cebd6b953",
+   "test_native_lexical_source.py": "10504cadd1fb79a16ed0c222df1b7d980d5c316fc753e8535514b7d7a065cbc3",
+   "test_runtest_protocol_source.py": "677970b8c22334dc89f6c92b989f15a2c2023f8bd6038948a8f7c0531e721ebe",
+   "test_startup_temp_source.py": "ff109d2aa1c2473eb5ca2e4a01e2915b7afa141f0e0dcbad77a40665e1bcd3b8"
+--- sol/candidate/producer/test_cancellation_pidfd_join_source.py
++++ join/candidate/producer/test_cancellation_pidfd_join_source.py
+@@ -0,0 +1,213 @@
++"""Joined exact-source controls, NOT_RUN. No native/PID/syscall proof or grant.
++
++Only inert owner/registry models plus private pytest files are used. The parent
++must admit execution separately. Existing 181 and pidfd 36 cases are retained.
++"""
++import ast
++import copy
++import json
++from types import MethodType, SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import test_native_boundary_source as boundary
++
++
++def rewrite(owner, path, record):
++    """Deliberate fault in an inert model receipt, never a real runtime artifact."""
++    assert path.is_relative_to(owner.out)
++    path.chmod(0o600)
++    path.write_text(json.dumps(record))
++    path.chmod(0o400)
++
++
++def set_field(record, key, value):
++    if value == '<missing>':
++        del record[key]
++    else:
++        record[key] = value
++
++
++def prepare_next(owner):
++    admission = owner.out / 'model-admission.json'
++    owner.h.put(admission, {'source_model': True})
++    pre = dict(owner.pre, admission=str(admission), admission_sha256=owner.h.sha(admission), reserve_seconds=1)
++    original = dict(owner.original, deadline_monotonic=1800)
++    phases = [dict(owner.phase, outer=1), dict(name='next-phase', outer=1)]
++    class ReachedPrelaunch(RuntimeError):
++        pass
++    def require(ok, why):
++        if not ok:
++            raise ValueError(why)
++    lock = Mock(side_effect=ReachedPrelaunch('before allocation'))
++    api = boundary.definitions(boundary.ROOT / 'owner-helper/owner_observer.py', {'prepare'},
++        cohort=lambda out: (original, pre), phases_for=lambda clock: phases,
++        require=require, read=owner.h.read, sha=owner.h.sha, private=owner.h.private,
++        time=SimpleNamespace(monotonic=lambda: 10), lock_probe=lock)
++    return lambda: api['prepare'](owner.out, 1), lock, ReachedPrelaunch
++
++
++@pytest.mark.parametrize('value', ['', 'close:OSError', None, True, False, '<missing>'])
++def test_pidfd_original_snapshot_is_complete_immutable_and_never_contains_fd(tmp_path, value):
++    owner = boundary.owner_model(tmp_path)
++    row = boundary.original_row(owner)
++    set_field(row, 'runtest_pidfd_error', value)
++    # The runtime-only descriptor must never enter the disposition even if a
++    # malformed input supplies it. Actual checkpoint exclusion has its own test.
++    row['_runtest_pidfd'] = 71
++    record = owner.retain_registry_disposition([row], boundary.checkpoint(owner, row))
++    path = owner.parent / 'registry-disposition.json'
++    before = path.read_bytes()
++    assert record['fields_complete'] is (value != '<missing>')
++    assert '_runtest_pidfd' not in record['original_row']
++    assert record['original_row']['runtest_pidfd_error'] == (None if value == '<missing>' else value)
++    assert owner.original_row_allows_next_phase(boundary.recovered_session(owner)) is (value == '')
++    assert path.read_bytes() == before
++    owner.close()
++    assert path.read_bytes() == before
++
++
++@pytest.mark.parametrize('value', ['', 'signal:OSError', None, True, False, '<missing>'])
++def test_current_recovered_pidfd_error_cannot_be_defaulted_away(tmp_path, value):
++    owner = boundary.owner_model(tmp_path)
++    row = boundary.original_row(owner)
++    owner.retain_registry_disposition([row], boundary.checkpoint(owner, row))
++    session = boundary.recovered_session(owner)
++    if value == '<missing>':
++        del session.runtest_pidfd_error
++    else:
++        session.runtest_pidfd_error = value
++    assert owner.original_row_allows_next_phase(session) is (value == '')
++    assert owner.registry_disposition['original_row']['runtest_pidfd_error'] == ''
++
++
++@pytest.mark.parametrize('site', ['original', 'current', 'drain'])
++@pytest.mark.parametrize('value', ['', 'close:OSError', None, True, False, '<missing>'])
++def test_full_finish_pidfd_errors_preserve_exit_and_close_without_next_phase(tmp_path, site, value):
++    owner = boundary.owner_model(tmp_path)
++    row = boundary.original_row(owner)
++    if site == 'original':
++        set_field(row, 'runtest_pidfd_error', value)
++    finish, registry = boundary.finish_model(owner, row)
++    if site == 'current':
++        session = next(iter(registry._running.values()))
++        if value == '<missing>':
++            del session.runtest_pidfd_error
++        else:
++            session.runtest_pidfd_error = value
++    if site == 'drain':
++        path = owner.parent / 'runtest-drain.json'
++        data = owner.h.read(path)
++        set_field(data, 'registry_pidfd_error', value)
++        rewrite(owner, path, data)
++    snapshot = (owner.parent / 'registry-disposition.json').read_bytes()
++    finish()
++    registry.finish_runtest.assert_called_once()
++    release = owner.h.read(owner.parent / 'registry-release.json')
++    assert release['exit_code'] == 0
++    assert release['next_phase_admissible'] is (value == '')
++    assert release['runtime_or_product_accepted'] is False
++    assert (owner.parent / 'registry-disposition.json').read_bytes() == snapshot
++
++
++@pytest.mark.parametrize('value', ['', 'close:OSError', None, True, False, '<missing>'])
++def test_next_prepare_checks_pidfd_even_with_matching_snapshot_hash(tmp_path, value):
++    owner = boundary.owner_model(tmp_path)
++    finish, registry = boundary.finish_model(owner, boundary.original_row(owner))
++    finish()
++    path = owner.parent / 'registry-disposition.json'
++    record = owner.h.read(path)
++    set_field(record['original_row'], 'runtest_pidfd_error', value)
++    rewrite(owner, path, record)
++    released_path = owner.parent / 'registry-release.json'
++    released = owner.h.read(released_path)
++    released['original_registry_disposition_sha256'] = owner.h.sha(path)
++    rewrite(owner, released_path, released)
++    prepare, lock, reached = prepare_next(owner)
++    with pytest.raises(reached if value == '' else ValueError):
++        prepare()
++    assert lock.call_count == (1 if value == '' else 0)
++    assert not (owner.out / 'next-phase').exists()
++
++
++@pytest.mark.parametrize('field', ['runtest_pidfd_error', 'runtest_stop_requested',
++                                  'runtest_launch_pending', 'runtest_persistence_error',
++                                  'runtest_outer_closed', 'fields_complete', 'extra_field'])
++def test_first_snapshot_rejects_safety_or_completeness_corruption_on_readback(tmp_path, field):
++    owner = boundary.owner_model(tmp_path)
++    bad = {'runtest_pidfd_error': 'close:OSError', 'runtest_stop_requested': True,
++           'runtest_launch_pending': True, 'runtest_persistence_error': 'OSError',
++           'runtest_outer_closed': {'prior': 'closure'}}
++    row = boundary.original_row(owner)
++    if field == 'fields_complete':
++        del row['runtest_pidfd_error']
++    elif field != 'extra_field':
++        row[field] = bad[field]
++    digest = boundary.checkpoint(owner, row)
++    writer = owner.h.put
++    def corrupt(path, value):
++        value = copy.deepcopy(value)
++        if field == 'fields_complete':
++            value[field] = True
++        elif field == 'extra_field':
++            value['unexpected'] = 'not the original written record'
++        else:
++            value['original_row'][field] = boundary.original_row(owner)[field]
++        writer(path, value)
++    owner.h.put = corrupt
++    with pytest.raises(RuntimeError, match='DISPOSITION_READBACK_FAILED'):
++        owner.retain_registry_disposition([row], digest)
++    assert owner.registry_disposition is None
++    # A failed readback never authorizes continuation by silently keeping the
++    # expected in-memory value instead of the actual persisted receipt.
++
++
++@pytest.mark.parametrize('field', ['primary_error', 'cleanup_errors',
++                                  'registry_persistence_error', 'registry_pidfd_error'])
++@pytest.mark.parametrize('value', ['<missing>', True, False, 0, {}, 'failure'])
++def test_full_finish_requires_explicit_typed_healthy_drain_fields(tmp_path, field, value):
++    owner = boundary.owner_model(tmp_path)
++    finish, registry = boundary.finish_model(owner, boundary.original_row(owner))
++    path = owner.parent / 'runtest-drain.json'
++    data = owner.h.read(path)
++    set_field(data, field, value)
++    rewrite(owner, path, data)
++    finish()
++    registry.finish_runtest.assert_called_once()
++    release = owner.h.read(owner.parent / 'registry-release.json')
++    assert release['exit_code'] == 0 and release['next_phase_admissible'] is False
++
++
++@pytest.mark.parametrize('site', ['original', 'current', 'drain'])
++def test_pidfd_admission_controls_are_sensitive_to_each_new_error_predicate(tmp_path, site):
++    owner = boundary.owner_model(tmp_path)
++    row = boundary.original_row(owner)
++    if site == 'original':
++        row['runtest_pidfd_error'] = 'close:OSError'
++    finish, registry = boundary.finish_model(owner, row, mutate_pidfd=site == 'drain')
++    if site == 'drain':
++        path = owner.parent / 'runtest-drain.json'
++        data = owner.h.read(path); data['registry_pidfd_error'] = 'close:OSError'
++        rewrite(owner, path, data)
++    else:
++        if site == 'current':
++            next(iter(registry._running.values())).runtest_pidfd_error = 'close:OSError'
++        path = boundary.ROOT / 'owner-helper/runtest_outer.py'
++        tree = ast.parse(path.read_bytes())
++        method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and
++                      n.name == 'original_row_allows_next_phase')
++        predicate = next(n.value for n in ast.walk(method) if isinstance(n, ast.Return))
++        target = ("prior.get('runtest_pidfd_error') == ''" if site == 'original' else
++                  "getattr(session, 'runtest_pidfd_error', None) == ''")
++        before = len(predicate.values)
++        predicate.values = [n for n in predicate.values if ast.unparse(n) != target]
++        assert len(predicate.values) == before - 1
++        def check(ok, why):
++            if not ok:
++                raise RuntimeError(why)
++        namespace = {'check': check}
++        exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), 'exec'), namespace)
++        owner.original_row_allows_next_phase = MethodType(namespace[method.name], owner)
++    finish()
++    # Removing only the selected pidfd-empty predicate falsely allows admission.
++    assert owner.h.read(owner.parent / 'registry-release.json')['next_phase_admissible'] is True
+--- sol/candidate/producer/test_custody_repair_source.py
++++ join/candidate/producer/test_custody_repair_source.py
+@@ -7,6 +7,7 @@
+ reviewed finite native owner is required for those executions.
+ """
+ import json
++import copy
+ import ast
+ import subprocess
+ import os
+@@ -26,13 +27,14 @@
+     registry = source_overlay_model.registry()
+     session = source_overlay_model.identity_known_session()
+     order = []
+-    registry._terminate_host_pid = lambda pid, born: order.append(('terminate', pid, born))
++    registry._terminate_host_pid = lambda *args: pytest.fail('numeric PID fallback')
++    source_overlay_model.signal.pidfd_send_signal = lambda fd, sig, info, flags: order.append(('pidfd', fd, sig, info, flags))
+     def failure(_):
+         order.append(('checkpoint', fault))
+         raise OSError(fault)
+     registry._runtest_checkpoint = failure
+     outcome = registry.stop_runtest(session)
+-    assert order == [('terminate', session.pid, session.host_start_time), ('checkpoint', fault)]
++    assert order == [('pidfd', session._runtest_pidfd, 9, None, 0), ('checkpoint', fault)]
+     assert session.runtest_stop_requested and session.process is not None
+     assert outcome['status'] == 'STOP_UNCONFIRMED' and outcome['persistence_error'] == 'OSError'
+     assert session.id in registry._running
+@@ -141,14 +143,16 @@
+             registry._runtest_checkpoint(session)
+     assert session.runtest_stop_requested and session.runtest_persistence_error
+     assert registry._running[session.id] is session
++    mutant_session = copy.copy(session)  # Same failed-persistence state BEFORE the refused attempt adds its sticky error.
+     with pytest.raises(RuntimeError, match='SPAWN_FENCED'):
+         registry.spawn_runtest(session, ['inert'], {'start_new_session': True, 'cwd': session.cwd},
+                                native_owner=source_overlay_model.native_owner)
+     popen.assert_not_called()
+     assert session.process is None and session.runtest_launch_pending
+-    # Focused mutation sensitivity: removing ONLY the two persistence/stop
+-    # terms now reaches Popen. No unrelated no-replay condition masks the cut.
+-    source_overlay_model.unfenced_spawn(registry, session, ['inert'],
++    # Focused mutation sensitivity: all three explicit stop checks and the
++    # persistence term must be removed, since pidfd acquisition adds two
++    # correctly redundant stop fences. Deadlines/custody/no-replay remain.
++    source_overlay_model.unfenced_spawn(registry, mutant_session, ['inert'],
+         {'start_new_session': True, 'cwd': session.cwd}, native_owner=source_overlay_model.native_owner)
+     popen.assert_called_once()
+ 
+@@ -246,11 +250,13 @@
+         state['rows']=json.loads(json.dumps(rows))
+     fake_os=SimpleNamespace(open=open_directory,fsync=fsync,close=lambda fd: None,
+                             O_RDONLY=0,O_DIRECTORY=1,O_CLOEXEC=2,
+-                            getpgid=lambda pid:pid,getsid=lambda pid:pid)
++                            getpgid=lambda pid:pid,getsid=lambda pid:pid,
++                            pidfd_open=lambda pid,flags: 51,get_inheritable=lambda fd:False)
++    fake_signal=SimpleNamespace(SIGKILL=9,pidfd_send_signal=lambda fd,sig,info,flags:None)
+     fields=('runtest_custody','runtest_unit','runtest_deadline','runtest_boot_id',
+             'runtest_stop_requested','runtest_launch_pending','runtest_pgid','runtest_sid',
+             'runtest_persistence_error','task_id','owner_task_id','session_key','pid','host_start_time','command')
+-    fields += ('runtest_outer', 'runtest_outer_closed')
++    fields += ('runtest_outer', 'runtest_outer_closed', 'runtest_pidfd_error')
+     reg_module=types.ModuleType('tools.process_registry');reg_module._checkpoint_path=lambda:checkpoint
+     reg_module._CHECKPOINT_FIELDS=fields
+     utilities=types.ModuleType('utils');utilities.atomic_json_write=atomic
+@@ -264,7 +270,7 @@
+         exec(compile(ast.Module(body=chosen,type_ignores=[]),str(path),'exec'),namespace)
+         return namespace
+     inert_popen=Mock(return_value=Mock(pid=811,returncode=None))
+-    namespace={'subprocess':SimpleNamespace(Popen=inert_popen),'json':json,'os':fake_os,'Path':lambda p:SimpleNamespace(read_text=lambda:'boot'),
++    namespace={'subprocess':SimpleNamespace(Popen=inert_popen),'json':json,'os':fake_os,'signal':fake_signal,'Path':lambda p:SimpleNamespace(read_text=lambda:'boot'),
+                'time':SimpleNamespace(monotonic=lambda:1),'_checkpoint_path':lambda:checkpoint,
+                'logger':Mock(),'Optional':__import__('typing').Optional,'List':__import__('typing').List,
+                'Dict':__import__('typing').Dict,'Any':__import__('typing').Any,
+@@ -277,6 +283,9 @@
+         r=registry_type();r._lock=threading.Lock();r._checkpoint_lock=threading.RLock()
+         r._running={};r._finished={};r._LIFECYCLE_KILL_SOURCES=frozenset()
+         r._daemon_term_grace_seconds=lambda:1;r._safe_host_start_time=lambda pid:33
++        # Explicit inert preflight. Its actual source behavior is covered by
++        # all 36 retained pidfd controls; this fixture tests checkpoint ordering.
++        r._require_runtest_pidfd_acquisition=lambda:None
+         return r
+     current_registry=None
+     # Attach each constructed identity session to the most recent model registry.
+@@ -291,20 +300,35 @@
+           runtest_boot_id='boot',runtest_stop_requested=False,runtest_launch_pending=not launched,
+           runtest_pgid=811 if launched else 0,runtest_sid=811 if launched else 0,runtest_persistence_error='',task_id='source-model',
+           runtest_outer={'inert': 'binding'},runtest_outer_closed=None,
++          detached=False,_runtest_pidfd=51 if launched else None,runtest_pidfd_error='',
+           owner_task_id='source-model',session_key='model',command='data',exited=False,
+           pid_scope='host',persist_on_release=False,_scope_stop_pending=False)
+         current_registry._running[s.id]=s
+         return s
+     tree = ast.parse((candidate/'donor/tools/process_registry.py').read_bytes())
+     spawn_node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'spawn_runtest')
+-    # Native admission now precedes the session fence. Find the actual lock
+-    # scope rather than assuming a stale positional body index.
+-    fence = next(n for n in spawn_node.body if isinstance(n, ast.With)).body[0].test
++    # The pidfd version wraps the same locked fence in try/except.
++    fence = next(n for n in ast.walk(spawn_node) if isinstance(n, ast.If) and
++                 'RUNTEST_SPAWN_FENCED_NO_RETRY' in ast.unparse(n)).test
+     assert isinstance(fence, ast.BoolOp) and isinstance(fence.op, ast.Or)
+     removed = [n for n in fence.values if isinstance(n, ast.Attribute) and
+                n.attr in ('runtest_stop_requested', 'runtest_persistence_error')]
+     assert len(removed) == 2
+     fence.values = [n for n in fence.values if n not in removed]
++    later_stops = 0
++    for node in ast.walk(spawn_node):
++        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or) and node is not fence:
++            stops = [v for v in node.values if isinstance(v, ast.Attribute) and v.attr == 'runtest_stop_requested']
++            later_stops += len(stops)
++            node.values = [v for v in node.values if v not in stops]
++    assert later_stops == 2
++    # A one-term BoolOp is not a valid compiled AST: preserve the surviving
++    # original deadline expression directly, without dropping that guard.
++    class Collapse(ast.NodeTransformer):
++        def visit_BoolOp(self, node):
++            self.generic_visit(node)
++            return node.values[0] if len(node.values) == 1 else node
++    spawn_node = Collapse().visit(spawn_node)
+     mutant_ns = dict(namespace)
+     exec(compile(ast.Module(body=[spawn_node], type_ignores=[]), 'two-fence-mutation', 'exec'), mutant_ns)
+     @contextmanager
+@@ -328,4 +352,4 @@
+     return SimpleNamespace(registry=registry,identity_known_session=session,native_owner=native_owner,
+                            prelaunch_session=lambda name='fresh':session(name, launched=False),
+                            popen=inert_popen,unfenced_spawn=mutant_ns['spawn_runtest'],donor=donor_ns,
+-                           inject_checkpoint_failure=inject,state=state,utils=utilities,api=api_ns)
++                           inject_checkpoint_failure=inject,state=state,utils=utilities,api=api_ns,signal=fake_signal)
+--- sol/candidate/producer/test_native_boundary_source.py
++++ join/candidate/producer/test_native_boundary_source.py
+@@ -83,7 +83,8 @@
+            'runtest_boot_id': 'source-model-boot', 'runtest_outer': owner.binding,
+            'pid': 811, 'host_start_time': 33, 'runtest_pgid': 811, 'runtest_sid': 811,
+            'runtest_stop_requested': False, 'runtest_launch_pending': False,
+-           'runtest_persistence_error': '', 'runtest_outer_closed': None}
++           'runtest_persistence_error': '', 'runtest_outer_closed': None,
++           'runtest_pidfd_error': ''}
+     row.update(changes)
+     return row
+ 
+@@ -101,7 +102,7 @@
+     # or stand in for the original durable disposition.
+     return SimpleNamespace(**(dict(id='same-session', runtest_outer=owner.binding,
+         runtest_stop_requested=True, runtest_launch_pending=False,
+-        runtest_persistence_error='') | changes))
++        runtest_persistence_error='', runtest_pidfd_error='') | changes))
+ 
+ 
+ def test_cancel_before_allocation_is_durable_before_native_io(tmp_path):
+@@ -275,7 +276,7 @@
+            {n.id for n in ast.walk(decision.value) if isinstance(n, ast.Name)}
+ 
+ 
+-def finish_model(owner, row, *, drain_error=False, mutate=None):
++def finish_model(owner, row, *, drain_error=False, mutate=None, mutate_pidfd=False):
+     """Full exact finish caller with declared inert custody, never live proof."""
+     digest = checkpoint(owner, row)
+     owner.retain_registry_disposition([row], digest)
+@@ -301,7 +302,7 @@
+         'unit_id': 'f000', 'owner_task_id': 'original-model'})
+     put(parent / 'runtest-drain.json', {'session_id': session.id, 'reaped': True, 'exit_code': 0,
+         'primary_error': None, 'cleanup_errors': [],
+-        'registry_persistence_error': 'OSError' if drain_error else ''})
++        'registry_persistence_error': 'OSError' if drain_error else '', 'registry_pidfd_error': ''})
+     proof = {'binding': owner.binding, 'cessation_before_original_deadline': True,
+              'cessation_upper_monotonic': 10, 'source_model_not_actual': True}
+     owner.closure_for = Mock(return_value=proof)
+@@ -318,6 +319,14 @@
+     path = ROOT / 'owner-helper/owner_observer.py'
+     tree = ast.parse(path.read_bytes())
+     body = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'finish_runtime_file')
++    if mutate_pidfd:
++        predicate = next(n.value for n in ast.walk(body) if isinstance(n, ast.Assign) and
++            any(isinstance(t, ast.Name) and t.id == 'drain_allows_next' for t in n.targets) and
++            isinstance(n.value, ast.BoolOp))
++        before = len(predicate.values)
++        predicate.values = [n for n in predicate.values
++                            if ast.unparse(n) != "drain['registry_pidfd_error'] == ''"]
++        assert len(predicate.values) == before - 1
+     if mutate:
+         decision = next(n for n in ast.walk(body) if isinstance(n, ast.Assign) and
+             any(isinstance(t, ast.Name) and t.id == 'next_phase' for t in n.targets))

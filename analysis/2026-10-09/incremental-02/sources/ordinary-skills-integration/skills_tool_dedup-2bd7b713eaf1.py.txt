@@ -1,0 +1,139 @@
+"""skill_view repeat-view dedup registry: per-task cache of (canonical copy, file_path) ->
+(skill file mtime+size). A repeat view of an UNCHANGED file returns a short stub — the earlier
+tool result already carries the content verbatim. Cleared via ``reset_skill_view_dedup()`` on
+context compression AND on a committed proactive tool-result prune, because both replace the
+original content with a one-line marker.
+"""
+
+import json
+import os
+import threading
+from typing import Dict
+
+_skill_view_tracker: Dict[str, Dict[tuple, tuple]] = {}
+_skill_view_tracker_lock = threading.Lock()
+_SKILL_VIEW_DEDUP_CAP = 200
+
+_SKILL_VIEW_DEDUP_MESSAGE = (
+    "Skill content unchanged since it was loaded earlier in this "
+    "conversation — refer to the earlier skill_view result; it is still "
+    "current and complete. (Re-issued after context compression, this "
+    "returns the full content again.)")
+
+
+def _skill_view_fingerprint(payload: dict) -> tuple | None:
+    """Stat the skill file a successful skill_view served, for change detection."""
+    from hermes_cli import friday_skill_io as io
+    if io.active() is not None:
+        return None  # Re-read bounded own bytes; stat-only cache is not authority.
+    if not (src := payload.get("_source_path")):
+        return None
+    try:
+        st = os.stat(src)
+        from tools.skills_tool import _get_disabled_skill_names
+        return (src, st.st_mtime_ns, st.st_size, frozenset(_get_disabled_skill_names()))
+    except OSError:
+        return None
+
+
+def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
+    """Record a served skill_view so an identical repeat can be deduped."""
+    # Never dedup setup-needed views: readiness depends on config/env state that
+    # changes without the file changing; the model must see the refreshed status.
+    if (not task_id or payload.get("setup_needed")
+            or payload.get("readiness_status") == "setup_needed"):
+        return
+    if (fp := _skill_view_fingerprint(payload)) is None:
+        return
+    identity = payload.get("_skill_identity")
+    if identity is None:
+        return
+    key = (tuple(identity), file_path or "")
+    with _skill_view_tracker_lock:
+        cache = _skill_view_tracker.setdefault(str(task_id), {})
+        cache[key] = (*fp, str(payload.get("name") or name))
+        while len(cache) > _SKILL_VIEW_DEDUP_CAP:  # FIFO eviction
+            del cache[next(iter(cache))]
+
+
+def _check_skill_view_dedup(task_id, identity, file_path) -> str | None:
+    """Check an already resolved, authorized copy, never a requested name alias.
+
+    Called by the loader after its policy/platform and support-path gates. The
+    source identity includes the owning profile and plugin registration, so an
+    unrelated homonym cannot acknowledge a denied copy or hide its real content.
+    """
+    from hermes_cli import friday_skill_io as io
+    if io.active() is not None:
+        return None
+    if not task_id:
+        return None
+    from tools.skills_tool import _get_disabled_skill_names
+    disabled = frozenset(_get_disabled_skill_names())
+    key = (identity, file_path or "")
+    with _skill_view_tracker_lock:
+        cache = _skill_view_tracker.get(str(task_id))
+        if not cache or key not in cache:
+            return None
+        src, mtime_ns, size, prior_disabled, label = cache[key]
+        if disabled != prior_disabled:
+            cache.pop(key, None)
+            return None
+        try:
+            st = os.stat(src)
+            changed = (st.st_mtime_ns, st.st_size) != (mtime_ns, size)
+        except OSError:
+            changed = True
+        if changed:
+            cache.pop(key, None)
+            return None
+        return json.dumps({
+            "success": True, "status": "unchanged", "name": label,
+            "file": file_path or "SKILL.md", "dedup": True, "content_returned": False,
+            "message": _SKILL_VIEW_DEDUP_MESSAGE}, ensure_ascii=False)
+
+
+def _invalidate_skill_view_policy(task_id) -> None:
+    """Observe policy changes even when the loader refuses before cache lookup.
+
+    This only invalidates entries; it cannot acknowledge a view. After a deny
+    followed by enable, the useful full content must be loaded again.
+    """
+    if not task_id:
+        return
+    from tools.skills_tool import _get_disabled_skill_names
+    try:
+        disabled = frozenset(_get_disabled_skill_names())
+    except Exception:
+        reset_skill_view_dedup(str(task_id))
+        raise
+    with _skill_view_tracker_lock:
+        cache = _skill_view_tracker.get(str(task_id), {})
+        for key, fingerprint in list(cache.items()):
+            if fingerprint[3] != disabled:
+                cache.pop(key, None)
+
+
+def _skill_view_identity(skill_md, qualified_name="") -> tuple:
+    """Resolved native copy, lexical load location and qualified registration.
+
+    Constructed without reading the skill body. Local aliases that select the
+    same copy share it; distinct duplicates and plugin registrations do not.
+    """
+    from hermes_cli import friday_skill_io as io
+    cap = io.active()
+    if cap is not None:
+        io.read_bytes(skill_md)
+    from pathlib import Path
+    from hermes_constants import get_hermes_home
+    return (str(get_hermes_home().resolve()), qualified_name,
+            str(Path(skill_md).absolute()), str(Path(skill_md).resolve()))
+
+
+def reset_skill_view_dedup(task_id: str | None = None) -> None:
+    """Clear the dedup cache (all tasks when task_id is None); called on context compression."""
+    with _skill_view_tracker_lock:
+        if task_id is None:
+            _skill_view_tracker.clear()
+        else:
+            _skill_view_tracker.pop(str(task_id), None)

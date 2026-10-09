@@ -1,0 +1,235 @@
+"""Small association to the caller already owned by Hermes, never an admission token.
+
+The native executor creates WebCall/WebTurn. This module retains those actual
+objects, the actual UserScope and its original deadline; it creates no job,
+clock, process manager, network service or authority from configuration.
+"""
+from contextlib import contextmanager
+from dataclasses import dataclass
+import math
+from pathlib import Path
+import time
+
+
+class BrowserOwnerRefused(PermissionError):
+    pass
+
+
+def _call_identity(call):
+    values = tuple(getattr(call, k, None) for k in
+                   ('task_id', 'session_id', 'session_key', 'turn_id', 'call_id'))
+    if any(type(v) is not str or not v or len(v) > 4096 for v in values):
+        raise BrowserOwnerRefused('browser_actual_native_call_identity_required')
+    return values
+
+
+def _scope_identity(cap):
+    from hermes_cli.friday_user_scope import _fingerprint
+    return (str(cap.authorization_home), str(cap.home), cap.profile,
+            tuple(cap.principal), cap.admission_generation,
+            tuple(cap.directory_identity), _fingerprint(cap.binding))
+
+
+def _finite_deadline(value):
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise BrowserOwnerRefused('browser_original_owner_deadline_required')
+    if time.monotonic() >= value:
+        raise BrowserOwnerRefused('browser_original_owner_deadline_exhausted')
+    return value
+
+
+@contextmanager
+def browser_lock(lock, deadline):
+    """Bound an existing lock by an already retained ceiling; never renew it."""
+    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+        raise BrowserOwnerRefused('browser_original_owner_deadline_required')
+    if not lock.acquire(timeout=max(0.0, min(2.0, deadline - time.monotonic()))):
+        raise BrowserOwnerRefused('browser_owner_lock_unsettled')
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@dataclass(frozen=True)
+class BrowserOwner:
+    call: object
+    scope: object
+    call_identity: tuple
+    scope_identity: tuple
+    original_deadline: float
+    boot_id: str
+
+    def check(self):
+        """Recheck actual native objects; a subsequent call cannot extend the owner clock."""
+        from agent.web_call_context import current_web_call, WebCall
+        from hermes_cli.friday_user_scope import current, _same_scope
+        from hermes_constants import get_hermes_home
+        actual = current_web_call()
+        if (type(self.call) is not WebCall or type(actual) is not WebCall
+                or _call_identity(self.call) != self.call_identity
+                or _call_identity(actual)[:4] != self.call_identity[:4]
+                or actual.turn is not self.call.turn):
+            raise BrowserOwnerRefused('browser_native_owner_changed')
+        with browser_lock(self.call.turn.lock, min(self.original_deadline, actual.deadline(),
+                getattr(self.call.turn, 'browser_deadline', self.original_deadline))):
+            if (self.call not in self.call.turn.calls or actual not in self.call.turn.calls
+                    or self.call.stopped.is_set() or self.call.turn.stopped.is_set()):
+                raise BrowserOwnerRefused('browser_original_owner_stopped')
+            self.call.check()
+            actual.check()
+        cap = current(required=True)
+        if (not _same_scope(cap, self.scope) or _scope_identity(cap) != self.scope_identity
+                or _scope_identity(self.scope) != self.scope_identity
+                or str(get_hermes_home()) != self.scope_identity[1]):
+            raise BrowserOwnerRefused('browser_principal_profile_generation_changed')
+        self.scope.check()
+        if Path('/proc/sys/kernel/random/boot_id').read_text().strip() != self.boot_id:
+            raise BrowserOwnerRefused('browser_original_boot_changed')
+        return _finite_deadline(min(self.original_deadline, actual.deadline()))
+
+    @contextmanager
+    def fence(self, deadline=None):
+        """Launch/publication lock order is turn -> cleanup -> registry.
+
+        Stop uses the same turn fence. Hold it until the returned child and its
+        checkpoint custody have been published, including error paths.
+        """
+        ceiling = self.original_deadline if deadline is None else min(self.original_deadline, deadline)
+        ceiling = min(ceiling, getattr(self.call.turn, 'browser_deadline', ceiling))
+        with browser_lock(self.call.turn.lock, ceiling):
+            ceiling = min(ceiling, self.check())
+            yield ceiling
+
+    def task_key(self):
+        self.check()
+        from hermes_cli.friday_user_scope import browser_task_key
+        return browser_task_key(self.call_identity[0])
+
+    def require_route_task(self, task_id):
+        if task_id is not None and task_id not in (self.call_identity[0], self.task_key()):
+            raise BrowserOwnerRefused('browser_foreign_route_task')
+        self.check()
+
+    def public_http_backend(self, schemes_by_origin_var, *, is_async=False):
+        """Reuse the installed HTTP backend. It is not the missing Rust/Chrome route."""
+        self.check()
+        from tools.url_safety import _SSRFGuardedNetworkBackend, _SSRFGuardedAsyncNetworkBackend
+        cls = _SSRFGuardedAsyncNetworkBackend if is_async else _SSRFGuardedNetworkBackend
+        return cls(schemes_by_origin_var, public_only=True, owner_check=self.check)
+
+    def identity(self):
+        """Non-secret fields persisted in the existing ProcessRegistry checkpoint."""
+        return {'task_id': self.call_identity[0], 'parent_session_id': self.call_identity[1],
+                'session_key': self.call_identity[2], 'turn_id': self.call_identity[3],
+                'first_call_id': self.call_identity[4], 'authorization_home': self.scope_identity[0],
+                'profile_home': self.scope_identity[1], 'profile': self.scope_identity[2],
+                'principal': list(self.scope_identity[3]), 'access_generation': self.scope_identity[4],
+                'directory_identity': list(self.scope_identity[5]), 'binding_sha256': self.scope_identity[6],
+                'original_deadline': self.original_deadline, 'boot_id': self.boot_id}
+
+    @contextmanager
+    def _clock_refusal_fence(self):
+        """Qualify an exhausted caller only for a retained control's refusal.
+
+        current_web_call() deliberately checks the clock before returning. Its
+        raw ContextVar is read here solely to attribute that failure: this path
+        creates no owner and must never be used to admit effects/publication.
+        Foreign, revoked, stopped and nonmember callers cannot poison an owner.
+        """
+        from agent.web_call_context import _current
+        from hermes_cli.friday_user_scope import current, _same_scope
+        from hermes_constants import get_hermes_home
+        actual = _current.get()
+        self._clock_refusal_identity(actual)
+        with browser_lock(self.call.turn.lock, self.original_deadline):
+            # Identity/membership is rechecked inside the same launch/stop fence.
+            self._clock_refusal_identity(actual)
+            if (_current.get() is not actual
+                    or self.call not in self.call.turn.calls
+                    or actual not in self.call.turn.calls
+                    or self.call.stopped.is_set() or actual.stopped.is_set()
+                    or self.call.turn.stopped.is_set()):
+                raise BrowserOwnerRefused('browser_clock_refusal_owner_unsettled')
+            cap = current(required=True)
+            if (not _same_scope(cap, self.scope)
+                    or _scope_identity(cap) != self.scope_identity
+                    or _scope_identity(self.scope) != self.scope_identity
+                    or str(get_hermes_home()) != self.scope_identity[1]):
+                raise BrowserOwnerRefused('browser_clock_refusal_foreign_scope')
+            self.scope.check()
+            if Path('/proc/sys/kernel/random/boot_id').read_text().strip() != self.boot_id:
+                raise BrowserOwnerRefused('browser_original_boot_changed')
+            ceilings = (self.original_deadline, self.call.deadline(), actual.deadline(),
+                        getattr(self.call.turn, 'browser_deadline', self.original_deadline))
+            if any(type(v) not in (int, float) or not math.isfinite(v) for v in ceilings):
+                raise BrowserOwnerRefused('browser_original_owner_deadline_required')
+            ceiling = min(ceilings)
+            if time.monotonic() < ceiling:
+                raise BrowserOwnerRefused('browser_clock_refusal_not_exhausted')
+            yield ceiling  # Refusal-only; neither check() nor a launch permit.
+
+    def _clock_refusal_identity(self, actual):
+        from agent.web_call_context import WebCall
+        if (type(self.call) is not WebCall or type(actual) is not WebCall
+                or _call_identity(self.call) != self.call_identity
+                or _call_identity(actual)[:4] != self.call_identity[:4]
+                or actual.turn is not self.call.turn):
+            raise BrowserOwnerRefused('browser_clock_refusal_foreign_caller')
+
+
+def current_browser_owner():
+    from agent.web_call_context import current_web_call, WebCall
+    from hermes_cli.friday_user_scope import current
+    call = current_web_call()
+    if type(call) is not WebCall:
+        raise BrowserOwnerRefused('browser_actual_native_call_required')
+    retained = getattr(call, 'browser_owner', None)
+    if retained is None:
+        # Operator/no-principal is not an ambient network grant. Its native job
+        # producer is a concrete separate gap, not a manufactured UserScope.
+        cap = current(required=True)
+        with browser_lock(call.turn.lock, min(call.deadline(),
+                getattr(call.turn, 'browser_deadline', call.deadline()))):
+            if call not in call.turn.calls:
+                raise BrowserOwnerRefused('browser_actual_native_turn_membership_required')
+            call.check()
+            retained = BrowserOwner(call, cap, _call_identity(call), _scope_identity(cap),
+                                    _finite_deadline(call.deadline()),
+                                    Path('/proc/sys/kernel/random/boot_id').read_text().strip())
+            call.browser_owner = retained
+            call.turn.browser_deadline = min(getattr(call.turn, 'browser_deadline', retained.original_deadline),
+                                             retained.original_deadline)
+    if type(retained) is not BrowserOwner:
+        raise BrowserOwnerRefused('browser_original_owner_object_required')
+    retained.check()
+    return retained
+
+
+def bind_browser_session(task_id, session_info):
+    """Bind an existing browser dictionary; never substitute a new owner on reuse."""
+    actual = current_browser_owner()
+    if task_id != actual.task_key():
+        raise BrowserOwnerRefused('browser_original_task_key_required')
+    retained = session_info.get('_friday_execution_owner')
+    if retained is None:
+        retained = actual
+        session_info['_friday_execution_owner'] = retained
+    if type(retained) is not BrowserOwner:
+        raise BrowserOwnerRefused('browser_original_owner_object_required')
+    retained.check()
+    if (retained.scope_identity != actual.scope_identity
+            or retained.call_identity[:4] != actual.call_identity[:4]
+            or retained.call.turn is not actual.call.turn):
+        raise BrowserOwnerRefused('browser_original_session_owner_changed')
+    from hermes_cli.friday_user_scope import check_browser
+    check_browser(session_info)
+    return retained
+
+
+def browser_owner_stopped(session_info):
+    """Original owner's intent/clock only; foreign ambient identity cannot cancel it."""
+    owner = session_info.get('_friday_execution_owner')
+    return (type(owner) is BrowserOwner and
+            (owner.call.stopped.is_set() or owner.call.turn.stopped.is_set()
+             or time.monotonic() >= owner.original_deadline))

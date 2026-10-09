@@ -1,0 +1,901 @@
+"""Inert source candidate; main requires later independent exact Astra admission.
+Ordinary systemd unit loading; no systemd-run transient properties or retries.
+Custody semantics inherited from the existing run-live-g1.py, never replay G1.
+"""
+import argparse
+import code
+import datetime
+import errno
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import resource
+import signal
+import stat
+import subprocess
+import time
+from runtime_binding import validate_native_identity, native_identity_argv, start_time, manager_identity_valid, read_exact
+import select
+import socket
+import selectors
+
+ROOT = Path(__file__).resolve().parent
+UNIT_DIRECTORY = Path('/run/systemd/system')
+IDENTITY = json.loads((ROOT / 'source-identity.json').read_text())
+ADMIN_DIRECTORY = Path(IDENTITY['stage'])
+SUDOERS = Path(IDENTITY['sudoers'])
+INSTALL_JOURNAL = Path('/run/friday-offline-build-010d839888625d6d.install.json')
+SUDO = '/usr/bin/sudo'
+LOCK = Path('<LOCAL_HOME>/.jericho/runtime/friday-quality-ui-exclusive.lock')
+SYSTEMCTL = '/usr/bin/systemctl'
+BUSCTL = '/usr/bin/busctl'
+ENV = {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'HOME': '<LOCAL_HOME>'}
+STATE_KEYS = 'Id,LoadState,ActiveState,SubState,MainPID,ControlPID,ControlGroup,InvocationID,Job,Result,ExecMainCode,ExecMainStatus,Transient,FragmentPath,DropInPaths,NeedDaemonReload'
+EFFECTIVE_KEYS = STATE_KEYS + ',User,Group,Type,ExitType,Restart,RemainAfterExit,Slice,JobTimeoutUSec,JobRunningTimeoutUSec,RuntimeMaxUSec,TimeoutStartUSec,TimeoutStopUSec,KillMode,SendSIGKILL,KillSignal,FinalKillSignal,MemoryMax,MemorySwapMax,CPUQuotaPerSecUSec,CPUAffinity,TasksMax,OOMPolicy,RestrictAddressFamilies,UMask,WorkingDirectory,StandardInput,StandardOutput,StandardError,ExecStart,Environment,EnvironmentFiles,PrivateNetwork,PrivateUsers,PrivateUsersEx,PrivateMounts,PrivatePIDs,PrivateIPC,TemporaryFileSystem,ProtectHome,ProtectSystem,InaccessiblePaths,BindPaths,BindReadOnlyPaths,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities'
+MANAGER_KEYS = 'MainPID,InvocationID,ControlGroup,ActiveState'
+# Full client windows, not clipped requests. Worst post-start branch:
+# own show5 + manager4 + exact root stop12 + own show5 + manager4
+# + exact root cleanup15 =43, plus original local10 <=57. Root cleanup
+# includes its own PID1 read4, show3, optional reset2, reload2, show3;
+# the local tail must fit its checked15 window. All native bounds unchanged.
+# Local filesystem/processing must fit that ten-second allowance; otherwise
+# retain custody, never infer real timing from offline virtual observations.
+POST_START_WINDOW = 57
+MIN_START_WINDOW = 1500
+SOURCE_TASK = 'FRW041-NATIVE-OFFLINE-BUILD-SOL#1'
+IPC_TMPFS_OPTIONS = 'rw,nosuid,nodev,noexec,mode=1777,size=64M'
+
+
+def require(value, message):
+    if not value:
+        raise RuntimeError(message)
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def private(path, directory=False):
+    path = Path(path)
+    require(path == path.resolve(strict=True), 'symlink_path')
+    s = path.stat()
+    require(s.st_uid == 1000 and not s.st_mode & 0o022, 'foreign_writes_or_owner')
+    require(stat.S_ISDIR(s.st_mode) if directory else stat.S_ISREG(s.st_mode), 'wrong_file_type')
+    return s
+
+
+
+def root_file(path, mode=None):
+    path = Path(path)
+    require(path == path.resolve(strict=True), 'root_file_symlink')
+    s = path.lstat()
+    require(stat.S_ISREG(s.st_mode) and s.st_uid == s.st_gid == 0 and s.st_nlink == 1
+            and not s.st_mode & 0o022 and (mode is None or stat.S_IMODE(s.st_mode) == mode), 'root_file_boundary')
+    for parent in path.parents:
+        q=parent.lstat()
+        require(parent == parent.resolve(strict=True) and stat.S_ISDIR(q.st_mode)
+                and q.st_uid == q.st_gid == 0 and not q.st_mode & 0o022, 'root_parent_boundary')
+    return s
+
+
+def administrative_preflight(root, unit, payload):
+    bundle=json.loads((Path(root)/'install-bundle.json').read_text())
+    require(bundle['unit']==unit and bundle['stage']==str(ADMIN_DIRECTORY)
+            and bundle['fragment']=='/run/systemd/system/'+unit and bundle['policy']==str(SUDOERS)
+            and bundle['fragment_sha256']==hashlib.sha256(payload).hexdigest(), 'exact_install_bundle')
+    root_file(ADMIN_DIRECTORY/'receipt.json',0o444)
+    receipt=json.loads((ADMIN_DIRECTORY/'receipt.json').read_text())
+    require(receipt['state']=='EXACT_ROOT_DEPENDENCIES_INSTALLED_NOT_STARTED'
+            and receipt['unit']==unit and receipt['stage']==str(ADMIN_DIRECTORY)
+            and receipt['source']==str(root) and receipt['live']==IDENTITY['live_directory']
+            and receipt['trial_started'] is False, 'installed_authority_required')
+    require(set(receipt['assets'])=={'admin-control.py','preflight','start','observe','stop','cleanup','bootstrap.py','build.py','inputs.json','phase-plan.json'},'complete_root_dependency_inventory')
+    for name,pin in receipt['assets'].items():
+        p=ADMIN_DIRECTORY/name;s=root_file(p,pin['mode'])
+        original=Path(root)/('install-system.py' if name=='bootstrap.py' else name)
+        require(digest(p)==pin['sha256']==digest(original) and [s.st_dev,s.st_ino]==pin['identity'],'root_control_identity_changed')
+    p=Path(bundle['fragment']);s=root_file(p,0o444)
+    require(p.read_bytes()==payload and [s.st_dev,s.st_ino]==receipt['fragment_identity'],'foreign_root_fragment')
+    require(receipt['policy_sha256'] == bundle['policy_sha256'], 'root_receipt_policy_pin')
+    require(set(p.name for p in ADMIN_DIRECTORY.iterdir())==set(receipt['assets'])|{'receipt.json','control.lock','observe.lock'},'preexisting_or_unknown_root_execution')
+    root_file(INSTALL_JOURNAL,0o444)
+    require(receipt['journal_path']==str(INSTALL_JOURNAL) and receipt['journal_identity']==[INSTALL_JOURNAL.stat().st_dev,INSTALL_JOURNAL.stat().st_ino], 'installation_journal_identity')
+    return receipt
+
+def fresh_json(path, value):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(value, f, indent=2); f.write('\n'); f.flush(); os.fsync(f.fileno())
+
+
+def usec(value):
+    # systemctl renders timespans, rather than raw uint64 microseconds.
+    units = {'us': 1, 'ms': 1000, 's': 1000000, 'min': 60000000}
+    pieces = value.split()
+    require(bool(pieces), 'missing_timespan')
+    total = 0
+    for piece in pieces:
+        m = re.fullmatch(r'(\d+)(us|ms|s|min)', piece)
+        require(m is not None, 'unrecognized_timespan')
+        total += int(m[1]) * units[m[2]]
+    return total
+
+
+def affinity(value):
+    result = set()
+    for token in value.split():
+        require(bool(re.fullmatch(r'\d+(?:-\d+)?', token)), 'invalid_affinity')
+        ends = [int(x) for x in token.split('-')]
+        require(max(ends) < 4096, 'invalid_affinity')
+        result.update(range(ends[0], ends[-1] + 1))
+    return result
+
+
+def unit_name(nonce):
+    require(bool(re.fullmatch(r'[0-9a-f]{16}', nonce)), 'fresh_nonce_required')
+    return 'friday-native-offline-build-' + nonce + '.service'
+
+
+def quoted(value):
+    require(bool(re.fullmatch(r'[A-Za-z0-9_./=:+-]+', value)), 'unsafe_unit_argument')
+    return '"' + value + '"'
+
+
+def render(root, live, unit):
+    require(str(root)==str(ROOT) and str(live)==IDENTITY['live_directory'] and unit==IDENTITY['unit'], 'literal_build_contour')
+    return (ROOT/'offline-build.service').read_bytes(), ['/usr/bin/env', '-i', 'PATH=/usr/bin:/bin', 'LANG=C.UTF-8', 'PYTHONDONTWRITEBYTECODE=1', 'HOME=<SOL_WORK>/FRW041-NATIVE-OFFLINE-BUILD-run-010d839888625d6d/runtime-home', 'TMPDIR=<SOL_WORK>/FRW041-NATIVE-OFFLINE-BUILD-run-010d839888625d6d/runtime-tmp', 'XDG_CACHE_HOME=<SOL_WORK>/FRW041-NATIVE-OFFLINE-BUILD-run-010d839888625d6d/runtime-cache', 'XDG_CONFIG_HOME=<SOL_WORK>/FRW041-NATIVE-OFFLINE-BUILD-run-010d839888625d6d/runtime-config', '/usr/bin/python3', '-I', '-B', '<SOL_WORK>/FRW041-NATIVE-OFFLINE-BUILD-root-010d839888625d6d/build.py']
+
+
+def empty(state, unit):
+    return (state.get('Id') == unit and state.get('LoadState') == 'not-found'
+            and state.get('ActiveState') == 'inactive' and state.get('SubState') == 'dead'
+            and state.get('MainPID') == state.get('ControlPID') == '0'
+            and state.get('Job') in ('', '0') and not state.get('InvocationID')
+            and not state.get('ControlGroup') and not state.get('FragmentPath'))
+
+
+def manager_valid(value):
+    return manager_identity_valid(value)
+
+
+def unit_object_path(unit):
+    # systemd D-Bus path escape: every non-ASCII-alphanumeric byte is _hh.
+    return '/org/freedesktop/systemd1/unit/' + ''.join(
+        chr(b) if 48 <= b <= 57 or 65 <= b <= 90 or 97 <= b <= 122 else '_%02x' % b
+        for b in unit.encode('utf-8'))
+
+
+def typed_reply(stdout, signature):
+    def pairs(values):
+        result = {}
+        for key, value in values:
+            require(key not in result, 'duplicate_typed_property')
+            result[key] = value
+        return result
+    value = json.loads(stdout, object_pairs_hook=pairs,
+                       parse_constant=lambda value: require(False, 'invalid_typed_constant'))
+    require(isinstance(value, dict) and set(value) == {'type', 'data'}
+            and value['type'] == signature and isinstance(value['data'], list), 'typed_property_schema')
+    return value['data']
+
+
+def typed_value(properties, key, signature):
+    value=properties.get(key)
+    require(isinstance(value,dict) and set(value)=={'type','data'} and value['type']==signature, 'typed_execution_property_'+key)
+    data=value['data']
+    if signature=='b':valid=type(data) is bool
+    elif signature=='s':valid=type(data) is str
+    elif signature in ('u','t'):valid=type(data) is int and 0<=data<2**(32 if signature=='u' else 64)
+    elif signature=='as':valid=type(data) is list and all(type(x) is str for x in data)
+    elif signature=='ay':valid=type(data) is list and all(type(x) is int and 0<=x<=255 for x in data)
+    elif signature=='(bas)':valid=type(data) is list and len(data)==2 and type(data[0]) is bool and type(data[1]) is list and all(type(x) is str for x in data[1])
+    elif signature=='a(ssbt)':valid=type(data) is list and all(type(x) is list and len(x)==4 and type(x[0]) is str and type(x[1]) is str and type(x[2]) is bool and type(x[3]) is int and 0<=x[3]<2**64 for x in data)
+    elif signature=='a(ss)':valid=type(data) is list and all(type(x) is list and len(x)==2 and all(type(y) is str for y in x) for x in data)
+    elif signature=='a(sb)':valid=type(data) is list and all(type(x) is list and len(x)==2 and type(x[0]) is str and type(x[1]) is bool for x in data)
+    else:valid=False
+    require(valid,'typed_data_shape_'+key)
+    return data
+
+
+def validate_execution_properties(evidence, unit, root, live):
+    require(isinstance(evidence,dict) and set(evidence)=={'unit','manager_scope','object_path','type','data'}, 'typed_execution_shape')
+    require(evidence['unit']==unit and evidence['manager_scope']=='system' and evidence['object_path']==unit_object_path(unit) and evidence['type']=='a{sv}' and len(evidence['data'])==1, 'typed_execution_required')
+    props=evidence['data'][0]
+    for key,signature,value in [('User','s','jericho'),('Group','s','jericho'),('SupplementaryGroups','as',[]),('PrivateUsers','b',True),('PrivateUsersEx','s','self'),('PrivateIPC','b',True),('PrivateNetwork','b',True),('PrivateMounts','b',True),('PrivateDevices','b',True),('Delegate','b',False),('PrivatePIDs','b',True),('ProtectControlGroups','b',True),('ProtectKernelTunables','b',True),('NoNewPrivileges','b',True),('EnvironmentFiles','a(sb)',[])]:
+        actual=typed_value(props,key,signature)
+        require(type(actual) is type(value) and actual==value,'typed_exact_'+key)
+    require(typed_value(props,'RestrictAddressFamilies','(bas)')==[True,['AF_UNIX']], 'typed_AF_UNIX_only')
+    require(typed_value(props,'SystemCallFilter','(bas)')==[False,['connect','io_uring_enter','io_uring_register','io_uring_setup','sendmmsg','sendmsg','sendto']], 'typed_unix_address_and_io_uring_denial')
+    require(typed_value(props,'SystemCallArchitectures','as') in (['native'],['x86-64']), 'typed_native_ABI')
+    require(typed_value(props,'AllowedCPUs','ay')==[3],'typed_aggregate_cpuset')
+    require(typed_value(props,'RestrictNamespaces','t')==0, 'typed_namespace_creation_denial')
+    require(set(typed_value(props,'InaccessiblePaths','as'))=={'/run','/tmp','/var','/mnt','/media','/srv','/dev/mqueue'}, 'typed_masks')
+    ro=[str(Path('<SOL_WORK>/FRW041-NATIVE-BROWSER-BUILD-evidence')), str(Path('<SOL_WORK>/FRW041-NATIVE-BROWSER-ENTRY-REPAIR-evidence/joined')),str(ADMIN_DIRECTORY)]
+    for key,wanted in [('BindPaths',[[str(live),str(live),False,0]]),('BindReadOnlyPaths',[[x,('<SOL_WORK>/FRW041-NATIVE-OFFLINE-BUILD-root-010d839888625d6d' if x==str(ADMIN_DIRECTORY) else x),False,0] for x in ro])]:
+        rows=typed_value(props,key,'a(ssbt)')
+        require(sorted(rows)==sorted(wanted) and all(type(row[2]) is bool and type(row[3]) is int for row in rows), 'typed_exact_'+key)
+    require(typed_value(props,'TemporaryFileSystem','a(ss)')==[['/dev/shm',IPC_TMPFS_OPTIONS]],'typed_private_shm')
+
+
+def effective(state, unit, fragment, live, argv, environment_files=None):
+    required = {'Id': unit, 'LoadState': 'loaded', 'ActiveState': 'inactive', 'MainPID': '0',
+                'ControlPID': '0', 'Transient': 'no', 'FragmentPath': str(fragment),
+                'DropInPaths': '', 'NeedDaemonReload': 'no', 'Type': 'exec', 'ExitType': 'cgroup',
+                'Restart': 'no', 'RemainAfterExit': 'no', 'Slice': 'system.slice', 'User': 'jericho', 'Group': 'jericho',
+                'KillMode': 'control-group', 'SendSIGKILL': 'yes', 'KillSignal': '15', 'FinalKillSignal': '9',
+                'MemoryMax': '2147483648',
+                'MemorySwapMax': '0', 'TasksMax': '128', 'OOMPolicy': 'kill',
+                'PrivateNetwork': 'yes', 'PrivateUsers': 'yes', 'PrivateUsersEx': 'self', 'PrivateMounts': 'yes', 'PrivatePIDs': 'yes', 'PrivateIPC': 'yes',
+                'ProtectHome': 'tmpfs', 'ProtectSystem': 'strict', 'NoNewPrivileges': 'yes',
+                'CapabilityBoundingSet': '', 'AmbientCapabilities': '', 'UMask': '0077', 'WorkingDirectory': str(live),
+                'StandardInput': 'null', 'StandardOutput': 'null', 'StandardError': 'null', 'Environment': ''}
+    require(all(state.get(k) == v for k, v in required.items()), 'effective_property_mismatch')
+    families = state.get('RestrictAddressFamilies')
+    require(isinstance(families, str), 'effective_address_families_type')
+    names = families.split()
+    require(len(names) == 1 and set(names) == {'AF_UNIX'},
+            'effective_address_families_mismatch')
+    validate_execution_properties(environment_files, unit, Path(__file__).resolve().parent, live)
+    require('EnvironmentFiles' not in state or state['EnvironmentFiles'] == '', 'conflicting_environment_files')
+    require(state.get('Job') in ('', '0') and not state.get('InvocationID') and not state.get('ControlGroup'), 'preexisting_execution')
+    for key, seconds in {'JobTimeoutUSec': 1520, 'RuntimeMaxUSec': 1500, 'TimeoutStartUSec': 10,
+                         'TimeoutStopUSec': 5, 'CPUQuotaPerSecUSec': 2}.items():
+        require(usec(state.get(key, '')) == seconds * 1000000, 'effective_bound_' + key)
+    require(affinity(state.get('CPUAffinity', '')) == {0, 1}, 'effective_affinity')
+    # One exact loaded ExecStart, no injected second command/arguments.
+    command = state.get('ExecStart', '')
+    require(command.count('argv[]=') == 1 and command.count('path=') == 1
+            and command.startswith('{ path=/usr/bin/env ; argv[]=')
+            and command.split('argv[]=', 1)[1].split(' ; ', 1)[0] == ' '.join(argv), 'effective_execstart')
+
+
+def cessation(state, unit, fragment, cgroup, group_closed):
+    require(state.get('Id') == unit and state.get('FragmentPath') == str(fragment)
+            and state.get('Transient') == 'no' and not state.get('DropInPaths'), 'foreign_unit')
+    require(state.get('ActiveState') in ('inactive', 'failed') and state.get('MainPID') == state.get('ControlPID') == '0'
+            and state.get('Job') in ('', '0'), 'unit_not_stopped')
+    invocation = state.get('InvocationID', '')
+    require(not invocation or bool(re.fullmatch(r'[0-9a-f]{32}', invocation)), 'invocation_invalid')
+    require(state.get('ControlGroup') in ('', cgroup), 'foreign_cgroup')
+    require(group_closed is True, 'cgroup_not_stopped')
+    return invocation
+
+
+class Attempt:
+    """Finite single submission through the existing systemd manager."""
+    def __init__(self, root, live, clock, transport=None, now=time.monotonic, interruption=None):
+        self.root, self.live, self.clock = Path(root), Path(live), clock
+        self.unit = unit_name(clock['nonce'])
+        self.fragment = UNIT_DIRECTORY / self.unit
+        self.payload, self.argv = render(self.root, self.live, self.unit)
+        self.cgroup = '/system.slice/' + self.unit
+        self.now, self.transport = now, transport or self.native_call
+        self.records, self.submitted, self.closed = [], False, False
+        self.file_identity, self.file_complete, self.load_attempted, self.cleaned = None, False, False, False
+        self.manager = None
+        self.publication_intent, self.publication_refused = False, False
+        self.publication_fd = None
+        self.interruption = interruption or (lambda: None)
+        self.suffix_started, self.suffix_transport_seconds = None, 0.0
+        self.host_sentinel = None
+        self.root_control_handles = {}
+
+    @property
+    def host_sentinel_unresolved(self):
+        s = self.host_sentinel
+        return bool(s and ((s['listener'] is not None and not s['listener_closed']) or
+                          (s['intent'] and not s['bind_refused'] and not s['absent_confirmed'])))
+
+    def host_sentinel_evidence(self):
+        if self.host_sentinel is None:
+            return None
+        return {k: v for k, v in self.host_sentinel.items() if k != 'listener'}
+
+    def create_host_sentinel(self):
+        require(self.host_sentinel is None, 'build_has_no_host_socket')
+
+    def close_host_sentinel(self):
+        require(self.host_sentinel is None, 'build_has_no_host_socket')
+
+    @property
+    def unresolved(self):
+        # Missing inode/fd is uncertainty after intent, never proof of no effect.
+        return self.host_sentinel_unresolved or getattr(self, 'root_control_unknown', False) or (((self.publication_intent and not self.publication_refused)
+                or self.submitted) and not (self.closed and self.cleaned))
+
+    def before_effect(self):
+        require(self.interruption() is None, 'foreground_interrupted')
+
+    def close_publication(self):
+        if self.publication_fd is not None:
+            os.close(self.publication_fd)
+            self.publication_fd = None
+
+    def remaining(self, reserve=0):
+        n = self.clock['deadline_monotonic'] - self.now() - reserve
+        require(n > 0, 'original_budget_exhausted')
+        return n
+
+    def suffix_reserve(self, reserve=10):
+        if self.suffix_started is None:
+            return reserve
+        local_used = self.now() - self.suffix_started - self.suffix_transport_seconds
+        require(0 <= local_used <= 10, 'suffix_local_window_exceeded')
+        # Keep future full native windows plus the unspent part of local10.
+        # Previously spent local time is not reserved a second time.
+        return reserve - local_used
+
+    def native_call(self, argv, timeout):
+        if argv == [SUDO, '-n', '--', str(ADMIN_DIRECTORY / 'start')]:
+            return self.native_start(argv, timeout)
+        try:
+            p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, env=ENV, timeout=timeout, close_fds=True)
+        except subprocess.TimeoutExpired as exc:
+            # subprocess.run kills/reaps the finite client; native manager outcome remains unknown.
+            return {'returncode': None, 'timeout': True, 'client_reaped': True,
+                    'stdout': (exc.stdout or b'').decode(errors='replace'), 'stderr': (exc.stderr or b'').decode(errors='replace')}
+        return {'returncode': p.returncode, 'timeout': False, 'client_reaped': True,
+                'stdout': p.stdout.decode(errors='replace'), 'stderr': p.stderr.decode(errors='replace')}
+
+    def native_start(self, argv, timeout):
+        """One existing wait client, finite pipe rendezvous, no start retry/polling.
+        Native identity is read by the original host custodian; the isolated
+        probe never receives the user's systemd bus or a host network FD.
+        """
+        started = self.now()
+        client = None
+        ready_fd = grant_fd = finished_fd = None
+        host_tcp = host_abstract = host_filesystem = None
+        host_socket_path = Path("/dev/shm/friday-" + self.clock["nonce"] + ".sock")
+        identity = None
+        answer = None
+        try:
+            def fifo(name):
+                path = self.live / name
+                s = path.lstat()
+                require(stat.S_ISFIFO(s.st_mode) and s.st_uid == 1000 and stat.S_IMODE(s.st_mode) == 0o600 and s.st_nlink == 1, 'handshake_fifo_identity')
+                fd = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+                require((os.fstat(fd).st_dev, os.fstat(fd).st_ino) == (s.st_dev, s.st_ino), 'handshake_fifo_replaced')
+                return fd
+            ready_fd = fifo('identity-ready.fifo')
+            grant_fd = fifo('identity-grant.fifo')
+            finished_fd = fifo('payload-finished.fifo')
+            host_net=os.readlink('/proc/self/ns/net');host_user=os.readlink('/proc/self/ns/user')
+            host_ipc=os.readlink('/proc/self/ns/ipc');host_mount=os.readlink('/proc/self/ns/mnt')
+            client = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      env=ENV, close_fds=True)
+            # One bounded readiness wait. Late/no probe leaves the native unit
+            # outcome uncertain; existing execute() settlement still stops it.
+            wait = min(25, started + timeout - self.now())
+            ready_watch=selectors.DefaultSelector()
+            try:
+                ready_watch.register(ready_fd,selectors.EVENT_READ,'ready')
+                ready_watch.register(self.cancel_fd,selectors.EVENT_READ,'cancel')
+                require(wait>0,'readiness_clock_exhausted')
+                events=ready_watch.select(wait)
+                require(any(key.data=='ready' for key,_ in events) and self.interruption() is None,'payload_ready_missing_or_interrupted')
+            finally:ready_watch.close()
+            require(os.read(ready_fd, 128) == (self.clock['nonce'] + '\n').encode(), 'probe_ready_foreign')
+            self.capture_root_control('start')
+            self.before_effect()
+            # One fixed privileged observation may run while root start retains
+            # control.lock. Its separate observe.lock never queues behind --wait.
+            observation_row=self.client([SUDO,'-n','--',str(ADMIN_DIRECTORY/'observe')],seconds=10,reserve=POST_START_WINDOW)
+            require(not observation_row['timeout'] and observation_row['returncode']==0 and not observation_row['stderr'],
+                    'root_observation_transport')
+            self.capture_root_control('observe')
+            raw,_=read_exact(ADMIN_DIRECTORY/'observation.json',0,0o444)
+            observation=json.loads(raw);reply=json.loads(observation_row['stdout'])
+            require(all(reply.get(k)==v for k,v in observation.items()),'root_observation_reply_changed')
+            require(observation['state']=='EXACT_ROOT_NAMESPACE_OBSERVATION' and observation['unit']==self.unit
+                and observation['nonce']==self.clock['nonce'] and observation['clock_sha256']==self.clock_hash
+                and observation['manager']==self.manager and observation['operation_identity']==self.root_control_handles['observe'],
+                'root_observation_custody_binding')
+            # Root proc paths are selected solely by typed MainPID. Parent grants
+            # remain in this original Attempt; no proc authority or bus enters the payload.
+            pid=observation['pid'];birth=observation['start_ticks'];identity=observation['native_identity']
+            ns=observation['namespaces']
+            require(ns['net']!=host_net and ns['user']!=host_user and ns['ipc']!=host_ipc and ns['mnt']!=host_mount,
+                    'root_observed_namespace_isolation')
+            inv=validate_native_identity(identity,dict(self.clock,manager_identity=self.manager),self.cgroup,
+                    str(self.fragment),started,self.now(),pid=pid)
+            require(inv==observation['invocation_id'] and birth==identity['pid_start_time'],'root_observation_join')
+            typed_current=typed_reply(identity['stdout'],'a{sv}')
+            validate_execution_properties(dict(unit=self.unit,manager_scope='system',object_path=unit_object_path(self.unit),type='a{sv}',data=typed_current),self.unit,self.root,self.live)
+            require(observation['activation_monotonic']+1500+5<self.clock['deadline_monotonic'], 'native_absolute_budget_changed')
+            self.root_observation=observation
+            self.own_file()
+            grant=dict(native_identity=identity,manager_identity=self.manager,root_observation=observation,host_net=host_net,host_user=host_user,host_ipc=host_ipc,host_mount=host_mount)
+            fresh_json(self.live / 'host-current-invocation.json', grant)
+            self.before_effect()
+            data = json.dumps(grant, separators=(',', ':')).encode() + b'\n'
+            require(len(data) < 65536, 'identity_grant_too_large')
+            # Only a small notification crosses PIPE_BUF; raw JSON is durable.
+            require(os.write(grant_fd, (self.clock['nonce'] + '\n').encode()) == 17, 'identity_grant_short_write')
+            # start now returns after activation, releasing the existing root
+            # control lock; stop is immediately available during the build.
+            out,err=client.communicate(timeout=min(30,started+timeout-self.now()))
+            require(client.returncode==0 and not err,'root_start_client_failed')
+            self.capture_root_control('start');self.root_controls_closed()
+            watcher=selectors.DefaultSelector()
+            try:
+                watcher.register(finished_fd,selectors.EVENT_READ,'payload')
+                watcher.register(self.cancel_fd,selectors.EVENT_READ,'cancel')
+                events=watcher.select(max(0,started+timeout-self.now()))
+                require(bool(events),'native_build_wait_exhausted')
+                require(any(key.data=='payload' for key,_ in events) and self.interruption() is None,'native_build_interrupted')
+                require(os.read(finished_fd,128)==(self.clock['nonce']+'\n').encode(),'payload_completion_foreign')
+            finally:watcher.close()
+            left = started + timeout - self.now(); require(left > 0, 'native_wait_window_exhausted')
+            try:
+                out, err = client.communicate(timeout=left)
+                answer = {'returncode': client.returncode, 'timeout': False, 'client_reaped': True,
+                          'stdout': out.decode(errors='replace'), 'stderr': err.decode(errors='replace')}
+            except subprocess.TimeoutExpired:
+                client.kill(); out, err = client.communicate()
+                answer = {'returncode': None, 'timeout': True, 'client_reaped': True,
+                          'stdout': out.decode(errors='replace'), 'stderr': err.decode(errors='replace')}
+            self.capture_root_control('start'); self.root_controls_closed()
+            answer = dict(answer, host_identity=identity)
+        except BaseException as exc:
+            # Never turn client termination into a native-unit stop assertion.
+            if client is not None:
+                if client.poll() is None: client.kill()
+                out, err = client.communicate()
+            else: out, err = b'', b''
+            answer = {'returncode': None, 'timeout': True, 'client_reaped': True,
+                    'stdout': out.decode(errors='replace'), 'stderr': err.decode(errors='replace'),
+                    'handshake_error': str(exc), 'host_identity': identity}
+            try:
+                self.capture_root_control('start'); self.root_controls_closed()
+            except BaseException as control_error:
+                answer['root_control_unknown'] = str(control_error)
+                self.root_control_unknown = True
+        finally:
+            cleanup_errors = []
+            try:
+                for fd in (ready_fd, grant_fd, finished_fd):
+                    if fd is not None: os.close(fd)
+                for listener in (host_tcp, host_abstract):
+                    if listener is not None: listener.close()
+            finally:
+                # Preserve unrelated descriptor failure behavior, but it must
+                # never prevent the owned sentinel cleanup attempt.
+                try:
+                    self.close_host_sentinel()
+                except BaseException as exc:
+                    cleanup_errors.append(str(exc))
+                    if self.host_sentinel is not None:
+                        self.host_sentinel['cleanup_errors'].append(str(exc))
+                # Keep the original handshake exception/outcome. Supplemental
+                # cleanup failure never substitutes for it or clears custody.
+                if answer is not None:
+                    answer['host_sentinel'] = self.host_sentinel_evidence()
+                    if cleanup_errors:
+                        answer['cleanup_errors'] = cleanup_errors
+                        answer['timeout'] = True
+        return answer
+
+    def capture_root_control(self, operation):
+        p=ADMIN_DIRECTORY/('operation-'+operation+'.json')
+        root_file(p,0o444);value=json.loads(p.read_text())
+        require(value['operation']==operation and value['unit']==self.unit and value['nonce']==self.clock['nonce']
+                and value['boot_id']==self.clock['boot_id'] and value['deadline_monotonic']==self.clock['deadline_monotonic']
+                and type(value['pid']) is int and value['pid']>1 and type(value['start_ticks']) is int and value['start_ticks']>0,
+                'root_control_handle_identity')
+        self.root_control_handles[operation]=value
+
+    def root_controls_closed(self):
+        for value in self.root_control_handles.values():
+            proc=Path('/proc')/str(value['pid'])
+            try:birth=start_time(proc)
+            except FileNotFoundError:continue
+            require(birth != value['start_ticks'], 'root_control_still_owned_or_live')
+        return True
+
+    def call(self, tail, seconds=5, reserve=20, system=False):
+        argv = [SYSTEMCTL, '--system', '--no-pager', *tail]
+        return self.client(argv, seconds, reserve)
+
+    def client(self, argv, seconds=5, reserve=20):
+        require(self.remaining(self.suffix_reserve(reserve)) >= seconds, 'full_control_window_unavailable')
+        started = self.now()
+        row = self.transport(argv, seconds)
+        completed = self.now()
+        if self.suffix_started is not None:
+            self.suffix_transport_seconds += completed - started
+        row = dict(row, argv=argv, timeout_seconds=seconds, started_monotonic=started, completed_monotonic=completed)
+        self.records.append(row)
+        require(row.get('client_reaped') is True, 'client_not_reaped')
+        require(len(row.get('stdout', '').encode()) + len(row.get('stderr', '').encode()) <= 1048576, 'native_output_too_large')
+        return row
+
+    def checked(self, tail, reserve=20, seconds=5):
+        if tail == ['--job-mode=replace', 'stop', self.unit]:
+            row = self.client([SUDO, '-n', '--', str(ADMIN_DIRECTORY / 'stop')], seconds=seconds, reserve=reserve)
+        else:
+            raise RuntimeError('fixed_control_operation_required')
+        require(not row['timeout'] and row['returncode'] == 0 and not row['stderr'], 'native_control_uncertain')
+        self.capture_root_control('stop'); self.root_controls_closed()
+        return row
+
+    def show(self, props=STATE_KEYS, reserve=20, system=False):
+        if system:
+            return self.manager_identity(reserve)
+        unit = self.unit
+        row = self.call(['show', unit, '--property=' + props], reserve=reserve, system=system)
+        require(not row['timeout'] and row['returncode'] in (0, 4) and not row['stderr'], 'native_observation_uncertain')
+        lines = row['stdout'].splitlines()
+        require(all('=' in line for line in lines), 'invalid_native_output')
+        state = dict(line.split('=', 1) for line in lines)
+        require(len(state) == len(lines), 'duplicate_native_property')
+        return state
+
+    def environment_files(self):
+        prefix = [BUSCTL, '--system', '--no-pager', '--json=short', '--auto-start=no',
+                  '--allow-interactive-authorization=no', '--timeout=4']
+        path = unit_object_path(self.unit)
+        row = self.client(prefix + ['call', 'org.freedesktop.systemd1', path,
+            'org.freedesktop.DBus.Properties', 'GetAll', 's', 'org.freedesktop.systemd1.Service'], reserve=80)
+        require(row.get('timeout') is False and row.get('returncode') == 0
+                and row.get('stderr') == '', 'typed_observation_uncertain')
+        data = typed_reply(row['stdout'], 'a{sv}')
+        require(len(data) == 1 and isinstance(data[0], dict), 'typed_execution_schema')
+        return {'unit': self.unit, 'manager_scope': 'system', 'object_path': path,
+                'type': 'a{sv}', 'data': data}
+
+    def group_closed(self):
+        p = Path('/sys/fs/cgroup') / self.cgroup.lstrip('/')
+        try:
+            p.lstat()
+        except FileNotFoundError:
+            return True
+        # Permission/IO failures are unknown, never proof that the cgroup is absent.
+        require(p == p.resolve(strict=True), 'cgroup_symlink')
+        events = dict(line.split() for line in (p / 'cgroup.events').read_text().splitlines())
+        return events.get('populated') == '0' and not (p / 'cgroup.procs').read_text().strip()
+
+    def manager_identity(self, reserve=20):
+        prefix = [BUSCTL, '--system', '--no-pager', '--json=short', '--auto-start=no',
+                  '--allow-interactive-authorization=no', '--timeout=2', 'call',
+                  'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus']
+        a = self.client(prefix + ['GetNameOwner', 's', 'org.freedesktop.systemd1'], seconds=2, reserve=reserve+2)
+        require(not a['timeout'] and a['returncode'] == 0 and a['stderr'] == '', 'manager_owner_read')
+        names = typed_reply(a['stdout'], 's')
+        require(len(names) == 1 and bool(re.fullmatch(r':[0-9]+\.[0-9]+', names[0])), 'manager_bus_owner')
+        b = self.client(prefix + ['GetConnectionCredentials', 's', names[0]], seconds=2, reserve=reserve)
+        require(not b['timeout'] and b['returncode'] == 0 and b['stderr'] == '', 'manager_credentials_read')
+        rows = typed_reply(b['stdout'], 'a{sv}')
+        require(len(rows) == 1 and isinstance(rows[0], dict), 'manager_credentials_shape')
+        p = rows[0]
+        value = dict(scope='system', pid=typed_value(p, 'ProcessID', 'u'),
+                     uid=typed_value(p, 'UnixUserID', 'u'), bus_owner=names[0],
+                     boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                     start_ticks=start_time(Path('/proc/1')))
+        manager_valid(value)
+        return value
+
+    def adopt_installed(self):
+        # Transfer verified prepared artifacts into the original foreground
+        # Attempt before setup/native reads can fail; no fragment write/start.
+        self.publication_intent=True;self.load_attempted=True
+        receipt=administrative_preflight(self.root,self.unit,self.payload)
+        self.manager=receipt['manager'];manager_valid(self.manager)
+        self.file_identity=tuple(receipt['fragment_identity']);self.file_complete=True
+        self.publication_intent=True;self.load_attempted=True
+
+    def publish(self):
+        # Administrative preparation happened before the separately granted trial.
+        # UID1000 only adopts an exact preinstalled root receipt; it writes no fragment.
+        self.before_effect(); self.remaining(95)
+        require(self.unit == IDENTITY['unit'] and str(self.live) == IDENTITY['live_directory'], 'fixed_installed_contour')
+        receipt = administrative_preflight(self.root, self.unit, self.payload)
+        require(receipt['manager'] == self.manager, 'installed_manager_changed')
+        self.file_identity = tuple(receipt['fragment_identity'])
+        self.file_complete = True
+        self.publication_intent = True
+        self.load_attempted = True
+        row=self.client([SUDO,'-n','--',str(ADMIN_DIRECTORY/'preflight')],seconds=10,reserve=90)
+        require(row['timeout'] is False and row['returncode']==0 and row['stderr']=='','administrative_authority_absent_or_unknown')
+        checked=json.loads(row['stdout'])
+        require(checked['state']=='EXACT_ADMINISTRATIVE_PREFLIGHT_PASS' and checked['unit']==self.unit
+                and checked['manager']==self.manager and checked['receipt']==receipt,'root_preflight_receipt')
+        self.capture_root_control('preflight');self.root_controls_closed()
+
+    def own_file(self):
+        root_file(self.fragment)
+        s = self.fragment.lstat()
+        require((s.st_dev, s.st_ino) == self.file_identity and stat.S_IMODE(s.st_mode) == 0o444
+                and s.st_nlink == 1 and self.fragment.read_bytes() == self.payload, 'foreign_unit_file')
+
+    def cleanup(self, final):
+        require(not self.host_sentinel_unresolved, 'host_sentinel_cleanup_unconfirmed')
+        row = self.client([SUDO, '-n', '--', str(ADMIN_DIRECTORY / 'cleanup')], seconds=15, reserve=10)
+        require(row['timeout'] is False and row['returncode'] == 0 and row['stderr'] == '', 'administrative_cleanup_unknown')
+        receipt = json.loads(row['stdout'])
+        if self.manager is None:
+            manager_valid(receipt['manager']);self.manager=receipt['manager']
+        for operation,value in receipt['operation_handles'].items():
+            require(value['unit']==self.unit and value['nonce']==self.clock['nonce'] and value['boot_id']==self.clock['boot_id']
+                    and value['deadline_monotonic']==self.clock['deadline_monotonic'], 'root_control_receipt_contour')
+            self.root_control_handles[operation]=value
+        require(set(self.root_control_handles) <= {'preflight','start','observe','stop','cleanup'}
+                and 'cleanup' in self.root_control_handles and self.root_controls_closed(), 'root_control_reap_required')
+        require(receipt['state'] == 'EXACT_ROOT_ARTIFACTS_REMOVED' and receipt['unit'] == self.unit
+                and receipt['manager'] == self.manager and receipt['clock_sha256'] == self.clock_hash
+                and empty(receipt['after'], self.unit) and self.group_closed() and receipt['control_pid']==self.root_control_handles['cleanup']['pid']
+                and receipt['control_start_ticks']==self.root_control_handles['cleanup']['start_ticks'], 'unit_cleanup_unconfirmed')
+        require({row['path'] for row in receipt['absence_observations']} == {str(self.fragment),str(ADMIN_DIRECTORY),str(SUDOERS),str(INSTALL_JOURNAL)}
+                and len(receipt['absence_observations'])==4 and all(row['errno']==2 and self.clock['started_monotonic']<=row['observed_monotonic']<self.clock['deadline_monotonic'] for row in receipt['absence_observations']), 'root_absence_observations_required')
+        for path in (self.fragment, ADMIN_DIRECTORY, INSTALL_JOURNAL):
+            require(not path.exists() and not path.is_symlink(), 'root_artifacts_remain')
+        self.suffix_reserve(); self.remaining()
+        self.root_control_unknown = False
+        self.cleaned = True
+        return receipt['after']
+
+    def execute(self):
+        self.before_effect()
+        # Preserve prior conservative reserves for the full5s typed client.
+        before = self.show(reserve=105)
+        require(before.get('LoadState') == 'loaded' and before.get('ActiveState') == 'inactive'
+                and before.get('MainPID') == before.get('ControlPID') == '0' and before.get('Job') in ('', '0')
+                and not before.get('InvocationID') and not before.get('ControlGroup')
+                and self.group_closed(), 'installed_unit_already_used')
+        manager = self.show(system=True, reserve=100); manager_valid(manager); self.manager = manager
+        self.remaining(100)
+        self.publish()
+        self.before_effect()
+        self.load_attempted = True
+        # Root installation already loaded the immutable exact fragment; no user reload privilege.
+        loaded = self.show(EFFECTIVE_KEYS, reserve=90)
+        self.own_file()
+        environment_files = self.environment_files()
+        self.own_file()  # A typed empty reply never substitutes for the owned fragment.
+        effective(loaded, self.unit, self.fragment, self.live, self.argv, environment_files)
+        require(self.show(system=True, reserve=75) == manager, 'manager_changed_before_start')
+        # Full fixed 57s suffix includes the worst optional-stop/reset branch.
+        # A fast useful start has at least20s; a queued/slow start may be cut off
+        # by this supplemental client bound, without weakening manager1520/10/1500/5.
+        self.before_effect()
+        require(self.remaining(POST_START_WINDOW) >= MIN_START_WINDOW, 'start_window_insufficient')
+        fresh_json(self.live / 'submission.json', {'unit': self.unit, 'fragment': str(self.fragment),
+                   'unit_sha256': hashlib.sha256(self.payload).hexdigest(), 'manager': manager,
+                   'loaded': loaded, 'environment_files': environment_files,
+                   'prestart_records': self.records, 'clock': self.clock, 'native_start_count': 1})
+        self.before_effect()
+        require(self.remaining()>1575,'original_start_and_cessation_reserve')
+        window = min(1530, self.remaining(POST_START_WINDOW + 1))
+        require(window >= MIN_START_WINDOW, 'start_window_insufficient')
+        self.submitted = True
+        outcome = self.client([SUDO, '-n', '--', str(ADMIN_DIRECTORY / 'start')], seconds=window, reserve=POST_START_WINDOW)
+        self.suffix_started = outcome['completed_monotonic']
+        first = self.show(reserve=50)
+        self.own_file()
+        require(first.get('Id') == self.unit and first.get('FragmentPath') == str(self.fragment)
+                and not first.get('DropInPaths') and first.get('ControlGroup') in ('', self.cgroup), 'foreign_unit_after_start')
+        require(self.show(system=True, reserve=45) == manager, 'manager_changed_after_start')
+        self.checked(['--job-mode=replace', 'stop', self.unit], seconds=12, reserve=35)
+        final = self.show(reserve=30)
+        require(self.show(system=True, reserve=25) == manager, 'manager_changed_at_cessation')
+        inv = cessation(final, self.unit, self.fragment, self.cgroup, self.group_closed())
+        require(not inv or not first.get('InvocationID') or inv == first['InvocationID'], 'invocation_changed')
+        original_observation=getattr(self,'root_observation',None)
+        if original_observation is not None:
+            require(not inv or inv==original_observation['invocation_id'],'original_running_invocation_changed')
+        proof = None
+        if self.interruption() is None and not outcome['timeout'] and outcome['returncode'] == 0 and final.get('Result') == 'success':
+            path=self.live/'runtime.stdout';raw,metadata=read_exact(path,1000,0o600,maximum=1048575)
+            require([metadata.st_dev,metadata.st_ino]==self.root_observation['result_identity'],'probe_result_fd_changed')
+            proof=json.loads(raw)
+            require(proof.get('native_identity')==self.root_observation['native_identity'],'probe_result_root_provenance')
+            live_inv = validate_native_identity(proof.get('native_identity'), dict(self.clock, manager_identity=self.manager), self.cgroup,
+                    str(self.fragment), outcome['started_monotonic'], outcome['completed_monotonic'])
+            require(all(value in ('', live_inv) for value in (inv, first.get('InvocationID', ''))),
+                    'invocation_changed')
+            require(proof.get('probe')=='OFFLINE_NATIVE_BUILD_COMPLETE' and proof.get('cgroup')==self.cgroup and len(proof.get('binary_sha256',''))==64 and proof.get('installed_journey_accepted') is False, 'actual_build_proof_required')
+            binary=self.live/'target/debug/agent-browser'
+            require(proof.get('binary_path')==str(binary) and private(binary).st_nlink==1 and digest(binary)==proof['binary_sha256'], 'returned_binary_changed')
+            dashboard=self.live/'source/packages/dashboard/out'
+            assets={str(q.relative_to(dashboard)):digest(q) for q in dashboard.rglob('*') if q.is_file()}
+            require(assets==proof['dashboard'] and 'index.html' in assets and any(q.endswith('.woff2') for q in assets), 'returned_dashboard_changed')
+        # Cessation is a fact, not an outcome decision before cleanup/reporting.
+        fresh_json(self.live / 'cessation.json', {'state': 'CESSATION_CONFIRMED', 'proof': proof, 'final': final,
+                   'records': self.records, 'manager': manager, 'native_cgroup_closed': True,
+                   'runtime_accepted_by_source_task': False})
+        self.closed = True
+        after_cleanup = self.cleanup(final)
+        self.remaining()
+        state = 'INTERRUPTED_CESSATION_CONFIRMED' if self.interruption() is not None else ('PASS' if proof else ('START_TRANSPORT_UNCERTAIN_CESSATION_CONFIRMED' if outcome['timeout']
+                                    else 'FAILED_OR_REJECTED_CESSATION_CONFIRMED'))
+        return {'state': state, 'proof': proof, 'cleaned': self.cleaned, 'after_cleanup': after_cleanup,
+                'native_cgroup_closed': True, 'installed_journey_accepted': False}
+
+    def completion_status(self, result):
+        # Called after all persistence, flushed output and descriptor/handler
+        # bookkeeping. No success bytes are published before these checks.
+        # The caller must observe the reaped parent exit before this same clock
+        # expires; a pending receipt/stdout alone never proves accepted success.
+        if self.unresolved or not self.closed or not self.cleaned:
+            return 1
+        if self.interruption() is not None:
+            return 2
+        try:
+            self.suffix_reserve()
+            self.remaining()
+        except RuntimeError:
+            return 3
+        return 0 if result['state'] == 'PASS' else 1
+
+    def reconcile_prestart(self):
+        require(not self.submitted and self.publication_intent and not self.publication_refused,
+                'post_submission_or_no_owned_publication')
+        require(getattr(self,'clock_hash',None) is not None,'admission_incomplete_retains_custody')
+        self.remaining(35)
+        # Fixed cleanup revalidates root receipt and exact creation journal itself.
+        # A failed user-side adoption read cannot suppress this bounded rollback.
+        self.cleanup(None)
+        self.cleaned,self.closed=True,True
+
+
+def retain_unknown(attempt):
+    # Existing original foreground parent's descriptor remains custody. No new daemon,
+    # timer, polling, retry or replacement custodian. Recovery is external and reviewed.
+    while attempt.unresolved:
+        try:
+            code.interact(banner='STOP_UNCONFIRMED: original parent/lock retained; no retry.', local={'attempt': attempt})
+        except BaseException:
+            pass
+        if attempt.unresolved:
+            try: signal.pause()
+            except BaseException: pass
+
+
+def admit(path):
+    require(os.geteuid() == 1000 and 'CI' not in os.environ and not Path('/.dockerenv').exists()
+            and not Path('/run/.containerenv').exists()
+            and not any(x in Path('/proc/1/cgroup').read_text() for x in ('docker', 'kubepods', 'lxc')), 'host_automatic_no_sandbox_condition')
+    private(path)
+    admission = json.loads(Path(path).read_text())
+    require(admission.get('allow_one_offline_native_build') is True
+            and admission.get('runtime_authorized') is True
+            and admission.get('source_task') == SOURCE_TASK
+            and bool(re.fullmatch(r'[0-9a-f]{64}', admission.get('independent_review_sha256', ''))), 'fresh_root_review_required')
+    require(Path(path) == Path('<SOL_WORK>/FRW041-NATIVE-OFFLINE-BUILD-admission-010d839888625d6d/admission.json'), 'fixed_runtime_admission_path')
+    require(stat.S_IMODE(Path(path).stat().st_mode)==0o400,'immutable_runtime_admission_required')
+    names = json.loads((ROOT/'package-pins.json').read_text())
+    require(set(admission['source_sha256']) == set(names) | {'package-pins.json'}, 'complete_source_pin_set')
+    for name in admission['source_sha256']:
+        private(ROOT / name)
+        require(digest(ROOT / name) == admission['source_sha256'][name], 'source_changed')
+    review_path = Path(admission['independent_review_path']); private(review_path)
+    require(digest(review_path) == admission['independent_review_sha256'], 'independent_review_changed')
+    review = json.loads(review_path.read_text())
+    require(review['state'] == 'INDEPENDENT_OFFLINE_BUILD_SYSTEM_SERVICE_SOURCE_ACCEPTED'
+            and review['package_pins_sha256'] == digest(ROOT/'package-pins.json')
+            and review['source_task'] == SOURCE_TASK and review['runtime_grant'] is False, 'exact_changed_area_review_required')
+    clock_path = Path(admission['clock_path']); private(clock_path)
+    require(str(clock_path) == IDENTITY['trial_clock_path'] and stat.S_IMODE(clock_path.stat().st_mode)==0o400, 'fixed_immutable_original_clock_path')
+    require(digest(clock_path) == admission['clock_sha256'], 'clock_changed')
+    clock = json.loads(clock_path.read_text())
+    require(clock['budget_seconds'] == 1800 and clock['deadline_monotonic'] == clock['started_monotonic'] + 1800
+            and clock['started_monotonic'] <= time.monotonic() < clock['deadline_monotonic']
+            and clock['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            and clock['assignment'] == 'FRW041-NATIVE-OFFLINE-BUILD-RUN'
+            and clock['native_effects_authorized_by'] == 'Astra', 'original_clock_invalid')
+    name = unit_name(clock['nonce']); require(clock['unit'] == name == IDENTITY['unit'] and clock['nonce'] == IDENTITY['nonce'], 'unit_clock_mismatch')
+    # Complete frozen input graph is verified under the read-only unit before tool execution.
+    manifest = json.loads((ROOT / 'source-pins.json').read_text())
+    require(BUSCTL in manifest['pins'], 'typed_transport_pin_required')
+    alias = manifest['python_alias']
+    require(alias['path'] == '/usr/bin/python3'
+            and Path(alias['path']).resolve(strict=True) == Path(alias['resolved'])
+            and alias['resolved'] in manifest['pins'], 'python_alias_changed')
+    for p, pin in manifest['pins'].items():
+        require(time.monotonic() + 90 < clock['deadline_monotonic'], 'pin_budget_exhausted')
+        require(Path(p).stat().st_size == pin['size'] and digest(p) == pin['sha256'], 'dependency_changed')
+    live = Path(admission['live_directory'])
+    require(live.parent == ROOT.parent.parent and not live.exists() and live.name == 'FRW041-NATIVE-OFFLINE-BUILD-run-' + clock['nonce'], 'fresh_runtime_directory_required')
+    return admission, clock, live
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--admission', type=Path, required=True)
+    args = parser.parse_args()
+    require(os.getuid() == 1000 and os.isatty(0), 'foreground_native_owner_required')
+    os.umask(0o077); os.sched_setaffinity(0, {0, 1})
+    resource.setrlimit(resource.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
+    live=Path(IDENTITY['live_directory'])
+    fd = os.open(LOCK, os.O_RDONLY | os.O_NOFOLLOW)
+    s = os.fstat(fd)
+    require((s.st_dev, s.st_ino, s.st_uid, s.st_gid, s.st_nlink, s.st_size, stat.S_IMODE(s.st_mode))
+            == (2050, 9044963, 1000, 1000, 1, 0, 0o664), 'quality_lock_changed')
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    attempt = None
+    interrupt = [None]
+    cancel_read,cancel_write=os.pipe2(os.O_NONBLOCK|os.O_CLOEXEC)
+    def interrupted(signum, frame):
+        # Do not raise asynchronously across bookkeeping/finally boundaries.
+        # Admission checks stop pre-start effects; post-start finite settlement
+        # proceeds, or the same original foreground parent retains custody.
+        interrupt[0] = signum
+        try:os.write(cancel_write,b'!')
+        except BlockingIOError:pass
+    handlers = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)}
+    try:
+        attempt = Attempt(ROOT, live,dict(nonce=IDENTITY['nonce'],deadline_monotonic=0),interruption=lambda:interrupt[0])
+        attempt.cancel_fd=cancel_read
+        attempt.publication_intent=True;attempt.load_attempted=True
+        admission,clock,live=admit(args.admission)
+        attempt.clock=clock;attempt.clock_hash=admission['clock_sha256']
+        attempt.adopt_installed()
+        live.mkdir(mode=0o700)
+        for directory in ('runtime-tmp', 'runtime-cache', 'runtime-config', 'runtime-home', 'cargo-home'):
+            (live / directory).mkdir(mode=0o700)
+        for name in ('identity-ready.fifo', 'identity-grant.fifo', 'payload-finished.fifo'):
+            os.mkfifo(live / name, 0o600)
+        clock_fd = os.open(live/'clock.json', os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600)
+        with os.fdopen(clock_fd,'wb') as stream:
+            original_bytes = Path(admission['clock_path']).read_bytes()
+            require(hashlib.sha256(original_bytes).hexdigest() == admission['clock_sha256'], 'original_clock_changed_before_copy')
+            stream.write(original_bytes); stream.flush(); os.fsync(stream.fileno())
+        result = attempt.execute()
+        # A write/flush can itself cross the deadline or receive a signal. Keep
+        # every published success-path record explicitly pending. Acceptance is
+        # the final checked exit status plus the caller's actual reaped timestamp,
+        # never a provisional PASS written before the operation returns.
+        pending = dict(result, state='CESSATION_CONFIRMED_PENDING_FINAL_EXIT',
+                       probe_verified=bool(result['proof']), final_outcome_accepted=False,
+                       clock=clock, required_acceptance='parent_exit_0_reaped_before_original_deadline')
+        fresh_json(live / 'result.json', pending)
+        print(json.dumps(pending), flush=True)
+    except BaseException as exc:
+        if attempt and attempt.unresolved and not attempt.submitted:
+            try: attempt.reconcile_prestart()
+            except BaseException: pass
+        # Error reporting is best effort. It cannot control lock custody.
+        failure = None
+        try:
+            unknown = bool(attempt and attempt.unresolved)
+            failure = {'state': 'STOP_UNCONFIRMED' if unknown else 'REFUSED_CLOSED',
+                       'error': str(exc), 'error_type': type(exc).__name__, 'parent_pid': os.getpid(),
+                       'submitted': bool(attempt and attempt.submitted), 'signal': interrupt[0],
+                       'records': attempt.records if attempt else [], 'automatic_retry': False,
+                       'native_cgroup_closed': bool(attempt and attempt.closed),
+                       'cleaned': bool(attempt and attempt.cleaned), 'final_outcome_accepted': False}
+            failure['host_sentinel'] = attempt.host_sentinel_evidence() if attempt else None
+        except BaseException:
+            pass
+        if failure is not None:
+            try:
+                if live.exists(): fresh_json(live / 'failure.json', failure)
+            except BaseException:
+                pass
+            try: print(json.dumps(failure), flush=True)
+            except BaseException: pass
+        raise
+    finally:
+        # This finally executes despite simultaneous receipt/serialization/output
+        # failures or KeyboardInterrupt. Catchable signal handlers never throw.
+        # retain_unknown is itself allowed to suffer terminal/error interruption;
+        # only verified original reconciliation can clear unresolved custody.
+        if attempt is not None:
+            while attempt.unresolved:
+                try: retain_unknown(attempt)
+                except BaseException: pass
+        os.close(fd)
+        os.close(cancel_read);os.close(cancel_write)
+        for sig, old in handlers.items(): signal.signal(sig, old)
+    # This is deliberately after finally: even descriptor close/handler restore
+    # belong to the original clock. Already confirmed closure stays closed when
+    # reporting is late or interrupted; there is no new custody wait or retry.
+    return attempt.completion_status(result)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

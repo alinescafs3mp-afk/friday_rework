@@ -1,0 +1,561 @@
+"""Finite per-file native owner. SOURCE ONLY; no admission is supplied here.
+
+The existing owner admission owns the unit; this is not an Associations product
+job. NativeSupervisor receives a view of that pinned admission, then verifies the
+actual unit. The registry/test interpreter is created only by unit_entry(), after
+the native identity, kernel resource files and original timer have been checked.
+No command retries, polling, background watcher, alternate manager or root path.
+"""
+from pathlib import Path
+import importlib
+import inspect
+import hashlib
+import json
+import math
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+from plugins.friday_rework.supervision import NativeSupervisor, SupervisorError
+
+
+def check(value, message):
+    if not value:
+        raise RuntimeError(message)
+
+
+def duration(value):
+    """Parse systemctl's finite USEC property rendering, including compound spans."""
+    if value == '0':
+        return 0.0
+    units = {'us': 1e-6, 'ms': 1e-3, 's': 1, 'min': 60, 'h': 3600, 'd': 86400,
+             'w': 604800, 'month': 2629800, 'y': 31557600}
+    parts = re.findall(r'([0-9]+(?:\.[0-9]+)?)(us|ms|min|month|s|h|d|w|y)', value)
+    check(parts and ''.join(n + u for n, u in parts) == value.replace(' ', ''),
+          'UNREADABLE_FINITE_NATIVE_DURATION')
+    result = sum(float(n) * units[u] for n, u in parts)
+    check(math.isfinite(result), 'NONFINITE_NATIVE_DURATION')
+    return result
+
+
+def proc_identity(pid):
+    raw = Path('/proc', str(pid), 'stat').read_text()
+    return {'pid': pid, 'start_ticks': int(raw[raw.rfind(')') + 2:].split()[19])}
+
+
+class BoundedSupervisor(NativeSupervisor):
+    """Reuse all existing observe/stop guards; clip their individual RPC bounds.
+
+    Retained safety reconciliation may occur after deadline, but it never starts
+    work or declares a late observation to have occurred before that deadline.
+    """
+    def __init__(self, owner):
+        self.owner = owner
+
+    def _command(self, arguments, timeout):
+        return super()._command(arguments, self.owner.control_timeout(timeout))
+
+
+class FileOwner:
+    RPC = 5.0
+    START = 5.0
+    STOP = 5.0
+    PROOF = 60.0
+    extra_properties = ('Type', 'ExitType', 'Restart', 'RemainAfterExit', 'Delegate',
+        'NoNewPrivileges', 'ProtectControlGroups', 'TimeoutStartUSec', 'TimeoutStopUSec',
+        'TimeoutStartFailureMode', 'TimeoutStopFailureMode', 'RuntimeMaxUSec',
+        'RuntimeRandomizedExtraUSec', 'ActiveEnterTimestampMonotonic', 'ControlPID',
+        'ExecStartPre', 'ExecStartPost', 'ExecStop', 'ExecStopPost', 'DropInPaths',
+        'MemoryMax', 'MemorySwapMax', 'TasksMax', 'Job', 'FinalKillSignal')
+
+    def __init__(self, helper, out, index, *, retained=False):
+        self.h = helper
+        self.out = Path(out)
+        helper.private(self.out, 0o700)
+        helper.private(self.out / 'original-clock.json', 0o400)
+        helper.private(self.out / 'preflight.json', 0o400)
+        self.original = helper.read(self.out / 'original-clock.json')
+        self.pre = helper.read(self.out / 'preflight.json')
+        self.deadline = self.original['deadline_monotonic']
+        self.retained = retained
+        helper.private(self.pre['admission'], 0o400)
+        check(helper.sha(self.pre['admission']) == self.pre['admission_sha256'] and
+              helper.sha(self.out / 'original-clock.json') == self.pre['clock_sha256'],
+              'OUTER_ORIGINAL_ADMISSION_CHANGED')
+        self.grant = helper.read(self.pre['admission'])
+        phases = helper.phases_for(self.original)
+        check(type(index) is int and 0 <= index < len(phases), 'EXACT_OUTER_PHASE_REQUIRED')
+        self.phase = phases[index]
+        check(all(helper.finite(self.original.get(k)) for k in
+                  ('start_monotonic', 'deadline_monotonic', 'original_budget_seconds')) and
+              self.deadline == self.original['start_monotonic'] + self.original['original_budget_seconds'] and
+              self.original['scope'] == 'FINITE_SERIAL_DONOR_FILE_RUNTESTS' and
+              self.original['execution_authorized'] is True and
+              self.grant['state'] == 'INDEPENDENT_OWNER_DONOR_FILE_RUNTEST_ADMITTED' and
+              self.grant['execution_authorized'] is True and self.grant['output_root'] == str(self.out),
+              'NO_ORIGINAL_RUNTIME_ADMISSION')
+        check('runtest_file' in self.phase and self.original['boot_id'] ==
+              Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'OUTER_BOOT_OR_PHASE_CHANGED')
+        self.index = index
+        self.parent = self.out / self.phase['name']
+        helper.private(self.parent, 0o700)
+        helper.private(self.parent / 'run/clock.json', 0o400)
+        self.control = self.parent / 'native-owner'
+        if self.control.exists():
+            helper.private(self.control, 0o700)
+            helper.private(self.control / 'profile', 0o700)
+            helper.private(self.control / 'tmp', 0o700)
+        self.plan = self.grant['native_outer']
+        check(self.plan['schema'] == 1 and self.plan['original_clock_sha256'] == self.pre['clock_sha256'] and
+              self.plan['helper_pins_sha256'] == helper.sha(helper.HERE / 'source-pins.json'),
+              'NO_PINNED_OUTER_ADMISSION')
+        check(len(self.plan['phases']) == len(phases) and
+              [p['phase_index'] for p in self.plan['phases']] == list(range(len(phases))) and
+              len({p['unit'] for p in self.plan['phases']}) == len(phases), 'OUTER_PHASE_REUSE_OR_OMISSION')
+        self.spec = self.plan['phases'][index]
+        unit_key = hashlib.sha256((self.pre['clock_sha256'] + ':' + self.phase['name']).encode()).hexdigest()[:32]
+        check(self.spec['phase_index'] == index and self.spec['phase'] == self.phase['name'] and
+              self.spec['unit'] == 'friday-rework-worker-' + unit_key + '.service' and
+              self.spec['owner_boundary'] == self.grant['owner_boundary'] and
+              type(self.spec['tasks_max']) is int and self.spec['tasks_max'] > 1 and
+              len(set(self.spec['cpu_affinity'])) == 2 and
+              all(type(cpu) is int and cpu >= 0 for cpu in self.spec['cpu_affinity']),
+              'OUTER_PHASE_OR_RESOURCES_MISMATCH')
+        self.row = {'admission_hash': self.pre['admission_sha256'],
+                    'supervisor': {'scope': 'user', 'unit': self.spec['unit']}, 'native': None}
+        # The unchanged native grammar and owner-description checks still apply.
+        NativeSupervisor._unit(self.row)
+        self.supervisor = BoundedSupervisor(self)
+        self.binding = None
+        self.registry_disposition = None
+        self.disposition_reentered = False
+        self._stop_pending = False
+        binding_file = self.control / 'binding.json'
+        if binding_file.exists():
+            helper.private(binding_file, 0o400)
+            self.binding = helper.read(binding_file)
+            check(self.binding['original_clock_sha256'] == self.pre['clock_sha256'] and
+                  self.binding['phase_clock_sha256'] == helper.sha(self.parent / 'run/clock.json') and
+                  self.binding['unit'] == self.spec['unit'] and
+                  self.binding['manager'] == self.plan['manager'], 'FOREIGN_RETAINED_OUTER_BINDING')
+            self.row['native'] = {'invocation_id': self.binding['invocation_id'],
+                                  'worker_reference': str(self.control)}
+
+    def intent_identity(self):
+        """The already prepared phase owns cancellation before unit allocation."""
+        return {'original_clock_sha256': self.pre['clock_sha256'],
+                'phase_clock_sha256': self.h.sha(self.parent / 'run/clock.json'),
+                'phase': self.phase['name'], 'unit': self.spec['unit'],
+                'boot_id': self.original['boot_id'], 'original_deadline': self.deadline}
+
+    def stop_requested(self):
+        path = self.parent / 'native-stop.json'
+        if path.exists() or path.is_symlink():
+            self.h.private(path, 0o400)
+            record = self.h.read(path)
+            check(record.get('identity') == self.intent_identity() and
+                  record.get('intent') == 'cancel', 'FOREIGN_PHASE_STOP_INTENT')
+            return True
+        # A retained old control marker also fences admission; it is never
+        # deleted, moved or converted into a new phase allowance.
+        return (self._stop_pending or (self.control / 'stop.json').exists() or
+                (self.control / 'stop.json').is_symlink())
+
+    def persist_stop(self):
+        self._stop_pending = True  # Even failed persistence fences this owner.
+        path = self.parent / 'native-stop.json'
+        if not path.exists() and not path.is_symlink():
+            self.h.put(path, {'intent': 'cancel', 'identity': self.intent_identity(),
+                             'at_monotonic': time.monotonic()})
+        self.h.private(path, 0o400)
+        check(path.is_file() and self.stop_requested(), 'PHASE_STOP_INTENT_NOT_DURABLE')
+
+    def require_supported_containment(self):
+        """Fail closed BEFORE submission, entry or reservation on this route.
+
+        Installed systemd.exec explicitly excludes ProtectControlGroups from
+        per-user managers. NativeSupervisor supports only that manager scope.
+        A declarative property and current cpu/memory/pids values cannot prove
+        that descendants cannot migrate out. No independently qualified effective
+        containment route is supplied by this candidate. Closure/stop remain
+        available for retained ownership; they must not depend on this admission.
+        """
+        raise SupervisorError('NATIVE_USER_MANAGER_EFFECTIVE_CGROUP_CONTAINMENT_UNQUALIFIED')
+
+    def confined_donor_argv(self, semantic_argv, kwargs):
+        """Proposed child-only provider integration; never wrap trusted owner.
+
+        The existing gate stays unconditional. A future independently qualified
+        donor bridge would own an explicit status pipe and bind semantic/wrapper
+        argv before the existing registry takes the real host Popen/pidfd. This
+        proposal cannot promote a prepared profile or JSON full flag to admission.
+        """
+        self.require_supported_containment()
+        check(kwargs.get('close_fds') is True and not kwargs.get('pass_fds'),
+              'UNQUALIFIED_INHERITED_DESCRIPTOR')
+        check(not self.stop_requested(), 'PHASE_CANCELLED_NO_DONOR_PREPARATION')
+        # This is source-only until the actual existing-profile bridge and final
+        # source/runtime maps are independently bound. No new executable here.
+        raise SupervisorError('HOST_CONTROL_PROVIDER_BRIDGE_AND_NETWORK_BOUNDARY_UNQUALIFIED')
+
+    def prepare_donor_status(self, session, registry, run, semantic_argv, kwargs):
+        """Root status consumer calls this exact seam; old gate remains first."""
+        return self.prepare_donor_private_network(session, registry, run, semantic_argv, kwargs)
+
+    def prepare_donor_private_network(self, session, registry, run, semantic_argv, kwargs):
+        """Compose existing provider, root-owned status bridge and mature slirp.
+
+        Root integrates the reviewed status hook and binds the genuine TS provider
+        facade. No facade CLI, independently managed process or admission is added.
+        """
+        self.require_supported_containment()
+        check(kwargs.get('close_fds') is True and not kwargs.get('pass_fds'),
+              'UNQUALIFIED_INHERITED_DESCRIPTOR')
+        check(not self.stop_requested(), 'PHASE_CANCELLED_NO_PRIVATE_NETWORK')
+        provider = getattr(self.h, 'HOST_CONTROL_PREPARE', None)
+        check(callable(provider), 'EXISTING_HOST_CONTROL_PROVIDER_FACADE_UNBOUND')
+        pins = self.h.read(self.h.HERE / 'source-pins.json')
+        for name in ('native_status.py', 'private_network.py'):
+            check(self.h.sha(self.h.HERE / name) == pins[name], 'STATUS_NETWORK_SOURCE_DRIFT')
+        status = self.h.runpy.run_path(str(self.h.HERE / 'native_status.py'))
+        network = self.h.runpy.run_path(str(self.h.HERE / 'private_network.py'))
+        self.h.NETWORK_PATCH_SHA256 = '24431559f936d11bfdc75a0dab510ab0657c08e1c3646e9dd234ba65644ce189'
+        return network['prepare_network_status'](self, session, registry, run, semantic_argv, provider, status)
+
+    def retain_registry_disposition(self, rows, checkpoint_sha256):
+        """Persist PRE-recovery intent before recovery sets its safety stop flag.
+
+        Only the already quiescent unit's original checkpoint is consumed here.
+        A second recovery entry retains the first snapshot but cannot continue
+        phases: a crash may have hidden a later stop/persistence transition.
+        """
+        check(isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict),
+              'EXACT_ORIGINAL_REGISTRY_DISPOSITION_REQUIRED')
+        row = rows[0]
+        check(bool(row.get('session_id')) and row.get('runtest_custody') is True and
+              row.get('runtest_outer') == self.binding and
+              row.get('runtest_boot_id') == self.original['boot_id'] and
+              row.get('runtest_deadline') == self.deadline and
+              row.get('runtest_unit') == self.phase['runtest_file'] and
+              row.get('owner_task_id') == self.original['assignment'],
+              'FOREIGN_ORIGINAL_REGISTRY_DISPOSITION')
+        fields = ('session_id', 'owner_task_id', 'runtest_custody', 'runtest_unit',
+                  'runtest_deadline', 'runtest_boot_id', 'runtest_outer',
+                  'pid', 'host_start_time', 'runtest_pgid', 'runtest_sid',
+                  'runtest_stop_requested', 'runtest_launch_pending',
+                  'runtest_persistence_error', 'runtest_outer_closed', 'runtest_pidfd_error')
+        original_row = {key: row.get(key) for key in fields}
+        fields_complete = all(key in row for key in fields)
+        path = self.parent / 'registry-disposition.json'
+        checkpoint = self.control / 'profile/processes.json'
+        check(self.h.sha(checkpoint) == checkpoint_sha256, 'ORIGINAL_CHECKPOINT_CHANGED_BEFORE_SNAPSHOT')
+        self.disposition_reentered = path.exists() or path.is_symlink()
+        expected_record = {'schema': 1, 'identity': self.intent_identity(),
+            'checkpoint_sha256': checkpoint_sha256, 'original_row': original_row,
+            'fields_complete': fields_complete,
+            'state': 'ORIGINAL_REGISTRY_DISPOSITION_BEFORE_RECOVERY'}
+        if not self.disposition_reentered:
+            self.h.put(path, expected_record)
+        self.h.private(path, 0o400)
+        record = self.h.read(path)
+        prior = record.get('original_row', {})
+        stable = fields[:11]
+        check(record.get('schema') == 1 and record.get('identity') == self.intent_identity() and
+              record.get('state') == 'ORIGINAL_REGISTRY_DISPOSITION_BEFORE_RECOVERY' and
+              all(prior.get(key) == original_row[key] for key in stable) and
+              (self.disposition_reentered or
+               (record == expected_record and
+                record.get('fields_complete') is fields_complete)),
+              'ORIGINAL_REGISTRY_DISPOSITION_READBACK_FAILED')
+        check(self.h.sha(checkpoint) == checkpoint_sha256, 'ORIGINAL_CHECKPOINT_CHANGED_BEFORE_RECOVERY')
+        self.registry_disposition = record
+        return record
+
+    def original_row_allows_next_phase(self, session):
+        """Custody closure cannot turn cancelled/uncertain work into admission."""
+        check(self.registry_disposition is not None, 'PRE_RECOVERY_DISPOSITION_NOT_RETAINED')
+        prior = self.registry_disposition['original_row']
+        check(prior['session_id'] == session.id and prior['runtest_outer'] == session.runtest_outer,
+              'FOREIGN_RETAINED_REGISTRY_DISPOSITION')
+        return (not self.disposition_reentered and self.registry_disposition.get('fields_complete') is True and
+                prior.get('runtest_stop_requested') is False and
+                prior.get('runtest_launch_pending') is False and
+                prior.get('runtest_persistence_error') == '' and
+                prior.get('runtest_pidfd_error') == '' and
+                prior.get('runtest_outer_closed') is None and
+                session.runtest_launch_pending is False and
+                session.runtest_persistence_error == '' and
+                getattr(session, 'runtest_pidfd_error', None) == '' and not self.stop_requested())
+
+    def control_timeout(self, maximum):
+        remaining = self.deadline - time.monotonic()
+        if self.retained and remaining <= 0:
+            return maximum  # Safety only; never a new task/runtime allowance.
+        check(remaining > 0, 'ORIGINAL_OUTER_DEADLINE_EXHAUSTED')
+        return min(maximum, remaining)
+
+    def manager(self):
+        runtime = Path('/run/user') / str(os.getuid())
+        bus = runtime / 'bus'
+        before = bus.stat()
+        check(stat.S_ISSOCK(before.st_mode) and before.st_uid == os.getuid(), 'FOREIGN_NATIVE_USER_BUS')
+        result = subprocess.run(['/usr/bin/busctl', '--user', '--no-pager', '--json=short',
+            'call', 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+            'GetConnectionUnixProcessID', 's', 'org.freedesktop.systemd1'],
+            env={'PATH': '/usr/bin:/bin', 'XDG_RUNTIME_DIR': str(runtime),
+                 'DBUS_SESSION_BUS_ADDRESS': 'unix:path=' + str(bus), 'LC_ALL': 'C'},
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=self.control_timeout(3), check=False)
+        reply = json.loads(result.stdout)
+        check(result.returncode == 0 and reply.get('type') == 'u' and len(reply.get('data', [])) == 1,
+              'NATIVE_MANAGER_PEER_UNREADABLE')
+        pid = reply['data'][0]
+        check(type(pid) is int and pid > 0, 'NATIVE_MANAGER_PID_INVALID')
+        identity = proc_identity(pid)
+        identity.update(uid=Path('/proc', str(pid)).stat().st_uid,
+            exe=str(Path('/proc', str(pid), 'exe').resolve(strict=True)),
+            boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            bus=[str(bus), before.st_dev, before.st_ino])
+        after = bus.stat()
+        check(identity['uid'] == os.getuid() and
+              (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino) and
+              identity == self.plan['manager'], 'EXACT_NATIVE_MANAGER_CHANGED')
+        return identity
+
+    def _fields(self):
+        result = self.supervisor._command(['show', self.spec['unit'], '--property=' +
+            ','.join(('InvocationID', 'ControlGroup', *self.extra_properties))], 3)
+        pairs = [line.split('=', 1) for line in result.stdout.splitlines()]
+        check(result.returncode == 0 and all(len(p) == 2 for p in pairs), 'OUTER_PROPERTIES_UNREADABLE')
+        fields = dict(pairs)
+        check(len(fields) == len(pairs) and set(fields) ==
+              {'InvocationID', 'ControlGroup', *self.extra_properties}, 'OUTER_PROPERTIES_INCOMPLETE')
+        return fields
+
+    def _cgroup(self, binding, *, active):
+        group = binding['control_group']
+        root = Path('/sys/fs/cgroup')
+        path = root / group.lstrip('/')
+        check(group.startswith('/') and path.resolve() == path and path.is_relative_to(root) and
+              group.endswith('/' + self.spec['unit']), 'FOREIGN_OUTER_CGROUP')
+        try:
+            inode = path.stat()
+        except FileNotFoundError:
+            check(not active, 'ACTIVE_NATIVE_CGROUP_MISSING')
+            return False
+        check([inode.st_dev, inode.st_ino] == binding['cgroup_inode'], 'OUTER_CGROUP_REUSED')
+        populated = NativeSupervisor._populated(group)
+        check([path.stat().st_dev, path.stat().st_ino] == binding['cgroup_inode'], 'OUTER_CGROUP_CHANGED')
+        if active:
+            quota, period = (path / 'cpu.max').read_text().split()
+            check(quota != 'max' and int(quota) == 2 * int(period) and
+                  (path / 'memory.max').read_text().strip() == str(2 << 30) and
+                  (path / 'memory.swap.max').read_text().strip() == '0' and
+                  (path / 'pids.max').read_text().strip() == str(self.spec['tasks_max']),
+                  'AGGREGATE_KERNEL_LIMITS_NOT_ENFORCED')
+        return populated
+
+    def require_current(self, expected=None):
+        """Actual main/unit/cgroup membership, before reserve and again before Popen."""
+        self.h.clock_check(self.original)
+        check(not self.stop_requested(), 'OUTER_STOP_RETAINED_NO_RETRY')
+        self.require_supported_containment()
+        self.manager()
+        observed = self.supervisor.observe(self.row)
+        fields = self._fields()
+        check(not observed.missing and observed.main_pid == os.getpid() and
+              observed.active_state == 'active' and observed.sub_state == 'running' and
+              fields['InvocationID'] == observed.invocation_id and
+              fields['ControlGroup'] == observed.control_group, 'OWNER_NOT_EXACT_NATIVE_MAIN')
+        fixed = {'Type': 'exec', 'ExitType': 'main', 'Restart': 'no', 'RemainAfterExit': 'no',
+                 'Delegate': 'no', 'NoNewPrivileges': 'yes', 'ProtectControlGroups': 'yes',
+                 'TimeoutStartFailureMode': 'kill', 'TimeoutStopFailureMode': 'kill',
+                 'ControlPID': '0', 'ExecStartPre': '', 'ExecStartPost': '', 'ExecStop': '',
+                 'ExecStopPost': '', 'DropInPaths': '', 'FinalKillSignal': '9',
+                 'MemoryMax': str(2 << 30), 'MemorySwapMax': '0', 'TasksMax': str(self.spec['tasks_max'])}
+        check(all(fields[k] == v for k, v in fixed.items()) and fields['Job'] in ('', '0'),
+              'OUTER_NATIVE_PROPERTIES_CHANGED')
+        launch = self.h.read(self.control / 'submission.json')
+        check(duration(fields['TimeoutStartUSec']) == self.START and
+              duration(fields['TimeoutStopUSec']) == self.STOP and
+              duration(fields['RuntimeRandomizedExtraUSec']) == 0 and
+              abs(duration(fields['RuntimeMaxUSec']) - launch['runtime_seconds']) < 1e-6,
+              'OUTER_NATIVE_TIMERS_CHANGED')
+        active_at = int(fields['ActiveEnterTimestampMonotonic']) / 1e6
+        check(self.original['start_monotonic'] <= active_at <= time.monotonic() and
+              active_at + duration(fields['RuntimeMaxUSec']) + self.STOP + self.PROOF < self.deadline,
+              'NATIVE_ACTIVATION_WOULD_EXTEND_ORIGINAL_DEADLINE')
+        own_groups = Path('/proc/self/cgroup').read_text().splitlines()
+        check(own_groups == ['0::' + observed.control_group] and
+              set(os.sched_getaffinity(0)) == set(self.spec['cpu_affinity']),
+              'OWNER_OUTSIDE_NATIVE_LIMITS')
+        inode = (Path('/sys/fs/cgroup') / observed.control_group.lstrip('/')).stat()
+        actual = {'unit': observed.unit, 'invocation_id': observed.invocation_id,
+            'control_group': observed.control_group, 'cgroup_inode': [inode.st_dev, inode.st_ino],
+            'manager': self.plan['manager'], 'boot_id': self.original['boot_id'],
+            'main': proc_identity(os.getpid()), 'original_clock_sha256': self.pre['clock_sha256'],
+            'phase_clock_sha256': self.h.sha(self.parent / 'run/clock.json'),
+            'original_deadline': self.deadline, 'phase': self.phase['name']}
+        check(self._cgroup(actual, active=True), 'OWNER_CGROUP_NOT_POPULATED')
+        self.manager()
+        check(expected is None or expected == actual, 'RETAINED_OUTER_BINDING_CHANGED')
+        check(self.binding is None or self.binding == actual, 'OUTER_INVOCATION_OR_MAIN_REPLACED')
+        return actual
+
+    def reserve_binding(self):
+        actual = self.require_current(self.binding)
+        check(self.binding is not None, 'OUTER_BINDING_NOT_DURABLE_BEFORE_RESERVATION')
+        return actual
+
+    def close(self, *, stop=False):
+        """One finite native reconciliation. Missing submission alone proves nothing."""
+        error = None
+        if stop:
+            try:
+                self.persist_stop()
+            except BaseException as exc:
+                error = exc
+            # Intent precedes manager/control I/O, even with no native-owner
+            # directory. Persistence failure still reaches the known boundary.
+            try:
+                self.manager()
+                observed = self.supervisor.stop(self.row)
+            except BaseException as cleanup:
+                if error is not None:
+                    raise SupervisorError('OUTER_STOP_UNCONFIRMED_AND_INTENT_PERSISTENCE_FAILED') from cleanup
+                raise
+            if error is not None:
+                raise SupervisorError('OUTER_STOP_INTENT_PERSISTENCE_FAILED') from error
+        else:
+            self.manager()
+            observed = self.supervisor.observe(self.row)
+        # Reload the binding left by the real unit; no binding => no reservation
+        # can be released, even if systemd reports a missing unit after timeout.
+        check(self.binding is not None, 'UNKNOWN_SUBMISSION_RETAINED_NO_RETRY')
+        check(observed.quiescent and (observed.missing or
+              observed.invocation_id == self.binding['invocation_id']), 'OUTER_STOP_UNCONFIRMED')
+        if not observed.missing:
+            fields = self._fields()
+            check(fields['InvocationID'] == self.binding['invocation_id'] and
+                  fields['Job'] in ('', '0') and fields['Restart'] == 'no' and
+                  fields['ExecStartPre'] == fields['ExecStartPost'] == fields['ExecStop'] == fields['ExecStopPost'] == '',
+                  'OUTER_NATIVE_JOB_OR_INVOCATION_UNSETTLED')
+        check(not self._cgroup(self.binding, active=False), 'OUTER_CGROUP_STILL_POPULATED')
+        self.manager()
+        upper = time.monotonic()
+        return {'binding': self.binding, 'cessation_upper_monotonic': upper,
+                'cessation_before_original_deadline': upper < self.deadline,
+                'unit_missing': observed.missing, 'native_result': observed.result}
+
+    def closure_for(self, session):
+        check(session.runtest_outer == self.binding and session.runtest_boot_id == self.original['boot_id'] and
+              session.runtest_deadline == self.deadline and session.owner_task_id == self.original['assignment'] and
+              session.runtest_unit == self.phase['runtest_file'], 'FOREIGN_REGISTRY_OUTER_BOUNDARY')
+        proof = self.close()
+        # A durable known PID must not have escaped into another cgroup. PID
+        # reuse does not authorize a signal; no proc/PGID inference closes UNKNOWN.
+        if session.pid is not None and session.host_start_time is not None:
+            try:
+                check(proc_identity(session.pid)['start_ticks'] != session.host_start_time,
+                      'KNOWN_OWNED_PID_STILL_ALIVE_AFTER_NATIVE_CLOSE')
+            except FileNotFoundError:
+                pass
+        return proof
+
+    def registry(self):
+        """Original registry, same private profile/checkpoint; never a fake Popen."""
+        profile = str(self.control / 'profile')
+        check(os.environ.get('HERMES_HOME') == profile and
+              not os.environ.get('HERMES_PROFILE'), 'EXACT_OWNER_REGISTRY_PROFILE_REQUIRED')
+        sys.path.insert(0, self.h.SPEC['roots']['native'])
+        module = importlib.import_module('tools.process_registry')
+        ref = self.h.SPEC['runtime_overlay']['registry']
+        check(str(Path(inspect.getsourcefile(module.ProcessRegistry)).resolve()) == ref['path'] and
+              self.h.sha(ref['path']) == ref['sha256'] and
+              module._checkpoint_path() == Path(profile) / 'processes.json', 'ORIGINAL_REGISTRY_BINDING_CHANGED')
+        return module.ProcessRegistry()
+
+    def unit_entry(self):
+        check(not self.stop_requested(), 'STOP_BEFORE_UNIT_ENTRY_NO_RETRY')
+        self.require_supported_containment()
+        check(self.binding is None, 'UNIT_ENTRY_ALREADY_CONSUMED_NO_RETRY')
+        self.h.put(self.control / 'entry.json', {'state': 'ENTERED_ONCE', 'pid': os.getpid()})
+        self.binding = self.require_current()
+        self.row['native'] = {'invocation_id': self.binding['invocation_id'], 'worker_reference': str(self.control)}
+        self.h.put(self.control / 'binding.json', self.binding)
+        registry = self.registry()
+        check(not (self.control / 'profile/processes.json').exists(), 'OLD_REGISTRY_PROFILE_NO_RETRY')
+        try:
+            self.h.run_donor_file(self.out, self.index, registry, native_owner=self)
+            self.h.observe(self.out, self.index)
+        finally:
+            network = getattr(self, '_network_attachment', None)
+            if network is not None and not network.closed:
+                network.abort()  # includes cuts before StatusCustody construction
+
+        # ExitType=main and KillMode=control-group close all remaining SIDs after
+        # this interpreter exits. Registry release occurs outside, AFTER that.
+
+    def submit(self):
+        self.h.cohort(self.out)
+        check(not self.stop_requested(), 'STOP_BEFORE_ALLOCATION_NO_RETRY')
+        self.require_supported_containment()
+        check(self.binding is None and not self.control.exists(), 'OUTER_ALREADY_SUBMITTED_NO_RETRY')
+        self.manager()
+        check(self.supervisor.observe(self.row).missing, 'OUTER_UNIT_ALREADY_EXISTS_NO_RETRY')
+        self.control.mkdir(mode=0o700)
+        (self.control / 'profile').mkdir(mode=0o700)
+        (self.control / 'tmp').mkdir(mode=0o700)
+        left = self.deadline - time.monotonic()
+        runtime = math.floor((left - self.RPC - self.START - self.STOP - self.PROOF - 1) * 1e6) / 1e6
+        check(runtime > self.phase['outer'] + self.pre['reserve_seconds'], 'INSUFFICIENT_ORIGINAL_NATIVE_BUDGET')
+        props = {'Type': 'exec', 'ExitType': 'main', 'Restart': 'no', 'RemainAfterExit': 'no',
+            'KillMode': 'control-group', 'SendSIGKILL': 'yes', 'FinalKillSignal': 'SIGKILL',
+            'NoNewPrivileges': 'yes', 'ProtectControlGroups': 'yes', 'Delegate': 'no', 'UMask': '0077',
+            'RuntimeMaxSec': f'{runtime:.6f}s', 'RuntimeRandomizedExtraSec': '0',
+            'TimeoutStartSec': f'{self.START}s', 'TimeoutStopSec': f'{self.STOP}s',
+            'TimeoutStartFailureMode': 'kill', 'TimeoutStopFailureMode': 'kill',
+            'JobTimeoutSec': f'{self.RPC + self.START}s', 'MemoryMax': str(2 << 30),
+            'MemorySwapMax': '0', 'CPUQuota': '200%', 'TasksMax': str(self.spec['tasks_max']),
+            'CPUAffinity': ' '.join(map(str, self.spec['cpu_affinity'])), 'StandardInput': 'null',
+            'StandardOutput': 'append:' + str(self.control / 'stdout'),
+            'StandardError': 'append:' + str(self.control / 'stderr')}
+        # Prefix is pinned by the final startup/input review; no fallback to the
+        # old hardcoded backend PID or an inherited developer environment.
+        prefix = self.h.SPEC['native_outer']['owner_argv_prefix']
+        argv = ['/usr/bin/systemd-run', '--user', '--no-ask-password', '--wait', '--expand-environment=no',
+                '--unit=' + self.spec['unit'], '--description=' + self.supervisor.description(self.row)]
+        argv += ['--property=' + k + '=' + v for k, v in props.items()]
+        argv += ['/usr/bin/env', '-i', 'PATH=/usr/bin:/bin', 'LANG=C.UTF-8',
+                 'HOME=' + str(self.control / 'profile'), 'HERMES_HOME=' + str(self.control / 'profile'),
+                 'TMPDIR=' + str(self.control / 'tmp'),
+                 'PYTHONDONTWRITEBYTECODE=1', *prefix, str(self.h.HERE / 'owner_observer.py'),
+                 'unit-runtime', str(self.out), str(self.index)]
+        self.h.put(self.control / 'submission.json', {'state': 'UNKNOWN', 'argv': argv,
+            'runtime_seconds': runtime, 'original_clock_sha256': self.pre['clock_sha256'],
+            'original_deadline': self.deadline, 'at_monotonic': time.monotonic()})
+        check(not self.stop_requested(), 'STOP_BEFORE_SUBMISSION_NO_RETRY')
+        # One native launch/wait, not a model/shell polling loop. On timeout even
+        # a missing unit remains UNKNOWN; a delayed job cannot reserve before its
+        # self-check of activation + runtime + stop against the original clock.
+        runtime_dir = f'/run/user/{os.getuid()}'
+        try:
+            result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                env={'PATH': '/usr/bin:/bin', 'XDG_RUNTIME_DIR': runtime_dir,
+                     'DBUS_SESSION_BUS_ADDRESS': f'unix:path={runtime_dir}/bus', 'LC_ALL': 'C'},
+                timeout=self.control_timeout(max(0.001, self.deadline - time.monotonic() - self.PROOF)), check=False)
+            self.h.put(self.control / 'launch-result.json', {'returncode': result.returncode,
+                'stdout': result.stdout, 'stderr': result.stderr, 'at_monotonic': time.monotonic()})
+        except BaseException as primary:
+            # Timeout/failed result persistence is UNKNOWN, not a second launch.
+            # Reload a binding the child may have durably written in the meantime.
+            try:
+                FileOwner(self.h, self.out, self.index, retained=True).close(stop=True)
+            except BaseException as cleanup:
+                raise RuntimeError('SUBMISSION_UNKNOWN_STOP_UNCONFIRMED_NO_RETRY: ' +
+                                   type(cleanup).__name__) from primary
+            raise
+        return result.returncode

@@ -1,0 +1,880 @@
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -61,89 +61,10 @@
+         return True
+ 
+ 
+-# --- Async bridging (single source of truth; registry.dispatch uses it too) ---
+-# Loops are persistent (never asyncio.run per call): cached httpx/AsyncOpenAI
+-# clients stay bound to a live loop, so their GC cleanup can't hit "Event loop
+-# is closed". Main thread shares one loop; worker threads own thread-local loops.
+-
+-_tool_loop = None          # persistent loop for the main (CLI) thread
+-_tool_loop_lock = threading.Lock()
+-_worker_thread_local = threading.local()  # per-worker-thread persistent loops
+-
+-
+-def _get_tool_loop():
+-    """Long-lived event loop for async tool handlers on the main thread."""
+-    global _tool_loop
+-    with _tool_loop_lock:
+-        if _tool_loop is None or _tool_loop.is_closed():
+-            _tool_loop = asyncio.new_event_loop()
+-        return _tool_loop
+-
+-
+-def _get_worker_loop():
+-    """Persistent event loop for the current worker thread (thread-local)."""
+-    loop = getattr(_worker_thread_local, 'loop', None)
+-    if loop is None or loop.is_closed():
+-        loop = asyncio.new_event_loop()
+-        asyncio.set_event_loop(loop)
+-        _worker_thread_local.loop = loop
+-    return loop
+-
+-
+-def _run_async(coro):
+-    """Run a coroutine from sync code; safe under a running loop (gateway/RL env)."""
+-    try:
+-        loop = asyncio.get_running_loop()
+-    except RuntimeError:
+-        loop = None
+-    if loop and loop.is_running():
+-        # Inside a running loop: run in a fresh thread whose loop we keep a
+-        # reference to, so on timeout we can cancel the task inside it
+-        # (ThreadPoolExecutor.cancel() is a no-op on a running worker).
+-        import concurrent.futures
+-        worker_loop: Optional[asyncio.AbstractEventLoop] = None
+-        loop_ready = threading.Event()
+-
+-        def _run_in_worker():
+-            nonlocal worker_loop
+-            worker_loop = asyncio.new_event_loop()
+-            loop_ready.set()
+-            try:
+-                asyncio.set_event_loop(worker_loop)
+-                return worker_loop.run_until_complete(coro)
+-            finally:
+-                try:  # drain tasks still pending after an external cancel
+-                    pending = asyncio.all_tasks(worker_loop)
+-                    for t in pending:
+-                        t.cancel()
+-                    if pending:
+-                        worker_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+-                except Exception:
+-                    pass
+-                worker_loop.close()
+-
+-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+-        # Carry profile + approval/sudo context so get_hermes_home() resolves correctly.
+-        from tools.thread_context import propagate_context_to_thread
+-        future = pool.submit(propagate_context_to_thread(_run_in_worker))
+-        try:
+-            return future.result(timeout=300)
+-        except concurrent.futures.TimeoutError:
+-            # Cancel inside the worker's own loop so the thread can wind down.
+-            if loop_ready.wait(timeout=1.0) and worker_loop is not None:
+-                try:
+-                    for t in asyncio.all_tasks(worker_loop):
+-                        worker_loop.call_soon_threadsafe(t.cancel)
+-                except RuntimeError:
+-                    pass  # loop already closed
+-            raise
+-        finally:
+-            pool.shutdown(wait=False)  # never block the caller on a stuck coroutine
+-
+-    if threading.current_thread() is not threading.main_thread():
+-        return _get_worker_loop().run_until_complete(coro)
+-    return _get_tool_loop().run_until_complete(coro)
+-
++from tools.dispatch_helpers import (
++    _get_tool_loop, _get_worker_loop, _run_async, _sanitize_tool_error,
++    _TOOL_ERROR_STRIP_RES, _tool_loop_lock, _worker_thread_local,
++)
+ 
+ # --- Tool discovery (importing each tools/*.py triggers registry.register) ---
+ discover_builtin_tools()
+@@ -621,30 +542,6 @@
+ _READ_SEARCH_TOOLS = {"read_file", "search_files"}
+ 
+ 
+-# --- Tool error sanitization --------------------------------------------------
+-# Defense-in-depth: strip role tags / CDATA / code fences from exception text the
+-# model will read, and cap length (cap shared with tools/registry.py so text never
+-# passes two different caps with two different markers).
+-_TOOL_ERROR_STRIP_RES = (
+-    re.compile(r'</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>', re.IGNORECASE),
+-    re.compile(r'^\s*```(?:json|xml|html|markdown)?\s*', re.MULTILINE),
+-    re.compile(r'\s*```\s*$', re.MULTILINE),
+-    re.compile(r'<!\[CDATA\[.*?\]\]>', re.DOTALL),
+-)
+-
+-
+-def _sanitize_tool_error(error_msg: str) -> str:
+-    """Strip structural framing tokens from a tool error before the model sees it."""
+-    if not error_msg:
+-        return "[TOOL_ERROR] "
+-    sanitized = error_msg
+-    for pattern in _TOOL_ERROR_STRIP_RES:
+-        sanitized = pattern.sub("", sanitized)
+-    if len(sanitized) > _TOOL_ERROR_MAX_LEN:
+-        sanitized = sanitized[:_TOOL_ERROR_MAX_LEN - 3] + "..."
+-    return f"[TOOL_ERROR] {sanitized}"
+-
+-
+ @dataclass(frozen=True)
+ class _CallIds:
+     """Identity fields of one tool call, threaded through hooks and middleware."""
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -23,7 +23,7 @@
+ logger = logging.getLogger(__name__)
+ 
+ # Cap on a tool error body; only trims runaway interpolated exceptions (static msgs are ~115 chars).
+-_MAX_TOOL_ERROR_CHARS = 2048
++from tools.dispatch_helpers import _TOOL_ERROR_MAX_LEN as _MAX_TOOL_ERROR_CHARS
+ _TOOL_ERROR_TRUNCATION_MARKER = "… [truncated]"
+ # Logs keep more of the body than the model sees, but still a bounded amount.
+ _MAX_LOGGED_ERROR_CHARS = 8192
+@@ -908,7 +908,7 @@
+             # plugin handler is not broken by every field the dispatcher injects (#68318).
+             kwargs = _kwargs_accepted_by(entry.handler, kwargs)
+             if entry.is_async:
+-                from model_tools import _run_async
++                from tools.dispatch_helpers import _run_async
+                 result = _run_async(entry.handler(args, **kwargs))
+             else:
+                 result = entry.handler(args, **kwargs)
+@@ -919,7 +919,7 @@
+             # Sanitize so framing tokens/CDATA/fences in exception text aren't structural noise.
+             raw = f"Tool execution failed: {type(e).__name__}: {e}"
+             try:
+-                from model_tools import _sanitize_tool_error
++                from tools.dispatch_helpers import _sanitize_tool_error
+                 sanitized = _sanitize_tool_error(raw)
+             except Exception:
+                 sanitized = raw  # defensive: never let the sanitizer block error propagation
+--- /dev/null
++++ b/tools/dispatch_helpers.py
+@@ -0,0 +1,117 @@
++"""Shared tool dispatch mechanics; importing this module performs no tool discovery."""
++
++import asyncio
++import re
++import threading
++from typing import Optional
++
++_TOOL_ERROR_MAX_LEN = 2048
++
++# --- Async bridging (single source of truth; registry.dispatch uses it too) ---
++# Loops are persistent (never asyncio.run per call): cached httpx/AsyncOpenAI
++# clients stay bound to a live loop, so their GC cleanup can't hit "Event loop
++# is closed". Main thread shares one loop; worker threads own thread-local loops.
++
++_tool_loop = None          # persistent loop for the main (CLI) thread
++_tool_loop_lock = threading.Lock()
++_worker_thread_local = threading.local()  # per-worker-thread persistent loops
++
++
++def _get_tool_loop():
++    """Long-lived event loop for async tool handlers on the main thread."""
++    global _tool_loop
++    with _tool_loop_lock:
++        if _tool_loop is None or _tool_loop.is_closed():
++            _tool_loop = asyncio.new_event_loop()
++        return _tool_loop
++
++
++def _get_worker_loop():
++    """Persistent event loop for the current worker thread (thread-local)."""
++    loop = getattr(_worker_thread_local, 'loop', None)
++    if loop is None or loop.is_closed():
++        loop = asyncio.new_event_loop()
++        asyncio.set_event_loop(loop)
++        _worker_thread_local.loop = loop
++    return loop
++
++
++def _run_async(coro):
++    """Run a coroutine from sync code; safe under a running loop (gateway/RL env)."""
++    try:
++        loop = asyncio.get_running_loop()
++    except RuntimeError:
++        loop = None
++    if loop and loop.is_running():
++        # Inside a running loop: run in a fresh thread whose loop we keep a
++        # reference to, so on timeout we can cancel the task inside it
++        # (ThreadPoolExecutor.cancel() is a no-op on a running worker).
++        import concurrent.futures
++        worker_loop: Optional[asyncio.AbstractEventLoop] = None
++        loop_ready = threading.Event()
++
++        def _run_in_worker():
++            nonlocal worker_loop
++            worker_loop = asyncio.new_event_loop()
++            loop_ready.set()
++            try:
++                asyncio.set_event_loop(worker_loop)
++                return worker_loop.run_until_complete(coro)
++            finally:
++                try:  # drain tasks still pending after an external cancel
++                    pending = asyncio.all_tasks(worker_loop)
++                    for t in pending:
++                        t.cancel()
++                    if pending:
++                        worker_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
++                except Exception:
++                    pass
++                worker_loop.close()
++
++        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
++        # Carry profile + approval/sudo context so get_hermes_home() resolves correctly.
++        from tools.thread_context import propagate_context_to_thread
++        future = pool.submit(propagate_context_to_thread(_run_in_worker))
++        try:
++            return future.result(timeout=300)
++        except concurrent.futures.TimeoutError:
++            # Cancel inside the worker's own loop so the thread can wind down.
++            if loop_ready.wait(timeout=1.0) and worker_loop is not None:
++                try:
++                    for t in asyncio.all_tasks(worker_loop):
++                        worker_loop.call_soon_threadsafe(t.cancel)
++                except RuntimeError:
++                    pass  # loop already closed
++            raise
++        finally:
++            pool.shutdown(wait=False)  # never block the caller on a stuck coroutine
++
++    if threading.current_thread() is not threading.main_thread():
++        return _get_worker_loop().run_until_complete(coro)
++    return _get_tool_loop().run_until_complete(coro)
++
++
++# --- Tool error sanitization --------------------------------------------------
++# Defense-in-depth: strip role tags / CDATA / code fences from exception text the
++# model will read, and cap length (cap shared with tools/registry.py so text never
++# passes two different caps with two different markers).
++_TOOL_ERROR_STRIP_RES = (
++    re.compile(r'</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>', re.IGNORECASE),
++    re.compile(r'^\s*```(?:json|xml|html|markdown)?\s*', re.MULTILINE),
++    re.compile(r'\s*```\s*$', re.MULTILINE),
++    re.compile(r'<!\[CDATA\[.*?\]\]>', re.DOTALL),
++)
++
++
++def _sanitize_tool_error(error_msg: str) -> str:
++    """Strip structural framing tokens from a tool error before the model sees it."""
++    if not error_msg:
++        return "[TOOL_ERROR] "
++    sanitized = error_msg
++    for pattern in _TOOL_ERROR_STRIP_RES:
++        sanitized = pattern.sub("", sanitized)
++    if len(sanitized) > _TOOL_ERROR_MAX_LEN:
++        sanitized = sanitized[:_TOOL_ERROR_MAX_LEN - 3] + "..."
++    return f"[TOOL_ERROR] {sanitized}"
++
++
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -561,9 +561,27 @@
+     detached: bool = False                      # Recovered from checkpoint (no pipe)
+     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
+     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
++    runtest_custody: bool = False
++    runtest_unit: str = ""
++    runtest_deadline: float = 0.0
++    runtest_boot_id: str = ""
++    runtest_stop_requested: bool = False
++    runtest_launch_pending: bool = False
++    runtest_pgid: Optional[int] = None
++    runtest_sid: Optional[int] = None
++    runtest_persistence_error: str = ""
+     web_tool_call_id: str = ""
+     web_turn_id: str = ""
+     web_custody: bool = False
++    browser_custody: bool = False
++    browser_identity: str = ""  # Exact non-secret retained native job/principal snapshot.
++    browser_task_key: str = ""
++    browser_session_name: str = ""
++    browser_output_paths: list = field(default_factory=list)
++    browser_client_deadline: float = 0.0  # Current command ceiling, never the owner identity clock.
++    browser_client_wait_confirmed: bool = False
++    browser_client_returncode: Optional[int] = None
++    browser_stop_error: str = ""
+     web_invocation: str = ""
+     web_cgroup: str = ""
+     web_cgroup_identity: list = field(default_factory=list)
+@@ -662,14 +680,17 @@
+ # Session fields persisted verbatim in the crash-recovery checkpoint (plus
+ # ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
+ _CHECKPOINT_FIELDS = (
++    "runtest_custody", "runtest_unit", "runtest_deadline", "runtest_boot_id", "runtest_stop_requested", "runtest_launch_pending", "runtest_pgid", "runtest_sid", "runtest_persistence_error",
+     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "wsl_chain", "cwd",
+     "started_at", "task_id", "owner_task_id", "session_key",
++    "browser_custody", "browser_identity", "browser_task_key", "browser_session_name",
++    "browser_output_paths", "browser_client_deadline", "browser_client_wait_confirmed", "browser_client_returncode", "browser_stop_error",
+     "web_tool_call_id", "web_turn_id", "web_custody", "web_invocation", "web_cgroup", "web_cgroup_identity", "web_deadline", "web_boot_id", "web_unconfirmed", "web_stop_requested",
+     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
+     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
+     "heartbeat_seconds", "persist_on_release")
+ _CHECKPOINT_DEFAULTS = {
+-    f.name: ([] if f.name in ("watch_patterns", "web_cgroup_identity") else f.default)
++    f.name: ([] if f.name in ("watch_patterns", "web_cgroup_identity", "browser_output_paths") else f.default)
+     for f in ProcessSession.__dataclass_fields__.values()
+     if f.name in _CHECKPOINT_FIELDS
+ }
+@@ -718,6 +739,8 @@
+     _SHELL_NOISE_SUBSTRINGS = (
+         "no job control in this shell", "cannot set terminal process group",
+         "tcsetattr: Inappropriate ioctl for device")
++
++    _checkpoint_lock = threading.RLock()
+ 
+     # Class default so registries built via __new__ (tests) still restore on first drain.
+     _completions_restored = False
+@@ -1038,7 +1061,7 @@
+         A completion is not queued here: recovery has no waitable handle, so it
+         never collected an exit status.
+         """
+-        if session is None or session.web_custody or session.exited or not session.detached or session.pid_scope != "host":
++        if session is None or session.web_custody or session.runtest_custody or session.exited or not session.detached or session.pid_scope != "host":
+             return session
+         fate = self._detached_host_fate(session.pid, session.host_start_time)
+         if fate == "running":
+@@ -1280,6 +1303,139 @@
+             self._terminate_host_pid(proc.pid, session.host_start_time)
+         with suppress(Exception):
+             proc.wait(timeout=5)
++
++    def _runtest_checkpoint(self, session):
++        """Strict existing checkpoint transaction, including directory durability.
++
++        Every generic writer takes this same lock before snapshotting. Readback
++        is inside that transaction, never evidence for an unordered old writer.
++        """
++        with self._checkpoint_lock:
++            try:
++                self._write_checkpoint(strict=True)
++                rows = json.loads(_checkpoint_path().read_text())
++                matches = [r for r in rows if r.get('session_id') == session.id]
++                if len(matches) != 1 or any(matches[0].get(k) != getattr(session, k) for k in
++                        ('runtest_custody', 'runtest_unit', 'runtest_deadline', 'runtest_boot_id',
++                         'runtest_stop_requested', 'runtest_launch_pending', 'runtest_pgid', 'runtest_sid',
++                         'runtest_persistence_error', 'task_id', 'owner_task_id', 'session_key', 'pid', 'host_start_time')):
++                    raise RuntimeError('RUNTEST_CUSTODY_CHECKPOINT_UNCONFIRMED')
++            except BaseException as error:
++                # A later successful diagnostic write cannot silently clear an
++                # earlier unknown custody transition or permit another launch.
++                with session._lock:
++                    session.runtest_stop_requested = True
++                    session.runtest_persistence_error = type(error).__name__
++                raise
++
++    def reserve_runtest(self, *, command, cwd, task_id, session_key, unit_id, deadline):
++        """Reserve in THIS registry before donor Popen. Does not grant execution.
++
++        Existing caller supplies original deadline and reviewed environment. The
++        donor remains sole stdout drainer; generic reconcile must not finish it.
++        """
++        import math
++        if not task_id or not session_key or not math.isfinite(deadline) or deadline <= time.monotonic():
++            raise RuntimeError('INVALID_RUNTEST_OWNER_OR_ORIGINAL_DEADLINE')
++        session = self._new_session(command, task_id, task_id, session_key, cwd,
++            runtest_custody=True, runtest_unit=unit_id, runtest_deadline=deadline,
++            runtest_boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
++            runtest_launch_pending=True, persist_on_release=False, notify_on_complete=False)
++        with self._lock:
++            if any(s.runtest_custody and s.owner_task_id == task_id for s in self._running.values()):
++                raise RuntimeError('PREVIOUS_RUNTEST_CUSTODY_NOT_CLOSED')
++            self._running[session.id] = session
++        self._runtest_checkpoint(session)
++        return session
++
++    def spawn_runtest(self, session, argv, popen_kwargs):
++        """Transfer the actual handle to the sole donor BEFORE fallible setup.
++
++        Reservation was durable before Popen. The caller's donor try/finally
++        already covers this callback; its retained_handle callback can recover
++        session.process if an exception interrupts return. No second Popen.
++        """
++        with session._lock:
++            if (not session.runtest_custody or not session.runtest_launch_pending or session.process is not None or
++                session.runtest_stop_requested or session.runtest_persistence_error or
++                time.monotonic() >= session.runtest_deadline or
++                Path('/proc/sys/kernel/random/boot_id').read_text().strip() != session.runtest_boot_id):
++                raise RuntimeError('RUNTEST_SPAWN_FENCED_NO_RETRY')
++            if popen_kwargs.get('start_new_session') is not True or str(popen_kwargs.get('cwd')) != session.cwd:
++                raise RuntimeError('EXACT_DONOR_SID_AND_CWD_REQUIRED')
++            proc = subprocess.Popen(argv, **popen_kwargs)
++            session.process = proc
++            session.pid = proc.pid
++            session.runtest_launch_pending = False
++            return proc
++
++    def attach_runtest(self, session, proc):
++        """Fallible identity/checkpoint setup AFTER donor has the actual handle."""
++        with session._lock:
++            if session.process is not proc or proc.pid != session.pid or session.runtest_launch_pending:
++                raise RuntimeError('FOREIGN_RUNTEST_HANDLE')
++            session.host_start_time = self._safe_host_start_time(proc.pid)
++            session.runtest_pgid = os.getpgid(proc.pid)
++            session.runtest_sid = os.getsid(proc.pid)
++            if (session.runtest_pgid != proc.pid or session.runtest_sid != proc.pid or
++                    session.host_start_time is None):
++                session.runtest_stop_requested = True
++                raise RuntimeError('RUNTEST_NATIVE_IDENTITY_UNCONFIRMED')
++        self._runtest_checkpoint(session)
++
++    def stop_runtest(self, session, *, source='process.kill'):
++        # Immediate in-memory intent and identity-safe termination precede ANY
++        # diagnostic I/O. Checkpoint failure must not delay the requested stop.
++        # This existing stop has a separate pidfd review prerequisite; we never
++        # weaken identity checks or turn a termination request into cessation.
++        with session._lock:
++            session.runtest_stop_requested = True
++            pending = session.runtest_launch_pending
++            pid, born = session.pid, session.host_start_time
++        result = {'status': 'STOP_UNCONFIRMED', 'session_id': session.id, 'source': source,
++                  'persistence_error': session.runtest_persistence_error}
++        if pending or pid is None or born is None:
++            result['reason'] = 'RESERVED_OR_UNCONFIRMED_SPAWN_RETAINED_NO_RETRY'
++        elif session.runtest_deadline - time.monotonic() <= 2 * self._daemon_term_grace_seconds() + 1:
++            result['reason'] = 'OWNER_NATIVE_HARD_DEADLINE_CUSTODY_REQUIRED'
++        else:
++            try:
++                self._terminate_host_pid(pid, born)
++                result['termination_attempted'] = True
++            except BaseException as error:
++                result['termination_error'] = type(error).__name__
++        try:
++            self._runtest_checkpoint(session)
++        except BaseException as error:
++            result['persistence_error'] = type(error).__name__
++        if result.get('termination_attempted') and not result['persistence_error']:
++            result['status'] = 'STOP_REQUESTED'
++        # Donor alone drains/waits; independent whole SID/PGID and outer
++        # closure remain mandatory before registry/capacity release.
++        return result
++
++    def finish_runtest(self, session, *, owner_observation):
++        """Publish only after independently reconciled backend/group closure."""
++        proc = session.process
++        if (session.runtest_launch_pending or proc is None or proc.returncode is None or
++            owner_observation.get('session_id') != session.id or
++            owner_observation.get('pid') != session.pid or
++            owner_observation.get('start_ticks') != session.host_start_time or
++            owner_observation.get('pgid') != session.runtest_pgid or
++            owner_observation.get('sid') != session.runtest_sid or
++            owner_observation.get('boot_id') != session.runtest_boot_id or
++            owner_observation.get('backend_reaped') is not True or
++            owner_observation.get('whole_group_absent') is not True or
++            owner_observation.get('outer_custody_quiescent') is not True or
++            not 0 < owner_observation.get('cessation_upper_monotonic', float('inf')) < session.runtest_deadline):
++            raise RuntimeError('RUNTEST_CUSTODY_RETAINED_STOP_UNCONFIRMED')
++        # A past diagnostic failure never permits a launch retry. After BOTH
++        # actual closure proofs, however, strict durable reconciliation may
++        # settle this same handle; retain the historical error in its record.
++        self._runtest_checkpoint(session)
++        self._completion_consumed.add(session.id)
++        self._finish_exited(session, proc.returncode, source='independent_runtest_owner')
++        session.runtest_custody = False
+ 
+     def adopt_local(
+         self, proc: subprocess.Popen, *, command: str, cwd: Optional[str], task_id: str = "",
+@@ -1591,6 +1747,8 @@
+         """Mark a reader-observed exit (a raced kill keeps its own code/reason) and finish.
+         Under the session lock, like kill_process's commit: otherwise the kill can land between
+         mark_exited's ``killed`` check and its writes, and the reader overwrites the kill."""
++        if session.browser_custody and not session.web_settled:
++            raise RuntimeError("STOP_UNCONFIRMED")
+         with session._lock:
+             session.mark_exited(exit_code, reason, source)
+         self._move_to_finished(session)
+@@ -1600,6 +1758,8 @@
+         Idempotent: kill_process() and the reader thread can both call this; only
+         the FIRST move enqueues the completion notification, so no duplicates.
+         Returns True when this call is the one that persisted the session."""
++        if session.browser_custody and not session.web_settled:
++            raise RuntimeError("STOP_UNCONFIRMED")
+         with self._lock:
+             was_running = session.id in self._running
+             if was_running:
+@@ -1972,6 +2132,8 @@
+         """
+         if session is None or session.exited:
+             return
++        if session.runtest_custody:
++            return  # Donor owns pipe and independently confirmed completion.
+         if session.web_custody:
+             return  # Wrapper exit cannot finish a strict whole-cgroup web handle.
+         proc = getattr(session, "process", None)
+@@ -2184,6 +2346,8 @@
+         session = self.get(session_id)
+         if session is None:
+             return _not_found(session_id)
++        if session.runtest_custody:
++            return self.stop_runtest(session, source=source)
+         if session.web_custody:
+             self._latch_web_stop(session)
+             return self.settle_web(session, stop=True)
+@@ -2580,7 +2744,17 @@
+                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
+                 and not (lifecycle and s.persist_on_release)
+             ]
+-        results = [self.kill_process(s.id, source=source, consume_output=consume_output) for s in targets]
++        results = []
++        for session in targets:
++            try:
++                results.append(self.kill_process(session.id, source=source, consume_output=consume_output))
++            except BaseException as error:
++                # Attempt every already-owned target; a failed stop is retained
++                # and cannot be counted as closed or abort later cancellations.
++                session._scope_stop_pending = True
++                logger.error("Owned stop unconfirmed for %s: %s", session.id, type(error).__name__)
++                results.append({'status': 'STOP_UNCONFIRMED', 'session_id': session.id,
++                                'reason': type(error).__name__})
+         return sum(
+             (r.get("status") in {"killed", "already_exited"}
+              or (r.get("status") == "QUIESCENT" and bool(r.get("newly_settled"))))
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -2,6 +2,7 @@
+ 
+ import json
+ import logging
++import os
+ import time
+ from typing import Any, Dict, List, Optional
+ 
+@@ -17,35 +18,46 @@
+ 
+     # ----- Checkpoint (crash recovery) -----
+ 
+-    def _write_checkpoint(self, extra_entries: Optional[List[Dict[str, Any]]] = None):
+-        """Write running process metadata to the checkpoint file atomically."""
++    def _write_checkpoint(self, extra_entries: Optional[List[Dict[str, Any]]] = None, *, strict=False):
++        """One ordered transaction for ALL writers of the existing checkpoint.
++
++        No snapshot can be prepared before acquiring the transaction lock and
++        later overwrite a newly acknowledged reservation. Generic callers keep
++        their best-effort return contract; critical admission propagates errors.
++        """
+         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
+-
++        from utils import atomic_json_write
+         try:
+-            with self._lock:
+-                entries = []
+-                for s in self._running.values():
+-                    if s.exited:
+-                        continue
+-                    # Backfill the start time so recovery can detect PID recycling
+-                    # even for sessions spawned before this field existed.
+-                    if s.host_start_time is None and s.pid_scope == "host" and s.pid:
+-                        s.host_start_time = self._safe_host_start_time(s.pid)
+-                    entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
+-                    # Redact inline credentials before persisting (~/.hermes/processes.json).
+-                    # Recovery uses command only for display (adoption re-validates the
+-                    # PID, never re-runs it), so masking is lossless.
+-                    # See #77484.
+-                    entry["command"] = redact_sensitive_text(s.command, code_file=True)
+-                    entry["owner_task_id"] = s.owner_task_id or s.task_id
+-                    entries.append(entry)
+-                if extra_entries:
+-                    tracked_ids = {item.get("session_id") for item in entries}
+-                    entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
+-            from utils import atomic_json_write
+-            atomic_json_write(_checkpoint_path(), entries)
+-        except Exception as e:
+-            logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
++            with self._checkpoint_lock:
++                with self._lock:
++                    entries = []
++                    for s in self._running.values():
++                        if s.exited:
++                            continue
++                        if s.host_start_time is None and s.pid_scope == "host" and s.pid:
++                            s.host_start_time = self._safe_host_start_time(s.pid)
++                        entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
++                        entry["command"] = redact_sensitive_text(s.command, code_file=True)
++                        entry["owner_task_id"] = s.owner_task_id or s.task_id
++                        entries.append(entry)
++                    if extra_entries:
++                        tracked_ids = {item.get("session_id") for item in entries}
++                        entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
++                    path = _checkpoint_path()
++                    atomic_json_write(path, entries, fsync_dir=True)
++                    # utils.fsync_directory is intentionally best-effort. This
++                    # existing critical checkpoint needs a non-swallowing call.
++                    fd = os.open(path.resolve(strict=True).parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
++                    try:
++                        os.fsync(fd)
++                    finally:
++                        os.close(fd)
++        except BaseException as error:
++            if strict:
++                raise
++            if not isinstance(error, Exception):
++                raise
++            logger.debug("Failed to write checkpoint file: %s", error, exc_info=True)
+ 
+     def recover_from_checkpoint(self) -> int:
+         """On gateway startup, probe PIDs from the checkpoint file; returns how many
+@@ -66,6 +78,17 @@
+         unresolved_scope_entries: List[Dict[str, Any]] = []
+         for entry in entries:
+             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
++            if entry.get("runtest_custody"):
++                # Keep even a PID-less intent. Recovery is never a launch retry.
++                session = ProcessSession(id=entry["session_id"],
++                    **{f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}, detached=True)
++                session.runtest_stop_requested = True
++                session._scope_stop_pending = True
++                with self._lock:
++                    if session.id not in self._running:
++                        self._running[session.id] = session
++                        recovered += 1
++                continue
+             if entry.get("web_custody"):
+                 # Adopt intent even with no PID, or with a dead/reused wrapper.
+                 # Never infer cgroup cessation from a failed gateway's pipes.
+--- a/scripts/run_tests_parallel.py
++++ b/scripts/run_tests_parallel.py
+@@ -508,6 +508,7 @@
+     pytest_args: List[str],
+     repo_root: Path,
+     file_timeout: float,
++    *, custody=None,
+ ) -> Tuple[Path, int, str, dict[str, int], float]:
+     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
+     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+@@ -529,74 +530,173 @@
+     # One root for each subprocess removes the shared directory that the race
+     # needs. The parent deletes the root after the attempt.
+     env = os.environ.copy()
+-    temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
++    temproot = (tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root()) if custody is None
++                else custody["temporary_root"]())
+     env["PYTEST_DEBUG_TEMPROOT"] = temproot
+     # Every tempfile.* call inside the test process lands in the same per-run root, so the
+     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
+     env["TMPDIR"] = temproot
+ 
+     subproc_start = time.monotonic()
+-    # launch the pytest process
+-    proc = subprocess.Popen(
+-        cmd,
+-        cwd=repo_root,
+-        stdout=subprocess.PIPE,
+-        stderr=subprocess.STDOUT,
+-        text=True, encoding="utf-8", errors="replace",
+-        env=env,
+-        # POSIX: place the child at the head of its own process group so
+-        # _kill_tree can SIGKILL the group atomically.
+-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+-        # _kill_tree handles the Windows path via taskkill /F /T.
+-        start_new_session=True,
+-    )
+-
+-    # Capture the pgid NOW, before the leader can exit and be reaped. Once
+-    # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
+-    # even though grandchildren in that group are still alive — defeating
+-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
+-    pgid: int | None = None
+-    if sys.platform != "win32":
++    if custody is None:
++        # launch the pytest process
++        launch = subprocess.Popen if custody is None else custody["spawn"]
++        proc = launch(
++            cmd,
++            cwd=repo_root,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++            text=True, encoding="utf-8", errors="replace",
++            env=env,
++            # POSIX: place the child at the head of its own process group so
++            # _kill_tree can SIGKILL the group atomically.
++            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
++            # _kill_tree handles the Windows path via taskkill /F /T.
++            start_new_session=True,
++        )
++
++        # Capture the pgid NOW, before the leader can exit and be reaped. Once
++        # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
++        # even though grandchildren in that group are still alive — defeating
++        # the whole cleanup. None on Windows where the pgid concept doesn't apply.
++        pgid: int | None = None
++        if sys.platform != "win32":
++            try:
++                pgid = os.getpgid(proc.pid)
++            except (ProcessLookupError, PermissionError):
++                pgid = None
++
+         try:
+-            pgid = os.getpgid(proc.pid)
+-        except (ProcessLookupError, PermissionError):
+-            pgid = None
+-
+-    try:
+-        output, _ = proc.communicate(timeout=file_timeout)
+-        rc = proc.returncode
+-    except subprocess.TimeoutExpired:
+-        _kill_tree(proc, pgid=pgid)
++            output, _ = proc.communicate(timeout=file_timeout)
++            rc = proc.returncode
++        except subprocess.TimeoutExpired:
++            if custody is None:
++                _kill_tree(proc, pgid=pgid)
++            else:
++                custody["stop"](proc, pgid)
++            try:
++                output, _ = proc.communicate(timeout=10 if custody is None else custody["remaining"]())
++            except subprocess.TimeoutExpired:
++                output = "(file timeout exceeded; output unavailable)"
++            rc = 124  # de facto convention for "killed by timeout".
++            output = (
++                f"({file_timeout:.0f}s exceeded; "
++                f"{"process tree SIGKILL intent" if custody is None else "owned stop requested; independent cessation required"})\n{output}"
++            )
++        except BaseException:
++            # KeyboardInterrupt / runner crash — make sure no zombie
++            # grandchildren outlive us.
++            if custody is None:
++                _kill_tree(proc, pgid=pgid)
++            else:
++                custody["stop"](proc, pgid)
++            raise
++        else:
++            # Happy path: pytest exited on its own. Kill the group anyway in
++            # case it left grandchildren behind; already-dead is a no-op.
++            if custody is None:
++                _kill_tree(proc, pgid=pgid)
++            else:
++                custody["stop"](proc, pgid)
++
++            output +=  "\n"
++        finally:
++            if custody is not None:
++                # Refusal retains the exact temp root and registry handle. Never
++                # unlink evidence while a child/group may still own it.
++                custody["settle"](proc, pgid, temproot)
++            # Delete the temp root for this attempt. Nothing reads it after the
++            # subprocess exits. More than 3000 of them fill the disk of the
++            # runner over one suite. Permission fixtures leave read-only dirs
++            # behind; make them writable and retry instead of skipping them.
++            _rmtree_force(temproot)
++
++    else:
++        # Establish the sole donor drain/reap/settlement path BEFORE Popen or
++        # any fallible identity/checkpoint/backend write. No detached drainer.
++        proc = None
++        pgid = None
++        output = ""
++        rc = None
++        primary_error = None
++        cuts = []
++        settled = False
+         try:
+-            output, _ = proc.communicate(timeout=10)
+-        except subprocess.TimeoutExpired:
+-            output = "(file timeout exceeded; output unavailable)"
+-        rc = 124  # de facto convention for "killed by timeout".
+-        output = (
+-            f"({file_timeout:.0f}s exceeded; "
+-            f"process tree SIGKILL'd)\n{output}"
+-        )
+-    except BaseException:
+-        # KeyboardInterrupt / runner crash — make sure no zombie
+-        # grandchildren outlive us.
+-        _kill_tree(proc, pgid=pgid)
+-        raise
+-    else:
+-        # Happy path: pytest exited on its own. Kill the group anyway in
+-        # case it left grandchildren behind; already-dead is a no-op.
+-        _kill_tree(proc, pgid=pgid)
+-
+-        output +=  "\n"
+-    finally:
+-        # Delete the temp root for this attempt. Nothing reads it after the
+-        # subprocess exits. More than 3000 of them fill the disk of the
+-        # runner over one suite. Permission fixtures leave read-only dirs
+-        # behind; make them writable and retry instead of skipping them.
+-        _rmtree_force(temproot)
++            proc = custody["spawn"](cmd, cwd=repo_root, stdout=subprocess.PIPE,
++                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
++                env=env, start_new_session=True)
++            # Registry/owner identity and diagnostic writes occur only AFTER
++            # the donor received the actual handle and entered this try/finally.
++            custody["after_spawn"](proc)
++            pgid = os.getpgid(proc.pid) if sys.platform != "win32" else None
++            output, _ = proc.communicate(timeout=file_timeout)
++            rc = proc.returncode
++        except subprocess.TimeoutExpired as error:
++            primary_error = error
++            rc = 124
++        except BaseException as error:
++            primary_error = error
++        finally:
++            if proc is None:
++                # Same already-spawned object if callback return was interrupted;
++                # never Popen again, never adopt a numeric foreign handle.
++                proc = custody["retained_handle"]()
++            if proc is not None:
++                pgid = custody["retained_pgid"]()
++                try:
++                    custody["stop"](proc, pgid)
++                except BaseException as error:
++                    cuts.append({'operation': 'stop', 'error': type(error).__name__})
++                # Even failed stop/checkpoint must reach this same donor reader.
++                # communicate after TimeoutExpired continues CPython's same
++                # retained pipe state; it is not a second competing drainer.
++                if proc.returncode is None:
++                    try:
++                        output, _ = proc.communicate(timeout=custody["remaining"]())
++                    except BaseException as error:
++                        cuts.append({'operation': 'drain_reap', 'error': type(error).__name__})
++                        partial = getattr(error, 'output', None)
++                        if partial is not None:
++                            output = partial.decode('utf-8', 'replace') if isinstance(partial, bytes) else partial
++                if not output and primary_error is not None:
++                    partial = getattr(primary_error, 'output', None)
++                    if partial is not None:
++                        output = partial.decode('utf-8', 'replace') if isinstance(partial, bytes) else partial
++                # In-memory output custody precedes fallible diagnostic writes.
++                # capture stores it in the existing registry session even when
++                # the durable receipt cannot be written; it does not read pipes.
++                try:
++                    custody["capture"](proc, output, primary_error, cuts)
++                except BaseException as error:
++                    cuts.append({'operation': 'capture', 'error': type(error).__name__})
++                try:
++                    custody["settle"](proc, pgid, temproot)
++                    settled = True
++                except BaseException as error:
++                    cuts.append({'operation': 'settle', 'error': type(error).__name__})
++                if primary_error is None and rc is None:
++                    rc = proc.returncode
++            # Failure never removes the only partial output/temp evidence. An
++            # actual outer receipt still gates registry/capacity release later.
++            if settled and primary_error is None and not cuts:
++                _rmtree_force(temproot)
++        if cuts or not settled:
++            # Actual handle/output remain in the existing session; callers may
++            # reconcile that same custody but must never replay this file.
++            failure = RuntimeError('RUNTEST_DONOR_CUSTODY_RETAINED_STOP_UNCONFIRMED:' + repr(cuts))
++            raise failure from primary_error
++        if primary_error is not None and not isinstance(primary_error, subprocess.TimeoutExpired):
++            raise primary_error
++        if isinstance(primary_error, subprocess.TimeoutExpired):
++            output = f"({file_timeout:.0f}s exceeded; owned stop requested; independent cessation required)\n{output}"
++        else:
++            output += "\n"
+ 
+     if rc not in (0, 5) and not output.strip():
+         output = f"pytest child exited {rc} (0x{rc & 0xffffffff:08x}) with no output: {file}\n"
+ 
++    if custody is not None:
++        custody["terminal"](proc.returncode)  # Keep real5; donor console still normalizes it.
+     if rc == 5:
+         # No tests collected in THIS file — legitimate per-file: a
+         # platform-gated or fully-marker-filtered file (e.g. a win32-only

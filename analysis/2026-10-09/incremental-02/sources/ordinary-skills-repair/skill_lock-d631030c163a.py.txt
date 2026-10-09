@@ -1,0 +1,292 @@
+"""One native publication fence for marked user homes, including admin writers.
+
+The marker selects a lock, never grants a UserScope or ordinary authorization.
+All managed locks collapse to <home>/.skills.lock; no inner per-skill/ledger lock
+may precede it. Reentrancy is per thread and retains the original descriptor.
+Unmarked native homes keep their existing locking and platform behavior.
+"""
+from contextlib import contextmanager
+from functools import wraps
+import os
+from pathlib import Path
+import stat
+import threading
+
+from hermes_cli.friday_user_scope import current, MARKER, ScopeDenied
+
+_HELD = threading.local()
+
+
+def _identity(st):
+    return st.st_dev, st.st_ino
+
+
+def _private(st, directory=False):
+    if (st.st_uid != os.getuid() or st.st_mode & 0o077
+            or (directory and not stat.S_ISDIR(st.st_mode))
+            or (not directory and (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1))):
+        raise ScopeDenied()
+
+
+def _held():
+    if not hasattr(_HELD, 'homes'):
+        _HELD.homes = {}
+    return _HELD.homes
+
+
+def require_skill_lock(home, *, authority=True):
+    """Cleanup may only use storage owned by the current publication window."""
+    entry = _held().get(Path(home))
+    if entry is None or entry[0] != os.getpid():
+        raise ScopeDenied()
+    entry[1](authority=authority)
+
+
+@contextmanager
+def managed_home_lock(home):
+    """Yield True under the managed fence, False for an unmarked donor home.
+
+    Home/marker/lock descriptors and their ancestor links are checked before
+    and after flock's actual wait. A replaced lock is refused, never reopened
+    to silently follow a different inode. No path inside skills/ is a lock.
+    """
+    home = Path(home)
+    cap = current()
+    if cap is not None and home != cap.home:
+        raise ScopeDenied()
+    held = _held()
+    entry = held.get(home)
+    if entry is not None:
+        if entry[0] != os.getpid():
+            raise ScopeDenied()  # fork must not inherit a false reentrant claim
+        entry[1]()
+        if cap is not None:
+            cap.check()
+        yield True
+        entry[1]()
+        if cap is not None:
+            cap.check()
+        return
+    try:
+        os.lstat(home / MARKER)
+    except FileNotFoundError:
+        if cap is not None:
+            raise ScopeDenied()
+        yield False
+        return
+    if (not home.is_absolute() or '..' in home.parts or held):
+        raise ScopeDenied()  # one managed home at a time; no cross-home lock cycle
+    try:
+        import fcntl
+    except ImportError:
+        raise ScopeDenied() from None
+    fds, links = [], []
+    item = None
+    locked = False
+    try:
+        fds.append(os.open('/', os.O_RDONLY | os.O_DIRECTORY))
+        for name in home.parts[1:]:
+            parent = fds[-1]
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            fds.append(fd)
+            links.append((parent, name, _identity(os.fstat(fd))))
+        homefd = fds[-1]
+        _private(os.fstat(homefd), True)
+        if cap is not None and _identity(os.fstat(homefd)) != cap.directory_identity:
+            raise ScopeDenied()
+        marker = os.open(MARKER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=homefd)
+        fds.append(marker)
+        _private(os.fstat(marker))
+        marker_identity = _identity(os.fstat(marker))
+        item = os.open('.skills.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                       0o600, dir_fd=homefd)
+        _private(os.fstat(item))
+        lock_identity = _identity(os.fstat(item))
+
+        def check(*, authority=True):
+            if authority and cap is not None:
+                cap.check()
+            for parent, name, identity in links:
+                st = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if not stat.S_ISDIR(st.st_mode) or _identity(st) != identity:
+                    raise ScopeDenied()
+            _private(os.fstat(homefd), True)
+            for name, fd, identity in ((MARKER, marker, marker_identity), ('.skills.lock', item, lock_identity)):
+                st = os.stat(name, dir_fd=homefd, follow_symlinks=False)
+                _private(st); _private(os.fstat(fd))
+                if _identity(st) != identity:
+                    raise ScopeDenied()
+
+        check()
+        fcntl.flock(item, fcntl.LOCK_EX)
+        locked = True
+        check()
+        held[home] = (os.getpid(), check)
+        yield True
+        check()
+    finally:
+        held.pop(home, None)
+        if item is not None:
+            try:
+                if locked:
+                    fcntl.flock(item, fcntl.LOCK_UN)
+            finally:
+                os.close(item)
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def skill_write_window(home, *, admin_only=False, with_arguments=False):
+    """Fence an existing native operation, including its validation and metadata.
+
+    `home` is a call-time resolver for the actual destination, not a cached
+    profile. The body/feature gates and unmarked donor semantics are retained.
+    """
+    def decorate(fn):
+        @wraps(fn)
+        def fenced(*args, **kwargs):
+            if admin_only and current() is not None:
+                raise ScopeDenied()
+            with managed_home_lock(home(*args, **kwargs) if with_arguments else home()):
+                return fn(*args, **kwargs)
+        return fenced
+    return decorate
+
+
+def managed_output(path):
+    """An output of this already-fenced native operation, never guessed authority."""
+    path = Path(path)
+    for home in _held():
+        if path.is_relative_to(home):
+            require_skill_lock(home)
+            if '..' in path.parts:
+                raise ScopeDenied()
+            return home
+    return None
+
+
+def native_mkdir(path, mode=0o777, parents=False, exist_ok=False):
+    path = Path(path)
+    home = managed_output(path)
+    if home is None:
+        return path.mkdir(mode=mode, parents=parents, exist_ok=exist_ok)
+    # Path.mkdir(parents=True, mode=0700) leaves intermediate parents at0777.
+    # Create each explicit output directory privately; never chmod old objects.
+    if path == home:
+        _private(path.lstat(), True)
+        if not exist_ok:
+            raise FileExistsError(str(path))
+        return
+    if parents:
+        native_mkdir(path.parent, parents=True, exist_ok=True)
+    else:
+        _private(path.parent.lstat(), True)
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        if not exist_ok:
+            raise
+        _private(path.lstat(), True)
+
+
+def native_open(path, mode='r', **kwargs):
+    """Explicit private creation for managed native outputs; old bytes untouched
+    on incompatible mode/type/link. Donor open semantics remain unchanged."""
+    import builtins
+    path = Path(path)
+    home = managed_output(path)
+    if home is None or not any(c in mode for c in 'wax+'):
+        return builtins.open(path, mode, **kwargs)
+    native_mkdir(path.parent, parents=True, exist_ok=True)
+    def opener(name, flags):
+        fd = os.open(name, (flags & ~os.O_TRUNC) | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            _private(os.fstat(fd))
+            if flags & os.O_TRUNC:
+                os.ftruncate(fd, 0)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+    return builtins.open(path, mode, opener=opener, **kwargs)
+
+
+def native_write_text(path, data, encoding=None, errors=None, newline=None):
+    with native_open(path, 'w', encoding=encoding, errors=errors, newline=newline) as stream:
+        return stream.write(data)
+
+
+def native_write_bytes(path, data):
+    with native_open(path, 'wb') as stream:
+        return stream.write(data)
+
+
+def _atomic_mode(path, kwargs):
+    path = Path(path)
+    if managed_output(path) is not None:
+        native_mkdir(path.parent, parents=True, exist_ok=True)
+        try:
+            old = path.lstat()
+            _private(old)
+            mode = old.st_mode & 0o700
+        except FileNotFoundError:
+            mode = 0o600
+        kwargs['mode'] = mode
+    return kwargs
+
+
+def atomic_write_text(path, content, **kwargs):
+    from utils import atomic_write_text as native
+    return native(path, content, **_atomic_mode(path, kwargs))
+
+
+def atomic_json_write(path, data, **kwargs):
+    from utils import atomic_json_write as native
+    return native(path, data, **_atomic_mode(path, kwargs))
+
+
+def mkdir_under_hermes_home(path):
+    from hermes_constants import assert_named_profile_home_live
+    assert_named_profile_home_live(path)
+    native_mkdir(path, parents=True, exist_ok=True)
+    return Path(path)
+
+
+def native_copy2(src, dest, **kwargs):
+    import shutil
+    dest = Path(dest)
+    if managed_output(dest) is None:
+        return shutil.copy2(src, dest, **kwargs)
+    # Only a freshly-created copy is normalized; never chmod an old owner file.
+    if dest.exists() or dest.is_symlink():
+        raise FileExistsError(str(dest))
+    native_mkdir(dest.parent, parents=True, exist_ok=True)
+    with open(src, 'rb') as source, native_open(dest, 'xb') as output:
+        shutil.copyfileobj(source, output)
+        st = os.stat(src)
+        os.fchmod(output.fileno(), st.st_mode & 0o700)
+        os.utime(output.fileno(), ns=(st.st_atime_ns, st.st_mtime_ns))
+    return str(dest)
+
+
+def native_copytree(src, dest, *, ignore=None):
+    import shutil
+    dest = Path(dest)
+    if managed_output(dest) is None:
+        return shutil.copytree(src, dest, ignore=ignore)
+    # Build actual outputs privately instead of copytree's final copystat,
+    # which would reintroduce donor0644/0755. No old object is chmodded/adopted.
+    native_mkdir(dest, parents=True, exist_ok=False)
+    names = os.listdir(src)
+    ignored = set(ignore(str(src), names) if ignore else ())
+    for name in names:
+        if name in ignored:
+            continue
+        source = Path(src) / name
+        if source.is_dir():
+            native_copytree(source, dest / name, ignore=ignore)
+        else:
+            native_copy2(source, dest / name)
+    st = os.stat(src)
+    os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns))
+    return str(dest)

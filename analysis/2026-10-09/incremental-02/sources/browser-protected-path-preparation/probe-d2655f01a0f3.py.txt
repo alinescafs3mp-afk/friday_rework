@@ -1,0 +1,215 @@
+"""Inert prerequisite probe. Execute only after independent root admission."""
+import errno
+import hashlib
+import json
+import os
+from pathlib import Path
+import socket
+import stat
+import sys
+import time
+
+
+EXECUTABLE = '/opt/friday-pw1228-670ba079b751/chrome-headless-shell'
+EXECUTABLE_SHA256 = '670ba079b75107746ba41abad131180a31a7c7219aa1bd4061fb471f4535d541'
+PROFILE = '/etc/apparmor.d/friday-pw1228-670ba079b751'
+PROFILE_SHA256 = '31bd16e6a4c51a1766f9423e07c152ee1162f6a4459edd8441c364bddf6bd76e'
+LABEL = 'friday-pw1228-670ba079b751 (unconfined)'
+UNSAFE_SWITCHES = {'--no-sandbox', '--disable-seccomp-filter-sandbox',
+                   '--disable-namespace-sandbox', '--disable-setuid-sandbox',
+                   '--single-process', '--no-zygote'}
+
+
+def require(value, message):
+    if not value:
+        raise RuntimeError(message)
+
+
+def protected_install():
+    """Read-only verification of the installed bytes and root write boundary."""
+    manifest = json.loads(Path(__file__).with_name('source-pins.json').read_text())
+    install, pins = manifest['protected_browser'], manifest['pins']
+    root = Path(EXECUTABLE).parent
+    require(install['root'] == str(root) and install['profile'] == PROFILE
+            and install['file_count'] == len(install['file_modes']) == 287,
+            'protected_manifest_shape')
+    require(pins[EXECUTABLE]['sha256'] == EXECUTABLE_SHA256
+            and pins[PROFILE]['sha256'] == PROFILE_SHA256, 'protected_fixed_pins')
+    for parent in (Path('/'), Path('/opt'), Path('/etc'), Path('/etc/apparmor.d')):
+        s = parent.lstat()
+        require(parent == parent.resolve(strict=True) and stat.S_ISDIR(s.st_mode)
+                and s.st_uid == s.st_gid == 0 and not s.st_mode & 0o022,
+                'unprotected_install_parent')
+    directories = {root, *(root / name for name in install['directories'])}
+    files = {root / name: mode for name, mode in install['file_modes'].items()}
+    require(set(root.rglob('*')) == (directories - {root}) | set(files),
+            'protected_inventory_changed')
+    for directory in directories:
+        s = directory.lstat()
+        require(directory == directory.resolve(strict=True) and stat.S_ISDIR(s.st_mode)
+                and s.st_uid == s.st_gid == 0 and stat.S_IMODE(s.st_mode) == 0o555,
+                'protected_directory_changed')
+    files[Path(PROFILE)] = install['profile_mode']
+    for path, mode in files.items():
+        s, pin = path.lstat(), pins[str(path)]
+        require(path == path.resolve(strict=True) and stat.S_ISREG(s.st_mode)
+                and s.st_uid == s.st_gid == 0 and stat.S_IMODE(s.st_mode) == mode
+                and not mode & 0o022 and s.st_size == pin['size']
+                and hashlib.sha256(path.read_bytes()).hexdigest() == pin['sha256'],
+                'protected_file_changed:' + str(path))
+    return {'file_count': 287, 'executable_sha256': EXECUTABLE_SHA256,
+            'profile_sha256': PROFILE_SHA256, 'root_owned_user_nonwritable': True}
+
+
+def start_time(proc):
+    return int((proc / 'stat').read_text().rsplit(')', 1)[1].split()[19])
+
+
+def process_record(pid, relative, members, browser=False):
+    # Never enumerate /proc. Only explicit CDP PIDs already in our own cgroup.
+    require(type(pid) is int and pid > 0 and pid in members, 'pid_outside_owned_cgroup')
+    proc = Path('/proc') / str(pid)
+    before = start_time(proc)
+    require((proc / 'cgroup').read_text().strip() == '0::' + relative, 'process_cgroup_changed')
+    status = dict(line.split(':', 1) for line in (proc / 'status').read_text().splitlines())
+    argv = (proc / 'cmdline').read_bytes().rstrip(b'\0').decode().split('\0')
+    require(not UNSAFE_SWITCHES.intersection(x.split('=', 1)[0] for x in argv),
+            'unsafe_browser_switch')
+    result = {'pid': pid, 'start_time': before, 'cgroup': relative, 'argv': argv,
+              'uid': [int(x) for x in status['Uid'].split()],
+              'nspid': [int(x) for x in status['NSpid'].split()],
+              'no_new_privs': int(status['NoNewPrivs']), 'seccomp': int(status['Seccomp']),
+              'seccomp_filters': int(status['Seccomp_filters']),
+              'cap_eff': int(status['CapEff'], 16), 'cap_prm': int(status['CapPrm'], 16),
+              'uid_map': [[int(x) for x in row.split()] for row in (proc / 'uid_map').read_text().splitlines()],
+              'gid_map': [[int(x) for x in row.split()] for row in (proc / 'gid_map').read_text().splitlines()]}
+    if browser:
+        result['executable'] = os.readlink(proc / 'exe')
+        result['label'] = (proc / 'attr/apparmor/current').read_text().strip()
+    require(start_time(proc) == before, 'process_identity_changed')
+    return result
+
+
+def check_sandbox_records(browser, renderers, parent_uid_map, parent_nspid):
+    require(browser['executable'] == EXECUTABLE and browser['label'] == LABEL,
+            'protected_browser_not_attached')
+    require(browser['uid'] == [1000] * 4 and browser['cap_eff'] == browser['cap_prm'] == 0
+            and browser['uid_map'] == parent_uid_map
+            and len(browser['nspid']) == len(parent_nspid)
+            and browser['nspid'][0] == browser['pid'], 'browser_identity_invalid')
+    require(browser['seccomp'] == 2 and browser['seccomp_filters'] >= 1,
+            'inherited_network_seccomp_absent')
+    require(bool(renderers), 'no_renderer_observed')
+    for renderer in renderers:
+        require('--type=renderer' in renderer['argv']
+                and renderer['uid'] == [1000] * 4
+                and renderer['cgroup'] == browser['cgroup']
+                and renderer['cap_eff'] == renderer['cap_prm'] == 0,
+                'renderer_identity_invalid')
+        require(renderer['no_new_privs'] == 1 and renderer['seccomp'] == 2
+                and renderer['seccomp_filters'] > browser['seccomp_filters'],
+                'renderer_seccomp_not_added')
+        require(renderer['nspid'][0] == renderer['pid']
+                and len(renderer['nspid']) > len(browser['nspid']),
+                'renderer_pid_namespace_absent')
+        require(renderer['uid_map'] != browser['uid_map']
+                and len(renderer['uid_map']) == len(renderer['gid_map']) == 1
+                # Chromium 149.0.7827.55 WriteToIdMapFile maps getuid/getgid
+                # to the same inside ID, one entry. See pinned primary refs.
+                and renderer['uid_map'][0] == [1000, 1000, 1]
+                and renderer['gid_map'][0] == [1000, 1000, 1],
+                'renderer_user_namespace_absent')
+
+
+def observe_sandbox(browser, group, relative):
+    session = browser.new_browser_cdp_session()
+    try:
+        infos = session.send('SystemInfo.getProcessInfo')['processInfo']
+    finally:
+        session.detach()
+    members = {int(x) for x in (group / 'cgroup.procs').read_text().split()}
+    require(0 < len(infos) <= 128 and 0 < len(members) <= 128, 'process_bound_exceeded')
+    require(all(type(row['id']) is int and row['id'] in members for row in infos),
+            'cdp_pid_outside_owned_cgroup')
+    require(len({row['id'] for row in infos}) == len(infos), 'duplicate_cdp_pid')
+    browser_ids = [row['id'] for row in infos if row['type'] == 'browser']
+    renderer_ids = [row['id'] for row in infos if row['type'] == 'renderer']
+    require(len(browser_ids) == 1 and renderer_ids, 'missing_browser_or_renderer')
+    browser_record = process_record(browser_ids[0], relative, members, browser=True)
+    # Preserve the actual observation even if a later read/check refuses.
+    # stderr is diagnostic, never a successful probe proof.
+    print(json.dumps({'sandbox_browser_observation': browser_record}), file=sys.stderr, flush=True)
+    renderers = []
+    for pid in renderer_ids:
+        record = process_record(pid, relative, members)
+        print(json.dumps({'sandbox_renderer_observation': record}), file=sys.stderr, flush=True)
+        renderers.append(record)
+    parent_uid_map = [[int(x) for x in row.split()] for row in Path('/proc/self/uid_map').read_text().splitlines()]
+    parent_status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines())
+    check_sandbox_records(browser_record, renderers, parent_uid_map, parent_status['NSpid'].split())
+    final_members = {int(x) for x in (group / 'cgroup.procs').read_text().split()}
+    for record in [browser_record, *renderers]:
+        require(record['pid'] in final_members
+                and start_time(Path('/proc') / str(record['pid'])) == record['start_time'],
+                'observed_process_not_stable')
+    return {'browser': browser_record, 'renderers': renderers,
+            'meaning': 'Observed AppArmor attachment, nested PID namespace, single-ID user namespace, NNP and additional seccomp filters. No claim of complete filter-policy verification or full AppArmor confinement.'}
+
+
+def main():
+    owner = json.loads(Path(sys.argv[1]).read_text())
+    assert owner['deadline_monotonic'] == owner['started_monotonic'] + owner['budget_seconds']
+    assert time.monotonic() + 50 < owner['deadline_monotonic'], 'original_budget_insufficient'
+    relative = Path('/proc/self/cgroup').read_text().strip().split('::', 1)[1]
+    assert relative == '/user.slice/user-1000.slice/<REDACTED_EMAIL>/app.slice/' + owner['unit'], 'wrong_service_cgroup'
+    group = Path('/sys/fs/cgroup') / relative.lstrip('/')
+    caps = {name: (group / name).read_text().strip() for name in ('memory.max', 'memory.swap.max', 'cpu.max', 'pids.max')}
+    assert caps['memory.max'] == '2147483648'
+    assert caps['memory.swap.max'] == '0'
+    quota, period = caps['cpu.max'].split()
+    assert quota != 'max' and int(quota) == 2 * int(period)
+    assert caps['pids.max'] == '128'
+    assert set(os.sched_getaffinity(0)) == {0, 1}
+    denied = []
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+        except OSError as exc:
+            assert exc.errno in (errno.EAFNOSUPPORT, errno.EPERM, errno.EACCES)
+            denied.append(family.name)
+        else:
+            sock.close()
+            raise RuntimeError('network_family_not_denied')
+    from importlib.metadata import version
+    assert version('playwright') == '1.61.0'
+    from playwright.sync_api import sync_playwright
+    installed = protected_install()
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(executable_path=EXECUTABLE, headless=True, chromium_sandbox=True, timeout=15000)
+        try:
+            assert browser.version == '149.0.7827.55'
+            context = browser.new_context(service_workers='block', accept_downloads=False)
+            requests = []
+            def deny(route):
+                requests.append(route.request.url)
+                route.abort()
+            context.route('**/*', deny)
+            page = context.new_page()
+            page.set_default_timeout(5000)
+            assert page.url == 'about:blank'
+            page.set_content('<!doctype html><button id="b">0</button><script>document.getElementById("b").onclick=function(){this.textContent="1"}</script>')
+            page.locator('#b').click()
+            assert page.locator('#b').text_content() == '1'
+            assert page.evaluate('6 * 7') == 42
+            assert page.url == 'about:blank' and requests == []
+            sandbox_evidence = observe_sandbox(browser, group, relative)
+            context.close()
+        finally:
+            browser.close()
+        assert not browser.is_connected()
+    assert time.monotonic() < owner['deadline_monotonic'], 'original_budget_exhausted'
+    print(json.dumps({'probe': 'BROWSER_PREREQUISITE_PASS', 'playwright': '1.61.0', 'chromium': '149.0.7827.55', 'sandbox_requested': True, 'sandbox_observed': True, 'sandbox_evidence': sandbox_evidence, 'protected_executable': EXECUTABLE, 'installed': installed, 'network_families_denied': denied, 'cgroup': relative, 'caps': caps, 'javascript': True, 'browser_closed': True, 'installed_journey_accepted': False}), flush=True)
+
+
+if __name__ == '__main__':
+    main()

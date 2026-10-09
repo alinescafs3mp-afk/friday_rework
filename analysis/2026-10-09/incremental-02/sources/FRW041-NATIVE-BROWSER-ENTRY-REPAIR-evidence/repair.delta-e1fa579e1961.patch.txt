@@ -1,0 +1,303 @@
+--- a/tools/browser_tool_owner.py
++++ b/tools/browser_tool_owner.py
+@@ -128,6 +128,55 @@
+                 'directory_identity': list(self.scope_identity[5]), 'binding_sha256': self.scope_identity[6],
+                 'original_deadline': self.original_deadline, 'boot_id': self.boot_id}
+ 
++    @contextmanager
++    def _clock_refusal_fence(self):
++        """Qualify an exhausted caller only for a retained control's refusal.
++
++        current_web_call() deliberately checks the clock before returning. Its
++        raw ContextVar is read here solely to attribute that failure: this path
++        creates no owner and must never be used to admit effects/publication.
++        Foreign, revoked, stopped and nonmember callers cannot poison an owner.
++        """
++        from agent.web_call_context import _current
++        from hermes_cli.friday_user_scope import current, _same_scope
++        from hermes_constants import get_hermes_home
++        actual = _current.get()
++        self._clock_refusal_identity(actual)
++        with browser_lock(self.call.turn.lock, self.original_deadline):
++            # Identity/membership is rechecked inside the same launch/stop fence.
++            self._clock_refusal_identity(actual)
++            if (_current.get() is not actual
++                    or self.call not in self.call.turn.calls
++                    or actual not in self.call.turn.calls
++                    or self.call.stopped.is_set() or actual.stopped.is_set()
++                    or self.call.turn.stopped.is_set()):
++                raise BrowserOwnerRefused('browser_clock_refusal_owner_unsettled')
++            cap = current(required=True)
++            if (not _same_scope(cap, self.scope)
++                    or _scope_identity(cap) != self.scope_identity
++                    or _scope_identity(self.scope) != self.scope_identity
++                    or str(get_hermes_home()) != self.scope_identity[1]):
++                raise BrowserOwnerRefused('browser_clock_refusal_foreign_scope')
++            self.scope.check()
++            if Path('/proc/sys/kernel/random/boot_id').read_text().strip() != self.boot_id:
++                raise BrowserOwnerRefused('browser_original_boot_changed')
++            ceilings = (self.original_deadline, self.call.deadline(), actual.deadline(),
++                        getattr(self.call.turn, 'browser_deadline', self.original_deadline))
++            if any(type(v) not in (int, float) or not math.isfinite(v) for v in ceilings):
++                raise BrowserOwnerRefused('browser_original_owner_deadline_required')
++            ceiling = min(ceilings)
++            if time.monotonic() < ceiling:
++                raise BrowserOwnerRefused('browser_clock_refusal_not_exhausted')
++            yield ceiling  # Refusal-only; neither check() nor a launch permit.
++
++    def _clock_refusal_identity(self, actual):
++        from agent.web_call_context import WebCall
++        if (type(self.call) is not WebCall or type(actual) is not WebCall
++                or _call_identity(self.call) != self.call_identity
++                or _call_identity(actual)[:4] != self.call_identity[:4]
++                or actual.turn is not self.call.turn):
++            raise BrowserOwnerRefused('browser_clock_refusal_foreign_caller')
++
+ 
+ def current_browser_owner():
+     from agent.web_call_context import current_web_call, WebCall
+--- a/tools/browser_stream_control.py
++++ b/tools/browser_stream_control.py
+@@ -72,8 +72,12 @@
+             except (BrowserOwnerRefused, TimeoutError) as error:
+                 if str(error) in ('browser_original_owner_deadline_exhausted',
+                                   'web_original_deadline'):
+-                    # A later caller must not revive an already exhausted bound.
+-                    object.__setattr__(self, '_refused', True)
++                    # A clock error can precede native identity checks. Attribute
++                    # it before latching; an expired foreign caller cannot poison.
++                    with owner._clock_refusal_fence() as ceiling:
++                        object.__setattr__(self, '_retained_deadline',
++                                           min(self._retained_deadline, ceiling))
++                        object.__setattr__(self, '_refused', True)
+                 raise
+ 
+     def check(self, owner, session):
+@@ -110,7 +114,30 @@
+     Publication and native launch/custody still need an enclosing owner fence
+     in the eventual managed launch integration. No integration is supplied here.
+     """
+-    owner = bind_browser_session(task_id, session_info)
++    try:
++        owner = bind_browser_session(task_id, session_info)
++    except (BrowserOwnerRefused, TimeoutError) as error:
++        if str(error) in ('browser_original_owner_deadline_exhausted', 'web_original_deadline'):
++            retained = session_info.get('_friday_stream_control')
++            owner = session_info.get('_friday_execution_owner')
++            session = session_info.get('session_name')
++            if type(retained) is StreamControl and type(owner) is BrowserOwner:
++                retained._identity(owner, session)
++                with owner._clock_refusal_fence() as ceiling:
++                    from hermes_cli.friday_user_scope import browser_task_key, check_browser
++                    # Exact original dictionary/session and principal-scoped route
++                    # still have to match. An unchecked WebCall grants nothing.
++                    check_browser(session_info)
++                    if task_id != browser_task_key(owner.call_identity[0]):
++                        raise BrowserOwnerRefused('browser_original_task_key_required')
++                    if session_info.get('_friday_stream_control') is not retained:
++                        raise BrowserOwnerRefused('browser_stream_original_control_required')
++                    retained._identity(session_info.get('_friday_execution_owner'),
++                                       session_info.get('session_name'))
++                    object.__setattr__(retained, '_retained_deadline',
++                                       min(retained._retained_deadline, ceiling))
++                    object.__setattr__(retained, '_refused', True)
++        raise
+     session = session_info.get('session_name')
+     if type(session) is not str or not session or len(session) > 512:
+         raise BrowserOwnerRefused('browser_stream_actual_daemon_session_required')
+--- a/tests/tools/test_browser_stream_control.py
++++ b/tests/tools/test_browser_stream_control.py
+@@ -161,18 +161,15 @@
+             c.headers(a, 'daemon')
+ 
+ 
+-def test_terminal_native_check_failure_before_fence_yield_is_retained():
+-    a = owner()
+-    with clocks(a):
+-        c = control(a)
+-        for error in (TimeoutError('web_original_deadline'),
+-                      BrowserOwnerRefused('browser_original_owner_deadline_exhausted')):
+-            c = control(a)
+-            with patch.object(BrowserOwner, 'check', side_effect=error):
+-                with pytest.raises(type(error)):
+-                    record(c, a)
+-            with pytest.raises(BrowserOwnerRefused, match='permanently_refused'):
+-                record(c, a)
++def test_terminal_native_check_failure_before_fence_yield_is_retained(native_stream):
++    n = native_stream
++    c = stream_control(n.key, n.info)
++    with n.caller(105.0):
++        n.clock.now = 106.0
++        with pytest.raises(TimeoutError, match='web_original_deadline'):
++            c.launch_environment(n.owner, 'daemon', {})
++    with n.caller(120.0), pytest.raises(BrowserOwnerRefused, match='permanently_refused'):
++        c.headers(n.owner, 'daemon')
+ 
+ 
+ def test_secret_publication_and_retained_creation_share_existing_turn_lock():
+@@ -250,3 +247,165 @@
+ def test_missing_real_native_context_is_not_an_admission_record():
+     with pytest.raises((RuntimeError, BrowserOwnerRefused)):
+         stream_control('task', {'session_name': 'daemon'})
++
++
++@pytest.fixture
++def native_stream(monkeypatch, tmp_path):
++    """Real WebCall/ContextVars/UserScope/bind, with authority storage doubled.
++
++    No bind, current_web_call, BrowserOwner.check/fence or check_browser stub.
++    These are source controls pending isolated admission, not live observations.
++    """
++    from agent import web_call_context as calls
++    from hermes_cli import friday_user_scope as users
++    from tools import browser_tool_owner as owners, browser_stream_control as streams, interrupt
++    clock = SimpleNamespace(now=100.0)
++    timer = SimpleNamespace(monotonic=lambda: clock.now)
++    for module in (calls, owners, streams):
++        monkeypatch.setattr(module, 'time', timer)
++    monkeypatch.setattr(interrupt, 'is_interrupted', lambda: False)
++    home = tmp_path / 'profile'; home.mkdir(mode=0o700)
++    st = home.stat()
++    cap = users.UserScope(tmp_path / 'authority', home, 'alice',
++        ('telegram', 'botprofile', 'bot-id', 'alice'), {'runtime_profile': 'alice'},
++        (st.st_dev, st.st_ino), 3)
++    def authority_storage(value):
++        if value.revoked:
++            raise users.ScopeDenied()
++        return value
++    monkeypatch.setattr(users.UserScope, 'check', authority_storage)
++    monkeypatch.setattr(users, '_ENGAGED', False)
++    agent = SimpleNamespace(session_id='parent', _current_turn_id='turn',
++                            _web_run_deadline=120.0, _web_turn=calls.WebTurn())
++    original = calls.make_web_call(agent, 120.0, 'task', 'first')
++    original.session_key = 'key'
++    @contextmanager
++    def caller(deadline=120.0, *, scope=None, fields=None, foreign_turn=False, member=True):
++        a = agent if not foreign_turn else SimpleNamespace(session_id='parent',
++                _current_turn_id='turn', _web_run_deadline=120.0, _web_turn=calls.WebTurn())
++        call = calls.make_web_call(a, deadline, 'task', 'subsequent')
++        call.run_deadline = deadline
++        call.session_key = 'key'
++        for name, value in (fields or {}).items():
++            setattr(call, name, value)
++        if not member:
++            call.turn.calls.discard(call)
++        token = users._CURRENT.set(cap if scope is None else scope)
++        try:
++            with calls.bind_web_call(call):
++                yield call
++        finally:
++            users._CURRENT.reset(token)
++    token = users._CURRENT.set(cap)
++    try:
++        with users.authority(home), calls.bind_web_call(original):
++            own = owners.current_browser_owner()
++            info = {'session_name': 'daemon', '_friday_owner_home': str(home),
++                    '_friday_user_scope': cap, '_friday_managed': True}
++            yield SimpleNamespace(clock=clock, cap=cap, owner=own, info=info,
++                                  key=own.task_key(), call=original, caller=caller)
++    finally:
++        users._CURRENT.reset(token)
++
++
++@pytest.mark.parametrize('publication', ['none', 'launch', 'headers'])
++@pytest.mark.parametrize('exhausted', ['current', 'original_call', 'original_owner'])
++def test_real_bind_clock_failure_permanently_latches_original_control(native_stream, publication, exhausted):
++    n = native_stream
++    c = stream_control(n.key, n.info)
++    token, bound = c.token, c.original_deadline
++    if publication == 'launch': c.launch_environment(n.owner, 'daemon', {})
++    elif publication == 'headers': c.headers(n.owner, 'daemon')
++    if exhausted == 'current': deadline, n.clock.now = 105.0, 106.0
++    elif exhausted == 'original_call':
++        deadline, n.clock.now = 120.0, 106.0
++        n.call.run_deadline = 105.0
++    else:
++        deadline, n.clock.now = 130.0, 121.0
++        n.call.base_deadline = n.call.run_deadline = 130.0
++        # Native calls remain live, but the retained original owner's 120
++        # is exhausted: this reaches the real BrowserOwnerRefused branch.
++    with n.caller(deadline), pytest.raises((TimeoutError, BrowserOwnerRefused)):
++        stream_control(n.key, n.info)  # Real bind/current_web_call failure.
++    assert n.info['_friday_stream_control'] is c and c._refused
++    assert c.owner is n.owner and c.token == token and c.original_deadline == bound
++    n.call.base_deadline = n.call.run_deadline = 120.0
++    n.clock.now = 107.0 if exhausted != 'original_owner' else 100.0
++    # Clock rollback only stresses sticky refusal; it is never a runtime reset.
++    with n.caller(120.0):
++        for operation in (lambda: stream_control(n.key, n.info),
++                          lambda: c.launch_environment(n.owner, 'daemon', {}),
++                          lambda: c.headers(n.owner, 'daemon')):
++            with pytest.raises(BrowserOwnerRefused, match='permanently_refused'):
++                operation()
++
++
++@pytest.mark.parametrize('axis', ['principal', 'generation', 'task_id', 'session_key',
++                                'turn_id', 'turn', 'membership', 'session', 'route', 'scope'])
++@pytest.mark.parametrize('operation', ['entry', 'headers', 'launch'])
++def test_expired_foreign_caller_cannot_poison_retained_control(native_stream, axis, operation):
++    n = native_stream
++    c = stream_control(n.key, n.info)
++    args = {}; info = n.info; key = n.key
++    if axis == 'principal': args['scope'] = replace(n.cap, principal=('telegram', 'x', 'y', 'foreign'))
++    elif axis == 'generation': args['scope'] = replace(n.cap, admission_generation=4)
++    elif axis in ('task_id', 'session_key', 'turn_id'): args['fields'] = {axis: 'foreign'}
++    elif axis == 'turn': args['foreign_turn'] = True
++    elif axis == 'membership': args['member'] = False
++    elif axis == 'session': info = {**n.info, 'session_name': 'foreign'}
++    elif axis == 'route': key = 'foreign'
++    else: info = {**n.info, '_friday_user_scope': replace(n.cap, admission_generation=4)}
++    n.clock.now = 106.0
++    with n.caller(105.0, **args), pytest.raises((RuntimeError, PermissionError, TimeoutError)):
++        if operation == 'entry': stream_control(key, info)
++        elif axis in ('session', 'route', 'scope'):
++            # Dictionary/route identities are entry-only surfaces. Other public
++            # methods have an explicit owner/session instead, without a route.
++            c.headers(replace(n.owner), 'foreign')
++        elif operation == 'headers': c.headers(n.owner, 'daemon')
++        else: c.launch_environment(n.owner, 'daemon', {})
++    assert not c._refused and c._retained_deadline == 120.0
++    assert n.info['_friday_stream_control'] is c
++    with n.caller(120.0):
++        assert stream_control(n.key, n.info) is c
++        assert c.check(n.owner, 'daemon') == 120.0
++
++
++@pytest.mark.parametrize('publication', ['none', 'headers'])
++def test_real_live_shorter_caller_keeps_minimum_or_refuses_published_control(native_stream, publication):
++    n = native_stream
++    c = stream_control(n.key, n.info)
++    if publication == 'headers': c.headers(n.owner, 'daemon')
++    with n.caller(105.0):
++        if publication == 'headers':
++            with pytest.raises(BrowserOwnerRefused, match='published_deadline_shortened'):
++                stream_control(n.key, n.info)
++        else:
++            assert stream_control(n.key, n.info) is c and c._retained_deadline == 105.0
++    with n.caller(120.0):
++        if publication == 'headers':
++            with pytest.raises(BrowserOwnerRefused, match='permanently_refused'):
++                c.headers(n.owner, 'daemon')
++        else:
++            assert json.loads(c.launch_environment(n.owner, 'daemon', {})
++                    ['AGENT_BROWSER_FRIDAY_STREAM_CONTROL'])['deadline_monotonic'] == 105.0
++
++
++def test_real_expired_first_entry_mints_no_control_or_owner(native_stream):
++    n = native_stream
++    n.clock.now = 106.0
++    with n.caller(105.0) as actual, pytest.raises(TimeoutError, match='web_original_deadline'):
++        stream_control(n.key, n.info)
++    assert '_friday_stream_control' not in n.info
++    assert '_friday_execution_owner' not in n.info
++    assert not hasattr(actual, 'browser_owner')
++
++
++def test_real_same_clock_positive_keeps_owner_token_and_session(native_stream):
++    n = native_stream
++    c = stream_control(n.key, n.info)
++    with n.caller(120.0):
++        assert stream_control(n.key, n.info) is c
++        assert n.info['_friday_execution_owner'] is n.owner
++        assert c.headers(n.owner, 'daemon')['Authorization'] == 'Bearer ' + c.token
++        assert c.original_deadline == 120.0 and c._retained_deadline == 120.0

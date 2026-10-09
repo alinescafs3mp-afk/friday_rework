@@ -1,0 +1,460 @@
+"""Inert prerequisite probe. Execute only after independent root admission."""
+import errno
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import stat
+import subprocess
+import sys
+import time
+
+
+EXECUTABLE = '/opt/friday-pw1228-670ba079b751/chrome-headless-shell'
+EXECUTABLE_SHA256 = '670ba079b75107746ba41abad131180a31a7c7219aa1bd4061fb471f4535d541'
+PROFILE = '/etc/apparmor.d/friday-pw1228-670ba079b751'
+PROFILE_SHA256 = '31bd16e6a4c51a1766f9423e07c152ee1162f6a4459edd8441c364bddf6bd76e'
+LABEL = 'friday-pw1228-670ba079b751 (unconfined)'
+UNSAFE_SWITCHES = {'--no-sandbox', '--disable-seccomp-filter-sandbox',
+                   '--disable-namespace-sandbox', '--disable-setuid-sandbox',
+                   '--single-process', '--no-zygote'}
+
+
+def require(value, message):
+    if not value:
+        raise RuntimeError(message)
+
+
+def native_identity_argv(unit):
+    require(bool(re.fullmatch(r'friday-browser-prerequisite-[0-9a-f]{16}\.service', unit)),
+            'native_identity_unit')
+    path = '/org/freedesktop/systemd1/unit/' + ''.join(
+        chr(b) if 48 <= b <= 57 or 65 <= b <= 90 or 97 <= b <= 122 else '_%02x' % b
+        for b in unit.encode())
+    # GetAll with an empty interface is supported by systemd's sd-bus server.
+    # One read of the exact running unit; explicit AF_UNIX address needs no
+    # additional environment. "call" applies both no-activation/auth flags.
+    return ['/usr/bin/busctl', '--address=unix:path=<USER_RUNTIME>/bus', '--no-pager',
+            '--json=short', '--auto-start=no', '--allow-interactive-authorization=no',
+            '--timeout=4', 'call', 'org.freedesktop.systemd1', path,
+            'org.freedesktop.DBus.Properties', 'GetAll', 's', '']
+
+
+def validate_native_identity(evidence, owner, relative, fragment, start, end, pid=None):
+    require(isinstance(evidence, dict), 'native_identity_missing')
+    unit = 'friday-browser-prerequisite-' + owner['nonce'] + '.service'
+    require(evidence.get('argv') == native_identity_argv(unit)
+            and evidence.get('nonce') == owner['nonce']
+            and evidence.get('boot_id') == owner['boot_id']
+            and evidence.get('cgroup') == relative
+            and evidence.get('timeout_seconds') == 5
+            and evidence.get('timeout') is False and type(evidence.get('returncode')) is int
+            and evidence['returncode'] == 0
+            and evidence.get('client_reaped') is True and evidence.get('stderr') == '',
+            'native_identity_transport')
+    observed_pid = evidence.get('pid')
+    require(type(observed_pid) is int and observed_pid > 0
+            and (pid is None or observed_pid == pid)
+            and type(evidence.get('pid_start_time')) is int and evidence['pid_start_time'] > 0,
+            'native_identity_owner_pid')
+    a, b = evidence.get('started_monotonic'), evidence.get('completed_monotonic')
+    require(type(a) in (int, float) and type(b) in (int, float)
+            and owner['started_monotonic'] <= start <= a <= b <= end < owner['deadline_monotonic']
+            and b - a <= 5, 'native_identity_stale_or_late')
+    raw = evidence.get('stdout')
+    require(isinstance(raw, str) and len(raw.encode()) < 1048576, 'native_identity_output')
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            require(key not in result, 'native_identity_duplicate')
+            result[key] = value
+        return result
+    value = json.loads(raw, object_pairs_hook=pairs,
+                       parse_constant=lambda value: require(False, 'native_identity_nonfinite'))
+    require(isinstance(value, dict) and set(value) == {'type', 'data'}
+            and value['type'] == 'a{sv}' and isinstance(value['data'], list)
+            and len(value['data']) == 1 and isinstance(value['data'][0], dict),
+            'native_identity_schema')
+    properties = value['data'][0]
+    expected = {'Id': ('s', unit), 'LoadState': ('s', 'loaded'),
+                'ActiveState': ('s', 'active'), 'SubState': ('s', 'running'),
+                'MainPID': ('u', observed_pid), 'ControlPID': ('u', 0),
+                'ControlGroup': ('s', relative), 'FragmentPath': ('s', fragment),
+                'Transient': ('b', False), 'NeedDaemonReload': ('b', False),
+                'DropInPaths': ('as', [])}
+    for key, (signature, data) in expected.items():
+        actual = properties.get(key)
+        require(isinstance(actual, dict) and set(actual) == {'type', 'data'}
+                and actual['type'] == signature and type(actual['data']) is type(data)
+                and actual['data'] == data, 'native_identity_property_' + key)
+    invocation = properties.get('InvocationID')
+    require(isinstance(invocation, dict) and set(invocation) == {'type', 'data'}
+            and invocation['type'] == 'ay' and isinstance(invocation['data'], list)
+            and len(invocation['data']) == 16
+            and all(type(x) is int and 0 <= x <= 255 for x in invocation['data'])
+            and any(invocation['data']), 'native_identity_invocation')
+    return bytes(invocation['data']).hex()
+
+
+def observe_native_identity(owner, relative):
+    started = time.monotonic()
+    require(started + 55 < owner['deadline_monotonic'], 'native_identity_budget')
+    pid, birth = os.getpid(), start_time(Path('/proc/self'))
+    argv = native_identity_argv(owner['unit'])
+    evidence = {'argv': argv, 'nonce': owner['nonce'], 'boot_id': owner['boot_id'],
+                'pid': pid, 'pid_start_time': birth, 'cgroup': relative,
+                'started_monotonic': started, 'timeout_seconds': 5}
+    try:
+        row = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, timeout=5, close_fds=True)
+        evidence.update(returncode=row.returncode, timeout=False,
+                        stdout=row.stdout.decode(), stderr=row.stderr.decode())
+    except subprocess.TimeoutExpired as exc:
+        # run() kills and reaps this finite read client, without a retry.
+        evidence.update(returncode=None, timeout=True,
+                        stdout=(exc.stdout or b'').decode(errors='replace'),
+                        stderr=(exc.stderr or b'').decode(errors='replace'))
+    evidence.update(completed_monotonic=time.monotonic(), client_reaped=True)
+    print(json.dumps({'native_identity_observation': evidence}), file=sys.stderr, flush=True)
+    require(os.getpid() == pid and start_time(Path('/proc/self')) == birth
+            and Path('/proc/self/cgroup').read_text().strip() == '0::' + relative,
+            'native_identity_process_changed')
+    validate_native_identity(evidence, owner, relative,
+            '<USER_RUNTIME>/systemd/user/' + owner['unit'], started,
+            evidence['completed_monotonic'], pid=pid)
+    return evidence
+
+
+def protected_install(mapped_root=False):
+    """Read-only verification of the installed bytes and root write boundary."""
+    root_uid = 65534 if mapped_root else 0
+    if mapped_root:
+        require(Path('/proc/self/uid_map').read_text().split() == ['1000', '1000', '1']
+                and Path('/proc/self/gid_map').read_text().split() == ['1000', '1000', '1'], 'private_self_user_map')
+    manifest = json.loads(Path(__file__).with_name('source-pins.json').read_text())
+    install, pins = manifest['protected_browser'], manifest['pins']
+    root = Path(EXECUTABLE).parent
+    require(install['root'] == str(root) and install['profile'] == PROFILE
+            and install['file_count'] == len(install['file_modes']) == 287,
+            'protected_manifest_shape')
+    require(pins[EXECUTABLE]['sha256'] == EXECUTABLE_SHA256
+            and pins[PROFILE]['sha256'] == PROFILE_SHA256, 'protected_fixed_pins')
+    for parent in (Path('/'), Path('/opt'), Path('/etc'), Path('/etc/apparmor.d')):
+        s = parent.lstat()
+        require(parent == parent.resolve(strict=True) and stat.S_ISDIR(s.st_mode)
+                and s.st_uid == s.st_gid == root_uid and not s.st_mode & 0o022,
+                'unprotected_install_parent')
+    directories = {root, *(root / name for name in install['directories'])}
+    files = {root / name: mode for name, mode in install['file_modes'].items()}
+    require(set(root.rglob('*')) == (directories - {root}) | set(files),
+            'protected_inventory_changed')
+    for directory in directories:
+        s = directory.lstat()
+        require(directory == directory.resolve(strict=True) and stat.S_ISDIR(s.st_mode)
+                and s.st_uid == s.st_gid == root_uid and stat.S_IMODE(s.st_mode) == 0o555,
+                'protected_directory_changed')
+    files[Path(PROFILE)] = install['profile_mode']
+    for path, mode in files.items():
+        s, pin = path.lstat(), pins[str(path)]
+        require(path == path.resolve(strict=True) and stat.S_ISREG(s.st_mode)
+                and s.st_uid == s.st_gid == root_uid and stat.S_IMODE(s.st_mode) == mode
+                and not mode & 0o022 and s.st_size == pin['size']
+                and hashlib.sha256(path.read_bytes()).hexdigest() == pin['sha256'],
+                'protected_file_changed:' + str(path))
+    return {'file_count': 287, 'executable_sha256': EXECUTABLE_SHA256,
+            'profile_sha256': PROFILE_SHA256, 'root_owned_user_nonwritable': not mapped_root,
+            'private_user_map_verified': mapped_root, 'mapped_root_uid': root_uid}
+
+
+def start_time(proc):
+    return int((proc / 'stat').read_text().rsplit(')', 1)[1].split()[19])
+
+
+def command_line_observation(argv, browser=False):
+    """A rewritten process title is diagnostic text, never complete argv proof."""
+    require(bool(argv) and all(isinstance(x, str) and x for x in argv),
+            'empty_process_command_line')
+    rewritten = len(argv) == 1 and argv[0] != EXECUTABLE
+    if rewritten:
+        require(not browser and argv[0].startswith(EXECUTABLE + ' '),
+                'unexpected_process_title')
+        # Chromium's renderer process title can be truncated. Whitespace tokens
+        # identify only visible switches; they cannot reconstruct original argv.
+        tokens = argv[0].split()
+        complete_tokens = tokens if argv[0][-1].isspace() else tokens[:-1]
+        require(not UNSAFE_SWITCHES.intersection(x.split('=', 1)[0] for x in tokens),
+                'unsafe_browser_switch')
+        # A cut-off unsafe switch also cannot be admitted as a benign token.
+        require(not (tokens[-1].startswith('--')
+                     and any(flag.startswith(tokens[-1]) for flag in UNSAFE_SWITCHES)),
+                'unsafe_browser_switch_prefix')
+        return {'format': 'rewritten_process_title', 'complete': False,
+                'unsafe_switch_absence_proven': False,
+                'renderer_type_observed': '--type=renderer' in complete_tokens}
+    require(argv[0] == EXECUTABLE, 'unexpected_process_argv0')
+    require(not UNSAFE_SWITCHES.intersection(x.split('=', 1)[0] for x in argv),
+            'unsafe_browser_switch')
+    return {'format': 'nul_separated_argv', 'complete': True,
+            'unsafe_switch_absence_proven': True,
+            'renderer_type_observed': '--type=renderer' in argv}
+
+
+def process_record(pid, relative, members, browser=False):
+    # Never enumerate /proc. Only explicit CDP PIDs already in our own cgroup.
+    require(type(pid) is int and pid > 0 and pid in members, 'pid_outside_owned_cgroup')
+    proc = Path('/proc') / str(pid)
+    before = start_time(proc)
+    require((proc / 'cgroup').read_text().strip() == '0::' + relative, 'process_cgroup_changed')
+    status = dict(line.split(':', 1) for line in (proc / 'status').read_text().splitlines())
+    argv = (proc / 'cmdline').read_bytes().rstrip(b'\0').decode().split('\0')
+    argv_observation = command_line_observation(argv, browser=browser)
+    result = {'pid': pid, 'start_time': before, 'cgroup': relative, 'argv': argv,
+              'argv_observation': argv_observation,
+              'uid': [int(x) for x in status['Uid'].split()],
+              'nspid': [int(x) for x in status['NSpid'].split()],
+              'no_new_privs': int(status['NoNewPrivs']), 'seccomp': int(status['Seccomp']),
+              'seccomp_filters': int(status['Seccomp_filters']),
+              'cap_eff': int(status['CapEff'], 16), 'cap_prm': int(status['CapPrm'], 16),
+              'user_namespace': os.readlink(proc / 'ns/user'),
+              'network_namespace': os.readlink(proc / 'ns/net'),
+              'uid_map': [[int(x) for x in row.split()] for row in (proc / 'uid_map').read_text().splitlines()],
+              'gid_map': [[int(x) for x in row.split()] for row in (proc / 'gid_map').read_text().splitlines()]}
+    if browser:
+        result['executable'] = os.readlink(proc / 'exe')
+        result['label'] = (proc / 'attr/apparmor/current').read_text().strip()
+    require(start_time(proc) == before, 'process_identity_changed')
+    return result
+
+
+def check_sandbox_records(browser, renderers, parent_uid_map, parent_nspid):
+    command_line_observation(browser['argv'], browser=True)
+    require(browser['executable'] == EXECUTABLE and browser['label'] == LABEL,
+            'protected_browser_not_attached')
+    require(browser['uid'] == [1000] * 4 and browser['cap_eff'] == browser['cap_prm'] == 0
+            and browser['uid_map'] == parent_uid_map
+            and len(browser['nspid']) == len(parent_nspid)
+            and browser['nspid'][0] == browser['pid'], 'browser_identity_invalid')
+    require(browser['seccomp'] == 2 and browser['seccomp_filters'] >= 1,
+            'inherited_network_seccomp_absent')
+    require(bool(renderers), 'no_renderer_observed')
+    for renderer in renderers:
+        argv_observation = command_line_observation(renderer['argv'])
+        require(argv_observation['renderer_type_observed']
+                and renderer['uid'] == [1000] * 4
+                and renderer['cgroup'] == browser['cgroup']
+                and renderer['cap_eff'] == renderer['cap_prm'] == 0,
+                'renderer_identity_invalid')
+        require(renderer['no_new_privs'] == 1 and renderer['seccomp'] == 2
+                and renderer['seccomp_filters'] > browser['seccomp_filters'],
+                'renderer_seccomp_not_added')
+        require(renderer['nspid'][0] == renderer['pid']
+                and len(renderer['nspid']) > len(browser['nspid']),
+                'renderer_pid_namespace_absent')
+        require(renderer['user_namespace'] != browser['user_namespace']
+                and len(renderer['uid_map']) == len(renderer['gid_map']) == 1
+                # Chromium 149.0.7827.55 WriteToIdMapFile maps getuid/getgid
+                # to the same inside ID, one entry. See pinned primary refs.
+                and renderer['uid_map'][0] == [1000, 1000, 1]
+                and renderer['gid_map'][0] == [1000, 1000, 1],
+                'renderer_user_namespace_absent')
+
+
+NATIVE_CLI = '<PROJECT>/.runtime/friday-candidate-g2/tools/agent-browser-0.26.0-linux-x64/bin/agent-browser-linux-x64'
+NATIVE_CLI_SHA256 = '8784dc259abf72ee04e751b45677d956387af50c99aec5dcd7a41a9bc498e3c3'
+
+
+def loopback_evidence(grant):
+    """Actual kernel contour + independent owned host sentinels, never URL filtering."""
+    net = os.readlink('/proc/self/ns/net')
+    user = os.readlink('/proc/self/ns/user')
+    require(net != grant['host_net'] and user != grant['host_user'], 'host_namespace_retained')
+    require(os.getpid() == 1 and os.readlink('/proc/self/ns/pid') == grant['namespace_pid'], 'pid_namespace_not_owned')
+    require(sorted(x.name for x in Path('/sys/class/net').iterdir()) == ['lo'], 'nonloopback_interface_present')
+    routes = Path('/proc/net/route').read_text().splitlines()
+    require(all(line.split()[0] == 'lo' for line in routes[1:] if line.strip()), 'nonloopback_route_present')
+    routes6 = Path('/proc/net/ipv6_route').read_text().splitlines()
+    require(all(line.split()[-1] == 'lo' for line in routes6 if line.strip()), 'nonloopback_ipv6_route_present')
+    require(not Path('<USER_RUNTIME>/bus').exists() and not Path('/run/dbus/system_bus_socket').exists(), 'host_bus_visible')
+    # Private PID procfs prevents /proc/<host-pid>/root mount/socket aliases.
+    # Remaining /usr,/etc,/opt are selected system/protected runtime trust;
+    # no blanket hostile-same-UID filesystem containment claim is made.
+    fd_kinds = []
+    for item in Path('/proc/self/fd').iterdir():
+        try: mode = os.fstat(int(item.name)).st_mode
+        except OSError as exc:
+            if exc.errno == errno.EBADF: continue
+            raise
+        require(not stat.S_ISSOCK(mode), 'inherited_host_socket')
+        fd_kinds.append({'fd': int(item.name), 'mode_type': stat.S_IFMT(mode)})
+    attempts = []
+    cases = [(socket.AF_INET, ('127.0.0.1', grant['host_tcp_port']), {errno.ECONNREFUSED}),
+             (socket.AF_INET, ('192.0.2.1', 9), {errno.ENETUNREACH, errno.EHOSTUNREACH}),
+             (socket.AF_INET, ('10.0.0.1', 9), {errno.ENETUNREACH, errno.EHOSTUNREACH}),
+             (socket.AF_INET6, ('2001:db8::1', 9), {errno.ENETUNREACH, errno.EHOSTUNREACH}),
+             (socket.AF_UNIX, '\0' + grant['host_abstract'], {errno.ECONNREFUSED})]
+    for family, target, expected in cases:
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            try: sock.connect(target)
+            except OSError as exc:
+                require(exc.errno in expected, 'egress_control_unexpected_cause')
+                attempts.append({'family': family.name, 'target': repr(target), 'errno': exc.errno})
+            else: raise RuntimeError('host_or_external_route_available')
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(('127.0.0.1', 0)); listener.listen(1); listener.settimeout(1)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+            client.settimeout(1); client.connect(listener.getsockname())
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(1); client.sendall(b'owned-loopback'); require(connection.recv(32) == b'owned-loopback', 'loopback_io_failed')
+    return {'network_namespace': net, 'user_namespace': user, 'only_loopback': True,
+            'routes4': routes, 'routes6': routes6, 'negative_controls': attempts,
+            'owned_loopback_io': True, 'inherited_socket_absent_at_entry': True, 'entry_fd_types': fd_kinds,
+            'claim': 'isolated IP and abstract Unix namespace, masked known host IPC roots; selected runtime files remain trusted'}
+
+
+def cdp_process_info(profile):
+    """Read-only CDP process attribution. Navigation/actions use actual native CLI."""
+    from websockets.sync.client import connect
+    lines = (profile / 'DevToolsActivePort').read_text().splitlines()
+    require(len(lines) == 2 and lines[0].isdigit() and lines[1].startswith('/devtools/browser/'), 'owned_cdp_endpoint_invalid')
+    port = int(lines[0]); require(0 < port < 65536, 'owned_cdp_port_invalid')
+    endpoint = 'ws://127.0.0.1:' + str(port) + lines[1]
+    with connect(endpoint, proxy=None, open_timeout=2, close_timeout=1, max_size=1048576) as connection:
+        connection.send(json.dumps({'id': 1, 'method': 'SystemInfo.getProcessInfo'}))
+        end = time.monotonic() + 3
+        for _ in range(16):
+            require(time.monotonic() < end, 'cdp_observation_deadline')
+            message = json.loads(connection.recv(timeout=end - time.monotonic()))
+            if message.get('id') == 1:
+                require('error' not in message and isinstance(message.get('result', {}).get('processInfo'), list), 'cdp_process_info_failed')
+                return message['result']['processInfo']
+        raise RuntimeError('cdp_observation_unrelated_messages')
+
+
+def observe_sandbox(profile, group, relative, host_net):
+    infos = cdp_process_info(profile)
+    # Kernel renders cgroup.procs in the reader's PID namespace. CDP must
+    # identify processes in this same namespace; no host-wide proc scan.
+    members = {int(x) for x in (group / 'cgroup.procs').read_text().split()}
+    require(0 < len(infos) <= 128 and 0 < len(members) <= 128, 'process_bound_exceeded')
+    require(all(type(row['id']) is int and row['id'] in members for row in infos), 'cdp_pid_outside_owned_cgroup')
+    require(len({row['id'] for row in infos}) == len(infos), 'duplicate_cdp_pid')
+    browser_ids = [row['id'] for row in infos if row['type'] == 'browser']
+    renderer_ids = [row['id'] for row in infos if row['type'] == 'renderer']
+    require(len(browser_ids) == 1 and renderer_ids, 'missing_browser_or_renderer')
+    browser_record = process_record(browser_ids[0], relative, members, browser=True)
+    print(json.dumps({'sandbox_browser_observation': browser_record}), file=sys.stderr, flush=True)
+    renderers = []
+    for pid in renderer_ids:
+        record = process_record(pid, relative, members)
+        print(json.dumps({'sandbox_renderer_observation': record}), file=sys.stderr, flush=True)
+        renderers.append(record)
+    parent_uid_map = [[int(x) for x in row.split()] for row in Path('/proc/self/uid_map').read_text().splitlines()]
+    parent_status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines())
+    check_sandbox_records(browser_record, renderers, parent_uid_map, parent_status['NSpid'].split())
+    require(browser_record['network_namespace'] == os.readlink('/proc/self/ns/net')
+            and all(r['network_namespace'] != host_net for r in renderers), 'browser_network_namespace_changed')
+    final_members = {int(x) for x in (group / 'cgroup.procs').read_text().split()}
+    for record in [browser_record, *renderers]:
+        require(record['pid'] in final_members and start_time(Path('/proc') / str(record['pid'])) == record['start_time'], 'observed_process_not_stable')
+    return {'browser': browser_record, 'renderers': renderers,
+            'meaning': 'Actual protected executable/AppArmor, zero capabilities, additional renderer seccomp, nested PID and distinct user namespace. PrivateUsers outer mapping can equal nested mapping; namespace inode must differ. No complete filter-policy proof.'}
+
+
+def native_command(live, nonce, args, deadline, records):
+    cli = Path(NATIVE_CLI)
+    require(hashlib.sha256(cli.read_bytes()).hexdigest() == NATIVE_CLI_SHA256, 'native_cli_changed')
+    environment = {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'HOME': str(live / 'runtime-home'),
+                   'TMPDIR': str(live / 'runtime-tmp'), 'XDG_CACHE_HOME': str(live / 'runtime-cache'),
+                   'XDG_CONFIG_HOME': str(live / 'runtime-config'), 'AGENT_BROWSER_SOCKET_DIR': str(live / 'native-sockets'),
+                   'AGENT_BROWSER_IDLE_TIMEOUT_MS': '15000'}
+    require(os.geteuid() == 1000 and 'CI' not in environment and not Path('/.dockerenv').exists()
+            and not Path('/run/.containerenv').exists() and not any(x in Path('/proc/1/cgroup').read_text() for x in ('docker', 'kubepods', 'lxc')), 'automatic_no_sandbox_condition')
+    config = live / 'native-config.json'
+    expected = {'engine': 'chrome', 'headed': False, 'executablePath': EXECUTABLE,
+                'profile': str(live / 'chrome-profile'), 'args': '', 'json': True,
+                'ignoreHttpsErrors': False, 'allowFileAccess': False, 'autoConnect': False}
+    require(json.loads(config.read_text()) == expected, 'managed_config_changed')
+    argv = [NATIVE_CLI, '--config', str(config), '--session', 'friday-' + nonce,
+            '--engine', 'chrome', '--executable-path', EXECUTABLE, '--json', *args]
+    left = deadline - time.monotonic(); require(left > 0, 'native_probe_budget_exhausted')
+    row = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         cwd=live, env=environment, timeout=min(15, left), close_fds=True)
+    record = {'argv': argv, 'returncode': row.returncode, 'stdout': row.stdout.decode(), 'stderr': row.stderr.decode(), 'client_reaped': True}
+    records.append(record); print(json.dumps({'native_cli_observation': record}), file=sys.stderr, flush=True)
+    require(len(row.stdout) + len(row.stderr) <= 1048576 and row.returncode == 0, 'native_cli_failed_or_excessive_output')
+    value = json.loads(row.stdout)
+    require(isinstance(value, dict) and value.get('success') is True, 'native_cli_response_failed')
+    return value
+
+
+def receive_identity(owner, relative, live):
+    # The original host custodian holds both FIFO ends before start. No host
+    # socket enters this namespace. RuntimeMax45 is the independent hard bound.
+    with (live / 'identity-ready.fifo').open('wb', buffering=0) as ready:
+        require(ready.write((owner['nonce'] + '\n').encode()) == 17, 'ready_short_write')
+    import select
+    with (live / 'identity-grant.fifo').open('rb', buffering=0) as channel:
+        require(select.select([channel], [], [], 12)[0], 'current_identity_grant_missing')
+        require(channel.read(128) == (owner['nonce'] + '\n').encode(), 'current_identity_grant_foreign')
+    grant = json.loads((live / 'host-current-invocation.json').read_text())
+    identity = grant['native_identity']
+    # Validate the host PID in exact typed current unit. Inside private procfs,
+    # self PID is1; matching namespace inode links it to that host MainPID.
+    validate_native_identity(identity, owner, relative, '<USER_RUNTIME>/systemd/user/' + owner['unit'],
+                             identity['started_monotonic'], identity['completed_monotonic'], pid=identity['pid'])
+    require(os.getpid() == 1 and os.readlink('/proc/self/ns/pid') == grant['namespace_pid'], 'current_identity_namespace_mismatch')
+    return grant
+
+
+def main():
+    owner = json.loads(Path(sys.argv[1]).read_text())
+    require(owner['deadline_monotonic'] == owner['started_monotonic'] + owner['budget_seconds']
+            and time.monotonic() + 50 < owner['deadline_monotonic']
+            and owner['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'original_clock_invalid')
+    relative = Path('/proc/self/cgroup').read_text().strip().split('::', 1)[1]
+    require(relative == '/user.slice/user-1000.slice/<REDACTED_EMAIL>/app.slice/' + owner['unit'], 'wrong_service_cgroup')
+    group = Path('/sys/fs/cgroup') / relative.lstrip('/')
+    caps = {name: (group / name).read_text().strip() for name in ('memory.max', 'memory.swap.max', 'cpu.max', 'pids.max')}
+    require(caps['memory.max'] == '2147483648' and caps['memory.swap.max'] == '0' and caps['pids.max'] == '128', 'resource_caps_wrong')
+    quota, period = caps['cpu.max'].split(); require(quota != 'max' and int(quota) == 2 * int(period), 'cpu_quota_wrong')
+    require(set(os.sched_getaffinity(0)) == {0, 1}, 'affinity_wrong')
+    live = Path(sys.argv[1]).parent
+    installed = protected_install(mapped_root=True)
+    grant = receive_identity(owner, relative, live)
+    network = loopback_evidence(grant)
+    config = {'engine': 'chrome', 'headed': False, 'executablePath': EXECUTABLE,
+              'profile': str(live / 'chrome-profile'), 'args': '', 'json': True,
+              'ignoreHttpsErrors': False, 'allowFileAccess': False, 'autoConnect': False}
+    config_path = live / 'native-config.json'
+    fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f: json.dump(config, f); f.flush(); os.fsync(f.fileno())
+    from urllib.parse import quote
+    html = '<!doctype html><title>friday-' + owner['nonce'] + '</title><button id="b" onclick="this.textContent=String(Number(this.textContent)+1)">0</button>'
+    records = []; native_deadline = min(time.monotonic() + 28, owner['deadline_monotonic'] - 50)
+    native_command(live, owner['nonce'], ['open', 'data:text/html,' + quote(html, safe='')], native_deadline, records)
+    native_command(live, owner['nonce'], ['snapshot'], native_deadline, records)
+    value = native_command(live, owner['nonce'], ['eval', "document.querySelector('#b').click(); [document.title, document.querySelector('#b').textContent, 6*7]"], native_deadline, records)
+    require(value.get('data', {}).get('result') == ['friday-' + owner['nonce'], '1', 42], 'native_dom_or_js_wrong')
+    version = (live / 'native-sockets' / ('friday-' + owner['nonce'] + '.version')).read_text().strip()
+    require(version == '0.26.0', 'native_daemon_version_wrong')
+    sandbox = observe_sandbox(live / 'chrome-profile', group, relative, grant['host_net'])
+    native_command(live, owner['nonce'], ['close'], native_deadline, records)
+    # Native close success is retained as progress, not proof of descendant stop.
+    # Parent ExitType=cgroup + observed cgroup empty + cleanup + reaped exit are
+    # the terminal proof. Native stop record remains unaccepted until that suffix.
+    require(time.monotonic() < owner['deadline_monotonic'], 'original_budget_exhausted')
+    print(json.dumps({'probe': 'BROWSER_NATIVE_LOOPBACK_PREREQUISITE_PASS', 'native_identity': grant['native_identity'],
+        'native_agent_browser': version, 'sandbox_requested': True, 'sandbox_observed': True,
+        'sandbox_evidence': sandbox, 'protected_executable': EXECUTABLE, 'installed': installed,
+        'loopback_isolation_observed': True, 'network': network, 'host_identity_received_before_native_launch': True,
+        'cgroup': relative, 'caps': caps, 'javascript': True, 'browser_closed': True,
+        'browser_closed_meaning': 'native close response only; mandatory parent cgroup cessation follows',
+        'native_cli_records': records, 'installed_journey_accepted': False}), flush=True)
+
+
+if __name__ == '__main__':
+    main()

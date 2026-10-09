@@ -1,0 +1,164 @@
+"""Bounded offline identity/flow controls. Native boundaries are synthetic."""
+import ast,copy,datetime,hashlib,importlib.util,json,os,resource,signal,sys,time,unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+E=Path(__file__).resolve().parent;C=E/'candidate';W=E.parent
+os.umask(0o077);os.sched_setaffinity(0,{0,1});resource.setrlimit(resource.RLIMIT_AS,(2*1024**3,2*1024**3));resource.setrlimit(resource.RLIMIT_CPU,(40,40));signal.alarm(60)
+clock=json.loads((E/'clock.json').read_text());assert time.monotonic()+60<clock['deadline_monotonic']
+def audit(event,args):
+ if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.posix_spawn','os.posix_spawnp'):raise RuntimeError('offline_native_effect_denied')
+ if event=='open' and isinstance(args[0],(str,bytes,os.PathLike)) and args[2]&(os.O_WRONLY|os.O_RDWR|os.O_CREAT|os.O_TRUNC|os.O_APPEND):
+  assert Path(os.fsdecode(args[0])).resolve().is_relative_to(E),'foreign_write_denied'
+sys.addaudithook(audit)
+def load(name,path):
+ s=importlib.util.spec_from_file_location(name,path);v=importlib.util.module_from_spec(s);sys.modules[name]=v;s.loader.exec_module(v);return v
+p=load('probe',C/'probe.py');m=load('candidate',C/'run-live-unit.py')
+S=Path('<SOL_WORK>')
+t=load('typed',S/'FRW041-BROWSER-TYPED-PROPERTY-evidence/test_typed.py');t.m=m;t.E=E;t.prior.m=m;t.prior.E=E
+prior=t.prior
+unit=m.unit_name('1234567890abcdef');cg='/user.slice/user-1000.slice/<REDACTED_EMAIL>/app.slice/'+unit
+owner={'nonce':'1234567890abcdef','unit':unit,'boot_id':'offline-boot','started_monotonic':0,'deadline_monotonic':120,'budget_seconds':120}
+def identity(clock=owner,cgroup=cg,fragment='<USER_RUNTIME>/systemd/user/'+unit,pid=123,at=1):
+ u=m.unit_name(clock['nonce'])
+ values={'Id':('s',u),'LoadState':('s','loaded'),'ActiveState':('s','active'),'SubState':('s','running'),'MainPID':('u',pid),'ControlPID':('u',0),'ControlGroup':('s',cgroup),'FragmentPath':('s',str(fragment)),'Transient':('b',False),'NeedDaemonReload':('b',False),'DropInPaths':('as',[]),'InvocationID':('ay',[170]*16)}
+ raw=json.dumps({'type':'a{sv}','data':[{k:{'type':typ,'data':v} for k,(typ,v) in values.items()}]})
+ return {'argv':p.native_identity_argv(u),'nonce':clock['nonce'],'boot_id':clock['boot_id'],'cgroup':cgroup,'pid':pid,'pid_start_time':10,'started_monotonic':at,'completed_monotonic':at,'timeout_seconds':5,'returncode':0,'timeout':False,'client_reaped':True,'stdout':raw,'stderr':''}
+def prop(e,k,v,typ=None):
+ j=json.loads(e['stdout']);d=j['data'][0]
+ if v=='DELETE':d.pop(k)
+ else:d[k]={'type':typ or d[k]['type'],'data':v}
+ e['stdout']=json.dumps(j)
+oldcall=prior.Fixture.call
+def upgraded(self,argv,timeout):
+ a=self.attempt;a.clock.update(boot_id='offline-boot',unit=a.unit)
+ r=oldcall(self,argv,timeout)
+ if 'start' in argv:
+  f=a.live/'runtime.stdout'
+  if f.exists():
+   v=json.loads(f.read_text());v.update(sandbox_observed=True,protected_executable=p.EXECUTABLE,sandbox_evidence={'renderers':[{'synthetic':True}]},native_identity=identity(a.clock,a.cgroup,a.fragment,at=a.now()));f.write_text(json.dumps(v))
+ return r
+prior.Fixture.call=upgraded
+class Identity(unittest.TestCase):
+ def check(self,e=None):return p.validate_native_identity(identity() if e is None else e,owner,cg,'<USER_RUNTIME>/systemd/user/'+unit,0,10,pid=123)
+ def test_valid(self):self.assertEqual(self.check(),'a'*32)
+ def test_native_fields_missing_malformed_foreign(self):
+  values={'Id':['foreign.service','DELETE'],'InvocationID':[[],[0]*16,[170]*15,[True]*16,[256]*16,'a'*32,'DELETE'], 'MainPID':[0,124,True,'123','DELETE'],'ControlPID':[1],'ControlGroup':['/foreign','DELETE'],'FragmentPath':['/foreign'],'ActiveState':['inactive','activating'],'SubState':['dead'],'LoadState':['not-found'],'Transient':[True],'NeedDaemonReload':[True],'DropInPaths':[['/foreign']]}
+  for k,vs in values.items():
+   for v in vs:
+    with self.subTest(key=k,value=v):
+     e=identity();prop(e,k,v)
+     with self.assertRaises(RuntimeError):self.check(e)
+  e=identity();prop(e,'MainPID',123,'s')
+  with self.assertRaises(RuntimeError):self.check(e)
+ def test_stale_missing_and_forged_transport(self):
+  for k,v in [('nonce','0'*16),('boot_id','old'),('pid',124),('pid',True),('pid_start_time',0),('cgroup','/foreign'),('argv',[]),('timeout_seconds',6),('returncode',1),('returncode',False),('timeout',True),('client_reaped',False),('stderr','denied'),('started_monotonic',-1),('completed_monotonic',11),('completed_monotonic',float('nan'))]:
+   with self.subTest(key=k,value=v):
+    e=identity();e[k]=v
+    with self.assertRaises(RuntimeError):self.check(e)
+  for v in (None,{},[],{'stdout':'x'}):
+   with self.assertRaises(RuntimeError):self.check(v) if v is not None else p.validate_native_identity(None,owner,cg,'x',0,10)
+ def test_json_strict(self):
+  for raw in ('', '{}','[]','{"type":"a{sv}","data":[]}','{"type":"a{sv}","data":[{},{}]}','{"type":"a{sv}","data":[NaN]}','{"type":"a{sv}","type":"a{sv}","data":[{}]}',identity()['stdout']+'{}'):
+   e=identity();e['stdout']=raw
+   with self.assertRaises((RuntimeError,ValueError)):self.check(e)
+ def test_observer_native_read_success(self):
+  calls=[]
+  def run(argv,**kw):
+   calls.append((argv,kw));self.assertEqual(argv,p.native_identity_argv(unit));self.assertEqual(kw,{'stdin':p.subprocess.DEVNULL,'stdout':p.subprocess.PIPE,'stderr':p.subprocess.PIPE,'timeout':5,'close_fds':True});return SimpleNamespace(returncode=0,stdout=identity()['stdout'].encode(),stderr=b'')
+  with patch.object(p.subprocess,'run',run),patch.object(p.os,'getpid',return_value=123),patch.object(p,'start_time',return_value=10),patch.object(Path,'read_text',return_value='0::'+cg),patch.object(p.time,'monotonic',side_effect=[1,2]),patch.object(p,'print',create=True):
+   e=p.observe_native_identity(owner,cg);self.assertEqual(e['completed_monotonic'],2);self.assertEqual(len(calls),1)
+ def test_native_timeout_refusal_and_wrong_pid(self):
+  for result in (p.subprocess.TimeoutExpired(['busctl'],5),PermissionError('denied'),SimpleNamespace(returncode=1,stdout=b'',stderr=b'denied'),SimpleNamespace(returncode=0,stdout=identity(pid=999)['stdout'].encode(),stderr=b'')):
+   with self.subTest(result=str(result)),patch.object(p.subprocess,'run',side_effect=result if isinstance(result,BaseException) else None,return_value=result) as run,patch.object(p.os,'getpid',return_value=123),patch.object(p,'start_time',return_value=10),patch.object(Path,'read_text',return_value='0::'+cg),patch.object(p.time,'monotonic',side_effect=[1,2]),patch.object(p,'print',create=True):
+    with self.assertRaises((RuntimeError,PermissionError)):p.observe_native_identity(owner,cg)
+    self.assertEqual(run.call_count,1)
+ def test_native_read_budget_no_call(self):
+  with patch.object(p.time,'monotonic',return_value=65),patch.object(p.subprocess,'run',side_effect=AssertionError('no effect')):
+   with self.assertRaisesRegex(RuntimeError,'native_identity_budget'):p.observe_native_identity(owner,cg)
+ def test_native_local_cgroup_and_birth(self):
+  for births,text in (([10,11],'0::'+cg),([10,10],'0::/foreign')):
+   with patch.object(p.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=identity()['stdout'].encode(),stderr=b'')),patch.object(p.os,'getpid',return_value=123),patch.object(p,'start_time',side_effect=births),patch.object(Path,'read_text',return_value=text),patch.object(p.time,'monotonic',side_effect=[1,2]),patch.object(p,'print',create=True):
+    with self.assertRaisesRegex(RuntimeError,'native_identity_process_changed'):p.observe_native_identity(owner,cg)
+class Flow(t.TypedControls):
+ def typed(self,second=None):
+  self.a.transport=lambda argv,timeout:second or t.good('{"type":"a(sb)","data":[]}');return self.a.environment_files()
+ def adjust(self,first='',final='',mutation=None):
+  def call(argv,timeout):
+   r=self.f.call(argv,timeout)
+   if 'show' in argv and '--user' in argv and self.f.started and self.f.loaded:
+    j=dict(x.split('=',1) for x in r['stdout'].splitlines());j.update(InvocationID=first if self.f.poststart_shows==1 else final,ExecMainCode='0',ControlGroup='');r['stdout']='\n'.join(k+'='+v for k,v in j.items())+'\n'
+   if 'start' in argv and mutation:
+    f=self.live/'runtime.stdout';v=json.loads(f.read_text());mutation(v);f.write_text(json.dumps(v))
+   return r
+  self.a.transport=call
+ def test_gc_both_observations_empty(self):
+  self.adjust();r=self.a.execute();self.assertEqual(self.a.completion_status(r),0);self.assertTrue(self.a.closed and self.a.cleaned);self.assertEqual(self.f.start_count,1);self.assertEqual(r['proof']['native_identity']['pid'],123)
+ def test_gc_between_observations(self):
+  self.adjust(first='a'*32);self.assertEqual(self.a.completion_status(self.a.execute()),0)
+ def test_live_native_matches_retained(self):self.assertEqual(self.a.completion_status(self.a.execute()),0)
+ def test_mismatch_native_to_first(self):
+  self.adjust(first='c'*32)
+  with self.assertRaisesRegex(RuntimeError,'invocation_changed'):self.a.execute()
+  self.assertTrue(self.a.unresolved)
+ def test_mismatch_native_to_final(self):
+  self.adjust(final='c'*32)
+  with self.assertRaisesRegex(RuntimeError,'invocation_changed'):self.a.execute()
+ def test_gc_missing_identity_never_pass(self):
+  self.adjust(mutation=lambda v:v.pop('native_identity'))
+  with self.assertRaisesRegex(RuntimeError,'native_identity_missing'):self.a.execute()
+  self.assertTrue(self.a.unresolved)
+ def test_gc_forged_identity_never_pass(self):
+  self.adjust(mutation=lambda v:prop(v['native_identity'],'MainPID',999))
+  with self.assertRaisesRegex(RuntimeError,'native_identity_property_MainPID'):self.a.execute()
+ def test_gc_stale_identity_never_pass(self):
+  self.adjust(mutation=lambda v:v['native_identity'].update(nonce='0'*16))
+  with self.assertRaisesRegex(RuntimeError,'native_identity_transport'):self.a.execute()
+ def test_browser_proof_still_required(self):
+  self.adjust(mutation=lambda v:v.pop('sandbox_observed'))
+  with self.assertRaisesRegex(RuntimeError,'probe_proof_invalid'):self.a.execute()
+ def test_native_cleanup_uncertain_retains(self):
+  def call(argv,timeout):
+   r=self.f.call(argv,timeout)
+   if 'daemon-reload' in argv and self.f.started:r.update(timeout=True,returncode=None)
+   return r
+  self.a.transport=call
+  with self.assertRaisesRegex(RuntimeError,'native_control_uncertain'):self.a.execute()
+  self.assertTrue(self.a.closed);self.assertFalse(self.a.cleaned);self.assertTrue(self.a.unresolved)
+class Invariants(unittest.TestCase):
+ def test_exact_unchanged_donor_and_dependency_pins(self):
+  self.assertEqual((C/'source-pins.json').read_bytes(),(W/'browser-native-g6-source/source-pins.json').read_bytes())
+  pins=json.loads((C/'source-pins.json').read_text())['pins']
+  for path,v in pins.items():
+   b=Path(path).read_bytes();self.assertEqual(len(b),v['size']);self.assertEqual(hashlib.sha256(b).hexdigest(),v['sha256'])
+ def test_unchanged_guard_functions_and_unit(self):
+  def methods(path):
+   out={}
+   for n in ast.parse(path.read_text()).body:
+    if isinstance(n,ast.FunctionDef):out[n.name]=ast.dump(n)
+    elif isinstance(n,ast.ClassDef):
+     for f in n.body:
+      if isinstance(f,ast.FunctionDef):out[n.name+'.'+f.name]=ast.dump(f)
+   return out
+  before=methods(W/'browser-native-g6-source/run-live-unit.py');after=methods(C/'run-live-unit.py')
+  self.assertEqual(set(before),set(after));self.assertEqual({n for n in before if before[n]!=after[n]},{'Attempt.execute'})
+  bp=methods(W/'browser-native-g6-source/probe.py');ap=methods(C/'probe.py');self.assertEqual({n for n in bp if bp[n]!=ap[n]},{'main'});self.assertEqual(set(ap)-set(bp),{'native_identity_argv','validate_native_identity','observe_native_identity'})
+  self.assertEqual((m.POST_START_WINDOW,m.MIN_START_WINDOW),(55,20));self.assertEqual(m.SOURCE_TASK,'FRW041-BROWSER-NATIVE-INVOCATION-REPAIR#1')
+ def test_real_g6_retained_proof_is_not_retroactively_accepted(self):
+  old=json.loads((W/'browser-native-g6-source/live-9e9f857cd4d394b6/runtime.stdout').read_text());self.assertEqual(old['probe'],'BROWSER_PREREQUISITE_PASS');self.assertNotIn('native_identity',old)
+  with self.assertRaisesRegex(RuntimeError,'native_identity_missing'):p.validate_native_identity(old.get('native_identity'),owner,cg,'x',0,10)
+  closed=W/'BROWSER-PREREQUISITE-G6-CLOSED-RECEIVED.json';self.assertEqual(hashlib.sha256(closed.read_bytes()).hexdigest(),'eebd0d6d70ddd1cbde661dbbc67561cef9d8ad3b4449a59db9a07c78d1a996bb')
+ def test_native_identity_before_browser_and_in_final_proof(self):
+  tree=ast.parse((C/'probe.py').read_text());s=ast.unparse(next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='main'));self.assertLess(s.index('observe_native_identity'),s.index('playwright.chromium.launch'));self.assertIn("'native_identity': native_identity",s)
+final=load('finalization',S/'FRW041-BROWSER-NATIVE-FINALIZATION-evidence/test_finalization.py');final.m=m;final.E=E;final.prior=prior
+selected=['test_missing_show_property_accepts_only_typed_empty','test_conflicting_explicit_show_value_refuses','test_foreign_proof_refuses','test_all_other_required_properties_still_strict','test_full_nonempty_refuses_and_cleans','test_full_timeout_refuses_and_cleans','test_full_wrong_type_refuses_and_cleans','test_full_explicit_conflict_refuses_and_cleans','test_manager_drift_retains_original_custody','test_original_clock_too_small_no_publication_or_client']
+legacy=['test_settled_rejection_not_pass','test_uncertain_transport_settled','test_active_timeout_exact_stop','test_stop_uncertain_retains','test_manager_changed_retains','test_uncertain_reload_reconcile','test_partial_publication','test_existing_file_refusal','test_tamper_and_inode','test_unit_link_and_mode','test_budget_expired_no_publication','test_budget_setup_insufficient']
+legacy+=['test_cessation_negatives','test_cgroup_io_unknown_not_absent','test_cgroup_absent_exact_enoent','test_invocation_change_keeps_custody','test_cleanup_bound_no_reset','test_cleanup_failed_reload_retains','test_unadmitted_entry_refuses','test_render_native_queue_no_transient_route']
+custody=['test_simultaneous_receipt_stdout_stderr_real_fd_custody','test_retention_entry_interrupt_cannot_release','test_full_declared_windows_optional_reset_with_local_margin','test_full_windows_local_near_ten','test_worst_windows_without_reset','test_observation_overrun_never_shrinks_control_or_releases','test_local_allowance_exceeded_retains','test_insufficient_full_control_window_no_clipped_call','test_small_start_window_refuses_and_reconciles_without_reset','test_signal_after_start_cessation_proved_but_never_pass']
+suite=unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(Identity),unittest.defaultTestLoader.loadTestsFromTestCase(Invariants),unittest.TestSuite(Flow(n) for n in list(Flow.__dict__) if n.startswith('test_')),unittest.TestSuite(Flow(n) for n in selected),unittest.TestSuite(prior.Controls(n) for n in legacy),unittest.defaultTestLoader.loadTestsFromTestCase(final.Finalization),unittest.TestSuite(prior.CustodyControls(n) for n in custody)])
+controls=[]
+class Recorded(unittest.TextTestResult):
+ def addSuccess(self,test):super().addSuccess(test);controls.append(test.id())
+start=time.monotonic();result=unittest.TextTestRunner(verbosity=2,resultclass=Recorded).run(suite)
+report={'status':'PASS' if result.wasSuccessful() else 'FAIL','cases':result.testsRun,'passed':controls,'failures':[(t.id(),e) for t,e in result.failures+result.errors],'elapsed_seconds':time.monotonic()-start,'source_sha256':{f.name:hashlib.sha256(f.read_bytes()).hexdigest() for f in C.iterdir()},'resources':{'cpu_affinity':sorted(os.sched_getaffinity(0)),'memory_max':resource.getrlimit(resource.RLIMIT_AS),'cpu_limit':resource.getrlimit(resource.RLIMIT_CPU),'wall_seconds':60},'effects':{'native':0,'browser':0,'services':0,'network':0,'sudo':0,'model_children':0},'meaning':'Fresh controls of this candidate. Native/live responses and browser proof are synthetic; donor, dependency pins and private file custody checks are actual. No runtime acceptance.','completed_msk':datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3))).isoformat()}
+(E/'offline-controls.json').write_text(json.dumps(report,indent=2)+'\n');raise SystemExit(0 if result.wasSuccessful() else 1)

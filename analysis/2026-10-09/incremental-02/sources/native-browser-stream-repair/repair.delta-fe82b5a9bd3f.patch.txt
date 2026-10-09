@@ -1,0 +1,576 @@
+--- a/agent-browser/cli/src/native/stream/control.rs
++++ b/agent-browser/cli/src/native/stream/control.rs
+@@ -97,11 +97,16 @@
+             || !matches!(parts[1], "/" | "/api/tabs") { return false; }
+         let mut auth = None;
+         let mut binding = None;
++        let mut upgrade = None;
+         for line in lines {
+             if line.is_empty() { break; }
+             if line.starts_with(' ') || line.starts_with('\t') { return false; }
+             let Some((name,value)) = line.split_once(':') else { return false; };
+             if name.eq_ignore_ascii_case("origin") { return false; }
++            if name.eq_ignore_ascii_case("upgrade") {
++                if upgrade.is_some() { return false; }
++                upgrade = Some(value.trim());
++            }
+             if name.eq_ignore_ascii_case("authorization") {
+                 if auth.is_some() { return false; }
+                 auth = Some(value.trim());
+@@ -111,6 +116,14 @@
+                 binding = Some(value.trim());
+             }
+         }
++        // Exact Friday wire routes: HTTP GET /api/tabs and WS GET /.
++        // The dispatcher uses the same case-insensitive WebSocket marker.
++        let route_allowed = match upgrade {
++            Some(value) if value.eq_ignore_ascii_case("websocket") => parts[1] == "/",
++            None => parts[1] == "/api/tabs",
++            _ => false,
++        };
++        if !route_allowed { return false; }
+         let expected = format!("Bearer {}", control.token);
+         constant_match(auth.unwrap_or(""), &expected)
+             && constant_match(binding.unwrap_or(""), &control.binding)
+@@ -184,6 +197,25 @@
+         assert!(StreamPolicy::parse(&record().replace("120.0","null"),"own","boot",100.0).is_err());
+     }
+     #[test]
++    fn friday_routes_distinguish_http_tabs_and_websocket_root() {
++        let p = gate();
++        assert!(p.authorize_fields(&request("GET", "/api/tabs", "")));
++        assert!(p.authorize_fields(&request("GET", "/", "Upgrade: WebSocket\r\n")));
++        assert!(!p.authorize_fields(&request("GET", "/", "")));
++        assert!(!p.authorize_fields(&request("GET", "/api/tabs", "Upgrade: websocket\r\n")));
++        assert!(!p.authorize_fields(&request("GET", "/", "Upgrade: h2c\r\n")));
++        assert!(!p.authorize_fields(&request("GET", "/", "Upgrade: websocket\r\nUpgrade: websocket\r\n")));
++    }
++    #[test]
++    fn shorter_issued_absolute_clock_is_not_replaced_by_a_duration() {
++        let shorter = record().replace("120.0", "105.0");
++        let p = StreamPolicy::parse(&shorter, "own", "boot", 100.0).unwrap();
++        let StreamPolicy::Friday(control) = p else { panic!("expected Friday"); };
++        assert_eq!(control.deadline_monotonic, 105.0);
++        assert!(StreamPolicy::parse(&shorter, "own", "boot", 105.0).is_err());
++        assert!(StreamPolicy::parse(&shorter, "own", "boot", 120.0).is_err());
++    }
++    #[test]
+     fn unmanaged_donor_behavior_is_unchanged() {
+         assert!(StreamPolicy::Donor.authorize_fields("GET /api/sessions HTTP/1.1\r\n\r\n"));
+         assert!(!StreamPolicy::Donor.is_friday());
+--- a/agent-browser/cli/src/native/stream/websocket.rs
++++ b/agent-browser/cli/src/native/stream/websocket.rs
+@@ -109,6 +109,22 @@
+             false
+         }
+     })
++}
++
++// The donor historically examines only Origin in this callback. Do not
++// serialize or constrain its unrelated opaque header values for Friday policy.
++fn authorize_ws_owner(
++    policy: &StreamPolicy,
++    req: &tokio_tungstenite::tungstenite::handshake::server::Request,
++) -> bool {
++    if !policy.is_friday() { return true; }
++    let mut head = format!("{} {} HTTP/1.1\r\n", req.method(), req.uri());
++    for (name, value) in req.headers() {
++        let Ok(value) = value.to_str() else { return false; };
++        head.push_str(&format!("{}: {}\r\n", name, value));
++    }
++    head.push_str("\r\n");
++    policy.authorize(&head)
+ }
+ 
+ /// Peek at the TCP stream to dispatch between WebSocket upgrade and plain HTTP.
+@@ -221,17 +237,7 @@
+                 .get("origin")
+                 .and_then(|v| v.to_str().ok())
+                 .map(|s| s.to_string());
+-            let mut head = format!("{} {} HTTP/1.1\r\n", req.method(), req.uri());
+-            for (name, value) in req.headers() {
+-                let Ok(value) = value.to_str() else {
+-                    let mut reject = tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(None);
+-                    *reject.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
+-                    return Err(reject);
+-                };
+-                head.push_str(&format!("{}: {}\r\n",name,value));
+-            }
+-            head.push_str("\r\n");
+-            if !policy.authorize(&head) || !is_allowed_origin(origin.as_deref()) {
++            if !authorize_ws_owner(&policy, req) || !is_allowed_origin(origin.as_deref()) {
+                 let mut reject =
+                     tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some(
+                         "Origin not allowed".to_string(),
+@@ -411,3 +417,21 @@
+         _ => {}
+     }
+ }
++
++#[cfg(test)]
++mod owner_header_tests {
++    use super::*;
++    use tokio_tungstenite::tungstenite::http::{HeaderValue, Request};
++
++    #[test]
++    fn donor_does_not_convert_or_reject_unrelated_opaque_header_values() {
++        let mut req = Request::builder().method("GET").uri("/").body(()).unwrap();
++        let opaque = HeaderValue::from_bytes(&[0x80]).unwrap();
++        assert!(opaque.to_str().is_err());
++        req.headers_mut().insert("x-unrelated", opaque);
++        assert!(authorize_ws_owner(&StreamPolicy::Donor, &req));
++        // Origin handling remains the existing separate donor predicate.
++        assert!(is_allowed_origin(None));
++        assert!(!is_allowed_origin(Some("https://foreign.example")));
++    }
++}
+--- a/hermes/tests/tools/test_browser_stream_control.py
++++ b/hermes/tests/tools/test_browser_stream_control.py
+@@ -1,56 +1,252 @@
+-"""Meaningful SOURCE controls; no test in this package was executed by Sol."""
++"""SOURCE controls only. Fixtures are not native admission or live-stop evidence."""
++from contextlib import contextmanager
++from dataclasses import replace
+ import json
+-import time
++import threading
++from types import SimpleNamespace
+ from unittest.mock import patch
+ 
+ import pytest
+ 
+-from tools.browser_stream_control import StreamControl, stream_control
++from tools.browser_stream_control import StreamControl, stream_control, _binding
+ from tools.browser_tool_owner import BrowserOwner, BrowserOwnerRefused
+ 
+ 
+-def owner(deadline):
+-    # Pure identity/serialization fixture, not real runtime admission or UserScope.
+-    return BrowserOwner(object(), object(), ('task','parent','key','turn','first'),
+-        ('authorization','profile','name',('telegram','user'),1,(1,2,3),'binding'),
++def owner(deadline=120.0):
++    turn = SimpleNamespace(lock=threading.RLock(), browser_deadline=deadline)
++    return BrowserOwner(SimpleNamespace(turn=turn), object(),
++        ('task', 'parent', 'key', 'turn', 'first'),
++        ('authorization', 'profile', 'name', ('telegram', 'user'), 1, (1, 2, 3), 'binding'),
+         deadline, 'boot')
+ 
+ 
+-def test_backend_control_requires_the_original_owner_object_and_session():
+-    a, b = owner(time.monotonic()+60), owner(time.monotonic()+60)
+-    with patch.object(BrowserOwner, 'check', lambda self: self.original_deadline):
+-        from tools.browser_stream_control import _binding
+-        c = StreamControl(a,'daemon',_binding(a),a.original_deadline,'b'*64)
+-        assert c.headers(a,'daemon')['Authorization'] == 'Bearer '+'b'*64
+-        assert json.loads(c.launch_environment(a,'daemon',{})['AGENT_BROWSER_FRIDAY_STREAM_CONTROL'])['session']=='daemon'
+-        for candidate,session in [(b,'daemon'),(a,'foreign'),(object(),'daemon')]:
++@contextmanager
++def clocks(a, caller=120.0, now=100.0):
++    state = {'caller': caller, 'now': now}
++    def check(self):
++        assert self.call.turn.lock._is_owned()
++        return min(self.original_deadline, state['caller'])
++    # Real BrowserOwner.fence and browser_lock remain in use. Only native
++    # identity/clock checking is a fixture; this cannot admit a real UserScope.
++    with patch.object(BrowserOwner, 'check', check), \
++         patch('time.monotonic', lambda: state['now']), \
++         patch('tools.browser_stream_control.bind_browser_session', lambda task, info: a):
++        yield state
++
++
++def record(c, a, env=None):
++    return json.loads(c.launch_environment(a, 'daemon', {} if env is None else env)
++                      ['AGENT_BROWSER_FRIDAY_STREAM_CONTROL'])
++
++
++def control(a):
++    return StreamControl(a, 'daemon', _binding(a), a.original_deadline, 'b' * 64)
++
++
++@pytest.mark.parametrize('turn,caller,expected', [(110.0, 105.0, 105.0), (105.0, 110.0, 105.0),
++                                                  (130.0, 140.0, 120.0)])
++def test_creation_uses_minimum_live_owner_turn_and_caller(turn, caller, expected):
++    a = owner()
++    a.call.turn.browser_deadline = turn
++    info = {'session_name': 'daemon'}
++    with clocks(a, caller):
++        c = stream_control('task', info)
++        assert c.original_deadline == expected
++        assert record(c, a)['deadline_monotonic'] == expected
++        assert stream_control('task', info) is c
++        assert c.headers(a, 'daemon')['Authorization'] == 'Bearer ' + c.token
++
++
++@pytest.mark.parametrize('axis', ['turn', 'caller'])
++def test_unpublished_reuse_keeps_shorter_live_120_to_105_even_after_caller_increases(axis):
++    a = owner()
++    info = {'session_name': 'daemon'}
++    with clocks(a) as state:
++        c = stream_control('task', info)
++        token = c.token
++        if axis == 'turn':
++            a.call.turn.browser_deadline = 105.0
++        else:
++            state['caller'] = 105.0
++        assert stream_control('task', info) is c
++        assert c.check(a, 'daemon') == 105.0
++        a.call.turn.browser_deadline = state['caller'] = 120.0
++        assert record(c, a)['deadline_monotonic'] == 105.0
++        assert c.original_deadline == 120.0 and c.token == token
++        assert c.headers(a, 'daemon')['Authorization'] == 'Bearer ' + token
++
++
++@pytest.mark.parametrize('axis', ['turn', 'caller'])
++@pytest.mark.parametrize('publication', ['launch', 'headers'])
++def test_first_publication_rechecks_current_live_ceiling(axis, publication):
++    a = owner()
++    with clocks(a) as state:
++        c = control(a)
++        if axis == 'turn':
++            a.call.turn.browser_deadline = 105.0
++        else:
++            state['caller'] = 105.0
++        if publication == 'launch':
++            assert record(c, a)['deadline_monotonic'] == 105.0
++        else:
++            assert c.headers(a, 'daemon')['Authorization'] == 'Bearer ' + c.token
++        a.call.turn.browser_deadline = state['caller'] = 120.0
++        assert record(c, a)['deadline_monotonic'] == 105.0
++
++
++@pytest.mark.parametrize('axis', ['turn', 'caller'])
++@pytest.mark.parametrize('first', ['launch', 'headers'])
++@pytest.mark.parametrize('attempt', ['reuse', 'launch', 'headers'])
++def test_published_120_cannot_reissue_at_105_or_revive_at_120(axis, first, attempt):
++    a = owner()
++    info = {'session_name': 'daemon'}
++    with clocks(a) as state:
++        c = stream_control('task', info)
++        token = c.token
++        if first == 'launch':
++            assert record(c, a)['deadline_monotonic'] == 120.0
++        else:
++            c.headers(a, 'daemon')
++        if axis == 'turn':
++            a.call.turn.browser_deadline = 105.0
++        else:
++            state['caller'] = 105.0
++        with pytest.raises(BrowserOwnerRefused, match='published_deadline_shortened_stop_required'):
++            if attempt == 'reuse':
++                stream_control('task', info)
++            elif attempt == 'launch':
++                record(c, a)
++            else:
++                c.headers(a, 'daemon')
++        # Refusal is not evidence that the prior listener/socket has stopped.
++        a.call.turn.browser_deadline = state['caller'] = 120.0
++        for operation in (lambda: stream_control('task', info), lambda: record(c, a),
++                          lambda: c.headers(a, 'daemon')):
++            with pytest.raises(BrowserOwnerRefused, match='permanently_refused'):
++                operation()
++        assert info['_friday_stream_control'] is c
++        assert c.original_deadline == 120.0 and c.token == token
++
++
++@pytest.mark.parametrize('axis', ['turn', 'caller'])
++def test_exhausted_creation_does_not_publish_a_retained_control(axis):
++    a = owner()
++    info = {'session_name': 'daemon'}
++    with clocks(a) as state:
++        if axis == 'turn':
++            a.call.turn.browser_deadline = 100.0
++        else:
++            state['caller'] = 100.0
++        with pytest.raises(BrowserOwnerRefused, match='original_deadline_exhausted'):
++            stream_control('task', info)
++        assert '_friday_stream_control' not in info
++
++
++@pytest.mark.parametrize('axis', ['turn', 'caller', 'now'])
++def test_exhausted_clock_cannot_publish_or_revive(axis):
++    a = owner()
++    with clocks(a) as state:
++        c = control(a)
++        if axis == 'turn':
++            a.call.turn.browser_deadline = 100.0
++        elif axis == 'caller':
++            state['caller'] = 100.0
++        else:
++            state['now'] = 120.0
++        with pytest.raises(BrowserOwnerRefused, match='original_deadline_exhausted'):
++            record(c, a)
++        a.call.turn.browser_deadline = state['caller'] = 120.0
++        state['now'] = 100.0  # Even a fixture clock rollback cannot revive refusal.
++        with pytest.raises(BrowserOwnerRefused, match='permanently_refused'):
++            c.headers(a, 'daemon')
++
++
++def test_terminal_native_check_failure_before_fence_yield_is_retained():
++    a = owner()
++    with clocks(a):
++        c = control(a)
++        for error in (TimeoutError('web_original_deadline'),
++                      BrowserOwnerRefused('browser_original_owner_deadline_exhausted')):
++            c = control(a)
++            with patch.object(BrowserOwner, 'check', side_effect=error):
++                with pytest.raises(type(error)):
++                    record(c, a)
++            with pytest.raises(BrowserOwnerRefused, match='permanently_refused'):
++                record(c, a)
++
++
++def test_secret_publication_and_retained_creation_share_existing_turn_lock():
++    a = owner()
++    class Environment:
++        def keys(self):
++            assert a.call.turn.lock._is_owned()
++            return ['OTHER']
++        def __getitem__(self, key):
++            assert a.call.turn.lock._is_owned()
++            return 'preserved'
++    class Session(dict):
++        def __setitem__(self, key, value):
++            assert a.call.turn.lock._is_owned()
++            super().__setitem__(key, value)
++    with clocks(a):
++        c = stream_control('task', Session(session_name='daemon'))
++        env = c.launch_environment(a, 'daemon', Environment())
++        assert env['OTHER'] == 'preserved'
++        assert record(c, a)['deadline_monotonic'] == 120.0
++
++
++@pytest.mark.parametrize('during_copy', [105.0, 100.0])
++def test_launch_rechecks_a_ceiling_changed_during_environment_copy(during_copy):
++    a = owner()
++    with clocks(a) as state:
++        c = control(a)
++        class Environment:
++            def keys(self):
++                assert a.call.turn.lock._is_owned()
++                state['caller'] = during_copy
++                return []
++            def __getitem__(self, key):
++                raise KeyError(key)
++        if during_copy > state['now']:
++            assert record(c, a, Environment())['deadline_monotonic'] == 105.0
++        else:
++            with pytest.raises(BrowserOwnerRefused, match='original_deadline_exhausted'):
++                record(c, a, Environment())
++
++
++def test_original_owner_session_principal_and_generation_are_not_substituted():
++    a = owner()
++    foreign_principal = a.scope_identity[:3] + (('telegram', 'other'),) + a.scope_identity[4:]
++    foreign_generation = a.scope_identity[:4] + (2,) + a.scope_identity[5:]
++    foreign = [owner(), replace(a, scope_identity=foreign_principal),
++               replace(a, scope_identity=foreign_generation), object()]
++    with clocks(a):
++        c = control(a)
++        for candidate, session in [(other, 'daemon') for other in foreign] + [(a, 'foreign')]:
+             with pytest.raises(BrowserOwnerRefused, match='original_owner_changed'):
+-                c.headers(candidate,session)
+-
+-
+-def test_control_never_extends_or_renews_its_original_deadline():
+-    a=owner(time.monotonic()+60)
+-    from tools.browser_stream_control import _binding
+-    c=StreamControl(a,'daemon',_binding(a),a.original_deadline,'b'*64)
+-    with patch.object(BrowserOwner,'check',lambda self:time.monotonic()-1):
+-        with pytest.raises(BrowserOwnerRefused,match='original_deadline_exhausted'):
+-            c.headers(a,'daemon')
+-    assert c.original_deadline==a.original_deadline
+-
+-
+-def test_secret_is_not_in_repr_and_is_not_supplied_by_ambient_env():
+-    a=owner(time.monotonic()+60)
+-    from tools.browser_stream_control import _binding
+-    c=StreamControl(a,'daemon',_binding(a),a.original_deadline,'b'*64)
+-    assert 'b'*64 not in repr(c)
+-    with patch.object(BrowserOwner,'check',lambda self:self.original_deadline):
+-        env=c.launch_environment(a,'daemon',{'AGENT_BROWSER_FRIDAY_CONTROL_REQUIRED':'0',
+-            'AGENT_BROWSER_FRIDAY_STREAM_CONTROL':'foreign','OTHER':'preserved'})
+-        assert env['OTHER']=='preserved'
+-        assert env['AGENT_BROWSER_FRIDAY_CONTROL_REQUIRED']=='1'
+-        assert json.loads(env['AGENT_BROWSER_FRIDAY_STREAM_CONTROL'])['token']=='b'*64
++                c.headers(candidate, session)
++        # A foreign caller cannot poison the retained rightful capability.
++        assert record(c, a)['deadline_monotonic'] == 120.0
++        with patch.object(BrowserOwner, 'check', side_effect=BrowserOwnerRefused(
++                'browser_principal_profile_generation_changed')):
++            with pytest.raises(BrowserOwnerRefused, match='principal_profile_generation_changed'):
++                c.headers(a, 'daemon')
++
++
++def test_same_deadline_positive_secret_redaction_and_ambient_env_override():
++    a = owner()
++    with clocks(a):
++        c = control(a)
++        assert 'b' * 64 not in repr(c)
++        env = c.launch_environment(a, 'daemon', {'AGENT_BROWSER_FRIDAY_CONTROL_REQUIRED': '0',
++            'AGENT_BROWSER_FRIDAY_STREAM_CONTROL': 'foreign', 'OTHER': 'preserved'})
++        assert env['OTHER'] == 'preserved'
++        assert env['AGENT_BROWSER_FRIDAY_CONTROL_REQUIRED'] == '1'
++        assert json.loads(env['AGENT_BROWSER_FRIDAY_STREAM_CONTROL'])['token'] == 'b' * 64
++        assert record(c, a)['deadline_monotonic'] == 120.0
++        assert c.headers(a, 'daemon')['Authorization'] == 'Bearer ' + 'b' * 64
+ 
+ 
+ def test_missing_real_native_context_is_not_an_admission_record():
+-    with pytest.raises((RuntimeError,BrowserOwnerRefused)):
+-        stream_control('task',{'session_name':'daemon'})
++    with pytest.raises((RuntimeError, BrowserOwnerRefused)):
++        stream_control('task', {'session_name': 'daemon'})
+--- a/hermes/tools/browser_stream_control.py
++++ b/hermes/tools/browser_stream_control.py
+@@ -1,9 +1,11 @@
+-"""Backend-only control for the pinned native stream patch, not an admission grant.
++"""Backend-only stream control source; no native execution admission or stop.
+ 
+-Root must wire this into the existing managed launch *after* independently
+-reviewing the pinned owner dependency and the complete missing native producers.
+-No network, task manager, daemon or browser is created by this module.
++The owner turn lock protects the retained ceiling and secret publication. Once
++published, the immutable Rust listener may already exist: a shorter ceiling
++permanently refuses this capability. It does NOT close a previously issued
++socket or listener; authoritative native cancellation is a separate producer.
+ """
++from contextlib import contextmanager
+ from dataclasses import dataclass, field
+ import hashlib
+ import json
+@@ -11,7 +13,9 @@
+ import secrets
+ import time
+ 
+-from tools.browser_tool_owner import BrowserOwner, BrowserOwnerRefused, bind_browser_session
++from tools.browser_tool_owner import (
++    BrowserOwner, BrowserOwnerRefused, bind_browser_session, browser_lock,
++)
+ 
+ 
+ def _binding(owner):
+@@ -26,48 +30,101 @@
+     binding: str
+     original_deadline: float
+     token: str = field(repr=False)
++    # Only these monotone custody fields change, under the existing turn lock.
++    # The retained object, original bound, owner, session and token never change.
++    _retained_deadline: float = field(init=False, repr=False, compare=False)
++    _published_deadline: object = field(default=None, init=False, repr=False, compare=False)
++    _refused: bool = field(default=False, init=False, repr=False, compare=False)
+ 
+-    def check(self, owner, session):
++    def __post_init__(self):
++        if type(self.original_deadline) not in (int, float) or not math.isfinite(self.original_deadline):
++            raise BrowserOwnerRefused('browser_stream_original_deadline_required')
++        object.__setattr__(self, '_retained_deadline', self.original_deadline)
++
++    def _identity(self, owner, session):
+         if (type(owner) is not BrowserOwner or owner is not self.owner
+                 or session != self.session or _binding(owner) != self.binding):
+             raise BrowserOwnerRefused('browser_stream_original_owner_changed')
+-        ceiling = min(self.original_deadline, owner.check())
+-        if not math.isfinite(ceiling) or time.monotonic() >= ceiling:
+-            raise BrowserOwnerRefused('browser_stream_original_deadline_exhausted')
+-        return ceiling
++
++    @contextmanager
++    def _fenced(self, owner, session):
++        self._identity(owner, session)
++        # BrowserOwner.fence/check already use this same reentrant turn lock.
++        # The outer lock also protects a terminal clock failure before fence yields.
++        with browser_lock(owner.call.turn.lock, self._retained_deadline):
++            self._identity(owner, session)
++            if self._refused:
++                raise BrowserOwnerRefused('browser_stream_control_permanently_refused')
++            try:
++                with owner.fence(self._retained_deadline) as ceiling:
++                    if type(ceiling) not in (int, float) or not math.isfinite(ceiling):
++                        object.__setattr__(self, '_refused', True)
++                        raise BrowserOwnerRefused('browser_stream_original_deadline_required')
++                    ceiling = min(self.original_deadline, self._retained_deadline, ceiling)
++                    object.__setattr__(self, '_retained_deadline', ceiling)
++                    if time.monotonic() >= ceiling:
++                        object.__setattr__(self, '_refused', True)
++                        raise BrowserOwnerRefused('browser_stream_original_deadline_exhausted')
++                    if self._published_deadline is not None and ceiling < self._published_deadline:
++                        object.__setattr__(self, '_refused', True)
++                        raise BrowserOwnerRefused('browser_stream_published_deadline_shortened_stop_required')
++                    yield ceiling
++            except (BrowserOwnerRefused, TimeoutError) as error:
++                if str(error) in ('browser_original_owner_deadline_exhausted',
++                                  'web_original_deadline'):
++                    # A later caller must not revive an already exhausted bound.
++                    object.__setattr__(self, '_refused', True)
++                raise
++
++    def check(self, owner, session):
++        with self._fenced(owner, session) as ceiling:
++            return ceiling
+ 
+     def launch_environment(self, owner, session, existing_env):
+-        self.check(owner, session)
+-        value = {'schema': 1, 'session': self.session, 'binding': self.binding,
+-                 'token': self.token, 'boot_id': owner.boot_id,
+-                 'deadline_monotonic': self.original_deadline}
+-        env = dict(existing_env)
+-        env['AGENT_BROWSER_FRIDAY_CONTROL_REQUIRED'] = '1'
+-        env['AGENT_BROWSER_FRIDAY_STREAM_CONTROL'] = json.dumps(value, separators=(',', ':'))
+-        return env
++        with self._fenced(owner, session):
++            env = dict(existing_env)
++            # Mapping conversion can take time or re-enter trusted backend code.
++            # Recheck under the same fence immediately before publication.
++            ceiling = self.check(owner, session)
++            value = {'schema': 1, 'session': self.session, 'binding': self.binding,
++                     'token': self.token, 'boot_id': owner.boot_id,
++                     'deadline_monotonic': ceiling}
++            env['AGENT_BROWSER_FRIDAY_CONTROL_REQUIRED'] = '1'
++            env['AGENT_BROWSER_FRIDAY_STREAM_CONTROL'] = json.dumps(value, separators=(',', ':'))
++            object.__setattr__(self, '_published_deadline', ceiling)
++            return env
+ 
+     def headers(self, owner, session):
+-        self.check(owner, session)
+-        # Backend headers only; never URLs, page JS, frontend assets, logs or receipts.
+-        return {'Authorization': 'Bearer ' + self.token, 'X-Friday-Owner': self.binding}
++        with self._fenced(owner, session) as ceiling:
++            # Headers also publish the secret. Treat any publication as potentially
++            # consumed; no retry is permission to replace an immutable listener.
++            headers = {'Authorization': 'Bearer ' + self.token, 'X-Friday-Owner': self.binding}
++            object.__setattr__(self, '_published_deadline', ceiling)
++            return headers
+ 
+ 
+ def stream_control(task_id, session_info):
+-    """Retain one capability for the already-bound original owner and daemon.
++    """Retain exactly one control under the original owner's existing turn fence.
+ 
+-    This does not call require_browser_execution, bypass it, or claim raw CDP,
+-    page-network or cgroup containment. A new caller cannot renew the record.
++    No require_browser_execution bypass, clock renewal or replacement token.
++    Publication and native launch/custody still need an enclosing owner fence
++    in the eventual managed launch integration. No integration is supplied here.
+     """
+     owner = bind_browser_session(task_id, session_info)
+     session = session_info.get('session_name')
+     if type(session) is not str or not session or len(session) > 512:
+         raise BrowserOwnerRefused('browser_stream_actual_daemon_session_required')
+-    with owner.fence() as ceiling:
++    # Retained controls must see even a fence failure (e.g. an exhausted caller)
++    # under the same lock, so they cannot be silently revived by the next caller.
++    with browser_lock(owner.call.turn.lock, owner.original_deadline):
+         retained = session_info.get('_friday_stream_control')
+         if retained is None:
+-            retained = StreamControl(owner, session, _binding(owner),
+-                                     min(owner.original_deadline, ceiling), secrets.token_hex(32))
+-            session_info['_friday_stream_control'] = retained
++            with owner.fence() as ceiling:
++                retained = StreamControl(owner, session, _binding(owner),
++                                         min(owner.original_deadline, ceiling), secrets.token_hex(32))
++                retained.check(owner, session)
++                session_info['_friday_stream_control'] = retained
++                return retained
+         if type(retained) is not StreamControl:
+             raise BrowserOwnerRefused('browser_stream_original_control_required')
+         retained.check(owner, session)

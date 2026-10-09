@@ -1,0 +1,634 @@
+--- previous/dsh_prepare.py
++++ prepared/dsh_prepare.py
+@@ -16,13 +16,21 @@
+ 
+ 
+ class StopUnconfirmed(RuntimeError):
+-    """An owned command was signalled but its cessation was not observed."""
++    """Keep the exact Popen handle when original-deadline reap is unconfirmed."""
++    def __init__(self, message, *, process=None, starttime=None, deadline=None):
++        super().__init__(message)
++        if process is not None:
++            self.owned_process = process
++            self.observation = {'pid': process.pid, 'starttime_ticks': starttime,
++                'returncode': process.returncode, 'timeout': True,
++                'reaped': process.returncode is not None,
++                'original_deadline': deadline, 'reason': 'STOP_UNCONFIRMED'}
+ 
+ 
+ SAFE_OBSERVATION_FIELDS = ('returncode', 'elapsed_seconds', 'timeout', 'stdout_sha256',
+                            'stderr_sha256', 'stdout_bytes', 'stderr_bytes', 'pid',
+                            'starttime_ticks', 'reaped', 'reason',
+-                           'namespace_init_exit_verified')
++                           'namespace_init_exit_verified', 'owner_receipt', 'original_deadline')
+ 
+ 
+ def safe_observation(observation):
+@@ -86,11 +94,13 @@
+                 pass
+             remaining = deadline - time.monotonic()
+             if remaining <= 0:
+-                raise StopUnconfirmed('STOP_UNCONFIRMED: original cleanup budget exhausted')
++                raise StopUnconfirmed('STOP_UNCONFIRMED: original cleanup budget exhausted',
++                    process=process, starttime=starttime, deadline=deadline)
+             try:
+                 out, err = process.communicate(timeout=remaining)
+             except subprocess.TimeoutExpired as exc:
+-                raise StopUnconfirmed('STOP_UNCONFIRMED: contained command not reaped') from exc
++                raise StopUnconfirmed('STOP_UNCONFIRMED: contained command not reaped',
++                    process=process, starttime=starttime, deadline=deadline) from exc
+         else:
+             os.killpg(process.pid, signal.SIGTERM)
+             try:
+@@ -118,7 +128,8 @@
+                    "stderr_sha256": hashlib.sha256(err.encode()).hexdigest(),
+                    "stdout_bytes": len(out.encode()), "stderr_bytes": len(err.encode()),
+                    "pid": process.pid, "starttime_ticks": starttime,
+-                   "reaped": process.returncode is not None, "reason": reason}
++                   "reaped": process.returncode is not None, "reason": reason,
++                   "original_deadline": deadline}
+     if log:
+         log.parent.mkdir(parents=True, exist_ok=True)
+         log.with_suffix(".stdout").write_text(out)
+--- previous/install_containment.py
++++ prepared/install_containment.py
+@@ -92,24 +92,31 @@
+         self.pin, self.budget, self.env = pin, budget, env
+         self.binary = budget.call(checked_binary, pin)
+ 
+-    def run(self, command, cwd, *, timeout=1800, read_only=False, log=None):
++    def run(self, command, cwd, *, timeout=1800, read_only=False, log=None, qualifier=None):
+         from scripts.dsh_prepare import run, CommandFailed, StopUnconfirmed, safe_observation
+         self.budget.call(checked_binary, self.pin)
+         # Reserve cleanup *inside* the original deadline; no fresh grace clock.
+         limit = min(timeout, self.budget.check(reserve=1))
+         reader, writer = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+-        failure = None; result = None; observation = {}; data = b''
++        failure = None; result = None; observation = {}; data = b''; owner = None; namespace_attempted = False
+         try:
+             args = argv(self.binary, command, read_only=read_only)
+             args[1:1] = ['--json-status-fd', str(writer)]
++            inherited = (writer,)
++            if qualifier is not None:
++                if read_only is not False:
++                    raise ValueError('explicit_ts_mount_plan_supplies_read_only_boundary')
++                from scripts.qualifier_scope import prepare
++                args, inherited, owner = prepare(self.budget, command, writer, qualifier, self.env)
+             try:
+                 logging = {'log': log} if log is not None else {}
++                namespace_attempted = True
+                 result = run(args, cwd, timeout=limit, env=self.env,
+-                             deadline=self.budget.deadline, pass_fds=(writer,), **logging)
++                             deadline=self.budget.deadline, pass_fds=inherited, **logging)
+                 observation = result[1]
+             except BaseException as exc:
+                 failure = exc
+-                if isinstance(exc, CommandFailed): observation = exc.observation
++                if isinstance(exc, (CommandFailed, StopUnconfirmed)): observation = getattr(exc, 'observation', {})
+             os.close(writer); writer = None
+             # Exactly two small native records fit in the pipe. Never wait for
+             # EOF from an uncertain monitor or use its stdout as proof.
+@@ -123,13 +130,29 @@
+         finally:
+             if writer is not None: os.close(writer)
+             os.close(reader)
++        if qualifier is not None and not namespace_attempted and failure is not None:
++            # A concrete owner prerequisite refused before namespace launch;
++            # do not invent an owned native execution requiring stop.
++            raise failure
+         known = namespace_exit(data, observation)
++        if owner is not None:
++            from scripts.qualifier_scope import finish
++            observation['namespace_init_exit_verified'] = known and observation.get('returncode') != 3
++            try:
++                observation['owner_receipt'] = finish(self.budget, owner, observation.copy(), data)
++            except StopUnconfirmed as exc:
++                if isinstance(failure, StopUnconfirmed) and hasattr(failure, 'owned_process'):
++                    exc.owned_process = failure.owned_process
++                    exc.observation = failure.observation
++                raise exc from failure
+         if not known or observation.get('returncode') == 3:
+             stopped = StopUnconfirmed('STOP_UNCONFIRMED: namespace init exit not established')
+             if observation: stopped.observation = safe_observation(observation)
+             raise stopped from failure
+         observation['namespace_init_exit_verified'] = True
+-        if failure is not None: raise failure
++        if failure is not None:
++            if isinstance(failure, CommandFailed): failure.observation = safe_observation(observation)
++            raise failure
+         self.budget.check()
+         return result
+ 
+--- previous/qualifier_scope.py
++++ prepared/qualifier_scope.py
+@@ -0,0 +1,212 @@
++"""SOURCE ONLY. Explicit TS option for the existing finite Containment.run.
++
++No admission/clock/lock/unit constructor. Caller supplies its original Budget,
++held lock, declared task limit, unique scope and fresh owned output. No service
++supervisor or discovery/retry. Actual installed behavior remains NOT_RUN.
++"""
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++import stat
++import time
++
++LOCK = Path('<LOCAL_HOME>/.jericho/runtime/friday-quality-ui-exclusive.lock')
++LOCK_ID = (2050, 9044963, 1000, 1000, 1, 0, 0o664)
++
++
++def identity(st):
++    return (st.st_dev, st.st_ino, st.st_uid, st.st_gid,
++            st.st_nlink, st.st_size, stat.S_IMODE(st.st_mode))
++
++
++def held(fd):
++    if type(fd) is not int or fd < 3 or identity(os.fstat(fd)) != LOCK_ID:
++        raise ValueError('canonical_existing_quality_fd_required')
++    if LOCK.resolve() != LOCK or identity(LOCK.lstat()) != LOCK_ID:
++        raise ValueError('canonical_quality_path_changed')
++    text = Path(f'/proc/self/fdinfo/{fd}').read_text()
++    if not any('FLOCK  ADVISORY  WRITE' in line and f'{LOCK_ID[1]} ' in line
++               for line in text.splitlines()):
++        raise ValueError('held_quality_open_description_required')
++    return text
++
++
++def birth(pid):
++    raw = Path(f'/proc/{pid}/stat').read_text()
++    return int(raw.rsplit(')', 1)[1].split()[19])
++
++
++def scope_show(unit, budget, env):
++    # Existing bounded foreground command, one read, no polling or stop/reset.
++    from scripts.dsh_prepare import run
++    out, observation = run(['/usr/bin/systemctl', '--user', 'show', unit,
++        '--property=Id,LoadState,ActiveState,ControlGroup,InvocationID'], Path('/'),
++        env=env, timeout=min(1, budget.check()), deadline=budget.deadline)
++    rows = [line.split('=', 1) for line in out.splitlines()]
++    if len(rows) != 5 or len({r[0] for r in rows}) != 5:
++        raise ValueError('exact_scope_properties_required')
++    return dict(rows), observation
++
++
++def prepare(budget, command, status_fd, option, env):
++    """Prepare argv/FDs only; Containment owns the single launch and receipt."""
++    if set(option) != {'unit', 'tasks', 'quality_fd', 'run', 'ts_root', 'host_guard',
++                        'mounts', 'pins', 'links', 'aggregate_cgroup'}:
++        raise ValueError('exact_existing_owner_ts_option_required')
++    if not re.fullmatch(r'friday-qualify-[a-z0-9][a-z0-9-]{0,190}\.scope', option['unit']):
++        raise ValueError('unique_caller_owned_scope_required')
++    if type(option['tasks']) is not int or not 0 < option['tasks'] < 2**31:
++        raise ValueError('original_declared_task_count_required')
++    fd = option['quality_fd']; held(fd)
++    if fd == status_fd or not stat.S_ISFIFO(os.fstat(status_fd).st_mode):
++        raise ValueError('distinct_status_and_quality_fd_required')
++    run = Path(option['run']); root = Path(option['ts_root'])
++    if (run != run.resolve() or root != root.resolve() or not run.name.startswith('ts24-run-')
++            or run.is_relative_to(root.parent) or root.is_relative_to(run)
++            or run.stat().st_uid != os.getuid() or stat.S_IMODE(run.stat().st_mode) != 0o700):
++        raise ValueError('fresh_external_owned_output_required')
++    clock = json.loads((run / 'clock.json').read_text())
++    if (clock['original_budget_seconds'] != 180 or clock['execution_authorized'] is not False
++            or clock['scope'] != 'TS24_SOURCE_OFFLINE_ONLY'
++            or clock['deadline_monotonic'] != clock['started_monotonic'] + 180
++            or clock['deadline_monotonic'] != budget.deadline
++            or clock['boot_id'] != Path('/proc/sys/kernel/random/boot_id').read_text().strip()):
++        raise ValueError('same_existing_original_ts180_required')
++    if command != ['/usr/bin/python3', '-I', str(root / 'launch.py'), str(run), 'FRW_TS_CUSTODY_FD']:
++        raise ValueError('exact_qualified_ts24_command_required')
++    if len(os.sched_getaffinity(0)) > 2:
++        raise ValueError('existing_owner_affinity_not_bound')
++    for path, sha in option['pins'].items():
++        budget.check()
++        if hashlib.sha256(Path(path).read_bytes()).hexdigest() != sha:
++            raise ValueError('qualifier_source_or_native_pin_changed')
++    for path, target in option['links'].items():
++        budget.check()
++        if os.readlink(path) != target:
++            raise ValueError('qualifier_link_changed')
++    # The existing root-owned aggregate ancestor must already cover the finite
++    # coordinator AND the future scope. A sibling scope plus per-process affinity
++    # is not aggregate2CPU2GiB. No shared slice mutation or new slice is done here.
++    parent_line = Path('/proc/self/cgroup').read_text().strip()
++    if not parent_line.startswith('0::/') or '\n' in parent_line:
++        raise ValueError('existing_aggregate_parent_cgroup_required')
++    aggregate = Path(option['aggregate_cgroup'])
++    own = Path('/sys/fs/cgroup') / parent_line[4:]
++    if (aggregate != aggregate.resolve() or aggregate == Path('/sys/fs/cgroup')
++            or not own.is_relative_to(aggregate)):
++        raise ValueError('existing_owner_aggregate_ancestor_unbound')
++    aggregate_caps = {k: (aggregate / k).read_text().strip()
++        for k in ('memory.max','memory.swap.max','cpu.max','pids.max')}
++    quota, period = aggregate_caps['cpu.max'].split()
++    if (not quota.isdecimal() or not period.isdecimal() or not 0 < int(quota) <= 2 * int(period)
++            or not aggregate_caps['memory.max'].isdecimal()
++            or not 0 < int(aggregate_caps['memory.max']) <= 2 << 30
++            or aggregate_caps['memory.swap.max'] != '0'
++            or aggregate_caps['pids.max'] != str(option['tasks'])):
++        raise ValueError('existing_whole_owner_aggregate_envelope_unbound')
++    if re.fullmatch(r'friday-qualify-[a-z0-9][a-z0-9-]{0,190}\.slice', aggregate.name) is None:
++        raise ValueError('existing_per_job_aggregate_slice_required')
++    slice_props, slice_query = scope_show(aggregate.name, budget, env)
++    if (slice_props['Id'] != aggregate.name or slice_props['LoadState'] != 'loaded'
++            or slice_props['ActiveState'] != 'active'
++            or Path('/sys/fs/cgroup') / slice_props['ControlGroup'].lstrip('/') != aggregate):
++        raise ValueError('existing_aggregate_slice_not_actually_bound')
++    # Pre-existing names refuse; never stop or reclaim somebody else's scope.
++    before, query = scope_show(option['unit'], budget, env)
++    if before['Id'] != option['unit'] or before['LoadState'] != 'not-found' or before['ControlGroup']:
++        raise ValueError('scope_name_not_fresh')
++    reader, writer = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
++    context = dict(option, reader=reader, writer=writer, owner_pid=os.getpid(),
++                   owner_birth=birth(os.getpid()), deadline=budget.deadline,
++                   boot_id=clock['boot_id'], before_scope=before, before_query=query,
++                   quality_before=held(fd), env=env, aggregate_caps=aggregate_caps,
++                   aggregate_slice_before=slice_props, aggregate_query=slice_query,
++                   aggregate_identity=[aggregate.stat().st_dev, aggregate.stat().st_ino])
++    envelope = {key: context[key] for key in ('unit', 'tasks', 'quality_fd',
++                'run', 'ts_root', 'mounts', 'owner_pid', 'owner_birth', 'deadline', 'boot_id',
++                'aggregate_cgroup', 'aggregate_caps', 'aggregate_identity')}
++    envelope.update(memory_bytes=2 << 30, cpu_percent=200, scope_observation_fd=writer,
++                    native_status_fd=status_fd)
++    args = ['/usr/bin/systemd-run', '--user', '--scope', '--quiet', '--no-ask-password',
++        '--expand-environment=no', '--unit=' + option['unit'],
++        '--slice=' + aggregate.name,
++        '--property=MemoryMax=2147483648', '--property=MemorySwapMax=0',
++        '--property=CPUQuota=200%', '--property=TasksMax=' + str(option['tasks']),
++        '--property=MemoryOOMGroup=yes', '--property=KillMode=control-group',
++        '--property=SendSIGKILL=yes',
++        '--property=RuntimeMaxSec=' + str(min(90, budget.check(reserve=2))) + 's',
++        '/usr/bin/python3', '-I', option['host_guard'], json.dumps(envelope), *command]
++    return args, (status_fd, fd, writer), context
++
++
++def finish(budget, context, observation, native_data):
++    """One post-exit exact ownership join; uncertain facts retain stop evidence."""
++    from scripts.dsh_prepare import StopUnconfirmed
++    receipt = {'state': 'STOP_UNCONFIRMED', 'requested_unit': context['unit'],
++               'native_status_sha256': hashlib.sha256(native_data).hexdigest(),
++               'command': observation, 'runtimeGrant': False,
++               'aggregate_before': {'path': context['aggregate_cgroup'],
++                 'identity': context['aggregate_identity'], 'caps': context['aggregate_caps']}}
++    try:
++        os.close(context['writer']); context['writer'] = None
++        try: raw = os.read(context['reader'], 4097)
++        except BlockingIOError: raw = b''
++        if not raw or len(raw) > 4096: raise ValueError('host_scope_observation_missing')
++        host = json.loads(raw)
++        receipt['host_before'] = host
++        receipt['host_scope_observation_sha256'] = hashlib.sha256(raw).hexdigest()
++        if (host['unit'] != context['unit'] or host['owner_pid'] != context['owner_pid']
++                or host['owner_birth'] != context['owner_birth']
++                or host['deadline'] != budget.deadline
++                or host['boot_id'] != context['boot_id']
++                or not re.fullmatch('[0-9a-f]{32}', host['invocation'])):
++            raise ValueError('host_scope_identity_changed')
++        budget.check()
++        props, query = scope_show(context['unit'], budget, context['env'])
++        receipt['scope_after'] = props; receipt['after_query'] = query
++        cg = Path(host['cgroup'])
++        if cg.exists():
++            if [cg.stat().st_dev, cg.stat().st_ino] != host['cgroup_identity']:
++                raise ValueError('owned_scope_inode_reused')
++            events = dict(line.split() for line in (cg / 'cgroup.events').read_text().splitlines())
++            receipt['cgroup_after'] = events
++            if events.get('populated') != '0': raise ValueError('owned_scope_still_populated')
++        else: receipt['cgroup_after'] = 'ABSENT'
++        if props['LoadState'] != 'not-found':
++            if (props['Id'] != host['unit'] or props['InvocationID'] != host['invocation']
++                    or props['ActiveState'] not in ('inactive', 'failed')
++                    or props['ControlGroup'] not in ('', host['control_group'])):
++                raise ValueError('owned_scope_not_terminal')
++        elif props['ControlGroup'] or cg.exists():
++            raise ValueError('scope_missing_but_group_retained')
++        pid = observation.get('pid')
++        # Popen was retained/reaped by run. Never reopen a PID for signalling.
++        if (not observation.get('namespace_init_exit_verified') or not observation.get('reaped')
++                or type(pid) is not int or Path(f'/proc/{pid}').exists()):
++            raise ValueError('original_native_custody_not_closed')
++        try: os.killpg(pid, 0)
++        except ProcessLookupError: pass
++        else: raise ValueError('owned_foreground_group_retained')
++        aggregate = Path(context['aggregate_cgroup'])
++        aggregate_after = {k: (aggregate / k).read_text().strip() for k in context['aggregate_caps']}
++        if ([aggregate.stat().st_dev, aggregate.stat().st_ino] != context['aggregate_identity']
++                or aggregate_after != context['aggregate_caps']):
++            raise ValueError('aggregate_owner_envelope_changed')
++        receipt['aggregate_after'] = aggregate_after
++        receipt['quality_after'] = held(context['quality_fd'])
++        receipt['state'] = 'OWNED_NAMESPACE_AND_SCOPE_TERMINAL_LOCK_STILL_HELD'
++        receipt['elapsed_terminal_observation'] = time.monotonic()
++        budget.check()
++    except BaseException as exc:
++        receipt['failure'] = type(exc).__name__ + ':' + str(exc)
++        stopped = StopUnconfirmed('STOP_UNCONFIRMED: exact TS owner scope join')
++        stopped.owner_receipt = receipt
++        raise stopped from exc
++    finally:
++        if context['writer'] is not None: os.close(context['writer'])
++        os.close(context['reader'])
++    # The root caller returns its lock only AFTER this receipt and its own final
++    # evidence. This module never unlocks it and cannot prove that later return.
++    return receipt
+--- previous/qualify_ts24.py
++++ prepared/qualify_ts24.py
+@@ -0,0 +1,155 @@
++"""NOT_RUN. One source qualifier call through the existing finite owner.
++
++The root already owns Budget180, a canonical held quality OFD, existing capped
++aggregate slice, distinct reviewed output and actual independent source review.
++This call creates none of those, supplies no grant and never unlocks the parent.
++"""
++import hashlib
++import json
++import os
++from pathlib import Path
++import stat
++
++
++def digest(path):
++    with Path(path).open('rb') as stream:
++        return hashlib.file_digest(stream, 'sha256').hexdigest()
++
++
++def evidence_join(run, budget, owner, max_evidence_bytes):
++    """Read only AFTER original native and scope closure; no disconnected PASS."""
++    if type(max_evidence_bytes) is not int or not 0 < max_evidence_bytes < 2 << 30:
++        raise ValueError('original_declared_evidence_bound_required')
++    budget.check()
++    pre_exec = json.loads((run / 'pre-exec-os.json').read_text())
++    if (pre_exec['host_custody_sha256'] != owner['host_scope_observation_sha256']
++            or pre_exec['host_before'] != owner['host_before']
++            or pre_exec['pid'] != 1 or pre_exec['runtimeGrant'] is not False
++            or pre_exec['deadline'] != budget.deadline
++            or pre_exec['cgroup'] != owner['host_before']['cgroup']):
++        raise ValueError('host_namespace_launch_receipt_not_joined')
++    progress = json.loads((run / 'progress.json').read_text())
++    collected = progress['collected']; results = progress['results']
++    ids = {row['id'] for row in collected}
++    if (progress['state'] != 'SOURCE_TS24_CASES_PASS_AWAIT_ROOT_CLOSURE'
++            or progress.get('closed') is not True or progress['runtimeGrant'] is not False
++            or progress['errors'] or len(collected) != 24 or len(ids) != 24
++            or len(results) != 24 or {row['id'] for row in results} != ids
++            or any(row['result']['state'] != 'passed' for row in results)):
++        raise ValueError('actual_unique_ts24_results_not_closed')
++    pins = {}; events = []; total = 0
++    paths = sorted(run.glob('guard-*.jsonl'))
++    if not paths: raise ValueError('actual_node_lifetime_evidence_missing')
++    for path in paths:
++        budget.check()
++        st = path.lstat()
++        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid():
++            raise ValueError('foreign_guard_evidence_file')
++        total += st.st_size
++        if total > max_evidence_bytes: raise ValueError('original_evidence_bound_exhausted')
++        raw = path.read_bytes(); pins[str(path)] = hashlib.sha256(raw).hexdigest()
++        events.extend(json.loads(line) for line in raw.splitlines())
++    if any(row.get('event') == 'DENIED' for row in events):
++        raise ValueError('source_guard_refusal_preserved')
++    starts = [row for row in events if row['event'] == 'START']
++    exits = [row for row in events if row['event'] == 'EXIT']
++    inherited = [row for row in events if row['event'] == 'QUALITY_FD_INHERITED']
++    parent_pids = {r['pid'] for r in starts if r['role'] == 'parent'}
++    all_pids = {r['pid'] for r in starts}
++    exit_pids = {r['pid'] for r in exits}
++    if (len(parent_pids) != 1 or not [r for r in starts if r['role'] == 'worker']
++            or len(all_pids) != len(starts) or not parent_pids.issubset(exit_pids)
++            or not exit_pids.issubset(all_pids)
++            or {r['pid'] for r in inherited} != all_pids
++            or any(r['code'] != 0 or r['child_still_active'] is not None for r in exits)):
++        raise ValueError('whole_node_worker_lifetime_not_reconciled')
++    forks = [r for r in events if r['event'] == 'FORK']
++    child_exits = [r for r in events if r['event'] == 'CHILD_EXIT']
++    worker_pids = {r['pid'] for r in starts if r['role'] == 'worker'}
++    if ({r['child_pid'] for r in forks} != worker_pids
++            or {r['child_pid'] for r in child_exits} != worker_pids
++            or any(not (r['code'] == 0 and r['signal'] is None
++                        or r['code'] is None and r['signal'] == 'SIGTERM') for r in child_exits)):
++        raise ValueError('fork_exit_and_worker_records_not_joined')
++    def key(row): return row['canonical'], row['codeSha256']
++    final = {key(r) for r in events if r['event'] == 'VITEST_FINAL_RESULT_SOURCE' and 'canonical' in r}
++    temps = {key(r) for r in events if r['event'] == 'VITEST_TMP_WRITTEN' and 'canonical' in r}
++    fetch = {key(r) for r in events if r['event'] in ('VITEST_WORKER_FETCH','VITEST_ENV_FETCH') and 'canonical' in r}
++    begins = [r for r in events if r['event'] in ('VITEST_EVAL_BEGIN','VITE_RUNNER_EVAL_BEGIN')]
++    done = [r for r in events if r['event'] in ('VITEST_EVAL_DONE','VITE_RUNNER_EVAL_DONE')]
++    if not begins: raise ValueError('actual_vm_evaluation_not_observed')
++    for row in begins:
++        base_key = row['canonical'], row['finalSourceSha256']
++        if base_key not in final or key(row) not in fetch:
++            raise ValueError('evaluated_bytes_not_joined_to_final_worker_payload')
++        if not any(r['pid'] == row['pid'] and key(r) == key(row) for r in done):
++            raise ValueError('evaluation_completion_missing')
++    for row in events:
++        if row['event'] == 'VITEST_TMP_WRITTEN' and (row['canonical'], row['finalSourceSha256']) not in final:
++            raise ValueError('temporary_cache_suffix_not_joined_to_final_source')
++        if row.get('tmp') is not None:
++            if row['tempSha256'] != row['codeSha256'] or key(row) not in temps:
++                raise ValueError('actual_fork_temporary_bytes_not_joined')
++    mapped = [r for r in events if r['event'] == 'MAPPED_OBJECTS_SNAPSHOT']
++    if any(not any(r['pid'] == s['pid'] and r['phase'] == 'pre-framework' for r in mapped) for s in starts):
++        raise ValueError('node_initial_native_maps_missing')
++    for row in events:
++        if row['event'] == 'ADDON_LOAD_REQUEST':
++            if not any(m['pid'] == row['pid'] and m['phase'] == 'after-addon:' + row['path'] for m in mapped):
++                raise ValueError('native_addon_maps_not_joined')
++    if owner['state'] != 'OWNED_NAMESPACE_AND_SCOPE_TERMINAL_LOCK_STILL_HELD':
++        raise ValueError('owned_scope_termination_not_joined')
++    budget.check()
++    return {'pre_exec_sha256': digest(run / 'pre-exec-os.json'),
++            'progress_sha256': digest(run / 'progress.json'), 'guard_files': pins,
++            'observed_test_ids': sorted(ids), 'node_starts': starts,
++            'actual_evaluations': begins, 'actual_completions': done,
++            'final_sources': sorted(final), 'worker_payloads': sorted(fetch),
++            'native_maps': mapped, 'meaning': 'Actual trusted source qualification observations only; native hostile-effect/control completeness still requires independent root negatives.',
++            'runtimeGrant': False}
++
++
++def qualify(custody, *, budget, quality_fd, run, unit, tasks, aggregate_cgroup,
++            max_evidence_bytes):
++    from scripts.install_containment import Containment
++    from scripts.dsh_prepare import StopUnconfirmed
++    from scripts.qualifier_scope import held
++    if type(custody) is not Containment or custody.budget is not budget:
++        raise ValueError('same_existing_containment_and_original_budget_required')
++    root = Path(__file__).resolve().parents[2] / 'ts24'
++    run = Path(run)
++    held(quality_fd); budget.check(reserve=2)
++    pins = {}; links = {}
++    for name in ('runner-pins','support-pins','native-runtime-pins','launcher-runtime-pins'):
++        value = json.loads((root / (name + '.json')).read_text())
++        pins.update(value.get('files', value))
++        if name != 'native-runtime-pins': links.update(value.get('links', {}))
++    owner_pins = json.loads((root.parent / 'owner-source-pins.json').read_text())
++    pins.update(owner_pins)
++    # Root-owned original inputs are immutable across candidate effects.
++    initial = {name: digest(run / name) for name in ('clock.json','admission.json')}
++    option = {'unit': unit, 'tasks': tasks, 'quality_fd': quality_fd,
++        'run': str(run), 'ts_root': str(root),
++        'host_guard': str(Path(__file__).with_name('ts_scope_guard.py')),
++        'mounts': {'path': str(root / 'mount-plan.json'), 'sha256': digest(root / 'mount-plan.json')},
++        'pins': pins, 'links': links, 'aggregate_cgroup': str(aggregate_cgroup)}
++    receipt = {'state': 'SOURCE_QUALIFICATION_PENDING', 'runtimeGrant': False,
++               'original_deadline': budget.deadline, 'original_inputs': initial}
++    try:
++        _, observed = custody.run(['/usr/bin/python3', '-I', str(root / 'launch.py'),
++            str(run), 'FRW_TS_CUSTODY_FD'], run, timeout=min(90, budget.check(reserve=2)), qualifier=option)
++        receipt['execution'] = observed
++        receipt['source_evidence'] = evidence_join(run, budget, observed['owner_receipt'], max_evidence_bytes)
++        if {name: digest(run / name) for name in initial} != initial:
++            raise ValueError('original_root_input_bytes_changed')
++        receipt['quality_parent_still_held'] = held(quality_fd)
++        receipt['state'] = 'TRUSTED_TS24_SOURCE_RESULTS_JOINED_ROOT_LOCK_RETURN_PENDING'
++        budget.check()
++        return receipt
++    except BaseException as exc:
++        receipt['failure'] = type(exc).__name__ + ':' + str(exc)
++        receipt['execution'] = getattr(exc, 'observation', receipt.get('execution'))
++        receipt['owner_stop_evidence'] = getattr(exc, 'owner_receipt', None)
++        receipt['state'] = 'STOP_UNCONFIRMED' if isinstance(exc, StopUnconfirmed) else 'SOURCE_QUALIFICATION_FAILED'
++        exc.qualifier_receipt = receipt
++        raise
+--- previous/ts_scope_guard.py
++++ prepared/ts_scope_guard.py
+@@ -0,0 +1,137 @@
++"""NOT_RUN. Host facts BEFORE the single existing bwrap PID namespace.
++
++Executed only by the existing finite foreground scope after independent review.
++No new clock/admission/supervisor, no fallback, no parent lock release. The exact
++effective DSH_SCOPE_GUARD checks are inserted at preparation time below.
++"""
++import fcntl
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++import stat
++import subprocess
++import sys
++import time
++
++p = json.loads(sys.argv[1])
++assert time.monotonic()<p['deadline']
++assert Path('/proc/sys/kernel/random/boot_id').read_text().strip()==p['boot_id']
++line=Path('/proc/self/cgroup').read_text().strip()
++assert line.startswith('0::/') and '\n' not in line
++group=line[3:]; assert group.endswith('/'+p['unit'])
++root=Path('/sys/fs/cgroup')/group.lstrip('/')
++assert root.resolve()==root
++caps={k:(root/k).read_text().strip() for k in ('memory.max','memory.swap.max','cpu.max','pids.max')}
++assert caps['memory.max']==str(p['memory_bytes']) and caps['memory.swap.max']=='0'
++assert caps['pids.max']==str(p['tasks'])
++q,t=caps['cpu.max'].split()
++assert q.isdecimal() and t.isdecimal() and int(t)>0 and int(q)*100==p['cpu_percent']*int(t)
++assert time.monotonic()<p['deadline']
++
++
++def original():
++    assert time.monotonic() + 2 < p['deadline']
++
++
++def held(fd):
++    st = os.fstat(fd)
++    assert (st.st_dev, st.st_ino, st.st_uid, st.st_gid, st.st_nlink,
++            st.st_size, stat.S_IMODE(st.st_mode)) == (2050, 9044963, 1000, 1000, 1, 0, 0o664)
++    text = Path(f'/proc/self/fdinfo/{fd}').read_text()
++    assert any('FLOCK  ADVISORY  WRITE' in line and f'{st.st_ino} ' in line for line in text.splitlines())
++    assert any('FLOCK  ADVISORY  WRITE' in line and f' {p["owner_pid"]} ' in line
++               and f'{st.st_ino} ' in line for line in Path('/proc/locks').read_text().splitlines())
++    return text
++
++
++def sealed(name, raw):
++    fd = os.memfd_create(name, os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)
++    try:
++        view = memoryview(raw)
++        while view:
++            n = os.write(fd, view)
++            if n <= 0: raise ValueError('sealed_observation_short_write')
++            view = view[n:]
++        # Existing Linux ABI policy: these constants are not exported by the
++        # selected CPython. Never modify fcntl globally or accept a writable FD.
++        assert sys.platform == 'linux' and os.uname().machine in ('x86_64', 'aarch64')
++        fcntl.fcntl(fd, 1033, 15)
++        assert fcntl.fcntl(fd, 1034) == 15 and os.fstat(fd).st_nlink == 0
++        os.lseek(fd, 0, os.SEEK_SET)
++        os.set_inheritable(fd, True)
++        return fd
++    except BaseException:
++        os.close(fd)
++        raise
++
++
++original()
++aggregate = Path(p['aggregate_cgroup'])
++assert root.is_relative_to(aggregate) and root != aggregate
++assert [aggregate.stat().st_dev, aggregate.stat().st_ino] == p['aggregate_identity']
++assert {k: (aggregate / k).read_text().strip() for k in p['aggregate_caps']} == p['aggregate_caps']
++owner_stat = Path(f'/proc/{p["owner_pid"]}/stat').read_text()
++assert int(owner_stat.rsplit(')', 1)[1].split()[19]) == p['owner_birth']
++assert os.getpid() == os.getpgrp() and os.getsid(0) == os.getpid()
++assert 0 < len(os.sched_getaffinity(0)) <= 2
++lock = held(p['quality_fd'])
++assert (root / 'memory.oom.group').read_text().strip() == '1'
++query = subprocess.run(['/usr/bin/systemctl', '--user', 'show', p['unit'],
++    '--property=Id,LoadState,ActiveState,ControlGroup,InvocationID'],
++    check=True, capture_output=True, text=True, timeout=min(1, p['deadline'] - time.monotonic()))
++props = dict(line.split('=', 1) for line in query.stdout.strip().splitlines())
++assert props['Id'] == p['unit'] and props['LoadState'] == 'loaded'
++assert props['ActiveState'] == 'active' and props['ControlGroup'] == group
++assert re.fullmatch('[0-9a-f]{32}', props['InvocationID'])
++snapshot = {key: p[key] for key in ('unit', 'tasks', 'owner_pid', 'owner_birth',
++             'boot_id', 'deadline', 'quality_fd')}
++snapshot.update(invocation=props['InvocationID'], control_group=group,
++    cgroup=str(root), cgroup_identity=[root.stat().st_dev, root.stat().st_ino],
++    caps=caps, affinity=sorted(os.sched_getaffinity(0)),
++    host_namespace_inodes={n: Path('/proc/self/ns/' + n).stat().st_ino for n in ('pid', 'mnt', 'net')},
++    scope_pid=os.getpid(), scope_birth=int(Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]),
++    quality_fdinfo=lock, aggregate_cgroup=p['aggregate_cgroup'],
++    aggregate_identity=p['aggregate_identity'], aggregate_caps=p['aggregate_caps'], runtimeGrant=False)
++metadata = json.dumps(snapshot, sort_keys=True).encode()
++assert len(metadata) <= 4096
++assert os.write(p['scope_observation_fd'], metadata) == len(metadata)
++os.close(p['scope_observation_fd'])  # Payload never owns this evidence writer.
++custody = sealed('frw-ts-host-scope-observation', metadata)
++
++mount_ref = p['mounts']; raw = Path(mount_ref['path']).read_bytes()
++assert hashlib.sha256(raw).hexdigest() == mount_ref['sha256']
++mount = json.loads(raw)
++args = ['--json-status-fd', str(p['native_status_fd']), '--unshare-pid',
++    '--die-with-parent', '--new-session', '--as-pid-1', '--unshare-net',
++    '--unshare-ipc', '--unshare-uts', '--tmpfs', '/']
++files = set(mount['support_files']) | set(mount['ro_files'])
++links = dict(mount['support_links'], **mount['links'])
++ro_roots = mount['ro_roots']
++assert ro_roots == [p['ts_root'], '/usr/lib/python3.14']
++destinations = set(files) | set(ro_roots) | set(links) | {str(root), p['run'], '/dev', '/proc'}
++directories = {'/sys', '/sys/fs', '/sys/fs/cgroup', '/usr', '/usr/lib', '/usr/lib64'}
++for item in destinations:
++    q = Path(item)
++    assert q.is_absolute() and '..' not in q.parts
++    directories.update(str(parent) for parent in q.parents if str(parent) != '/')
++for directory in sorted(directories, key=lambda value: (value.count('/'), value)):
++    # Never create a directory on top of a deliberately selected link.
++    if directory not in links: args += ['--dir', directory]
++for source in ro_roots: args += ['--ro-bind', source, source]
++for source in sorted(files):
++    if not any(Path(source).is_relative_to(Path(q)) for q in ro_roots):
++        args += ['--ro-bind', source, source]
++for link, target in sorted(links.items()): args += ['--symlink', target, link]
++args += ['--ro-bind', str(root), str(root), '--bind', p['run'], p['run'],
++         '--dev', '/dev', '--proc', '/proc', '--remount-ro', '/', '--']
++command = sys.argv[2:]
++assert command[-1] == 'FRW_TS_CUSTODY_FD'
++command[-1] = str(custody)
++args += command
++# Existing bwrap --args accepts NUL-delimited argv through a file descriptor.
++# This avoids ARG_MAX for the complete unpruned support file/link inventory.
++argument_fd = sealed('frw-ts-exact-bwrap-args', b'\0'.join(os.fsencode(a) for a in args) + b'\0')
++original(); held(p['quality_fd'])
++os.execve('/usr/bin/bwrap', ['/usr/bin/bwrap', '--args', str(argument_fd)], dict(os.environ))

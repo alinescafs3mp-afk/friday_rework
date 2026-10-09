@@ -1,0 +1,151 @@
+"""One-shot descriptor provenance for this trusted, finite data runner only.
+
+This is not a hostile-code sandbox. An exclusive os.open in the private RUN
+mints a permit; the very next open event must consume it. Descriptor close,
+replacement and range-close invalidate it. No descriptor is duplicated here.
+"""
+from pathlib import Path
+import fcntl
+import os
+import stat
+
+
+class PrivatePublicationFD:
+    FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+
+    def __init__(self, root):
+        self.root = Path(root)
+        self.pending = {}
+        self.live = {}
+        self.admitted = 0
+        self.original_open = os.open
+        self.original_close = os.close
+        self.original_closerange = os.closerange
+        self.original_dup = os.dup
+        self.original_dup2 = os.dup2
+
+    @staticmethod
+    def identity(info):
+        return (info.st_dev, info.st_ino, info.st_uid, info.st_gid,
+                info.st_mode, info.st_nlink, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns)
+
+    def private_path(self, path):
+        if not path.is_absolute() or not path.is_relative_to(self.root):
+            return False
+        if path.name != 'classification-review.json' or path.parent.name != 'collect-native':
+            return False
+        if path.resolve(strict=True) != path:
+            return False
+        parent = path.parent
+        while parent.is_relative_to(self.root):
+            info = parent.lstat()
+            if not (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                    and stat.S_IMODE(info.st_mode) == 0o700):
+                return False
+            if parent == self.root:
+                return True
+            parent = parent.parent
+        return False
+
+    def verified(self, descriptor, path, expected=None):
+        try:
+            info = os.fstat(descriptor)
+            identity = self.identity(info)
+            flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+            return (self.private_path(path) and stat.S_ISREG(info.st_mode)
+                    and info.st_uid == os.getuid() and info.st_nlink == 1
+                    and stat.S_IMODE(info.st_mode) == 0o400 and info.st_size == 0
+                    and (flags & os.O_ACCMODE) == os.O_WRONLY
+                    and not (flags & os.O_APPEND) and not os.get_inheritable(descriptor)
+                    and self.identity(path.lstat()) == identity
+                    and os.readlink('/proc/self/fd/' + str(descriptor)) == str(path)
+                    and (expected is None or identity == expected))
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def open(self, path, flags, mode=0o777, *, dir_fd=None):
+        # The unchanged audit hook first authorizes the path and invalidates all
+        # older permits. Only a successful, exact exclusive creation mints one.
+        descriptor = self.original_open(path, flags, mode, dir_fd=dir_fd)
+        self.pending.pop(descriptor, None)
+        self.live.pop(descriptor, None)
+        if dir_fd is None and flags == self.FLAGS and mode == 0o400:
+            target = Path(os.fsdecode(path))
+            if self.verified(descriptor, target):
+                identity = self.identity(os.fstat(descriptor))
+                self.pending[descriptor] = (target, identity)
+                self.live[descriptor] = (target, identity[:2])
+        return descriptor
+
+    def admit_open(self, raw, mode, flags):
+        # Called for EVERY open, including reads, before existing path policy.
+        # A reopened fd number/inode therefore cannot inherit an old permit.
+        permit = self.pending.get(raw) if type(raw) is int else None
+        self.pending.clear()
+        if type(raw) is not int:
+            return False
+        if raw in (1, 2):
+            return True  # Preserve the existing stdout/stderr exception.
+        if permit is None or mode not in ('w', 'wb') or (flags & os.O_ACCMODE) != os.O_WRONLY:
+            return False
+        target, identity = permit
+        accepted = self.verified(raw, target, identity)
+        if accepted:
+            self.admitted += 1
+        return accepted
+
+    def close(self, descriptor):
+        self.pending.pop(descriptor, None)
+        self.live.pop(descriptor, None)
+        return self.original_close(descriptor)
+
+    def closerange(self, low, high):
+        for descriptor in tuple(self.pending):
+            if low <= descriptor < high:
+                self.pending.pop(descriptor)
+        for descriptor in tuple(self.live):
+            if low <= descriptor < high:
+                self.live.pop(descriptor)
+        return self.original_closerange(low, high)
+
+    def dup(self, descriptor):
+        self.pending.clear()
+        target = self.original_dup(descriptor)
+        self.live.pop(target, None)
+        if descriptor in self.live:
+            self.live[target] = self.live[descriptor]
+        return target
+
+    def dup2(self, descriptor, target, inheritable=True):
+        # An alias/replacement never receives publication provenance. Track
+        # known aliases only to make their accidental leaks a terminal failure.
+        self.pending.clear()
+        result = self.original_dup2(descriptor, target, inheritable=inheritable)
+        binding = self.live.get(descriptor)
+        self.live.pop(target, None)
+        if binding is not None:
+            self.live[target] = binding
+        return result
+
+    def leaks(self):
+        # Exact known publication descriptors only; no global absence claim.
+        found = []
+        for descriptor, (path, identity) in tuple(self.live.items()):
+            try:
+                info = os.fstat(descriptor)
+                if (info.st_dev, info.st_ino) == identity:
+                    found.append({'fd': descriptor, 'path': str(path)})
+                    continue
+            except OSError:
+                pass
+            self.live.pop(descriptor, None)
+            self.pending.pop(descriptor, None)
+        return found
+
+    def install(self):
+        os.open = self.open
+        os.close = self.close
+        os.closerange = self.closerange
+        os.dup = self.dup
+        os.dup2 = self.dup2

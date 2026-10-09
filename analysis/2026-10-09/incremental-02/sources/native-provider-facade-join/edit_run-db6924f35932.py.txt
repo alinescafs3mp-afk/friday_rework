@@ -1,0 +1,125 @@
+from pathlib import Path
+p=Path('<ASTRA_WORK>/native-provider-facade-join/candidate/project/scripts/dsh_prepare.py')
+s=p.read_text()
+s=s.replace('import re\n','import re\nimport selectors\n')
+s=s.replace('def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None, pass_fds=()):', '''def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None, pass_fds=(),
+        owned_preparation=None, input_bytes=None):''')
+s=s.replace('    if argv[0] == "git":\n', '''    if owned_preparation is not None:
+        # Same finite installer command path, with stricter native-owner custody.
+        # No namespace/worker/manager is created by this preparation command.
+        if pass_fds or log is not None or not env or input_bytes is None:
+            raise ValueError('owned_preparation_exact_io_required')
+        return _run_owned_preparation(argv, donor, env, timeout, deadline,
+                                      input_bytes, owned_preparation)
+    if input_bytes is not None:
+        raise ValueError('preparation_input_requires_original_owner')
+    if argv[0] == "git":
+''',1)
+pos=s.index('\ndef locked_source(')
+s=s[:pos]+'''
+def _run_owned_preparation(argv, cwd, env, timeout, deadline, data, owner):
+    """Bound actual bytes and retain/reap this finite SDK process on every exit.
+
+    `owner` is the already verified FileOwner facade, never an input JSON object.
+    Cancel checks are synchronous while this exact command is active. Cleanup
+    consumes its original deadline. The registry worker is a DIFFERENT Popen.
+    """
+    import math
+    if (type(data) is not bytes or not 0 < len(data) <= 32768 or
+            type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0 or
+            type(deadline) not in (int, float) or not math.isfinite(deadline)):
+        raise ValueError('invalid_owned_preparation_bounds')
+    start = time.monotonic()
+    end = min(start + timeout, deadline - 0.25)
+    if end <= start:
+        raise ValueError('owned_preparation_budget_exhausted')
+    owner.guard()
+    process = None
+    streams = selectors.DefaultSelector()
+    output = {'stdout': bytearray(), 'stderr': bytearray()}
+    limits = {'stdout': 65536, 'stderr': 4096}
+    failed = None
+    sent = 0
+    try:
+        process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
+            pass_fds=(), start_new_session=True, bufsize=0)
+        owner.retain(process)  # Retain handle before any fallible observation/IO.
+        for stream, label, event in ((process.stdin, 'stdin', selectors.EVENT_WRITE),
+                (process.stdout, 'stdout', selectors.EVENT_READ),
+                (process.stderr, 'stderr', selectors.EVENT_READ)):
+            os.set_blocking(stream.fileno(), False)
+            streams.register(stream, event, label)
+        while streams.get_map():
+            owner.guard()
+            left = end - time.monotonic()
+            if left <= 0:
+                raise TimeoutError('owned_preparation_deadline')
+            for key, _ in streams.select(min(left, 0.05)):
+                stream, label = key.fileobj, key.data
+                if label == 'stdin':
+                    try:
+                        sent += os.write(stream.fileno(), data[sent:sent + 8192])
+                    except BlockingIOError:
+                        continue
+                    if sent == len(data):
+                        streams.unregister(stream)
+                        stream.close()
+                else:
+                    try:
+                        part = os.read(stream.fileno(), min(8192, limits[label] + 1 - len(output[label])))
+                    except BlockingIOError:
+                        continue
+                    output[label].extend(part)
+                    if len(output[label]) > limits[label]:
+                        raise ValueError('owned_preparation_' + label + '_overflow')
+                    if not part:
+                        streams.unregister(stream)
+                        stream.close()
+        owner.guard()
+        process.wait(timeout=max(0.001, end - time.monotonic()))
+        if time.monotonic() >= end or process.returncode != 0 or output['stderr']:
+            raise ValueError('owned_preparation_failed_or_late')
+    except BaseException as error:
+        failed = error
+        owner.fence()  # In-memory stop remains set even if durable write fails.
+    finally:
+        streams.close()
+        if process is not None:
+            # On uncertain/failing command kill the whole command group even
+            # when its leader exited. The enclosing native unit keeps custody.
+            if failed is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError as error:
+                    failed = error
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+            try:
+                if process.returncode is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, 0)
+                    process.wait(timeout=remaining)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                owner.fence()
+                raise StopUnconfirmed('STOP_UNCONFIRMED: original SDK command not reaped') from error
+            finally:
+                owner.record(process, {
+                    'stdout_bytes': len(output['stdout']), 'stderr_bytes': len(output['stderr']),
+                    'stdout_sha256': hashlib.sha256(output['stdout']).hexdigest(),
+                    'stderr_sha256': hashlib.sha256(output['stderr']).hexdigest(),
+                    'returncode': process.returncode, 'reaped': process.returncode is not None,
+                    'elapsed_seconds': time.monotonic() - start,
+                    'state': 'REFUSED' if failed is not None else 'PREPARED_NOT_ADMITTED'})
+    if failed is not None:
+        raise RuntimeError('owned_sdk_preparation_refused') from failed
+    owner.guard()
+    return bytes(output['stdout']), {'reaped': True, 'pid': process.pid,
+                                    'runtimeGrant': False}
+
+''' + s[pos:]
+p.write_text(s)

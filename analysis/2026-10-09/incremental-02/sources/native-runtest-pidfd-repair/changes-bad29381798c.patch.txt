@@ -1,0 +1,323 @@
+--- a/donor/tools/process_registry.py
++++ b/donor/tools/process_registry.py
+@@ -570,6 +570,9 @@
+     runtest_pgid: Optional[int] = None
+     runtest_sid: Optional[int] = None
+     runtest_persistence_error: str = ""
++    runtest_pidfd_error: str = ""
++    # Live descriptor only: never checkpoint an FD number or reopen a recovered PID.
++    _runtest_pidfd: Optional[int] = field(default=None, repr=False)
+     runtest_outer: Optional[dict] = None
+     runtest_outer_closed: Optional[dict] = None
+     web_tool_call_id: str = ""
+@@ -682,7 +685,7 @@
+ # Session fields persisted verbatim in the crash-recovery checkpoint (plus
+ # ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
+ _CHECKPOINT_FIELDS = (
+-    "runtest_custody", "runtest_unit", "runtest_deadline", "runtest_boot_id", "runtest_stop_requested", "runtest_launch_pending", "runtest_pgid", "runtest_sid", "runtest_persistence_error", "runtest_outer", "runtest_outer_closed",
++    "runtest_custody", "runtest_unit", "runtest_deadline", "runtest_boot_id", "runtest_stop_requested", "runtest_launch_pending", "runtest_pgid", "runtest_sid", "runtest_persistence_error", "runtest_pidfd_error", "runtest_outer", "runtest_outer_closed",
+     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "wsl_chain", "cwd",
+     "started_at", "task_id", "owner_task_id", "session_key",
+     "browser_custody", "browser_identity", "browser_task_key", "browser_session_name",
+@@ -1320,7 +1323,7 @@
+                 if len(matches) != 1 or any(matches[0].get(k) != getattr(session, k) for k in
+                         ('runtest_custody', 'runtest_unit', 'runtest_deadline', 'runtest_boot_id',
+                          'runtest_stop_requested', 'runtest_launch_pending', 'runtest_pgid', 'runtest_sid',
+-                         'runtest_persistence_error', 'runtest_outer', 'runtest_outer_closed',
++                         'runtest_persistence_error', 'runtest_pidfd_error', 'runtest_outer', 'runtest_outer_closed',
+                          'task_id', 'owner_task_id', 'session_key', 'pid', 'host_start_time')):
+                     raise RuntimeError('RUNTEST_CUSTODY_CHECKPOINT_UNCONFIRMED')
+             except BaseException as error:
+@@ -1356,72 +1359,170 @@
+         self._runtest_checkpoint(session)
+         return session
+ 
++    @staticmethod
++    def _require_runtest_pidfd_acquisition():
++        """Dedicated finite native owner only; never the general donor spawn path.
++
++        pidfd_open on a child that exited already is safe only while the zombie
++        cannot be reaped. The pinned CPython 3.14.7 HAVE_SIGACTION build resets
++        sa_flags to SA_ONSTACK (without SA_NOCLDWAIT) in PyOS_setsig. Reasserting
++        an already-default SIGCHLD therefore clears inherited no-zombie flags.
++        A lone main thread, no reaping signal handler and no wait/poll between
++        Popen and pidfd_open leave that child unreaped until the donor gets it.
++        The final interpreter/import review must establish that no hidden native
++        reaper or trace/audit callback is installed; this is not an arbitrary
++        multi-threaded registry capability or a replacement for that review.
++        """
++        import sys
++        if (not _IS_LINUX or sys.implementation.name != 'cpython' or
++                sys.version_info[:3] != (3, 14, 7) or
++                not callable(getattr(os, 'pidfd_open', None)) or
++                not callable(getattr(signal, 'pidfd_send_signal', None))):
++            raise RuntimeError('RUNTEST_PINNED_NATIVE_PIDFD_UNAVAILABLE')
++        if (threading.current_thread() is not threading.main_thread() or
++                len(list(Path('/proc/self/task').iterdir())) != 1 or
++                sys.gettrace() is not None or sys.getprofile() is not None):
++            raise RuntimeError('RUNTEST_SINGLE_MAIN_REAPER_REQUIRED')
++        if (signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL or
++                signal.getsignal(signal.SIGINT) not in (signal.SIG_DFL, signal.default_int_handler)):
++            raise RuntimeError('RUNTEST_SIGNAL_REAPER_NOT_QUALIFIED')
++        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
++        status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines())
++        child_bit = 1 << (signal.SIGCHLD - 1)
++        allowed_caught = (1 << (signal.SIGINT - 1)
++                          if signal.getsignal(signal.SIGINT) == signal.default_int_handler else 0)
++        if (signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL or
++                int(status['SigIgn'], 16) & child_bit or
++                int(status['SigCgt'], 16) != allowed_caught or
++                len(list(Path('/proc/self/task').iterdir())) != 1):
++            raise RuntimeError('RUNTEST_SIGNAL_DEFAULT_READBACK_UNCONFIRMED')
++
+     def spawn_runtest(self, session, argv, popen_kwargs, *, native_owner):
+-        """Transfer the actual handle to the sole donor BEFORE fallible setup.
+-
+-        Reservation was durable before Popen. The caller's donor try/finally
+-        already covers this callback; its retained_handle callback can recover
+-        session.process if an exception interrupts return. No second Popen.
++        """Pin the actual child before transferring it to the sole donor waiter.
++
++        Native whole-cgroup custody already exists before this callback. Retain
++        the Popen first, then acquire its pidfd with no intervening reap. Failures
++        consume the launch and leave that same handle for the donor's finally;
++        missing pidfd never authorizes numeric-PID cleanup or a second Popen.
+         """
+-        native_owner.require_current(session.runtest_outer)
++        try:
++            with session._lock:
++                if (not session.runtest_custody or session.detached or
++                        not session.runtest_launch_pending or session.process is not None or
++                        session._runtest_pidfd is not None or session.runtest_stop_requested or
++                        session.runtest_persistence_error or session.runtest_pidfd_error or
++                        time.monotonic() >= session.runtest_deadline or
++                        Path('/proc/sys/kernel/random/boot_id').read_text().strip() != session.runtest_boot_id):
++                    raise RuntimeError('RUNTEST_SPAWN_FENCED_NO_RETRY')
++                # Consume even a failed preflight/Popen attempt; recovery also
++                # fences every retained reservation, including a PID-less row.
++                session.runtest_launch_pending = False
++                native_owner.require_current(session.runtest_outer)
++                if popen_kwargs.get('start_new_session') is not True or str(popen_kwargs.get('cwd')) != session.cwd:
++                    raise RuntimeError('EXACT_DONOR_SID_AND_CWD_REQUIRED')
++                self._require_runtest_pidfd_acquisition()
++                if session.runtest_stop_requested or time.monotonic() >= session.runtest_deadline:
++                    raise RuntimeError('RUNTEST_STOPPED_BEFORE_POPEN_NO_RETRY')
++                session.process = subprocess.Popen(argv, **popen_kwargs)
++                session.pid = session.process.pid
++                session._runtest_pidfd = os.pidfd_open(session.pid, 0)
++                if os.get_inheritable(session._runtest_pidfd):
++                    raise RuntimeError('RUNTEST_PIDFD_CLOEXEC_REQUIRED')
++                if session.runtest_stop_requested or time.monotonic() >= session.runtest_deadline:
++                    raise RuntimeError('RUNTEST_STOPPED_DURING_SPAWN_NO_RETRY')
++                return session.process
++        except BaseException as error:
++            with session._lock:
++                session.runtest_stop_requested = True
++                if not session.runtest_pidfd_error:
++                    session.runtest_pidfd_error = 'spawn:' + type(error).__name__
++            # No diagnostic error can replace/lose the handle or retry launch.
++            try:
++                self._runtest_checkpoint(session)
++            except BaseException:
++                pass  # _runtest_checkpoint already retains the persistence error.
++            raise
++
++    def attach_runtest(self, session, proc):
++        """Record identity after pidfd acquisition; donor has not waited yet."""
++        try:
++            with session._lock:
++                if (session.process is not proc or proc.pid != session.pid or session.runtest_launch_pending or
++                        session._runtest_pidfd is None or session.runtest_stop_requested or session.runtest_pidfd_error):
++                    raise RuntimeError('FOREIGN_OR_UNPINNED_RUNTEST_HANDLE')
++                session.host_start_time = self._safe_host_start_time(proc.pid)
++                session.runtest_pgid = os.getpgid(proc.pid)
++                session.runtest_sid = os.getsid(proc.pid)
++                if (session.runtest_pgid != proc.pid or session.runtest_sid != proc.pid or
++                        session.host_start_time is None):
++                    raise RuntimeError('RUNTEST_NATIVE_IDENTITY_UNCONFIRMED')
++            self._runtest_checkpoint(session)
++        except BaseException:
++            # getpgid/getsid/start-tick and strict checkpoint failures all leave
++            # the acquired pidfd and actual Popen with the same donor finally.
++            session.runtest_stop_requested = True
++            raise
++
++    def stop_runtest(self, session, *, source='process.kill'):
++        # Latch before waiting for the acquisition/close lock. A stop arriving
++        # during Popen cannot be erased by its return or an attach/checkpoint.
++        session.runtest_stop_requested = True
++        result = {'status': 'STOP_UNCONFIRMED', 'session_id': session.id, 'source': source,
++                  'persistence_error': session.runtest_persistence_error,
++                  'native_whole_cgroup_closure_required': True}
+         with session._lock:
+-            if (not session.runtest_custody or not session.runtest_launch_pending or session.process is not None or
+-                session.runtest_stop_requested or session.runtest_persistence_error or
+-                time.monotonic() >= session.runtest_deadline or
+-                Path('/proc/sys/kernel/random/boot_id').read_text().strip() != session.runtest_boot_id):
+-                raise RuntimeError('RUNTEST_SPAWN_FENCED_NO_RETRY')
+-            if popen_kwargs.get('start_new_session') is not True or str(popen_kwargs.get('cwd')) != session.cwd:
+-                raise RuntimeError('EXACT_DONOR_SID_AND_CWD_REQUIRED')
+-            proc = subprocess.Popen(argv, **popen_kwargs)
+-            session.process = proc
+-            session.pid = proc.pid
+-            session.runtest_launch_pending = False
+-            return proc
+-
+-    def attach_runtest(self, session, proc):
+-        """Fallible identity/checkpoint setup AFTER donor has the actual handle."""
+-        with session._lock:
+-            if session.process is not proc or proc.pid != session.pid or session.runtest_launch_pending:
+-                raise RuntimeError('FOREIGN_RUNTEST_HANDLE')
+-            session.host_start_time = self._safe_host_start_time(proc.pid)
+-            session.runtest_pgid = os.getpgid(proc.pid)
+-            session.runtest_sid = os.getsid(proc.pid)
+-            if (session.runtest_pgid != proc.pid or session.runtest_sid != proc.pid or
+-                    session.host_start_time is None):
+-                session.runtest_stop_requested = True
+-                raise RuntimeError('RUNTEST_NATIVE_IDENTITY_UNCONFIRMED')
+-        self._runtest_checkpoint(session)
+-
+-    def stop_runtest(self, session, *, source='process.kill'):
+-        # Immediate in-memory intent and identity-safe termination precede ANY
+-        # diagnostic I/O. Checkpoint failure must not delay the requested stop.
+-        # This existing stop has a separate pidfd review prerequisite; we never
+-        # weaken identity checks or turn a termination request into cessation.
+-        with session._lock:
+-            session.runtest_stop_requested = True
+-            pending = session.runtest_launch_pending
+-            pid, born = session.pid, session.host_start_time
+-        result = {'status': 'STOP_UNCONFIRMED', 'session_id': session.id, 'source': source,
+-                  'persistence_error': session.runtest_persistence_error}
+-        if pending or pid is None or born is None:
+-            result['reason'] = 'RESERVED_OR_UNCONFIRMED_SPAWN_RETAINED_NO_RETRY'
+-        elif session.runtest_deadline - time.monotonic() <= 2 * self._daemon_term_grace_seconds() + 1:
+-            result['reason'] = 'OWNER_NATIVE_HARD_DEADLINE_CUSTODY_REQUIRED'
+-        else:
+-            try:
+-                self._terminate_host_pid(pid, born)
+-                result['termination_attempted'] = True
+-            except BaseException as error:
+-                result['termination_error'] = type(error).__name__
++            if (not session.runtest_custody or session.detached or
++                    session.process is None or session._runtest_pidfd is None):
++                result['reason'] = 'NO_LIVE_PIDFD_RETAIN_NATIVE_OWNER_NO_NUMERIC_FALLBACK'
++            else:
++                try:
++                    # Abort only this actual child; no PID/start-time TOCTOU,
++                    # descendant walk, wait/poll, grace sleep or numeric signal.
++                    # FD close uses this same lock, so it cannot be reused here.
++                    signal.pidfd_send_signal(session._runtest_pidfd, signal.SIGKILL, None, 0)
++                    result['termination_attempted'] = True
++                except ProcessLookupError:
++                    result['termination_attempted'] = True
++                    result['root_already_exited'] = True
++                except BaseException as error:
++                    result['termination_error'] = type(error).__name__
++                    if not session.runtest_pidfd_error:
++                        session.runtest_pidfd_error = 'signal:' + type(error).__name__
+         try:
+             self._runtest_checkpoint(session)
+         except BaseException as error:
+             result['persistence_error'] = type(error).__name__
++        result['persistence_error'] = session.runtest_persistence_error or result['persistence_error']
+         if result.get('termination_attempted') and not result['persistence_error']:
+             result['status'] = 'STOP_REQUESTED'
+-        # Donor alone drains/waits; independent whole SID/PGID and outer
+-        # closure remain mandatory before registry/capacity release.
++        result['pidfd_error'] = session.runtest_pidfd_error
++        # This status records only root signal intent, never tree cessation.
++        # Donor alone drains/reaps; the native owner retains all descendants and
++        # the original hard deadline, even when a root pidfd reports ESRCH.
+         return result
++
++    def release_runtest_pidfd(self, session, proc):
++        """Close once after the SOLE donor's wait, before fallible diagnostics.
++
++        Unreaped failures retain the FD until that donor later reaps or the
++        finite native owner exits (kernel closes its FDs). Recovery never owns
++        an inherited descriptor and must use actual native outer closure.
++        """
++        with session._lock:
++            if proc is not session.process or proc is None:
++                raise RuntimeError('FOREIGN_RUNTEST_REAP_HANDLE')
++            if proc.returncode is None or session._runtest_pidfd is None:
++                return
++            fd, session._runtest_pidfd = session._runtest_pidfd, None
++            try:
++                os.close(fd)
++            except BaseException as error:
++                # Linux releases the fd early even on most close errors. Never
++                # retry a numeric fd that may already identify a different file.
++                session.runtest_stop_requested = True
++                if not session.runtest_pidfd_error:
++                    session.runtest_pidfd_error = 'close:' + type(error).__name__
++                raise
+ 
+     def finish_runtest(self, session, *, native_owner, returncode=None):
+         """Settle the original durable handle, including PID-less recovery.
+@@ -1439,6 +1540,8 @@
+         if proc is not None and returncode != proc.returncode:
+             raise RuntimeError('ACTUAL_DONOR_EXIT_CHANGED')
+         proof = native_owner.closure_for(session)
++        if proc is not None:
++            self.release_runtest_pidfd(session, proc)
+         # Durable closure precedes release. Historical errors/pending flags stay.
+         session.runtest_outer_closed = dict(proof, returncode=returncode)
+         session.runtest_stop_requested = True
+--- a/donor/tools/process_registry_checkpoint.py
++++ b/donor/tools/process_registry_checkpoint.py
+@@ -34,7 +34,10 @@
+                     for s in self._running.values():
+                         if s.exited:
+                             continue
+-                        if s.host_start_time is None and s.pid_scope == "host" and s.pid:
++                        # Runtest identity is captured only before the donor reaps.
++                        # Recovery must not fill it from a possibly recycled PID.
++                        if (not s.runtest_custody and s.host_start_time is None
++                                and s.pid_scope == "host" and s.pid):
+                             s.host_start_time = self._safe_host_start_time(s.pid)
+                         entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
+                         entry["command"] = redact_sensitive_text(s.command, code_file=True)
+--- a/owner-helper/owner_observer.py
++++ b/owner-helper/owner_observer.py
+@@ -909,8 +909,9 @@
+         kwargs['env'] = temp_api['clean_environment'](run, clock=clock)
+         kwargs['stdin'] = donor['subprocess'].DEVNULL
+         kwargs['close_fds'] = True
+-        # No stat, checkpoint or backend write after Popen in this callback.
+-        # The donor receives the actual handle before after_spawn may fail.
++        # Registry retains the actual handle and acquires a native pidfd before
++        # return; its failure path is covered by donor retained_handle/finally.
++        # Identity/checkpoint/backend writes may still fail after transfer.
+         return registry.spawn_runtest(session, before['argv'], kwargs, native_owner=native_owner)
+     def after_spawn(proc):
+         holder['proc'] = proc
+@@ -927,12 +928,18 @@
+             'phase_clock_sha256': before['phase_clock_sha256'], 'native_outer': session.runtest_outer})
+     def capture(proc, output, error, cuts):
+         require(proc is session.process, 'FOREIGN_DONOR_OUTPUT')
+-        session.append_output(output)
+-        holder['proc'] = proc
++        # Keep output before fallible diagnostics/FD close. Root reap and local
++        # fd release do not release registry or native whole-cgroup custody.
++        try:
++            session.append_output(output)
++            holder['proc'] = proc
++        finally:
++            registry.release_runtest_pidfd(session, proc)
+         put(parent / 'runtest-drain.json', {'session_id': session.id, 'pid': proc.pid,
+             'exit_code': proc.returncode, 'output': output,
+             'primary_error': type(error).__name__ if error is not None else None,
+             'cleanup_errors': list(cuts), 'registry_persistence_error': session.runtest_persistence_error,
++            'registry_pidfd_error': session.runtest_pidfd_error,
+             'sole_drainer': 'donor communicate', 'reaped': proc.returncode is not None,
+             'runtime_or_product_accepted': False})
+     def stop(proc, pgid):
+@@ -946,6 +953,7 @@
+     def settle(proc, pgid, temproot):
+         require(temproot == str(temp_api['verify_donor_temporary_root'](clock)), 'FOREIGN_DONOR_TEMP_SETTLEMENT')
+         require(proc is session.process and pgid == session.runtest_pgid, 'FOREIGN_DONOR_SETTLEMENT')
++        require(not session.runtest_pidfd_error, 'RUNTEST_PIDFD_FAILURE_RETAINED_NO_ACCEPTANCE')
+         require(proc.returncode is not None, 'DONOR_NOT_REAPED')
+         require(type(session.pid) is int and session.pid == proc.pid and
+                 type(session.host_start_time) is int and session.host_start_time > 0 and

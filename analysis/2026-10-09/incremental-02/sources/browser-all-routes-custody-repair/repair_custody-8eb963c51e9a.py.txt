@@ -1,0 +1,223 @@
+"""Source transformation only: retain original Popen under existing session custody."""
+from pathlib import Path
+W = Path(__file__).parent
+C = W / 'candidate/native/tools'
+p = C / 'browser_tool_session.py'
+s = p.read_text()
+s = s.replace('stdin_payload: Optional[bytes] = None, *, deadline=None, managed_required=False) -> "subprocess.Popen":',
+'''stdin_payload: Optional[bytes] = None, *, deadline=None, managed_required=False,
+                         task_id=None, session_info=None) -> "subprocess.Popen":''', 1)
+old = '''        return subprocess.Popen(argv, stdout=fds[0], stderr=fds[1], stdin=stdin, env=env, **_popen_extra)'''
+new = '''        if not managed:
+            return subprocess.Popen(argv, stdout=fds[0], stderr=fds[1], stdin=stdin, env=env, **_popen_extra)
+        # Prepare the record before creation, and publish the exact child into
+        # its existing session before closing fds or returning to any caller.
+        # A Popen object owns waitpid for this child; no numeric PID is adopted.
+        custody = {
+            'proc': None, 'pid': None, 'task_id': task_id,
+            'session_name': session_info['session_name'], 'deadline': deadline,
+            'output_paths': tuple(os.path.join(socket_dir, f'_{slot}_{tag}')
+                                  for slot in ('stdout', 'stderr')),
+            'wait_confirmed': False, 'errors': [],
+        }
+        with _bt._cleanup_lock:
+            _require_managed_client_slot(task_id, session_info)
+            check_managed_execution(deadline)
+            session_info['_friday_direct_client'] = custody
+            try:
+                proc = subprocess.Popen(argv, stdout=fds[0], stderr=fds[1], stdin=stdin, env=env, **_popen_extra)
+            except BaseException:
+                # Popen did not return an owned child. Existing unresolved
+                # records were refused above and can never be replaced here.
+                session_info.pop('_friday_direct_client')
+                raise
+            custody['proc'] = proc
+            custody['pid'] = proc.pid
+            return proc'''
+assert old in s
+s = s.replace(old, new, 1)
+needle = '''    if managed:
+        check_managed_execution(deadline)
+    fds = [os.open'''
+replacement = '''    if managed:
+        check_managed_execution(deadline)
+        _check_session_authority(task_id, session_info)
+        with _bt._cleanup_lock:
+            _require_managed_client_slot(task_id, session_info)
+    fds = [os.open'''
+assert needle in s
+s = s.replace(needle, replacement, 1)
+start = s.index('\ndef _session_record(')
+s = s[:start] + '''
+def _require_managed_client_slot(task_id, session_info):
+    """Called under the existing cleanup lock, before any creation effects."""
+    if (not isinstance(session_info, dict)
+            or _bt._active_sessions.get(task_id) is not session_info
+            or session_info.get('session_key') != task_id
+            or not session_info.get('_friday_managed')):
+        raise PermissionError('browser_original_session_custody_required')
+    if session_info.get('_friday_stop_unconfirmed') or session_info.get('_friday_direct_client') is not None:
+        raise PermissionError('browser_direct_client_custody_unresolved')
+
+
+def _confirm_managed_client_wait(task_id, session_info, proc, returncode):
+    """Record only the result of an actual wait on this exact original child."""
+    with _bt._cleanup_lock:
+        custody = session_info.get('_friday_direct_client')
+        if (_bt._active_sessions.get(task_id) is not session_info or not custody
+                or custody['task_id'] != task_id or custody['proc'] is not proc
+                or custody['pid'] != proc.pid or custody['session_name'] != session_info['session_name']):
+            raise RuntimeError('browser_original_client_custody_changed')
+        if (isinstance(returncode, bool) or not isinstance(returncode, int)
+                or returncode != proc.returncode):
+            raise RuntimeError('browser_actual_client_wait_unconfirmed')
+        custody['wait_confirmed'] = True
+        custody['returncode'] = returncode
+
+
+def _release_waited_managed_client(task_id, session_info, *, diagnostic=False):
+    """No process/cgroup claim: release direct-child custody only after wait."""
+    with _bt._cleanup_lock:
+        custody = session_info.get('_friday_direct_client')
+        if custody is None:
+            return
+        if (_bt._active_sessions.get(task_id) is not session_info
+                or custody['task_id'] != task_id or not custody['wait_confirmed']):
+            raise RuntimeError('browser_actual_client_wait_required')
+        if diagnostic:
+            # Keep files and original failure metadata outside model delivery.
+            # STOP_UNCONFIRMED prevents both replacement and output overwrite.
+            session_info['_friday_client_diagnostics'] = {
+                key: value for key, value in custody.items() if key != 'proc'}
+        session_info.pop('_friday_direct_client')
+
+
+def _reconcile_managed_client(task_id, session_info):
+    """Existing same-session stop path; no fresh identity, owner or grace clock.
+
+    An expired original deadline permits one nonblocking wait(timeout=0), not a
+    new budget. Kill failure cannot skip wait. Every failure retains the exact
+    original Popen and its diagnostic paths for a later same-owner invocation.
+    """
+    with _bt._cleanup_lock:
+        custody = session_info.get('_friday_direct_client')
+        if custody is None:
+            return None
+        if (_bt._active_sessions.get(task_id) is not session_info
+                or custody['task_id'] != task_id
+                or custody['session_name'] != session_info.get('session_name')
+                or custody['proc'] is None or custody['proc'].pid != custody['pid']):
+            raise RuntimeError('browser_original_client_custody_changed')
+        proc = custody['proc']
+        waited = custody['wait_confirmed']
+    if not waited:
+        try:
+            proc.kill()
+        except BaseException as exc:
+            custody['errors'].append('client_stop: ' + type(exc).__name__ + ': ' + str(exc))
+        try:
+            returncode = proc.wait(timeout=max(0.0, min(1.0, custody['deadline'] - time.monotonic())))
+            _confirm_managed_client_wait(task_id, session_info, proc, returncode)
+        except BaseException as exc:
+            custody['errors'].append('client_wait: ' + type(exc).__name__ + ': ' + str(exc))
+    if custody['wait_confirmed']:
+        _release_waited_managed_client(task_id, session_info, diagnostic=True)
+    # Even a successful direct wait proves nothing about forked daemon/Chrome,
+    # listeners or whole scope cessation. The caller retains STOP_UNCONFIRMED.
+    return custody
+
+''' + s[start:]
+# Keep legacy monkeypatch/caller signature intact; pass custody only for managed.
+old = '''proc = _popen_agent_browser(cmd_parts, browser_env, task_socket_dir, command, stdin_payload, deadline=deadline, managed_required=managed)'''
+new = '''proc = _popen_agent_browser(cmd_parts, browser_env, task_socket_dir, command, stdin_payload,
+                                    deadline=deadline, managed_required=managed,
+                                    **({'task_id': task_id, 'session_info': session_info} if managed else {}))'''
+assert old in s
+s = s.replace(old, new, 1)
+s = s.replace('''                    proc.wait(timeout=min(0.25, remaining))
+                    break''', '''                    returncode = proc.wait(timeout=min(0.25, remaining))
+                    _confirm_managed_client_wait(task_id, session_info, proc, returncode)
+                    break''', 1)
+s = s.replace('''            _stop_failed_managed_client(proc, task_id, session_info, deadline, failure)
+            _unlink_command_output_files(stdout_path, stderr_path)
+            raise''', '''            _stop_failed_managed_client(proc, task_id, session_info, deadline, failure)
+            raise''', 1)
+s = s.replace('''            check_managed_execution(deadline)
+        return result
+    except BaseException as failure:''', '''            check_managed_execution(deadline)
+            _release_waited_managed_client(task_id, session_info)
+        return result
+    except BaseException as failure:''', 1)
+s = s.replace('''    finally:
+        _unlink_command_output_files(stdout_path, stderr_path)
+
+
+def _stop_failed_managed_client''', '''    finally:
+        if not managed or not session_info.get('_friday_stop_unconfirmed'):
+            _unlink_command_output_files(stdout_path, stderr_path)
+
+
+def _stop_failed_managed_client''', 1)
+start, end = s.index('def _stop_failed_managed_client('), s.index('\n\ndef run_fenced(')
+s = s[:start] + '''def _stop_failed_managed_client(proc, task_id, session_info, deadline, failure):
+    """Preserve the original refusal and exact task-owned client on every error."""
+    session_info['_friday_stop_unconfirmed'] = True
+    errors = []
+    custody = session_info.get('_friday_direct_client')
+    reconciled = None
+    try:
+        if custody is None or custody['proc'] is not proc or custody['deadline'] != deadline:
+            raise RuntimeError('browser_original_client_custody_changed')
+        custody['failure'] = type(failure).__name__ + ': ' + str(failure)
+        reconciled = _reconcile_managed_client(task_id, session_info)
+        errors.extend(reconciled['errors'])
+    except BaseException as exc:
+        errors.append('client_reconciliation: ' + str(exc))
+    try:
+        _lifecycle._force_reap_browser_session(task_id, _client_reconciled=reconciled)
+    except BaseException as exc:
+        errors.append('native_stop: ' + str(exc))
+    session_info['_friday_stop_error'] = '; '.join(errors) or 'owned_scope_cessation_unavailable'
+    failure.add_note('STOP_UNCONFIRMED: ' + session_info['_friday_stop_error'])
+''' + s[end:]
+p.write_text(s)
+
+p = C / 'browser_tool_lifecycle.py'
+s = p.read_text()
+s = s.replace('def _release_session_resources(task_id: str, session_info: Dict[str, Any]) -> None:',
+              'def _release_session_resources(task_id: str, session_info: Dict[str, Any], *, _client_reconciled=None) -> None:', 1)
+old = '''        try:
+            _stop_retained_managed_daemon(session_info)
+        except Exception as exc:
+            session_info['_friday_stop_error'] = str(exc)
+        else:
+            session_info['_friday_stop_error'] = 'owned_scope_cessation_unavailable'
+        raise RuntimeError('browser_stop_unconfirmed_owned_scope_proof_required: ' + session_info['_friday_stop_error'])'''
+new = '''        errors = []
+        # Reconcile the original client before daemon handling, including when
+        # no daemon ever published a PID. Never adopt a late PID to replace it.
+        pending = session_info.get('_friday_direct_client')
+        if pending is not None and pending is not _client_reconciled:
+            try:
+                reconciled = _session._reconcile_managed_client(task_id, session_info)
+                if reconciled is not None:
+                    errors.extend(reconciled['errors'])
+            except BaseException as exc:
+                errors.append('client_reconciliation: ' + str(exc))
+        try:
+            _stop_retained_managed_daemon(session_info)
+        except BaseException as exc:
+            errors.append('native_stop: ' + str(exc))
+        session_info['_friday_stop_error'] = '; '.join(errors) or 'owned_scope_cessation_unavailable'
+        raise RuntimeError('browser_stop_unconfirmed_owned_scope_proof_required: ' + session_info['_friday_stop_error'])'''
+assert old in s
+s = s.replace(old, new, 1)
+s = s.replace('def _force_reap_browser_session(task_id: str) -> None:',
+              'def _force_reap_browser_session(task_id: str, *, _client_reconciled=None) -> None:', 1)
+s = s.replace('''    if session_info and session_info.get('_friday_managed'):
+        _release_session_resources(task_id, session_info)
+        return''', '''    if session_info and session_info.get('_friday_managed'):
+        _release_session_resources(task_id, session_info, _client_reconciled=_client_reconciled)
+        return''', 1)
+p.write_text(s)
+print('Source custody/reconciliation added to existing session/lifecycle; no execution.')

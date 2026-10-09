@@ -1,0 +1,386 @@
+from test_support import *
+import select, subprocess, time
+from hermes_cli.skill_lock import managed_home_lock, require_skill_lock
+observations={};children=[]
+@contextlib.contextmanager
+def admin():
+ token=us._CURRENT.set(None)
+ try:yield
+ finally:us._CURRENT.reset(token)
+
+def refused_call(*args,**kwargs):
+ try:return call(*args,**kwargs)
+ except (fio.ScopeDenied,RuntimeError) as exc:return {'success':False,'refusal':type(exc).__name__,'message':str(exc)}
+
+def failure(result):
+ assert not result.get('success'),result
+
+def positive_history_batch():
+ with scope('history-batch') as cap:
+  require_success(call('create','alpha',content=content(body='one')))
+  require_success(call('edit','alpha',content=content(body='two')))
+  entry=ledger.list_entries('alpha')[0]['id']
+  assert ledger.rollback_entry(entry)[0]
+  assert 'one' in fio.read_text(cap.home/'skills/alpha/SKILL.md')
+  require_success(call(operations=[{'action':'create','name':'beta','content':content('beta')},{'action':'write_file','name':'alpha','file_path':'references/a.txt','file_content':'support data'}]))
+  before=digest_tree(cap.home)
+  failure(call(operations=[{'action':'patch','name':'alpha','old_string':'one','new_string':'changed'},{'action':'patch','name':'beta','old_string':'not present','new_string':'bad'}]))
+  # Blob CAS may add unreferenced history on aborted native validation; native
+  # visible tree/usage/ledger must stay byte-identical.
+  after=digest_tree(cap.home)
+  assert {k:v for k,v in before.items() if k.startswith('skills/')}=={k:v for k,v in after.items() if k.startswith('skills/')}
+  assert any(e['action']=='rollback' for e in ledger.list_entries('alpha'))
+  assert not list(cap.home.glob('.skills-txn-*'))
+
+
+def concurrent_rollback():
+ with scope('cross-process') as cap:
+  require_success(call('create','alpha',content=content(body='version one')))
+  require_success(call('edit','alpha',content=content(body='version two')))
+  entry=ledger.list_entries('alpha')[0]['id'];base_snapshot=fio._snapshot;fired=False;proc=None
+  def snapshot(path):
+   nonlocal fired,proc
+   result=base_snapshot(path)
+   if fio._TX.get() is not None and not fired:
+    fired=True
+    proc=subprocess.Popen([sys.executable,str(R/'admin_child.py'),str(cap.home),entry],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+    children.append(proc)
+    ready,_,_=select.select([proc.stdout],[],[],10)
+    assert ready,'child did not reach native fence'
+    line=proc.stdout.readline();assert line.startswith('WAIT '),line
+    ready,_,_=select.select([proc.stdout],[],[],0.2)
+    assert not ready and proc.poll() is None,'admin crossed scoped fence'
+    observations['cross_process']={'child_pid':proc.pid,'blocked_after_final_live_snapshot':True}
+   return result
+  fio._snapshot=snapshot
+  try:
+   with fio.transaction():fio.write_text(cap.home/'skills/alpha/SKILL.md',content(body='version three scoped'))
+  finally:fio._snapshot=base_snapshot
+  out,err=proc.communicate(timeout=10)
+  assert proc.returncode==0,(out,err)
+  report=json.loads(out);assert report['result'][0] and report['unscoped'],report
+  after=fio.read_text(cap.home/'skills/alpha/SKILL.md')
+  assert 'version one' in after,after
+  rows=ledger.list_entries('alpha');assert any(r['action']=='rollback' for r in rows),rows
+  safety=next(r for r in rows if r['action']=='pre-rollback')
+  assert any(b'version three scoped' in ledger.read_blob(v['sha256']) for v in safety['before'])
+  observations['cross_process'].update(admin_completed_after_release=True,admin_bytes_and_both_ledger_rows_survived=True,exit_code=proc.returncode)
+
+
+def reentrant_and_unmanaged():
+ with scope('reentrant') as cap:
+  require_success(call('create','alpha',content=content()))
+  with usage.skill_file_lock(cap.home/'skills/.locks/one.lock'):
+   inode=(cap.home/'.skills.lock').stat().st_ino
+   with admin(),usage.skill_file_lock(cap.home/'skills/.locks/two.lock'):
+    require_skill_lock(cap.home)
+    assert (cap.home/'.skills.lock').stat().st_ino==inode
+   assert not (cap.home/'skills/.locks').exists()
+ home=root/'donor';home.mkdir(mode=0o700)
+ with us.authority(home):
+  assert us.current() is None
+  require_success(call('create','donor',content=content('donor')))
+  require_success(call('patch','donor',old_string='Original instructions.',new_string='Donor mutation.'))
+  assert not (home/'.skills.lock').exists()
+  assert (home/'skills/.locks').exists()
+  assert ledger.rollback_entry(ledger.list_entries('donor')[0]['id'])[0]
+  assert 'Original instructions.' in (home/'skills/donor/SKILL.md').read_text()
+
+
+def next_acquire(home):
+ with managed_home_lock(home):pass
+
+def lock_replacement():
+ with scope('lock-replace') as cap:
+  path=cap.home/'.skills.lock'
+  try:
+   with managed_home_lock(cap.home):
+    path.rename(cap.home/'original-lock');path.write_text('')
+  except fio.ScopeDenied:pass
+  else:raise AssertionError('replacement accepted')
+
+
+def staged_precheck():
+ with scope('stage-before-check') as cap:
+  require_success(call('create','alpha',content=content()))
+  verify=fio._verify_materialized;fired=False
+  def mutate(parent,name,*args):
+   nonlocal fired
+   if str(name).startswith('.skills-txn-') and not fired:
+    fired=True
+    path=pathlib.Path(os.readlink('/proc/self/fd/'+str(parent)))/name/'alpha/SKILL.md'
+    path.write_text('INVALID STAGE')
+   return verify(parent,name,*args)
+  fio._verify_materialized=mutate
+  try:failure(refused_call('edit','alpha',content=content(body='expected updated')))
+  finally:fio._verify_materialized=verify
+  assert 'Original instructions.' in fio.read_text(cap.home/'skills/alpha/SKILL.md')
+  retained=list(cap.home.glob('.skills-txn-*'));assert len(retained)==1
+  assert (retained[0]/'alpha/SKILL.md').read_text()=='INVALID STAGE'
+  failure(refused_call('edit','alpha',content=content(body='second attempt')))
+  assert list(cap.home.glob('.skills-txn-*'))==retained
+
+
+def stage_syscall():
+ with scope('stage-at-syscall') as cap:
+  require_success(call('create','alpha',content=content()))
+  cdll=fio.ctypes.CDLL;fired=False
+  class Library:
+   def __init__(self,*a,**k):self.lib=cdll(*a,**k)
+   def __getattr__(self,name):
+    fn=getattr(self.lib,name)
+    class Rename:
+     def __setattr__(self,n,v):setattr(fn,n,v)
+     def __call__(self,a,b,c,d,e):
+      nonlocal fired
+      if not fired:
+       fired=True
+       (pathlib.Path(os.readlink('/proc/self/fd/'+str(a)))/os.fsdecode(b)/'alpha/SKILL.md').write_text('UNVALIDATED HOST SUBSTITUTION')
+      return fn(a,b,c,d,e)
+    return Rename()
+  fio.ctypes.CDLL=Library
+  try:result=refused_call('edit','alpha',content=content(body='expected'))
+  finally:fio.ctypes.CDLL=cdll
+  failure(result)
+  retained=list(cap.home.glob('.skills-txn-*'));assert len(retained)==1
+  assert 'Original instructions.' in (retained[0]/'alpha/SKILL.md').read_text()
+  assert fio.read_text(cap.home/'skills/alpha/SKILL.md')=='UNVALIDATED HOST SUBSTITUTION'
+  observations['stage_syscall']={'false_success_prevented':True,'old_tree_retained':True,'hostile_bytes_temporarily_published':True,'classification':'out-of-bound arbitrary same-UID host injection; postcheck detects, not atomic exclusion'}
+
+
+def cleanup_unknown_precheck():
+ with scope('cleanup-unknown') as cap:
+  require_success(call('create','alpha',content=content()))
+  verify=fio._verify_materialized;seen=False
+  def mutate(parent,name,*args):
+   nonlocal seen
+   if str(name).startswith('.skills-txn-') and fio._TX.get().published and not seen:
+    seen=True
+    path=pathlib.Path(os.readlink('/proc/self/fd/'+str(parent)))/name/'alpha/SKILL.md'
+    path.unlink();path.write_text('UNKNOWN KEEP')
+   return verify(parent,name,*args)
+  fio._verify_materialized=mutate
+  try:failure(refused_call('edit','alpha',content=content(body='expected')))
+  finally:fio._verify_materialized=verify
+  retained=list(cap.home.glob('.skills-txn-*'));assert len(retained)==1
+  assert (retained[0]/'alpha/SKILL.md').read_text()=='UNKNOWN KEEP'
+  failure(refused_call('edit','alpha',content=content(body='later')))
+  assert list(cap.home.glob('.skills-txn-*'))==retained
+
+
+def cleanup_syscall_limit():
+ with scope('cleanup-syscall') as cap:
+  require_success(call('create','alpha',content=content()))
+  original=os.unlink;fired=False
+  def unlink(path,*,dir_fd=None):
+   nonlocal fired
+   parent=os.readlink('/proc/self/fd/'+str(dir_fd)) if dir_fd is not None else ''
+   if not fired and os.fsdecode(path)=='SKILL.md' and '/.skills-txn-' in parent:
+    fired=True;original(path,dir_fd=dir_fd)
+    (pathlib.Path(parent)/'SKILL.md').write_text('OUT OF BOUND SAME-UID REPLACEMENT')
+   return original(path,dir_fd=dir_fd)
+  os.unlink=unlink
+  try:result=refused_call('edit','alpha',content=content(body='updated'))
+  finally:os.unlink=original
+  require_success(result);assert fired and not list(cap.home.glob('.skills-txn-*'))
+  observations['cleanup_syscall']={'unknown_replacement_deleted':True,'classification':'OBSERVED_RESIDUAL_HOST_LIMIT, not product safety PASS','reason':'Linux pathname unlink cannot exclude arbitrary same-UID actor ignoring lock; admitted APIs cannot address private detached staging'}
+
+
+def ordinary_paths_refused():
+ with scope('ordinary-boundary') as cap:
+  require_success(call('create','alpha',content=content()))
+  assert json.loads(us.scoped_file('write_file',{'path':'allowed.txt','content':'own workspace'}))['success']
+  for path in [cap.home/'.skills-txn-synthetic/alpha/SKILL.md',cap.home/'.skills.lock',cap.home/'skills/alpha/SKILL.md']:
+   denied(lambda:us.scoped_file('write_file',{'path':str(path),'content':'bad'}))
+  failure(call('write_file','alpha',file_path='../../.skills-txn-synthetic/a',file_content='bad'))
+  denied(lambda:fio.read_bytes(cap.home/'.skills-txn-synthetic/a'))
+  denied(lambda:us.guard_tool('terminal',{}))
+
+
+def revoked_cleanup():
+ with scope('revoked-cleanup') as cap:
+  require_success(call('create','alpha',content=content()))
+  verify=fio._verify_materialized
+  def revoke(parent,name,*args):
+   result=verify(parent,name,*args)
+   if name=='skills':admitted[cap.key]['enabled']=False
+   return result
+  fio._verify_materialized=revoke
+  try:result=refused_call('edit','alpha',content=content(body='changed'))
+  finally:fio._verify_materialized=verify
+  failure(result);assert cap.revoked
+  assert not list(cap.home.glob('.skills-txn-*'))
+
+
+@contextlib.contextmanager
+def observe_native_writes(home,label):
+ # Audit every concrete write syscall reached through each native entry window.
+ watched[0]=(home,label)
+ try:yield
+ finally:watched[0]=None
+watched=[None];window_counts={}
+def audit_window(event,args):
+ if watched[0] is None:return
+ home,label=watched[0]
+ paths=[]
+ if event=='open' and isinstance(args[0],(str,bytes)) and (args[2] or 0)&(os.O_WRONLY|os.O_RDWR|os.O_CREAT|os.O_TRUNC):paths=[args[0]]
+ elif event in ('os.mkdir','os.remove','os.rmdir','os.chmod','os.utime'):paths=[args[0]]
+ elif event=='os.rename':paths=list(args[:2])
+ for path in paths:
+  path=pathlib.Path(os.readlink("/proc/self/fd/"+str(path)) if isinstance(path,int) else os.fsdecode(path))
+  if path.is_absolute() and (path.is_relative_to(home/'skills') or path.is_relative_to(home/'.curator_backups')):
+   require_skill_lock(home,authority=False);window_counts[label]=window_counts.get(label,0)+1
+sys.addaudithook(audit_window)
+
+
+def curator_windows():
+ from agent import curator_backup as backup
+ from hermes_cli import curator
+ from agent import curator as native_curator
+ with scope('curator-windows') as cap:
+  require_success(call('create','alpha',content=content()))
+  with admin():
+   with observe_native_writes(cap.home,'curator-state-claim'):
+    native_curator.set_paused(True)
+    assert native_curator.load_state()['paused'] is True
+    assert native_curator._claim_run() is True
+    assert native_curator._claim_run() is False
+    native_curator._release_run_claim()
+   with observe_native_writes(cap.home,'archive'):assert usage.archive_skill('alpha')[0]
+   with observe_native_writes(cap.home,'restore'):assert usage.restore_skill('alpha')[0]
+   with observe_native_writes(cap.home,'snapshot'):snap=backup.snapshot_skills('synthetic repair control')
+   assert snap is not None
+   (cap.home/'skills/alpha/SKILL.md').write_text(content(body='after backup'))
+   with observe_native_writes(cap.home,'tree-rollback'):result=backup.rollback(snap.name)
+   assert result[0],result
+   assert 'Original instructions.' in (cap.home/'skills/alpha/SKILL.md').read_text()
+   assert usage.archive_skill('alpha')[0]
+   old=time.time()-3*86400;archive=cap.home/'skills/.archive/alpha';os.utime(archive,(old,old))
+   data=usage.load_usage();data['alpha']['archived_at']='2020-01-01T00:00:00+00:00';usage.save_usage(data)
+   with observe_native_writes(cap.home,'purge'):assert curator._cmd_purge(types.SimpleNamespace(days=1,yes=True,dry_run=False))==0
+   assert not archive.exists()
+   assert any(e['action']=='purge' for e in ledger.list_entries())
+   with observe_native_writes(cap.home,'ledger-maintenance'):ledger.compact_ledger();ledger.gc_blobs()
+
+
+def hub_sync_windows():
+ from tools import skills_hub_install as install,skills_hub as hub,skills_sync as sync
+ from tools.skills_hub_models import SkillBundle
+ from tools.skills_guard import ScanResult
+ with scope('hub-sync') as cap:
+  with admin():
+   bundle=SkillBundle('hub-alpha',{'SKILL.md':content('hub-alpha')},'synthetic','synthetic/hub-alpha','trusted')
+   scan=ScanResult('hub-alpha','synthetic','trusted','safe')
+   with observe_native_writes(cap.home,'hub-direct-metadata'):
+    hub.ensure_hub_dirs();hub._write_index_cache('synthetic',{'value':1})
+    taps=hub.TapsManager();assert taps.add('synthetic/repo');assert taps.remove('synthetic/repo')
+    hub.append_audit_log('CONTROL','hub-alpha','synthetic','trusted','safe')
+   with observe_native_writes(cap.home,'hub-quarantine'):q=install.quarantine_bundle(bundle)
+   with observe_native_writes(cap.home,'hub-discard'):
+    install.discard_quarantine(q)
+   assert not q.exists()
+   q=install.quarantine_bundle(bundle)
+   with observe_native_writes(cap.home,'hub-install'):path=install.install_from_quarantine(q,'hub-alpha','',bundle,scan)
+   assert path.exists() and hub.HubLockFile().get_installed('hub-alpha')
+   with observe_native_writes(cap.home,'hub-uninstall'):assert install.uninstall_skill('hub-alpha')[0]
+   assert not path.exists() and not hub.HubLockFile().get_installed('hub-alpha')
+   bundled=root/'synthetic-bundled';(bundled/'bundled-one').mkdir(parents=True,mode=0o700)
+   (bundled/'bundled-one/SKILL.md').write_text(content('bundled-one'))
+   (bundled/'bundled-one/SKILL.md').chmod(0o644);(bundled/'bundled-one').chmod(0o755)
+   optional=root/'synthetic-optional';(optional/'optional-one').mkdir(parents=True,mode=0o700)
+   (optional/'optional-one/SKILL.md').write_text(content('optional-one'))
+   (optional/'optional-one/SKILL.md').chmod(0o644);(optional/'optional-one').chmod(0o755)
+   original=sync._get_bundled_dir;original_optional=sync._get_optional_dir
+   sync._get_bundled_dir=lambda:bundled;sync._get_optional_dir=lambda:optional
+   try:
+    with observe_native_writes(cap.home,'sync'):report=sync.sync_skills(quiet=True)
+    from tools import skills_sync_optional as optional_sync
+    with observe_native_writes(cap.home,'optional-restore'):
+     optional_report=optional_sync.restore_official_optional_skill('optional-one',restore=True)
+    assert optional_report['ok'],optional_report
+    assert (cap.home/'skills/optional-one/SKILL.md').is_file()
+    from tools import skills_sync_bundled_ops as bundled_ops
+    with observe_native_writes(cap.home,'bundled-reset'):
+     assert bundled_ops.reset_bundled_skill('bundled-one',restore=True)['ok']
+    with observe_native_writes(cap.home,'bundled-remove'):
+     assert bundled_ops.remove_pristine_bundled_skills()['ok']
+    assert not (cap.home/'skills/bundled-one').exists()
+    with observe_native_writes(cap.home,'bundled-ensure'):
+     assert bundled_ops.ensure_bundled_skill('bundled-one')['ok']
+    assert bundled_ops.set_bundled_skills_opt_out(True)['ok']
+    assert bundled_ops.set_bundled_skills_opt_out(False)['ok']
+   finally:sync._get_bundled_dir=original;sync._get_optional_dir=original_optional
+   assert (cap.home/'skills/bundled-one/SKILL.md').is_file(),report
+   assert 'bundled-one' in (cap.home/'skills/.bundled_manifest').read_text()
+ for label in ('archive','restore','snapshot','tree-rollback','purge','curator-state-claim','hub-direct-metadata','hub-quarantine','hub-install','hub-uninstall','hub-discard','sync','optional-restore','bundled-reset','bundled-remove','bundled-ensure'):
+  assert window_counts.get(label,0)>0,(label,window_counts)
+ observations['native_window_write_syscalls']=window_counts
+
+
+def managed_admin_modes():
+ from tools import skills_hub_install as install
+ from tools.skills_hub_models import SkillBundle
+ from tools.skills_guard import ScanResult
+ with scope('admin-modes') as cap:
+  require_success(call('create','alpha',content=content()))
+  with admin():
+   require_success(call('create','native-new',content=content('native-new'),category='new-category'))
+   q=install.quarantine_bundle(SkillBundle('hubmode',{'SKILL.md':content('hubmode'),'references/file.txt':'body'},'synthetic','synthetic/hubmode','trusted'))
+   install.install_from_quarantine(q,'hubmode','new-hub-category',SkillBundle('hubmode',{'SKILL.md':content('hubmode')},'synthetic','synthetic/hubmode','trusted'),ScanResult('hubmode','synthetic','trusted','safe'))
+  assert 'Original instructions.' in fio.read_text(cap.home/'skills/new-category/native-new/SKILL.md')
+  fio._snapshot(cap.home/'skills')
+  assert all(not (p.lstat().st_mode & 0o077) for p in (cap.home/'skills').rglob('*'))
+  foreign=cap.home/'skills/preexisting-public.txt';foreign.write_text('PRESERVE UNKNOWN OLD OWNER BYTES');foreign.chmod(0o644)
+  from hermes_cli.skill_lock import atomic_write_text
+  with admin(),managed_home_lock(cap.home):
+   denied(lambda:atomic_write_text(foreign,'must not overwrite'))
+  assert foreign.read_text()=='PRESERVE UNKNOWN OLD OWNER BYTES' and foreign.stat().st_mode&0o777==0o644
+
+
+def normal_umask(fn):
+ old=os.umask(0o022)
+ try:return fn()
+ finally:os.umask(old)
+
+
+try:
+ for name,fn in [
+  ('native_history_batch_atomic_failure',positive_history_batch),
+  ('fresh_admin_rollback_cross_process_serialization',concurrent_rollback),
+  ('same_home_reentrancy_and_unmanaged_native_compatibility',reentrant_and_unmanaged),
+  ('lock_hostile_object_refusal',lambda: lock_redirects_safe()),
+  ('lock_inode_replacement_refusal',lock_replacement),
+  ('staged_actual_bytes_prepublication_binding_bounded_retention',staged_precheck),
+  ('staged_exact_syscall_host_substitution_detected',stage_syscall),
+  ('cleanup_unknown_content_retained_bounded',cleanup_unknown_precheck),
+  ('cleanup_exact_syscall_host_limit',cleanup_syscall_limit),
+  ('ordinary_filesystem_tool_boundary',ordinary_paths_refused),
+  ('postpublication_revocation_cleanup',revoked_cleanup),
+  ('curator_archive_restore_snapshot_rollback_purge_maintenance',lambda:normal_umask(curator_windows)),
+  ('native_hub_install_uninstall_sync_windows',lambda:normal_umask(hub_sync_windows)),
+  ('managed_admin_normal022_private_outputs_unknown_owner_refusal',lambda:normal_umask(managed_admin_modes)),
+ ]:
+  if name=='lock_hostile_object_refusal':
+   # Exclude the separately exercised replaced-lock case from this matrix.
+   def lock_redirects_safe():
+    for mode in ('symlink','hardlink','fifo','public'):
+     with scope('hostile-'+mode) as cap:
+      path=cap.home/'.skills.lock';other=cap.home/'other';other.write_text('untouched')
+      if mode=='symlink':path.symlink_to(other)
+      elif mode=='hardlink':os.link(other,path)
+      elif mode=='fifo':os.mkfifo(path,0o600)
+      else:path.write_text('');path.chmod(0o644)
+      with admin():denied(lambda:next_acquire(cap.home))
+      assert other.read_text()=='untouched'
+  if name in ('curator_archive_restore_snapshot_rollback_purge_maintenance','native_hub_install_uninstall_sync_windows'):test(name,fn)
+finally:
+ cessation=[]
+ for proc in children:
+  if proc.poll() is None:
+   proc.terminate()
+   try:proc.wait(timeout=3)
+   except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=3)
+  cessation.append({'pid':proc.pid,'returncode':proc.returncode,'reaped':True})
+ inputs={str(pathlib.Path(mod.__file__)):hashlib.sha256(pathlib.Path(mod.__file__).read_bytes()).hexdigest() for mod in tuple(sys.modules.values()) if getattr(mod,'__file__',None) and str(getattr(mod,'__file__')).startswith((str(C),str(N))) and pathlib.Path(mod.__file__).is_file()}
+ (R/'writer-controls.json').write_text(json.dumps({'controls':results,'observations':observations,'input_hashes':inputs,'children_cessation':cessation,'limitations':'Synthetic bounded filesystem; real native writer functions, fixture config/admission/registry. No service, model, network, CLI process or release gate.'},indent=2)+'\n')
+ print(json.dumps({'controls':results,'observations':observations,'children_cessation':cessation},indent=2))

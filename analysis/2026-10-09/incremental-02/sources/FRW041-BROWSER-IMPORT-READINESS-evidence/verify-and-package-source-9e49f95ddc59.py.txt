@@ -1,0 +1,146 @@
+"""Finite stdlib source utility: hashes/AST/diffs only, never executes candidates."""
+import ast
+import difflib
+import hashlib
+import json
+import os
+from pathlib import Path
+import resource
+import time
+
+E = Path(__file__).parent
+C = E / 'candidate'
+W = Path('<ASTRA_WORK>')
+B = W / 'native-browser-composed-source/source'
+D = W / 'registry-distribution-metadata-repair/candidate'
+os.sched_setaffinity(0, {0, 1})
+resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))
+clock = json.loads((E / 'clock.json').read_bytes())
+assert time.monotonic() < clock['deadline_monotonic_projected'] - 90
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def tree(path):
+    return ast.parse(path.read_bytes())
+
+
+def functions(t):
+    return {n.name: ast.dump(n, include_attributes=False) for n in t.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
+checks = {}
+for rel, expected in {
+    'native/hermes_cli/config.py': {'_env_var_policy_name', 'validate_env_var_name_for_write'},
+    'native/hermes_cli/web_server.py': {'should_require_dashboard_auth'},
+    'project/tools/configure_product.py': {'compose_product', '_dashboard'},
+    'project/plugins/friday_rework/onboarding.py': {'validate_template'},
+    'native/gateway/config.py': set(),
+}.items():
+    old = functions(tree(B / rel))
+    new = functions(tree(C / 'source' / rel))
+    changed = [key for key in old if old[key] != new.get(key)]
+    assert set(old) == set(new) and set(changed) == expected
+    checks[rel] = {'old_functions': len(old), 'retained_names': True,
+                  'changed_functions': changed, 'all_other_functions_ast_equal': True}
+
+old = functions(tree(D / 'private_effect_fence.py'))
+new = functions(tree(C / 'diagnostics/private_effect_fence.py'))
+changed = [key for key in old if old[key] != new.get(key)]
+assert set(changed) == {'audit', 'install'}
+checks['fence'] = {'old_functions': len(old), 'changed_old_functions': changed,
+                   'new_functions': sorted(set(new) - set(old)),
+                   'deny_ast_identical': old['deny'] == new['deny'],
+                   'all_other_existing_functions_ast_equal': True}
+fn = next(n for n in tree(C / 'diagnostics/private_effect_fence.py').body
+          if isinstance(n, ast.FunctionDef) and n.name == 'audit')
+assert isinstance(fn.body[0], ast.If)
+fn.body[0].body = fn.body[0].body[1:]
+assert ast.dump(fn, include_attributes=False) == old['audit']
+checks['fence']['old_audit_after_exact_passive_insertion_removed_ast_equal'] = True
+
+
+def assignments(t):
+    out = {}
+    for node in t.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    out[target.id] = ast.dump(node.value, include_attributes=False)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            out[node.target.id] = ast.dump(node.value, include_attributes=False)
+    return out
+
+
+ca = assignments(tree(B / 'native/hermes_cli/config.py'))
+la = assignments(tree(C / 'source/native/hermes_cli/config_env_policy.py'))
+assert all(ca[key] == la[key] for key in
+           ['_ENV_VAR_NAME_RE', '_ENV_VAR_NAME_DENY_PREFIXES', '_ENV_VAR_NAME_DENYLIST'])
+checks['canonical_env_constants_ast_equal'] = True
+assert (B / 'native/hermes_cli/config_defaults.py').read_bytes() == (
+    C / 'source/native/hermes_cli/config_defaults.py').read_bytes()
+checks['exact_default_config_leaf_copied'] = True
+shared = ['native/tools/process_registry.py', 'native/tools/process_registry_checkpoint.py',
+          'native/scripts/run_tests_parallel.py', 'native/tools/process_registry_web.py',
+          'native/model_tools.py', 'native/tools/registry.py', 'native/tools/dispatch_helpers.py']
+checks['retained_shared_base'] = {rel: digest(B / rel) for rel in shared}
+assert not any((C / 'source' / rel).exists() for rel in shared)
+counts = {}
+for p in [C / 'test_render_import_policy_source.py', C / 'test_loader_refusal_diagnostic_source.py']:
+    rows = []
+    for node in tree(p).body:
+        if isinstance(node, ast.FunctionDef) and node.name.startswith('test_'):
+            count = 1
+            for dec in node.decorator_list:
+                if isinstance(dec, ast.Call) and ast.unparse(dec.func) == 'pytest.mark.parametrize':
+                    values = dec.args[1]
+                    assert isinstance(values, (ast.List, ast.Tuple))
+                    count *= len(values.elts)
+            rows.append({'name': node.name, 'static_literal_cases': count, 'runtime': 'NOT_RUN'})
+    counts[p.name] = {'definitions': len(rows), 'literal_cases': sum(r['static_literal_cases'] for r in rows),
+                      'cases': rows, 'actual_pytest_collection': None}
+checks['supplementary_source_controls'] = counts
+checks['AST_compile_files'] = []
+for path in C.rglob('*.py'):
+    ast.parse(path.read_bytes())
+    compile(path.read_bytes(), str(path), 'exec', dont_inherit=True)
+    checks['AST_compile_files'].append(str(path))
+checks.update({'candidate_imports': False, 'test_execution': False, 'source_only': True,
+               'resources': {'affinity': sorted(os.sched_getaffinity(0)), 'AS': resource.getrlimit(resource.RLIMIT_AS)},
+               'elapsed_seconds': time.monotonic() - clock['started_monotonic_projected']})
+(E / 'static-verification.json').write_text(json.dumps(checks, indent=2) + '\n')
+product_patch = ''
+for p in sorted((C / 'source').rglob('*.py')):
+    rel = p.relative_to(C / 'source')
+    base = B / rel
+    before = base.read_text() if base.exists() else ''
+    product_patch += ''.join(difflib.unified_diff(
+        before.splitlines(True), p.read_text().splitlines(True),
+        fromfile='a/' + str(rel) if base.exists() else '/dev/null', tofile='b/' + str(rel)))
+(C / 'product.patch').write_text(product_patch)
+(C / 'diagnostics.patch').write_text(''.join(difflib.unified_diff(
+    (D / 'private_effect_fence.py').read_text().splitlines(True),
+    (C / 'diagnostics/private_effect_fence.py').read_text().splitlines(True),
+    fromfile='a/private_effect_fence.py', tofile='b/private_effect_fence.py')))
+(C / 'source.patch').write_text(product_patch + (C / 'diagnostics.patch').read_text())
+logical = json.loads((W / 'native-browser-composed-source/selected-pins.json').read_bytes())
+overlays = {}
+for p in sorted((C / 'source').rglob('*.py')):
+    rel = p.relative_to(C / 'source')
+    base = B / rel
+    overlays[str(rel)] = {'path': str(p), 'sha256': digest(p), 'size': p.stat().st_size,
+                          'base_path': str(base), 'base_sha256': logical.get(str(base))}
+(C / 'source-overlay-pins.json').write_text(json.dumps({
+    'base_selected_pins': {'path': str(W / 'native-browser-composed-source/selected-pins.json'),
+                          'sha256': 'cda1aff6bd02c1ab787071345cfa8498fabde88827d60d619e4657262873a400'},
+    'overlays': overlays, 'base_files': len(logical), 'new_files': 2,
+    'unchanged_data_copy': 'native/hermes_cli/config_defaults.py',
+    'standalone_candidate_executable': False, 'must_materialize_full_existing_source': True,
+    'runtime_rebound': False, 'candidate_imports_or_tests': False}, indent=2) + '\n')
+print(json.dumps({'changed_functions': {key: value.get('changed_functions', value.get('changed_old_functions'))
+                                       for key, value in checks.items() if isinstance(value, dict)},
+                  'supplementary_cases': {key: value['literal_cases'] for key, value in counts.items()},
+                  'elapsed_seconds': checks['elapsed_seconds'], 'runtime': 'NOT_RUN'}))
