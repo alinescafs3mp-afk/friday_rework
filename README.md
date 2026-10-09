@@ -19,3 +19,5 @@ See `docs/mandatory-web-admin.md` and `validation/acceptance-web-admin.json` for
 [Additional outcomes and provenance](analysis/2026-10-09/incremental-03/README.md) closes the selected 171-row metadata omission table, including previously omitted failures, successful runs and exact Linux header provenance. The complete daily checkpoint remains pending.
 
 [Recent fixes and integration decisions](analysis/2026-10-09/incremental-04/README.md) adds callback and TypeScript source repairs, independent findings and 36 selected process records. Runtime qualification and the complete daily checkpoint remain pending.
+
+[Cache identity, process ownership and review decisions](analysis/2026-10-09/incremental-05/README.md) adds later source corrections, their independent findings and the remaining execution gaps. This is the fifth intermediate publication; installed journeys and the complete daily checkpoint remain pending.

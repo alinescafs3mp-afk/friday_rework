@@ -1,32 +1,41 @@
 # Foundation checkpoint — 2026-10-09
 
-Current checkpoint, 2026-10-09 18:46 MSK: three intermediate analysis bundles
-have been published through commit `5fd58a2a8b9ac420a5604eb530b8b78990871512`.
-They include source snapshots, historical outcomes, decisions and explicit
-coverage gaps. The daily checkpoint starts at 21:00 MSK and remains pending;
-intermediate publication continues independently of release acceptance.
+Current source checkpoint, 2026-10-09 20:01 MSK. The first four intermediate
+analysis publications end at `88b27585dd51a7913560c23e8abdd8bcc51b4eb0`.
+The fifth bundle adds the later TypeScript and callback repairs, their review
+findings and the decisions that still prevent execution. This remains an
+intermediate publication. The daily checkpoint starts at 21:00 MSK, covering
+all work after `3bf8b315254da4346cfda67cf951dc0f0ae0cc49`; it is not complete.
 
 | Area | Latest verified result | Next missing result |
 | --- | --- | --- |
-| Callback diagnostic | Independent source review confirms the repaired partial-report chronology and unchanged original guard semantics. | Real execution of the current 277-case qualification, cost probes and 38-case diagnostic remains NOT_RUN. Sol is implementing cumulative CPU ownership in the existing finite wrapper. |
-| TypeScript evidence | Independent review confirms descriptor custody and OOM handling changes at source level. It found a returned-code hash read from mutable state and lost request identity across worker/cache boundaries. | A coherent source repair is active; the original 24-case runtime gate remains NOT_RUN. |
-| TypeScript native admission | Investigation of the installed systemd version and applicable source found unresolved identity, pending-request and original-deadline semantics. | A supported complete admission path and actual whole-scope qualification; closing or reaping the CLI alone is insufficient. |
-| A0 runtime | The prior attempt is closed; the recorded journal corruption remains unresolved. | A verified recovery source and subsequent authorized runtime qualification. No new A0 kernel trial or daemon start is claimed. |
+| TypeScript cache and evidence | Independent source review accepts the Sol cache/VM/control package with Astra's exact module-ID selector correction. The earlier selector failure remains recorded. | Bind the replacement to the actual candidate and its manifests, then execute the original 24 cases and the required genuine controls under qualified native ownership. The old manifest does not identify the replacement. |
+| Callback process ownership | A coherent source repair adds persistent reap state, direct-child identity custody and CPU allocation before fork. Sol's independent review is active. | Close actual caller birth and the interval before the child interpreter arms its limits; qualify the whole execution path. The 277-case run and cost probes remain NOT_RUN. |
+| Before-interpreter enforcement | Pinned Linux source and independent review support inherited ptrace EXITKILL custody. | The complete route is unresolved: GNU timeout startup, timer readiness, signal delivery and parent wait semantics still matter. No ptrace trial or execution grant has occurred. |
+| TypeScript native admission | Installed-systemd source investigation found unresolved identity, pending-request and original-deadline semantics. | A supported complete admission path and actual whole-scope qualification. Reaping the CLI alone does not close a pending manager submission. |
+| A0 runtime | The prior attempt is closed; the recorded journal corruption remains unresolved. | A verified recovery source and subsequent runtime qualification. No new A0 kernel trial or daemon start is claimed. |
 
-The callback budget is one 180-second wall-clock lifetime with a cumulative
-45-second CPU budget, affinity 0/1, a per-process 2 GiB address-space limit and
-the original 60-second closure reserve. A dedicated aggregate-memory cgroup
-and a wait4-only accounting format were additional assumptions in a prepared
-adapter, not original requirements. Source review removed that mistaken
-prerequisite from the repair direction; it did not establish working CPU
-accounting or grant execution. GNU timeout's group kill can precede its own
-child reap, so descendant CPU cannot simply be inferred from one wait4 result.
+The callback budget remains one 180-second wall-clock lifetime, cumulative
+45-second CPU, affinity 0/1, a per-process 2 GiB address-space limit and the
+original 60-second closure reserve. A dedicated aggregate-memory cgroup and
+a wait4-only accounting format were additional assumptions in an earlier
+adapter, not original requirements. Removing those assumptions did not grant
+execution. CPU attributed through adopted children must not be lost or counted
+twice, and numeric process-group membership alone does not prove custody.
 
 The historical 579-case source qualification PASS and G20 exit137 remain
-unchanged results on their respective bytes. G20's signal cause remains unknown;
-its consumed attempt is not retried. Source presence, source review, offline
-execution, live wiring and release acceptance remain separate. All seven
-installed journeys and four web contexts are unaccepted.
+results on their respective bytes. G20's signal cause remains unknown; its
+consumed attempt is not retried. Python AST checks and source review do not
+mean JavaScript, controls or live journeys ran. All seven installed journeys
+and four web contexts are still unaccepted. Missing development packages,
+the browser system installation and A0 recovery remain separately tracked
+technical dependencies; old Friday stays stopped.
+
+The fifth bundle's source, outcomes and process records are linked from the
+repository README. The private reconciliation found 51 peer assignments with
+consistent paired states at its recorded cut. That consistency is not proof
+of complete daily source coverage; later work and root-only changes still
+belong to the daily reconciliation.
 
 The detailed earlier observations below are history, not current assignments.
 
