@@ -1,0 +1,356 @@
+/* Inert analytical source export; no execution or deployment grant. */
+/* DISTINCT QUALIFICATION BYTES. NOT production finite_birth.c/dso.
+ * Build only after independent root review. Every perturbation is explicit.
+ * No qualification binary is supplied; all controls NOT_RUN. */
+/* SOURCE ONLY: same-process CPython 3.14 / Linux clone3 birth seam.
+ * No executable or service; load only as a reviewed same-process DSO via PyDLL.
+ * The fork child performs raw Linux syscalls and execve/_exit ONLY. It NEVER
+ * re-enters copied CPython or libc atfork state. Therefore AfterFork_Child is
+ * deliberately absent (CPython C API sys.html, conditional requirement).
+ * Parent BeforeFork/AfterFork_Parent are paired on success AND failure.
+ * Qualified scope requires POSIX_CPU_TIMERS_TASK_WORK=y in the final kernel:
+ * otherwise IRQ-side RLIMIT_CPU auto-increment could precede copy_signal.
+ */
+#define _GNU_SOURCE
+/* Exact selected CPython 3.14.7 bundle headers precede libc headers. */
+#include <Python.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <linux/sched.h>
+#include <linux/close_range.h>
+#include <sched.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+_Static_assert(sizeof(sig_atomic_t) == sizeof(int), "pidfd slot ABI");
+_Static_assert(sizeof(void *) == 8, "qualified Linux LP64 ABI only");
+_Static_assert(CLONE_CLEAR_SIGHAND == 0x100000000ULL, "Linux UAPI");
+
+static volatile sig_atomic_t armed, attempted, root_pid, birth_fd = -1;
+static volatile sig_atomic_t expired, cpu_hit, signal_errno, rollback_errno;
+static volatile sig_atomic_t can_abort, borrowing;
+static int timer_live, alarm_installed, cpu_installed;
+int frw_close(int terminal_observed);
+static struct sigaction old_alarm, old_cpu_action;
+static struct rlimit old_cpu, old_as;
+static cpu_set_t old_affinity;
+static timer_t timer_id;
+static sigjmp_buf abort_birth;
+static struct timespec deadline;
+#include "finite_fault_seam.h"
+
+static int deadline_reached(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) return 1;
+    return now.tv_sec > deadline.tv_sec ||
+           (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec);
+}
+
+static int signal_birth_fd(void)
+{
+    int fd = birth_fd;
+    if (fd < 0) return 0;
+    if (syscall(SYS_pidfd_send_signal, fd, SIGKILL, NULL, q_plan == 20 ? 0x80000000UL : 0) == 0) return 0;
+    if (errno == ESRCH) return 0; /* ONLY wait4 can prove reaped/closed. */
+    return errno;
+}
+
+static void bound_signal(int signo)
+{
+    int saved_errno = errno;
+    if (signo == SIGALRM) expired = 1;
+    if (signo == SIGXCPU) cpu_hit = 1;
+    /* Kernel publishes pidfd before fd_install; userspace handler runs only
+     * after syscall completion. Success: retained owned fd already installed.
+     * Failure after put_user: unused slot released, never close/reuse it here.
+     * Single-thread/no other fd-creating handlers is a mandatory precondition.
+     */
+    if (birth_fd >= 0) {
+        int error = signal_birth_fd();
+        if (error) signal_errno = error; /* EBADF can be tentative on failure. */
+    } else if (can_abort) {
+        /* No pidfd publication => no runnable successful child. Covers signal
+         * before syscall AND restartable/failed syscall before publication.
+         * Jump target is C, after BeforeFork; it always runs AfterFork_Parent.
+         * This region contains no Python or non-async-safe libc operations.
+         */
+        errno = saved_errno;
+        siglongjmp(abort_birth, 1);
+    }
+    errno = saved_errno;
+}
+
+static int single_main_python(void)
+{
+    if (!PyGILState_Check() || PyInterpreterState_Get() != PyInterpreterState_Main()
+        || syscall(SYS_gettid) != getpid()) return EPERM;
+    DIR *tasks = opendir("/proc/self/task");
+    if (!tasks) return errno;
+    int count = 0, error = 0;
+    struct dirent *entry;
+    errno = 0;
+    while ((entry = readdir(tasks))) {
+        if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') ++count;
+    }
+    if (errno) error = errno;
+    if (closedir(tasks) < 0 && !error) error = errno;
+    return error ? error : (count == 1 ? 0 : EBUSY);
+}
+
+static int dispositions_intact(void)
+{
+    struct sigaction alarm_action, cpu_action, child_action;
+    sigset_t mask;
+    if (sigaction(SIGALRM, NULL, &alarm_action) < 0 ||
+        sigaction(SIGXCPU, NULL, &cpu_action) < 0 ||
+        sigaction(SIGCHLD, NULL, &child_action) < 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &mask) < 0) return errno;
+    if (alarm_action.sa_handler != bound_signal ||
+        cpu_action.sa_handler != bound_signal || sigismember(&mask, SIGALRM) ||
+        sigismember(&mask, SIGXCPU) || sigismember(&mask, SIGCHLD) ||
+        child_action.sa_handler != SIG_DFL ||
+        (child_action.sa_flags & SA_NOCLDWAIT)) return EINVAL;
+    return 0;
+}
+
+/* Returns errno (0 success), never launches a process. Call via PyDLL. */
+int frw_arm(long long seconds, long nanoseconds)
+{
+    int error;
+    sigset_t mask, pending;
+    struct sigaction handler;
+    struct sigevent event;
+    struct itimerspec spec;
+    if (armed || attempted || timer_live || alarm_installed || cpu_installed) return EALREADY;
+    if ((error = single_main_python())) return error;
+    if (PyErr_CheckSignals() < 0) return EINTR; /* PyDLL propagates exception. */
+    if (nanoseconds < 0 || nanoseconds >= 1000000000L) return EINVAL;
+    deadline.tv_sec = (time_t)seconds;
+    deadline.tv_nsec = nanoseconds;
+    if (deadline_reached()) return ETIMEDOUT;
+    if (sigprocmask(SIG_SETMASK, NULL, &mask) < 0 || sigpending(&pending) < 0 ||
+        sigaction(SIGALRM, NULL, &old_alarm) < 0 ||
+        sigaction(SIGXCPU, NULL, &old_cpu_action) < 0) return errno;
+    /* Python table and OS actions must both be default (wrapper checks table).
+     * No stale native/Python pending SIGALRM/SIGXCPU is borrowed into this seam.
+     */
+    if (old_alarm.sa_handler != SIG_DFL || old_cpu_action.sa_handler != SIG_DFL ||
+        sigismember(&mask, SIGALRM) || sigismember(&mask, SIGXCPU) ||
+        sigismember(&pending, SIGALRM) || sigismember(&pending, SIGXCPU)) return EBUSY;
+    memset(&handler, 0, sizeof handler);
+    handler.sa_handler = bound_signal;
+    sigemptyset(&handler.sa_mask);
+    sigaddset(&handler.sa_mask, SIGALRM);
+    sigaddset(&handler.sa_mask, SIGXCPU);
+    /* No SA_RESTART: finite callers must observe interrupted operations. */
+    if (q_fail(101) || sigaction(SIGALRM, &handler, NULL) < 0) return errno;
+    alarm_installed = 1;
+    if (q_fail(102) || sigaction(SIGXCPU, &handler, NULL) < 0) return errno;
+    cpu_installed = 1;
+    memset(&event, 0, sizeof event);
+    event.sigev_notify = SIGEV_SIGNAL;
+    event.sigev_signo = SIGALRM;
+    if (q_create(&event, &timer_id) < 0) return errno;
+    timer_live = 1;
+    memset(&spec, 0, sizeof spec);
+    spec.it_value = deadline; /* Original TIMER_ABSTIME; never a renewed budget. */
+    if (q_settime(timer_id, &spec) < 0) return errno;
+    armed = 1;
+    q_mark(1);
+    if (q_plan == 11) q_pending();
+    return 0;
+
+}
+
+/* Raw Linux syscalls + local C/errno access; no copied runtime callbacks. */
+static _Noreturn void child_exec(const char *cwd, char *const argv[],
+                               int gate_read, int error_write, int parent)
+{
+    struct rlimit cpu, as;
+    cpu_set_t affinity;
+    struct { int stage, error; } failure = {1, 0};
+    char *const env[] = {"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", NULL};
+    if (syscall(SYS_prlimit64, 0, RLIMIT_CPU, NULL, &cpu) < 0 || cpu.rlim_cur != 6 ||
+        syscall(SYS_prlimit64, 0, RLIMIT_AS, NULL, &as) < 0 || as.rlim_cur != (2ULL<<30)) goto failed;
+    /* Raw syscall fills only the kernel mask bytes, not all of cpu_set_t. */
+    CPU_ZERO(&affinity);
+    if (syscall(SYS_sched_getaffinity, 0, sizeof affinity, &affinity) < 0) goto failed;
+    for (int i = 0; i < CPU_SETSIZE; ++i)
+        if (!!CPU_ISSET(i, &affinity) != (i < 2)) goto failed;
+    cpu.rlim_cur = 6; cpu.rlim_max = 45;
+    as.rlim_cur = as.rlim_max = 2ULL << 30;
+    if (syscall(SYS_prlimit64, 0, RLIMIT_CPU, &cpu, NULL) < 0 ||
+        syscall(SYS_prlimit64, 0, RLIMIT_AS, &as, NULL) < 0) goto failed;
+    cpu.rlim_cur = cpu.rlim_max = 0;
+    if (syscall(SYS_prlimit64, 0, RLIMIT_CORE, &cpu, NULL) < 0) goto failed;
+    failure.stage = 2;
+    if (syscall(SYS_prctl, PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) < 0 ||
+        syscall(SYS_getppid) != parent || syscall(SYS_setsid) < 0 ||
+        syscall(SYS_chdir, cwd) < 0) goto failed;
+    failure.stage = 3;
+    /* Mark every inherited fd CLOEXEC in this private fd table, then preserve
+     * only the existing gate. Error pipe stays CLOEXEC; no fd/PID reacquisition.
+     */
+    if (syscall(SYS_close_range, 3U, ~0U, CLOSE_RANGE_CLOEXEC) < 0 ||
+        syscall(SYS_fcntl, gate_read, F_SETFD, 0) < 0) goto failed;
+    failure.stage = 4;
+    syscall(SYS_execve, argv[0], argv, env);
+failed:
+    failure.error = errno ? errno : EPROTO;
+    (void)syscall(SYS_write, error_write, &failure,
+                  q_plan == 30 ? sizeof failure - 1 : sizeof failure);
+    (void)syscall(SYS_exit_group, 126);
+    __builtin_trap(); /* Never return to Python even if exit_group is denied. */
+}
+
+static void restore_envelope(void)
+{
+    int error = 0;
+    if (!borrowing) return;
+    if (q_fail(201) || syscall(SYS_prlimit64, 0, RLIMIT_CPU, &old_cpu, NULL) < 0) error = errno;
+    if ((q_fail(202) || syscall(SYS_prlimit64, 0, RLIMIT_AS, &old_as, NULL) < 0) && !error) error = errno;
+    if ((q_fail(203) || syscall(SYS_sched_setaffinity, 0, sizeof old_affinity, &old_affinity) < 0) && !error) error = errno;
+    rollback_errno = error;
+    if (!error) borrowing = 0;
+}
+
+/* One attempted birth only. Caller supplies prepared immutable C argv/cwd.
+ * Positive PID is also retained BEFORE AfterFork_Parent / Python return.
+ * Negative errno may coexist with retained root_pid (restoration failure).
+ */
+long frw_spawn(const char *cwd, char *const argv[], int gate_read, int error_write)
+{
+    int error;
+    struct rusage usage;
+    struct rlimit cpu, as;
+    cpu_set_t affinity;
+    struct clone_args args = {0};
+    int parent = getpid();
+    long pid = -1;
+    if (!armed || attempted || !cwd || !argv || !argv[0]) return -EINVAL;
+    if ((error = single_main_python()) || (error = dispositions_intact())) return -error;
+    if (PyErr_CheckSignals() < 0) return -EINTR;
+    attempted = 1;
+    PyOS_BeforeFork();
+    ++q_before_fork;
+    /* Registered before callbacks may create threads/change dispositions. */
+    if ((error = single_main_python()) || (error = dispositions_intact())) goto parent_done;
+    if (expired || cpu_hit || deadline_reached()) { error = ETIMEDOUT; goto parent_done; }
+    if (getrusage(RUSAGE_SELF, &usage) < 0 ||
+        getrlimit(RLIMIT_CPU, &old_cpu) < 0 || getrlimit(RLIMIT_AS, &old_as) < 0 ||
+        sched_getaffinity(0, sizeof old_affinity, &old_affinity) < 0) {
+        error = errno; goto parent_done;
+    }
+    if (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec +
+        (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1000000.0 >= 6.0 ||
+        (old_cpu.rlim_cur != RLIM_INFINITY && old_cpu.rlim_cur < 6) ||
+        (old_cpu.rlim_max != RLIM_INFINITY && old_cpu.rlim_max < 45) ||
+        (old_as.rlim_cur != RLIM_INFINITY && old_as.rlim_cur < (2ULL<<30)) ||
+        (old_as.rlim_max != RLIM_INFINITY && old_as.rlim_max < (2ULL<<30))) {
+        error = ERANGE; goto parent_done;
+    }
+    cpu = old_cpu; cpu.rlim_cur = 6;
+    as = old_as; as.rlim_cur = 2ULL << 30;
+    CPU_ZERO(&affinity); CPU_SET(0, &affinity); CPU_SET(1, &affinity);
+    args.flags = CLONE_CLEAR_SIGHAND | CLONE_PIDFD;
+    args.pidfd = (uint64_t)(uintptr_t)&birth_fd;
+    args.exit_signal = SIGCHLD;
+    /* stack=0/stack_size=0, private VM/files/sighand, ordinary wait4 child.
+     * No CLONE_VM/THREAD/SIGHAND/VFORK/PARENT/FILES or new hierarchy.
+     */
+    if (sigsetjmp(abort_birth, 1)) { error = ECANCELED; goto restore_parent; }
+    can_abort = 1;
+    if (expired || cpu_hit || deadline_reached()) { error = ETIMEDOUT; goto restore_parent; }
+    borrowing = 1; /* Before first mutation, so every partial setup restores. */
+    if (q_fail(103) || syscall(SYS_sched_setaffinity, 0, sizeof affinity, &affinity) < 0 ||
+        q_fail(104) || syscall(SYS_prlimit64, 0, RLIMIT_AS, &as, NULL) < 0 ||
+        q_fail(105) || syscall(SYS_prlimit64, 0, RLIMIT_CPU, &cpu, NULL) < 0) {
+        error = errno; goto restore_parent;
+    }
+    /* SIGXCPU/ALRM remain unblocked. A pre-publication endpoint jumps to
+     * restoration; a post-publication endpoint signals the birth pidfd even
+     * before this raw syscall returns to C or any Python wrapper exists.
+     */
+    pid = q_clone(&args, sizeof args);
+    error = errno;
+    if (pid == 0) child_exec(cwd, argv, gate_read, error_write, parent);
+    if (pid > 0) { root_pid = (sig_atomic_t)pid; error = 0; }
+    else {
+        /* Kernel rollback may have written a now-uninstalled fd number.
+         * No close: that number is not an owned descriptor on syscall failure.
+         */
+        birth_fd = -1;
+        signal_errno = 0;
+    }
+restore_parent:
+    can_abort = 0;
+    restore_envelope();
+    if (root_pid && (expired || cpu_hit || deadline_reached() || rollback_errno)) {
+        int signal_error = signal_birth_fd();
+        if (signal_error) signal_errno = signal_error;
+    }
+parent_done:
+    PyOS_AfterFork_Parent();
+    ++q_after_fork;
+    q_mark(4);
+    if (q_plan == 10 && root_pid) q_pending();
+    if (rollback_errno) return -rollback_errno;
+    return error ? -error : root_pid;
+}
+
+int frw_pid(void) { return root_pid; }
+int frw_fd(void) { return birth_fd; } /* Borrowed, never close outside helper. */
+int frw_expired(void) { return expired || deadline_reached(); }
+int frw_cpu_hit(void) { return cpu_hit; }
+int frw_signal_errno(void) { return signal_errno; }
+int frw_rollback_errno(void) { return rollback_errno; }
+int frw_kill(void) { return signal_birth_fd(); }
+
+/* Root wait4 + all adopted custody must be terminal before this is called.
+ * The caller owns that established condition; no cleanup claim is invented.
+ */
+int frw_close(int terminal_observed)
+{
+    sigset_t block, previous;
+    struct timespec zero = {0, 0};
+    int error = 0;
+    if (!armed && !timer_live && !alarm_installed && !cpu_installed) return 0;
+    if (root_pid && !terminal_observed) return EBUSY;
+    if (borrowing || rollback_errno) return EBUSY;
+    sigemptyset(&block); sigaddset(&block, SIGALRM); sigaddset(&block, SIGXCPU);
+    if (sigprocmask(SIG_BLOCK, &block, &previous) < 0) return errno;
+    if (timer_live) {
+        if (timer_delete(timer_id) < 0) { error = errno; goto restore_mask; }
+        timer_live = 0;
+    }
+    /* Only our two standard pending signals: finite drain, not waiting. */
+    (void)sigtimedwait(&block, NULL, &zero);
+    (void)sigtimedwait(&block, NULL, &zero);
+    if (birth_fd >= 0) {
+        int fd = birth_fd; birth_fd = -1;
+        if (close(fd) < 0) error = errno;
+    }
+    if (cpu_installed) {
+        if (sigaction(SIGXCPU, &old_cpu_action, NULL) < 0) { if (!error) error = errno; }
+        else cpu_installed = 0;
+    }
+    if (alarm_installed) {
+        if (sigaction(SIGALRM, &old_alarm, NULL) < 0) { if (!error) error = errno; }
+        else alarm_installed = 0;
+    }
+    if (!timer_live && !cpu_installed && !alarm_installed) armed = 0;
+restore_mask:
+    if (sigprocmask(SIG_SETMASK, &previous, NULL) < 0 && !error) error = errno;
+    return error;
+}
