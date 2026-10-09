@@ -1,5 +1,7 @@
 # Foundation checkpoint — 2026-10-09
 
+09.10.2026: сохранён [исходный срез F4 native/F5 bootstrap](../analysis/2026-10-09/incremental-07/README.md). F4 реализует native birth/exec в том же caller, F5 — GNU shim и TraceCustody bootstrap. Independent source review требует R1/R2 failure-flow ремонта; root review F5 нашёл J1: три устаревших вложенных SHA из 76. Это законченные непринятые исходники и результаты анализа. Final join/build/ABI/F6 отсутствуют в срезе. Все 7 journeys и 4 web UNACCEPTED, прежняя Friday OFF, G20 CLOSED без retry. Исходные ресурсы, сценарии и stop-границы сохранены.
+
 Current analysis update: 9 October, 22:10 MSK. The first daily publication is
 complete and remotely verified at `00c3b825260792b834e7f2aecf19eaabaa02935d`
 (21:16:32 MSK). The [sixth incremental analysis](../analysis/2026-10-09/incremental-06/README.md)

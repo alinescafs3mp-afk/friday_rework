@@ -25,3 +25,5 @@ See `docs/mandatory-web-admin.md` and `validation/acceptance-web-admin.json` for
 [Daily work and coverage — 9 October](analysis/2026-10-09/daily/README.md) joins the five intermediate publications with the later Astra/Sol material, describes coverage boundaries and lists the next runtime acceptance work. Read its explicit cutoff and residual gaps; publication does not establish product readiness.
 
 [Caller bootstrap failures and contract corrections](analysis/2026-10-09/incremental-06/README.md) adds the next completed source-analysis block after the verified daily commit `00c3b825260792b834e7f2aecf19eaabaa02935d`, including explicit late upstream-service carryover. F4/F5 remain unclosed; active successors and runtime acceptance are outside this cut.
+
+Промежуточный [срез исходников F4 native/F5 bootstrap от 09.10.2026](analysis/2026-10-09/incremental-07/README.md) сохраняет полный изменённый код и три открытых source findings R1/R2/J1. Обе реализации не приняты; final build/F6 NOT_RUN, продуктовая приёмка не меняется.
