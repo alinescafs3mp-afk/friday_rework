@@ -1,0 +1,316 @@
+# INERT ANALYSIS SOURCE: no execution grant; private bindings redacted.
+"""Exact unreaped direct-child custody for the existing exclusive finite owner.
+No group signal. A matching PGID is observation only, never signal authority.
+Single-threaded parent, SIGCHLD default/no SA_NOCLDWAIT, no competing reaper:
+those are caller prerequisites. Runtime qualification remains NOT_RUN.
+"""
+import os
+import signal
+import time
+
+class StopUnconfirmed(RuntimeError):
+    pass
+
+class Custody:
+    def __init__(self, proc, owner_pid, proc_stat, proc_children, group_members):
+        self.proc = proc
+        self.owner_pid = owner_pid
+        self.proc_stat = proc_stat
+        self.proc_children = proc_children
+        self.group_members = group_members
+        self.owned = {}  # Only checked direct children; unreaped PID cannot recycle.
+        self.rows = []
+        self.released = set()  # Numeric PID never reacquired after reap/custody loss.
+        self.unidentified = {proc.pid}  # Exact Popen handle; no signal before birth proof.
+        self.gnu_reap = None
+        self.birth = None
+        self.closed = False
+        self.discovered = {}  # Not authority. Never copied into owned.
+        self.anomalies = []
+        self.events = []
+        self.native_root = None  # Default GNU/Trace users have no exemption.
+
+    @classmethod
+    def from_native(cls, proc, owner_pid, proc_stat, proc_children, group_members,
+                    wall, caller_identity):
+        # Only the existing trusted one-birth native consumers use this factory.
+        # Retained C PID/pidfd are provenance, not new numeric signal authority.
+        if cls is not Custody or wall is None:
+            raise StopUnconfirmed('NATIVE_CUSTODY_REQUIRES_EXACT_BASE_AND_RETAINED_WALL')
+        pid, fd = wall.pid, wall.root_fd
+        keys = ('pid', 'start_ticks', 'pgid', 'sid')
+        parent = {key: caller_identity[key] for key in keys}
+        now = proc_stat(owner_pid)
+        if (type(pid) is not int or pid <= 0 or pid != proc.pid or pid == owner_pid
+                or type(fd) is not int or fd < 0 or parent['pid'] != owner_pid
+                or any(type(parent[key]) is not int or parent[key] <= 0 for key in keys)
+                or any(now[key] != parent[key] for key in keys)):
+            raise StopUnconfirmed('NATIVE_RETAINED_BIRTH_OR_PREBIRTH_PARENT_MISMATCH')
+        result = cls(proc, owner_pid, proc_stat, proc_children, group_members)
+        result.native_root = {'pid': pid, 'retained_pidfd': fd, 'parent': parent,
+                              'start_ticks': None, 'session': 'UNOBSERVED',
+                              'provenance': 'RETAINED_NATIVE_BIRTH_PREBIRTH_CALLER_SNAPSHOT'}
+        return result
+
+    def _observe_group(self, row):
+        native = self.native_root if row['pid'] == self.proc.pid else None
+        expected = (self.proc.pid, self.proc.pid)
+        group = (row['pgid'], row['sid'])
+        if native is not None:
+            if native['session'] == 'INVALID':
+                return False  # No later observation clears an escape/regression.
+            if group == expected:
+                state = 'ESTABLISHED'
+            elif (native['session'] != 'ESTABLISHED'
+                  and group == (native['parent']['pgid'], native['parent']['sid'])):
+                # An observed inherited tuple, NOT an invented pre-exec witness.
+                state = 'INHERITED_OBSERVED'
+            else:
+                native['session'] = 'INVALID'
+                self._anomaly('CHILD_ESCAPED_EXPECTED_GROUP:' + str(row['pid']))
+                return False
+            if native['session'] != state:
+                native['session'] = state
+                self.events.append({'pid': row['pid'], 'native_session_observation': state,
+                                    'pgid': row['pgid'], 'sid': row['sid']})
+            return True
+        if group != expected:
+            self._anomaly('CHILD_ESCAPED_EXPECTED_GROUP:' + str(row['pid']))
+            return False
+        return True
+
+    def bind_native_session(self, row):
+        # Called only after the existing exec/parent/group/exe/argv checks.
+        # Binding observation is irreversible even before first discovery.
+        native = self.native_root
+        prior = self.owned.get(self.proc.pid)
+        if (native is None or self.closed or self.proc.pid in self.released
+                or row['pid'] != self.proc.pid or row['ppid'] != self.owner_pid
+                or type(row['start_ticks']) is not int or row['start_ticks'] <= 0
+                or (native['start_ticks'] is not None and native['start_ticks'] != row['start_ticks'])
+                or (prior is not None and (not prior['authority'] or prior['reap'] is not None
+                    or prior['birth']['start_ticks'] != row['start_ticks']))):
+            raise StopUnconfirmed('NATIVE_SESSION_BIND_IDENTITY_NOT_HELD')
+        if (row['pgid'], row['sid']) != (self.proc.pid, self.proc.pid):
+            native['session'] = 'INVALID'
+            self._anomaly('CHILD_ESCAPED_EXPECTED_GROUP:' + str(self.proc.pid))
+            raise StopUnconfirmed('NATIVE_SESSION_BIND_NOT_ESTABLISHED')
+        if not self._observe_group(row):
+            raise StopUnconfirmed('NATIVE_SESSION_BIND_PRIOR_ESCAPE')
+        native['start_ticks'] = row['start_ticks']
+
+    def _anomaly(self, value):
+        if value not in self.anomalies:
+            self.anomalies.append(value)
+
+    def discover(self):
+        if self.closed:
+            return [], []
+        failures = []
+        try:
+            members, scan_errors = self.group_members(self.proc.pid)
+        except (OSError, ValueError, IndexError) as error:
+            members, scan_errors = [], [{'group_scan_error': repr(error)}]
+        failures.extend(scan_errors)
+        for row in members:
+            self.discovered[(row['pid'], row['start_ticks'])] = row
+        # Always complete direct-child discovery before cardinality checks,
+        # even if the separate process-group scan partially failed.
+        try:
+            direct = self.proc_children()
+        except (OSError, ValueError) as error:
+            direct = []
+            failures.append({'direct_children_error': repr(error)})
+        for pid in direct:
+            if pid in self.released:
+                self._anomaly('RELEASED_PID_DISCOVERED:' + str(pid))
+                failures.append({'pid':pid,'error':'NO_REACQUIRE_AFTER_RELEASE'})
+                continue
+            try:
+                row = self.proc_stat(pid)
+            except (OSError, ValueError, IndexError) as error:
+                # A proved direct child stays waitable even if a later proc read
+                # fails. Unknown identity is not promoted and is not signaled.
+                if pid not in self.owned:
+                    self.unidentified.add(pid)
+                failures.append({'pid': pid, 'identity_error': repr(error)})
+                continue
+            prior = self.owned.get(pid)
+            native = self.native_root if pid == self.proc.pid else None
+            if (row['pid'] != pid or row['ppid'] != self.owner_pid
+                    or type(row['start_ticks']) is not int or row['start_ticks'] <= 0):
+                if prior is not None:
+                    prior['authority'] = False
+                    self.released.add(pid)
+                    self._anomaly('LOST_DIRECT_CUSTODY:' + str(pid))
+                failures.append({'pid': pid, 'error': 'NOT_EXACT_DIRECT_CHILD'})
+                continue
+            if ((prior is not None and (not prior['authority'] or prior['reap'] is not None
+                                        or prior['birth']['start_ticks'] != row['start_ticks']))
+                    or (native is not None and native['start_ticks'] is not None
+                        and native['start_ticks'] != row['start_ticks'])):
+                if prior is not None:
+                    prior['authority'] = False
+                self.released.add(pid)
+                self.unidentified.discard(pid)
+                self._anomaly('RELEASED_OR_REPLACED_PID:' + str(pid))
+                failures.append({'pid': pid, 'error': 'NO_REACQUIRE_AFTER_REAP'})
+                continue
+            if native is not None:
+                native['start_ticks'] = row['start_ticks']
+            # Check every observation, including an already owned child's row.
+            self._observe_group(row)
+            if prior is not None:
+                continue
+            if self.gnu_reap is not None and pid == self.proc.pid:
+                failures.append({'pid': pid, 'error': 'GNU_ALREADY_RELEASED'})
+                continue
+            self.owned[pid] = {'birth': dict(row), 'reap': None, 'authority': True}
+            self.unidentified.discard(pid)
+            if pid == self.proc.pid:
+                self.birth = dict(row)
+        # Check after BOTH discoveries. Extra inherited descendants are retained,
+        # reaped with usage, and make the sequence fail; they are never ignored.
+        identities = set(self.discovered) | {(pid,item['birth']['start_ticks']) for pid,item in self.owned.items()}
+        if len(identities) > 2:
+            self._anomaly('UNEXPECTED_DESCENDANT_CARDINALITY')
+        return members, failures
+
+    def reap_ready(self):
+        failures = []
+        for pid, item in list(self.owned.items()):
+            if item['reap'] is not None or not item['authority']:
+                continue
+            try:
+                got, status, usage = os.wait4(pid, os.WNOHANG)
+            except InterruptedError:
+                continue
+            except (ChildProcessError, OSError) as error:
+                item['authority'] = False  # ECHILD/unknown wait failure cannot authorize a replacement.
+                self.released.add(pid)
+                failures.append({'pid': pid, 'wait4_error': repr(error)})
+                self._anomaly('LOST_EXACT_REAP:' + str(pid))
+                continue
+            if got == 0:
+                continue
+            # Retain the original kernel row before any next scan, signal or I/O.
+            row = {'pid': got, 'identity': item['birth'], 'wait_status': status,
+                   'exit_code': os.waitstatus_to_exitcode(status),
+                   'user': usage.ru_utime, 'system': usage.ru_stime,
+                   'rusage': list(usage), 'kernel_usage': True,
+                   'includes_only_descendants_actually_waited_by_this_child': True}
+            item['reap'] = row
+            item['authority'] = False
+            self.released.add(pid)
+            self.unidentified.discard(pid)
+            self.rows.append(row)
+            if got == self.proc.pid:
+                self.gnu_reap = row
+                self.proc.returncode = row['exit_code']
+        # Preserve usage even if a fast-exit/proc error prevented birth capture.
+        # This is exact wait of a direct-child/Popen handle, never signal authority.
+        for pid in list(self.unidentified.difference(self.owned)):
+            try:
+                got, status, usage = os.wait4(pid, os.WNOHANG)
+            except InterruptedError:
+                continue
+            except (ChildProcessError, OSError) as error:
+                self.unidentified.remove(pid)
+                self.released.add(pid)
+                self._anomaly('LOST_UNIDENTIFIED_REAP:' + str(pid))
+                failures.append({'pid': pid, 'unidentified_wait4_error': repr(error)})
+                continue
+            if got == 0:
+                continue
+            row = {'pid': got, 'identity': None, 'wait_status': status,
+                   'exit_code': os.waitstatus_to_exitcode(status),
+                   'user': usage.ru_utime, 'system': usage.ru_stime,
+                   'rusage': list(usage), 'kernel_usage': True,
+                   'birth_unobserved': True}
+            self.rows.append(row)
+            self.unidentified.remove(pid)
+            self.released.add(pid)
+            self._anomaly('REAP_BIRTH_UNKNOWN:' + str(pid))
+            if got == self.proc.pid:
+                self.gnu_reap = row
+                self.proc.returncode = row['exit_code']
+        return failures
+
+    def signal_owned(self):
+        if self.closed:
+            return []
+        failures = []
+        for pid, item in list(self.owned.items()):
+            if item['reap'] is not None or not item['authority']:
+                continue  # Signal authority was released by exact wait4.
+            try:
+                now = self.proc_stat(pid)
+                if now['pid'] != pid or now['ppid'] != self.owner_pid or now['start_ticks'] != item['birth']['start_ticks']:
+                    item['authority'] = False
+                    self.released.add(pid)
+                    self._anomaly('LOST_SIGNAL_CUSTODY:' + str(pid))
+                    raise StopUnconfirmed('IDENTITY_NOT_HELD:' + str(pid))
+                self._observe_group(now)  # Escape fails acceptance, not exact cleanup authority.
+                # There is no intervening reaper. Exit produces a retained zombie;
+                # PID cannot be reused before our wait4 releases this child.
+                os.kill(pid, signal.SIGKILL)
+                self.events.append({'pid': pid, 'signal': 'SIGKILL', 'exact_birth': now['start_ticks']})
+            except ProcessLookupError:
+                # ESRCH is an event, not evidence of reap/closed/no usage.
+                self.events.append({'pid': pid, 'signal_or_stat': 'ESRCH_REAP_STILL_REQUIRED'})
+            except (OSError, ValueError, IndexError, StopUnconfirmed) as error:
+                failures.append({'pid': pid, 'signal_error': repr(error)})
+        return failures
+
+    def finish(self, deadline, terminate=False):
+        if self.closed:
+            # Reentrant closure never scans a potentially reused group or waits
+            # or charges the original GNU twice. Content/error state lives outside.
+            if self.gnu_reap is None or self.birth is None or self.birth != self.gnu_reap['identity']:
+                raise StopUnconfirmed('CORRUPT_RETAINED_GNU_CLOSURE')
+            return
+        while time.monotonic() < deadline:
+            members, errors = self.discover()
+            errors.extend(self.reap_ready())
+            # Fresh adoption happens at exit. Discover after all reaps as well;
+            # never infer an adopted birth from a numeric process group.
+            members, late_errors = self.discover()
+            errors.extend(late_errors)
+            errors.extend(self.reap_ready())
+            if errors:
+                if terminate:
+                    errors.extend(self.signal_owned())  # Only already proved live handles.
+                raise StopUnconfirmed('DISCOVERY_OR_REAP_ERRORS:' + repr(errors))
+            if terminate or self.anomalies or self.gnu_reap is not None:
+                signal_errors = self.signal_owned()
+                if signal_errors:
+                    raise StopUnconfirmed('EXACT_SIGNAL_ERRORS:' + repr(signal_errors))
+            members, final_errors = self.discover()
+            if final_errors:
+                raise StopUnconfirmed('FINAL_DISCOVERY_ERRORS:' + repr(final_errors))
+            direct = self.proc_children()
+            if self.gnu_reap is not None and not members and not direct:
+                if self.birth is None or self.unidentified:
+                    raise StopUnconfirmed('UNCONFIRMED_BIRTH_WITH_RETAINED_USAGE')
+                if any(v['reap'] is None for v in self.owned.values()):
+                    raise StopUnconfirmed('MISSING_REAP_FOR_OWNED_CHILD')
+                self.closed = True
+                return
+            if self.gnu_reap is not None and members and not direct:
+                # Last proved anchor has gone. A matching group number does not
+                # authorize killing any replacement, even on error re-entry.
+                raise StopUnconfirmed('UNPROVED_GROUP_AFTER_AUTHORITY_RELEASE')
+            time.sleep(min(0.01, max(0, deadline-time.monotonic())))
+        raise StopUnconfirmed('ORIGINAL_ABSOLUTE_DEADLINE_EXHAUSTED')
+
+    def evidence(self):
+        return {'gnu_birth': self.birth, 'gnu_reap': self.gnu_reap,
+                'closed': self.closed, 'rows': self.rows,
+                'discovered_only': list(self.discovered.values()),
+                'owned_births': [v['birth'] for v in self.owned.values()],
+                'authority_held': [pid for pid,item in self.owned.items() if item['authority']],
+                'anomalies': self.anomalies, 'events': self.events,
+                'unidentified_wait_handles': sorted(self.unidentified),
+                'released_pids_no_reacquire': sorted(self.released),
+                'native_root_custody': dict(self.native_root) if self.native_root is not None else None,
+                'signal_authority': 'EXACT_UNREAPED_DIRECT_CHILD_ONLY_NO_KILLPG'}
