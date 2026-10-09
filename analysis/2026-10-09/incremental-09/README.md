@@ -1,0 +1,19 @@
+# Первый primitive runtime: отказ и исправленный исходник — 09.10.2026
+
+Первый реальный запуск закончился `EPROTO (71), OWNER_NATIVE_EXEC_STAGE:1`: native child завершился с кодом 126 до `setsid/exec`. Target не стартовал; ни один из восьми controls не принят. [Фактический исход и закрытие](outcomes.json) сохраняют этот отказ.
+
+Native handle закрыт через 0.03500160598196089 с; внешняя проверка прекращения caller/child завершена через 12.290723032027017 с при исходных 180 с. Quality lock освобождён и повторно захвачен проверкой. Доступный wait4 CPU — только нижняя граница 0.000267 с; полный CPU accounting — `null`. CPU caller учтён отдельно, его write/exit tail неизвестен и не принят за ноль. Попытка потреблена; автоматического retry нет.
+
+В исходнике подтверждён дефект: полный `cpu_set_t` читался после raw `sched_getaffinity`, хотя syscall записал лишь 16 из 128 байт. [Сохранённый read-only self-query](affinity-abi-observation.json) показал неизменённый заполненный tail. Он не повторял candidate. Это согласуется с отказом, но конкретный stage1 subcheck и маска child не сохранены: единственная причина `EPROTO` и успешность исправления runtime не доказаны.
+
+[Исправление](affinity-repair.diff.txt) добавляет `CPU_ZERO(&affinity)` перед raw query. [Полный исправленный C](sources/affinity-repair/qualification/finite_birth.c.txt) действительно собран: [build outcome](build-outcome.json), compiler exit0, 347 прежних pins, 319 dependency entries, 18 link entries. Новая библиотека `20cbb92a…` в этом срезе **NOT_LOADED**, независимое review ремонта ещё не включено. Успех build не является live-приёмкой.
+
+[Source index](source-index.json) содержит пять полных inert exports: три primitive overlay, прежний 50-строчный root launch и исправленный C. [Три overlay](sources/primitive/qualification/primitive_qualification.py.txt) перенесены без изменения тел; [entry](sources/primitive/qualification/invoke_qualification.py.txt) и [target](sources/primitive/qualification/primitive_target.py.txt) сохранены полностью. В [root launch](sources/root-launch/launch.py.txt) заменены только три private paths и bound filesystem identity. Неопределённые `PUBLIC_LOCK_*` — намеренные символы, не рабочая настройка. Private exact inverse map проверяет восстановление всех исходных байт. Исторические SOURCE ONLY/NOT_RUN comments сохранены; текущие результаты описаны отдельно.
+
+[Повторная композиция](composition-outcome.json): 41 payload, 94 проверенные внутренние ссылки, 31386 неизменных внешних entries исключены. Это подготовка, без runtime grant и без trial исправленных байт в данном срезе. Полные прежние support bodies связаны через source index, без дублирования; прежние [incremental-08](../incremental-08/README.md), [native/GNU исходники](../incremental-07/source-index.json) и [custody/kernel](../incremental-05/source-index.json) остаются доступными.
+
+[Завершённые прежние reviews](review-history.json) относятся к точным старым байтам и своему scope. Дефект первого запуска не скрыт их статическим положительным результатом. Поздний active review не считается завершённым автоматически. Срез запечатан по входам до 23:46:34 МСК; последующие результаты сюда не перенесены.
+
+[Coverage](coverage.json), [worklog](WORKLOG.md), [allowlist](ALLOWLIST.json) и [manifest](MANIFEST.json) описывают этот ограниченный аналитический пакет. **Full F6, GNU, original all11 и installed 7 journeys / 4 web остаются UNACCEPTED.** Источники, конфигурация, wiring, offline, live и acceptance разделены. Операционные permits/policy, process identities, private handoffs, binaries и donor corpus не публикуются. Это не runnable bundle и не разрешение исполнения. Root должен независимо проверить итоговые публикационные байты и drafts.
+
+Существующие [donor notices](../incremental-08/THIRD_PARTY_NOTICES.md) и [source metadata](../incremental-08/upstream-source-references.json) сохраняются; новая лицензия не устанавливается. Новые донорские копии не добавлены.

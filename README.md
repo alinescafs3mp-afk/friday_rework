@@ -29,3 +29,7 @@ See `docs/mandatory-web-admin.md` and `validation/acceptance-web-admin.json` for
 Промежуточный [срез исходников F4 native/F5 bootstrap от 09.10.2026](analysis/2026-10-09/incremental-07/README.md) сохраняет полный изменённый код и три открытых source findings R1/R2/J1. Обе реализации не приняты; final build/F6 NOT_RUN, продуктовая приёмка не меняется.
 
 09.10.2026: [incremental-08](analysis/2026-10-09/incremental-08/README.md) сохраняет объединённый исходник с независимо закрытыми J1/R1/R2 и первые две DSO-сборки PASS без загрузки. Полные изменённые тела и внутренние pin-map delta опубликованы для анализа; ABI/F6 и установленный продукт (7 journeys / 4 web) остаются UNACCEPTED.
+
+[Первый primitive runtime: отказ и source repair](analysis/2026-10-09/incremental-09/README.md): фактический `EPROTO71` до target exec закрыт в исходные 180 с; восемь controls не приняты. Подтверждён uninitialized affinity tail, опубликованы пять полных исходников и реальная сборка исправленного C. Новая библиотека в срезе NOT_LOADED; sole cause и успешный runtime-повтор не доказаны. Full F6/GNU/all11/7 journeys/4 web UNACCEPTED.
+
+10.10.2026: [последующий реальный запуск G2](analysis/2026-10-10/native-validation-g2.json) прошёл восемь native-проверок и независимое ревью точных результатов. Процессы завершены, блокировка освобождена. GNU ещё не запускался: исправляются два найденных несоответствия. Полная приёмка Friday остаётся открытой.
