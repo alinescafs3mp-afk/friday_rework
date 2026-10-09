@@ -1,0 +1,128 @@
+/** Source preparation for the opt-in host-control boundary; never an admission. */
+import { isIP } from 'node:net'
+import { posix } from 'node:path'
+const { isAbsolute, normalize, sep } = posix
+import { scopedGrantArgs } from '@deepseek-ai/node-addon-system/landlock-run'
+import { HostControlUnavailableError } from '@deepseek-ai/dsh-sandbox'
+import type { HostControlPolicy, HostControlPreparation } from '@deepseek-ai/dsh-sandbox'
+
+function beneath(path: string, root: string): boolean {
+  return path === root || path.startsWith(root + sep)
+}
+
+function exactPath(path: string): void {
+  if (!isAbsolute(path) || normalize(path) !== path || path === '/' || path.includes('\0')) {
+    throw new HostControlUnavailableError('EXACT_NON_ROOT_PATH_REQUIRED')
+  }
+}
+
+/** Validate the explicit mount inventory at the durable caller boundary. */
+export function validateHostControlPolicy(policy: HostControlPolicy): void {
+  if (policy.capability !== 'host-control-v1' || policy.mode === 'danger-full-access') {
+    throw new HostControlUnavailableError('STRONG_CAPABILITY_REQUIRED')
+  }
+  exactPath(policy.workspaceRoot)
+  exactPath(policy.temporaryRoot)
+  if (policy.temporaryRoot === '/tmp' || policy.workspaceRoot === '/home') {
+    throw new HostControlUnavailableError('PRIVATE_WRITE_ROOT_REQUIRED')
+  }
+  const mounts = [...policy.readOnly, ...policy.readWrite]
+  if (policy.readOnly.length === 0 || policy.protectedPaths.length === 0) {
+    throw new HostControlUnavailableError('EXPLICIT_RUNTIME_AND_CREDENTIAL_INVENTORY_REQUIRED')
+  }
+  for (const path of [...mounts, ...policy.protectedPaths]) exactPath(path)
+  if (new Set(mounts).size !== mounts.length) {
+    throw new HostControlUnavailableError('DUPLICATE_MOUNT')
+  }
+  const forbidden = ['/run', '/sys', '/proc', '/dev', '/root', '/home', '/tmp', '/var', '/etc']
+  for (const root of mounts) {
+    if (forbidden.includes(root) || ['/run', '/sys', '/proc', '/dev'].some(path => beneath(root, path))) {
+      throw new HostControlUnavailableError('HOST_CONTROL_OR_BROAD_ROOT_MOUNT')
+    }
+    if (policy.protectedPaths.some(path => beneath(path, root) || beneath(root, path))) {
+      throw new HostControlUnavailableError('PROTECTED_CREDENTIAL_MOUNT_OVERLAP')
+    }
+  }
+  if (!mounts.some(root => beneath(policy.workspaceRoot, root))) {
+    throw new HostControlUnavailableError('WORKSPACE_CWD_NOT_EXPOSED')
+  }
+  for (const root of policy.readWrite) {
+    if (policy.mode === 'read-only' ||
+        ![policy.workspaceRoot, policy.temporaryRoot].some(path => beneath(root, path))) {
+      throw new HostControlUnavailableError('WRITE_OUTSIDE_EXACT_PRIVATE_ROOTS')
+    }
+  }
+  if (!Number.isSafeInteger(policy.statusFd) || policy.statusFd < 3) {
+    throw new HostControlUnavailableError('OWNED_STATUS_DESCRIPTOR_REQUIRED')
+  }
+  if (policy.privateNetwork !== undefined) {
+    const network = policy.privateNetwork
+    const expectedKeys = ['barrierProtocol', 'blockFd', 'driver', 'nameservers', 'resolverFd', 'resolverSha256']
+    if (Object.keys(network).sort().join(',') !== expectedKeys.join(',')) {
+      throw new HostControlUnavailableError('EXACT_PRIVATE_NETWORK_KEYS_REQUIRED')
+    }
+    if (network.driver !== 'slirp4netns-1.3.3-frw-private-loopback' ||
+        !Number.isSafeInteger(network.blockFd) || network.blockFd < 3 || network.blockFd === policy.statusFd ||
+        network.barrierProtocol !== 'frw-success-byte-1-v1' ||
+        !Number.isSafeInteger(network.resolverFd) || network.resolverFd < 3 ||
+        new Set([network.blockFd, network.resolverFd, policy.statusFd]).size !== 3 ||
+        !/^[0-9a-f]{64}$/.test(network.resolverSha256) ||
+        network.nameservers.length === 0 || network.nameservers.length > 3 ||
+        network.nameservers.some(value => isIP(value) === 0 || value.startsWith('127.') ||
+          value === '::1' || value.startsWith('::ffff:') || value.includes('%') ||
+          value === '0.0.0.0' || value === '::' || value.startsWith('10.0.2.') || value.startsWith('fd00:'))) {
+      throw new HostControlUnavailableError('OWNED_PRIVATE_NETWORK_AND_EXTERNAL_DNS_REQUIRED')
+    }
+  }
+  if (policy.requiredCapabilities.length === 0 || new Set(policy.requiredCapabilities).size !== policy.requiredCapabilities.length) {
+    throw new HostControlUnavailableError('EXACT_REQUIRED_CAPABILITIES_REQUIRED')
+  }
+}
+
+/**
+ * Compose the existing bwrap and scoped Landlock invocation on an empty root.
+ * Paths must later be revalidated as exact authorized objects, including aliases,
+ * contents and binary closure. This function does not perform a functional probe.
+ */
+export function prepareHostControl(
+  argv: readonly string[], policy: HostControlPolicy, launcher: string,
+): HostControlPreparation {
+  validateHostControlPolicy(policy)
+  exactPath(launcher)
+  if (!policy.readOnly.some(root => beneath(launcher, root))) {
+    throw new HostControlUnavailableError('SCOPED_LAUNCHER_NOT_IN_AUTHORIZED_RUNTIME_MOUNTS')
+  }
+  if (argv.length === 0 || argv.some(value => value.includes('\0'))) {
+    throw new HostControlUnavailableError('EXACT_COMMAND_REQUIRED')
+  }
+  const profile = [
+    '--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts',
+    '--disable-userns', '--assert-userns-disabled', '--cap-drop', 'ALL',
+    '--clearenv', '--die-with-parent', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+  ]
+  for (const root of policy.readOnly) profile.push('--ro-bind', root, root)
+  for (const root of policy.readWrite) profile.push('--bind', root, root)
+  if (policy.privateNetwork !== undefined) {
+    profile.push('--unshare-net', '--block-fd', String(policy.privateNetwork.blockFd),
+      '--ro-bind-data', String(policy.privateNetwork.resolverFd), '/etc/resolv.conf')
+  }
+  profile.push('--chdir', policy.workspaceRoot, '--json-status-fd', String(policy.statusFd))
+  const inner = [launcher, ...scopedGrantArgs({
+    readOnly: [...policy.readOnly, '/proc', ...(policy.privateNetwork ? ['/etc/resolv.conf'] : [])], readWrite: [...policy.readWrite, '/dev/null'],
+  }), '--', ...argv]
+  return {
+    capability: 'host-control-v1',
+    state: 'UNQUALIFIED_SOURCE_PREPARATION',
+    semanticArgv: [...argv],
+    argv: ['/usr/bin/bwrap', ...profile, '--', ...inner],
+    requiredCapabilities: [...policy.requiredCapabilities],
+    statusFd: policy.statusFd,
+    ...(policy.privateNetwork ? { network: { ...policy.privateNetwork, nameservers: [...policy.privateNetwork.nameservers] } } : {}),
+    missing: [
+      ...(policy.privateNetwork ? ['PRIVATE_NETWORK_BUILD_KERNEL_AND_ROUTE_QUALIFICATION_MISSING'] : ['REACHABLE_LOCAL_NETWORK_CONTROL_UNMEDIATED']),
+      'FINAL_OBJECT_ALIAS_CREDENTIAL_AND_KERNEL_QUALIFICATION_MISSING',
+      'ACTUAL_STATUS_DESCRIPTOR_AND_HOST_CHILD_IDENTITY_UNVERIFIED',
+    ],
+    runtimeGrant: false,
+  }
+}

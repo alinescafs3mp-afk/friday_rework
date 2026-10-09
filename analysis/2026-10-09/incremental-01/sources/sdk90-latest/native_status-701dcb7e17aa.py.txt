@@ -1,0 +1,667 @@
+"""Owned bwrap 0.11.1 status transport. SOURCE ONLY, no runtime admission.
+
+Only the donor registry creates/reaps the monitor. This module reads one private
+status pipe and host procfs. No signal target is derived from sandbox numbers.
+The existing FileOwner gate and downstream wrapped-result refusal remain in force.
+"""
+from pathlib import Path
+import ctypes
+import fcntl
+import hashlib
+import json
+import math
+import os
+import select
+import stat
+import struct
+import time
+
+BWRAP = '/usr/bin/bwrap'
+BWRAP_SHA256 = '523da3e7399044be5163aee6f57a77a6bef7454376e28f0a0627920bae1b76b6'
+INSTALLED_BWRAP_SHA256 = BWRAP_SHA256
+# Final matched rebuild SHA must be independently bound; generic version is insufficient.
+BWRAP_NETWORK_SHA256 = 'UNBOUND'
+PRIVATE_NETWORK_HOOK_VERSION = 2
+MAX_STATUS = 4096
+MAX_RECORD = 2048
+MAX_CONTOUR = 32768
+NS_NAMES = ('pid', 'mnt', 'ipc', 'uts', 'net', 'user', 'cgroup')
+
+
+class StatusRefusal(RuntimeError):
+    pass
+
+
+def require(ok, reason):
+    if not ok:
+        raise StatusRefusal(reason)
+
+
+def strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, 'DUPLICATE_STATUS_KEY')
+        result[key] = value
+    return result
+
+
+class NativeRecords:
+    """Bounded JSONL grammar pinned to upstream 0.11.1, never generic JSON proof."""
+    def __init__(self):
+        self.pending = b''
+        self.total = 0
+        self.start = None
+        self.exit = None
+        self.eof = False
+        self.digest = hashlib.sha256()
+
+    def feed(self, data):
+        require(not self.eof and type(data) is bytes, 'STATUS_AFTER_EOF')
+        self.total += len(data)
+        require(self.total <= MAX_STATUS, 'STATUS_OVERSIZE')
+        self.digest.update(data)
+        self.pending += data
+        while b'\n' in self.pending:
+            line, self.pending = self.pending.split(b'\n', 1)
+            require(0 < len(line) <= MAX_RECORD, 'STATUS_RECORD_OVERSIZE_OR_EMPTY')
+            try:
+                row = json.loads(line.decode('ascii'), object_pairs_hook=strict_object,
+                                 parse_constant=lambda _: (_ for _ in ()).throw(StatusRefusal('STATUS_NONFINITE')))
+            except (ValueError, UnicodeError, RecursionError) as error:
+                raise StatusRefusal('STATUS_MALFORMED') from error
+            require(type(row) is dict and row, 'STATUS_OBJECT_REQUIRED')
+            if 'child-pid' in row:
+                require(self.start is None and self.exit is None, 'DUPLICATE_OR_LATE_START')
+                allowed = {'child-pid'} | {name + '-namespace' for name in NS_NAMES if name != 'user'}
+                require(set(row) <= allowed and {'pid-namespace', 'mnt-namespace'} <= set(row),
+                        'UNSUPPORTED_STATUS_FIELDS_OR_NAMESPACES')
+                require(all(type(value) is int and 0 < value < 2**64 for value in row.values()),
+                        'INVALID_NATIVE_IDENTITY')
+                require(row['child-pid'] < 2**31, 'INVALID_NATIVE_PID')
+                self.start = row
+            else:
+                require(set(row) == {'exit-code'} and self.start is not None and self.exit is None,
+                        'UNKNOWN_DUPLICATE_OR_EARLY_EXIT')
+                require(type(row['exit-code']) is int and 0 <= row['exit-code'] <= 255,
+                        'INVALID_NATIVE_EXIT')
+                self.exit = row['exit-code']
+        require(len(self.pending) <= MAX_RECORD, 'STATUS_RECORD_OVERSIZE')
+
+    def finish(self):
+        require(not self.eof and not self.pending, 'TRUNCATED_OR_DUPLICATE_EOF')
+        self.eof = True
+        require(self.start is not None and self.exit is not None, 'INCOMPLETE_NATIVE_STATUS')
+
+
+def read_bounded(path, maximum, *, dir_fd=None):
+    """Trusted procfs/cgroupfs byte cap; mutable contour uses owned descriptors."""
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        chunks = []; size = 0
+        while True:
+            part = os.read(fd, min(8192, maximum + 1 - size))
+            if not part: return b''.join(chunks)
+            chunks.append(part); size += len(part)
+            require(size <= maximum, 'PROC_OR_CONTOUR_OVERSIZE')
+    finally:
+        os.close(fd)
+
+
+def identity(pid):
+    """Pinned proc directory plus double birth read: no path-based PID reuse."""
+    require(type(pid) is int and 0 < pid < 2**31, 'HOST_PID_REQUIRED')
+    root = os.open('/proc/' + str(pid), os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        def birth():
+            raw = read_bounded('stat', 8192, dir_fd=root).decode('ascii')
+            values = raw[raw.rfind(')') + 2:].split()
+            require(int(raw.split(' ', 1)[0]) == pid and len(values) >= 20 and
+                    values[0] not in ('Z', 'X'), 'PROCESS_NOT_LIVE')
+            return (int(values[19]), int(values[1]), int(values[2]), int(values[3]))
+        before = birth()
+        status = dict(line.split(':', 1) for line in read_bounded('status', 32768, dir_fd=root).decode('ascii').splitlines())
+        vectors = {key: [int(v) for v in status[key].split()] for key in ('NSpid', 'NSpgid', 'NSsid')}
+        namespaces = {}
+        for name in NS_NAMES:
+            obj = os.stat('ns/' + name, dir_fd=root)
+            namespaces[name] = [obj.st_dev, obj.st_ino]
+        row = dict(pid=pid, start_ticks=before[0], ppid=before[1], pgid=before[2], sid=before[3],
+                   namespaces=namespaces, vectors=vectors,
+                   cgroup=read_bounded('cgroup', 8192, dir_fd=root).decode('ascii').splitlines(),
+                   exe=os.readlink('exe', dir_fd=root),
+                   cmdline=read_bounded('cmdline', 32768, dir_fd=root).split(b'\0')[:-1])
+        require(birth() == before, 'PROCESS_BIRTH_OR_PARENT_CHANGED')
+        require(vectors['NSpid'][0] == pid and vectors['NSpgid'][0] == before[2] and
+                vectors['NSsid'][0] == before[3], 'PROCFS_NOT_HOST_DOMAIN')
+        return row
+    finally:
+        os.close(root)
+
+
+def same_birth(current, saved):
+    return all(current[key] == saved[key] for key in
+               ('pid', 'start_ticks', 'ppid', 'pgid', 'sid', 'namespaces', 'cgroup'))
+
+
+def provider_argv(prepared, semantic, status_fd, network=None):
+    """Validate the existing provider output; keep its mounts and scoped launcher."""
+    require(type(prepared) is dict and prepared.get('capability') == 'host-control-v1' and
+            prepared.get('state') == 'UNQUALIFIED_SOURCE_PREPARATION' and
+            prepared.get('runtimeGrant') is False and prepared.get('semanticArgv') == semantic and
+            prepared.get('statusFd') == status_fd, 'FOREIGN_OR_PROMOTED_PREPARATION')
+    argv = prepared.get('argv')
+    require(type(argv) is list and argv and argv[0] == BWRAP and
+            all(type(v) is str and '\0' not in v for v in argv), 'EXACT_BWRAP_ARGV_REQUIRED')
+    # Parse only the concrete existing provider vocabulary; no --args, --pidns,
+    # --userns, --sync-fd, --as-pid-1 or other descriptor/namespace override.
+    arity = {'--unshare-user': 0, '--unshare-pid': 0, '--unshare-ipc': 0,
+             '--unshare-uts': 0, '--disable-userns': 0, '--assert-userns-disabled': 0,
+             '--cap-drop': 1, '--clearenv': 0, '--die-with-parent': 0,
+             '--proc': 1, '--dev': 1, '--tmpfs': 1, '--ro-bind': 2,
+             '--bind': 2, '--chdir': 1, '--json-status-fd': 1}
+    if network is not None:
+        network.validate_preparation(prepared)
+        arity.update({'--unshare-net': 0, '--block-fd': 1, '--ro-bind-data': 2})
+    seen = {}; offset = 1
+    while offset < len(argv) and argv[offset] != '--':
+        flag = argv[offset]
+        require(flag in arity and offset + arity[flag] < len(argv), 'UNSUPPORTED_BWRAP_OPTION')
+        seen.setdefault(flag, []).append(argv[offset + 1:offset + 1 + arity[flag]])
+        offset += 1 + arity[flag]
+    require(seen.get('--json-status-fd') == [[str(status_fd)]] and
+            seen.get('--unshare-pid') == [[]] and seen.get('--unshare-user') == [[]] and
+            seen.get('--clearenv') == [[]] and seen.get('--die-with-parent') == [[]],
+            'STATUS_OR_NAMESPACE_OPTION_DRIFT')
+    if network is not None:
+        require(seen.get('--unshare-net') == [[]] and
+                seen.get('--block-fd') == [[str(network.block_read)]] and
+                seen.get('--ro-bind-data') == [[str(network.resolver_fd), '/etc/resolv.conf']] and
+                seen.get('--dev') == [['/dev']] and
+                len({status_fd, network.block_read, network.resolver_fd}) == 3,
+                'OWNED_NETWORK_BARRIER_OR_DNS_MOUNT_DRIFT')
+    inner = argv[offset + 1:]
+    require(offset < len(argv) and inner and inner[0].startswith('/') and
+            len(inner) > len(semantic) and inner[-len(semantic):] == semantic and
+            inner[-len(semantic) - 1] == '--', 'SCOPED_LAUNCHER_OR_SEMANTIC_DRIFT')
+    return list(argv)
+
+
+def expected_lineage(semantic, contour, outer_seconds):
+    """The pinned invocation.py execs timeout; bind the live resulting argv too."""
+    indices = [i for i, value in enumerate(semantic) if value.endswith('/invocation.py')]
+    require(len(indices) == 1, 'INVOCATION_LINEAGE_AMBIGUOUS')
+    index = indices[0]
+    require(index >= 4 and semantic[index-3:index] == ['-P', '-s', '-B'],
+            'RUNTIME_INTERPRETER_LINEAGE_DRIFT')
+    tail = semantic[index+1:]
+    require(len(tail) == 5 and tail[2] in ('guard.py', 'native_guard.py') and
+            tail[4].startswith('--runtest-file=') and semantic[index-4].startswith('/'),
+            'RUNTIME_GUARD_LINEAGE_DRIFT')
+    external = contour['external_deadline_monotonic']
+    require(type(external) in (float, int) and math.isfinite(external) and
+            type(outer_seconds) in (float, int) and math.isfinite(outer_seconds) and outer_seconds > 0,
+            'INVALID_EXISTING_TIMEOUT_DEADLINE')
+    guard = [semantic[index-4], '-P', '-s', '-B', str(Path(semantic[index]).parent / tail[2]),
+             tail[1], tail[0], tail[3], tail[4], '--external-deadline', repr(external)]
+    timeout = ['timeout', '--signal=KILL', '--verbose', f'{outer_seconds:.6f}s', *guard]
+    return timeout, guard
+
+
+class ContourEvent:
+    """One finite synchronous close-write notification, never a polling worker.
+
+    libc symbols and this new source edge require exact runtime-family review.
+    This descriptor is CLOEXEC, is not in pass_fds and never reaches the payload.
+    """
+    def __init__(self, directory):
+        self.fd = None
+        self.handles = []
+        self.directories = []
+        self.leaf_fd = self.read_fd = None
+        directory = Path(directory)
+        require(directory.is_absolute() and '..' not in directory.parts and
+                len(directory.parts) <= 128, 'EXACT_PRIVATE_CONTOUR_DIRECTORY_REQUIRED')
+        self.path = directory / 'native-contour.json'
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.inotify_init1.argtypes = [ctypes.c_int]; libc.inotify_init1.restype = ctypes.c_int
+        libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        libc.inotify_add_watch.restype = ctypes.c_int
+        try:
+            # Same owned O_PATH -> checked regular proc-fd reopen pattern as
+            # owner_observer.verify_lexical_input; retain each lexical ancestor.
+            for index, name in enumerate(directory.parts):
+                fd = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             **({} if index == 0 else {'dir_fd': self.directories[-1][1]}))
+                self.handles.append(fd)
+                obj = os.fstat(fd)
+                require(fd >= 3 and stat.S_ISDIR(obj.st_mode) and
+                        obj.st_uid in (0, os.getuid()) and not obj.st_mode & 0o022,
+                        'FOREIGN_OR_WRITABLE_CONTOUR_ANCESTOR')
+                self.directories.append((name, fd, self._directory_identity(obj)))
+            obj = os.fstat(self.directories[-1][1])
+            require(obj.st_uid == os.getuid() and stat.S_IMODE(obj.st_mode) == 0o700,
+                    'PRIVATE_CONTOUR_DIRECTORY_REQUIRED')
+            self.require_current()
+            try:
+                os.stat(self.path.name, dir_fd=self.directories[-1][1], follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise StatusRefusal('CONTOUR_ALREADY_PRESENT')
+            fd = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+            if 0 <= fd < 3: os.close(fd)
+            require(fd >= 3, 'CONTOUR_NOTIFICATION_UNAVAILABLE')
+            self.fd = fd
+            # This intentional proc fd link names our retained directory, not
+            # a second resolution of a mutable user supplied path.
+            watched = '/proc/self/fd/' + str(self.directories[-1][1])
+            self.watch = libc.inotify_add_watch(fd, os.fsencode(watched), 0x8 | 0x400 | 0x800)
+            require(self.watch >= 0, 'CONTOUR_WATCH_UNAVAILABLE')
+            self.require_current()
+        except BaseException:
+            self.close()
+            raise
+        self.ready = False
+        self.total = 0
+
+    @staticmethod
+    def _directory_identity(obj):
+        return (obj.st_dev, obj.st_ino, obj.st_mode, obj.st_uid, obj.st_gid)
+
+    @staticmethod
+    def _leaf_identity(obj):
+        return (obj.st_dev, obj.st_ino, obj.st_mode, obj.st_uid, obj.st_gid,
+                obj.st_nlink, obj.st_size, obj.st_mtime_ns, obj.st_ctime_ns)
+
+    def require_current(self):
+        for index, (name, fd, saved) in enumerate(self.directories):
+            obj = os.stat(name, follow_symlinks=False,
+                          **({} if index == 0 else {'dir_fd': self.directories[index - 1][1]}))
+            require(self._directory_identity(obj) == saved == self._directory_identity(os.fstat(fd)),
+                    'CONTOUR_ANCESTRY_CHANGED')
+        if self.leaf_fd is not None:
+            obj = os.stat(self.path.name, dir_fd=self.directories[-1][1], follow_symlinks=False)
+            require(self._leaf_identity(obj) == self.leaf_identity ==
+                    self._leaf_identity(os.fstat(self.leaf_fd)), 'CONTOUR_OBJECT_CHANGED')
+            if self.read_fd is not None:
+                require(self._leaf_identity(os.fstat(self.read_fd)) == self.leaf_identity,
+                        'CONTOUR_READ_DESCRIPTOR_CHANGED')
+
+    def read_contour(self, current):
+        """Finite bytes on the admitted private run filesystem, not a latency
+        guarantee for arbitrary filesystems. O_PATH/type checks reject special
+        files before data-open; the regular reopen is NONBLOCK. I/O may still stall:
+        the existing caller/outer boundary owns interruption and final cleanup.
+        Inotify names are hints, never proof of which inode the guard closed.
+        """
+        current()
+        require(self.ready and self.leaf_fd is None, 'CONTOUR_NOT_READY_OR_ALREADY_READ')
+        self.require_current()
+        fd = os.open(self.path.name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     dir_fd=self.directories[-1][1])
+        self.handles.append(fd)
+        obj = os.fstat(fd)
+        require(fd >= 3 and stat.S_ISREG(obj.st_mode) and obj.st_uid == os.getuid() and
+                obj.st_dev == self.directories[-1][2][0] and obj.st_nlink == 1 and
+                not obj.st_mode & 0o022 and 0 < obj.st_size <= MAX_CONTOUR,
+                'CONTOUR_REGULAR_OWNED_BOUNDED_FILE_REQUIRED')
+        self.leaf_fd, self.leaf_identity = fd, self._leaf_identity(obj)
+        current()
+        self.require_current()
+        # Reopen only the already checked object. NOFOLLOW is intentionally
+        # absent for this exact private proc fd link, never for contour names.
+        fd = os.open('/proc/self/fd/' + str(self.leaf_fd), os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        self.handles.append(fd)
+        self.read_fd = fd
+        require(fd >= 3 and not os.get_inheritable(fd) and
+                fcntl.fcntl(fd, fcntl.F_GETFL) & (os.O_ACCMODE | os.O_NONBLOCK) == os.O_NONBLOCK,
+                'CONTOUR_READ_FLAGS_CHANGED')
+        self.require_current()
+        chunks = []; size = 0
+        while True:
+            current()
+            part = os.read(fd, min(8192, MAX_CONTOUR + 1 - size))
+            current()
+            if not part: break
+            chunks.append(part); size += len(part)
+            require(size <= MAX_CONTOUR, 'CONTOUR_OVERSIZE')
+        require(size == self.leaf_identity[6], 'CONTOUR_SHORT_OR_CHANGED')
+        self.require_current()
+        current()
+        return b''.join(chunks)
+
+    def consume(self):
+        data = os.read(self.fd, 8192)
+        self.total += len(data)
+        require(data and self.total <= 65536, 'CONTOUR_EVENT_OVERSIZE')
+        offset = 0
+        while offset < len(data):
+            require(len(data) - offset >= 16, 'TORN_CONTOUR_EVENT')
+            wd, mask, cookie, length = struct.unpack_from('iIII', data, offset)
+            offset += 16
+            require(offset + length <= len(data) and wd == self.watch and
+                    not mask & (0x4000 | 0x8000 | 0x400 | 0x800), 'CONTOUR_WATCH_LOST')
+            name = data[offset:offset + length].split(b'\0', 1)[0]; offset += length
+            if name == b'native-contour.json' and mask & 0x8:
+                require(not self.ready, 'DUPLICATE_CONTOUR_CLOSE')
+                self.ready = True
+
+    def close(self):
+        errors = []
+        if self.fd is not None:
+            fd, self.fd = self.fd, None
+            try: os.close(fd)
+            except OSError as error: errors.append(error)
+        handles, self.handles = self.handles, []
+        for fd in reversed(handles):
+            try: os.close(fd)
+            except OSError as error: errors.append(error)
+        if errors: raise errors[0]
+
+
+class StatusCustody:
+    """Finite adapter owned by the existing FileOwner, bound to one session.
+
+    No public JSON receipt can recreate this retained object after a crash.
+    Recovered sessions remain UNBOUND and use the existing native outer cleanup.
+    """
+    def __init__(self, owner, session, registry, run, semantic, prepare, *, startup_end, network=None):
+        self.owner, self.session, self.registry = owner, session, registry
+        self.network = network
+        self.semantic = list(semantic)
+        self.read_fd = self.write_fd = None
+        self.events = None
+        self.records = NativeRecords()
+        self.spawned = False
+        self.failed = False
+        self.observed = None
+        self.proc = None
+        self.closed = False
+        self.deadline = session.runtest_deadline
+        require(getattr(owner, '_status_custody', None) is None, 'OWNER_STATUS_ALREADY_CONSUMED')
+        owner._status_custody = self  # retain before allocation/callback/return can fail
+        self.startup_end = startup_end  # exact caller anchor, allocated before DNS/status work
+        try:
+            require(network is None or network.startup_end == self.startup_end, 'SHARED_STARTUP_ANCHOR_REQUIRED')
+            self._startup_current()
+            self.owner.require_current(self.session.runtest_outer)
+            self._startup_current()
+            require(Path(run) == owner.parent / 'run', 'FOREIGN_CONTOUR_RUN_DIRECTORY')
+            self.events = ContourEvent(run)
+            self._startup_current()
+            self.read_fd, self.write_fd = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+            require(self.read_fd >= 3 and self.write_fd >= 3, 'STANDARD_FD_COLLISION')
+            # The writer is blocking as expected by upstream write_to_fd. Only
+            # the parent-owned reader is nonblocking. Their OFDs are distinct.
+            os.set_blocking(self.write_fd, True)
+            r, w = os.fstat(self.read_fd), os.fstat(self.write_fd)
+            require(stat.S_ISFIFO(r.st_mode) and stat.S_ISFIFO(w.st_mode) and
+                    (r.st_dev, r.st_ino) == (w.st_dev, w.st_ino) and
+                    not os.get_inheritable(self.read_fd) and not os.get_inheritable(self.write_fd),
+                    'OWNED_CLOEXEC_PIPE_REQUIRED')
+            self.pipe_identity = [r.st_dev, r.st_ino]
+            self._startup_current()
+            prepared = prepare(list(self.semantic), self.write_fd)
+            self._startup_current()
+            self.argv = provider_argv(prepared, self.semantic, self.write_fd, self.network)
+            expected_binary_sha = BWRAP_NETWORK_SHA256 if self.network is not None else BWRAP_SHA256
+            if self.network is not None:
+                require(len(expected_binary_sha) == 64 and expected_binary_sha != INSTALLED_BWRAP_SHA256 and
+                        all(c in '0123456789abcdef' for c in expected_binary_sha),
+                        'REVIEWED_SUCCESS_ONLY_BWRAP_BUILD_UNBOUND')
+            require(hashlib.sha256(Path(BWRAP).read_bytes()).hexdigest() == expected_binary_sha,
+                    'BWRAP_BINARY_DRIFT')
+            self._startup_current()
+        except BaseException:
+            self.abort()
+            raise
+
+    def _current(self):
+        require(not self.failed and not self.closed and not self.owner.stop_requested() and
+                not self.session.runtest_stop_requested and not self.session.runtest_persistence_error and
+                not self.session.runtest_pidfd_error and math.isfinite(self.deadline) and
+                time.monotonic() < self.deadline - self.owner.pre['reserve_seconds'],
+                'STATUS_CANCELLED_UNCERTAIN_OR_LATE')
+
+    def _startup_current(self):
+        self._current()
+        require(type(self.startup_end) in (float, int) and math.isfinite(self.startup_end) and
+                self.startup_end <= self.deadline - self.owner.pre['reserve_seconds'] and
+                time.monotonic() < self.startup_end, 'STARTUP_DEADLINE_EXHAUSTED')
+
+    def _pipe_endpoint(self, fd, writing):
+        require(type(fd) is int and fd >= 3, 'MISSING_OWNED_STATUS_ENDPOINT')
+        endpoint = os.fstat(fd)
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        require(stat.S_ISFIFO(endpoint.st_mode) and endpoint.st_uid == os.getuid() and
+                [endpoint.st_dev, endpoint.st_ino] == self.pipe_identity and
+                flags & os.O_ACCMODE == (os.O_WRONLY if writing else os.O_RDONLY) and
+                not os.get_inheritable(fd), 'STATUS_ENDPOINT_REPLACED_OR_INHERITABLE')
+
+    def spawn(self, kwargs):
+        require(not self.spawned, 'STATUS_SPAWN_ALREADY_CONSUMED')
+        self.spawned = True
+        try:
+            self._startup_current()
+            require(kwargs.get('close_fds') is True and not kwargs.get('pass_fds') and
+                    not kwargs.get('shell') and 'executable' not in kwargs and 'preexec_fn' not in kwargs,
+                    'FOREIGN_INHERITED_DESCRIPTOR_OR_EXEC_OVERRIDE')
+            self._pipe_endpoint(self.read_fd, False)
+            self._pipe_endpoint(self.write_fd, True)
+            inherited = ((self.write_fd, self.network.block_read, self.network.resolver_fd)
+                         if self.network is not None else (self.write_fd,))
+            require(len(set(inherited)) == len(inherited), 'OWNED_DESCRIPTOR_COLLISION')
+            exact = dict(kwargs, pass_fds=inherited)
+            # The only Popen and pidfd acquisition stay in the real registry.
+            self._startup_current()
+            self.proc = self.registry.spawn_runtest(self.session, self.argv, exact, native_owner=self.owner)
+            if self.network is not None:
+                self.network.donor_spawned(self.proc)
+            self._startup_current()
+        except BaseException:
+            self.abort()
+            raise
+        finally:
+            if self.write_fd is not None:
+                fd, self.write_fd = self.write_fd, None
+                try: os.close(fd)
+                except OSError as error:
+                    self.abort()
+                    raise StatusRefusal('STATUS_WRITER_CLOSE_UNCONFIRMED') from error
+        try:
+            self._startup_current()
+            return self.proc
+        except BaseException:
+            self.abort()
+            raise
+
+    def _status_ready(self):
+        self._pipe_endpoint(self.read_fd, False)
+        data = os.read(self.read_fd, min(1024, MAX_STATUS + 1 - self.records.total))
+        if data:
+            self.records.feed(data)
+        else:
+            self.records.finish()
+
+    def startup(self, proc, expected_contour, expected_guard_exe):
+        try:
+            self._startup_current()
+            require(proc is self.proc is self.session.process and proc.args == self.argv and
+                    self.session._runtest_pidfd is not None, 'UNOWNED_STATUS_HANDLE')
+            monitor = identity(proc.pid)
+            self._startup_current()
+            require(monitor['start_ticks'] == self.session.host_start_time and
+                    monitor['pgid'] == monitor['sid'] == proc.pid and monitor['exe'] == BWRAP and
+                    monitor['cmdline'] == [os.fsencode(v) for v in self.argv], 'HOST_MONITOR_DRIFT')
+            network_attached = self.network is None
+            while self.records.start is None or not self.events.ready or not network_attached:
+                self._startup_current()
+                if self.records.start is not None and not network_attached:
+                    require(self.records.exit is None and not self.records.eof, 'NETWORK_STATUS_ALREADY_EXITED')
+                    self.network.attach_before_payload(monitor, self.records.start)
+                    self._startup_current()
+                    network_attached = True
+                    if self.events.ready:
+                        break
+                remaining = self.startup_end - time.monotonic()
+                require(remaining > 0 and not self.records.eof and self.records.exit is None,
+                        'STARTUP_MISSING_LATE_OR_ALREADY_EXITED')
+                ready, _, _ = select.select([self.read_fd, self.events.fd], [], [], min(remaining, 0.1))
+                self._startup_current()
+                # Bounded cancellation checks only during this synchronous startup.
+                if self.read_fd in ready: self._status_ready()
+                self._startup_current()
+                if self.events.fd in ready: self.events.consume()
+                self._startup_current()
+            self._startup_current()
+            require(network_attached and not self.records.eof and self.records.exit is None, 'STARTUP_ALREADY_EXITED')
+            data = self.events.read_contour(self._startup_current)
+            self._startup_current()
+            contour = json.loads(data, object_pairs_hook=strict_object)
+            require(type(contour) is dict, 'CONTOUR_OBJECT_REQUIRED')
+            for key, value in expected_contour.items():
+                require(contour.get(key) == value, 'FOREIGN_STARTUP_CONTOUR')
+            self._startup_current()
+            observed = self._join_live(monitor, contour, expected_guard_exe)
+            self._startup_current()
+            require(same_birth(identity(proc.pid), monitor), 'MONITOR_BIRTH_CHANGED')
+            self._startup_current()
+            self.owner.require_current(self.session.runtest_outer)
+            self._startup_current()
+            self.events.require_current()
+            self._startup_current()
+            accepted = dict(observed, contour_sha256=hashlib.sha256(data).hexdigest(),
+                                 status_pipe=self.pipe_identity, native_start=dict(self.records.start),
+                                 source='owned-bwrap-0.11.1-status-and-live-host-procfs',
+                                 state='OBSERVED_NOT_QUALIFIED', runtimeGrant=False)
+            self.events.close()
+            self._startup_current()
+            self.observed = accepted
+            return self.observed
+        except BaseException:
+            self.abort()
+            raise
+
+    def _join_live(self, monitor, contour, expected_guard_exe):
+        self._startup_current()
+        outer = self.session.runtest_outer
+        cgroup = Path('/sys/fs/cgroup') / outer['control_group'].lstrip('/')
+        cstat = cgroup.stat()
+        require([cstat.st_dev, cstat.st_ino] == outer['cgroup_inode'], 'CGROUP_OBJECT_CHANGED')
+        require(read_bounded('/proc/sys/kernel/random/boot_id', 128).decode().strip() ==
+                self.session.runtest_boot_id == outer['boot_id'], 'BOOT_CHANGED')
+        owner_ns = Path('/proc/self/ns/pid').stat()
+        require(monitor['namespaces']['pid'] == [owner_ns.st_dev, owner_ns.st_ino], 'MONITOR_FOREIGN_PID_NAMESPACE')
+        tasks_max = self.owner.spec['tasks_max']  # original admitted unit bound, never a reduced parallelism cap
+        require(type(tasks_max) is int and tasks_max > 1, 'ORIGINAL_TASK_BOUND_REQUIRED')
+        members = [int(v) for v in read_bounded(cgroup / 'cgroup.procs', tasks_max * 12).split()]
+        self._startup_current()
+        require(0 < len(members) <= tasks_max and len(members) == len(set(members)), 'TASK_CENSUS_OVERFLOW')
+        child_pid = self.records.start['child-pid']  # native record, in monitor's host namespace
+        require(child_pid in members and monitor['pid'] in members, 'UNOWNED_NATIVE_CHILD')
+        child = identity(child_pid)
+        require(child['ppid'] == monitor['pid'] and child['namespaces']['pid'] != monitor['namespaces']['pid'] and
+                child['vectors']['NSpid'] == [child_pid, 1], 'SANDBOX_INIT_DOMAIN_DRIFT')
+        for key, value in self.records.start.items():
+            if key.endswith('-namespace'):
+                require(child['namespaces'][key[:-10]][1] == value, 'NATIVE_NAMESPACE_MISMATCH')
+        require(contour.get('pid_namespace') == child['namespaces']['pid'], 'CONTOUR_NAMESPACE_MISMATCH')
+        rows = []  # disappearing/unreadable member => refuse, never infer
+        for pid in members:
+            self._startup_current()
+            rows.append(identity(pid))
+            self._startup_current()
+        selected = {}
+        for role in ('timeout', 'guard'):
+            claim = contour[role]
+            require(type(claim) is dict and type(claim.get('pid')) is int and claim['pid'] > 1,
+                    'INVALID_INNER_IDENTITY')
+            matches = [row for row in rows if row['namespaces']['pid'] == child['namespaces']['pid'] and
+                       row['vectors']['NSpid'] == [row['pid'], claim['pid']] and
+                       row['start_ticks'] == claim['start_ticks']]
+            require(len(matches) == 1, 'AMBIGUOUS_ABSENT_OR_REUSED_INNER_IDENTITY')
+            row = matches[0]
+            require(row['vectors']['NSpgid'] == [row['pgid'], claim['pgid']] and
+                    row['vectors']['NSsid'] == [row['sid'], claim['sid']] and row['exe'] == claim['exe'],
+                    'INNER_GROUP_SESSION_OR_EXEC_MISMATCH')
+            selected[role] = row
+        timeout, guard = selected['timeout'], selected['guard']
+        expected_timeout, expected_guard = expected_lineage(self.semantic, contour, self.owner.phase['outer'])
+        external = contour['external_deadline_monotonic']
+        now = time.monotonic()
+        require(now < external < self.deadline and external - now <= self.owner.phase['outer'] and
+                timeout['cmdline'] == [os.fsencode(v) for v in expected_timeout] and
+                guard['cmdline'] == [os.fsencode(v) for v in expected_guard], 'LIVE_EXEC_LINEAGE_OR_DEADLINE_DRIFT')
+        require(timeout['ppid'] == child_pid and guard['ppid'] == timeout['pid'] and
+                timeout['pgid'] == timeout['sid'] == timeout['pid'] and
+                guard['pgid'] == guard['sid'] == timeout['pid'] and
+                contour['guard']['ppid'] == contour['timeout']['pid'] and
+                timeout['exe'] == str(Path('/usr/bin/gnutimeout').resolve(strict=True)) and
+                guard['exe'] == expected_guard_exe, 'TIMEOUT_GUARD_HOST_TREE_MISMATCH')
+        for row in [monitor, child, timeout, guard]:
+            self._startup_current()
+            require(row['cgroup'] == ['0::' + outer['control_group']], 'FOREIGN_CGROUP')
+            require(same_birth(identity(row['pid']), row), 'LIVE_BIRTH_OR_NAMESPACE_CHANGED')
+        final_cgroup = cgroup.stat()
+        self._startup_current()
+        require([final_cgroup.st_dev, final_cgroup.st_ino] == outer['cgroup_inode'], 'CGROUP_OBJECT_CHANGED')
+        # Diagnostic identities only; the registry retains solely monitor's pidfd.
+        def portable(row):
+            return {key: value for key, value in row.items() if key != 'cmdline'}
+        return dict(host_monitor=portable(monitor), sandbox_child=portable(child),
+                    timeout_host=portable(timeout), guard_host=portable(guard),
+                    native_outer=outer, original_deadline=self.deadline,
+                    owner_pid_namespace=[owner_ns.st_dev, owner_ns.st_ino])
+
+    def finish(self, proc):
+        """Called only after sole donor communicate; EOF is not a cessation proof."""
+        try:
+            self._current()
+            require(proc is self.proc is self.session.process and proc.returncode is not None and
+                    self.observed is not None and not self.records.eof, 'UNOWNED_OR_UNOBSERVED_STATUS_FINISH')
+            while not self.records.eof:
+                self._current()
+                ready, _, _ = select.select([self.read_fd], [], [], 0)
+                require(ready, 'STATUS_WRITER_LEAK_OR_EOF_GAP')
+                self._status_ready()
+            require(self.records.exit == proc.returncode, 'NATIVE_EXIT_DONOR_MISMATCH')
+            if self.network is not None:
+                self.network.finish_after_donor(proc)
+            self._current()
+            return dict(state='NATIVE_STATUS_COMPLETE_NOT_CESSATION', exit_code=self.records.exit,
+                        bytes=self.records.total, sha256=self.records.digest.hexdigest(),
+                        runtimeGrant=False)
+        except BaseException:
+            self.failed = True
+            self.session.runtest_stop_requested = True
+            raise
+        finally:
+            self.close()
+
+    def abort(self):
+        self.failed = True
+        self.session.runtest_stop_requested = True
+        try:
+            if self.network is not None:
+                self.network.abort()
+        finally:
+            self.close()
+
+    def close(self):
+        # Latch first; no cleanup error can make this object reusable. No wait,
+        # signal or detached helper: donor finally and native outer own closure.
+        self.closed = True
+        errors = []
+        for field in ('read_fd', 'write_fd'):
+            fd = getattr(self, field)
+            if fd is not None:
+                setattr(self, field, None)
+                try: os.close(fd)
+                except OSError as error: errors.append(error)
+        if self.events is not None:
+            try: self.events.close()
+            except OSError as error: errors.append(error)
+        if errors:
+            self.failed = True
+            self.session.runtest_stop_requested = True
+            raise StatusRefusal('STATUS_DESCRIPTOR_CLOSE_UNCONFIRMED') from errors[0]

@@ -1,0 +1,213 @@
+"""Joined exact-source controls, NOT_RUN. No native/PID/syscall proof or grant.
+
+Only inert owner/registry models plus private pytest files are used. The parent
+must admit execution separately. Existing 181 and pidfd 36 cases are retained.
+"""
+import ast
+import copy
+import json
+from types import MethodType, SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import test_native_boundary_source as boundary
+
+
+def rewrite(owner, path, record):
+    """Deliberate fault in an inert model receipt, never a real runtime artifact."""
+    assert path.is_relative_to(owner.out)
+    path.chmod(0o600)
+    path.write_text(json.dumps(record))
+    path.chmod(0o400)
+
+
+def set_field(record, key, value):
+    if value == '<missing>':
+        del record[key]
+    else:
+        record[key] = value
+
+
+def prepare_next(owner):
+    admission = owner.out / 'model-admission.json'
+    owner.h.put(admission, {'source_model': True})
+    pre = dict(owner.pre, admission=str(admission), admission_sha256=owner.h.sha(admission), reserve_seconds=1)
+    original = dict(owner.original, deadline_monotonic=1800)
+    phases = [dict(owner.phase, outer=1), dict(name='next-phase', outer=1)]
+    class ReachedPrelaunch(RuntimeError):
+        pass
+    def require(ok, why):
+        if not ok:
+            raise ValueError(why)
+    lock = Mock(side_effect=ReachedPrelaunch('before allocation'))
+    api = boundary.definitions(boundary.ROOT / 'owner-helper/owner_observer.py', {'prepare'},
+        cohort=lambda out: (original, pre), phases_for=lambda clock: phases,
+        require=require, read=owner.h.read, sha=owner.h.sha, private=owner.h.private,
+        time=SimpleNamespace(monotonic=lambda: 10), lock_probe=lock)
+    return lambda: api['prepare'](owner.out, 1), lock, ReachedPrelaunch
+
+
+@pytest.mark.parametrize('value', ['', 'close:OSError', None, True, False, '<missing>'])
+def test_pidfd_original_snapshot_is_complete_immutable_and_never_contains_fd(tmp_path, value):
+    owner = boundary.owner_model(tmp_path)
+    row = boundary.original_row(owner)
+    set_field(row, 'runtest_pidfd_error', value)
+    # The runtime-only descriptor must never enter the disposition even if a
+    # malformed input supplies it. Actual checkpoint exclusion has its own test.
+    row['_runtest_pidfd'] = 71
+    record = owner.retain_registry_disposition([row], boundary.checkpoint(owner, row))
+    path = owner.parent / 'registry-disposition.json'
+    before = path.read_bytes()
+    assert record['fields_complete'] is (value != '<missing>')
+    assert '_runtest_pidfd' not in record['original_row']
+    assert record['original_row']['runtest_pidfd_error'] == (None if value == '<missing>' else value)
+    assert owner.original_row_allows_next_phase(boundary.recovered_session(owner)) is (value == '')
+    assert path.read_bytes() == before
+    owner.close()
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('value', ['', 'signal:OSError', None, True, False, '<missing>'])
+def test_current_recovered_pidfd_error_cannot_be_defaulted_away(tmp_path, value):
+    owner = boundary.owner_model(tmp_path)
+    row = boundary.original_row(owner)
+    owner.retain_registry_disposition([row], boundary.checkpoint(owner, row))
+    session = boundary.recovered_session(owner)
+    if value == '<missing>':
+        del session.runtest_pidfd_error
+    else:
+        session.runtest_pidfd_error = value
+    assert owner.original_row_allows_next_phase(session) is (value == '')
+    assert owner.registry_disposition['original_row']['runtest_pidfd_error'] == ''
+
+
+@pytest.mark.parametrize('site', ['original', 'current', 'drain'])
+@pytest.mark.parametrize('value', ['', 'close:OSError', None, True, False, '<missing>'])
+def test_full_finish_pidfd_errors_preserve_exit_and_close_without_next_phase(tmp_path, site, value):
+    owner = boundary.owner_model(tmp_path)
+    row = boundary.original_row(owner)
+    if site == 'original':
+        set_field(row, 'runtest_pidfd_error', value)
+    finish, registry = boundary.finish_model(owner, row)
+    if site == 'current':
+        session = next(iter(registry._running.values()))
+        if value == '<missing>':
+            del session.runtest_pidfd_error
+        else:
+            session.runtest_pidfd_error = value
+    if site == 'drain':
+        path = owner.parent / 'runtest-drain.json'
+        data = owner.h.read(path)
+        set_field(data, 'registry_pidfd_error', value)
+        rewrite(owner, path, data)
+    snapshot = (owner.parent / 'registry-disposition.json').read_bytes()
+    finish()
+    registry.finish_runtest.assert_called_once()
+    release = owner.h.read(owner.parent / 'registry-release.json')
+    assert release['exit_code'] == 0
+    assert release['next_phase_admissible'] is (value == '')
+    assert release['runtime_or_product_accepted'] is False
+    assert (owner.parent / 'registry-disposition.json').read_bytes() == snapshot
+
+
+@pytest.mark.parametrize('value', ['', 'close:OSError', None, True, False, '<missing>'])
+def test_next_prepare_checks_pidfd_even_with_matching_snapshot_hash(tmp_path, value):
+    owner = boundary.owner_model(tmp_path)
+    finish, registry = boundary.finish_model(owner, boundary.original_row(owner))
+    finish()
+    path = owner.parent / 'registry-disposition.json'
+    record = owner.h.read(path)
+    set_field(record['original_row'], 'runtest_pidfd_error', value)
+    rewrite(owner, path, record)
+    released_path = owner.parent / 'registry-release.json'
+    released = owner.h.read(released_path)
+    released['original_registry_disposition_sha256'] = owner.h.sha(path)
+    rewrite(owner, released_path, released)
+    prepare, lock, reached = prepare_next(owner)
+    with pytest.raises(reached if value == '' else ValueError):
+        prepare()
+    assert lock.call_count == (1 if value == '' else 0)
+    assert not (owner.out / 'next-phase').exists()
+
+
+@pytest.mark.parametrize('field', ['runtest_pidfd_error', 'runtest_stop_requested',
+                                  'runtest_launch_pending', 'runtest_persistence_error',
+                                  'runtest_outer_closed', 'fields_complete', 'extra_field'])
+def test_first_snapshot_rejects_safety_or_completeness_corruption_on_readback(tmp_path, field):
+    owner = boundary.owner_model(tmp_path)
+    bad = {'runtest_pidfd_error': 'close:OSError', 'runtest_stop_requested': True,
+           'runtest_launch_pending': True, 'runtest_persistence_error': 'OSError',
+           'runtest_outer_closed': {'prior': 'closure'}}
+    row = boundary.original_row(owner)
+    if field == 'fields_complete':
+        del row['runtest_pidfd_error']
+    elif field != 'extra_field':
+        row[field] = bad[field]
+    digest = boundary.checkpoint(owner, row)
+    writer = owner.h.put
+    def corrupt(path, value):
+        value = copy.deepcopy(value)
+        if field == 'fields_complete':
+            value[field] = True
+        elif field == 'extra_field':
+            value['unexpected'] = 'not the original written record'
+        else:
+            value['original_row'][field] = boundary.original_row(owner)[field]
+        writer(path, value)
+    owner.h.put = corrupt
+    with pytest.raises(RuntimeError, match='DISPOSITION_READBACK_FAILED'):
+        owner.retain_registry_disposition([row], digest)
+    assert owner.registry_disposition is None
+    # A failed readback never authorizes continuation by silently keeping the
+    # expected in-memory value instead of the actual persisted receipt.
+
+
+@pytest.mark.parametrize('field', ['primary_error', 'cleanup_errors',
+                                  'registry_persistence_error', 'registry_pidfd_error'])
+@pytest.mark.parametrize('value', ['<missing>', True, False, 0, {}, 'failure'])
+def test_full_finish_requires_explicit_typed_healthy_drain_fields(tmp_path, field, value):
+    owner = boundary.owner_model(tmp_path)
+    finish, registry = boundary.finish_model(owner, boundary.original_row(owner))
+    path = owner.parent / 'runtest-drain.json'
+    data = owner.h.read(path)
+    set_field(data, field, value)
+    rewrite(owner, path, data)
+    finish()
+    registry.finish_runtest.assert_called_once()
+    release = owner.h.read(owner.parent / 'registry-release.json')
+    assert release['exit_code'] == 0 and release['next_phase_admissible'] is False
+
+
+@pytest.mark.parametrize('site', ['original', 'current', 'drain'])
+def test_pidfd_admission_controls_are_sensitive_to_each_new_error_predicate(tmp_path, site):
+    owner = boundary.owner_model(tmp_path)
+    row = boundary.original_row(owner)
+    if site == 'original':
+        row['runtest_pidfd_error'] = 'close:OSError'
+    finish, registry = boundary.finish_model(owner, row, mutate_pidfd=site == 'drain')
+    if site == 'drain':
+        path = owner.parent / 'runtest-drain.json'
+        data = owner.h.read(path); data['registry_pidfd_error'] = 'close:OSError'
+        rewrite(owner, path, data)
+    else:
+        if site == 'current':
+            next(iter(registry._running.values())).runtest_pidfd_error = 'close:OSError'
+        path = boundary.ROOT / 'owner-helper/runtest_outer.py'
+        tree = ast.parse(path.read_bytes())
+        method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and
+                      n.name == 'original_row_allows_next_phase')
+        predicate = next(n.value for n in ast.walk(method) if isinstance(n, ast.Return))
+        target = ("prior.get('runtest_pidfd_error') == ''" if site == 'original' else
+                  "getattr(session, 'runtest_pidfd_error', None) == ''")
+        before = len(predicate.values)
+        predicate.values = [n for n in predicate.values if ast.unparse(n) != target]
+        assert len(predicate.values) == before - 1
+        def check(ok, why):
+            if not ok:
+                raise RuntimeError(why)
+        namespace = {'check': check}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), 'exec'), namespace)
+        owner.original_row_allows_next_phase = MethodType(namespace[method.name], owner)
+    finish()
+    # Removing only the selected pidfd-empty predicate falsely allows admission.
+    assert owner.h.read(owner.parent / 'registry-release.json')['next_phase_admissible'] is True

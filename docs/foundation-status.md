@@ -1,6 +1,488 @@
-# Foundation checkpoint — 2026-10-08
+# Foundation checkpoint — 2026-10-09
 
-Current checkpoint, 14:53 MSK: disabled own-profile setup and the normal
+Current checkpoint, 2026-10-09 16:55 MSK: a partial source/outcome snapshot
+is prepared for intermediate publication. See the [work log](../analysis/2026-10-09/incremental-01/WORKLOG.md)
+and [selected outcome records](../analysis/2026-10-09/incremental-01/outcomes.json).
+The TS owner source package completed, but independent review found four
+connected blockers: aggregate process ownership, current TS pin consumption,
+whole-lifetime deadline enforcement and transformed-code event reconciliation.
+A coherent repair is active. Sol separately implements bounded callback cost
+measurements after a real CPython probe showed the proposed general monitoring
+misses calls inside profile/audit callbacks. No runtime acceptance follows.
+All seven installed journeys and four web contexts remain unaccepted.
+The detailed earlier observations below are history, not current assignments.
+
+Earlier checkpoint, 2026-10-09 16:03 MSK: repaired SDK/network source
+qualification passed all579 cases (original562 plus17 ABI controls), with1737
+complete phase reports, no denial/skip/collection error and unchanged inputs.
+Closure finished within16.081 of the original180 seconds; both processes
+and their group were absent and the quality lock returned. A root report
+classifier incorrectly expected a filename prefix on outside-root pytest
+nodes. Its failed-label receipt remains immutable; independent exact pinned
+pytest/source/node evidence establishes additive source PASS without rerun.
+This does not qualify the installed SDK or native boundary.
+
+Browser G20 source and complete producer/consumer bindings passed independent
+review; changed71 source controls passed. The real positive preparation still
+failed with exit137 after three of38 cases (nine phase reports). Closure,
+source/metadata integrity and lock return completed within46.973 of180 seconds.
+The last saved CPU reading was43.974 of45 seconds; signal cause remains
+unknown. Other18 native preparations and full725 remain NOT_RUN. A targeted
+remaining-cost investigation is active; no limit increase or old-attempt retry.
+
+Sol completed the coherent qualifier repair and is now integrating the
+existing finite owner with TS24 after one verified pre-task compact. Real
+aggregate resources, host-to-namespace descriptor custody, native libraries,
+final transformed worker inputs and whole-unit cessation must be connected
+before execution. Current source hooks/configuration do not establish those
+runtime facts. No replacement manager or product capability exclusion is accepted.
+
+Complete matching bwrap/slirp archives and exact patched copies are prepared.
+Actual helper build still requires missing development packages and existing
+outer resource ownership. A0 is separately blocked by observed journal archive
+corruption; no clean original or supported complete recovery has been verified.
+The existing owner recovery-source question remains pending. Old Friday stays
+off; no A0 kernel trial or installed journey is inferred from source results.
+All seven installed journeys and four web contexts remain unaccepted.
+
+The corrected browser installer passed all 183
+actual offline tests, with unchanged inputs and confirmed process/lock closure.
+The checked system-service installation is ready; interactive administrator
+authentication is still required. Neither installation nor a live browser
+journey has been accepted from these tests.
+
+The normal Hermes browser source repair previously passed
+independent review across 22 files and 18 retained browser APIs. Admission now
+covers the separate CDP, dialog, exec, vault, router and harness paths, while
+failed client termination retains the original Popen handle and deadline.
+These changes are not yet live qualification: the existing task owner's
+positive network admission and whole-scope stop integration remain required.
+
+The next source package connects the actual native user/job identity, original
+deadline and ProcessRegistry custody to browser operations, and adds a strict
+public HTTP dial path. Independent review confirmed the repaired launch/stop
+lock order and retained deadline propagation. It found one remaining readback
+gap: the persisted per-command deadline was not compared with the retained
+value. The correction and two negative test cases passed independent
+changed-source review; execution remains pending. Sol verified the installed
+agent-browser 0.26.0 against its official release and exact upstream commit,
+then supplied stream authentication and deadline source changes. Independent
+review found a launch serialization path that lost a shorter current owner
+deadline. The coherent correction retains the same object/token, applies the
+minimum before publication and permanently refuses a later shortening without
+claiming that an issued listener has stopped. Independent review then found a
+real-bind clock exception path that could leave the control reusable. That
+correction and its 17,967-file donor join have passed independent source review.
+Sol delivered the fixed system-service build package with whole-build network
+and aggregate resource limits. Independent review found two pre-build defects:
+the syscall filter defaults to SIGSYS while its denial checks expect an ordinary
+error, and the consumed Cargo configuration was outside the verified input map.
+The coherent correction passed independent source review: the exact denied
+syscalls now return EPERM, both admission consumers require the signed D-Bus
+value, and Cargo rechecks its exact configuration before dispatch. All 101,301
+prior input entries are retained; the configuration is the sole added file.
+Sol joined all 170 source cases: the retained 58, 36 asset/bootstrap,
+58 lifecycle and 18 dashboard/phase cases, without duplicating the original 32.
+Independent review verified the final bindings and unchanged runner guards,
+then found a fixture defect: a private fragment path conflicts with the
+adopter's required system path. Two positive cases cannot reach their target;
+six negative cases could pass for the wrong reason. The fixture mapping,
+bootstrap mode and mutation-specific checks were repaired and independently
+reviewed. The full offline gate then collected all 170 cases: 165 passed and
+five failed. All 36 installer cases passed. Four later lifecycle cases reference
+a nonexistent module attribute; the dashboard success fixture fails the real
+Cargo configuration ancestry check. That attempt closed in 61.280 of its original 180 seconds,
+with unchanged inputs, both expected SIGALRM events, no remaining processes
+and the lock returned. The external child-birth snapshot was missed and is
+not claimed as observed. The coherent fixture repair passed independent source
+review and a fresh full gate: all 170 actual cases passed, closing in 63.345 of
+180 seconds. The runner recorded its own and the GNU parent's kernel birth
+identities before fixtures; exact processes and group were absent afterwards,
+all 65 input pins were unchanged and the canonical lock was returned.
+Production path checks remain intact. A subsequent check of the actual native
+admission found a source-relocation defect: it derives the runtime parent from
+the source directory although the pinned runtime identity remains in Sol's
+workspace. The exact identity correction passed independent source review and
+a fresh complete offline gate: all 193 cases passed, including 23 actual
+admission cases. The attempt closed in 62.713 of its original 180 seconds,
+with all 65 input pins unchanged, exact processes and group absent, and the
+canonical lock returned. The owner then installed the exact inactive system
+service in 3.123 seconds. Its root assets, source pins, installation journal and
+inactive state were independently checked. The first native owner entry refused
+before any service call: Astra incorrectly copied nested package metadata into
+the admission's string-hash map. Source bytes remain unchanged. The failed
+attempt and original clock are retained. Independently reviewed recovery closed
+the original parent in 1,008.620 of its original 1,800 seconds; its entire group
+was absent and the exact lock was returned. The service has never started; its
+inactive installed assets remain under Astra's custody. Independent cleanup-only
+review found that the proposed sixty-second bound did not cover authentication
+and external process cessation. The source correction concluded with a precise unresolved prerequisite:
+an existing privileged foreground path covering authentication, root execution
+and external cessation within the same original bound has not been verified.
+The initial delivery timeout remains recorded; owner continuation and the exact
+completed result were reconciled without duplicate execution. No cleanup occurred. The installed sudo-rs binary and exact Ubuntu source are
+now linked through signed archive metadata. Specific post-fork error paths and
+missing monitor waits leave the whole-operation privileged custody requirement
+open; signal forwarding alone does not close it.
+The input producer's complete post-run verification, external closure and
+connected preparation controls passed independent source review. The actual
+112-case gate then passed 111 cases and found one producer defect: clean_path
+accepts a double leading slash. The failed qualification closed in 2.623 of
+180 seconds, with all 68 inputs unchanged, the process group absent and the
+lock returned. The predicate correction and fresh bindings then passed
+independent review. A new complete gate passed all 112 cases and 336 phase
+reports, closing in 2.429 of 180 seconds with all 68 inputs unchanged, exact
+process/group cessation and the lock returned. The failed predecessor remains
+recorded. No native build result is accepted; the consumed build identity cannot
+be reused.
+Offline package-manager flags alone do not contain Next SWC fallback downloads. Complete pinned donor/dashboard source, Rust/Node/pnpm toolchains,
+331 locked crates and 710 applicable dashboard packages are now assembled.
+Tool usability, dashboard output and the native build remain unexecuted.
+No stream wiring or native network enforcement is accepted from this source work.
+Production browser admission still refuses because
+the HTTP helper does not govern Chromium page traffic, CDP/stream access or
+the complete native process scope. Those remain required product gaps.
+
+The repaired offline import boundary passed all 54 focused checks. A fresh
+complete-suite attempt then stopped before collection on an outside-write
+refusal. Pinned pytest source defaults its file logger to /dev/null; the runner
+had omitted an explicit private log path. That source-based diagnosis is kept
+separate from the actual denial, which recorded no path. The attempt closed
+in 3.317 of its original 900 seconds, with 31,296 input checks unchanged,
+its exact process group absent and the lock returned. Independent review
+accepted the private-log source change and found three package metadata
+inconsistencies. The corrected references passed independent source review.
+The earlier rejected review continuation was traced to a literal target-name
+mismatch; the closed assignment and unused authorization were preserved.
+A separately admitted generation 2 collected all 21 controls, then stopped on
+an outside-read refusal before any test report. The exact refused path and
+stack were not recorded. This attempt closed in 12.864 of its original 900
+seconds, with 31,296 input checks unchanged, no remaining processes and the
+lock returned. Bounded refusal diagnostics then passed independent source
+review and all 27 actual focused controls, closing in 23.636 of their original
+180 seconds with 932 pins unchanged. A separately admitted generation 3
+collected all 21 controls and refused before runtests. It captured the exact
+path and stack: snapshot() attempted to hash /usr/lib/locale/locale-archive,
+which was absent from the admitted runtime file map. This attempt closed in
+8.099 of its original 900 seconds with 31,296 input checks unchanged, its exact
+group absent and the lock returned. Generation 4 admitted the exact archive
+file, then refused the next mapping, /usr/lib/locale/C.utf8/LC_CTYPE, before any
+runtest. It closed in 7.970 of its original 900 seconds with 31,297 pins unchanged,
+its exact group absent and the lock returned. A source-free isolated startup
+observation recorded all 11 mapped paths: LC_CTYPE and gconv-modules.cache were
+the only two missing entries. The coherent correction pins both exact files
+and saves the complete mapping inventory before content hashes, retaining
+unknown-file refusal. Independent review and all 32 focused controls passed.
+Generation 5 passed 21 controls and 45 native tests, then refused an unpinned
+ELF read used to identify libc; it closed in 19.633 of its original 900 seconds.
+Independent review accepted three exact additional inputs: both ELF probe
+files and the current boot ID needed by the owner fixture. Generation 6 passed
+21 controls and 47 native tests, including both libc cases, then stopped at
+ctypes.dlopen during real tool-registry initialization. It closed in 13.530 of
+its original 900 seconds with 31,302 input checks unchanged, exact groups absent
+and the lock returned. The remaining native cases and project/owner suites are
+not run. Source diagnosis found that registry error handling imports
+model_tools, which performs full tool discovery. An owned product patch moves
+the existing sanitizer and async bridge into a lightweight shared module while
+preserving normal discovery and the remaining implementations. Independent
+review found three incorrect expectations in its seven new regression cases.
+Sol delivered their correction and the complete donor source join. The first
+join reviewer stopped on model capacity and its original budget expired; that
+partial review remains incomplete. A later complete independent review covered
+the final join, dedicated self-pipe boundary and all 341 source cases. It found
+one stale supplementary AST test outside the selected gate; a source correction
+is prepared. A fresh generation 7 actually passed all 109 controls and five of
+seven registry cases. The first async case then stopped at the wrapper guard
+with exit 125. The attempt closed in 100.697 of its original 900 seconds, with
+31,312 input checks unchanged, both process groups absent and the lock returned.
+The native 116, project 38 and owner 71 cases remain NOT_RUN on these bytes.
+Source investigation identified an incorrect assumption that raw C socketpair
+objects emit the same constructor audit events as Python wrappers. That diagnosis
+uses the exact installed Python wrapper and [official CPython 3.14.7 C source](https://github.com/python/cpython/blob/v3.14.7/Modules/socketmodule.c);
+the refused event's raw argument types were not recorded. The coherent boundary
+correction passed independent source review: two Python constructor audits per
+pair, retained raw-to-wrapper descriptor custody and exact closure checks. Its
+complete successor package passed independent integration review. The current
+19 supplementary source checks passed, closing in 0.649 of 180 seconds with
+810 inputs unchanged. Generation 8 passed all 192 controls and five registry
+cases. The first native pair produced the expected two Python audits, then
+the test stopped at the pidfd_open boundary. The exact arguments were not
+captured; installed CPython source contains a self-PID capability probe during
+loop construction. The attempt closed in 75.729 of 900 seconds, with 31,312
+input checks unchanged, both groups absent and the lock returned. The remaining
+native 116, project 38 and owner 71 cases were not run. Full loop-initialization
+and closure correction now covers all five exact registry/native/owner probe
+paths and has passed independent source review. The original 424 cases remain;
+197 additional boundary cases were integrated and independently reviewed.
+Generation 9 passed all 389 controls and all seven registry cases, with both
+real loop socket pairs and both self-pidfds closed. The native group collected
+116 cases: 106 passed, one failed and nine were not run. The direct-helper
+negative fixture had replaced the helper it intended to test; it failed before
+loop creation. A subsequent closure check incorrectly demanded that nonexistent
+probe and masked the original failure. The attempt closed in 83.969 of its
+original 900 seconds, with 31,314 input checks unchanged, all exact processes
+and groups absent, and the lock returned. The dependent 38 project and 71 owner
+cases were not run. The coherent fixture and failed-before-probe accounting repair passed
+independent source review and was integrated into generation 10. Its fresh
+supplementary check passed all 19 cases, closing in 23.289 of 180 seconds with
+812 pins unchanged. The full attempt passed all 493 controls, seven registry
+cases and 116 native cases. Project collection then refused an absent
+entry_points.txt probe made by the actual Pydantic/importlib metadata loader;
+no project test body or dependent owner case ran. All four attempted backends
+closed in 179.099 of the original 900 seconds, with 31,323 input checks
+unchanged, exact processes and groups absent, and the lock returned. The
+missing-metadata handling was then repaired without disabling plugins or
+loosening content-read protection. Its 70 focused cases and 19 supplementary
+cases passed, with both runs closed and inputs unchanged. Generation 11 passed
+615 cases; one old AST preservation control rejected the intended metadata
+change. Project collection now reached all 38 cases, but the first body stopped
+on forbidden ctypes.dlopen. The library and caller were not recorded, so neither
+a harmless load nor permission to load is inferred. The attempt closed in
+441.989 of its original 900 seconds; exact process groups were absent, input and
+metadata maps were unchanged, and the lock returned. Owner cases remain unrun.
+The preservation-control correction passed independent source review; its inert
+successor has no execution grant while loader readiness is unresolved. Earlier
+failed attempts remain preserved.
+The four original compatibility suites remain
+mandatory in their own real effect envelope; none is in the separate current
+70-file native protocol plan. The browser and protocol candidates also modify
+three shared source files, including ProcessRegistry. Sol supplied their joined
+source with the final-proof and fresh-prelaunch fixture corrections. Independent
+source review accepted the joined delta. The reviewed 17,947-file source was
+materialized with all 14 overlays and every destination hash verified; runtime
+consumers are not yet rebound. The exact joined source then passed all 80
+focused custody/protocol controls and 240 phase reports. The finite run closed
+in 40.577 of its original 180 seconds: all 13,425 input pins were unchanged,
+the original processes and complete group/session were absent, and the exact
+exclusive lock was returned. Its real thread races exercised checkpoint order;
+process and filesystem durability calls in these controls remain inert models.
+Native process containment is not accepted from this result.
+The import repair reuses native defaults and separates pure configuration
+validation from heavy dashboard/provider imports. Independent review found a
+missing Optional import and possible disclosure of unknown loader arguments.
+Both were corrected; unknown text is now recorded without content or a digest.
+The exact corrected delta and guard-preservation comparator passed independent
+source review. All 68 supplementary controls and 204 phase reports then passed,
+with closure in 38.715 of the original 180 seconds, 13,444 unchanged input pins,
+no remaining owned processes/group/session and the exact lock returned. These
+controls do not identify the earlier refused library or prove a real loader run.
+The reviewed 17,949-file browser source is materialized with verified hashes.
+Separately, the combined Python startup/private-temp and native outer-owner
+source is now under Sol's independent review. Final runtime binding and native
+execution remain pending. Both sets of custody fields and stop behavior remain required. No old-phase replay or installed
+journey acceptance follows from these partial results.
+
+Previously, both focused offline suites were attempted on that exact source. Of 154
+collected cases, 38 passed, two stopped at the execution fence and 114 were not
+run. Importing retained browser providers loads requests/urllib3, whose IPv6
+availability probe constructs a socket. The offline scope forbids that effect.
+Both executions closed with unchanged inputs, no remaining processes and the
+exclusive lock returned within the original budget. No guard was weakened,
+failed phase replayed or unexecuted test counted as passing.
+
+The isolated native-client candidate passed 72 controlled source tests. Its
+first actual launch attempt refused before service start because systemd
+serialized the exact allowed address families in a different order. The
+minimal set comparison repair then passed independent review and 90 actual
+source tests, including the recorded full manager response and negative cases.
+A fresh attempt passed configuration admission but failed at namespace setup
+with 226/NAMESPACE. The kernel recorded AppArmor denying CAP_SYS_ADMIN to
+systemd-executor after its transition to unprivileged_userns. The probe and
+browser did not start. Both attempts closed: exact processes, unit fragment,
+cgroup and host sentinel were absent, and the lock returned within each
+original 120-second budget. No global policy or system setting was relaxed.
+Read-only investigation of the installed systemd source identified the normal
+system-manager service path: privileged namespace preparation, then payload
+execution as the ordinary user with empty capabilities. A coherent browser
+service and exact installation/start/stop/cleanup package has been delivered.
+Final independent review found five connected defects: privileged log opens
+through user-writable paths, inaccessible cross-namespace process observations,
+an original clock not retained before start, blocking reads of nonregular
+inputs, and incomplete custody of a partially installed package. The complete
+25-file repair reached independent final review, which found three installer
+defects: umask leaves the root staging directory unreadable by the ordinary
+owner; a local variable shadows the identity function before receipt publication;
+and failures during bootstrap or diagnostic output can lose installer custody.
+The complete correction passed independent source review. A real finite offline
+run then collected 179 cases: 161 passed and 18 failed, with no execution-fence
+refusal. The failing prestart fixture still describes append logging while the
+reviewed service requires null output. The controlled fixture was corrected
+without weakening that requirement or rewriting historical observations.
+Independent changed-source review passed, then all 183 cases passed in the
+new bounded run, including four added parameter cases. It closed in 0.634 of
+its original 180 seconds, with source hashes unchanged, processes absent and
+the lock returned. The old red attempt remains consumed. The exact reviewed
+installation command has been provided for the owner's authenticated terminal;
+installation and live execution remain unqualified. General polkit start permission is not
+being assumed safe: systemd uses the same unit/start details for transient-unit
+creation. Global policy and the shared executor remain unchanged.
+
+The earlier protected Chromium prerequisite remains qualified only for its
+actual Playwright pipe transport. It does not qualify the native TCP/CDP client
+or an installed administrative browser journey. All source test counts above
+are offline controlled observations, not live product acceptance.
+
+The prior 38 fresh GNU-supervised guard controls remain evidenced and closed.
+Exact product/native collection is still pending. Review found that pytest can
+return pathless node IDs for externally rooted files, so module attribution
+needs real collector identity. Sol delivered the complete producer/observer
+pair, including compound identities and skipped/empty module attribution.
+Independent review accepted those semantics but found a start-time evidence
+gap for tests that finish before the first backend reply. A focused source
+repair records an independent prelaunch lower bound without claiming a
+live-process timestamp. Independent review accepted the exact producer/helper
+pair. One new bounded attempt then executed both positive controls: two tests
+passed in each phase. Actual project collection stopped with exit 125 when
+pydantic's plugin discovery attempted an unreviewed read of the interpreter's
+python314.zip search entry. No project collection receipt was produced; native
+collection was not run. The original 900-second attempt closed after 286.808
+seconds with all 18,067 input hashes unchanged, exact processes absent and the
+exclusive lock returned. The repaired source pair preserves genuine kernel
+ENOENT for that exact absent leaf without permitting an archive content open.
+The merged collector also uses native pytest unwrapping: 40 actual local
+test definitions decorated with mock.patch must not be discarded as imported
+aliases. Independent review accepted the exact complete pair. Its 35 standalone
+positive and negative path controls passed, with all 781 input hashes unchanged,
+exact process/group cessation and lock return in 28.575 of the original 180
+seconds. A preceding attempt refused pytest's default logging write before
+collecting tests and closed in 46.819 seconds. The successful command directed
+pytest logging to its private output directory without weakening the write
+fence. All 38 real controls subsequently passed under both current guards,
+including read/write/effect denials and both timeout paths. They closed in
+285.408 of the original 1,800 seconds with 799 pins unchanged, all original
+process groups absent and the exclusive lock returned.
+
+A fresh exact-collection attempt then passed both positive phases, two tests
+each. Project collection stopped before test execution with exit 125: Hermes'
+normal container detection reads /proc/1/cgroup, which the guard has not admitted.
+Native collection was not run. The attempt closed in 154.486 of its original
+900 seconds with 18,721 hashes unchanged, exact processes absent and the lock
+returned. The failed result is preserved. Independent review accepted a narrow correction
+for the exact public /proc/1/cgroup and /proc/version reads. The changed source
+passed 41 standalone tests and 84 subtests; no host-prefix, credential, write or
+network allowance was added. A fresh isolated startup observation also passed.
+All 38 controls then actually passed on these exact new bytes: two positive,
+32 denied-effect and four timeout scenarios. Closure took 244.905 of the
+original 1,800 seconds, with 804 unchanged pins and all process groups absent.
+A new collection attempt passed both positive phases, then refused /proc/stat
+during pinned psutil initialization. It closed in 167.615 of its original
+900 seconds with 18,722 hashes unchanged and its exact process group absent.
+The narrow psutil correction passed independent source review, 43 focused
+tests with 120 subtests, isolated startup and all 38 actual guard scenarios.
+The latter closed in 245.646 of the original 1,800 seconds with 818 pins
+unchanged. Fresh exact project collection then returned exit 0 and 627 nodes.
+Independent reconciliation refused 17 repeated identical directory receipts;
+no raw observations were rewritten or silently deduplicated. The original
+900-second attempt closed in 382.937 seconds with 18,733 hashes unchanged,
+all known processes/groups absent and the lock returned. Independent review
+accepted a producer correction that coalesces only an identical retained
+directory object before callbacks; distinct objects, changed snapshots and
+duplicate callbacks remain refused. The complete metadata correction also
+rebases the actual launch templates. Its 10 focused test groups and 54
+subtests passed, followed by a real isolated startup observation. Both closed
+with 18,739 hashes unchanged, process groups absent and the lock returned.
+All 38 guard scenarios then passed on these exact bytes, closing in 250.854
+seconds with 821 unchanged pins and all groups absent. Fresh project collection
+returned 627 nodes with 25 coherent collection reports, including all 17 modules.
+Its source join had no unresolved rows. Final owner reconciliation nevertheless
+failed: the root inspection accessed originalname, absent from retained-row
+metadata, then called observe without checking that failure. The attempt is
+INCONCLUSIVE, closed after 314.456 of its original 900 seconds with all three
+groups absent and 18,734 hashes unchanged. This is an owner orchestration error;
+the failed result is preserved. A read-only diagnosis checked all 627 definitions
+and 6,027 source references against the correct schema. Native collection and
+every runtest remain unexecuted; no failed attempt was replayed.
+Independent review of the replacement owner inspector found that a different
+valid definition could be substituted while retaining the actual test metadata;
+a bounded data control reproduced publication of that incorrect inspection.
+It also found an insufficient binding between fixture names and their source
+references. The positive 627-row check and nine refusal controls passed before
+the failing control stopped the attempt. Its processes and lock closed cleanly.
+The coherent correction passed independent root source inspection and a real
+627-row positive check plus 33 negative controls. The bounded data check closed
+in 47.228 of its original 180 seconds with 123 input pins unchanged.
+A fresh collection then passed both positive phases and independently reconciled
+all 627 project nodes across 17 modules. Native collection printed four nodes,
+then failed on an undeclared search-path entry before test execution. Its exact
+raw entry was not captured. Three pinned native test files insert the lexical
+path tests/tools/../..; this is a source-based cause hypothesis, not an observed
+raw path. The whole attempt closed in 126.712 of its original 900 seconds with
+18,734 hashes unchanged, all four process groups absent and the lock returned.
+The lexical correction passed independent source review. It checks every real
+directory component and both parent hops without allowing general path
+normalization or weakening absent-file checks. All 76 focused controls passed
+and closed in 21.423 of their original 180 seconds with 795 pins unchanged.
+A fresh full isolated startup observation closed in 27.517 of its original
+90 seconds. All 38 guard scenarios then passed on the current pair: two positive,
+32 refusal and four timeout cases. They closed in 220.521 of their original
+1,800 seconds, with 837 pins unchanged, all groups absent and the lock returned.
+The current project classification bindings passed independent source review.
+Sol delivered the corresponding inspection of actual native collection records
+with 30 proposed source controls. Independent review found a wrong original-clock
+filename and missing reconciliation of actual conditional-skip markers against
+source declarations. The complete correction passed independent source review.
+A fresh data check collected 18 methods; 15 passed before the write boundary
+stopped receipt publication. It closed in 92.001 of its original 180 seconds,
+with all 1,542 pins unchanged, processes absent and the lock returned. The
+retained empty receipt and source support a refusal of fdopen on an owned
+descriptor; the exact triggering descriptor was not captured. A narrow
+descriptor-provenance correction, bounded diagnostics and 14 additional
+controls passed independent source review. The new bounded run passed all 32
+methods and 49 actual subtests. It closed in 56.449 of its original 180 seconds,
+with all 1,549 pins unchanged, no refused effects or known publication-FD leaks,
+exact processes and group absent, and the lock returned. Negative FD controls
+exercise the real admission predicate; they do not claim process-terminal
+denials. A subsequent original-900 run passed both positive controls and
+independently reconciled 627 project nodes across 17 modules. Native collection
+returned 1,150 nodes across all 53 modules, with eight separately inspected
+deselections. Its metadata inspection succeeded, but final owner reconciliation
+refused four lexical `tests/tools/../../hermes_*.py` input spellings absent from
+the canonical hash map. These exact aliases were also present in module origins;
+their bytes matched the pinned canonical files. The attempt remains INCONCLUSIVE
+and closed in 141.583 seconds, with all 18,735 input pins unchanged, all four
+process groups absent and the lock returned. The exact four-alias observer
+join and its consumer bindings then passed independent source review. All 54
+source controls passed with closure in 1.127 of 180 seconds; the earlier
+misconfigured temporary directory refusal and a separate late owner closure
+remain failed qualification records. The rebound inspector passed 32 methods
+and 49 subtests, closing in 42.335 of 180 seconds with 1,571 pins unchanged.
+A fresh actual collection passed both positive phases and fully reconciled
+627 project nodes across 17 modules and 1,150 Hermes nodes across 53 modules,
+including eight separately inspected deselections. All four phases closed in
+127.926 of 900 seconds with 18,735 owner input pins unchanged, all process
+groups absent and the lock returned. The four literal aliases are checked
+against their pinned canonical contents and actual module origins. No native
+runtest or installed capability is accepted from collection. Subsequent source
+readiness found that the collection controller suppresses conftests and changes
+the native event loop, while the donor's normal runner isolates each file in a
+fresh interpreter. Source integration now connects the existing producer and
+owner to the donor's per-file invocation and ProcessRegistry custody, retaining
+normal conftests/plugins and complete phase reports. Independent review found
+five defects: persistence errors could prevent stopping a process; failures after
+Popen could lose the donor drain/reap path; checkpoint writers could reorder
+updates; contradictory exit-five/event sequences could pass the census; and
+AnyIO plugin contents were missing from complete input checks. Sol is assigned
+one coherent repair after a verified single pre-task compact; the actual new
+work turn is active. Startup, fixture effects and outer process custody still
+need qualification; these source hooks confer no runtime acceptance.
+Two stopped process
+cases, six HTTP/git cases and two inline-shell cases remain ten explicit required
+NOT_RUN gaps; none is an accepted exclusion.
+
+A separate real isolated Python startup matched all four expected search paths
+and both installed startup shim origins. It imported no candidate or tests;
+the original 90-second observation closed in 24.258 seconds with its exact
+processes absent, input hashes unchanged and the exclusive lock returned.
+Source and fixture readiness for all 17/53 selected files is prepared, but
+both project and native collection with complete receipt reconciliation are
+now evidenced. Runtime tests and installed journeys remain outstanding. A data-only source/fixture join does not issue
+inspection flags or acceptance from a template. No old counts are transferred.
+
+A0's full-journal prerequisite remains blocked. All seven installed user
+journeys and four autonomous-web contexts remain unaccepted. Old Friday stays
+stopped; legacy inference endpoints remain configurable temporary test backends.
+
+Earlier checkpoint, 14:53 MSK: disabled own-profile setup and the normal
 both-worker installer now create the initial A0 qualification probe through
 the existing route, native runtime and custody path. The operator no longer
 has to attach another user's probe. Qualification consumes the exact profile,

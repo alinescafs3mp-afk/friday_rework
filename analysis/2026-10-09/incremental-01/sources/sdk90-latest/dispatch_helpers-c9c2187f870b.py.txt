@@ -1,0 +1,117 @@
+"""Shared tool dispatch mechanics; importing this module performs no tool discovery."""
+
+import asyncio
+import re
+import threading
+from typing import Optional
+
+_TOOL_ERROR_MAX_LEN = 2048
+
+# --- Async bridging (single source of truth; registry.dispatch uses it too) ---
+# Loops are persistent (never asyncio.run per call): cached httpx/AsyncOpenAI
+# clients stay bound to a live loop, so their GC cleanup can't hit "Event loop
+# is closed". Main thread shares one loop; worker threads own thread-local loops.
+
+_tool_loop = None          # persistent loop for the main (CLI) thread
+_tool_loop_lock = threading.Lock()
+_worker_thread_local = threading.local()  # per-worker-thread persistent loops
+
+
+def _get_tool_loop():
+    """Long-lived event loop for async tool handlers on the main thread."""
+    global _tool_loop
+    with _tool_loop_lock:
+        if _tool_loop is None or _tool_loop.is_closed():
+            _tool_loop = asyncio.new_event_loop()
+        return _tool_loop
+
+
+def _get_worker_loop():
+    """Persistent event loop for the current worker thread (thread-local)."""
+    loop = getattr(_worker_thread_local, 'loop', None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _worker_thread_local.loop = loop
+    return loop
+
+
+def _run_async(coro):
+    """Run a coroutine from sync code; safe under a running loop (gateway/RL env)."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        # Inside a running loop: run in a fresh thread whose loop we keep a
+        # reference to, so on timeout we can cancel the task inside it
+        # (ThreadPoolExecutor.cancel() is a no-op on a running worker).
+        import concurrent.futures
+        worker_loop: Optional[asyncio.AbstractEventLoop] = None
+        loop_ready = threading.Event()
+
+        def _run_in_worker():
+            nonlocal worker_loop
+            worker_loop = asyncio.new_event_loop()
+            loop_ready.set()
+            try:
+                asyncio.set_event_loop(worker_loop)
+                return worker_loop.run_until_complete(coro)
+            finally:
+                try:  # drain tasks still pending after an external cancel
+                    pending = asyncio.all_tasks(worker_loop)
+                    for t in pending:
+                        t.cancel()
+                    if pending:
+                        worker_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                except Exception:
+                    pass
+                worker_loop.close()
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # Carry profile + approval/sudo context so get_hermes_home() resolves correctly.
+        from tools.thread_context import propagate_context_to_thread
+        future = pool.submit(propagate_context_to_thread(_run_in_worker))
+        try:
+            return future.result(timeout=300)
+        except concurrent.futures.TimeoutError:
+            # Cancel inside the worker's own loop so the thread can wind down.
+            if loop_ready.wait(timeout=1.0) and worker_loop is not None:
+                try:
+                    for t in asyncio.all_tasks(worker_loop):
+                        worker_loop.call_soon_threadsafe(t.cancel)
+                except RuntimeError:
+                    pass  # loop already closed
+            raise
+        finally:
+            pool.shutdown(wait=False)  # never block the caller on a stuck coroutine
+
+    if threading.current_thread() is not threading.main_thread():
+        return _get_worker_loop().run_until_complete(coro)
+    return _get_tool_loop().run_until_complete(coro)
+
+
+# --- Tool error sanitization --------------------------------------------------
+# Defense-in-depth: strip role tags / CDATA / code fences from exception text the
+# model will read, and cap length (cap shared with tools/registry.py so text never
+# passes two different caps with two different markers).
+_TOOL_ERROR_STRIP_RES = (
+    re.compile(r'</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>', re.IGNORECASE),
+    re.compile(r'^\s*```(?:json|xml|html|markdown)?\s*', re.MULTILINE),
+    re.compile(r'\s*```\s*$', re.MULTILINE),
+    re.compile(r'<!\[CDATA\[.*?\]\]>', re.DOTALL),
+)
+
+
+def _sanitize_tool_error(error_msg: str) -> str:
+    """Strip structural framing tokens from a tool error before the model sees it."""
+    if not error_msg:
+        return "[TOOL_ERROR] "
+    sanitized = error_msg
+    for pattern in _TOOL_ERROR_STRIP_RES:
+        sanitized = pattern.sub("", sanitized)
+    if len(sanitized) > _TOOL_ERROR_MAX_LEN:
+        sanitized = sanitized[:_TOOL_ERROR_MAX_LEN - 3] + "..."
+    return f"[TOOL_ERROR] {sanitized}"
+
+

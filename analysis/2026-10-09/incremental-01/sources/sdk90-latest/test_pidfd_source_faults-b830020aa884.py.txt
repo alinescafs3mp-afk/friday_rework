@@ -1,0 +1,407 @@
+"""NOT RUN. Extracted-source controls, never evidence of Linux/native behavior.
+
+Run only after separate authorization, with the pinned Python 3.14.7 and pytest.
+No candidate module import: only selected AST definitions enter a fake dependency
+namespace. Syscalls/processes/checkpoint/native ownership are explicit doubles.
+Real pidfd, signal flags, root/descendant and native deadline controls are separate.
+"""
+import ast
+import copy
+import hashlib
+import json
+from pathlib import Path
+from types import SimpleNamespace as NS
+from unittest.mock import patch
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+# Exact isolated source qualification layout, never an ambient sibling tree.
+BINDINGS_SHA256 = '1debecd8dd9d4a2c9e16a68bc410b441b1e9cf3e76dc25b101e8b36bfd26510e'
+raw_bindings = (ROOT / 'controls/source-inputs.json').read_bytes()
+assert hashlib.sha256(raw_bindings).hexdigest() == BINDINGS_SHA256
+bindings = json.loads(raw_bindings)
+assert str(ROOT) == bindings['final_root']
+BASE = Path(bindings['original_base_root'])
+for root, label in ((ROOT, 'final'), (BASE, 'original_base')):
+    assert root.is_absolute() and root.resolve(strict=True) == root
+    for relative, expected in bindings['inputs'][label].items():
+        path = root / relative
+        assert path.resolve(strict=True) == path and path.is_file() and not path.is_symlink()
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == expected, str(path)
+SOURCE = ROOT / 'donor/tools/process_registry.py'
+METHODS = {'_require_runtest_pidfd_acquisition', 'spawn_runtest', 'attach_runtest',
+           'stop_runtest', 'release_runtest_pidfd', 'finish_runtest'}
+
+
+class Lock:
+    """Detect accidentally unguarded descriptor signaling/close without threads."""
+    held = False
+
+    def __enter__(self):
+        assert not self.held
+        self.held = True
+
+    def __exit__(self, *unused):
+        self.held = False
+
+
+def forbidden(*args, **kwargs):
+    raise AssertionError('numeric termination, competing reap or foreign native effect')
+
+
+def harness():
+    events = []
+    proc = NS(pid=402, returncode=None, poll=forbidden, wait=forbidden,
+              terminate=forbidden, kill=forbidden)
+    session = NS(id='owned', cwd='/fixture', runtest_custody=True, detached=False,
+                 runtest_launch_pending=True, process=None, pid=None,
+                 _runtest_pidfd=None, runtest_pidfd_error='', runtest_stop_requested=False,
+                 runtest_persistence_error='', runtest_deadline=90., runtest_boot_id='boot',
+                 runtest_outer={'unit': 'exact'}, runtest_outer_closed=None,
+                 host_start_time=None, runtest_pgid=None, runtest_sid=None, _lock=Lock())
+    state = NS(tasks=1, caught=2, ignored=0, no_cldwait=True, now=10., inherit=False)
+    handlers = {17: 0, 2: object()}
+    standard_int = handlers[2]
+
+    class FakePath:
+        def __init__(self, path):
+            self.path = path
+
+        def iterdir(self):
+            assert self.path == '/proc/self/task'
+            return iter(range(state.tasks))
+
+        def read_text(self):
+            if self.path.endswith('boot_id'):
+                return 'boot\n'
+            if self.path == '/proc/self/status':
+                return f'SigCgt:\t{state.caught:x}\nSigIgn:\t{state.ignored:x}\n'
+            if self.path == '/checkpoint':
+                return '[]'
+            raise AssertionError(self.path)
+
+    def reset(sig, handler):
+        assert sig == 17 and handler == 0
+        events.append('reset')
+        handlers[sig] = handler
+        state.no_cldwait = False  # A model, not a kernel observation.
+
+    def popen(*args, **kwargs):
+        assert session.runtest_launch_pending is False
+        events.append('Popen')
+        return proc
+
+    def open_pidfd(pid, flags):
+        assert pid == proc.pid and flags == 0 and session.process is proc
+        assert not state.no_cldwait
+        events.append('pidfd_open')
+        return 51
+
+    def send(fd, sig, info, flags):
+        assert session._lock.held and fd == 51
+        assert (sig, info, flags) == (9, None, 0)
+        events.append('pidfd_signal')
+
+    def close(fd):
+        assert session._lock.held and fd == 51 and session._runtest_pidfd is None
+        events.append('close')
+
+    signal = NS(SIGCHLD=17, SIGINT=2, SIGKILL=9, SIG_DFL=0, SIG_IGN=1,
+                default_int_handler=standard_int, getsignal=handlers.__getitem__,
+                signal=reset, pidfd_send_signal=send)
+    os = NS(pidfd_open=open_pidfd, get_inheritable=lambda fd: state.inherit,
+            getpgid=lambda pid: pid, getsid=lambda pid: pid, close=close,
+            kill=forbidden, killpg=forbidden)
+    main = object()
+    threading = NS(current_thread=lambda: main, main_thread=lambda: main)
+    fake_sys = NS(implementation=NS(name='cpython'), version_info=(3, 14, 7),
+                  gettrace=lambda: None, getprofile=lambda: None)
+    import json
+    env = dict(os=os, signal=signal, threading=threading, Path=FakePath,
+               time=NS(monotonic=lambda: state.now), _IS_LINUX=True,
+               subprocess=NS(Popen=popen), json=json,
+               _checkpoint_path=lambda: FakePath('/checkpoint'))
+    module = ast.parse(SOURCE.read_text())
+    cls = next(n for n in module.body if isinstance(n, ast.ClassDef) and n.name == 'ProcessRegistry')
+    selected = [copy.deepcopy(n) for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in METHODS]
+    tree = ast.Module(body=[ast.ClassDef(name='Subject', bases=[], keywords=[],
+                                       body=selected, decorator_list=[])], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(tree), str(SOURCE), 'exec'), env)
+    registry = env['Subject']()
+    registry._runtest_checkpoint = lambda s: events.append('checkpoint')
+    registry._safe_host_start_time = lambda pid: 700
+    registry._terminate_host_pid = forbidden
+    registry._completion_consumed = set()
+    registry.get = lambda sid: session
+    registry._finish_exited = lambda *a, **k: events.append('finish')
+    registry._write_checkpoint = lambda **kwargs: events.append('strict_release')
+    owner = NS(require_current=lambda expected: events.append('native_current'),
+               closure_for=lambda s: {'native_cgroup': 'actually_closed_in_model'})
+    h = NS(registry=registry, session=session, proc=proc, events=events, state=state,
+           os=os, signal=signal, handlers=handlers, sys=fake_sys, env=env,
+           owner=owner, threading=threading)
+
+    def spawn():
+        with patch.dict('sys.modules', {'sys': fake_sys}):
+            return registry.spawn_runtest(session, ['exact'],
+                {'start_new_session': True, 'cwd': '/fixture'}, native_owner=owner)
+    h.spawn = spawn
+    return h
+
+
+def test_acquire_before_transfer_and_no_competing_reap():
+    h = harness()
+    assert h.spawn() is h.proc
+    assert h.events == ['native_current', 'reset', 'Popen', 'pidfd_open']
+    h.registry.attach_runtest(h.session, h.proc)
+    assert (h.session.host_start_time, h.session.runtest_pgid, h.session.runtest_sid) == (700, 402, 402)
+    assert h.events[-1] == 'checkpoint'
+    assert h.session._runtest_pidfd == 51
+
+
+@pytest.mark.parametrize('fault', ['ignored', 'handler', 'threads', 'not_main', 'trace',
+                                  'native_handler', 'missing_open', 'missing_signal',
+                                  'wrong_python', 'reset', 'readback'])
+def test_preflight_failure_is_no_launch_no_retry(fault):
+    h = harness()
+    if fault == 'ignored': h.handlers[17] = 1
+    if fault == 'handler': h.handlers[17] = lambda: None
+    if fault == 'threads': h.state.tasks = 2
+    if fault == 'not_main': h.threading.current_thread = lambda: object()
+    if fault == 'trace': h.sys.gettrace = lambda: object()
+    if fault == 'native_handler': h.state.caught |= 1 << 16
+    if fault == 'missing_open': h.os.pidfd_open = None
+    if fault == 'missing_signal': h.signal.pidfd_send_signal = None
+    if fault == 'wrong_python': h.sys.version_info = (3, 13, 0)
+    if fault == 'reset': h.signal.signal = lambda *a: (_ for _ in ()).throw(OSError('reset'))
+    if fault == 'readback': h.state.ignored = 1 << 16
+    with pytest.raises((RuntimeError, OSError)): h.spawn()
+    assert h.session.runtest_stop_requested and not h.session.runtest_launch_pending
+    assert h.session.process is None and 'Popen' not in h.events
+    with pytest.raises(RuntimeError): h.spawn()
+    assert 'Popen' not in h.events
+
+
+@pytest.mark.parametrize('error', [ProcessLookupError(), OSError(38, 'ENOSYS'),
+                                 OSError(24, 'EMFILE'), PermissionError()])
+def test_pidfd_failure_retains_actual_popen_and_forbids_numeric_fallback(error):
+    h = harness()
+    h.os.pidfd_open = lambda *a: (_ for _ in ()).throw(error)
+    with pytest.raises(type(error)): h.spawn()
+    assert h.session.process is h.proc and h.session._runtest_pidfd is None
+    assert h.session.runtest_stop_requested and h.session.runtest_pidfd_error
+    outcome = h.registry.stop_runtest(h.session)
+    assert outcome['status'] == 'STOP_UNCONFIRMED'
+    assert 'pidfd_signal' not in h.events
+    with pytest.raises(RuntimeError): h.spawn()
+    assert h.events.count('Popen') == 1
+
+
+def test_popen_failure_consumes_attempt():
+    h = harness()
+    def fail(*args, **kwargs):
+        h.events.append('Popen')
+        raise OSError('constructor failed')
+    h.env['subprocess'].Popen = fail
+    with pytest.raises(OSError): h.spawn()
+    assert h.session.process is None and h.session.runtest_stop_requested
+    with pytest.raises(RuntimeError): h.spawn()
+    assert h.events.count('Popen') == 1
+
+
+@pytest.mark.parametrize('fault', ['start_ticks', 'getpgid', 'getsid', 'checkpoint'])
+def test_post_acquisition_setup_failure_keeps_handle_and_safe_stop(fault):
+    h = harness(); h.spawn()
+    def fail(*a, **k): raise OSError(fault)
+    if fault == 'start_ticks': h.registry._safe_host_start_time = fail
+    elif fault in ('getpgid', 'getsid'): setattr(h.os, fault, fail)
+    else: h.registry._runtest_checkpoint = fail
+    with pytest.raises(OSError): h.registry.attach_runtest(h.session, h.proc)
+    assert h.session.process is h.proc and h.session._runtest_pidfd == 51
+    assert h.session.runtest_stop_requested
+    outcome = h.registry.stop_runtest(h.session)
+    assert 'pidfd_signal' in h.events
+    assert outcome['native_whole_cgroup_closure_required']
+    if fault == 'checkpoint': assert outcome['status'] == 'STOP_UNCONFIRMED'
+
+
+def test_stop_intent_racing_popen_is_not_lost():
+    h = harness(); original = h.env['subprocess'].Popen
+    def stopped(*a, **k):
+        h.session.runtest_stop_requested = True
+        return original(*a, **k)
+    h.env['subprocess'].Popen = stopped
+    with pytest.raises(RuntimeError): h.spawn()
+    assert h.session.process is h.proc and h.session._runtest_pidfd == 51
+    h.registry.stop_runtest(h.session)
+    assert 'pidfd_signal' in h.events
+
+
+@pytest.mark.parametrize('close_first', [False, True])
+def test_stop_and_close_are_serialized_without_fd_reuse(close_first):
+    h = harness(); h.spawn(); h.proc.returncode = 0
+    if close_first:
+        h.registry.release_runtest_pidfd(h.session, h.proc)
+        assert h.registry.stop_runtest(h.session)['status'] == 'STOP_UNCONFIRMED'
+        assert 'pidfd_signal' not in h.events
+    else:
+        h.registry.stop_runtest(h.session)
+        h.registry.release_runtest_pidfd(h.session, h.proc)
+        assert h.events.index('pidfd_signal') < h.events.index('close')
+    h.registry.release_runtest_pidfd(h.session, h.proc)
+    assert h.events.count('close') == 1
+    assert h.session.runtest_custody and h.session.runtest_outer_closed is None
+
+
+def test_unreaped_root_retains_fd_and_close_error_never_retries_fd_number():
+    h = harness(); h.spawn()
+    h.registry.release_runtest_pidfd(h.session, h.proc)
+    assert h.session._runtest_pidfd == 51 and 'close' not in h.events
+    h.proc.returncode = -9
+    def bad_close(fd): h.events.append('close_failed'); raise OSError('EINTR')
+    h.os.close = bad_close
+    with pytest.raises(OSError): h.registry.release_runtest_pidfd(h.session, h.proc)
+    assert h.session._runtest_pidfd is None and h.session.runtest_pidfd_error
+    h.registry.release_runtest_pidfd(h.session, h.proc)
+    assert h.events.count('close_failed') == 1
+    assert h.registry.stop_runtest(h.session)['status'] == 'STOP_UNCONFIRMED'
+
+
+def test_root_esrch_never_proves_descendant_closure():
+    h = harness(); h.spawn()
+    h.signal.pidfd_send_signal = lambda *a: (_ for _ in ()).throw(ProcessLookupError())
+    outcome = h.registry.stop_runtest(h.session)
+    assert outcome['root_already_exited'] and outcome['native_whole_cgroup_closure_required']
+    h.proc.returncode = 0
+    h.owner.closure_for = lambda s: (_ for _ in ()).throw(RuntimeError('descendant alive'))
+    with pytest.raises(RuntimeError):
+        h.registry.finish_runtest(h.session, native_owner=h.owner, returncode=0)
+    assert h.session.runtest_custody and h.session.runtest_outer_closed is None
+    assert 'finish' not in h.events
+
+
+@pytest.mark.parametrize('pid', [None, 402])
+def test_recovered_rows_never_reacquire_pidfd_or_infer_closure(pid):
+    h = harness(); h.session.detached = True; h.session.pid = pid
+    assert h.registry.stop_runtest(h.session)['status'] == 'STOP_UNCONFIRMED'
+    with pytest.raises(RuntimeError): h.spawn()
+    assert 'Popen' not in h.events and 'pidfd_open' not in h.events
+    assert h.session.process is None and h.session._runtest_pidfd is None
+    h.registry.finish_runtest(h.session, native_owner=h.owner, returncode=None)
+    assert 'finish' in h.events  # Only the separately supplied outer proof settles it.
+
+
+def test_fd_is_runtime_only_and_checkpoint_cannot_manufacture_identity():
+    tree = ast.parse(SOURCE.read_text())
+    fields = next(n.value for n in tree.body if isinstance(n, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == '_CHECKPOINT_FIELDS' for t in n.targets))
+    strings = {n.value for n in ast.walk(fields) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    assert '_runtest_pidfd' not in strings and 'runtest_pidfd_error' in strings
+    writer = ast.parse((ROOT / 'donor/tools/process_registry_checkpoint.py').read_text())
+    guarded = [n for n in ast.walk(writer) if isinstance(n, ast.If)
+               and 's.host_start_time is None' in ast.unparse(n.test)]
+    assert len(guarded) == 1 and 'not s.runtest_custody' in ast.unparse(guarded[0].test)
+
+
+def test_untouched_general_donor_and_registry_capabilities():
+    old = ast.parse((BASE / 'donor/tools/process_registry.py').read_text())
+    new = ast.parse(SOURCE.read_text())
+    def definitions(tree):
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'ProcessRegistry')
+        return {n.name: ast.dump(n, include_attributes=False) for n in cls.body if isinstance(n, ast.FunctionDef)}
+    before, after = definitions(old), definitions(new)
+    permitted = METHODS | {'_runtest_checkpoint'}
+    assert all(after[name] == value for name, value in before.items() if name not in permitted)
+    # Not an execution/import: actual donor custody path still bypasses its numeric killer.
+    assert (ROOT / 'donor/scripts/run_tests_parallel.py').read_bytes() == (BASE / 'donor/scripts/run_tests_parallel.py').read_bytes()
+    donor = ast.parse((ROOT / 'donor/scripts/run_tests_parallel.py').read_text())
+    primitive = next(n for n in donor.body if isinstance(n, ast.FunctionDef) and n.name == '_run_one_file_once')
+    branch = next(n for n in primitive.body if isinstance(n, ast.If) and ast.unparse(n.test) == 'custody is None')
+    calls = [n for node in branch.orelse for n in ast.walk(node) if isinstance(n, ast.Call)]
+    assert not any(isinstance(n.func, ast.Name) and n.func.id == '_kill_tree' for n in calls)
+
+
+@pytest.mark.parametrize('cut', ['return', 'after_spawn', 'timeout', 'capture_write'])
+def test_actual_donor_finally_keeps_one_handle_one_waiter_and_closes_fd(cut):
+    """Exercise the actual unmodified donor primitive with inert OS doubles."""
+    import subprocess
+    h = harness()
+    donor_tree = ast.parse((ROOT / 'donor/scripts/run_tests_parallel.py').read_text())
+    primitive = copy.deepcopy(next(n for n in donor_tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == '_run_one_file_once'))
+    module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0),
+                            primitive], type_ignores=[])
+    donor_env = dict(sys=NS(executable='/pinned', platform='linux'),
+                     os=NS(environ={}, getpgid=lambda pid: pid),
+                     time=NS(monotonic=lambda: 10.),
+                     subprocess=NS(PIPE=-1, STDOUT=-2, Popen=forbidden,
+                                   TimeoutExpired=subprocess.TimeoutExpired),
+                     _kill_tree=forbidden,
+                     _parse_pytest_summary=lambda output: {'passed': 1},
+                     _describe_interpreter_crash=lambda *a: None,
+                     _rmtree_force=lambda root: h.events.append('temp_remove'))
+    exec(compile(ast.fix_missing_locations(module), '<actual-donor-primitive>', 'exec'), donor_env)
+    captures = []
+    def spawn(*a, **k):
+        proc = h.spawn()
+        if cut == 'return': raise RuntimeError('callback return cut')
+        return proc
+    def attach(proc):
+        h.registry.attach_runtest(h.session, proc)
+        if cut == 'after_spawn': raise OSError('diagnostic cut')
+    def communicate(**kwargs):
+        h.events.append('communicate')
+        if cut == 'timeout' and h.events.count('communicate') == 1:
+            raise subprocess.TimeoutExpired('exact', 1, output=b'partial')
+        h.proc.returncode = -9 if cut == 'timeout' else 0
+        return ('retained output', None)
+    h.proc.communicate = communicate
+    def stop(proc, pgid):
+        assert proc is h.session.process and pgid == h.session.runtest_pgid
+        if proc.returncode is None: h.registry.stop_runtest(h.session)
+    def capture(proc, output, error, cuts):
+        captures.append((proc, output))
+        h.registry.release_runtest_pidfd(h.session, proc)
+        if cut == 'capture_write': raise OSError('receipt write cut')
+    def settle(proc, pgid, root):
+        assert proc is h.session.process and proc.returncode is not None
+    custody = dict(spawn=spawn, after_spawn=attach,
+                   retained_handle=lambda: h.session.process,
+                   retained_pgid=lambda: h.session.runtest_pgid,
+                   stop=stop, capture=capture, settle=settle, remaining=lambda: 1.,
+                   terminal=lambda rc: None, temporary_root=lambda: '/retained-temp')
+    def run():
+        return donor_env['_run_one_file_once'](Path('/fixture/test.py'), [], Path('/fixture'), 1., custody=custody)
+    if cut == 'timeout':
+        assert run()[1] == 124
+    else:
+        with pytest.raises((RuntimeError, OSError)): run()
+    assert captures == [(h.proc, 'retained output')]
+    assert h.events.count('Popen') == 1
+    assert h.events.count('communicate') == (2 if cut == 'timeout' else 1)
+    assert h.events.count('close') == 1 and h.session._runtest_pidfd is None
+    assert h.session.process is h.proc and h.session.runtest_custody
+    assert h.session.runtest_outer_closed is None
+    assert 'temp_remove' not in h.events
+
+
+@pytest.mark.parametrize('failure', ['write', 'close'])
+def test_actual_owner_capture_keeps_output_before_fallible_fd_or_receipt(failure):
+    h = harness(); h.spawn(); h.proc.returncode = 0
+    output = []
+    h.session.append_output = output.append
+    tree = ast.parse((ROOT / 'owner-helper/owner_observer.py').read_text())
+    run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run_donor_file')
+    capture = copy.deepcopy(next(n for n in run.body if isinstance(n, ast.FunctionDef) and n.name == 'capture'))
+    def require(ok, reason):
+        if not ok: raise RuntimeError(reason)
+    def put(*a, **k): raise OSError('receipt')
+    if failure == 'close': h.os.close = lambda fd: (_ for _ in ()).throw(OSError('close'))
+    env = dict(registry=h.registry, session=h.session, holder={}, parent=Path('/fake'),
+               require=require, put=put)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[capture], type_ignores=[])),
+                 '<actual-owner-capture>', 'exec'), env)
+    with pytest.raises(OSError): env['capture'](h.proc, 'retained transcript', None, [])
+    assert output == ['retained transcript'] and env['holder']['proc'] is h.proc
+    assert h.session._runtest_pidfd is None and h.session.runtest_custody

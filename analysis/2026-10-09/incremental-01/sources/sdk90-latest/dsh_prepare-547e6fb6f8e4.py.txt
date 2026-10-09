@@ -1,0 +1,812 @@
+#!/usr/bin/env python3
+"""Prepare the complete locked Harness donor without changing its sources."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+
+class StopUnconfirmed(RuntimeError):
+    """An owned command was signalled but its cessation was not observed."""
+
+
+SAFE_OBSERVATION_FIELDS = ('returncode', 'elapsed_seconds', 'timeout', 'stdout_sha256',
+                           'stderr_sha256', 'stdout_bytes', 'stderr_bytes', 'pid',
+                           'starttime_ticks', 'reaped', 'reason',
+                           'namespace_init_exit_verified')
+
+
+def safe_observation(observation):
+    return {key: observation[key] for key in SAFE_OBSERVATION_FIELDS if key in observation}
+
+
+class CommandFailed(RuntimeError):
+    """Reaped command failure; never carry argv, environment or raw output."""
+
+    def __init__(self, observation):
+        self.observation = safe_observation(observation)
+        super().__init__('command_timeout' if observation['timeout'] else 'command_nonzero_exit')
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def clean_environment(donor):
+    # Build tools retain the user's actual home, but receive no model/Telegram keys.
+    allowed = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM",
+               "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy")
+    env = {key: os.environ[key] for key in allowed if key in os.environ}
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0",
+               GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+               COREPACK_ENABLE_DOWNLOAD_PROMPT="0",
+               COREPACK_HOME=str(donor / ".git/friday-corepack"),
+               npm_config_cache=str(donor / ".git/friday-npm-cache"),
+               npm_config_child_concurrency="4", npm_config_network_concurrency="8",
+               NODE_OPTIONS="--disable-wasm-trap-handler",
+               DSH_TELEMETRY_DISABLED="1", DSH_HOME=str(donor / ".git/friday-smoke-home"))
+    return env
+
+
+def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None, pass_fds=(),
+        owned_preparation=None, input_bytes=None):
+    """Bound one group; callers needing detached-tree custody use a PID namespace."""
+    if owned_preparation is not None:
+        # Same finite installer command path, with stricter native-owner custody.
+        # No namespace/worker/manager is created by this preparation command.
+        if pass_fds or log is not None or not env or input_bytes is None:
+            raise ValueError('owned_preparation_exact_io_required')
+        return _run_owned_preparation(argv, donor, env, timeout, deadline,
+                                      input_bytes, owned_preparation)
+    if input_bytes is not None:
+        raise ValueError('preparation_input_requires_original_owner')
+    if argv[0] == "git":
+        argv = ["git", "-c", "core.hooksPath=" + os.devnull,
+                "-c", "protocol.file.allow=never", "-c", "protocol.ext.allow=never",
+                "-c", "pack.threads=4", *argv[1:]]
+    start = time.monotonic()
+    process = subprocess.Popen(argv, cwd=donor, env=env or clean_environment(donor),
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=True, pass_fds=pass_fds)
+    try:
+        starttime = int(Path(f'/proc/{process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        starttime = None
+    timed_out = False
+    try:
+        out, err = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        if deadline is not None:
+            # Installer namespace cleanup consumes the same original budget.
+            # Kill namespace owner immediately; Linux closes all descendant
+            # sessions when its PID-namespace init dies (including setsid).
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StopUnconfirmed('STOP_UNCONFIRMED: original cleanup budget exhausted')
+            try:
+                out, err = process.communicate(timeout=remaining)
+            except subprocess.TimeoutExpired as exc:
+                raise StopUnconfirmed('STOP_UNCONFIRMED: contained command not reaped') from exc
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                out, err = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                out, err = process.communicate(timeout=5)
+    reason = ('device_null_unavailable' if
+              "fatal: could not open '/dev/null' for reading and writing: Permission denied" in err
+              else 'command_timeout' if timed_out else 'command_nonzero_exit' if process.returncode else 'command_succeeded')
+    source_reasons = {'git_source_operation_failed': 'source_git_operation_failed',
+                      'source_preparation_deadline': 'source_preparation_deadline',
+                      'source_input_or_io_failed': 'source_input_or_io_failed',
+                      'fresh_destination_required': 'source_destination_exists',
+                      'dirty_donor_refused': 'source_donor_changed',
+                      'donor_identity_changed': 'source_donor_changed',
+                      'overlay_hash_mismatch': 'source_overlay_changed'}
+    for code, stable in source_reasons.items():
+        if err.strip() == 'FRIDAY_SOURCE_REFUSED reason=' + code:
+            reason = stable
+            break
+    observation = {"argv": argv, "returncode": process.returncode,
+                   "elapsed_seconds": round(time.monotonic() - start, 3),
+                   "timeout": timed_out, "stdout_sha256": hashlib.sha256(out.encode()).hexdigest(),
+                   "stderr_sha256": hashlib.sha256(err.encode()).hexdigest(),
+                   "stdout_bytes": len(out.encode()), "stderr_bytes": len(err.encode()),
+                   "pid": process.pid, "starttime_ticks": starttime,
+                   "reaped": process.returncode is not None, "reason": reason}
+    if log:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.with_suffix(".stdout").write_text(out)
+        log.with_suffix(".stderr").write_text(err)
+        log.with_suffix(".json").write_text(json.dumps(observation, indent=2) + "\n")
+    if timed_out or process.returncode:
+        raise CommandFailed(observation)
+    return out.strip(), observation
+
+
+def _run_owned_preparation(argv, cwd, env, timeout, deadline, data, owner):
+    """Bound actual bytes and retain/reap this finite SDK process on every exit.
+
+    `owner` is the already verified FileOwner facade, never an input JSON object.
+    Cancel checks are synchronous while this exact command is active. Cleanup
+    consumes its original deadline. The registry worker is a DIFFERENT Popen.
+    """
+    import math
+    if (type(data) is not bytes or not 0 < len(data) <= 32768 or
+            type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0 or
+            type(deadline) not in (int, float) or not math.isfinite(deadline)):
+        raise ValueError('invalid_owned_preparation_bounds')
+    start = time.monotonic()
+    end = min(start + timeout, deadline - 0.25)
+    if end <= start:
+        raise ValueError('owned_preparation_budget_exhausted')
+    owner.guard()
+    process = None
+    pidfd = None
+    streams = selectors.DefaultSelector()
+    output = {'stdout': bytearray(), 'stderr': bytearray()}
+    limits = {'stdout': 65536, 'stderr': 4096}
+    failed = None
+    sent = 0
+    try:
+        process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
+            pass_fds=(), start_new_session=True, bufsize=0)
+        owner.retain(process)  # Pure retention before fallible observation/IO.
+        pidfd = os.pidfd_open(process.pid, 0)
+        os.set_inheritable(pidfd, False)
+        streams.register(pidfd, selectors.EVENT_READ, 'exit')
+        owner.started(process)
+        for stream, label, event in ((process.stdin, 'stdin', selectors.EVENT_WRITE),
+                (process.stdout, 'stdout', selectors.EVENT_READ),
+                (process.stderr, 'stderr', selectors.EVENT_READ)):
+            os.set_blocking(stream.fileno(), False)
+            streams.register(stream, event, label)
+        while streams.get_map():
+            owner.guard()
+            left = end - time.monotonic()
+            if left <= 0:
+                raise TimeoutError('owned_preparation_deadline')
+            for key, _ in streams.select(min(left, 0.05)):
+                stream, label = key.fileobj, key.data
+                if label == 'exit':
+                    streams.unregister(pidfd)  # Keep pidfd until final reap/close.
+                elif label == 'stdin':
+                    try:
+                        sent += os.write(stream.fileno(), data[sent:sent + 8192])
+                    except BlockingIOError:
+                        continue
+                    if sent == len(data):
+                        streams.unregister(stream)
+                        stream.close()
+                else:
+                    try:
+                        part = os.read(stream.fileno(), min(8192, limits[label] + 1 - len(output[label])))
+                    except BlockingIOError:
+                        continue
+                    output[label].extend(part)
+                    if len(output[label]) > limits[label]:
+                        raise ValueError('owned_preparation_' + label + '_overflow')
+                    if not part:
+                        streams.unregister(stream)
+                        stream.close()
+        owner.guard()
+        if time.monotonic() >= end or output['stderr']:
+            raise ValueError('owned_preparation_failed_or_late')
+        # pidfd readiness was observed and removed above; no second waiter.
+        process.wait(timeout=0)
+        if process.returncode != 0:
+            raise ValueError('owned_preparation_nonzero')
+    except BaseException as error:
+        failed = error
+        owner.fence()  # In-memory stop remains set even if durable write fails.
+    finally:
+        try:
+            streams.close()
+        except BaseException as error:
+            failed = error
+            owner.fence()
+        if process is not None:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except BaseException as error:
+                        failed = error
+                        owner.fence()
+            # Before reap, the owned leader retains its PID even after exit.
+            # Never send a numeric group signal after that PID was reaped.
+            # Whole-unit residual custody remains with the original FileOwner.
+            if failed is not None and process.returncode is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError as error:
+                    failed = error
+            try:
+                if process.returncode is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, 0)
+                    process.wait(timeout=remaining)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                owner.fence()
+                raise StopUnconfirmed('STOP_UNCONFIRMED: original SDK command not reaped') from error
+            finally:
+                if pidfd is not None:
+                    fd, pidfd = pidfd, None  # Never retry an uncertain numeric close.
+                    try:
+                        os.close(fd)
+                    except BaseException as error:
+                        failed = error
+                        owner.fence()
+                owner.record(process, {
+                    'stdout_bytes': len(output['stdout']), 'stderr_bytes': len(output['stderr']),
+                    'stdout_sha256': hashlib.sha256(output['stdout']).hexdigest(),
+                    'stderr_sha256': hashlib.sha256(output['stderr']).hexdigest(),
+                    'returncode': process.returncode, 'reaped': process.returncode is not None,
+                    'elapsed_seconds': time.monotonic() - start,
+                    'state': 'REFUSED' if failed is not None else 'COMMAND_REAPED_NOT_VALIDATED'})
+    if failed is not None:
+        raise RuntimeError('owned_sdk_preparation_refused') from failed
+    owner.guard()
+    return bytes(output['stdout']), {'reaped': True, 'pid': process.pid,
+                                    'runtimeGrant': False}
+
+
+def locked_source(lock):
+    rows = [row for row in json.loads(lock.read_text())["repositories"] if row["id"] == "dsh"]
+    if len(rows) != 1:
+        raise ValueError("Expected exactly one locked Harness donor")
+    source = rows[0]
+    if (source["clone_url"] != "https://github.com/deepseek-ai/deepseek-harness.git"
+            or source["repo"] != "deepseek-ai/deepseek-harness"):
+        raise ValueError("Unexpected Harness upstream")
+    for key in ("commit", "tree"):
+        if not re.fullmatch(r"[0-9a-f]{40}", source[key]):
+            raise ValueError(f"Invalid locked {key}")
+    return source
+
+
+def verify_source(donor, source):
+    if donor.is_symlink() or (donor / ".git").is_symlink() or not (donor / ".git").is_dir():
+        raise ValueError("An independent, non-symlink donor checkout is required")
+    for name in ("index.lock", "HEAD.lock", "config.lock", "shallow.lock"):
+        if (donor / ".git" / name).exists():
+            raise ValueError(f"Competing donor writer: {name}")
+    def git(*args):
+        return run(["git", "--no-optional-locks", *args], donor)[0]
+    head = git("rev-parse", "HEAD")
+    tree = git("rev-parse", "HEAD^{tree}")
+    if (head, tree) != (source["commit"], source["tree"]):
+        raise ValueError(f"Wrong donor identity: {head} {tree}")
+    if git("status", "--porcelain=v1", "--untracked-files=no"):
+        raise ValueError("Donor tracked source/index is dirty; refusing changes")
+    if git("remote", "get-url", "origin") != source["clone_url"]:
+        raise ValueError("Wrong donor origin")
+    if git("branch", "--show-current"):
+        raise ValueError("Expected detached pinned checkout")
+    expected = {}
+    for row in git("ls-tree", "-r", "-z", "HEAD").split("\0"):
+        if row:
+            header, name = row.split("\t", 1)
+            mode, kind, blob = header.split()
+            if kind != "blob":
+                raise ValueError("Submodule preparation requires an explicit recursive pin")
+            expected[name] = (mode, blob)
+    index = {}
+    for row in git("ls-files", "--stage", "-z").split("\0"):
+        if row:
+            header, name = row.split("\t", 1)
+            mode, blob, stage = header.split()
+            if stage != "0":
+                raise ValueError("Unmerged donor index")
+            index[name] = (mode, blob)
+    if index != expected:
+        raise ValueError("Donor index differs from pinned HEAD")
+    if git("ls-files", "--others", "--exclude-standard", "-z"):
+        raise ValueError("Unexpected untracked donor source; refusing build/startup")
+    # Dotenv files are commonly ignored, but the native launcher loads them.
+    for path in donor.glob(".env*"):
+        if path.name not in expected:
+            raise ValueError("Unexpected donor-root environment file; refusing build/startup")
+    crlf_paths = []
+    for name, (mode, blob) in expected.items():
+        path = donor / name
+        if path.parent != path.parent.resolve():
+            raise ValueError(f"Symlinked source parent: {name}")
+        info = path.lstat()
+        if mode == "120000" and stat.S_ISLNK(info.st_mode):
+            data = os.fsencode(os.readlink(path))
+        elif mode in ("100644", "100755") and stat.S_ISREG(info.st_mode):
+            if bool(info.st_mode & stat.S_IXUSR) != (mode == "100755"):
+                raise ValueError(f"Wrong source executable mode: {name}")
+            data = path.read_bytes()
+        else:
+            raise ValueError(f"Wrong source file type: {name}")
+        actual = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+        if actual != blob:
+            # Upstream explicitly checks Windows .cmd files out with CRLF.
+            # Apply only that declared conversion, never arbitrary clean filters.
+            attr = git("check-attr", "-z", "eol", "--", name).split("\0")
+            canonical = data.replace(b"\r\n", b"\n")
+            canonical_blob = hashlib.sha1(b"blob " + str(len(canonical)).encode() + b"\0" + canonical).hexdigest()
+            if (mode == "120000" or attr[:3] != [name, "eol", "crlf"]
+                    or b"\n" in data.replace(b"\r\n", b"") or canonical_blob != blob):
+                raise ValueError(f"Source blob differs from pin: {name}")
+            crlf_paths.append(name)
+    return {"commit": head, "tree": tree, "tracked_clean": True,
+            "tracked_blob_and_git_mode_count": len(expected), "index_matches_head": True,
+            "unexpected_source_and_root_env_refused": True,
+            "upstream_declared_crlf_checkout_paths": crlf_paths,
+            "source_lock_sha256": None,
+            "notices": {name: digest(donor / name) for name in ("LICENSE", "THIRD_PARTY_NOTICES.md")},
+            "dependency_locks": {"pnpm-lock.yaml": digest(donor / "pnpm-lock.yaml")}}
+
+
+def node_supported(version):
+    numbers = tuple(int(x) for x in version.lstrip("v").split(".")[:3])
+    return (numbers[0] == 22 and numbers >= (22, 19, 0)) or numbers[0] >= 24
+
+
+def toolchain(donor, *, download=False):
+    package = json.loads((donor / "package.json").read_text())
+    manager = package["packageManager"]
+    if not re.fullmatch(r"pnpm@\d+\.\d+\.\d+", manager):
+        raise ValueError("Expected exact upstream pnpm version")
+    node, _ = run(["node", "--version"], donor)
+    if not node_supported(node):
+        raise ValueError(f"Unsupported Node {node}; upstream requires {package['engines']['node']}")
+    executable, _ = run(["node", "-p", "process.execPath"], donor)
+    headers = Path(executable).parent.parent / "include/node/node_api.h"
+    result = {"node": node, "node_executable": executable, "node_sha256": digest(executable),
+              "node_api_headers": str(headers), "node_api_headers_available": headers.is_file(),
+              "declared_node_engine": package["engines"]["node"], "package_manager": manager,
+              "corepack": shutil.which("corepack"), "cc": shutil.which("cc"),
+              "python3": shutil.which("python3"), "make": shutil.which("make")}
+    if download:
+        actual, _ = run(["corepack", "pnpm", "--version"], donor, timeout=180)
+        if actual != manager.split("@", 1)[1]:
+            raise ValueError(f"Wrong pnpm executable: {actual}")
+        result["observed_pnpm"] = actual
+    return result
+
+
+def build_inventory(donor):
+    files = []
+    # Source-backed Node launch resolves workspace lib output; keep that identity together.
+    dirs = list(donor.glob("apps/*/lib")) + list(donor.glob("packages/*/*/lib")) + list(donor.glob("vendor/*/lib"))
+    for directory in dirs:
+        for path in sorted(directory.rglob("*")):
+            if path.is_file() and not path.is_symlink():
+                files.append([str(path.relative_to(donor)), digest(path)])
+    for path in sorted((donor / "native/system/packages").rglob("*.node")):
+        files.append([str(path.relative_to(donor)), digest(path)])
+    files.sort()
+    return {"file_count": len(files), "sha256": hashlib.sha256(json.dumps(files, separators=(",", ":")).encode()).hexdigest(),
+            "files": files}
+
+
+SDK_SELECTION_KIND = 'STAGED_INSTALLED_RUNTIME_DEPENDENCY_CLOSURE_V1'
+SDK_ROOTS = ('packages/sandbox/sandbox-local', 'vendor/cordis',
+             'native/system/packages/entry')
+SDK_MAX_FILES = 100000
+SDK_MAX_MAP = 8 << 20
+SDK_MAX_BYTES = 2 << 30
+
+
+def sdk_walk_error(error):
+    """An unreadable package subtree is never an empty dependency closure."""
+    raise error
+
+
+def sdk_relative(root, path):
+    """Accept only existing objects within the selected installation."""
+    rel = path.relative_to(root)
+    resolved = path.resolve(strict=True)
+    if (not rel.parts or '.git' in rel.parts or not resolved.is_relative_to(root) or
+            '.git' in resolved.relative_to(root).parts):
+        raise ValueError('host_control_external_installation_object')
+    return str(rel)
+
+
+def sdk_manifest(path):
+    """Bound the metadata bytes used to derive the installed graph."""
+    if path != path.resolve(strict=True):
+        raise ValueError('host_control_package_manifest_alias')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > SDK_MAX_MAP:
+            raise ValueError('host_control_package_manifest_bound')
+        with os.fdopen(os.dup(fd), 'rb') as source:
+            raw = source.read(SDK_MAX_MAP + 1)
+        after = os.fstat(fd)
+        identity = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        if len(raw) != before.st_size or identity(before) != identity(after):
+            raise ValueError('host_control_package_manifest_changed')
+    finally:
+        os.close(fd)
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('host_control_duplicate_manifest_key')
+            result[key] = value
+        return result
+    def nonfinite(_):
+        raise ValueError('host_control_nonfinite_manifest')
+    value = json.loads(raw, object_pairs_hook=unique, parse_constant=nonfinite)
+    if type(value) is not dict or type(value.get('name')) is not str or type(value.get('version')) is not str:
+        raise ValueError('host_control_package_identity_required')
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def sdk_dependency_closure(donor):
+    """Read pnpm's installed graph, never solve or install dependencies.
+
+    Keep every installed dependency, peer and optional dependency, including
+    foreign-platform packages. Missing mandatory entries and dangling links
+    refuse. Absent optional entries are recorded, never inferred from names or
+    silently treated as a successful module load. Actual Node qualification of
+    this finite SDK path is still required on the resulting immutable stage.
+    """
+    donor = Path(donor)
+    pending = [donor / rel for rel in SDK_ROOTS]
+    packages, edges, absent, manifests = {}, [], [], {}
+    while pending:
+        package = pending.pop(0)
+        rel = sdk_relative(donor, package)
+        if package != package.resolve() or package == donor:
+            raise ValueError('host_control_noncanonical_package')
+        if rel in packages:
+            continue
+        manifest = package / 'package.json'
+        value, manifest_hash = sdk_manifest(manifest)
+        packages[rel] = {'name': value['name'], 'version': value['version']}
+        manifests[str(manifest.relative_to(donor))] = manifest_hash
+        if len(packages) > 4096:
+            raise ValueError('host_control_package_count_bound')
+        for section in ('dependencies', 'peerDependencies', 'optionalDependencies'):
+            dependencies = value.get(section, {})
+            if type(dependencies) is not dict:
+                raise ValueError('host_control_dependency_manifest_shape')
+            for name, version in sorted(dependencies.items()):
+                if not re.fullmatch(r'(?:@[a-z0-9._~-]+/)?[a-z0-9._~-]+', name) or name in ('.', '..'):
+                    raise ValueError('host_control_dependency_name')
+                if type(version) is not str or not version:
+                    raise ValueError('host_control_dependency_version')
+                optional = section == 'optionalDependencies' or (section == 'peerDependencies' and
+                    value.get('peerDependenciesMeta', {}).get(name, {}).get('optional') is True)
+                parent, found, searched = package, None, []
+                while parent.is_relative_to(donor):
+                    if parent.name != 'node_modules':
+                        possible = parent / 'node_modules' / name
+                        searched.append(str(possible.relative_to(donor)))
+                        if os.path.lexists(possible):
+                            found = possible
+                            break
+                    if parent == donor:
+                        break
+                    parent = parent.parent
+                edge = {'from': rel, 'section': section, 'name': name, 'declared': version}
+                if found is None:
+                    if not optional:
+                        raise ValueError('host_control_required_dependency_missing:' + name)
+                    absent.append({**edge, 'searched': searched, 'state': 'OPTIONAL_NOT_INSTALLED'})
+                    continue
+                # Preserve pnpm's actual physical paths and link text. A linked
+                # ancestor would need a separate mapping; never flatten it here.
+                if found.parent != found.parent.resolve():
+                    raise ValueError('host_control_dependency_ancestor_alias')
+                via = sdk_relative(donor, found)
+                target = found.resolve(strict=True)
+                target_rel = sdk_relative(donor, target)
+                target_manifest, _ = sdk_manifest(target / 'package.json')
+                if target_manifest['name'] != name:
+                    raise ValueError('host_control_dependency_identity_mismatch')
+                edges.append({**edge, 'via': via, 'target': target_rel,
+                              'link': os.readlink(found) if found.is_symlink() else None})
+                pending.append(target)
+                if len(edges) + len(absent) > SDK_MAX_FILES:
+                    raise ValueError('host_control_dependency_edge_bound')
+    return {'method': SDK_SELECTION_KIND, 'sourceRoot': str(donor),
+            'roots': list(SDK_ROOTS), 'packages': packages, 'edges': edges,
+            'optionalAbsent': absent, 'manifestPins': manifests,
+            'pathMapping': 'same-relative-path-and-sha256', 'runtimeGrant': False}
+
+
+def stage_host_control_sdk(donor, destination):
+    """Copy a closed SDK view after the ordinary full donor build.
+
+    No donor file is pruned or modified. Package bodies are copied completely;
+    only their node_modules graphs are selected by installed dependency edges.
+    Source, bundled lib, package metadata, native assets and notices travel
+    together. The destination must be new and is never promoted on failure.
+    """
+    donor, destination = Path(donor), Path(destination)
+    if (donor != donor.resolve() or not destination.is_absolute() or
+            destination.parent != destination.parent.resolve() or
+            destination.is_relative_to(donor) or donor.is_relative_to(destination) or
+            os.path.lexists(destination)):
+        raise ValueError('host_control_new_external_stage_required')
+    closure = sdk_dependency_closure(donor)
+    selected, links = set(), {}
+    for rel in closure['packages']:
+        package = donor / rel
+        for directory, dirs, names in os.walk(package, followlinks=False, onerror=sdk_walk_error):
+            if '.git' in dirs or '.git' in names:
+                raise ValueError('host_control_git_in_package_body')
+            dirs[:] = [name for name in dirs if
+                       not (name == 'node_modules' and Path(directory) == package)]
+            for name in [*dirs, *names]:
+                source = Path(directory) / name
+                source_rel = sdk_relative(donor, source)
+                if source.is_symlink():
+                    links[source_rel] = os.readlink(source)
+                elif source.is_file():
+                    selected.add(source_rel)
+                elif not source.is_dir():
+                    raise ValueError('host_control_special_installation_file')
+                if len(selected) + len(links) > SDK_MAX_FILES:
+                    raise ValueError('host_control_installation_file_bound')
+    for edge in closure['edges']:
+        if edge['link'] is not None:
+            links[edge['via']] = edge['link']
+    # Node consults package scopes above a package; pin those too. The root
+    # manifest supplies scope, not a request to include root devDependencies.
+    for rel in list(selected):
+        parent = (donor / rel).parent
+        while parent.is_relative_to(donor):
+            metadata = parent / 'package.json'
+            if os.path.lexists(metadata):
+                if metadata.is_symlink() or not metadata.is_file():
+                    raise ValueError('host_control_resolution_metadata_alias')
+                selected.add(sdk_relative(donor, metadata))
+            if parent == donor:
+                break
+            parent = parent.parent
+    selected.update(('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'LICENSE', 'THIRD_PARTY_NOTICES.md'))
+    if len(selected) + len(links) > SDK_MAX_FILES:
+        raise ValueError('host_control_installation_file_bound')
+    expected_sizes = {rel: (donor / rel).stat().st_size for rel in selected}
+    total = sum(expected_sizes.values())
+    if total > SDK_MAX_BYTES:
+        raise ValueError('host_control_installation_byte_bound')
+    # Reject before allocating/copying a tree whose finite map cannot fit.
+    estimate = {'files': {rel: '0' * 64 for rel in selected}, 'links': links,
+                'sdkClosure': closure}
+    if len(json.dumps(estimate, sort_keys=True, indent=2).encode()) > SDK_MAX_MAP - 65536:
+        raise ValueError('host_control_selection_map_bound')
+    destination.mkdir(mode=0o700)
+    copied = {}
+    for rel in sorted(selected):
+        source = donor / rel
+        if source != source.resolve() or not source.is_file():
+            raise ValueError('host_control_source_alias_or_special')
+        target = destination / rel
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError('host_control_special_installation_file')
+            if before.st_size != expected_sizes[rel]:
+                raise ValueError('host_control_source_changed_during_stage')
+            hasher, size = hashlib.sha256(), 0
+            with target.open('xb') as output:
+                while True:
+                    block = os.read(fd, 65536)
+                    if not block:
+                        break
+                    size += len(block)
+                    if size > before.st_size:
+                        raise ValueError('host_control_source_changed_during_stage')
+                    output.write(block)
+                    hasher.update(block)
+                os.fchmod(output.fileno(), stat.S_IMODE(before.st_mode) & 0o777)
+            after = os.fstat(fd)
+            identity = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+            if size != before.st_size or identity(before) != identity(after):
+                raise ValueError('host_control_source_changed_during_stage')
+            copied[rel] = hasher.hexdigest()
+        finally:
+            os.close(fd)
+    for rel, expected in closure['manifestPins'].items():
+        if copied.get(rel) != expected:
+            raise ValueError('host_control_dependency_manifest_changed')
+    for rel, link in sorted(links.items()):
+        source = donor / rel
+        if not source.is_symlink() or os.readlink(source) != link or os.path.isabs(link):
+            raise ValueError('host_control_link_changed_or_absolute')
+        sdk_relative(donor, source)
+        target = destination / rel
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target.symlink_to(link)
+    for rel in links:
+        sdk_relative(destination, destination / rel)
+    # A metadata race or ancestor fallback must not change a declared absence.
+    for absent in closure['optionalAbsent']:
+        if any(os.path.lexists(destination / rel) or os.path.lexists(donor / rel)
+               for rel in absent['searched']):
+            raise ValueError('host_control_optional_dependency_changed')
+    rebuilt = sdk_dependency_closure(destination)
+    if any(rebuilt[key] != closure[key] for key in
+           ('roots', 'packages', 'edges', 'optionalAbsent', 'manifestPins', 'pathMapping')):
+        raise ValueError('host_control_staged_dependency_graph_changed')
+    closure['copiedFiles'] = len(copied)
+    closure['copiedBytes'] = total
+    closure['copiedLinks'] = len(links)
+    return closure, copied, links
+
+
+def host_control_build_selection(donor, toolchain, sdk_root):
+    """Select exact built SDK/launcher bytes; this is never a runtime admission.
+
+    Called by the existing preparer after its source/build checks. The FileOwner
+    independently compares sourcePins against its reviewed composed overlay, so
+    selecting an old unpatched build cannot bind the newly added SDK method.
+    """
+    donor = Path(donor)
+    if donor != donor.resolve() or os.uname().sysname != 'Linux':
+        raise ValueError('host_control_linux_canonical_installation_required')
+    machine = {'x86_64': 'x64', 'aarch64': 'arm64'}.get(os.uname().machine)
+    if machine is None:
+        raise ValueError('host_control_platform_not_selected')
+    closure, copied, copied_links = stage_host_control_sdk(donor, sdk_root)
+    donor = Path(sdk_root)
+    files, links = {}, {}
+    total = 0
+    for directory, dirs, names in os.walk(donor, followlinks=False, onerror=sdk_walk_error):
+        if Path(directory) == donor and '.git' in dirs:
+            dirs.remove('.git')
+        for name in [*dirs, *names]:
+            path = Path(directory) / name
+            rel = str(path.relative_to(donor))
+            if path.is_symlink():
+                target = path.resolve(strict=True)
+                if not target.is_relative_to(donor) or '.git' in target.relative_to(donor).parts:
+                    raise ValueError('host_control_external_installation_link')
+                links[rel] = os.readlink(path)
+            elif path.is_file():
+                total += path.stat().st_size
+                if total > SDK_MAX_BYTES:
+                    raise ValueError('host_control_installation_byte_bound')
+                # Stream installed files; do not allocate the whole tree in RAM.
+                h = hashlib.sha256()
+                with path.open('rb') as source:
+                    for block in iter(lambda: source.read(65536), b''):
+                        h.update(block)
+                files[rel] = h.hexdigest()
+            elif not path.is_dir():
+                raise ValueError('host_control_special_installation_file')
+            if len(files) + len(links) > SDK_MAX_FILES:
+                raise ValueError('host_control_installation_file_bound')
+    if files != copied or links != copied_links:
+        raise ValueError('host_control_stage_copy_drift')
+    imports = {
+        'provider': 'packages/sandbox/sandbox-local/lib/index.js',
+        'cordis': 'vendor/cordis/lib/index.js',
+        'landlock': 'native/system/packages/entry/lib/index.js',
+    }
+    source_names = (
+        'packages/sandbox/sandbox-local/src/index.ts',
+        'packages/sandbox/sandbox-local/src/host-control.ts',
+        'packages/sandbox/sandbox-local/src/profiles.ts',
+        'packages/sandbox/sandbox/src/index.ts',
+        'native/system/packages/entry/src/index.ts',
+        'native/system/packages/entry/src/main.c',
+    )
+    launcher = 'native/system/packages/linux-' + machine + '/bin/landlock-run'
+    if any(name not in files for name in [*imports.values(), *source_names, launcher]):
+        raise ValueError('host_control_compiled_sdk_or_scoped_launcher_missing')
+    entry = Path(__file__).resolve().with_name('dsh_host_control_prepare.mjs')
+    node = Path(toolchain['node_executable'])
+    if node != node.resolve() or digest(node) != toolchain['node_sha256']:
+        raise ValueError('host_control_node_selection_drift')
+    return {'schema': 1, 'state': 'BUILT_SOURCE_SELECTION_NOT_ADMISSION',
+        'donorCommit': '5badb15009ae1756c3afe0ae0cef1faafc290ccc',
+        'root': str(donor), 'profile': 'builtin-linux-host-control-v1',
+        'node': {'path': str(node), 'sha256': digest(node)},
+        'entry': {'path': str(entry), 'sha256': digest(entry)},
+        'commandHelper': {'path': str(Path(__file__).resolve()), 'sha256': digest(__file__)},
+        'imports': imports, 'launcher': launcher, 'sourcePins': {n: files[n] for n in source_names},
+        'files': files, 'links': links, 'sdkClosure': closure,
+        'resolutionFiles': sorted(n for n in files if n == 'package.json' or n.endswith('/package.json')),
+        'runtimeGrant': False}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("source", "check", "toolchain", "build", "smoke"))
+    parser.add_argument("--donor", type=Path, required=True)
+    parser.add_argument("--lock", type=Path, default=Path(__file__).resolve().parents[1] / "sources.lock.json")
+    parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--build-timeout", type=int, default=900)
+    parser.add_argument("--host-control-selection", type=Path,
+                        help="Stage the SDK closure in new evidence/host-control-sdk and write its selection; never admission")
+    args = parser.parse_args()
+    if args.host_control_selection is not None and args.action not in ('build', 'check'):
+        raise ValueError('host_control_selection_requires_existing_build_or_check')
+    donor = args.donor.absolute()
+    if donor != donor.resolve():
+        raise ValueError("Refusing symlinked donor path or parent")
+    source = locked_source(args.lock)
+    if args.action == "source" and not donor.exists():
+        donor.mkdir(mode=0o700, parents=False)
+        run(["git", "init", "--quiet"], donor)
+        run(["git", "remote", "add", "origin", source["clone_url"]], donor)
+        run(["git", "fetch", "--depth=1", "origin", source["commit"]], donor, timeout=180)
+        run(["git", "checkout", "--detach", source["commit"]], donor)
+    identity = verify_source(donor, source)
+    identity["source_lock_sha256"] = digest(args.lock)
+    result = {"donor": str(donor), "source": identity, "toolchain": toolchain(donor, download=args.action in ("toolchain", "build")),
+              "runtime_task": "NOT_RUN", "inference": "NOT_RUN", "telemetry_disabled": True}
+    evidence = args.evidence.absolute()
+    evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if args.action == "build":
+        if not result["toolchain"]["node_api_headers_available"] or not result["toolchain"]["cc"]:
+            raise RuntimeError("Native build prerequisite missing: Node development headers and cc are required")
+        result["install"] = run(["corepack", "pnpm", "install", "--frozen-lockfile", "--store-dir", str(donor / ".git/friday-pnpm-store")],
+                                donor, timeout=900, log=evidence / "dsh-install")[1]
+        result["build"] = run(["corepack", "pnpm", "run", "build"], donor,
+                              timeout=args.build_timeout, log=evidence / "dsh-build")[1]
+        verify_source(donor, source)
+    cli = donor / "apps/cli/lib/bin.js"
+    if args.action == "smoke":
+        if not cli.is_file():
+            raise RuntimeError("Built source CLI missing; run build first")
+        result["smoke"] = []
+        for label, flags in (("version", ["--version"]), ("help", ["--help"]),
+                             ("headless-config", ["--profile", "headless", "--dump-default-config"]),
+                             ("headless-help", ["--profile", "headless", "--help"])):
+            output, observation = run(["node", str(cli), *flags], donor, log=evidence / ("dsh-" + label))
+            if label == "version" and json.loads((donor / "package.json").read_text())["version"] not in output:
+                raise ValueError("CLI version does not match source package")
+            result["smoke"].append({"kind": label, **observation})
+        result["startup_scope"] = "Native entrypoint, headless composition and profile help; no agent/session/model run"
+    if cli.is_file():
+        result["cli"] = {"path": str(cli), "sha256": digest(cli)}
+        inventory = build_inventory(donor)
+        (evidence / "dsh-build-inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
+        result["workspace_build_identity"] = {key: inventory[key] for key in ("file_count", "sha256")}
+    if args.host_control_selection is not None:
+        destination = args.host_control_selection.absolute()
+        if destination.parent != evidence or os.path.lexists(destination):
+            raise ValueError('host_control_selection_must_be_new_owned_evidence')
+        selection = host_control_build_selection(donor, result['toolchain'], evidence / 'host-control-sdk')
+        encoded = json.dumps(selection, sort_keys=True, indent=2).encode() + b'\n'
+        if len(encoded) > SDK_MAX_MAP:
+            raise ValueError('host_control_selection_map_bound')
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'wb') as output:
+            output.write(encoded)
+        result['host_control_preparation_selection'] = {
+            'path': str(destination), 'sha256': digest(destination), 'runtimeGrant': False}
+    (evidence / ("dsh-" + args.action + ".json")).write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps({"action": args.action, "source": identity, "toolchain": result["toolchain"], "cli": result.get("cli")}, indent=2))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)

@@ -28,7 +28,7 @@ SOFTWARE.
 
 ## Hermes
 
-The Hermes patches and Hermes-derived source copies/overlays in `analysis/2026-10-09/incremental-01` are based on pinned Hermes commit `781334eea4b9225a3e194faf0c241d9afe218634`. The upstream notice applies to those portions.
+The Hermes patches and Hermes-derived source copies/overlays in this analysis package are based on pinned Hermes commit `781334eea4b9225a3e194faf0c241d9afe218634`. The upstream notice applies to those portions.
 
 MIT License
 
@@ -54,7 +54,7 @@ SOFTWARE.
 
 ## DeepSeek Harness
 
-The Harness-derived TypeScript source/test copies and overlays in `analysis/2026-10-09/incremental-01` originate from commit `5badb15009ae1756c3afe0ae0cef1faafc290ccc`. Separately licensed native/system objects and upstream C copies are excluded from this subset. The upstream root notice follows.
+The Harness-derived TypeScript source/test copies and overlays in this analysis package originate from commit `5badb15009ae1756c3afe0ae0cef1faafc290ccc`. Separately licensed native/system objects and upstream C copies are excluded from this subset. The upstream root notice follows.
 
 MIT License
 

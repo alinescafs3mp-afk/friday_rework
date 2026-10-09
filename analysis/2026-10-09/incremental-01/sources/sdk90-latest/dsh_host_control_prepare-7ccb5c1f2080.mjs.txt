@@ -1,0 +1,165 @@
+/** Private finite SDK preparation command owned by FileOwner, never a dsh app. */
+import fs from 'node:fs'
+import path from 'node:path'
+import crypto from 'node:crypto'
+import { createRequire, registerHooks, syncBuiltinESMExports } from 'node:module'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import childProcess from 'node:child_process'
+import net from 'node:net'
+import tls from 'node:tls'
+import http from 'node:http'
+import https from 'node:https'
+import dns from 'node:dns'
+import dgram from 'node:dgram'
+import workerThreads from 'node:worker_threads'
+
+const MAX_INPUT = 32768
+const MAX_OUTPUT = 65536
+const MAX_MAP = 8 << 20
+const MAX_MODULE = 8 << 20
+const fail = () => { throw new Error('SDK_PREPARATION_REFUSED') }
+const check = value => { if (!value) fail() }
+const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
+
+function readBounded(fd, maximum) {
+  const chunks = []; let size = 0
+  while (true) {
+    const chunk = Buffer.alloc(Math.min(8192, maximum + 1 - size))
+    const count = fs.readSync(fd, chunk, 0, chunk.length, null)
+    if (!count) break
+    size += count
+    check(size <= maximum)
+    chunks.push(chunk.subarray(0, count))
+  }
+  return Buffer.concat(chunks, size)
+}
+
+function pinnedFile(filename, digest, maximum) {
+  check(path.isAbsolute(filename) && fs.realpathSync(filename) === filename)
+  const fd = fs.openSync(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+  try {
+    const before = fs.fstatSync(fd)
+    check(before.isFile() && before.size <= maximum)
+    const data = readBounded(fd, maximum)
+    const after = fs.fstatSync(fd)
+    check(before.dev === after.dev && before.ino === after.ino && before.size === after.size &&
+      before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs && sha(data) === digest)
+    return data
+  } finally { fs.closeSync(fd) }
+}
+
+/** Refuse accidental probes/processes/network before importing the donor SDK. */
+function blockEffects() {
+  globalThis.fetch = fail
+  for (const [object, names] of [
+    [childProcess, ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']],
+    [net, ['connect', 'createConnection', 'createServer']],
+    [tls, ['connect', 'createServer']], [http, ['request', 'get', 'createServer']],
+    [https, ['request', 'get', 'createServer']], [dns, ['lookup', 'resolve', 'resolve4', 'resolve6']],
+    [dns.promises, ['lookup', 'resolve', 'resolve4', 'resolve6']],
+    [dgram, ['createSocket']], [workerThreads, ['Worker']],
+  ]) for (const name of names) object[name] = fail
+  net.Socket.prototype.connect = fail
+  net.Server.prototype.listen = fail
+  syncBuiltinESMExports()
+}
+
+let ctx
+let hooks
+try {
+  check(process.platform === 'linux' && process.argv.length === 2 &&
+    Object.keys(process.env).every(key => ['LANG', 'LC_ALL'].includes(key)))
+  const request = JSON.parse(readBounded(0, MAX_INPUT).toString('utf8'))
+  check(request.schema === 1 && request.runtimeGrant === false &&
+    Object.keys(request).sort().join(',') === 'buildSelection,phase,policy,runtimeGrant,schema,semanticArgv')
+  const ref = request.buildSelection
+  const build = JSON.parse(pinnedFile(ref.path, ref.sha256, MAX_MAP).toString('utf8'))
+  check(build.schema === 1 && build.state === 'BUILT_SOURCE_SELECTION_NOT_ADMISSION' &&
+    build.runtimeGrant === false && build.profile === 'builtin-linux-host-control-v1' &&
+    build.donorCommit === '5badb15009ae1756c3afe0ae0cef1faafc290ccc' &&
+    process.execPath === build.node.path && fileURLToPath(import.meta.url) === build.entry.path &&
+    fs.realpathSync(build.root) === build.root)
+  check(build.sdkClosure?.method === 'STAGED_INSTALLED_RUNTIME_DEPENDENCY_CLOSURE_V1' &&
+    build.sdkClosure.sourceRoot !== build.root && build.sdkClosure.runtimeGrant === false &&
+    build.sdkClosure.pathMapping === 'same-relative-path-and-sha256')
+  pinnedFile(build.node.path, build.node.sha256, 256 << 20)
+  pinnedFile(build.entry.path, build.entry.sha256, MAX_MODULE)
+  const root = build.root
+  const entryPath = rel => {
+    check(typeof rel === 'string' && !path.isAbsolute(rel) && !rel.split('/').includes('..') &&
+      !rel.split('/').includes('.git') && Object.hasOwn(build.files, rel))
+    return path.join(root, rel)
+  }
+  const moduleFile = url => {
+    check(url.startsWith('file:') && !new URL(url).search && !new URL(url).hash)
+    const filename = fileURLToPath(url)
+    check(filename.startsWith(root + '/') && fs.realpathSync(filename) === filename)
+    const rel = path.relative(root, filename)
+    check(entryPath(rel) === filename && !filename.endsWith('.node'))
+    return [filename, build.files[rel]]
+  }
+  // Synchronous hooks run in this same finite process, not a loader worker.
+  // Every evaluated file is supplied from the exact hashed bytes below.
+  hooks = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      const result = nextResolve(specifier, context)
+      if (!result.url.startsWith('node:')) moduleFile(result.url)
+      return result
+    },
+    load(url, context, nextLoad) {
+      if (url.startsWith('node:')) return nextLoad(url, context)
+      const [filename, digest] = moduleFile(url)
+      const source = pinnedFile(filename, digest, MAX_MODULE)
+      const result = nextLoad(url, context)
+      check(['module', 'commonjs', 'json'].includes(result.format))
+      return { ...result, source }
+    },
+  })
+  blockEffects()
+  const providerPath = entryPath(build.imports.provider)
+  const cordisPath = entryPath(build.imports.cordis)
+  const landlockPath = entryPath(build.imports.landlock)
+  check(build.imports.provider === 'packages/sandbox/sandbox-local/lib/index.js' &&
+    build.imports.cordis === 'vendor/cordis/lib/index.js' &&
+    build.imports.landlock === 'native/system/packages/entry/lib/index.js')
+  // Resolve from the actual provider, so an unrelated Cordis/launcher copy
+  // cannot supply the constructor or launcher selection.
+  const requireProvider = createRequire(providerPath)
+  check(fs.realpathSync(requireProvider.resolve('@deepseek-ai/cordis')) === cordisPath &&
+    fs.realpathSync(requireProvider.resolve('@deepseek-ai/node-addon-system/landlock-run')) === landlockPath)
+  const { Context } = await import(pathToFileURL(cordisPath).href)
+  const { LocalSandboxProvider } = await import(pathToFileURL(providerPath).href)
+  const { launcherPath } = await import(pathToFileURL(landlockPath).href)
+  const launcher = launcherPath()
+  check(fs.realpathSync(launcher) === entryPath(build.launcher))
+  pinnedFile(entryPath(build.launcher), build.files[build.launcher], MAX_MODULE)
+  check(Array.isArray(request.semanticArgv) && request.semanticArgv.length > 0 &&
+    request.semanticArgv.length <= 256 && request.semanticArgv.every(v => typeof v === 'string' && !v.includes('\0')) &&
+    Number.isSafeInteger(request.policy.statusFd) && request.policy.statusFd >= 3)
+  ctx = new Context()
+  await ctx.plugin(LocalSandboxProvider, {})
+  const provider = ctx.sandbox
+  check(provider instanceof LocalSandboxProvider && Object.keys(provider.internals).length === 0)
+  // This is the actual SDK method. It owns builtin Linux profile composition
+  // and the launcher's scopedGrantArgs; no Python/composer/fake callback path.
+  const preparation = provider.prepareHostControl(request.semanticArgv, request.policy)
+  check(preparation.runtimeGrant === false && preparation.state === 'UNQUALIFIED_SOURCE_PREPARATION' &&
+    preparation.statusFd === request.policy.statusFd &&
+    JSON.stringify(preparation.semanticArgv) === JSON.stringify(request.semanticArgv))
+  await ctx.fiber.dispose()
+  ctx = undefined
+  const output = Buffer.from(JSON.stringify({schema: 1, phase: request.phase, preparation, runtimeGrant: false}) + '\n')
+  check(output.length <= MAX_OUTPUT)
+  let written = 0
+  while (written < output.length) written += fs.writeSync(1, output, written, output.length - written)
+} catch (error) {
+  // No paths, argv, raw imported errors, environment or raw provider output.
+  process.exitCode = 1
+  fs.writeSync(2, 'SDK_PREPARATION_REFUSED\n')
+} finally {
+  if (ctx) {
+    try { await ctx.fiber.dispose() }
+    catch (error) { process.exitCode = 1 }
+  }
+  hooks?.deregister()
+}
