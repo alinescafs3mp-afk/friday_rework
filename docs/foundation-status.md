@@ -1,15 +1,33 @@
 # Foundation checkpoint — 2026-10-09
 
-Current checkpoint, 2026-10-09 16:55 MSK: a partial source/outcome snapshot
-is prepared for intermediate publication. See the [work log](../analysis/2026-10-09/incremental-01/WORKLOG.md)
-and [selected outcome records](../analysis/2026-10-09/incremental-01/outcomes.json).
-The TS owner source package completed, but independent review found four
-connected blockers: aggregate process ownership, current TS pin consumption,
-whole-lifetime deadline enforcement and transformed-code event reconciliation.
-A coherent repair is active. Sol separately implements bounded callback cost
-measurements after a real CPython probe showed the proposed general monitoring
-misses calls inside profile/audit callbacks. No runtime acceptance follows.
-All seven installed journeys and four web contexts remain unaccepted.
+Current checkpoint, 2026-10-09 18:46 MSK: three intermediate analysis bundles
+have been published through commit `5fd58a2a8b9ac420a5604eb530b8b78990871512`.
+They include source snapshots, historical outcomes, decisions and explicit
+coverage gaps. The daily checkpoint starts at 21:00 MSK and remains pending;
+intermediate publication continues independently of release acceptance.
+
+| Area | Latest verified result | Next missing result |
+| --- | --- | --- |
+| Callback diagnostic | Independent source review confirms the repaired partial-report chronology and unchanged original guard semantics. | Real execution of the current 277-case qualification, cost probes and 38-case diagnostic remains NOT_RUN. Sol is implementing cumulative CPU ownership in the existing finite wrapper. |
+| TypeScript evidence | Independent review confirms descriptor custody and OOM handling changes at source level. It found a returned-code hash read from mutable state and lost request identity across worker/cache boundaries. | A coherent source repair is active; the original 24-case runtime gate remains NOT_RUN. |
+| TypeScript native admission | Investigation of the installed systemd version and applicable source found unresolved identity, pending-request and original-deadline semantics. | A supported complete admission path and actual whole-scope qualification; closing or reaping the CLI alone is insufficient. |
+| A0 runtime | The prior attempt is closed; the recorded journal corruption remains unresolved. | A verified recovery source and subsequent authorized runtime qualification. No new A0 kernel trial or daemon start is claimed. |
+
+The callback budget is one 180-second wall-clock lifetime with a cumulative
+45-second CPU budget, affinity 0/1, a per-process 2 GiB address-space limit and
+the original 60-second closure reserve. A dedicated aggregate-memory cgroup
+and a wait4-only accounting format were additional assumptions in a prepared
+adapter, not original requirements. Source review removed that mistaken
+prerequisite from the repair direction; it did not establish working CPU
+accounting or grant execution. GNU timeout's group kill can precede its own
+child reap, so descendant CPU cannot simply be inferred from one wait4 result.
+
+The historical 579-case source qualification PASS and G20 exit137 remain
+unchanged results on their respective bytes. G20's signal cause remains unknown;
+its consumed attempt is not retried. Source presence, source review, offline
+execution, live wiring and release acceptance remain separate. All seven
+installed journeys and four web contexts are unaccepted.
+
 The detailed earlier observations below are history, not current assignments.
 
 Earlier checkpoint, 2026-10-09 16:03 MSK: repaired SDK/network source

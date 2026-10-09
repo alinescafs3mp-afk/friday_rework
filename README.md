@@ -17,3 +17,5 @@ See `docs/mandatory-web-admin.md` and `validation/acceptance-web-admin.json` for
 [Expanded source, outcomes and process analysis](analysis/2026-10-09/incremental-02/README.md) adds 349 historical result summaries, 40 design/control plans, source snapshots and explicit remaining coverage gaps. It is an intermediate publication, not the completed daily checkpoint or a release.
 
 [Additional outcomes and provenance](analysis/2026-10-09/incremental-03/README.md) closes the selected 171-row metadata omission table, including previously omitted failures, successful runs and exact Linux header provenance. The complete daily checkpoint remains pending.
+
+[Recent fixes and integration decisions](analysis/2026-10-09/incremental-04/README.md) adds callback and TypeScript source repairs, independent findings and 36 selected process records. Runtime qualification and the complete daily checkpoint remain pending.

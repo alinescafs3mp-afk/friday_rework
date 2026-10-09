@@ -1,0 +1,31 @@
+2026-10-09 — incremental source and result checkpoint 04
+
+The seven selected closed packages and four necessary predecessor records below extend the public record after `5fd58a2a8b9ac420a5604eb530b8b78990871512`. Browser cost-observation review was already published as a nested record and is referenced by exact committed object and JSON pointer; the other three predecessor summaries fill outcome coverage gaps. Predecessor source leaves are tied to current successors without copying obsolete code. The first daily baseline is `3bf8b315254da4346cfda67cf951dc0f0ae0cc49`. This slice is prepared for analysis; the root integrator records its eventual commit. It is not a complete daily checkpoint or a runtime acceptance.
+
+Callback repair review confirmed F1/F2/F4/F6 at source level but found that a collection snapshot appended after newer report samples rejects an otherwise valid partial history (R1). The r2 producer records the actual report boundary and final-sample presence; its consumer inserts only that snapshot and never sorts report history. Prepared controls cover 1/3/9/114 saved reports without final, complete final/latest, and malformed boundaries. Five semantic files changed. The independent review also caught and then confirmed repair of the stale projection assertion while retaining full original AST equality. All actual controls remain NOT_RUN.
+
+The owner-route investigation found a real missing finite owner: per-child limits and lower-bound samples cannot prove one cumulative 45 CPU budget covering the owner, GNU, modes, descendants and closure. GNU group-KILL can kill timeout before it reaps its child, so wait4(GNU) alone can lose descendant CPU. The original contract is one 180-second wall clock, cumulative 45 CPU, affinity [0,1], per-process AS 2 GiB and original GNU 60 plus 60 closure reserve. Dedicated aggregate cgroup memory, wait4-only receipt, fixed 3 CPU future reserve and reduced 30-second closure are unsupported new assumptions in the prepared adapter. They are preserved as historical source defects, not adopted requirements. The active wrapper implementation is outside this sealed slice.
+
+TS custody preparation changes 12 source leaves and retains three entrypoint dependencies. Independent review confirms exceptional custody and the earlier per-worker static coverage repair. Two new source blockers remain: a returned request hash is read from a mutable shared transform node after inline-map mutation, and parent request/transform IDs are lost at ordinary/cache/temp worker boundaries. Six framework overlays are supplied as authored patches against exact Vite/Vitest upstream bytes with existing license references. Source repairs under active implementation are not represented as finished.
+
+The systemd investigation follows exact installed-version source and distribution patch provenance. It identifies manager PIDFD downgrade on FD exhaustion, a numeric attachment race, queued effects that outlive a client, disconnect without cancellation, and relative timeouts that do not establish the original absolute pre-request deadline. Dead PIDFD, job completion, and terminal scope closure are distinct. These are gaps in the selected admission route; universal Linux impossibility is not claimed. No speculative adapter, native change or live acceptance was produced.
+
+Recorded package accounting (Moscow time; overlapping durations are not additive):
+
+- callback-diagnostic-repair-review: accepted 2026-10-09T18:06:02.417000+03:00, finished 2026-10-09T18:17:22.201358+03:00, elapsed 679.784358 seconds.
+- callback-partial-chronology-r2: accepted UNKNOWN, finished UNKNOWN, elapsed UNKNOWN seconds. Snapshot only: 2026-10-09T18:28:21.803525+03:00.
+- callback-partial-chronology-review: accepted 2026-10-09T18:25:26.598000+03:00, finished 2026-10-09T18:31:24.988308+03:00, elapsed 358.390308 seconds.
+- callback-owner-route: accepted 2026-10-09T18:15:47.372000+03:00, finished 2026-10-09T18:25:51.490788+03:00, elapsed 604.118788 seconds.
+- ts-custody-evidence-repair: accepted 2026-10-09T17:34:14.965000+03:00, finished 2026-10-09T18:01:36.903214+03:00, elapsed 1641.938214 seconds.
+- ts-custody-review: accepted 2026-10-09T18:11:11.962000+03:00, finished 2026-10-09T18:24:57.083842+03:00, elapsed 825.121842 seconds.
+- pending-admission-seam: accepted 2026-10-09T17:53:55+03:00, finished 2026-10-09T18:04:42.384284+03:00, elapsed 647.384 seconds.
+- ts-owner-coherent-repair: accepted 2026-10-09T16:52:44+03:00, finished 2026-10-09T17:16:43.345107+03:00, elapsed 1439.345107 seconds.
+- ts-owner-coherent-review: accepted 2026-10-09T17:19:44.910000+03:00, finished 2026-10-09T17:31:44.856031+03:00, elapsed 719.946031 seconds.
+- callback-cost-integration-review: accepted 2026-10-09T17:08:31.948+03:00, finished 2026-10-09T17:20:23.000+03:00, elapsed 711.052 seconds.
+- browser-cost-observation-review: accepted 2026-10-09T16:19:12.302000+03:00, finished 2026-10-09T16:30:45.623386+03:00, elapsed 693.321386 seconds.
+
+Historical G20 remains FAILED137, cause UNKNOWN, consumed and closed. Qualification 277/831, callback probes and diagnostic 38/114 remain NOT_RUN. All seven journeys and all four web journeys are UNACCEPTED. Source, wiring, static observations, execution and acceptance are separate in outcomes.json. Full private maps/raw observations are withheld; exact original and transformed hashes remain in the ledger.
+
+## Root process reconciliation
+
+A lifecycle check against the current Astra/Sol roots found historical receipt decisions absent from the primary public outcome index. The selected 36 records are retained in `process-decisions.json`. Most underlying implementation/review reports were already published; the new receipt records supply integration decisions and actual timestamps without private message payloads. One failed original parent closed in 1,008.620 seconds of its 1,800-second budget; the native build never started and inactive root assets remained retained. One source review was cancelled after a capacity failure and expiry of its original budget; it did not produce accepted final evidence. Public preparations and reviews are distinguished from product implementation and acceptance. No aggregate work duration is inferred.
