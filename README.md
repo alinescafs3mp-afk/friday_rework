@@ -12,12 +12,14 @@ See `docs/mandatory-web-admin.md` and `validation/acceptance-web-admin.json` for
 
 [Donor capabilities and integration status](docs/donor-capabilities.md) distinguish planned, implemented, connected and verified functionality, including the mandatory web and administration journeys.
 
-[Work log and intermediate analysis — 9 October](analysis/2026-10-09/incremental-01/README.md) record completed work, failed attempts, remaining gaps and next steps. This is a partial publication; the daily checkpoint is still due.
+[Work log and intermediate analysis — 9 October](analysis/2026-10-09/incremental-01/README.md) record completed work, failed attempts, remaining gaps and next steps. This was the first partial publication; its observations remain historical.
 
 [Expanded source, outcomes and process analysis](analysis/2026-10-09/incremental-02/README.md) adds 349 historical result summaries, 40 design/control plans, source snapshots and explicit remaining coverage gaps. It is an intermediate publication, not the completed daily checkpoint or a release.
 
-[Additional outcomes and provenance](analysis/2026-10-09/incremental-03/README.md) closes the selected 171-row metadata omission table, including previously omitted failures, successful runs and exact Linux header provenance. The complete daily checkpoint remains pending.
+[Additional outcomes and provenance](analysis/2026-10-09/incremental-03/README.md) closes the selected 171-row metadata omission table, including previously omitted failures, successful runs and exact Linux header provenance. These observations precede the reconciled daily cut.
 
-[Recent fixes and integration decisions](analysis/2026-10-09/incremental-04/README.md) adds callback and TypeScript source repairs, independent findings and 36 selected process records. Runtime qualification and the complete daily checkpoint remain pending.
+[Recent fixes and integration decisions](analysis/2026-10-09/incremental-04/README.md) adds callback and TypeScript source repairs, independent findings and 36 selected process records. Runtime qualification remained pending at that cut.
 
-[Cache identity, process ownership and review decisions](analysis/2026-10-09/incremental-05/README.md) adds later source corrections, their independent findings and the remaining execution gaps. This is the fifth intermediate publication; installed journeys and the complete daily checkpoint remain pending.
+[Cache identity, process ownership and review decisions](analysis/2026-10-09/incremental-05/README.md) adds later source corrections, their independent findings and the remaining execution gaps. This is the fifth intermediate publication. Installed journeys remain unaccepted.
+
+[Daily work and coverage — 9 October](analysis/2026-10-09/daily/README.md) joins the five intermediate publications with the later Astra/Sol material, describes coverage boundaries and lists the next runtime acceptance work. Read its explicit cutoff and residual gaps; publication does not establish product readiness.

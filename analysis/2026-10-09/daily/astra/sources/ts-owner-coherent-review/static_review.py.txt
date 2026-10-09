@@ -1,0 +1,149 @@
+"""Finite independent source/hash/AST review. Never imports candidate modules."""
+import ast
+from collections import Counter
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import resource
+
+os.sched_setaffinity(0, sorted(os.sched_getaffinity(0))[:2])
+resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))
+OUT = Path(__file__).parent
+W = OUT.parent
+D = W / 'ts-owner-coherent-repair'
+T = D / 'ts24'
+checks = []
+refs = {}
+
+def h(p):
+    with Path(p).open('rb') as f:
+        return hashlib.file_digest(f, 'sha256').hexdigest()
+
+def check(name, ok, **detail):
+    checks.append(dict(check=name, passed=bool(ok), **detail))
+
+def checked_ref(ref):
+    p = ref['path']
+    actual = h(p)
+    refs[p] = dict(path=p, sha256=actual)
+    check('supplied exact reference', actual == ref['sha256'], path=p)
+
+result = json.loads((D / 'result.json').read_text())
+checked_ref(dict(path=str(D / 'result.json'), sha256='40011dbb824a9d5d0672de5cabbf08635116d63f376d8745d6d4138dbf82bc56'))
+def walk(value):
+    if isinstance(value, dict):
+        if isinstance(value.get('path'), str) and isinstance(value.get('sha256'), str):
+            checked_ref(value)
+        for v in value.values():
+            walk(v)
+    elif isinstance(value, list):
+        for v in value:
+            walk(v)
+walk(result)
+check('exact fourteen changed sources', len(result['changed_sources']) == 14)
+parsed = []
+for row in result['changed_sources']:
+    p = Path(row['source']['path'])
+    if p.suffix == '.py':
+        ast.parse(p.read_text(), filename=str(p))
+        parsed.append(str(p))
+check('six changed Python ASTs parse', len(parsed) == 6)
+
+maps = {}
+conflicts = []
+def merge(label, mapping):
+    for p, sha in mapping.items():
+        if p in maps and maps[p] != sha:
+            conflicts.append(dict(path=p, label=label, old=maps[p], new=sha))
+        maps[p] = sha
+for name in ('runner-pins', 'support-pins', 'native-runtime-pins', 'launcher-runtime-pins'):
+    v = json.loads((T / (name + '.json')).read_text())
+    merge(name, v.get('files', v))
+source = json.loads((T / 'source-view-pins.json').read_text())
+merge('source-view', {p: ref['sha256'] for p, ref in source.items()})
+merge('owner-source', json.loads((D / 'owner-source-pins.json').read_text()))
+expected_union = json.loads((D / 'consumed-input-pins.json').read_text())
+check('actual coordinator consumed map equals supplied map', maps == expected_union)
+check('consumed maps have no conflicting hashes', not conflicts, conflicts=conflicts)
+hash_failures = []
+for p, sha in maps.items():
+    actual = h(p)
+    if actual != sha:
+        hash_failures.append(dict(path=p, expected=sha, actual=actual))
+check('all consumed leaves retain exact bytes', not hash_failures, count=len(maps), failures=hash_failures)
+source_checks = []
+for p, ref in source.items():
+    source_checks.append(dict(path=p, original=ref['path'], expected=ref['sha256'],
+                             actual=h(p), original_actual=h(ref['path']),
+                             consumed=maps.get(p)))
+check('eleven actual current leaves match original corpus and consumers', len(source_checks) == 11 and
+      all(len({r['expected'], r['actual'], r['original_actual'], r['consumed']}) == 1 for r in source_checks))
+
+mount = json.loads((T / 'mount-plan.json').read_text())
+ro_files = set(mount['support_files']) | set(mount['ro_files'])
+ro_roots = [Path(x) for x in mount['ro_roots']]
+uncovered = [p for p in maps if p not in ro_files and str(Path(p).resolve()) not in ro_files and
+             not any(Path(p).is_relative_to(root) for root in ro_roots)]
+check('declared readonly mount covers every consumed file', not uncovered, uncovered=uncovered)
+check('owner manifest mounted for launch.py', str(D / 'owner-source-pins.json') in ro_files)
+links = {}
+link_failures = []
+for name in ('support-pins', 'launcher-runtime-pins'):
+    value = json.loads((T / (name + '.json')).read_text())
+    for p, target in value['links'].items():
+        if p in links and links[p] != target:
+            link_failures.append(dict(path=p, reason='conflict'))
+        links[p] = target
+        if os.readlink(p) != target:
+            link_failures.append(dict(path=p, reason='readlink_mismatch'))
+check('actual coordinator link targets consistent', not link_failures, count=len(links), failures=link_failures)
+
+unchanged = json.loads((D / 'unchanged-corpus-refs.json').read_text())
+sdk_manifest = Path(unchanged['SDK90']['path'])
+sdk = json.loads(sdk_manifest.read_text())
+sdk_base = sdk_manifest.parent / 'candidate'
+sdk_errors = [p for p, sha in sdk.items() if h(sdk_base / p) != sha]
+check('SDK90 unchanged', len(sdk) == 90 and not sdk_errors, failures=sdk_errors)
+derived = []
+for ref in unchanged['TS24_original_files']:
+    p = Path(ref['path'])
+    checked_ref(ref)
+    raw = p.read_text()
+    suite = re.search(r"describe\('([^']+)'", raw)
+    prefix = suite[1] + ' > ' if suite else ''
+    for each, name in re.findall(r"\bit(?:\.each\(\[([^\]]*)\]\))?\('([^']+)'", raw):
+        values = []
+        if each:
+            for token in each.split(','):
+                token = token.strip()
+                repeat = re.fullmatch(r"'([^']*)'\.repeat\((\d+)\)", token)
+                values.append(repeat[1] * int(repeat[2]) if repeat else token[1:-1] if token.startswith("'") else token)
+        else:
+            values = [None]
+        for value in values:
+            derived.append((str(p), prefix + (name.replace('%s', value) if value is not None else name)))
+expected = json.loads((T / 'expected-cases.json').read_text())
+check('unchanged twenty-four file/fullName identities', len(derived) == 24 and
+      Counter(derived) == Counter((r['file'], r['name']) for r in expected) and
+      sorted(Counter(p for p, _ in derived).values()) == [12, 12])
+overlay = json.loads((T / 'framework-overlays.json').read_text())['files']
+check('five overlay donor and replacement identities', len(overlay) == 5 and all(
+    h(p) == row['original_sha256'] and h(row['overlay']) == row['overlay_sha256'] and
+    str(T / 'guard.mjs') in Path(row['overlay']).read_text().splitlines()[0]
+    for p, row in overlay.items()))
+for filename in ('systemd-v259.5-run.c', 'systemd-v259.5-scope.c', 'bubblewrap-0.11.1.c'):
+    p = W / 'ts-owner-integration-review' / filename
+    refs[str(p)] = dict(path=str(p), sha256=h(p))
+report = dict(state='STATIC_REVIEW_CHECKS_ONLY', checks=checks, source_leaves=source_checks,
+              references=list(refs.values()), consumed_file_count=len(maps),
+              python_ast_files=parsed, sdk_leaf_count=len(sdk), case_count=len(derived),
+              resources=dict(affinity=sorted(os.sched_getaffinity(0)),
+                             address_space_limit=resource.getrlimit(resource.RLIMIT_AS)[0]),
+              candidate_imports=0, candidate_tests=0, native_calls=0, children=0)
+(OUT / 'static-observations.json').write_text(json.dumps(report, indent=2) + '\n')
+print(json.dumps(dict(checks=len(checks), failed=[r for r in checks if not r['passed']],
+                     references=len(refs), consumed_file_count=len(maps), python_ast_files=len(parsed),
+                     sdk_leaf_count=len(sdk), current_source_count=len(source), cases=len(derived),
+                     resources=report['resources'])))

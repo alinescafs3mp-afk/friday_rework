@@ -1,41 +1,38 @@
 # Foundation checkpoint — 2026-10-09
 
-Current source checkpoint, 2026-10-09 20:01 MSK. The first four intermediate
-analysis publications end at `88b27585dd51a7913560c23e8abdd8bcc51b4eb0`.
-The fifth bundle adds the later TypeScript and callback repairs, their review
-findings and the decisions that still prevent execution. This remains an
-intermediate publication. The daily checkpoint starts at 21:00 MSK, covering
-all work after `3bf8b315254da4346cfda67cf951dc0f0ae0cc49`; it is not complete.
+Current source checkpoint: 9 October, 20:42 MSK. Five intermediate publications
+are on `main`, ending at `ac9955ede3a21e20b6620a137ced2d3c77c5212e`.
+The daily analysis publication covers work after
+`3bf8b315254da4346cfda67cf951dc0f0ae0cc49`, including those five blocks and
+the later reconciled material. Publication and product acceptance are separate.
 
 | Area | Latest verified result | Next missing result |
 | --- | --- | --- |
-| TypeScript cache and evidence | Independent source review accepts the Sol cache/VM/control package with Astra's exact module-ID selector correction. The earlier selector failure remains recorded. | Bind the replacement to the actual candidate and its manifests, then execute the original 24 cases and the required genuine controls under qualified native ownership. The old manifest does not identify the replacement. |
-| Callback process ownership | A coherent source repair adds persistent reap state, direct-child identity custody and CPU allocation before fork. Sol's independent review is active. | Close actual caller birth and the interval before the child interpreter arms its limits; qualify the whole execution path. The 277-case run and cost probes remain NOT_RUN. |
-| Before-interpreter enforcement | Pinned Linux source and independent review support inherited ptrace EXITKILL custody. | The complete route is unresolved: GNU timeout startup, timer readiness, signal delivery and parent wait semantics still matter. No ptrace trial or execution grant has occurred. |
-| TypeScript native admission | Installed-systemd source investigation found unresolved identity, pending-request and original-deadline semantics. | A supported complete admission path and actual whole-scope qualification. Reaping the CLI alone does not close a pending manager submission. |
-| A0 runtime | The prior attempt is closed; the recorded journal corruption remains unresolved. | A verified recovery source and subsequent runtime qualification. No new A0 kernel trial or daemon start is claimed. |
+| TypeScript cache and evidence | Sol materialized the accepted cache/VM/control implementation and exact module-ID selector into the real candidate and consumer maps. Independent review accepted the join: 11,458 files, 242 links and nine Python ASTs checked. | Qualify native execution, then run the original 24 cases and the 22 negative and 12 positive controls. Source counts do not establish execution. |
+| Callback process ownership | Sol independently accepted persistent reap state, exact direct-child custody and CPU allocation before fork. | Close actual caller birth/accounting and enforcement before the child interpreter starts; qualify the real kernel path. The 277-case run and cost probes remain NOT_RUN. |
+| Before-interpreter enforcement | Linux source supports inherited ptrace EXITKILL custody. A proposed extra 60-second root cutoff was rejected because it would also kill legitimate work during the existing closure interval. | A concrete implementation preserving the original GNU timeout and closure semantics. No ptrace trial or successor runtime has run. |
+| TypeScript native admission | Installed-systemd source investigation found unresolved process identity, pending-request and original-deadline semantics. | A supported admission path with actual whole-scope qualification. CLI exit alone does not prove the manager submission stopped. |
+| A0 runtime | The previous failed attempt is closed. Journal corruption remains unresolved. | A verified recovery source followed by runtime qualification. No new A0 kernel trial or daemon start is claimed. |
 
-The callback budget remains one 180-second wall-clock lifetime, cumulative
-45-second CPU, affinity 0/1, a per-process 2 GiB address-space limit and the
-original 60-second closure reserve. A dedicated aggregate-memory cgroup and
-a wait4-only accounting format were additional assumptions in an earlier
-adapter, not original requirements. Removing those assumptions did not grant
-execution. CPU attributed through adopted children must not be lost or counted
-twice, and numeric process-group membership alone does not prove custody.
+The callback limits remain one original 180-second lifetime, cumulative
+45-second CPU, affinity 0/1, a per-process 2 GiB address-space limit and GNU's
+60-second execution timeout plus a separate 60-second closure reserve.
+No budget is restarted. The rejected extra cutoff is a source counterexample,
+not an observed kernel failure or proof that other implementations cannot work.
+A correction to an inaccurate source comment changes no executable behavior.
 
 The historical 579-case source qualification PASS and G20 exit137 remain
-results on their respective bytes. G20's signal cause remains unknown; its
-consumed attempt is not retried. Python AST checks and source review do not
-mean JavaScript, controls or live journeys ran. All seven installed journeys
-and four web contexts are still unaccepted. Missing development packages,
-the browser system installation and A0 recovery remain separately tracked
-technical dependencies; old Friday stays stopped.
+results on their respective exact bytes. G20's signal cause is unknown and its
+consumed attempt is not retried. Python AST checks do not mean JavaScript,
+controls or live journeys ran. All seven installed journeys and four web
+contexts remain unaccepted. The missing development packages, browser system
+installation and A0 recovery are separately tracked dependencies. Old Friday
+stays stopped; legacy inference endpoints remain temporary test profiles.
 
-The fifth bundle's source, outcomes and process records are linked from the
-repository README. The private reconciliation found 51 peer assignments with
-consistent paired states at its recorded cut. That consistency is not proof
-of complete daily source coverage; later work and root-only changes still
-belong to the daily reconciliation.
+Astra owns integration, runtime acceptance and publication. Sol prepares bounded
+implementation and independent review packages in his existing visible session.
+Daily analysis keeps their source changes, decisions, failures and pending work
+visible without publishing private handoffs, credentials or live bindings.
 
 The detailed earlier observations below are history, not current assignments.
 
