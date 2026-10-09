@@ -1,0 +1,5 @@
+Эта подборка сохраняет существующие авторские notices и не устанавливает новую лицензию для всего проекта. Полные GNU, Linux и CPython исходники здесь не копируются; включены только собственные исходники проекта и выбранные объяснения.
+
+GNU coreutils9.7: GNU GPL version3 or later, [исходник timeout](https://github.com/coreutils/coreutils/blob/v9.7/src/timeout.c), [лицензия](https://github.com/coreutils/coreutils/blob/v9.7/COPYING). Linux7.0: GPL-2.0-only с сохранением конкретных notices соответствующих файлов, [fork.c](https://github.com/torvalds/linux/blob/v7.0/kernel/fork.c), [COPYING](https://github.com/torvalds/linux/blob/v7.0/COPYING). CPython3.14.7: PSF License Version2 и исторические notices, [signalmodule.c](https://github.com/python/cpython/blob/v3.14.7/Modules/signalmodule.c), [LICENSE](https://github.com/python/cpython/blob/v3.14.7/LICENSE).
+
+Точные локальные source SHA и границы применимости — в[upstream-source-references.json](upstream-source-references.json). Прежние notices сохранены по[ссылке incremental-05](../incremental-05/THIRD_PARTY_NOTICES.md). Документация и source-порядок не доказывают installed ABI, syscall delivery или приёмку.

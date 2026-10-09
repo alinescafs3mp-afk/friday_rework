@@ -1,5 +1,18 @@
 # Foundation checkpoint — 2026-10-09
 
+Current analysis update: 9 October, 22:10 MSK. The first daily publication is
+complete and remotely verified at `00c3b825260792b834e7f2aecf19eaabaa02935d`
+(21:16:32 MSK). The [sixth incremental analysis](../analysis/2026-10-09/incremental-06/README.md)
+begins the next publication period. It includes the hard-refused four-file F4
+caller prototype, Sol's pre-implementation GNU-detach source contradiction,
+additive contract/observer/version corrections and selected Python identity.
+F4/F5 remain unclosed; F6 and live acceptance remain NOT_RUN. Their active
+native/bootstrap successors are outside this cut. The dated late upstream
+observation is explicit carryover: nightly check succeeded, Hermes was ahead,
+compatibility was NOT_ASSESSED and no updates were applied. All seven journeys
+and four web contexts remain unaccepted; G20 remains consumed FAILED137,
+Old Friday OFF and other stops unchanged. Earlier checkpoints below are history.
+
 Current source checkpoint: 9 October, 20:42 MSK. Five intermediate publications
 are on `main`, ending at `ac9955ede3a21e20b6620a137ced2d3c77c5212e`.
 The daily analysis publication covers work after

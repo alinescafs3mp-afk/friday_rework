@@ -23,3 +23,5 @@ See `docs/mandatory-web-admin.md` and `validation/acceptance-web-admin.json` for
 [Cache identity, process ownership and review decisions](analysis/2026-10-09/incremental-05/README.md) adds later source corrections, their independent findings and the remaining execution gaps. This is the fifth intermediate publication. Installed journeys remain unaccepted.
 
 [Daily work and coverage — 9 October](analysis/2026-10-09/daily/README.md) joins the five intermediate publications with the later Astra/Sol material, describes coverage boundaries and lists the next runtime acceptance work. Read its explicit cutoff and residual gaps; publication does not establish product readiness.
+
+[Caller bootstrap failures and contract corrections](analysis/2026-10-09/incremental-06/README.md) adds the next completed source-analysis block after the verified daily commit `00c3b825260792b834e7f2aecf19eaabaa02935d`, including explicit late upstream-service carryover. F4/F5 remain unclosed; active successors and runtime acceptance are outside this cut.
