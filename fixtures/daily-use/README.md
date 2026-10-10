@@ -53,10 +53,10 @@ checker reserves 0.25 seconds for forced cleanup. These are unchanged finite
 oracle bounds, not job budgets, aggregate worker quotas or soak defaults. No
 checker was executed by this preparation.
 
-The soak duration, chat concurrency, arrival schedule, mix weights, sample
-interval, baselines, latency thresholds and recovery policy remain explicitly
-unchosen. Preserve the existing shared single heavy-worker admission slot across
-Harness and A0; deployment chat/queue/load parameters require actual selection.
+The current source package selects the proposed load/check policy described
+below. Actual baseline values, installed candidate/profile and admitted recovery
+policy remain unbound. Preserve the existing shared single heavy-worker slot
+across Harness and A0; planned chat/queue/load values grant no runtime authority.
 AC034 later requires at least one real gateway restart and one real worker
 failure plus latency/resource trends and a complete original job outcome ledger.
 AC040 later requires stops during repair and queued retry, followed by normal
@@ -84,3 +84,69 @@ data consistency only, with runtime truth unattested and independent review
 required. A changed input requires fresh binding/review, not a stale PASS.
 
 The corpus path defaults to the supplied product root. For a separate source proposal, pass `--corpus-root /path/to/proposal/fixtures/daily-use`. Every worker-visible source reference, including the original engineering brief, is checked against owner-only separation. Checker metadata is fixed to the reviewed original checker hashes and limits; it cannot supply a worker grant. Reads check the complete current directory path again after reading.
+
+## Selected preparation policy (still not admitted)
+
+The current corpus selects a bounded 7200-second observation window including a
+900-second baseline, two conversation slots and the unchanged single shared heavy
+worker slot. The 24 mixed-use occurrences cover all 12 categories; ten baseline
+chat/status requests are counted separately. The baseline status target must be
+a completed owned task from the accepted installed journeys. These counts are
+proposed test load, not observed throughput or a runtime execution budget.
+
+The exact offsets and rational mix weights are in tasks.json. Ordinary offsets
+are target arrivals subject to original admission/capacity. The queued-retry stop
+fires on an actual pending retry after the controlled worker failure, before the
+listed latest offset; it does not wait for that offset or manufacture a retry.
+The active-repair case stops on actual repair activity. Gateway restart follows
+both terminal stopped cases and independently confirmed cessation; any uncertain
+effect prevents the dependent restart. Missing timing/coverage stays NOT_RUN.
+
+Sample resources every 10 seconds; compare 300-second baseline/final quiescent
+windows with at least 30 samples each. Record host pressure separately from the
+owned gateway/worker measurements. Selected response ceilings are 5 seconds for
+native admission acknowledgement, 120 seconds for chat and 15 seconds for status,
+further bounded by twice the measured per-class baseline p95 (nearest rank).
+Gateway RSS growth is bounded by the larger of 64 MiB and 10% of its baseline
+median, always inside original granted limits; open-FD growth is at most five,
+with zero residual owned workers and zero unexplained task outcomes. Small-sample
+p95 is a descriptive check, not a statistical reliability or 24/7 claim.
+
+Existing-policy recovery is proposed at most once per worker/delivery case, with
+one gateway restart. Unknown effects, explicit stops and expired original
+deadlines never authorize replay, a new worker for delivery or budget reset.
+The actual retry policy, baseline values, candidate fingerprint and local profile
+remain null until separate admission. Readiness and schedule feasibility against
+unaltered original job budgets must be established before effects; do not shorten
+budgets or silently extend the window to obtain green coverage.
+
+### Long-task initial workspace
+
+Use `initial_setup.prefix` followed by the exact original UTF-8 brief as the
+future admitted WorkBrief text. The combined 8023 bytes fit the real 8192-byte
+consumer limit. Attach the same two immutable files; staging assigns UUID names,
+so discover the gzip through its exact hash, not a presumed filename or order.
+The prefix explicitly restricts safe first extraction and owner-write changes
+to the task directory and three allowed source files. All original Git and
+protected source bytes/modes stay unchanged. No extraction or reseeding occurs
+on continuation. Local mode checks do not establish kernel access isolation.
+The original archive, brief, seed and all 32 input/oracle pins remain unchanged.
+
+The data validator retains the earlier pending-soak format and the earlier
+selected-long-source format without setup. New selected soak preparation requires
+the explicit setup and rejects inconsistent schedules, missing categories,
+changed recovery/stop semantics, fabricated observations and authority claims.
+Its PASS still means data integrity only; all runtime prerequisites and gates
+remain unaccepted.
+
+The changed controls can be reproduced without workers or fixture-code execution:
+
+```sh
+python3 -I -S -B validation/test_daily_planning.py \
+  --product-root /absolute/product \
+  --archive-root /absolute/audited-directive \
+  --output /absolute/private-new-result.json
+```
+
+The test reads the immutable prior public commit for compatibility checks and
+refuses optimized execution or an existing result path. It never starts the soak.

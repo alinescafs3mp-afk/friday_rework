@@ -6,6 +6,8 @@ Composition: pinned Hermes host, intact DeepSeek Harness coding worker, intact d
 
 The legacy Friday checkout, runtime, data and Telegram consumer stay preserved. Publication target: `alinescafs3mp-afk/friday_rework`, branch `main`. Secrets, private handoffs, donor checkouts, live runtime state and raw private evidence are excluded from source control. Sanitized, inert source snapshots and selected result extracts are published separately for analysis with their validation status.
 
+[Daily-use setup and strict load-plan validation](analysis/2026-10-10/soak-setup/README.md) are independently accepted as source only; the original rejection and corrected evidence are retained. G7 failed, G8 is prepared but not executed, and installed runtime journeys remain unaccepted.
+
 See `docs/foundation-status.md` for verified progress and current gaps. See `sources.lock.json` for the selected upstream identities and `docs/integration-boundary.md` for the implementation boundary. The existing owner task register remains authoritative; this repository adds no dispatcher or second backlog.
 
 See `docs/mandatory-web-admin.md` and `validation/acceptance-web-admin.json` for the owner's cumulative web/admin requirements and complete user journeys. These capabilities are not yet accepted.

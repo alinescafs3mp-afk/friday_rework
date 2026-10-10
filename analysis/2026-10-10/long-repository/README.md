@@ -27,3 +27,8 @@ not counted as fresh independent checks.
 
 No stopped FRW013 continuation review or native execution was restarted. Actual
 repository/association/deadline preservation and privacy remain runtime gates.
+
+Historical binding: the source integration and review above refer to immutable
+publication `66e57c147649979a7794c5c323c409a385cb79f7`. The reviewed validator
+remains bound by its original hash and Git URL in `independent-review.json`; later
+planning/setup changes do not inherit these historical outcomes.
