@@ -29,14 +29,19 @@ def digest(path):
 
 
 def _local(url):
-    p = urlsplit(url)
-    address = ipaddress.ip_address(p.hostname or '')
-    nets = [ipaddress.ip_network(n) for n in
-            ('127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '::1/128')]
-    if (p.scheme not in ('http', 'https') or not p.port or p.username or p.password
-            or p.query or p.fragment or p.path.rstrip('/') != '/v1'
-            or not any(address.version == n.version and address in n for n in nets)):
-        raise ValueError('explicit_local_inference_required')
+    try:
+        if not isinstance(url, str) or url != url.strip() or any(ord(c) < 32 or ord(c) == 127 for c in url):
+            raise ValueError
+        p = urlsplit(url)
+        address = ipaddress.ip_address(p.hostname or '')
+        nets = [ipaddress.ip_network(n) for n in
+                ('127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '::1/128')]
+        if (p.scheme not in ('http', 'https') or not p.port or p.username or p.password
+                or p.query or p.fragment or p.path != '/v1'
+                or not any(address.version == n.version and address in n for n in nets)):
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ValueError('explicit_local_inference_required') from None
     return url.rstrip('/')
 
 
@@ -50,35 +55,117 @@ def validate_template(template):
     config = copy.deepcopy(template['config'])
     tools, names = template['tools'], template['required_secrets']
     if (not isinstance(config, dict) or not isinstance(tools, list) or not tools
+            or any(not isinstance(k, str) for k in tools)
             or len(set(tools)) != len(tools) or not set(tools) <= scope.SAFE
             or not {'web_search', 'web_extract', 'friday_work', 'friday_result'} <= set(tools)
-            or not isinstance(names, list) or not names or len(set(names)) != len(names)
-            or any(not isinstance(k, str) or not re.fullmatch('[A-Z][A-Z0-9_]{0,127}', k) for k in names)):
+            or not isinstance(names, list) or not names
+            or any(not isinstance(k, str) or not re.fullmatch('[A-Z][A-Z0-9_]{0,127}', k) for k in names)
+            or len(set(names)) != len(names)):
         raise ValueError('incomplete_onboarding_template')
-    from hermes_cli.config import validate_env_var_name_for_write
+    from hermes_cli.config import DEFAULT_CONFIG, validate_env_var_name_for_write
+    from gateway.config import PLATFORM_TOKEN_ENV_NAMES
     for name in names:
         validate_env_var_name_for_write(name)
-    model = config['model']; provider = model['provider']; url = _local(model['base_url'])
-    if (provider not in ('custom', 'custom:friday-local') or not isinstance(model['default'], str)
-            or not model['default'].strip() or model['default'] == 'auto'
-            or config.get('fallback_providers') != [] or config.get('fallback_model') != {}):
+    model = config.get('model')
+    if not isinstance(model, dict):
         raise ValueError('explicit_local_inference_required')
-    providers = config.get('providers', {})
-    if provider == 'custom:friday-local':
-        entry = providers.get('friday-local', {})
-        if (_local(entry['api']) != url or entry.get('key_env') not in names
-                or entry.get('discover_models') is not False):
-            raise ValueError('explicit_scoped_provider_required')
-    elif config.get('api_key_env') not in names:
+    provider, selected = model.get('provider'), model.get('default')
+    url = _local(model.get('base_url'))
+    if (provider != 'custom:friday-local' or not isinstance(selected, str)
+            or not selected or selected != selected.strip() or selected.lower() == 'auto'
+            or '${' in selected or any(ord(c) < 32 or ord(c) == 127 for c in selected)
+            or model.get('api_mode') != 'chat_completions' or model.get('openai_runtime')
+            or type(config.get('fallback_providers')) is not list or config['fallback_providers'] != []
+            or type(config.get('fallback_model')) is not dict or config['fallback_model'] != {}):
+        raise ValueError('explicit_local_inference_required')
+    key = model.get('key_env')
+    if (not isinstance(key, str) or key not in names or key == 'EXA_API_KEY'
+            or key in PLATFORM_TOKEN_ENV_NAMES.values() or key.startswith('HERMES_DASHBOARD_')):
         raise ValueError('explicit_scoped_provider_required')
-    for route in config.get('auxiliary', {}).values():
-        if isinstance(route, dict) and route.get('enabled') is not False:
-            if (route.get('provider') != provider or route.get('base_url', '').rstrip('/') != url
-                    or route.get('fallback_chain') != [] or route.get('key_env') not in names):
-                raise ValueError('auxiliary_local_route_required')
-    delegation = config.get('delegation', {})
-    if delegation.get('provider') != provider or delegation.get('fallback_providers') != []:
+    auth = config.get('auth')
+    if not isinstance(auth, dict) or auth.get('adopt_external_logins') is not False:
+        raise ValueError('explicit_scoped_provider_required')
+    providers = config.get('providers', {})
+    if not isinstance(providers, dict) or set(providers) != {'friday-local'}:
+        raise ValueError('explicit_scoped_provider_required')
+    entry = providers['friday-local']
+    if (not isinstance(entry, dict) or _local(entry.get('api')) != url
+            or entry.get('key_env') != key or entry.get('default_model') != selected
+            or entry.get('transport') != 'chat_completions'
+            or entry.get('discover_models') is not False or entry.get('enabled', True) is not True
+            or entry.get('name', 'friday-local') != 'friday-local'
+            or not isinstance(entry.get('models'), dict) or set(entry['models']) != {selected}
+            or not isinstance(entry['models'][selected], dict)):
+        raise ValueError('explicit_scoped_provider_required')
+    if config.get('custom_providers', []) != []:
+        raise ValueError('explicit_scoped_provider_required')
+    # Native route aliases and request mergers must not replace the installation
+    # route or obtain a different credential. Capacity/reasoning fields remain
+    # native inputs; this is validation, not an inference implementation.
+    route_fields = {'model', 'provider', 'base_url', 'url', 'api', 'api_key', 'api_key_env',
+                    'key_env', 'key_cmd', 'api_mode', 'authorization', 'host', 'headers',
+                    'default_headers', 'extra_headers', 'extra_query', 'fallback_chain',
+                    'fallback_model', 'fallback_providers'}
+    user_headers = {'accept', 'accept-language', 'user-agent', 'x-request-id',
+                    'x-correlation-id', 'traceparent', 'tracestate'}
+    def extensions(block):
+        if 'api_key' in block or 'key_cmd' in block:
+            raise ValueError('inline_credentials_refused')
+        if 'key_env' in block and block['key_env'] != key:
+            raise ValueError('explicit_scoped_provider_required')
+        if 'api_key_env' in block and block['api_key_env'] != key:
+            raise ValueError('explicit_scoped_provider_required')
+        for field in ('base_url', 'url', 'api'):
+            if field in block and _local(block[field]) != url:
+                raise ValueError('inference_route_override_refused')
+        for field, expected in (('model', selected), ('default_model', selected),
+                                ('provider', provider), ('api_mode', 'chat_completions'),
+                                ('transport', 'chat_completions')):
+            if field in block and block[field] != expected:
+                raise ValueError('inference_route_override_refused')
+        for field in ('default_headers', 'extra_headers'):
+            if field in block:
+                value = block[field]
+                if (not isinstance(value, dict) or any(not isinstance(k, str) or k.lower() not in user_headers
+                        or not isinstance(v, str) or '\r' in v or '\n' in v for k, v in value.items())):
+                    raise ValueError('inference_route_override_refused')
+        if 'extra_body' in block:
+            value = block['extra_body']
+            if not isinstance(value, dict) or any(not isinstance(k, str) or k.lower() in route_fields for k in value):
+                raise ValueError('inference_route_override_refused')
+        if 'request_overrides' in block:
+            value = block['request_overrides']
+            if not isinstance(value, dict) or any(not isinstance(k, str) or k.lower() in route_fields - {'extra_headers'} for k in value):
+                raise ValueError('inference_route_override_refused')
+            extensions(value)
+        for field, empty in (('fallback_chain', []), ('fallback_providers', []), ('fallback_model', {})):
+            if field in block and (type(block[field]) is not type(empty) or block[field] != empty):
+                raise ValueError('explicit_local_inference_required')
+    extensions(model)
+    extensions(entry)
+    extensions(entry['models'][selected])
+    def same_route(block, reason, fallback):
+        if (not isinstance(block, dict) or block.get('provider') != provider
+                or block.get('model') != selected or not isinstance(block.get('base_url'), str)
+                or _local(block['base_url']) != url or block.get('key_env') != key
+                or block.get('api_mode') != 'chat_completions'
+                or type(block.get(fallback)) is not list or block[fallback] != []
+                or ('enabled' in block and type(block['enabled']) is not bool)):
+            raise ValueError(reason)
+        extensions(block)
+    auxiliary = config.get('auxiliary')
+    required_aux = {name for name, value in DEFAULT_CONFIG['auxiliary'].items()
+                    if isinstance(value, dict) and 'provider' in value}
+    if (not isinstance(auxiliary, dict) or not required_aux <= set(auxiliary)
+            or type(auxiliary.get('transient_retries')) is not int or auxiliary['transient_retries'] < 0):
+        raise ValueError('auxiliary_local_route_required')
+    for name, route in auxiliary.items():
+        if name != 'transient_retries':
+            same_route(route, 'auxiliary_local_route_required', 'fallback_chain')
+    delegation = config.get('delegation')
+    if not isinstance(delegation, dict):
         raise ValueError('delegation_local_route_required')
+    same_route(delegation, 'delegation_local_route_required', 'fallback_providers')
     web = config.get('web', {})
     if (web.get('backend') != 'exa' or web.get('search_backend') != 'exa'
             or web.get('extract_backend') != 'exa' or web.get('keyless_rescue') is not False
