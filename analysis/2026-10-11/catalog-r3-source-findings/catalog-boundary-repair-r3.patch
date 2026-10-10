@@ -1,0 +1,340 @@
+--- a/hermes/hermes_cli/urllib_security.py
++++ b/hermes/hermes_cli/urllib_security.py
+@@ -110,7 +110,90 @@
+ 
+     _https_handler_cls = getattr(urllib.request, "HTTPSHandler", None)
+     replace_https = ssl_context is not None and _https_handler_cls is not None
++    # One memo for the handler graph preserves intentional links inside the
++    # owned graph. The installed parent is never copied or changed. TLS contexts
++    # are external native policy handles, exposed through an immutable view.
++    # Every Python mutable instance/container and synchronization lock is owned.
++    import types
++    import ssl
++    lock_types = (type(threading.Lock()), type(threading.RLock()))
++    class ReadOnlyTLS:
++        # Native SSLContext cannot be duplicated without losing opaque keys,
++        # callbacks and platform trust-store policy. A read-only view retains
++        # those semantics while a cloned handler cannot mutate installed policy.
++        __slots__ = ("_policy",)
++        _read_methods = frozenset({"wrap_socket", "wrap_bio", "get_ca_certs",
++                                   "cert_store_stats", "get_ciphers", "session_stats"})
++        def __init__(self, policy):
++            object.__setattr__(self, "_policy", policy)
++        @property
++        def __class__(self):
++            return ssl.SSLContext
++        def __getattribute__(self, name):
++            if name == "_policy":
++                from hermes_cli.friday_user_scope import ScopeDenied
++                raise ScopeDenied()
++            return object.__getattribute__(self, name)
++        def __setattr__(self, name, value):
++            from hermes_cli.friday_user_scope import ScopeDenied
++            raise ScopeDenied()
++        def __getattr__(self, name):
++            from hermes_cli.friday_user_scope import ScopeDenied
++            policy = object.__getattribute__(self, "_policy")
++            value = getattr(policy, name)
++            if callable(value):
++                if name not in self._read_methods:
++                    raise ScopeDenied()
++                def read(*a, **k):
++                    request_guard()
++                    result = value(*a, **k)
++                    try:
++                        request_guard()
++                    except BaseException:
++                        if name == "wrap_socket":
++                            try:
++                                result.close()
++                            except BaseException:
++                                logger.debug("catalog TLS cleanup failed", exc_info=True)
++                        raise
++                    return result
++                return read
++            if isinstance(value, (str, bytes, int, float, bool, type(None), tuple)):
++                return value
++            raise ScopeDenied()
++    memo = {}
++    seen = set()
++    opaque = (type, types.FunctionType, types.BuiltinFunctionType, types.ModuleType,
++              weakref.ReferenceType)
++    def prepare(value):
++        key = id(value)
++        if key in seen:
++            return
++        seen.add(key)
++        if isinstance(value, ssl.SSLContext):
++            memo[key] = ReadOnlyTLS(value)
++            return
++        if isinstance(value, lock_types):
++            memo[key] = threading.RLock() if isinstance(value, lock_types[1]) else threading.Lock()
++            return
++        if isinstance(value, opaque) or value is installed:
++            return
++        if isinstance(value, dict):
++            children = list(value.keys()) + list(value.values())
++        elif isinstance(value, (list, tuple, set, frozenset)):
++            children = list(value)
++        else:
++            children = list(getattr(value, "__dict__", {}).values())
++            for cls in type(value).__mro__:
++                slots = cls.__dict__.get("__slots__", ())
++                slots = (slots,) if isinstance(slots, str) else slots
++                for name in slots:
++                    if name not in ("__dict__", "__weakref__") and hasattr(value, name):
++                        children.append(getattr(value, name))
++        for child in children:
++            prepare(child)
+     handlers = []
++    originals = []
+     for handler in getattr(installed, "handlers", ()):
+         if (isinstance(handler, urllib.request.HTTPRedirectHandler)
+                 or (replace_https and isinstance(handler, _https_handler_cls))):
+@@ -121,25 +204,83 @@
+             if cloned is handler:
+                 from hermes_cli.friday_user_scope import ScopeDenied
+                 raise ScopeDenied()
+-        if request_guard is not None and isinstance(handler, urllib.request.HTTPCookieProcessor):
+-            jar = handler.cookiejar
+-            with jar._cookies_lock:
+-                isolated = copy.copy(jar)
+-                if isolated is jar:
+-                    from hermes_cli.friday_user_scope import ScopeDenied
++            memo[id(handler)] = cloned
++        handlers.append(cloned)
++        originals.append(handler)
++    if request_guard is not None:
++        from hermes_cli.friday_user_scope import ScopeDenied
++        # Avoid copying parent through nested bound methods/handler references.
++        memo[id(installed)] = None
++        for handler, cloned in zip(originals, handlers):
++            state = {k: v for k, v in handler.__dict__.items() if k != "parent"}
++            slots = {}
++            for cls in type(handler).__mro__:
++                names = cls.__dict__.get("__slots__", ())
++                names = (names,) if isinstance(names, str) else names
++                for name in names:
++                    if name not in ("__dict__", "__weakref__", "parent") and hasattr(handler, name):
++                        slots[name] = getattr(handler, name)
++            prepare(state)
++            prepare(slots)
++            try:
++                state = copy.deepcopy(state, memo)
++                slots = copy.deepcopy(slots, memo)
++            except Exception as error:
++                raise ScopeDenied() from error
++            request_guard()
++            cloned.__dict__.clear()
++            cloned.__dict__.update(state)
++            for name, value in slots.items():
++                setattr(cloned, name, value)
++            request_guard()
++        # Audit the reachable clone, rather than only deepcopy's memo: a
++        # custom __deepcopy__ returning itself is deliberately not memoized by
++        # Python. Such a value must not smuggle mutable installed state through.
++        checked = set()
++        def audit(value):
++            key = id(value)
++            if key in checked:
++                return
++            checked.add(key)
++            if isinstance(value, (ReadOnlyTLS, ssl.SSLContext)):
++                return  # native policy exposed read-only in managed handler state
++            if isinstance(value, weakref.ReferenceType):
++                # Weak references could retain an original mutable target. They
++                # cannot be transparently rehomed without changing its lifetime.
++                if value() is not None:
+                     raise ScopeDenied()
+-                isolated._cookies = copy.deepcopy(jar._cookies)
+-                isolated._policy = copy.deepcopy(jar._policy)
+-                isolated._cookies_lock = threading.RLock()
+-            cloned.cookiejar = isolated
+-            request_guard()
+-        if request_guard is not None and isinstance(handler, (
+-                urllib.request.AbstractBasicAuthHandler, urllib.request.AbstractDigestAuthHandler)):
+-            cloned.passwd = copy.deepcopy(handler.passwd)
+-            request_guard()
+-        handlers.append(cloned)
++                return
++            if isinstance(value, opaque):
++                return
++            if isinstance(value, dict):
++                mutable = True
++                children = list(value.keys()) + list(value.values())
++            elif isinstance(value, (list, set, bytearray, memoryview)):
++                mutable = True
++                children = list(value) if not isinstance(value, (bytearray, memoryview)) else []
++            elif isinstance(value, (tuple, frozenset)):
++                mutable = False
++                children = list(value)
++            else:
++                state = getattr(value, "__dict__", {})
++                mutable = bool(state) or isinstance(value, lock_types)
++                children = list(state.values())
++                for cls in type(value).__mro__:
++                    names = cls.__dict__.get("__slots__", ())
++                    names = (names,) if isinstance(names, str) else names
++                    for name in names:
++                        if name not in ("__dict__", "__weakref__") and hasattr(value, name):
++                            mutable = True
++                            children.append(getattr(value, name))
++            if mutable and key in seen:
++                raise ScopeDenied()
++            for child in children:
++                audit(child)
++        for cloned in handlers:
++            audit(cloned)
+     if replace_https:
+-        handlers.append(_https_handler_cls(context=ssl_context))
++        context = ReadOnlyTLS(ssl_context) if request_guard is not None else ssl_context
++        handlers.append(_https_handler_cls(context=context))
+     handlers.append(SafeCredentialRedirectHandler(original_url))
+     handlers.append(_CrossOriginRequestSanitizer(original_url))
+     secured = urllib.request.build_opener(*handlers)
+@@ -215,11 +356,106 @@
+                 request_guard(request, final=True)
+                 connections = []
+                 responses = []
++                import http.client
++                expected_wire = [None]
++                expected_request = [None]
++                request_dict = urllib.request.Request.__dict__["__dict__"]
++                connection_dict = http.client.HTTPConnection.__dict__["__dict__"]
++                owned_sockets = []
++                active_connection = [None]
++                def effect_guard(data=None, socket=None):
++                    request_guard(request, final=True)
++                    connection = active_connection[0]
++                    parsed = urllib.parse.urlsplit(request.full_url)
++                    if connection is None or (getattr(connection, "host", None), getattr(connection, "port", None)) != (
++                            parsed.hostname, parsed.port or _DEFAULT_PORTS[parsed.scheme]):
++                        raise ScopeDenied()
++                    if getattr(connection, "_tunnel_host", None):
++                        raise ScopeDenied()
++                    if data is not None:
++                        # Preserve native framing but attest its finished bytes. No
++                        # body, duplicate headers, alternate method/path or key can
++                        # cross this boundary after an encoder/send callback.
++                        if type(data) is not bytes or expected_wire[0] is None:
++                            raise ScopeDenied()
++                        head, sep, body = data.partition(b"\r\n\r\n")
++                        if sep != b"\r\n\r\n" or body:
++                            raise ScopeDenied()
++                        lines = head.decode("latin1").split("\r\n")
++                        if lines[0] != "GET " + parsed.path + " HTTP/1.1":
++                            raise ScopeDenied()
++                        wire = {}
++                        for line in lines[1:]:
++                            name, separator, value = line.partition(":")
++                            name = name.lower()
++                            if not separator or name in wire:
++                                raise ScopeDenied()
++                            wire[name] = value.lstrip(" ")
++                        if wire != expected_wire[0]:
++                            raise ScopeDenied()
++                    request_guard(request, final=True)
++                    # The final Request callback has now finished. Read native
++                    # instance dictionaries through retained descriptors, with no
++                    # further dynamic methods/properties before the byte effect.
++                    state = connection_dict.__get__(connection)
++                    if (type(state.get("host")) is not str or type(state.get("port")) is not int
++                            or (state["host"], state["port"]) != (parsed.hostname,
++                                parsed.port or _DEFAULT_PORTS[parsed.scheme])
++                            or state.get("_tunnel_host") or state.get("sock") is not socket):
++                        raise ScopeDenied()
++                    state = request_dict.__get__(request)
++                    expected = expected_request[0]
++                    if expected is None or state.get("_data") is not None or state.get("_tunnel_host"):
++                        raise ScopeDenied()
++                    for name in ("_full_url", "type", "host", "selector"):
++                        if type(state.get(name)) is not str or state[name] != expected[name]:
++                            raise ScopeDenied()
++                    method = state.get("method")
++                    if method is not None and (type(method) is not str or method != "GET"):
++                        raise ScopeDenied()
++                    for name in ("headers", "unredirected_hdrs"):
++                        headers = state.get(name)
++                        if (type(headers) is not dict
++                                or any(type(k) is not str or type(v) is not str for k, v in headers.items())
++                                or headers != expected[name]):
++                            raise ScopeDenied()
++                class OwnedSocket:
++                    def __init__(self, sock):
++                        self._sock = sock
++                        owned_sockets.append(sock)
++                    def __getattr__(self, name):
++                        return getattr(self._sock, name)
++                    def sendall(self, data, *a, **k):
++                        target = self._sock.sendall
++                        effect_guard(data, socket=self)
++                        return target(data, *a, **k)
++                    def send(self, data, *a, **k):
++                        target = self._sock.send
++                        effect_guard(data, socket=self)
++                        return target(data, *a, **k)
++                    def close(self):
++                        return self._sock.close()
++                native_class = http_class
++                if isinstance(http_class, type) and issubclass(http_class, http.client.HTTPConnection):
++                    class NativeConnection(http_class):
++                        def __init__(self, *a, **k):
++                            # Track before constructor callbacks, including failed
++                            # constructors that already own a socket.
++                            active_connection[0] = self
++                            connections.append(self)
++                            super().__init__(*a, **k)
++                        def __setattr__(self, name, value):
++                            if name == "sock" and value is not None and not isinstance(value, OwnedSocket):
++                                value = OwnedSocket(value)
++                            super().__setattr__(name, value)
++                    native_class = NativeConnection
+                 class Connection:
+                     def __init__(self, host, *ctor_args, **ctor_kwargs):
+-                        connection = http_class(host, *ctor_args, **ctor_kwargs)
++                        connection = native_class(host, *ctor_args, **ctor_kwargs)
+                         object.__setattr__(self, "_connection", connection)
+-                        connections.append(connection)
++                        if connection not in connections:
++                            connections.append(connection)
++                        active_connection[0] = connection
+                         request_guard(request, final=True)
+                     def __getattr__(self, name):
+                         return getattr(self._connection, name)
+@@ -247,6 +483,16 @@
+                                     and port == (parsed.port or _DEFAULT_PORTS[parsed.scheme])))
+                                 or getattr(connection, "_tunnel_host", None)):
+                             raise ScopeDenied()
++                        # Freeze plain header values after all conversions and
++                        # then recheck retained authority. Native encoders still
++                        # receive the original values and run normally.
++                        expected = {str(n).lower(): str(v) for n, v in canonical.items()}
++                        expected.setdefault("host", parsed.netloc)
++                        expected.setdefault("accept-encoding", "identity")
++                        expected_wire[0] = expected
++                        state = request_dict.__get__(request)
++                        expected_request[0] = {name: state[name] for name in ("_full_url", "type", "host", "selector")}
++                        expected_request[0].update({name: dict(state[name]) for name in ("headers", "unredirected_hdrs")})
+                         request_guard(request, final=True)
+                         connection.request(method, url, data, headers, **options)
+                         request_guard(request, final=True)
+@@ -269,7 +515,9 @@
+                             return native_close()
+                         finally:
+                             for connection in connections:
+-                                connection.close()
++                                settle(connection)
++                            for sock in owned_sockets:
++                                settle(sock)
+                     response.close = close
+                     return response
+                 except BaseException as error:
+@@ -277,6 +525,8 @@
+                         settle(response)
+                     for connection in connections:
+                         settle(connection)
++                    for sock in owned_sockets:
++                        settle(sock)
+                     # stdlib catches OSError around h.request; ScopeDenied is a
+                     # PermissionError. Retain the admission refusal as the cause.
+                     if isinstance(error, urllib.error.URLError) and isinstance(error.reason, ScopeDenied):
