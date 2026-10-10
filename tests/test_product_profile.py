@@ -25,6 +25,13 @@ def template(bundle):
     return bundle['config']['plugins']['entries']['friday_rework']['settings']['onboarding']['templates']['friday-local']
 
 
+def test_missing_scoped_delegation_refuses_normal_template(monkeypatch):
+    from hermes_cli import friday_user_scope as scope
+    monkeypatch.setattr(scope, 'SAFE', scope.SAFE - {'delegate_task'})
+    with pytest.raises(ValueError, match='^scoped_native_delegation_required$'):
+        compose_product(inputs())
+
+
 def test_composition_preserves_native_capabilities_and_routes():
     from hermes_cli.config import DEFAULT_CONFIG
     bundle = compose_product(inputs()); config = bundle['config']
@@ -112,6 +119,9 @@ def test_ambient_keys_and_input_data_never_adopted(monkeypatch):
         'runtime': {'enabled': False}, 'results': {'enabled': True}}
     assert ordinary['config']['skills']['external_dirs'] == []
     assert not ordinary['config']['skills']['project_discovery']
+    assert 'delegate_task' in ordinary['tools']
+    assert 'delegation' in ordinary['config']['toolsets']
+    assert all('delegation' in tools for tools in ordinary['config']['platform_toolsets'].values())
     assert 'dashboard_auth/basic' not in ordinary['config']['plugins']['enabled']
     assert 'dashboard_auth/basic' in ordinary['config']['plugins']['disabled']
 

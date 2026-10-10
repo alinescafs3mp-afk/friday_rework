@@ -113,7 +113,7 @@ create-only and cannot replace an existing inode. No shell fallback is used.
 Actual permitted functions are the explicit binding `tools` list, visible in
 the existing administrator effective plugin settings. The intact donor catalog
 is not erased: catalog visibility does not grant execution. Ordinary shell,
-code execution, arbitrary MCP/connectors, native subagent/profile delegation,
+code execution, arbitrary MCP/connectors, foreign-profile delegation,
 config mutation and unreviewed file/skill/browser operations are refused. Safe
 ordinary native commands are help/status/stop/cancel/new/reset/queue/memory.
 This list is a declared **unaccepted capability gap**, not full donor acceptance
@@ -123,6 +123,12 @@ path into intact Harness/A0; result access uses the original checked
 exact retained ingress account/user/runtime, preserving the original native
 identity, inputs, budgets, stop and output checks. No new worker/queue/database
 or unsupervised alternative terminal is created.
+
+The [scoped native delegation candidate](native-delegation.md) retains the
+ordinary user's original identity, local route, tools and budget before creating
+a child session. New normal templates include that toolset; existing users are
+unchanged. Source/configuration wiring and offline fixtures do not establish
+native delegation or complete ordinary-user acceptance.
 
 An authenticated native event may leave `SessionSource.profile` unset while
 its pinned `RoutingIdentity` names the runtime profile. The native ingress
@@ -247,3 +253,29 @@ not independent review, live acceptance or a runtime readiness producer. Both
 workers' useful autonomous web, full authenticated admin and all seven product
 journeys still require their mandatory actual checks. Direct ordinary
 skill/cron/terminal remains a separate explicit policy gap.
+
+
+## Ordinary native skills integration candidate
+
+The new `user-skills.patch` keeps Hermes' native skill files, manager actions,
+frontmatter validation, static scan/lint, naming, history and batch semantics.
+Newly approved ordinary templates include `skills_list`, `skill_view` and
+`skill_manage`; existing grants are not enlarged or migrated automatically.
+Personal roots and supporting documents use bounded descriptor I/O and current
+principal/generation checks. Prompt, slash/autoload and list/view projections
+share those readers. Scoped reads rebuild from current private bytes instead
+of accepting the donor's stat-only or persistent snapshots as authority.
+
+Reading instructions is passive: it does not install declared packages, run
+inline shell, capture secrets, register global environment passthrough or
+import/discover plugins. Unverified execution/dependency/mount requirements
+are returned as setup needed. Native unscoped donor behavior remains present.
+Commands and scripts can be read; execution still requires the existing
+admitted task path and the original task budget.
+
+Remaining ordinary-user gaps are explicit: admission for project/external and
+plugin skill libraries, inline-shell/package activation, scoped credential
+mounts, and the ordinary slash admission route. These are not accepted feature
+exclusions. Mixed privileged unscoped writes into a managed ordinary skill
+home need the same publication-lock proof before release. Source/offline
+integration, installed execution and release acceptance remain separate.

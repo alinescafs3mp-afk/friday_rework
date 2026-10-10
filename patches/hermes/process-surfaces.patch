@@ -1,0 +1,1167 @@
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -224,6 +224,9 @@
+             return None
+ 
+         if is_internal:
++            from gateway.run_notifications_authority import admit_process_notice
++            if not admit_process_notice(self, event, source):
++                return None
+             return event, source, True
+ 
+         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
+diff --git a/gateway/run_notifications.py b/gateway/run_notifications.py
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -1159,6 +1159,8 @@
+         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
+         watch_events = _drain_gateway_watch_events(completion_queue)
+         for evt in watch_events:
++            if not self._delegation_notice_visible(evt):
++                continue
+             async with self._completion_event_scope(evt):
+                 if self._load_background_notifications_mode() == "off":
+                     continue
+@@ -1187,6 +1189,10 @@
+         turn's event.complete the CLIENT owns the next turn on this stateless surface, so never
+         self-post them as a new role=user prompt. Other watch events wake the session via self-post.
+         """
++        # This surface has no final original-authority envelope for process
++        # wakes yet, including events with a canonical API session source.
++        if evt.get("type") != "async_delegation" and evt.get("user_authority") is not None:
++            return None
+         from gateway.wake import deliver_wake, persist_delegation_delivery
+         scope = contextlib.nullcontext()
+         if evt.get("type") == "async_delegation":
+@@ -1326,7 +1332,10 @@
+             raw_sid = str(evt.get("origin_session_id") or "").strip() or str(source.chat_id or "")
+             return await self._self_post_api_server(adapter, synth_text, raw_sid, evt)
+         try:
+-            metadata = {"notification_origin": "process_registry_synthetic"}
++            from gateway.run_notifications_authority import process_notice_metadata
++            metadata = {"notification_origin": "process_registry_synthetic", **process_notice_metadata(evt)}
++            if evt.get("type") == "async_delegation":
++                metadata["notification_origin"] = "async_delegation_synthetic"
+             synth_text = _mark_internal_notification(synth_text)
+             session_key = str(evt.get("session_key") or "").strip()
+             from agent.notification_presentation import diagnostic_process_event
+@@ -1504,7 +1513,10 @@
+ 
+     def _delegation_notice_visible(self, evt: dict, *, source=None, require_authority=False) -> bool:
+         """A notice uses the retained pin; API writes also check final events here."""
+-        if evt.get("type") != "async_delegation" or (not require_authority and not evt.get("task_failure_notice")):
++        if evt.get("type") != "async_delegation":
++            from gateway.run_notifications_authority import process_notice_visible
++            return process_notice_visible(self, evt, source)
++        if not require_authority and not evt.get("task_failure_notice"):
+             return True
+         from tools.async_delegation import _visible
+         from hermes_cli.friday_user_scope import scoped_source, ScopeDenied
+@@ -1716,6 +1728,15 @@
+                 self._completion_notification_batch_tasks.pop(key, None)
+             if not entries:
+                 return
++            permitted = []
++            for entry in entries:
++                if self._delegation_notice_visible(entry[1]):
++                    permitted.append(entry)
++                else:
++                    self._settle_batch_waiters([entry], None)
++            entries = permitted
++            if not entries:
++                return
+             synth_text = entries[0][0] if len(entries) == 1 else self._format_coalesced_process_completions(entries)
+             # A duplicate primary returns None from the dedupe seam; try the next identity so a fresh
+             # sibling is never discarded with it.
+@@ -1781,7 +1802,10 @@
+                 setattr(self, attr, default())
+         if self._completion_notification_batches_stopping:
+             return False
+-        key = self._event_route_key(evt, self._COMPLETION_BATCH_KEY_FIELDS)
++        from copy import deepcopy
++        from tools.process_registry_authority import event_authority_key
++        evt = deepcopy(evt)
++        key = (*self._event_route_key(evt, self._COMPLETION_BATCH_KEY_FIELDS), event_authority_key(evt))
+         future = asyncio.get_running_loop().create_future()
+         self._completion_notification_batches.setdefault(key, []).append((synth_text, evt, future))
+         if key not in self._completion_notification_batch_tasks:
+@@ -2001,6 +2025,10 @@
+         from gateway.run import _non_conversational_metadata
+         source = await asyncio.to_thread(self._build_process_event_source, watcher)
+         adapter = self._resolve_injection_adapter(platform_name, source)
++        if (source is None or str(source.chat_id or "") != str(chat_id or "")
++                or str(source.thread_id or "") != str(thread_id or "")
++                or not self._delegation_notice_visible(watcher, source=source)):
++            return
+         if adapter and chat_id:
+             with _log_suppressed(logging.ERROR, "Watcher delivery error: %s"):
+                 send_meta = {"thread_id": thread_id} if thread_id else None
+@@ -2015,6 +2043,11 @@
+         from agent.redact import redact_terminal_output
+         from tools.ansi_strip import strip_ansi
+         from tools.process_registry import transform_process_output
++        from tools.process_registry_authority import copy_authority
++        from hermes_cli.friday_user_scope import ScopeDenied
++        pin = copy_authority(session)
++        if watcher.get("user_authority") != pin:
++            raise ScopeDenied()
+         _command = getattr(session, "command", "") or ""
+         _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
+         _raw = transform_process_output(_raw, command=_command, returncode=session.exit_code,
+@@ -2034,6 +2067,7 @@
+             _out = _raw
+         return {
+             "type": "completion",
++            "user_authority": pin,
+             "session_id": session_id,
+             **{k: watcher.get(k, "") for k in _WATCHER_ROUTE_FIELDS},
+             "message_id": str(watcher.get("message_id") or "").strip() or None,
+@@ -2112,6 +2146,9 @@
+             await asyncio.sleep(interval)
+             session = process_registry.get(session_id)
+             if session is None:
++                break
++            if (watcher.get("user_authority") != getattr(session, "user_authority", None)
++                    or not self._delegation_notice_visible(watcher)):
+                 break
+             if silent:
+                 # Still wait for the process to exit so we can log it, but don't push any messages.
+diff --git a/gateway/run_notifications_authority.py b/gateway/run_notifications_authority.py
+new file mode 100644
+--- /dev/null
++++ b/gateway/run_notifications_authority.py
+@@ -0,0 +1,39 @@
++"""Existing native routing authorizes the recipient; the saved pin only constrains it."""
++from copy import deepcopy
++
++
++def process_notice_visible(runner, event, source=None):
++    from tools.process_registry_authority import event_visible
++    from hermes_cli.friday_user_scope import ScopeDenied
++    try:
++        source = source or runner._build_process_event_source(event)
++        if source is None:
++            # Scoped raw API self-POST has no final authority envelope yet.
++            return event.get("user_authority") is None and event_visible(event)
++        if not runner._is_user_authorized_for_source(source):
++            return False
++        with runner._profile_scope_for_source(source):
++            return event_visible(event)
++    except (ScopeDenied, ValueError, OSError, TypeError):
++        return False
++
++
++def process_notice_metadata(event):
++    if event.get("type") == "async_delegation":
++        return {}
++    return {"process_authority_event": {"type": event.get("type", "completion"),
++            "user_authority": deepcopy(event.get("user_authority"))}}
++
++
++def admit_process_notice(runner, event, source):
++    metadata = getattr(event, "metadata", None) or {}
++    if metadata.get("notification_origin") != "process_registry_synthetic":
++        return True
++    saved = metadata.get("process_authority_event")
++    # Old synthetic process events have no pin. The actual recipient context
++    # still rejects them in a protected profile; never infer a fresh pin.
++    if saved is None:
++        saved = {"type": "completion", "user_authority": None}
++    if not isinstance(saved, dict) or saved.get("type") == "async_delegation":
++        return False
++    return process_notice_visible(runner, saved, source)
+diff --git a/gateway/slash_commands_status.py b/gateway/slash_commands_status.py
+--- a/gateway/slash_commands_status.py
++++ b/gateway/slash_commands_status.py
+@@ -437,58 +437,68 @@
+ 
+     async def _handle_agents_command(self, event: MessageEvent) -> str:
+         """Handle /agents command - list active agents and running tasks."""
+-        from gateway.run import _AGENT_PENDING_SENTINEL
+-        from tools.process_registry import format_uptime_short, process_registry
+-        now = time.time()
+-        current_session_key = self._session_key_for_source(event.source)
+-        running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
+-        agent_rows: list[dict] = []
+-        for session_key, agent in (getattr(self, "_running_agents", {}) or {}).items():
+-            pending = agent is _AGENT_PENDING_SENTINEL
+-            agent_rows.append({
+-                "session_key": session_key,
+-                "elapsed": max(0, int(now - float(running_started.get(session_key, now)))),
+-                "state": t("gateway.agents.state_starting") if pending else t("gateway.agents.state_running"),
+-                "session_id": "" if pending else str(getattr(agent, "session_id", "") or ""),
+-                "model": "" if pending else str(getattr(agent, "model", "") or ""),
+-            })
+-        agent_rows.sort(key=lambda row: row["elapsed"], reverse=True)
+-        procs = _quiet_sync(process_registry.list_sessions, [])
+-        running_processes = [p for p in procs if p.get("status") == "running"]
+-        background_tasks = [task for task in (getattr(self, "_background_tasks", set()) or set())
+-                            if hasattr(task, "done") and not task.done()]
+-
+-        # Background (async) delegations — delegate_task(background=true).
+-        # Live per-child activity comes from the registry's progress sampler (#51690): api calls, current
+-        # tool, seconds since last activity.
+-        from tools.async_delegation import list_async_delegations
+-        delegations = [d for d in _quiet_sync(list_async_delegations, [])
+-                       if d.get("status") in ("running", "stalling", "finalizing")]
+-
+-        def _agent_row(idx_row):
+-            idx, row = idx_row
+-            current = t("gateway.agents.this_chat") if row["session_key"] == current_session_key else ""
+-            sid = f" · `{row['session_id']}`" if row["session_id"] else ""
+-            model = f" · `{row['model']}`" if row["model"] else ""
+-            return [f"{idx}. `{row['session_key']}` · {row['state']} · "
+-                    f"{format_uptime_short(row['elapsed'])}{sid}{model}{current}"]
+-
+-        def _proc_row(proc):
+-            cmd = _clip(" ".join(str(proc.get("command", "")).split()), 90)
+-            return [f"- `{proc.get('session_id', '?')}` · "
+-                    f"{format_uptime_short(int(proc.get('uptime_seconds', 0)))} · `{cmd}`"]
+-
+-        lines = [t("gateway.agents.header"), "", t("gateway.agents.active_agents", count=len(agent_rows))]
+-        lines += _capped_rows(list(enumerate(agent_rows, 1)), _agent_row)
+-        lines += ["", t("gateway.agents.running_processes", count=len(running_processes))]
+-        lines += _capped_rows(running_processes, _proc_row)
+-        lines += ["", t("gateway.agents.async_jobs", count=len(background_tasks))]
+-        if delegations:
+-            lines += ["", t("gateway.agents.background_delegations", count=len(delegations))]
+-            lines += _capped_rows(delegations, _agents_delegation_lines)
+-        if not (agent_rows or running_processes or background_tasks or delegations):
+-            lines += ["", t("gateway.agents.none")]
+-        return "\n".join(lines)
++        from hermes_cli.process_presentation import process_presentation
++        with process_presentation():
++            from gateway.run import _AGENT_PENDING_SENTINEL
++            from hermes_cli.friday_user_scope import ScopeDenied, check_agent
++            from tools.process_registry_authority import capture_authority
++            from tools.process_registry import format_uptime_short, process_registry
++            now = time.time()
++            current_session_key = self._session_key_for_source(event.source)
++            running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
++            agent_rows: list[dict] = []
++            for session_key, agent in (getattr(self, "_running_agents", {}) or {}).items():
++                pending = agent is _AGENT_PENDING_SENTINEL
++                try:
++                    check_agent(None if pending else agent)
++                except ScopeDenied:
++                    continue
++                agent_rows.append({
++                    "session_key": session_key,
++                    "elapsed": max(0, int(now - float(running_started.get(session_key, now)))),
++                    "state": t("gateway.agents.state_starting") if pending else t("gateway.agents.state_running"),
++                    "session_id": "" if pending else str(getattr(agent, "session_id", "") or ""),
++                    "model": "" if pending else str(getattr(agent, "model", "") or ""),
++                })
++            agent_rows.sort(key=lambda row: row["elapsed"], reverse=True)
++            procs = _quiet_sync(lambda: process_registry.list_sessions(visible_only=True), [])
++            running_processes = [p for p in procs if p.get("status") == "running"]
++            # These legacy asyncio handles do not carry a principal capability.
++            background_tasks = [] if capture_authority() is not None else [
++                task for task in (getattr(self, "_background_tasks", set()) or set())
++                if hasattr(task, "done") and not task.done()]
++
++            # Background (async) delegations — delegate_task(background=true).
++            # Live per-child activity comes from the registry's progress sampler (#51690): api calls, current
++            # tool, seconds since last activity.
++            from tools.async_delegation import list_async_delegations
++            delegations = [d for d in _quiet_sync(list_async_delegations, [])
++                           if d.get("status") in ("running", "stalling", "finalizing")]
++
++            def _agent_row(idx_row):
++                idx, row = idx_row
++                current = t("gateway.agents.this_chat") if row["session_key"] == current_session_key else ""
++                sid = f" · `{row['session_id']}`" if row["session_id"] else ""
++                model = f" · `{row['model']}`" if row["model"] else ""
++                return [f"{idx}. `{row['session_key']}` · {row['state']} · "
++                        f"{format_uptime_short(row['elapsed'])}{sid}{model}{current}"]
++
++            def _proc_row(proc):
++                cmd = _clip(" ".join(str(proc.get("command", "")).split()), 90)
++                return [f"- `{proc.get('session_id', '?')}` · "
++                        f"{format_uptime_short(int(proc.get('uptime_seconds', 0)))} · `{cmd}`"]
++
++            lines = [t("gateway.agents.header"), "", t("gateway.agents.active_agents", count=len(agent_rows))]
++            lines += _capped_rows(list(enumerate(agent_rows, 1)), _agent_row)
++            lines += ["", t("gateway.agents.running_processes", count=len(running_processes))]
++            lines += _capped_rows(running_processes, _proc_row)
++            lines += ["", t("gateway.agents.async_jobs", count=len(background_tasks))]
++            if delegations:
++                lines += ["", t("gateway.agents.background_delegations", count=len(delegations))]
++                lines += _capped_rows(delegations, _agents_delegation_lines)
++            if not (agent_rows or running_processes or background_tasks or delegations):
++                lines += ["", t("gateway.agents.none")]
++            return "\n".join(lines)
+ 
+     async def _handle_topup_command(self, event: MessageEvent) -> str:
+         """Handle /topup -- show the Nous balance and hand off to the portal. Does NOT charge, confirm,
+diff --git a/hermes_cli/cli_chat_turn_mixin.py b/hermes_cli/cli_chat_turn_mixin.py
+--- a/hermes_cli/cli_chat_turn_mixin.py
++++ b/hermes_cli/cli_chat_turn_mixin.py
+@@ -60,6 +60,8 @@
+         """
+         from cli import ChatConsole, _ChatTurn, _DIM, _RST, _accent_hex, _cprint, set_secret_capture_callback
+         from tools.process_registry_notifications import TimelineNotification
++        if isinstance(message, TimelineNotification) and not message.process_visible(getattr(self, "agent", None)):
++            return None
+         # Single-query and direct chat callers do not go through run().
+         set_secret_capture_callback(self._secret_capture_callback)
+         # Reset per turn; only a real interrupt flips it, so early returns leave it False.
+@@ -90,6 +92,8 @@
+             from agent.message_sanitization import _sanitize_surrogates
+             message = _sanitize_surrogates(message)
+ 
++        if isinstance(message, TimelineNotification) and not message.process_visible(agent):
++            return None
+         self._chat_stage_user_message(agent, message)
+         if isinstance(message, TimelineNotification):
+             message = str(message)  # UI metadata is on the staged row, never in model content.
+diff --git a/hermes_cli/cli_commands_mixin.py b/hermes_cli/cli_commands_mixin.py
+--- a/hermes_cli/cli_commands_mixin.py
++++ b/hermes_cli/cli_commands_mixin.py
+@@ -915,68 +915,73 @@
+ 
+         See #14602.
+         """
+-        from tools.process_registry import process_registry
+-        running = [p for p in process_registry.list_sessions() if p.get("status") == "running"]
+-        # Background subagents live in their own registry, not the process registry.
+-        n_async = _probe("tools.async_delegation", "active_count", 0)
+-        if not running and not n_async:
+-            return print(f"  {_t('stop.none_running')}")
+-        if running:
+-            print(f"  {_t('stop.stopping', count=len(running))}")
+-            killed = process_registry.kill_all(source='cli.stop')
+-            receipt = process_registry.web_custody_receipt()
++        from hermes_cli.process_presentation import process_presentation
++        with process_presentation(session={"agent": getattr(self, "agent", None)}, mutation={"action": "kill"}, bulk=True):
++            from hermes_cli.process_presentation import stop_presented_processes, stop_presented_delegations
++            # Always include finished handles whose native stop remains pending.
++            receipt = stop_presented_processes('cli.stop')
++            delegation_stop = stop_presented_delegations('cli.stop')
++            interrupted = delegation_stop['requested']
+             if receipt['status'] == 'STOP_UNCONFIRMED':
+-                print('  Stop pending: native web process cessation is unconfirmed.')
+-            else:
+-                print(f"  {_t('stop.stopped', count=killed)}")
+-        if n_async:
+-            from tools.async_delegation import interrupt_all
+-            print(f"  {_t('stop.interrupted_delegations', count=interrupt_all(reason='/stop'))}")
++                print('  Stop pending: native process cessation is unconfirmed.')
++            elif receipt['killed']:
++                print(f"  {_t('stop.stopped', count=receipt['killed'])}")
++            elif not delegation_stop['attempted']:
++                print(f"  {_t('stop.none_running')}")
++            if interrupted:
++                print(f"  {_t('stop.interrupted_delegations', count=interrupted)}")
++            if delegation_stop['status'] == 'STOP_UNCONFIRMED':
++                print('  Stop pending: async delegation cessation is unconfirmed.')
+ 
+     def _handle_agents_command(self):
+         """Handle /agents — show background processes and agent status."""
+-        from tools.process_registry import format_uptime_short, process_registry
+-        processes = process_registry.list_sessions()
+-        running = [p for p in processes if p.get("status") == "running"]
+-        finished = [p for p in processes if p.get("status") != "running"]
+-        _cp(f"  {_t('agents.running_processes', count=len(running))}")
+-        for p in running:
+-            up = format_uptime_short(p.get("uptime_seconds", 0))
+-            _cp(f"    {p.get('session_id', '?')} · {up} · {p.get('command', '')[:80]}")
+-        if finished:
+-            _cp(f"  {_t('agents.recently_finished', count=len(finished))}")
+-        # Background (async) delegations — delegate_task(background=true)
+-        delegations = _probe("tools.async_delegation", "list_async_delegations", [])
+-        if delegations:
+-            running_d = [d for d in delegations if d.get("status") in ("running", "stalling")]
+-            _cp(f"  {_t('agents.background_delegations', count=len(running_d))}")
+-            for d in delegations:
+-                status = d.get("status", "?")
+-                line = f"    {d.get('delegation_id', '?')} · {status} · {(d.get('goal') or '')[:60]}"
+-                # Live-status detail for in-flight delegations.
+-                # See #51690.
+-                if status == "stalling":
+-                    quiet = d.get("stalled_after_quiet_seconds")
+-                    if quiet is not None:
+-                        line += _t("agents.no_progress", seconds=f"{quiet:.0f}")
+-                elif status == "running":
+-                    quiet = d.get("seconds_since_progress")
+-                    if quiet is not None and quiet >= 60:
+-                        line += _t("agents.quiet", seconds=f"{quiet:.0f}")
+-                _cp(line)
+-                for i, child in enumerate(d.get("children_activity") or []):
+-                    if not isinstance(child, dict):
+-                        continue
+-                    tool = child.get("current_tool")
+-                    doing = _t("agents.in_tool", tool=tool) if tool else _t("agents.between_turns")
+-                    part = "      " + _t("agents.child_line", index=i + 1,
+-                                         api_calls=child.get("api_calls", "?"), doing=doing)
+-                    idle = child.get("seconds_since_activity")
+-                    if idle is not None:
+-                        part += _t("agents.last_activity", seconds=f"{idle:.0f}")
+-                    _cp(part)
+-        agent_running = getattr(self, "_agent_running", False)
+-        _cp(f"  {_t('agents.agent_running') if agent_running else _t('agents.agent_idle')}")
++        from hermes_cli.process_presentation import process_presentation
++        with process_presentation(session={"agent": getattr(self, "agent", None)}) as recheck:
++            def emit(text):
++                recheck()
++                _cp(text)
++            from tools.process_registry import format_uptime_short, process_registry
++            processes = process_registry.list_sessions(visible_only=True)
++            running = [p for p in processes if p.get("status") == "running"]
++            finished = [p for p in processes if p.get("status") != "running"]
++            emit(f"  {_t('agents.running_processes', count=len(running))}")
++            for p in running:
++                up = format_uptime_short(p.get("uptime_seconds", 0))
++                emit(f"    {p.get('session_id', '?')} · {up} · {p.get('command', '')[:80]}")
++            if finished:
++                emit(f"  {_t('agents.recently_finished', count=len(finished))}")
++            # Background (async) delegations — delegate_task(background=true)
++            delegations = _probe("tools.async_delegation", "list_async_delegations", [])
++            if delegations:
++                running_d = [d for d in delegations if d.get("status") in ("running", "stalling")]
++                emit(f"  {_t('agents.background_delegations', count=len(running_d))}")
++                for d in delegations:
++                    status = d.get("status", "?")
++                    line = f"    {d.get('delegation_id', '?')} · {status} · {(d.get('goal') or '')[:60]}"
++                    # Live-status detail for in-flight delegations.
++                    # See #51690.
++                    if status == "stalling":
++                        quiet = d.get("stalled_after_quiet_seconds")
++                        if quiet is not None:
++                            line += _t("agents.no_progress", seconds=f"{quiet:.0f}")
++                    elif status == "running":
++                        quiet = d.get("seconds_since_progress")
++                        if quiet is not None and quiet >= 60:
++                            line += _t("agents.quiet", seconds=f"{quiet:.0f}")
++                    emit(line)
++                    for i, child in enumerate(d.get("children_activity") or []):
++                        if not isinstance(child, dict):
++                            continue
++                        tool = child.get("current_tool")
++                        doing = _t("agents.in_tool", tool=tool) if tool else _t("agents.between_turns")
++                        part = "      " + _t("agents.child_line", index=i + 1,
++                                             api_calls=child.get("api_calls", "?"), doing=doing)
++                        idle = child.get("seconds_since_activity")
++                        if idle is not None:
++                            part += _t("agents.last_activity", seconds=f"{idle:.0f}")
++                        emit(part)
++            agent_running = getattr(self, "_agent_running", False)
++            emit(f"  {_t('agents.agent_running') if agent_running else _t('agents.agent_idle')}")
+ 
+     # ---- /journey, /paste, /copy, /image --------------------------------------------------
+     def _handle_journey_command(self, cmd_original: str) -> None:
+diff --git a/hermes_cli/cli_process_dock.py b/hermes_cli/cli_process_dock.py
+--- a/hermes_cli/cli_process_dock.py
++++ b/hermes_cli/cli_process_dock.py
+@@ -39,36 +39,47 @@
+ def process_rows(now: float | None = None) -> list:
+     """Running processes plus those that exited within ``RETAIN_SECONDS``, newest-running first.
+ 
+-    The classic CLI is one conversation per OS process, so every registry entry (its own
+-    spawns and any a child handed back) belongs to this dock; gateway-hosted surfaces scope
+-    by session key in ``tui_gateway`` instead.
++    Only entries visible to the current principal are eligible. A process or
++    conversation identifier never substitutes for that retained authority.
+     """
+-    from tools.process_registry import process_registry
++    from hermes_cli.friday_user_scope import ScopeDenied
++    try:
++        from hermes_cli.process_presentation import process_presentation
++        with process_presentation():
++            from tools.process_registry import process_registry
++            from tools.process_registry_authority import require_visible, resolve_visible
+ 
+-    now = time.time() if now is None else now
+-    rows = []
+-    for entry in process_registry.list_sessions():
+-        proc = process_registry.get(entry["session_id"])
+-        if proc is None:
+-            continue
+-        status = process_status(entry)
+-        exited_at = proc.exited_at if status != "running" else 0.0
+-        if status != "running" and now - exited_at > RETAIN_SECONDS:
+-            continue
+-        end = exited_at or now
+-        rows.append({
+-            "kind": "process",
+-            "key": proc.id,
+-            "id": proc.id,
+-            "command": " ".join((proc.command or "").split()) or t("cli.dock.process_goal_label"),
+-            "status": status,
+-            "exit_code": proc.exit_code,
+-            "elapsed": max(0, int(end - proc.started_at)),
+-            "since_exit": max(0, int(now - exited_at)) if exited_at else 0,
+-            "detail": _last_output_line(proc.output_buffer),
+-        })
+-    rows.sort(key=lambda r: (r["status"] != "running", -r["elapsed"] if r["status"] == "running" else r["since_exit"]))
+-    return rows
++            now = time.time() if now is None else now
++            rows = []
++            checked = []
++            for entry in process_registry.list_sessions(visible_only=True):
++                proc = resolve_visible(process_registry, entry["session_id"])
++                if proc is None:
++                    continue
++                status = process_status(entry)
++                exited_at = proc.exited_at if status != "running" else 0.0
++                if status != "running" and now - exited_at > RETAIN_SECONDS:
++                    continue
++                end = exited_at or now
++                require_visible(proc)
++                checked.append(proc)
++                rows.append({
++                    "kind": "process",
++                    "key": proc.id,
++                    "id": proc.id,
++                    "command": " ".join((proc.command or "").split()) or t("cli.dock.process_goal_label"),
++                    "status": status,
++                    "exit_code": proc.exit_code,
++                    "elapsed": max(0, int(end - proc.started_at)),
++                    "since_exit": max(0, int(now - exited_at)) if exited_at else 0,
++                    "detail": _last_output_line(proc.output_buffer),
++                })
++            rows.sort(key=lambda r: (r["status"] != "running", -r["elapsed"] if r["status"] == "running" else r["since_exit"]))
++            for proc in checked:
++                require_visible(proc)
++            return rows
++    except ScopeDenied:
++        return []
+ 
+ 
+ _GLYPH = {"running": "⚙", "done": "✔", "failed": "✘", "killed": "✘", "lost": "?"}
+@@ -93,17 +104,39 @@
+ 
+ 
+ def process_tail(process_id: str) -> str:
+-    from tools.process_registry import process_registry
++    from hermes_cli.friday_user_scope import ScopeDenied
++    try:
++        from hermes_cli.process_presentation import process_presentation
++        with process_presentation():
++            from tools.process_registry import process_registry
++            from tools.process_registry_authority import require_visible, resolve_visible
+ 
+-    proc = process_registry.get(process_id)
+-    if proc is None:
+-        return t("cli.dock.process_gone")
+-    text = (proc.output_buffer or "")[-32768:]
+-    text = "".join(c for c in text if c.isprintable() or c in "\n\t")
+-    return text or t("cli.dock.no_output")
++            proc = resolve_visible(process_registry, process_id)
++            if proc is None:
++                return t("cli.dock.process_gone")
++            text = (proc.output_buffer or "")[-32768:]
++            text = "".join(c for c in text if c.isprintable() or c in "\n\t")
++            require_visible(proc)
++            return text or t("cli.dock.no_output")
++    except ScopeDenied:
++        return "product_user_scope_refused"
+ 
+ 
+ def kill(process_id: str) -> dict:
+-    from tools.process_registry import process_registry
++    from hermes_cli.friday_user_scope import ScopeDenied
++    try:
++        from hermes_cli.process_presentation import process_presentation
++        with process_presentation(mutation={"action": "kill", "session_id": process_id}):
++            from tools.process_registry import process_registry
++            from tools.process_registry_authority import require_visible, resolve_visible
+ 
+-    return process_registry.kill_process(process_id)
++            proc = resolve_visible(process_registry, process_id)
++            if proc is None:
++                from hermes_cli.friday_user_scope import ScopeDenied
++                raise ScopeDenied()
++            require_visible(proc)
++            result = process_registry.kill_process(proc.id)
++            require_visible(proc)
++            return result
++    except ScopeDenied:
++        return {"status": "error", "error": "product_user_scope_refused"}
+diff --git a/hermes_cli/cli_process_notifications.py b/hermes_cli/cli_process_notifications.py
+--- a/hermes_cli/cli_process_notifications.py
++++ b/hermes_cli/cli_process_notifications.py
+@@ -64,6 +64,12 @@
+                 from agent.notification_presentation import diagnostic_process_event
+                 if diagnostic_process_event(event) and not isinstance(pending, TimelineNotification):
+                     pending = TimelineNotification(text, text, "internal_notification", "diagnostic")
++            if evt_type != "async_delegation":
++                if not isinstance(pending, (TimelineNotification, ProcessNotificationBatch)):
++                    pending = TimelineNotification(text, text, "internal_notification")
++                if isinstance(pending, TimelineNotification):
++                    from copy import deepcopy
++                    pending.process_events = deepcopy(tuple(event for event, _text in notifications))
+             self._pending_input.put(pending)
+ 
+     def _tui_unwrap_input(self, user_input):
+@@ -73,9 +79,16 @@
+         from tools.process_registry_notifications import (
+             PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch, TimelineNotification)
+         if isinstance(user_input, ProcessNotificationBatch):
+-            rendered = user_input.render(process_registry)
++            # Keep one original snapshot across rendering and the eventual turn.
++            # A late empty re-read must never erase the authority of rendered text.
++            retained = tuple(user_input._live(process_registry))
++            batch = ProcessNotificationBatch(retained)
++            rendered = batch.render(process_registry)
+             user_input = rendered and TimelineNotification(
+-                rendered, user_input.display_text(process_registry), PROCESS_COMPLETE_DISPLAY_KIND)
++                rendered, batch.display_text(process_registry), PROCESS_COMPLETE_DISPLAY_KIND,
++                process_events=tuple(event for event, _text in retained))
++        if isinstance(user_input, TimelineNotification) and not user_input.process_visible(getattr(self, "agent", None)):
++            user_input = None
+         # Voice-transcribed messages arrive wrapped in a sentinel so only genuine STT output gets the voice
+         # prefix (#65827).
+         is_voice_input = isinstance(user_input, _VoiceInputMessage)
+diff --git a/hermes_cli/goals.py b/hermes_cli/goals.py
+--- a/hermes_cli/goals.py
++++ b/hermes_cli/goals.py
+@@ -741,7 +741,15 @@
+     try:
+         from tools.process_registry import process_registry
+ 
+-        return bool(process_registry.is_session_waiting(session_id))
++        from tools.process_registry_authority import require_visible, resolve_visible
++        from hermes_cli.process_presentation import process_presentation
++        with process_presentation():
++            proc = resolve_visible(process_registry, session_id)
++            if proc is None:
++                return False
++            result = bool(process_registry.is_session_waiting(proc.id))
++            require_visible(proc)
++            return result
+     except Exception:
+         return False
+ 
+@@ -1030,7 +1038,7 @@
+     try:
+         from tools.process_registry import process_registry
+ 
+-        sessions = process_registry.list_sessions(task_id=task_id) or []
++        sessions = process_registry.list_sessions(task_id=task_id, visible_only=True) or []
+     except Exception as exc:
+         logger.debug("gather_background_processes failed: %s", exc)
+         return []
+diff --git a/hermes_cli/process_presentation.py b/hermes_cli/process_presentation.py
+new file mode 100644
+--- /dev/null
++++ b/hermes_cli/process_presentation.py
+@@ -0,0 +1,102 @@
++"""Authority checks for ordinary process views and controls, never trusted cleanup.
++
++An RPC/session key is only a conversation filter. This helper requires the
++already authenticated ambient capability; it does not bind or reconstruct one.
++"""
++from contextlib import contextmanager
++
++
++@contextmanager
++def process_presentation(*, session=None, mutation=None, bulk=False):
++    from hermes_cli.friday_user_scope import ScopeDenied, check_agent, guard_tool
++    from tools.process_registry_authority import capture_authority, visible
++
++    def check():
++        pin = capture_authority()
++        # An unbound protected home is not the legacy single-user CLI.
++        if pin is None and not visible(None):
++            raise ScopeDenied()
++        if session is not None:
++            check_agent(session.get("agent"))
++        if mutation is not None:
++            guard_tool("process_manage", mutation)
++        # Native kill_all includes trusted lifecycle custody and cannot be
++        # promoted into a principal-scoped mutation by a task/session filter.
++        if bulk and pin is not None:
++            raise ScopeDenied()
++        return pin
++
++    authority = check()
++    def recheck():
++        if check() != authority:
++            raise ScopeDenied()
++    try:
++        yield recheck
++    finally:
++        # Also mask a private native exception when access was revoked while
++        # the operation failed. RPC error rendering is an output boundary too.
++        recheck()
++
++
++def _visible_processes(registry):
++    from tools.process_registry_authority import resolve_visible
++    # Include finished scopes still awaiting a stop retry, even when native
++    # list presentation omits an uncollected detached exit. IDs are only lookup
++    # keys; resolve_visible checks retained authority before PID refresh.
++    with registry._lock:
++        ids = list(dict.fromkeys((*registry._running, *registry._finished)))
++    for sid in ids:
++        proc = resolve_visible(registry, sid)
++        if proc is not None:
++            yield proc
++
++
++def stop_presented_processes(source):
++    """User bulk control over visible native handles; trusted kill_all stays native."""
++    from tools.process_registry import process_registry
++    from tools.process_registry_authority import require_visible
++    with process_presentation(mutation={"action": "kill"}):
++        results = []
++        for proc in _visible_processes(process_registry):
++            if proc.exited and not getattr(proc, "_scope_stop_pending", False):
++                continue
++            require_visible(proc)
++            result = process_registry.kill_process(proc.id, source=source, consume_output=False)
++            require_visible(proc)
++            results.append(result)
++        # Native custody membership, restricted to this principal's rows.
++        retained = []
++        with process_registry._lock:
++            running_ids = frozenset(process_registry._running)
++        for proc in _visible_processes(process_registry):
++            require_visible(proc)
++            if proc.id in running_ids and proc.web_custody and not proc.web_settled:
++                retained.append(proc.id)
++        killed = sum(
++            (r.get("status") in {"killed", "already_exited"}
++             or (r.get("status") == "QUIESCENT" and bool(r.get("newly_settled"))))
++            and "scope_stop_failed" not in r for r in results)
++        pending = retained or any(r.get("scope_stop_failed") or r.get("process_running")
++                                  or r.get("status") in {"error", "STOP_UNCONFIRMED"} for r in results)
++        return {"status": "STOP_UNCONFIRMED" if pending else "QUIESCENT",
++                "sessions": retained, "killed": killed}
++
++
++def stop_presented_delegations(source):
++    """User stop filters native retained records; shutdown keeps interrupt_all."""
++    from tools import async_delegation as native
++    with process_presentation(mutation={"action": "kill"}) as recheck:
++        with native._records_lock:
++            targets = [record for record in native._records.values()
++                       if record.get("status") in native._ACTIVE_STATES and native._visible(record)]
++        count = 0
++        for record in targets:
++            recheck()
++            if native._visible(record):
++                count += native._interrupt_records([record], source, source,
++                                                   "Interrupted %d visible async delegation(s) (%s)")
++        # An accepted interrupt is only a request; finalization proves exit.
++        pending = any(record.get("status") in native._ACTIVE_STATES for record in targets)
++        return {"attempted": len(targets), "requested": count,
++                "status": "STOP_UNCONFIRMED" if pending or count < len(targets)
++                          else "STOP_REQUESTED" if targets else "NO_VISIBLE_ACTIVE"}
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -4,6 +4,7 @@
+ Nothing runs on the host unless TERMINAL_ENV=local; other backends run in their sandbox.
+ """
+ 
++from tools.process_registry_authority import copy_authority
+ import codecs
+ from contextlib import suppress
+ import json
+@@ -929,7 +930,8 @@
+             "session_key": session.session_key,
+             "task_id": session.task_id,
+             "owner_task_id": session.owner_task_id,
+-            "user_authority": session.user_authority,
++            "user_authority": copy_authority(session),
++            "parent_session_id": session.parent_session_id,
+             "command": session.command,
+             **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
+         }
+@@ -1642,7 +1644,8 @@
+                 "session_key": session.session_key,
+                 "task_id": session.task_id,
+                 "owner_task_id": session.owner_task_id,
+-                "user_authority": session.user_authority,
++                "user_authority": copy_authority(session),
++            "parent_session_id": session.parent_session_id,
+                 "command": session.command,
+                 **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
+                 **self._exit_fields(session),
+@@ -1899,6 +1902,9 @@
+             is_async_delegation = evt.get("type") == "async_delegation"
+             if not self._owns_event(evt, session_key, owns_event, is_async_delegation):
+                 requeue.append(evt)
++                continue
++            from tools.process_registry_authority import event_visible
++            if not event_visible(evt):
+                 continue
+             # Routing happened first so a foreign session cannot drop the owner's
+             # event via its own consumed/observed state.
+diff --git a/tools/process_registry_authority.py b/tools/process_registry_authority.py
+--- a/tools/process_registry_authority.py
++++ b/tools/process_registry_authority.py
+@@ -107,3 +107,32 @@
+         return json.dumps(result, ensure_ascii=False)
+     except ScopeDenied:
+         return native.tool_error("product_user_scope_refused")
++
++
++def copy_authority(session):
++    """Copy the retained origin; never recapture the current admission."""
++    from copy import deepcopy
++    return deepcopy(getattr(session, "user_authority", None))
++
++
++def event_visible(event, agent=None):
++    """Process notices retain their original grant through every native queue.
++
++    Delegation events keep their existing, separate durable-delivery guards.
++    Missing pins are valid only in the existing unscoped native context.
++    """
++    if event.get("type") == "async_delegation":
++        return True
++    from hermes_cli.friday_user_scope import ScopeDenied, check_agent
++    try:
++        if not visible(event.get("user_authority")):
++            return False
++        if agent is not None:
++            check_agent(agent)
++        return True
++    except ScopeDenied:
++        return False
++
++
++def event_authority_key(event):
++    return json.dumps(event.get("user_authority"), sort_keys=True, separators=(",", ":"), allow_nan=False)
+diff --git a/tools/process_registry_checkpoint.py b/tools/process_registry_checkpoint.py
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -126,8 +126,10 @@
+             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
+             # Re-enqueue watcher so gateway can resume notifications
+             if session.watcher_interval > 0:
++                from tools.process_registry_authority import copy_authority
+                 self.pending_watchers.append({
+                     "session_id": session.id,
++                    "user_authority": copy_authority(session),
+                     "check_interval": session.watcher_interval,
+                     "session_key": session.session_key,
+                     **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
+diff --git a/tools/process_registry_notifications.py b/tools/process_registry_notifications.py
+--- a/tools/process_registry_notifications.py
++++ b/tools/process_registry_notifications.py
+@@ -17,9 +17,14 @@
+ 
+     notifications: tuple[tuple[dict, str], ...]
+ 
++    def __post_init__(self):
++        from copy import deepcopy
++        object.__setattr__(self, "notifications", deepcopy(self.notifications))
++
+     def _live(self, registry) -> list:
++        from tools.process_registry_authority import event_visible
+         return [(event, text) for event, text in self.notifications
+-                if not registry.is_completion_consumed(event.get("session_id", ""))]
++                if event_visible(event) and not registry.is_completion_consumed(event.get("session_id", ""))]
+ 
+     def render(self, registry) -> str | None:
+         messages = [text for _event, text in self._live(registry)]
+@@ -367,12 +372,18 @@
+     display_kind: str
+     notification_category: str
+ 
+-    def __new__(cls, text: str, display_text: str, display_kind: str, notification_category: str = "result"):
++    def __new__(cls, text: str, display_text: str, display_kind: str, notification_category: str = "result", *, process_events=()):
+         instance = super().__new__(cls, text)
+         instance.display_text = display_text
+         instance.display_kind = display_kind
++        from copy import deepcopy
+         instance.notification_category = notification_category
++        instance.process_events = deepcopy(tuple(process_events))
+         return instance
++
++    def process_visible(self, agent=None):
++        from tools.process_registry_authority import event_visible
++        return all(event_visible(event, agent) for event in self.process_events)
+ 
+     @classmethod
+     def for_delegation(cls, text: str, event: dict) -> "TimelineNotification":
+diff --git a/tools/terminal_tool_background.py b/tools/terminal_tool_background.py
+--- a/tools/terminal_tool_background.py
++++ b/tools/terminal_tool_background.py
+@@ -124,9 +124,11 @@
+     the chat mute for as long as that turn lasts (#112033). Before the gateway
+     serves, or while it stops, the descriptor waits in ``pending_watchers`` for the
+     startup / post-turn drain instead."""
++    from tools.process_registry_authority import copy_authority
+     proc_session.watcher_interval = 5
+     watcher = {
+         "session_id": proc_session.id, "check_interval": 5, "session_key": session_key,
++        "user_authority": copy_authority(proc_session),
+         "platform": proc_session.watcher_platform,
+         **{attr.removeprefix("watcher_"): getattr(proc_session, attr)
+            for attr, _ in _ROUTING_FIELDS[:-1]},
+diff --git a/tui_gateway/contracts/tools_commands.py b/tui_gateway/contracts/tools_commands.py
+--- a/tui_gateway/contracts/tools_commands.py
++++ b/tui_gateway/contracts/tools_commands.py
+@@ -61,7 +61,7 @@
+ 
+ 
+ method("process.stop", params=ProcessStopParams, result=ProcessStopResult,
+-       doc="Kill every background process in the registry (``/stop``), answering the count killed.")
++       doc="Stop visible background processes (``/stop``), answering the count killed.")
+ 
+ 
+ class AgentsListParams(Params):
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -260,9 +260,16 @@
+ 
+ 
+ def _stop_processes(params):
+-    registry = _tools_mod("tools.process_registry").process_registry
+-    killed = registry.kill_all(source="process.stop")
+-    return dict(registry.web_custody_receipt(), killed=killed)
++    from hermes_cli.process_presentation import stop_presented_processes
++    return stop_presented_processes("process.stop")
++
++
++def _agents_processes(params):
++    from hermes_cli.process_presentation import process_presentation
++    with process_presentation():
++        return {"processes": [
++            {"session_id": p["session_id"], "command": p["command"][:80], "status": p["status"], "uptime": p["uptime_seconds"]}
++            for p in _tools_mod("tools.process_registry").process_registry.list_sessions(visible_only=True)]}
+ 
+ 
+ # One-expression handlers: name → (fail_code, payload builder(params)).
+@@ -276,29 +283,49 @@
+         for n, i in _tools_mod("hermes_cli.plugins").get_plugin_manager()._plugins.items()]}),
+     "tools.list": (5031, lambda params: {"toolsets": _toolset_rows(params, with_tools=True)}),
+     "toolsets.list": (5032, lambda params: {"toolsets": _toolset_rows(params, with_tools=False)}),
+-    "agents.list": (5033, lambda params: {"processes": [
+-        {"session_id": p["session_id"], "command": p["command"][:80], "status": p["status"], "uptime": p["uptime_seconds"]}
+-        for p in _tools_mod("tools.process_registry").process_registry.list_sessions()]}),
++    "agents.list": (5033, _agents_processes),
+ }
+ for _name, (_code, _build) in _SIMPLE_RPCS.items():
+     # Look the builder up at call time: bind_module rebinds the table's lambdas onto server globals.
+     _rpc(_name, _code)(lambda rid, params, _n=_name: _ok(rid, _SIMPLE_RPCS[_n][1](params)))
+ del _name, _code, _build
+-_rpc("process.list", 5010, live_session=True)(
++def _process_rpc(name):
++    """Process reads/controls never build an agent before checking authority."""
++    def decorate(body):
++        @_rpc(name, 5010)
++        def handler(rid, params):
++            from hermes_cli.process_presentation import process_presentation
++            session, err = _sess_nowait(params, rid)
++            if err:
++                return err
++            with process_presentation(session=session):
++                return body(rid, params, session)
++        return handler
++    return decorate
++
++
++_process_rpc("process.list")(
+     lambda rid, params, session: _ok(rid, {"processes": _session_processes(session)}))
+ 
+ 
+-@_rpc("process.kill", live_session=True, fail_code=5010)
++@_process_rpc("process.kill")
+ def _(rid, params: dict, session) -> dict:
+-    """Kill ONE background process, scoped to the caller's session (unlike process.stop's kill_all)."""
++    """Kill one visible process after tool authority and conversation ownership checks."""
++    from hermes_cli.process_presentation import process_presentation
++    from tools.process_registry_authority import require_visible, resolve_visible
+     proc_id = str(params.get("process_id") or "")
+-    if not proc_id:
+-        return _err(rid, 4012, "process_id required")
+-    registry = _tools_mod("tools.process_registry").process_registry
+-    proc = registry.get(proc_id)
+-    if proc is None or str(getattr(proc, "session_key", "") or "") != str(session.get("session_key") or ""):
+-        return _err(rid, 4044, f"no such process: {proc_id}")
+-    return _ok(rid, registry.kill_process(proc_id))
++    with process_presentation(session=session, mutation={"action": "kill", "session_id": proc_id}):
++        if not proc_id:
++            return _err(rid, 4012, "process_id required")
++        registry = _tools_mod("tools.process_registry").process_registry
++        proc = resolve_visible(registry, proc_id)
++        key = str(session.get("session_key") or "")
++        if proc is None or not key or str(getattr(proc, "session_key", "") or "") != key:
++            return _err(rid, 4044, "no such process")
++        require_visible(proc)
++        result = registry.kill_process(proc.id)
++        require_visible(proc)
++        return _ok(rid, result)
+ 
+ 
+ def _mcp_reload_confirm_required() -> bool:
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1114,7 +1114,13 @@
+     display_metadata: dict | None = None, image_paths: list[str] | None = None,
+     queued_prompt_generation: int | None = None,
+     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
+-    turn_author: dict | None = None) -> bool:
++    turn_author: dict | None = None, process_events=()) -> bool:
++    from copy import deepcopy
++    from tools.process_registry_authority import event_visible
++    from hermes_cli.friday_user_scope import ScopeDenied
++    process_events = deepcopy(tuple(process_events))
++    if not all(event_visible(event, session.get("agent")) for event in process_events):
++        raise ScopeDenied()
+     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
+     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
+     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
+@@ -1160,10 +1166,12 @@
+         st = _TurnRun(
+             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
+             receipt_committed=terminal_callback is None)
+-        st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
+-            notification_category=(display_metadata or {}).get("notification_category"))
+         goal_followup = None
+         try:
++            if not all(event_visible(event, session.get("agent")) for event in process_events):
++                raise ScopeDenied()
++            st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
++                notification_category=(display_metadata or {}).get("notification_category"))
+             prepared = _prepare_turn_input(sid, session, st, text, images)
+             if prepared is None:
+                 if st.terminal_callback is not None and not st.receipt_attempted:
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -3488,21 +3488,26 @@
+ 
+ 
+ def _session_processes(session: dict) -> list:
+-    """Background processes owned by this session (registry session_key match)."""
+-    # Drain completion notifications that arrived during this turn. The background poller handles
+-    # between-turn delivery; this is the safety net for events that arrived mid-turn. Ownership filter
+-    # (#42674, #35652): a turn finishing in session B must not consume an event that belongs to session A.
+-    # The registry requeues every addressed event this session cannot positively claim; the poller then
+-    # delivers it to a live owner or drops an orphan.
++    """Visible background processes, additionally filtered by conversation key."""
+     from tools.process_registry import process_registry
+-    key = str(session.get("session_key") or "")
+-    owned = []
+-    for entry in process_registry.list_sessions():
+-        proc = process_registry.get(entry["session_id"])
+-        if proc is not None and str(getattr(proc, "session_key", "") or "") == key:
+-            entry["output_tail"] = (proc.output_buffer or "")[-4000:]  # the 200-char list preview is too thin for the viewer
+-            owned.append(entry)
+-    return owned
++    from tools.process_registry_authority import require_visible, resolve_visible
++    from hermes_cli.process_presentation import process_presentation
++    with process_presentation(session=session):
++        key = str(session.get("session_key") or "")
++        if not key:
++            return []
++        owned = []
++        checked = []
++        for entry in process_registry.list_sessions(session_key=key, visible_only=True):
++            proc = resolve_visible(process_registry, entry["session_id"])
++            if proc is not None and str(getattr(proc, "session_key", "") or "") == key:
++                require_visible(proc)
++                entry["output_tail"] = (proc.output_buffer or "")[-4000:]
++                checked.append(proc)
++                owned.append(entry)
++        for proc in checked:
++            require_visible(proc)
++        return owned
+ 
+ 
+ # Serialize reload.mcp (runs on the pool): overlapping shutdown+discover pairs would leave the registry half-built.
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -160,14 +160,20 @@
+     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
+ 
+ 
+-def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> None:
++def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, *, process_events=(), **kwargs) -> None:
+     """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure."""
+     try:
+         from gateway.warning_notifications import render_notification
++        from tools.process_registry_authority import event_visible
++        from hermes_cli.friday_user_scope import ScopeDenied
+         with _session_profile_runtime_scope(session):
++            if not all(event_visible(event, session.get("agent")) for event in process_events):
++                raise ScopeDenied()
+             render_notification(lambda: _emit("message.start", sid), platform="tui",
+                                 diagnostic=(kwargs.get("display_metadata") or {}).get("notification_category") == "diagnostic")
+-        _run_prompt_submit(rid, sid, session, text, **kwargs)
++        if not all(event_visible(event, session.get("agent")) for event in process_events):
++            raise ScopeDenied()
++        _run_prompt_submit(rid, sid, session, text, process_events=process_events, **kwargs)
+     except Exception as exc:
+         _notif_log_failure(what, exc)
+         _notif_release_turn(session)
+@@ -495,7 +501,7 @@
+     if diagnostic_process_event(evt):
+         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"
+     try:
+-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
++        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", process_events=(evt,), **kwargs)
+     except Exception:
+         release_event_delivery(evt, claim)
+         return
+@@ -536,6 +542,9 @@
+         return True
+     if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
+         return True
++    from tools.process_registry_authority import event_visible
++    if not event_visible(evt, session.get("agent")):
++        return True
+     text = fmt(evt)
+     if not text:
+         return True
+@@ -572,6 +581,8 @@
+     from tools.process_registry_notifications import PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch
+     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
+ 
++    from tools.process_registry_authority import event_visible
++    notifications = [(event, text) for event, text in notifications if event_visible(event, session.get("agent"))]
+     if not notifications:
+         return
+     if not _notif_claim_turn(session):
+@@ -598,7 +609,8 @@
+     try:
+         if text is not None:
+             _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
+-                          "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
++                          "completion batch dispatch failed", process_events=tuple(event for event, _text, _claim in claimed),
++                          display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
+                           display_metadata={"display_text": batch.display_text(registry)})
+     except Exception:
+         for event, _text, claim in claimed:
+@@ -810,12 +822,26 @@
+         if not session_key:
+             return ""
+         with _sessions_lock:
+-            return next((sid for sid, s in _sessions.items() if str(s.get("session_key") or "") == session_key), "")
++            candidates = [(sid, s) for sid, s in _sessions.items() if str(s.get("session_key") or "") == session_key]
++        from tools.process_registry_authority import event_visible, copy_authority
++        event = {"user_authority": copy_authority(session)}
++        for sid, recipient in candidates:
++            # Do not switch homes under an inherited capability merely to probe it.
++            if event["user_authority"] is not None and str(_session_home(recipient)) != event["user_authority"].get("home"):
++                continue
++            with _session_profile_runtime_scope(recipient):
++                if event_visible(event, recipient.get("agent")):
++                    return sid
++        return ""
++    def emit_owned(event, session, payload):
++        sid = _owner_sid(session)
++        if sid:
++            _emit(event, sid, payload)
+     if getattr(process_registry, "on_output", None) is None:
+-        process_registry.on_output = lambda session, chunk: _emit(
+-            "agent.terminal.output", _owner_sid(session), {"process_id": session.id, "chunk": chunk})
++        process_registry.on_output = lambda session, chunk: emit_owned(
++            "agent.terminal.output", session, {"process_id": session.id, "chunk": chunk})
+     if getattr(process_registry, "on_close", None) is None:
+-        process_registry.on_close = lambda session, pid: _emit("terminal.close", _owner_sid(session), {"process_id": pid})
++        process_registry.on_close = lambda session, pid: emit_owned("terminal.close", session, {"process_id": pid})
+     if not _desktop_ui_wired:
+         with contextlib.suppress(Exception):
+             from tools import desktop_ui

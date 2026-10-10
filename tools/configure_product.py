@@ -30,7 +30,7 @@ INFERENCE = frozenset({'base_url', 'model', 'key_env', 'context', 'max_input',
 AUTH_NAMES = ('HERMES_DASHBOARD_BASIC_AUTH_USERNAME',
               'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH', 'HERMES_DASHBOARD_BASIC_AUTH_SECRET')
 NORMAL_TOOLSETS = ['hermes-cli', 'web', 'friday_rework']
-USER_TOOLSETS = ['web', 'memory', 'file', 'session_search', 'friday_rework']
+USER_TOOLSETS = ['web', 'memory', 'file', 'session_search', 'delegation', 'skills', 'friday_rework']
 
 
 def _exact(value, keys, label):
@@ -222,7 +222,7 @@ def compose_product(spec):
     ordinary['plugins']['entries']['friday_rework']['settings'] = {
         'runtime': {'enabled': False}, 'results': {'enabled': True}}
     # Per-user native skill dirs start empty; no owner/project auto-discovery.
-    ordinary['skills'].update(external_dirs=[], project_discovery=False, trusted_project_dirs=[], auto_load=[])
+    ordinary['skills'].update(create_dir=None, external_dirs=[], project_discovery=False, trusted_project_dirs=[], auto_load=[])
     web_names = ['EXA_API_KEY'] if web['profile'] == 'exa-paid' else []
     service_names = []
     required = [inference['key_env'], *web_names]
@@ -234,6 +234,13 @@ def compose_product(spec):
     if (len(set(required)) != len(required) or inference['key_env'] in AUTH_NAMES
             or any(inference['key_env'] in names for names in channel_names.values())):
         raise ValueError('separate_scoped_credential_references_required')
+    # A normal installation must carry the scoped native delegation overlay.
+    # Do not render an apparently complete profile against the older denied surface.
+    if 'delegate_task' not in scope.SAFE:
+        raise ValueError('scoped_native_delegation_required')
+    # Skill toolsets require matching scoped native capabilities as well.
+    if not {'skills_list', 'skill_view', 'skill_manage'} <= scope.SAFE:
+        raise ValueError('scoped_native_skills_required')
     template = {'config': ordinary, 'tools': sorted(scope.SAFE), 'required_secrets': required}
     # Installation-owned declarations only: never propagate owner readiness,
     # profile identity, receipts, keys or per-job capabilities into a user.

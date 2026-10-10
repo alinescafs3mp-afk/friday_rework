@@ -1,0 +1,309 @@
+diff --git a/agent/client_lifecycle.py b/agent/client_lifecycle.py
+--- a/agent/client_lifecycle.py
++++ b/agent/client_lifecycle.py
+@@ -204,6 +204,8 @@
+     def _close_openai_client(self, client: Any, *, reason: str, shared: bool) -> None:
+         if client is None:
+             return
++        if not shared and getattr(self, "_friday_delegation", None) is not None:
++            return self._close_scoped_request_client(_OPENAI_SLOT, client)
+         ctx = self._client_log_context()
+         # Force-close TCP sockets first (no CLOSE-WAIT accumulation), then the graceful SDK close.
+         force_closed = self._force_close_tcp_sockets(client)
+@@ -401,8 +403,37 @@
+                 if reason in self._REQUEST_CLIENT_REUSE_REASONS and not cache["poisoned"]:
+                     cache["in_use"] = False
+                     return True
++                if getattr(self, "_friday_delegation", None) is not None:
++                    # Transfer ownership BEFORE the request registry/cache releases it.
++                    self._retain_scoped_request_client(slot_attr, client)
+                 _reset_slot(cache)
++            elif getattr(self, "_friday_delegation", None) is not None and client is not None:
++                # Concurrent uncached requests own an equally real client.
++                self._retain_scoped_request_client(slot_attr, client)
+         return False
++
++    def _retain_scoped_request_client(self, slot_attr: str, client: Any) -> None:
++        with self._openai_client_lock():
++            pending = getattr(self, "_friday_pending_request_clients", None)
++            if pending is None:
++                self._friday_pending_request_clients = pending = []
++            if not any(row["client"] is client for row in pending):
++                pending.append({"slot": slot_attr, "client": client})
++
++    def _close_scoped_request_client(self, slot_attr: str, client: Any) -> None:
++        """Owner-thread close; a failed SDK operation keeps the exact native handle."""
++        if client is None:
++            return
++        with self._openai_client_lock():
++            self._retain_scoped_request_client(slot_attr, client)
++            try:
++                self._force_close_tcp_sockets(client)
++                client.close()
++            except BaseException:
++                self._friday_delegation.update(cancelled=True, cleanup_unconfirmed=True)
++                raise RuntimeError("native_delegation_STOP_UNCONFIRMED") from None
++            self._friday_pending_request_clients[:] = [
++                row for row in self._friday_pending_request_clients if row["client"] is not client]
+ 
+     def _take_request_slot(self, slot_attr: str) -> tuple:
+         """Teardown: empty the slot and return ``(client, was_in_use)``."""
+@@ -477,22 +508,39 @@
+             self._close_openai_client(client, reason=reason, shared=False)
+ 
+     def _close_scoped_request_slot(self, slot_attr: str) -> None:
+-        """A checked-out or failed-close client remains in its exact native cache slot."""
++        """Drain this agent's retained owner releases and its inactive cache slot."""
+         with self._openai_client_lock():
+             cache = getattr(self, slot_attr, None)
+             client = cache.get("client") if cache else None
+-            if client is None:
+-                return
+-            if cache.get("in_use"):
+-                raise RuntimeError("native_delegation_STOP_UNCONFIRMED")
+-            # No active owner: use the existing close operation, but keep its handle on failure.
+-            self._force_close_tcp_sockets(client)
+-            client.close()
+-            _reset_slot(cache)
++            failures = []
++            pending = list(getattr(self, "_friday_pending_request_clients", ()))
++            for row in pending:
++                if row["slot"] == slot_attr:
++                    try:
++                        self._close_scoped_request_client(slot_attr, row["client"])
++                    except BaseException as exc:
++                        failures.append(exc)
++            if client is not None:
++                if cache.get("in_use"):
++                    failures.append(RuntimeError("native_delegation_STOP_UNCONFIRMED"))
++                elif any(row["client"] is client and row["slot"] == slot_attr for row in pending):
++                    # One attempt per handle in this cleanup slice, even when the
++                    # retained failed client is also still the inactive cache client.
++                    if not any(row["client"] is client for row in self._friday_pending_request_clients):
++                        _reset_slot(cache)
++                else:
++                    try:
++                        self._close_scoped_request_client(slot_attr, client)
++                    except BaseException as exc:
++                        failures.append(exc)
++                    else:
++                        _reset_slot(cache)
++            if failures:
++                raise RuntimeError("native_delegation_STOP_UNCONFIRMED") from None
+ 
+     def _close_cached_request_openai_client(self, *, reason: str) -> None:
+         """Teardown hook: really close the cached per-request wire client."""
+-        if getattr(self, "_friday_cleanup_in_progress", False):
++        if getattr(self, "_friday_delegation", None) is not None:
+             return self._close_scoped_request_slot(_OPENAI_SLOT)
+         client, in_use = self._take_request_slot(_OPENAI_SLOT)
+         if client is None:
+@@ -555,6 +603,8 @@
+         """Owner-thread close: clean finish keeps the pool warm; otherwise force-close sockets (CLOSE-WAIT) + SDK close."""
+         if client is None or self._release_request_slot(_ANTHROPIC_SLOT, client, reason):
+             return
++        if getattr(self, "_friday_delegation", None) is not None:
++            return self._close_scoped_request_client(_ANTHROPIC_SLOT, client)
+         try:
+             self._force_close_tcp_sockets(client)
+             client.close()
+@@ -566,7 +616,7 @@
+ 
+     def _close_cached_request_anthropic_client(self, *, reason: str) -> None:
+         """Teardown hook: really close the cached per-request Anthropic client."""
+-        if getattr(self, "_friday_cleanup_in_progress", False):
++        if getattr(self, "_friday_delegation", None) is not None:
+             return self._close_scoped_request_slot(_ANTHROPIC_SLOT)
+         client, in_use = self._take_request_slot(_ANTHROPIC_SLOT)
+         if client is None:
+diff --git a/gateway/run_notifications.py b/gateway/run_notifications.py
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -1192,7 +1192,23 @@
+         if evt.get("type") == "async_delegation":
+             info = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
+             fail = "Async delegation delivery persist failed for session %s: %s"
+-            deliver = lambda: persist_delegation_delivery(adapter, text=synth_text, session_id=raw_sid, evt=evt)  # noqa: E731
++            # Snapshot the original event/pin, not a future grant or mutable producer dict.
++            import copy
++            import contextvars
++            retained_evt = dict(evt)
++            retained_evt["friday_user_authority"] = copy.deepcopy(evt.get("friday_user_authority"))
++            authority_context = contextvars.copy_context()
++
++            def authority_guard():
++                if (retained_evt.get("friday_user_authority") is not None
++                        and _raw_process_event_session_id(retained_evt) != raw_sid):
++                    return False
++                return authority_context.copy().run(
++                    self._delegation_notice_visible, retained_evt, require_authority=True)
++
++            deliver = lambda: persist_delegation_delivery(  # noqa: E731
++                adapter, text=synth_text, session_id=raw_sid, evt=retained_evt,
++                authority_guard=authority_guard)
+         else:
+             info = "Watch pattern notification — waking api_server session %s via self-post"
+             fail = "Watch notification self-post wake failed for session %s: %s"
+@@ -1486,9 +1502,9 @@
+                 return False
+         return True
+ 
+-    def _delegation_notice_visible(self, evt: dict, *, source=None) -> bool:
+-        """An interim notice uses the retained pin, never the final delivery row."""
+-        if evt.get("type") != "async_delegation" or not evt.get("task_failure_notice"):
++    def _delegation_notice_visible(self, evt: dict, *, source=None, require_authority=False) -> bool:
++        """A notice uses the retained pin; API writes also check final events here."""
++        if evt.get("type") != "async_delegation" or (not require_authority and not evt.get("task_failure_notice")):
+             return True
+         from tools.async_delegation import _visible
+         from hermes_cli.friday_user_scope import scoped_source, ScopeDenied
+diff --git a/gateway/wake.py b/gateway/wake.py
+--- a/gateway/wake.py
++++ b/gateway/wake.py
+@@ -139,7 +139,8 @@
+     return metadata
+ 
+ 
+-async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: str, evt: Optional[dict] = None) -> None:
++async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: str,
++                                      evt: Optional[dict] = None, authority_guard=None) -> None:
+     """Persist an async-delegation completion as a durable DELIVERY row (see module docstring)
+     WITHOUT running any agent turn. Raises on failure so the caller can release the durable claim
+     and retry.
+@@ -174,9 +175,18 @@
+                 session_id = str(resolved)
+         except Exception:
+             logger.debug("delegation delivery continuation resolve failed for %s", session_id, exc_info=True)
+-    await asyncio.to_thread(
+-        db.append_delegation_delivery, session_id, text, _delegation_display_metadata(evt or {}),
+-    )
++    metadata = _delegation_display_metadata(evt or {})
++    if authority_guard is None:
++        # Preserve ordinary unscoped callers. A retained protected event cannot
++        # bypass the actual gateway source check by calling this helper directly.
++        if (evt or {}).get("friday_user_authority") is not None:
++            raise PermissionError("native_delegation_delivery_authority_required")
++        await asyncio.to_thread(db.append_delegation_delivery, session_id, text, metadata)
++    else:
++        await asyncio.to_thread(
++            db.append_delegation_delivery, session_id, text, metadata,
++            authority_guard=authority_guard,
++        )
+     logger.info(
+         "async delegation completion persisted as delivery row for api_server session %s (no wake turn)", session_id
+     )
+diff --git a/hermes_state_messages.py b/hermes_state_messages.py
+--- a/hermes_state_messages.py
++++ b/hermes_state_messages.py
+@@ -411,7 +411,8 @@
+         # holding the lock for seconds (VACUUM, checkpoint) can't kill it.
+         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+ 
+-    def append_delegation_delivery(self, session_id: str, content: str, metadata: Dict[str, Any]) -> int:
++    def append_delegation_delivery(self, session_id: str, content: str, metadata: Dict[str, Any],
++                                   *, authority_guard=None) -> int:
+         """Record a detached API result once, between client turns, including replay after rotation.
+ 
+         The event's unit id, not its text or active flag, is the identity. Check and insert
+@@ -427,6 +428,10 @@
+         params = self._message_row_params(session_id, "user", msg, None, time.time(), keep_reasoning=True)
+ 
+         def _do(conn):
++            # Run in the actual writer operation, including every lock retry.
++            # Never persist the authority callback or its private identity in metadata.
++            if authority_guard is not None and not authority_guard():
++                raise PermissionError("native_delegation_delivery_authority_revoked")
+             existing = conn.execute(
+                 """WITH RECURSIVE lineage(id) AS (
+                     SELECT ? UNION
+@@ -440,6 +445,8 @@
+             if existing is not None:
+                 return existing[0]
+             self._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
++            if authority_guard is not None and not authority_guard():
++                raise PermissionError("native_delegation_delivery_authority_revoked")
+             msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+             self._bump_session_counters(conn, session_id, 1, 0, unit=True)
+             return msg_id
+diff --git a/tools/delegate_tool_child_run.py b/tools/delegate_tool_child_run.py
+--- a/tools/delegate_tool_child_run.py
++++ b/tools/delegate_tool_child_run.py
+@@ -426,9 +426,22 @@
+     sweep + one delayed re-sweep for a connection opened in between; a worker that still won't settle keeps its
+     resources until process exit.
+     """
+-    child_future.add_done_callback(
+-        lambda _done: cleanup() if cleanup is not None else
+-        _close_child(child, "Failed to close timed-out child after worker exit"))
++    # Future callbacks execute after submit's context has unwound, or inline
++    # during registration if already done. Retain the original context in both cases.
++    callback_context = contextvars.copy_context() if getattr(child, "_friday_delegation", None) is not None else None
++
++    def _finish(_done):
++        def _cleanup():
++            if cleanup is not None:
++                cleanup()
++            else:
++                _close_child(child, "Failed to close timed-out child after worker exit")
++        if callback_context is None:
++            _cleanup()
++        else:
++            callback_context.run(_cleanup)
++
++    child_future.add_done_callback(_finish)
+     # Bounded drain (#94248 native half): the deferred close above only fires once the abandoned worker
+     # unwinds, but that worker is typically parked inside an in-flight OpenSSL read (Codex / httpx). Never
+     # hard-close that transport from this thread — releasing FDs under a live SSL read is the #29507/#70773
+@@ -1082,6 +1095,13 @@
+         heartbeat.stop()
+         delegated = getattr(child, "_friday_delegation", None)
+         if delegated is not None:
++            # Pin the actual original profile and existing host before deferring.
++            # A later operator context or a replacement host cannot adopt cleanup.
++            from agent import relay_runtime
++            if not hasattr(self, "_cleanup_profile_key"):
++                self._cleanup_profile_key = relay_runtime.current_profile_key()
++                self._cleanup_runtime = relay_runtime.get_runtime(
++                    create=False, profile_key=self._cleanup_profile_key)
+             if close_deferred:
+                 _stop_unconfirmed(child)
+                 # Register only after the finally path owns the lease/registry teardown.
+@@ -1092,6 +1112,18 @@
+                 # Callback registration may run inline if the future just settled;
+                 # retain a conservative outcome without overwriting confirmed cleanup.
+                 raise RuntimeError("native_delegation_STOP_UNCONFIRMED")
++            try:
++                child_sid = str(getattr(child, "session_id", "") or "")
++                if relay_runtime.current_profile_key() != self._cleanup_profile_key:
++                    raise _stop_unconfirmed(child)
++                runtime = relay_runtime.get_runtime(create=False, profile_key=self._cleanup_profile_key)
++                if self._cleanup_runtime is not None and runtime is not self._cleanup_runtime:
++                    raise _stop_unconfirmed(child)
++                if relay_runtime.SESSION_COORDINATOR.has_active_turn(
++                        profile_key=self._cleanup_profile_key, session_id=child_sid):
++                    raise _stop_unconfirmed(child)
++            except BaseException:
++                raise _stop_unconfirmed(child) from None
+             _close_child(child, "Failed to close scoped child after delegation")
+             # Ancillary cleanup is also part of this boundary. Its failures must not
+             # disappear behind best-effort helpers after the live controls were removed.
+@@ -1104,11 +1136,17 @@
+                 child_sid = str(getattr(child, "session_id", "") or "")
+                 shutdown_kernels_for_delegated_child(child_sid)
+                 from agent import relay_runtime
+-                runtime = relay_runtime.get_runtime(create=False)
++                if relay_runtime.current_profile_key() != self._cleanup_profile_key:
++                    raise _stop_unconfirmed(child)
++                runtime = relay_runtime.get_runtime(create=False, profile_key=self._cleanup_profile_key)
++                if self._cleanup_runtime is not None and runtime is not self._cleanup_runtime:
++                    raise _stop_unconfirmed(child)
+                 if relay_runtime.SESSION_COORDINATOR.has_active_turn(
+-                        profile_key=relay_runtime.current_profile_key(), session_id=child_sid):
++                        profile_key=self._cleanup_profile_key, session_id=child_sid):
+                     raise _stop_unconfirmed(child)
+                 if runtime is not None and child_sid:
++                    # Keep its exact host if the worker created it after registration.
++                    self._cleanup_runtime = runtime
+                     runtime.unregister_subagent({"child_session_id": child_sid})
+                 if child_pool is not None and leased_cred_id is not None:
+                     child_pool.release_lease(leased_cred_id)

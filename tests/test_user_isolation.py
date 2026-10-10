@@ -480,10 +480,10 @@ def test_same_user_id_in_second_configured_native_account_is_a_distinct_principa
     from tools.memory_tool import MemoryStore
     other=users.root/'profiles/other';other.mkdir(mode=0o700)
     binding=dict(platform='telegram',transport_profile='other',account_id='bot-B',user_id='1',
-                 runtime_profile='account-B-user-1',tools=['memory','session_search','read_file','write_file'])
+                 runtime_profile='account-b-user-1',tools=['memory','session_search','read_file','write_file'])
     cfg={'plugins':{'entries':{'friday_rework':{'settings':{
         'product_access':{'enabled':True,'accounts':[dict(platform='telegram',transport_profile='other',
-            account_id='bot-B',runtime_profiles=['account-B-user-1'])]},
+            account_id='bot-B',runtime_profiles=['account-b-user-1'])]},
         'user_isolation':{'enabled':True,'bindings':[binding]}}}}}}
     (other/'config.yaml').write_text(json.dumps(cfg));(other/'config.yaml').chmod(0o600)
     with scope.authority(other):
@@ -492,8 +492,8 @@ def test_same_user_id_in_second_configured_native_account_is_a_distinct_principa
         state.set(KEY,{'schema':KEY,'users':{principal_id(*(row[k] for k in
             ('platform','transport_profile','account_id','user_id'))):row}})
     home=scope.provision_new_home(other,binding,{})
-    source=SessionSource(Platform.TELEGRAM,'shared-chat',user_id='1',profile='account-B-user-1')
-    source._identity=RoutingIdentity('other','account-B-user-1',other,home)
+    source=SessionSource(Platform.TELEGRAM,'shared-chat',user_id='1',profile='account-b-user-1')
+    source._identity=RoutingIdentity('other','account-b-user-1',other,home)
     assert users.gateway._principal_authorized(source,allow_adapter_delegation=True)
     with users.enter(0):
         memory=MemoryStore();memory.load_from_disk();memory.add('memory','ACCOUNT-A-PRIVATE')
