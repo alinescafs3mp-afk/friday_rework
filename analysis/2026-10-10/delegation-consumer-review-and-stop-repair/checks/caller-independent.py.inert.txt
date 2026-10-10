@@ -1,0 +1,413 @@
+"""Independent, finite AST/inert review. Never imports a candidate module."""
+import ast, builtins, hashlib, io, json, os, resource
+from pathlib import Path
+from types import SimpleNamespace as N
+
+os.sched_setaffinity(0, {0, 1})
+resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))
+OUT = Path(__file__).parent
+BASE = Path('/PRIVATE_SOL_RUNTIME')
+E = BASE/'FRW041-CALLER-CONTROL-EXCEPTION-REPAIR-evidence'
+A = Path('/PRIVATE_ASTRA_RUNTIME')
+pins = {}
+def pin(path, expected=None):
+    path = Path(path); data = path.read_bytes(); h = hashlib.sha256(data).hexdigest()
+    assert expected is None or h == expected, (path, h, expected)
+    pins[str(path)] = {'sha256': h, 'bytes': len(data)}
+    return data
+pin(E/'source-pins.json', '82d226d93958f9722a663a8e09e3d64ab79155e14031b29a47565b8c57b5a062')
+spec = json.loads((E/'source-pins.json').read_text())
+sources = {}
+for item in spec['files']:
+    sources[item['relative']] = {k: pin(item[k]['path'], item[k]['sha256']).decode() for k in ('before', 'after')}
+    assert (sources[item['relative']]['before'] != sources[item['relative']]['after']) == item['changed']
+for path, expected in json.loads((E/'input-pins.json').read_text()).items(): pin(path, expected)
+for path, expected in [
+    (BASE/'FRW041-CALLER-CONTROL-EXCEPTION-REPAIR-RESULT.json','3b12cc622349f0cf46a8ff19dc87aee733c29007b54682d80fbf11baa854a6ee'),
+    (E/'REPORT.md','1547196ce9526d8c15c1911eae5029727f1a1c68a3575a5ad5aa8287c3a50b42'),
+    (E/'source-checks.json','e93b38d2fb787f99916f95a37cde49ca5ded2d2e83c2312f08c3802e704d770b'),
+    (A/'CALLER-CONTROL-EXCEPTION-REPAIR-SOL-RECEIVED.json','c9b26f74125254a004d8b4ce77017274bbdbd684c94229571d0345b5d3961b31'),
+    (A/'native-helper-build-sources/bubblewrap-0.11.1-patched/bubblewrap.c','ee31ef74f0f01efe0aaba4324821d3ccd3b0874fc8099dd07026fd57012b5d0b'),
+]: pin(path, expected)
+binding = json.loads(pin(E/'G1-source-binding.json'))
+for entry in binding['ordinary_current_consumers']: pin(entry['path'], entry['sha256'])
+pin(binding['offered_existing_entry']['path'], binding['offered_existing_entry']['sha256'])
+pin(binding['inert_prior_entry']['path'], binding['inert_prior_entry']['sha256'])
+
+def definitions(source):
+    result = {}
+    def visit(nodes, prefix=''):
+        for n in nodes:
+            if isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+                result[prefix+n.name] = ast.dump(n, include_attributes=False)
+                if isinstance(n, ast.ClassDef): visit(n.body, prefix+n.name+'.')
+    visit(ast.parse(source).body); return result
+delta = {}
+for filename, pair in sources.items():
+    b, a = (definitions(pair[k]) for k in ('before', 'after'))
+    delta[filename] = {'changed': [k for k in b if k in a and b[k] != a[k]],
+                       'added': sorted(set(a)-set(b)), 'removed': sorted(set(b)-set(a))}
+assert not any(v['removed'] for v in delta.values())
+assert delta['scripts/dsh_prepare.py']['changed'] == ['_run_caller']
+assert delta['scripts/install_containment.py']['changed'] == ['CallerControl', 'CallerControl.__init__', 'CallerControl._own', 'CallerControl.spawned', 'CallerControl.native_data', 'CallerControl.signal_owned', 'CallerControl.close']
+
+class Requirement(RuntimeError): pass
+def require(value, msg):
+    if not value: raise Requirement(msg)
+
+def extract(source, selected, namespace):
+    tree = ast.parse(source)
+    body = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in selected]
+    exec(compile(ast.Module(body=body, type_ignores=[]), '<selected-source-functions>', 'exec'), namespace)
+
+class Probe:
+    """All effects below are inert Python data updates; no real fd/process exists."""
+    def __init__(self, version='after', fault=None, nonzero=False):
+        self.version=version; self.fault=fault; self.nonzero=nonzero; self.events=[]; self.used=set()
+        self.now=10.; self.deadline=180.; self.live=set(range(10,20)); self.reused=set()
+        self.usage=N(ru_utime=.01, ru_stime=.02)
+        self.process=N(pid=222, returncode=None, stdout=self.stream(100,'stdout'), stderr=self.stream(101,'stderr'))
+        self.selector=self.make_selector()
+        mods={
+            'resource': N(getrusage=lambda _:self.usage, RUSAGE_SELF=0),
+            'selectors': N(DefaultSelector=self.default_selector, EVENT_READ=1),
+            'signal': N(pidfd_send_signal=self.send_signal, SIGKILL=9),
+            'select': N(select=self.select_fd),
+            'scripts.install_containment': N(require_caller=require),
+        }
+        def importer(name, *args, **kwargs):
+            assert name in mods, ('unexpected selected-body import',name)
+            return mods[name]
+        self.importer=importer
+        bi=dict(vars(builtins));bi['__import__']=importer
+        self.ns={'__builtins__':bi, 'hashlib':hashlib, 'json':json,
+                 'require_caller':require, 'time':N(monotonic=self.tick),
+                 'CALLER_TOPOLOGY':'inert-existing-topology',
+                 'os':N(close=self.close_fd, write=self.write, read=self.read,
+                        pidfd_open=self.pidfd_open, open=self.open_fd,
+                        set_blocking=lambda *args:None, wait4=self.wait4,
+                        waitstatus_to_exitcode=lambda x:x, WNOHANG=1,
+                        O_PATH=1,O_DIRECTORY=2,O_CLOEXEC=4,O_WRONLY=8,O_CREAT=16,O_EXCL=32,O_NOFOLLOW=64,
+                        fdopen=lambda *args:self.output_stream(),fsync=lambda *args:None),
+                 'subprocess':N(Popen=self.popen, DEVNULL=-1,PIPE=-2),
+                 'host_identity':self.host_identity, 'pidfd_alive':lambda *args:None}
+        src=sources['scripts/install_containment.py'][version]
+        tree=ast.parse(src); cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='CallerControl')
+        names={'_own','_close_fd','_close_channel','spawned','native_data','signal_owned','terminal','close'}
+        cls.body=[n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name in names]
+        exec(compile(ast.Module(body=[cls],type_ignores=[]),'<selected-CallerControl-methods>','exec'),self.ns)
+        extract(src,{'caller_transition','parse_native_record','validate_host_binding'},self.ns)
+        self.ns['strict_object']=json.loads
+        dsh=sources['scripts/dsh_prepare.py'][version]
+        fields=next(n for n in ast.parse(dsh).body if isinstance(n,ast.Assign) and any(isinstance(x,ast.Name) and x.id=='SAFE_OBSERVATION_FIELDS' for x in n.targets))
+        self.ns['SAFE_OBSERVATION_FIELDS']=ast.literal_eval(fields.value)
+        extract(dsh, {'StopUnconfirmed','safe_observation','CommandFailed','_run_caller'},self.ns)
+        c=self.ns['CallerControl'](); self.control=c
+        c.fds=set(); c.fd_records={};c.channel_records={};c.cleanup_errors=[]
+        c.clock={'deadline_monotonic':180.,'started_monotonic':0.,'boot_id':'boot'}
+        c.budget=N(check=self.budget_check);c.monitor_fd=c.caller_fd=None;c.monitor=c.caller=None
+        c.controller=self.host_identity(111);c.quality=19;c.status_r=10;c.status_w=11;c.gate_r=12;c.gate_w=15
+        c.channel=self.channel('channel');c.child_channel=self.channel('child_channel')
+        c.state='CREATED';c.status=b'';c.rows=[];c.refused=False;c.terminal_confirmed=False;c.closed=False
+        c.consumed=False;c.owned_process=c.owned_selector=None
+        c.output=Path('/INERT-NEVER-OPENED'); c.config={'permit':{},'runner_sources':{}}
+        c.permit={'plan':'selected','source_manifest_sha256':'inert'};c.pin={}
+        c.quality_lock=lambda:self.events.append(['quality_observed'])
+        c.prepare=self.prepare; c.control_data=self.control_data
+        for fd in (10,11,12,15,19): c._own(fd)
+        if version=='after':
+            probe=self
+            class Records(dict):
+                def __setitem__(self,key,value):
+                    if key==15 and value=='CLOSED' and probe.once('gate_cancel_after_close'):
+                        raise KeyboardInterrupt('after close, before CLOSED')
+                    super().__setitem__(key,value)
+            c.fd_records=Records(c.fd_records)
+        else:
+            probe=self
+            class FDSet(set):
+                def remove(self,key):
+                    if key==15 and probe.once('gate_cancel_after_close'):raise KeyboardInterrupt('after close before remove')
+                    super().remove(key)
+            c.fds=FDSet(c.fds)
+    def once(self,name):
+        active = self.fault==name or (isinstance(self.fault,tuple) and name in self.fault)
+        if active and name not in self.used: self.used.add(name);return True
+        return False
+    def stream(self,fd,name):
+        def close():
+            self.events.append([name+'_close'])
+            if self.once(name+'_close_error'):raise OSError(5,'inert stream close')
+        return N(fileno=lambda:fd,close=close)
+    def channel(self,name):
+        def close():
+            self.events.append([name+'_close'])
+            if self.once(name+'_close_error'):raise KeyboardInterrupt('inert channel close')
+        return N(close=close)
+    def default_selector(self):
+        if self.once('selector_create_error'):raise OSError(5,'inert selector construction')
+        return self.selector
+    def make_selector(self):
+        self.keys={};self.stage=0
+        def register(obj,mask,data):
+            if self.once('selector_register_error'):raise OSError(5,'inert registration')
+            self.keys[data]=N(fileobj=obj,fd=obj if isinstance(obj,int) else 500,data=data)
+        def unregister(obj):
+            for k,v in list(self.keys.items()):
+                if v.fileobj is obj or v.fileobj==obj:del self.keys[k];return
+            raise KeyError(obj)
+        def select(timeout):
+            self.events.append(['selector_select',self.stage])
+            if self.once('selector_select_error'):raise OSError(5,'inert selector')
+            self.stage+=1
+            kinds={1:['native'],2:['control'],3:['native','monitor'],4:['native','stdout','stderr']}.get(self.stage,[])
+            assert self.stage<=6, 'fixture would loop'
+            return [(self.keys[k],1) for k in kinds if k in self.keys]
+        def close():
+            self.events.append(['selector_close'])
+            if self.once('selector_close_error'):raise OSError(5,'inert selector close')
+        return N(register=register,unregister=unregister,select=select,get_map=lambda:self.keys,close=close)
+    def tick(self):
+        self.now+=.1
+        return self.now
+    def budget_check(self,**kwargs):
+        self.events.append(['budget_check',kwargs])
+        if self.once('budget_expired'):raise Requirement('EXPIRED_ORIGINAL_D')
+    def host_identity(self,pid):
+        return dict(pid=pid,ppid={111:1,222:111,333:222}[pid],start_ticks=pid,boot_id='boot',
+                    nspid=[333,1] if pid==333 else [pid],pid_namespace='pid:[88]' if pid==333 else 'pid:[77]',mount_namespace='mnt:[1]')
+    def prepare(self,argv):
+        self.events.append(['prepare']);return ['inert-bwrap'],()
+    def popen(self,*args,**kwargs):
+        self.events.append(['popen_inert'])
+        if self.once('popen_error'):raise OSError(5,'unreturned Popen modeled only')
+        return self.process
+    def pidfd_open(self,pid,flags):
+        self.events.append(['pidfd_open',pid])
+        if self.once('pidfd_open_error'):raise OSError(5,'binding error')
+        return {222:14,333:13}[pid]
+    def open_fd(self,path,*args):
+        self.events.append(['open_inert',str(path)])
+        return 16 if str(path).startswith('/proc') else 50
+    def close_fd(self,fd):
+        self.events.append(['close_fd',fd])
+        if fd==15 and self.once('gate_close_error'):raise OSError(9,'gate close failed')
+        if fd==14 and self.once('other_close_error'):raise OSError(5,'other close failed')
+        if fd==19 and self.once('quality_close_error'):
+            self.live.discard(fd);raise KeyboardInterrupt('quality may have been released')
+        if fd in self.reused:self.events.append(['REUSED_FD_CLOSE',fd]);raise OSError(9,'would close new object')
+        self.live.discard(fd)
+        if fd==15 and (self.fault=='gate_cancel_after_close' or isinstance(self.fault,tuple) and 'gate_cancel_after_close' in self.fault):self.reused.add(fd)
+    def write(self,fd,data):
+        self.events.append(['write',fd,data.decode()]);return len(data)
+    def read(self,fd,n):
+        if fd==10:
+            if self.stage==1:return b'{"child-pid":333,"pid-namespace":88}\n'
+            if self.stage==3:return json.dumps({'exit-code':2 if self.nonzero else 0}).encode()+b'\n'
+        return b''
+    def control_data(self):
+        # The unmodified READY/SCM exchange is deliberately not runtime tested.
+        require(self.control.state=='BOOTSTRAP','model reaches control after actual gate')
+        self.events.append(['inert_existing_handshake']);self.control.state='RUNNING'
+    def send_signal(self,fd,*args):
+        self.events.append(['pidfd_signal',fd])
+        if self.once('signal_error'):raise OSError(5,'inert signal error')
+    def wait4(self,pid,options):
+        self.events.append(['wait4',pid,self.now])
+        if self.once('wait_error'):raise OSError(10,'inert wait error')
+        return pid,2 if self.nonzero else 0,self.usage
+    def select_fd(self,*args):
+        self.events.append(['select_fd']);return ([13],[],[])
+    def output_stream(self):
+        class Stream(io.StringIO):
+            def fileno(self):return 50
+        return Stream()
+    def run(self):
+        try:
+            value=self.ns['_run_caller'](['inert'],None,timeout=150,log=None,
+                env={'PATH':'/usr/bin:/bin','LANG':'C','LC_ALL':'C'},deadline=180.,control=self.control)
+            return N(kind='return',value=value,exc=None)
+        except BaseException as exc:return N(kind=type(exc).__name__,value=None,exc=exc)
+
+results=[]
+def check(name,fn):
+    try:
+        facts=fn();results.append({'name':name,'pass':True,'facts':facts})
+    except BaseException as exc:
+        results.append({'name':name,'pass':False,'error':repr(exc)})
+
+def run_case(version, faults, expected, nonzero=False):
+    p=Probe(version,faults,nonzero);r=p.run();c=p.control
+    assert r.kind==expected,(r.kind,repr(r.exc),p.events)
+    if expected=='StopUnconfirmed':
+        assert r.exc.caller_control is c
+        if version=='after':
+            assert r.exc.owned_process is (None if faults in ('popen_error','selector_create_error') else p.process)
+            assert r.exc.owned_selector is (None if faults=='selector_create_error' else p.selector)
+            assert c.cleanup_errors or not c.terminal_confirmed
+    return p,r
+
+def gate(version):
+    p,r=run_case(version,'gate_cancel_after_close','StopUnconfirmed' if version=='after' else 'OSError')
+    ev=p.events
+    assert ['write',15,'1'] in ev
+    assert not any(e[0]=='inert_existing_handshake' for e in ev)
+    if version=='after':
+        assert sum(e==['close_fd',15] for e in ev)==1
+        assert ['pidfd_signal',13] in ev and any(e[0]=='wait4' and e[1]==222 for e in ev)
+        assert p.control.fd_records[15]=='CLOSE_UNKNOWN'
+        assert not any(e[0]=='REUSED_FD_CLOSE' for e in ev)
+    else:
+        assert not any(e[0] in ('pidfd_signal','wait4') for e in ev)
+        assert any(e[0]=='REUSED_FD_CLOSE' for e in ev)
+    return {'outward':r.kind,'events':ev,'records':p.control.fd_records}
+check('prior_F1_counterexample_exact_old_bodies',lambda:gate('before'))
+check('repaired_F1_same_after_close_interruption',lambda:gate('after'))
+
+def scenario(fault,expected='StopUnconfirmed',nonzero=False):
+    p,r=run_case('after',fault,expected,nonzero)
+    ev=p.events;c=p.control
+    assert ['selector_close'] in ev or fault=='selector_create_error'
+    if fault not in ('popen_error','selector_create_error'):
+        assert ['stdout_close'] in ev and ['stderr_close'] in ev
+    if fault in ('gate_close_error',('gate_close_error','signal_error'),'selector_register_error','pidfd_open_error','selector_select_error','wait_error'):
+        assert any(e[0]=='wait4' and e[1]==222 for e in ev)
+    if fault in ('gate_close_error',('gate_close_error','signal_error')): assert ['pidfd_signal',13] in ev
+    if fault in ('selector_close_error','stdout_close_error','stderr_close_error',('selector_close_error','stdout_close_error','stderr_close_error'),'other_close_error','channel_close_error'):
+        assert ['close_fd',19] not in ev and not c.closed
+    if fault=='quality_close_error':
+        assert c.fd_records[19]=='CLOSE_UNKNOWN' and 19 not in p.live and not c.closed
+    if expected in ('return','CommandFailed'):
+        assert c.closed and c.terminal_confirmed
+        closes=[e[1] for e in ev if e[0]=='close_fd'];assert closes[-1]==19
+    return {'outward':r.kind,'events':ev,'cleanup':c.cleanup_errors,'closed':c.closed,'terminal':c.terminal_confirmed,'records':c.fd_records}
+for fault in ['gate_close_error',('gate_close_error','signal_error'),'pidfd_open_error','selector_register_error','selector_select_error','wait_error',
+              'selector_close_error','stdout_close_error','stderr_close_error',('selector_close_error','stdout_close_error','stderr_close_error'),
+              'channel_close_error','other_close_error','quality_close_error']:
+    check('actual_closure_'+str(fault),lambda f=fault:scenario(f))
+check('positive_terminal_success_release_quality_last',lambda:scenario(None,'return'))
+check('positive_known_reaped_nonzero_stays_CommandFailed',lambda:scenario(None,'CommandFailed',True))
+check('unreturned_Popen_preserved_as_declared_G2',lambda:scenario('popen_error','OSError'))
+check('selector_constructor_failure_no_owned_process',lambda:scenario('selector_create_error','OSError'))
+
+def direct_stop(fault=None,stale=False,expired=False):
+    p=Probe(fault=fault);c=p.control;c.monitor_fd=14;c._own(14);c.caller_fd=13;c._own(13)
+    if stale:c.fd_records[13]='CLOSE_UNKNOWN'
+    if expired:p.fault='budget_expired'
+    errs=c.signal_owned()
+    assert bool([e for e in p.events if e[0]=='pidfd_signal']) == (not stale and not expired)
+    if stale or expired:assert errs
+    return {'events':p.events,'errors':errs}
+check('stale_PIDFD_never_signalled',lambda:direct_stop(stale=True))
+check('original_budget_expiry_refuses_signal',lambda:direct_stop(expired=True))
+
+def partial_own():
+    p=Probe();c=p.control;c.terminal_confirmed=True
+    class BreakSet(set):
+        def add(self,x): raise KeyboardInterrupt('secondary set bookkeeping interrupted')
+    c.fds=BreakSet(c.fds)
+    try:c._own(18)
+    except KeyboardInterrupt:pass
+    assert c.fd_records[18]=='OPEN' and 18 not in c.fds
+    c.close();assert ['close_fd',18] in p.events and c.closed
+    assert [x for x in p.events if x[0]=='close_fd'][-1]==['close_fd',19]
+    return {'events':p.events}
+check('captured_own_record_survives_secondary_set_interruption',partial_own)
+
+def ambiguous_reuse():
+    p=Probe(fault='gate_cancel_after_close');c=p.control
+    c._close_fd(15,'probe_gate')
+    for _ in range(2): assert c._close_fd(15,'probe_again')
+    try:c._own(15)
+    except Requirement:pass
+    else:raise AssertionError('ambiguous fd reuse accepted')
+    assert sum(x==['close_fd',15] for x in p.events)==1
+    return {'events':p.events,'records':c.fd_records}
+check('ambiguous_number_close_and_reownership_never_retried',ambiguous_reuse)
+
+def finalizer_regression(version, finalizer):
+    p=Probe(version,finalizer)
+    # Actual terminal() refuses to confirm a non-ready inert caller PIDFD.
+    # This yields the same prior typed-unknown route, before finalizers run.
+    p.ns['__builtins__']['__import__']=lambda name,*a,**kw: N(select=lambda *args:([],[],[])) if name=='select' else p.importer(name,*a,**kw)
+    r=p.run()
+    assert r.kind==('StopUnconfirmed' if version=='after' else 'OSError'),(r.kind,p.events)
+    if version=='before':
+        chain=r.exc.__context__
+        assert isinstance(chain,p.ns['StopUnconfirmed']) and chain.caller_control is p.control
+        if finalizer=='selector_close_error': assert ['stdout_close'] not in p.events
+        else:assert ['stderr_close'] not in p.events
+    else:
+        assert ['stdout_close'] in p.events and ['stderr_close'] in p.events
+        assert r.exc.original_failure is not None
+        assert r.exc.caller_control is p.control and r.exc.owned_process is p.process and r.exc.owned_selector is p.selector
+    return {'outward':r.kind,'events':p.events}
+for version in ('before','after'):
+    for finalizer in ('selector_close_error','stdout_close_error'):
+        check(version+'_prior_finalizer_'+finalizer,lambda v=version,f=finalizer:finalizer_regression(v,f))
+
+def preclose_cancel(channel=False):
+    p=Probe();c=p.control
+    class Records(dict):
+        fired=False
+        def __setitem__(self,k,v):
+            if v=='CLOSE_ATTEMPTED' and not self.fired:
+                self.fired=True;super().__setitem__(k,v);raise KeyboardInterrupt('before close invocation')
+            super().__setitem__(k,v)
+    if channel:
+        c.channel_records=Records();assert c._close_channel('channel')
+        assert c._close_channel('channel')
+        assert c.channel_records['channel']=='CLOSE_UNKNOWN'
+        assert ['channel_close'] not in p.events
+    else:
+        c.fd_records=Records(c.fd_records);assert c._close_fd(15,'gate')
+        assert c._close_fd(15,'again')
+        assert c.fd_records[15]=='CLOSE_UNKNOWN'
+        assert ['close_fd',15] not in p.events and 15 in p.live
+    return {'events':p.events,'cleanup':c.cleanup_errors}
+check('pre_syscall_cancellation_retains_unknown_no_numeric_retry',preclose_cancel)
+check('channel_pre_syscall_cancellation_no_retry',lambda:preclose_cancel(True))
+
+def stop_and_wait_fail():
+    p,r=run_case('after',('gate_close_error','signal_error','wait_error'),'StopUnconfirmed')
+    assert ['pidfd_signal',13] in p.events and any(e[0]=='wait4' for e in p.events)
+    assert any('monitor_wait4' in e for e in p.control.cleanup_errors)
+    assert all(['close_fd',fd] not in p.events for fd in (13,14,19))
+    return {'events':p.events,'cleanup':p.control.cleanup_errors}
+check('gate_signal_and_recovery_wait_fail_independently_with_custody',stop_and_wait_fail)
+
+def deadline_during_error():
+    p=Probe(fault='selector_select_error')
+    original=p.selector.select
+    def select_then_expire(timeout):
+        p.now=180.
+        return original(timeout)
+    p.selector.select=select_then_expire
+    p.control.budget.check=lambda **kw: require(p.now<180,'ORIGINAL_DEADLINE_EXPIRED')
+    r=p.run()
+    assert r.kind=='StopUnconfirmed' and r.exc.caller_control is p.control
+    assert not any(e[0] in ('pidfd_signal','wait4') for e in p.events)
+    return {'events':p.events,'cleanup':p.control.cleanup_errors}
+check('error_at_original_D_gets_no_new_wait_or_signal_budget',deadline_during_error)
+
+def terminal_cleanup_fanout():
+    p=Probe(fault=('channel_close_error','other_close_error'));c=p.control
+    c.monitor_fd=14;c.caller_fd=13;c._own(14);c._own(13);c.terminal_confirmed=True
+    try:c.close()
+    except Requirement:pass
+    else:raise AssertionError('cleanup ambiguity accepted')
+    assert ['channel_close'] in p.events and ['child_channel_close'] in p.events
+    for fd in (10,11,12,13,14,15):assert ['close_fd',fd] in p.events
+    assert ['close_fd',19] not in p.events and c.fd_records[19]=='OPEN' and not c.closed
+    return {'events':p.events,'cleanup':c.cleanup_errors,'records':c.fd_records}
+check('terminal_channel_and_nonquality_failures_do_not_skip_other_finalizers',terminal_cleanup_fanout)
+
+
+(OUT/'input-pins.json').write_text(json.dumps(pins,indent=2)+'\n')
+(OUT/'ast-delta.json').write_text(json.dumps(delta,indent=2)+'\n')
+payload={'kind':'EXACT_SELECTED_AST_INERT_OBJECTS_ONLY','candidate_imports':False,'native':'NOT_RUN',
+         'resources':{'affinity':sorted(os.sched_getaffinity(0)),'rlimit_as':resource.getrlimit(resource.RLIMIT_AS)},
+         'pass':sum(x['pass'] for x in results),'fail':sum(not x['pass'] for x in results),'results':results}
+(OUT/'probes.json').write_text(json.dumps(payload,indent=2)+'\n')
+print(json.dumps({'pass':payload['pass'],'fail':payload['fail'],'failures':[x for x in results if not x['pass']]}))
+raise SystemExit(bool(payload['fail']))
