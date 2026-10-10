@@ -21,6 +21,25 @@ the `default` receiving profile. Model, endpoint, capacity, output reservations,
 web limits, Dashboard public authority and operator are actual supplied inputs.
 No secrets belong in this JSON, command arguments or preparation receipts.
 
+The 10 October input reconciliation prepared a clean checkout with 103 source
+pins: twelve historical pins changed and two plugin modules were added. The
+profile, credential references, worker limits and original 3600-second install
+budget were preserved. The staged input remains inert: its protected DSH web
+declaration has expired, and native execution admission is unresolved. Prepare
+a current declaration through the existing operator flow before qualification;
+source hashes alone cannot establish current network permission or connectivity.
+Use the clean reviewed checkout so ignored Python caches do not enter the
+complete plugin inventory. This preparation creates no installation home or
+execution clock and does not authorize replay of an earlier attempt.
+
+The installer now validates the protected DSH declaration during initial input
+validation, before preparing native commands or claiming the installation home.
+Expired, malformed, foreign-home/profile or insufficiently protected declarations
+refuse with `current_dsh_web_policy_required`; changed pins retain their existing
+diagnostic. This reuses the worker's policy parser and grants no network access.
+Current namespace and actual DNS/TLS observations remain mandatory later in
+qualification and on the worker path. Rebind source pins after this source change.
+
 The optional `credential_sources` map supplies explicit protected references
 for a normal installation. Each target environment name selects exactly
 `{"path":"/private/operator-input.json","format":"json","name":"SOURCE_NAME"}`;
@@ -215,7 +234,8 @@ preparation or separately admitted exact fixed deployment; useful web for A0 and
 both workers in the normal compiler; independent review and actual authenticated
 Dashboard startup/attach acceptance; protected launch credentials and scoped pool/channel ownership;
 native gateway exact-home unit installation/readiness; final PM/build realization
-and independent acceptance of all six mandatory web/admin journeys. Ordinary
+and independent acceptance of all seven mandatory runtime journeys, including
+autonomous web in all four required contexts. Ordinary
 SAFE-tool and text-only capacity compatibility limitations remain as documented
 in the normal profile. None is removed by this source candidate.
 
@@ -277,7 +297,7 @@ pinned installation inspection. It verifies source/install metadata only and
 returns `SOURCE_OWNERSHIP_VERIFIED_RUNTIME_NOT_RUN`, `ready=false`, credentials
 unchecked. Whole `start` still refuses absent A0/web/kernel admission. Successful
 source fixtures or this narrow check do not authorize native units, workers,
-channel login, model calls or all-six release acceptance.
+channel login, model calls or acceptance of all seven runtime journeys.
 
 Validation uses the actual composed donor, private synthetic source/config and
 Basic keys, native lock/record/parser/CLI/auth middleware and ASGI identity route.
@@ -285,7 +305,7 @@ Network transports and bind/main-loop boundaries remain intercepted. The record
 policy cases reuse a once-verified complete source identity; byte-drift cases and
 full-source positives use the uncached native consumer. Actual authenticated
 HTTP/socket startup, race under independently scheduled real processes and all
-six live journeys still require parent integration and independent acceptance.
+seven live journeys still require parent integration and independent acceptance.
 
 
 ## Protected local Dashboard profile
@@ -422,7 +442,7 @@ there is no alternative admin launch mode to bypass product or A0 admission.
 The owner supplied public authority is `https://192.168.1.78:9119`, distinct from
 guest bind `192.168.12.128:9119`. Input remains configurable and exact. No actual
 certificate, browser trust, host route, authenticated LAN/attach, startup,
-service/PM realization or all-six-journey acceptance is inferred from these
+service/PM realization or acceptance of all seven runtime journeys is inferred from these
 parameters or the source controls. Independent review and final root join/gate
 remain required.
 

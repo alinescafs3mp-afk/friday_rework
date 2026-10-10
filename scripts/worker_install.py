@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 from pathlib import Path
 
 from scripts.friday_install import canonical, directory, digest, owned_file, pin, publish, read_json, require
@@ -41,6 +42,20 @@ def settings(value):
             require(isinstance(row['web'], dict) and set(row['web']) == {'resolver', 'trust_bundle', 'egress_evidence'},
                     'explicit_dsh_web_inputs_required')
             for ref in row['web'].values(): pin(ref)
+            # Reject unusable declarations before native preparation consumes
+            # the install budget. This is permission validation only; ordinary
+            # qualification still proves current namespace and DNS/TLS access.
+            from scripts.friday_install import ROOT
+            from plugins.friday_rework.host_runtime import _pin
+            from plugins.friday_rework.worker_web import DshWebInputs, WorkerWebError, web_policy
+            web = DshWebInputs(**{k: _pin(v) for k, v in row['web'].items()},
+                research_policy=_pin({'path': str(ROOT / 'config/RESEARCH.md'),
+                                     'sha256': value['project_files']['config/RESEARCH.md']}),
+                profile=value['product']['web']['profile'])
+            try:
+                web_policy(web, value['home'], value['product']['profile'], time.time())
+            except WorkerWebError:
+                require(False, 'current_dsh_web_policy_required')
         else:
             from plugins.friday_rework.adapters.a0_web import checked_web
             checked_web(row['web'])

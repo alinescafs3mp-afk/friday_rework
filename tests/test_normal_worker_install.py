@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -99,6 +100,10 @@ def normal(service, monkeypatch):
     doc(home/'preparation/a0.json',{'donor':'a0','checkout':str(a),'source':identity,
                                   'source_lock_sha256':v['sources_lock']['sha256']})
     policy=write(s.deploy/'policy.json',b'SYNTHETIC DECLARATION, NO LIVE AUTHORITY')
+    dsh_policy=doc(s.deploy/'dsh-policy.json',{
+        'schema':'friday.worker-web.policy.v1','runtime_home':str(home),'runtime_profile':'default',
+        'boot_id':'synthetic-component-only','net_namespace':[1,1],'expires_unix':time.time()+3600,
+        'allow_public_https':True,'document_probes':['https://example.com/docs']})
     network={'name':'synthetic-existing-bridge','endpoints':[
         v['product']['a0_deployment']['chat']['endpoint'],v['product']['a0_deployment']['embedding']['endpoint']],
         'policy':policy}
@@ -108,7 +113,7 @@ def normal(service, monkeypatch):
              'toolchain_root':str(node.parent.parent),
              'resources':{'memory_bytes':2*1024**3,'cpu_percent':200,'tasks':64,'shutdown_seconds':2,'tmp_bytes':64*1024**2},
              'web':{'resolver':write(s.deploy/'resolver',b'nameserver 192.0.2.53\n'),
-                    'trust_bundle':write(s.deploy/'trust',b'SYNTHETIC CA'), 'egress_evidence':policy}},
+                    'trust_bundle':write(s.deploy/'trust',b'SYNTHETIC CA'), 'egress_evidence':dsh_policy}},
       'a0':{'budget_seconds':300,'max_file_bytes':1024,'max_total_bytes':4096,'docker':pin(a0_runtime.DOCKER),
             'policy':policy,'git_metadata':{'source':str(metadata),'manifest_sha256':'b'*64},
             'expected_files':[{'logical_name':'result.txt','media_type':'text/plain'}],
@@ -130,6 +135,41 @@ def normal(service, monkeypatch):
 
 def prepared(s):
     return workers.prepared_product(s.value,s.home,s.budget)
+
+
+@pytest.mark.parametrize('case', ['expired', 'at-expiry', 'foreign-home', 'foreign-profile',
+                                'malformed', 'public-disabled', 'bad-url', 'public-file'])
+def test_unusable_web_declaration_refuses_before_install_commands(normal, monkeypatch, case):
+    s=normal; now=1700000000
+    monkeypatch.setattr(workers.time, 'time', lambda: now)
+    policy=s.value['worker_install']['dsh']['web']['egress_evidence']
+    path=Path(policy['path']); v=json.loads(path.read_text());v['expires_unix']=now+3600
+    if case=='expired':v['expires_unix']=now-1
+    elif case=='at-expiry':v['expires_unix']=now
+    elif case=='foreign-home':v['runtime_home']=str(s.deploy/'foreign-home')
+    elif case=='foreign-profile':v['runtime_profile']='foreign'
+    elif case=='public-disabled':v['allow_public_https']=False
+    elif case=='bad-url':v['document_probes']=['https://user:SECRET@example.com/docs']
+    policy=doc(path,v) if case!='malformed' else write(path,b'not a policy')
+    if case=='public-file':path.chmod(0o644)
+    s.value['worker_install']['dsh']['web']['egress_evidence']=policy
+    before={str(p):p.read_bytes() for p in s.home.rglob('*') if p.is_file()}
+    def unexpected(*args, **kwargs):
+        pytest.fail('invalid policy reached native command preparation')
+    monkeypatch.setattr(entry, 'commands', unexpected)
+    with pytest.raises(entry.Refused, match='current_dsh_web_policy_required'):
+        entry.install(s.value, s.deploy/'nonexistent-input.json')
+    assert before=={str(p):p.read_bytes() for p in s.home.rglob('*') if p.is_file()}
+    assert not s.calls
+
+
+def test_current_web_declaration_preflight_is_not_network_readiness(normal):
+    s=normal;before=copy.deepcopy(s.value)
+    assert workers.settings(s.value)==s.value['worker_install']
+    assert s.value==before and not s.calls
+    # The deliberately synthetic boot/namespace cannot authorize the real
+    # native network boundary; preflight only validates the declaration.
+    assert not (s.home/'workers').exists()
 
 
 def materialized(s):
