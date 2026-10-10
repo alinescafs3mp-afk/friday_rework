@@ -955,4 +955,12 @@ def stage_keyless_provider(harness):
     return {"path": str(target), "sha256": digest(raw), "runtime_ready": False}
 
 if __name__ == '__main__':
+    # Helpers import require/Refused from this canonical module. Executing the
+    # file as __main__ must keep the same class identity, or typed refusals are
+    # misreported as generic native failures at the public CLI boundary.
+    canonical_module = sys.modules.get('scripts.friday_install')
+    if canonical_module is not None and canonical_module is not sys.modules[__name__]:
+        print('Friday entry refused: phase=entry reason=installer_module_identity_conflict', file=sys.stderr)
+        raise SystemExit(2)
+    sys.modules['scripts.friday_install'] = sys.modules[__name__]
     main()
