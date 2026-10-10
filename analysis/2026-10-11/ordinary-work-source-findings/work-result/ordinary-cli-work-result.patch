@@ -1,0 +1,1262 @@
+--- a/hermes/agent/agent_runtime_helpers.py
++++ b/hermes/agent/agent_runtime_helpers.py
+@@ -2645,11 +2645,13 @@
+     if skip_tool_execution_middleware:
+         return _execute(function_args)
+     from hermes_cli.middleware import run_tool_execution_middleware
+-    return run_tool_execution_middleware(
+-        function_name, function_args,
+-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+-        original_args=function_args, **hook_ids,
+-    )
++    from hermes_cli.friday_cli_work import native_cli_call
++    with native_cli_call(agent, effective_task_id, tool_call_id, function_name):
++        return run_tool_execution_middleware(
++            function_name, function_args,
++            lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
++            original_args=function_args, **hook_ids,
++        )
+ 
+ 
+ def repair_tool_call(agent, tool_name: str) -> str | None:
+--- a/hermes/agent/tool_executor.py
++++ b/hermes/agent/tool_executor.py
+@@ -813,13 +813,15 @@
+         request_args = request_result.payload if isinstance(request_result.payload, dict) else relay_args
+         trace.clear()
+         trace.extend(request_result.trace)
+-        return run_tool_execution_middleware(
+-            function_name,
+-            request_args,
+-            lambda next_args: _authorized_dispatch(next_args if isinstance(next_args, dict) else request_args),
+-            original_args=function_args,
+-            **tool_hook_ids(agent, effective_task_id, tool_call_id),
+-        )
++        from hermes_cli.friday_cli_work import native_cli_call
++        with native_cli_call(agent, effective_task_id, tool_call_id, function_name):
++            return run_tool_execution_middleware(
++                function_name,
++                request_args,
++                lambda next_args: _authorized_dispatch(next_args if isinstance(next_args, dict) else request_args),
++                original_args=function_args,
++                **tool_hook_ids(agent, effective_task_id, tool_call_id),
++            )
+ 
+     state.result, _relay_args = relay_tools.execute(
+         function_name,
+--- a/hermes/cli.py
++++ b/hermes/cli.py
+@@ -1305,14 +1305,16 @@
+ 
+     @cli_bound
+     def _run_plugin_slash_command(self, base_cmd: str, user_args: str) -> None:
+-        reject_cli_extension(self)
++        from hermes_cli.friday_cli_work import require_local_command, cli_command
++        require_local_command(self, base_cmd.lstrip('/'))
+         from hermes_cli.plugins import get_plugin_command_handler, resolve_plugin_command_result
+ 
+         plugin_handler = get_plugin_command_handler(base_cmd.lstrip("/"))
+         if not plugin_handler:
+             return
+         try:
+-            result = resolve_plugin_command_result(plugin_handler(user_args))
++            with cli_command(self, base_cmd.lstrip('/')):
++                result = resolve_plugin_command_result(plugin_handler(user_args))
+             if result:
+                 _cprint(str(result))
+         except Exception as e:
+--- a/hermes/hermes_cli/cli_chat_turn_mixin.py
++++ b/hermes/hermes_cli/cli_chat_turn_mixin.py
+@@ -61,6 +61,8 @@
+         objects for attached images voice_input: True when the message came from voice transcription (gates
+         the concise voice-response prefix, #65827)
+         """
++        from hermes_cli.friday_cli_work import capture_cli_receive
++        received_cli_input = capture_cli_receive(self, message, images)
+         from cli import ChatConsole, _ChatTurn, _DIM, _RST, _accent_hex, _cprint, set_secret_capture_callback
+         from tools.process_registry_notifications import TimelineNotification
+         if isinstance(message, TimelineNotification) and not message.process_visible(getattr(self, "agent", None)):
+@@ -107,6 +109,7 @@
+         from agent.notification_presentation import notification_config_snapshot, notification_policy_snapshot
+         with notification_policy_snapshot(agent, "cli", notification_config_snapshot()):
+             turn = _ChatTurn()
++            turn._friday_cli_received = received_cli_input
+             from gateway.warning_notifications import diagnostic_turn_muted
+             turn.mute_notification_reply = diagnostic_turn_muted(
+                 agent._pending_cli_user_message.get("display_metadata"), "cli", agent._notification_config)
+@@ -360,7 +363,8 @@
+         try:
+             from agent.notification_presentation import notification_turn
+             muted = getattr(turn, "mute_notification_reply", False)
+-            with notification_turn(self.agent, muted=muted, session_id=self.session_id):
++            from hermes_cli.friday_cli_work import cli_turn
++            with cli_turn(self, message, received=getattr(turn, '_friday_cli_received', None)), notification_turn(self.agent, muted=muted, session_id=self.session_id):
+                 turn.result = self.agent.run_conversation(
+                     user_message=agent_message,
+                     conversation_history=self.conversation_history[:-1],
+--- a/hermes/hermes_cli/friday_cli_principal.py
++++ b/hermes/hermes_cli/friday_cli_principal.py
+@@ -62,6 +62,13 @@
+         return {"schema": "friday.cli-os-authority.v1", "uid": self.os_uid,
+                 "principal_id": self.key, "generation": self.admission_generation,
+                 "admission_sha256": users._fingerprint(self.admission)}
++
++    def require_owner(self, owner, ingress):
++        from hermes_cli.friday_cli_work import check_owner
++        check_owner(owner, ingress)
++
++    def require_retained_owner(self, owner, ingress):
++        self.require_owner(owner, ingress)
+ 
+     def check(self):
+         try:
+@@ -194,6 +201,10 @@
+         base = command.strip().split()[0].lstrip("/").lower()
+         definition = resolve_command(base)
+         name = definition.name if definition is not None else base
++        if name in {'friday-stop','friday-pause','friday-status'}:
++            from hermes_cli.friday_cli_work import require_local_command
++            require_local_command(cli,name)
++            return
+         if definition is None or name not in {"help", "status", "stop", "cancel", "new", "reset", "history", "resume", "sessions", "memory", "exit", "quit"}:
+             raise users.ScopeDenied()
+ 
+--- /dev/null
++++ b/hermes/hermes_cli/friday_cli_work.py
+@@ -0,0 +1,468 @@
++"""Original authenticated classic CLI producers; no new scheduler or session store.
++
++Local work is finite foreground only. The native async bridge drives the owned
++PluginContext task ledger until settlement. Stdio/TUI and file-input ingress
++are unsupported here and refuse before a work claim. Serialized facts never
++reconstruct an admission capability or an output route.
++"""
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass
++import base64
++import copy
++import hashlib
++import json
++from pathlib import Path
++import sqlite3
++
++from hermes_cli import friday_user_scope as users
++from hermes_cli.friday_cli_principal import current_cli
++
++_TURN = ContextVar('friday_original_cli_turn', default=None)
++_TOOL = ContextVar('friday_original_cli_tool', default=None)
++_CONTROL = ContextVar('friday_original_cli_control', default=None)
++CALL_FIELDS = ('task_id', 'session_id', 'turn_id', 'api_request_id', 'tool_call_id')
++OWNER_FIELDS = {'schema', 'platform', 'session_id', 'profile', 'transport_profile',
++                'account_id', 'user_id', 'os_uid', 'authority', 'home', 'ingress_message_id'}
++INGRESS_FIELDS = {'schema', 'platform', 'session_id', 'runtime_profile',
++                  'transport_profile', 'account_id', 'user_id', 'authority',
++                  'runtime_home', 'input', 'route'}
++ROUTE_FIELDS = {'schema', 'platform', 'session_id', 'runtime_profile',
++                'transport_profile', 'account_id', 'user_id', 'authority', 'runtime_home', 'output'}
++
++
++def is_cli():
++    cap = users.current()
++    return cap is not None and cap.principal[0] == 'cli'
++
++
++def _canonical(value):
++    return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False).encode('utf-8')
++
++
++def validate_route(value):
++    if (not isinstance(value, dict) or set(value) != ROUTE_FIELDS
++            or value['schema'] != 'friday.cli-output-route.v1' or value['platform'] != 'cli'
++            or value['output'] != 'original-classic-cli-stream'):
++        raise users.ScopeDenied()
++    for k in ('session_id','runtime_profile','transport_profile','account_id','user_id','runtime_home'):
++        if not isinstance(value[k],str) or not value[k] or '\x00' in value[k] or len(value[k].encode()) > 2048:
++            raise users.ScopeDenied()
++    a=value['authority']
++    if (not isinstance(a,dict) or set(a) != {'schema','uid','principal_id','generation','admission_sha256'}
++            or a['schema'] != 'friday.cli-os-authority.v1' or type(a['uid']) is not int or a['uid'] < 0
++            or type(a['generation']) is not int or a['generation'] < 1
++            or not isinstance(a['principal_id'],str) or not a['principal_id']
++            or not isinstance(a['admission_sha256'],str) or len(a['admission_sha256']) != 64
++            or any(c not in '0123456789abcdef' for c in a['admission_sha256'])):
++        raise users.ScopeDenied()
++    return copy.deepcopy(value)
++
++
++def validate_ingress(value):
++    if (not isinstance(value,dict) or set(value) != INGRESS_FIELDS
++            or value['schema'] != 'friday.cli-ingress.v1' or value['platform'] != 'cli'):
++        raise users.ScopeDenied()
++    route=validate_route(value['route'])
++    expected={k:value[k] for k in ('platform','session_id','runtime_profile','transport_profile','account_id','user_id','authority','runtime_home')}
++    if any(route[k] != v for k,v in expected.items()): raise users.ScopeDenied()
++    content=value['input']
++    if (not isinstance(content,dict) or set(content) != {'native_message_id','sha256','size_bytes','attachments'}
++            or type(content['native_message_id']) is not int or content['native_message_id'] < 1
++            or type(content['size_bytes']) is not int or not 0 < content['size_bytes'] <= 65536
++            or not isinstance(content['sha256'],str) or len(content['sha256']) != 64
++            or any(c not in '0123456789abcdef' for c in content['sha256'])
++            or content['attachments'] != []):
++        raise users.ScopeDenied()
++    if len(_canonical(value)) > 65536: raise users.ScopeDenied()
++    return copy.deepcopy(value)
++
++
++def owner_from_receipt(value):
++    value=validate_ingress(value)
++    return {'schema':'friday.cli-owner.v1','platform':'cli','session_id':value['session_id'],
++            'profile':value['runtime_profile'],'transport_profile':value['transport_profile'],
++            'account_id':value['account_id'],'user_id':value['user_id'],
++            'os_uid':value['authority']['uid'],'authority':copy.deepcopy(value['authority']),
++            'home':value['runtime_home'],'ingress_message_id':value['input']['native_message_id']}
++
++
++def validate_owner(value):
++    if (not isinstance(value,dict) or set(value) != OWNER_FIELDS
++            or value.get('schema') != 'friday.cli-owner.v1' or value.get('platform') != 'cli'
++            or type(value['ingress_message_id']) is not int or value['ingress_message_id'] < 1
++            or type(value['os_uid']) is not int or value['os_uid'] < 0):
++        raise users.ScopeDenied()
++    route={'schema':'friday.cli-output-route.v1','output':'original-classic-cli-stream',
++           'platform':'cli','session_id':value['session_id'],'runtime_profile':value['profile'],
++           'transport_profile':value['transport_profile'],'account_id':value['account_id'],
++           'user_id':value['user_id'],'authority':value['authority'],'runtime_home':value['home']}
++    validate_route(route)
++    if value['os_uid'] != value['authority']['uid']: raise users.ScopeDenied()
++    return copy.deepcopy(value)
++
++
++def _session_query(cap,session_id,query,args=(),*,allow_new=False):
++    path=cap.home/'state.db'; before=users._private(path)
++    connection=sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=.2)
++    try:
++        connection.execute('PRAGMA query_only=ON')
++        row=connection.execute('SELECT source,user_id,profile_name,origin_json FROM sessions WHERE id=?',(session_id,)).fetchone()
++        expected={'schema':'friday.account_origin.v1','platform':'cli',
++                  'transport_profile':cap.principal[1],'account_id':cap.principal[2]}
++        if row is None:
++            # Native Hermes creates a first session only after building the
++            # system prompt. Before that original producer starts, capture an
++            # empty transcript boundary without inventing/adopting a session.
++            if not allow_new or connection.execute('SELECT COUNT(*) FROM messages WHERE session_id=?',(session_id,)).fetchone()[0]:
++                raise users.ScopeDenied()
++        elif (row[:3] != ('cli',cap.principal[3],cap.profile)
++                or json.loads(row[3] or '{}').get('friday_account_origin') != expected
++                or json.loads(row[3] or '{}').get('friday_cli_authority') != cap.session_authority):
++            raise users.ScopeDenied()
++        result=connection.execute(query,args).fetchall()
++        after=users._private(path)
++        if (before.st_dev,before.st_ino) != (after.st_dev,after.st_ino): raise users.ScopeDenied()
++        cap.check()
++        return result
++    except (sqlite3.Error,ValueError,TypeError):
++        raise users.ScopeDenied() from None
++    finally:
++        connection.close()
++
++
++def _check_lease(lease):
++    from hermes_constants import get_hermes_home
++    cap=current_cli(required=True)
++    if (not isinstance(lease,dict) or not lease.get('active') or lease['cap'] is not cap
++            or get_hermes_home() != cap.home or lease['home'] != cap.home):
++        raise users.ScopeDenied()
++    cli,agent=lease['cli'],lease['agent']
++    if (getattr(cli,'_friday_cli_scope',None) is not cap or cli.agent is not agent
++            or cli.session_id != lease['session_id'] or agent.session_id != lease['session_id']
++            or getattr(agent,'platform',None) != 'cli' or getattr(agent,'_user_id',None) != cap.principal[3]
++            or getattr(agent,'_session_db',None) is not lease['database']
++            or Path(lease['database'].db_path) != cap.home/'state.db'
++            or getattr(cli,'console',None) is not lease['console']
++            or getattr(lease['console'],'file',None) is not lease['stream']):
++        raise users.ScopeDenied()
++    info=users._private(cap.home/'state.db')
++    if (info.st_dev,info.st_ino) != lease['database_identity']: raise users.ScopeDenied()
++    users.check_agent(agent)
++    return cap
++
++
++@contextmanager
++def cli_turn(cli,message,*,received=None):
++    if not is_cli():
++        yield
++        return
++    cap=current_cli(required=True)
++    if (not isinstance(received, CLIReceivedInput) or received.cap is not cap
++            or received.cli is not cli or received.home != cap.home
++            or received.session_id != cli.session_id or received.message != message
++            or _TURN.get() is not None or type(message) is not str
++            or not message.strip() or len(message.encode()) > 65536):
++        raise users.ScopeDenied()  # no trusted file receive contract on this path
++    agent=cli.agent; db=getattr(agent,'_session_db',None)
++    from hermes_state import SessionDB
++    if not isinstance(db,SessionDB) or Path(db.db_path) != cap.home/'state.db': raise users.ScopeDenied()
++    console=getattr(cli,'console',None);stream=getattr(console,'file',None)
++    if not callable(getattr(stream,'write',None)) or not callable(getattr(stream,'flush',None)):
++        raise users.ScopeDenied()
++    lease={'active':True,'cap':cap,'home':cap.home,'cli':cli,'agent':agent,'session_id':cli.session_id,
++           'database':db,'console':console,'stream':stream,'message':message,'receipt':None}
++    info=users._private(cap.home/'state.db');lease['database_identity']=(info.st_dev,info.st_ino)
++    _check_lease(lease)
++    rows=_session_query(cap,cli.session_id,'SELECT COALESCE(MAX(id),0) FROM messages WHERE session_id=?',(cli.session_id,),
++                        allow_new=getattr(agent,'_session_db_created',True) is False)
++    lease['before_message_id']=rows[0][0]
++    token=_TURN.set(lease)
++    try: yield
++    finally:
++        lease['active']=False
++        _TURN.reset(token)
++
++
++def current_turn():
++    lease=_TURN.get();_check_lease(lease)
++    return lease
++
++
++def route_for(lease):
++    cap=_check_lease(lease)
++    return {'schema':'friday.cli-output-route.v1','platform':'cli','session_id':lease['session_id'],
++            'runtime_profile':cap.profile,'transport_profile':cap.principal[1],
++            'account_id':cap.principal[2],'user_id':cap.principal[3],
++            'authority':cap.session_authority,'runtime_home':str(cap.home),
++            'output':'original-classic-cli-stream'}
++
++
++def ingress_for(lease):
++    cap=_check_lease(lease)
++    prior=lease['receipt']
++    if prior is None:
++        rows=_session_query(cap,lease['session_id'],
++             "SELECT id,content FROM messages WHERE session_id=? AND role='user' AND id>? ORDER BY id LIMIT 2",
++             (lease['session_id'],lease['before_message_id']))
++        if len(rows)!=1 or rows[0][1] != lease['message']: raise users.ScopeDenied()
++        raw=lease['message'].encode('utf-8')
++        route=route_for(lease)
++        prior={'schema':'friday.cli-ingress.v1',**{k:route[k] for k in ('platform','session_id','runtime_profile','transport_profile','account_id','user_id','authority','runtime_home')},
++               'input':{'native_message_id':rows[0][0],'sha256':hashlib.sha256(raw).hexdigest(),'size_bytes':len(raw),'attachments':[]},'route':route}
++        lease['receipt']=validate_ingress(prior)
++    check_owner(owner_from_receipt(prior),prior)
++    return copy.deepcopy(prior)
++
++
++def check_owner(owner,ingress):
++    cap=current_cli(required=True);lease=current_turn();value=validate_ingress(ingress)
++    if validate_owner(owner) != owner_from_receipt(value) or value['route'] != route_for(lease): raise users.ScopeDenied()
++    content=value['input']
++    rows=_session_query(cap,value['session_id'],
++          "SELECT role,content FROM messages WHERE id=? AND session_id=?",
++          (content['native_message_id'],value['session_id']))
++    if len(rows)!=1 or rows[0][0]!='user' or not isinstance(rows[0][1],str): raise users.ScopeDenied()
++    raw=rows[0][1].encode('utf-8')
++    if len(raw)!=content['size_bytes'] or hashlib.sha256(raw).hexdigest()!=content['sha256']: raise users.ScopeDenied()
++
++
++@contextmanager
++def native_cli_call(agent,task_id,tool_call_id,tool_name):
++    if tool_name not in {'friday_work','friday_result'} or not is_cli():
++        yield
++        return
++    outer=_TOOL.get()
++    token=_TOOL.set(None)
++    lease=None
++    try:
++        if outer is not None: raise users.ScopeDenied()
++        turn=current_turn()
++        if agent is not turn['agent'] or task_id != turn['session_id'] or not isinstance(tool_call_id,str) or not tool_call_id:
++            raise users.ScopeDenied()
++        ids={'task_id':task_id,'session_id':agent.session_id,'turn_id':getattr(agent,'_current_turn_id',None),
++             'api_request_id':getattr(agent,'_current_api_request_id',None),'tool_call_id':tool_call_id}
++        if any(not isinstance(v,str) or not v or '\x00' in v or len(v.encode())>512 for v in ids.values()): raise users.ScopeDenied()
++        lease={'active':True,'turn':turn,'ids':ids};_TOOL.set(lease)
++        yield
++    finally:
++        if lease is not None: lease['active']=False
++        _TOOL.reset(token)
++
++
++def admitted_call(context):
++    lease=_TOOL.get();turn=current_turn()
++    if (not isinstance(lease,dict) or not lease.get('active') or lease['turn'] is not turn
++            or any(context.get(k) != lease['ids'][k] for k in CALL_FIELDS)
++            or turn['agent']._current_turn_id != lease['ids']['turn_id']
++            or turn['agent']._current_api_request_id != lease['ids']['api_request_id']):
++        raise users.ScopeDenied()
++    return ingress_for(turn),copy.deepcopy(lease['ids'])
++
++
++def check_store(cap,state):
++    if cap is None:
++        if is_cli(): raise users.ScopeDenied()
++        return
++    if current_cli(required=True) is not cap or Path(state.data_dir) != cap.home/'plugin-data'/state._data_namespace or state._plugin_id != 'friday_rework':
++        raise users.ScopeDenied()
++
++
++def _require_context(context,route):
++    turn=current_turn();cap=_check_lease(turn);manager=context._manager
++    loaded=manager._plugins.get(context.plugin_id)
++    if (context.plugin_id != 'friday_rework' or context._load_abandoned or getattr(manager,'_gateway_unloading',False)
++            or loaded is None or not loaded.enabled or loaded.manifest is not context.manifest
++            or Path(manager.home_path) != cap.home or manager._cli_ref is not turn['cli']
++            or validate_route(route) != route_for(turn)):
++        raise users.ScopeDenied()
++    check_store(cap,context.state)
++    return turn
++
++
++def require_cli_foreground(context,route):
++    import asyncio
++    _require_context(context,route)
++    if context.get_config('local_work') != {'enabled':True}: raise users.ScopeDenied()
++    try: asyncio.get_running_loop()
++    except RuntimeError: return
++    raise users.ScopeDenied()  # refuse async/stdio paths and bridge's temporary-loop branch
++
++
++def run_cli_foreground(context,coro,*,route,name=None):
++    import asyncio
++    from hermes_cli.plugins_gateway_work import _close_unstarted
++    try: require_cli_foreground(context,route)
++    except BaseException:
++        _close_unstarted(coro)
++        raise
++    async def run():
++        try:
++            # Native unload/discovery uses this same lock. Registration happens
++            # before yielding; unload can then cancel the exact native ledger task.
++            with context._manager._discovery_lock:
++                _require_context(context,route)
++                if context.get_config('local_work') != {'enabled':True}: raise users.ScopeDenied()
++                task=context.spawn_task(coro,name=name)
++            result=await task
++            _require_context(context,route)
++            return result
++        finally:
++            _close_unstarted(coro)
++    from model_tools import _run_async
++    try:
++        return _run_async(run())
++    finally:
++        _close_unstarted(coro)
++
++
++def should_stop():
++    turn=current_turn();agent=turn['agent'];hard=getattr(agent,'_hard_interrupt_requested',None)
++    return bool(getattr(agent,'_interrupt_requested',False) or (hard is not None and hard.is_set()))
++
++
++async def deliver_cli_document(context,*,route,data,file_name,caption=None,timeout=30):
++    # Output is an exact, bounded ASCII JSON/base64 envelope on the retained
++    # original native classic UI stream. A completed flush is output acceptance,
++    # not a claim that a human has read it. No attachment/download API is invented.
++    entered=False
++    try:
++        turn=_require_context(context,route)
++        if (context.get_config('results') != {'enabled':True} or type(data) is not bytes or len(data)>256*1024
++                or not isinstance(file_name,str) or not file_name or len(file_name.encode())>255
++                or any(ord(c)<32 or c in '/\\' for c in file_name)):
++            return {'state':'FAILED','error':'cli_document_preflight_rejected'}
++        body={'schema':'friday.cli-document-output.v1','route':validate_route(route),
++              'file_name':file_name,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),
++              'encoding':'base64','data':base64.b64encode(data).decode('ascii'),'caption':caption}
++        encoded=json.dumps(body,sort_keys=True,ensure_ascii=True,allow_nan=False)+'\n'
++        _require_context(context,route)
++        entered=True
++        count=turn['stream'].write(encoded)
++        turn['stream'].flush()
++        _require_context(context,route)
++        if count != len(encoded): return {'state':'UNKNOWN'}
++        return {'state':'DELIVERED','kind':'local-output','route':validate_route(route),
++                'file_name':file_name,'bytes':len(data),'sha256':body['sha256'],
++                'native_output':'write-and-flush','human_read':'UNCONFIRMED'}
++    except Exception:
++        return {'state':'UNKNOWN'} if entered else {'state':'FAILED','error':'cli_document_preflight_rejected'}
++
++
++PRINCIPAL_FIELDS = {'platform','session_id','profile','transport_profile','account_id',
++                    'user_id','os_uid','authority','home'}
++
++
++def principal_from_route(route):
++    value=validate_route(route)
++    return {'platform':'cli','session_id':value['session_id'],'profile':value['runtime_profile'],
++            'transport_profile':value['transport_profile'],'account_id':value['account_id'],
++            'user_id':value['user_id'],'os_uid':value['authority']['uid'],
++            'authority':value['authority'],'home':value['runtime_home']}
++
++
++def validate_principal(value):
++    if not isinstance(value,dict) or set(value) != PRINCIPAL_FIELDS or value['platform']!='cli': raise users.ScopeDenied()
++    route={'schema':'friday.cli-output-route.v1','output':'original-classic-cli-stream',
++           'platform':'cli','session_id':value['session_id'],'runtime_profile':value['profile'],
++           'transport_profile':value['transport_profile'],'account_id':value['account_id'],
++           'user_id':value['user_id'],'authority':value['authority'],'runtime_home':value['home']}
++    if principal_from_route(route) != value: raise users.ScopeDenied()
++    return copy.deepcopy(value)
++
++
++def require_local_command(cli,name):
++    if not is_cli(): return
++    from hermes_cli.plugins import _ensure_plugins_discovered
++    cap=current_cli(required=True);manager=_ensure_plugins_discovered()
++    entry=manager._plugin_commands.get(name)
++    loaded=manager._plugins.get('friday_rework')
++    if (name not in {'friday-stop','friday-pause','friday-status'}
++            or Path(manager.home_path)!=cap.home or manager._cli_ref is not cli
++            or getattr(cli,'_friday_cli_scope',None) is not cap
++            or loaded is None or not loaded.enabled or entry is None
++            or entry.get('plugin_key')!='friday_rework' or entry.get('gateway_control') is not False):
++        raise users.ScopeDenied()
++
++
++@contextmanager
++def cli_command(cli,name):
++    if not is_cli():
++        yield
++        return
++    require_local_command(cli,name)
++    cap=current_cli(required=True);agent=cli.agent;db=getattr(agent,'_session_db',None)
++    from hermes_state import SessionDB
++    if not isinstance(db,SessionDB) or Path(db.db_path)!=cap.home/'state.db': raise users.ScopeDenied()
++    console=cli.console;stream=console.file
++    lease={'active':True,'cap':cap,'home':cap.home,'cli':cli,'agent':agent,
++           'session_id':cli.session_id,'database':db,'console':console,'stream':stream}
++    info=users._private(cap.home/'state.db');lease['database_identity']=(info.st_dev,info.st_ino)
++    _check_lease(lease)
++    _session_query(cap,cli.session_id,'SELECT id FROM sessions WHERE id=?',(cli.session_id,))
++    if _TURN.get() is not None or _CONTROL.get() is not None: raise users.ScopeDenied()
++    control={'active':True,'turn':lease,'receipt':{'schema':'friday.cli-control.v1','command':name,'route':route_for(lease)}}
++    tt=_TURN.set(lease);ct=_CONTROL.set(control)
++    try: yield
++    finally:
++        control['active']=False;lease['active']=False
++        _CONTROL.reset(ct);_TURN.reset(tt)
++
++
++def get_cli_control(context):
++    lease=_CONTROL.get()
++    if lease is None or not lease['active']: return None
++    _require_context(context,lease['receipt']['route'])
++    if _TURN.get() is not lease['turn']: return None
++    return copy.deepcopy(lease['receipt'])
++
++
++def retain_local_owner(context,ingress):
++    turn=_require_context(context,ingress['route'])
++    check_owner(owner_from_receipt(ingress),ingress)
++    return {'cap':turn['cap'],'cli':turn['cli'],'agent':turn['agent'],
++            'database':turn['database'],'database_identity':turn['database_identity'],'console':turn['console'],'stream':turn['stream'],
++            'context':context,'manager':context._manager,'manifest':context.manifest,'state':context.state,
++            'route':copy.deepcopy(ingress['route'])}
++
++
++def check_local_job(host,row):
++    if row['owner'].get('platform') != 'cli': return
++    original=host._local_owners.get(row['existing_task_id'])
++    if original is None: raise users.ScopeDenied()  # cannot remint from a durable record on restart
++    turn=current_turn();ingress=row['host']['binding']['ingress']
++    if (host.ctx is not original['context'] or host.ctx._manager is not original['manager']
++            or host.ctx.manifest is not original['manifest'] or host.ctx.state is not original['state']
++            or any(turn[k] is not original[k] for k in ('cap','cli','agent','database','console','stream'))
++            or turn['database_identity'] != original['database_identity']
++            or ingress['route'] != original['route']):
++        raise users.ScopeDenied()
++    _require_context(host.ctx,original['route'])
++    check_owner(row['owner'],ingress)
++
++
++@dataclass(frozen=True)
++class CLIReceivedInput:
++    cap: object
++    cli: object
++    home: Path
++    session_id: str
++    message: str
++
++
++def capture_cli_receive(cli,message,images=None):
++    """Original native chat entry, before reference/image transformations.
++
++    The opaque original capability is never part of a tool payload or persisted
++    receipt. Unsupported receive types/attachments/reference expansion refuse;
++    later admission also needs the original message in the real native DB.
++    """
++    if not is_cli(): return None
++    cap=current_cli(required=True)
++    if (getattr(cli,'_friday_cli_scope',None) is not cap or images not in (None,[])
++            or type(message) is not str or not message.strip() or len(message.encode())>65536
++            or not isinstance(cli.session_id,str) or not cli.session_id):
++        raise users.ScopeDenied()
++    from agent.context_references import parse_context_references
++    if parse_context_references(message): raise users.ScopeDenied()
++    return CLIReceivedInput(cap,cli,cap.home,cli.session_id,message)
+--- a/hermes/hermes_cli/plugins.py
++++ b/hermes/hermes_cli/plugins.py
+@@ -652,7 +652,23 @@
+         from hermes_cli.plugins_gateway_control import register_gateway_control
+         return register_gateway_control(self, name, handler)
+ 
++    def require_cli_work(self, route):
++        from hermes_cli.friday_cli_work import require_cli_foreground
++        return require_cli_foreground(self, route)
++
++    def run_cli_work(self, coro, *, route, name=None):
++        """Finite foreground work; original native bridge and unload ledger."""
++        from hermes_cli.friday_cli_work import run_cli_foreground
++        return run_cli_foreground(self, coro, route=route, name=name)
++
++    async def deliver_cli_document(self, **kwargs):
++        from hermes_cli.friday_cli_work import deliver_cli_document
++        return await deliver_cli_document(self, **kwargs)
++
+     def get_command_context(self) -> Optional[dict]:
++        from hermes_cli.friday_cli_work import is_cli, get_cli_control
++        if is_cli():
++            return get_cli_control(self)
+         from hermes_cli.plugin_command_context import get_command_context
+         return get_command_context(self)
+ 
+--- a/hermes/hermes_cli/plugins_gateway_work.py
++++ b/hermes/hermes_cli/plugins_gateway_work.py
+@@ -184,11 +184,35 @@
+             raise TypeError("spawn_task expects a coroutine")
+         loop = asyncio.get_running_loop()
+         task_name = name or f"plugin:{self.plugin_id}:task"
+-        task = loop.create_task(coro, name=task_name)
+-        handle = self._track("background_task", task_name, lambda: cancel_task(task))
+-        task.add_done_callback(lambda _t: handle.dispose())
+-        logger.debug("Plugin %s spawned supervised task: %s", self.manifest.name, task_name)
+-        return task
++        # Register ownership before task creation. A registration failure must
++        # not leave an unowned task queued on the native loop.
++        task = None
++        def release():
++            if task is None:
++                _close_unstarted(coro)
++            else:
++                cancel_task(task)
++        try:
++            logger.debug("Plugin %s spawning supervised task: %s", self.manifest.name, task_name)
++            handle = self._track("background_task", task_name, release)
++        except BaseException:
++            _close_unstarted(coro)
++            raise
++        try:
++            task = loop.create_task(coro, name=task_name)
++            task.add_done_callback(lambda _t: handle.dispose())
++            if not handle.active:
++                cancel_task(task)  # unload raced registration before assignment
++            return task
++        except BaseException:
++            handle.dispose()
++            if task is not None:
++                def reap(finished):
++                    if not finished.cancelled():
++                        finished.exception()
++                    _close_unstarted(coro)
++                task.add_done_callback(reap)
++            raise
+ 
+     def schedule_gateway_work(self, coro, *, route: Mapping[str, Any], name: str | None = None):
+         """Submit owned work to the live gateway loop, including from a sync tool thread.
+--- a/project/plugins/friday_rework/admission.py
++++ b/project/plugins/friday_rework/admission.py
+@@ -33,6 +33,9 @@
+ 
+ 
+ def _snapshot(value):
++    if isinstance(value, dict) and value.get('platform') == 'cli':
++        from hermes_cli.friday_cli_work import validate_ingress
++        return validate_ingress(value)
+     top = {"platform", "session_key", "source_profile", "transport_profile", "runtime_profile", "message"}
+     fields = {"bot_id", "user_id", "chat_id", "thread_id", "message_id", "platform_update_id", "reply_to_message_id", "media"}
+     if (not isinstance(value, dict) or set(value) not in (top, top | {"chat_type"})
+@@ -82,6 +85,9 @@
+ 
+ def _receipt_key(value):
+     # One routed message cannot silently acquire another bot/update identity.
++    if value.get('platform') == 'cli':
++        return hashlib.sha256(_encoded(['cli', value['session_id'], value['runtime_home'],
++                                      value['input']['native_message_id']])).hexdigest()
+     return hashlib.sha256(_encoded([
+         value["session_key"], value["source_profile"], value["message"]["message_id"]
+     ])).hexdigest()
+@@ -94,6 +100,8 @@
+     chat type. The gateway rechecks current authorization and actual adapter.
+     """
+     value = _snapshot(matched_ingress)
++    if value['platform'] == 'cli':
++        return copy.deepcopy(value['route'])
+     if "chat_type" not in value:
+         raise ValueError("missing_admitted_delivery_route")
+     message = value["message"]
+@@ -119,10 +127,18 @@
+     # Mask an outer invocation before allocation/validation can fail. Hermes
+     # falls through after middleware exceptions, so no such fallback may use
+     # the parent's correlation as proof for this call.
++    outer = _call.get()
+     token = _call.set(None)
+     try:
+         try:
+-            identity = tuple(_text(context.get(key)) for key in CALL_FIELDS)
++            if outer is not None:
++                raise ValueError('nested_native_call')
++            from hermes_cli.friday_cli_work import is_cli, admitted_call
++            if is_cli():
++                _, verified = admitted_call(context)
++                identity = tuple(verified[key] for key in CALL_FIELDS)
++            else:
++                identity = tuple(_text(context.get(key)) for key in CALL_FIELDS)
+         except Exception:
+             identity = None
+         _call.set(identity)
+@@ -176,8 +192,25 @@
+ 
+     def match(self, owner, *, task_id, session_id):
+         call = _call.get()
+-        if call is None or call[:2] != (task_id, session_id) or session_id != owner["id"]:
++        original_session = owner['session_id'] if owner.get('platform') == 'cli' else owner['id']
++        if call is None or call[:2] != (task_id, session_id) or session_id != original_session:
+             raise ValueError("missing_native_correlation")
++        if owner.get('platform') == 'cli':
++            from hermes_cli.friday_cli_work import admitted_call, check_owner
++            snapshot, native = admitted_call(dict(zip(CALL_FIELDS, call)))
++            check_owner(owner, snapshot)
++            with self.associations._locked():
++                document = self._read()
++                key = _receipt_key(snapshot)
++                prior = document['receipts'].get(key)
++                if prior is not None and prior != snapshot:
++                    raise ValueError('ingress_identity_conflict')
++                if prior is None:
++                    document['receipts'][key] = snapshot
++                    self.associations.state_set(KEY, document)
++                _sync_directory(Path(self.state.data_dir))
++            check_owner(owner, snapshot)
++            return copy.deepcopy(snapshot), native
+         lookup = {"session_key": owner["key"], "source_profile": owner["profile"],
+                   "message": {"message_id": owner["message_id"]}}
+         with self.associations._locked():
+--- a/project/plugins/friday_rework/associations.py
++++ b/project/plugins/friday_rework/associations.py
+@@ -50,6 +50,9 @@
+ 
+ 
+ def _owner(value):
++    if isinstance(value,dict) and value.get('platform') == 'cli':
++        from hermes_cli.friday_cli_work import validate_owner
++        return validate_owner(value)
+     if not isinstance(value, dict) or set(value) != OWNER_FIELDS:
+         raise AssociationError("invalid_owner")
+     return {k: _text(v, empty=k in {"thread_id", "profile"}) for k, v in value.items()}
+@@ -179,9 +182,24 @@
+     """
+     def __init__(self, native_state, *, clock=time.time):
+         self.state = native_state
++        from hermes_cli.friday_cli_work import is_cli, check_store
++        from hermes_cli.friday_cli_principal import current_cli
++        self._cli_authority = current_cli(required=True) if is_cli() else None
++        check_store(self._cli_authority, self.state)
++        self._cli_state = self.state
++        self._cli_directory = Path(self.state.data_dir)
++        self._cli_namespace = self.state._data_namespace if self._cli_authority is not None else None
+         self.clock = clock
+         self._thread_lock = threading.RLock()
+         self._lock_allowance = ContextVar("association_lock_allowance", default=None)
++
++    def _check_local_state(self):
++        from hermes_cli.friday_cli_work import check_store
++        check_store(self._cli_authority, self.state)
++        if self._cli_authority is not None and (self.state is not self._cli_state
++                or Path(self.state.data_dir) != self._cli_directory
++                or self.state._data_namespace != self._cli_namespace):
++            raise AssociationError('foreign_cli_state')
+ 
+     @contextmanager
+     def lock_budget(self):
+@@ -195,15 +213,21 @@
+             self._lock_allowance.reset(token)
+ 
+     def state_get(self, key, default=None):
++        self._check_local_state()
+         with self.lock_budget():
+-            return self.state.get(key, default, lock_budget=self._lock_allowance.get())
++            value = self.state.get(key, default, lock_budget=self._lock_allowance.get())
++            self._check_local_state()
++            return value
+ 
+     def state_set(self, key, value):
++        self._check_local_state()
+         with self.lock_budget():
+             self.state.set(key, value, lock_budget=self._lock_allowance.get())
++        self._check_local_state()
+ 
+     @contextmanager
+     def _locked(self):
++        self._check_local_state()
+         # Unload and coroutine cancellation use the same owned store through
+         # different executor threads. Their contention is not a foreign writer.
+         with self.lock_budget():
+@@ -219,6 +243,7 @@
+ 
+     @contextmanager
+     def _locked_file(self):
++        self._check_local_state()
+         directory = Path(self.state.data_dir)
+         if not directory.is_absolute() or directory.resolve() != directory:
+             raise AssociationError("unsafe_state_directory")
+@@ -258,6 +283,7 @@
+                 data = {"schema_version": 1, "jobs": {}}
+                 self._save(data)
+             _validate_store(data)
++            self._check_local_state()
+             if not marker:
+                 if os.pwrite(fd, b"v1\n", 0) != 3:
+                     raise OSError("short_admission_marker_write")
+@@ -501,9 +527,13 @@
+         message/session never changes the retained delivery destination.
+         """
+         fields = {"bot_id", "user_id", "chat_id", "thread_id", "profile"}
+-        if not isinstance(principal, dict) or set(principal) != fields:
+-            raise AssociationError("invalid_control_principal")
+-        principal = {k: _text(v, empty=k in {"thread_id", "profile"}) for k, v in principal.items()}
++        if isinstance(principal,dict) and principal.get('platform') == 'cli':
++            from hermes_cli.friday_cli_work import validate_principal
++            principal = validate_principal(principal)
++        else:
++            if not isinstance(principal, dict) or set(principal) != fields:
++                raise AssociationError("invalid_control_principal")
++            principal = {k: _text(v, empty=k in {"thread_id", "profile"}) for k, v in principal.items()}
+         _text(task_id, 128)
+         with self._locked() as data:
+             row = data["jobs"].get(task_id)
+--- a/project/plugins/friday_rework/boundary.py
++++ b/project/plugins/friday_rework/boundary.py
+@@ -36,6 +36,12 @@
+     # Only values bound in this execution context can be routing observations.
+     # This is not authorization/admission proof; bot/update/input provenance
+     # must be joined at the trusted gateway boundary before any future launch.
++    from hermes_cli.friday_cli_work import is_cli, current_turn, ingress_for, owner_from_receipt
++    if is_cli():
++        owner = owner_from_receipt(ingress_for(current_turn()))
++        if session_id is not None and session_id != owner['session_id']:
++            raise ValueError('session_mismatch')
++        return owner
+     names = ("PLATFORM", "CHAT_ID", "CHAT_TYPE", "THREAD_ID", "USER_ID",
+              "KEY", "ID", "MESSAGE_ID", "PROFILE")
+     wanted = {"HERMES_SESSION_" + name for name in names}
+--- a/project/plugins/friday_rework/host.py
++++ b/project/plugins/friday_rework/host.py
+@@ -46,6 +46,7 @@
+         # Cached *checked* associations permit emergency stop after store damage.
+         # They are not an admission authority, task database or execution queue.
+         self._owned = {}
++        self._local_owners = {}  # retained native objects; never reconstructed from rows
+         self._a0_controllers = {}
+         self._a0_admissions = set()
+         self._closed = False
+@@ -77,6 +78,8 @@
+             scope = current()
+             ingress, correlation = self.admission.match(
+                 owner, task_id=kwargs.get("task_id"), session_id=kwargs.get("session_id"))
++            if owner.get('platform') == 'cli' and any(kwargs.get(k) != correlation[k] for k in correlation):
++                raise HostUnavailable('missing_native_cli_call')
+             if scope is not None:
+                 scope.require_owner(owner, ingress)
+         except (ValueError, RuntimeError, OSError):
+@@ -93,6 +96,8 @@
+             if old is not None:
+                 from hermes_cli.friday_user_scope import check_retained_job
+                 check_retained_job(old)
++                from hermes_cli.friday_cli_work import check_local_job
++                check_local_job(self, old)
+                 # Exact duplicate is read-only: no budget reset, preparation,
+                 # new scheduler task, cache restaging or implicit continuation.
+                 binding = old.get("host", {}).get("binding", {})
+@@ -103,8 +108,12 @@
+             configured = self.ctx.get_config("runtime")
+             if not isinstance(configured, dict) or configured.get("enabled") is not True:
+                 return json.dumps({"accepted": False, "error": "worker_not_admitted"})
+-            if any(not callable(getattr(self.ctx, api, None))
+-                   for api in ("get_command_context", "schedule_gateway_work")):
++            if ingress['platform'] == 'cli':
++                if any(not callable(getattr(self.ctx, api, None)) for api in ('require_cli_work','run_cli_work')):
++                    raise HostUnavailable('cli_foreground_unavailable')
++                self.ctx.require_cli_work(delivery_route(ingress))
++            elif any(not callable(getattr(self.ctx, api, None))
++                     for api in ("get_command_context", "schedule_gateway_work")):
+                 raise HostUnavailable("worker_not_available")
+             runtime = check_runtime(select_runtime(configured, brief.worker), self.store)
+             if ('a0' in runtime) != (brief.worker == 'a0'):
+@@ -131,13 +140,26 @@
+                 acceptance=acceptance,
+                 host_binding=host_binding)
+             if not fresh:
++                from hermes_cli.friday_user_scope import check_retained_job
++                from hermes_cli.friday_cli_work import check_local_job
++                check_retained_job(row)
++                check_local_job(self, row)
++                if row['host']['binding'] != host_binding:
++                    raise AssociationError('admission_conflict')
+                 return json.dumps(status(row))
+             self._owned[address] = copy.deepcopy(row)
++            if ingress['platform'] == 'cli':
++                from hermes_cli.friday_cli_work import retain_local_owner
++                self._local_owners[address] = retain_local_owner(self.ctx, ingress)
+             if brief.worker == 'a0': self._a0_admissions.add(address)
+             # No fallback to a shared directory, no clobber of earlier artifacts.
+             workspace = Path(row["workspace_reference"])
+             staging = Path(runtime["staging_root"]) / address
+             for directory in (workspace, staging):
++                from hermes_cli.friday_user_scope import check_retained_job
++                from hermes_cli.friday_cli_work import check_local_job
++                check_retained_job(row)
++                check_local_job(self, row)
+                 private_directory(directory.parent)
+                 directory.mkdir(mode=0o700)
+                 private_directory(directory)
+@@ -158,6 +180,9 @@
+                 # Only the host's native producer can provide current evidence,
+                 # after durable reservation and byte-verified input retention.
+                 return json.dumps(self.produce_a0_capability(address, owner))
++            if ingress['platform'] == 'cli':
++                answer = self.ctx.run_cli_work(self._run(row), route=route, name='friday:' + address)
++                return json.dumps({**answer, 'scheduling': 'FINITE_FOREGROUND'})
+             self.ctx.schedule_gateway_work(self._run(row), route=route, name="friday:" + address)
+             return json.dumps(status(row))
+         except (ValueError, RuntimeError, OSError, TypeError, KeyError) as error:
+@@ -178,6 +203,8 @@
+         row = self.store.get(task_id, owner)
+         from hermes_cli.friday_user_scope import check_retained_job
+         check_retained_job(row)
++        from hermes_cli.friday_cli_work import check_local_job
++        check_local_job(self, row)
+         runtime = row['host']['binding']['runtime']
+         if row['worker_kind'] != 'a0' or select_runtime(self.ctx.get_config('runtime'), 'a0') != runtime:
+             raise HostUnavailable('foreign_a0_runtime_binding')
+@@ -226,11 +253,17 @@
+         stop-only: it cannot redispatch a precrash reservation or attachment.
+         """
+         row, session = self._a0_producer_session(task_id, owner)
++        if row['owner'].get('platform') == 'cli':
++            self.ctx.require_cli_work(delivery_route(row['host']['binding']['ingress']))
+         row, fresh = self.store.attach_a0_capability(task_id, owner, pin, session.validate_capability)
+         self._remember(row)
+         if fresh:
+-            self.ctx.schedule_gateway_work(self._run(row), route=delivery_route(row['host']['binding']['ingress']),
+-                                           name='friday:'+task_id)
++            route = delivery_route(row['host']['binding']['ingress'])
++            if row['owner'].get('platform') == 'cli':
++                self.ctx.require_cli_work(route)
++                self.ctx.run_cli_work(self._run(row), route=route,name='friday:'+task_id)
++            else:
++                self.ctx.schedule_gateway_work(self._run(row), route=route,name='friday:'+task_id)
+         return status(row)
+ 
+     def _remember(self, row):
+@@ -270,6 +303,10 @@
+ 
+     def _retain_settlement(self, row, observation):
+         row = self._remember(self.store.get(row["existing_task_id"], row["owner"]))
++        from hermes_cli.friday_user_scope import check_retained_job
++        check_retained_job(row)
++        from hermes_cli.friday_cli_work import check_local_job
++        check_local_job(self, row)
+         terminal = quiet = None
+         if isinstance(observation, NativeObservation) and observation.state in {"completed", "failed", "stopped"}:
+             terminal = {"state": observation.state, "evidence_reference": observation.evidence_reference,
+@@ -299,8 +336,11 @@
+         row = self._remember(self.store.get(row["existing_task_id"], row["owner"]))
+         from hermes_cli.friday_user_scope import check_retained_job
+         check_retained_job(row)
++        from hermes_cli.friday_cli_work import check_local_job
++        check_local_job(self, row)
+         controller = self._controller(row)
+-        if self._closed or row["stop_intent"]:
++        from hermes_cli.friday_cli_work import should_stop
++        if self._closed or row["stop_intent"] or (row['owner'].get('platform') == 'cli' and should_stop()):
+             return self._stop(row, row["stop_intent"] or "cancel")
+         if self.store.clock() >= row["deadline_unix"]:
+             # Withdrawal precedes prepare; expiry never gets a fresh budget.
+@@ -311,7 +351,11 @@
+         check_runtime(runtime, self.store)
+         brief = parse_brief(row["host"]["binding"]["brief"])
+         inputs = tuple(VerifiedInput(**v) for v in row["host"]["inputs"])
++        check_retained_job(row)
++        check_local_job(self, row)
+         controller.prepare(row["existing_task_id"], row["owner"], brief, inputs)
++        check_retained_job(row)
++        check_local_job(self, row)
+         return self._settle(row, controller.start(row["existing_task_id"], row["owner"], brief, inputs))
+ 
+     def _reconcile(self, row):
+@@ -340,6 +384,8 @@
+             return row  # Restart/status never prepares or launches.
+         from hermes_cli.friday_user_scope import check_retained_job
+         check_retained_job(row)
++        from hermes_cli.friday_cli_work import check_local_job
++        check_local_job(self, row)
+         return self._settle(row, self._controller(row).reconcile(row["existing_task_id"], row["owner"]))
+ 
+     def _stop(self, row, intent):
+@@ -359,7 +405,9 @@
+                          and row['host']['a0'].get('route') is None))):
+                 return self._settle(row, NativeObservation("", "", "association:" + row["existing_task_id"] + "#stop_intent",
+                                                          row["elapsed_seconds"], "stopped"))
+-            principal = {k: row["owner"][k] for k in PRINCIPAL}
++            principal = ({k: row['owner'][k] for k in ('platform','session_id','profile','transport_profile',
++                           'account_id','user_id','os_uid','authority','home')}
++                         if row['owner'].get('platform') == 'cli' else {k: row["owner"][k] for k in PRINCIPAL})
+             value = self._controller(row).stop(row["existing_task_id"], principal, intent)
+             return self._settle(row, value)
+         except BaseException as error:
+@@ -378,7 +426,9 @@
+             current = await asyncio.shield(execution)
+             while current["host"]["quiescence"] is None:
+                 await asyncio.sleep(min(1.0, max(.01, current["deadline_unix"] - self.store.clock())))
+-                if self._closed or select_runtime(self.ctx.get_config("runtime"), row["worker_kind"]) != row["host"]["binding"]["runtime"]:
++                from hermes_cli.friday_cli_work import should_stop
++                if (self._closed or (row['owner'].get('platform') == 'cli' and should_stop())
++                        or select_runtime(self.ctx.get_config("runtime"), row["worker_kind"]) != row["host"]["binding"]["runtime"]):
+                     current = await asyncio.to_thread(self._stop, current, "cancel")
+                 else:
+                     current = await asyncio.to_thread(self._reconcile, current)
+@@ -411,6 +461,11 @@
+     def _principal(self, receipt, command):
+         if not isinstance(receipt, dict):
+             raise HostUnavailable("unproved_control")
++        if receipt.get('schema') == 'friday.cli-control.v1':
++            from hermes_cli.friday_cli_work import get_cli_control, principal_from_route
++            if self.ctx.get_command_context() != receipt or receipt['command'] != command:
++                raise HostUnavailable('unproved_cli_control')
++            return principal_from_route(receipt['route'])
+         operation = receipt.get("native_operation")
+         if operation is not None:
+             if (command != "friday-stop" or operation not in ("stop", "new")
+@@ -476,6 +531,10 @@
+ 
+     @staticmethod
+     def _matches_control(row, principal, receipt):
++        if principal.get('platform') == 'cli':
++            return ('host' in row and row['host']['quiescence'] is None
++                    and all(row['owner'].get(k) == v for k,v in principal.items())
++                    and row['host']['binding']['ingress']['route'] == receipt['route'])
+         return ("host" in row and row["host"]["quiescence"] is None
+                 and all(row["owner"][k] == principal[k] for k in PRINCIPAL)
+                 and row["host"]["binding"]["ingress"]["transport_profile"]
+@@ -493,6 +552,11 @@
+             if not isinstance(raw_args, str) or (builtin and raw_args != ""):
+                 raise HostUnavailable("unproved_control")
+             reference = raw_args.strip()
++            if principal.get('platform') == 'cli':
++                from hermes_cli.friday_cli_work import check_local_job
++                for owned in tuple(self._owned.values()):
++                    if (not reference or owned['existing_task_id'] == reference):
++                        check_local_job(self, owned)
+             candidates = [r for r in tuple(self._owned.values())
+                           if (not reference or r["existing_task_id"] == reference)
+                           and self._matches_control(r, principal, receipt)]
+@@ -510,10 +574,12 @@
+                 # a subsequent metadata wait cannot withhold this checked stop.
+                 cached = copy.deepcopy(rows[0])
+             row = self.store.get_for_control(reference, principal)
++            from hermes_cli.friday_cli_work import check_local_job
++            check_local_job(self, row)
+             if "host" not in row:
+                 raise HostUnavailable("missing_host_binding")
+-            if (row["host"]["binding"]["ingress"]["transport_profile"]
+-                    != receipt["admitted_ingress"]["transport_profile"]):
++            transport = receipt['route']['transport_profile'] if receipt.get('schema') == 'friday.cli-control.v1' else receipt['admitted_ingress']['transport_profile']
++            if (row["host"]["binding"]["ingress"]["transport_profile"] != transport):
+                 raise HostUnavailable("foreign_control_profile")
+             self._remember(row)
+             cached = row
+@@ -578,6 +644,8 @@
+         for command in ("friday-stop", "friday-pause", "friday-status"):
+             def handler(raw_args, name=command):
+                 return host.control(name, raw_args)
+-            ctx.register_command(command, handler, args_hint="[reference]", gateway_control=True,
+-                                 native_controls=("stop", "new") if command == "friday-stop" else ())
++            from hermes_cli.friday_cli_work import is_cli
++            local = is_cli()
++            ctx.register_command(command, handler, args_hint="[reference]", gateway_control=not local,
++                                 native_controls=("stop", "new") if command == "friday-stop" and not local else ())
+     return host
+--- a/project/plugins/friday_rework/host_record.py
++++ b/project/plugins/friday_rework/host_record.py
+@@ -24,6 +24,9 @@
+ 
+ 
+ def owner_from_ingress(correlation, ingress):
++    if ingress.get('platform') == 'cli':
++        from hermes_cli.friday_cli_work import owner_from_receipt
++        return owner_from_receipt(ingress)
+     message = ingress["message"]
+     return {**{k: message[k] for k in ("bot_id", "user_id", "chat_id", "thread_id", "message_id")},
+             "session_id": correlation["session_id"], "session_key": ingress["session_key"],
+@@ -322,7 +325,8 @@
+             if (not isinstance(authority, dict) or set(authority) != {"principal_id", "generation"}
+                     or type(authority["generation"]) is not int or authority["generation"] < 1
+                     or authority["principal_id"] != principal_id(ingress["platform"], ingress["transport_profile"],
+-                        ingress["message"]["bot_id"], ingress["message"]["user_id"])):
++                        (ingress['account_id'] if ingress['platform'] == 'cli' else ingress["message"]["bot_id"]),
++                        (ingress['user_id'] if ingress['platform'] == 'cli' else ingress["message"]["user_id"]))):
+                 raise ValueError()
+         brief = parse_brief(binding["brief"])
+         runtime = validate_runtime(binding["runtime"])
+--- a/project/plugins/friday_rework/inputs.py
++++ b/project/plugins/friday_rework/inputs.py
+@@ -22,6 +22,12 @@
+     Old receipts lacking content remain readable, but cannot authorize bytes.
+     """
+     ingress = _snapshot(matched_ingress)
++    if ingress['platform'] == 'cli':
++        from hermes_cli.friday_cli_work import check_owner, owner_from_receipt
++        check_owner(owner_from_receipt(ingress), ingress)
++        if ingress['input']['attachments'] != []:
++            raise ArtifactError('cli_file_receive_unsupported')
++        return ()
+     if (type(max_file_bytes) is not int or max_file_bytes <= 0
+             or type(max_total_bytes) is not int or max_total_bytes <= 0):
+         raise ArtifactError("invalid_input_limits")
+--- a/project/plugins/friday_rework/result_tool.py
++++ b/project/plugins/friday_rework/result_tool.py
+@@ -27,6 +27,10 @@
+     """
+     from hermes_cli.friday_user_scope import check_retained_job
+     check_retained_job(row)
++    if row['owner'].get('platform') == 'cli':
++        from hermes_cli.friday_cli_work import check_local_job
++        check_local_job(host, row)
++        return  # foreground return is the retained original parent result, no queue injection
+     if host.ctx.get_config("results") != {"enabled": True} or host._closed:
+         return
+     def reserve():
+@@ -71,12 +75,26 @@
+     # every supplied ID, never invent omitted IDs from arguments/environment.
+     if (call is None or call[:2] != (kwargs.get("task_id"), kwargs.get("session_id"))
+             or any(k in kwargs and kwargs[k] != call[i] for i, k in enumerate(CALL_FIELDS))
+-            or call[0] != call[1] or call[1] != owner["id"]):
++            or call[0] != call[1] or call[1] != (owner['session_id'] if owner.get('platform') == 'cli' else owner["id"])):
+         raise AssociationError("unproved_result_call")
+     row = host.store.snapshot().get(reference)
+     if not row or "host" not in row:
+         raise AssociationError("unknown_result")
+     binding, original = row["host"]["binding"], row["owner"]
++    if owner.get('platform') == 'cli':
++        from hermes_cli.friday_cli_work import check_owner, validate_owner
++        from hermes_cli.friday_user_scope import check_retained_job
++        if (host._closed or Path(host.store.state.data_dir) != host._state_directory
++                or get_hermes_home() != Path(binding['runtime']['runtime_home'])
++                or any(owner[k] != original[k] for k in validate_owner(original) if k != 'ingress_message_id')):
++            raise AssociationError('foreign_result_owner')
++        if any(kwargs.get(k) != call[i] for i,k in enumerate(CALL_FIELDS)):
++            raise AssociationError('missing_native_cli_call')
++        from hermes_cli.friday_cli_work import check_local_job
++        check_local_job(host, row)
++        check_owner(original, binding['ingress'])
++        check_retained_job(row)
++        return row
+     if (host._closed or Path(host.store.state.data_dir) != host._state_directory
+             or get_hermes_home() != Path(binding["runtime"]["runtime_home"])
+             or owner["platform"] != "telegram" or owner["key"] != original["session_key"]
+@@ -166,6 +184,13 @@
+             if action == "deliver":
+                 if "result" not in row:
+                     raise AssociationError("result_not_collected")
++                if row['owner'].get('platform') == 'cli':
++                    route = delivery_route(row['host']['binding']['ingress'])
++                    self.host.ctx.require_cli_work(route)
++                    delivery = self.host.ctx.run_cli_work(self.deliver(row, retry=args.get('retry',False)),
++                                  route=route,name='friday-result:'+row['existing_task_id'])
++                    return json.dumps({**status(self.host.store.get(row['existing_task_id'],row['owner'])),
++                                       'delivery_requested':True,'delivery_observation':delivery})
+                 self.host.ctx.schedule_gateway_work(
+                     self.deliver(row, retry=args.get("retry", False)),
+                     route=delivery_route(row["host"]["binding"]["ingress"]),
+@@ -181,6 +206,8 @@
+         for artifact in row["result"]["artifacts"]:
+             current = self.host.store.get(row["existing_task_id"], row["owner"])
+             check_retained_job(current)
++            from hermes_cli.friday_cli_work import check_local_job
++            check_local_job(self.host, current)
+             attempts = current["result"]["deliveries"][artifact["reference"]]
+             if attempts and attempts[-1]["state"] in {"DELIVERED", "UNKNOWN"}:
+                 continue  # Never duplicate a delivered or uncertain native send.
+--- a/project/plugins/friday_rework/results.py
++++ b/project/plugins/friday_rework/results.py
+@@ -42,7 +42,12 @@
+ 
+ 
+ def _expected_receipt(row, artifact):
+-    message = row["host"]["binding"]["ingress"]["message"]
++    ingress=row['host']['binding']['ingress']
++    if ingress['platform'] == 'cli':
++        from .admission import delivery_route
++        return {'kind':'local-output','sha256':artifact['sha256'],'bytes':artifact['size_bytes'],
++                'file_name':artifact['logical_name'],'route':delivery_route(ingress)}
++    message = ingress["message"]
+     return {"kind": "document", "sha256": artifact["sha256"],
+             "bytes": artifact["size_bytes"], "file_name": artifact["logical_name"],
+             "bot_id": message["bot_id"], "chat_id": message["chat_id"],
+@@ -55,11 +60,24 @@
+         return {"state": "UNKNOWN"}
+     if value["state"] == "FAILED":
+         # Only these native pre-send refusals establish that no send happened.
+-        if value.get("error") in {"gateway_delivery_preflight_rejected", "gateway_document_route_rejected",
+-                                  "invalid_document", "document_bytes_unsupported"}:
+-            return {"state": "FAILED", "error": value["error"]}
+-        return {"state": "UNKNOWN"}
++        allowed = {'cli_document_preflight_rejected'} if row['owner'].get('platform') == 'cli' else {
++            'gateway_delivery_preflight_rejected','gateway_document_route_rejected','invalid_document','document_bytes_unsupported'}
++        if value.get('error') in allowed:
++            return {'state':'FAILED','error':value['error']}
++        return {'state':'UNKNOWN'}
+     expected = _expected_receipt(row, artifact)
++    if row['owner'].get('platform') == 'cli':
++        from hermes_cli.friday_cli_work import validate_route
++        try:
++            validate_route(value.get('route'))
++        except Exception:
++            return {'state':'UNKNOWN'}
++        if type(value.get('bytes')) is not int:
++            return {'state':'UNKNOWN'}
++        if (value['state']=='DELIVERED' and all(value.get(k)==v for k,v in expected.items())
++                and value.get('native_output')=='write-and-flush' and value.get('human_read')=='UNCONFIRMED'):
++            return {'state':'DELIVERED',**expected,'native_output':'write-and-flush','human_read':'UNCONFIRMED'}
++        return {'state':'UNKNOWN'}
+     if value["state"] == "DELIVERED" and all(value.get(k) == v for k, v in expected.items()):
+         message = value.get("message_id")
+         if isinstance(message, str) and message.isascii() and message.isdecimal() and int(message) > 0:
+@@ -445,12 +463,15 @@
+     """One explicit send of retained bytes to the retained original destination."""
+     from .admission import delivery_route
+     row = store.get(row["existing_task_id"], row["owner"])
++    from hermes_cli.friday_user_scope import check_retained_job
++    check_retained_job(row)
+     artifact = next((a for a in row.get("result", {}).get("artifacts", []) if a["reference"] == reference), None)
+     if artifact is None:
+         raise AssociationError("unknown_result_artifact")
+     # Recheck bytes BEFORE reserving a send. A changed staging file never sends.
+     payload = await asyncio.to_thread(read_staged, staging_root=output_root(row), artifact=StagedArtifact(**artifact),
+                                       max_bytes=row["host"]["binding"]["runtime"]["max_file_bytes"])
++    check_retained_job(row)
+     attempt, row = begin_delivery(store, row["existing_task_id"], row["owner"], reference, retry=retry)
+     terminal = row["host"]["terminal"]
+     partial = row["stop_intent"] is not None or terminal is None or terminal["state"] != "completed"
+@@ -458,9 +479,12 @@
+              "FAIL": "Проверка цели не пройдена.", "PASS": "Проверено чтением файлов; запуск тестов этим не подтверждается."}[row["goal_verification"]]
+     caption = ("Частичный результат. " if partial else "Результат исполнителя. ") + check
+     try:
+-        receipt = await ctx.deliver_gateway_document(route=delivery_route(row["host"]["binding"]["ingress"]),
++        check_retained_job(row)
++        send = ctx.deliver_cli_document if row['owner'].get('platform') == 'cli' else ctx.deliver_gateway_document
++        receipt = await send(route=delivery_route(row["host"]["binding"]["ingress"]),
+                     data=payload, file_name=artifact["logical_name"], caption=caption, timeout=30)
+     except Exception:
+         receipt = {"state": "UNKNOWN"}
+     # Cancellation/BaseException leaves durable UNKNOWN; no false FAILED/retry.
++    check_retained_job(row)
+     return finish_delivery(store, row["existing_task_id"], row["owner"], reference, attempt["number"], receipt)
