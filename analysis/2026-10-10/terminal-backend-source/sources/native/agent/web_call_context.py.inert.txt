@@ -1,0 +1,130 @@
+"""Original native call clocks and a sticky per-turn web launch/stop fence."""
+from contextlib import contextmanager
+from contextvars import ContextVar
+import math
+import threading
+import time
+
+_current = ContextVar('native_web_call', default=None)
+_child_deadline = ContextVar('native_web_child_deadline', default=None)
+
+
+class WebTurn:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.stopped = threading.Event()
+        self.calls = set()
+        self.receipt = {'status': 'QUIESCENT', 'sessions': []}
+
+    def stop(self):
+        # Admission sees the latch even while launch holds the lock. Neither a
+        # reused thread id nor clear_interrupt() can clear this turn's intent.
+        self.stopped.set()
+        if not self.lock.acquire(timeout=2):
+            self.receipt = {'status': 'STOP_UNCONFIRMED', 'reason': 'web_launch_unsettled'}
+            return self.receipt
+        try:
+            receipts = [call.stop() for call in list(self.calls)]
+            self.receipt = {'status': 'QUIESCENT' if all(r['status']=='QUIESCENT' for r in receipts)
+                            else 'STOP_UNCONFIRMED', 'sessions': receipts}
+            return self.receipt
+        finally:
+            self.lock.release()
+
+
+class WebCall:
+    def __init__(self, turn, deadline, task_id, session_id, call_id, authorization_gate=None, run_deadline=None):
+        self.turn = turn
+        self.base_deadline = deadline
+        self.run_deadline = run_deadline
+        self.authorization_gate = authorization_gate
+        self.task_id, self.session_id, self.call_id = task_id, session_id, call_id
+        self.turn_id = ""
+        self.session_key = session_id
+        self.stopped = threading.Event()
+        self.session = None
+        self.registry = None
+        self.receipt = {'status': 'QUIESCENT', 'session_id': None}
+        with turn.lock:
+            turn.calls.add(self)
+
+    def deadline(self):
+        value = self.base_deadline
+        if value is not None and self.authorization_gate is not None:
+            value += self.authorization_gate.excluded_seconds()
+        if self.run_deadline is not None:
+            value = min(value, self.run_deadline) if value is not None else self.run_deadline
+        if value is None or not math.isfinite(value):
+            raise RuntimeError('web_original_deadline_required')
+        return value
+
+    def check(self):
+        from tools.interrupt import is_interrupted
+        if self.stopped.is_set() or self.turn.stopped.is_set() or is_interrupted():
+            raise RuntimeError('web_call_stopped')
+        if time.monotonic() >= self.deadline():
+            raise TimeoutError('web_original_deadline')
+
+    def stop(self):
+        self.stopped.set()
+        if not self.turn.lock.acquire(timeout=2):
+            self.receipt = {'status':'STOP_UNCONFIRMED','reason':'web_launch_unsettled'}
+            return self.receipt
+        try:
+            if self.session is not None:
+                self.receipt = self.registry.settle_web(self.session, stop=True)
+            if self.receipt['status'] == 'QUIESCENT':
+                self.turn.calls.discard(self)
+            return self.receipt
+        finally:
+            self.turn.lock.release()
+
+
+def make_web_call(agent, deadline, task_id, call_id, authorization_gate=None):
+    # Installed at turn start; partial callers lazily get a turn before submit.
+    turn = getattr(agent, '_web_turn', None)
+    if turn is None:
+        turn = agent._web_turn = WebTurn()
+    if getattr(agent, '_interrupt_requested', False):
+        turn.stopped.set()
+    call = WebCall(turn, deadline, task_id, getattr(agent,'session_id','') or '', call_id,
+                   authorization_gate, getattr(agent,'_web_run_deadline',None))
+    call.agent = agent
+    from tools.approval_context import get_current_session_key
+    call.session_key = get_current_session_key(default='') or call.session_id
+    call.turn_id = getattr(agent,'_current_turn_id','') or ''
+    return call
+
+
+@contextmanager
+def bind_web_call(call):
+    token = _current.set(call)
+    try:
+        yield
+    finally:
+        _current.reset(token)
+        with call.turn.lock:
+            if call.session is None:
+                call.turn.calls.discard(call)
+
+
+def current_web_call():
+    call = _current.get()
+    if call is None:
+        raise RuntimeError('web_caller_context_required')
+    call.check()
+    return call
+
+
+def check_web_deadline():
+    """Redispatch gate inside the trusted child, including copied asyncio contexts."""
+    deadline = _child_deadline.get()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError('web_original_deadline')
+
+
+def child_deadline(deadline):
+    if type(deadline) not in (float,int) or not math.isfinite(deadline):
+        raise RuntimeError('web_original_deadline_required')
+    _child_deadline.set(deadline)
+    check_web_deadline()

@@ -1,0 +1,678 @@
+"""Scoped ordinary terminal custody on the EXISTING native process handles.
+
+Foreground, pipe and true PTY use this one launch/stop path. A checkpoint or
+transport failure retains the handle and prevents replay; cleanup never needs
+a new user grant and never signals an unrelated host PID/group.
+"""
+from __future__ import annotations
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import select
+import subprocess
+import time
+import uuid
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from tools.process_registry import ProcessSession
+
+from tools.terminal_binding import TerminalBinding, TerminalScopeDenied, canonical, digest, directory_identity, _private_child
+from tools.terminal_containment import (START_RESERVE, SETTLE_RESERVE, PROPERTIES, fields, verify_unit,
+                                       cgroup_observation, private_bytes, durable_json, control_command,
+                                       control_env, launch_argv)
+
+
+class TerminalProcessMixin:
+    def _checked_scoped_checkpoint(self, session):
+        from hermes_cli.friday_user_scope import authority
+        from tools.process_registry import _checkpoint_path
+        if not self._lock.acquire(timeout=1):
+            raise RuntimeError('terminal_checkpoint_lock_bound')
+        try:
+            with authority(session.user_authority['home']):
+                self._write_checkpoint(strict=True)
+                entries = json.loads(private_bytes(_checkpoint_path()))
+            matches = [row for row in entries if row.get('session_id') == session.id]
+            if len(matches) != 1 or matches[0].get('terminal_metadata') != session.terminal_metadata:
+                raise RuntimeError('terminal_intent_checkpoint_unacknowledged')
+            if (matches[0].get('user_authority') != session.user_authority
+                    or matches[0].get('terminal_stop_requested') != session.terminal_stop_requested):
+                raise RuntimeError('terminal_checkpoint_authority_or_stop_changed')
+        finally:
+            self._lock.release()
+
+    def _latch_terminal_stop(self, session, reason='stop_requested'):
+        session.terminal_stop_requested = True
+        session.terminal_unconfirmed = True
+        session._scope_stop_pending = True
+        session.terminal_metadata['phase'] = 'STOP_REQUESTED'
+        session.terminal_metadata['stop_reason'] = reason
+        # Do not put disk fsync ahead of native stop. Launch/permit observes the
+        # same sticky bit immediately; stop/checkpoint settlement follows it.
+
+    def _terminal_show(self, session, timeout=1, *, starting=False):
+        result = control_command(['show', session.systemd_unit, '--property=' + ','.join(PROPERTIES)], timeout)
+        if result.returncode:
+            raise RuntimeError('terminal_native_unit_unreadable')
+        data = fields(result.stdout.decode(), PROPERTIES)
+        if not starting and data['LoadState'] == 'not-found':
+            required = {'Id': session.systemd_unit, 'MainPID': '0', 'ExecMainPID': '0',
+                        'InvocationID': '', 'ControlGroup': '', 'ActiveState': 'inactive',
+                        'SubState': 'dead', 'Transient': 'no'}
+            if any(data[k] != v for k, v in required.items()):
+                raise RuntimeError('terminal_contradictory_missing_unit')
+            return data
+        return verify_unit(data, session.terminal_metadata, starting=starting)
+
+    def _terminal_wrapper_gone(self, session):
+        if session.process is not None:
+            return session.process.poll() is not None
+        if session._pty is not None:
+            return not session._pty.isalive()
+        if not session.pid:
+            return not session.terminal_metadata.get('attempted')
+        if session.host_start_time is None:
+            raise RuntimeError('terminal_wrapper_birth_required')
+        return self._detached_host_fate(session.pid, session.host_start_time) in ('gone', 'reused')
+
+    def _terminal_capture(self, session, data):
+        meta = session.terminal_metadata
+        if data['LoadState'] == 'not-found':
+            return
+        group = data['ControlGroup'] or meta.get('cgroup')
+        if not group:
+            raise RuntimeError('terminal_uncaptured_native_cgroup')
+        observation = cgroup_observation(group, meta.get('cgroup_identity'))
+        meta['invocation'] = data['InvocationID']
+        meta['cgroup'] = group
+        meta['cgroup_identity'] = observation['identity']
+        pid = int(data['MainPID'])
+        if pid:
+            if not observation['populated']:
+                raise RuntimeError('terminal_main_without_populated_cgroup')
+            birth = self._safe_host_start_time(pid)
+            if birth is None:
+                raise RuntimeError('terminal_native_main_birth_required')
+            if meta.get('main_pid') and (pid != meta['main_pid'] or birth != meta['main_birth']):
+                raise RuntimeError('terminal_native_main_birth_changed')
+            meta['main_pid'], meta['main_birth'] = pid, birth
+
+    def _terminal_prepare(self, command, binding, cwd, use_pty, timeout, persist_on_release):
+        from agent.web_call_context import current_web_call
+        binding.check(caller=True)
+        if getattr(self, '_terminal_recovery_blocked', False):
+            raise RuntimeError('STOP_UNCONFIRMED')
+        call = current_web_call()
+        if not call.call_id:
+            raise TerminalScopeDenied('terminal_launch_correlation_required')
+        if not isinstance(command, str) or len(command.encode()) > 1_500_000:
+            raise TerminalScopeDenied('terminal_command_bound')
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise TerminalScopeDenied('terminal_finite_command_timeout_required')
+        deadline = min(binding.original_deadline, call.deadline(), time.monotonic() + timeout)
+        remaining = deadline - time.monotonic()
+        if remaining <= START_RESERVE + SETTLE_RESERVE + 1:
+            raise TerminalScopeDenied('terminal_insufficient_start_stop_budget')
+        launch_key = digest({'binding': binding.retained(), 'call': call.call_id,
+                             'command_sha256': hashlib.sha256(command.encode()).hexdigest(), 'pty': use_pty})
+        policy = binding.resources
+        n = policy['max_active']
+        resources = {key: policy[key] // n for key in ('cpu_quota_pct', 'memory_bytes', 'tasks_max', 'tmp_bytes')}
+        if resources['cpu_quota_pct'] < 1:
+            raise TerminalScopeDenied('terminal_cpu_allocation_too_small')
+        control_root = _private_child(Path(binding.cap.home) / 'cache', 'terminal-custody')
+        # This durable tombstone outlives native rolling result retention. Its
+        # existence is a refusal, including an uncertain earlier submission.
+        control_dir = control_root / launch_key
+        control_dir.mkdir(mode=0o700)
+        ready_dir = _private_child(control_dir, 'ready')
+        nonce = uuid.uuid4().hex
+        mounts = [{'path': binding.workspace, 'identity': list(binding.workspace_identity)},
+                  {'path': binding.state_root, 'identity': list(binding.state_identity)}]
+        shell_env = {'PATH': '/usr/bin:/bin', 'HOME': binding.state_root, 'TMPDIR': '/tmp',
+                     'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'PAGER': 'cat', 'GIT_PAGER': 'cat'}
+        payload = {'command': command, 'cwd': binding.cwd(cwd), 'environment': shell_env,
+                   'mounts': mounts, 'nonce': nonce, 'command_deadline': deadline,
+                   'startup_deadline': min(deadline - SETTLE_RESERVE, time.monotonic() + START_RESERVE)}
+        durable_json(control_dir / 'payload.json', payload, exclusive=True)
+        helper = Path(__file__).with_name('terminal_exec_gate.py')
+        metadata = {'binding': binding.retained(), 'launch_key': launch_key, 'call_id': call.call_id,
+                    'nonce': nonce, 'command_sha256': hashlib.sha256(command.encode()).hexdigest(),
+                    'payload_sha256': hashlib.sha256(private_bytes(control_dir / 'payload.json')).hexdigest(),
+                    'helper_sha256': hashlib.sha256(helper.read_bytes()).hexdigest(),
+                    'command_deadline': deadline, 'original_deadline': binding.original_deadline,
+                    'boot_id': binding.boot_id, 'control_dir': str(control_dir), 'ready_dir': str(ready_dir),
+                    'resource': resources, 'pty': bool(use_pty), 'phase': 'INTENT', 'attempted': False,
+                    'released': False, 'runtime_us': math.floor((remaining - START_RESERVE - SETTLE_RESERVE) * 1_000_000)}
+        return metadata, payload
+
+    def spawn_scoped_local(self, command, *, binding, cwd=None, use_pty=False, foreground=False,
+                           timeout=120, persist_on_release=False):
+        if not isinstance(binding, TerminalBinding):
+            raise TerminalScopeDenied('terminal_authenticated_binding_required')
+        binding.check(caller=True)
+        # Existing registry ownership lock serializes allocation and intent.
+        with self._lock:
+            owned = [s for s in self._running.values() if s.terminal_custody
+                     and s.user_authority.get('home') == binding.user_authority['home'] and not s.terminal_settled]
+            if any(s.terminal_unconfirmed or s.terminal_stop_requested for s in owned):
+                raise RuntimeError('STOP_UNCONFIRMED')
+            if len(owned) >= binding.resources['max_active']:
+                raise TerminalScopeDenied('terminal_aggregate_capacity_exhausted')
+            policy = binding.resources
+            for key in ('cpu_quota_pct', 'memory_bytes', 'tasks_max', 'tmp_bytes'):
+                used = sum(s.terminal_metadata['resource'][key] for s in owned)
+                if used + policy[key] // policy['max_active'] > policy[key]:
+                    raise TerminalScopeDenied('terminal_aggregate_allocation_exhausted')
+            metadata, payload = self._terminal_prepare(command, binding, cwd, use_pty, timeout, persist_on_release)
+            session = self._new_session(command, binding.task_id, binding.task_id, binding.session_key,
+                                        payload['cwd'], terminal_custody=True,
+                                        user_authority=binding.user_authority, terminal_metadata=metadata,
+                                        persist_on_release=persist_on_release)
+            session.parent_session_id = binding.parent_session_id
+            session._terminal_binding = binding
+            from agent.web_call_context import current_web_call
+            session._terminal_agent = getattr(current_web_call(), 'agent', None)
+            if session._terminal_agent is not None:
+                if not hasattr(session._terminal_agent, '_terminal_sessions'):
+                    session._terminal_agent._terminal_sessions = {}
+                session._terminal_agent._terminal_sessions[session.id] = (self, session)
+            session._terminal_foreground = foreground
+            session.systemd_unit = 'hermes-worker-terminal-' + session.id + '.service'
+            metadata['unit'] = session.systemd_unit
+            metadata['description'] = 'Hermes terminal ' + digest({'binding': binding.retained(),
+                'launch': metadata['launch_key'], 'payload': metadata['payload_sha256'], 'unit': session.systemd_unit})
+            self._running[session.id] = session
+        try:
+            self._checked_scoped_checkpoint(session)
+            binding.check(caller=True)
+            if session.terminal_stop_requested:
+                raise TerminalScopeDenied('terminal_sticky_stop')
+            argv = launch_argv(binding, metadata, payload)
+            metadata['attempted'] = True
+            metadata['phase'] = 'LAUNCH_UNCERTAIN'
+            self._checked_scoped_checkpoint(session)
+            binding.check(caller=True)
+            if session.terminal_stop_requested:
+                raise TerminalScopeDenied('terminal_sticky_stop')
+            if use_pty:
+                from ptyprocess import PtyProcess
+                # No exception can select a pipe fallback after this point.
+                proc = PtyProcess.spawn(argv, cwd=payload['cwd'], env=control_env(), dimensions=(30, 120))
+                session._pty = proc
+            else:
+                proc = subprocess.Popen(argv, text=True, encoding='utf-8', errors='replace',
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        cwd=payload['cwd'], env=control_env(), start_new_session=True)
+                session.process = proc
+                proc._hermes_terminal_session = session
+            session.pid = proc.pid
+            session.host_start_time = self._safe_host_start_time(proc.pid)
+            if session.host_start_time is None:
+                raise RuntimeError('terminal_wrapper_birth_required')
+            self._checked_scoped_checkpoint(session)
+            self._terminal_await_ready(session, payload)
+            if not foreground:
+                self._track_started(session, self._pty_reader_loop if use_pty else self._reader_loop,
+                                    'proc-terminal-reader-' + session.id)
+            return session
+        except BaseException:
+            self.settle_scoped_local(session, stop=True)
+            raise
+
+    def _terminal_await_ready(self, session, payload):
+        meta = session.terminal_metadata
+        if meta['attempted'] is not True or meta['phase'] != 'LAUNCH_UNCERTAIN':
+            raise RuntimeError('terminal_release_without_launch_intent')
+        binding = session._terminal_binding
+        ready_path = Path(meta['ready_dir']) / 'ready.json'
+        while time.monotonic() < payload['startup_deadline']:
+            binding.check(caller=True)
+            if session.terminal_stop_requested:
+                raise TerminalScopeDenied('terminal_sticky_stop')
+            if ready_path.exists():
+                ready = json.loads(private_bytes(ready_path, 16384))
+                if ready != {'nonce': meta['nonce'], 'payload_sha256': meta['payload_sha256'], 'mounts': payload['mounts']}:
+                    raise RuntimeError('terminal_gate_identity_changed')
+                data = self._terminal_show(session, starting=True)
+                self._terminal_capture(session, data)
+                meta['phase'] = 'BOUND'
+                self._checked_scoped_checkpoint(session)
+                # One durable release intent before publishing the one permit.
+                binding.check(caller=True)
+                if session.terminal_stop_requested:
+                    raise TerminalScopeDenied('terminal_sticky_stop')
+                meta['phase'] = 'RELEASE_INTENT'
+                self._checked_scoped_checkpoint(session)
+                with binding.turn.lock:
+                    binding.check(caller=True)
+                    if session.terminal_stop_requested:
+                        raise TerminalScopeDenied('terminal_sticky_stop')
+                    durable_json(Path(meta['control_dir']) / 'permit.json',
+                                 {'nonce': meta['nonce'], 'payload_sha256': meta['payload_sha256']}, exclusive=True)
+                    meta['released'] = True
+                    meta['phase'] = 'RUNNING'
+                    session.terminal_unconfirmed = False
+                    self._checked_scoped_checkpoint(session)
+                return
+            if self._terminal_wrapper_gone(session):
+                raise RuntimeError('terminal_gate_exited_before_release')
+            time.sleep(.01)
+        raise TimeoutError('terminal_launch_startup_bound')
+
+    def check_terminal_custody(self, session):
+        if not session.terminal_custody or session.terminal_settled:
+            return
+        try:
+            if session.terminal_stop_requested or time.monotonic() >= session.terminal_metadata['command_deadline']:
+                raise TerminalScopeDenied('terminal_stop_or_deadline')
+            if session._terminal_binding is None:
+                return  # recovered status/cleanup only; never recreate a grant
+            session._terminal_binding.check()
+        except Exception:
+            self.settle_scoped_local(session, stop=True)
+            raise TerminalScopeDenied('terminal_custody_stopped') from None
+
+    def finish_scoped_reader(self, session):
+        # Native stdout EOF is not process exit. Stay on its existing reader,
+        # bounded by the immutable manager deadline, without another watcher.
+        until = session.terminal_metadata['command_deadline'] - SETTLE_RESERVE
+        while not self._terminal_wrapper_gone(session) and time.monotonic() < until:
+            try:
+                self.check_terminal_custody(session)
+            except PermissionError:
+                break
+            if session.process is not None:
+                try:
+                    session.process.wait(timeout=min(.2, max(.001, until-time.monotonic())))
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                time.sleep(.02)
+        return self.settle_scoped_local(session,
+            stop=session.terminal_stop_requested or time.monotonic() >= until)
+
+    def _terminal_access(self, session, *, input=False):
+        if session is None or not session.terminal_custody:
+            return
+        from hermes_cli.friday_user_scope import delegation_visible
+        if not delegation_visible(session.user_authority):
+            raise TerminalScopeDenied('terminal_foreign_or_revoked_process')
+        from agent.web_call_context import current_web_call
+        call = current_web_call()
+        owner = session.terminal_metadata.get('owner_binding', session.terminal_metadata['binding'])
+        if (call.task_id != session.owner_task_id or call.session_key != session.session_key
+                or call.session_id != owner['parent_session_id']):
+            raise TerminalScopeDenied('terminal_foreign_task_or_session')
+        if input:
+            if session.detached or session._terminal_binding is None or session.terminal_unconfirmed or session.terminal_stop_requested:
+                raise TerminalScopeDenied('terminal_stdin_custody_unavailable')
+            session._terminal_binding.check(caller=True, owner_task_id=session.owner_task_id, session_key=session.session_key,
+                owner_session_id=owner['parent_session_id'])
+            self.check_terminal_custody(session)
+
+    def terminal_stdin(self, session, data=b'', *, close=False):
+        self._terminal_access(session, input=True)
+        raw = data.encode('utf-8', 'surrogateescape') if isinstance(data, str) else data
+        if not isinstance(raw, bytes) or len(raw) > 2_000_000:
+            raise TerminalScopeDenied('terminal_stdin_bound')
+        if not session._terminal_stdin_lock.acquire(timeout=.2):
+            raise TerminalScopeDenied('terminal_stdin_busy')
+        written = 0
+        try:
+            self._terminal_access(session, input=True)
+            if session._pty is not None:
+                fd = session._pty.fd
+                if close:
+                    raw = b'\x04'  # native PTY EOF; do not close/kill the process
+            elif session.process is not None and session.process.stdin is not None:
+                if close:
+                    session.process.stdin.close()
+                    return {'status': 'ok', 'message': 'stdin closed', 'written_bytes': 0}
+                fd = session.process.stdin.fileno()
+            else:
+                raise TerminalScopeDenied('terminal_original_stdin_lost')
+            os.set_blocking(fd, False)
+            until = min(session.terminal_metadata['command_deadline'] - SETTLE_RESERVE, time.monotonic() + 1)
+            while written < len(raw):
+                self._terminal_access(session, input=True)
+                remaining = until - time.monotonic()
+                if remaining <= 0:
+                    return {'status': 'error', 'error': 'terminal_stdin_bounded_partial_no_retry', 'written_bytes': written}
+                _, writable, _ = select.select([], [fd], [], min(.05, remaining))
+                if writable:
+                    self._terminal_access(session, input=True)
+                    try:
+                        written += os.write(fd, raw[written:written + 65536])
+                    except BlockingIOError:
+                        continue
+            return {'status': 'ok', 'message': 'EOF sent' if close else 'stdin written', 'written_bytes': written}
+        finally:
+            session._terminal_stdin_lock.release()
+
+    def adopt_scoped_local(self, session, proc, *, task_id, owner_task_id, session_key, output_so_far, notify_on_complete):
+        self._terminal_access(session, input=True)
+        with self._lock:
+            if (self._running.get(session.id) is not session or session.process is not proc
+                    or not session._terminal_foreground or session._reader_thread is not None
+                    or session.owner_task_id != owner_task_id or session.session_key != session_key):
+                raise TerminalScopeDenied('terminal_original_adoption_required')
+            session._terminal_foreground = False
+            session.notify_on_complete = notify_on_complete
+            if output_so_far:
+                session.append_output(output_so_far)
+            session.terminal_metadata['phase'] = 'ADOPTED'
+        self._checked_scoped_checkpoint(session)
+        self._track_started(session, self._reader_loop, 'proc-terminal-reader-' + session.id)
+        return session
+
+    def settle_scoped_local(self, session, *, stop=False):
+        if stop:
+            self._latch_terminal_stop(session)
+        if not session._terminal_settle_lock.acquire(timeout=.2):
+            return {'status': 'STOP_UNCONFIRMED', 'session_id': session.id, 'reason': 'terminal_settlement_in_progress'}
+        try:
+            if session.terminal_settled:
+                return {'status': 'QUIESCENT', 'session_id': session.id, 'returncode': session.exit_code}
+            meta = session.terminal_metadata
+            session.terminal_unconfirmed = True
+            try:
+                if Path('/proc/sys/kernel/random/boot_id').read_text().strip() != meta['boot_id']:
+                    raise RuntimeError('terminal_original_boot_changed')
+                until = time.monotonic() + 3
+                if not meta['attempted']:
+                    gone = True  # durable no-submit branch; no native effect existed
+                    data = None
+                else:
+                    data = self._terminal_show(session)
+                    self._terminal_capture(session, data)
+                    if data['LoadState'] == 'not-found':
+                        if meta['released'] and not meta.get('cgroup_identity'):
+                            raise RuntimeError('terminal_released_custody_missing')
+                    elif stop or session.detached:
+                        result = control_command(['stop', session.systemd_unit], until - time.monotonic())
+                        if result.returncode:
+                            raise RuntimeError('terminal_native_stop_unconfirmed')
+                    # Bounded wait for the original wrapper. No host kill fallback.
+                    while not self._terminal_wrapper_gone(session) and time.monotonic() < until:
+                        time.sleep(.01)
+                    gone = self._terminal_wrapper_gone(session)
+                    after = self._terminal_show(session, until - time.monotonic())
+                    if after['LoadState'] != 'not-found':
+                        self._terminal_capture(session, after)
+                        if after['ActiveState'] not in ('inactive', 'failed') or after['MainPID'] != '0':
+                            raise RuntimeError('terminal_native_boundary_still_active')
+                    if meta.get('cgroup_identity'):
+                        if cgroup_observation(meta['cgroup'], meta['cgroup_identity'])['populated']:
+                            raise RuntimeError('terminal_descendants_still_active')
+                    elif data['LoadState'] != 'not-found':
+                        raise RuntimeError('terminal_cgroup_custody_uncaptured')
+                if not gone:
+                    raise RuntimeError('terminal_wrapper_stop_unconfirmed')
+                rc = (session.process.returncode if session.process is not None else
+                      session._pty.exitstatus if session._pty is not None else None)
+                meta['phase'] = 'QUIESCENT'
+                meta['output_recovered'] = not session.detached
+                if session.terminal_stop_requested:
+                    path = Path(meta['control_dir']) / 'STOP'
+                    if not path.exists():
+                        durable_json(path, {'stop': True}, exclusive=True)
+                self._checked_scoped_checkpoint(session)
+                session.terminal_settled = True
+                session.terminal_unconfirmed = False
+                session._scope_stop_pending = False
+                agent = getattr(session, '_terminal_agent', None)
+                if agent is not None:
+                    agent._terminal_sessions.pop(session.id, None)
+                self._finish_exited(session, rc, reason='killed' if stop else 'lost' if session.detached else 'exited',
+                                    source='native_terminal_settlement')
+                return {'status': 'QUIESCENT', 'session_id': session.id, 'returncode': rc,
+                        'original_deadline': meta['original_deadline'], 'newly_settled': True,
+                        'output_recovered': not session.detached}
+            except Exception:
+                session._scope_stop_pending = True
+                try:
+                    self._checked_scoped_checkpoint(session)
+                except Exception:
+                    pass
+                return {'status': 'STOP_UNCONFIRMED', 'session_id': session.id, 'unit': session.systemd_unit,
+                        'original_deadline': meta.get('original_deadline'), 'output_recovered': not session.detached}
+        finally:
+            session._terminal_settle_lock.release()
+
+    def stop_terminal_for_session(self, session_key, *, parent_session_id='', profile_home):
+        with self._lock:
+            targets = [s for s in self._running.values() if s.terminal_custody and not s.terminal_settled
+                       and s.user_authority.get('home') == str(profile_home)
+                       and (s.session_key == session_key or parent_session_id and s.parent_session_id == parent_session_id)]
+        for s in targets:
+            self._latch_terminal_stop(s)
+        receipts = [self.settle_scoped_local(s, stop=True) for s in targets]
+        return {'status': 'QUIESCENT' if all(r['status'] == 'QUIESCENT' for r in receipts) else 'STOP_UNCONFIRMED',
+                'sessions': receipts, 'newly_settled': sum(bool(r.get('newly_settled')) for r in receipts)}
+
+    def terminal_custody_receipt(self):
+        with self._lock:
+            retained = [s.id for s in self._running.values() if s.terminal_custody and not s.terminal_settled]
+        blocked = bool(getattr(self, '_terminal_recovery_blocked', False))
+        return {'status': 'STOP_UNCONFIRMED' if retained or blocked else 'QUIESCENT', 'sessions': retained,
+                'recovery_blocked': blocked}
+
+    def has_terminal_custody_for_session(self, session_key, *, parent_session_id='', profile_home):
+        if getattr(self, '_terminal_recovery_blocked', False):
+            return True
+        with self._lock:
+            return any(s.terminal_custody and not s.terminal_settled and s.user_authority.get('home') == str(profile_home)
+                       and (s.session_key == session_key or parent_session_id and s.parent_session_id == parent_session_id)
+                       for s in self._running.values())
+
+    def terminal_handoff_agent(self, session, parent):
+        from hermes_cli.friday_user_scope import check_agent
+        check_agent(parent)
+        with self._lock:
+            if session.terminal_stop_requested or session.terminal_unconfirmed or session.terminal_settled:
+                raise TerminalScopeDenied('terminal_handoff_custody_unavailable')
+            old = getattr(session, '_terminal_agent', None)
+            if old is not None:
+                old._terminal_sessions.pop(session.id, None)
+            if not hasattr(parent, '_terminal_sessions'):
+                parent._terminal_sessions = {}
+            parent._terminal_sessions[session.id] = (self, session)
+            session._terminal_agent = parent
+
+
+
+    # BEGIN NATIVE LOCAL METHODS
+    def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
+        """PTY spawn for interactive CLI tools (Codex, Claude Code, REPLs).
+        Raises ImportError when no PTY backend is installed and re-raises any spawn
+        failure; ``spawn_local`` falls back to pipe mode in both cases."""
+        from tools.process_registry import (_IS_WINDOWS, systemd_user_bus_env)
+        if _IS_WINDOWS:
+            from winpty import PtyProcess as _PtyProcessCls
+        else:
+            from ptyprocess import PtyProcess as _PtyProcessCls
+        pty_argv = self._scope_argv(session, safe_command, session.id, "PTY")
+        pty_env = self._spawn_env(env_vars)
+        if session.systemd_unit:
+            pty_env = systemd_user_bus_env(pty_env)
+        # A PTY is a real TTY, so pager-happy tools (git log/diff, man) WILL page and
+        # hang waiting for `q` — default them to cat, honoring any pager the user set.
+        pty_env.setdefault("GIT_PAGER", "cat")
+        pty_env.setdefault("PAGER", "cat")
+        pty_proc = _PtyProcessCls.spawn(pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120))
+        session.pid = pty_proc.pid
+        session.host_start_time = self._safe_host_start_time(session.pid)
+        session._pty = pty_proc
+        self._track_started(session, self._pty_reader_loop, f"proc-pty-reader-{session.id}")
+        return session
+
+    def spawn_local(
+        self, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
+        env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "",
+        persist_on_release: bool = False) -> ProcessSession:
+        """Spawn a background process locally (TERMINAL_ENV=local; other backends use
+        spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
+        for interactive CLIs, falling back to a plain pipe when unavailable or failing.
+        ``persist_on_release`` keeps the process out of agent-lifecycle kill sweeps (#41225)."""
+        # Bash parses ``A && B &`` as ``(A && B) &`` — a subshell that holds our stdout
+        # pipe open forever when B is a long-running server. The rewriter turns it into
+        # ``A && { B & }``. Lazy import: terminal_tool imports this module.
+        # Guard against the `A && B &` subshell-wait trap (issue #68915).
+        from tools.process_registry import (_IS_WINDOWS, _resolve_safe_cwd, logger, _stop_systemd_unit, windows_hide_flags, systemd_user_bus_env)
+        from hermes_cli.friday_user_scope import current
+        if current() is not None:
+            from tools.terminal_binding import TerminalScopeDenied
+            raise TerminalScopeDenied('terminal_unbound_local_spawn_refused')
+        from tools.terminal_tool_sudo import _rewrite_compound_background as _rewrite_bg
+
+        safe_command = _rewrite_bg(command)
+        session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
+                                    persist_on_release=persist_on_release)
+        pty_scope_attempted = False
+        if use_pty:
+            try:
+                return self._spawn_local_pty(session, safe_command, env_vars)
+            except ImportError:
+                logger.warning("ptyprocess not installed, falling back to pipe mode")
+            except Exception as e:
+                logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+                if session.systemd_unit:
+                    pty_scope_attempted = True
+                    if not _stop_systemd_unit(session.systemd_unit):
+                        raise RuntimeError(
+                            "PTY scope could not be reaped; refusing pipe fallback "
+                            "to avoid duplicate command execution"
+                        ) from e
+                    session.systemd_unit = ""
+        # Pipe path (non-PTY or PTY fallback).
+        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
+        spawn_argv = self._scope_argv(session, safe_command, unit_suffix, "Local")
+        spawn_env = self._spawn_env(env_vars)
+        if session.systemd_unit:
+            spawn_env = systemd_user_bus_env(spawn_env)
+        # start_new_session is REQUIRED with systemd-run --scope too: the scope does not
+        # give the worker a new session, so from an interactive TUI the worker would
+        # share the foreground process group and background spawns would stop the whole
+        # session (observed as dead TUIs in state T). Cgroup isolation is unaffected —
+        # the scope attaches to the invoked process, not the spawning session.
+        proc = subprocess.Popen(
+            spawn_argv, text=True, cwd=session.cwd, env=spawn_env, encoding="utf-8",
+            errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            start_new_session=True, **_popen_kwargs)
+        session.process = proc
+        session.pid = proc.pid
+        session.host_start_time = self._safe_host_start_time(session.pid)
+        try:
+            self._track_started(session, self._reader_loop, f"proc-reader-{session.id}")
+        except Exception:
+            self._reap_untracked(session, proc)
+            raise
+        return session
+
+    def adopt_local(
+        self, proc: subprocess.Popen, *, command: str, cwd: Optional[str], task_id: str = "",
+        session_key: str = "", owner_task_id: str = "", output_so_far: str = "",
+        notify_on_complete: bool = True) -> ProcessSession:
+        """Take over a still-running foreground Popen as a tracked background session
+        (yield-to-background: the user sent a message while the command was running).
+        The caller has stopped its own drain thread; the registry's reader continues from
+        the pipe's current position and ``output_so_far`` seeds the buffer so nothing
+        already captured is lost."""
+        session = getattr(proc, '_hermes_terminal_session', None)
+        if session is not None:
+            return self.adopt_scoped_local(session, proc, task_id=task_id, owner_task_id=owner_task_id,
+                session_key=session_key, output_so_far=output_so_far, notify_on_complete=notify_on_complete)
+        from hermes_cli.friday_user_scope import current
+        if current() is not None:
+            from tools.terminal_binding import TerminalScopeDenied
+            raise TerminalScopeDenied('terminal_unbound_adoption_refused')
+        session = self._new_session(command, task_id, owner_task_id, session_key, cwd)
+        session.process = proc
+        session.pid = proc.pid
+        session.host_start_time = self._safe_host_start_time(session.pid)
+        session.notify_on_complete = notify_on_complete
+        if output_so_far:
+            session.append_output(output_so_far)
+        self._track_started(session, self._reader_loop, f"proc-reader-{session.id}")
+        return session
+
+    def _finish_reader(self, session, decoder, append, label, wait, exit_code) -> None:
+        """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes
+        one U+FFFD instead of vanishing), reap the child (no zombies), record the exit.
+
+        A process may close stdout long before it exits.  The reader owns a dedicated
+        daemon thread, so it must keep waiting rather than publish a false completion
+        and discard the only ``Popen`` handle that can reap the child.
+        """
+        from tools.process_registry import (logger)
+        from contextlib import suppress
+        with suppress(Exception):
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                append(tail)
+        if session.terminal_custody:
+            # Its manager owns the original hard deadline. Do not wait without
+            # a bound merely because stdout has closed before the process.
+            self.finish_scoped_reader(session)
+            return
+        try:
+            wait()
+        except Exception as e:
+            # A PTY child reaped by isalive() already has its exitstatus; only an
+            # unknown status must stay tracked for later reconciliation.
+            if exit_code() is None:
+                logger.warning("%s wait failed; leaving process tracked: %s", label, e)
+                return
+            logger.warning("%s wait failed; recording known exit status: %s", label, e)
+        self._finish_exited(session, exit_code())
+
+    def write_stdin(self, session_id: str, data: str) -> dict:
+        """Send raw data to a running process's stdin (no newline appended)."""
+
+        from tools.process_registry import (_IS_WINDOWS)
+        session = self.get(session_id)
+        if session is not None and session.terminal_custody:
+            return self.terminal_stdin(session, data)
+        def via_pty(pty):
+            # pywinpty expects str on Windows; ptyprocess expects bytes on POSIX.
+            if _IS_WINDOWS:
+                pty.write(data.decode("utf-8") if isinstance(data, bytes) else str(data))
+            else:
+                # surrogateescape: a PTY is a byte stream — round-trip the original
+                # bytes instead of crashing on surrogate content.
+                pty.write(data.encode("utf-8", "surrogateescape") if isinstance(data, str) else data)
+
+        def via_pipe(stdin):
+            stdin.write(data)
+            stdin.flush()
+        return self._stdin_op(session_id, via_pty, via_pipe, {"status": "ok", "bytes_written": len(data)})
+
+    def close_stdin(self, session_id: str) -> dict:
+        """Close a running process's stdin / send EOF without killing the process."""
+        session = self.get(session_id)
+        if session is not None and session.terminal_custody:
+            return self.terminal_stdin(session, close=True)
+        session = self.get(session_id)
+        msg = "EOF sent" if session is not None and session._pty else "stdin closed"
+        return self._stdin_op(
+            session_id, lambda pty: pty.sendeof(), lambda stdin: stdin.close(), {"status": "ok", "message": msg})
+
+    # END NATIVE LOCAL METHODS
+
+def stop_terminal_for_agent(agent):
+    """The existing agent's exact in-memory associations, including old turns.
+
+    Durable ownership stays exclusively in ProcessRegistry/checkpoint. This
+    explicit native interrupt path needs no current/revived user capability.
+    """
+    targets = list(getattr(agent, '_terminal_sessions', {}).values())
+    for registry, session in targets:
+        registry._latch_terminal_stop(session)
+    receipts = [registry.settle_scoped_local(session, stop=True) for registry, session in targets]
+    return {'status': 'QUIESCENT' if all(r['status'] == 'QUIESCENT' for r in receipts) else 'STOP_UNCONFIRMED',
+            'sessions': receipts}

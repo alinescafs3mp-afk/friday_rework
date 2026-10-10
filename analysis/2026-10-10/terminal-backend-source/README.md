@@ -1,0 +1,5 @@
+# Native terminal backend source candidate
+
+Sol delivered 17 changed source files over normal25 with 74 selected-source controls and exact patch reconstruction. This preserves the existing local environment, process registry, foreground/background/PTY interfaces and shell state while adding retained original authority, finite custody, strict checkpointing and one-shot launch admission. The [source inventory](source-index.json) includes the complete changed files and patch; [author controls](author-controls.json) use explicit inert fixtures.
+
+**Independent review, integration and runtime admission are pending.** This candidate is published for analysis and is not installed or enabled. It predates Astra’s process-authority and surface overlays; overlapping files must be merged and checked. Actual systemd/bwrap compatibility, PTY behavior, credential/mount boundaries, descendant cessation, original deadlines and resource enforcement remain unexecuted. SAFE is unchanged. [Outcome and required acceptance](outcome.json) distinguish implementation from tested operation.

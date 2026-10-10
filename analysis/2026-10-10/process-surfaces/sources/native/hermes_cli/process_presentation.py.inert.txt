@@ -1,0 +1,102 @@
+"""Authority checks for ordinary process views and controls, never trusted cleanup.
+
+An RPC/session key is only a conversation filter. This helper requires the
+already authenticated ambient capability; it does not bind or reconstruct one.
+"""
+from contextlib import contextmanager
+
+
+@contextmanager
+def process_presentation(*, session=None, mutation=None, bulk=False):
+    from hermes_cli.friday_user_scope import ScopeDenied, check_agent, guard_tool
+    from tools.process_registry_authority import capture_authority, visible
+
+    def check():
+        pin = capture_authority()
+        # An unbound protected home is not the legacy single-user CLI.
+        if pin is None and not visible(None):
+            raise ScopeDenied()
+        if session is not None:
+            check_agent(session.get("agent"))
+        if mutation is not None:
+            guard_tool("process_manage", mutation)
+        # Native kill_all includes trusted lifecycle custody and cannot be
+        # promoted into a principal-scoped mutation by a task/session filter.
+        if bulk and pin is not None:
+            raise ScopeDenied()
+        return pin
+
+    authority = check()
+    def recheck():
+        if check() != authority:
+            raise ScopeDenied()
+    try:
+        yield recheck
+    finally:
+        # Also mask a private native exception when access was revoked while
+        # the operation failed. RPC error rendering is an output boundary too.
+        recheck()
+
+
+def _visible_processes(registry):
+    from tools.process_registry_authority import resolve_visible
+    # Include finished scopes still awaiting a stop retry, even when native
+    # list presentation omits an uncollected detached exit. IDs are only lookup
+    # keys; resolve_visible checks retained authority before PID refresh.
+    with registry._lock:
+        ids = list(dict.fromkeys((*registry._running, *registry._finished)))
+    for sid in ids:
+        proc = resolve_visible(registry, sid)
+        if proc is not None:
+            yield proc
+
+
+def stop_presented_processes(source):
+    """User bulk control over visible native handles; trusted kill_all stays native."""
+    from tools.process_registry import process_registry
+    from tools.process_registry_authority import require_visible
+    with process_presentation(mutation={"action": "kill"}):
+        results = []
+        for proc in _visible_processes(process_registry):
+            if proc.exited and not getattr(proc, "_scope_stop_pending", False):
+                continue
+            require_visible(proc)
+            result = process_registry.kill_process(proc.id, source=source, consume_output=False)
+            require_visible(proc)
+            results.append(result)
+        # Native custody membership, restricted to this principal's rows.
+        retained = []
+        with process_registry._lock:
+            running_ids = frozenset(process_registry._running)
+        for proc in _visible_processes(process_registry):
+            require_visible(proc)
+            if proc.id in running_ids and proc.web_custody and not proc.web_settled:
+                retained.append(proc.id)
+        killed = sum(
+            (r.get("status") in {"killed", "already_exited"}
+             or (r.get("status") == "QUIESCENT" and bool(r.get("newly_settled"))))
+            and "scope_stop_failed" not in r for r in results)
+        pending = retained or any(r.get("scope_stop_failed") or r.get("process_running")
+                                  or r.get("status") in {"error", "STOP_UNCONFIRMED"} for r in results)
+        return {"status": "STOP_UNCONFIRMED" if pending else "QUIESCENT",
+                "sessions": retained, "killed": killed}
+
+
+def stop_presented_delegations(source):
+    """User stop filters native retained records; shutdown keeps interrupt_all."""
+    from tools import async_delegation as native
+    with process_presentation(mutation={"action": "kill"}) as recheck:
+        with native._records_lock:
+            targets = [record for record in native._records.values()
+                       if record.get("status") in native._ACTIVE_STATES and native._visible(record)]
+        count = 0
+        for record in targets:
+            recheck()
+            if native._visible(record):
+                count += native._interrupt_records([record], source, source,
+                                                   "Interrupted %d visible async delegation(s) (%s)")
+        # An accepted interrupt is only a request; finalization proves exit.
+        pending = any(record.get("status") in native._ACTIVE_STATES for record in targets)
+        return {"attempted": len(targets), "requested": count,
+                "status": "STOP_UNCONFIRMED" if pending or count < len(targets)
+                          else "STOP_REQUESTED" if targets else "NO_VISIBLE_ACTIVE"}

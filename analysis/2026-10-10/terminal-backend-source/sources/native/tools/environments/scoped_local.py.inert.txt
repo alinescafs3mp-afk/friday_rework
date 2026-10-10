@@ -1,0 +1,204 @@
+"""Native LocalEnvironment shell snapshots behind mandatory terminal custody.
+
+No host bootstrap, login rc or ambient environment fallback. The same bash
+snapshot/wrapper/output routines remain responsible for useful shell state.
+"""
+import copy
+import os
+from pathlib import Path
+import threading
+import uuid
+
+from tools.environments.local import LocalEnvironment
+from tools.environments.base import BaseEnvironment, _snapshot_bootstrap_script
+from tools.environments.base_session_env import _wrap_command_script
+from tools.terminal_binding import TerminalBinding, TerminalScopeDenied, directory_identity
+from tools.terminal_containment import private_bytes
+
+
+class ScopedLocalEnvironment(LocalEnvironment):
+    scoped_terminal = True
+    _sudo_nopasswd_probe_supported = False
+    _profile_scoped_passthrough = False
+
+    def __init__(self, cwd='', timeout=120, env=None, *, binding):
+        if not isinstance(binding, TerminalBinding) or env:
+            raise TerminalScopeDenied('terminal_explicit_binding_no_env_passthrough')
+        # Install authority before BaseEnvironment allocates shell paths, and
+        # before the first actual native snapshot-bootstrap command is launched.
+        self.binding = binding.check(caller=True)
+        self._terminal_execute_lock = threading.Lock()
+        self._terminal_last_session = None
+        self._terminal_failed = False
+        self._prefer_nonlogin = True
+        BaseEnvironment.__init__(self, cwd=binding.cwd(cwd), timeout=timeout, env={})
+        self._prefer_nonlogin = True
+        self.init_session()
+
+    def get_temp_dir(self):
+        self.binding.check()
+        return self.binding.state_root
+
+    def _snapshot_excluded_passthrough_names(self):
+        return ()  # initial environment is explicit and contains no credentials
+
+    def init_session(self):
+        bootstrap = _snapshot_bootstrap_script(excluded_names=(), **self._snapshot_script_kwargs(self.cwd))
+        proc = self._run_bash(bootstrap, login=False, timeout=max(9, self._snapshot_timeout))
+        result = self._wait_for_process(proc, timeout=self._snapshot_timeout, bounded_capture=True)
+        if result.get('custody_status') != 'QUIESCENT' or result.get('returncode') != 0:
+            self._terminal_failed = True
+            raise TerminalScopeDenied('terminal_snapshot_bootstrap_failed_no_retry')
+        self._snapshot_ready = True
+        self._update_cwd(result)
+
+    def _before_execute(self):
+        if self._terminal_failed:
+            raise TerminalScopeDenied('terminal_environment_requires_reconciliation')
+        self.binding.check(caller=True)
+        private_bytes(self._snapshot_path, 2_000_000)
+        self.cwd = self.binding.cwd(self.cwd)
+
+    def _prepare_command(self, command):
+        # Native command approval already ran. No host sudo probe/password
+        # transport may escape the unprivileged namespace.
+        return command, None
+
+    def _wrap_command(self, command, cwd):
+        return _wrap_command_script(command, passthrough_names=(), snapshot_ready=self._snapshot_ready,
+                                    strict_snapshot=True, **self._snapshot_script_kwargs(cwd))
+
+    def _recover_cwd(self):
+        self.cwd = self.binding.cwd(self.cwd)
+
+    def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+        from tools.process_registry import process_registry
+        self.binding.check(caller=True)
+        self._recover_cwd()
+        session = process_registry.spawn_scoped_local(cmd_string, binding=self.binding, cwd=self.cwd,
+                                                     timeout=timeout, foreground=True)
+        self._terminal_last_session = session
+        proc = session.process
+        if stdin_data is not None:
+            outcome = process_registry.terminal_stdin(session, stdin_data)
+            if outcome.get('status') != 'ok':
+                process_registry.settle_scoped_local(session, stop=True)
+                raise TerminalScopeDenied('terminal_stdin_partial_no_retry')
+        # Foreground native commands receive EOF after their supplied input;
+        # background/PTY sessions retain their original pipe for process.write.
+        process_registry.terminal_stdin(session, close=True)
+        return proc
+
+    def _check_running_process(self, proc):
+        from tools.process_registry import process_registry
+        session = getattr(proc, '_hermes_terminal_session', None)
+        if session is None:
+            raise TerminalScopeDenied('terminal_original_handle_required')
+        process_registry.check_terminal_custody(session)
+
+    def _wait_for_process(self, proc, timeout=120, **kwargs):
+        from tools.process_registry import process_registry
+        session = getattr(proc, '_hermes_terminal_session', None)
+        try:
+            result = BaseEnvironment._wait_for_process(self, proc, timeout=timeout, **kwargs)
+            if result.get('yielded_session_id'):
+                if result['yielded_session_id'] != session.id or session._terminal_foreground:
+                    raise TerminalScopeDenied('terminal_adoption_identity_changed')
+                return result
+            receipt = process_registry.settle_scoped_local(session,
+                stop=bool(result.get('hermes_interrupted') or result.get('hermes_timed_out')))
+            result['custody_status'] = receipt['status']
+            result['process_session_id'] = session.id
+            result['original_deadline'] = session.terminal_metadata['original_deadline']
+            if receipt['status'] != 'QUIESCENT':
+                self._terminal_failed = True
+                result['returncode'] = None
+                result['status'] = 'STOP_UNCONFIRMED'
+            return result
+        except BaseException:
+            self._terminal_failed = True
+            if session is not None:
+                process_registry.settle_scoped_local(session, stop=True)
+            raise
+
+    def execute(self, command, cwd='', **kwargs):
+        if not self._terminal_execute_lock.acquire(timeout=.2):
+            raise TerminalScopeDenied('terminal_snapshot_writer_busy')
+        try:
+            self.binding.check(caller=True)
+            result = BaseEnvironment.execute(self, command, cwd=self.binding.cwd(cwd or self.cwd), **kwargs)
+            session = self._terminal_last_session
+            if session is not None and not result.get('yielded_session_id') and not session.terminal_settled:
+                from tools.process_registry import process_registry
+                receipt = process_registry.settle_scoped_local(session, stop=True)
+                result['custody_status'] = receipt['status']
+                if receipt['status'] != 'QUIESCENT':
+                    self._terminal_failed = True
+                    result['returncode'] = None
+                    result['status'] = 'STOP_UNCONFIRMED'
+            return result
+        finally:
+            self._terminal_execute_lock.release()
+
+    def background_command(self, command, cwd):
+        """Stable native snapshot copy; a background command cannot write back
+        into the foreground's shell state. PTY/REPL keeps its own native state."""
+        self.binding.check(caller=True)
+        if not self._terminal_execute_lock.acquire(timeout=.2):
+            raise TerminalScopeDenied('terminal_snapshot_writer_busy')
+        try:
+            clone = copy.copy(self)
+            clone._terminal_snapshot_clone = True
+            identifier = uuid.uuid4().hex
+            clone._snapshot_path = self.binding.state_root + '/hermes-background-' + identifier + '.sh'
+            clone._cwd_file = self.binding.state_root + '/hermes-background-' + identifier + '.cwd'
+            data = private_bytes(self._snapshot_path, 2_000_000)
+            fd = os.open(clone._snapshot_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(data); stream.flush(); os.fsync(stream.fileno())
+            return _wrap_command_script(command, passthrough_names=(), snapshot_ready=clone._snapshot_ready,
+                strict_snapshot=True, emit_cwd_marker=False, **clone._snapshot_script_kwargs(self.binding.cwd(cwd)))
+        finally:
+            self._terminal_execute_lock.release()
+
+    def _extract_cwd_from_output(self, result):
+        previous = self.cwd
+        BaseEnvironment._extract_cwd_from_output(self, result)
+        try:
+            self.cwd = self.binding.cwd(self.cwd)
+        except TerminalScopeDenied:
+            self.cwd = previous
+            result.pop('cwd_observed', None)
+            result.pop('cwd', None)
+
+    def _kill_process(self, proc):
+        from tools.process_registry import process_registry
+        session = getattr(proc, '_hermes_terminal_session', None)
+        if session is None:
+            raise TerminalScopeDenied('terminal_original_stop_handle_required')
+        return process_registry.settle_scoped_local(session, stop=True)
+
+    _kill_spawned_tree = _kill_process
+    _force_kill_process = _kill_process
+
+    def cleanup(self):
+        if not hasattr(self, 'binding') or getattr(self, '_terminal_snapshot_clone', False):
+            return
+        from tools.process_registry import process_registry
+        with process_registry._lock:
+            owned = [s for s in process_registry._running.values() if s.terminal_custody
+                     and s.terminal_metadata['binding']['state_root'] == self.binding.state_root]
+        receipts = [process_registry.settle_scoped_local(s, stop=True) for s in owned if not s.persist_on_release]
+        if any(r['status'] != 'QUIESCENT' for r in receipts) or any(s.persist_on_release for s in owned):
+            return  # retain scratch and custody until the exact boundary settles
+        directory_identity(self.binding.state_root)
+        fd = os.open(self.binding.state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            for p in (getattr(self, '_snapshot_path', ''), getattr(self, '_cwd_file', '')):
+                if p and Path(p).parent == Path(self.binding.state_root):
+                    try:
+                        os.unlink(Path(p).name, dir_fd=fd)
+                    except FileNotFoundError:
+                        pass
+        finally:
+            os.close(fd)
