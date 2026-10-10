@@ -1,0 +1,15 @@
+# Catalog boundary failures and locked dependency preparation, 2026-10-11
+
+This inactive analysis snapshot preserves the exact five-module R1 catalog/consumer candidate, the two bases changed by its patch, and the independent SOURCE_FAIL. The files do not activate a product overlay or grant native, installed, runtime or release acceptance.
+
+The author reproduced 64/64 connected opener controls and 73/73 affected consumer controls. Independent review nevertheless found 14 failures among 59 own controls: 30 boundary controls (19 PASS/11 FAIL), 26 consumer controls (26 PASS), and three policy-state controls (three FAIL). Author reproduction is separate evidence; the counts are not combined.
+
+The five failure causes are missing direct-helper caller admission, authority changes between the transport guard and actual connection request, cancellation response leakage, fresh-cache returns after authority changes, and a shallow-copied cookie handler mutating the installed shared CookieJar. The independent transport probe executes stdlib do_open with an inert connection API adapter; no sockets or real model calls run. Final zero handles follows harness cleanup and does not hide the observed response leak. Complete installed-source/effective YAML and full native API/runtime gates remain NOT_RUN.
+
+A coherent R2 repair continues on its original finite clock; its changed bytes need fresh independent acceptance. Sol completed the original output-bound assignment in the existing visible developer TUI; its exact RESULT was received and its notice consumed once. The supported direct standard-sink path remains source-author-only, while normal prompt_toolkit patch_stdout delivery is explicitly unsupported and needs coherent frontend source work plus independent acceptance. Linux descriptor semantics and installed output remain NOT_RUN. No assignment or compact was duplicated.
+
+[REPORT.json](REPORT.json) records the actual source/control digests, limitations and runtime frontier. [ENVIRONMENT.json](ENVIRONMENT.json) records a separately accepted isolated Python 3.14.4 core/dev/test dependency environment: 89 distributions match the unchanged Hermes lock, 18 dependency imports and six API probes pass, uv pip check and frozen check pass. Preparation includes an identical offline reinstall with whole-descendant resource accounting. Dependency availability is not native-source or runtime acceptance.
+
+The [patch](catalog-boundary-repair.patch) changes models.py and urllib_security.py against the exact bodies under base/. The other three repaired consumer modules are retained byte for byte under successor/. Earlier failed/debugging reports remain private immutable provenance; four historical path hashes resolve only to retained historical bytes, with no current acceptance transfer.
+
+The full gate waits for stable independently accepted source repairs and the final immutable composition. G8 still needs a genuine owner foreground terminal; kernel120 is not granted, normal3600 is unstarted, and the seven installed journeys and release remain unaccepted. Old Friday and Pandora remain OFF.
