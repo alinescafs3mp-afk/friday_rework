@@ -1,0 +1,238 @@
+"""Join native call correlation to a durable post-authorization ingress receipt.
+
+This authorizes no worker by itself: verified workspace/input bytes, budgets,
+native supervision and adapter readiness are separate controller prerequisites.
+"""
+from __future__ import annotations
+
+from contextvars import ContextVar
+import copy
+import hashlib
+import json
+from pathlib import Path
+import re
+
+from .associations import Associations, _sync_directory
+from .boundary import bound_owner, parse_brief, work_handler
+
+KEY = "admitted_ingress.v1"
+CALL_FIELDS = ("task_id", "session_id", "turn_id", "api_request_id", "tool_call_id")
+_call = ContextVar("friday_native_call", default=None)
+
+
+def _text(value, limit=512, empty=False):
+    if not isinstance(value, str) or (not empty and not value.strip()) or "\x00" in value:
+        raise ValueError("invalid_ingress")
+    if len(value.encode("utf-8")) > limit:
+        raise ValueError("invalid_ingress")
+    return value
+
+
+def _encoded(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def _snapshot(value):
+    if isinstance(value, dict) and value.get('platform') == 'cli':
+        from hermes_cli.friday_cli_work import validate_ingress
+        return validate_ingress(value)
+    top = {"platform", "session_key", "source_profile", "transport_profile", "runtime_profile", "message"}
+    fields = {"bot_id", "user_id", "chat_id", "thread_id", "message_id", "platform_update_id", "reply_to_message_id", "media"}
+    if (not isinstance(value, dict) or set(value) not in (top, top | {"chat_type"})
+            or value["platform"] != "telegram"):
+        raise ValueError("unproved_ingress")
+    if "chat_type" in value and (not isinstance(value["chat_type"], str)
+                                or value["chat_type"] not in {"dm", "group", "channel", "thread"}):
+        raise ValueError("invalid_ingress_chat_type")
+    for key in top - {"message"}:
+        _text(value[key], empty=key == "source_profile")
+    message = value["message"]
+    if not isinstance(message, dict) or set(message) != fields:
+        raise ValueError("invalid_ingress")
+    for key in fields - {"media"}:
+        _text(message[key], empty=key in {"thread_id", "reply_to_message_id"})
+    if not isinstance(message["media"], list) or len(message["media"]) > 64:
+        raise ValueError("invalid_ingress")
+    for media in message["media"]:
+        required_media = {"local_reference", "mime_type", "origin"}
+        if not isinstance(media, dict) or set(media) not in (required_media, required_media | {"content"}):
+            raise ValueError("invalid_ingress")
+        _text(media["local_reference"], 2048)
+        _text(media["mime_type"], 256)
+        if "content" in media:
+            content = media["content"]
+            if (not isinstance(content, dict) or set(content) != {"size_bytes", "sha256"}
+                    or type(content["size_bytes"]) is not int or content["size_bytes"] < 0
+                    or not isinstance(content["sha256"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", content["sha256"])):
+                raise ValueError("invalid_ingress_content")
+        origin = media["origin"]
+        if origin is not None:
+            required = {"bot_id", "chat_id", "thread_id", "message_id", "file_id", "file_unique_id", "declared_bytes"}
+            if not isinstance(origin, dict) or set(origin) != required:
+                raise ValueError("invalid_ingress")
+            for key in required - {"declared_bytes"}:
+                _text(origin[key], empty=key == "thread_id")
+            size = origin["declared_bytes"]
+            if size is not None and (type(size) is not int or size < 0):
+                raise ValueError("invalid_ingress")
+            if any(origin[k] != message[k] for k in ("bot_id", "chat_id", "thread_id")):
+                raise ValueError("foreign_input_origin")
+    if len(_encoded(value)) > 65536:
+        raise ValueError("ingress_too_large")
+    return copy.deepcopy(value)
+
+
+def _receipt_key(value):
+    # One routed message cannot silently acquire another bot/update identity.
+    if value.get('platform') == 'cli':
+        return hashlib.sha256(_encoded(['cli', value['session_id'], value['runtime_home'],
+                                      value['input']['native_message_id']])).hexdigest()
+    return hashlib.sha256(_encoded([
+        value["session_key"], value["source_profile"], value["message"]["message_id"]
+    ])).hexdigest()
+
+
+def delivery_route(matched_ingress):
+    """Route from the persisted, matched receipt, never an ambient session.
+
+    Historical receipts remain readable, but cannot invent the missing native
+    chat type. The gateway rechecks current authorization and actual adapter.
+    """
+    value = _snapshot(matched_ingress)
+    if value['platform'] == 'cli':
+        return copy.deepcopy(value['route'])
+    if "chat_type" not in value:
+        raise ValueError("missing_admitted_delivery_route")
+    message = value["message"]
+    return {
+        "source": {
+            "platform": value["platform"], "chat_id": message["chat_id"],
+            "chat_type": value["chat_type"], "user_id": message["user_id"],
+            "thread_id": message["thread_id"] or None, "message_id": message["message_id"],
+        },
+        "transport_profile": value["transport_profile"],
+        "runtime_profile": value["runtime_profile"], "bot_id": message["bot_id"],
+    }
+
+
+def native_call_scope(*, tool_name, args, next_call, **context):
+    """Transport correlation through the supported middleware, never effects.
+
+    Native policy is inside next_call. If this wrapper fails, Hermes may fall
+    through; therefore the registered handler independently requires a scope.
+    """
+    if tool_name not in {"friday_work", "friday_result"}:
+        return next_call(args)
+    # Mask an outer invocation before allocation/validation can fail. Hermes
+    # falls through after middleware exceptions, so no such fallback may use
+    # the parent's correlation as proof for this call.
+    outer = _call.get()
+    token = _call.set(None)
+    try:
+        try:
+            if outer is not None:
+                raise ValueError('nested_native_call')
+            from hermes_cli.friday_cli_work import is_cli, admitted_call
+            if is_cli():
+                _, verified = admitted_call(context)
+                identity = tuple(verified[key] for key in CALL_FIELDS)
+            else:
+                identity = tuple(_text(context.get(key)) for key in CALL_FIELDS)
+        except Exception:
+            identity = None
+        _call.set(identity)
+        # Native middleware propagates downstream errors without replay. Keep
+        # the surrounding call usable when it handles an inner tool failure.
+        return next_call(args)
+    finally:
+        _call.reset(token)
+
+
+class IngressAdmissions:
+    def __init__(self, state):
+        self.state = state
+        self.associations = Associations(state)
+
+    def _read(self):
+        document = self.associations.state_get(KEY, {"schema_version": 1, "receipts": {}})
+        if (not isinstance(document, dict) or set(document) != {"schema_version", "receipts"}
+                or type(document["schema_version"]) is not int or document["schema_version"] != 1
+                or not isinstance(document["receipts"], dict)):
+            raise ValueError("invalid_ingress_store")
+        for key, value in document["receipts"].items():
+            if key != _receipt_key(_snapshot(value)):
+                raise ValueError("invalid_ingress_store")
+        return document
+
+    def record(self, *, admitted_ingress=None, session_key, message_id, source, platform, **_):
+        snapshot = _snapshot(admitted_ingress)
+        message = snapshot["message"]
+        if (platform != snapshot["platform"] or session_key != snapshot["session_key"]
+                or message_id != message["message_id"] or not isinstance(source, dict)
+                or any((source.get(k) or "") != message[k] for k in ("user_id", "chat_id", "thread_id", "message_id"))
+                or (source.get("profile") or "") != snapshot["source_profile"]):
+            raise ValueError("ingress_source_mismatch")
+        chat_type = source.get("chat_type")
+        if (not isinstance(chat_type, str) or chat_type not in {"dm", "group", "channel", "thread"}
+                or ("chat_type" in snapshot and snapshot["chat_type"] != chat_type)):
+            raise ValueError("ingress_source_mismatch")
+        snapshot["chat_type"] = chat_type
+        with self.associations._locked():
+            document = self._read()
+            key = _receipt_key(snapshot)
+            prior = document["receipts"].get(key)
+            if prior is not None:
+                if prior != snapshot:
+                    raise ValueError("ingress_identity_conflict")
+                return
+            document["receipts"][key] = snapshot
+            self.associations.state_set(KEY, document)
+            _sync_directory(Path(self.state.data_dir))
+
+    def match(self, owner, *, task_id, session_id):
+        call = _call.get()
+        original_session = owner['session_id'] if owner.get('platform') == 'cli' else owner['id']
+        if call is None or call[:2] != (task_id, session_id) or session_id != original_session:
+            raise ValueError("missing_native_correlation")
+        if owner.get('platform') == 'cli':
+            from hermes_cli.friday_cli_work import admitted_call, check_owner
+            snapshot, native = admitted_call(dict(zip(CALL_FIELDS, call)))
+            check_owner(owner, snapshot)
+            with self.associations._locked():
+                document = self._read()
+                key = _receipt_key(snapshot)
+                prior = document['receipts'].get(key)
+                if prior is not None and prior != snapshot:
+                    raise ValueError('ingress_identity_conflict')
+                if prior is None:
+                    document['receipts'][key] = snapshot
+                    self.associations.state_set(KEY, document)
+                _sync_directory(Path(self.state.data_dir))
+            check_owner(owner, snapshot)
+            return copy.deepcopy(snapshot), native
+        lookup = {"session_key": owner["key"], "source_profile": owner["profile"],
+                  "message": {"message_id": owner["message_id"]}}
+        with self.associations._locked():
+            snapshot = self._read()["receipts"].get(_receipt_key(lookup))
+            if snapshot is None:
+                raise ValueError("missing_admitted_ingress")
+            if (snapshot["platform"] != owner["platform"]
+                    or ("chat_type" in snapshot and snapshot["chat_type"] != owner.get("chat_type"))
+                    or any(snapshot["message"][k] != owner[k] for k in ("user_id", "chat_id", "thread_id", "message_id"))):
+                raise ValueError("foreign_admitted_ingress")
+            # Native state may have committed before an earlier caller failed
+            # its directory barrier. Complete that barrier before using it.
+            _sync_directory(Path(self.state.data_dir))
+            return copy.deepcopy(snapshot), dict(zip(CALL_FIELDS, call))
+
+    def handle(self, args, **kwargs):
+        try:
+            parse_brief(args)
+            owner = bound_owner(session_id=kwargs.get("session_id"))
+            self.match(owner, task_id=kwargs.get("task_id"), session_id=kwargs.get("session_id"))
+        except (ValueError, UnicodeError, RuntimeError, OSError):
+            return json.dumps({"accepted": False, "error": "unproved_admission"})
+        # This candidate proves the join; the controller/worker readiness gate
+        # stays closed until actual native supervision and adapters are wired.
+        return work_handler(args, **kwargs)
