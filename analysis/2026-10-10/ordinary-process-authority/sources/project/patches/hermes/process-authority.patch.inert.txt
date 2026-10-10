@@ -1,0 +1,295 @@
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -545,6 +545,7 @@
+     owner_task_id: str = ""                     # RAW spawning task id ("sa-..."); ownership
+                                                 # checks must use this, not task_id
+     session_key: str = ""                       # Gateway session key (reset protection)
++    user_authority: Optional[dict] = None       # Original principal/profile/admission; never rebound on recovery
+     pid: Optional[int] = None
+     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
+     env_ref: Any = None                         # Environment object (sandbox spawns)
+@@ -663,7 +664,7 @@
+ # ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
+ _CHECKPOINT_FIELDS = (
+     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "wsl_chain", "cwd",
+-    "started_at", "task_id", "owner_task_id", "session_key",
++    "started_at", "task_id", "owner_task_id", "session_key", "user_authority",
+     "web_tool_call_id", "web_turn_id", "web_custody", "web_invocation", "web_cgroup", "web_cgroup_identity", "web_deadline", "web_boot_id", "web_unconfirmed", "web_stop_requested",
+     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
+     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
+@@ -928,6 +929,7 @@
+             "session_key": session.session_key,
+             "task_id": session.task_id,
+             "owner_task_id": session.owner_task_id,
++            "user_authority": session.user_authority,
+             "command": session.command,
+             **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
+         }
+@@ -1120,10 +1122,12 @@
+     @staticmethod
+     def _new_session(command, task_id, owner_task_id, session_key, cwd, **extra) -> ProcessSession:
+         from gateway.session_context import get_session_env
++        from tools.process_registry_authority import capture_authority
+ 
+         return ProcessSession(
+             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
+             owner_task_id=owner_task_id, session_key=session_key, cwd=cwd,
++            user_authority=capture_authority(),
+             parent_session_id=get_session_env("HERMES_SESSION_ID", ""),
+             wsl_chain=_is_wsl_launcher_command(command),
+             started_at=time.time(), **extra)
+@@ -1638,6 +1642,7 @@
+                 "session_key": session.session_key,
+                 "task_id": session.task_id,
+                 "owner_task_id": session.owner_task_id,
++                "user_authority": session.user_authority,
+                 "command": session.command,
+                 **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
+                 **self._exit_fields(session),
+@@ -2408,7 +2413,7 @@
+         """O(1) running count for status-bar polling; dict ``len()`` is atomic, no lock."""
+         return len(self._running)
+ 
+-    def list_sessions(self, task_id: str = None, session_key: str = None, *, include_retained: bool = False) -> list:
++    def list_sessions(self, task_id: str = None, session_key: str = None, *, include_retained: bool = False, visible_only: bool = False) -> list:
+         """Running and recently-finished processes for ``task_id`` and/or ``session_key``;
+         cross-task entries sharing the gateway session (a forgotten preview server
+         blocking session reset) are flagged ``"session_scoped": true``.
+@@ -2418,6 +2423,8 @@
+         under that gateway session are surfaced too, even if they belong to a different task — so the agent
+         can discover a forgotten preview server that is blocking session reset (#29177).
+         """
++        from tools.process_registry_authority import capture_authority, visible
++        authority = capture_authority() if visible_only else None
+         # Only an explicit tool query reads historical receipts. Status bars and
+         # gateway liveness scans call this frequently and need the live registry.
+         sessions = load_completed_results() if include_retained else {}
+@@ -2427,6 +2434,7 @@
+         all_sessions = [
+             refreshed for refreshed in (
+                 self._refresh_detached_session(s) for s in sessions.values()
++                if not visible_only or visible(s.user_authority)
+             ) if refreshed is not None and not self._uncollected_gone(refreshed)
+         ]
+         if task_id or session_key:
+@@ -2437,6 +2445,8 @@
+             ]
+         result = []
+         for s in all_sessions:
++            if visible_only and not visible(s.user_authority):
++                continue
+             # List-only refreshes must observe child exit even while descendants
+             # keep the capture pipe open; retain the existing completion owner.
+             self._reconcile_local_exit(s)
+@@ -2472,6 +2482,9 @@
+             if s.detached:
+                 entry["detached"] = True
+             result.append(entry)
++        if visible_only and capture_authority() != authority:
++            from hermes_cli.friday_user_scope import ScopeDenied
++            raise ScopeDenied()
+         return result
+ 
+     # ----- Session/Task Queries (for gateway integration) -----
+@@ -2522,7 +2535,8 @@
+             session.task_id = to_task_id
+             session.session_key = to_session_key
+             session.handoff_note = note
+-            return session
++        self._write_checkpoint()
++        return session
+ 
+     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:
+         """Active processes for a gateway session key. Processes older than
+@@ -2724,7 +2738,7 @@
+     return {"processes": [
+         _redact_process_result(p)
+         for p in process_registry.list_sessions(
+-            task_id=task_id, session_key=session_key or None, include_retained=True)]}
++            task_id=task_id, session_key=session_key or None, include_retained=True, visible_only=True)]}
+ 
+ 
+ # action -> (handler(session_id, args) -> dict, redact output?). Output-bearing
+@@ -2754,6 +2768,8 @@
+     parent = parent_ref() if callable(parent_ref) else None
+     if parent is None:
+         return {"error": "handoff is only available to a running subagent with a live parent; you are not one."}
++    from tools.process_registry_authority import check_handoff, resolve_visible
++    check_handoff(child, parent, resolve_visible(process_registry, session_id))
+     parent_owner = str(getattr(parent, "_current_task_id", "") or getattr(parent, "session_id", "") or "")
+     if not parent_owner:
+         return {"error": "parent has no process owner id yet; retry after the parent's turn has started."}
+@@ -2782,22 +2798,8 @@
+ 
+ 
+ def _handle_process(args, **kw):
+-    action = args.get("action", "")
+-    # Coerce to string — some models send session_id as an integer
+-    session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
+-    if action == "list":
+-        return json.dumps(_list_processes(kw.get("task_id")), ensure_ascii=False)
+-    if action == "handoff":
+-        if not session_id:
+-            return tool_error("session_id is required for handoff")
+-        return json.dumps(_handoff_process(session_id, args, kw.get("task_id")), ensure_ascii=False)
+-    if action in _SESSION_ACTIONS:
+-        if not session_id:
+-            return tool_error(f"session_id is required for {action}")
+-        handler, redact = _SESSION_ACTIONS[action]
+-        result = handler(session_id, args)
+-        return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
+-    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
++    from tools.process_registry_authority import handle_process
++    return handle_process(args, **kw)
+ 
+ 
+ registry.register(
+diff --git a/tools/process_registry_authority.py b/tools/process_registry_authority.py
+new file mode 100644
+--- /dev/null
++++ b/tools/process_registry_authority.py
+@@ -0,0 +1,109 @@
++"""Ordinary-user access to the existing process registry.
++
++The retained capability is the original principal/profile/admission generation,
++not a task ID or a new grant. Trusted teardown keeps the native registry API:
++revoking a user's read/write access must never prevent its owned-process cleanup.
++This boundary alone does not authorize an ordinary terminal backend.
++"""
++import json
++
++
++def capture_authority():
++    from hermes_cli.friday_user_scope import delegation_authority
++    return delegation_authority()
++
++
++def visible(pin):
++    from hermes_cli.friday_user_scope import delegation_visible
++    return delegation_visible(pin)
++
++
++def require_visible(session):
++    from hermes_cli.friday_user_scope import ScopeDenied
++    if session is None or not visible(session.user_authority):
++        raise ScopeDenied()
++
++
++def resolve_visible(registry, session_id):
++    """Resolve only within the caller's authority, before any PID refresh.
++
++    Canonical IDs returned here are used by the native handlers. An invisible
++    exact match is unavailable, while invisible prefixes neither disclose nor
++    make an otherwise unique visible prefix ambiguous.
++    """
++    from tools.process_registry_results import load_completed_results
++    capture_authority()  # Validate even an empty registry / lost context.
++    if not isinstance(session_id, str) or not session_id:
++        return None
++    query = session_id.strip()
++    if not query.startswith("proc_"):
++        query = "proc_" + query
++    if len(query) - len("proc_") < registry._MIN_PREFIX_CHARS:
++        return None
++    sessions = load_completed_results(query)
++    with registry._lock:
++        sessions.update({sid: s for store in (registry._finished, registry._running)
++                         for sid, s in store.items() if sid.startswith(query)})
++    exact = sessions.get(query)
++    if exact is not None:
++        chosen = exact if visible(exact.user_authority) else None
++    else:
++        matches = [s for s in sessions.values() if visible(s.user_authority)]
++        chosen = matches[0] if len(matches) == 1 else None
++    if chosen is None:
++        return None
++    require_visible(chosen)
++    refreshed = registry._refresh_detached_session(chosen)
++    if refreshed is not None:
++        require_visible(refreshed)
++    return refreshed
++
++
++def check_handoff(child, parent, session):
++    from hermes_cli.friday_user_scope import check_agent
++    require_visible(session)
++    # Both agents retain the original scope; ambient equality alone cannot
++    # authorize a handoff to a foreign, revoked, or cancelled parent/child.
++    check_agent(child)
++    check_agent(parent)
++
++
++def handle_process(args, **kw):
++    from hermes_cli.friday_user_scope import ScopeDenied, guard_tool
++    from tools import process_registry as native
++
++    try:
++        authority = capture_authority()
++        # Preserve the ordinary tool allowlist, including terminal's current
++        # refusal until its complete backend and supervision are qualified.
++        guard_tool("process_manage", args)
++        action = args.get("action", "")
++        sid = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
++        if action == "list":
++            result = native._list_processes(kw.get("task_id"))
++            capture_authority()
++        elif action == "handoff" or action in native._SESSION_ACTIONS:
++            if not sid:
++                return native.tool_error(f"session_id is required for {action}")
++            session = resolve_visible(native.process_registry, sid)
++            if session is None:
++                raise ScopeDenied()
++            require_visible(session)
++            if action == "handoff":
++                result = native._handoff_process(session.id, args, kw.get("task_id"))
++            else:
++                handler, redact = native._SESSION_ACTIONS[action]
++                result = handler(session.id, args)
++                if redact:
++                    result = native._redact_process_result(result)
++            # A blocking wait can span revocation. Never return its output
++            # under a subsequent grant, even if the native operation finished.
++            require_visible(session)
++        else:
++            return native.tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
++        guard_tool("process_manage", args)
++        if capture_authority() != authority:
++            raise ScopeDenied()
++        return json.dumps(result, ensure_ascii=False)
++    except ScopeDenied:
++        return native.tool_error("product_user_scope_refused")
+diff --git a/tools/process_registry_results.py b/tools/process_registry_results.py
+--- a/tools/process_registry_results.py
++++ b/tools/process_registry_results.py
+@@ -21,7 +21,7 @@
+ _RESULT_FIELDS = (
+     "id", "command", "cwd", "task_id", "owner_task_id", "session_key",
+     "parent_session_id", "started_at", "exit_code", "completion_reason",
+-    "termination_source", "notify_on_complete",
++    "termination_source", "notify_on_complete", "user_authority",
+ )
+ 
+ 
+@@ -86,6 +86,7 @@
+ def load_completed_results(prefix: str = "") -> dict:
+     """Restore read-only snapshots; no process handles, watchers, or queue events."""
+     from tools.process_registry import ProcessSession
++    from tools.process_registry_authority import visible
+ 
+     from gateway.session_context import get_session_env
+ 
+@@ -105,10 +106,12 @@
+             record = json.loads(path.read_text(encoding="utf-8-sig"))
+             if record["id"] != path.stem or not re.fullmatch(r"proc_[\w]+", record["id"]):
+                 continue
++            if not visible(record.get("user_authority")):
++                continue
+             if not _owns_result(owner, record.get("parent_session_id")):
+                 continue
+             session = ProcessSession(
+-                **{key: record[key] for key in _RESULT_FIELDS},
++                **{key: (record.get(key) if key == "user_authority" else record[key]) for key in _RESULT_FIELDS},
+                 exited=True, output_buffer=record["output"],
+             )
+             session._completion_event.set()
