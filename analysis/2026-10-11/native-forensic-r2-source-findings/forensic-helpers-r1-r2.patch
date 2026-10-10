@@ -1,0 +1,204 @@
+--- a/forensic_helpers.py
++++ b/forensic_helpers.py
+@@ -23,14 +23,18 @@
+ 
+ def _safe_text(value):
+     text = str(value)
+-    text = re.sub(r'(?i)(bearer\s+)[^\s"\']+', r'\1[REDACTED]', text)
++    text = re.sub(r"(?im)((?:proxy-)?authorization\s*:\s*)[^\r\n]+", r"\1[REDACTED]", text)
++    text = re.sub(r"(?i)((?:bearer|basic)\s+)[^\s\"']+", r"\1[REDACTED]", text)
+     text = re.sub(r'\bsk-[A-Za-z0-9_-]+', '[REDACTED]', text)
+-    text = re.sub(r'(?i)((?:api[_-]?key|access[_-]?token|password|secret)["\']?\s*[=:]\s*["\']?)[^\s,"\']+', r'\1[REDACTED]', text)
++    marker = r"(?:api[_-]?key|access[_-]?token|password|secret)[\"']?\s*[=:]\s*"
++    text = re.sub(r"(?i)(" + marker + r')"(?:\\.|[^"\\])*"', r'\1"[REDACTED]"', text)
++    text = re.sub(r"(?i)(" + marker + r")'(?:\\.|[^'\\])*'", r"\1'[REDACTED]'", text)
++    text = re.sub(r"(?i)(" + marker + r"[\"']?)[^\s,\"']+", r"\1[REDACTED]", text)
+     return text
+ 
+ 
+ def _atomic_json(path, value, initial=False):
+-    """Owner-only bounded replacement; old UNKNOWN survives every write failure."""
++    """Private bounded replacement; post-replace directory failure has unknown durability."""
+     data = (json.dumps(value, ensure_ascii=True, sort_keys=True) + '\n').encode()
+     if len(data) > FORENSIC_LIMIT:
+         raise ValueError('Bounded forensic record exceeded')
+@@ -73,7 +77,7 @@
+     _checkpoint(forensic_path, evidence, 'receipt_committed')
+ 
+ 
+-def _exception(exc, phase):
++def _exception(exc, phase, streams=None):
+     result = {'class': type(exc).__module__ + '.' + type(exc).__qualname__,
+               'phase': phase, 'message': _safe_text(str(exc))[:1024]}
+     chain = []; cause = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+@@ -94,7 +98,11 @@
+             result[key] = value
+     for key, attribute in (('stdout', 'output'), ('stderr', 'stderr')):
+         value = getattr(exc, attribute, None)
+-        if value is not None:
++        if streams is not None:
++            # The original accumulator has full counts/hash and marker context.
++            # Never reconstruct an exception excerpt from already clipped raw bytes.
++            result[key] = streams[key].record()
++        elif value is not None:
+             stream = _Stream(); stream.add(value)
+             result[key] = stream.record()
+     return result
+@@ -105,10 +113,18 @@
+         self.limit = limit
+         self.head = b''; self.tail = b''; self.total = 0
+         self.digest = hashlib.sha256(); self.types = set()
++        self.marker_context = b''; self.unsafe_excerpt = False
+ 
+     def add(self, value):
+         self.types.add('bytes' if isinstance(value, bytes) else 'text')
+         data = value if isinstance(value, bytes) else str(value).encode('utf-8', 'surrogatepass')
++        # Recognized ASCII marker detection precedes clipping, across chunk boundaries.
++        # Conservative omission avoids retaining an unlabelled credential suffix.
++        # This is not arbitrary-secret discovery; false-positive omission is allowed.
++        scan = self.marker_context + data
++        if re.search(br'(?i)(?:bearer|basic|sk-|api[_-]?key|access[_-]?token|password|secret|authorization)', scan):
++            self.unsafe_excerpt = True
++        self.marker_context = scan[-32:]
+         self.digest.update(data); self.total += len(data)
+         remaining = self.limit // 2 - len(self.head)
+         if remaining > 0:
+@@ -122,13 +138,16 @@
+     def record(self):
+         # Exact byte excerpts where safe; redact before either base64 or text storage.
+         raw = self.data()
++        unavailable = 'RECOGNIZED_CREDENTIAL_MARKER' if self.unsafe_excerpt else None
+         text = raw.decode('utf-8', 'backslashreplace')
+-        safe = _safe_text(text)
+-        redacted = safe != text
+-        retained = safe.encode() if redacted else raw
++        safe = '[EXCERPT_UNAVAILABLE:RECOGNIZED_CREDENTIAL_MARKER]' if unavailable else _safe_text(text)
++        redacted = bool(unavailable) or safe != text
++        retained = b'' if unavailable else (safe.encode() if redacted else raw)
+         return {'observed_types': sorted(self.types), 'total_bytes': self.total,
+                 'captured_bytes': len(raw), 'truncated': self.total > len(raw),
+                 'raw_sha256': self.digest.hexdigest(), 'redacted': redacted,
++                'excerpt_available': unavailable is None, 'excerpt_unavailable_reason': unavailable,
++                'retained_bytes': len(retained),
+                 'encoding': 'base64', 'bytes': base64.b64encode(retained).decode(),
+                 'text': safe[:1024], 'text_truncated': len(safe) > 1024, 'partial': True}
+ 
+@@ -168,45 +187,81 @@
+ 
+ 
+ def _observed_rpc_ids(evidence, streams):
+-    """Only actual structured CLI diagnostics, never manufacture a client identity."""
+-    observations = []
++    """Bounded complete diagnostic scan; four observations are a display cap only."""
++    observations = []; first_pair = None; conflict = False; complete = True
++    observed_count = 0; scanned_lines = 0
++    def unique_object(pairs):
++        value = {}
++        for key, item in pairs:
++            if key in value:
++                raise ValueError('Ambiguous duplicate JSON field')
++            value[key] = item
++        return value
+     for name, stream in streams.items():
+-        # Truncated output cannot provide a complete structured diagnostic.
+-        if stream.total > STREAM_LIMIT:
++        if stream.total > len(stream.data()):
++            complete = False
+             continue
+-        for line in stream.data().decode('utf-8', 'replace').splitlines()[:64]:
+-            try:
+-                value = json.loads(line)
+-            except (ValueError, TypeError):
++        for raw_line in stream.data().splitlines():
++            scanned_lines += 1
++            try:
++                line = raw_line.decode('utf-8')
++            except UnicodeDecodeError:
++                # Binary/plaintext output is not a structured RPC diagnostic.
++                # Corrupt JSON-looking diagnostics cannot supply a complete identity scan.
++                if raw_line.lstrip().startswith(b'{') or b'thread/queue/add' in raw_line:
++                    complete = False
++                continue
++            try:
++                value = json.loads(line, object_pairs_hook=unique_object)
++            except (ValueError, TypeError, RecursionError, OverflowError):
++                if line.lstrip().startswith('{') or 'thread/queue/add' in line:
++                    complete = False
+                 continue
+             if not isinstance(value, dict) or value.get('method') != 'thread/queue/add':
+                 continue
+             params = value.get('params')
+-            if not isinstance(params, dict) or params.get('threadId') != evidence.get('recipient_thread'):
++            if not isinstance(params, dict):
++                complete = False
++                continue
++            if not isinstance(params.get('threadId'), str):
++                complete = False
++                continue
++            if params['threadId'] != evidence.get('recipient_thread'):
+                 continue
+             rpc = value.get('id'); client = params.get('clientUserMessageId')
+-            if not isinstance(rpc, (str, int)) or isinstance(rpc, bool):
+-                continue
+-            if not isinstance(client, str) or not client or len(client) > 128 or len(str(rpc)) > 128:
+-                continue
+-            # Keep the same-request pairing, source, and diagnostic-only authority.
++            if (not isinstance(rpc, (str, int)) or isinstance(rpc, bool)
++                    or not isinstance(client, str) or not client
++                    or len(client) > 128 or len(str(rpc)) > 128):
++                complete = False
++                continue
+             safe_rpc = rpc if isinstance(rpc, int) else _safe_text(rpc)
+             safe_client = _safe_text(client)
+             if safe_rpc != rpc or safe_client != client:
+-                continue
+-            observations.append({'rpc_request_id': rpc, 'rpc_request_id_type': type(rpc).__name__,
+-                                 'client_user_message_id': client,
+-                                 'source': name + ':JSON:thread/queue/add', 'authority': 'CLI_DIAGNOSTIC_ONLY_NOT_SETTLEMENT'})
+-            if len(observations) == 4:
+-                break
+-        if len(observations) == 4:
+-            break
+-    evidence['identities']['observed_request_pairs'] = observations
+-    evidence['identities']['rpc_request_id'] = 'UNKNOWN'
+-    evidence['identities']['client_user_message_id'] = 'UNKNOWN'
+-    if observations and len({(item['rpc_request_id'], item['client_user_message_id']) for item in observations}) == 1:
+-        evidence['identities']['rpc_request_id'] = observations[0]['rpc_request_id']
+-        evidence['identities']['client_user_message_id'] = observations[0]['client_user_message_id']
++                complete = False
++                continue
++            pair = (type(rpc).__name__, rpc, client)
++            if first_pair is None:
++                first_pair = pair
++            elif pair != first_pair:
++                conflict = True
++            observed_count += 1
++            if len(observations) < 4:
++                observations.append({'rpc_request_id': rpc, 'rpc_request_id_type': type(rpc).__name__,
++                                     'client_user_message_id': client,
++                                     'source': name + ':JSON:thread/queue/add',
++                                     'authority': 'CLI_DIAGNOSTIC_ONLY_NOT_SETTLEMENT'})
++    identities = evidence['identities']
++    identities['observed_request_pairs'] = observations
++    identities['diagnostic_scan'] = {'complete': complete, 'conflict': conflict,
++                                   'observed_pair_count': observed_count,
++                                   'display_limit': 4, 'display_truncated': observed_count > 4,
++                                   'scanned_lines': scanned_lines,
++                                   'scope': 'COMPLETE_CAPTURED_JSON_DIAGNOSTICS_ONLY_NOT_SETTLEMENT'}
++    identities['rpc_request_id'] = 'UNKNOWN'
++    identities['client_user_message_id'] = 'UNKNOWN'
++    if complete and first_pair is not None and not conflict:
++        identities['rpc_request_id'] = first_pair[1]
++        identities['client_user_message_id'] = first_pair[2]
+ 
+ 
+ def _queue_run(command, path, evidence):
+@@ -278,7 +333,7 @@
+         stdout = streams['stdout'].data().decode('utf-8') if streams['stdout'].total <= STREAM_LIMIT else ''
+         return subprocess.CompletedProcess(command, returncode, stdout, '')
+     except BaseException as exc:
+-        evidence['exception'] = _exception(exc, phase)
++        evidence['exception'] = _exception(exc, phase, streams=streams)
+         if process is None and isinstance(exc, OSError):
+             evidence['queue_call'] = 'NOT_CALLED_EXEC_FAILED' if phase == 'queue_spawn' else 'NOT_CALLED_LOCAL_PREPARATION_FAILED'
+         evidence['streams'] = {name: stream.record() for name, stream in streams.items()}
