@@ -1,0 +1,552 @@
+# INERT ANALYSIS COPY; NOT AN INSTALLATION INPUT OR EXECUTION GRANT.
+"""Finite installer process custody using the OS bubblewrap PID namespace.
+
+This wraps each complete preparer/PM/build family, including detached sessions.
+No process discovery, service manager, weaker fallback or background monitor.
+"""
+from __future__ import annotations
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import stat
+import time
+
+
+class Budget:
+    def __init__(self, seconds, *, started=None, deadline=None):
+        start = time.monotonic() if started is None else started
+        self.started, self.seconds = start, seconds
+        self.explicit_original = started is not None and deadline is not None
+        if type(seconds) is not int or not 30 <= seconds <= 7200:
+            raise ValueError('finite_install_budget_required')
+        self.deadline = start + seconds if deadline is None else deadline
+        if not math.isfinite(self.deadline) or self.deadline > start + seconds:
+            raise ValueError('original_install_deadline_required')
+        self.check()
+
+    def check(self, *, reserve=0):
+        remaining = self.deadline - time.monotonic() - reserve
+        if remaining <= 0:
+            raise ValueError('original_install_budget_exhausted')
+        return remaining
+
+    def call(self, function, *args, **kwargs):
+        self.check()
+        result = function(*args, **kwargs)
+        self.check()
+        return result
+
+
+def checked_binary(pin):
+    if not isinstance(pin, dict) or set(pin) != {'path', 'sha256'} or pin['path'] != '/usr/bin/bwrap':
+        raise ValueError('explicit_system_bubblewrap_pin_required')
+    path = Path(pin['path'])
+    if path.resolve() != path:
+        raise ValueError('system_bubblewrap_required')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_mode & 0o022:
+            raise ValueError('protected_system_bubblewrap_required')
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            data = stream.read(4 * 1024**2 + 1)
+        after = os.fstat(fd)
+        if any(getattr(before, key) != getattr(after, key) for key in ('st_dev', 'st_ino', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns')) or len(data) > 4 * 1024**2 or hashlib.sha256(data).hexdigest() != pin['sha256']:
+            raise ValueError('system_bubblewrap_pin_changed')
+    finally:
+        os.close(fd)
+    return str(path)
+
+
+def argv(binary, command, *, read_only=False):
+    # Keep current installation filesystem/network semantics. This boundary
+    # supplies process lifetime custody, not a new filesystem or network grant.
+    # The finite command is namespace PID 1. Bubblewrap therefore waits for
+    # namespace-init exit, after the kernel has drained its descendants, rather
+    # than returning the application-status event while its reaper still exits.
+    if type(read_only) is not bool:
+        raise ValueError('explicit_read_only_boolean_required')
+    # Mount protection belongs to this same native boundary. Nesting another
+    # bwrap would request another user namespace and can be refused by the OS.
+    return [binary, '--unshare-pid', '--die-with-parent', '--new-session', '--as-pid-1',
+            '--ro-bind' if read_only else '--bind', '/', '/',
+            '--dev', '/dev', '--proc', '/proc', '--', *command]
+
+
+def namespace_exit(data, observation):
+    """Only bwrap's monitor owns this pipe; sandbox commands never inherit it."""
+    try:
+        rows = [json.loads(line) for line in data.splitlines() if line.strip()]
+        return (len(data) <= 4096 and len(rows) == 2
+                and isinstance(rows[0], dict) and type(rows[0].get('child-pid')) is int
+                and rows[0]['child-pid'] > 0
+                and rows[1] == {'exit-code': observation['returncode']}
+                and type(rows[1]['exit-code']) is int
+                and observation['returncode'] >= 0
+                and observation['timeout'] is False and observation['reaped'] is True)
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
+class Containment:
+    def __init__(self, pin, budget, env, *, caller_control=None):
+        self.pin, self.budget, self.env = pin, budget, env
+        self.caller_control = (CallerControl(pin, budget, caller_control)
+                               if caller_control is not None else None)
+        self.binary = (self.caller_control.binary if self.caller_control is not None
+                       else budget.call(checked_binary, pin))
+
+    def run(self, command, cwd, *, timeout=1800, read_only=False, log=None):
+        from scripts.dsh_prepare import run, CommandFailed, StopUnconfirmed, safe_observation
+        if self.caller_control is not None:
+            require_caller(read_only is True, 'CALLER_SOURCE_MUST_BE_READ_ONLY')
+            require_caller(self.env == {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C'}, 'EXACT_CLEAN_CALLER_ENV')
+            self.budget.call(checked_caller_binary, self.pin)
+            return run(command, cwd, timeout=min(timeout, self.budget.check(reserve=1)),
+                       env=self.env, deadline=self.budget.deadline, log=log,
+                       caller_control=self.caller_control)
+        self.budget.call(checked_binary, self.pin)
+        # Reserve cleanup *inside* the original deadline; no fresh grace clock.
+        limit = min(timeout, self.budget.check(reserve=1))
+        reader, writer = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+        failure = None; result = None; observation = {}; data = b''
+        try:
+            args = argv(self.binary, command, read_only=read_only)
+            args[1:1] = ['--json-status-fd', str(writer)]
+            try:
+                logging = {'log': log} if log is not None else {}
+                result = run(args, cwd, timeout=limit, env=self.env,
+                             deadline=self.budget.deadline, pass_fds=(writer,), **logging)
+                observation = result[1]
+            except BaseException as exc:
+                failure = exc
+                if isinstance(exc, CommandFailed): observation = exc.observation
+            os.close(writer); writer = None
+            # Exactly two small native records fit in the pipe. Never wait for
+            # EOF from an uncertain monitor or use its stdout as proof.
+            try:
+                data = os.read(reader, 4097)
+            except BlockingIOError:
+                pass
+        except BaseException as exc:
+            failure = exc
+            data = b''
+        finally:
+            if writer is not None: os.close(writer)
+            os.close(reader)
+        known = namespace_exit(data, observation)
+        if not known or observation.get('returncode') == 3:
+            stopped = StopUnconfirmed('STOP_UNCONFIRMED: namespace init exit not established')
+            if observation: stopped.observation = safe_observation(observation)
+            raise stopped from failure
+        observation['namespace_init_exit_verified'] = True
+        if failure is not None: raise failure
+        self.budget.check()
+        return result
+
+    def probe(self, python, cwd):
+        outer = os.readlink('/proc/self/ns/pid')
+        code = ('import os; assert os.readlink("/proc/self/ns/pid") != ' + repr(outer)
+                + '; fd=os.open("/dev/null",os.O_RDWR); '
+                  'assert os.read(fd,1)==b""; assert os.write(fd,b"probe")==5; '
+                  'os.close(fd); print("FRIDAY_PID_NAMESPACE_OK")')
+        result = self.run([python, '-B', '-c', code], cwd, timeout=5)[0]
+        if result != 'FRIDAY_PID_NAMESPACE_OK':
+            raise ValueError('required_pid_namespace_unavailable')
+
+# Opt-in qualification topology. This has NO inherited native acceptance from
+# the installer or the old host caller. Only the supplied admission may enable it.
+CALLER_TOPOLOGY = 'FOREGROUND_CONTROLLER_BWRAP_MONITOR_PID1_CALLER_ONE_NATIVE_CHILD_V1'
+PATCHED_BWRAP = '/usr/local/libexec/friday/bwrap-frw-success-only-v1'
+PATCHED_SOURCE_SHA256 = 'ee31ef74f0f01efe0aaba4324821d3ccd3b0874fc8099dd07026fd57012b5d0b'
+QUALITY_PATH = 'PRIVATE_QUALITY_LOCK_PATH'
+QUALITY_ID = [PRIVATE_QUALITY_DEVICE, PRIVATE_QUALITY_INODE, PRIVATE_QUALITY_UID, PRIVATE_QUALITY_GID, PRIVATE_QUALITY_NLINK, PRIVATE_QUALITY_SIZE, PRIVATE_QUALITY_MODE]
+
+
+def require_caller(ok, reason):
+    if not ok:
+        raise ValueError('CALLER_CONTROL:' + reason)
+
+
+def strict_object(raw):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            require_caller(key not in result, 'DUPLICATE_JSON_KEY')
+            result[key] = value
+        return result
+    value = json.loads(raw, object_pairs_hook=unique,
+                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError('NONFINITE_JSON')))
+    require_caller(type(value) is dict, 'OBJECT_REQUIRED')
+    return value
+
+
+def disjoint_output_tree(output, source):
+    return output != source and output not in source.parents and source not in output.parents
+
+
+def original_caller_clock(clock, now, boot):
+    require_caller(type(clock) is dict and clock.get('budget_seconds') == 180
+                   and clock.get('cpu_seconds') == 45, 'ORIGINAL_180_TREE45')
+    start, end = clock.get('started_monotonic'), clock.get('deadline_monotonic')
+    require_caller(all(type(v) in (int, float) and math.isfinite(v) for v in (start, end, now))
+                   and end - start == 180 and start <= now < end, 'ORIGINAL_DEADLINE')
+    require_caller(type(clock.get('assignment')) is str and bool(clock['assignment'])
+                   and type(clock.get('generation')) is int and clock['generation'] > 0
+                   and clock.get('boot_id') == boot, 'ORIGINAL_ASSIGNMENT_BOOT')
+    require_caller('owner_pid' not in clock and 'owner_start_ticks' not in clock, 'NO_OLD_CALLER_REUSE')
+    return end
+
+
+def caller_transition(state, event):
+    transitions = {('CREATED', 'native_identity'): 'HOST_BOUND',
+                   ('HOST_BOUND', 'gate_byte'): 'BOOTSTRAP',
+                   ('BOOTSTRAP', 'ready'): 'CALLER_READY',
+                   ('CALLER_READY', 'descriptor_grant'): 'GRANTED',
+                   ('GRANTED', 'accepted'): 'RUNNING',
+                   ('RUNNING', 'native_reap'): 'TERMINAL'}
+    require_caller((state, event) in transitions, 'ILLEGAL_HANDSHAKE_TRANSITION')
+    return transitions[state, event]
+
+
+def parse_native_record(raw, first):
+    require_caller(len(raw) <= 4096, 'NATIVE_STATUS_OVERFLOW')
+    row = strict_object(raw)
+    if first:
+        require_caller(type(row.get('child-pid')) is int and row['child-pid'] > 1,
+                       'EXACT_HOST_CHILD_REQUIRED')
+        require_caller(type(row.get('pid-namespace')) is int and row['pid-namespace'] > 0,
+                       'NATIVE_PID_NAMESPACE_REQUIRED')
+        require_caller(all(k == 'child-pid' or k.endswith('-namespace') for k in row)
+                       and all(type(v) is int and v > 0 for v in row.values()), 'NATIVE_IDENTITY_SCHEMA')
+    else:
+        require_caller(set(row) == {'exit-code'} and type(row['exit-code']) is int
+                       and 0 <= row['exit-code'] <= 255, 'NATIVE_EXIT_SCHEMA')
+    return row
+
+
+def host_identity(pid):
+    fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+    status = Path(f'/proc/{pid}/status').read_text().splitlines()
+    nspid = [int(v) for line in status if line.startswith('NSpid:') for v in line.split()[1:]]
+    require_caller(nspid and nspid[0] == pid, 'CONTROLLER_HOST_PROC_REQUIRED')
+    return dict(pid=pid, start_ticks=int(fields[19]), ppid=int(fields[1]), nspid=nspid,
+                pid_namespace=os.readlink(f'/proc/{pid}/ns/pid'),
+                mount_namespace=os.readlink(f'/proc/{pid}/ns/mnt'),
+                boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip())
+
+
+def validate_host_binding(caller, monitor, controller, native):
+    require_caller(caller['pid'] == native['child-pid'] and caller['ppid'] == monitor['pid']
+                   and monitor['ppid'] == controller['pid'], 'EXACT_PARENT_CHAIN')
+    require_caller(caller['pid_namespace'] == 'pid:[' + str(native['pid-namespace']) + ']'
+                   and caller['pid_namespace'] != controller['pid_namespace']
+                   and caller['nspid'] == controller['nspid'][:-1] + [caller['pid'], 1],
+                   'NEW_PID1_NAMESPACE_REQUIRED')
+    require_caller(all(type(x['start_ticks']) is int and x['start_ticks'] > 0
+                       and x['boot_id'] == controller['boot_id'] for x in (caller, monitor)),
+                   'START_BOOT_IDENTITY')
+
+
+def pidfd_alive(fd, expected_pid):
+    import select
+    lines = Path(f'/proc/self/fdinfo/{fd}').read_text().splitlines()
+    pids = [int(line.split()[1]) for line in lines if line.startswith('Pid:')]
+    require_caller(pids == [expected_pid] and not select.select([fd], [], [], 0)[0], 'STALE_OR_WRONG_PIDFD')
+
+
+def protected_file(path, *, owner, limit, sha256=None):
+    path = Path(path)
+    require_caller(path.is_absolute() and path.resolve() == path, 'CANONICAL_PROTECTED_PATH')
+    for parent in path.parents:
+        st = parent.stat()
+        require_caller(st.st_uid in (0, owner) and not st.st_mode & 0o022, 'WRITABLE_PROTECTED_PARENT')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        require_caller(stat.S_ISREG(before.st_mode) and before.st_uid == owner
+                       and not before.st_mode & 0o022 and before.st_size <= limit, 'PROTECTED_FILE_REQUIRED')
+        raw = os.read(fd, limit + 1)
+        after = os.fstat(fd)
+        require_caller(len(raw) == before.st_size <= limit and
+                       all(getattr(before, k) == getattr(after, k) for k in
+                           ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')), 'FILE_CHANGED')
+        require_caller(sha256 is None or hashlib.sha256(raw).hexdigest() == sha256, 'FILE_HASH')
+        return raw
+    finally:
+        os.close(fd)
+
+
+def checked_caller_binary(pin):
+    require_caller(type(pin) is dict and set(pin) == {'path', 'sha256', 'uid', 'source_sha256', 'gate'}
+                   and pin['path'] == PATCHED_BWRAP and pin['uid'] == 0
+                   and pin['source_sha256'] == PATCHED_SOURCE_SHA256
+                   and pin['gate'] == 'SUCCESS_ONLY_BYTE_1_EOF_ERROR_REFUSE'
+                   and type(pin['sha256']) is str and len(pin['sha256']) == 64,
+                   'EXACT_PATCHED_BINARY_CONTRACT_REQUIRED')
+    protected_file(pin['path'], owner=0, limit=4 << 20, sha256=pin['sha256'])
+    require_caller(os.stat(pin['path']).st_mode & 0o111 and not os.stat(pin['path']).st_mode & 0o6000,
+                   'NON_SETID_EXECUTABLE_REQUIRED')
+    return pin['path']
+
+
+class CallerControl:
+    """One finite invocation inside Containment; no process, service or clock of its own."""
+    def __init__(self, pin, budget, config):
+        import resource
+        self.pin, self.budget, self.config = pin, budget, dict(config)
+        self.clock = config['original_clock']
+        self.controller = host_identity(os.getpid())
+        original_caller_clock(self.clock, time.monotonic(), self.controller['boot_id'])
+        require_caller(budget.explicit_original and budget.seconds == 180
+                       and budget.started == self.clock['started_monotonic']
+                       and budget.deadline == self.clock['deadline_monotonic'], 'SAME_EXPLICIT_ORIGINAL_DEADLINE')
+        require_caller(config['schema'] == 'friday.existing-runner-caller-control.v1'
+                       and config['topology'] == CALLER_TOPOLOGY
+                       and config['execution_authorized'] is True
+                       and config['retry_authorized'] is False, 'SEPARATE_NEW_TOPOLOGY_ADMISSION')
+        require_caller(config['cpu_scope'] == 'SELECTED_FAULT_CANDIDATE_CHILD_TREE45_CALLER_LIFETIME_SEPARATE'
+                       and config['whole_trusted_family_hard45_proven'] is False,
+                       'DO_NOT_REDEFINE_SELECTED_PLAN_CPU_SCOPE')
+        ref = config['admission']
+        review = strict_object(protected_file(ref['path'], owner=os.getuid(), limit=65536, sha256=ref['sha256']))
+        canonical = {k: v for k, v in config.items() if k != 'admission'}
+        require_caller(review['configuration_sha256'] == hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            and review['state'] == 'NEW_CALLER_TOPOLOGY_INDEPENDENTLY_ADMITTED_FOR_SELECTED_OBSERVATION'
+            and review['topology'] == CALLER_TOPOLOGY and review['execution_authorized'] is True
+            and review['old_native_acceptance_reused'] is False, 'INDEPENDENT_EXACT_NEW_ADMISSION')
+        sources = config['runner_sources']
+        expected_sources = {str(Path(__file__).resolve()), str(Path(__file__).resolve().with_name('dsh_prepare.py'))}
+        require_caller(set(sources) == expected_sources, 'EXACT_EXISTING_RUNNER_SOURCES')
+        for path, sha in sources.items():
+            protected_file(path, owner=os.getuid(), limit=1 << 20, sha256=sha)
+        with open('/proc/self/exe', 'rb') as executable:
+            require_caller(hashlib.file_digest(executable, 'sha256').hexdigest() == config['controller_interpreter_sha256'],
+                           'EXACT_CONTROLLER_INTERPRETER')
+        self.binary = checked_caller_binary(pin)
+        ref = config['permit']
+        self.permit_raw = protected_file(ref['path'], owner=os.getuid(), limit=65536, sha256=ref['sha256'])
+        self.permit = strict_object(self.permit_raw)
+        require_caller(self.permit['original_clock'] == self.clock
+                       and self.permit['source_reviewed_observation_authorized'] is True
+                       and self.permit['caller_control']['topology'] == CALLER_TOPOLOGY
+                       and self.permit['caller_control']['binary'] == pin,
+                       'PERMIT_CLOCK_TOPOLOGY')
+        self.output = Path(config['output_directory'])
+        require_caller(self.output.is_absolute() and self.output.resolve() == self.output
+                       and self.output.is_dir() and self.output.stat().st_uid == os.getuid()
+                       and stat.S_IMODE(self.output.stat().st_mode) == 0o700
+                       and not list(self.output.iterdir()), 'FRESH_APPROVED_OUTPUT')
+        require_caller(self.permit['runtime_directory'] == str(self.output/'native-fault-run')
+                       and self.permit['launch_binding'] == str(self.output/'launch-binding.json')
+                       and self.permit['caller_control']['output_directory'] == str(self.output), 'EXACT_OUTPUT_JOIN')
+        here = Path(self.permit['qualification_directory'])
+        require_caller(here.is_absolute() and here.resolve() == here
+                       and disjoint_output_tree(self.output, here.parent)
+                       and self.output != Path('/'), 'NO_SOURCE_WRITABLE_EXPANSION')
+        # These trusted ancestors already belong to this original finite unit.
+        # No prlimit(PID) race, preexec hook, new root budget or hard6 shortcut.
+        require_caller(sorted(os.sched_getaffinity(0)) == [0, 1]
+                       and resource.getrlimit(resource.RLIMIT_AS) == (2 << 30, 2 << 30)
+                       and all(v == resource.RLIM_INFINITY or v >= 45 for v in resource.getrlimit(resource.RLIMIT_CPU)),
+                       'EXISTING_ANCESTOR_RESOURCE_ENVELOPE')
+        self.state = 'CREATED'; self.fds = set(); self.caller_fd = self.monitor_fd = None
+        self.caller = self.monitor = None; self.rows = []; self.status = b''
+        self.quality = None; self.channel = self.child_channel = None
+        self.terminal_confirmed = False; self.closed = False; self.refused = False; self.consumed = False
+
+    def _own(self, fd):
+        self.fds.add(fd)
+        return fd
+
+    def prepare(self, command):
+        import fcntl
+        import socket
+        require_caller(not self.consumed and self.state == 'CREATED', 'NO_SECOND_INVOCATION')
+        self.consumed = True
+        self.budget.check(reserve=1)
+        # Durable one-shot claim in the already approved output directory. No
+        # second registry or budget: the same assignment/generation is consumed.
+        fd = os.open(self.output/'controller-claim.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump({'original_clock': self.clock, 'permit': self.config['permit'],
+                       'controller': self.controller, 'consumed': True, 'retry_authorized': False}, stream)
+            stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
+        self.budget.check(reserve=1)
+        p = self.permit
+        expected = [p['interpreter'], '-I', '-B', '-S',
+                    str(Path(p['qualification_directory'])/'native_fault_launch.py'), self.config['permit']['path']]
+        require_caller(command == expected, 'EXACT_CALLER_COMMAND')
+        self.status_r, self.status_w = [self._own(fd) for fd in os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)]
+        self.gate_r, self.gate_w = [self._own(fd) for fd in os.pipe2(os.O_CLOEXEC)]
+        self.channel, self.child_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+        self.channel.setblocking(False)
+        self.controller_fd = self._own(os.pidfd_open(os.getpid(), 0))
+        self.controller_proc = self._own(os.open('/proc/self', os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC))
+        self.quality = self._own(os.open(QUALITY_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC))
+        st = os.fstat(self.quality)
+        require_caller([st.st_dev, st.st_ino, st.st_uid, st.st_gid, st.st_nlink, st.st_size,
+                        stat.S_IMODE(st.st_mode)] == QUALITY_ID, 'QUALITY_IDENTITY')
+        fcntl.flock(self.quality, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.quality_snapshot = self.quality_lock()
+        # The sole gate writer is never inherited. The monitor drops all caller
+        # fds; the namespace caller receives controller lifetime fds, not authority.
+        args = [self.binary, '--json-status-fd', str(self.status_w), '--block-fd', str(self.gate_r),
+                '--unshare-pid', '--die-with-parent', '--new-session', '--as-pid-1',
+                '--ro-bind', '/', '/', '--bind', str(self.output), str(self.output),
+                '--dev', '/dev', '--proc', '/proc', '--', *expected,
+                '--caller-control', str(self.child_channel.fileno()), str(self.controller_fd), str(self.controller_proc)]
+        self.expected_argv = args[args.index('--') + 1:]
+        return args, (self.status_w, self.gate_r, self.child_channel.fileno(), self.controller_fd, self.controller_proc)
+
+    def quality_lock(self):
+        st = os.fstat(self.quality)
+        token = f'{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}'
+        locks = [line.split() for line in Path(f'/proc/self/fdinfo/{self.quality}').read_text().splitlines()
+                 if line.startswith('lock:')]
+        require_caller(any(len(row) == 9 and row[2:5] == ['FLOCK', 'ADVISORY', 'WRITE']
+                           and row[5] == str(self.controller['pid']) and row[6] == token for row in locks),
+                       'CONTROLLER_FLOCK_NOT_HELD')
+        return dict(fd=self.quality, identity=QUALITY_ID, owner=self.controller, rows=locks)
+
+    def spawned(self, process):
+        self.monitor_fd = self._own(os.pidfd_open(process.pid, 0))
+        pidfd_alive(self.monitor_fd, process.pid)
+        self.monitor = host_identity(process.pid)
+        require_caller(self.monitor['ppid'] == self.controller['pid'], 'MONITOR_PARENT')
+        for fd in (self.status_w, self.gate_r):
+            os.close(fd); self.fds.remove(fd)
+        self.child_channel.close(); self.child_channel = None
+
+    def native_data(self, data):
+        self.status += data
+        require_caller(len(self.status) <= 4096, 'NATIVE_STATUS_OVERFLOW')
+        lines = self.status.splitlines(keepends=True)
+        complete = [line for line in lines if line.endswith(b'\n')]
+        require_caller(all(line.strip() for line in complete), 'EMPTY_NATIVE_RECORD')
+        require_caller(len(complete) <= 2, 'EXTRA_NATIVE_RECORD')
+        while len(self.rows) < len(complete):
+            row = parse_native_record(complete[len(self.rows)], not self.rows)
+            self.rows.append(row)
+            if len(self.rows) == 1:
+                # Child is still blocked; bwrap has not execed candidate Python.
+                self.caller_fd = self._own(os.pidfd_open(row['child-pid'], 0))
+                pidfd_alive(self.caller_fd, row['child-pid'])
+                self.caller = host_identity(row['child-pid'])
+                self.caller_proc = self._own(os.open(f'/proc/{self.caller["pid"]}', os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC))
+                validate_host_binding(self.caller, self.monitor, self.controller, row)
+                pidfd_alive(self.monitor_fd, self.monitor['pid'])
+                self.state = caller_transition(self.state, 'native_identity')
+                if self.refused:
+                    self.signal_owned()
+                    continue
+                self.budget.check(reserve=1)
+                require_caller(os.write(self.gate_w, b'1') == 1, 'SHORT_NATIVE_GATE_WRITE')
+                os.close(self.gate_w); self.fds.remove(self.gate_w); self.gate_w = None
+                self.state = caller_transition(self.state, 'gate_byte')
+
+    def control_data(self):
+        import array
+        import socket
+        raw, ancillary, flags, _ = self.channel.recvmsg(16385, 0)
+        require_caller(raw and len(raw) <= 16384 and not ancillary and not flags, 'CONTROL_EOF_TRUNCATION_OR_RIGHTS')
+        row = strict_object(raw)
+        self.budget.check(reserve=1)
+        pidfd_alive(self.caller_fd, self.caller['pid'])
+        pidfd_alive(self.monitor_fd, self.monitor['pid'])
+        require_caller(host_identity(self.caller['pid']) == self.caller
+                       and host_identity(self.monitor['pid']) == self.monitor, 'LIVE_IDENTITY_CHANGED')
+        if self.state == 'BOOTSTRAP':
+            cmdline = Path(f'/proc/{self.caller["pid"]}/cmdline').read_bytes()
+            require_caller(cmdline.split(b'\0')[:-1] == [os.fsencode(v) for v in self.expected_argv],
+                           'LIVE_CALLER_ARGV_CHANGED')
+            with open(f'/proc/{self.caller["pid"]}/exe', 'rb') as executable:
+                require_caller(hashlib.file_digest(executable, 'sha256').hexdigest() == self.permit['interpreter_sha256'],
+                               'LIVE_CALLER_INTERPRETER_CHANGED')
+            self.budget.check(reserve=1)
+            require_caller(row == {'op': 'READY', 'pid': 1, 'start_ticks': self.caller['start_ticks'],
+                                   'pid_namespace': self.caller['pid_namespace'],
+                                   'mount_namespace': self.caller['mount_namespace'],
+                                   'boot_id': self.clock['boot_id'], 'permit_sha256': self.config['permit']['sha256']},
+                           'WRONG_CALLER_READY')
+            self.state = caller_transition(self.state, 'ready')
+            self.quality_lock()
+            grant = dict(op='GRANT', topology=CALLER_TOPOLOGY, controller=self.controller,
+                         monitor=self.monitor, caller=self.caller, original_clock=self.clock,
+                         permit_sha256=self.config['permit']['sha256'], quality=self.quality_snapshot, binary=self.pin)
+            payload = json.dumps(grant, sort_keys=True, separators=(',', ':')).encode()
+            require_caller(len(payload) <= 16384, 'GRANT_OVERSIZE')
+            rights = array.array('i', [self.quality, self.caller_fd, self.monitor_fd, self.caller_proc])
+            require_caller(self.channel.sendmsg([payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)]) == len(payload),
+                           'SHORT_DESCRIPTOR_GRANT')
+            self.state = caller_transition(self.state, 'descriptor_grant')
+        else:
+            require_caller(self.state == 'GRANTED' and set(row) == {'op', 'start_ticks', 'quality_fd'}
+                           and row['op'] == 'ACCEPTED' and row['start_ticks'] == self.caller['start_ticks']
+                           and type(row['quality_fd']) is int and row['quality_fd'] >= 3,
+                           'DUPLICATE_OR_WRONG_ACCEPT')
+            shared = os.stat(f'/proc/{self.caller["pid"]}/fd/{row["quality_fd"]}')
+            require_caller((shared.st_dev, shared.st_ino) == tuple(QUALITY_ID[:2]), 'CALLER_QUALITY_FD_NOT_SHARED')
+            info = Path(f'/proc/{self.caller["pid"]}/fdinfo/{row["quality_fd"]}').read_text()
+            token = f'{os.major(shared.st_dev):02x}:{os.minor(shared.st_dev):02x}:{shared.st_ino}'
+            locks = [line.split() for line in info.splitlines() if line.startswith('lock:')]
+            require_caller(any(len(r) == 9 and r[2:5] == ['FLOCK', 'ADVISORY', 'WRITE']
+                               and r[5] == str(self.controller['pid']) and r[6] == token for r in locks),
+                           'CALLER_SHARED_OFD_FLOCK_NOT_VISIBLE_IN_HOST_PROC')
+            self.state = caller_transition(self.state, 'accepted')
+
+    def signal_owned(self):
+        import signal
+        errors = []
+        self.refused = True
+        if getattr(self, 'gate_w', None) is not None:
+            os.close(self.gate_w); self.fds.remove(self.gate_w); self.gate_w = None
+        # Caller SIGKILL also drains its namespace. Never kill a numeric PID or
+        # kill the monitor first once it owns a namespace child to reap.
+        fd = self.caller_fd if self.caller_fd is not None else self.monitor_fd
+        if fd is not None:
+            try: signal.pidfd_send_signal(fd, signal.SIGKILL, None, 0)
+            except ProcessLookupError: pass
+            except OSError as exc: errors.append(type(exc).__name__ + ':' + str(exc.errno))
+        return errors
+
+    def terminal(self, observation):
+        import select
+        require_caller(self.caller_fd is not None and select.select([self.caller_fd], [], [], 0)[0],
+                       'EXACT_CALLER_EXIT_NOT_OBSERVED')
+        require_caller(len(self.rows) == 2 and self.status.endswith(b'\n')
+                       and len(self.status.splitlines()) == 2
+                       and self.rows[1] == {'exit-code': observation['returncode']}
+                       and observation['reaped'] and observation['returncode'] != 3, 'NATIVE_REAP_NOT_ESTABLISHED')
+        self.quality_lock()
+        self.terminal_confirmed = True
+        if self.state == 'RUNNING': self.state = caller_transition(self.state, 'native_reap')
+        # wait4(monitor) covers monitor + its actually waited caller/descendants.
+        # It cannot separate the monitor CPU and must never be added to the
+        # caller's child rows again. The parent's own CPU is reported separately.
+        observation.update(original_clock=self.clock, permit_ref=self.config['permit'],
+                           selected_plan=self.permit['plan'], source_manifest_sha256=self.permit['source_manifest_sha256'],
+                           bwrap_pin=self.pin, runner_sources=self.config['runner_sources'],
+                           native_status_sha256=hashlib.sha256(self.status).hexdigest(),
+                           caller_control_topology=CALLER_TOPOLOGY,
+                           caller_host_identity=self.caller, controller_identity=self.controller,
+                           native_monitor_identity=self.monitor, namespace_init_exit_verified=True,
+                           caller_pidfd_exit_observed=True, caller_control_state=self.state,
+                           tree_cpu_accounting='MONITOR_WAIT4_INCLUDES_ACTUALLY_WAITED_CALLER_TREE',
+                           unobserved_unwaited_descendant_cpu='UNKNOWN_NOT_ZERO_IF_CANDIDATE_CUSTODY_INCOMPLETE',
+                           exact_separate_monitor_and_caller_exit_cpu='NOT_EXPORTED_BY_EXISTING_BWRAP_STATUS',
+                           caller_custody_retained_through_exit_reap=True)
+
+    def close(self):
+        # Called only after bounded collection/terminal receipt. On uncertain
+        # cessation keep the FLOCK and exact PIDFDs alive in this controller.
+        require_caller(self.monitor_fd is None or self.terminal_confirmed, 'STOP_UNCONFIRMED_RETAIN_CUSTODY')
+        for channel in (self.channel, self.child_channel):
+            if channel is not None: channel.close()
+        for fd in tuple(self.fds):
+            os.close(fd); self.fds.remove(fd)
+        self.closed = True
+
