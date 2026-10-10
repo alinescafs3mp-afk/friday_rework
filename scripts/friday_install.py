@@ -40,6 +40,64 @@ class Refused(ValueError):
         super().__init__(self.reason)
 
 
+def remember_secondary(exc, secondary):
+    # Retain objects only in memory; never stringify exceptions or traceback
+    # inventories. The finite installation path uses at most sixteen entries.
+    previous = getattr(exc, 'friday_secondary_failures', ())
+    if type(previous) is not tuple:
+        previous = ()
+    exc.friday_secondary_failures = (previous + (secondary,))[:16]
+
+
+class InstallerExit(SystemExit):
+    """CLI status is not a proof of command cessation; keep the original cause."""
+    def __init__(self, code, original):
+        super().__init__(code)
+        self.friday_custody_primary = original
+        self.friday_custody_state = 'UNCONFIRMED' if code == 3 else 'REFUSAL_UNPROVEN'
+
+
+def retained_diagnostic(exc, phase):
+    fallback = {'phase': phase, 'reason': 'diagnostic_unavailable'}
+    try:
+        from scripts.dsh_prepare import StopUnconfirmed
+        if isinstance(exc, StopUnconfirmed):
+            fallback.update(reason='stop_unconfirmed', cessation='UNCONFIRMED')
+        existing = getattr(exc, 'friday_diagnostic', None)
+        diagnostic = existing if type(existing) is dict else safe_diagnostic(exc, phase)
+        if type(diagnostic) is not dict:
+            raise TypeError('diagnostic_object_required')
+        exc.friday_diagnostic = diagnostic
+        return diagnostic
+    except BaseException as secondary:
+        remember_secondary(exc, secondary)
+        exc.friday_diagnostic = fallback
+        return fallback
+
+
+def exit_retaining_cause(parser, code, exc, phase):
+    # Construct the typed transfer before any diagnostic, formatting or output.
+    # argparse's generic SystemExit and failed diagnostics never own custody.
+    transfer = InstallerExit(code, exc)
+    try:
+        detail = diagnostic_text(retained_diagnostic(exc, phase))
+        attempt = getattr(exc, 'friday_attempt', None)
+        if type(attempt) is dict:
+            sha = attempt.get('input_sha256')
+            if type(sha) is str and len(sha) == 64 and all(c in '0123456789abcdef' for c in sha):
+                detail += ' attempt=' + sha
+        message = ('STOP_UNCONFIRMED: ' + detail + '; owned command cessation is unconfirmed; '
+                   'do not retry or release ownership before reconciliation\n' if code == 3 else
+                   'Friday entry refused: ' + detail + '\n')
+        parser.exit(code, message)
+        remember_secondary(exc, RuntimeError('parser_exit_returned'))
+    except BaseException as secondary:
+        if not (type(secondary) is SystemExit and type(secondary.code) is int and secondary.code == code):
+            remember_secondary(exc, secondary)
+    transfer.friday_custody_secondary = getattr(exc, 'friday_secondary_failures', ())
+    raise transfer from exc
+
+
 def require(condition, reason):
     if not condition:
         raise Refused(reason)
@@ -494,7 +552,7 @@ def install(value, input_path, *, budget=None):
     try:
         containment.probe(value['bootstrap_python']['path'], ROOT)
     except (OSError, ValueError, RuntimeError) as exc:
-        exc.friday_diagnostic = safe_diagnostic(exc, 'namespace_probe')
+        retained_diagnostic(exc, 'namespace_probe')
         raise
     budget.call(home.mkdir, mode=0o700)
     claim = partial_claim(input_hash, budget)
@@ -504,7 +562,7 @@ def install(value, input_path, *, budget=None):
             return containment.run(command, cwd, timeout=timeout,
                                    log=home / 'preparation/native-install' / phase)[0]
         except (OSError, ValueError, RuntimeError) as exc:
-            diagnostic = safe_diagnostic(exc, phase)
+            diagnostic = retained_diagnostic(exc, phase)
             exc.friday_diagnostic = diagnostic
             exc.friday_attempt = claim
             # This receipt is evidence, never permission to replay the attempt.
@@ -514,7 +572,8 @@ def install(value, input_path, *, budget=None):
             try:
                 require(read_json(home / MARKER) == claim, 'install_claim_changed')
                 publish(home / FAILURE, failure, budget=budget)
-            except (OSError, ValueError, RuntimeError):
+            except BaseException as secondary:
+                remember_secondary(exc, secondary)
                 diagnostic['failure_receipt'] = 'NOT_PUBLISHED'
             raise
     execute('compose', argv['compose'], ROOT, 130)
@@ -750,13 +809,14 @@ def resume_harness(request, request_path, *, prepared=None):
                        if phase in ('pm_python', 'completed_native_check') else {})
             return custody.run(command, cwd, timeout=timeout, **options)[0]
         except (OSError, ValueError, RuntimeError) as exc:
-            diagnostic = safe_diagnostic(exc, phase)
+            diagnostic = retained_diagnostic(exc, phase)
             exc.friday_diagnostic = diagnostic; exc.friday_attempt = claim
             try:
                 publish(home / 'FRIDAY-INSTALL.harness-resume.failure.json', {
                     'schema': 'friday.native-install-failure.v1', 'original_attempt': claim,
                     'diagnostic': diagnostic, 'resume_allowed': False}, budget=budget)
-            except (OSError, ValueError, RuntimeError):
+            except BaseException as secondary:
+                remember_secondary(exc, secondary)
                 diagnostic['failure_receipt'] = 'NOT_PUBLISHED'
             raise
     expression = 'from pm.environments import project_python; from pathlib import Path; print(project_python(Path.cwd()))'
@@ -932,15 +992,10 @@ def main():
     except StopUnconfirmed as exc:
         # Fixed text only: neither argv, stderr nor a chained error is safe to
         # print. Keep uncertain process custody distinct from a normal refusal.
-        detail = diagnostic_text(getattr(exc, 'friday_diagnostic', safe_diagnostic(exc, args.phase)))
-        if hasattr(exc, 'friday_attempt'): detail += ' attempt=' + exc.friday_attempt['input_sha256']
-        parser.exit(3, 'STOP_UNCONFIRMED: ' + detail + '; owned command cessation is unconfirmed; '
-                       'do not retry or release ownership before reconciliation\n')
+        exit_retaining_cause(parser, 3, exc, args.phase)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
         # Native errors/inputs can contain credentials: print no exception body.
-        detail = diagnostic_text(getattr(exc, 'friday_diagnostic', safe_diagnostic(exc, args.phase)))
-        if hasattr(exc, 'friday_attempt'): detail += ' attempt=' + exc.friday_attempt['input_sha256']
-        parser.exit(2, 'Friday entry refused: ' + detail + '\n')
+        exit_retaining_cause(parser, 2, exc, args.phase)
 
 
 

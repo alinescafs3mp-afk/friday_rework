@@ -75,6 +75,10 @@ def argv(binary, command, *, read_only=False):
 def namespace_exit(data, observation):
     """Only bwrap's monitor owns this pipe; sandbox commands never inherit it."""
     try:
+        if (type(data) is not bytes or len(data) > 4096
+                or type(observation) is not dict
+                or type(observation.get('returncode')) is not int):
+            return False
         rows = [json.loads(line) for line in data.splitlines() if line.strip()]
         return (len(data) <= 4096 and len(rows) == 2
                 and isinstance(rows[0], dict) and type(rows[0].get('child-pid')) is int
@@ -98,7 +102,15 @@ class Containment:
         # Reserve cleanup *inside* the original deadline; no fresh grace clock.
         limit = min(timeout, self.budget.check(reserve=1))
         reader, writer = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
-        failure = None; result = None; observation = {}; data = b''
+        failure = None; secondary = []; result = None; observation = {}; data = b''
+        # A later diagnostic/pipe error must never replace the invocation cause.
+        # This is a finite list: each setup/run/read/close/witness stage runs once.
+        def failed(exc):
+            nonlocal failure
+            if failure is None:
+                failure = exc
+            else:
+                secondary.append(exc)
         try:
             args = argv(self.binary, command, read_only=read_only)
             args[1:1] = ['--json-status-fd', str(writer)]
@@ -108,27 +120,69 @@ class Containment:
                              deadline=self.budget.deadline, pass_fds=(writer,), **logging)
                 observation = result[1]
             except BaseException as exc:
-                failure = exc
-                if isinstance(exc, CommandFailed): observation = exc.observation
-            os.close(writer); writer = None
+                failed(exc)
+                if isinstance(exc, CommandFailed):
+                    try:
+                        observation = exc.observation
+                    except BaseException as observation_failure:
+                        failed(observation_failure)
+            closing = writer; writer = None  # never retry an ambiguous close
+            try:
+                os.close(closing)
+            except BaseException as close_failure:
+                failed(close_failure)
             # Exactly two small native records fit in the pipe. Never wait for
             # EOF from an uncertain monitor or use its stdout as proof.
             try:
                 data = os.read(reader, 4097)
             except BlockingIOError:
                 pass
+            except BaseException as read_failure:
+                failed(read_failure)
         except BaseException as exc:
-            failure = exc
-            data = b''
+            failed(exc)
         finally:
-            if writer is not None: os.close(writer)
-            os.close(reader)
-        known = namespace_exit(data, observation)
-        if not known or observation.get('returncode') == 3:
-            stopped = StopUnconfirmed('STOP_UNCONFIRMED: namespace init exit not established')
-            if observation: stopped.observation = safe_observation(observation)
+            if writer is not None:
+                closing = writer; writer = None
+                try:
+                    os.close(closing)
+                except BaseException as close_failure:
+                    failed(close_failure)
+            try:
+                os.close(reader)
+            except BaseException as close_failure:
+                failed(close_failure)
+        try:
+            known = namespace_exit(data, observation) is True
+        except BaseException as witness_failure:
+            failed(witness_failure)
+            known = False
+        if (known and not secondary
+                and (failure is None or isinstance(failure, CommandFailed))
+                and observation.get('returncode') != 3):
+            try:
+                observation['namespace_init_exit_verified'] = True
+            except BaseException as observation_failure:
+                failed(observation_failure)
+                known = False
+        # A cleanup/observation failure is conservatively unknown even when a
+        # record happened to look complete. Exit 3 also propagates inner custody.
+        if (not known or secondary or isinstance(failure, StopUnconfirmed)
+                or (type(observation) is dict and observation.get('returncode') == 3)
+                or (failure is not None and not isinstance(failure, CommandFailed))):
+            stopped = (failure if isinstance(failure, StopUnconfirmed) else
+                       StopUnconfirmed('STOP_UNCONFIRMED: namespace init exit not established'))
+            stopped.friday_custody_primary = failure
+            if type(observation) is dict and observation:
+                try:
+                    stopped.observation = safe_observation(observation)
+                except BaseException as observation_failure:
+                    secondary.append(observation_failure)
+            stopped.friday_custody_secondary = tuple(secondary)
+            stopped.friday_custody_state = 'UNCONFIRMED'
+            if stopped is failure:
+                raise stopped
             raise stopped from failure
-        observation['namespace_init_exit_verified'] = True
         if failure is not None: raise failure
         self.budget.check()
         return result
