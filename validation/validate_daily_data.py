@@ -56,6 +56,11 @@ CHECKER_PINS = {'product:fixtures/host-repair/check.py': '7f42526e8d4ae75f0eb86c
  'product:fixtures/engineering-repair/check.py': 'b9599e9c29cc396a480e31c10eea143248c683d80616a93bd04dc0cb1ba81215'}
 
 
+# Exact independently reviewable historical long-task bytes; no worker authority.
+LONG_SOURCE_PINS = {'product:fixtures/long-repository/worker-input.tar.gz': '21c635d246f3eb8b17dfcbfe56e2fcd29654b4c26ab579108ef5d6d4d02abc9f', 'product:fixtures/long-repository/brief.txt': 'f466dc3266e3eccc637f898eb495cbc741a23d29a5b2efc2ebd1ea0eabeddad5', 'product:fixtures/long-repository/owner/selection.json': '73e2612775b31590aa08e2388216bb7ab257773d05d364d81aebe7e8a0dbd69c', 'product:fixtures/long-repository/owner/known_solution.py': '8bdbf15f9950dadb69df9e910463587d72a74e1ee35934fd43b9cf5f6c1d27db', 'product:fixtures/long-repository/owner/test_daily_finalizer.py': 'c842884bb1638e76fba4a914d3785593fcb16527d45d967c3fb6422dfd16b729', 'product:fixtures/long-repository/owner/current_reference_checks.py': '77f7a98192c08c582c8b25c02d2ebdbc6c7cd68666f557b0175b080b54a6f86a'}
+LONG_PREFIX = 'product:fixtures/long-repository/'
+
+
 def need(condition, reason):
     if not condition:
         raise ValueError(reason)
@@ -176,8 +181,6 @@ def validate(document, sources, corpus_root, roots):
     need(limits['state'] == 'PENDING_ORIGINAL_ADMISSION'
          and all(limits[x] is None for x in PENDING_LIMITS), 'invented original limits')
     need(document['acceptance']['FRW-030'] == 'SOURCE_DATA_PREPARED_REVIEW_REQUIRED; LIVE_NOT_ACCEPTED'
-         and document['acceptance']['long_coding_coverage'] ==
-             'PENDING_REAL_TARGET; not satisfied by short arithmetic or engineering calibration'
          and document['acceptance']['AC034'] == document['acceptance']['AC040'] == 'NOT_RUN'
          and document['acceptance']['exclusions'] == []
          and set(document['acceptance']['prerequisites']) == {'FRW-022', 'FRW-023', 'FRW-029'}
@@ -229,11 +232,49 @@ def validate(document, sources, corpus_root, roots):
         need(len(raw) == pin['bytes'] and hashlib.sha256(raw).hexdigest() == pin['sha256']
              and raw.decode('utf-8').strip(), 'brief missing/changed')
         if task['category'] == 'long_coding':
-            need(task['data_readiness'] == 'PENDING_REAL_TARGET'
-                 and task['target']['repository'] is None
-                 and task['target']['original_user_goal'] is None
-                 and any(x.startswith('MISSING_REAL_LONG_TASK:') for x in task['dependencies'])
-                 and uploads == [], 'fake long coding coverage')
+            if task['data_readiness'] == 'PENDING_REAL_TARGET':
+                need(task['target']['repository'] is None
+                     and task['target']['original_user_goal'] is None
+                     and any(x.startswith('MISSING_REAL_LONG_TASK:') for x in task['dependencies'])
+                     and uploads == [] and document['acceptance']['long_coding_coverage'] ==
+                     'PENDING_REAL_TARGET; not satisfied by short arithmetic or engineering calibration',
+                     'fake long coding coverage')
+                long_readiness = 'PENDING_REAL_TARGET'
+            else:
+                need(task['data_readiness'] == 'REAL_REPOSITORY_SOURCE_SELECTED_NOT_RUN'
+                     and document['acceptance']['long_coding_coverage'] ==
+                     'REAL_REPOSITORY_SOURCE_SELECTED; execution, continuation and duration NOT_RUN',
+                     'source selection is not runtime coverage')
+                need(all(key in source_bytes and hashlib.sha256(source_bytes[key]).hexdigest() == pin
+                         for key, pin in LONG_SOURCE_PINS.items()), 'long-task exact source/oracle pins')
+                selection = load(source_bytes[LONG_PREFIX + 'owner/selection.json'])
+                target = task['target']
+                need(same_json(target['repository'], {
+                    'kind': 'PINNED_HISTORICAL_GIT_SEED',
+                    'archive_source': LONG_PREFIX + 'worker-input.tar.gz',
+                    'seed_commit': selection['seed_commit'],
+                    'source_commit': selection['source_commit'],
+                    'worker_repository': 'worker/repository'}), 'long-task original repository binding')
+                need(same_json(target['input_pin_set'], list(LONG_SOURCE_PINS))
+                     and target['original_user_goal'] == LONG_PREFIX + 'brief.txt'
+                     and target['owner_selection'] == LONG_PREFIX + 'owner/selection.json',
+                     'long-task goal/input binding')
+                need(uploads == [LONG_PREFIX + 'worker-input.tar.gz', LONG_PREFIX + 'brief.txt']
+                     and {LONG_PREFIX + name for name in selection['owner_only']} <= set(owner)
+                     and raw == source_bytes[LONG_PREFIX + 'brief.txt'], 'long-task input/owner separation')
+                need(selection['worker_grant'] == 'PENDING_ORIGINAL_ADMISSION'
+                     and selection['runtime_limit_seconds'] is None
+                     and selection['runtime_deadline'] is None
+                     and selection['runtime_task_id'] is None
+                     and selection['runtime_native_association'] is None
+                     and selection['runtime_executed'] is False
+                     and selection['long_duration_proven'] is False
+                     and selection['continuation']['observed'] is False
+                     and selection['continuation']['reset_original_deadline'] is False,
+                     'long-task invented runtime/grant/continuation')
+                need(not any(x.startswith('MISSING_REAL_LONG_TASK:') for x in task['dependencies']),
+                     'obsolete selected-task prerequisite')
+                long_readiness = 'REAL_REPOSITORY_SOURCE_SELECTED_NOT_RUN'
     need(categories == CATEGORIES and len(ids) == len(CATEGORIES), 'missing/extra task category')
     actual_briefs = {str(p.relative_to(corpus_root)) for p in (corpus_root / 'briefs').iterdir()}
     need(actual_briefs == briefs, 'orphan/missing brief file')
@@ -284,7 +325,7 @@ def validate(document, sources, corpus_root, roots):
     return {'state': 'PASS_DATA_INTEGRITY_ONLY', 'tasks': len(ids),
             'categories': len(categories), 'source_pins_verified': len(source_bytes),
             'brief_pins_verified': len(briefs), 'original_engineering_manifest_pins': len(manifest['pins']),
-            'long_coding': 'PENDING_REAL_TARGET', 'soak_parameters': 'PENDING_ADMISSION',
+            'long_coding': long_readiness, 'soak_parameters': 'PENDING_ADMISSION',
             'fixture_checkers_executed': False, 'runtime_executed': False,
             'attests_runtime_truth': False, 'review_required': True}
 

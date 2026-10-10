@@ -10,7 +10,7 @@ Astra owns review, integration, final task selection and runtime admission.
 | Telegram settings question | Grounded answer from the existing supplied settings bytes |
 | Current urllib3 research | Actually read official sources and a version-aware answer, or honest retrieval failure |
 | Short Harness calculator repair | Exact original input, independent unchanged owner checks, diff and returned artifact |
-| Long original repository continuation | **PENDING_REAL_TARGET**: real multi-file repository, original goal/tests/write scope/grant must first be selected |
+| Long original repository continuation | Pinned historical daily-finalizer repository, exact feature goal and separate owner oracle; execution/continuation/duration remain NOT_RUN |
 | A0 engineering repair | Original app/CP1251 CSV, both settings faults, confined diff, four outputs and actual independent five-check result |
 | Binary file return | Same 149 CSV bytes and original authorized destination |
 | Owned-task status | Authoritative original association; no new worker |
@@ -20,19 +20,24 @@ Astra owns review, integration, final task selection and runtime admission.
 | Missing required attachment | Ask for the missing file/refuse; no fabricated repair or borrowed attachment |
 | Worker failure | Original bounded failure or policy-admitted same-job recovery; uncertain effects never replay |
 
-The short arithmetic fixture is intentionally small. It supplies neither a long
-coding scenario nor sustained duration evidence. The long case names the actual
-FRW-022 repository/continuation integration goal but has no authorized concrete
-long repository/task fixture yet. Its null target and explicit dependency block
-execution. Selecting it requires a real agreed multi-file goal and immutable
-inputs/checks, not repetition, sleep or relabelling the arithmetic example.
+The long case now selects the real historical root-qualified reference repair in
+Friday_rework's daily Git inventory tool. The [repository input](../long-repository/README.md)
+contains five original project files and one clean seed commit, an exact Russian
+feature brief, and separate immutable owner checks. The original source passes
+its old tests but fails the new feature checks; the known historical solution
+passes them. This is source selection and functional calibration only. Actual
+Harness work, explicit continuation of its retained diff, original deadline,
+delivery and measured duration remain NOT_RUN. The arithmetic example is still
+only short calibration; no artificial delay supplies long-duration evidence.
 
-`source-pins.json` binds 26 existing product/archive files to the actual intake
+`source-pins.json` binds 32 product/archive inputs and owner files to the actual intake
 commit. Inputs and checkers are referenced byte-for-byte rather than copied or
 modified. Engineering uses the original `brief.txt`, manifest and mapping; paths
 in mapping remain templates until genuine current admission fills them.
 
 Only the named user input files and the applicable brief reach the worker.
+For the long case this is the worker-only archive and its brief; the owner
+selection record, known solution and final tests never enter its read/write grant.
 Owner tests, checkers, calibration corrections/reports, manifests and mapping
 evidence stay owner-controlled and outside worker write grants. Engineering may
 change only settings and generated outputs; the original app and binary CSV stay
