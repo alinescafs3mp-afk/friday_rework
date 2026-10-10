@@ -1,0 +1,7 @@
+# Preserve explicit source roots in daily analysis
+
+The daily-use corpus pins both product files and the immutable directive archive. The previous finalizer looked for an archive-qualified acceptance matrix in the product repository and reported one false missing link. Its actual archive bytes matched their source pin; the original report remains historical evidence.
+
+The [adopted finalizer](../../../scripts/daily-analysis/daily_finalizer.py) now recognizes only the exact daily-use source-pin schema with matching, canonical root/id/path and typed hash/byte fields. Product references are verified against the selected immutable Git cut. Archive references are recorded as **EXTERNAL_UNVERIFIED**; the tool does not read external roots, authenticate their data or convert that classification into acceptance. Malformed, unknown, ambiguous and traversing bindings refuse. Sibling and nested ordinary links remain checked.
+
+[Validation](result.json): 20 actual Git fixture tests, 24 previous reference controls and 12 independent changed-area controls passed. The actual `7d6bf8f` cut contains 24 verified product pins and two explicit external archive pins with zero publication gaps. The finalizer continues to label every output PROVISIONAL_NOT_DAILY_COMPLETE and grants no runtime or product authority. The daily 21:00 checkpoint still requires the actual final period cut and remote verification.

@@ -218,6 +218,156 @@ class FinalizerTests(unittest.TestCase):
         index, _ = self.invoke(output=self.root / "valid-current")
         self.assertEqual(index["counts"]["hash_references"], 1)
 
+    def pin(self, root="archive", path="validation/acceptance_matrix.json", payload=b"{}\n"):
+        return {"id": root + ":" + path, "root": root, "path": path,
+                "sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload)}
+
+    def pins(self, entries):
+        self.write("fixtures/daily-use/source-pins.json", json.dumps({
+            "schema": "friday.daily-use.source-pins.v1", "sources": entries}))
+        return self.commit("root reference fixture")
+
+    def freeze(self):
+        for p in self.repo.rglob("*"):
+            if p.is_file():
+                p.chmod(0o444)
+        for p in sorted(self.repo.rglob("*"), reverse=True):
+            if p.is_dir():
+                p.chmod(0o555)
+        self.repo.chmod(0o555)
+        return self.snapshot()
+
+    def snapshot(self):
+        return {str(p.relative_to(self.repo)): (p.stat().st_mode, hashlib.sha256(p.read_bytes()).hexdigest())
+                for p in self.repo.rglob("*") if p.is_file()}
+
+    def test_rooted_archive_external_and_original_reproduction(self):
+        end = self.pins([self.pin()])
+        frozen = self.freeze()
+        original = os.environ.get("ORIGINAL_FINALIZER")
+        if original:
+            out = self.root / "original-output"
+            cp = subprocess.run([sys.executable, original, "--repo", str(self.repo),
+                                 "--base", self.base, "--end", end, "--output", str(out)],
+                                env=self.env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            old = json.loads((out / "publication-integrity.json").read_text())
+            self.assertEqual([r["kind"] for r in old["publication_gaps"]], ["JSON_LINK_MISSING"])
+            self.assertEqual(old["publication_gaps"][0]["target"], "validation/acceptance_matrix.json")
+        index, result = self.invoke(end=end)
+        self.assertEqual(result["publication_gaps"], [])
+        self.assertEqual(result["hash_references"], [])
+        self.assertEqual(index["counts"]["external_root_references"], 1)
+        self.assertEqual(result["external_root_references"][0]["status"], "EXTERNAL_UNVERIFIED")
+        self.assertNotIn("actual_sha256", result["external_root_references"][0])
+        self.assertEqual(result["external_root_references"][0]["target"], "archive:validation/acceptance_matrix.json")
+        self.assertEqual(self.snapshot(), frozen)
+
+    def test_rooted_archive_collision_does_not_verify_product_copy(self):
+        self.write("validation/acceptance_matrix.json", '{"different":"product bytes"}\n')
+        end = self.pins([self.pin()])
+        frozen = self.freeze()
+        _, result = self.invoke(end=end)
+        self.assertEqual(result["hash_references"], [])
+        self.assertEqual(result["external_root_references"][0]["status"], "EXTERNAL_UNVERIFIED")
+        self.assertEqual(self.snapshot(), frozen)
+
+    def test_rooted_product_paths_validate_all_roots(self):
+        entries = []
+        for path in ("fixtures/payload.txt", "plugins/payload.txt", "docs/payload.txt"):
+            self.write(path, "payload")
+            entries.append(self.pin("product", path, b"payload"))
+        end = self.pins(entries)
+        frozen = self.freeze()
+        _, result = self.invoke(end=end)
+        self.assertEqual(len(result["hash_references"]), 3)
+        self.assertEqual({r["status"] for r in result["hash_references"]}, {"PASS"})
+        self.assertEqual(result["external_root_references"], [])
+        self.assertEqual(self.snapshot(), frozen)
+
+    def test_rooted_product_missing_refused(self):
+        end = self.pins([self.pin("product", "fixtures/missing.txt")])
+        frozen = self.freeze()
+        cp = self.invoke(end=end, success=False)
+        self.assertIn("PUBLIC_REFERENCE_MISSING", cp.stderr)
+        self.assertFalse((self.root / "output").exists())
+        self.assertEqual(self.snapshot(), frozen)
+
+    def test_rooted_product_hash_and_size_drift_refused(self):
+        self.write("fixtures/payload.txt", "changed")
+        end = self.pins([self.pin("product", "fixtures/payload.txt", b"earlier")])
+        frozen = self.freeze()
+        cp = self.invoke(end=end, success=False)
+        self.assertIn("PUBLIC_REFERENCE_MISMATCH", cp.stderr)
+        self.assertEqual(self.snapshot(), frozen)
+
+    def test_rooted_product_byte_count_drift_refused(self):
+        self.write("fixtures/payload.txt", "payload")
+        item = self.pin("product", "fixtures/payload.txt", b"payload")
+        end = self.pins([{**item, "bytes": item["bytes"] + 1}])
+        frozen = self.freeze()
+        cp = self.invoke(end=end, success=False)
+        self.assertIn("PUBLIC_REFERENCE_MISMATCH", cp.stderr)
+        self.assertEqual(self.snapshot(), frozen)
+
+    def test_rooted_external_output_can_be_inventoried_again(self):
+        self.pins([self.pin()])
+        _, result = self.invoke()
+        self.write("analysis/report/coverage.json", json.dumps(result))
+        end = self.commit("inventory previous coverage output")
+        frozen = self.freeze()
+        _, reread = self.invoke(end=end, output=self.root / "reread")
+        self.assertEqual(reread["publication_gaps"], [])
+        self.assertEqual(reread["findings"], [])
+        self.assertEqual(len(reread["external_root_references"]), 1)
+        self.assertEqual(self.snapshot(), frozen)
+
+    def test_rooted_invalid_bindings_cannot_hide_gaps(self):
+        good = self.pin()
+        cases = [{**good, "root": "unknown", "id": "unknown:" + good["path"]},
+                 {**good, "id": "product:" + good["path"]},
+                 {**good, "path": "../validation/acceptance_matrix.json",
+                  "id": "archive:../validation/acceptance_matrix.json"},
+                 {**good, "path": "validation/../acceptance_matrix.json",
+                  "id": "archive:validation/../acceptance_matrix.json"},
+                 {**good, "path": "/validation/acceptance_matrix.json",
+                  "id": "archive:/validation/acceptance_matrix.json"},
+                 {**good, "path": "validation/%2e%2e/acceptance_matrix.json",
+                  "id": "archive:validation/%2e%2e/acceptance_matrix.json"},
+                 {**good, "public_path": "docs/missing.json"},
+                 {**good, "public_sha256": "0" * 64},
+                 {**good, "public_bytes": 4},
+                 {**good, "sha256": "invalid"}, {**good, "bytes": True},
+                 {k: v for k, v in good.items() if k != "root"},
+                 {k: v for k, v in good.items() if k != "id"}, None]
+        for n, bad in enumerate(cases):
+            with self.subTest(case=n):
+                end = self.pins([bad])
+                before = self.snapshot()
+                cp = self.invoke(end=end, output=self.root / ("bad-root-" + str(n)), success=False)
+                self.assertIn("INVALID_ROOT_REFERENCE", cp.stderr)
+                self.assertEqual(self.snapshot(), before)
+        self.pins([good, good])
+        cp = self.invoke(output=self.root / "duplicate", success=False)
+        self.assertIn("INVALID_ROOT_REFERENCE", cp.stderr)
+
+    def test_rooted_archive_does_not_hide_sibling_or_unbound_reference(self):
+        end = self.pins([{**self.pin(), "reference": "docs/missing.json"}])
+        frozen = self.freeze()
+        _, result = self.invoke(end=end)
+        self.assertEqual([r["target"] for r in result["publication_gaps"]], ["docs/missing.json"])
+        self.assertEqual(len(result["external_root_references"]), 1)
+        self.assertEqual(self.snapshot(), frozen)
+
+    def test_rooted_label_without_schema_does_not_waive_link(self):
+        self.write("docs/source.json", json.dumps(self.pin()))
+        end = self.commit("unbound root label")
+        frozen = self.freeze()
+        _, result = self.invoke(end=end)
+        self.assertEqual(len(result["publication_gaps"]), 1)
+        self.assertEqual(result["external_root_references"], [])
+        self.assertEqual(self.snapshot(), frozen)
+
     def test_root_manifest_and_odd_paths(self):
         self.write("odd name\nwith-tab\t.txt", "literal path")
         self.write("MANIFEST.json", json.dumps({"files": [

@@ -1,0 +1,856 @@
+raise SystemExit('INERT_PUBLIC_ANALYSIS_NO_RUNTIME_AUTHORITY')
+#!/usr/bin/python3
+# Entry bootstrap deliberately precedes every project import. -B alone is insufficient.
+if __name__ == '__main__':
+    raise SystemExit('INERT_UNBOUND_SOURCE: fresh binding, review and authority required')
+    import sys
+    if not (sys.flags.isolated and sys.flags.no_site):
+        raise SystemExit('REFUSED: require python -I -S -B; no project imports performed')
+    import os, json, hashlib, types
+    _root = os.path.dirname(os.path.realpath(__file__))
+    _manifest_raw = open(os.path.join(_root, 'manifest.json'), 'rb').read()
+    if '--describe' in sys.argv and os.path.basename(__file__) == 'driver.py':
+        print(json.dumps({'status': 'SOURCE_ONLY_NATIVE_NOT_RUN', 'manifest_sha256': hashlib.sha256(_manifest_raw).hexdigest()}))
+        raise SystemExit(0)
+    _driver = os.path.basename(__file__) == 'driver.py'
+    if _driver:
+        try:
+            _receipt_path = sys.argv[sys.argv.index('--receipt') + 1]
+            _receipt_sha = sys.argv[sys.argv.index('--receipt-sha256') + 1]
+        except (ValueError, IndexError):
+            raise SystemExit('REFUSED: separate pinned receipt required before project imports')
+        if _receipt_path != os.path.join(_root, 'authorization.json'):
+            raise SystemExit('REFUSED: receipt path')
+    else:
+        _receipt_path = os.path.join(_root, 'native-evidence', 'receipt.json')
+    _fd = os.open(_receipt_path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        _st = os.fstat(_fd)
+        if _st.st_uid != os.getuid() or _st.st_nlink != 1 or (_st.st_mode & 0o177777) != 0o100600:
+            raise SystemExit('REFUSED: receipt metadata')
+        _raw = os.read(_fd, 1048576)
+    finally:
+        os.close(_fd)
+    if _driver and hashlib.sha256(_raw).hexdigest() != _receipt_sha:
+        raise SystemExit('REFUSED: receipt bytes hash')
+    _r = json.loads(_raw)
+    if _r.get('execution_authorized') is not True or _r.get('manifest_sha256') != hashlib.sha256(_manifest_raw).hexdigest():
+        raise SystemExit('REFUSED: source manifest authority')
+    _manifest = json.loads(_manifest_raw)
+    _verified = {}
+    for _name, _pin in _manifest['files'].items():
+        if _name not in ('common.py', 'payload.py', 'observer.py', 'driver.py', 'recipe.json', 'witness.py', 'owner_launcher.py', 'parent_integration.py', 'dropins.py'):
+            raise SystemExit('REFUSED: source allowlist')
+        _bytes = open(os.path.join(_root, _name), 'rb').read()
+        if hashlib.sha256(_bytes).hexdigest() != _pin:
+            raise SystemExit('REFUSED: source drift')
+        _verified[_name] = _bytes
+    if set(_verified) != {'common.py', 'payload.py', 'observer.py', 'driver.py', 'recipe.json', 'witness.py', 'owner_launcher.py', 'parent_integration.py', 'dropins.py'}:
+        raise SystemExit('REFUSED: missing source pin')
+    # Compile precisely the bytes just verified. No SourceFileLoader/import of
+    # project paths, no pyc lookup, no deletion/ignoring a discovered cache file.
+    for _module_name in ('witness', 'dropins', 'common', 'payload', 'observer'):
+        _name = _module_name + '.py'
+        _module = types.ModuleType(_module_name)
+        _module.__file__ = os.path.join(_root, _name)
+        sys.modules[_module_name] = _module
+        exec(compile(_verified[_name], _module.__file__, 'exec'), _module.__dict__)
+
+"""Finite executable driver. Requires a separate exact-hash native receipt.
+
+The shipped package contains NO live receipt. --describe is source-only.
+A client failure after start submission is uncertain and forbids further starts.
+The driver itself has no reload/install/cleanup operations; its reviewed parent owns the explicit drop-in lifecycle.
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import resource
+import signal
+import stat
+import sys
+import time
+from common import (ROOT, PREP, EVIDENCE, LOCK, NAMES, ROLES, Refused, absent, call,
+                    json_pairs, cgroup_sample, clocks, digest, identity, own_cgroup, parse_show,
+                    private_bytes, read_json, remaining, require, same_process,
+                    show_argv, validate_receipt, within, write_once, MANAGER_SHOW, JOURNAL_FIELDS,
+                    JOURNAL_JOB_MESSAGE_IDS)
+from observer import late_ready_case
+from payload import token
+
+
+class Exclusive:
+    def __init__(self, path=LOCK, expected=None, inherited_fd=None):
+        self.path = path
+        self.expected = expected or {'inode': PRIVATE_LOCK_INODE, 'mode': 0o664, 'uid': 1000, 'gid': 1000, 'nlink': 1}
+        self.fd = None
+        self.inherited_fd = inherited_fd
+        self.before = None
+
+    def signature(self, s):
+        require(stat.S_ISREG(s.st_mode), 'nonregular lock')
+        return {'inode': s.st_ino, 'mode': stat.S_IMODE(s.st_mode), 'uid': s.st_uid,
+                'gid': s.st_gid, 'nlink': s.st_nlink}
+
+    def check(self):
+        require(self.signature(os.fstat(self.fd)) == self.expected, 'lock fd metadata drift')
+        require(self.signature(os.stat(self.path, follow_symlinks=False)) == self.expected, 'lock path metadata drift')
+        require(os.fstat(self.fd).st_size == 0, 'lock contents drift')
+
+    def acquire(self):
+        # Existing canonical inode only: neither O_CREAT nor chmod/truncate.
+        self.fd = (os.dup(self.inherited_fd) if self.inherited_fd is not None else
+                   os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW))
+        try:
+            self.check()
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.check()
+            self.before = self.signature(os.fstat(self.fd))
+            return self
+        except BaseException:
+            os.close(self.fd)
+            self.fd = None
+            raise
+
+    def release(self):
+        if self.fd is not None:
+            try:
+                self.check()
+            finally:
+                os.close(self.fd)
+                self.fd = None
+
+
+def parent_flock_visible(path, parent_pid, lock_text=None):
+    """Require a preexisting exclusive flock owned by the pinned grantor.
+
+    Acquisition through the inherited description must then succeed without
+    conflicting with that lock. A merely open parent FD is insufficient.
+    """
+    s = path.stat()
+    if lock_text is None:
+        lock_text = Path('/proc/locks').read_text()
+    for line in lock_text.splitlines():
+        fields = line.split()
+        if len(fields) < 8 or fields[1:4] != ['FLOCK', 'ADVISORY', 'WRITE']:
+            continue
+        try:
+            major, minor, inode = fields[5].split(':')
+            match = (int(fields[4]) == parent_pid and int(inode) == s.st_ino and
+                     int(major, 16) == os.major(s.st_dev) and int(minor, 16) == os.minor(s.st_dev))
+            if match:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def expected_properties(role, p):
+    fixed = {'Id': NAMES[role], 'Type': 'notify', 'Transient': 'yes', 'DropInPaths': '/PRIVATE/USER_RUNTIME/systemd/user/' + NAMES[role] + '.d/90-frw011-job-timeout.conf',
+             'Restart': 'no', 'KillMode': 'control-group', 'SendSIGKILL': 'yes',
+             'FinalKillSignal': '9', 'TimeoutStartUSec': '8s', 'TimeoutStopUSec': '2s',
+             'TimeoutStartFailureMode': 'kill', 'TimeoutStopFailureMode': 'kill',
+             'RuntimeRandomizedExtraUSec': '0', 'JobTimeoutUSec': '20s', 'JobRunningTimeoutUSec': '20s',
+             'CollectMode': 'inactive-or-failed', 'MemoryMax': '134217728',
+             'CPUQuotaPerSecUSec': '2s', 'TasksMax': '8', 'NotifyAccess': 'main',
+             'NoNewPrivileges': 'yes',
+             'RuntimeMaxUSec': '35s' if role == 'sentinel' else ('8s' if role.startswith('outer-') else '12s')}
+    require(all(p.get(k) == v for k, v in fixed.items()), 'native property mismatch ' + role)
+    require(p.get('CPUAffinity') in ('0 1', '0-1'), 'native CPU affinity')
+    require(p.get('FragmentPath') in ('/PRIVATE/USER_RUNTIME/systemd/transient/' + NAMES[role], ''), 'foreign fragment')
+    for prop, file, mode in [('ExecStart', 'payload.py', 'payload'),
+                             ('ExecCondition', 'payload.py', 'condition'),
+                             ('ExecStopPost', 'observer.py', 'stop-post')]:
+        raw = p.get(prop, '')
+        found = re.findall(r'argv\[\]=(.*?)\s*;', raw)
+        require(found == ['/usr/bin/python3 -I -S -B %s %s %s' % (ROOT / file, mode, role)], 'native exec argv ' + prop)
+        require(raw.count('{') == 1, 'multiple native commands ' + prop)
+    bound = {'dependent-bound': 'outer-bound', 'dependent-late': 'outer-bound', 'dependent-timeout': 'outer-timeout'}
+    require(p.get('BindsTo', '').split() == ([NAMES[bound[role]]] if role in bound else []), 'BindsTo mismatch')
+    if role in bound:
+        require(NAMES[bound[role]] in p.get('After', '').split(), 'missing After')
+    require(NAMES['sentinel'] not in p.get('After', '').split() and
+            NAMES['sentinel'] not in p.get('BindsTo', '').split(), 'sentinel dependency')
+
+
+MANDATORY_CHECKPOINTS = ('outers-active', 'pending-before-self-exit',
+                         'late-ready-observed', 'late-dependency',
+                         'no-replay-controls', 'timeout-controls')
+CHECKPOINT_DEADLINES = dict(zip(MANDATORY_CHECKPOINTS, (11, 14, 19, 22, 29, 30)))
+
+
+def manager_process(pid, witness_client):
+    """Inspect only the pinned manager process; never scan processes or logs."""
+    first = identity(pid)
+    uid = Path('/proc/%d/status' % pid).read_text().split('Uid:', 1)[1].splitlines()[0].split()
+    require(witness_client is not None, 'authenticated current-image witness required')
+    observed = witness_client.observe()
+    require(observed['process_after']['pid'] == pid, 'witness manager PID')
+    exe = observed['exe']
+    last = identity(pid)
+    require(first['starttime_ticks'] == last['starttime_ticks'] and
+            first['state'] not in ('Z', 'X') and last['state'] not in ('Z', 'X'), 'manager process changed')
+    require(uid == ['1000'] * 4 and exe == '/usr/lib/systemd/systemd', 'foreign manager process')
+    return last
+
+
+
+
+class Driver:
+    def __init__(self, receipt, manager_call=call, evidence=EVIDENCE, clock=clocks,
+                 job_bus=None, witness_client=None, finish_witness=None,
+                 *, recipe_bytes, recipe_sha256):
+        self.r = receipt
+        self.witness = witness_client
+        self.finish_witness = finish_witness
+        self.parent_terminal = {}
+        self.call = manager_call
+        self.e = evidence
+        self.clock = clock
+        self.job_bus = job_bus
+        require(job_bus is not None and job_bus.subscribed, 'pre-subscribed original-parent bus required')
+        require(type(recipe_bytes) is bytes and hashlib.sha256(recipe_bytes).hexdigest() == recipe_sha256,
+                'verified recipe buffer required')
+        self.recipe = json.loads(recipe_bytes, object_pairs_hook=json_pairs)
+        require(set(self.recipe['native_start_argv']) == set(ROLES), 'complete recipe roles')
+        self.calls, self.samples, self.issues, self.checkpoints = [], [], [], []
+        self.starts = {role: 0 for role in ROLES}
+        self.submission_uncertain = False
+        self.no_more_starts = False
+        self.original = {}
+        self.identities = {role: [] for role in ROLES}
+        self.cgroups = {role: set() for role in ROLES}
+        self.last = {}
+        self.last_cgroups = {}
+        self.initial_absence = False
+        self.pending_witness = False
+        self.reconstruction_attempted = False
+        self.reconstruction_started_ns = None
+        self.late_started_ns = None
+        self.sentinel_checkpoints = []
+        self.events = []
+        # A complete pre-submit observation can never discharge a later effect.
+        # Invalidate before transport, including failed/partial reads. Only a
+        # fully validated snapshot of the current revision restores freshness.
+        self.submission_revision = 0
+        self.observed_revision = None
+        self.last_snapshot_valid = False
+        self.last_submission_at = None
+        self.scenarios_completed = False
+        self.late_observation_finished_ns = None
+        self.late_started_at = None
+        self.late_job = None
+        self.direct_job_reads = []
+        self.late_job_ids = set()
+        self.manager_checks = []
+
+    def phase_read(self, argv):
+        require(within(self.r, 22, self.clock()), 'late evidence original deadline')
+        timeout = min(0.5, remaining(self.r, 22))
+        result = self.call(argv, timeout)
+        self.calls.append(result)
+        require(result['argv'] == argv and result['returncode'] == 0 and not result['timed_out'] and
+                not result.get('output_truncated', False) and result.get('client_reaped') is True and
+                not result['stderr'] and len(result['stdout'].encode()) <= 65536 and
+                within(self.r, 22, self.clock()), 'late evidence transport/deadline failure')
+        return result
+
+    def verify_manager(self):
+        pinned = self.r['user_manager']
+        require(Path('/proc/sys/kernel/random/boot_id').read_text().strip() == self.r['boot_id'], 'manager boot changed')
+        before = manager_process(pinned['pid'], self.witness)
+        response = self.phase_read(MANAGER_SHOW)
+        pairs = [line.split('=', 1) for line in response['stdout'].splitlines()]
+        require(all(len(x) == 2 for x in pairs), 'invalid manager identity response')
+        observed = json_pairs(pairs)
+        require(observed == {'Id': 'user@1000.service', 'ActiveState': 'active',
+                            'MainPID': str(pinned['pid']), 'InvocationID': pinned['invocation_id']},
+                'original user manager changed')
+        after = manager_process(pinned['pid'], self.witness)
+        require(before['starttime_ticks'] == after['starttime_ticks'] == pinned['starttime_ticks'],
+                'original manager PID reused')
+        self.manager_checks.append({'at': self.clock(), 'pinned': dict(pinned), 'observed': observed,
+                                    'starttime_ticks': after['starttime_ticks']})
+
+
+    def late_job_observed(self):
+        require(self.last_snapshot_valid and self.observed_revision == self.submission_revision,
+                'direct job requires fresh post-submission observation')
+        require(within(self.r,22,self.clock()), 'original late evidence deadline')
+        self.job_bus.pump(22)
+        terminal=self.job_bus.terminal()
+        if terminal is None: return False
+        if not self.direct_job_reads:
+            self.verify_manager()
+            self.job_bus.verify_owner(22)
+            self.direct_job_reads.append(dict(terminal))
+        self.late_job=terminal
+        return (self.last['dependent-late'].get('ActiveState') in ('inactive','failed') and
+                self.last['dependent-late'].get('Job') in ('','0'))
+
+    def manager(self, argv, effect=False):
+        require(within(self.r, 108, self.clock()), 'read-only deadline')
+        if effect:
+            require(not self.no_more_starts and within(self.r, 35, self.clock()), 'submission closed')
+        timeout = min(2.0, remaining(self.r, 108))
+        if effect:
+            from dropins import admission_left
+            admission_left(self.r, self.clock,
+                           lambda: parent_flock_visible(LOCK, self.r['canonical_lock_holder']['pid']), 35)
+        try:
+            result = self.call(argv, timeout, expected='start' if effect else 'read')
+            self.calls.append(result)
+            if result['timed_out'] or result['returncode'] not in ((0,) if effect else (0, 1)):
+                raise Refused('uncertain native submission' if effect else 'manager read failure')
+            return result
+        except BaseException:
+            self.no_more_starts = True
+            if effect:
+                self.submission_uncertain = True
+            raise
+
+    def snapshot(self, initial=False):
+        self.last_snapshot_valid = False
+        snapshot_started = self.clock()
+        revision = self.submission_revision
+        response = self.manager(show_argv())
+        p = parse_show(response['stdout'])
+        if initial:
+            require(all(absent(v) for v in p.values()), 'preexisting/unknown unit or definition')
+            self.initial_absence = True
+        minimum = {'Id', 'LoadState', 'ActiveState', 'SubState', 'InvocationID',
+                   'MainPID', 'ControlPID', 'ControlGroup', 'Job', 'FragmentPath', 'DropInPaths'}
+        require(all(minimum <= set(item) for item in p.values()), 'incomplete cessation properties')
+        snapshot = {'at': self.clock(), 'started': snapshot_started,
+                    'submission_revision': revision, 'properties': p, 'cgroups': {}}
+        for role, item in p.items():
+            if role == 'dependent-late' and self.starts[role] and item.get('Job') not in ('', '0'):
+                job = item.get('Job', '')
+                require(re.fullmatch('[1-9][0-9]{0,9}', job) is not None, 'invalid observed dependent job')
+                self.late_job_ids.add(job)
+            inv = item.get('InvocationID')
+            if inv and inv != '0' * 32:
+                require(re.fullmatch('[0-9a-f]{32}', inv) is not None, 'invalid invocation')
+                if role not in self.original and self.starts[role]:
+                    self.original[role] = inv
+                elif role in self.original and inv != self.original[role]:
+                    # Late dependency or intentional reconstruction may run the
+                    # outer condition again. It must never admit another main.
+                    permitted = role == 'outer-bound' and (self.starts['dependent-late'] or self.reconstruction_attempted)
+                    require(permitted and item.get('MainPID') == '0', 'foreign/replayed invocation')
+                if self.starts[role]:
+                    expected_properties(role, item)
+            if item.get('ControlGroup'):
+                self.cgroups[role].add(item['ControlGroup'])
+            for key in ('MainPID', 'ControlPID'):
+                pid = int(item.get(key, '0'))
+                if pid:
+                    try:
+                        found = identity(pid)
+                    except FileNotFoundError:
+                        snapshot.setdefault('vanished_pids', []).append(pid)
+                        continue
+                    require(own_cgroup(role, found), 'foreign PID cgroup')
+                    self.remember(role, found)
+            for cg in self.cgroups[role]:
+                sample = cgroup_sample(role, cg)
+                snapshot['cgroups'][cg] = sample
+                for found in sample['pids']:
+                    self.remember(role, found)
+        for role,item in p.items():
+            if item.get('ActiveState')=='deactivating' and item.get('SubState')=='stop-post' and item.get('MainPID')=='0':
+                self.parent_terminal[(role,item.get('InvocationID'))]={'properties':dict(item),'observed_at':self.clock(),'capture_started':response['started']}
+        self.scan_events()
+        require(revision == self.submission_revision, 'submission changed during snapshot')
+        if self.last_submission_at is not None:
+            require(all(snapshot_started[k] >= self.last_submission_at[k]
+                        for k in ('monotonic_ns', 'boottime_ns')), 'pre-submission snapshot')
+        self.last, self.last_cgroups = p, snapshot['cgroups']
+        self.observed_revision = revision
+        snapshot['completed'] = self.clock()
+        self.samples.append(snapshot)
+        self.last_snapshot_valid = True
+        return p
+
+    def remember(self, role, item):
+        if not any((x['pid'], x['starttime_ticks']) == (item['pid'], item['starttime_ticks']) for x in self.identities[role]):
+            self.identities[role].append(item)
+
+    def scan_events(self):
+        self.events = []
+        for path in sorted(self.e.glob('*.json')):
+            if path.name in ('receipt.json', 'native-result.json') or path.name.endswith('.admission.json'):
+                continue
+            item = read_json(path)
+            if 'role' not in item or 'event' not in item:
+                continue
+            role = item['role']
+            require(role in ROLES, 'unknown event role')
+            require(own_cgroup(role, item), 'event cgroup scope')
+            require(item.get('session_binding')=={k:self.r[k] for k in ('assignment','generation','attempt_token','manifest_sha256','boot_id','accepted_monotonic_ns','accepted_boottime_ns')} and type(item['session_binding'].get('generation')) is int, 'event original binding')
+            native=self.parent_terminal.get((role,item.get('invocation_id')))
+            if item['event']=='stop-post' and native is not None and native['properties'].get('ControlPID')==str(item['pid']) and all(item[a]<=native['capture_started'][a] for a in ('monotonic_ns','boottime_ns')):
+                item={**item,'properties':native['properties'],'native_capture_valid':True,'native_capture_owner':'ORIGINAL_PARENT','parent_observed_at':native['observed_at']}
+            if item['event'] == 'stop-post' and item.get('native_capture_valid'):
+                native = item.get('properties', {})
+                require(native.get('InvocationID') == item['invocation_id'] and
+                        native.get('ActiveState') == 'deactivating' and native.get('SubState') == 'stop-post' and
+                        native.get('MainPID') == '0', 'invalid native hook capture')
+                expected_properties(role, native)
+            self.events.append(item)
+            self.remember(role, item)
+            # Payload and hook record their own cgroup, retaining it even when
+            # the entire invocation started and ended between driver samples.
+            for line in item['cgroup'].splitlines():
+                if line.startswith('0::'):
+                    self.cgroups[role].add(line[3:])
+            if item['event'] == 'entered':
+                if role in self.original:
+                    require(item['invocation_id'] == self.original[role], 'new main invocation')
+                else:
+                    self.original[role] = item['invocation_id']
+            if role in self.original and item['event'] in ('entered', 'ready-sent', 'child'):
+                require(item['invocation_id'] == self.original[role], 'replayed payload')
+        for role in ROLES:
+            require(len(self.select(role, 'entered')) <= 1, 'replayed entered event')
+
+    def select(self, role, event):
+        return [x for x in self.events if x['role'] == role and x['event'] == event]
+
+    def terminal(self, role):
+        entries = [x for x in self.select(role, 'stop-post') if x.get('native_capture_valid') is True
+                   and x['invocation_id'] == self.original.get(role)
+                   and x.get('properties', {}).get('InvocationID') == self.original.get(role)]
+        return entries[0] if len(entries) == 1 else None
+
+    def start(self, role, reconstruct=False):
+        require(role in ROLES and self.initial_absence, 'start allowlist/absence')
+        require(not self.submission_uncertain, 'no replay after uncertain start')
+        if reconstruct:
+            require(role == 'outer-bound' and self.starts[role] == 1 and absent(self.last[role]), 'GC reconstruction precondition')
+            require(not (self.e / (role + '.permit')).exists(), 'consumed original permit required')
+            self.reconstruction_attempted = True
+            self.reconstruction_started_ns = self.clock()['monotonic_ns']
+        else:
+            require(self.starts[role] == 0 and absent(self.last[role]), 'unit already submitted/present')
+        if role == 'dependent-late':
+            self.verify_manager()
+            self.late_started_at = self.clock()
+            self.late_started_ns = self.late_started_at['monotonic_ns']
+        self.starts[role] += 1  # irreversible local attempted state BEFORE transport
+        self.submission_revision += 1
+        self.last_submission_at = self.clock()
+        self.last_snapshot_valid = False
+        try:
+            from dropins import before_submit
+            before_submit(self.r['dropin_admission'], self.r, NAMES, self.clock,
+                          lambda: parent_flock_visible(LOCK, self.r['canonical_lock_holder']['pid']))
+            if role == 'dependent-late':
+                try:
+                    return self.job_bus.submit(self.recipe['native_start_argv'][role])
+                except BaseException:
+                    self.submission_uncertain = self.job_bus.correlation is not None
+                    raise
+            return self.manager(self.recipe['native_start_argv'][role], effect=True)
+        except BaseException:
+            self.no_more_starts = True
+            # manager() latches uncertainty only after a transport attempt.
+            # A readback/admission refusal does not invent an unattempted effect.
+            # Any earlier true uncertainty is retained.
+            raise
+
+    def active(self, role):
+        p = self.last.get(role, {})
+        entered = self.select(role, 'entered')
+        return ((p.get('ActiveState'), p.get('SubState')) == ('active', 'running') and
+                len(entered) == 1 and p.get('InvocationID') == entered[0]['invocation_id'] and
+                p.get('MainPID') == str(entered[0]['pid']) and same_process(entered[0]))
+
+    def checkpoint(self, name):
+        require(self.last_snapshot_valid and self.observed_revision == self.submission_revision,
+                'checkpoint lacks fresh complete observation')
+        require(len(self.checkpoints) < len(MANDATORY_CHECKPOINTS) and
+                name == MANDATORY_CHECKPOINTS[len(self.checkpoints)], 'checkpoint order')
+        require(within(self.r, CHECKPOINT_DEADLINES[name], self.clock()), 'checkpoint deadline')
+        if 'sentinel' in self.original:
+            p = self.last.get('sentinel', {})
+            alive = (self.active('sentinel') and p.get('InvocationID') == self.original['sentinel'])
+            entered = self.select('sentinel', 'entered')
+            alive = alive and len(entered) == 1 and same_process(entered[0])
+            require(alive, 'sentinel changed or ceased before scenario checkpoint')
+            self.sentinel_checkpoints.append({'name': name, 'unchanged_alive': True, **self.clock()})
+        else:
+            raise Refused('checkpoint lacks original sentinel')
+        self.checkpoints.append({'name': name, **self.clock()})
+
+    def until(self, second, predicate):
+        while within(self.r, second, self.clock()):
+            self.snapshot()
+            if not within(self.r, second, self.clock()):
+                return False
+            if predicate():
+                return True
+            time.sleep(min(0.05, remaining(self.r, second)))
+        return False
+
+    def scenarios(self):
+        self.snapshot(initial=True)
+        self.start('sentinel')
+        require(self.until(7, lambda: self.active('sentinel')), 'sentinel initialization')
+        for role in ('outer-bound', 'outer-negative', 'outer-timeout'):
+            self.start(role)
+        require(self.until(11, lambda: all(self.active(r) for r in ('outer-bound', 'outer-negative', 'outer-timeout'))), 'outer initialization')
+        self.checkpoint('outers-active')
+        for role in ('dependent-bound', 'dependent-negative', 'dependent-timeout'):
+            self.start(role)
+        def pending():
+            return all(self.last[r].get('ActiveState') == 'activating' and
+                       self.last[r].get('SubState') == 'start' and len(self.select(r, 'entered')) == 1 and
+                       self.last[r].get('MainPID') == str(self.select(r, 'entered')[0]['pid']) and
+                       same_process(self.select(r, 'entered')[0])
+                       for r in ('dependent-bound', 'dependent-negative')) and self.active('dependent-timeout') and all(
+                           self.select(r, 'child') for r in ('outer-timeout', 'dependent-timeout'))
+        require(self.until(14, pending), 'missing actual pending/descendant witness')
+        self.pending_witness = True
+        self.checkpoint('pending-before-self-exit')
+        for role in ('outer-bound', 'outer-negative'):
+            require(within(self.r, 15), 'self-exit trigger deadline')
+            write_once(self.e / (role + '.exit-now'), json.dumps(self.clock()).encode())
+        require(self.until(19, lambda: bool(self.terminal('outer-bound')) and bool(self.terminal('outer-negative')) and
+                           bool(self.terminal('dependent-bound')) and self.active('dependent-negative')), 'late READY scenario evidence')
+        self.checkpoint('late-ready-observed')
+        require(self.last['outer-bound'].get('ActiveState') in ('inactive', 'failed') and
+                all(not same_process(x) for x in self.select('outer-bound', 'entered')), 'outer not ceased')
+        self.start('dependent-late')
+        require(self.until(22, self.late_job_observed),
+                'late dependency observation deadline')
+        self.late_observation_finished_ns = self.clock()['monotonic_ns']
+        self.checkpoint('late-dependency')
+        if self.finish_witness is not None:
+            require(self.finish_witness()['state']=='WITNESS_REAPED','original witness cessation unknown')
+        collected = self.until(26, lambda: absent(self.last['outer-bound']))
+        if collected:
+            self.start('outer-bound', reconstruct=True)
+            require(self.until(29, lambda: any(x['monotonic_ns'] >= self.reconstruction_started_ns
+                                              for x in self.select('outer-bound', 'condition-skipped'))
+                               and absent(self.last['outer-bound'])), 'reconstruction control deadline')
+        else:
+            self.issues.append('NOT_RUN_RETENTION: no forced GC/re-registration')
+            self.no_more_starts = True
+        self.checkpoint('no-replay-controls')
+        require(self.until(30, lambda: bool(self.terminal('outer-timeout')) and
+                           bool(self.terminal('dependent-timeout'))), 'timeout control deadline')
+        self.checkpoint('timeout-controls')
+        self.scenarios_completed = True
+
+    def ceased(self):
+        if (self.submission_uncertain or not self.last_snapshot_valid or
+                self.observed_revision != self.submission_revision or set(self.last) != set(ROLES)):
+            return False
+        for role in ROLES:
+            p = self.last[role]
+            if p.get('ActiveState') not in ('inactive', 'failed') or p.get('Job') not in ('', '0') or any(p.get(k) != '0' for k in ('MainPID', 'ControlPID')):
+                return False
+            if any(same_process(x) for x in self.identities[role]):
+                return False
+            for cg in self.cgroups[role]:
+                record = self.last_cgroups.get(cg)
+                if record is None or record['pids'] or (record['exists'] and 'populated 0' not in record.get('events', '').splitlines()):
+                    return False
+            if self.starts[role] and role not in self.original and not absent(p):
+                return False
+        return True
+
+    def scenario_validity(self):
+        checkpoints = tuple(x['name'] for x in self.checkpoints)
+        sentinel = tuple(x['name'] for x in self.sentinel_checkpoints)
+        expected_starts = {r: (2 if r == 'outer-bound' else 1) for r in ROLES}
+        timely = all(x['name'] in CHECKPOINT_DEADLINES and
+                     within(self.r, CHECKPOINT_DEADLINES[x['name']], x) for x in self.checkpoints)
+        valid = (self.scenarios_completed and timely and checkpoints == MANDATORY_CHECKPOINTS
+                 and sentinel == MANDATORY_CHECKPOINTS and self.starts == expected_starts
+                 and self.pending_witness and not self.issues and not self.submission_uncertain
+                 and all(x['unchanged_alive'] for x in self.sentinel_checkpoints))
+        return {'status': 'PASS' if valid else 'INCONCLUSIVE',
+                'completed': self.scenarios_completed, 'checkpoints_within_original_deadlines': timely,
+                'required_checkpoints': list(MANDATORY_CHECKPOINTS),
+                'observed_checkpoints': list(checkpoints),
+                'missing_checkpoints': [n for n in MANDATORY_CHECKPOINTS if n not in checkpoints],
+                'sentinel_coverage_complete': sentinel == MANDATORY_CHECKPOINTS,
+                'submission_coverage_complete': self.starts == expected_starts,
+                'control_errors': list(self.issues)}
+
+    def late_dependency_case(self):
+        if not self.starts['dependent-late']:
+            return {'status': 'NOT_RUN', 'reason': 'late submission not attempted'}
+        if ((self.e / 'dependent-late.main-once').exists() or
+                self.select('dependent-late', 'entered') or
+                len(self.select('outer-bound', 'entered')) > 1):
+            return {'status': 'FAIL', 'reason': 'late payload entry'}
+        # --no-block only acknowledges registration. Require the separately
+        # captured typed job outcome; preserve outer condition evidence without
+        # interpreting absence as a reason or inventing a missing-outer cause.
+        begin, end = self.late_started_ns, self.late_observation_finished_ns
+        if begin is None or end is None:
+            return {'status': 'INCONCLUSIVE', 'reason': 'late observation phase incomplete'}
+        def in_attempt(x):
+            return begin <= x['monotonic_ns'] <= end and (
+                self.reconstruction_started_ns is None or x['monotonic_ns'] < self.reconstruction_started_ns)
+        skips = [x for x in self.select('outer-bound', 'condition-skipped') if in_attempt(x)
+                 and x['invocation_id'] != self.original.get('outer-bound')]
+        outcomes = [x for x in self.select('outer-bound', 'stop-post') if in_attempt(x)
+                    and x.get('native_capture_valid') is True and x.get('service_result') == 'exec-condition'
+                    and x.get('properties', {}).get('Result') == 'exec-condition'
+                    and any(y['invocation_id'] == x['invocation_id'] and
+                            y['monotonic_ns'] <= x['monotonic_ns'] for y in skips)]
+        job = self.late_job
+        hooks = [x.get('service_result') for x in self.select('dependent-late', 'stop-post') if in_attempt(x)]
+        # Any dependent payload/hook activity contradicts a start rejected before
+        # execution. Require no second outer main, not a guessed outer cause.
+        no_payload = not any(x['role'] == 'dependent-late' for x in self.events) and not hooks
+        good = (job is not None and job['result'] == 'dependency' and job['protocol'] == self.r['evidence_protocol'] and
+                job['assignment'] == self.r['assignment'] and job['generation'] == self.r['generation'] and
+                job['attempt_token'] == self.r['attempt_token'] and job['boot_id'] == self.r['boot_id'] and no_payload and
+                self.starts['dependent-late'] == 1 and not self.submission_uncertain and
+                len(self.select('outer-bound', 'entered')) == 1 and self.ceased())
+        status = 'PASS' if good else ('FAIL' if job is not None else 'INCONCLUSIVE')
+        return {'status': status,
+                'reason': ('trusted original manager rejected the one-use start job as dependency'
+                           if good else 'missing or contradicted dependent start-job outcome'),
+                'attempt_interval_ns': [begin, end],
+                'outer_condition_denial_observed': len(outcomes) == 1,
+                'dependent_hook_results': hooks,
+                'dependency_job_outcome': job or 'UNOBSERVED',
+                'cessation_observed': self.ceased()}
+
+    def timeout_binding_case(self):
+        outer, dep = self.terminal('outer-timeout'), self.terminal('dependent-timeout')
+        missing = {'status': 'INCONCLUSIVE', 'reason': 'missing terminal timestamps/descendant evidence'}
+        if not (outer and dep and all(self.select(r, 'child') for r in ('outer-timeout', 'dependent-timeout'))):
+            return missing
+        if any(x.get('native_capture_owner') != 'ORIGINAL_PARENT' for x in (outer, dep)):
+            return {'status': 'INCONCLUSIVE', 'reason': 'missing original-parent terminal capture owner'}
+        op, dp = outer['properties'], dep['properties']
+        if any(not x.get('service_result') or not x['properties'].get('Result') for x in (outer, dep)):
+            return {'status': 'INCONCLUSIVE', 'reason': 'missing native service-result evidence'}
+        try:
+            outer_entered, outer_stopped, outer_exited = (int(op[k]) for k in
+                ('ActiveEnterTimestampMonotonic', 'ActiveExitTimestampMonotonic', 'ExecMainExitTimestampMonotonic'))
+            entered, stopped, exited = (int(dp[k]) for k in
+                ('ActiveEnterTimestampMonotonic', 'ActiveExitTimestampMonotonic', 'ExecMainExitTimestampMonotonic'))
+        except (KeyError, TypeError, ValueError):
+            return missing
+        if min(outer_entered, outer_stopped, outer_exited, entered, stopped, exited) <= 0:
+            return missing
+        # "timeout" alone is not its cause. In this controlled trace the mains
+        # and children ignore TERM: a stop timeout followed by SIGKILL is expected.
+        # Require captured exit metadata plus native stop duration and exclude
+        # the dependent's own startup/runtime deadline before making an inference.
+        try:
+            exit_metadata = all(x['exit_code'] == 'killed' and
+                                x['exit_status'] in ('KILL', '9') and
+                                x['properties']['ExecMainStatus'] == '9' for x in (outer, dep))
+        except KeyError:
+            return {'status': 'INCONCLUSIVE', 'reason': 'missing captured native exit cause metadata'}
+        for role, item in (('outer-timeout', op), ('dependent-timeout', dp)):
+            expected_properties(role, item)
+        child_contract = all(x.get('session_id') == x['pid'] and
+                             x.get('ignored_signals', 0) & (1 << (signal.SIGTERM - 1))
+                             for r in ('outer-timeout', 'dependent-timeout') for x in self.select(r, 'child'))
+        children_dead = all(not same_process(x) for r in ('outer-timeout', 'dependent-timeout')
+                            for x in self.select(r, 'child'))
+        before_fallback = entered < stopped <= exited < entered + 12_000_000
+        temporal = (0 < outer_entered <= entered and
+                    outer_entered + 8_000_000 <= outer_stopped <= stopped and
+                    outer_stopped <= outer_exited)
+        stop_timeout_intervals = (outer_exited >= outer_stopped + 2_000_000 and
+                                  exited >= stopped + 2_000_000)
+        # R is observer emission, not first hook entry H or cleanup completion C.
+        # Native spontaneous RuntimeMax stop does not guarantee either R order.
+        reverse = dep['monotonic_ns'] <= outer['monotonic_ns']
+        whole_boundary_ceased = self.ceased()
+        outer_timeout = outer.get('service_result') == op.get('Result') == 'timeout'
+        dep_result = dep.get('service_result')
+        compatible_result = dep_result == dp.get('Result') == 'timeout'
+        allowed = [show_argv(), MANAGER_SHOW, *self.recipe['native_start_argv'].values()]
+        controlled_effects = bool(self.calls) and all(
+            x.get('argv') in allowed and x.get('capture_complete') is True and
+            x.get('client_reaped') is True and x.get('timed_out') is False and
+            x.get('output_truncated') is False and x.get('decode_error') is False and
+            x.get('returncode') in ((0, 1) if x.get('argv') in (show_argv(), MANAGER_SHOW) else (0,)) and
+            all(type(x.get(k, {}).get(clock)) is int for k in ('started', 'finished')
+                for clock in ('monotonic_ns', 'boottime_ns')) and
+            all(0 < x['started'][clock] <= x['finished'][clock]
+                for clock in ('monotonic_ns', 'boottime_ns'))
+            for x in self.calls)
+        entries_and_ready = all(len(self.select(r, 'entered')) == 1 and
+                                len(self.select(r, 'ready-sent')) == 1 and
+                                not self.select(r, 'ready-error')
+                                for r in ('outer-timeout', 'dependent-timeout'))
+        mains_ignore_TERM = entries_and_ready and all(
+            self.select(r, 'ready-sent')[0].get('ignored_signals', 0) & (1 << (signal.SIGTERM - 1))
+            for r in ('outer-timeout', 'dependent-timeout'))
+        observations = {'before_fallback': before_fallback,
+                        'outer_timeout_before_dependent_stop': temporal,
+                        'native_stop_timeout_intervals': stop_timeout_intervals,
+                        'captured_SIGKILL_exit_metadata': exit_metadata,
+                        'reverse_stop_hook_order': reverse,
+                        'reverse_stop_hook_order_classification': 'diagnostic_only',
+                        'reverse_stop_hook_order_limitation': 'R_dep<=R_outer; neither hook-entry nor cleanup order',
+                        'whole_owned_boundary_ceased': whole_boundary_ceased,
+                        'main_TERM_ignore_at_READY': bool(mains_ignore_TERM),
+                        'setsid_children_ceased': children_dead,
+                        'actual_setsid_and_TERM_ignore': bool(child_contract),
+                        'outer_service_result': outer.get('service_result'),
+                        'dependent_service_result': dep_result,
+                        'compatible_dependent_result': compatible_result,
+                        'only_declared_manager_effects': controlled_effects,
+                        'entered_and_READY_controls': entries_and_ready,
+                        'native_times_us': {'outer_entered': outer_entered, 'outer_stopped': outer_stopped,
+                                            'outer_exited': outer_exited, 'dependent_entered': entered,
+                                            'dependent_stopped': stopped, 'dependent_exited': exited}}
+        good = (outer_timeout and temporal and before_fallback and stop_timeout_intervals
+                and exit_metadata and child_contract and children_dead and whole_boundary_ceased
+                and compatible_result and controlled_effects and entries_and_ready and mains_ignore_TERM)
+        return {'status': 'PASS' if good else 'FAIL',
+                'reason': ('dependency stop inferred from controlled native timing, configuration and exit cause'
+                           if good else 'timeout dependency control contradicted'),
+                'proof_kind': 'INFERENCE_FROM_CONTROLLED_NATIVE_TRACE',
+                'limitation': 'not a captured originating job-cause field; assumes no undeclared external manager effects',
+                **observations}
+
+    def evaluate(self):
+        cases = {}
+        for suffix, bound in [('bound', True), ('negative', False)]:
+            sends = self.select('dependent-' + suffix, 'ready-sent')
+            cases['late-ready-' + suffix] = late_ready_case(self.terminal('outer-' + suffix), self.terminal('dependent-' + suffix), sends[0] if len(sends) == 1 else None, bound)
+            if not self.pending_witness:
+                cases['late-ready-' + suffix] = {'status': 'INCONCLUSIVE', 'reason': 'no actual pending witness'}
+        cases['late-dependency'] = self.late_dependency_case()
+        skips = [x for x in self.select('outer-bound', 'condition-skipped') if
+                 self.reconstruction_started_ns is not None and x['monotonic_ns'] >= self.reconstruction_started_ns
+                 and x['invocation_id'] != self.original.get('outer-bound')]
+        cases['post-gc-no-replay'] = {'status': 'PASS' if self.reconstruction_attempted and skips and len(self.select('outer-bound', 'entered')) == 1 else 'INCONCLUSIVE', 'condition_skips': len(skips)}
+        cases['native-timeout-binding'] = self.timeout_binding_case()
+        sentinel = self.terminal('sentinel')
+        cases['sentinel'] = {'status': 'PASS' if sentinel and sentinel.get('service_result') == 'timeout'
+            and tuple(x['name'] for x in self.sentinel_checkpoints) == MANDATORY_CHECKPOINTS
+            and all(x['unchanged_alive'] for x in self.sentinel_checkpoints)
+            and self.ceased() else 'INCONCLUSIVE', 'checkpoints': self.sentinel_checkpoints}
+        return cases
+
+    def run(self):
+        try:
+            self.scenarios()
+        except (Exception, KeyboardInterrupt) as error:
+            self.issues.append(type(error).__name__ + ': ' + str(error))
+            self.no_more_starts = True
+        if self.finish_witness is not None:
+            result=self.finish_witness()
+            if result['state']!='WITNESS_REAPED':
+                self.issues.append('witness STOP_UNCONFIRMED'); self.no_more_starts=True
+        while within(self.r, 105):
+            try:
+                self.snapshot()
+                if self.ceased():
+                    break
+            except Exception as error:
+                self.issues.append(type(error).__name__ + ': ' + str(error))
+                self.no_more_starts = True
+                # No repeated failing transport loop. Preserve unknown cessation.
+                break
+            time.sleep(min(0.05, remaining(self.r, 105)))
+        return self.report()
+
+    def report(self):
+        try:
+            ceased = self.ceased()
+        except Exception as error:
+            ceased = False
+            self.issues.append('cessation unknown: ' + str(error))
+        try:
+            cases = self.evaluate()
+        except Exception as error:
+            cases = {'evaluation': {'status': 'INCONCLUSIVE', 'reason': str(error)}}
+        validity = self.scenario_validity()
+        return {'status': 'OBSERVED' if ceased else 'STOP_UNCONFIRMED', 'native': True,
+                'all_cases_pass': ceased and validity['status'] == 'PASS' and bool(cases)
+                                  and all(x['status'] == 'PASS' for x in cases.values()),
+                'scenario_validity': validity,
+                'cessation_evidence': {'last_snapshot_valid': self.last_snapshot_valid,
+                                      'submission_revision': self.submission_revision,
+                                      'observed_revision': self.observed_revision},
+                'parent_must_retain_lock': not ceased,
+                'cases': cases, 'issues': self.issues, 'receipt': self.r,
+                'starts_attempted': self.starts, 'submission_uncertain': self.submission_uncertain,
+                'original_invocations': self.original, 'pid_start_identities': self.identities,
+                'checkpoints': self.checkpoints, 'manager_calls': self.calls,
+                'samples': self.samples, 'events': self.events, 'finished': self.clock(),
+                'direct_job_evidence': self.direct_job_reads, 'bus_inventory': self.job_bus.inventory(),
+                'archival_journal': 'UNMODIFIED_DAMAGED_ARCHIVE_NOT_RECONSTRUCTED_NOT_USED_AS_AUTHORITY',
+                'original_manager_checks': self.manager_checks,
+                'privileged_manager_observations': self.witness.records if self.witness is not None else [],
+                'lock_release': 'Direct parent Driver callable; no FD9 duplicate. Original parent retains FD9 until independently verified cleanup and separate release decision',
+                'product_kernel120': 'NOT_GRANTED_NOT_RUN'}
+
+
+def run_parent(receipt, transport, witness, recipe_bytes, recipe_sha256):
+    """Complete setup under BOTH original5s clocks before enabling starts."""
+    driver=None
+    old_alarm=signal.getsignal(signal.SIGALRM)
+    old_term=signal.getsignal(signal.SIGTERM)
+    r=receipt
+    def setup_gate():
+        require(within(r,5), 'original5 direct-parent setup deadline')
+        transport.left(5)
+    try:
+        setup_gate()
+        r=validate_receipt(receipt)
+        setup_gate()
+        require(not EVIDENCE.exists(),'fresh direct-parent admission')
+        holder=r['canonical_lock_holder']
+        require(holder['pid']==os.getpid() and holder['starttime_ticks']==identity(os.getpid())['starttime_ticks']
+                and holder['fd']==9 and parent_flock_visible(LOCK,os.getpid()),'original parent custody')
+        setup_gate()
+        EVIDENCE.mkdir(mode=0o700)
+        setup_gate()
+        write_once(EVIDENCE/'receipt.json',r)
+        setup_gate()
+        for role in ROLES:
+            permit=token(r,role)
+            setup_gate()
+            write_once(EVIDENCE/(role+'.permit'),permit)
+            setup_gate()
+        driver=Driver(r,job_bus=transport.job_bus,witness_client=witness.client,finish_witness=witness.finish,
+                      recipe_bytes=recipe_bytes,recipe_sha256=recipe_sha256)
+        setup_gate()
+        def alarm(signum,frame): raise TimeoutError('original direct Driver deadline/signal')
+        signal.signal(signal.SIGALRM,alarm);signal.signal(signal.SIGTERM,alarm)
+        signal.setitimer(signal.ITIMER_REAL,remaining(r,107))
+        # This final gate covers receipt/eight permits/construction/signal setup.
+        # begin_driver rechecks both clocks before changing capability phase.
+        setup_gate()
+        transport.begin_driver()
+        report=driver.run()
+        require(within(r,110),'Driver return after original110')
+        write_once(EVIDENCE/'native-result.json',report)
+        return report
+    finally:
+        # Close or refuse capability first, even when setup never completed.
+        try:
+            if hasattr(transport,'job_bus'): transport.job_bus.close()
+        finally:
+            if transport.driver_started: transport.close_driver()
+            else: transport.refuse_setup()
+            signal.setitimer(signal.ITIMER_REAL,0)
+            signal.signal(signal.SIGALRM,old_alarm);signal.signal(signal.SIGTERM,old_term)
+            signal.setitimer(signal.ITIMER_REAL,remaining(r,120))
+            if witness.finished is None: witness.finish()
+
+
+if __name__ == '__main__':
+    raise SystemExit('INERT_PARENT_CALLABLE_ONLY_NO_DRIVER_CHILD')

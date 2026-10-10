@@ -24,6 +24,7 @@ MSK = ZoneInfo("Europe/Moscow")
 ROOTS = ("analysis/", "docs/", "scripts/", "tests/", "validation/")
 HEX = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 HASH = re.compile(r"[0-9a-f]{64}\Z")
+SOURCE_PINS_SCHEMA = "friday.daily-use.source-pins.v1"
 
 
 class Refusal(Exception):
@@ -152,6 +153,24 @@ def resolve(source, target, link=False):
     return None if result == ".." or result.startswith("../") else result
 
 
+def source_pin(item):
+    """Recognize only canonical, unambiguous product/archive pin records."""
+    if not isinstance(item, dict):
+        return False
+    root, path = item.get("root"), item.get("path")
+    if (root not in ("product", "archive") or not isinstance(path, str)
+            or not path or any(part in ("", ".", "..") for part in path.split("/"))
+            or any(c.isspace() or ord(c) < 32 or c in "\\:%?#<>" for c in path)
+            or item.get("id") != root + ":" + path
+            or any(k in item for k in ("repository_file", "public_file", "public_path", "file",
+                                       "public_sha256", "published_sha256", "transformed_sha256",
+                                       "public_bytes", "published_bytes", "transformed_bytes"))
+            or not isinstance(item.get("sha256"), str) or not HASH.fullmatch(item["sha256"])
+            or type(item.get("bytes")) is not int or item["bytes"] < 0):
+        return False
+    return True
+
+
 def package(path):
     if path.startswith("analysis/"):
         return "/".join(path.split("/")[:3])
@@ -174,6 +193,7 @@ def verify_public(git, tree, touched):
     candidates = {p for p in scope if p.endswith((".json", ".md")) and tree[p]["type"] == "blob"}
     git.blobs(tree[p]["git_blob"] for p in candidates)
     jsons = {}; errors = []; gaps = []; manifests = []; refs = []; links = []; jlinks = []
+    rooted = {}; external = []
     def content(path):
         oid = tree[path]["git_blob"]; git.blobs([oid]); return git.cache[oid]
 
@@ -186,6 +206,32 @@ def verify_public(git, tree, touched):
             errors.append({"kind": "INVALID_JSON", "path": p})
 
     assertions = []
+    # This schema alone defines these root names. Never resolve an external root
+    # on disk, infer its contents, or let a root label waive a product assertion.
+    for p, obj in jsons.items():
+        if not isinstance(obj, dict) or obj.get("schema") != SOURCE_PINS_SCHEMA:
+            continue
+        entries = obj.get("sources")
+        if not isinstance(entries, list) or not entries:
+            errors.append({"kind": "INVALID_SOURCE_PINS", "path": p})
+            continue
+        seen = set()
+        for i, item in enumerate(entries):
+            trail = ("sources", str(i))
+            if not source_pin(item) or item["id"] in seen:
+                errors.append({"kind": "INVALID_ROOT_REFERENCE", "source": p,
+                               "json_pointer": pointer(trail)})
+                continue
+            seen.add(item["id"])
+            rooted[(p, trail)] = item["root"]
+            row = {"source": p, "json_pointer": pointer(trail), "root": item["root"],
+                   "target": item["path"], "expected_sha256": item["sha256"],
+                   "expected_bytes": item["bytes"]}
+            if item["root"] == "archive":
+                external.append({**row, "target": item["id"], "status": "EXTERNAL_UNVERIFIED",
+                                 "reason": "Outside the pinned product Git tree; not read or verified."})
+            else:
+                assertions.append({**row, "kind": "PUBLIC_REFERENCE"})
     for p, obj in jsons.items():
         if posixpath.basename(p) != "MANIFEST.json":
             continue
@@ -228,6 +274,8 @@ def verify_public(git, tree, touched):
                                    "expected_bytes": artifact.get("bytes"),
                                    "kind": "PUBLIC_REFERENCE"})
         for trail, item in walk(obj):
+            if (p, trail) in rooted:
+                continue
             if daily_index and trail and trail[0] == "integrity_artifact":
                 continue
             if historical_daily_path(obj, trail):
@@ -282,6 +330,8 @@ def verify_public(git, tree, touched):
     for p, obj in jsons.items():
         for trail, item in walk(obj):
             for key, value in item.items():
+                if (p, trail) in rooted and key in {"id", "root", "path", "sha256", "bytes"}:
+                    continue
                 if historical_daily_path(obj, trail + (key,)):
                     continue
                 if key == "logical_source":
@@ -298,7 +348,8 @@ def verify_public(git, tree, touched):
                     if row["status"] != "PASS":
                         gaps.append({"kind": "JSON_LINK_MISSING", **row})
     return {"manifests": manifests, "hash_references": refs, "local_markdown_links": links,
-            "local_json_links": jlinks, "findings": errors, "publication_gaps": gaps,
+            "local_json_links": jlinks, "external_root_references": external,
+            "findings": errors, "publication_gaps": gaps,
             "json_files_parsed": len(jsons), "provenance_hashes_outside_public_scope_skipped": skipped}
 
 
@@ -365,7 +416,7 @@ def build(repo, base, end, output):
                  for block, members in sorted(blocks.items())]
     counts = {"commits": len(commits), "net_changed_paths": len(net), "touched_paths": len(paths),
               "intermediate_only_paths": len(intermediate), "logical_blocks": len(blockrows),
-              **{k: len(checks[k]) for k in ("manifests", "hash_references", "local_markdown_links", "local_json_links")},
+              **{k: len(checks[k]) for k in ("manifests", "hash_references", "local_markdown_links", "local_json_links", "external_root_references")},
               "json_files_parsed": checks["json_files_parsed"], "publication_gaps": len(checks["publication_gaps"])}
     now = datetime.now(MSK).isoformat()
     authority = {"stage": STAGE, "daily_checkpoint_complete": False, "publication_accepted": False,
@@ -378,6 +429,7 @@ def build(repo, base, end, output):
                  "intermediate_only_paths": intermediate, "block_partition_exact": True,
                  "limits": ["Validation examines touched final files and their enclosing final manifests; historical blobs are hashed, not revalidated as current packages.",
                             "Public hash conventions match the provisional inventory; original/provenance/private assertions are outside scope.",
+                            "Canonical daily-use source pins bind product paths to this Git tree; archive pins are recorded as EXTERNAL_UNVERIFIED without reading an external root or granting authority.",
                             "Daily-index historical range fields are provenance bound by the report manifest, not assertions against this newer cutoff; current report artifact references are still checked.",
                             "Inline Markdown destinations and explicit local JSON paths only; logical_source provenance labels, reference-style Markdown, fragments and external URLs are not validated.",
                             "No semantic status-order inference, secret audit, private-source audit, live checks, or remote verification."]}
