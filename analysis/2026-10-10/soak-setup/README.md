@@ -53,3 +53,5 @@ This source acceptance grants no runtime admission. G7 remains consumed FAIL;
 G8 source is prepared, with runtime pending the real owner terminal. Kernel120
 is NOT_GRANTED and normal3600 is UNSTARTED. Original budgets, the single shared
 heavy slot, null observations and all stop exclusions remain unchanged.
+
+[The checker source index](../soak-check-sources/README.md) now covers the 28 connected programs: 11 inert source exports and 17 exact published bodies. It preserves the first accounting failure and packaging failure, their corrections, and exact original-versus-exported hashes. Publication adds no checker execution or acceptance.
