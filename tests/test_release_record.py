@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Real entry, synthetic contained file fixtures; no runtime/acceptance claims."""
+import contextlib
+import copy
+import hashlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import types
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parent.parent
+ARCHIVE = Path(os.environ.get('FRIDAY_V2_ARCHIVE_ROOT',
+                             ROOT.parent / 'Friday_rework_Astra_Sol_Directive_V2_2026-10-06'))
+PRODUCT = ROOT
+tempfile.tempdir = str(ROOT / 'fixtures')
+spec = importlib.util.spec_from_file_location('release_record', ROOT / 'validation/validate_release_record.py')
+consumer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(consumer)
+source = (ARCHIVE / 'tools/test_runtime_record.py').read_bytes()
+assert hashlib.sha256(source).hexdigest() == '82a8ae373611227267310618b208c3ce510e348fd24041db078472e075557da3'
+old = types.ModuleType('audited_v2_fixture_tests')
+old.__file__ = str(ARCHIVE / 'tools/test_runtime_record.py')
+exec(compile(source, old.__file__, 'exec'), old.__dict__)
+MATRIX_BYTES = (ARCHIVE / 'validation/acceptance_matrix.json').read_bytes()
+DELTA_BYTES = (PRODUCT / 'validation/acceptance-web-admin.json').read_bytes()
+PREDICATE_BYTES = (ARCHIVE / 'tools/validate_run_record.py').read_bytes()
+assert hashlib.sha256(MATRIX_BYTES).hexdigest() == consumer.BASE_SHA256
+assert hashlib.sha256(DELTA_BYTES).hexdigest() == consumer.DELTA_SHA256
+assert hashlib.sha256(PREDICATE_BYTES).hexdigest() == consumer.PREDICATES_SHA256
+
+
+class CumulativeTests(old.RuntimeRecordTests):
+    """Inherited V2 candidate/status/time/bytes regressions hit the new entry."""
+    invocations = 0
+
+    def setUp(self):
+        super().setUp()
+        (self.root / 'tools').mkdir()
+        (self.root / 'tools/validate_run_record.py').write_bytes(PREDICATE_BYTES)
+        (self.root / 'validation/acceptance-web-admin.json').write_bytes(DELTA_BYTES)
+        self.matrix = json.loads(MATRIX_BYTES)
+        self.original_matrix = copy.deepcopy(self.matrix)
+        for item in self.record['records']:
+            if item['check_id'] == 'AC043':
+                item['status'] = 'PASS'
+        for number in range(53, 59):
+            if number != 55:
+                self.record['records'].append(old.row(f'AC{number:03}'))
+        for worker in ('Harness', 'A0'):
+            row = old.row('AC055')
+            row['worker'] = worker
+            proof = f'SYNTHETIC {worker} file fixture; no worker executed.\n'.encode()
+            path = worker + '.txt'
+            (self.evidence / path).write_bytes(proof)
+            row['evidence'] = [{'path': path, 'bytes': len(proof),
+                                'sha256': hashlib.sha256(proof).hexdigest()}]
+            self.record['records'].append(row)
+        self.record['acceptance_definition'] = {
+            'base_sha256': consumer.BASE_SHA256, 'web_admin_sha256': consumer.DELTA_SHA256}
+        old.bind(self.record)
+
+    def invoke(self, matrix=None, record=None, options=(), raw_matrix=None, raw_record=None):
+        matrix = self.matrix if matrix is None else matrix
+        record = self.record if record is None else record
+        data = (raw_matrix.encode() if raw_matrix is not None else
+                MATRIX_BYTES if matrix == self.original_matrix else json.dumps(matrix).encode())
+        (self.root / 'validation/acceptance_matrix.json').write_bytes(data)
+        path = self.evidence / 'record.json'
+        path.write_text(raw_record if raw_record is not None else json.dumps(record, ensure_ascii=False))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = consumer.main(['--record', str(path), '--base-root', str(self.root),
+                                  '--product-root', str(self.root), '--evidence-root', str(self.evidence),
+                                  *options])
+        CumulativeTests.invocations += 1
+        report = json.loads(output.getvalue())
+        self.assertIs(report['attests_runtime_truth'], False)
+        self.assertIs(report['review_required'], True)
+        return code, report
+
+    def test_valid_useful_and_foundation(self):
+        report = self.accepted()
+        self.assertEqual(report['required_count'], 47)
+        self.assertEqual(report['required_check_count'], 46)
+        self.assertEqual(self.accepted(options=('--target', 'FOUNDATION'))['required_count'], 9)
+
+    def test_daily_requires_daily_rows(self):
+        self.rejected(options=('--target', 'DAILY'))
+        for item in self.record['records']:
+            if old.BASELINE.get(item['check_id']) == 'DAILY':
+                item['status'] = 'PASS'
+        old.bind(self.record)
+        self.assertEqual(self.accepted(options=('--target', 'DAILY'))['required_count'], 56)
+
+    def test_matrix_duplicate_gate_downgrade_and_wrong_row_types(self):
+        for key, value in (('id', []), ('gate', 'OPTIONAL'), ('critical', False),
+                           ('steps', []), ('expected', ['']), ('initial_status', 'PASS')):
+            matrix = copy.deepcopy(self.matrix)
+            matrix['checks'][0][key] = value
+            self.rejected(code=2, contains='SHA-256 mismatch', matrix=matrix)
+        matrix = copy.deepcopy(self.matrix)
+        matrix['checks'].append(copy.deepcopy(matrix['checks'][0]))
+        self.rejected(code=2, contains='SHA-256 mismatch', matrix=matrix)
+
+    def test_added_case_is_validated_and_required(self):
+        # Immutable base cannot be extended/relabelled by a caller; owner delta is separate.
+        self.matrix['checks'].append(old.definition('AC059', 'USEFUL'))
+        self.rejected(code=2, contains='SHA-256 mismatch')
+
+    def test_optional_is_explicit_and_fully_validated(self):
+        self.rejected(options=('--require-optional', 'AC044'))
+        next(r for r in self.record['records'] if r['check_id'] == 'AC044')['status'] = 'PASS'
+        old.bind(self.record)
+        self.assertEqual(self.accepted(options=('--require-optional', 'AC044'))['required_count'], 48)
+        self.rejected(options=('--require-optional', 'AC001'))
+        self.rejected(options=('--require-optional', 'AC043'))
+        self.rejected(options=('--allow-not-applicable', 'AC999'))
+
+    def test_only_approved_na_still_requires_candidate(self):
+        # The inherited all-NA FOUNDATION case survives; web/admin can never be excepted.
+        options = ['--target', 'FOUNDATION']
+        for item in self.record['records']:
+            if old.BASELINE.get(item['check_id']) == 'FOUNDATION':
+                item.update(status='NOT_APPLICABLE', applicability_reason='Synthetic reviewed exclusion.',
+                            scope_decision_reference='fixture/review/foundation')
+                options.extend(('--allow-not-applicable', item['check_id']))
+            elif item['status'] == 'PASS':
+                item['status'] = 'NOT_RUN'
+        old.bind(self.record)
+        self.accepted(options=options)
+        self.record['candidate'] = None
+        self.rejected(code=1, contains='candidate', options=options)
+
+    def test_old_base_only_cannot_satisfy_owner_scope(self):
+        self.record['records'] = [r for r in self.record['records'] if int(r['check_id'][2:]) <= 52]
+        next(r for r in self.record['records'] if r['check_id'] == 'AC043')['status'] = 'NOT_RUN'
+        report = self.rejected(contains='AC055:Harness')
+        self.assertIn('AC043', report['unresolved_required_checks'])
+        self.assertIn('AC055:A0', report['unresolved_required_checks'])
+
+    def test_each_mandatory_record_cannot_be_missing_or_not_run(self):
+        for ident in sorted(consumer.MANDATORY):
+            for state in ('MISSING', 'NOT_RUN', 'FAIL', 'BLOCKED'):
+                with self.subTest(check=ident, state=state):
+                    record = copy.deepcopy(self.record)
+                    if state == 'MISSING':
+                        record['records'] = [r for r in record['records'] if r['check_id'] != ident]
+                    else:
+                        for row in record['records']:
+                            if row['check_id'] == ident:
+                                row['status'] = state
+                    report = self.rejected(record=record)
+                    self.assertTrue(any(x.startswith(ident) for x in report['unresolved_required_checks']))
+
+    def test_mandatory_exceptions_never_override_owner(self):
+        for ident in sorted(consumer.MANDATORY):
+            record = copy.deepcopy(self.record)
+            for row in record['records']:
+                if row['check_id'] == ident:
+                    row.update(status='NOT_APPLICABLE', applicability_reason='Fixture only.',
+                               scope_decision_reference='fixture/review/exception')
+            self.rejected(contains='mandatory owner', record=record)
+            self.rejected(contains='cannot be excepted', record=record,
+                          options=('--allow-not-applicable', ident))
+
+    def test_workers_missing_duplicate_unknown_and_wrong_types(self):
+        for worker in ('Harness', 'A0'):
+            record = copy.deepcopy(self.record)
+            record['records'] = [r for r in record['records'] if r.get('worker') != worker]
+            self.rejected(contains='AC055:' + worker, record=record)
+            record = copy.deepcopy(self.record)
+            record['records'].append(copy.deepcopy(next(r for r in record['records'] if r.get('worker') == worker)))
+            self.rejected(contains='Duplicate', record=record)
+        for worker in ('Hermes', 'harness', 'AZero', None, [], {}, False, 1):
+            record = copy.deepcopy(self.record)
+            next(r for r in record['records'] if r.get('worker') == 'Harness')['worker'] = worker
+            self.rejected(contains='known worker', record=record)
+        record = copy.deepcopy(self.record)
+        next(r for r in record['records'] if r.get('worker') == 'Harness').pop('worker')
+        self.rejected(contains='known worker', record=record)
+        record = copy.deepcopy(self.record)
+        record['records'][0]['worker'] = 'A0'
+        self.rejected(contains='unknown record fields', record=record)
+        record = copy.deepcopy(self.record)
+        next(r for r in record['records'] if r.get('worker') == 'Harness')['workers'] = ['A0']
+        self.rejected(contains='unknown record fields', record=record)
+
+    def test_worker_specific_evidence_and_same_candidate_required(self):
+        for worker in ('Harness', 'A0'):
+            record = copy.deepcopy(self.record)
+            row = next(r for r in record['records'] if r.get('worker') == worker)
+            row['evidence'] = []
+            self.rejected(contains='evidence', record=record)
+            row['candidate_sha256'] = 'f' * 64
+            self.rejected(contains='stale evidence', record=record)
+        record = copy.deepcopy(self.record)
+        h = next(r for r in record['records'] if r.get('worker') == 'Harness')
+        a = next(r for r in record['records'] if r.get('worker') == 'A0')
+        a['evidence'] = copy.deepcopy(h['evidence'])
+        self.rejected(contains='separate evidence', record=record)
+        os.link(self.evidence / 'Harness.txt', self.evidence / 'hardlink.txt')
+        a['evidence'][0]['path'] = 'hardlink.txt'
+        self.rejected(contains='separate evidence', record=record)
+
+    def test_exact_record_definition_pins_required(self):
+        for value in (None, {}, [], 'base52', {'base_sha256': 'f' * 64,
+                                            'web_admin_sha256': consumer.DELTA_SHA256},
+                      {'base_sha256': consumer.BASE_SHA256, 'web_admin_sha256': 'f' * 64}):
+            record = copy.deepcopy(self.record)
+            record['acceptance_definition'] = value
+            self.rejected(contains='cumulative base/delta', record=record)
+
+    def test_delta_and_predicate_drift_are_refused(self):
+        for path, data in ((self.root / 'validation/acceptance-web-admin.json', DELTA_BYTES),
+                           (self.root / 'tools/validate_run_record.py', PREDICATE_BYTES)):
+            path.write_bytes(data + b'\n')
+            self.rejected(code=2, contains='SHA-256 mismatch')
+            path.write_bytes(data)
+        delta = json.loads(DELTA_BYTES)
+        delta['base']['sha256'] = 'f' * 64
+        (self.root / 'validation/acceptance-web-admin.json').write_text(json.dumps(delta))
+        self.rejected(code=2, contains='SHA-256 mismatch')
+
+    def test_evidence_ancestors_root_nonregular_and_malformed_paths(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'proof.txt').write_bytes(old.PROOF)
+        (self.evidence / 'linked-dir').symlink_to(outside, target_is_directory=True)
+        for value in ('linked-dir/proof.txt', 'proof.txt/', './proof.txt', 'proof.txt/..',
+                      '.', 'a//b', '../outside/proof.txt', '/proof.txt', 'a\x00b'):
+            record = copy.deepcopy(self.record)
+            record['records'][0]['evidence'][0]['path'] = value
+            self.rejected(code=1, record=record)
+        fifo = self.evidence / 'fifo'
+        os.mkfifo(fifo)
+        record = copy.deepcopy(self.record)
+        record['records'][0]['evidence'][0]['path'] = 'fifo'
+        self.rejected(code=1, record=record)
+        (self.root / 'linked-evidence').symlink_to(self.evidence, target_is_directory=True)
+        self.rejected(code=2, options=('--evidence-root', str(self.root / 'linked-evidence')))
+
+    def test_altered_evidence_and_real_cumulative_template(self):
+        (self.evidence / 'proof.txt').write_bytes(b'altered same source record\n')
+        self.rejected(contains='hash mismatch')
+        (self.evidence / 'proof.txt').write_bytes(old.PROOF)
+        template = json.loads((ROOT / 'validation/RELEASE_EVIDENCE_TEMPLATE.json').read_bytes())
+        report = self.rejected(record=template)
+        self.assertEqual(len(template['records']), 59)
+        self.assertEqual(len(report['unresolved_required_checks']), 47)
+        self.assertFalse(report['declared_target_satisfied'])
+
+    def test_same_fd_alteration_and_leaf_replacement_are_refused(self):
+        # Change the real fixture between read and final fstat, without a thread or worker.
+        real_read = os.read
+        proof = self.evidence / 'proof.txt'
+        for mode in ('alter', 'replace'):
+            proof.write_bytes(old.PROOF)
+            changed = False
+            def change_after_read(fd, size):
+                nonlocal changed
+                value = real_read(fd, size)
+                if value == old.PROOF and not changed:
+                    changed = True
+                    if mode == 'alter':
+                        proof.write_bytes(b'X' * len(old.PROOF))
+                    else:
+                        temporary = self.evidence / 'replacement'
+                        temporary.write_bytes(old.PROOF)
+                        os.replace(temporary, proof)
+                return value
+            with mock.patch.object(consumer.os, 'read', change_after_read):
+                self.rejected(contains='altered')
+            self.assertTrue(changed)
+
+    def test_symlinked_record_and_definition_are_refused(self):
+        record = self.evidence / 'record.json'
+        record.write_text(json.dumps(self.record))
+        link = self.evidence / 'record-link.json'
+        link.symlink_to(record)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = consumer.main(['--record', str(link), '--base-root', str(self.root),
+                                  '--product-root', str(self.root)])
+        CumulativeTests.invocations += 1
+        self.assertEqual(code, 2)
+        self.assertFalse(json.loads(output.getvalue())['attests_runtime_truth'])
+        predicate = self.root / 'tools/validate_run_record.py'
+        predicate.unlink()
+        predicate.symlink_to(ARCHIVE / 'tools/validate_run_record.py')
+        self.rejected(code=2)
+
+    def test_containing_directory_change_during_final_evidence_read(self):
+        # Real local directory changes at a deterministic read boundary. Both
+        # symlink substitution and a new directory with the same leaf inode
+        # must be rejected, including when the evidence root itself moves.
+        import shutil
+        real_read = os.read
+        for mode in ('nested_symlink', 'nested_same_leaf', 'root_symlink'):
+            with self.subTest(mode=mode):
+                row = next(r for r in self.record['records'] if r.get('worker') == 'A0')
+                original_rows = list(self.record['records'])
+                original_path = row['evidence'][0]['path']
+                self.record['records'].remove(row)
+                self.record['records'].append(row)
+                data = (self.evidence / 'A0.txt').read_bytes()
+                moving = self.evidence if mode == 'root_symlink' else self.evidence / 'changing-parent'
+                if moving != self.evidence:
+                    moving.mkdir()
+                    (moving / 'A0.txt').write_bytes(data)
+                    row['evidence'][0]['path'] = 'changing-parent/A0.txt'
+                destination = self.root / ('moved-' + mode)
+                changed = False
+                def move_after_read(fd, size):
+                    nonlocal changed
+                    value = real_read(fd, size)
+                    if value == data and not changed:
+                        changed = True
+                        moving.rename(destination)
+                        if mode == 'nested_same_leaf':
+                            moving.mkdir()
+                            os.link(destination / 'A0.txt', moving / 'A0.txt')
+                        else:
+                            moving.symlink_to(destination, target_is_directory=True)
+                    return value
+                try:
+                    with mock.patch.object(consumer.os, 'read', move_after_read):
+                        self.rejected(contains='altered')
+                    self.assertTrue(changed)
+                finally:
+                    if changed:
+                        if moving.is_symlink():
+                            moving.unlink()
+                        else:
+                            shutil.rmtree(moving)
+                        destination.rename(moving)
+                    if moving != self.evidence:
+                        shutil.rmtree(moving)
+                    row['evidence'][0]['path'] = original_path
+                    self.record['records'] = original_rows
+
+
+if __name__ == '__main__':
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(CumulativeTests)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    print(json.dumps({'offline_regression': 'PASS' if result.wasSuccessful() else 'FAIL',
+                      'test_methods_run': result.testsRun,
+                      'validator_fixture_invocations': CumulativeTests.invocations,
+                      'attests_runtime_truth': False, 'product_runtime': 'NOT_RUN',
+                      'fixture_root': str(ROOT / 'fixtures'),
+                      'note': 'Inherited meaningful V2 regressions run through actual cumulative entry. '
+                              'All files are synthetic; no worker, product or service was executed.'}, indent=2))
+    raise SystemExit(0 if result.wasSuccessful() else 1)
