@@ -1,0 +1,414 @@
+"""Trusted foreground web children owned by the existing ProcessRegistry.
+
+A mandatory transient user service supplies whole-cgroup stop and a hard clock
+while the caller is down. No bare-process fallback. Trusted input is withheld
+until the existing registry checkpoint, unit identity and clock are checked.
+"""
+import json
+import math
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import subprocess
+import time
+
+_SETTLE_RESERVE = 4.0
+_START_RESERVE = 3.0
+_MAX_RESULT = 2_000_000
+_PROPERTIES = ('Id','Description','InvocationID','ActiveState','SubState','MainPID',
+               'ExecMainPID','ExecMainCode','ExecMainStatus','ControlGroup',
+               'KillMode','SendSIGKILL','Restart','RuntimeMaxUSec','TimeoutStopUSec',
+               'ActiveEnterTimestampMonotonic','RemainAfterExit','ExitType',
+               'NoNewPrivileges','ProtectControlGroups','Delegate','RuntimeRandomizedExtraUSec')
+
+
+def _usec(value):
+    """systemctl show formats microsecond D-Bus properties as time spans."""
+    from decimal import Decimal
+    scales={'us':1,'ms':1000,'s':1000000,'min':60000000,'h':3600000000,'d':86400000000}
+    if re.fullmatch(r'[0-9]+',value):return int(value)
+    total=Decimal(0)
+    parts=value.split()
+    if not parts:raise ValueError('invalid_systemd_timespan')
+    for part in parts:
+        match=re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)(us|ms|s|min|h|d)',part)
+        if not match:raise ValueError('invalid_systemd_timespan')
+        total+=Decimal(match[1])*scales[match[2]]
+    if total!=int(total):raise ValueError('nonintegral_systemd_timespan')
+    return int(total)
+
+
+def validate_web_checkpoint(entry):
+    """Validate the retained original web intent; never recreate a user grant."""
+    sid = entry.get('session_id', '')
+    if (not isinstance(sid, str) or not re.fullmatch(r'proc_[0-9a-f]{12}', sid)
+            or entry.get('web_custody') is not True or entry.get('terminal_custody', False) is not False
+            or entry.get('systemd_unit') != 'hermes-worker-web-' + sid + '.service'):
+        raise RuntimeError('web_invalid_recovery_identity')
+    deadline = entry.get('web_deadline')
+    if type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline <= 0:
+        raise RuntimeError('web_invalid_recovery_clock')
+    boot = entry.get('web_boot_id')
+    if not isinstance(boot, str) or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', boot):
+        raise RuntimeError('web_invalid_recovery_boot')
+    for key in ('command', 'task_id', 'owner_task_id', 'session_key', 'parent_session_id', 'web_tool_call_id', 'web_turn_id'):
+        if not isinstance(entry.get(key, ''), str):
+            raise RuntimeError('web_invalid_recovery_owner')
+    home = entry.get('cwd')
+    if not isinstance(home, str) or not Path(home).is_absolute() or '..' in Path(home).parts:
+        raise RuntimeError('web_invalid_recovery_home')
+    pin = entry.get('user_authority')
+    if pin is not None and (not isinstance(pin, dict) or pin.get('home') != home):
+        raise RuntimeError('web_invalid_recovery_authority')
+    for key in ('web_stop_requested', 'web_unconfirmed'):
+        if type(entry.get(key, False if key == 'web_stop_requested' else True)) is not bool:
+            raise RuntimeError('web_invalid_recovery_state')
+    invocation = entry.get('web_invocation', '')
+    if not isinstance(invocation, str) or (invocation and not re.fullmatch(r'[0-9a-f]{32}', invocation)):
+        raise RuntimeError('web_invalid_recovery_invocation')
+    group = entry.get('web_cgroup', '')
+    if (not isinstance(group, str) or (group and (not Path(group).is_absolute()
+            or group == '/' or '..' in Path(group).parts
+            or Path(group).name != entry['systemd_unit']))):
+        raise RuntimeError('web_invalid_recovery_cgroup')
+    identity = entry.get('web_cgroup_identity', [])
+    if (not isinstance(identity, list) or (identity and (not group or not invocation or len(identity) != 2
+            or any(type(value) is not int or value < 0 for value in identity)))):
+        raise RuntimeError('web_invalid_recovery_cgroup_identity')
+    for key in ('pid', 'host_start_time'):
+        value = entry.get(key)
+        if value is not None and (type(value) is not int or value < (1 if key == 'pid' else 0)):
+            raise RuntimeError('web_invalid_recovery_wrapper')
+
+
+class WebProcessMixin:
+    def _latch_web_stop(self, session):
+        # Intent precedes any observation/lock. In-progress Popen/checkpoint and
+        # stdin writers observe the same call fence; recovery retains the bit.
+        session.web_stop_requested = True
+        for event in getattr(session, 'web_stop_events', ()):
+            event.set()
+
+    def has_web_custody_for_session(self, session_key, *, parent_session_id='', profile_home):
+        if getattr(self, '_custody_recovery_blocked', False):
+            return True
+        with self._lock:
+            return any(s.web_custody and (not s.web_settled or s._scope_stop_pending) and s.cwd == str(profile_home)
+                       and (s.session_key == session_key
+                            or (parent_session_id and s.parent_session_id == parent_session_id))
+                       for s in self._running.values())
+
+    def stop_web_for_session(self, session_key, *, parent_session_id='', profile_home):
+        """Stop retained native handles in this profile and conversation only."""
+        with self._lock:
+            targets = [s for s in self._running.values()
+                       if s.web_custody and (not s.web_settled or s._scope_stop_pending) and s.cwd == str(profile_home)
+                       and (s.session_key == session_key
+                            or (parent_session_id and s.parent_session_id == parent_session_id))]
+        # Latch the entire fan-out before the first potentially slow settlement.
+        for session in targets:
+            self._latch_web_stop(session)
+        receipts = [self.settle_web(s, stop=True) for s in targets]
+        blocked = bool(getattr(self, '_custody_recovery_blocked', False)
+                       or getattr(self, '_terminal_recovery_blocked', False))
+        return {'status': 'QUIESCENT' if not blocked and all(r['status'] == 'QUIESCENT' for r in receipts)
+                else 'STOP_UNCONFIRMED', 'sessions': receipts, 'recovery_blocked': blocked,
+                'newly_settled': sum(bool(r.get('newly_settled')) for r in receipts)}
+
+    def web_custody_receipt(self):
+        """Read the existing handles after a stop; counts do not prove cessation."""
+        with self._lock:
+            retained=[s.id for s in self._running.values() if s.web_custody and (not s.web_settled or s._scope_stop_pending)]
+        blocked = bool(getattr(self, '_custody_recovery_blocked', False))
+        return {'status':'STOP_UNCONFIRMED' if retained or blocked else 'QUIESCENT','sessions':retained,
+                'recovery_blocked':blocked}
+
+    def _web_command(self, argv, timeout):
+        from tools.process_registry import systemd_user_bus_env
+        if timeout <= 0:
+            raise TimeoutError('web_original_deadline')
+        return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, env=systemd_user_bus_env({'PATH':os.defpath,'LANG':'C.UTF-8'}),
+                              timeout=min(timeout,2.5 if 'stop' in argv else 1.0), check=False)
+
+    def _web_show(self, session, timeout=1.0):
+        binary = shutil.which('systemctl')
+        if not binary:
+            raise RuntimeError('web_systemd_required')
+        result = self._web_command([binary,'--user','show',session.systemd_unit,
+                                   '--property='+','.join(_PROPERTIES)],timeout)
+        if result.returncode:
+            raise RuntimeError('web_unit_observation_failed')
+        data = {}
+        for line in result.stdout.decode().splitlines():
+            if not line:
+                continue
+            key, separator, value = line.partition('=')
+            if not separator or key not in _PROPERTIES or key in data:
+                raise RuntimeError('web_unit_observation_failed')
+            data[key] = value
+        if set(data) != set(_PROPERTIES):
+            raise RuntimeError('web_unit_observation_failed')
+        if data.get('Id') != session.systemd_unit or data.get('Description') != 'Hermes web '+session.id:
+            raise RuntimeError('web_unit_identity_changed')
+        if not re.fullmatch('[0-9a-f]{32}',data.get('InvocationID','')):
+            raise RuntimeError('web_invocation_required')
+        if session.web_invocation and data['InvocationID'] != session.web_invocation:
+            raise RuntimeError('web_invocation_changed')
+        if (data.get('KillMode')!='control-group' or data.get('SendSIGKILL')!='yes'
+                or data.get('Restart')!='no' or data.get('RemainAfterExit')!='no'
+                or data.get('ExitType')!='main' or data.get('NoNewPrivileges')!='yes'
+                or data.get('ProtectControlGroups')!='yes' or data.get('Delegate')!='no'
+                or _usec(data.get('RuntimeRandomizedExtraUSec',''))!=0):
+            raise RuntimeError('web_unit_policy_changed')
+        return data
+
+    def _web_populated(self, session):
+        # Retain the original cgroup path; disappearance proves the recorded
+        # cgroup was removed, not merely that the wrapper PID went away.
+        path = Path('/sys/fs/cgroup')/session.web_cgroup.lstrip('/')
+        if (not session.web_cgroup or '..' in Path(session.web_cgroup).parts
+                or path.resolve()!=path):
+            raise RuntimeError('web_cgroup_required')
+        try:
+            st=path.stat()
+            if session.web_cgroup_identity and [st.st_dev,st.st_ino]!=session.web_cgroup_identity:
+                raise RuntimeError('web_cgroup_identity_changed')
+            text = (path/'cgroup.events').read_text()
+        except FileNotFoundError:
+            return False
+        data = dict(line.split() for line in text.splitlines())
+        if data.get('populated') not in ('0','1'):
+            raise RuntimeError('web_cgroup_observation_failed')
+        return data['populated']=='1'
+
+    def _web_capture_cgroup(self, session):
+        group=Path('/sys/fs/cgroup')/session.web_cgroup.lstrip('/')
+        if group.resolve()!=group or '..' in group.parts:raise RuntimeError('web_cgroup_required')
+        st=group.stat()
+        session.web_cgroup_identity=[st.st_dev,st.st_ino]
+        if not self._web_populated(session):raise RuntimeError('web_cgroup_not_populated')
+
+    def _web_checkpoint(self, session):
+        from tools.process_registry import _checkpoint_path
+        from tools.terminal_containment import private_bytes
+        # The existing registry RLock covers write AND readback, including mixed
+        # terminal/web custody. A stale matching file cannot mask a failed fsync.
+        with self._lock:
+            self._write_checkpoint(strict=True)
+            rows = json.loads(private_bytes(_checkpoint_path()))
+            matches = [r for r in rows if r.get('session_id') == session.id]
+            if len(matches) != 1 or any(matches[0].get(k) != getattr(session, k) for k in
+                                     ('systemd_unit','task_id','owner_task_id','session_key','user_authority',
+                                      'web_custody','web_invocation','web_cgroup','web_cgroup_identity','web_deadline','web_boot_id',
+                                      'web_tool_call_id','web_turn_id','parent_session_id','web_stop_requested')):
+                raise RuntimeError('web_checkpoint_required')
+
+    def spawn_web(self, call):
+        from tools.process_registry import systemd_user_bus_env
+        from hermes_constants import get_hermes_home
+        import sys
+        from hermes_cli.friday_user_scope import delegation_authority
+        call.check()
+        if getattr(self, '_custody_recovery_blocked', False):
+            raise RuntimeError('STOP_UNCONFIRMED')
+        if call.session is not None or call.registry is not None:
+            raise RuntimeError('web_call_already_submitted')
+        deadline = call.deadline()
+        remaining = deadline-time.monotonic()
+        if remaining <= _SETTLE_RESERVE+_START_RESERVE+1:
+            raise TimeoutError('web_insufficient_settlement_budget')
+        binary = shutil.which('systemd-run')
+        if not binary or not shutil.which('systemctl'):
+            raise RuntimeError('web_systemd_required')
+        session = self._new_session('native web child',call.task_id,call.task_id,call.session_key,
+                                    str(get_hermes_home()),
+                                    web_custody=True,web_deadline=deadline,user_authority=delegation_authority(),
+                                    web_boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip())
+        session.systemd_unit = 'hermes-worker-web-'+session.id+'.service'
+        session.parent_session_id = call.session_id
+        session.web_tool_call_id=call.call_id or "";session.web_turn_id=call.turn_id
+        session.web_stop_events=(call.stopped,call.turn.stopped)
+        with self._lock:
+            if any(s.web_custody and s.web_unconfirmed
+                   and (s.session_key==call.session_key or s.cwd==str(get_hermes_home()))
+                   for s in self._running.values()):
+                raise RuntimeError('STOP_UNCONFIRMED')
+            self._running[session.id] = session
+        # Intent is in the registry before launch. A failed Popen or observation
+        # is retained there for exact-unit reconciliation, never auto-replayed.
+        call.registry,call.session = self,session
+        self._web_checkpoint(session)
+        call.check()  # Stop during intent/checkpoint must fence Popen too.
+        if session.web_stop_requested:raise RuntimeError("web_call_stopped")
+        entry = str(Path(__file__).with_name('web_process_child.py'))
+        env = systemd_user_bus_env({'PATH':os.defpath,'HOME':str(get_hermes_home()),
+                                   'HERMES_HOME':str(get_hermes_home()),'LANG':'C.UTF-8',
+                                   'PYTHONDONTWRITEBYTECODE':'1','PYTHONUNBUFFERED':'1'})
+        argv=[binary,'--user','--pipe','--wait','--quiet','--expand-environment=no',
+              '--unit='+session.systemd_unit,'--description=Hermes web '+session.id,
+              '--property=Type=exec','--property=RemainAfterExit=no','--property=ExitType=main',
+              '--property=Restart=no','--property=RuntimeRandomizedExtraSec=0',
+              '--property=TimeoutStartSec=3s','--property=NoNewPrivileges=yes',
+              '--property=ProtectControlGroups=yes','--property=Delegate=no',
+              '--property=KillMode=control-group','--property=SendSIGKILL=yes',
+              '--property=TimeoutStopSec=1s','--property=RuntimeMaxSec='+str(math.floor((remaining-_SETTLE_RESERVE-_START_RESERVE)*1_000_000))+'us',
+              '--property=MemoryMax=1G','--property=TasksMax=64',
+              '--property=WorkingDirectory='+str(get_hermes_home()),
+              '--','/usr/bin/env','-i',*[k+'='+v for k,v in env.items()
+                                        if k not in ('DBUS_SESSION_BUS_ADDRESS','XDG_RUNTIME_DIR')],
+              sys.executable,'-I','-B',entry]
+        proc=subprocess.Popen(argv,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
+                              env=env,cwd=session.cwd,start_new_session=True)
+        session.process,session.pid=proc,proc.pid
+        session.host_start_time=self._safe_host_start_time(proc.pid)
+        self._web_checkpoint(session)
+        # One finite startup observation window, always inside the original
+        # deadline. No work is released until the manager acknowledges identity.
+        until=min(deadline-_SETTLE_RESERVE,time.monotonic()+3)
+        while True:
+            call.check()
+            try:
+                data=self._web_show(session,min(1,until-time.monotonic()))
+                entered=int(data['ActiveEnterTimestampMonotonic'])/1_000_000
+                if entered>0 and int(data.get('MainPID','0'))>0 and data.get('ControlGroup'):
+                    break
+            except (RuntimeError,ValueError):
+                pass
+            if proc.poll() is not None or time.monotonic()>=until:
+                raise RuntimeError('web_native_boundary_not_ready')
+            call.stopped.wait(.02)
+        session.web_invocation=data['InvocationID'];session.web_cgroup=data['ControlGroup']
+        # Services only accept RuntimeMaxSec at creation on systemd 259. Use a
+        # conservative startup allowance, then check the ACTUAL activation
+        # origin. Reject a late launch before input instead of pretending a
+        # runtime property update can move an already-armed timer.
+        runtime = _usec(data.get('RuntimeMaxUSec',''))
+        if (entered + runtime/1_000_000 > deadline-_SETTLE_RESERVE+.000001
+                or _usec(data.get('TimeoutStopUSec','')) > 1_000_000
+                or data.get('ControlGroup')!=session.web_cgroup):
+            raise RuntimeError('web_hard_deadline_unverified')
+        self._web_capture_cgroup(session)
+        call.check()
+        if session.web_stop_requested:raise RuntimeError("web_call_stopped")
+        session.web_unconfirmed=False
+        self._web_checkpoint(session)
+        call.check()
+        return session
+
+    def web_exchange(self, session, payload, call):
+        encoded=json.dumps(payload,ensure_ascii=True,allow_nan=False).encode()+b'\n'
+        if len(encoded)>65536:
+            raise RuntimeError('web_input_too_large')
+        proc=session.process
+        os.set_blocking(proc.stdin.fileno(),False);os.set_blocking(proc.stdout.fileno(),False)
+        offset=0;raw=bytearray()
+        while True:
+            call.check()
+            remaining=session.web_deadline-_SETTLE_RESERVE-time.monotonic()
+            if remaining<=0:
+                raise TimeoutError('web_original_deadline')
+            rd,wr,_=select.select([proc.stdout], [proc.stdin] if offset<len(encoded) else [],[],min(.05,remaining))
+            if wr:
+                from tools.interrupt import run_if_not_interrupted
+                def write_input():
+                    nonlocal offset
+                    if session.web_stop_requested or call.stopped.is_set() or call.turn.stopped.is_set():raise RuntimeError('web_call_stopped')
+                    offset+=os.write(proc.stdin.fileno(),encoded[offset:])
+                    if offset==len(encoded):proc.stdin.close()
+                with call.turn.lock:
+                    call.check()
+                    if not run_if_not_interrupted(write_input):raise RuntimeError('web_call_stopped')
+            if rd:
+                part=os.read(proc.stdout.fileno(),8192)
+                if not part:
+                    raise RuntimeError('web_result_incomplete')
+                raw.extend(part)
+                if len(raw)>_MAX_RESULT:raise RuntimeError('web_result_too_large')
+                if b'\n' in raw:
+                    result=json.loads(raw)
+                    if set(result)!= {'result'} or not isinstance(result['result'],str):
+                        raise RuntimeError('web_result_invalid')
+                    return result['result']
+
+    def settle_web(self, session, *, stop=False):
+        # Serialize exactly this existing handle. Parent EOF, systemctl rc and
+        # Future cancellation are not observations of whole-boundary cessation.
+        if stop:self._latch_web_stop(session)
+        if not session.web_settle_lock.acquire(timeout=1):
+            return {'status':'STOP_UNCONFIRMED','session_id':session.id,'reason':'web_settlement_in_progress'}
+        try:
+            if session.web_settled:
+                # Retry only the durable completion of this already-quiescent
+                # handle. Never relaunch or repeat its native unit stop.
+                try:
+                    if self._running.get(session.id) is session:
+                        self._move_to_finished(session)
+                except Exception:
+                    return {'status':'STOP_UNCONFIRMED','session_id':session.id,
+                            'reason':'web_result_not_durable','native_quiescent':True}
+                return {'status':'QUIESCENT','session_id':session.id,'returncode':session.exit_code}
+            session.web_unconfirmed=True
+            try:
+                if Path('/proc/sys/kernel/random/boot_id').read_text().strip()!=session.web_boot_id:
+                    raise RuntimeError('web_boot_changed')
+                until=min(session.web_deadline,time.monotonic()+3)
+                proc=session.process
+                wrapper_gone=(proc.poll() is not None if proc is not None
+                              else self._detached_host_fate(session.pid,session.host_start_time) in ('gone','reused'))
+                already_gone=bool(session.web_invocation and session.web_cgroup_identity
+                                  and wrapper_gone and not self._web_populated(session))
+                if not session.web_invocation:
+                    # No input was released; acquire the recorded unique intent
+                    # using its exact owner description, never guess a PID group.
+                    data=self._web_show(session,min(1,until-time.monotonic()))
+                    session.web_invocation=data['InvocationID'];session.web_cgroup=data.get('ControlGroup','')
+                natural=False
+                proc=session.process
+                if not already_gone and not stop and proc is not None:
+                    # --wait propagates the real service exit; its complete wait
+                    # also includes native control-group teardown. Do not stop a
+                    # child between result publication and actual exit zero.
+                    while proc.poll() is None:
+                        if any(event.is_set() for event in getattr(session,'web_stop_events',())):
+                            stop=True
+                            break
+                        if time.monotonic()>=until:raise TimeoutError('web_settlement_deadline')
+                        time.sleep(.01)
+                    if not stop:
+                        rc=proc.wait(timeout=max(.001,until-time.monotonic()))
+                        natural=rc==0
+                if (stop or proc is None) and not already_gone:
+                    self._web_show(session,min(1,until-time.monotonic()))
+                    result=self._web_command([shutil.which('systemctl'),'--user','stop',session.systemd_unit],
+                                             until-time.monotonic())
+                    if result.returncode:raise RuntimeError('web_stop_failed')
+                if self._web_populated(session):raise RuntimeError('web_cgroup_still_populated')
+                proc=session.process
+                if proc is not None:
+                    rc=proc.wait(timeout=max(.001,until-time.monotonic()))
+                    if already_gone and not stop:natural=rc==0
+                else:
+                    if self._detached_host_fate(session.pid,session.host_start_time) not in ('gone','reused'):
+                        raise RuntimeError('web_wrapper_still_running')
+                    rc=None
+                session.web_settled=True;session.web_unconfirmed=False;session._scope_stop_pending=False
+                session.mark_exited(rc,reason='killed' if stop else 'exited',source='native_web_settlement')
+                self._completion_consumed.add(session.id)
+                self._move_to_finished(session)
+                return {'status':'QUIESCENT','session_id':session.id,'returncode':rc,
+                        'native_child_exit_zero':natural,'original_deadline':session.web_deadline,
+                        'newly_settled':True}
+            except Exception:
+                session._scope_stop_pending=True
+                try:
+                    self._write_checkpoint()
+                except Exception:
+                    pass  # Keep original custody and report uncertainty on disk failure.
+                return {'status':'STOP_UNCONFIRMED','session_id':session.id,
+                        'unit':session.systemd_unit,'original_deadline':session.web_deadline}
+
+        finally:
+            session.web_settle_lock.release()

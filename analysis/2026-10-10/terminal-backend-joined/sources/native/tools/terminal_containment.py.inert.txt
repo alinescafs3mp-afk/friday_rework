@@ -1,0 +1,267 @@
+"""Small strict primitives for existing ProcessRegistry terminal custody.
+
+No broker or dispatcher: the native local environment owns shell state, the
+registry owns handles, and the existing user manager owns each command cgroup.
+"""
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import time
+import uuid
+
+from tools.terminal_binding import TerminalScopeDenied, directory_identity
+
+START_RESERVE = 3.0
+SETTLE_RESERVE = 4.0
+PROPERTIES = ('Id', 'LoadState', 'Transient', 'Description', 'InvocationID', 'ActiveState', 'SubState',
+              'MainPID', 'ExecMainPID', 'ControlGroup', 'Type', 'KillMode', 'SendSIGKILL', 'Restart',
+              'RuntimeMaxUSec', 'TimeoutStartUSec', 'TimeoutStopUSec', 'ActiveEnterTimestampMonotonic',
+              'RemainAfterExit', 'ExitType', 'NoNewPrivileges', 'ProtectControlGroups', 'Delegate',
+              'RuntimeRandomizedExtraUSec', 'MemoryMax', 'TasksMax', 'CPUQuotaPerSecUSec', 'UMask')
+
+
+def timespan(value):
+    from tools.process_registry_web import _usec
+    return _usec(value)
+
+
+def fields(raw, expected):
+    rows = [line.split('=', 1) for line in raw.splitlines()]
+    if any(len(row) != 2 for row in rows):
+        raise RuntimeError('terminal_malformed_unit_observation')
+    value = dict(rows)
+    if len(rows) != len(value) or set(value) != set(expected):
+        raise RuntimeError('terminal_duplicate_or_missing_unit_fields')
+    return value
+
+
+def unsigned(value):
+    if not re.fullmatch(r'0|[1-9][0-9]{0,19}', value):
+        raise RuntimeError('terminal_invalid_native_integer')
+    return int(value)
+
+
+def verify_unit(data, metadata, *, starting=False):
+    if data['Id'] != metadata['unit'] or data['Description'] != metadata['description']:
+        raise RuntimeError('terminal_native_owner_changed')
+    fixed = {'LoadState': 'loaded', 'Transient': 'yes', 'Type': 'exec', 'KillMode': 'control-group',
+             'SendSIGKILL': 'yes', 'Restart': 'no', 'RemainAfterExit': 'no', 'ExitType': 'main',
+             'NoNewPrivileges': 'yes', 'ProtectControlGroups': 'yes', 'Delegate': 'no', 'UMask': '0077'}
+    if any(data[k] != v for k, v in fixed.items()):
+        raise RuntimeError('terminal_native_policy_changed')
+    invocation = data['InvocationID']
+    if not re.fullmatch('[0-9a-f]{32}', invocation):
+        raise RuntimeError('terminal_native_invocation_required')
+    if metadata.get('invocation') and invocation != metadata['invocation']:
+        raise RuntimeError('terminal_native_invocation_changed')
+    states = {'active': {'running'}, 'activating': {'start', 'start-pre', 'start-post'},
+              'deactivating': {'stop', 'stop-sigterm', 'stop-sigkill', 'stop-post', 'final-sigterm', 'final-sigkill'},
+              'inactive': {'dead'}, 'failed': {'failed'}}
+    if data['SubState'] not in states.get(data['ActiveState'], set()):
+        raise RuntimeError('terminal_contradictory_native_state')
+    main, exec_pid = unsigned(data['MainPID']), unsigned(data['ExecMainPID'])
+    group = data['ControlGroup']
+    if main and (not group or data['ActiveState'] in ('inactive', 'failed') or main != exec_pid):
+        raise RuntimeError('terminal_contradictory_native_pid')
+    if group and (not group.startswith('/') or '..' in Path(group).parts
+                  or not group.endswith('/' + metadata['unit'])):
+        raise RuntimeError('terminal_native_cgroup_owner_changed')
+    if metadata.get('cgroup') and group and group != metadata['cgroup']:
+        raise RuntimeError('terminal_native_cgroup_changed')
+    if (timespan(data['RuntimeRandomizedExtraUSec']) != 0
+            or timespan(data['TimeoutStartUSec']) > 3_000_000
+            or timespan(data['TimeoutStopUSec']) > 1_000_000
+            or timespan(data['RuntimeMaxUSec']) != metadata['runtime_us']):
+        raise RuntimeError('terminal_native_timer_changed')
+    entered = unsigned(data['ActiveEnterTimestampMonotonic']) / 1_000_000
+    if starting and (not main or not group or not entered or data['ActiveState'] != 'active'):
+        raise RuntimeError('terminal_native_boundary_not_ready')
+    if entered and entered + metadata['runtime_us'] / 1_000_000 > metadata['command_deadline'] - SETTLE_RESERVE:
+        raise RuntimeError('terminal_native_deadline_late')
+    resource = metadata['resource']
+    if (unsigned(data['MemoryMax']) != resource['memory_bytes']
+            or unsigned(data['TasksMax']) != resource['tasks_max']
+            or timespan(data['CPUQuotaPerSecUSec']) != resource['cpu_quota_pct'] * 10_000):
+        raise RuntimeError('terminal_native_allocation_changed')
+    return data
+
+
+def cgroup_observation(group, identity=None):
+    if not group or not group.startswith('/') or '..' in Path(group).parts:
+        raise RuntimeError('terminal_cgroup_required')
+    root = Path('/sys/fs/cgroup')
+    path = root / group.lstrip('/')
+    if path.resolve() != path or not path.is_relative_to(root):
+        raise RuntimeError('terminal_cgroup_symlink')
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        if identity is None:
+            raise RuntimeError('terminal_uncaptured_cgroup_missing')
+        return {'populated': False, 'removed': True, 'identity': identity}
+    observed = [st.st_dev, st.st_ino]
+    if identity is not None and observed != identity:
+        raise RuntimeError('terminal_cgroup_birth_changed')
+    rows = [line.split() for line in (path / 'cgroup.events').read_text().splitlines()]
+    if any(len(row) != 2 for row in rows) or len(dict(rows)) != len(rows):
+        raise RuntimeError('terminal_malformed_cgroup_events')
+    value = dict(rows)
+    if value.get('populated') not in ('0', '1'):
+        raise RuntimeError('terminal_cgroup_populated_required')
+    return {'populated': value['populated'] == '1', 'removed': False, 'identity': observed}
+
+
+def private_bytes(path, limit=8_000_000):
+    p = Path(path)
+    fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid()
+                or st.st_mode & 0o077 or st.st_size > limit):
+            raise RuntimeError('terminal_unsafe_durable_file')
+        with os.fdopen(fd, 'rb', closefd=False) as f:
+            return f.read(limit + 1)
+    finally:
+        os.close(fd)
+
+
+def durable_json(path, value, *, exclusive=False):
+    """Strict acknowledgement: data + rename + directory fsync + exact readback."""
+    p = Path(path)
+    directory_identity(p.parent)
+    encoded = (json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False) + '\n').encode()
+    tmp = p if exclusive else p.with_name(p.name + '.tmp.' + uuid.uuid4().hex)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(encoded); f.flush(); os.fsync(f.fileno())
+        if not exclusive:
+            if p.exists() or p.is_symlink():
+                private_bytes(p)
+            os.replace(tmp, p)
+        d = os.open(p.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(d)
+        finally:
+            os.close(d)
+        if private_bytes(p) != encoded:
+            raise RuntimeError('terminal_checkpoint_readback_failed')
+    finally:
+        if not exclusive and tmp.exists():
+            tmp.unlink()
+
+
+def control_env():
+    runtime = '/run/user/' + str(os.getuid())
+    return {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C',
+            'XDG_RUNTIME_DIR': runtime, 'DBUS_SESSION_BUS_ADDRESS': 'unix:path=' + runtime + '/bus'}
+
+
+def validate_recovered_entry(entry):
+    """Malformed custody is retained and blocks admission, never a host PID job."""
+    from tools.terminal_binding import digest, allocation
+    session_id = entry.get('session_id', '')
+    meta = entry.get('terminal_metadata')
+    if not re.fullmatch('proc_[0-9a-f]{12}', session_id) or not isinstance(meta, dict):
+        raise RuntimeError('terminal_invalid_recovery_identity')
+    required = {'binding', 'launch_key', 'call_id', 'nonce', 'command_sha256', 'payload_sha256',
+                'helper_sha256', 'command_deadline', 'original_deadline', 'boot_id', 'control_dir',
+                'ready_dir', 'resource', 'pty', 'phase', 'attempted', 'released', 'runtime_us', 'unit', 'description'}
+    if not required <= set(meta):
+        raise RuntimeError('terminal_incomplete_recovery_intent')
+    if entry.get('systemd_unit') != 'hermes-worker-terminal-' + session_id + '.service' or meta['unit'] != entry['systemd_unit']:
+        raise RuntimeError('terminal_recovery_unit_mismatch')
+    pin = meta['binding']
+    if not isinstance(pin, dict) or entry.get('user_authority') != pin.get('authority'):
+        raise RuntimeError('terminal_recovery_authority_mismatch')
+    expected = 'Hermes terminal ' + digest({'binding': pin, 'launch': meta['launch_key'],
+        'payload': meta['payload_sha256'], 'unit': meta['unit']})
+    if expected != meta['description']:
+        raise RuntimeError('terminal_recovery_admission_digest_mismatch')
+    for key in ('launch_key', 'command_sha256', 'payload_sha256', 'helper_sha256'):
+        if not isinstance(meta[key], str) or not re.fullmatch('[0-9a-f]{64}', meta[key]):
+            raise RuntimeError('terminal_invalid_recovery_digest')
+    for key in ('attempted', 'released', 'pty'):
+        if type(meta[key]) is not bool:
+            raise RuntimeError('terminal_invalid_recovery_state')
+    for key in ('command_deadline', 'original_deadline'):
+        if type(meta[key]) not in (float, int) or not math.isfinite(meta[key]) or meta[key] <= 0:
+            raise RuntimeError('terminal_invalid_recovery_clock')
+    if (meta['original_deadline'] != pin.get('original_deadline')
+            or meta['command_deadline'] > meta['original_deadline'] or meta['boot_id'] != pin.get('boot_id')
+            or type(meta['runtime_us']) is not int or meta['runtime_us'] <= 0):
+        raise RuntimeError('terminal_recovery_original_clock_changed')
+    policy = allocation(pin.get('allocation'))
+    exact = {key: policy[key] // policy['max_active'] for key in ('cpu_quota_pct', 'memory_bytes', 'tasks_max', 'tmp_bytes')}
+    if meta['resource'] != exact:
+        raise RuntimeError('terminal_recovery_allocation_changed')
+    home = Path(pin['authority']['home'])
+    control = home / 'cache' / 'terminal-custody' / meta['launch_key']
+    if str(control) != meta['control_dir'] or str(control / 'ready') != meta['ready_dir']:
+        raise RuntimeError('terminal_recovery_control_path_changed')
+    if pin.get('workspace') != str(home / 'workspace') or not Path(pin['state_root']).is_relative_to(home / 'cache' / 'terminal-scoped'):
+        raise RuntimeError('terminal_recovery_mount_path_changed')
+    directory_identity(control)
+    if hashlib.sha256(private_bytes(control / 'payload.json')).hexdigest() != meta['payload_sha256']:
+        raise RuntimeError('terminal_recovery_payload_changed')
+    return entry
+
+
+def control_command(arguments, timeout=1):
+    if timeout <= 0:
+        raise TimeoutError('terminal_control_budget_exhausted')
+    return subprocess.run(['/usr/bin/systemctl', '--user', '--no-pager', *arguments],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          env=control_env(), timeout=min(timeout, 2.5 if 'stop' in arguments else 1), check=False)
+
+
+def sandbox_argv(binding, metadata, payload):
+    # /usr and its standard merged-usr links are the only system toolchain mount.
+    # No host /etc, home, /run, /sys, manager socket or credential passthrough.
+    argv = ['/usr/bin/bwrap', '--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts',
+            '--unshare-net', '--die-with-parent', '--cap-drop', 'ALL', '--clearenv',
+            '--ro-bind', '/usr', '/usr']
+    if not metadata['pty']:
+        argv.append('--new-session')
+    for alias in ('bin', 'sbin', 'lib', 'lib64'):
+        p = Path('/') / alias
+        if p.exists():
+            target = p.resolve()
+            if not target.is_relative_to('/usr'):
+                raise TerminalScopeDenied('terminal_unsupported_toolchain_layout')
+            argv += ['--symlink', str(target), str(p)]
+    argv += ['--proc', '/proc', '--dev', '/dev', '--size', str(metadata['resource']['tmp_bytes']), '--tmpfs', '/tmp']
+    for row in payload['mounts']:
+        # bwrap creates missing destination ancestors within its empty root.
+        argv += ['--bind', row['path'], row['path']]
+    helper = Path(__file__).with_name('terminal_exec_gate.py')
+    if hashlib.sha256(helper.read_bytes()).hexdigest() != metadata['helper_sha256']:
+        raise TerminalScopeDenied('terminal_launch_helper_changed')
+    argv += ['--ro-bind', str(helper), '/.hermes-terminal-gate.py',
+             '--ro-bind', metadata['control_dir'], '/.hermes-terminal-control',
+             '--bind', metadata['ready_dir'], '/.hermes-terminal-ready']
+    for key, value in payload['environment'].items():
+        argv += ['--setenv', key, value]
+    return argv + ['--chdir', payload['cwd'], '--remount-ro', '/', '--',
+                   '/usr/bin/python3', '-I', '-B', '/.hermes-terminal-gate.py']
+
+
+def launch_argv(binding, metadata, payload):
+    resource = metadata['resource']
+    properties = {'Type': 'exec', 'RemainAfterExit': 'no', 'ExitType': 'main', 'Restart': 'no',
+                  'RuntimeRandomizedExtraSec': '0', 'TimeoutStartSec': '3s', 'TimeoutStopSec': '1s',
+                  'NoNewPrivileges': 'yes', 'ProtectControlGroups': 'yes', 'Delegate': 'no',
+                  'KillMode': 'control-group', 'SendSIGKILL': 'yes', 'UMask': '0077',
+                  'RuntimeMaxSec': str(metadata['runtime_us']) + 'us',
+                  'MemoryMax': str(resource['memory_bytes']), 'TasksMax': str(resource['tasks_max']),
+                  'CPUQuota': str(resource['cpu_quota_pct']) + '%'}
+    return ['/usr/bin/systemd-run', '--user', '--pty' if metadata['pty'] else '--pipe', '--wait', '--quiet',
+            '--expand-environment=no', '--unit=' + metadata['unit'], '--description=' + metadata['description'],
+            *['--property=' + k + '=' + v for k, v in properties.items()], '--',
+            '/usr/bin/env', '-i', 'PATH=/usr/bin:/bin', 'LANG=C.UTF-8',
+            *sandbox_argv(binding, metadata, payload)]

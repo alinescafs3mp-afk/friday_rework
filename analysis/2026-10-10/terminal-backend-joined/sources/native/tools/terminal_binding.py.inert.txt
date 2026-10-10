@@ -1,0 +1,208 @@
+"""Authenticated immutable projection for the native scoped local backend.
+
+This module grants no tools. SAFE and native command approvals remain in force.
+Only the native caller ContextVar and checked UserScope can make a binding;
+terminal arguments, cwd, environment variables and recovered JSON cannot do so.
+"""
+from dataclasses import dataclass, field
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import stat
+import time
+
+
+class TerminalScopeDenied(PermissionError):
+    def __init__(self, reason="terminal_scope_refused"):
+        super().__init__(reason)
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def digest(value):
+    return hashlib.sha256(canonical(value).encode()).hexdigest()
+
+
+def directory_identity(path):
+    path = Path(path)
+    if not path.is_absolute() or path.resolve(strict=True) != path:
+        raise TerminalScopeDenied("terminal_mount_symlink")
+    st = path.lstat()
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise TerminalScopeDenied("terminal_mount_not_private")
+    return (st.st_dev, st.st_ino)
+
+
+def checked_tree(root, limit=40000):
+    """Reject existing socket/device/foreign/hard-link exposure before admission.
+
+    Namespace mount identities are checked again by the inert launch gate. A
+    path symlink inside a mount may resolve only within that same mount.
+    """
+    root = Path(root)
+    count = 0
+    for parent, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            count += 1
+            if count > limit:
+                raise TerminalScopeDenied("terminal_mount_inventory_bound")
+            p = Path(parent) / name
+            st = p.lstat()
+            if st.st_uid != os.getuid():
+                raise TerminalScopeDenied("terminal_foreign_mount_entry")
+            if stat.S_ISLNK(st.st_mode):
+                if not p.resolve().is_relative_to(root):
+                    raise TerminalScopeDenied("terminal_mount_symlink_escape")
+            elif not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+                raise TerminalScopeDenied("terminal_control_socket_or_device")
+            elif stat.S_ISREG(st.st_mode) and st.st_nlink != 1:
+                raise TerminalScopeDenied("terminal_external_hardlink")
+
+
+def allocation(policy):
+    keys = {"local_only", "cpu_quota_pct", "memory_bytes", "tasks_max", "tmp_bytes", "max_active"}
+    if not isinstance(policy, dict) or set(policy) != keys or policy["local_only"] is not True:
+        raise TerminalScopeDenied("terminal_explicit_allocation_required")
+    bounds = {"cpu_quota_pct": (1, 200), "memory_bytes": (32 * 1024**2, 1024**3),
+              "tasks_max": (4, 64), "tmp_bytes": (1024**2, 128 * 1024**2), "max_active": (1, 8)}
+    for key, (lo, hi) in bounds.items():
+        if type(policy[key]) is not int or not lo <= policy[key] <= hi:
+            raise TerminalScopeDenied("terminal_invalid_allocation")
+    # These are aggregate profile allocations. Each concurrently admitted
+    # command receives a fixed fraction; no late process can enlarge its grant.
+    n = policy["max_active"]
+    if policy["tasks_max"] // n < 4 or policy["memory_bytes"] // n < 32 * 1024**2:
+        raise TerminalScopeDenied("terminal_allocation_too_small")
+    return dict(policy)
+
+
+def _private_child(parent, name):
+    parent = Path(parent)
+    directory_identity(parent)
+    path = parent / name
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    directory_identity(path)
+    return path
+
+
+@dataclass(frozen=True)
+class TerminalBinding:
+    authority_json: str
+    task_id: str
+    parent_session_id: str
+    session_key: str
+    turn_id: str
+    original_deadline: float
+    boot_id: str
+    workspace: str
+    workspace_identity: tuple
+    state_root: str
+    state_identity: tuple
+    allocation_json: str
+    cap: object = field(repr=False, compare=False)
+    turn: object = field(repr=False, compare=False)
+
+    @property
+    def user_authority(self):
+        return json.loads(self.authority_json)
+
+    @property
+    def resources(self):
+        return json.loads(self.allocation_json)
+
+    def retained(self):
+        return {"authority": self.user_authority, "task_id": self.task_id,
+                "parent_session_id": self.parent_session_id, "session_key": self.session_key,
+                "turn_id": self.turn_id, "original_deadline": self.original_deadline,
+                "boot_id": self.boot_id, "workspace": self.workspace,
+                "workspace_identity": list(self.workspace_identity), "state_root": self.state_root,
+                "state_identity": list(self.state_identity), "allocation": self.resources}
+
+    def check(self, *, caller=False, owner_task_id=None, session_key=None, owner_session_id=None):
+        from hermes_cli.friday_user_scope import authority, delegation_authority
+        # Trusted readers retain this capability; they never adopt an ambient
+        # new principal. Its sticky revocation check is still live.
+        with authority(self.cap.home):
+            self.cap.check()
+        expected = {"principal": list(self.cap.principal), "profile": self.cap.profile,
+                    "home": str(self.cap.home), "authorization_home": str(self.cap.authorization_home),
+                    "binding_sha256": digest(self.cap.binding), "generation": self.cap.admission_generation}
+        if expected != self.user_authority:
+            raise TerminalScopeDenied("terminal_authority_changed")
+        if self.turn.stopped.is_set() or time.monotonic() >= self.original_deadline:
+            raise TerminalScopeDenied("terminal_original_stop_or_deadline")
+        if Path('/proc/sys/kernel/random/boot_id').read_text().strip() != self.boot_id:
+            raise TerminalScopeDenied("terminal_original_boot_changed")
+        if (directory_identity(self.workspace) != self.workspace_identity
+                or directory_identity(self.state_root) != self.state_identity):
+            raise TerminalScopeDenied("terminal_mount_identity_changed")
+        if caller:
+            from agent.web_call_context import current_web_call
+            call = current_web_call()
+            if (delegation_authority() != self.user_authority
+                    or call.task_id != (owner_task_id or self.task_id)
+                    or call.session_key != (session_key or self.session_key)
+                    or call.session_id != (owner_session_id or self.parent_session_id)):
+                raise TerminalScopeDenied("terminal_original_caller_required")
+        return self
+
+    def cwd(self, value):
+        self.check()
+        p = Path(value or self.workspace)
+        if not p.is_absolute():
+            p = Path(self.workspace) / p
+        resolved = p.resolve()
+        if not resolved.is_relative_to(Path(self.workspace)):
+            raise TerminalScopeDenied("terminal_cwd_escape")
+        if not resolved.is_dir():
+            return self.workspace  # only the same admitted root is a fallback
+        return str(resolved)
+
+
+def cache_key(task_id):
+    from hermes_cli.friday_user_scope import current, delegation_authority
+    if current() is None:
+        return None
+    from agent.web_call_context import current_web_call
+    call = current_web_call()
+    if not call.task_id or not call.session_id or not call.turn_id:
+        raise TerminalScopeDenied("terminal_native_task_required")
+    # Caller raw task never collapses to the shared native container/default key.
+    key = "scoped-terminal:" + digest({"authority": delegation_authority(), "task": call.task_id,
+                                      "turn": call.turn_id, "original_deadline": call.run_deadline})
+    if task_id not in (None, call.task_id, key):
+        raise TerminalScopeDenied("terminal_task_binding_mismatch")
+    return key
+
+
+def admit_binding():
+    from hermes_cli.friday_user_scope import current, delegation_authority
+    from agent.web_call_context import current_web_call
+    from hermes_cli.config import load_config_readonly
+    cap = current(required=True)
+    call = current_web_call()
+    d = call.run_deadline
+    if type(d) not in (float, int) or not math.isfinite(d) or d - time.monotonic() <= 8:
+        raise TerminalScopeDenied("terminal_original_task_deadline_required")
+    if not all(isinstance(v, str) and v for v in (call.task_id, call.session_id, call.session_key, call.turn_id)):
+        raise TerminalScopeDenied("terminal_native_task_required")
+    policy = allocation(load_config_readonly().get("terminal", {}).get("scoped"))
+    workspace = cap.home / "workspace"
+    workspace_id = directory_identity(workspace)
+    checked_tree(workspace)
+    cache = _private_child(cap.home, "cache")
+    root = _private_child(cache, "terminal-scoped")
+    state = _private_child(root, digest({"authority": delegation_authority(), "task": call.task_id,
+                                      "turn": call.turn_id, "deadline": d}))
+    return TerminalBinding(canonical(delegation_authority()), call.task_id, call.session_id,
+                           call.session_key, call.turn_id, float(d),
+                           Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                           str(workspace), workspace_id, str(state), directory_identity(state),
+                           canonical(policy), cap, call.turn).check(caller=True)
