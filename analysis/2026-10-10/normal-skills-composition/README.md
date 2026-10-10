@@ -1,0 +1,11 @@
+# Ordinary skills in the current normal composition
+
+This source package joins the repaired native skills implementation with the accepted normal24 composition, including delegation. The existing exporter successfully composed 25 layers and 17,639 files. All 24 preceding layers retain their exact identities; the added overlay changes 26 existing files and adds three. Thirty accepted skill source bodies remain byte-identical. The single native merge conflict was the tool allowlist: the merged file retains delegation and adds the three reviewed skills tools, with every other scope function unchanged.
+
+The ordinary-user renderer now includes both skills and delegation, keeps skill discovery scoped to the user, and refuses a native scope missing any required skill tool. This combines the existing protections; it does not admit a direct terminal or browser. The source checker reads actual renderer constants, addressing the preceding checker's hardcoded toolset fixture. It uses selected AST bodies and explicit inert boundaries, so its results are source evidence only. The copied project tests are retained as source and were not executed in this package.
+
+See [source inventory](source-index.json), [composition](composition.json), [author checks](author-source-checks.json), and [current acceptance state](outcome.json). The preceding [normal24 package](../normal-delegation-composition/README.md) remains the exact base. The sources are inert analysis copies, and publishing them does not activate the product. The earlier stopped skills gate remains stopped; no historical budget or failed attempt is reset.
+
+Required next acceptance remains the actual prepared G8 owner-terminal result and confirmed cleanup, fresh applicable worker admission, exact installation inputs, both worker qualifications within the original installation budget, and the seven installed journeys/four web contexts. Native terminal integration remains required. No installed skills, live runtime, browser or release acceptance is claimed.
+
+Independent source review accepted the exact composition and inert export: ten checks passed, separate from the 21 author checks. Its initial checker parser error and correction are retained in the [review](independent-review.json); no product source changed during that correction.
