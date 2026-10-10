@@ -1,0 +1,11 @@
+# Normal delegation composition — 10 October 2026
+
+The actual normal Hermes source now composes all 24 layers automatically. Independent review checked all 17,636 files and accepted the source/configuration wiring; only five consumer bodies changed from the preceding 23-layer composition. Ordinary installation discovers these layers through its existing exporter and complete patch inventory.
+
+The repaired consumers retain failed SDK clients for later cleanup, retain the original profile/context during deferred notification cleanup, and recheck the original access generation in the actual message append after asynchronous waits. The prior three failing conditions remain in the earlier published snapshot. Independent consumer review passed 42 checks; final composition review passed 39, reusing unchanged accepted bodies. Author 48/39/17 counts are separate evidence.
+
+This package preserves all 15 integration files and all five final changed consumer bodies as exact inert source bytes. `source-index.json` identifies every file. The existing donor license is retained. No private paths, handoffs, user data or credential values are included. These files are analysis material; the production tree is not changed by this publication.
+
+Source presence, configuration, wiring, offline verification, live execution and release acceptance are recorded separately in `outcome.json`. Native configuration/import, ordinary installation, authenticated cold start, real delegation/reconciliation and all seven product/four web journeys remain unaccepted. The selected renderer checks use explicit inert native boundaries. No new runtime admission, retry, clock, source pin update or legacy restart follows from publication.
+
+Astra owns integration and final acceptance. Sol completed the normal wiring and is preparing the exact ordinary installation inputs. The next demonstrable result remains the normally installed and authenticated candidate with both worker paths; the separate caller laboratory is not a substitute. Existing system dependencies and retained A0/runtime stops must be resolved through their actual paths. Legacy local-model capacity is a temporary test profile; inference remains local without cloud fallback.

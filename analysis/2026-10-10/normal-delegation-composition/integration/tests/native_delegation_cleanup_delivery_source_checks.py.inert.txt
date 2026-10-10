@@ -1,0 +1,514 @@
+"""Author SOURCE controls: selected exact AST bodies and inert interfaces only."""
+import ast, builtins, contextlib, contextvars, copy, datetime, hashlib, io, json
+import os, pathlib, resource, sqlite3, types, __future__
+from concurrent.futures import Future
+
+S=types.SimpleNamespace
+import argparse
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--source',type=pathlib.Path,required=True)
+parser.add_argument('--baseline',type=pathlib.Path,required=True,
+                    help='Exact 23-layer source before this dependent repair')
+parser.add_argument('--output',type=pathlib.Path,required=True)
+args=parser.parse_args()
+BASE=args.baseline
+SRC=args.source
+rows=[]; pins={}; modules={'__future__':__future__, 'copy':copy,'contextvars':contextvars}
+logger=S(**{k:lambda *a,**kw:None for k in ('debug','info','warning','error','exception')})
+SENT='native_delegation_STOP_UNCONFIRMED'
+def read(rel):
+    p=SRC/rel
+    if not p.exists():p=BASE/rel
+    b=p.read_bytes(); pins[str(p)]=hashlib.sha256(b).hexdigest();return b
+def node(rel,name):
+    n=ast.parse(read(rel))
+    for part in name.split('.'):
+        n=next(v for v in n.body if isinstance(v,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and v.name==part)
+    return copy.deepcopy(n)
+def importer(name,globals=None,locals=None,fromlist=(),level=0):
+    assert name in modules, 'Forbidden native import '+name
+    return modules[name]
+def load(rel,name,env):
+    n=node(rel,name)
+    n.decorator_list=[d for d in n.decorator_list if not isinstance(d,ast.Name) or d.id not in ('staticmethod','classmethod')]
+    env.setdefault('__builtins__',{**vars(builtins),'__import__':importer})
+    env.setdefault('logger',logger);env.setdefault('time',S(time=lambda:100.,monotonic=lambda:100.))
+    m=ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),n],type_ignores=[])
+    exec(compile(ast.fix_missing_locations(m),rel,'exec'),env);return env[n.name]
+def raises(fn,text=SENT):
+    try:fn()
+    except BaseException as exc:
+        if text is not None:assert str(exc)==text,(type(exc).__name__,str(exc),text)
+        return exc
+    raise AssertionError('Expected refusal')
+def check(name,fn):
+    try:rows.append({'name':name,'status':'PASS','observation':fn()})
+    except AssertionError as exc:rows.append({'name':name,'status':'FAIL','error':str(exc)})
+    except BaseException as exc:rows.append({'name':name,'status':'HARNESS_ERROR','error':type(exc).__name__+': '+str(exc)})
+def run(coro):
+    try:coro.send(None)
+    except StopIteration as exc:return exc.value
+    raise AssertionError('Unexpected async work')
+
+# Actual request release, close, cached cleanup and final AIAgent.close.
+client='agent/client_lifecycle.py'; agent='run_agent.py'
+env={'suppress':contextlib.suppress,'_DELEGATED_CLOSE_FAILURES':contextvars.ContextVar('close_errors',default=None),
+     '_OPENAI_SLOT':'_request_client_cache','_ANTHROPIC_SLOT':'_request_anthropic_client_cache','_NO_SOCKETS_SUFFIX':' fixture no sockets'}
+load(agent,'_quietly',env);load(client,'_reset_slot',env)
+class Agent:
+    _REQUEST_CLIENT_REUSE_REASONS=frozenset({'request_complete','stream_request_complete'})
+for rel,prefix,names in [
+    (client,'ClientLifecycleMixin.',['_request_slot','_release_request_slot','_take_request_slot','_close_openai_client',
+        '_abort_request_slot_client','_abort_request_openai_client','_abort_request_anthropic_client',
+        '_retain_scoped_request_client','_close_scoped_request_client','_close_request_openai_client',
+        '_close_request_anthropic_client','_close_scoped_request_slot','_close_cached_request_openai_client',
+        '_close_cached_request_anthropic_client']),
+    (agent,'AIAgent.',['close','_close_resources','_drop_shared_client','_close_request_clients'])]:
+    for name in names:setattr(Agent,name,load(rel,prefix+name,env))
+class Wire:
+    def __init__(self,fail=True,exc=OSError):self.fail=fail;self.closed=0;self.exc=exc
+    def close(self):
+        self.closed+=1
+        if self.fail:raise self.exc('SDK close failed')
+def make_agent(wire=None,in_use=True,scoped=True,kind='openai'):
+    a=Agent();a._friday_delegation={} if scoped else None;a._openai_client_lock=lambda:contextlib.nullcontext()
+    a._client_log_context=lambda:'fixture';a._anthropic_log_context=lambda:'fixture';a._force_close_tcp_sockets=lambda c:0
+    a._request_client_cache={'client':None,'in_use':False,'poisoned':False,'key':None}
+    a._request_anthropic_client_cache={'client':None,'in_use':False,'poisoned':False,'key':None}
+    cache=a._request_client_cache if kind=='openai' else a._request_anthropic_client_cache
+    cache.update(client=wire,in_use=in_use,key='same')
+    a.shutdown_memory_provider=lambda *_:None;a._close_task_resources=lambda *_:None
+    a._close_active_children=lambda **_:None;a._close_codex_session=lambda:None
+    a._trim_process_memory=lambda:None;a._finalize_owned_session_row=lambda:None
+    return a
+def pending(a,w):return any(row['client'] is w for row in getattr(a,'_friday_pending_request_clients',()))
+def owner_failed(kind='openai',poisoned=False,exc=OSError):
+    w=Wire(exc=exc);a=make_agent(w,kind=kind)
+    slot=a._request_client_cache if kind=='openai' else a._request_anthropic_client_cache
+    slot['poisoned']=poisoned
+    fn=a._close_request_openai_client if kind=='openai' else a._close_request_anthropic_client
+    raises(lambda:fn(w,reason='stream_request_complete' if poisoned else 'request_error_cleanup'))
+    assert pending(a,w) and slot['client'] is None and w.closed==1
+    raises(a.close);assert pending(a,w) and w.closed==2 and a._friday_delegation['cleanup_unconfirmed']
+    w.fail=False;a.close();assert not pending(a,w) and w.closed==3
+    return {'initial_and_final_failures_retained':True,'actual_later_close_succeeded':True,'kind':kind}
+check('R1_request_error_exact_handle_then_final_close',owner_failed)
+check('R1_anthropic_request_error_then_final_close',lambda:owner_failed('anthropic'))
+check('R1_keyboard_interrupt_retains_exact_handle',lambda:owner_failed(exc=KeyboardInterrupt))
+qenv={'threading':S(get_ident=lambda:17)}
+registry_close=load('agent/chat_completion_helpers.py','_RequestClientRegistry.close_once',qenv)
+def registry_owner():
+    w=Wire();a=make_agent(w);a._request_client_cache['poisoned']=True
+    request=S(lock=contextlib.nullcontext(),client=w,kind='openai',owner_tid=17,agent=a)
+    raises(lambda:registry_close(request,'stream_request_complete'))
+    assert request.client is None and pending(a,w) and w.closed==1
+    raises(a.close);assert pending(a,w) and w.closed==2
+    w.fail=False;a.close();assert not pending(a,w)
+    return 'Actual poisoned streaming registry clears itself only after ownership transferred to agent pending list'
+check('R1_actual_poisoned_stream_owner_registry',registry_owner)
+def nonstream_finally():
+    w=Wire();a=make_agent(w);a._interrupt_requested=False;a._touch_activity=lambda *_:None
+    request=S(lock=contextlib.nullcontext(),stale=False,make_client=None,abort_hook=object(),
+              start_watchdogs=lambda:None,stop_watchdogs=lambda:None,pop_client=lambda:w)
+    e={'_check_stale_giveup':lambda _:None,'_resolve_direct_stale_timeout':lambda *a:60,
+       '_InlineRequest':lambda *a:request,'_dispatch_nonstreaming_api_request':lambda *a,**kw:(_ for _ in ()).throw(OSError('request failed')),
+       '_reset_stale_streak':lambda _:None}
+    modules['agent.chat_completion_nonstream']=S(_inline_nonstream_hard_timeout=lambda _:None)
+    direct=load('agent/chat_completion_helpers.py','direct_api_call',e)
+    raises(lambda:direct(a,{}));assert pending(a,w)
+    raises(a.close);assert pending(a,w)
+    return 'Actual nonstream finally releases its popped client into retained scoped cleanup and final STOP'
+check('R1_actual_nonstream_request_finally_consumer',nonstream_finally)
+def healthy_reuse(scoped=True):
+    for kind in ('openai','anthropic'):
+        w=Wire(False);a=make_agent(w,scoped=scoped,kind=kind)
+        fn=a._close_request_openai_client if kind=='openai' else a._close_request_anthropic_client
+        fn(w,reason='request_complete');assert not pending(a,w) and w.closed==0
+        cache=a._request_client_cache if kind=='openai' else a._request_anthropic_client_cache
+        assert cache['client'] is w and not cache['in_use'];a.close();assert w.closed==1
+    return 'Warm reuse retained and final close exactly once'
+check('R1_scoped_healthy_reuse_unchanged',healthy_reuse)
+check('R1_unscoped_healthy_reuse_unchanged',lambda:healthy_reuse(False))
+def unscoped_error():
+    w=Wire();a=make_agent(w,scoped=False)
+    a._close_request_openai_client(w,reason='request_error_cleanup');a.close()
+    assert not pending(a,w) and w.closed==1 and a._request_client_cache['client'] is None
+    return 'Existing unscoped best-effort failure behavior retained'
+check('R1_unscoped_error_cleanup_unchanged',unscoped_error)
+def multiple_pending():
+    w1,w2=Wire(),Wire();a=make_agent(w1)
+    for w in (w1,w2):raises(lambda:a._close_request_openai_client(w,reason='request_error_cleanup'))
+    assert pending(a,w1) and pending(a,w2)
+    w1.fail=False;raises(a.close);assert not pending(a,w1) and pending(a,w2)
+    w2.fail=False;a.close();assert not pending(a,w2)
+    return 'Uncached concurrent request handle retained; successful sibling does not erase failed sibling'
+check('R1_multiple_exact_pending_clients',multiple_pending)
+def inactive_failed_cache():
+    w=Wire();a=make_agent(w,in_use=False);raises(a.close)
+    assert w.closed==1 and pending(a,w) and a._request_client_cache['client'] is w
+    raises(a.close);assert w.closed==2 and pending(a,w)
+    w.fail=False;a.close();assert w.closed==3 and not pending(a,w) and a._request_client_cache['client'] is None
+check('R1_final_failed_cache_one_attempt_per_slice',inactive_failed_cache)
+def active_worker():
+    w=Wire();a=make_agent(w);a._delegate_worker_future=Future()
+    raises(a.close);assert w.closed==0 and a._request_client_cache['client'] is w
+check('R1_active_worker_still_prevents_cross_thread_close',active_worker)
+def force_fail():
+    w=Wire(False);a=make_agent(w);a._force_close_tcp_sockets=lambda _:(_ for _ in ()).throw(OSError('shutdown failed'))
+    raises(lambda:a._close_request_openai_client(w,reason='request_error_cleanup'))
+    assert pending(a,w) and w.closed==0;raises(a.close);assert pending(a,w)
+check('R1_socket_shutdown_failure_retains_exact_client',force_fail)
+
+# Real Future callbacks after context unwind; actual Relay end_turn + unregister fallback.
+childrel='tools/delegate_tool_child_run.py';chenv={**env,'contextvars':contextvars,'contextmanager':contextlib.contextmanager}
+load('tools/delegate_tool_progress.py','_quiet',chenv)
+for name in ('_stop_unconfirmed','_close_child','_defer_close_after_timeout'):load(childrel,name,chenv)
+effects=[];homevar=contextvars.ContextVar('original_profile',default='operator')
+capvar=contextvars.ContextVar('original_authority',default='operator-authority')
+active=[False];hosts={}
+relay=S(get_runtime=lambda *,create=False,profile_key=None:hosts.get(profile_key or homevar.get()),
+        current_profile_key=lambda:homevar.get(),
+        SESSION_COORDINATOR=S(has_active_turn=lambda **kw:kw['profile_key']=='user' and active[0]))
+modules['agent']=S(relay_runtime=relay);modules['model_tools']=S(_last_resolved_tool_names=[])
+modules['tools.code_kernel']=S(shutdown_kernels_for_delegated_child=lambda sid:effects.append(('kernels',sid)))
+chenv.update(_unregister_subagent=lambda sid,**kw:effects.append(('registry',sid)),
+             _detach_child=lambda p,c:effects.append(('detach',c.session_id)),
+             _safe_progress=lambda *a,**kw:effects.append(('complete',kw)))
+cleanup=load(childrel,'_ChildRun.cleanup',chenv)
+rr='agent/relay_runtime.py';re={'contextlib':contextlib}
+load(rr,'_warn_on_error',re)
+class Host:
+    def __init__(self,failures=0):
+        self._sessions_lock=contextlib.nullcontext();self._subagent_parents={'child':'parent'}
+        self._subagent_parent_handles={'child':object()};self.closes=0;self.failures=failures
+    def close_session(self,event):
+        self.closes+=1;effects.append(('relay_close',homevar.get(),capvar.get()))
+        if self.closes<=self.failures:raise OSError('native Relay close failure')
+for name in ('unregister_subagent','_forget_subagent'):setattr(Host,name,load(rr,'RelayRuntime.'+name,re))
+re['RelayRuntime']=Host;end_turn=load(rr,'RelaySessionCoordinator.end_turn',re)
+hb=S(stop=lambda:None);pool=S(release_lease=lambda lease:effects.append(('lease',lease)))
+@contextlib.contextmanager
+def origin():
+    t=homevar.set('user');u=capvar.set('user-original-authority')
+    try:yield
+    finally:capvar.reset(u);homevar.reset(t)
+def make_run(future=None,close_error=False):
+    def close():
+        effects.append(('child_close',homevar.get(),capvar.get()))
+        if close_error:raise OSError('child close failed')
+    child=S(_friday_delegation={},session_id='child',close=close)
+    runner=S(child=child,subagent_id='sub-1',parent_agent='parent',child_future=future,
+             child_progress_cb=None,_pending_completion=None)
+    runner.cleanup=lambda **kw:cleanup(runner,**kw)
+    return runner,child
+def invoke(r,late):return r.cleanup(heartbeat=hb,child_pool=pool,leased_cred_id='lease',close_deferred=late)
+def settle(f):
+    # Expected Future callback failures remain in Future's actual diagnostic path.
+    err=io.StringIO()
+    with contextlib.redirect_stderr(err):f.set_result({'status':'completed'})
+    return err.getvalue()
+def deferred_positive(already_done=False):
+    effects.clear();hosts.clear();hosts['user']=Host();future=Future()
+    if already_done:future.set_result(None)
+    r,c=make_run(future)
+    with origin():raises(lambda:invoke(r,True))
+    if not already_done:settle(future)
+    assert ('child_close','user','user-original-authority') in effects
+    assert ('relay_close','user','user-original-authority') in effects
+    assert ('detach','child') in effects and not c._friday_delegation['cleanup_unconfirmed']
+    assert homevar.get()=='operator' and capvar.get()=='operator-authority'
+    return {'callback_context':'original user/profile/capability','inline':already_done,'effects':effects.copy()}
+check('R2_late_Future_callback_restores_original_context',deferred_positive)
+check('R2_already_done_inline_registration_race',lambda:deferred_positive(True))
+def end_turn_fallback(failures=1):
+    effects.clear();hosts.clear();host=hosts['user']=Host(failures);future=Future();r,c=make_run(future)
+    lease=S(host=host,live_runtime=lambda:host,parent_session_id='parent',session_id='child',session=S(lock=contextlib.nullcontext(),segment_turns=0))
+    turn=S(finalize_lock=contextlib.nullcontext(),closed=False,lease=lease,_active_registered=False)
+    coordinator=S(_close_turn_scope=lambda *a,**kw:None,_unregister_active_turn=lambda _:None,
+                  _reset_turn_context=lambda _:None,_consume_deferred_close=lambda _:None)
+    with origin():
+        raises(lambda:invoke(r,True));end_turn(coordinator,turn,outcome='interrupted')
+        assert host.closes==1 and 'child' in host._subagent_parents
+    diagnostic=settle(future)
+    assert host.closes==2 and r._cleanup_runtime is host
+    if failures==1:
+        assert 'child' not in host._subagent_parents and ('detach','child') in effects and not c._friday_delegation['cleanup_unconfirmed']
+    else:
+        assert 'child' in host._subagent_parents and not any(e[0] in {'detach','lease','registry'} for e in effects)
+        assert c._friday_delegation['cleanup_unconfirmed'] and SENT in diagnostic
+    return {'actual_end_turn_close_attempts':host.closes,'continued_failure':failures>1,'controls_retained':failures>1}
+check('R2_actual_Relay_end_turn_failed_close_fallback',end_turn_fallback)
+check('R2_persistent_original_Relay_failure_keeps_controls',lambda:end_turn_fallback(2))
+def invalid_runtime(mode):
+    effects.clear();hosts.clear();host=hosts['user']=Host();future=Future();r,c=make_run(future)
+    with origin():raises(lambda:invoke(r,True))
+    if mode=='active':active[0]=True
+    elif mode=='missing':hosts.pop('user')
+    else:hosts['user']=Host()
+    try:
+        diagnostic=settle(future)
+        assert not any(e[0] in {'child_close','detach','lease','registry'} for e in effects),effects
+        assert c._friday_delegation['cleanup_unconfirmed'] and SENT in diagnostic
+        assert r._cleanup_runtime is host
+    finally:active[0]=False
+check('R2_original_profile_active_turn_blocks_cleanup',lambda:invalid_runtime('active'))
+check('R2_original_runtime_disappeared_blocks_detach',lambda:invalid_runtime('missing'))
+check('R2_replacement_runtime_cannot_adopt_cleanup',lambda:invalid_runtime('replacement'))
+def direct_foreign():
+    effects.clear();hosts.clear();hosts['user']=Host();future=Future();r,c=make_run(future)
+    with origin():raises(lambda:invoke(r,True))
+    raises(lambda:invoke(r,False));assert not effects and c._friday_delegation['cleanup_unconfirmed']
+check('R2_foreign_direct_cleanup_refused_before_effects',direct_foreign)
+def child_failure():
+    effects.clear();hosts.clear();hosts['user']=Host();future=Future();r,c=make_run(future,True)
+    with origin():raises(lambda:invoke(r,True))
+    settle(future);assert c._friday_delegation['cleanup_unconfirmed'] and not any(e[0] in {'lease','registry','detach'} for e in effects)
+check('R2_child_close_failure_does_not_release_controls',child_failure)
+
+# API gateway -> actual wake awaits -> actual append transaction, with real memory SQLite.
+class Denied(PermissionError):pass
+class Cap:
+    def __init__(self,user='alice',generation=7):
+        self.principal=('api_server','transport','account',user);self.profile=user+'-profile'
+        self.home=pathlib.Path('/fixture/'+user);self.authorization_home=pathlib.Path('/fixture/root')
+        self.binding={'tools':['delegate_task']};self.admission_generation=generation;self.directory_identity=(1,2);self.revoked=False
+    def check(self):
+        if self.revoked:raise Denied('revoked')
+        return self
+cap=Cap();currentvar=contextvars.ContextVar('API_original_cap',default=cap)
+scope='hermes_cli/friday_user_scope.py'
+se={'_CURRENT':currentvar,'_ENGAGED':False,'ScopeDenied':Denied,'UserScope':Cap,'json':json,'hashlib':hashlib,
+    'Path':pathlib.Path,'contextmanager':contextlib.contextmanager,'MARKER':'marker',
+    'policy':lambda home:True,'check_database':lambda cap:None}
+for name in ('current','_fingerprint','_same_scope','delegation_authority','delegation_visible','scoped_source'):load(scope,name,se)
+modules['hermes_constants']=S(get_hermes_home=lambda:cap.home)
+modules['gateway.session_identity']=S(identity_of=lambda s:s.identity)
+modules['hermes_cli.friday_user_scope']=S(**{n:se[n] for n in ('current','delegation_authority','delegation_visible','scoped_source','_same_scope')},ScopeDenied=Denied)
+ve={};visible=load('tools/async_delegation.py','_visible',ve);modules['tools.async_delegation']=S(_visible=visible)
+async def immediate(fn,*a,**kw):return fn(*a,**kw)
+ge={'contextlib':contextlib,'asyncio':S(to_thread=immediate)}
+gateway='gateway/run_notifications.py'
+load(gateway,'_raw_process_event_session_id',ge)
+class Gateway:pass
+Gateway._delegation_notice_visible=load(gateway,'GatewayNotificationsMixin._delegation_notice_visible',ge)
+Gateway._self_post_api_server=load(gateway,'GatewayNotificationsMixin._self_post_api_server',ge)
+identity=S(authorization_home=cap.authorization_home,runtime_profile=cap.profile,runtime_home=cap.home,
+           transport_profile='transport',transport_inferred=False,multiplexed=True)
+source=S(identity=identity,_friday_user_scope=cap,platform=S(value='api_server'),user_id='alice',profile=cap.profile,chat_id='raw',thread_id='')
+g=Gateway();g._build_process_event_source=lambda evt:source;g._is_user_authorized=lambda src:src is source
+modules['gateway.warning_notifications']=S(warning_notifications_enabled=lambda _:True)
+we={'asyncio':S(to_thread=immediate)}
+load('gateway/wake.py','_delegation_display_metadata',we)
+persist=load('gateway/wake.py','persist_delegation_delivery',we)
+modules['gateway.wake']=S(deliver_wake=lambda *a,**kw:None,persist_delegation_delivery=persist)
+me={'json':json,'stamp_message_uid':lambda msg:msg.update(uid='fixture-uid'),
+    '_INSERT_MESSAGE_SQL':'INSERT INTO messages(session_id,content,display_kind,display_metadata) VALUES(?,?,?,?)'}
+append=load('hermes_state_messages.py','SessionMessagesMixin.append_delegation_delivery',me)
+class DB:
+    _TRANSCRIPT_WRITE_PATIENCE_S=1
+    append_delegation_delivery=append
+    def __init__(self):
+        self.conn=sqlite3.connect(':memory:')
+        self.conn.execute('CREATE TABLE sessions(id TEXT PRIMARY KEY,parent_session_id TEXT,end_reason TEXT)')
+        self.conn.execute('CREATE TABLE messages(id INTEGER PRIMARY KEY,session_id TEXT,content TEXT,display_kind TEXT,display_metadata TEXT)')
+        self.conn.execute("INSERT INTO sessions VALUES('raw',NULL,NULL)");self.conn.commit()
+        self.write_hook=lambda:None;self.guard_hook=lambda:None;self.resolve_hook=lambda sid:sid;self.counters=0
+    def resolve_resume_session_id(self,sid):return self.resolve_hook(sid)
+    def _message_row_params(self,sid,role,msg,*args,**kw):return(sid,msg['content'],msg['display_kind'],json.dumps(msg['display_metadata']))
+    def _check_transcript_write_guards(self,*a,**kw):self.guard_hook()
+    def _bump_session_counters(self,*a,**kw):self.counters+=1
+    def _execute_write(self,fn,**kw):
+        self.write_hook()
+        with self.conn:return fn(self.conn)
+    def count(self):return self.conn.execute('SELECT count(*) FROM messages').fetchone()[0]
+def evt(final=False):
+    return {'type':'async_delegation','delegation_id':'unit','session_key':'raw','origin_session_id':'raw',
+            'platform':'api_server','task_failure_notice':not final,'results':[{'task_index':0,'status':'error'}],
+            'friday_user_authority':se['delegation_authority']()}
+def api_positive(final=False):
+    db=DB();e=evt(final);a=S(_ensure_session_db=lambda:db)
+    try:
+        assert run(g._self_post_api_server(a,'notice','raw',e)) is True
+        assert run(g._self_post_api_server(a,'notice','raw',e)) is True
+        assert db.count()==1 and db.counters==1
+        metadata=json.loads(db.conn.execute('SELECT display_metadata FROM messages').fetchone()[0])
+        assert 'friday_user_authority' not in metadata and 'authority_guard' not in metadata
+        assert ('delivery_notice' in metadata)==(not final)
+        return {'actual_SQL_rows':1,'deduplicated_replay':True,'final_event':final,'private_pin_not_persisted':True}
+    finally:db.conn.close()
+check('R3_actual_API_append_positive_and_deduplication',api_positive)
+check('R3_final_API_event_also_retains_authority',lambda:api_positive(True))
+def api_revoke(boundary,change='revoke',final=False):
+    db=DB();e=evt(final);oldgen=cap.admission_generation;olduser=source.user_id
+    def mutate():
+        if change=='regrant':cap.admission_generation+=1;e['friday_user_authority']=se['delegation_authority']()
+        elif change=='foreign':source.user_id='bob'
+        else:cap.revoked=True
+    def ensure():
+        if boundary=='DB':mutate()
+        return db
+    def resolve(sid):
+        if boundary=='lineage':mutate()
+        return sid
+    db.resolve_hook=resolve
+    if boundary=='writer':db.write_hook=mutate
+    if boundary=='guard':db.guard_hook=mutate
+    try:
+        response=run(g._self_post_api_server(S(_ensure_session_db=ensure),'notice','raw',e))
+        assert response is False and db.count()==0 and db.counters==0,(response,db.count())
+        return {'actual_SQL_rows':0,'boundary':boundary,'change':change,'final_event':final}
+    finally:cap.revoked=False;cap.admission_generation=oldgen;source.user_id=olduser;db.conn.close()
+for boundary in ('DB','lineage','writer','guard'):
+    for change in ('revoke','regrant','foreign'):
+        check('R3_'+boundary+'_'+change,lambda b=boundary,c=change:api_revoke(b,c))
+check('R3_final_revoke_after_DB_await',lambda:api_revoke('DB',final=True))
+def foreign_raw_target():
+    db=DB()
+    try:
+        assert run(g._self_post_api_server(S(_ensure_session_db=lambda:db),'notice','foreign',evt())) is False
+        assert db.count()==0
+    finally:db.conn.close()
+check('R3_foreign_raw_session_target_refused',foreign_raw_target)
+def direct_scoped_no_guard():
+    db=DB()
+    try:
+        raises(lambda:run(persist(S(_ensure_session_db=lambda:db),text='notice',session_id='raw',evt=evt())),None)
+        assert db.count()==0
+    finally:db.conn.close()
+check('R3_scoped_helper_cannot_bypass_actual_guard',direct_scoped_no_guard)
+def ordinary_direct():
+    db=DB()
+    try:
+        run(persist(S(_ensure_session_db=lambda:db),text='notice',session_id='raw',evt={'delegation_id':'ordinary'}))
+        assert db.count()==1
+    finally:db.conn.close()
+check('R3_ordinary_unscoped_direct_persistence_unchanged',ordinary_direct)
+def compression_replay():
+    db=DB();e=evt()
+    try:
+        assert run(g._self_post_api_server(S(_ensure_session_db=lambda:db),'notice','raw',e)) is True
+        db.conn.execute("UPDATE sessions SET end_reason='compression' WHERE id='raw'")
+        db.conn.execute("INSERT INTO sessions VALUES('tip','raw',NULL)");db.conn.commit()
+        db.resolve_hook=lambda sid:'tip'
+        assert run(g._self_post_api_server(S(_ensure_session_db=lambda:db),'notice','raw',e)) is True
+        assert db.count()==1 and db.counters==1
+        return 'Actual recursive lineage SQL reuses original notice id across compression'
+    finally:db.conn.close()
+check('R3_actual_compressed_lineage_replay_deduplicated',compression_replay)
+
+
+# The unchanged real stranger-thread abort must still defer owner close.
+def stranger_owner_transition():
+    w=Wire(False);a=make_agent(w);request=S(lock=contextlib.nullcontext(),client=w,kind='openai',owner_tid=99,agent=a)
+    registry_close(request,'interrupt');assert w.closed==0 and request.client is w and a._request_client_cache['poisoned']
+    request.owner_tid=17;registry_close(request,'stream_request_complete')
+    assert w.closed==1 and request.client is None and not pending(a,w)
+    return 'Actual stranger abort poisons without releasing client; actual owner then closes once'
+check('R1_actual_stranger_abort_owner_close_preserved',stranger_owner_transition)
+
+# An ambient/default/foreign callback context cannot become the API authority.
+def foreign_callback_context():
+    db=DB();e=evt();foreign=Cap('bob');tokenbox=[]
+    def ensure():
+        tokenbox.append(currentvar.set(foreign));return db
+    try:
+        assert run(g._self_post_api_server(S(_ensure_session_db=ensure),'notice','raw',e)) is True
+        assert db.count()==1 and currentvar.get() is foreign
+        return 'Retained original context enters actual writer callback; ambient foreign capability is not merged/adopted'
+    finally:
+        for token in reversed(tokenbox):currentvar.reset(token)
+        db.conn.close()
+check('R3_actual_writer_uses_retained_not_foreign_context',foreign_callback_context)
+
+# The actual per-attempt writer callback checks every invocation, including retry.
+def append_retry_recheck():
+    db=DB();e=evt();guardcalls=[]
+    def guard():guardcalls.append(cap.revoked);return not cap.revoked
+    try:
+        assert db.append_delegation_delivery('raw','notice',we['_delegation_display_metadata'](e),authority_guard=guard)==1
+        cap.revoked=True
+        raises(lambda:db.append_delegation_delivery('raw','notice',we['_delegation_display_metadata'](e),authority_guard=guard),None)
+        assert db.count()==1 and guardcalls==[False,False,True]
+        return 'Exact _do closure revalidates on next invocation, including duplicate/retry; no revoked dedup success'
+    finally:cap.revoked=False;db.conn.close()
+check('R3_append_callback_every_invocation_rechecks_guard',append_retry_recheck)
+
+# Existing late-result path remains deliberately nonterminal with occupied capacity.
+def conservative_late_SQL():
+    conn=sqlite3.connect(':memory:')
+    conn.execute('CREATE TABLE async_delegations(delegation_id TEXT PRIMARY KEY,state TEXT,result_json TEXT,updated_at REAL)')
+    conn.execute('INSERT INTO async_delegations VALUES(?,?,?,?)',('unit','running',json.dumps({'results':[{'task_index':0,'status':'completed'}]}),0))
+    @contextlib.contextmanager
+    def transaction():
+        with conn:yield conn
+    ae={'_DB_LOCK':contextlib.nullcontext(),'_records_lock':contextlib.nullcontext(),'_transaction':transaction,
+        'json':json,'_ACTIVE_STATES':{'running','stalling'},'_LIVE_STATES':{'running','stalling','finalizing'}}
+    for name in ('_persist_stop_unconfirmed','record_unit_child','_finalize','active_count','_sweep_stale_locked'):
+        load('tools/async_delegation.py',name,ae)
+    handle=object();events=[];ae['_push_completion_event']=lambda *a:events.append(a)
+    ae['_records']={'unit':{'delegation_id':'unit','slot_key':'unit','status':'stalling','stop_unconfirmed':True,
+                         '_runner_finished':True,'interrupt_fn':handle,'progress_fn':handle}}
+    try:
+        ae['_finalize']('unit',{},'error');ae['record_unit_child']('unit',{'task_index':1,'status':'completed'})
+        state,raw=conn.execute('SELECT state,result_json FROM async_delegations').fetchone()
+        assert state=='running' and json.loads(raw)['stop_unconfirmed'] and len(json.loads(raw)['results'])==2
+        assert ae['_records']['unit']['interrupt_fn'] is handle and ae['active_count']()==1 and not events
+        assert ae['_sweep_stale_locked'](1000)==([],[],False)
+        return 'Actual memory SQL keeps both siblings and STOP; exact handle/capacity retained, no late result invention'
+    finally:conn.close()
+check('actual_late_SQL_capacity_remains_conservative',conservative_late_SQL)
+
+def missing_pin_final():
+    db=DB();e=evt(True);e['friday_user_authority']=None
+    try:
+        assert run(g._self_post_api_server(S(_ensure_session_db=lambda:db),'notice','raw',e)) is False
+        assert db.count()==0
+    finally:db.conn.close()
+check('R3_protected_final_missing_original_pin_refused',missing_pin_final)
+def ordinary_gateway():
+    db=DB();token=currentvar.set(None);e={'type':'async_delegation','delegation_id':'ordinary','session_key':'raw','platform':'api_server'}
+    try:
+        assert run(g._self_post_api_server(S(_ensure_session_db=lambda:db),'notice','raw',e)) is True
+        assert db.count()==1
+    finally:currentvar.reset(token);db.conn.close()
+check('R3_ordinary_unscoped_actual_gateway_preserved',ordinary_gateway)
+def unscoped_callback():
+    calls=[];child=S(close=lambda:calls.append(homevar.get()));future=Future()
+    with origin():chenv['_defer_close_after_timeout'](child,future)
+    settle(future);assert calls==['operator']
+    return 'Existing unscoped callback behavior preserved; scoped-only context pin does not change donor default'
+check('R2_unscoped_callback_semantics_preserved',unscoped_callback)
+
+# Source preservation: no unrelated definitions changed and conservative nonterminal behavior remains.
+def source_delta():
+    allowed={
+      'agent/client_lifecycle.py':{'ClientLifecycleMixin._release_request_slot','ClientLifecycleMixin._close_openai_client',
+        'ClientLifecycleMixin._close_scoped_request_slot','ClientLifecycleMixin._close_cached_request_openai_client',
+        'ClientLifecycleMixin._close_cached_request_anthropic_client','ClientLifecycleMixin._close_request_anthropic_client',
+        'ClientLifecycleMixin._retain_scoped_request_client','ClientLifecycleMixin._close_scoped_request_client'},
+      'tools/delegate_tool_child_run.py':{'_defer_close_after_timeout','_ChildRun.cleanup'},
+      'gateway/run_notifications.py':{'GatewayNotificationsMixin._self_post_api_server','GatewayNotificationsMixin._delegation_notice_visible'},
+      'gateway/wake.py':{'persist_delegation_delivery'},
+      'hermes_state_messages.py':{'SessionMessagesMixin.append_delegation_delivery'}}
+    def funcs(t,prefix=''):
+        result={}
+        for n in t.body:
+            if isinstance(n,ast.ClassDef):result.update(funcs(n,prefix+n.name+'.'))
+            elif isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)):result[prefix+n.name]=ast.dump(n,include_attributes=False)
+        return result
+    deltas={}
+    for rel,expected in allowed.items():
+        old=funcs(ast.parse((BASE/rel).read_bytes()));new=funcs(ast.parse(read(rel)))
+        changed={k for k in old.keys()|new.keys() if old.get(k)!=new.get(k)}
+        assert changed==expected,(rel,changed^expected);deltas[rel]=sorted(changed)
+    return deltas
+check('exact_AST_delta_no_feature_removal',source_delta)
+result={'kind':'AUTHOR_SOURCE_ONLY','checks':rows,'passed':sum(r['status']=='PASS' for r in rows),
+        'failed':sum(r['status']=='FAIL' for r in rows),'harness_errors':sum(r['status']=='HARNESS_ERROR' for r in rows),
+        'pins':pins,'native_imports':False,'actual_threads_workers':False,'actual_native_handles':False,
+        'sqlite':'memory-only, all closed','cpu_affinity':sorted(os.sched_getaffinity(0)),
+        'as_limit':resource.getrlimit(resource.RLIMIT_AS),'independent_review':False,'runtime_acceptance':False,
+        'at_msk':datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3))).isoformat()}
+path=args.output;path.write_text(json.dumps(result,ensure_ascii=False,indent=2,default=str)+'\n')
+print(json.dumps({k:v for k,v in result.items() if k!='pins'},ensure_ascii=False,default=str))
+raise SystemExit(1 if result['failed'] or result['harness_errors'] else 0)

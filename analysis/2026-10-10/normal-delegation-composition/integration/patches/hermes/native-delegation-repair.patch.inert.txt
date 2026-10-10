@@ -1,0 +1,614 @@
+diff --git a/agent/client_lifecycle.py b/agent/client_lifecycle.py
+--- a/agent/client_lifecycle.py
++++ b/agent/client_lifecycle.py
+@@ -117,9 +117,15 @@
+                     # user can still stop it on purpose via process_manage kill.
+                     if process.get("persist_on_release"):
+                         continue
+-                    process_registry.kill_process(
++                    result = process_registry.kill_process(
+                         process["session_id"], source="agent_close", consume_output=True,
+                     )
++                    if getattr(self, "_friday_cleanup_in_progress", False) and (
++                            not isinstance(result, dict) or result.get("status") not in
++                            {"killed", "already_exited", "QUIESCENT"}
++                            or result.get("process_running") or result.get("scope_stop_failed")
++                            or result.get("survivors")):
++                        raise RuntimeError("native_delegation_STOP_UNCONFIRMED")
+ 
+         def release_computer_use() -> None:
+             from tools.computer_use.tool import release_computer_use_session
+@@ -206,6 +212,8 @@
+             logger.info("OpenAI client closed (%s, shared=%s, tcp_force_closed=%d) %s", reason, shared, force_closed, ctx)
+         except Exception as exc:
+             logger.debug("OpenAI client close failed (%s, shared=%s) %s error=%s", reason, shared, ctx, exc)
++            if getattr(self, "_friday_cleanup_in_progress", False):
++                raise
+ 
+     def _retire_shared_openai_client(self, client: Any, *, reason: str) -> None:
+         """Ownership-safe retirement of a replaced shared OpenAI client: ``shutdown()`` sockets only, FDs to GC.
+@@ -468,8 +476,24 @@
+         if not self._release_request_slot(_OPENAI_SLOT, client, reason):
+             self._close_openai_client(client, reason=reason, shared=False)
+ 
++    def _close_scoped_request_slot(self, slot_attr: str) -> None:
++        """A checked-out or failed-close client remains in its exact native cache slot."""
++        with self._openai_client_lock():
++            cache = getattr(self, slot_attr, None)
++            client = cache.get("client") if cache else None
++            if client is None:
++                return
++            if cache.get("in_use"):
++                raise RuntimeError("native_delegation_STOP_UNCONFIRMED")
++            # No active owner: use the existing close operation, but keep its handle on failure.
++            self._force_close_tcp_sockets(client)
++            client.close()
++            _reset_slot(cache)
++
+     def _close_cached_request_openai_client(self, *, reason: str) -> None:
+         """Teardown hook: really close the cached per-request wire client."""
++        if getattr(self, "_friday_cleanup_in_progress", False):
++            return self._close_scoped_request_slot(_OPENAI_SLOT)
+         client, in_use = self._take_request_slot(_OPENAI_SLOT)
+         if client is None:
+             return
+@@ -542,6 +566,8 @@
+ 
+     def _close_cached_request_anthropic_client(self, *, reason: str) -> None:
+         """Teardown hook: really close the cached per-request Anthropic client."""
++        if getattr(self, "_friday_cleanup_in_progress", False):
++            return self._close_scoped_request_slot(_ANTHROPIC_SLOT)
+         client, in_use = self._take_request_slot(_ANTHROPIC_SLOT)
+         if client is None:
+             return
+diff --git a/gateway/run_notifications.py b/gateway/run_notifications.py
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -1213,6 +1213,8 @@
+         try:
+             logger.info(info, raw_sid)
+             async with scope:
++                if not self._delegation_notice_visible(evt):
++                    return None
+                 await deliver()
+             return True
+         except Exception as e:
+@@ -1275,6 +1277,8 @@
+         """
+         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
+         source = await asyncio.to_thread(self._build_process_event_source, evt)
++        if not self._delegation_notice_visible(evt, source=source):
++            return None
+         if not source:
+             # API-server sessions bind the RAW X-Hermes-Session-Id key, not a structured ``agent:...`` key.
+             raw_sid = _raw_process_event_session_id(evt)
+@@ -1344,6 +1348,8 @@
+             _prime = getattr(adapter, "prime_routing_cache", None)
+             if callable(_prime):
+                 _prime(synth_event)
++            if not self._delegation_notice_visible(evt, source=source):
++                return None
+             await admit_internal_event(adapter, synth_event)
+             return True
+         except WakeNotAccepted:
+@@ -1480,6 +1486,26 @@
+                 return False
+         return True
+ 
++    def _delegation_notice_visible(self, evt: dict, *, source=None) -> bool:
++        """An interim notice uses the retained pin, never the final delivery row."""
++        if evt.get("type") != "async_delegation" or not evt.get("task_failure_notice"):
++            return True
++        from tools.async_delegation import _visible
++        from hermes_cli.friday_user_scope import scoped_source, ScopeDenied
++        try:
++            if evt.get("friday_user_authority") is None:
++                return _visible(evt)  # unchanged unscoped behavior; protected missing pins refuse
++            if source is None:
++                source = self._build_process_event_source(evt)
++            if source is None or not self._is_user_authorized(source):
++                return False
++            # Native authorization binds the real source. Its current generation must
++            # equal the original event pin; revoke/regrant cannot adopt old work.
++            with scoped_source(source):
++                return _visible(evt)
++        except (ScopeDenied, ValueError, OSError):
++            return False
++
+     async def _preflight_completion_delivery(self, evt: dict) -> "_CompletionClaim":
+         """Claim the durable row (async delegations) and verify the target before adapter acceptance.
+ 
+@@ -1489,6 +1515,9 @@
+         """
+         claim = self._CompletionClaim()
+         evt_type = evt.get("type")
++        if not self._delegation_notice_visible(evt):
++            claim.proceed = False
++            return claim
+         if evt_type == "async_delegation" and not await self._completion_delivery_ready(evt):
+             claim.proceed, claim.early_result = False, False
+             return claim
+@@ -1779,7 +1808,9 @@
+         from tools.process_registry import process_registry as _pr
+         # API delivery does not start a model turn, so there is nothing to coalesce.
+         # Keep each unit's stable identity with its row across partial delivery/retry.
+-        if group and group[0].get("origin_session_id"):
++        if group and (group[0].get("origin_session_id") or any(evt.get("task_failure_notice") for evt in group)):
++            # Interim notices are individually revalidated immediately before adapter
++            # delivery; coalescing must not hide an old sibling inside an admitted event.
+             outcomes = []
+             for evt in group:
+                 text = _format_gateway_process_notification(evt)
+diff --git a/hermes_cli/friday_user_scope.py b/hermes_cli/friday_user_scope.py
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -489,10 +489,11 @@
+         return
+     check_agent(parent)
+     from tools.delegate_tool_toolsets import DELEGATE_BLOCKED_TOOLS
+-    from hermes_cli.friday_credential_admission import route_inputs
+-    provider, model, url, _, mode = route_inputs(
++    from hermes_cli.friday_credential_admission import route_inputs, runtime_checked
++    route = route_inputs(
+         runtime.get('provider'), runtime.get('base_url'), runtime.get('api_key'), runtime.get('model'))
+-    if (runtime.get('api_mode') != mode or runtime.get('fallback_model')
++    runtime_checked(runtime, route)  # actual three-value route + checked local key/transport
++    if (runtime.get('fallback_model')
+             or runtime.get('acp_command') or runtime.get('acp_args')
+             or runtime.get('command') or runtime.get('args')
+             or getattr(parent, '_user_id', None) != cap.principal[3]
+diff --git a/run_agent.py b/run_agent.py
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -30,6 +30,7 @@
+ import re
+ import time
+ import threading
++from contextvars import ContextVar
+ import uuid
+ import warnings
+ from typing import List, Dict, Any, Optional, Callable
+@@ -173,12 +174,17 @@
+ _openrouter_prewarm_done = threading.Event()
+ 
+ 
++_DELEGATED_CLOSE_FAILURES = ContextVar("delegated_close_failures", default=None)
++
++
+ def _quietly(fn: Callable, *args, **kwargs) -> None:
+     """Run one teardown step, swallowing any exception so sibling steps still run."""
+     try:
+         fn(*args, **kwargs)
+-    except Exception:
+-        pass
++    except Exception as exc:
++        failures = _DELEGATED_CLOSE_FAILURES.get()
++        if failures is not None:
++            failures.append(type(exc).__name__)
+ 
+ 
+ def _call_engine_hook(engine: Any, hook: str, *args, **kwargs) -> None:
+@@ -971,6 +977,28 @@
+         _quietly(self._close_codex_session)
+ 
+     def close(self) -> None:
++        delegated = getattr(self, "_friday_delegation", None)
++        if delegated is None:
++            self._close_resources()
++            return
++        future = getattr(self, "_delegate_worker_future", None)
++        if ((future is not None and not future.done())
++                or getattr(self, "_friday_cleanup_in_progress", False)):
++            delegated.update(cancelled=True, cleanup_unconfirmed=True)
++            raise RuntimeError("native_delegation_STOP_UNCONFIRMED")
++        failures = []
++        token = _DELEGATED_CLOSE_FAILURES.set(failures)
++        self._friday_cleanup_in_progress = True
++        try:
++            _quietly(self._close_resources)
++        finally:
++            self._friday_cleanup_in_progress = False
++            _DELEGATED_CLOSE_FAILURES.reset(token)
++        if failures:
++            delegated.update(cancelled=True, cleanup_unconfirmed=True)
++            raise RuntimeError("native_delegation_STOP_UNCONFIRMED")
++
++    def _close_resources(self) -> None:
+         """Release every resource this agent holds (idempotent); each phase is guarded so one failure never
+         blocks the rest."""
+         # close() is the hard owner boundary; shutdown_memory_provider() is idempotent so gateway pre-calls
+@@ -998,10 +1026,23 @@
+         try:
+             with self._active_children_lock:
+                 children = list(self._active_children)
+-                self._active_children.clear()
++                if getattr(self, "_friday_delegation", None) is None:
++                    self._active_children[:] = [c for c in children
++                        if getattr(c, "_friday_delegation", None) is not None]
+         except Exception:
++            if getattr(self, "_friday_cleanup_in_progress", False):
++                raise
+             return
+         for child in children:
++            if getattr(child, "_friday_delegation", None) is not None:
++                # Keep the exact child until its own guarded close succeeds.
++                def close_scoped_child():
++                    child.close()
++                    with self._active_children_lock:
++                        if child in self._active_children:
++                            self._active_children.remove(child)
++                _quietly(close_scoped_child)
++                continue
+             if soft:
+                 try:
+                     child.release_clients()
+@@ -1032,8 +1073,12 @@
+         close() so a concurrent reader can't grab a half-closed session."""
+         codex_session = getattr(self, "_codex_session", None)
+         if codex_session is not None:
+-            self._codex_session = None
+-            codex_session.close()
++            if getattr(self, "_friday_cleanup_in_progress", False):
++                codex_session.close()
++                self._codex_session = None
++            else:
++                self._codex_session = None
++                codex_session.close()
+ 
+     @staticmethod
+     def _trim_process_memory() -> None:
+@@ -1051,11 +1096,14 @@
+         if getattr(self, "_end_session_on_close", True) and session_db and session_id:
+             _quietly(lambda: session_db.end_session(session_id, "agent_close"))
+         if getattr(self, "_owns_session_db", False) and session_db is not None:
+-            self._owns_session_db = False
++            scoped_close = getattr(self, "_friday_cleanup_in_progress", False)
++            if not scoped_close:
++                self._owns_session_db = False
+             # Shared instances no-op on close(); release the refcount so the registry closes on the last caller.
+             # See #90837.
+             from hermes_state_registry import release_or_close
+             release_or_close(session_db)
++            self._owns_session_db = False
+ 
+     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
+         """Replay the most recent todo tool response (the gateway builds a fresh AIAgent per message). Only
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -220,6 +220,22 @@
+                    )""", (pending_count - _MAX_DURABLE_PENDING,))
+ 
+ 
++def _persist_stop_unconfirmed(delegation_id: str) -> None:
++    """Keep the existing row live and preserve finished siblings; no terminal event."""
++    try:
++        with _DB_LOCK, _transaction() as conn:
++            row = conn.execute("SELECT result_json FROM async_delegations WHERE delegation_id=? AND state='running'",
++                               (delegation_id,)).fetchone()
++            if row is None:
++                return
++            partial = json.loads(row[0] or "{}") or {}
++            partial.update(stop_unconfirmed=True, error="STOP_UNCONFIRMED")
++            conn.execute("UPDATE async_delegations SET result_json=?, updated_at=? WHERE delegation_id=? AND state='running'",
++                         (json.dumps(partial), time.time(), delegation_id))
++    except Exception:
++        logger.warning("Async delegation %s: could not persist STOP_UNCONFIRMED", delegation_id, exc_info=True)
++
++
+ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+     now = time.time()
+     with _DB_LOCK, _transaction() as conn:
+@@ -244,8 +260,9 @@
+             partial = json.loads(row[0] or "{}") or {}
+             results = [r for r in partial.get("results") or [] if r.get("task_index") != entry.get("task_index")]
+             results.append(entry)
++            partial.update(results=results, partial=True)
+             conn.execute("UPDATE async_delegations SET result_json=?, updated_at=? WHERE delegation_id=? AND state='running'",
+-                         (json.dumps({"results": results, "partial": True}), time.time(), delegation_id))
++                         (json.dumps(partial), time.time(), delegation_id))
+     except Exception:  # noqa: BLE001 — recovery bookkeeping must never fail a live child
+         logger.warning("Async delegation %s: could not record finished child %s", delegation_id, entry.get("task_index"), exc_info=True)
+ 
+@@ -488,6 +505,8 @@
+ 
+ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
+     """Claim a durable delegation event; non-durable events (and interim notices) need no token."""
++    if evt.get("type") == "async_delegation" and not _visible(evt):
++        return None
+     if is_interim_delegation_event(evt):
+         return ""
+     delegation_id = str(evt.get("delegation_id") or "") if evt.get("type") == "async_delegation" else ""
+@@ -815,6 +834,11 @@
+         try:
+             result = runner() or {}
+             status = classify(result)
++            with _records_lock:
++                rec = _records.get(delegation_id)
++                if rec is not None:
++                    # A real normal return passed every child's cleanup boundary.
++                    rec["stop_unconfirmed"] = False
+         except Exception as exc:  # noqa: BLE001 — must never crash the worker
+             if str(exc) == 'native_delegation_STOP_UNCONFIRMED':
+                 with _records_lock:
+@@ -826,6 +850,10 @@
+             logger.exception(f"Async delegation{label} %s crashed", delegation_id)
+             result = crash_result(f"{type(exc).__name__}: {exc}", round(time.time() - dispatched_at, 2))
+         finally:
++            with _records_lock:
++                rec = _records.get(delegation_id)
++                if rec is not None:
++                    rec["_runner_finished"] = True
+             _finalize(delegation_id, result, status)
+ 
+     from hermes_cli.backend_retirement import retirement
+@@ -923,8 +951,14 @@
+         record = _records.get(delegation_id)
+         if record is None or record.get("status") not in _ACTIVE_STATES:
+             return
+-        if record.get('stop_unconfirmed') is True:
+-            return  # keep exact native interrupt/progress handles; no false terminal publication
++        if (record.get("friday_user_authority") is not None
++                and not record.get("_runner_finished")):
++            # The stale monitor's elapsed grace is not proof the worker exited.
++            record["stop_unconfirmed"] = True
++        if record.get("stop_unconfirmed") is True:
++            record.update(status="stalling", error="STOP_UNCONFIRMED")
++            _persist_stop_unconfirmed(delegation_id)
++            return  # retain exact native interrupt/progress handles and occupied slot
+         record["status"] = "finalizing"
+         record["completed_at"] = time.time()
+         record["interrupt_fn"] = None  # drop the closure; child is done
+@@ -1003,6 +1037,8 @@
+         if record is None or record.get("status") not in _ACTIVE_STATES:
+             return
+         snapshot = dict(record)
++    if not _visible(snapshot):
++        return
+     try:
+         from tools.process_registry import process_registry
+     except Exception as exc:  # pragma: no cover
+@@ -1011,6 +1047,7 @@
+     evt = {
+         "type": "async_delegation", "task_failure_notice": True, "is_batch": True, "n_tasks": n_tasks,
+         "delegation_id": delegation_id, "results": [entry],
++        "friday_user_authority": snapshot.get("friday_user_authority"),
+         "session_key": snapshot.get("session_key", ""),
+         "origin_ui_session_id": snapshot.get("origin_ui_session_id", ""),
+         "origin_session_id": snapshot.get("origin_session_id", ""),
+@@ -1020,7 +1057,8 @@
+         "status": "running", "dispatched_at": snapshot.get("dispatched_at") or time.time(), "completed_at": time.time(),
+         **{k: snapshot[k] for k in _ROUTING_KEYS if snapshot.get(k)}}
+     try:
+-        process_registry.completion_queue.put(evt)
++        if _visible(snapshot) and _visible(evt):
++            process_registry.completion_queue.put(evt)
+     except Exception as exc:  # pragma: no cover
+         logger.error("Async delegation batch %s: failed to enqueue task failure notice: %s", delegation_id, exc)
+ 
+@@ -1046,6 +1084,8 @@
+     tuples, stalling ids past the grace window, and whether anything is left to monitor."""
+     stalled, expired, any_monitorable = [], [], False  # (delegation_id, quiet_for, in_tool) / ids past grace
+     for record in _records.values():
++        if record.get("stop_unconfirmed"):
++            continue  # retained controls, not a periodic attempt to assert termination
+         status = record.get("status")
+         if status == "stalling":
+             any_monitorable = True
+diff --git a/tools/delegate_tool_child_run.py b/tools/delegate_tool_child_run.py
+--- a/tools/delegate_tool_child_run.py
++++ b/tools/delegate_tool_child_run.py
+@@ -45,8 +45,22 @@
+         entry["missed_steer"] = late_steer
+         entry["error"] += (" [steer did not land before the subagent stopped: " f"{late_steer}]")
+ 
++def _stop_unconfirmed(child: Any) -> RuntimeError:
++    delegated = getattr(child, "_friday_delegation", None)
++    if delegated is not None:
++        delegated["cancelled"] = True
++        delegated["cleanup_unconfirmed"] = True
++    return RuntimeError("native_delegation_STOP_UNCONFIRMED")
++
++
+ def _close_child(child: Any, log_message: str) -> None:
+-    """Best-effort ``child.close()`` (tool sandboxes, browser daemons, httpx clients)."""
++    """Scoped cleanup must succeed before exact control handles can be released."""
++    if getattr(child, "_friday_delegation", None) is not None:
++        try:
++            child.close()
++        except BaseException:
++            raise _stop_unconfirmed(child) from None
++        return
+     with _quiet(log_message, exc_info=True):
+         close = getattr(child, "close", None)
+         if callable(close):
+@@ -402,7 +416,7 @@
+         )
+     return None
+ 
+-def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
++def _defer_close_after_timeout(child: Any, child_future: Any, *, cleanup=None) -> None:
+     """Hand ``child.close()`` to a Future done-callback and drain its transports.
+ 
+     The interrupt is cooperative: the worker still runs its finally path, so closing now could close SQLite under its
+@@ -412,7 +426,9 @@
+     sweep + one delayed re-sweep for a connection opened in between; a worker that still won't settle keeps its
+     resources until process exit.
+     """
+-    child_future.add_done_callback(lambda _done: _close_child(child, "Failed to close timed-out child after worker exit"))
++    child_future.add_done_callback(
++        lambda _done: cleanup() if cleanup is not None else
++        _close_child(child, "Failed to close timed-out child after worker exit"))
+     # Bounded drain (#94248 native half): the deferred close above only fires once the abandoned worker
+     # unwinds, but that worker is typically parked inside an in-flight OpenSSL read (Codex / httpx). Never
+     # hard-close that transport from this thread — releasing FDs under a live SSL read is the #29507/#70773
+@@ -775,10 +791,12 @@
+     ) -> Dict[str, Any]:
+         """Shared tail of every failure path: emit ``subagent.complete`` (``status`` defaults to the entry's), note
+         the steer text that won the race with the failure, report the worktree."""
+-        _safe_progress(
+-            self.child_progress_cb, "subagent.complete", preview=preview, status=status or entry["status"],
+-            duration_seconds=entry["duration_seconds"], summary=summary,
+-        )
++        payload = dict(preview=preview, status=status or entry["status"],
++                       duration_seconds=entry["duration_seconds"], summary=summary)
++        if getattr(self.child, "_friday_delegation", None) is not None:
++            self._pending_completion = payload
++        else:
++            _safe_progress(self.child_progress_cb, "subagent.complete", **payload)
+         _append_missed_steer(entry, late_steer)
+         return self.attach_worktree(entry)
+ 
+@@ -861,6 +879,8 @@
+                 )
+ 
+         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
++        self.child_future = future  # exact worker; a wait timeout is not proof of exit
++        child._delegate_worker_future = future
+         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.
+         # Without the second, a worker wedged after its final answer holds a finite (-Q / Bot Chat
+         # one-shot) turn — and its session lease — forever, since that runtime has no gateway
+@@ -960,9 +980,17 @@
+             "_child_role": getattr(child, "_delegate_role", None),
+             "diagnostic_path": diagnostic_path,
+         }
+-        self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
+-        close_deferred = is_timeout and not future.done()
+-        if close_deferred:
++        scoped = getattr(child, "_friday_delegation", None) is not None
++        close_deferred = not future.done() and (scoped or is_timeout)
++        if scoped and close_deferred:
++            _stop_unconfirmed(child)
++            _error_entry.update(status="stop_unconfirmed", error="STOP_UNCONFIRMED: " + _err)
++            _append_missed_steer(_error_entry, _late_pending_steer)
++            # No worktree finalization/completion event while the worker may still write.
++        else:
++            self.finish_failed(_error_entry, _late_pending_steer,
++                               preview=f"Timed out after {duration}s" if is_timeout else str(exc))
++        if close_deferred and not scoped:
+             _defer_close_after_timeout(child, future)
+         return None, _error_entry, close_deferred
+ 
+@@ -1040,15 +1068,61 @@
+         if _cost_usd is not None:
+             with _quiet(None):
+                 complete_kwargs["cost_usd"] = float(_cost_usd)
+-        _safe_progress(self.child_progress_cb, "subagent.complete", **complete_kwargs)
++        if getattr(child, "_friday_delegation", None) is not None:
++            self._pending_completion = complete_kwargs
++        else:
++            _safe_progress(self.child_progress_cb, "subagent.complete", **complete_kwargs)
+ 
+     def cleanup(self, *, heartbeat: _Heartbeat, child_pool: Any, leased_cred_id: Any, close_deferred: bool) -> None:
+-        """Finally-path teardown (idempotent, never raises). Order matters: stop heartbeat → drop registry entry →
++        """Finally-path teardown; scoped uncertainty raises before removing controls. Order matters: stop heartbeat → drop registry entry →
+         release credential lease → restore the parent's process-global tool names → detach from the parent's
+         interrupt list → close the child (unless a timed-out worker still owns it) → pop the child's Relay scope if
+         no turn is active."""
+         child = self.child
+         heartbeat.stop()
++        delegated = getattr(child, "_friday_delegation", None)
++        if delegated is not None:
++            if close_deferred:
++                _stop_unconfirmed(child)
++                # Register only after the finally path owns the lease/registry teardown.
++                # The callback runs after actual worker exit; never join an unconfirmed worker.
++                _defer_close_after_timeout(child, self.child_future, cleanup=lambda: self.cleanup(
++                    heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id,
++                    close_deferred=False))
++                # Callback registration may run inline if the future just settled;
++                # retain a conservative outcome without overwriting confirmed cleanup.
++                raise RuntimeError("native_delegation_STOP_UNCONFIRMED")
++            _close_child(child, "Failed to close scoped child after delegation")
++            # Ancillary cleanup is also part of this boundary. Its failures must not
++            # disappear behind best-effort helpers after the live controls were removed.
++            try:
++                import model_tools
++                saved = getattr(child, "_delegate_saved_tool_names", None)
++                if isinstance(saved, list):
++                    model_tools._last_resolved_tool_names = list(saved)
++                from tools.code_kernel import shutdown_kernels_for_delegated_child
++                child_sid = str(getattr(child, "session_id", "") or "")
++                shutdown_kernels_for_delegated_child(child_sid)
++                from agent import relay_runtime
++                runtime = relay_runtime.get_runtime(create=False)
++                if relay_runtime.SESSION_COORDINATOR.has_active_turn(
++                        profile_key=relay_runtime.current_profile_key(), session_id=child_sid):
++                    raise _stop_unconfirmed(child)
++                if runtime is not None and child_sid:
++                    runtime.unregister_subagent({"child_session_id": child_sid})
++                if child_pool is not None and leased_cred_id is not None:
++                    child_pool.release_lease(leased_cred_id)
++            except BaseException:
++                raise _stop_unconfirmed(child) from None
++            if self.subagent_id:
++                _unregister_subagent(self.subagent_id, agent=child)
++            _detach_child(self.parent_agent, child)
++            delegated["cleanup_unconfirmed"] = False
++            pending = getattr(self, "_pending_completion", None)
++            if pending is not None:
++                self._pending_completion = None
++                _safe_progress(self.child_progress_cb, "subagent.complete", **pending)
++            return
+ 
+         # Safe even if the child was never registered (ID missing on test doubles).
+         if self.subagent_id:
+@@ -1069,7 +1143,7 @@
+ 
+         # Close tool resources (terminal sandboxes, browser daemons, background
+         # processes, httpx clients) so subagent subprocesses don't outlive the delegation.
+-        if not close_deferred:
++        if not close_deferred and delegated is None:
+             _close_child(child, "Failed to close child agent after delegation")
+         # The child's execute_code kernels live exactly as long as the child (pinned against the LRU
+         # cap while it runs); dispose them here so they never squat the cap after the child is gone.
+diff --git a/tools/delegate_tool_dispatch.py b/tools/delegate_tool_dispatch.py
+--- a/tools/delegate_tool_dispatch.py
++++ b/tools/delegate_tool_dispatch.py
+@@ -134,12 +134,18 @@
+ 
+     def _entry_of(future, idx):
+         if not future.done():
++            child = _child_by_index.get(idx)
++            if getattr(child, "_friday_delegation", None) is not None:
++                from tools.delegate_tool_child_run import _stop_unconfirmed
++                raise _stop_unconfirmed(child)
+             return _fabricated_entry(
+                 idx, "interrupted", "Parent agent interrupted — child did not finish in time", _child_by_index.get(idx),
+             )
+         try:
+             return future.result()
+         except Exception as exc:
++            if str(exc) == "native_delegation_STOP_UNCONFIRMED":
++                raise  # preserve the control outcome through the async/lifecycle consumers
+             return _fabricated_entry(idx, "error", str(exc), _child_by_index.get(idx))
+ 
+     executor = DaemonThreadPoolExecutor(max_workers=batch.max_children)
+@@ -173,6 +179,13 @@
+                         _live = batch.live_paths[_i] if isinstance(_i, int) and 0 <= _i < len(batch.live_paths) else None
+                         push_task_failure_notice(
+                             batch.unit_id, {**entry, **({"live_transcript": _live} if _live else {})}, n_tasks=n_tasks)
++    except BaseException:
++        # A failed child cleanup may coexist with still-running siblings. Keep their
++        # existing controls, signal them, and never turn this path into an indefinite join.
++        interrupted = True
++        for _, _, child in batch.children:
++            _signal_child_stop(child)
++        raise
+     finally:
+         # Abandoned workers unwind on their own (daemon threads, and the
+         # child-run layer already applies the deferred-close transport drain).
+diff --git a/tools/delegate_tool_registry.py b/tools/delegate_tool_registry.py
+--- a/tools/delegate_tool_registry.py
++++ b/tools/delegate_tool_registry.py
+@@ -265,7 +265,9 @@
+             "parent_id": r.get("parent_id"),
+             "goal": r.get("goal"),
+             "model": r.get("model"),
+-            "status": r.get("status"),
++            "status": ("stop_unconfirmed" if
++                       (getattr(r.get("agent"), "_friday_delegation", None) or {}).get("cleanup_unconfirmed")
++                       else r.get("status")),
+             "running_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) else None,
+             "accepting_steer": bool(r.get("accepting_steer", False)),
+             "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
