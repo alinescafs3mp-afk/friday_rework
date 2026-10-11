@@ -1,0 +1,9 @@
+# Remaining release frontier
+
+The original Sol wrapped-output assignment remains UNKNOWN and reserved. An idle native TUI and empty queue do not settle an original ambiguous request. No duplicate TASK, second compact, hidden replacement implementation, automatic replay or new Sol goal is permitted. The existing ordinary wrapped frontend must remain supported; replacing it with direct streams or refusing all wrappers would change the required product.
+
+G7 is consumed FAIL with confirmed custody cleanup and cannot be replayed. G8 has an independently accepted, materialized source projection; a fresh read-only check confirms the same boot, manager and runtime-root identities, unchanged15files and eight unstarted target units. G8 still requires the real owner foreground terminal, interactive sudo and original FD9 custody. This readiness check grants no runtime execution or release. Kernel120 remains NOT_GRANTED_NOT_RUN; ordinary3600 remains UNSTARTED.
+
+The current combined candidate must pass the full mandatory final source process and independent artifact review after its known source blocker is closed. Installed qualification must then execute all seven ordinary journeys, repository seeding and continuation, mixed Harness/A0 handoff, executed goal verification, artifact delivery, real authenticated Telegram and two-user WebUI. Real web retrieval is required in normal conversation, explicit research and delegated Harness/A0 mid-task work. Admin admission/revoke, actual task stop and persistent settings require live evidence. Source fixtures and selected-source tests do not prove these journeys.
+
+Old Friday and Pandora remain OFF. Existing resource, privacy, ownership, no-replay and safeguard stops remain. The daily21:00MSK full-period checkpoint with22:00target is separate from these interim source publications. No forecast or release acceptance is claimed.
