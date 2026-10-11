@@ -25,6 +25,7 @@ ROOTS = ("analysis/", "docs/", "scripts/", "tests/", "validation/")
 HEX = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 SOURCE_PINS_SCHEMA = "friday.daily-use.source-pins.v1"
+HISTORICAL_INVENTORY_SCHEMA = "friday.normal28.public-project-inventory.v2"
 
 
 class Refusal(Exception):
@@ -182,7 +183,7 @@ def directory_prefix(path):
     return directory + "/" if directory else ""
 
 
-def verify_public(git, tree, touched):
+def verify_public(git, tree, touched, end_commit=None):
     def exists(path):
         return path is not None and (path in tree or any(p.startswith(path.rstrip("/") + "/") for p in tree))
 
@@ -204,6 +205,56 @@ def verify_public(git, tree, touched):
             jsons[p] = json.loads(content(p))
         except (ValueError, UnicodeError):
             errors.append({"kind": "INVALID_JSON", "path": p})
+
+    historical = {}; historical_rows = []
+    # Only this typed inventory binds references to an explicit ancestor snapshot.
+    # Generic public references and enclosing manifests still bind the end tree.
+    for p, obj in jsons.items():
+        if not isinstance(obj, dict) or obj.get("schema") != HISTORICAL_INVENTORY_SCHEMA:
+            continue
+        snapshot = obj.get("snapshot_commit"); entries = obj.get("references")
+        if (not isinstance(snapshot, str) or not HEX.fullmatch(snapshot)
+                or not isinstance(end_commit, str) or not HEX.fullmatch(end_commit)
+                or not isinstance(entries, list) or not entries
+                or type(obj.get("project_files_count")) is not int
+                or obj["project_files_count"] != len(entries)):
+            errors.append({"kind": "INVALID_HISTORICAL_INVENTORY", "path": p}); continue
+        try:
+            git.commit(snapshot); git.commit(end_commit)
+            git.run("merge-base", "--is-ancestor", snapshot, end_commit)
+            old_tree = git.tree(snapshot)
+        except Refusal:
+            errors.append({"kind": "INVALID_HISTORICAL_SNAPSHOT", "path": p}); continue
+        targets = [resolve(p, entry["repository_file"]) for entry in entries
+                   if isinstance(entry, dict) and isinstance(entry.get("repository_file"), str)]
+        git.blobs(old_tree[target]["git_blob"] for target in targets
+                  if target in old_tree and old_tree[target]["type"] == "blob")
+        seen = set()
+        for i, entry in enumerate(entries):
+            trail = ("references", str(i)); historical[(p, trail)] = True
+            if (not isinstance(entry, dict) or set(entry) != {"repository_file", "sha256", "bytes"}
+                    or not isinstance(entry["repository_file"], str)
+                    or not isinstance(entry["sha256"], str) or not HASH.fullmatch(entry["sha256"])
+                    or type(entry["bytes"]) is not int or entry["bytes"] < 0):
+                errors.append({"kind": "INVALID_HISTORICAL_REFERENCE", "source": p,
+                               "json_pointer": pointer(trail)}); continue
+            target = resolve(p, entry["repository_file"])
+            if target is None or target in seen:
+                errors.append({"kind": "INVALID_HISTORICAL_REFERENCE", "source": p,
+                               "json_pointer": pointer(trail)}); continue
+            seen.add(target)
+            row = {"source": p, "json_pointer": pointer(trail), "snapshot_commit": snapshot,
+                   "target": target, "expected_sha256": entry["sha256"], "expected_bytes": entry["bytes"],
+                   "kind": "HISTORICAL_GIT_REFERENCE", "runtime_grant": False}
+            if target not in old_tree or old_tree[target]["type"] != "blob":
+                row["status"] = "MISSING"
+            else:
+                oid = old_tree[target]["git_blob"]; git.blobs([oid]); b = git.cache[oid]
+                row.update(actual_sha256=digest(b), actual_bytes=len(b))
+                row["status"] = "PASS" if digest(b) == entry["sha256"] and len(b) == entry["bytes"] else "MISMATCH"
+            historical_rows.append(row)
+            if row["status"] != "PASS":
+                errors.append({**row, "kind": row["kind"] + "_" + row["status"]})
 
     assertions = []
     # This schema alone defines these root names. Never resolve an external root
@@ -274,7 +325,7 @@ def verify_public(git, tree, touched):
                                    "expected_bytes": artifact.get("bytes"),
                                    "kind": "PUBLIC_REFERENCE"})
         for trail, item in walk(obj):
-            if (p, trail) in rooted:
+            if (p, trail) in rooted or (p, trail) in historical:
                 continue
             if daily_index and trail and trail[0] == "integrity_artifact":
                 continue
@@ -332,6 +383,8 @@ def verify_public(git, tree, touched):
             for key, value in item.items():
                 if (p, trail) in rooted and key in {"id", "root", "path", "sha256", "bytes"}:
                     continue
+                if (p, trail) in historical and key in {"repository_file", "sha256", "bytes"}:
+                    continue
                 if historical_daily_path(obj, trail + (key,)):
                     continue
                 if key == "logical_source":
@@ -349,6 +402,7 @@ def verify_public(git, tree, touched):
                         gaps.append({"kind": "JSON_LINK_MISSING", **row})
     return {"manifests": manifests, "hash_references": refs, "local_markdown_links": links,
             "local_json_links": jlinks, "external_root_references": external,
+            "historical_git_references": historical_rows,
             "findings": errors, "publication_gaps": gaps,
             "json_files_parsed": len(jsons), "provenance_hashes_outside_public_scope_skipped": skipped}
 
@@ -401,7 +455,7 @@ def build(repo, base, end, output):
                 git.blobs([tree[p]["git_blob"]]); data = git.cache[tree[p]["git_blob"]]
                 row.update(sha256=digest(data), bytes=len(data))
         paths.append(row)
-    checks = verify_public(git, tree, touched)
+    checks = verify_public(git, tree, touched, end_commit=end)
     if checks["findings"]:
         kinds = sorted({e["kind"] for e in checks["findings"]})
         raise Refusal("public integrity validation failed: " + ", ".join(kinds))
@@ -416,7 +470,7 @@ def build(repo, base, end, output):
                  for block, members in sorted(blocks.items())]
     counts = {"commits": len(commits), "net_changed_paths": len(net), "touched_paths": len(paths),
               "intermediate_only_paths": len(intermediate), "logical_blocks": len(blockrows),
-              **{k: len(checks[k]) for k in ("manifests", "hash_references", "local_markdown_links", "local_json_links", "external_root_references")},
+              **{k: len(checks[k]) for k in ("manifests", "hash_references", "local_markdown_links", "local_json_links", "external_root_references", "historical_git_references")},
               "json_files_parsed": checks["json_files_parsed"], "publication_gaps": len(checks["publication_gaps"])}
     now = datetime.now(MSK).isoformat()
     authority = {"stage": STAGE, "daily_checkpoint_complete": False, "publication_accepted": False,
@@ -432,6 +486,7 @@ def build(repo, base, end, output):
                             "Canonical daily-use source pins bind product paths to this Git tree; archive pins are recorded as EXTERNAL_UNVERIFIED without reading an external root or granting authority.",
                             "Daily-index historical range fields are provenance bound by the report manifest, not assertions against this newer cutoff; current report artifact references are still checked.",
                             "Inline Markdown destinations and explicit local JSON paths only; logical_source provenance labels, reference-style Markdown, fragments and external URLs are not validated.",
+                            "Typed normal28 v2 source inventory references verify exact blobs at a full ancestral snapshot_commit; their historical byte integrity never asserts current source or runtime acceptance.",
                             "No semantic status-order inference, secret audit, private-source audit, live checks, or remote verification."]}
     integrity_bytes = encode(integrity)
     index = {"schema": "friday.analysis.daily-period-index.v1", "date_msk": now[:10], "prepared_at_msk": now,
