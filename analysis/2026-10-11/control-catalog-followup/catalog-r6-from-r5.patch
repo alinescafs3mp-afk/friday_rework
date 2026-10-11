@@ -1,0 +1,237 @@
+--- a/hermes/hermes_cli/urllib_security.py
++++ b/hermes/hermes_cli/urllib_security.py
+@@ -316,6 +316,69 @@
+     """Guard cloned dispatch and actual stdlib connection/effect boundaries."""
+     from functools import wraps
+     from hermes_cli.friday_user_scope import ScopeDenied
++    import contextvars
++    import http.client
++    import threading
++    # A callable factory may run inherited native connect before returning its
++    # instance. Interpose that finite native function entry, with a context-local
++    # callback; unrelated concurrent callers retain the original behavior.
++    # This is an effect boundary, not a sandbox for arbitrary factory Python.
++    registry = _bind_request_guard.__dict__.setdefault(
++        "_constructor_connect_scope",
++        (threading.RLock(), contextvars.ContextVar("catalog_constructor_connect", default=None), [0, None, None]))
++    scope_lock, connect_context, scope_state = registry
++    from contextlib import contextmanager
++    @contextmanager
++    def constructor_connect_scope(prepare):
++        with scope_lock:
++            if scope_state[0] == 0:
++                import types
++                native_connect = http.client.HTTPConnection.connect
++                key = "_hermes_catalog_constructor_connect_scope"
++                if (type(native_connect) is not types.FunctionType or native_connect.__closure__
++                        or key in native_connect.__dict__):
++                    raise ScopeDenied()
++                original_code = native_connect.__code__
++                # Retain and execute the complete original stdlib body. Pin its
++                # function entry as well as class lookup: callers may have saved
++                # the original connect function before this constructor starts.
++                native_body = types.FunctionType(original_code, native_connect.__globals__,
++                    native_connect.__name__, native_connect.__defaults__, native_connect.__closure__)
++                native_body.__kwdefaults__ = native_connect.__kwdefaults__
++                boundary = (connect_context, native_body)
++                def dispatch(connection):
++                    import http.client as native_http
++                    context, body = native_http.HTTPConnection.connect.__dict__["_hermes_catalog_constructor_connect_scope"]
++                    callback = context.get()
++                    if callback is not None:
++                        callback(connection)
++                    return body(connection)
++                native_connect.__dict__[key] = boundary
++                native_connect.__code__ = dispatch.__code__
++                scope_state[1:] = [(native_connect, original_code, boundary), dispatch.__code__]
++            elif (http.client.HTTPConnection.connect is not scope_state[1][0]
++                    or scope_state[1][0].__code__ is not scope_state[2]):
++                raise ScopeDenied()
++            scope_state[0] += 1
++        token = connect_context.set(prepare)
++        try:
++            yield
++        finally:
++            connect_context.reset(token)
++            with scope_lock:
++                scope_state[0] -= 1
++                if scope_state[0] == 0:
++                    native_connect, original_code, boundary = scope_state[1]
++                    key = "_hermes_catalog_constructor_connect_scope"
++                    intact = (http.client.HTTPConnection.connect is native_connect
++                        and native_connect.__code__ is scope_state[2]
++                        and native_connect.__dict__.get(key) is boundary)
++                    native_connect.__code__ = original_code
++                    native_connect.__dict__.pop(key, None)
++                    http.client.HTTPConnection.connect = native_connect
++                    scope_state[1:] = [None, None]
++                    if not intact:
++                        raise ScopeDenied()
+ 
+     def settle(handle):
+         # Preserve the causal exception while still attempting native cleanup.
+@@ -666,6 +729,9 @@
+                     state = plain_dict(connection_dict.__get__(connection))
+                     record = connect_targets.get(id(connection))
+                     endpoint = expected_endpoint[0]
++                    request_state = plain_request_state()
++                    if request_state.get("_hermes_catalog_admission") is not original_carrier:
++                        raise ScopeDenied()
+                     if (type(endpoint) is not tuple or len(endpoint) != 3
+                             or type(endpoint[0]) is not str or type(endpoint[1]) is not int
+                             or type(endpoint[2]) is not str or record is None
+@@ -702,13 +768,6 @@
+                     state["_create_connection"] = checked
+                 def read_connect_target(connection):
+                     record = connect_targets.get(id(connection))
+-                    if record is None and construction_prior_objects[0] is not None and not transport_closed[0]:
+-                        # A legitimate native constructor may preconnect after
+-                        # initializing its endpoint. Adopt that instance target
+-                        # before its first actual effect, using the original
+-                        # request endpoint and construction custody snapshot.
+-                        bind_connect_target(connection)
+-                        record = connect_targets.get(id(connection))
+                     state = plain_dict(connection_dict.__get__(connection))
+                     if record is None or record[0] is not connection or state.get("_create_connection") is not record[2]:
+                         raise ScopeDenied()
+@@ -717,6 +776,64 @@
+                 owned_native_class = None
+                 def native_instance(value, cls):
+                     return any(base is cls for base in type.__getattribute__(type(value), "__mro__"))
++                adopted_connections = set()
++                def adopt_native_instance(connection):
++                    if id(connection) in adopted_connections:
++                        return
++                    state = plain_dict(connection_dict.__get__(connection))
++                    sock = state.get("sock")
++                    if sock is not None and id(sock) in connection_prior_objects[id(connection)][0]:
++                        # The connection itself is new and owned; the
++                        # socket is foreign. Detach it before owned
++                        # cleanup, without changing or closing the sock.
++                        state["sock"] = None
++                        raise ScopeDenied()
++                    class AdoptedConnection(type(connection)):
++                        __slots__ = ()
++                        def __getattribute__(self, name):
++                            if name == "sock":
++                                return read_socket(self)
++                            if name == "_create_connection":
++                                return read_connect_target(self)
++                            return super().__getattribute__(name)
++                        def __setattr__(self, name, value):
++                            if name == "sock":
++                                value = own_socket(self, value)
++                            super().__setattr__(name, value)
++                    try:
++                        object.__setattr__(connection, "__class__", AdoptedConnection)
++                    except (TypeError, AttributeError) as error:
++                        raise ScopeDenied() from error
++                    state = plain_dict(connection_dict.__get__(connection))
++                    sock = state.get("sock")
++                    if sock is not None:
++                        state["sock"] = own_socket(connection, sock)
++                    adopted_connections.add(id(connection))
++                def prepare_constructor_connect(connection):
++                    # Entered BEFORE stdlib's connect audit and before target
++                    # lookup, for classes and callable/lambda factories alike.
++                    prior = None
++                    try:
++                        prior = construction_prior_objects[0]
++                        if (transport_closed[0] or prior is None
++                                or not native_instance(connection, http.client.HTTPConnection)
++                                or id(connection) in prior[0]
++                                or (active_connection[0] is not None and active_connection[0] is not connection)):
++                            raise ScopeDenied()
++                        if not any(connection is owned for owned in connections):
++                            connections.append(connection)
++                        active_connection[0] = connection
++                        connection_prior_objects[id(connection)] = prior
++                        # Pin BEFORE adoption's __init_subclass__ callbacks too.
++                        bind_connect_target(connection)
++                        if not (owned_native_class is not None and native_instance(connection, owned_native_class)):
++                            # Pin target lookup as well as invocation before the
++                            # native audit; a replaced instance callable must not
++                            # bypass checked() by replacing its dictionary slot.
++                            adopt_native_instance(connection)
++                        bind_connect_target(connection)
++                    finally:
++                        prior = None
+                 if isinstance(http_class, type) and issubclass(http_class, http.client.HTTPConnection):
+                     class NativeConnection(http_class):
+                         def __init__(self, *a, **k):
+@@ -760,7 +877,8 @@
+                             preexisting = {id(value) for value in prior_objects}
+                             construction_prior_objects[0] = (preexisting, prior_objects)
+                             try:
+-                                connection = native_class(host, *ctor_args, **ctor_kwargs)
++                                with constructor_connect_scope(prepare_constructor_connect):
++                                    connection = native_class(host, *ctor_args, **ctor_kwargs)
+                             except BaseException:
+                                 # A callable can fail after allocating native
+                                 # handles. Discover only objects born during this
+@@ -780,6 +898,13 @@
+                                     and native_instance(connection, owned_native_class)))
+                             if id(connection) in preexisting or (native_instance(connection, http.client.HTTPConnection) and not gc.is_tracked(connection)):
+                                 raise ScopeDenied()
++                            if active_connection[0] is not None and active_connection[0] is not connection:
++                                # Refuse a factory's second returned instance,
++                                # while still settling that newly born handle.
++                                if not any(connection is owned for owned in connections):
++                                    connections.append(connection)
++                                connection_prior_objects[id(connection)] = (preexisting, prior_objects)
++                                raise ScopeDenied()
+                             object.__setattr__(self, "_connection", connection)
+                             if not any(connection is owned for owned in connections):
+                                 connections.append(connection)
+@@ -788,37 +913,13 @@
+                             # Callable connection factories are a supported stdlib
+                             # seam. Adopt the returned native instance into an owned
+                             # layout-compatible subclass so its later connect/send
+-                            # sock assignments use the same effect boundary. Original
+-                            # classes and the installed opener stay untouched.
++                            # sock assignments use the same effect boundary. Custom
++                            # classes and the installed opener stay intact; the
++                            # scoped stdlib connect dispatcher has been restored.
++                            if native_instance(connection, http.client.HTTPConnection):
++                                bind_connect_target(connection)
+                             if adopt:
+-                                state = plain_dict(connection_dict.__get__(connection))
+-                                sock = state.get("sock")
+-                                if sock is not None and id(sock) in preexisting:
+-                                    # The connection itself is new and owned; the
+-                                    # socket is foreign. Detach it before owned
+-                                    # cleanup, without changing or closing the sock.
+-                                    state["sock"] = None
+-                                    raise ScopeDenied()
+-                                class AdoptedConnection(type(connection)):
+-                                    __slots__ = ()
+-                                    def __getattribute__(self, name):
+-                                        if name == "sock":
+-                                            return read_socket(self)
+-                                        if name == "_create_connection":
+-                                            return read_connect_target(self)
+-                                        return super().__getattribute__(name)
+-                                    def __setattr__(self, name, value):
+-                                        if name == "sock":
+-                                            value = own_socket(self, value)
+-                                        super().__setattr__(name, value)
+-                                try:
+-                                    object.__setattr__(connection, "__class__", AdoptedConnection)
+-                                except (TypeError, AttributeError) as error:
+-                                    raise ScopeDenied() from error
+-                                state = plain_dict(connection_dict.__get__(connection))
+-                                sock = state.get("sock")
+-                                if sock is not None:
+-                                    state["sock"] = own_socket(connection, sock)
++                                adopt_native_instance(connection)
+                             if native_instance(connection, http.client.HTTPConnection):
+                                 bind_connect_target(connection)
+                                 response_class = getattr(connection, "response_class")
+@@ -923,6 +1024,7 @@
+                         socket_custody.clear()
+                         raw_owners.clear()
+                         connect_targets.clear()
++                        adopted_connections.clear()
+                         connections.clear()
+                         owned_sockets.clear()
+                         owned_buffers.clear()
