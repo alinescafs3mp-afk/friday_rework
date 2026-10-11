@@ -1,0 +1,513 @@
+--- parent/project/plugins/friday_rework/associations.py
++++ metadata-source/project/plugins/friday_rework/associations.py
+@@ -192,6 +192,7 @@
+         self.clock = clock
+         self._thread_lock = threading.RLock()
+         self._lock_allowance = ContextVar("association_lock_allowance", default=None)
++        self._metadata_allowance = ContextVar("association_metadata_allowance", default=None)
+ 
+     def _check_local_state(self):
+         from hermes_cli.friday_cli_work import check_store
+@@ -212,17 +213,60 @@
+         finally:
+             self._lock_allowance.reset(token)
+ 
++    @contextmanager
++    def metadata_deadline(self, deadline, *, guard=None):
++        """Narrow one original CLI consumer clock; never replenish or retry a save.
++
++        Checks bracket native reads/encoding/fsync and the actual publication.
++        Blocking calls still can outlast the clock; post-publication failure is
++        uncertain and cannot authorize another send or a compensating rewrite.
++        """
++        if (isinstance(deadline, bool) or not isinstance(deadline, (int, float))
++                or not math.isfinite(deadline) or guard is not None and not callable(guard)):
++            raise ValueError("invalid_metadata_deadline")
++        previous = self._metadata_allowance.get()
++        if previous is not None:
++            deadline = min(deadline, previous[0])
++            current_guard = guard
++            def guard():
++                if previous[1] is not None:
++                    previous[1]()
++                if current_guard is not None:
++                    current_guard()
++        token = self._metadata_allowance.set((deadline, guard))
++        try:
++            self._check_metadata()
++            yield
++        finally:
++            self._metadata_allowance.reset(token)
++
++    def _check_metadata(self):
++        self._check_local_state()
++        allowance = self._metadata_allowance.get()
++        if allowance is not None:
++            if time.monotonic() >= allowance[0]:
++                raise TimeoutError("association_metadata_deadline")
++            if allowance[1] is not None:
++                allowance[1]()
++            if time.monotonic() >= allowance[0]:
++                raise TimeoutError("association_metadata_deadline")
++
++    def _metadata_options(self):
++        allowance = self._metadata_allowance.get()
++        return ({"operation_deadline": allowance[0], "commit_guard": self._check_metadata}
++                if allowance is not None else {})
++
+     def state_get(self, key, default=None):
+         self._check_local_state()
+         with self.lock_budget():
+-            value = self.state.get(key, default, lock_budget=self._lock_allowance.get())
++            value = self.state.get(key, default, lock_budget=self._lock_allowance.get(), **self._metadata_options())
+             self._check_local_state()
+             return value
+ 
+     def state_set(self, key, value):
+         self._check_local_state()
+         with self.lock_budget():
+-            self.state.set(key, value, lock_budget=self._lock_allowance.get())
++            self.state.set(key, value, lock_budget=self._lock_allowance.get(), **self._metadata_options())
+         self._check_local_state()
+ 
+     @contextmanager
+@@ -232,6 +276,10 @@
+         # different executor threads. Their contention is not a foreign writer.
+         with self.lock_budget():
+             with self._lock_allowance.get().acquiring() as deadline:
++                self._check_metadata()
++                allowance = self._metadata_allowance.get()
++                if allowance is not None:
++                    deadline = min(deadline, allowance[0])
+                 remaining = deadline - time.monotonic()
+                 if remaining <= 0 or not self._thread_lock.acquire(timeout=remaining):
+                     raise TimeoutError("association_lock_deadline")
+@@ -240,6 +288,7 @@
+                     yield data
+             finally:
+                 self._thread_lock.release()
++            self._check_metadata()
+ 
+     @contextmanager
+     def _locked_file(self):
+@@ -272,6 +321,7 @@
+                     fs = path.stat()
+                     if not stat.S_ISREG(fs.st_mode) or fs.st_uid != os.getuid() or fs.st_nlink != 1:
+                         raise AssociationError("unsafe_native_state")
++            self._check_metadata()
+             marker = os.pread(fd, 4, 0)
+             if marker not in (b"", b"v1\n"):
+                 raise AssociationError("invalid_admission_marker")
+@@ -284,26 +334,37 @@
+                 self._save(data)
+             _validate_store(data)
+             self._check_local_state()
++            self._check_metadata()
+             if not marker:
+                 if os.pwrite(fd, b"v1\n", 0) != 3:
+                     raise OSError("short_admission_marker_write")
++            self._check_metadata()
+             os.fsync(fd)
++            self._check_metadata()
+             # mkdir(parents=True) can create multiple directory entries. Sync
+             # bottom-up on every open, including recovery after a failed first
+             # initialization, before returning access or an external grant.
+             for parent in (directory, *directory.parents):
++                self._check_metadata()
+                 _sync_directory(parent)
++            self._check_metadata()
+             yield data
+         finally:
+             os.close(fd)
+ 
+     def _save(self, data):
++        self._check_metadata()
+         _validate_store(data)
+         self.state_set(KEY, data)
+         # PluginState fsyncs its temporary file, but not the replacement's
+         # directory. Keep its native writer/store; finish the commit under our
+         # compound-operation lock and propagate an uncertain durability error.
+         _sync_directory(Path(self.state.data_dir))
++        try:
++            self._check_metadata()
++        except Exception as exc:
++            from utils import AtomicWriteUncertainError
++            raise AtomicWriteUncertainError("Association published; durability completion uncertain") from exc
+ 
+     @staticmethod
+     def _owned(data, task_id, owner):
+--- parent/project/plugins/friday_rework/results.py
++++ metadata-source/project/plugins/friday_rework/results.py
+@@ -11,7 +11,7 @@
+ import os
+ import fcntl
+ import stat
+-from contextlib import contextmanager
++from contextlib import contextmanager, nullcontext
+ from dataclasses import asdict
+ from pathlib import Path
+ import re
+@@ -462,9 +462,7 @@
+ async def deliver_artifact(ctx, store, row, reference, *, retry=False, deadline=None):
+     """One explicit send of retained bytes to the retained original destination."""
+     from .admission import delivery_route
+-    row = store.get(row["existing_task_id"], row["owner"])
+     from hermes_cli.friday_user_scope import check_retained_job
+-    check_retained_job(row)
+     local = row['owner'].get('platform') == 'cli'
+     if local:
+         from hermes_cli.friday_cli_output import output_deadline
+@@ -472,29 +470,45 @@
+         if remaining <= 0:
+             raise AssociationError('original_delivery_budget_exhausted')
+         deadline = output_deadline(min(30, remaining), deadline)
+-    artifact = next((a for a in row.get("result", {}).get("artifacts", []) if a["reference"] == reference), None)
+-    if artifact is None:
+-        raise AssociationError("unknown_result_artifact")
+-    # Recheck bytes BEFORE reserving a send. A changed staging file never sends.
+-    payload = await asyncio.to_thread(read_staged, staging_root=output_root(row), artifact=StagedArtifact(**artifact),
+-                                      max_bytes=row["host"]["binding"]["runtime"]["max_file_bytes"])
+-    check_retained_job(row)
+-    attempt, row = begin_delivery(store, row["existing_task_id"], row["owner"], reference, retry=retry)
+-    terminal = row["host"]["terminal"]
+-    partial = row["stop_intent"] is not None or terminal is None or terminal["state"] != "completed"
+-    check = {"NOT_RUN": "Проверка цели не выполнена.", "UNKNOWN": "Проверка цели не завершена.",
+-             "FAIL": "Проверка цели не пройдена.", "PASS": "Проверено чтением файлов; запуск тестов этим не подтверждается."}[row["goal_verification"]]
+-    caption = ("Частичный результат. " if partial else "Результат исполнителя. ") + check
+-    try:
++    def check_metadata_scope():
+         check_retained_job(row)
+-        send = ctx.deliver_cli_document if row['owner'].get('platform') == 'cli' else ctx.deliver_gateway_document
+-        kwargs = {'deadline':deadline - min(.5, max(0, deadline - asyncio.get_running_loop().time()) / 4)} if local else {}
+-        receipt = await send(route=delivery_route(row["host"]["binding"]["ingress"]),
+-                    data=payload, file_name=artifact["logical_name"], caption=caption, timeout=30, **kwargs)
+-    except Exception:
+-        receipt = {"state": "UNKNOWN"}
+-    # Cancellation/BaseException leaves durable UNKNOWN; no false FAILED/retry.
+-    check_retained_job(row)
+-    if local and asyncio.get_running_loop().time() >= deadline:
+-        receipt = {'state':'UNKNOWN'}
+-    return finish_delivery(store, row["existing_task_id"], row["owner"], reference, attempt["number"], receipt)
++        from hermes_cli.friday_cli_work import should_stop
++        if should_stop():
++            raise AssociationError('cli_delivery_stopped')
++    with (store.metadata_deadline(deadline, guard=check_metadata_scope) if local else nullcontext()):
++        row = store.get(row["existing_task_id"], row["owner"])
++        check_retained_job(row)
++        artifact = next((a for a in row.get("result", {}).get("artifacts", []) if a["reference"] == reference), None)
++        if artifact is None:
++            raise AssociationError("unknown_result_artifact")
++        # Recheck bytes BEFORE reserving a send. A changed staging file never sends.
++        payload = await asyncio.to_thread(read_staged, staging_root=output_root(row), artifact=StagedArtifact(**artifact),
++                                          max_bytes=row["host"]["binding"]["runtime"]["max_file_bytes"])
++        check_retained_job(row)
++        attempt, row = begin_delivery(store, row["existing_task_id"], row["owner"], reference, retry=retry)
++        terminal = row["host"]["terminal"]
++        partial = row["stop_intent"] is not None or terminal is None or terminal["state"] != "completed"
++        check = {"NOT_RUN": "Проверка цели не выполнена.", "UNKNOWN": "Проверка цели не завершена.",
++                 "FAIL": "Проверка цели не пройдена.", "PASS": "Проверено чтением файлов; запуск тестов этим не подтверждается."}[row["goal_verification"]]
++        caption = ("Частичный результат. " if partial else "Результат исполнителя. ") + check
++        try:
++            check_retained_job(row)
++            send = ctx.deliver_cli_document if row['owner'].get('platform') == 'cli' else ctx.deliver_gateway_document
++            kwargs = {'deadline':deadline - min(.5, max(0, deadline - asyncio.get_running_loop().time()) / 4)} if local else {}
++            receipt = await send(route=delivery_route(row["host"]["binding"]["ingress"]),
++                        data=payload, file_name=artifact["logical_name"], caption=caption, timeout=30, **kwargs)
++        except Exception:
++            receipt = {"state": "UNKNOWN"}
++        # Cancellation/BaseException leaves durable UNKNOWN; no false FAILED/retry.
++        check_retained_job(row)
++        if local and asyncio.get_running_loop().time() >= deadline:
++            receipt = {'state':'UNKNOWN'}
++        if not local:
++            return finish_delivery(store, row["existing_task_id"], row["owner"], reference, attempt["number"], receipt)
++        from utils import AtomicWriteUncertainError
++        try:
++            return finish_delivery(store, row["existing_task_id"], row["owner"], reference, attempt["number"], receipt)
++        except (TimeoutError, AtomicWriteUncertainError):
++            # Return the original durable reservation. Publication may already have
++            # happened; never reread/rewrite or authorize a duplicate send to decide.
++            return copy.deepcopy(row)
+--- parent/hermes/hermes_cli/plugins_state.py
++++ metadata-source/hermes/hermes_cli/plugins_state.py
+@@ -137,8 +137,25 @@
+             self._acquiring = False
+ 
+ 
+-def _acquisition_scope(deadline, budget):
+-    return budget.acquiring() if budget is not None else nullcontext(deadline)
++@contextmanager
++def _acquisition_scope(deadline, budget, operation_deadline=None):
++    with (budget.acquiring() if budget is not None else nullcontext(deadline)) as acquired:
++        yield (operation_deadline if acquired is None else acquired if operation_deadline is None
++               else min(acquired, operation_deadline))
++
++
++def _state_operation_check(operation_deadline=None, commit_guard=None):
++    if operation_deadline is not None and (isinstance(operation_deadline, bool)
++            or not isinstance(operation_deadline, (int, float)) or not math.isfinite(operation_deadline)):
++        raise ValueError("operation_deadline must be a finite monotonic timestamp")
++    if commit_guard is not None and not callable(commit_guard):
++        raise ValueError("commit_guard must be callable")
++    if operation_deadline is not None and time.monotonic() >= operation_deadline:
++        raise TimeoutError("Plugin state operation deadline exceeded")
++    if commit_guard is not None:
++        commit_guard()
++    if operation_deadline is not None and time.monotonic() >= operation_deadline:
++        raise TimeoutError("Plugin state operation deadline exceeded")
+ 
+ 
+ def _lock_remaining(deadline):
+@@ -149,8 +166,8 @@
+ 
+ 
+ @contextmanager
+-def _thread_state_lock(lock, deadline, budget=None):
+-    with _acquisition_scope(deadline, budget) as acquisition_deadline:
++def _thread_state_lock(lock, deadline, budget=None, operation_deadline=None):
++    with _acquisition_scope(deadline, budget, operation_deadline) as acquisition_deadline:
+         if acquisition_deadline is None:
+             lock.acquire()
+         elif not lock.acquire(timeout=_lock_remaining(acquisition_deadline)):
+@@ -185,7 +202,7 @@
+ 
+ @contextmanager
+ def _locked_plugin_state(path: Path, *, lock_deadline: float | None = None,
+-                         lock_budget: LockAcquisitionBudget | None = None):
++                         lock_budget: LockAcquisitionBudget | None = None, operation_deadline=None):
+     """Serialize state read-modify-write across threads/processes (fcntl / msvcrt). The lock lives in a
+     sibling file because atomic replacement changes the target's inode."""
+     if lock_deadline is not None and (isinstance(lock_deadline, bool)
+@@ -194,10 +211,11 @@
+     if lock_budget is not None and (not isinstance(lock_budget, LockAcquisitionBudget)
+                                     or lock_deadline is not None):
+         raise ValueError("lock_budget must be a LockAcquisitionBudget, without lock_deadline")
++    _state_operation_check(operation_deadline)
+     lock_path = path.with_name(f".{path.name}.lock")
+-    with _thread_state_lock(_PLUGIN_STATE_LOCKS_GUARD, lock_deadline, lock_budget):
++    with _thread_state_lock(_PLUGIN_STATE_LOCKS_GUARD, lock_deadline, lock_budget, operation_deadline):
+         thread_lock = _PLUGIN_STATE_LOCKS.setdefault(str(lock_path.resolve(strict=False)), threading.RLock())
+-    with _thread_state_lock(thread_lock, lock_deadline, lock_budget):
++    with _thread_state_lock(thread_lock, lock_deadline, lock_budget, operation_deadline):
+         lock_path.parent.mkdir(parents=True, exist_ok=True)
+         with open(lock_path, "a+b") as handle:
+             if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+@@ -206,7 +224,7 @@
+                     handle.write(b"\0")
+                     handle.flush()
+                 handle.seek(0)
+-            with _acquisition_scope(lock_deadline, lock_budget) as acquisition_deadline:
++            with _acquisition_scope(lock_deadline, lock_budget, operation_deadline) as acquisition_deadline:
+                 _acquire_state_file(handle, acquisition_deadline)
+             try:
+                 yield
+@@ -260,18 +278,30 @@
+         return data
+ 
+     def get(self, key: str, default: Any = None, *, lock_deadline: float | None = None,
+-            lock_budget: LockAcquisitionBudget | None = None) -> Any:
++            lock_budget: LockAcquisitionBudget | None = None, operation_deadline=None,
++            commit_guard=None) -> Any:
+         """Read JSON; opt into an absolute deadline or cumulative acquisition budget."""
+         self._validate_key(key)
+-        with _locked_plugin_state(self.path, lock_deadline=lock_deadline, lock_budget=lock_budget):
+-            return self._read_unlocked().get(key, default)
++        _state_operation_check(operation_deadline, commit_guard)
++        with _locked_plugin_state(self.path, lock_deadline=lock_deadline, lock_budget=lock_budget,
++                                  operation_deadline=operation_deadline):
++            _state_operation_check(operation_deadline, commit_guard)
++            value = self._read_unlocked().get(key, default)
++            _state_operation_check(operation_deadline, commit_guard)
++        _state_operation_check(operation_deadline, commit_guard)
++        return value
+ 
+     def set(self, key: str, value: Any, *, lock_deadline: float | None = None,
+-            lock_budget: LockAcquisitionBudget | None = None) -> None:
++            lock_budget: LockAcquisitionBudget | None = None, operation_deadline=None,
++            commit_guard=None) -> None:
+         """Atomically set one JSON value without dropping concurrent updates."""
+         self._validate_key(key)
+-        with _locked_plugin_state(self.path, lock_deadline=lock_deadline, lock_budget=lock_budget):
++        _state_operation_check(operation_deadline, commit_guard)
++        with _locked_plugin_state(self.path, lock_deadline=lock_deadline, lock_budget=lock_budget,
++                                  operation_deadline=operation_deadline):
++            _state_operation_check(operation_deadline, commit_guard)
+             data = self._read_unlocked()
++            _state_operation_check(operation_deadline, commit_guard)
+             if self._plugin_id == "friday_rework" and key == "product_access.v1":
+                 from hermes_cli.friday_product_access import KEY, advance_access
+                 value = advance_access(data.get(KEY, {"schema": KEY, "users": {}}), value)
+@@ -280,10 +310,18 @@
+                 encoded = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+             except (TypeError, ValueError) as exc:
+                 raise ValueError(f"Plugin state value for {key!r} is not JSON-serializable") from exc
++            _state_operation_check(operation_deadline, commit_guard)
+             if len(encoded) > self.quota_bytes:
+                 raise ValueError(
+                     f"Plugin state quota exceeded: {len(encoded)} bytes is greater "
+                     f"than the {self.quota_bytes}-byte per-plugin quota"
+                 )
+             from utils import atomic_json_write
+-            atomic_json_write(self.path, data, mode=0o600)
++            options = ({"write_deadline": operation_deadline, "commit_guard": commit_guard}
++                       if operation_deadline is not None or commit_guard is not None else {})
++            atomic_json_write(self.path, data, mode=0o600, **options)
++        try:
++            _state_operation_check(operation_deadline, commit_guard)
++        except Exception as exc:
++            from utils import AtomicWriteUncertainError
++            raise AtomicWriteUncertainError("Plugin state published; lock completion uncertain") from exc
+--- parent/hermes/utils.py
++++ metadata-source/hermes/utils.py
+@@ -3,6 +3,7 @@
+ import errno
+ import json
+ import logging
++import math
+ import os
+ import re
+ import shutil
+@@ -165,7 +166,31 @@
+     os.unlink(tmp_str)
+ 
+ 
+-def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
++class AtomicWriteUncertainError(RuntimeError):
++    """Publication completed, but completion/durability was not confirmed in scope.
++
++    No rollback or retry is safe: the original target may already contain the new
++    receipt. Synchronous filesystem calls are not made preemptible by this error.
++    """
++    published = True
++
++
++def _check_atomic_write(write_deadline=None, commit_guard=None):
++    if write_deadline is not None and (isinstance(write_deadline, bool)
++            or not isinstance(write_deadline, (int, float)) or not math.isfinite(write_deadline)):
++        raise ValueError("write_deadline must be a finite monotonic timestamp")
++    if commit_guard is not None and not callable(commit_guard):
++        raise ValueError("commit_guard must be callable")
++    if write_deadline is not None and time.monotonic() >= write_deadline:
++        raise TimeoutError("Atomic write deadline exceeded")
++    if commit_guard is not None:
++        commit_guard()
++    if write_deadline is not None and time.monotonic() >= write_deadline:
++        raise TimeoutError("Atomic write deadline exceeded")
++
++
++def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path], *,
++                   write_deadline=None, commit_guard=None) -> str:
+     """Atomically move *tmp_path* onto *target*, preserving symlinks.
+ 
+     Resolves a symlink first so ``os.replace`` writes the real file in place and the symlink
+@@ -174,10 +199,12 @@
+     retry) or a Windows rename contended by another open handle (winerror 5/32/33: bounded retry,
+     then in-place rewrite).
+     """
++    _check_atomic_write(write_deadline, commit_guard)
+     target_str = str(target)
+     real_path = _publish_path(target_str)
+     tmp_str = str(tmp_path)
+     try:
++        _check_atomic_write(write_deadline, commit_guard)
+         os.replace(tmp_str, real_path)
+         return real_path
+     except OSError as exc:
+@@ -188,8 +215,13 @@
+             # Lazy: keeps ``utils`` free of a package-level dependency on ``agent``.
+             from agent.retry_utils import jittered_backoff
+             for attempt in range(1, _REPLACE_RETRY_ATTEMPTS + 1):
+-                time.sleep(jittered_backoff(attempt, base_delay=_REPLACE_RETRY_BASE_DELAY_S, max_delay=_REPLACE_RETRY_MAX_DELAY_S))
++                _check_atomic_write(write_deadline, commit_guard)
++                delay = jittered_backoff(attempt, base_delay=_REPLACE_RETRY_BASE_DELAY_S, max_delay=_REPLACE_RETRY_MAX_DELAY_S)
++                if write_deadline is not None:
++                    delay = min(delay, max(0, write_deadline - time.monotonic()))
++                time.sleep(delay)
+                 try:
++                    _check_atomic_write(write_deadline, commit_guard)
+                     os.replace(tmp_str, real_path)
+                     return real_path
+                 except OSError as retry_exc:
+@@ -203,6 +235,7 @@
+                      getattr(exc, "winerror", None) or errno.errorcode.get(exc.errno or 0, exc.errno),
+                      "in-place rewrite" if contended else "copy")
+         # The rewrite re-raises its own error, so an ACL denial is reported as such, not as contention.
++        _check_atomic_write(write_deadline, commit_guard)
+         (_rewrite_in_place if contended else _copy_fallback)(tmp_str, real_path)
+     return real_path
+ 
+@@ -288,7 +321,8 @@
+ 
+ 
+ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mode: "int | None" = None,
+-                  preserve_owner: bool = True, binary: bool = False, fsync_dir: bool = False) -> None:
++                  preserve_owner: bool = True, binary: bool = False, fsync_dir: bool = False,
++                  write_deadline=None, commit_guard=None) -> None:
+     """Temp file + fsync + :func:`atomic_replace`, then re-apply owner/mode.
+ 
+     *write(f)* emits the payload into the open handle (text, or bytes when *binary*). The temp file
+@@ -308,25 +342,39 @@
+     # would resurrect the profile before the write can fail.
+     from hermes_constants import mkdir_under_hermes_home
+ 
++    _check_atomic_write(write_deadline, commit_guard)
+     mkdir_under_hermes_home(path.parent)
++    _check_atomic_write(write_deadline, commit_guard)
+     if mode is None and not path.exists():
+         mode = default_new_file_mode()
+     original_owner = _preserve_file_owner(path) if preserve_owner else None
++    _check_atomic_write(write_deadline, commit_guard)
+     fd, tmp_path = mkstemp_beside(path, prefix=prefix, suffix=".tmp")
++    replaced = None
+     try:
+         with os.fdopen(fd, "wb" if binary else "w", encoding=None if binary else encoding) as f:
++            _check_atomic_write(write_deadline, commit_guard)
+             if mode is not None and hasattr(os, "fchmod"):
+                 os.fchmod(f.fileno(), mode)
++            _check_atomic_write(write_deadline, commit_guard)
+             write(f)
++            _check_atomic_write(write_deadline, commit_guard)
+             f.flush()
++            _check_atomic_write(write_deadline, commit_guard)
+             os.fsync(f.fileno())
+-        replaced = Path(atomic_replace(tmp_path, path))  # symlink-preserving actual destination
++        _check_atomic_write(write_deadline, commit_guard)
++        options = ({"write_deadline": write_deadline, "commit_guard": commit_guard}
++                   if write_deadline is not None or commit_guard is not None else {})
++        replaced = Path(atomic_replace(tmp_path, path, **options))  # symlink-preserving actual destination
+         _restore_file_metadata(replaced, original_owner, mode)
+         if fsync_dir:
+             fsync_directory(replaced.parent)
+-    except BaseException:
++        _check_atomic_write(write_deadline, commit_guard)
++    except BaseException as exc:
+         with suppress(OSError):
+             os.unlink(tmp_path)
++        if replaced is not None and isinstance(exc, Exception):
++            raise AtomicWriteUncertainError("Atomic write published; completion uncertain") from exc
+         raise
+ 
+ 
+@@ -379,7 +427,8 @@
+ 
+ def atomic_json_write(
+     path: Union[str, Path], data: Any, *, indent: int = 2, mode: int | None = None,
+-    ensure_ascii: bool = False, fsync_dir: bool = False, **dump_kwargs: Any,
++    ensure_ascii: bool = False, fsync_dir: bool = False, write_deadline=None,
++    commit_guard=None, **dump_kwargs: Any,
+ ) -> None:
+     """Write JSON to *path* atomically (temp file + fsync + replace).
+ 
+@@ -388,10 +437,11 @@
+     bytes. ``mode=0o600`` is the private-credential form: the temp file is 0600 from creation
+     (mkstemp), so the payload is never umask-readable.
+     """
++    _check_atomic_write(write_deadline, commit_guard)
+     path = Path(path)
+     _atomic_write(path, lambda f: _dump_json(data, f, indent=indent, ensure_ascii=ensure_ascii, dump_kwargs=dump_kwargs),
+                   prefix=f".{path.stem}_", mode=mode if mode is not None else _preserve_file_mode(path),
+-                  fsync_dir=fsync_dir)
++                  fsync_dir=fsync_dir, write_deadline=write_deadline, commit_guard=commit_guard)
+ 
+ 
+ def read_json_or_empty(path: Union[str, Path]) -> dict:
