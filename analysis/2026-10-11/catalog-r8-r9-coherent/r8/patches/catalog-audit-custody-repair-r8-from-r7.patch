@@ -1,0 +1,371 @@
+--- a/hermes/hermes_cli/urllib_security.py
++++ b/hermes/hermes_cli/urllib_security.py
+@@ -317,6 +317,7 @@
+     from functools import wraps
+     from hermes_cli.friday_user_scope import ScopeDenied
+     import contextvars
++    import sys
+     import http.client
+     import threading
+     # A callable factory may run inherited native connect before returning its
+@@ -328,65 +329,113 @@
+         (threading.RLock(), contextvars.ContextVar("catalog_constructor_connect", default=None), [0, None, None]))
+     scope_lock, connect_context, scope_state = registry
+     from contextlib import contextmanager
++    def cleanup_step(errors, name, action):
++        try:
++            action()
++        except BaseException as error:
++            errors.append((name, error))
++
++    def finish_scope(errors, causal):
++        if not errors:
++            return
++        # Audit policy is never retried or bypassed. Retain an explicit poisoned
++        # scope after an unconfirmed restoration; later factories must refuse.
++        details = tuple(name + ":" + type(error).__name__ for name, error in errors)
++        _bind_request_guard.__dict__["_constructor_scope_stop_unconfirmed"] = details
++        note = "STOP_UNCONFIRMED catalog scope restoration " + ", ".join(details)
++        if causal is not None:
++            causal.add_note(note)
++            return
++        error = ScopeDenied()
++        error.add_note(note)
++        raise error from errors[0][1]
++
++    def restore_native(state, method_name, errors):
++        entry, dispatch_code = state[1:]
++        if method_name == "connect":
++            native, code, boundary, attributes = entry
++            key = "_hermes_catalog_constructor_connect_scope"
++        else:
++            native, code, attributes, boundary = entry
++            key = "_hermes_catalog_constructor_birth_scope"
++        intact = (getattr(http.client.HTTPConnection, method_name) is native
++                  and native.__code__ is dispatch_code
++                  and native.__dict__ == {**attributes, key: boundary})
++        # Attempt each independent repair, even when policy rejects a code
++        # assignment. Code constants retain the original body for in-flight
++        # unrelated dispatchers; cleared Contexts make refused dispatch neutral.
++        if native.__code__ is not code:
++            cleanup_step(errors, method_name + " code", lambda: setattr(native, "__code__", code))
++        cleanup_step(errors, method_name + " attributes", lambda: (native.__dict__.clear(), native.__dict__.update(attributes)))
++        cleanup_step(errors, method_name + " class", lambda: setattr(http.client.HTTPConnection, method_name, native))
++        state[1:] = [None, None]
++        return intact
++
+     @contextmanager
+     def constructor_connect_scope(prepare):
+-        with scope_lock:
+-            if scope_state[0] == 0:
+-                import types
+-                native_connect = http.client.HTTPConnection.connect
+-                key = "_hermes_catalog_constructor_connect_scope"
+-                if (type(native_connect) is not types.FunctionType or native_connect.__closure__
+-                        or key in native_connect.__dict__):
++        token = None
++        lease = False
++        complete = False
++        try:
++            if _bind_request_guard.__dict__.get("_constructor_scope_stop_unconfirmed"):
++                raise ScopeDenied()
++            with scope_lock:
++                if scope_state[0] == 0:
++                    import types
++                    native_connect = http.client.HTTPConnection.connect
++                    key = "_hermes_catalog_constructor_connect_scope"
++                    if (type(native_connect) is not types.FunctionType or native_connect.__closure__
++                            or key in native_connect.__dict__):
++                        raise ScopeDenied()
++                    original_code = native_connect.__code__
++                    original_attributes = native_connect.__dict__.copy()
++                    # Retain and execute the complete original stdlib body. Pin its
++                    # function entry as well as class lookup: callers may have saved
++                    # the original connect function before this constructor starts.
++                    native_body = types.FunctionType(original_code, native_connect.__globals__,
++                        native_connect.__name__, native_connect.__defaults__, native_connect.__closure__)
++                    native_body.__kwdefaults__ = native_connect.__kwdefaults__
++                    boundary = (connect_context, native_body)
++                    def dispatch(connection):
++                        context, body = ("_hermes_catalog_stable_connect_boundary",)
++                        import threading as native_threading
++                        owner = context.get()
++                        if owner is not None and owner[0] == native_threading.get_ident():
++                            owner[1](connection)
++                        return body(connection)
++                    # A caller already executing the dispatcher may outlive the
++                    # constructor window. Its own code constant retains the full
++                    # native body; restoration cannot remove its lookup target.
++                    dispatch_code = dispatch.__code__.replace(co_consts=tuple(
++                        boundary if value == ("_hermes_catalog_stable_connect_boundary",) else value
++                        for value in dispatch.__code__.co_consts))
++                    scope_state[1:] = [(native_connect, original_code, boundary, original_attributes), dispatch_code]
++                    scope_state[0] += 1
++                    lease = True
++                    native_connect.__dict__[key] = boundary
++                    native_connect.__code__ = dispatch_code
++                elif (http.client.HTTPConnection.connect is not scope_state[1][0]
++                        or scope_state[1][0].__code__ is not scope_state[2]):
+                     raise ScopeDenied()
+-                original_code = native_connect.__code__
+-                original_attributes = native_connect.__dict__.copy()
+-                # Retain and execute the complete original stdlib body. Pin its
+-                # function entry as well as class lookup: callers may have saved
+-                # the original connect function before this constructor starts.
+-                native_body = types.FunctionType(original_code, native_connect.__globals__,
+-                    native_connect.__name__, native_connect.__defaults__, native_connect.__closure__)
+-                native_body.__kwdefaults__ = native_connect.__kwdefaults__
+-                boundary = (connect_context, native_body)
+-                def dispatch(connection):
+-                    context, body = ("_hermes_catalog_stable_connect_boundary",)
+-                    import threading as native_threading
+-                    owner = context.get()
+-                    if owner is not None and owner[0] == native_threading.get_ident():
+-                        owner[1](connection)
+-                    return body(connection)
+-                # A caller already executing the dispatcher may outlive the
+-                # constructor window. Its own code constant retains the full
+-                # native body; restoration cannot remove its lookup target.
+-                dispatch_code = dispatch.__code__.replace(co_consts=tuple(
+-                    boundary if value == ("_hermes_catalog_stable_connect_boundary",) else value
+-                    for value in dispatch.__code__.co_consts))
+-                native_connect.__dict__[key] = boundary
+-                native_connect.__code__ = dispatch_code
+-                scope_state[1:] = [(native_connect, original_code, boundary, original_attributes), dispatch_code]
+-            elif (http.client.HTTPConnection.connect is not scope_state[1][0]
+-                    or scope_state[1][0].__code__ is not scope_state[2]):
+-                raise ScopeDenied()
+-            scope_state[0] += 1
+-        token = connect_context.set((threading.get_ident(), prepare))
+-        try:
++                if not lease:
++                    scope_state[0] += 1
++                    lease = True
++            token = connect_context.set((threading.get_ident(), prepare))
++            complete = True
+             yield
+         finally:
+-            connect_context.reset(token)
+-            with scope_lock:
+-                scope_state[0] -= 1
+-                if scope_state[0] == 0:
+-                    native_connect, original_code, boundary, original_attributes = scope_state[1]
+-                    key = "_hermes_catalog_constructor_connect_scope"
+-                    intact = (http.client.HTTPConnection.connect is native_connect
+-                        and native_connect.__code__ is scope_state[2]
+-                        and native_connect.__dict__ == {**original_attributes, key: boundary})
+-                    native_connect.__code__ = original_code
+-                    native_connect.__dict__.clear()
+-                    native_connect.__dict__.update(original_attributes)
+-                    http.client.HTTPConnection.connect = native_connect
+-                    scope_state[1:] = [None, None]
+-                    if not intact:
+-                        raise ScopeDenied()
++            causal = sys.exception()
++            errors = []
++            if token is not None:
++                cleanup_step(errors, "connect Context", lambda: connect_context.reset(token))
++            if lease:
++                with scope_lock:
++                    scope_state[0] -= 1
++                    if scope_state[0] == 0:
++                        intact = restore_native(scope_state, "connect", errors)
++                        if complete and not intact and causal is None and not errors:
++                            errors.append(("connect integrity", ScopeDenied()))
++            finish_scope(errors, causal)
+ 
+     # Native constructor origins are observed for ALL callers while a finite
+     # factory runs; a borrowed connection made in a neutral Context or another
+@@ -416,55 +465,15 @@
+                 raise ScopeDenied()
+     @contextmanager
+     def constructor_birth_scope(record):
+-        import sys
+         import types
+         owner_thread = threading.get_ident()
+         invocation = object()
+         previous = sys.getprofile()
+-        with birth_lock:
+-            if birth_state[0] == 0:
+-                native_init = http.client.HTTPConnection.__init__
+-                key = "_hermes_catalog_constructor_birth_scope"
+-                if (type(native_init) is not types.FunctionType or native_init.__closure__
+-                        or key in native_init.__dict__):
+-                    raise ScopeDenied()
+-                original_code = native_init.__code__
+-                original_attributes = native_init.__dict__.copy()
+-                native_body = types.FunctionType(original_code, native_init.__globals__,
+-                    native_init.__name__, native_init.__defaults__, native_init.__closure__)
+-                native_body.__kwdefaults__ = native_init.__kwdefaults__
+-                boundary = (birth_lock, birth_context, birth_origins, native_body, birth_state)
+-                def dispatch(connection, *args, **kwargs):
+-                    import threading as native_threading
+-                    lock, context, origins, body, state = ("_hermes_catalog_stable_birth_boundary",)
+-                    owner = context.get()
+-                    actual = (owner[2] if owner is not None
+-                              and owner[0] == native_threading.get_ident() else None)
+-                    with lock:
+-                        existing = origins.get(id(connection))
+-                        if state[0] == 0:
+-                            actual = None
+-                        elif existing is None:
+-                            origins[id(connection)] = (connection, actual)
+-                        elif existing[0] is not connection or existing[1] is not actual:
+-                            # A neutral/unrelated instance cannot become an owned
+-                            # birth through an explicit second constructor call.
+-                            from hermes_cli.friday_user_scope import ScopeDenied
+-                            raise ScopeDenied()
+-                    if actual is not None:
+-                        owner[1](connection)
+-                    return body(connection, *args, **kwargs)
+-                dispatch_code = dispatch.__code__.replace(co_consts=tuple(
+-                    boundary if value == ("_hermes_catalog_stable_birth_boundary",) else value
+-                    for value in dispatch.__code__.co_consts))
+-                native_init.__dict__[key] = boundary
+-                native_init.__code__ = dispatch_code
+-                birth_state[1:] = [(native_init, original_code, original_attributes, boundary), dispatch_code]
+-            elif (http.client.HTTPConnection.__init__ is not birth_state[1][0]
+-                    or birth_state[1][0].__code__ is not birth_state[2]):
+-                raise ScopeDenied()
+-            birth_state[0] += 1
+-        token = birth_context.set((owner_thread, record, invocation))
++        observer_state = [previous, invocation, record]
++        token = None
++        lease = False
++        profile_attempted = False
++        complete = False
+         def constructor_code(cls, name, code):
+             for base in type.__getattribute__(cls, "__mro__"):
+                 value = type.__getattribute__(base, "__dict__").get(name)
+@@ -474,10 +483,11 @@
+                     return True
+             return False
+         def observe(frame, event, argument):
+-            if previous is not None:
+-                previous(frame, event, argument)
++            prior = observer_state[0]
++            if prior is not None:
++                prior(frame, event, argument)
+             owner = birth_context.get()
+-            if owner is None or owner[0] != threading.get_ident() or owner[2] is not invocation:
++            if owner is None or owner[0] != threading.get_ident() or owner[2] is not observer_state[1]:
+                 return
+             code = frame.f_code
+             if event == "call" and code.co_argcount:
+@@ -485,7 +495,7 @@
+                 if (connection is not None and any(base is http.client.HTTPConnection
+                         for base in type.__getattribute__(type(connection), "__mro__"))
+                         and constructor_code(type(connection), "__init__", code)):
+-                    record(connection)
++                    observer_state[2](connection)
+             elif event == "return" and argument is not None and code.co_argcount:
+                 cls = frame.f_locals.get(code.co_varnames[0])
+                 if (isinstance(cls, type) and any(base is http.client.HTTPConnection
+@@ -493,32 +503,84 @@
+                         and constructor_code(cls, "__new__", code)
+                         and any(base is http.client.HTTPConnection
+                             for base in type.__getattribute__(type(argument), "__mro__"))):
+-                    record(argument, allocated=True)
+-        sys.setprofile(observe)
++                    observer_state[2](argument, allocated=True)
+         try:
++            if _bind_request_guard.__dict__.get("_constructor_scope_stop_unconfirmed"):
++                raise ScopeDenied()
++            with birth_lock:
++                if birth_state[0] == 0:
++                    native_init = http.client.HTTPConnection.__init__
++                    key = "_hermes_catalog_constructor_birth_scope"
++                    if (type(native_init) is not types.FunctionType or native_init.__closure__
++                            or key in native_init.__dict__):
++                        raise ScopeDenied()
++                    original_code = native_init.__code__
++                    original_attributes = native_init.__dict__.copy()
++                    native_body = types.FunctionType(original_code, native_init.__globals__,
++                        native_init.__name__, native_init.__defaults__, native_init.__closure__)
++                    native_body.__kwdefaults__ = native_init.__kwdefaults__
++                    boundary = (birth_lock, birth_context, birth_origins, native_body, birth_state)
++                    def dispatch(connection, *args, **kwargs):
++                        import threading as native_threading
++                        lock, context, origins, body, state = ("_hermes_catalog_stable_birth_boundary",)
++                        owner = context.get()
++                        actual = (owner[2] if owner is not None
++                                  and owner[0] == native_threading.get_ident() else None)
++                        with lock:
++                            existing = origins.get(id(connection))
++                            if state[0] == 0:
++                                actual = None
++                            elif existing is None:
++                                origins[id(connection)] = (connection, actual)
++                            elif existing[0] is not connection or existing[1] is not actual:
++                                # A neutral/unrelated instance cannot become an owned
++                                # birth through an explicit second constructor call.
++                                from hermes_cli.friday_user_scope import ScopeDenied
++                                raise ScopeDenied()
++                        if actual is not None:
++                            owner[1](connection)
++                        return body(connection, *args, **kwargs)
++                    dispatch_code = dispatch.__code__.replace(co_consts=tuple(
++                        boundary if value == ("_hermes_catalog_stable_birth_boundary",) else value
++                        for value in dispatch.__code__.co_consts))
++                    birth_state[1:] = [(native_init, original_code, original_attributes, boundary), dispatch_code]
++                    birth_state[0] += 1
++                    lease = True
++                    native_init.__dict__[key] = boundary
++                    native_init.__code__ = dispatch_code
++                elif (http.client.HTTPConnection.__init__ is not birth_state[1][0]
++                        or birth_state[1][0].__code__ is not birth_state[2]):
++                    raise ScopeDenied()
++                if not lease:
++                    birth_state[0] += 1
++                    lease = True
++            token = birth_context.set((owner_thread, record, invocation))
++            profile_attempted = True
++            sys.setprofile(observe)
++            complete = True
+             yield
+         finally:
+-            intact_profile = sys.getprofile() is observe
+-            sys.setprofile(previous)
+-            birth_context.reset(token)
+-            with birth_lock:
+-                birth_state[0] -= 1
+-                if birth_state[0] == 0:
+-                    native_init, original_code, original_attributes, boundary = birth_state[1]
+-                    intact_native = (http.client.HTTPConnection.__init__ is native_init
+-                        and native_init.__code__ is birth_state[2]
+-                        and native_init.__dict__ == {**original_attributes,
+-                            "_hermes_catalog_constructor_birth_scope": boundary})
+-                    native_init.__code__ = original_code
+-                    native_init.__dict__.clear()
+-                    native_init.__dict__.update(original_attributes)
+-                    http.client.HTTPConnection.__init__ = native_init
+-                    birth_state[1:] = [None, None]
+-                    birth_origins.clear()
+-                    if not intact_native:
+-                        raise ScopeDenied()
+-            if not intact_profile:
+-                raise ScopeDenied()
++            causal = sys.exception()
++            errors = []
++            intact_profile = not complete or sys.getprofile() is observe
++            if profile_attempted and sys.getprofile() is not previous:
++                cleanup_step(errors, "previous profile", lambda: sys.setprofile(previous))
++            # If policy keeps observe installed, it becomes an inert observer
++            # without retained invocation, custody callback or previous hook.
++            observer_state[:] = [None, None, None]
++            if token is not None:
++                cleanup_step(errors, "birth Context", lambda: birth_context.reset(token))
++            if lease:
++                with birth_lock:
++                    birth_state[0] -= 1
++                    if birth_state[0] == 0:
++                        intact_native = restore_native(birth_state, "__init__", errors)
++                        birth_origins.clear()
++                        if complete and not intact_native and causal is None and not errors:
++                            errors.append(("birth integrity", ScopeDenied()))
++            if not intact_profile and causal is None and not errors:
++                errors.append(("profile integrity", ScopeDenied()))
++            finish_scope(errors, causal)
+ 
+     def settle(handle):
+         # Preserve the causal exception while still attempting native cleanup.
