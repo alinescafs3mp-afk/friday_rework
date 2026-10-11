@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""Send one immutable Sol Link reference to an existing native TUI, once."""
+
+import argparse
+import base64
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import subprocess
+import selectors
+import stat
+import time
+
+ROOT = Path('/analysis/NOT_CONNECTED/runtime')
+RECEIPTS = ROOT / 'sol-link-native-receipts'
+NATIVE = '/analysis/NOT_CONNECTED/bin/codex'
+
+
+def binding(path):
+    text = path.read_text()
+    if text.lstrip().startswith('{'):
+        value = json.loads(text)
+    else:
+        value = dict(line.split(': ', 1) for line in text.splitlines() if ': ' in line and not line.startswith(' '))
+    return {'thread': value.get('thread_id', value.get('thread_uuid')),
+            'home': value.get('account_home', value.get('account_home_ref')),
+            'endpoint': value.get('backend_endpoint'), 'generation': value.get('generation'),
+            'role': value.get('role')}
+
+
+def reserve(path, receipt):
+    """UNKNOWN is durable before invoking queue; a crash never permits resend."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        old = json.loads(path.read_text())
+        for field in ('event_id', 'sha256', 'recipient_thread', 'recipient_generation',
+                      'assignment_id', 'assignment_generation', 'assignment_action'):
+            if old.get(field) != receipt.get(field):
+                raise SystemExit('Event ID collision; send refused.')
+        print(json.dumps({'state': old['state'], 'duplicate_suppressed': True, 'event_id': old['event_id']}))
+        return False
+    with os.fdopen(fd, 'w') as handle:
+        json.dump(receipt, handle)
+        handle.write('\n'); handle.flush(); os.fsync(handle.fileno())
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return True
+
+
+# Private bounded evidence, never a retry or a remote cancellation authority.
+FORENSIC_LIMIT = 65536
+STREAM_LIMIT = 4096
+QUEUE_TIMEOUT = 20
+
+
+class EvidencePersistenceError(RuntimeError):
+    pass
+
+
+def _safe_text(value):
+    text = str(value)
+    text = re.sub(r"(?im)((?:proxy-)?authorization\s*:\s*)[^\r\n]+", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)((?:bearer|basic)\s+)[^\s\"']+", r"\1[REDACTED]", text)
+    text = re.sub(r'\bsk-[A-Za-z0-9_-]+', '[REDACTED]', text)
+    marker = r"(?:api[_-]?key|access[_-]?token|password|secret)[\"']?\s*[=:]\s*"
+    text = re.sub(r"(?i)(" + marker + r')"(?:\\.|[^"\\])*"', r'\1"[REDACTED]"', text)
+    text = re.sub(r"(?i)(" + marker + r")'(?:\\.|[^'\\])*'", r"\1'[REDACTED]'", text)
+    text = re.sub(r"(?i)(" + marker + r"[\"']?)[^\s,\"']+", r"\1[REDACTED]", text)
+    return text
+
+
+def _atomic_json(path, value, initial=False):
+    """Private bounded replacement; post-replace directory failure has unknown durability."""
+    data = (json.dumps(value, ensure_ascii=True, sort_keys=True) + '\n').encode()
+    if len(data) > FORENSIC_LIMIT:
+        raise ValueError('Bounded forensic record exceeded')
+    if not initial:
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise PermissionError('Evidence target is not an owned private regular file')
+    temporary = path if initial else path.with_name('.' + path.name + '.write-' + str(os.getpid()))
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(data); handle.flush(); os.fsync(handle.fileno())
+        if not initial:
+            os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        # Never unlink an original reservation or old receipt.
+        if not initial:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _commit_receipt(path, receipt, forensic_path, evidence):
+    try:
+        _atomic_json(path, receipt)
+    except BaseException as exc:
+        evidence['bookkeeping_exception'] = _exception(exc, 'receipt_commit')
+        evidence['receipt_commit'] = 'UNKNOWN_DURABILITY'
+        _checkpoint(forensic_path, evidence, 'receipt_commit_failed')
+        raise
+    evidence['receipt_commit'] = 'DURABLE'
+    evidence['canonical_receipt_state'] = receipt['state']
+    _checkpoint(forensic_path, evidence, 'receipt_committed')
+
+
+def _exception(exc, phase, streams=None):
+    result = {'class': type(exc).__module__ + '.' + type(exc).__qualname__,
+              'phase': phase, 'message': _safe_text(str(exc))[:1024]}
+    chain = []; cause = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    seen = {id(exc)}
+    while cause is not None and id(cause) not in seen and len(chain) < 4:
+        seen.add(id(cause))
+        item = {'class': type(cause).__module__ + '.' + type(cause).__qualname__,
+                'message': _safe_text(str(cause))[:256]}
+        if isinstance(getattr(cause, 'errno', None), int):
+            item['errno'] = cause.errno
+        chain.append(item)
+        cause = cause.__cause__ or (None if cause.__suppress_context__ else cause.__context__)
+    if chain:
+        result['cause_chain'] = chain
+    for key in ('errno', 'timeout', 'returncode'):
+        value = getattr(exc, key, None)
+        if isinstance(value, (int, float)):
+            result[key] = value
+    for key, attribute in (('stdout', 'output'), ('stderr', 'stderr')):
+        value = getattr(exc, attribute, None)
+        if streams is not None:
+            # The original accumulator has full counts/hash and marker context.
+            # Never reconstruct an exception excerpt from already clipped raw bytes.
+            result[key] = streams[key].record()
+        elif value is not None:
+            stream = _Stream(); stream.add(value)
+            result[key] = stream.record()
+    return result
+
+
+class _Stream:
+    def __init__(self, limit=STREAM_LIMIT):
+        self.limit = limit
+        self.head = b''; self.tail = b''; self.total = 0
+        self.digest = hashlib.sha256(); self.types = set()
+        self.marker_context = b''; self.unsafe_excerpt = False
+
+    def add(self, value):
+        self.types.add('bytes' if isinstance(value, bytes) else 'text')
+        data = value if isinstance(value, bytes) else str(value).encode('utf-8', 'surrogatepass')
+        # Recognized ASCII marker detection precedes clipping, across chunk boundaries.
+        # Conservative omission avoids retaining an unlabelled credential suffix.
+        # This is not arbitrary-secret discovery; false-positive omission is allowed.
+        scan = self.marker_context + data
+        if re.search(br'(?i)(?:bearer|basic|sk-|api[_-]?key|access[_-]?token|password|secret|authorization)', scan):
+            self.unsafe_excerpt = True
+        self.marker_context = scan[-32:]
+        self.digest.update(data); self.total += len(data)
+        remaining = self.limit // 2 - len(self.head)
+        if remaining > 0:
+            self.head += data[:remaining]
+            data = data[remaining:]
+        self.tail = (self.tail + data)[-self.limit // 2:]
+
+    def data(self):
+        return self.head + self.tail
+
+    def record(self):
+        # Exact byte excerpts where safe; redact before either base64 or text storage.
+        raw = self.data()
+        unavailable = 'RECOGNIZED_CREDENTIAL_MARKER' if self.unsafe_excerpt else None
+        text = raw.decode('utf-8', 'backslashreplace')
+        safe = '[EXCERPT_UNAVAILABLE:RECOGNIZED_CREDENTIAL_MARKER]' if unavailable else _safe_text(text)
+        redacted = bool(unavailable) or safe != text
+        retained = b'' if unavailable else (safe.encode() if redacted else raw)
+        return {'observed_types': sorted(self.types), 'total_bytes': self.total,
+                'captured_bytes': len(raw), 'truncated': self.total > len(raw),
+                'raw_sha256': self.digest.hexdigest(), 'redacted': redacted,
+                'excerpt_available': unavailable is None, 'excerpt_unavailable_reason': unavailable,
+                'retained_bytes': len(retained),
+                'encoding': 'base64', 'bytes': base64.b64encode(retained).decode(),
+                'text': safe[:1024], 'text_truncated': len(safe) > 1024, 'partial': True}
+
+
+def _checkpoint(path, evidence, phase=None, initial=False):
+    if phase is not None and evidence.get('phase') != phase:
+        evidence['phase'] = phase
+        history = evidence.setdefault('phase_history', [])
+        history.append({'phase': phase, 'monotonic_ns': time.monotonic_ns()})
+        if len(history) > 16:
+            del history[1]
+    evidence['observed_at_utc'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    evidence['observed_monotonic_ns'] = time.monotonic_ns()
+    try:
+        _atomic_json(path, evidence, initial=initial)
+    except Exception as exc:
+        # No alternate queue call. The canonical durable reservation still suppresses resend.
+        causal = evidence.get('exception', {}).get('class', 'UNKNOWN')
+        raise EvidencePersistenceError('Private evidence persistence failed; phase=' + evidence.get('phase', 'UNKNOWN') + '; causal=' + causal + '; no retry') from exc
+
+
+def _lifecycle_run(command, phase, path, evidence):
+    evidence['queue_call'] = 'NOT_CALLED'
+    _checkpoint(path, evidence, phase + '_before_call')
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+    except BaseException as exc:
+        evidence['exception'] = _exception(exc, phase)
+        _checkpoint(path, evidence, phase + '_exception')
+        raise
+    evidence['lifecycle_result'] = {'phase': phase, 'returncode': result.returncode}
+    for name in ('stdout', 'stderr'):
+        stream = _Stream(limit=512); stream.add(getattr(result, name))
+        evidence['lifecycle_result'][name] = stream.record()
+    _checkpoint(path, evidence, phase + '_returned')
+    return result
+
+
+def _observed_rpc_ids(evidence, streams):
+    """Bounded complete diagnostic scan; four observations are a display cap only."""
+    observations = []; first_pair = None; conflict = False; complete = True
+    observed_count = 0; scanned_lines = 0
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError('Ambiguous duplicate JSON field')
+            value[key] = item
+        return value
+    for name, stream in streams.items():
+        if stream.total > len(stream.data()):
+            complete = False
+            continue
+        for raw_line in stream.data().splitlines():
+            scanned_lines += 1
+            try:
+                line = raw_line.decode('utf-8')
+            except UnicodeDecodeError:
+                # Binary/plaintext output is not a structured RPC diagnostic.
+                # Corrupt JSON-looking diagnostics cannot supply a complete identity scan.
+                if raw_line.lstrip().startswith(b'{') or b'thread/queue/add' in raw_line:
+                    complete = False
+                continue
+            try:
+                value = json.loads(line, object_pairs_hook=unique_object)
+            except (ValueError, TypeError, RecursionError, OverflowError):
+                if line.lstrip().startswith('{') or 'thread/queue/add' in line:
+                    complete = False
+                continue
+            if not isinstance(value, dict) or value.get('method') != 'thread/queue/add':
+                continue
+            params = value.get('params')
+            if not isinstance(params, dict):
+                complete = False
+                continue
+            if not isinstance(params.get('threadId'), str):
+                complete = False
+                continue
+            if params['threadId'] != evidence.get('recipient_thread'):
+                continue
+            rpc = value.get('id'); client = params.get('clientUserMessageId')
+            if (not isinstance(rpc, (str, int)) or isinstance(rpc, bool)
+                    or not isinstance(client, str) or not client
+                    or len(client) > 128 or len(str(rpc)) > 128):
+                complete = False
+                continue
+            safe_rpc = rpc if isinstance(rpc, int) else _safe_text(rpc)
+            safe_client = _safe_text(client)
+            if safe_rpc != rpc or safe_client != client:
+                complete = False
+                continue
+            pair = (type(rpc).__name__, rpc, client)
+            if first_pair is None:
+                first_pair = pair
+            elif pair != first_pair:
+                conflict = True
+            observed_count += 1
+            if len(observations) < 4:
+                observations.append({'rpc_request_id': rpc, 'rpc_request_id_type': type(rpc).__name__,
+                                     'client_user_message_id': client,
+                                     'source': name + ':JSON:thread/queue/add',
+                                     'authority': 'CLI_DIAGNOSTIC_ONLY_NOT_SETTLEMENT'})
+    identities = evidence['identities']
+    identities['observed_request_pairs'] = observations
+    identities['diagnostic_scan'] = {'complete': complete, 'conflict': conflict,
+                                   'observed_pair_count': observed_count,
+                                   'display_limit': 4, 'display_truncated': observed_count > 4,
+                                   'scanned_lines': scanned_lines,
+                                   'scope': 'COMPLETE_CAPTURED_JSON_DIAGNOSTICS_ONLY_NOT_SETTLEMENT'}
+    identities['rpc_request_id'] = 'UNKNOWN'
+    identities['client_user_message_id'] = 'UNKNOWN'
+    if complete and first_pair is not None and not conflict:
+        identities['rpc_request_id'] = first_pair[1]
+        identities['client_user_message_id'] = first_pair[2]
+
+
+def _queue_run(command, path, evidence):
+    """Same single CLI call and 20s transport; own local process cleanup only."""
+    started = time.monotonic()
+    deadline = started + QUEUE_TIMEOUT
+    evidence['transport_started_monotonic_ns'] = time.monotonic_ns()
+    evidence['transport_timeout_seconds'] = QUEUE_TIMEOUT
+    evidence['queue_call'] = 'UNKNOWN_SPAWN_BOUNDARY'
+    # Must be durable BEFORE Popen. A crash at this boundary cannot prove no call.
+    _checkpoint(path, evidence, 'queue_spawn_boundary')
+    process = None
+    persistence_failed = False
+    selector = None
+    streams = {'stdout': _Stream(), 'stderr': _Stream()}
+    phase = 'selector_prepare'
+    try:
+        selector = selectors.DefaultSelector()
+        phase = 'queue_spawn'
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        evidence['queue_call'] = 'CLI_STARTED_REMOTE_EFFECT_UNKNOWN'
+        evidence['identities']['cli_pid'] = process.pid
+        evidence['identities']['cli_spawn_return_utc'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        evidence['identities']['cli_exe_path'] = 'UNKNOWN'
+        try:
+            evidence['identities']['cli_exe_path'] = os.readlink('/proc/' + str(process.pid) + '/exe')
+        except OSError:
+            pass
+        evidence['identities']['cli_executable_stat'] = 'UNKNOWN'
+        try:
+            executable_stat = Path('/proc/' + str(process.pid) + '/exe').stat()
+            evidence['identities']['cli_executable_stat'] = {'device': executable_stat.st_dev, 'inode': executable_stat.st_ino,
+                                                          'size': executable_stat.st_size, 'mtime_ns': executable_stat.st_mtime_ns}
+        except OSError:
+            pass
+        try:
+            fields = Path('/proc/' + str(process.pid) + '/stat').read_text().rsplit(')', 1)[1].split()
+            evidence['identities']['cli_start_ticks'] = int(fields[19])
+        except (OSError, ValueError, IndexError):
+            evidence['identities']['cli_start_ticks'] = 'UNKNOWN'
+        _checkpoint(path, evidence, 'queue_cli_started')
+        for name in streams:
+            pipe = getattr(process, name)
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, name)
+        phase = 'queue_capture'
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, QUEUE_TIMEOUT,
+                                                output=streams['stdout'].data(), stderr=streams['stderr'].data())
+            for key, _ in selector.select(remaining):
+                chunk = os.read(key.fd, 4096)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                streams[key.data].add(chunk)
+                evidence['streams'] = {name: stream.record() for name, stream in streams.items()}
+                _observed_rpc_ids(evidence, streams)
+                _checkpoint(path, evidence)
+        phase = 'queue_wait'
+        returncode = process.wait(timeout=max(0, deadline - time.monotonic()))
+        evidence['returncode'] = returncode
+        evidence['streams'] = {name: stream.record() for name, stream in streams.items()}
+        _observed_rpc_ids(evidence, streams)
+        _checkpoint(path, evidence, 'queue_returned')
+        # Exact original success grammar; oversized stdout cannot be admitted by an excerpt.
+        phase = 'queue_decode_stdout'
+        stdout = streams['stdout'].data().decode('utf-8') if streams['stdout'].total <= STREAM_LIMIT else ''
+        return subprocess.CompletedProcess(command, returncode, stdout, '')
+    except BaseException as exc:
+        evidence['exception'] = _exception(exc, phase, streams=streams)
+        if process is None and isinstance(exc, OSError):
+            evidence['queue_call'] = 'NOT_CALLED_EXEC_FAILED' if phase == 'queue_spawn' else 'NOT_CALLED_LOCAL_PREPARATION_FAILED'
+        evidence['streams'] = {name: stream.record() for name, stream in streams.items()}
+        _observed_rpc_ids(evidence, streams)
+        if isinstance(exc, EvidencePersistenceError):
+            persistence_failed = True
+        else:
+            try:
+                _checkpoint(path, evidence, 'queue_exception')
+            except EvidencePersistenceError:
+                persistence_failed = True
+                raise
+        if isinstance(exc, (KeyboardInterrupt, SystemExit, EvidencePersistenceError)):
+            raise
+        return None
+    finally:
+        cleanup_errors = []
+        if selector is not None:
+            try:
+                selector.close()
+            except BaseException as exc:
+                cleanup_errors.append((exc, 'queue_selector_cleanup'))
+        if process is not None:
+            # Matches subprocess.run timeout cleanup: kill/reap only this owned CLI.
+            try:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+                evidence['local_process_closed'] = True
+                evidence['local_returncode'] = process.returncode
+            except BaseException as exc:
+                evidence['local_process_closed'] = 'UNKNOWN'
+                cleanup_errors.append((exc, 'queue_local_process_cleanup'))
+            finally:
+                for name in streams:
+                    try:
+                        getattr(process, name).close()
+                    except BaseException as exc:
+                        cleanup_errors.append((exc, 'queue_' + name + '_cleanup'))
+        else:
+            evidence['local_process_closed'] = True
+        evidence['local_handles_closed'] = not cleanup_errors
+        if cleanup_errors:
+            evidence['cleanup_exceptions'] = [_exception(exc, cleanup_phase) for exc, cleanup_phase in cleanup_errors]
+        evidence['elapsed_ms'] = round((time.monotonic() - started) * 1000)
+        # Remote settlement remains UNKNOWN even after local process closure.
+        if not persistence_failed:
+            _checkpoint(path, evidence)
+        if cleanup_errors:
+            raise cleanup_errors[0][0]
+
+
+_result_whole_wall = {'__name__': 'reviewed_whole_wall'}
+exec(compile(b'"""Inert Linux Python supervisor for ONE trusted, owned RESULT helper.\n\nNo subprocess/daemon/model. Caller must already be a dedicated resource-limited\nhelper, never TUI/backend. No general hostile-code containment is claimed.\nAll effectful loading, validation, filesystem operations and cleanup run in the\nsingle owned child. Parent performs only bounded IPC, pidfd signal and WNOHANG\nwait; never waits for worker filesystem or worker finally to cooperate.\n"""\nimport json\nimport math\nimport os\nfrom pathlib import Path\nimport resource\nimport select\nimport signal\nimport socket\nimport stat\nimport threading\nimport time\nimport uuid\n\nLIMIT = 65536\nAS = 268435456\nPENDING = {}  # Retain exact pidfd custody if termination is unconfirmed.\n\n\nclass Refusal(ValueError):\n    pass\n\n\ndef birth(pid):\n    return Path(\'/proc/\' + str(pid) + \'/stat\').read_text().rsplit(\')\', 1)[1].split()[19]\n\n\ndef caps():\n    return {\'AS\': list(resource.getrlimit(resource.RLIMIT_AS)),\n            \'CPU\': list(resource.getrlimit(resource.RLIMIT_CPU)),\n            \'FSIZE\': list(resource.getrlimit(resource.RLIMIT_FSIZE)),\n            \'CORE\': list(resource.getrlimit(resource.RLIMIT_CORE)),\n            \'affinity\': sorted(os.sched_getaffinity(0))}\n\n\ndef valid_caps(c):\n    for key, maximum in [(\'AS\', AS), (\'CPU\', 60), (\'FSIZE\', 67108864)]:\n        pair = c.get(key)\n        if (not isinstance(pair, list) or len(pair) != 2 or\n                any(type(x) is not int for x in pair) or\n                not 0 < pair[0] <= pair[1] <= maximum):\n            raise Refusal(\'finite dedicated helper caps required\')\n    if c.get(\'CORE\') != [0, 0] or not 0 < len(c.get(\'affinity\', [])) <= 2:\n        raise Refusal(\'core/affinity boundary\')\n\n\ndef frame(value):\n    b = json.dumps(value, allow_nan=False, sort_keys=True, separators=(\',\', \':\')).encode()\n    if len(b) > LIMIT:\n        raise Refusal(\'custody frame bound\')\n    return b\n\n\ndef send(sock, value, end):\n    b = frame(value)\n    while time.monotonic() < end:\n        try:\n            if sock.send(b) != len(b):\n                raise Refusal(\'short custody packet\')\n            return\n        except BlockingIOError:\n            select.select([], [sock], [], max(0, min(.01, end-time.monotonic())))\n    raise TimeoutError(\'custody send expired\')\n\n\ndef receive(sock):\n    b, _, flags, _ = sock.recvmsg(LIMIT + 1)\n    if not b:\n        raise EOFError(\'custody closed\')\n    if flags & socket.MSG_TRUNC or len(b) > LIMIT:\n        raise Refusal(\'custody frame bound\')\n    def pairs(items):\n        d = {}\n        for k, v in items:\n            if k in d:\n                raise Refusal(\'duplicate custody field\')\n            d[k] = v\n        return d\n    def bad(_):\n        raise Refusal(\'nonfinite custody field\')\n    o = json.loads(b, object_pairs_hook=pairs, parse_constant=bad)\n    if not isinstance(o, dict):\n        raise Refusal(\'custody envelope\')\n    return o\n\n\ndef persist_birth(directory, value):\n    """Worker-only I/O: fully inside retained parent deadline, before GO."""\n    p = Path(directory)\n    if not p.is_absolute() or str(p) != os.path.normpath(str(p)) or \'..\' in p.parts:\n        raise Refusal(\'custody path\')\n    for a in [*p.parents, p]:\n        if stat.S_ISLNK(a.lstat().st_mode):\n            raise Refusal(\'custody symlink\')\n    st = p.lstat()\n    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:\n        raise Refusal(\'private custody directory\')\n    # Existing records refuse: no same-directory retry or overwrite.\n    fd = os.open(p/\'WORKER-BIRTH.json\', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)\n    with os.fdopen(fd, \'wb\') as f:\n        f.write(frame(value)); f.flush(); os.fsync(f.fileno())\n    d = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n    try:\n        os.fsync(d)\n    finally:\n        os.close(d)\n\n\nclass Custody:\n    def __init__(self, sock, operation_end):\n        self.sock = sock\n        self.operation_end = operation_end\n        self.active = True\n        self.cleanup = 2.0\n\n    def tighten(self, end):\n        if type(end) not in (int, float) or not math.isfinite(end) or end <= time.monotonic():\n            raise Refusal(\'original useful clock expired\')\n        end = min(end, self.operation_end)\n        send(self.sock, {\'kind\': \'TIGHTEN\', \'end\': end}, self.operation_end)\n        while time.monotonic() < end:\n            if select.select([self.sock], [], [], max(0, min(.01, end-time.monotonic())))[0]:\n                if receive(self.sock) != {\'kind\': \'ACK\', \'end\': end}:\n                    raise Refusal(\'deadline acknowledgement\')\n                self.operation_end = end\n                return\n        raise TimeoutError(\'original clock not acknowledged\')\n\n    def commit(self, receipt):\n        # Called ONLY after canonical file+parent-directory fsync succeeded.\n        send(self.sock, {\'kind\': \'DURABLE\', \'receipt\': receipt}, self.operation_end)\n\n\ndef durable_shape(o):\n    if not isinstance(o, dict) or o.get(\'state\') != \'ENQUEUED\':\n        raise Refusal(\'unconfirmed admission marker\')\n    for k in (\'event_id\', \'sha256\', \'recipient_thread\', \'recipient_generation\',\n              \'sender_generation\', \'assignment_id\', \'assignment_generation\', \'submission_id\'):\n        if not isinstance(o.get(k), str) or not o[k]:\n            raise Refusal(\'admission marker identity\')\n    if str(uuid.UUID(o[\'submission_id\'])) != o[\'submission_id\']:\n        raise Refusal(\'admission marker submission\')\n    if uuid.UUID(o[\'submission_id\']).int == 0 or o.get(\'assignment_action\') != \'complete\':\n        raise Refusal(\'admission marker shape\')\n    frame(o)\n    return o\n\n\ndef signal_owned(pid, ticks, pidfd):\n    """Never send to a numeric PID after an identity mismatch.\n\n    pidfd binds the original child even if the numeric PID is reused. Refuse\n    missing pidfd support instead of substituting kill(PID) or a process group.\n    """\n    if pidfd is None:\n        raise Refusal(\'owned pidfd required\')\n    try:\n        if birth(pid) != ticks:\n            return False\n    except FileNotFoundError:\n        return False\n    signal.pidfd_send_signal(pidfd, signal.SIGKILL)\n    return True\n\n\ndef supervise(operation, custody_dir, *, wall=20.0, cleanup=2.0, hard_end=None):\n    """ONE fork, whole entry including import/load and unwinding <= original wall.\n\n    hard_end is the trusted caller\'s retained original useful monotonic deadline;\n    it may only shorten the 20s cap. The child also tightens against exact grant\n    clock before any reservation/lifecycle/native effect. A kernel-stuck child\n    gives STOP_UNCONFIRMED at the finite return boundary; never false closure.\n    """\n    started = time.monotonic()\n    if (type(wall) not in (int, float) or type(cleanup) not in (int, float)\n            or not math.isfinite(wall) or not math.isfinite(cleanup)\n            or not 0 < cleanup < wall <= 20):\n        raise Refusal(\'whole wall includes bounded cleanup\')\n    final_end = started + wall\n    if hard_end is not None:\n        if type(hard_end) not in (int, float) or not math.isfinite(hard_end):\n            raise Refusal(\'original caller deadline\')\n        final_end = min(final_end, hard_end)\n    operation_end = final_end-cleanup\n    if operation_end <= started:\n        raise Refusal(\'original caller clock expired\')\n    if threading.current_thread() is not threading.main_thread() or threading.active_count() != 1:\n        raise Refusal(\'dedicated single-thread helper required\')\n    # Automatic reaping or an inherited reaper breaks direct-wait custody.\n    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:\n        raise Refusal(\'SIGCHLD must be SIG_DFL before fork\')\n    caller_caps = caps(); valid_caps(caller_caps)\n    timer = signal.getitimer(signal.ITIMER_REAL)\n    if timer[1] or (timer[0] and timer[0] <= final_end-started):\n        raise Refusal(\'earlier/periodic owner timer retained\')\n    if PENDING:\n        raise Refusal(\'STOP_UNCONFIRMED existing custody; no new admission\')\n    if not hasattr(os, \'pidfd_open\') or not hasattr(signal, \'pidfd_send_signal\'):\n        raise Refusal(\'Linux pidfd custody unavailable\')\n    caller = {\'pid\': os.getpid(), \'birth\': birth(os.getpid()), \'caps\': caller_caps}\n    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)\n    a.setblocking(False); b.setblocking(False)\n    pid = os.fork()\n    if pid == 0:\n        try:\n            a.close()\n            # Fork inherited the already constrained 256MiB/CPU2 boundary.\n            resource.setrlimit(resource.RLIMIT_CPU, (min(40, resource.getrlimit(resource.RLIMIT_CPU)[0]), min(40, resource.getrlimit(resource.RLIMIT_CPU)[1])))\n            me = {\'pid\': os.getpid(), \'birth\': birth(os.getpid()), \'caps\': caps()}\n            valid_caps(me[\'caps\'])\n            persist_birth(custody_dir, {\'caller\': caller, \'worker\': me,\n                          \'combined_hard_AS\': caller_caps[\'AS\'][1]+me[\'caps\'][\'AS\'][1],\n                          \'before_GO\': True, \'operation_end\': operation_end, \'final_end\': final_end})\n            send(b, {\'kind\': \'BIRTH\', \'worker\': me}, operation_end)\n            while time.monotonic() < operation_end:\n                if select.select([b], [], [], max(0, min(.01, operation_end-time.monotonic())))[0]:\n                    if receive(b) != {\'kind\': \'GO\'}:\n                        raise Refusal(\'GO required\')\n                    break\n            else:\n                raise TimeoutError(\'GO expired\')\n            # Trusted accepted Python source must not create extra descendants.\n            def no_spawn(*_a, **_k):\n                raise Refusal(\'only registered worker permitted\')\n            os.fork = no_spawn\n            if hasattr(os, \'forkpty\'): os.forkpty = no_spawn\n            if hasattr(os, \'posix_spawn\'): os.posix_spawn = no_spawn\n            if hasattr(os, \'posix_spawnp\'): os.posix_spawnp = no_spawn\n            custody = Custody(b, operation_end)\n            custody.cleanup = cleanup\n            result = operation(custody)\n            send(b, {\'kind\': \'RESULT\', \'result\': result}, operation_end)\n            os._exit(0)  # No Python atexit/implicit unwinding outside custody.\n        except BaseException as exc:\n            try: send(b, {\'kind\': \'ERROR\', \'class\': type(exc).__name__}, operation_end)\n            except BaseException: pass\n            os._exit(2)\n    # Custody exists BEFORE any parent close, wait, birth or pidfd teardown.\n    # Retain socket objects as well as fd identity: an exceptional close may\n    # have released its descriptor already and must never be retried blindly.\n    held = {\'pid\': pid, \'birth\': None, \'pidfd\': None, \'pidfd_identity\': None,\n            \'custody_dir\': str(custody_dir), \'no_replay\': True,\n            \'durable\': None, \'result\': None, \'worker\': None,\n            \'wait_errors\': [], \'teardown_errors\': [], \'reaped\': False,\n            \'wait_status\': None, \'sockets\': [a, b]}\n    PENDING[pid] = held\n    ticks = None; pidfd = None; setup_failure = None\n    try:\n        ticks = birth(pid); held[\'birth\'] = ticks\n        pidfd = os.pidfd_open(pid); held[\'pidfd\'] = pidfd\n        st = os.fstat(pidfd)\n        held[\'pidfd_identity\'] = (st.st_dev, st.st_ino)\n    except BaseException as exc:\n        setup_failure = type(exc).__name__\n        teardown_error(held, \'setup\', exc)\n    try:\n        b.close()\n    except BaseException as exc:\n        teardown_error(held, \'peer_socket_close\', exc)\n    worker = None; result = None; durable = None; failure = setup_failure\n    status = None; stopped = False; packet_count = 0; wait_errors = held[\'wait_errors\']\n    try:\n        while pidfd is not None and time.monotonic() < operation_end:\n            readable = select.select([a], [], [], max(0, min(.01, operation_end-time.monotonic())))[0]\n            if readable:\n                try:\n                    message = receive(a)\n                except EOFError:\n                    break\n                packet_count += 1\n                if packet_count > 8:\n                    raise Refusal(\'custody notification bound\')\n                kind = message.get(\'kind\')\n                if kind == \'BIRTH\' and worker is None:\n                    worker = message[\'worker\']; held[\'worker\'] = worker; valid_caps(worker[\'caps\'])\n                    if worker[\'pid\'] != pid or worker[\'birth\'] != ticks:\n                        raise Refusal(\'worker birth mismatch\')\n                    if caller_caps[\'AS\'][1]+worker[\'caps\'][\'AS\'][1] > AS*2:\n                        raise Refusal(\'combined birth caps\')\n                    send(a, {\'kind\': \'GO\'}, operation_end)\n                elif kind == \'TIGHTEN\' and worker is not None:\n                    end = message[\'end\']\n                    if type(end) not in (int, float) or not math.isfinite(end) or end > operation_end:\n                        raise Refusal(\'clock reset/extension\')\n                    operation_end = end\n                    # Keep the SAME initial final boundary, only shorten it.\n                    final_end = min(final_end, end+cleanup)\n                    send(a, {\'kind\': \'ACK\', \'end\': end}, operation_end)\n                elif kind == \'DURABLE\' and worker is not None and durable is None:\n                    durable = durable_shape(message[\'receipt\']); held[\'durable\'] = durable\n                elif kind == \'RESULT\' and worker is not None:\n                    result = message[\'result\']; held[\'result\'] = result\n                    if not isinstance(result, dict): raise Refusal(\'worker result object\')\n                    if result.get(\'state\') == \'ENQUEUED\' and durable is None:\n                        raise Refusal(\'no durable marker; cannot promote UNKNOWN\')\n                elif kind == \'ERROR\':\n                    failure = message.get(\'class\', \'WorkerError\')\n                else:\n                    raise Refusal(\'custody phase/protocol\')\n            try:\n                got, st = os.waitpid(pid, os.WNOHANG)\n            except BaseException as exc:\n                wait_errors.append({\'phase\': \'loop\', \'class\': type(exc).__name__, \'errno\': getattr(exc, \'errno\', None)})\n                raise\n            if got == pid:\n                status = st; stopped = True; break\n            if got:\n                raise Refusal(\'wrong direct-wait child\')\n    except BaseException as exc:\n        failure = type(exc).__name__\n    finally:\n        if not stopped:\n            try: signal_owned(pid, ticks, pidfd)\n            except ProcessLookupError: pass\n            except BaseException as exc: failure = type(exc).__name__\n            while time.monotonic() < final_end:\n                try:\n                    got, st = os.waitpid(pid, os.WNOHANG)\n                except BaseException as exc:\n                    failure = type(exc).__name__\n                    wait_errors.append({\'phase\': \'cleanup\', \'class\': type(exc).__name__, \'errno\': getattr(exc, \'errno\', None)})\n                    break  # Unknown custody: drain packets, retain pidfd, never infer reaping.\n                if got == pid:\n                    status = st; stopped = True; break\n                if got:\n                    failure = \'wrong direct-wait child\'\n                    break\n                try:\n                    select.select([pidfd] if pidfd is not None else [], [], [], max(0, min(.01, final_end-time.monotonic())))\n                except BaseException as exc:\n                    failure = type(exc).__name__\n                    teardown_error(held, \'cleanup_select\', exc)\n                    break\n        # Drain already queued packets without waiting, so committed durable\n        # admission survives timeout between checkpoint and child teardown.\n        for _ in range(8-packet_count):\n            try:\n                message = receive(a)\n                if message.get(\'kind\') == \'DURABLE\' and worker is not None and durable is None:\n                    durable = durable_shape(message[\'receipt\']); held[\'durable\'] = durable\n                elif message.get(\'kind\') == \'RESULT\' and worker is not None:\n                    result = message[\'result\']; held[\'result\'] = result\n            except (BlockingIOError, EOFError): break\n            except BaseException as exc: failure = type(exc).__name__; break\n        held.update(durable=durable, result=result, worker=worker, reaped=stopped, wait_status=status)\n        try:\n            a.close()\n        except BaseException as exc:\n            failure = type(exc).__name__\n            teardown_error(held, \'parent_socket_close\', exc)\n    fresh_absent = False\n    if stopped:\n        try: fresh_absent = ticks is not None and birth(pid) != ticks\n        except FileNotFoundError: fresh_absent = ticks is not None\n        except BaseException as exc:\n            failure = type(exc).__name__\n            teardown_error(held, \'fresh_birth\', exc)\n    confirmed_stop = stopped and fresh_absent\n    # A close failure must return retained custody, even after a successful\n    # direct wait. Reconciliation checks descriptor identity before retrying.\n    if confirmed_stop and not held[\'teardown_errors\']:\n        confirmed_stop = release_resources(held)\n    else:\n        confirmed_stop = False\n    if confirmed_stop:\n        del PENDING[pid]\n    held.update(durable=durable, result=result, worker=worker, reaped=stopped,\n                wait_status=status, fresh_exact_birth_absent=fresh_absent)\n    # Do not infer zero RPCs from a deadline. No mutation is retried here.\n    out = result if isinstance(result, dict) else {\'state\': \'UNKNOWN\', \'queue_calls\': \'UNKNOWN\'}\n    if out.get(\'state\') == \'ENQUEUED\' and durable is None:\n        out = {\'state\': \'UNKNOWN\', \'queue_calls\': \'UNKNOWN\'}\n    if durable is not None:\n        out = {**out, **durable}\n    return {**out, \'whole_wall\': {\'caller\': caller, \'worker\': worker,\n                \'pid\': pid, \'birth\': ticks, \'packet_count\': packet_count,\n                \'started_monotonic\': started, \'operation_end\': operation_end, \'final_end\': final_end,\n                \'elapsed\': time.monotonic()-started, \'reaped\': stopped,\n                \'fresh_exact_birth_absent\': fresh_absent,\n                \'status\': \'STOP_CONFIRMED\' if confirmed_stop else \'STOP_UNCONFIRMED\',\n                \'direct_wait_returncode\': os.waitstatus_to_exitcode(status) if status is not None else None,\n                \'failure\': failure, \'wait_errors\': wait_errors, \'teardown_errors\': held[\'teardown_errors\'], \'no_replay\': True}, \'no_retry\': True,\n            \'enqueue_is_not_read\': True}\n\n\ndef teardown_error(held, phase, exc):\n    held[\'teardown_errors\'].append({\'phase\': phase, \'class\': type(exc).__name__,\n                                     \'errno\': getattr(exc, \'errno\', None)})\n\n\ndef release_resources(held):\n    """Release only still-owned handles, never an ambiguous reused number."""\n    ok = True\n    for sock in held[\'sockets\']:\n        if sock.fileno() >= 0:\n            try:\n                sock.close()\n            except BaseException as exc:\n                teardown_error(held, \'socket_reconcile_close\', exc); ok = False\n    fd = held[\'pidfd\']\n    if fd is not None:\n        try:\n            st = os.fstat(fd)\n        except OSError as exc:\n            if exc.errno == 9:  # Fresh EBADF proves this descriptor is absent.\n                held[\'pidfd\'] = None\n            else:\n                teardown_error(held, \'pidfd_fstat\', exc); ok = False\n        except BaseException as exc:\n            teardown_error(held, \'pidfd_fstat\', exc); ok = False\n        else:\n            if held[\'pidfd_identity\'] is None:\n                # Setup never established an fd identity. Keep the handle and\n                # caller alive; no inference of release or close of a reused fd.\n                ok = False\n            elif (st.st_dev, st.st_ino) != held[\'pidfd_identity\']:\n                # The old handle was released; the replacement is not ours.\n                held[\'pidfd\'] = None\n            else:\n                try:\n                    os.close(fd)\n                    held[\'pidfd\'] = None\n                except BaseException as exc:\n                    teardown_error(held, \'pidfd_close\', exc); ok = False\n    return ok and all(sock.fileno() < 0 for sock in held[\'sockets\']) and held[\'pidfd\'] is None\n\n\ndef reconcile_pending(pid):\n    """Same living caller: actual direct wait AND fresh birth AND handle close.\n\n    ECHILD, absence and close exceptions never substitute for direct wait.\n    No signal, new child, admission or replay occurs in reconciliation.\n    """\n    held = PENDING[pid]\n    if not held[\'reaped\']:\n        try:\n            got, status = os.waitpid(pid, os.WNOHANG)\n        except BaseException as exc:\n            held[\'wait_errors\'].append({\'phase\': \'reconcile\', \'class\': type(exc).__name__, \'errno\': getattr(exc, \'errno\', None)})\n            return {\'status\': \'STOP_UNCONFIRMED\', \'failure\': type(exc).__name__, \'no_replay\': True}\n        if got != pid:\n            return {\'status\': \'STOP_UNCONFIRMED\', \'no_replay\': True}\n        held[\'reaped\'] = True\n        held[\'wait_status\'] = status\n    try:\n        absent = held[\'birth\'] is not None and birth(pid) != held[\'birth\']\n    except FileNotFoundError:\n        absent = held[\'birth\'] is not None\n    except BaseException as exc:\n        teardown_error(held, \'reconcile_birth\', exc)\n        return {\'status\': \'STOP_UNCONFIRMED\', \'failure\': type(exc).__name__, \'no_replay\': True}\n    if not absent or not release_resources(held):\n        return {\'status\': \'STOP_UNCONFIRMED\', \'teardown_errors\': held[\'teardown_errors\'], \'no_replay\': True}\n    del PENDING[pid]\n    return {\'status\': \'STOP_CONFIRMED\', \'pid\': pid, \'birth\': held[\'birth\'],\n            \'reaped\': True, \'fresh_exact_birth_absent\': True,\n            \'direct_wait_returncode\': os.waitstatus_to_exitcode(held[\'wait_status\']),\n            \'durable\': held[\'durable\'], \'result\': held[\'result\'],\n            \'teardown_errors\': held[\'teardown_errors\'], \'no_replay\': True}\n', 'embedded-whole-wall-fca0ee2580ae62e2b40fd372230f4288e436e2ef0710aed830b90d4b63636408', 'exec'), _result_whole_wall)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--sender-binding', type=Path, required=True)
+    parser.add_argument('--recipient-binding', type=Path, required=True)
+    parser.add_argument('--event', required=True)
+    parser.add_argument('--kind', choices=('TASK', 'RESULT', 'REVIEW', 'BLOCKER', 'HELLO', 'CONTROL'), required=True)
+    parser.add_argument('--ref', type=Path, required=True)
+    parser.add_argument('--assignment-id')
+    parser.add_argument('--assignment-generation')
+    parser.add_argument('--assignment-action', choices=('active', 'result', 'cancel', 'pause', 'complete'))
+    parser.add_argument('--large-reason', help='Required justification for exceptional contracts over 2000 UTF-8 bytes')
+    parser.add_argument('--rpc-grant', type=Path)
+    parser.add_argument('--rpc-grant-sha')
+    parser.add_argument('--rpc-custody-dir', type=Path)
+    args = parser.parse_args()
+    if args.kind == 'RESULT':
+        if not args.rpc_grant or not args.rpc_grant_sha or not args.rpc_custody_dir:
+            parser.error('RESULT requires exact reviewed grant and owned custody; no CLI fallback')
+        selector_pin = {'path': '/analysis/NOT_CONNECTED/C26/Source-final/result_selector.py', 'bytes': 2794, 'sha256': 'ab9e8479fa7f90f0478bd7d4eaf5d4648338605ade0be3e1f6c281b59a58c349'}
+        transport_pin = {'path': '/analysis/NOT_CONNECTED/C26/Source-final/result_rpc.py', 'bytes': 26389, 'sha256': 'bcaa29320d000a7870555ba0ca7b8f814946330abc412caccd12bf35f93cf394'}
+        def run_result(custody):
+            import stat
+            selector_path = Path(selector_pin['path'])
+            selector_stat = selector_path.lstat()
+            if not stat.S_ISREG(selector_stat.st_mode) or selector_stat.st_uid != os.getuid() or selector_stat.st_nlink != 1 or selector_stat.st_mode & 0o077 or selector_stat.st_size > 65536 or any(p.is_symlink() for p in selector_path.parents):
+                parser.error('reviewed selector ownership')
+            selector_fd = os.open(selector_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                selector_open = os.fstat(selector_fd)
+                if (selector_stat.st_dev, selector_stat.st_ino, selector_stat.st_ctime_ns, selector_stat.st_mtime_ns) != (selector_open.st_dev, selector_open.st_ino, selector_open.st_ctime_ns, selector_open.st_mtime_ns):
+                    parser.error('reviewed selector race')
+                selector_bytes = os.read(selector_fd, 65537)
+            finally:
+                os.close(selector_fd)
+            if len(selector_bytes) != selector_pin['bytes'] or hashlib.sha256(selector_bytes).hexdigest() != selector_pin['sha256']:
+                parser.error('reviewed selector source pin')
+            selector = {'__file__': str(selector_path), '__name__': 'reviewed_result_selector'}
+            exec(compile(selector_bytes, str(selector_path), 'exec'), selector)
+            return selector['dispatch_in_worker'](args, parser, transport_pin, custody)
+        result = _result_whole_wall['supervise'](run_result, args.rpc_custody_dir)
+        print(json.dumps(result, sort_keys=True))
+        return result
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}', args.event):
+        parser.error('Invalid event ID')
+    if args.large_reason and len(args.large_reason.encode('utf-8')) > 2000:
+        parser.error('Large-contract justification exceeds 2000 UTF-8 bytes')
+    action = args.assignment_action
+    if args.kind != 'HELLO':
+        if not args.assignment_id or not args.assignment_generation:
+            parser.error('Non-HELLO events require --assignment-id and --assignment-generation')
+        for value in (args.assignment_id, args.assignment_generation):
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,95}', value):
+                parser.error('Invalid assignment ID or generation')
+        if action is None:
+            if args.kind == 'TASK':
+                action = 'active'
+            elif args.kind in ('RESULT', 'REVIEW'):
+                action = 'complete'
+            elif args.kind == 'BLOCKER':
+                action = 'pause'
+            else:
+                parser.error('CONTROL requires an explicit --assignment-action')
+    elif args.assignment_id or args.assignment_generation or action:
+        parser.error('HELLO does not carry an assignment')
+    sender, peer = binding(args.sender_binding), binding(args.recipient_binding)
+    helper = runpy.run_path(str(ROOT / 'sol-link-native-reconnect.py'))
+    slots = set(helper['SLOTS'].values())
+    if (sender['home'], sender['thread']) not in slots or (peer['home'], peer['thread']) not in slots:
+        parser.error('Binding is outside the two designated slots')
+    if sender['thread'] != os.environ.get('CODEX_THREAD_ID') or sender['thread'] == peer['thread']:
+        parser.error('Wrong sender thread')
+    if not sender['generation'] or not peer['generation']:
+        parser.error('Missing binding generation')
+    endpoint = Path(peer['home']) / 'app-server-control/app-server-control.sock'
+    if peer['endpoint'] not in (str(endpoint), 'unix://' + str(endpoint)):
+        parser.error('Peer endpoint mismatch')
+    helper['validate_control_directory'](endpoint, required=True)
+    live = helper['slot_state'](peer['home'], peer['thread'], endpoint)
+    if len(live['active_tui_pids']) != 1 or len(live['backend_pids']) != 1 or live['foreign_writer_pids']:
+        parser.error('Peer must have exactly one verified active TUI/backend')
+    if not set(live['backend_pids']).intersection(live['active_writer_pids']):
+        parser.error('Peer thread is not loaded by its backend')
+    ref = args.ref.resolve(strict=True)
+    if ref.stat().st_uid != os.getuid() or ref.stat().st_mode & 0o022 or not ref.is_file():
+        parser.error('Reference is not an owned regular file without foreign writes')
+    body = ref.read_bytes()
+    if len(body) > 2000 and not args.large_reason:
+        parser.error('Normal contracts are limited to 2000 bytes; reference detailed evidence separately')
+    digest = hashlib.sha256(body).hexdigest()
+    lifecycle_fields = '' if args.kind == 'HELLO' else (
+        f" assignment={args.assignment_id} assignment_generation={args.assignment_generation}"
+        f" assignment_action={action}"
+    )
+    message = (f"PEER {sender['role']} {args.kind} id={args.event}"
+               f"{lifecycle_fields} "
+               f"from_epoch={sender['generation']} to_epoch={peer['generation']} "
+               f"ref={ref} sha256={digest}")
+    if len(message.encode()) > 500:
+        parser.error('Notification exceeds 500 UTF-8 bytes')
+    RECEIPTS.mkdir(mode=0o700, exist_ok=True)
+    if RECEIPTS.stat().st_uid != os.getuid() or RECEIPTS.stat().st_mode & 0o077:
+        parser.error('Receipt directory is not private and owned')
+    receipt = {'event_id': args.event, 'sha256': digest, 'recipient_thread': peer['thread'],
+               'recipient_generation': peer['generation'], 'sender_generation': sender['generation'],
+               'assignment_id': args.assignment_id, 'assignment_generation': args.assignment_generation,
+               'assignment_action': action,
+               'state': 'UNKNOWN', 'notification_bytes': len(message.encode()),
+               'contract_bytes': len(body), 'large_reason': args.large_reason,
+               'peer_receipt': 'unconfirmed', 'dispatch': 'native_idle_boundary'}
+    path = RECEIPTS / (args.event + '.json')
+    if not reserve(path, receipt):
+        return
+    forensic_path = path.with_suffix('.forensic.json')
+    evidence = {'schema': 'friday.native-send.forensic.v1', 'event_id': args.event,
+                'sha256': digest, 'recipient_thread': peer['thread'],
+                'queue_call': 'NOT_CALLED', 'remote_settlement': 'UNKNOWN',
+                'identities': {'wrapper_pid': os.getpid(), 'cli_pid': 'UNKNOWN',
+                               'cli_start_ticks': 'UNKNOWN', 'cli_path': NATIVE,
+                               'cli_resolved_path': os.path.realpath(NATIVE),
+                               'rpc_request_id': 'UNKNOWN', 'client_user_message_id': 'UNKNOWN',
+                               'connection_id': 'UNKNOWN', 'cli_version': 'UNKNOWN',
+                               'queued_submission_id': 'UNKNOWN'},
+                'exception': {}, 'streams': {}}
+    _checkpoint(forensic_path, evidence, 'reserved_before_lifecycle', initial=True)
+    receipt['forensic_ref'] = str(forensic_path)
+    if args.kind != 'HELLO':
+        sender_slot = next(name for name, value in helper['SLOTS'].items()
+                           if value == (sender['home'], sender['thread']))
+        recipient_slot = next(name for name, value in helper['SLOTS'].items()
+                              if value == (peer['home'], peer['thread']))
+        lifecycle = ROOT / 'subagent-lifecycle/lifecycle.py'
+        base = ['/analysis/NOT_CONNECTED/bin/python', str(lifecycle)]
+        registrations = []
+        for slot in (sender_slot, recipient_slot):
+            check_cmd = [*base, 'peer-check', '--profile', slot,
+                         '--assignment', args.assignment_id,
+                         '--generation', args.assignment_generation,
+                         '--action', action, '--event', args.event]
+            checked = _lifecycle_run(check_cmd, 'lifecycle_preflight_' + slot, forensic_path, evidence)
+            if checked.returncode != 0:
+                registrations.append({'profile': slot, 'preflight': checked})
+                break
+            register_cmd = [*base, 'peer-register', '--profile', slot,
+                            '--assignment', args.assignment_id,
+                            '--generation', args.assignment_generation,
+                            '--action', action, '--kind', args.kind, '--event', args.event]
+            registrations.append({'profile': slot, 'command': register_cmd})
+        failed = next((item for item in registrations if 'preflight' in item), None)
+        if failed:
+            receipt['error'] = 'lifecycle_preflight_refused'
+            receipt['lifecycle_error'] = _safe_text(failed['preflight'].stderr)[-1000:]
+            _commit_receipt(path, receipt, forensic_path, evidence)
+            raise SystemExit('Lifecycle preflight refused peer delivery; no queue call was made.')
+        for item in registrations:
+            registered = _lifecycle_run(item['command'], 'lifecycle_registration_' + item['profile'], forensic_path, evidence)
+            if registered.returncode != 0:
+                receipt['error'] = 'lifecycle_registration_failed'
+                receipt['lifecycle_error'] = _safe_text(registered.stderr)[-1000:]
+                _commit_receipt(path, receipt, forensic_path, evidence)
+                raise SystemExit('Lifecycle registration failed; no queue call was made.')
+    result = _queue_run([NATIVE, 'queue', '--remote', 'unix://' + str(endpoint),
+                         '--thread', peer['thread'], '--message', message], forensic_path, evidence)
+    match = None if result is None else re.fullmatch(
+        r'Queued message ([0-9a-f-]+) for thread ([0-9a-f-]+)\.', result.stdout.strip())
+    if result is not None and result.returncode == 0 and match and match[2] == peer['thread']:
+        receipt.update(state='ENQUEUED', submission_id=match[1])
+        evidence['identities']['queued_submission_id'] = match[1]
+        evidence['admission'] = 'CLI_REPORTED_QUEUE_ADMISSION_ONLY'
+    else:
+        receipt['error'] = 'transport_uncertain_no_retry' if result is None else 'queue_result_uncertain_no_retry'
+        evidence['admission'] = 'UNKNOWN'
+    receipt['elapsed_ms'] = evidence['elapsed_ms']
+    evidence['intended_receipt_state'] = receipt['state']
+    evidence['receipt_commit'] = 'NOT_ATTEMPTED'
+    _checkpoint(forensic_path, evidence, 'before_receipt_commit')
+    # Final evidence is already fsynced; receipt bookkeeping failure cannot erase it.
+    _commit_receipt(path, receipt, forensic_path, evidence)
+    print(json.dumps({key: receipt[key] for key in ('event_id', 'state', 'peer_receipt', 'dispatch', 'notification_bytes', 'contract_bytes', 'elapsed_ms')}))
+
+
+if __name__ == '__main__':
+    main()

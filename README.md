@@ -1,5 +1,7 @@
 # Friday_rework
 
+12.10.2026: [G8 выполнен и независимо принят как безопасная native-диагностика](analysis/2026-10-12/g8-and-admission-checkpoint/README.md). Все шесть сценариев прошли, завершение известных процессов, уборка и освобождение FD9 подтверждены; повтор не разрешён. Это не допуск продуктового kernel120 или normal3600. Исходники установщика приняты условно, внешний helper возвращён с конкретными замечаниями; installed runtime и все семь journeys остаются NOT_ACCEPTED.
+
 11.10.2026, 21:33 МСК: [суточная публикация завершена](analysis/2026-10-11/DAILY-PUBLICATION-RECEIPT.json), точный удалённый коммит `546b4058cef42b0ae348ea25444cbab47e6e2f8e` проверен. Независимо принят состав, приватность и достоверность статусов [полного среза](analysis/2026-10-11/daily-complete-period-21msk/README.md): 52 предшествующих коммита / 765 изменённых путей, затем 12 файлов завершающей публикации. Поля PENDING в замороженных подготовленных материалах остаются историей; последующий результат записан отдельной квитанцией.
 
 [Финальные семантические и LF/ASCII исходники](analysis/2026-10-11/final-semantic-lf-ascii-source/README.md) приняты только в своих узких SOURCE-областях. [C20 с разрывом ресурсной границы](analysis/2026-10-11/C20-known-birth-gap-source/README.md) опубликован как непринятый материал вместе с [независимыми замечаниями](analysis/2026-10-11/daily-C20-independent-review-findings.json). Установленный runtime, все семь пользовательских journeys и релиз остаются NOT_ACCEPTED; G8 требует ранее описанного физического терминала владельца, kernel120 не допущен, normal3600 не запускался.
@@ -10,7 +12,7 @@ Composition: pinned Hermes host, intact DeepSeek Harness coding worker, intact d
 
 The legacy Friday checkout, runtime, data and Telegram consumer stay preserved. Publication target: `alinescafs3mp-afk/friday_rework`, branch `main`. Secrets, private handoffs, donor checkouts, live runtime state and raw private evidence are excluded from source control. Sanitized, inert source snapshots and selected result extracts are published separately for analysis with their validation status.
 
-[Daily-use setup and strict load-plan validation](analysis/2026-10-10/soak-setup/README.md) are independently accepted as source only; the original rejection and corrected evidence are retained. G7 failed, G8 is prepared but not executed, and installed runtime journeys remain unaccepted.
+[Daily-use setup and strict load-plan validation](analysis/2026-10-10/soak-setup/README.md) are independently accepted as source only; the original rejection and corrected evidence are retained. At that historical cut, G7 had failed and G8 was prepared but not executed. Installed runtime journeys remain unaccepted; the completed G8 diagnostic is recorded above.
 
 See `docs/foundation-status.md` for verified progress and current gaps. See `sources.lock.json` for the selected upstream identities and `docs/integration-boundary.md` for the implementation boundary. The existing owner task register remains authoritative; this repository adds no dispatcher or second backlog.
 

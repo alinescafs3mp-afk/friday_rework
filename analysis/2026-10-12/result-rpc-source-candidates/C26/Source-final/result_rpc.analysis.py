@@ -1,0 +1,550 @@
+"""Inert candidate. No import/main effects; LIVE requires reviewed, pinned grant.
+
+One queue/add, no queue/start, no subprocess, no retry, no model call.
+Offline transports are injected into the same send_prepared state machine.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import hashlib
+import io
+import json
+import math
+import os
+from pathlib import Path
+import re
+import resource
+import runpy
+import stat
+import signal
+import threading
+import time
+import uuid
+
+R = Path('/analysis/NOT_CONNECTED/runtime')
+LIMIT = 65536
+IDENT = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z', re.ASCII)
+ASSIGN = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,95}\Z', re.ASCII)
+HASH = re.compile(r'[0-9a-f]{64}\Z', re.ASCII)
+DEPENDENCIES = {
+    'sender': R / 'sol-link-sol.binding.json',
+    'recipient': R / 'sol-link-astra.binding.json',
+    'control': R / 'sol-link-native-control.py',
+    'reconnect': R / 'sol-link-native-reconnect.py',
+    'canonical': R / 'sol-link-native-send.py',
+    'lifecycle': R / 'subagent-lifecycle/lifecycle.py',
+    'lifecycle_core': R / 'subagent-lifecycle/lifecycle_core.py',
+    'native_endpoint': R / 'native_endpoint.py',
+}
+
+
+class Refusal(ValueError):
+    pass
+
+
+class WallDeadline(TimeoutError):
+    pass
+
+
+@contextlib.contextmanager
+def sync_wall(end):
+    """Interrupt synchronous Linux syscalls on the existing main thread.
+
+    An earlier/periodic owner timer is refused without changing it. Restore a
+    later one with elapsed time subtracted. This does not grant host custody or
+    establish an uninterruptible-kernel-I/O bound.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        raise Refusal('synchronous deadline requires main thread')
+    remaining = end - time.monotonic()
+    if not math.isfinite(remaining) or remaining <= 0:
+        raise WallDeadline('synchronous useful boundary expired')
+    old_timer = signal.getitimer(signal.ITIMER_REAL)
+    if old_timer[1] or (old_timer[0] and old_timer[0] <= remaining):
+        raise Refusal('earlier owner wall boundary retained')
+    old_handler = signal.getsignal(signal.SIGALRM)
+    started = time.monotonic()
+    def expire(_signum, _frame):
+        raise WallDeadline('synchronous useful boundary expired')
+    signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, remaining)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+        if old_timer[0]:
+            signal.setitimer(signal.ITIMER_REAL,
+                             max(0.000001, old_timer[0]-(time.monotonic()-started)))
+
+
+def sync_call(end, function, *args):
+    with sync_wall(end):
+        return function(*args)
+
+
+def duplicate_receipt(path, expected, custody=None):
+    """Recover only by fresh file+directory fsync; never replay a mutation."""
+    path = Path(path); ancestors(path); private_dir(path.parent)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
+                or st.st_mode & 0o077 or st.st_nlink != 1 or st.st_size > LIMIT):
+            raise Refusal('unsafe duplicate receipt')
+        raw = os.read(fd, LIMIT+1); old = loads(raw)
+        keys = ('event_id','sha256','recipient_thread','recipient_generation',
+                'sender_generation','assignment_id','assignment_generation','assignment_action')
+        if any(old.get(k) != expected[k] for k in keys):
+            raise Refusal('event collision')
+        if old.get('state') == 'UNKNOWN':
+            return 'UNKNOWN'
+        if old.get('state') != 'ENQUEUED' or type(old.get('submission_id')) is not str:
+            raise Refusal('invalid duplicate admission')
+        try:
+            if str(uuid.UUID(old['submission_id'])) != old['submission_id']:
+                raise Refusal('invalid duplicate submission')
+        except ValueError as exc:
+            raise Refusal('invalid duplicate submission') from exc
+        try:
+            os.fsync(fd); fsync_dir(path.parent)
+            current = path.lstat()
+            if (current.st_dev,current.st_ino) != (st.st_dev,st.st_ino):
+                raise Refusal('duplicate receipt changed')
+            os.lseek(fd,0,os.SEEK_SET)
+            if os.read(fd,LIMIT+1) != raw:
+                raise Refusal('duplicate receipt changed')
+        except (OSError, WallDeadline):
+            return 'UNKNOWN'
+        if custody is not None:
+            custody.commit(old)  # Same authenticated FD bytes, freshly fsynced.
+        return 'ENQUEUED'
+    finally:
+        os.close(fd)
+
+
+def loads(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise Refusal('duplicate JSON field')
+            result[key] = value
+        return result
+    def invalid(_):
+        raise Refusal('nonfinite JSON constant')
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=invalid)
+
+
+def encode(value):
+    raw = (json.dumps(value, sort_keys=True, ensure_ascii=True,
+                      allow_nan=False, separators=(',', ':')) + '\n').encode()
+    if len(raw) > LIMIT:
+        raise Refusal('receipt size')
+    return raw
+
+
+def ancestors(path):
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts or str(path) != os.path.normpath(str(path)):
+        raise Refusal('noncanonical absolute path')
+    for p in [*reversed(path.parents), path]:
+        st = p.lstat()
+        if stat.S_ISLNK(st.st_mode):
+            raise Refusal('symlink path')
+
+
+def private_dir(path):
+    ancestors(path)
+    st = Path(path).lstat()
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise Refusal('private directory')
+
+
+def pinned(ref, maximum=LIMIT):
+    if set(ref) != {'path', 'bytes', 'sha256'} or type(ref['bytes']) is not int:
+        raise Refusal('pin shape')
+    if not isinstance(ref['sha256'], str) or not HASH.fullmatch(ref['sha256']):
+        raise Refusal('pin hash syntax')
+    p = Path(ref['path']); ancestors(p)
+    if not stat.S_ISREG(p.lstat().st_mode):
+        raise Refusal('pin must be regular before open')
+    fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
+                or st.st_mode & 0o077 or st.st_nlink != 1 or not 0 <= st.st_size <= maximum):
+            raise Refusal('unsafe pin')
+        with os.fdopen(fd, 'rb', closefd=False) as f:
+            raw = f.read(maximum + 1)
+        if len(raw) != ref['bytes'] or hashlib.sha256(raw).hexdigest() != ref['sha256']:
+            raise Refusal('pin bytes/hash')
+        return raw
+    finally:
+        os.close(fd)
+
+
+def write_once(path, value):
+    path = Path(path); private_dir(path.parent); raw = encode(value)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        offset = 0
+        while offset < len(raw):
+            written = os.write(fd, raw[offset:])
+            if written <= 0:
+                raise OSError('zero receipt write')
+            offset += written
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    fsync_dir(path.parent)
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def replace_receipt(path, value):
+    path = Path(path); private_dir(path.parent); ancestors(path)
+    st = path.lstat()
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077 or st.st_nlink != 1:
+        raise Refusal('receipt ownership')
+    temporary = path.with_name('.' + path.name + '.' + uuid.uuid4().hex)
+    try:
+        write_once(temporary, value)
+        os.replace(temporary, path); fsync_dir(path.parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def deadline(clock, unix=None, mono=None):
+    unix = time.time() if unix is None else unix
+    mono = time.monotonic() if mono is None else mono
+    fields = ('original_start_unix', 'original_start_monotonic', 'original_seconds',
+              'cleanup_seconds', 'useful_deadline_unix', 'final_deadline_unix')
+    if any(type(clock.get(k)) not in (int, float) or not math.isfinite(clock[k]) for k in fields):
+        raise Refusal('clock numeric type')
+    start = clock['original_start_unix']; seconds = clock['original_seconds']; cleanup = clock['cleanup_seconds']
+    elapsed = mono - clock['original_start_monotonic']
+    if seconds <= cleanup or cleanup < 3 or elapsed < 0 or unix < start:
+        raise Refusal('future/invalid clock')
+    if abs((unix-start)-elapsed) > 2:
+        raise Refusal('clock divergence')
+    if clock['final_deadline_unix'] != start+seconds or clock['useful_deadline_unix'] != start+seconds-cleanup:
+        raise Refusal('extended/reset clock')
+    remaining = seconds-cleanup-elapsed
+    if remaining <= 3:
+        raise Refusal('expired useful clock')
+    return mono + min(20, remaining)
+
+
+def route(sender, peer, expected, controls, thread):
+    for slot, b in (('sol', sender), ('astra', peer)):
+        e = expected[slot]
+        if set(e) != {'thread', 'home', 'generation', 'endpoint'}:
+            raise Refusal('expected route shape')
+        endpoint = str(Path(e['home']) / 'app-server-control/app-server-control.sock')
+        if e['endpoint'] != endpoint:
+            raise Refusal('endpoint derivation')
+        if b.get('role') != ('Sol' if slot == 'sol' else 'Astra'):
+            raise Refusal('role direction')
+        for name, key in (('thread', 'thread_id'), ('home', 'account_home'), ('generation', 'generation')):
+            if b.get(key) != e[name]:
+                raise Refusal('binding ' + name)
+        if b.get('backend_endpoint') not in (endpoint, 'unix://'+endpoint):
+            raise Refusal('binding endpoint')
+        c = controls[slot]
+        if c.thread != e['thread'] or c.home != e['home'] or str(c.endpoint) != endpoint:
+            raise Refusal('NativeControl route')
+    if thread != expected['sol']['thread'] or expected['sol']['thread'] == expected['astra']['thread']:
+        raise Refusal('sender root')
+
+
+def notice(grant, body, expected):
+    event = grant['event']; assignment = grant['assignment']; generation = grant['generation']
+    if not isinstance(grant['notice']['path'], str) or any(c.isspace() for c in grant['notice']['path']):
+        raise Refusal('protocol ref whitespace')
+    if not isinstance(event, str) or not IDENT.fullmatch(event) or not event.startswith('SOL-'):
+        raise Refusal('event syntax/direction')
+    if not isinstance(assignment, str) or not ASSIGN.fullmatch(assignment) or not isinstance(generation, str) or not ASSIGN.fullmatch(generation):
+        raise Refusal('assignment syntax')
+    if not isinstance(body, bytes) or len(body) > 2000:
+        raise Refusal('contract bound')
+    if len(body) != grant['notice']['bytes'] or hashlib.sha256(body).hexdigest() != grant['notice']['sha256']:
+        raise Refusal('notice body/hash binding')
+    contract = loads(body)
+    if not isinstance(contract, dict) or set(contract) != {'status', 'result', 'manifest'}:
+        raise Refusal('notice shape')
+    if not isinstance(contract['status'], str) or not 0 < len(contract['status']) <= 120:
+        raise Refusal('notice status')
+    for key in ('result', 'manifest'):
+        if contract[key] != grant['artifacts'][key]:
+            raise Refusal('artifact binding')
+        pinned(contract[key], 67108864)
+    text = (f"PEER Sol RESULT id={event} assignment={assignment} assignment_generation={generation} "
+            f"assignment_action=complete from_epoch={expected['sol']['generation']} "
+            f"to_epoch={expected['astra']['generation']} ref={grant['notice']['path']} "
+            f"sha256={hashlib.sha256(body).hexdigest()}")
+    if len(text.encode()) > 500:
+        raise Refusal('notification bound')
+    return text
+
+
+def confirmation(result, event, text):
+    if not isinstance(result, dict) or set(result) != {'queuedSubmission'}:
+        raise Refusal('response shape')
+    q = result['queuedSubmission']
+    if not isinstance(q, dict) or not isinstance(q.get('id'), str):
+        raise Refusal('queue id absent')
+    try:
+        parsed = uuid.UUID(q['id'])
+    except (ValueError, AttributeError):
+        raise Refusal('queue id invalid') from None
+    if str(parsed) != q['id'] or parsed.int == 0:
+        raise Refusal('queue id noncanonical')
+    if q.get('clientUserMessageId') != event:
+        raise Refusal('response client')
+    rows = q.get('input')
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        raise Refusal('response input')
+    row = rows[0]
+    if set(row) - {'type', 'text', 'text_elements'} or row.get('type') != 'text' or row.get('text') != text:
+        raise Refusal('response text')
+    if 'text_elements' in row and row['text_elements'] != []:
+        raise Refusal('response elements')
+    return q['id']
+
+
+def reserve(path, receipt):
+    try:
+        write_once(path, receipt)
+        return True
+    except FileExistsError:
+        ancestors(path); st = path.lstat()
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077 or st.st_nlink != 1 or st.st_size > LIMIT:
+            raise Refusal('unsafe duplicate receipt')
+        old = loads(path.read_bytes())
+        keys = ('event_id', 'sha256', 'recipient_thread', 'recipient_generation',
+                'sender_generation', 'assignment_id', 'assignment_generation', 'assignment_action')
+        if any(old.get(k) != receipt[k] for k in keys):
+            raise Refusal('event collision')
+        return False
+
+
+def bounded_control(base, connector):
+    """Same verified NativeControl route; bounded handshake/send/receive/close."""
+    class Control(base):
+        async def open(self, end):
+            self.deadline = end
+            self.connection = connector(str(self.endpoint), uri='ws://localhost/', compression=None,
+                                        open_timeout=3, close_timeout=2, max_size=LIMIT)
+            async with asyncio.timeout_at(min(end-2, time.monotonic()+3)):
+                self.ws = await self.connection.__aenter__()
+            response = await self.rpc('initialize', {'clientInfo': {'name': 'friday_peer_control', 'version': '1'},
+                                                    'capabilities': {'experimentalApi': True}})
+            if not isinstance(response, dict) or response.get('codexHome') != self.home:
+                raise Refusal('initialize home')
+            async with asyncio.timeout_at(min(end-2, time.monotonic()+2)):
+                await self.ws.send(json.dumps({'method': 'initialized'}))
+
+        async def rpc(self, method, params):
+            if method not in ('initialize', 'thread/queue/add'):
+                raise Refusal('method outside one RESULT')
+            if method != 'initialize' and params.get('threadId') != self.thread:
+                raise Refusal('RPC thread')
+            self.sequence += 1; request_id = self.sequence
+            async with asyncio.timeout_at(min(self.deadline-2, time.monotonic()+5)):
+                await self.ws.send(json.dumps({'id': request_id, 'method': method, 'params': params}))
+                for _ in range(32):
+                    response = loads(await self.ws.recv())
+                    if not isinstance(response, dict):
+                        raise Refusal('RPC envelope')
+                    if 'id' not in response:
+                        if not isinstance(response.get('method'), str) or 'result' in response or 'error' in response:
+                            raise Refusal('invalid notification')
+                        continue
+                    if type(response['id']) is not int or response['id'] != request_id:
+                        raise Refusal('RPC response id')
+                    if set(response) - {'id', 'result', 'error'} or ('result' in response) == ('error' in response):
+                        raise Refusal('RPC result/error envelope')
+                    if 'error' in response:
+                        raise Refusal('RPC explicit error')
+                    return response['result']
+                raise Refusal('notification bound')
+
+        async def close(self, end):
+            if not hasattr(self, 'connection'):
+                return
+            try:
+                async with asyncio.timeout_at(min(end, time.monotonic()+2)):
+                    await self.connection.__aexit__(None, None, None)
+            except BaseException:
+                transport = getattr(getattr(self, 'ws', None), 'transport', None)
+                if transport is not None:
+                    transport.abort()  # This client only, never backend/turn/socket/lock.
+                raise
+    return Control
+
+
+async def send_prepared(control, grant, text, end, receipt_path, audit_dir, lifecycle, recheck, custody=None):
+    """One attempt, with durable existing-namespace dedup before any connection."""
+    e = grant['expected']; event = grant['event']
+    receipt = {'event_id': event, 'sha256': grant['notice']['sha256'],
+               'recipient_thread': e['astra']['thread'], 'recipient_generation': e['astra']['generation'],
+               'sender_generation': e['sol']['generation'], 'assignment_id': grant['assignment'],
+               'assignment_generation': grant['generation'], 'assignment_action': 'complete',
+               'state': 'UNKNOWN', 'peer_receipt': 'unconfirmed', 'transport': 'NATIVE_RPC_ONE_ATTEMPT',
+               'notification_bytes': len(text.encode()), 'contract_bytes': grant['notice']['bytes']}
+    if not sync_call(end, reserve, receipt_path, receipt):
+        try:
+            state = sync_call(end, duplicate_receipt, receipt_path, receipt, custody)
+        except WallDeadline:
+            state = 'UNKNOWN'
+        return {'state': state, 'duplicate_suppressed': True,
+                'queue_calls': 0, 'peer_receipt': 'unconfirmed', 'no_retry': True}
+    evidence = {'event_id': event, 'queue_call': 'NOT_CALLED', 'close': 'NOT_ATTEMPTED',
+                'rpc_request_id': 'NOT_RESERVED', 'no_retry': True}
+    failure = None
+    try:
+        if sync_call(end, lambda: any(audit_dir.iterdir())):
+            raise Refusal('nonempty task audit directory')
+        sync_call(end, recheck)
+        sync_call(end, lifecycle, 'check', 'sol'); sync_call(end, lifecycle, 'check', 'astra')
+        sync_call(end, lifecycle, 'register', 'sol'); sync_call(end, lifecycle, 'register', 'astra')
+        async with asyncio.timeout_at(end-2):
+            await control.open(end)
+            sync_call(end, recheck)
+            if time.monotonic() >= end-3:
+                raise Refusal('no useful mutation clock')
+            params = {'threadId': control.thread, 'clientUserMessageId': event,
+                      'input': [{'type': 'text', 'text': text}]}
+            evidence.update(queue_call='RESERVED_REMOTE_EFFECT_UNKNOWN', rpc_request_id=control.sequence+1)
+            sync_call(end, write_once, audit_dir/'RPC-ADD-RESERVED.json',
+                       {'id': control.sequence+1, 'method': 'thread/queue/add', 'params': params,
+                        'deadline_monotonic': end})
+            response = await control.rpc('thread/queue/add', params)
+            submission_id = confirmation(response, event, text)
+            sync_call(end, write_once, audit_dir/'RPC-ADD-CONFIRMED.json', response)
+            confirmed = {**receipt, 'state': 'ENQUEUED', 'submission_id': submission_id}
+            sync_call(end, replace_receipt, receipt_path, confirmed)  # Must be durable BEFORE teardown.
+            receipt = confirmed
+            if custody is not None:
+                custody.commit(confirmed)  # Only after file+parent fsync succeeded.
+            evidence['queue_call'] = 'CONFIRMED_NOT_READ_OR_EXECUTED'
+    except BaseException as exc:
+        failure = exc
+        evidence['exception_class'] = type(exc).__name__  # Never echo server/secret text.
+    finally:
+        try:
+            await control.close(end)
+            evidence['close'] = 'CLIENT_CLOSE_COMPLETED'
+        except BaseException as exc:
+            evidence['close'] = 'CLIENT_CLOSE_UNCONFIRMED_OWN_TRANSPORT_ABORTED_IF_AVAILABLE'
+            evidence['close_exception_class'] = type(exc).__name__
+            if failure is None:
+                failure = exc
+        # A close failure cannot erase a previously fsynced admission receipt.
+        try:
+            sync_call(end, write_once, audit_dir/'TRANSPORT-FINAL.json',
+                      {**evidence, 'durable_receipt_state': receipt['state']})
+            evidence['final_audit'] = 'CONFIRMED'
+        except BaseException as exc:
+            evidence['final_audit'] = 'UNCONFIRMED'
+            if failure is None:
+                failure = exc
+    return {**receipt, 'close': evidence['close'], 'final_audit': evidence['final_audit'], 'exception_class': type(failure).__name__ if failure else None,
+            'no_retry': True, 'enqueue_is_not_read': True}
+
+
+DEPENDENCY_LOADER = None  # Only offline fixtures inject; production default pins bytes.
+
+def prepare_delivery(grant_path, grant_sha, outer_end):
+    """Future installation entry only. C24 forbids calling it against a live route."""
+    for kind, maximum in ((resource.RLIMIT_AS, 268435456), (resource.RLIMIT_CPU, 60),
+                          (resource.RLIMIT_FSIZE, 67108864)):
+        soft, hard = resource.getrlimit(kind)
+        if not 0 < soft <= hard <= maximum:
+            raise Refusal('finite helper resource boundary required')
+    if resource.getrlimit(resource.RLIMIT_CORE) != (0, 0) or not 0 < len(os.sched_getaffinity(0)) <= 2:
+        raise Refusal('core/CPU boundary required')
+    p = Path(grant_path)
+    raw = pinned({'path': str(p), 'bytes': p.lstat().st_size, 'sha256': grant_sha})
+    grant = loads(raw)
+    if grant.get('decision') != 'APPROVE_ONE_NATIVE_RPC_RESULT' or grant.get('mode') != 'LIVE':
+        raise Refusal('reviewed live grant required')
+    source = grant['source']; source_bytes = pinned(source)
+    if Path(source['path']) != Path(__file__).resolve() or hashlib.sha256(source_bytes).hexdigest() != source['sha256']:
+        raise Refusal('source identity')
+    review = loads(pinned(grant['independent_review']))
+    if review.get('decision') != 'ACCEPT_ONE_NATIVE_RPC_RESULT_SOURCE' or review.get('source_sha256') != source['sha256']:
+        raise Refusal('independent review not accepted for exact source')
+    if set(grant['dependencies']) != set(DEPENDENCIES):
+        raise Refusal('dependency closure')
+    def recheck():
+        pinned(source); pinned(grant['notice'], 2000)
+        pinned(grant['independent_review']); pinned(grant['clock'])
+        for artifact in grant['artifacts'].values():
+            pinned(artifact, 67108864)
+        for name, path in DEPENDENCIES.items():
+            if grant['dependencies'][name]['path'] != str(path):
+                raise Refusal('dependency path')
+            pinned(grant['dependencies'][name], 262144)
+        if Path('/proc/sys/kernel/random/boot_id').read_text().strip() != grant['boot_id']:
+            raise Refusal('different boot')
+        deadline(loads(pinned(grant['clock'])))
+        for pid, ticks in grant['writer_births'].items():
+            if Path('/proc/'+pid+'/stat').read_text().rsplit(')', 1)[1].split()[19] != ticks:
+                raise Refusal('writer birth changed')
+    recheck()
+    def load_dependency(name):
+        ref = grant['dependencies'][name]
+        if DEPENDENCY_LOADER is not None:
+            return DEPENDENCY_LOADER(ref['path'])
+        raw = pinned(ref, 262144)
+        ns = {'__file__': ref['path'], '__name__': 'reviewed_native_dependency'}
+        exec(compile(raw, ref['path'], 'exec'), ns)
+        return ns
+    controls_ns = load_dependency('control')
+    base = controls_ns['NativeControl']
+    controls = {'sol': base('sol'), 'astra': base('astra')}
+    sender = loads(pinned(grant['dependencies']['sender']))
+    peer = loads(pinned(grant['dependencies']['recipient']))
+    route(sender, peer, grant['expected'], controls, os.environ.get('CODEX_THREAD_ID'))
+    text = notice(grant, pinned(grant['notice'], 2000), grant['expected'])
+    if set(grant['writer_births']) != {str(sender['pid']), str(sender['backend_pid']), str(peer['pid']), str(peer['backend_pid'])}:
+        raise Refusal('writer birth coverage')
+    end = min(outer_end, deadline(loads(pinned(grant['clock']))))
+    receipts = R/'sol-link-native-receipts'; private_dir(receipts)
+    audit_dir = Path(grant['audit_dir']); private_dir(audit_dir)
+    if audit_dir == receipts or audit_dir == R:
+        raise Refusal('private empty task audit directory required')
+    life = load_dependency('lifecycle')
+    def lifecycle(action, slot):
+        args = argparse.Namespace(profile=slot, assignment=grant['assignment'], generation=grant['generation'],
+                                  action='complete', event=grant['event'], kind='RESULT')
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = life['command_peer_check' if action == 'check' else 'command_peer_register'](args)
+        if rc != 0:
+            raise Refusal('paired lifecycle refused')
+    control = bounded_control(base, controls_ns['unix_connect'])('astra')
+    # Repeat the constructor's local validation immediately before use.
+    route(sender, peer, grant['expected'], {'sol': controls['sol'], 'astra': control}, os.environ.get('CODEX_THREAD_ID'))
+    return control, grant, text, end, receipts/(grant['event']+'.json'), audit_dir, lifecycle, recheck
+
+
+async def deliver_in_worker(grant_path, grant_sha, custody):
+    if custody is None or not custody.active:
+        raise Refusal("whole-entry owned supervisor required")
+    raw = pinned({"path": str(grant_path), "bytes": Path(grant_path).lstat().st_size, "sha256": grant_sha})
+    grant = loads(raw)
+    end = min(custody.operation_end, deadline(loads(pinned(grant["clock"]))) - custody.cleanup)
+    custody.tighten(end)  # Parent acknowledges original clock before any lifecycle/reservation/RPC.
+    arguments = sync_call(end, prepare_delivery, grant_path, grant_sha, end)
+    return await send_prepared(*arguments, custody=custody)

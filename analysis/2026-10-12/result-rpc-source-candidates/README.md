@@ -1,0 +1,23 @@
+# RESULT RPC candidate source analysis archive
+
+This archive publishes the C25/C28 custody repair and C26 whole-wall repair for analysis. It contains source and test definitions, with explicit pending execution and acceptance. The completed author snapshots and their original budgets are retained. Root records later independent review in REVIEW-DELTA.json; author NOT_RUN does not describe subsequent fixture executions.
+
+Seven source files preserve original bytes. Four analysis derivatives replace embedded private local paths with `/analysis/NOT_CONNECTED` markers. `SOURCE-MANIFEST.json` maps every original hash to its public hash and lists every replacement without exposing the original private path. These derivatives are unconnected and have not been built, imported, executed, installed or accepted. Original pin hashes remain references to private originals and can disagree with derived public bytes; this is an inert analysis archive, not an installable release.
+
+| Cohort | Published code | Recorded status of the completed source author package |
+| --- | --- | --- |
+| C25/C28 | Outer custody helper, unchanged installer and pure builder, sixteen author control definitions | Completed source author: repair prepared; sixteen controls NOT_RUN because its exact inputs lacked admitted host/caller ownership. The subsequent distinct independent fixture review is tracked in REVIEW-DELTA.json. |
+| C26 | Whole-wall supervisor, RPC state machine, selector, pure builder, physical and compatibility control definitions, generated sender analysis derivative | Author package PARTIAL_NOTACCEPTED; original pure build recorded PASS only; physical14, whole34, nested81 and standalone81 NOT_RUN; final independent review pending at preparation |
+| Public derivatives | Four path-sanitised copies and their original/public hashes | Static AST and publication checks only; no prior PASS or acceptance transferred to these new bytes |
+
+The C25 helper records wait/stop/cleanup failures in retained custody, keeps the actual owner-held PID/FD scope when direct wait is unconfirmed, and requires a distinct existing outside owner to cover caller bootstrap through final close and caller exit. It does not supply that owner or prove deployment admission. `C25/Controls/repair_controls.py` defines sixteen finite fault scenarios, including locked entry/descriptor/result operations, wait errors, pending notification failure and final owner close stalls. These are definitions rather than test results.
+
+C26 contains the single owned-worker supervisor and RESULT RPC/selector source. The generated analysis copy contains the byte-exact fca0 supervisor literal; this was checked statically without running the generated candidate. Its tests require private clock/admission inputs, the original canonical fixture and existing native dependency sources. Those prerequisites are intentionally not bundled, so the public snapshot is not a self-contained runnable harness. Test files have import-time effects; do not import or execute the archive as a validation step.
+
+`STATUS.json` distinguishes static preparation, the original author's recorded pure build, source tests, installation, native operations, runtime and final acceptance. The exact author's PURE-BUILD evidence hash is retained without its private path/process data. Older successful checks belong to older snapshots and are not credited to this final changed candidate.
+
+G7 remains a consumed failure with no replay. G8 acceptance covers the harmless diagnostic only. Kernel120 is not granted; normal3600, native19, the seven ordinary installed journeys and release are not accepted. C23 remains UNKNOWN with no resend. Old Friday remains OFF and Pandora excluded.
+
+No private receipts, TASK, rollouts, handoffs, account data, credentials, native/config changes or code activation are included. The daily analysis period begins at `546b4058cef42b0ae348ea25444cbab47e6e2f8e`; this interim source publication does not replace the daily checkpoint. `MANIFEST.json` lists public payload hashes; private preparation/provenance metadata is outside this public directory.
+
+The later exact original C25 helper passed 16 author and 9 independent owned fixture scenarios. `C25-FIXTURE-ACCEPTANCE.json` records the conditional source result and its limits; `C25/Fixture/` adds the exact independently admitted finite caller and host used for that verification. These fixtures still require private synthetic CLOCK/config/source layout and an actual execution owner before use. They are not installed authority; the sanitised public helper remains unexecuted and has no transferred acceptance. Earlier author NOT_RUN and the dated pending snapshot in REVIEW-DELTA remain historical.
