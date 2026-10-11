@@ -1,0 +1,265 @@
+--- a/hermes/hermes_cli/friday_cli_output.py
++++ b/hermes/hermes_cli/friday_cli_output.py
+@@ -363,6 +363,8 @@
+         self.done = Future()
+         self.task = None
+         self.started = False
++        self.terminal_entered = False
++        self.terminal_restored = False
+         self.effects = 0
+         self.outcome = None
+ 
+@@ -551,12 +553,17 @@
+             previous_chain = app._running_in_terminal_f
+             own_chain = None
+             try:
++                # Entry can erase the UI before native input cleanup is armed.
++                # A native context-manager failure leaves its frontend unsafe
++                # even if the chain Future is completed by its finally block.
++                request.terminal_entered = True
+                 async with in_terminal():
+                     own_chain = app._running_in_terminal_f
+                     request.guard()
+                     # Reuse the original finite writer on this same owner loop.
+                     await write_console_envelope(owner, payload, deadline=deadline,
+                               check=request.guard, stop=request.stop.is_set)
++                request.terminal_restored = True
+                 request.guard()  # Native reset/redraw/close precede acknowledgement.
+                 return 'bounded-owner-renderer-write'
+             finally:
+@@ -574,6 +581,10 @@
+         try:
+             request.outcome = (True, await run())
+         except BaseException as exc:
++            if request.terminal_entered and not request.terminal_restored:
++                # Revoke subsequent effects; this is not a cleanup receipt or
++                # a substitute for the native task's actual joined completion.
++                owner.close()
+             request.outcome = (False, exc)
+ 
+     def completed(task):
+--- a/project/plugins/friday_rework/associations.py
++++ b/project/plugins/friday_rework/associations.py
+@@ -167,11 +167,15 @@
+ 
+ def _sync_directory(directory):
+     fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++    _cleanup_primary_1 = None
+     try:
+         os.fsync(fd)
++    except BaseException as _cleanup_error_1:
++        _cleanup_primary_1 = _cleanup_error_1
++        raise
+     finally:
+         from hermes_cli.plugins_state import _state_lock_cleanup
+-        _state_lock_cleanup(lambda: os.close(fd))
++        _state_lock_cleanup(lambda: os.close(fd), primary=_cleanup_primary_1)
+ 
+ 
+ class Associations:
+@@ -308,11 +312,15 @@
+                     remaining = deadline - time.monotonic()
+                     if remaining <= 0 or not self._thread_lock.acquire(timeout=remaining):
+                         raise TimeoutError("association_lock_deadline")
++                _cleanup_primary_2 = None
+                 try:
+                     with self._locked_file() as data:
+                         yield data
++                except BaseException as _cleanup_error_2:
++                    _cleanup_primary_2 = _cleanup_error_2
++                    raise
+                 finally:
+-                    _state_lock_cleanup(self._thread_lock.release)
++                    _state_lock_cleanup(self._thread_lock.release, primary=_cleanup_primary_2)
+                 self._check_metadata()
+         except AtomicWriteUncertainError:
+             raise
+@@ -336,6 +344,7 @@
+         if ds.st_uid != os.getuid() or stat.S_IMODE(ds.st_mode) != 0o700:
+             raise AssociationError("state_directory_not_private")
+         fd = os.open(directory / "admission.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
++        _cleanup_primary_3 = None
+         try:
+             ls = os.fstat(fd)
+             if (not stat.S_ISREG(ls.st_mode) or ls.st_uid != os.getuid()
+@@ -384,9 +393,12 @@
+                 _sync_directory(parent)
+             self._check_metadata()
+             yield data
++        except BaseException as _cleanup_error_3:
++            _cleanup_primary_3 = _cleanup_error_3
++            raise
+         finally:
+             from hermes_cli.plugins_state import _state_lock_cleanup
+-            _state_lock_cleanup(lambda: os.close(fd))
++            _state_lock_cleanup(lambda: os.close(fd), primary=_cleanup_primary_3)
+ 
+     def _save(self, data):
+         self._check_metadata()
+--- a/hermes/hermes_cli/plugins_state.py
++++ b/hermes/hermes_cli/plugins_state.py
+@@ -166,9 +166,8 @@
+     return remaining
+ 
+ 
+-def _state_lock_cleanup(release):
+-    """Keep a body failure/cancellation primary if lock cleanup also fails."""
+-    primary = sys.exc_info()[1]
++def _state_lock_cleanup(release, *, primary=None):
++    """Keep only this lock body's explicit failure primary on cleanup."""
+     try:
+         release()
+     except Exception as cleanup:
+@@ -187,10 +186,14 @@
+             lock.acquire()
+         elif not lock.acquire(timeout=_lock_remaining(acquisition_deadline)):
+             raise TimeoutError("Plugin state lock deadline exceeded")
++    _cleanup_primary_1 = None
+     try:
+         yield
++    except BaseException as _cleanup_error_1:
++        _cleanup_primary_1 = _cleanup_error_1
++        raise
+     finally:
+-        _state_lock_cleanup(lock.release)
++        _state_lock_cleanup(lock.release, primary=_cleanup_primary_1)
+ 
+ 
+ def _acquire_state_file(handle, deadline):
+@@ -233,6 +236,7 @@
+     with _thread_state_lock(thread_lock, lock_deadline, lock_budget, operation_deadline):
+         lock_path.parent.mkdir(parents=True, exist_ok=True)
+         handle = open(lock_path, "a+b")
++        _cleanup_primary_2 = None
+         try:
+             if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+                 import msvcrt
+@@ -242,19 +246,26 @@
+                 handle.seek(0)
+             with _acquisition_scope(lock_deadline, lock_budget, operation_deadline) as acquisition_deadline:
+                 _acquire_state_file(handle, acquisition_deadline)
++            _cleanup_primary_3 = None
+             try:
+                 yield
++            except BaseException as _cleanup_error_3:
++                _cleanup_primary_3 = _cleanup_error_3
++                raise
+             finally:
+                 if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+                     def release():
+                         handle.seek(0)
+                         msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+-                    _state_lock_cleanup(release)
++                    _state_lock_cleanup(release, primary=_cleanup_primary_3)
+                 else:
+                     import fcntl
+-                    _state_lock_cleanup(lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN))
++                    _state_lock_cleanup(lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN), primary=_cleanup_primary_3)
++        except BaseException as _cleanup_error_2:
++            _cleanup_primary_2 = _cleanup_error_2
++            raise
+         finally:
+-            _state_lock_cleanup(handle.close)
++            _state_lock_cleanup(handle.close, primary=_cleanup_primary_2)
+ 
+ 
+ class PluginState:
+--- a/hermes/utils.py
++++ b/hermes/utils.py
+@@ -135,9 +135,8 @@
+     return _IS_WINDOWS and getattr(exc, "winerror", None) in _WINDOWS_CONTENDED_REPLACE_ERRORS
+ 
+ 
+-def _atomic_handle_cleanup(release):
+-    """Close owned native handles without masking a prior failure/cancellation."""
+-    primary = sys.exc_info()[1]
++def _atomic_handle_cleanup(release, *, primary=None):
++    """Close owned handles, preserving only this body's explicit failure."""
+     try:
+         release()
+     except Exception as cleanup:
+@@ -153,12 +152,20 @@
+     genuinely failed. Writing through the target also preserves its ACL, which ``os.replace``
+     does not (the temp file's inherited ACL wins there).
+     """
+-    with open(tmp_str, "rb") as src:
++    src = open(tmp_str, "rb")
++    read_primary = None
++    try:
+         data = src.read()
++    except BaseException as exc:
++        read_primary = exc
++        raise
++    finally:
++        _atomic_handle_cleanup(src.close, primary=read_primary)
+     fd = os.open(real_path, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+     mutation_started = published = False
+     stage = "rewrite_publication"
+     try:
++        _cleanup_primary_1 = None
+         try:
+             written = 0
+             while written < len(data):
+@@ -177,8 +184,11 @@
+                 with suppress(OSError):
+                     os.fsync(fd)
+             stage = "rewrite_cleanup"
++        except BaseException as _cleanup_error_1:
++            _cleanup_primary_1 = _cleanup_error_1
++            raise
+         finally:
+-            _atomic_handle_cleanup(lambda: os.close(fd))
++            _atomic_handle_cleanup(lambda: os.close(fd), primary=_cleanup_primary_1)
+         os.unlink(tmp_str)
+     except Exception as exc:
+         if mutation_started:
+@@ -201,11 +211,26 @@
+             shutil.copystat(tmp_str, real_path)
+         stage = "copy_durability"
+         if require_durability:
+-            with open(real_path, "rb") as f:
++            f = open(real_path, "rb")
++            sync_primary = None
++            try:
+                 os.fsync(f.fileno())
++            except BaseException as exc:
++                sync_primary = exc
++                raise
++            finally:
++                _atomic_handle_cleanup(f.close, primary=sync_primary)
+         else:
+-            with suppress(OSError), open(real_path, "rb") as f:
+-                os.fsync(f.fileno())
++            with suppress(OSError):
++                f = open(real_path, "rb")
++                sync_primary = None
++                try:
++                    os.fsync(f.fileno())
++                except BaseException as exc:
++                    sync_primary = exc
++                    raise
++                finally:
++                    _atomic_handle_cleanup(f.close, primary=sync_primary)
+         stage = "copy_cleanup"
+         os.unlink(tmp_str)
+     except Exception as exc:
+@@ -339,14 +364,18 @@
+         if strict:
+             raise
+         return
++    _cleanup_primary_2 = None
+     try:
+         if strict:
+             os.fsync(fd)
+         else:
+             with suppress(OSError):
+                 os.fsync(fd)
++    except BaseException as _cleanup_error_2:
++        _cleanup_primary_2 = _cleanup_error_2
++        raise
+     finally:
+-        _atomic_handle_cleanup(lambda: os.close(fd))
++        _atomic_handle_cleanup(lambda: os.close(fd), primary=_cleanup_primary_2)
+ 
+ 
+ def rmtree_readonly(path: Union[str, Path], *, ignore_errors: bool = False) -> None:

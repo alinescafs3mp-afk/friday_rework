@@ -1,0 +1,469 @@
+--- a/project/plugins/friday_rework/associations.py
++++ b/project/plugins/friday_rework/associations.py
+@@ -170,7 +170,8 @@
+     try:
+         os.fsync(fd)
+     finally:
+-        os.close(fd)
++        from hermes_cli.plugins_state import _state_lock_cleanup
++        _state_lock_cleanup(lambda: os.close(fd))
+ 
+ 
+ class Associations:
+@@ -193,6 +194,7 @@
+         self._thread_lock = threading.RLock()
+         self._lock_allowance = ContextVar("association_lock_allowance", default=None)
+         self._metadata_allowance = ContextVar("association_metadata_allowance", default=None)
++        self._publication_scope = ContextVar("association_publication_scope", default=None)
+ 
+     def _check_local_state(self):
+         from hermes_cli.friday_cli_work import check_store
+@@ -263,32 +265,65 @@
+             self._check_local_state()
+             return value
+ 
++    def _record_publication(self, publication):
++        observation = self._publication_scope.get()
++        if observation is not None:
++            observation[0] = publication
++
+     def state_set(self, key, value):
++        from utils import AtomicWriteUncertainError
+         self._check_local_state()
+-        with self.lock_budget():
+-            self.state.set(key, value, lock_budget=self._lock_allowance.get(), **self._metadata_options())
+-        self._check_local_state()
++        published = False
++        try:
++            with self.lock_budget():
++                self.state.set(key, value, lock_budget=self._lock_allowance.get(), **self._metadata_options())
++                published = True
++                self._record_publication("completed")
++            self._check_local_state()
++        except AtomicWriteUncertainError as exc:
++            self._record_publication(exc.publication)
++            raise
++        except Exception as exc:
++            if published:
++                raise AtomicWriteUncertainError("Association published; store completion uncertain",
++                                                stage="association_store_completion") from exc
++            raise
+ 
+     @contextmanager
+     def _locked(self):
++        from utils import AtomicWriteUncertainError
++        from hermes_cli.plugins_state import _state_lock_cleanup
+         self._check_local_state()
+-        # Unload and coroutine cancellation use the same owned store through
+-        # different executor threads. Their contention is not a foreign writer.
+-        with self.lock_budget():
+-            with self._lock_allowance.get().acquiring() as deadline:
++        observation = self._publication_scope.get()
++        token = self._publication_scope.set(observation if observation is not None else [None])
++        observation = self._publication_scope.get()
++        try:
++            # Metadata observation follows the existing owned lock; no new lock.
++            with self.lock_budget():
++                with self._lock_allowance.get().acquiring() as deadline:
++                    self._check_metadata()
++                    allowance = self._metadata_allowance.get()
++                    if allowance is not None:
++                        deadline = min(deadline, allowance[0])
++                    remaining = deadline - time.monotonic()
++                    if remaining <= 0 or not self._thread_lock.acquire(timeout=remaining):
++                        raise TimeoutError("association_lock_deadline")
++                try:
++                    with self._locked_file() as data:
++                        yield data
++                finally:
++                    _state_lock_cleanup(self._thread_lock.release)
+                 self._check_metadata()
+-                allowance = self._metadata_allowance.get()
+-                if allowance is not None:
+-                    deadline = min(deadline, allowance[0])
+-                remaining = deadline - time.monotonic()
+-                if remaining <= 0 or not self._thread_lock.acquire(timeout=remaining):
+-                    raise TimeoutError("association_lock_deadline")
+-            try:
+-                with self._locked_file() as data:
+-                    yield data
+-            finally:
+-                self._thread_lock.release()
+-            self._check_metadata()
++        except AtomicWriteUncertainError:
++            raise
++        except Exception as exc:
++            if observation[0] is not None:
++                raise AtomicWriteUncertainError("Association publication; lock completion uncertain",
++                        published=True if observation[0] == "completed" else None,
++                        stage="association_lock_exit") from exc
++            raise
++        finally:
++            self._publication_scope.reset(token)
+ 
+     @contextmanager
+     def _locked_file(self):
+@@ -350,21 +385,23 @@
+             self._check_metadata()
+             yield data
+         finally:
+-            os.close(fd)
++            from hermes_cli.plugins_state import _state_lock_cleanup
++            _state_lock_cleanup(lambda: os.close(fd))
+ 
+     def _save(self, data):
+         self._check_metadata()
+         _validate_store(data)
+         self.state_set(KEY, data)
+-        # PluginState fsyncs its temporary file, but not the replacement's
+-        # directory. Keep its native writer/store; finish the commit under our
+-        # compound-operation lock and propagate an uncertain durability error.
+-        _sync_directory(Path(self.state.data_dir))
++        # Keep the native writer; sync and post-save guards are postpublication.
+         try:
++            _sync_directory(Path(self.state.data_dir))
+             self._check_metadata()
+         except Exception as exc:
+             from utils import AtomicWriteUncertainError
+-            raise AtomicWriteUncertainError("Association published; durability completion uncertain") from exc
++            if isinstance(exc, AtomicWriteUncertainError):
++                raise
++            raise AtomicWriteUncertainError("Association published; durability completion uncertain",
++                                            stage="association_directory_completion") from exc
+ 
+     @staticmethod
+     def _owned(data, task_id, owner):
+--- a/hermes/hermes_cli/plugins_state.py
++++ b/hermes/hermes_cli/plugins_state.py
+@@ -7,6 +7,7 @@
+ import math
+ import os
+ import re
++import sys
+ import threading
+ import time
+ from contextlib import contextmanager, nullcontext
+@@ -165,6 +166,20 @@
+     return remaining
+ 
+ 
++def _state_lock_cleanup(release):
++    """Keep a body failure/cancellation primary if lock cleanup also fails."""
++    primary = sys.exc_info()[1]
++    try:
++        release()
++    except Exception as cleanup:
++        if primary is None:
++            raise
++        primary.add_note("Plugin state lock cleanup unconfirmed: " + type(cleanup).__name__)
++        from utils import AtomicWriteUncertainError
++        if isinstance(primary, AtomicWriteUncertainError):
++            primary.lock_completion = "unconfirmed"
++
++
+ @contextmanager
+ def _thread_state_lock(lock, deadline, budget=None, operation_deadline=None):
+     with _acquisition_scope(deadline, budget, operation_deadline) as acquisition_deadline:
+@@ -175,7 +190,7 @@
+     try:
+         yield
+     finally:
+-        lock.release()
++        _state_lock_cleanup(lock.release)
+ 
+ 
+ def _acquire_state_file(handle, deadline):
+@@ -217,7 +232,8 @@
+         thread_lock = _PLUGIN_STATE_LOCKS.setdefault(str(lock_path.resolve(strict=False)), threading.RLock())
+     with _thread_state_lock(thread_lock, lock_deadline, lock_budget, operation_deadline):
+         lock_path.parent.mkdir(parents=True, exist_ok=True)
+-        with open(lock_path, "a+b") as handle:
++        handle = open(lock_path, "a+b")
++        try:
+             if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+                 import msvcrt
+                 if handle.seek(0, os.SEEK_END) == 0:
+@@ -230,11 +246,15 @@
+                 yield
+             finally:
+                 if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+-                    handle.seek(0)
+-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
++                    def release():
++                        handle.seek(0)
++                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
++                    _state_lock_cleanup(release)
+                 else:
+                     import fcntl
+-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
++                    _state_lock_cleanup(lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN))
++        finally:
++            _state_lock_cleanup(handle.close)
+ 
+ 
+ class PluginState:
+@@ -297,31 +317,38 @@
+         """Atomically set one JSON value without dropping concurrent updates."""
+         self._validate_key(key)
+         _state_operation_check(operation_deadline, commit_guard)
+-        with _locked_plugin_state(self.path, lock_deadline=lock_deadline, lock_budget=lock_budget,
+-                                  operation_deadline=operation_deadline):
+-            _state_operation_check(operation_deadline, commit_guard)
+-            data = self._read_unlocked()
+-            _state_operation_check(operation_deadline, commit_guard)
+-            if self._plugin_id == "friday_rework" and key == "product_access.v1":
+-                from hermes_cli.friday_product_access import KEY, advance_access
+-                value = advance_access(data.get(KEY, {"schema": KEY, "users": {}}), value)
+-            data[key] = value
+-            try:
+-                encoded = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+-            except (TypeError, ValueError) as exc:
+-                raise ValueError(f"Plugin state value for {key!r} is not JSON-serializable") from exc
+-            _state_operation_check(operation_deadline, commit_guard)
+-            if len(encoded) > self.quota_bytes:
+-                raise ValueError(
+-                    f"Plugin state quota exceeded: {len(encoded)} bytes is greater "
+-                    f"than the {self.quota_bytes}-byte per-plugin quota"
+-                )
+-            from utils import atomic_json_write
+-            options = ({"write_deadline": operation_deadline, "commit_guard": commit_guard}
+-                       if operation_deadline is not None or commit_guard is not None else {})
+-            atomic_json_write(self.path, data, mode=0o600, **options)
+-        try:
++        published = False
++        try:
++            with _locked_plugin_state(self.path, lock_deadline=lock_deadline, lock_budget=lock_budget,
++                                      operation_deadline=operation_deadline):
++                _state_operation_check(operation_deadline, commit_guard)
++                data = self._read_unlocked()
++                _state_operation_check(operation_deadline, commit_guard)
++                if self._plugin_id == "friday_rework" and key == "product_access.v1":
++                    from hermes_cli.friday_product_access import KEY, advance_access
++                    value = advance_access(data.get(KEY, {"schema": KEY, "users": {}}), value)
++                data[key] = value
++                try:
++                    encoded = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
++                except (TypeError, ValueError) as exc:
++                    raise ValueError(f"Plugin state value for {key!r} is not JSON-serializable") from exc
++                _state_operation_check(operation_deadline, commit_guard)
++                if len(encoded) > self.quota_bytes:
++                    raise ValueError(
++                        f"Plugin state quota exceeded: {len(encoded)} bytes is greater "
++                        f"than the {self.quota_bytes}-byte per-plugin quota"
++                    )
++                from utils import atomic_json_write
++                options = ({"write_deadline": operation_deadline, "commit_guard": commit_guard}
++                           if operation_deadline is not None or commit_guard is not None else {})
++                atomic_json_write(self.path, data, mode=0o600, **options)
++                published = True
+             _state_operation_check(operation_deadline, commit_guard)
+         except Exception as exc:
+             from utils import AtomicWriteUncertainError
+-            raise AtomicWriteUncertainError("Plugin state published; lock completion uncertain") from exc
++            if isinstance(exc, AtomicWriteUncertainError):
++                raise
++            if published:
++                raise AtomicWriteUncertainError("Plugin state published; lock completion uncertain",
++                                                stage="plugin_state_lock_exit") from exc
++            raise
+--- a/hermes/utils.py
++++ b/hermes/utils.py
+@@ -8,6 +8,7 @@
+ import re
+ import shutil
+ import stat
++import sys
+ import tempfile
+ import threading
+ import time
+@@ -134,7 +135,18 @@
+     return _IS_WINDOWS and getattr(exc, "winerror", None) in _WINDOWS_CONTENDED_REPLACE_ERRORS
+ 
+ 
+-def _rewrite_in_place(tmp_str: str, real_path: str) -> None:
++def _atomic_handle_cleanup(release):
++    """Close owned native handles without masking a prior failure/cancellation."""
++    primary = sys.exc_info()[1]
++    try:
++        release()
++    except Exception as cleanup:
++        if primary is None:
++            raise
++        primary.add_note("Atomic handle cleanup unconfirmed: " + type(cleanup).__name__)
++
++
++def _rewrite_in_place(tmp_str: str, real_path: str, *, require_durability: bool = False) -> None:
+     """Overwrite *real_path* through the existing file — last resort for a still-held target.
+ 
+     Not atomic (a smaller window than a copy, not none), so it runs only after the rename has
+@@ -144,35 +156,80 @@
+     with open(tmp_str, "rb") as src:
+         data = src.read()
+     fd = os.open(real_path, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+-    try:
+-        written = 0
+-        while written < len(data):
+-            written += os.write(fd, data[written:])
+-        os.ftruncate(fd, len(data))
++    mutation_started = published = False
++    stage = "rewrite_publication"
++    try:
++        try:
++            written = 0
++            while written < len(data):
++                mutation_started = True
++                count = os.write(fd, data[written:])
++                if count <= 0:
++                    raise OSError(errno.EIO, "short in-place publication write")
++                written += count
++            mutation_started = True
++            os.ftruncate(fd, len(data))
++            published = True
++            stage = "rewrite_durability"
++            if require_durability:
++                os.fsync(fd)
++            else:
++                with suppress(OSError):
++                    os.fsync(fd)
++            stage = "rewrite_cleanup"
++        finally:
++            _atomic_handle_cleanup(lambda: os.close(fd))
++        os.unlink(tmp_str)
++    except Exception as exc:
++        if mutation_started:
++            raise AtomicWriteUncertainError(
++                "In-place publication completion uncertain", published=True if published else None,
++                stage=stage) from exc
++        raise
++
++
++def _copy_fallback(tmp_str: str, real_path: str, *, require_durability: bool = False) -> None:
++    """Copy/fsync/unlink fallback for cross-device and bind-mount renames."""
++    published = False
++    stage = "copy_publication"
++    try:
++        # Native copyfile can truncate/write the destination before raising.
++        # Its failed call cannot prove absence of publication; do not republish.
++        shutil.copyfile(tmp_str, real_path)
++        published = True
+         with suppress(OSError):
+-            os.fsync(fd)
+-    finally:
+-        os.close(fd)
+-    os.unlink(tmp_str)
+-
+-
+-def _copy_fallback(tmp_str: str, real_path: str) -> None:
+-    """Copy/fsync/unlink fallback for cross-device and bind-mount renames."""
+-    shutil.copyfile(tmp_str, real_path)
+-    with suppress(OSError):
+-        shutil.copystat(tmp_str, real_path)
+-    with suppress(OSError), open(real_path, "rb") as f:
+-        os.fsync(f.fileno())
+-    os.unlink(tmp_str)
++            shutil.copystat(tmp_str, real_path)
++        stage = "copy_durability"
++        if require_durability:
++            with open(real_path, "rb") as f:
++                os.fsync(f.fileno())
++        else:
++            with suppress(OSError), open(real_path, "rb") as f:
++                os.fsync(f.fileno())
++        stage = "copy_cleanup"
++        os.unlink(tmp_str)
++    except Exception as exc:
++        raise AtomicWriteUncertainError(
++            "Copy publication completion uncertain", published=True if published else None,
++            stage=stage) from exc
+ 
+ 
+ class AtomicWriteUncertainError(RuntimeError):
+-    """Publication completed, but completion/durability was not confirmed in scope.
++    """Publication completed or may have started; completion is unconfirmed.
+ 
+     No rollback or retry is safe: the original target may already contain the new
+     receipt. Synchronous filesystem calls are not made preemptible by this error.
+     """
+     published = True
++
++    def __init__(self, message, *, published=True, stage="completion"):
++        super().__init__(message)
++        self.published = published
++        self.publication = "completed" if published is True else "possible"
++        self.stage = stage
++        self.durability = "unconfirmed"
++        self.lock_completion = "unconfirmed"
++        self.temporary_cleanup = "unconfirmed"
+ 
+ 
+ def _check_atomic_write(write_deadline=None, commit_guard=None):
+@@ -236,7 +293,9 @@
+                      "in-place rewrite" if contended else "copy")
+         # The rewrite re-raises its own error, so an ACL denial is reported as such, not as contention.
+         _check_atomic_write(write_deadline, commit_guard)
+-        (_rewrite_in_place if contended else _copy_fallback)(tmp_str, real_path)
++        options = ({"require_durability": True}
++                   if write_deadline is not None or commit_guard is not None else {})
++        (_rewrite_in_place if contended else _copy_fallback)(tmp_str, real_path, **options)
+     return real_path
+ 
+ 
+@@ -265,7 +324,7 @@
+         return tempfile.mkstemp(dir=link_dir, **kw)
+ 
+ 
+-def fsync_directory(path: Union[str, Path]) -> None:
++def fsync_directory(path: Union[str, Path], *, strict: bool = False) -> None:
+     """Best-effort fsync of a directory entry so a just-renamed file survives power loss.
+ 
+     No-op on Windows (directories can't be opened with ``os.open``; the file fsync still applies)
+@@ -277,12 +336,17 @@
+     try:
+         fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+     except OSError:
++        if strict:
++            raise
+         return
+     try:
+-        with suppress(OSError):
++        if strict:
+             os.fsync(fd)
++        else:
++            with suppress(OSError):
++                os.fsync(fd)
+     finally:
+-        os.close(fd)
++        _atomic_handle_cleanup(lambda: os.close(fd))
+ 
+ 
+ def rmtree_readonly(path: Union[str, Path], *, ignore_errors: bool = False) -> None:
+@@ -368,13 +432,26 @@
+         replaced = Path(atomic_replace(tmp_path, path, **options))  # symlink-preserving actual destination
+         _restore_file_metadata(replaced, original_owner, mode)
+         if fsync_dir:
+-            fsync_directory(replaced.parent)
++            options = ({"strict": True}
++                       if write_deadline is not None or commit_guard is not None else {})
++            fsync_directory(replaced.parent, **options)
+         _check_atomic_write(write_deadline, commit_guard)
+     except BaseException as exc:
+-        with suppress(OSError):
++        try:
+             os.unlink(tmp_path)
++        except FileNotFoundError:
++            cleanup = "removed_or_absent"
++        except OSError:
++            cleanup = "unconfirmed"
++        else:
++            cleanup = "removed_or_absent"
++        if isinstance(exc, AtomicWriteUncertainError):
++            exc.temporary_cleanup = cleanup
++            raise
+         if replaced is not None and isinstance(exc, Exception):
+-            raise AtomicWriteUncertainError("Atomic write published; completion uncertain") from exc
++            uncertain = AtomicWriteUncertainError("Atomic write published; completion uncertain")
++            uncertain.temporary_cleanup = cleanup
++            raise uncertain from exc
+         raise
+ 
+ 
