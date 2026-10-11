@@ -1,5 +1,9 @@
 # Friday_rework
 
+11.10.2026, 21:33 МСК: [суточная публикация завершена](analysis/2026-10-11/DAILY-PUBLICATION-RECEIPT.json), точный удалённый коммит `546b4058cef42b0ae348ea25444cbab47e6e2f8e` проверен. Независимо принят состав, приватность и достоверность статусов [полного среза](analysis/2026-10-11/daily-complete-period-21msk/README.md): 52 предшествующих коммита / 765 изменённых путей, затем 12 файлов завершающей публикации. Поля PENDING в замороженных подготовленных материалах остаются историей; последующий результат записан отдельной квитанцией.
+
+[Финальные семантические и LF/ASCII исходники](analysis/2026-10-11/final-semantic-lf-ascii-source/README.md) приняты только в своих узких SOURCE-областях. [C20 с разрывом ресурсной границы](analysis/2026-10-11/C20-known-birth-gap-source/README.md) опубликован как непринятый материал вместе с [независимыми замечаниями](analysis/2026-10-11/daily-C20-independent-review-findings.json). Установленный runtime, все семь пользовательских journeys и релиз остаются NOT_ACCEPTED; G8 требует ранее описанного физического терминала владельца, kernel120 не допущен, normal3600 не запускался.
+
 Separate Hermes-based Friday implementation. Integration is under validation; no product acceptance or deployment is claimed.
 
 Composition: pinned Hermes host, intact DeepSeek Harness coding worker, intact dedicated Agent Zero engineering worker, and verified Friday personality/Telegram deltas. Production inference uses explicitly configured existing local endpoints, with no automatic cloud fallback. Autonomous web retrieval, web access during both worker paths, and a working administrative WebUI are mandatory release capabilities; authorized web connectivity is separate from model routing.
