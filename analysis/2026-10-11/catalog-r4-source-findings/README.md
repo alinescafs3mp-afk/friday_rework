@@ -1,0 +1,11 @@
+# Catalog boundary R4: independently rejected source snapshot
+
+This inactive analysis preserves the exact R4 source candidate and observed independent `SOURCE_FAIL`. Nothing in this directory is registered or installed as a product transport.
+
+The candidate changed `urllib_security.py` and retained four source files from R3. Author reproduction covered 821 logical controls in 822 actual executions, including one preserved inherited invalid cookie control; seven causal mutants are separate. Fresh independent review ran 92 distinct logical controls: 78 PASS and 14 SOURCE_FAIL. Its 94 raw ordinary executions contain two equivalent positive lifetime observations, and four further snapshot diagnostics count as observations rather than new logical controls. Three fresh independent mutants and their baselines are also separate; 933 actual case executions includes the author reproduction and these observations. Counts are not a release score.
+
+Three causes remain: raw socket backing custody is not retained across the effect callback; the original request admission carrier is captured too late; failed constructor tracebacks retain the temporary GC object snapshot. The carrier finding establishes an identity contract failure, not an observed foreign secret. All observed data and socket effects belonged to inert owned fixtures. Resource closure can pass while the traceback lifetime check fails.
+
+[REPORT.json](REPORT.json) separates reproduction, independent controls, limits and original clocks. [COUNTEREXAMPLES.json](COUNTEREXAMPLES.json) summarizes the three findings without publishing private fixture programs, receipts or payloads. The exact [patch](catalog-boundary-repair-r4.patch), [previous urllib source](base/hermes/hermes_cli/urllib_security.py), and five successor files provide the candidate identity; [MANIFEST.json](MANIFEST.json) binds every published payload.
+
+R3 findings remain historically red. R5 is a separate repair in progress and receives fresh acceptance on its final bytes. Source fixtures establish no native transport, full TLS handshake, local model call, normally installed journey, administrative WebUI isolation, Telegram delivery or release admission. This publication is an intermediate source checkpoint, not completion of the 21:00 Moscow daily report.
