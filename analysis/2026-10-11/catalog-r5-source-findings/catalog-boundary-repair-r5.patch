@@ -1,0 +1,589 @@
+--- a/hermes/hermes_cli/urllib_security.py
++++ b/hermes/hermes_cli/urllib_security.py
+@@ -48,8 +48,29 @@
+         self._cross_origin_safe_headers = frozenset(str(name).lower() for name in cross_origin_safe_headers)
+ 
+     def redirect_request(self, req, fp, code, msg, headers, newurl):
++        import types
++        request_dict = urllib.request.Request.__dict__["__dict__"]
++        original_state = request_dict.__get__(req)
++        admission = (original_state.get("_hermes_catalog_admission")
++                     if type(original_state) is dict and all(type(key) is str for key in original_state)
++                     else None)
++        admitted = type(admission) is types.FunctionType and admission in _CATALOG_ADMISSIONS
+         # Let urllib enforce status/method semantics first (notably 307/308).
+         redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
++        if admitted:
++            state = request_dict.__get__(req)
++            if (type(state) is not dict or any(type(key) is not str for key in state)
++                    or state.get("_hermes_catalog_admission") is not admission):
++                from hermes_cli.friday_user_scope import ScopeDenied
++                raise ScopeDenied()
++            if redirected is not None:
++                state = request_dict.__get__(redirected)
++                if (type(state) is not dict or any(type(key) is not str for key in state)
++                        or (state.get("_hermes_catalog_admission") is not None
++                            and state.get("_hermes_catalog_admission") is not admission)):
++                    from hermes_cli.friday_user_scope import ScopeDenied
++                    raise ScopeDenied()
++                state["_hermes_catalog_admission"] = admission
+         if redirected is None:
+             return None
+ 
+@@ -353,6 +374,11 @@
+         if isinstance(handler, urllib.request.AbstractHTTPHandler):
+             native = handler.do_open
+             def checked_transport(http_class, request, *args, _native=native, **kwargs):
++                request_dict = urllib.request.Request.__dict__["__dict__"]
++                original_state = request_dict.__get__(request)
++                if type(original_state) is not dict or any(type(key) is not str for key in original_state):
++                    raise ScopeDenied()
++                original_carrier = original_state.get("_hermes_catalog_admission")
+                 request_guard(request, final=True)
+                 connections = []
+                 responses = []
+@@ -363,26 +389,35 @@
+                 connection_dict = http.client.HTTPConnection.__dict__["__dict__"]
+                 def settle_connection(connection):
+                     try:
++                        state = connection_dict.__get__(connection) if native_instance(connection, http.client.HTTPConnection) else None
++                        if isinstance(state, dict):
++                            clean = {key: value for key, value in dict.items(state) if type(key) is str}
++                            sock = clean.get("sock")
++                            prior_ids = (connection_prior_objects.get(id(connection), construction_prior_objects[0]) or (None,))[0]
++                            if (sock is not None and type(sock) is not OwnedSocket
++                                    and prior_ids is not None and id(sock) not in prior_ids
++                                    and id(sock) not in raw_owners):
++                                owned_sockets.append(sock)
++                            clean["sock"] = None
++                            retained_response = clean.get("_HTTPConnection__response")
++                            if (retained_response is not None and prior_ids is not None
++                                    and id(retained_response) in prior_ids):
++                                clean["_HTTPConnection__response"] = None
++                            connection_dict.__set__(connection, clean)
++                        # The original owned close keeps native adapter and
++                        # instrumentation semantics; its socket and borrowed
++                        # response have already been safely detached.
+                         connection.close()
+                     except BaseException:
+                         logger.debug("catalog native connection cleanup failed", exc_info=True)
+-                    finally:
+-                        # An owned native dictionary may itself be the refused
+-                        # shape. Detach resource state using the native
+-                        # descriptor and base-dict iteration, never its hooks or
+-                        # colliding keys; retained raw sockets are closed below.
+-                        try:
+-                            state = connection_dict.__get__(connection)
+-                            if isinstance(state, dict):
+-                                clean = {key: value for key, value in dict.items(state) if type(key) is str}
+-                                clean["sock"] = None
+-                                connection_dict.__set__(connection, clean)
+-                        except BaseException:
+-                            logger.debug("catalog native resource detach failed", exc_info=True)
+                 owned_sockets = []
++                owned_buffers = []
+                 active_connection = [None]
+                 first_sockets = {}
+                 socket_owners = {}
++                socket_custody = {}
++                raw_owners = {}
++                connect_targets = {}
+                 connection_prior_objects = {}
+                 construction_prior_objects = [None]
+                 transport_closed = [False]
+@@ -412,7 +447,10 @@
+                         plain_headers(state.get(name))
+                     return state
+                 expected_endpoint = [None]
+-                expected_carrier = [None]
++                expected_carrier = [original_carrier]
++                initial_state = plain_request_state()
++                initial_url = urllib.parse.urlsplit(initial_state["_full_url"])
++                expected_endpoint[0] = (initial_url.hostname, initial_url.port or _DEFAULT_PORTS[initial_url.scheme], initial_url.path)
+                 def effect_guard(data=None, socket=None, raw_socket=None):
+                     if transport_closed[0]:
+                         raise ScopeDenied()
+@@ -477,7 +515,11 @@
+                     if type(socket) is not OwnedSocket:
+                         raise ScopeDenied()
+                     socket_state = plain_dict(owned_socket_dict.__get__(socket))
+-                    if socket_state.get("_sock") is not raw_socket:
++                    custody = socket_custody.get(id(socket))
++                    if (custody is None or custody[0] is not socket
++                            or custody[1] is not raw_socket or custody[2] is not connection
++                            or raw_owners.get(id(raw_socket)) is not connection
++                            or socket_state.get("_sock") is not custody[1]):
+                         raise ScopeDenied()
+                     state = plain_request_state()
+                     if (state.get("_data") is not None
+@@ -494,41 +536,106 @@
+                         if state[name] != expected[name]:
+                             raise ScopeDenied()
+                 class OwnedSocket:
+-                    def __init__(self, sock):
++                    def __init__(self, sock, connection):
+                         self._sock = sock
++                        socket_custody[id(self)] = (self, sock, connection)
++                        raw_owners[id(sock)] = connection
+                         owned_sockets.append(sock)
+                     def __getattr__(self, name):
+-                        return getattr(self._sock, name)
++                        custody = socket_custody.get(id(self))
++                        if transport_closed[0] or custody is None or custody[0] is not self:
++                            raise ScopeDenied()
++                        state = plain_dict(owned_socket_dict.__get__(self))
++                        if state.get("_sock") is not custody[1]:
++                            raise ScopeDenied()
++                        if name == "makefile":
++                            _raw, target = send_target(self, name)
++                            def makefile(*a, **k):
++                                if any(type(value) not in (str, int, bool, type(None)) for value in (*a, *k.values())):
++                                    raise ScopeDenied()
++                                socket_operation_guard(self, custody)
++                                buffer = target(*a, **k)
++                                prior_ids = connection_prior_objects.get(id(custody[2]), (None,))[0]
++                                if prior_ids is None or id(buffer) in prior_ids:
++                                    raise ScopeDenied()
++                                owned_buffers.append(buffer)
++                                socket_operation_guard(self, custody)
++                                return buffer
++                            return makefile
++                        return getattr(custody[1], name)
+                     def sendall(self, data, *a, **k):
+-                        # Native socket flags may otherwise run __index__ inside
+-                        # the retained C send after the last authority check.
+                         if len(a) > 1 or k or (a and type(a[0]) is not int):
+                             raise ScopeDenied()
+-                        sock = self._sock
+-                        target = sock.sendall
++                        sock, target = send_target(self, "sendall")
+                         effect_guard(data, socket=self, raw_socket=sock)
+                         return target(data, *a, **k)
+                     def send(self, data, *a, **k):
+                         if len(a) > 1 or k or (a and type(a[0]) is not int):
+                             raise ScopeDenied()
+-                        sock = self._sock
+-                        target = sock.send
++                        sock, target = send_target(self, "send")
+                         effect_guard(data, socket=self, raw_socket=sock)
+                         return target(data, *a, **k)
+                     def close(self):
+-                        return self._sock.close()
++                        custody = socket_custody.get(id(self))
++                        if custody is not None and custody[0] is self:
++                            return custody[1].close()
+                 owned_socket_dict = OwnedSocket.__dict__["__dict__"]
++                def socket_operation_guard(socket, custody):
++                    if transport_closed[0]:
++                        raise ScopeDenied()
++                    request_guard(request, final=True)
++                    state = plain_dict(owned_socket_dict.__get__(socket))
++                    connection_state = plain_dict(connection_dict.__get__(custody[2]))
++                    endpoint = expected_endpoint[0]
++                    if (socket_custody.get(id(socket)) is not custody
++                            or state.get("_sock") is not custody[1]
++                            or active_connection[0] is not custody[2]
++                            or raw_owners.get(id(custody[1])) is not custody[2]
++                            or (connection_state.get("sock") is not socket and connection_state.get("sock") is not None)
++                            or type(endpoint) is not tuple or len(endpoint) != 3
++                            or type(endpoint[0]) is not str or type(endpoint[1]) is not int
++                            or type(connection_state.get("host")) is not str
++                            or type(connection_state.get("port")) is not int
++                            or connection_state["host"] != endpoint[0] or connection_state["port"] != endpoint[1]):
++                        raise ScopeDenied()
++                def send_target(socket, name):
++                    import types
++                    if transport_closed[0]:
++                        raise ScopeDenied()
++                    custody = socket_custody.get(id(socket))
++                    if custody is None or custody[0] is not socket:
++                        raise ScopeDenied()
++                    # Resolve callbacks against the original owned raw handle,
++                    # then attest both the callback receiver and backing identity.
++                    sock = custody[1]
++                    target = getattr(sock, name)
++                    if type(target) not in (types.MethodType, types.BuiltinMethodType):
++                        raise ScopeDenied()
++                    receiver = target.__self__
++                    if receiver is not sock:
++                        prior_ids = connection_prior_objects.get(id(custody[2]), (None,))[0]
++                        if (prior_ids is not None and id(receiver) not in prior_ids
++                                and id(receiver) not in raw_owners):
++                            owned_sockets.append(receiver)
++                        raise ScopeDenied()
++                    return sock, target
+                 def own_socket(connection, value):
+                     if value is None:
+                         return None
++                    if transport_closed[0]:
++                        raise ScopeDenied()
+                     if socket_owners.get(id(value)) is connection:
++                        custody = socket_custody.get(id(value))
++                        if (custody is None or custody[0] is not value
++                                or custody[2] is not connection
++                                or plain_dict(owned_socket_dict.__get__(value)).get("_sock") is not custody[1]):
++                            raise ScopeDenied()
+                         return value
+-                    if id(value) in connection_prior_objects.get(id(connection), ((), None))[0]:
+-                        # A raw dictionary assignment must not smuggle an old
+-                        # foreign socket through native sock lookup or cleanup.
++                    if (id(value) in connection_prior_objects.get(id(connection), ((), None))[0]
++                            or id(value) in raw_owners or id(value) in socket_custody):
+                         plain_dict(connection_dict.__get__(connection))["sock"] = None
+                         raise ScopeDenied()
+-                    value = OwnedSocket(value)
++                    value = OwnedSocket(value, connection)
+                     socket_owners[id(value)] = connection
+                     first_sockets.setdefault(id(connection), value)
+                     return value
+@@ -537,6 +644,75 @@
+                     value = own_socket(connection, state.get("sock"))
+                     state["sock"] = value
+                     return value
++                def connect_guard(connection, address, timeout, source_address):
++                    import socket as native_socket
++                    if transport_closed[0]:
++                        raise ScopeDenied()
++                    if (type(address) is not tuple or len(address) != 2
++                            or type(address[0]) is not str or type(address[1]) is not int
++                            or (timeout is not native_socket._GLOBAL_DEFAULT_TIMEOUT
++                                and timeout is not None and type(timeout) not in (int, float))
++                            or (source_address is not None and (type(source_address) is not tuple
++                                or len(source_address) != 2 or type(source_address[0]) is not str
++                                or type(source_address[1]) is not int))):
++                        raise ScopeDenied()
++                    state = plain_dict(connection_dict.__get__(connection))
++                    tunnel = state.get("_tunnel_host")
++                    if tunnel:
++                        raise ScopeDenied()
++                    request_guard(request, final=True)
++                    # The connect audit and all user callbacks precede this
++                    # attestation of the actual retained create-connection target.
++                    state = plain_dict(connection_dict.__get__(connection))
++                    record = connect_targets.get(id(connection))
++                    endpoint = expected_endpoint[0]
++                    if (type(endpoint) is not tuple or len(endpoint) != 3
++                            or type(endpoint[0]) is not str or type(endpoint[1]) is not int
++                            or type(endpoint[2]) is not str or record is None
++                            or record[0] is not connection or active_connection[0] is not connection
++                            or state.get("_create_connection") is not record[2]
++                            or type(state.get("host")) is not str or type(state.get("port")) is not int
++                            or state["host"] != endpoint[0] or state["port"] != endpoint[1]
++                            or address != endpoint[:2] or state.get("_tunnel_host") is not tunnel
++                            or state.get("sock") is not None or id(connection) in first_sockets):
++                        raise ScopeDenied()
++                def bind_connect_target(connection):
++                    import socket as native_socket
++                    import types
++                    state = plain_dict(connection_dict.__get__(connection))
++                    retained = connect_targets.get(id(connection))
++                    if retained is not None:
++                        if retained[0] is not connection or state.get("_create_connection") is not retained[2]:
++                            raise ScopeDenied()
++                        return
++                    target = state.get("_create_connection")
++                    if type(target) not in (types.FunctionType, types.BuiltinFunctionType,
++                                            types.MethodType, types.BuiltinMethodType):
++                        raise ScopeDenied()
++                    def checked(address, timeout=native_socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
++                        connect_guard(connection, address, timeout, source_address)
++                        raw = target(address, timeout, source_address)
++                        prior_ids = connection_prior_objects.get(id(connection), (None,))[0]
++                        if prior_ids is None or id(raw) in prior_ids or id(raw) in raw_owners:
++                            raise ScopeDenied()
++                        owned_sockets.append(raw)
++                        connect_guard(connection, address, timeout, source_address)
++                        return raw
++                    connect_targets[id(connection)] = (connection, target, checked)
++                    state["_create_connection"] = checked
++                def read_connect_target(connection):
++                    record = connect_targets.get(id(connection))
++                    if record is None and construction_prior_objects[0] is not None and not transport_closed[0]:
++                        # A legitimate native constructor may preconnect after
++                        # initializing its endpoint. Adopt that instance target
++                        # before its first actual effect, using the original
++                        # request endpoint and construction custody snapshot.
++                        bind_connect_target(connection)
++                        record = connect_targets.get(id(connection))
++                    state = plain_dict(connection_dict.__get__(connection))
++                    if record is None or record[0] is not connection or state.get("_create_connection") is not record[2]:
++                        raise ScopeDenied()
++                    return record[2]
+                 native_class = http_class
+                 owned_native_class = None
+                 def native_instance(value, cls):
+@@ -544,6 +720,12 @@
+                 if isinstance(http_class, type) and issubclass(http_class, http.client.HTTPConnection):
+                     class NativeConnection(http_class):
+                         def __init__(self, *a, **k):
++                            # A custom __new__ may return a cached instance
++                            # even of this locally owned subclass. Refuse before
++                            # tracking, constructor mutation or cleanup ownership.
++                            prior_ids = (construction_prior_objects[0] or (None,))[0]
++                            if prior_ids is None or id(self) in prior_ids:
++                                raise ScopeDenied()
+                             # Track before constructor callbacks, including failed
+                             # constructors that already own a socket.
+                             active_connection[0] = self
+@@ -553,6 +735,8 @@
+                         def __getattribute__(self, name):
+                             if name == "sock":
+                                 return read_socket(self)
++                            if name == "_create_connection":
++                                return read_connect_target(self)
+                             return super().__getattribute__(name)
+                         def __setattr__(self, name, value):
+                             if name == "sock":
+@@ -570,68 +754,92 @@
+                         # freed object ID can otherwise be reused by a new
+                         # socket and falsely label it foreign. Release the
+                         # snapshot when this finite owned transport closes.
+-                        prior_objects = gc.get_objects()
+-                        preexisting = {id(value) for value in prior_objects}
+-                        construction_prior_objects[0] = (preexisting, prior_objects)
++                        prior_objects = preexisting = connection = value = state = sock = None
+                         try:
+-                            connection = native_class(host, *ctor_args, **ctor_kwargs)
+-                        except BaseException:
+-                            # A callable can fail after allocating native
+-                            # handles. Discover only objects born during this
+-                            # finite invocation, preserving foreign connections
+-                            # and foreign sockets while settling owned handles.
+-                            for value in gc.get_objects():
+-                                if id(value) not in preexisting and native_instance(value, http.client.HTTPConnection):
+-                                    state = connection_dict.__get__(value)
+-                                    if type(state) is dict and all(type(key) is str for key in state):
+-                                        sock = state.get("sock")
+-                                        if sock is not None and id(sock) in preexisting:
+-                                            state["sock"] = None
+-                                    settle_connection(value)
+-                            raise
+-                        adopt = (native_instance(connection, http.client.HTTPConnection)
+-                            and not (owned_native_class is not None
+-                                and native_instance(connection, owned_native_class)))
+-                        if adopt and (not gc.is_tracked(connection) or id(connection) in preexisting):
+-                            raise ScopeDenied()
+-                        object.__setattr__(self, "_connection", connection)
+-                        if not any(connection is owned for owned in connections):
+-                            connections.append(connection)
+-                        active_connection[0] = connection
+-                        connection_prior_objects[id(connection)] = (preexisting, prior_objects)
+-                        # Callable connection factories are a supported stdlib
+-                        # seam. Adopt the returned native instance into an owned
+-                        # layout-compatible subclass so its later connect/send
+-                        # sock assignments use the same effect boundary. Original
+-                        # classes and the installed opener stay untouched.
+-                        if adopt:
+-                            state = plain_dict(connection_dict.__get__(connection))
+-                            sock = state.get("sock")
+-                            if sock is not None and id(sock) in preexisting:
+-                                # The connection itself is new and owned; the
+-                                # socket is foreign. Detach it before owned
+-                                # cleanup, without changing or closing the sock.
+-                                state["sock"] = None
++                            prior_objects = gc.get_objects()
++                            preexisting = {id(value) for value in prior_objects}
++                            construction_prior_objects[0] = (preexisting, prior_objects)
++                            try:
++                                connection = native_class(host, *ctor_args, **ctor_kwargs)
++                            except BaseException:
++                                # A callable can fail after allocating native
++                                # handles. Discover only objects born during this
++                                # finite invocation, preserving foreign connections
++                                # and foreign sockets while settling owned handles.
++                                for value in gc.get_objects():
++                                    if id(value) not in preexisting and native_instance(value, http.client.HTTPConnection):
++                                        state = connection_dict.__get__(value)
++                                        if type(state) is dict and all(type(key) is str for key in state):
++                                            sock = state.get("sock")
++                                            if sock is not None and id(sock) in preexisting:
++                                                state["sock"] = None
++                                        settle_connection(value)
++                                raise
++                            adopt = (native_instance(connection, http.client.HTTPConnection)
++                                and not (owned_native_class is not None
++                                    and native_instance(connection, owned_native_class)))
++                            if id(connection) in preexisting or (native_instance(connection, http.client.HTTPConnection) and not gc.is_tracked(connection)):
+                                 raise ScopeDenied()
+-                            class AdoptedConnection(type(connection)):
+-                                __slots__ = ()
+-                                def __getattribute__(self, name):
+-                                    if name == "sock":
+-                                        return read_socket(self)
+-                                    return super().__getattribute__(name)
+-                                def __setattr__(self, name, value):
+-                                    if name == "sock":
+-                                        value = own_socket(self, value)
+-                                    super().__setattr__(name, value)
+-                            try:
+-                                object.__setattr__(connection, "__class__", AdoptedConnection)
+-                            except (TypeError, AttributeError) as error:
+-                                raise ScopeDenied() from error
+-                            state = plain_dict(connection_dict.__get__(connection))
+-                            sock = state.get("sock")
+-                            if sock is not None:
+-                                state["sock"] = own_socket(connection, sock)
+-                        request_guard(request, final=True)
++                            object.__setattr__(self, "_connection", connection)
++                            if not any(connection is owned for owned in connections):
++                                connections.append(connection)
++                            active_connection[0] = connection
++                            connection_prior_objects[id(connection)] = (preexisting, prior_objects)
++                            # Callable connection factories are a supported stdlib
++                            # seam. Adopt the returned native instance into an owned
++                            # layout-compatible subclass so its later connect/send
++                            # sock assignments use the same effect boundary. Original
++                            # classes and the installed opener stay untouched.
++                            if adopt:
++                                state = plain_dict(connection_dict.__get__(connection))
++                                sock = state.get("sock")
++                                if sock is not None and id(sock) in preexisting:
++                                    # The connection itself is new and owned; the
++                                    # socket is foreign. Detach it before owned
++                                    # cleanup, without changing or closing the sock.
++                                    state["sock"] = None
++                                    raise ScopeDenied()
++                                class AdoptedConnection(type(connection)):
++                                    __slots__ = ()
++                                    def __getattribute__(self, name):
++                                        if name == "sock":
++                                            return read_socket(self)
++                                        if name == "_create_connection":
++                                            return read_connect_target(self)
++                                        return super().__getattribute__(name)
++                                    def __setattr__(self, name, value):
++                                        if name == "sock":
++                                            value = own_socket(self, value)
++                                        super().__setattr__(name, value)
++                                try:
++                                    object.__setattr__(connection, "__class__", AdoptedConnection)
++                                except (TypeError, AttributeError) as error:
++                                    raise ScopeDenied() from error
++                                state = plain_dict(connection_dict.__get__(connection))
++                                sock = state.get("sock")
++                                if sock is not None:
++                                    state["sock"] = own_socket(connection, sock)
++                            if native_instance(connection, http.client.HTTPConnection):
++                                bind_connect_target(connection)
++                                response_class = getattr(connection, "response_class")
++                                if isinstance(response_class, type) and issubclass(response_class, http.client.HTTPResponse):
++                                    class OwnedResponse(response_class):
++                                        def __init__(self, *a, **k):
++                                            # HTTPResponse's base finalizer reads
++                                            # fp even when makefile refuses during
++                                            # construction. Initialize before any
++                                            # constructor callback and own the
++                                            # partial response through cleanup.
++                                            object.__setattr__(self, "fp", None)
++                                            responses.append(self)
++                                            super().__init__(*a, **k)
++                                    connection.response_class = OwnedResponse
++                            request_guard(request, final=True)
++                        finally:
++                            prior_objects = preexisting = connection = value = state = sock = None
++                            construction_prior_objects[0] = None
++                    def close(self):
++                        settle_connection(self._connection)
+                     def __getattr__(self, name):
+                         return getattr(self._connection, name)
+                     def __setattr__(self, name, value):
+@@ -668,14 +876,17 @@
+                         state = plain_request_state()
+                         expected_request[0] = {name: state[name] for name in ("_full_url", "type", "host", "selector")}
+                         expected_request[0].update({name: dict(state[name]) for name in ("headers", "unredirected_hdrs")})
+-                        expected_endpoint[0] = (parsed.hostname, parsed.port or _DEFAULT_PORTS[parsed.scheme], parsed.path)
+-                        expected_carrier[0] = state.get("_hermes_catalog_admission")
++                        if state.get("_hermes_catalog_admission") is not original_carrier:
++                            raise ScopeDenied()
+                         request_guard(request, final=True)
+                         connection.request(method, url, data, headers, **options)
+                         request_guard(request, final=True)
+                     def getresponse(self):
+                         request_guard(request, final=True)
+                         response = self._connection.getresponse()
++                        prior_ids = connection_prior_objects.get(id(self._connection), (None,))[0]
++                        if prior_ids is None or id(response) in prior_ids:
++                            raise ScopeDenied()
+                         responses.append(response)
+                         try:
+                             request_guard(request, final=True)
+@@ -684,19 +895,38 @@
+                             raise
+                         return response
+                 def finish_transport():
++                    if transport_closed[0]:
++                        return
+                     transport_closed[0] = True
+                     try:
+                         for connection in connections:
+                             settle_connection(connection)
++                        for wrapper, raw, connection in tuple(socket_custody.values()):
++                            state = owned_socket_dict.__get__(wrapper)
++                            if isinstance(state, dict):
++                                backing = next((value for key, value in dict.items(state)
++                                                if type(key) is str and key == "_sock"), None)
++                                prior_ids = connection_prior_objects.get(id(connection), (None,))[0]
++                                if (backing is not None and backing is not raw and prior_ids is not None
++                                        and id(backing) not in prior_ids and id(backing) not in raw_owners):
++                                    settle(backing)
++                            settle(raw)
+                         for sock in owned_sockets:
+                             settle(sock)
++                        for buffer in owned_buffers:
++                            settle(buffer)
+                     finally:
+-                        # Do not retain an entire GC object graph through an
+-                        # escaped native connection's owned class/closure.
+                         connection_prior_objects.clear()
+                         construction_prior_objects[0] = None
+                         first_sockets.clear()
+                         socket_owners.clear()
++                        socket_custody.clear()
++                        raw_owners.clear()
++                        connect_targets.clear()
++                        connections.clear()
++                        owned_sockets.clear()
++                        owned_buffers.clear()
++                        responses.clear()
+                 try:
+                     response = _native(Connection, request, *args, **kwargs)
+                     request_guard(request, final=True)
+@@ -730,16 +960,30 @@
+         if managed() or _MULTIPLEX_CONTEXT.get() is True or _SECRET_SCOPE.get() is not None:
+             raise ScopeDenied()
+         return callback
+-    admission = getattr(request, "_hermes_catalog_admission", None)
++    request_dict = urllib.request.Request.__dict__["__dict__"]
++    def carrier_state(value):
++        state = request_dict.__get__(value)
++        if type(state) is not dict or any(type(key) is not str for key in state):
++            raise ScopeDenied()
++        return state
++    admission = carrier_state(request).get("_hermes_catalog_admission")
+     if admission not in _CATALOG_ADMISSIONS:
+         raise ScopeDenied()
+-    admission(request)
+-    if callback is None or callback is admission:
+-        return admission
+-    def check(request=None, *, final=False):
+-        admission(request, final=final)
+-        callback(request, final=final)
+-        admission(request, final=final)
++    def check(value=None, *, final=False):
++        target = request if value is None else value
++        def same_carrier():
++            if (carrier_state(request).get("_hermes_catalog_admission") is not admission
++                    or carrier_state(target).get("_hermes_catalog_admission") is not admission):
++                raise ScopeDenied()
++        same_carrier()
++        admission(value, final=final)
++        same_carrier()
++        if callback is not None and callback is not admission:
++            callback(value, final=final)
++            same_carrier()
++            admission(value, final=final)
++            same_carrier()
++    check(request)
+     return check
+ 
+ 
