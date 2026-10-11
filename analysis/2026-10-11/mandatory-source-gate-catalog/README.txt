@@ -1,0 +1,13 @@
+Static mandatory gate source catalog, 2026-10-11
+
+This read-only analytical tool reads actual Python/JavaScript test files and parses registrations without importing or executing target modules. Run it with an explicit source-test root. It has no private path, developer assignment, clock, endpoint, inbox or receipt defaults. Its seven source-reader/classifier function/class bodies are preserved exactly from the source preparation candidate; the new CLI bounds the collection and uses relative output paths.
+
+On the current test tree, the earlier author catalog observed 128 files, 1496 Python test definitions, 1905 literal parameter entries and 39 unresolved parameterizations. These are static registration observations, not an actual pytest item count. Calls inside list values, variable-backed inputs and generated cases remain unresolved by literal evaluation. Effect signals are explicitly a lower bound: a mention may be mocked, and imports/calls can hide effects. Every target remains unsafe to import without separate admission.
+
+The larger private binding/runner candidate is unaccepted. Review found a target SHA revalidation gap between admission and execution, uncorroborated exclusive-slot custody, a lexical write-boundary bypass, unvalidated worker cleanup, and publication-boundary problems involving an internal assignment identity and a private clock. That original package is not published here and was not executed. This extracted catalog has no runner, source acceptance, kernel custody, runtime grant or release authority. It does not close whole-gate readiness, normal installation or any of the seven normally installed journeys.
+
+Complete actual test collection, effect-specific execution adapters, exact independently accepted final CLI/candidate binding, genuine kernel/normal admission and independent runtime evidence remain mandatory. AC043 and AC053-AC058 remain required; AC055 requires distinct Harness and A0 results. USEFUL contains47records for46unique checks; DAILY contains56records. Static registration observations cannot mark these rows PASS.
+
+No target test/checker/native module, service, model, network or live runtime path was run for this analysis checkpoint. Source-only extraction and independent publication review are separate from product acceptance.
+
+The first extracted collector was rejected because recursive enumeration completed before its file-count check. This revised collector consumes scandir entries incrementally, rejecting symlinks and stopping before its directory, visited-entry or source-file caps are exceeded. New negative controls cover excessive file collection and excessive nested directories. Earlier failures remain retained.
