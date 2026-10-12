@@ -70,3 +70,7 @@ See `docs/mandatory-web-admin.md` and `validation/acceptance-web-admin.json` for
 ## 2026-10-12: kernel/fixture/Root source and refused reviews
 
 [Inert C44, memory harness and C45 archive](analysis/2026-10-12/kernel-fixture-and-root-adapter-source-refusals/README.md): current C44 280, complete harness12 and C45 76 logical payloads with exact public pins and shared-copy ledger. C44 REFUSE5 and harness MH-R1 remain. C45 facility/fit refusal is Source reasoning; independent review was pending at the cutoff. Root timing deviations are explicit. Source/tests were not executed; runtime/release acceptance is not granted.
+
+## 2026-10-12: coherent FD and bounded memory source
+
+[Corrected Source23, FD adapter, Root wrapper and C46 actual128](analysis/2026-10-12/coherent-fd-and-memory-source/README.md): inert complete source, refusals and exact lineage. At this cutoff, merged23 final static review and C46 final actual review are ACTIVE; H991/FD8 are NOT_RUN. Corrected C46 static memory safety is independently accepted and128 actual memory controls PASS. Source310 is unchanged. Kernel/native/genuine/installed/full19/normal3600/all7/release remain unaccepted; independent final publication review required.

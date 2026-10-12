@@ -1,0 +1,13 @@
+# Coherent FD and memory source: frozen analysis candidate
+
+This archive preserves corrected Source23, the path-only current FD adapter and exterior Root memory wrapper, corrected C46 and actual128 observations. Every Python body is inert `.py.txt`. No archived Source was imported, compiled, called or tested during publication preparation. Transformed public Source is an analysis representation, not the executable independently accepted private bytes.
+
+At the pinned cutoff, merged23 final Source/adapter/wrapper safety review is ACTIVE; H991 and FD8 are NOT_RUN. C46 exact corrected static memory safety is independently accepted and its 114 original plus14 entry-negative controls actually PASS in memory. Final independent actual review is ACTIVE (Sol C48). Earlier whole C46 and merged23 refusals remain provenance. Source310 is unchanged, never rerun, with no transferred credit. Kernel/native/genuine/installed/full19/normal3600/all7/release remain unaccepted or unbound.
+
+STATUS.json fixes the cutoff and distinctions. SOURCE-PINS.json gives every included logical original SHA beside separate exact public artifact pins. Exact identical copies are deduplicated with a complete logical ledger. DEPENDENCY-PIN-LEDGER.json.gz resolves archived original bytes and explicitly catalogues unarchived historical/library/handoff provenance without acceptance. `pin-paths/` values name stable original-path identities in ALIAS-CATALOG.json; they are not runnable filesystem paths. Original nested `sha256` and `bytes` fields remain original-private provenance, never public byte claims.
+
+All current Source modules and control definitions are included. Exact top-level inventory exclusions are respected; nested MANIFEST and creator FINAL listed by existing manifests remain accounted and included when publishable. Whole TASK, INPUTS and compact/authority handoffs are withheld as private provenance. Full private inventory and reversal proof stay outside publication; public transformations/counts/aliases contain no private originals.
+
+Earlier helper births and aggregate usage stay UNKNOWN_NOT_ZERO. Merged23 first read-only helper used FSIZE128MiB before64MiB correction; no retroactive strict whole-chain caps or birth-complete closure credit. Historical late Root bookkeeping and every original clock stay visible. Declared244 reservation is not measured physical elapsed proof. EXPECTED-WHITESPACE.json preserves unified-diff blank context markers and expected diagnostics.
+
+Independent final publication review is required before sole-integrator Git effects. Later reviews, execution and acceptance are outside this immutable cutoff and require a separate record.
