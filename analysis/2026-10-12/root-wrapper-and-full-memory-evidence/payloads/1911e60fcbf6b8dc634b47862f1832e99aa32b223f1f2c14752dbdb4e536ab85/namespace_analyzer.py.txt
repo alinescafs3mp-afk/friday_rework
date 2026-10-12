@@ -1,0 +1,197 @@
+"""Finite stdlib AST metadata analyzer only. Does not compile, execute, import,
+call or test any candidate Source, harness, adapter or wrapper."""
+import ast, builtins, hashlib, json, os, stat, time
+from pathlib import Path
+W=Path(__file__).parent
+I=json.loads((W/'Input/INPUTS.json').read_bytes())
+assert time.time()<1791800381.0
+checks=[]
+def check(name,ok,detail=None):
+    checks.append({'check':name,'pass':bool(ok),'detail':detail})
+def read(row):
+    p=Path(row['path']);fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW)
+    with os.fdopen(fd,'rb') as f:
+        s=os.fstat(f.fileno());assert stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_size<=33554432
+        b=f.read(33554433);z=os.fstat(f.fileno())
+        assert (s.st_dev,s.st_ino,s.st_mode,s.st_uid,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns)==(z.st_dev,z.st_ino,z.st_mode,z.st_uid,z.st_nlink,z.st_size,z.st_mtime_ns,z.st_ctime_ns)
+    check('exact-pin:'+str(p),len(b)==row['bytes'] and hashlib.sha256(b).hexdigest()==row['sha256'])
+    assert checks[-1]['pass'];return b
+
+def consts(tree):
+    result={}
+    for n in tree.body:
+        if isinstance(n,ast.Assign) and len(n.targets)==1 and isinstance(n.targets[0],ast.Name):
+            try:result[n.targets[0].id]=ast.literal_eval(n.value)
+            except (ValueError,TypeError):pass
+    return result
+
+def bodymap(tree):return {n.name:n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.ClassDef))}
+def builtin_dict(tree,name):
+    n=bodymap(tree)[name];assert len(n.body)==1 and isinstance(n.body[0],ast.Return) and isinstance(n.body[0].value,ast.Dict)
+    d=n.body[0].value;out={}
+    for k,v in zip(d.keys,d.values):
+        assert isinstance(k,ast.Constant) and type(k.value)is str and isinstance(v,ast.Name) and k.value==v.id
+        assert k.value not in out;out[k.value]='EXACT_ROOT_BUILTINS.'+v.id
+    return out
+
+# Lexical dependency analysis. No symtable/compiler, eval, code object or
+# Source functions. Function locals are predeclared as Python requires;
+# enclosing class scopes are skipped for method closures, comprehensions have
+# their own target scope and their first iterable is read in the parent scope.
+class Scope:
+    def __init__(self,kind,parent,label,bindings=(),global_names=(),nonlocals=()):
+        self.kind=kind;self.parent=parent;self.label=label;self.bindings=set(bindings);self.globals=set(global_names);self.nonlocals=set(nonlocals)
+
+def target_names(n):return {x.id for x in ast.walk(n) if isinstance(x,ast.Name) and isinstance(x.ctx,(ast.Store,ast.Del))}
+def parameters(a):return {x.arg for x in a.posonlyargs+a.args+a.kwonlyargs}|({a.vararg.arg} if a.vararg else set())|({a.kwarg.arg} if a.kwarg else set())
+def local_bindings(nodes):
+    names=set();gs=set();ns=set()
+    def walk(n):
+        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):
+            names.add(n.name);return
+        if isinstance(n,(ast.Lambda,ast.ListComp,ast.SetComp,ast.DictComp,ast.GeneratorExp)):return
+        if isinstance(n,ast.Name) and isinstance(n.ctx,(ast.Store,ast.Del)):names.add(n.id)
+        if isinstance(n,ast.ExceptHandler) and n.name:names.add(n.name)
+        if isinstance(n,ast.Global):gs.update(n.names)
+        if isinstance(n,ast.Nonlocal):ns.update(n.names)
+        if isinstance(n,(ast.Import,ast.ImportFrom)):
+            for a in n.names:names.add(a.asname or a.name.split('.')[0])
+        for c in ast.iter_child_nodes(n):walk(c)
+    for n in nodes:walk(n)
+    return names-gs-ns,gs,ns
+
+class Dependencies:
+    def __init__(self,label,tree,provided,builtin_names):
+        self.label=label;self.provided=provided;self.builtin_names=set(builtin_names);self.loads=[];self.implicit=[]
+        b,g,n=local_bindings(tree.body);self.module=Scope('module',None,label,b,g,n)
+        for node in tree.body:self.visit(node,self.module)
+    def lookup(self,name,s):
+        cur=s
+        if name in cur.globals:cur=self.module
+        if name=='__class__' and cur.kind in ('function','lambda'):
+            p=cur.parent
+            while p and p.kind!='module':
+                if p.kind=='class':return 'IMPLICIT_CLASS_CELL'
+                p=p.parent
+        while cur:
+            if name in cur.bindings:return 'MODULE_BINDING' if cur.kind=='module' else 'LEXICAL:'+cur.label
+            nxt=cur.parent
+            if cur.kind in ('function','lambda','comprehension'):
+                while nxt and nxt.kind=='class':nxt=nxt.parent
+            cur=nxt
+        if name in self.provided:return 'INJECTED:'+self.provided[name]
+        if name in self.builtin_names:return 'EXACT_ROOT_BUILTINS.'+name
+        return 'UNRESOLVED'
+    def load(self,name,node,s,implicit=False):
+        row={'name':name,'line':getattr(node,'lineno',None),'scope':s.label,'binding':self.lookup(name,s)}
+        if implicit:self.implicit.append(row)
+        else:self.loads.append(row)
+    def function_outer(self,n,s):
+        for a in n.decorator_list:self.visit(a,s)
+        for x in n.args.defaults+[v for v in n.args.kw_defaults if v is not None]:self.visit(x,s)
+        for a in n.args.posonlyargs+n.args.args+n.args.kwonlyargs:
+            if a.annotation:self.visit(a.annotation,s)
+        if n.returns:self.visit(n.returns,s)
+    def visit(self,n,s):
+        if isinstance(n,ast.Name):
+            if isinstance(n.ctx,ast.Load):self.load(n.id,n,s)
+            return
+        if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)):
+            self.function_outer(n,s);b,g,nl=local_bindings(n.body);b.update(parameters(n.args));child=Scope('function',s,s.label+'.'+n.name,b,g,nl)
+            for x in n.body:self.visit(x,child)
+            return
+        if isinstance(n,ast.Lambda):
+            for x in n.args.defaults+[v for v in n.args.kw_defaults if v is not None]:self.visit(x,s)
+            child=Scope('lambda',s,s.label+'.lambda@'+str(n.lineno),parameters(n.args));self.visit(n.body,child);return
+        if isinstance(n,ast.ClassDef):
+            for x in n.bases+n.decorator_list:self.visit(x,s)
+            for x in n.keywords:self.visit(x.value,s)
+            self.load('__build_class__',n,s,True);self.load('__name__',n,s,True)
+            b,g,nl=local_bindings(n.body);child=Scope('class',s,s.label+'.'+n.name,b,g,nl)
+            for x in n.body:self.visit(x,child)
+            return
+        if isinstance(n,(ast.ListComp,ast.SetComp,ast.DictComp,ast.GeneratorExp)):
+            self.visit(n.generators[0].iter,s)
+            b=set().union(*(target_names(g.target) for g in n.generators));child=Scope('comprehension',s,s.label+'.comprehension@'+str(n.lineno),b)
+            for i,g in enumerate(n.generators):
+                if i:self.visit(g.iter,child)
+                for x in g.ifs:self.visit(x,child)
+            if isinstance(n,ast.DictComp):self.visit(n.key,child);self.visit(n.value,child)
+            else:self.visit(n.elt,child)
+            return
+        for c in ast.iter_child_nodes(n):self.visit(c,s)
+    def result(self):
+        all_rows=self.loads+self.implicit
+        global_rows=[r for r in all_rows if not r['binding'].startswith('LEXICAL:') and r['binding']!='IMPLICIT_CLASS_CELL']
+        return {'namespace':self.label,'module_bindings':sorted(self.module.bindings),'injected':self.provided,'closed_builtins':sorted(self.builtin_names),'global_names':sorted({r['name'] for r in global_rows}),'required_builtins':sorted({r['name'] for r in global_rows if r['binding'].startswith('EXACT_ROOT_BUILTINS.')}),'unresolved':[r for r in all_rows if r['binding']=='UNRESOLVED'],'global_loads':global_rows,'implicit_loads':self.implicit,'all_load_count':len(all_rows),'scope_method':'lexical AST only, no code compilation'}
+
+Hraw=read(I['final_source']['Harness/Source/memory_harness.py']);Araw=read(I['final_source']['Adapters/ROOT-FD-EXACT-AST-ADAPTER-V2.py']);H=ast.parse(Hraw);A=ast.parse(Araw)
+oldraw=read(I['prototype']['memory_executor.py']);newraw=(W/'Source/memory_executor.py').read_bytes();oldtree=ast.parse(oldraw);newtree=ast.parse(newraw)
+oldc=consts(oldtree);newc=consts(newtree);allowed=newc['allowed'];oldallowed=oldc['allowed']
+check('exact-two-builtin-additions',set(allowed)-set(oldallowed)=={'KeyError','UnicodeError'} and set(oldallowed)-set(allowed)==set() and len(allowed)==len(set(allowed)))
+check('entire-wrapper-AST-identical-except-allowed',ast.dump(ast.parse(newraw.decode().replace("'KeyError','UnicodeError',",'',1)),include_attributes=False)==ast.dump(oldtree,include_attributes=False))
+check('closed-Root-builtin-names-exact-objects',all(hasattr(builtins,n) for n in allowed) and not set(allowed)&{'open','__import__','eval','globals','locals'})
+safe_assign=[n for n in newtree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='safe' for t in n.targets)][0]
+check('exact-Root-object-comprehension',ast.dump(safe_assign.value,include_attributes=False)==ast.dump(ast.parse('{name:getattr(builtins,name) for name in allowed}',mode='eval').body,include_attributes=False))
+base={'__name__':'CONSTANT_MEMORY_NAMESPACE','__builtins__':'EXACT_CLOSED_SAFE_MAP','json':'TRUSTED_STDLIB_JSON','hashlib':'TRUSTED_STDLIB_HASHLIB','zlib':'TRUSTED_STDLIB_ZLIB','types':'TRUSTED_STDLIB_TYPES'}
+results=[Dependencies('H991_outer',H,base,allowed).result(),Dependencies('FD_adapter_outer',A,base,allowed).result()]
+for t,l in ((H,'H991'),(A,'FD_adapter')):
+ check(l+'-no-imports',not any(isinstance(n,(ast.Import,ast.ImportFrom)) for n in ast.walk(t)))
+ check(l+'-only-existing-definition-and-data-top-level',all(isinstance(n,(ast.Expr,ast.Assign,ast.FunctionDef,ast.ClassDef)) for n in t.body))
+hbuilt=builtin_dict(H,'safe_builtins');fbuilt=builtin_dict(A,'memory_builtins')
+for label,b in (('H991_selected',hbuilt),('FD_selected',fbuilt)):
+ check(label+'-builtin-identity-rebound-from-closed-Root',set(b)<=set(allowed) and not set(b)&{'open','__import__','eval','exec','compile','globals','locals'})
+sourcepins=json.loads(read(I['final_source']['SOURCE-PINS.json']));source_by_name={Path(r['path']).name:r for r in sourcepins['files']}
+check('Source23-count',sourcepins['count']==len(sourcepins['files'])==23)
+source_data={Path(r['path']).name:read(r) for r in sourcepins['files']}
+hconst=consts(H);sel=hconst['SOURCE_SELECTION'];ext=hconst['DEPENDENCY_EXTENSION'];chosen=[];selected_rows=[]
+for filename,original in sel.items():
+ constants=original['constants'];functions=original['functions']
+ if filename in ('native63_observe.py','native41_evidence.py'):
+  ec=ext['constants'];ef=ext['functions']
+  if filename=='native63_observe.py':ec=tuple(x for x in ec if x!='FAILURE_OUTPUT_OVERSHOOT_MAX');ef=tuple(x for x in ef if x!='failure_owned_state')
+  constants+=ec;functions+=ef
+  if filename=='native63_observe.py':functions+=ext['observer_functions']
+ wanted=set(constants)|set(functions);found=set();tree=ast.parse(source_data[filename]);text=source_data[filename].decode()
+ for n in tree.body:
+  name=n.name if isinstance(n,ast.FunctionDef) else n.targets[0].id if isinstance(n,ast.Assign) and len(n.targets)==1 and isinstance(n.targets[0],ast.Name) else None
+  if name not in wanted:continue
+  assert name not in found;found.add(name);chosen.append(n)
+  if isinstance(n,ast.Assign):ast.literal_eval(n.value)
+  if isinstance(n,ast.FunctionDef):
+   assert not n.decorator_list and n.returns is None
+   for a in n.args.posonlyargs+n.args.args+n.args.kwonlyargs:assert a.annotation is None
+   for d in n.args.defaults+[v for v in n.args.kw_defaults if v is not None]:ast.literal_eval(d)
+  check('selected-H-no-forbidden:'+filename+':'+name,not any(isinstance(x,(ast.Import,ast.ImportFrom)) or isinstance(x,ast.Name) and x.id in {'__import__','open','eval','exec','compile','os','Path','resource','time','threading','subprocess','importlib','globals','locals','__loader__','__spec__','__subclasses__'} or isinstance(x,ast.Attribute) and x.attr in {'__globals__','__code__','__subclasses__','__mro__'} for x in ast.walk(n)))
+  segment=ast.get_source_segment(text,n).encode();selected_rows.append({'file':filename,'name':name,'kind':type(n).__name__,'line':n.lineno,'bytes':len(segment),'sha256':hashlib.sha256(segment).hexdigest()})
+ check('selected-H-complete:'+filename,found==wanted,{'wanted':sorted(wanted),'found':sorted(found)})
+check('H-selected50',len(selected_rows)==50 and sum(r['kind']=='FunctionDef' for r in selected_rows)==22)
+hin={'__builtins__':'H_SAFE_EXACT_ROOT_OBJECTS','json':'TRUSTED_STDLIB_JSON','hashlib':'TRUSTED_STDLIB_HASHLIB','zlib':'TRUSTED_STDLIB_ZLIB','types':'TRUSTED_STDLIB_TYPES','sys':'INERT_SIMPLE_NAMESPACE_PRIVATE_EMPTY_MODULES','kernel_snapshot':'EXACT_FAKE_KERNEL_CALLBACK','same_read':'EXACT_MEMORY_STORE_CALLBACK','_real':'EXACT_SYNTHETIC_REAL_GUARD_CALLBACK'}
+results.append(Dependencies('H991_selected_combined',ast.Module(body=chosen,type_ignores=[]),hin,hbuilt).result())
+afconst=consts(A);fdrows=[]
+for filename,names in afconst['SOURCE_NAMES'].items():
+ tree=ast.parse(source_data[filename]);text=source_data[filename].decode();nodes=[n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.ClassDef)) and n.name in names]
+ check('FD-selected-complete:'+filename,{n.name for n in nodes}==set(names) and len(nodes)==len(names))
+ fin={'__builtins__':'FD_SAFE_EXACT_ROOT_OBJECTS','__name__':'MEMORY_MODULETYPE_NAME','os':'INERT_SIMPLE_NAMESPACE_REPLACED_ONLY_WITH_EXACT_FAKEFDS','time':'INERT_SIMPLE_NAMESPACE_REPLACED_ONLY_WITH_EXACT_FAKE_CLOCK','json':'TRUSTED_STDLIB_JSON','hashlib':'TRUSTED_STDLIB_HASHLIB','stat':'TRUSTED_STDLIB_STAT_PURE_CONSTANTS_AND_MODE_PREDICATES','ast':'TRUSTED_STDLIB_AST_STATIC_PARSER','SimpleNamespace':'TRUSTED_STDLIB_TYPES.SimpleNamespace'}
+ if filename=='stock_install_owner.py':fin['root_fd_custody']='EXACT_EXTRACTED_MEMORY_MODULE'
+ for n in nodes:
+  check('selected-FD-no-forbidden:'+filename+':'+n.name,not any(isinstance(x,(ast.Import,ast.ImportFrom)) or isinstance(x,ast.Name) and x.id in {'__import__','open','eval','exec','compile','Path','resource','sys','threading','subprocess','ctypes','signal','select','fcntl','globals','locals'} or isinstance(x,ast.Attribute) and x.attr in {'__globals__','__code__','__subclasses__','__mro__'} for x in ast.walk(n)))
+  for x in ast.walk(n):
+   if isinstance(x,(ast.FunctionDef,ast.ClassDef)):assert not x.decorator_list
+   if isinstance(x,ast.FunctionDef):
+    assert x.returns is None
+    for a in x.args.posonlyargs+x.args.args+x.args.kwonlyargs:assert a.annotation is None
+    for d in x.args.defaults+[v for v in x.args.kw_defaults if v is not None]:ast.literal_eval(d)
+  segment=ast.get_source_segment(text,n).encode();fdrows.append({'file':filename,'name':n.name,'kind':type(n).__name__,'line':n.lineno,'bytes':len(segment),'sha256':hashlib.sha256(segment).hexdigest()})
+ results.append(Dependencies('FD_selected:'+filename,ast.Module(body=nodes,type_ignores=[]),fin,fbuilt).result())
+check('FD-selected20',len(fdrows)==20)
+check('FD-current-literal-source-pins-exact',afconst['SOURCE_PINS']=={k:source_by_name[k] for k in afconst['SOURCE_NAMES']})
+for result in results:check('all-globals-resolved:'+result['namespace'],not result['unresolved'],result['unresolved'])
+old_missing=sorted(set(results[0]['required_builtins'])-set(oldallowed));check('old-actual-missing-exact-two',old_missing==['KeyError','UnicodeError'],old_missing)
+check('class-implicit-builtins-complete','__build_class__' in allowed and '__build_class__' in fbuilt)
+check('H-resource-boundary-unchanged',hconst['LIMITS']=={'AS':268435456,'CPU':30,'FSIZE':67108864,'CORE':0,'affinity':[0,1],'GNU_KILL_SECONDS':30,'leaf':65536,'aggregate':1048576,'births':128,'segments':18,'compressed':430080,'raw':16777216,'operations':1024,'events':2200,'pressure_iterations':384})
+proof={'schema':'friday.sol.c49.closed-namespace-ast-proof.v1','Source_functions_executed':False,'RootGO':None,'independent_review':'PENDING','actual120INCLUDING30':'UNSTARTED','static_checks':checks,'failed_checks':[c for c in checks if not c['pass']],'namespaces':results,'H_selected50':selected_rows,'FD_selected20':fdrows,'exact_harness':I['final_source']['Harness/Source/memory_harness.py'],'exact_adapter':I['final_source']['Adapters/ROOT-FD-EXACT-AST-ADAPTER-V2.py'],'source23':I['final_source']['SOURCE-PINS.json'],'old_missing':old_missing,'limitation':'Static name-resolution and exact-object lineage proof; not independent safety acceptance, Python security sandbox, resource measurement or functional execution. Trusted Root owns imports/caps/receipts outside candidate namespaces. compile/exec are supplied only to fixed reviewed extractors, excluded from selected Source builtins. OS/time globals inside FD selected Source are inert namespaces then exact FakeFDs/fake clocks, no real OS/provider object. No Source top imports executed.','at':time.time(),'self_and_GNU':[{'pid':p,'birth':Path('/proc/'+str(p)+'/stat').read_text().rsplit(')',1)[1].split()[19]} for p in (os.getpid(),os.getppid())]}
+p=W/'Evidence/NAMESPACE-PROOF.json';raw=(json.dumps(proof,sort_keys=True,indent=2,allow_nan=False)+'\n').encode();fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400)
+with os.fdopen(fd,'wb') as f:f.write(raw);f.flush();os.fsync(f.fileno())
+fd=os.open(p.parent,os.O_RDONLY|os.O_DIRECTORY);os.fsync(fd);os.close(fd)
+print(json.dumps({'checks':len(checks),'failed':proof['failed_checks'],'namespaces':[{k:r[k] for k in ('namespace','required_builtins','unresolved')} for r in results],'Hselected':len(selected_rows),'FDselected':len(fdrows),'proof_bytes':len(raw),'proof_sha256':hashlib.sha256(raw).hexdigest(),'self_and_GNU':proof['self_and_GNU']}))

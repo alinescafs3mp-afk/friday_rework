@@ -1,0 +1,9 @@
+# Corrected Root wrapper and complete bounded memory observations
+
+One inert analysis archive at the immutable STATUS.json cutoff: corrected7988 with whole final staticSafety, full actual H991/FD8 memory observations, and independent C48 acceptance of actual128 memory evidence. Exact unchanged Source23, H55272, FD7466 and actual128 dependencies link to already published bytes at main 4feb719e684e3a996771a6defb068a7454e30d0b.
+
+C49 is accepted for Source and named memory staticSafety only. Actual H991/FD8 completed the full original sequence under original120INCLUDING30; its exact known two fresh helper identities are Root closed. Its independent actual review was ACTIVE and NOT ACCEPTED at this cutoff. C48 accepts actual128 memory only. C50 and newer independent H991 review are excluded. Kernel/native/genuine installed/full19/normal3600/all7/release remain NOT ACCEPTED.
+
+Historical producer statuses, refusals, observations, stops, original clocks and unknown physical usage remain in inert wrapped payloads. Current cutoff status changes no historical refusal and grants no runtime permission. Source files end in .py.txt. JSON payloads are archived facts, never executable GO, native bindings or authentication.
+
+SOURCE-INVENTORY.json records current Source roles. INVENTORY.json records every exact manifest member and root closure, with explicit withheld native/private handoffs. PIN-LEDGER.json binds content-addressed original tuples to exact public paths/hashes, already published unchanged bytes or historical reference-only states. Duplicate bodies have logical links and one canonical file. Public links to the earlier archive are relative to this archive root. TRANSFORMATION-PROOF.json.gz contains full normalized AST and full-tree JSON proof hashes; exterior independent review can additionally check the private lossless reversal ledger. Every Source function, nonprivacy literal constant, synthetic fixture PID/100000/threshold is preserved.

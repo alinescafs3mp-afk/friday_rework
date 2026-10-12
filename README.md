@@ -74,3 +74,10 @@ See `docs/mandatory-web-admin.md` and `validation/acceptance-web-admin.json` for
 ## 2026-10-12: coherent FD and bounded memory source
 
 [Corrected Source23, FD adapter, Root wrapper and C46 actual128](analysis/2026-10-12/coherent-fd-and-memory-source/README.md): inert complete source, refusals and exact lineage. At this cutoff, merged23 final static review and C46 final actual review are ACTIVE; H991/FD8 are NOT_RUN. Corrected C46 static memory safety is independently accepted and128 actual memory controls PASS. Source310 is unchanged. Kernel/native/genuine/installed/full19/normal3600/all7/release remain unaccepted; independent final publication review required.
+
+
+## 2026-10-12: corrected7988 and full bounded memory observations
+
+[Exact inert Source and evidence archive](analysis/2026-10-12/root-wrapper-and-full-memory-evidence/README.md): corrected7988 C49 Source/staticSafety; full actual H991/FD8 memory run (original120INCLUDING30, known2 fresh Root closed); independent C48 actual128 memory-only acceptance. At this immutable cutoff the H991 actual independent review remains ACTIVE/NOT ACCEPTED. C50 is excluded; kernel/native/genuine installed/full19/normal3600/all7/release remain NOT ACCEPTED. Source bodies and JSON observations grant no runtime authority.
+
+Subsequent exact acceptance: [full H991/FD8 memory result independently accepted](analysis/2026-10-12/root-wrapper-and-full-memory-evidence/INDEPENDENT-MEMORY-ACCEPTANCE.json), with all original69 groups plus reserved2, 128 births/991 operations/18 segments, FD8 and both close variants. This update provides memory-only acceptance; kernel/native/genuine/installed/full release acceptance remains pending.
