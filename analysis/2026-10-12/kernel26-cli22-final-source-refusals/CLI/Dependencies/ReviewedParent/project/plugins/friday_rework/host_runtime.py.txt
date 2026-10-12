@@ -1,0 +1,1040 @@
+"""Explicit operator configuration -> exact accepted DSH adapter.
+
+No deployment defaults, environment routing, dynamic imports or model grants.
+An operator's pinned readiness receipt binds this config to actual reviewed
+runtime evidence. Per-row A0 evidence is produced only by current native checks.
+"""
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+
+from .adapters.dsh import DshAdapter, DshHostConfig, PinnedFile
+from .controller import WorkerBinding
+from .supervision import NativeSupervisor
+from .worker_web import DshWebInputs, WorkerWebError, scoped_environment, DshNetworkCheck
+
+
+class HostUnavailable(RuntimeError):
+    pass
+
+
+def _path(value):
+    if (not isinstance(value, str) or not re.fullmatch(r"/[A-Za-z0-9_./-]+", value)
+            or str(Path(value)) != value or ".." in Path(value).parts or value == "/"):
+        raise HostUnavailable("invalid_runtime_path")
+    return value
+
+
+def _pin(value):
+    if (not isinstance(value, dict) or set(value) != {"path", "sha256"}
+            or not isinstance(value["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])):
+        raise HostUnavailable("invalid_runtime_pin")
+    return PinnedFile(Path(_path(value["path"])), value["sha256"])
+
+
+def validate_runtime(value):
+    if isinstance(value, dict) and "a0" in value:
+        return validate_a0_runtime(value)
+    required = {"enabled", "runtime_profile", "runtime_home", "workspace_root", "staging_root", "cache_roots",
+                "budget_seconds", "max_file_bytes", "max_total_bytes", "dsh", "runtime_receipt"}
+    if (not isinstance(value, dict) or set(value) != required or value["enabled"] is not True
+            or not isinstance(value["runtime_profile"], str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value["runtime_profile"])):
+        raise HostUnavailable("worker_not_configured")
+    for key in ("runtime_home", "workspace_root", "staging_root"):
+        _path(value[key])
+    if not isinstance(value["cache_roots"], list) or not value["cache_roots"]:
+        raise HostUnavailable("missing_cache_roots")
+    for root in value["cache_roots"]:
+        _path(root)
+    for key, ceiling in (("budget_seconds", 86400), ("max_file_bytes", 16*1024**2),
+                         ("max_total_bytes", 64*16*1024**2)):
+        if type(value[key]) is not int or not 0 < value[key] <= ceiling:
+            raise HostUnavailable("invalid_runtime_limits")
+    dsh = value["dsh"]
+    required_dsh = {"payload_root", "toolchain_root", "node", "cli", "patch", "native_files", "key_name",
+                    "profile", "memory_bytes", "cpu_percent", "tasks", "shutdown_seconds", "tmp_bytes"}
+    if (not isinstance(dsh, dict) or set(dsh) not in (required_dsh, required_dsh | {'web'})
+            or dsh["profile"] != "headless"):
+        raise HostUnavailable("invalid_dsh_config")
+    for key in ("payload_root", "toolchain_root"):
+        _path(dsh[key])
+    for key in ("node", "cli", "patch"):
+        _pin(dsh[key])
+    if not isinstance(dsh["native_files"], list) or not dsh["native_files"]:
+        raise HostUnavailable("missing_native_pins")
+    for pin in dsh["native_files"]:
+        _pin(pin)
+    if 'web' in dsh:
+        web = dsh['web']
+        if (not isinstance(web, dict) or set(web) != {'profile','resolver','trust_bundle','egress_evidence','research_policy'}
+                or web['profile'] not in ('exa-paid', 'exa-keyless') or dsh['key_name'] == 'EXA_API_KEY'):
+            raise HostUnavailable('invalid_worker_web_config')
+        for key in ('resolver','trust_bundle','egress_evidence','research_policy'):
+            _pin(web[key])
+    for key, maximum in (("memory_bytes", 2*1024**3), ("cpu_percent", 400), ("tasks", 64),
+                         ("shutdown_seconds", 2), ("tmp_bytes", 64*1024**2)):
+        if type(dsh[key]) is not int or not 0 < dsh[key] <= maximum:
+            raise HostUnavailable("invalid_resource_grant")
+    if not isinstance(dsh["key_name"], str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", dsh["key_name"]):
+        raise HostUnavailable("invalid_key_reference")
+    _pin(value["runtime_receipt"])
+    return copy.deepcopy(value)
+
+
+def private_directory(path):
+    path = Path(path)
+    info = path.stat()
+    if (not path.is_absolute() or path.resolve() != path or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700):
+        raise HostUnavailable("nonprivate_runtime_root")
+    return path
+
+
+def configured_runtimes(value):
+    """Select from one native profile; each job still binds one exact runtime.
+
+    Existing single-worker profiles remain valid. The optional map owns no
+    queue, capability or lifecycle: the existing Associations capacity lock
+    continues to serialize both workers. A disabled profile admits neither.
+    """
+    if isinstance(value, dict) and set(value) == {"enabled"} and value["enabled"] is False:
+        return {}
+    if not isinstance(value, dict) or "workers" not in value:
+        runtime = validate_runtime(value)
+        return {"a0" if "a0" in runtime else "dsh": runtime}
+    workers = value.get("workers")
+    if (set(value) != {"enabled", "workers"} or value["enabled"] is not True
+            or not isinstance(workers, dict) or not workers
+            or not set(workers) <= {"dsh", "a0"}):
+        raise HostUnavailable("invalid_worker_selection")
+    result = {}
+    identity = None
+    paths = []
+    for kind, candidate in workers.items():
+        runtime = validate_runtime(candidate)
+        if ("a0" in runtime) != (kind == "a0"):
+            raise HostUnavailable("worker_runtime_mismatch")
+        current = (runtime["runtime_home"], runtime["runtime_profile"])
+        if identity is not None and current != identity:
+            raise HostUnavailable("foreign_worker_runtime_home")
+        identity = current
+        roots = [Path(runtime[k]) for k in ("workspace_root", "staging_root")]
+        roots += [Path(p) for p in runtime["cache_roots"]]
+        if any(a.is_relative_to(b) or b.is_relative_to(a) for a in roots for b in paths):
+            raise HostUnavailable("overlapping_worker_roots")
+        paths.extend(roots)
+        result[kind] = runtime
+    return result
+
+
+def select_runtime(value, worker):
+    if worker not in {"dsh", "a0"}:
+        raise HostUnavailable("worker_not_admitted")
+    selected = configured_runtimes(value).get(worker)
+    if selected is None:
+        raise HostUnavailable("worker_not_admitted")
+    return selected
+
+
+def add_runtime(value, worker, runtime):
+    """Add a separately checked worker; never replace or revive an old one."""
+    rows = configured_runtimes(value)
+    if worker in rows:
+        raise HostUnavailable("existing_worker_not_adopted")
+    rows[worker] = runtime
+    output = {"enabled": True, "workers": rows}
+    configured_runtimes(output)
+    # Preserve the historical single-worker representation for a first setup.
+    return copy.deepcopy(runtime if len(rows) == 1 else output)
+
+
+def check_runtime(value, associations):
+    if isinstance(value, dict) and "a0" in value:
+        return check_a0_runtime(value, associations)
+    from .host_record import digest
+    from hermes_constants import get_hermes_home
+    config = validate_runtime(value)
+    if Path(config["runtime_home"]) != get_hermes_home():
+        raise HostUnavailable("foreign_runtime_home")
+    workspace = private_directory(config["workspace_root"])
+    staging = private_directory(config["staging_root"])
+    # No worker writable mount contains the store or staged originals.
+    protected = [staging, Path(associations.state.data_dir),
+                 Path(config["dsh"]["payload_root"]), Path(config["dsh"]["toolchain_root"])]
+    if any(p.is_relative_to(workspace) or workspace.is_relative_to(p) for p in protected):
+        raise HostUnavailable("overlapping_runtime_roots")
+    for root in config["cache_roots"]:
+        p = Path(root)
+        if not p.is_dir() or p.resolve() != p:
+            raise HostUnavailable("unsafe_cache_root")
+    dsh = config["dsh"]
+    for pin in (dsh["node"], dsh["cli"], dsh["patch"], *dsh["native_files"]):
+        _pin(pin).read()
+    web = _dsh_web(dsh)
+    if web:
+        web.checked_patch(_pin(dsh['patch']).read())
+    receipt = json.loads(_pin(config["runtime_receipt"]).read())
+    adapter_hash = hashlib.sha256(Path(__file__).with_name("adapters").joinpath("dsh.py").read_bytes()).hexdigest()
+    fields = {"schema", "ready", "runtime_sha256", "adapter_sha256", "evidence"}
+    if web:
+        fields.add('web_source_pins')
+        import tools.web_profile as profile_helper
+        expected = {'plugins/friday_rework/worker_web.py':hashlib.sha256(Path(__file__).with_name('worker_web.py').read_bytes()).hexdigest(),
+                    'tools/web_profile.py':hashlib.sha256(Path(profile_helper.__file__).read_bytes()).hexdigest(),
+                    'config/RESEARCH.md':hashlib.sha256(web.research_policy.read()).hexdigest()}
+        if web.profile == 'exa-keyless':
+            from .worker_web import keyless_source
+            expected['plugins/friday_rework/adapters/dsh_keyless_web.mjs'] = hashlib.sha256(keyless_source()).hexdigest()
+        if not isinstance(receipt,dict) or receipt.get('web_source_pins') != expected:
+            raise HostUnavailable('worker_web_source_not_verified')
+    if (not isinstance(receipt, dict) or set(receipt) != fields
+            or receipt["schema"] != "friday-rework.dsh-runtime.v1" or receipt["ready"] is not True
+            or receipt["adapter_sha256"] != adapter_hash
+            or receipt["runtime_sha256"] != digest({k: v for k, v in config.items() if k != "runtime_receipt"})
+            or not isinstance(receipt["evidence"], list) or not receipt["evidence"]):
+        raise HostUnavailable("runtime_not_verified")
+    for pin in receipt["evidence"]:
+        _pin(pin).read()
+    if (Path(config['runtime_home']) / 'workers/qualification').exists():
+        from .user_worker_join import deployment_health as own_health
+        own_health(config)
+    return config
+
+
+def _dsh_web(dsh):
+    web = dsh.get('web')
+    return (DshWebInputs(*(_pin(web[k]) for k in ('resolver','trust_bundle','egress_evidence','research_policy')),
+                        profile=web['profile']) if web is not None else None)
+
+
+def dsh_binding(value, associations, *, web_network_check=None):
+    """Concrete config factory; recovery preserves retained config and budgets.
+
+    Stop does not re-read readiness or launch pins. DSH's own stop and emergency
+    native supervisor remain authoritative when those launch files drift.
+    """
+    config = validate_runtime(value)
+    dsh = config["dsh"]
+    web = _dsh_web(dsh)
+    def environment():
+        names = (dsh['key_name'], 'EXA_API_KEY') if web and web.profile == 'exa-paid' else (dsh['key_name'],)
+        try:
+            return scoped_environment(config['runtime_home'], names)
+        except WorkerWebError:
+            raise HostUnavailable('runtime_key_unavailable') from None
+    supervisor = NativeSupervisor()
+    native = DshHostConfig(
+        workspace_root=Path(config["workspace_root"]), payload_root=Path(dsh["payload_root"]),
+        toolchain_root=Path(dsh["toolchain_root"]), node=_pin(dsh["node"]), cli=_pin(dsh["cli"]),
+        patch=_pin(dsh["patch"]), native_files=tuple(_pin(p) for p in dsh["native_files"]),
+        environment=environment, key_name=dsh["key_name"],
+        web=web, verify_web_network=web_network_check,
+        current_association=lambda row: associations.get(row["existing_task_id"], row["owner"]),
+        **{k: dsh[k] for k in ("profile", "memory_bytes", "cpu_percent", "tasks", "shutdown_seconds", "tmp_bytes")})
+    adapter = DshAdapter(native, supervisor=supervisor, clock=associations.clock)
+    if web and web_network_check is None:
+        # Normal Hermes factory uses the concrete current producer. Explicit
+        # fixture injection remains a trusted Python seam, never config input.
+        object.__setattr__(native, "verify_web_network", DshNetworkCheck(config, associations, adapter))
+    return WorkerBinding(adapter, supervisor.stop)
+
+
+def validate_a0_runtime(value):
+    common = {'enabled','runtime_profile','runtime_home','workspace_root','staging_root','cache_roots',
+              'budget_seconds','max_file_bytes','max_total_bytes','a0','runtime_receipt'}
+    if (not isinstance(value, dict) or set(value) != common or value['enabled'] is not True
+            or not re.fullmatch('[A-Za-z0-9_-]{1,64}', value['runtime_profile'])):
+        raise HostUnavailable('a0_not_configured')
+    for k in ('runtime_home','workspace_root','staging_root'): _path(value[k])
+    if not isinstance(value['cache_roots'], list) or not value['cache_roots']:
+        raise HostUnavailable('missing_cache_roots')
+    for p in value['cache_roots']: _path(p)
+    for k, low, high in (('budget_seconds',30,1800),('max_file_bytes',1,16*1024**2),
+                         ('max_total_bytes',1,16*1024**2)):
+        if type(value[k]) is not int or not low <= value[k] <= high:
+            raise HostUnavailable('invalid_a0_bounds')
+    a = value['a0']
+    a_fields = {'runtime','launcher','docker','daemon_unit','git_metadata','expected_files','capability','policy','owner_slot'}
+    if (not isinstance(a,dict) or set(a) not in (a_fields,a_fields|{'deployment'},a_fields|{'web'},a_fields|{'deployment','web'})):
+        raise HostUnavailable('invalid_a0_config')
+    if 'web' in a:
+        from .adapters.a0_web import checked_web
+        try: checked_web(a['web'])
+        except ValueError: raise HostUnavailable('invalid_a0_web_service') from None
+    if 'deployment' in a:
+        from .adapters.a0_profile import checked_profile
+        try:
+            checked_profile(a['deployment'])
+        except ValueError:
+            raise HostUnavailable('invalid_a0_deployment_profile') from None
+    if a['owner_slot'] not in {'astra','sol'}:raise HostUnavailable('invalid_a0_operator_slot')
+    for k in ('runtime','launcher','docker','daemon_unit','policy'): _pin(a[k])
+    _pin(value['runtime_receipt'])
+    # Fresh capability is attached to the reserved row, never static config.
+    if a['capability'] is not None: raise HostUnavailable('obsolete_preclaim_a0_capability')
+    files = a['expected_files']
+    if (not isinstance(files,list) or not 0 < len(files) <= 16
+            or any(not isinstance(x,dict) or set(x) != {'logical_name','media_type'}
+                   or not isinstance(x['logical_name'],str) or not re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]{0,95}',x['logical_name'])
+                   or not isinstance(x['media_type'],str) or not re.fullmatch('[A-Za-z0-9.+_-]+/[A-Za-z0-9.+_-]+',x['media_type']) for x in files)
+            or len({x['logical_name'] for x in files}) != len(files)):
+        raise HostUnavailable('invalid_a0_expected_files')
+    g = a['git_metadata']
+    if not isinstance(g,dict) or set(g) != {'source','manifest_sha256'}:
+        raise HostUnavailable('invalid_a0_git_metadata')
+    _path(g['source'])
+    return copy.deepcopy(value)
+
+
+def check_a0_runtime(value, associations):
+    from .host_record import digest
+    from .adapters.a0_native import strict_json
+    from hermes_constants import get_hermes_home
+    c = validate_a0_runtime(value)
+    if get_hermes_home() != Path(c['runtime_home']): raise HostUnavailable('foreign_runtime_home')
+    workspace, staging = private_directory(c['workspace_root']), private_directory(c['staging_root'])
+    protected = [staging,Path(associations.state.data_dir),Path(c['a0']['git_metadata']['source'])]
+    if any(p.is_relative_to(workspace) or workspace.is_relative_to(p) for p in protected):
+        raise HostUnavailable('overlapping_runtime_roots')
+    for root in c['cache_roots']:
+        if Path(root).resolve() != Path(root) or not Path(root).is_dir(): raise HostUnavailable('unsafe_cache_root')
+    for k in ('runtime','launcher','docker','daemon_unit','policy'): _pin(c['a0'][k]).read()
+    receipt = strict_json(_pin(c['runtime_receipt']).read())
+    source = Path(__file__).parent
+    actual = {k: hashlib.sha256((source/p).read_bytes()).hexdigest() for k,p in {
+        'host':'host.py','host_runtime':'host_runtime.py','host_record':'host_record.py',
+        'associations':'associations.py','adapter':'adapters/a0.py','native':'adapters/a0_native.py',
+        'config':'adapters/a0_config.py','profile':'adapters/a0_profile.py','web':'adapters/a0_web.py'}.items()}
+    if (not isinstance(receipt,dict) or set(receipt) != {'schema','ready','runtime_sha256','source_pins','evidence'}
+            or receipt['schema'] != 'friday-rework.a0-runtime.v2' or receipt['ready'] is not True
+            or receipt['runtime_sha256'] != digest({k:v for k,v in c.items() if k != 'runtime_receipt'})
+            or receipt['source_pins'] != actual or not isinstance(receipt['evidence'],list) or not receipt['evidence']):
+        raise HostUnavailable('a0_readiness_not_verified')
+    for p in receipt['evidence']: _pin(p).read()
+    if (Path(c['runtime_home']) / 'workers/qualification').exists():
+        from .user_worker_join import deployment_health as own_health
+        own_health(c)
+    # Reusable reviewed deployment evidence; this grants no per-job effects.
+    # The producer attaches the exact freshly reserved row below.
+    return c
+
+
+def a0_binding(value, associations, row):
+    from .controller import WorkerBinding
+    session = A0HostSession(validate_a0_runtime(value), associations, row)
+    return WorkerBinding(session, session.emergency_stop)
+
+
+def a0_runtime_module(config):
+    """Load the exact configured native code and unchanged profile/web helpers."""
+    import types
+    pin = _pin(config['a0']['runtime']); data = pin.read()
+    m = types.ModuleType('frw_pinned_a0_runtime'); m.__file__ = str(pin.path)
+    exec(compile(data,str(pin.path),'exec'),m.__dict__)
+    for name, filename in [('PROFILE_SOURCE','a0_profile.py'), ('WEB_SOURCE','a0_web.py')]:
+        if hashlib.sha256(getattr(m,name).read_bytes()).digest() != hashlib.sha256(
+                (Path(__file__).parent / 'adapters' / filename).read_bytes()).digest():
+            raise HostUnavailable('a0_runtime_profile_source_mismatch' if name == 'PROFILE_SOURCE'
+                                  else 'a0_runtime_web_source_mismatch')
+    return m
+
+
+def a0_deployment_contract(config):
+    """Reusable mandatory configuration; no current row, route or grant."""
+    from .adapters.a0_profile import profile_templates, endpoint_urls
+    from .adapters.a0_web import service_files, checked_web
+    from .adapters.a0_config import LocalNetwork
+    c = validate_a0_runtime(config); a = c['a0']
+    if 'deployment' not in a or 'web' not in a:
+        raise HostUnavailable('a0_useful_web_runtime_contract_unavailable')
+    checked_web(a['web'])
+    for name in ('runtime','launcher','docker','daemon_unit','policy'): _pin(a[name]).read()
+    path = Path(c['runtime_home']) / 'workers/a0/inputs/a0-native-files.json'
+    actual = json.loads(PinnedFile(path,hashlib.sha256(path.read_bytes()).hexdigest()).read())
+    expected = {**profile_templates(a['deployment']), **service_files(a['web'])}
+    if actual != expected:
+        raise HostUnavailable('a0_deployment_inputs_changed')
+    # Route declaration validation is reusable; actual guard/namespace/network
+    # and web processes remain mandatory in A0HostSession for every fresh row.
+    LocalNetwork('friday-deployment-check',tuple(endpoint_urls(a['deployment'])),
+                 _pin(a['policy']),a['deployment']).checked()
+    return c
+
+
+def deployment_health(config):
+    """Ordinary producer evidence, distinct from live job admission/acceptance."""
+    from .host_record import digest
+    from .worker_web import web_policy, checked_network_observation
+    import time
+    c = validate_runtime(config); home = Path(c['runtime_home'])
+    if 'a0' in c: a0_deployment_contract(c)
+    else:
+        web = _dsh_web(c['dsh'])
+        if web is None: raise HostUnavailable('mandatory_worker_web_contract_required')
+        policy = web_policy(web,str(home),c['runtime_profile'],time.time())
+        ns = Path('/proc/self/ns/net').stat()
+        if (policy['boot_id'] != Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+                or policy['net_namespace'] != [ns.st_dev,ns.st_ino]):
+            raise HostUnavailable('worker_web_namespace_changed')
+    from hermes_cli import friday_user_scope as scope
+    if (home / scope.ONBOARDING).exists():
+        from .user_worker_join import deployment_health as user_health
+        return user_health(c)
+    marker_path = home / 'FRIDAY-INSTALL.json'
+    marker = json.loads(PinnedFile(marker_path,hashlib.sha256(marker_path.read_bytes()).hexdigest()).read())
+    ref = marker.get('worker_qualification')
+    if (marker.get('home') != str(home) or marker.get('worker_state') != 'BOTH_DEPLOYMENTS_QUALIFIED'
+            or not isinstance(ref,dict) or ref.get('path') != str(home / 'preparation/worker-qualification/observation.json')):
+        raise HostUnavailable('ordinary_worker_qualification_missing')
+    proof = json.loads(_pin(ref).read()); kind = 'a0' if 'a0' in c else 'dsh'
+    receipt = json.loads(_pin(c['runtime_receipt']).read())
+    if (proof.get('schema') != 'friday.worker-deployment-observation.v1' or proof.get('home') != str(home)
+            or proof.get('profile') != c['runtime_profile'] or proof.get('input_sha256') != marker['input_sha256']
+            or proof.get('effects') != 'OBSERVATION_ONLY' or proof.get('per_job_authority') != 'NOT_GRANTED'
+            or set(proof.get('workers',{})) != {'dsh','a0'} or receipt['evidence'][-1] != ref
+            or proof['workers'][kind]['runtime_sha256'] != digest({k:v for k,v in c.items() if k != 'runtime_receipt'})):
+        raise HostUnavailable('worker_deployment_observation_changed')
+    archive = proof['original']
+    if archive.get('path') != str(home / 'preparation/worker-qualification/original.json'):
+        raise HostUnavailable('foreign_original_worker_archive')
+    before = json.loads(_pin(archive).read())
+    if (before['marker']['original_attempt'] != marker['original_attempt']
+            or before['marker']['input_sha256'] != marker['input_sha256']
+            or before['marker']['home'] != str(home)
+            or proof['observed']['boot_id'] != marker['original_attempt']['boot_id']
+            or not 0 < proof['observed']['monotonic'] <= marker['original_attempt']['deadline_mono']):
+        raise HostUnavailable('original_worker_ownership_changed')
+    # Archive paths come from the exact original profile/worker inventory.
+    expected = dict(before['marker']['profile_files'])
+    expected.update({p:h for p,h in before['marker']['worker_files'].items() if p.endswith('/runtime-receipt.json')})
+    if before['files'] != expected or set(before['marker']['profile_files']) != {'config.yaml','SOUL.md','FRIDAY-PROFILE.json'}:
+        raise HostUnavailable('original_worker_archive_incomplete')
+    for name, sha in before['files'].items():
+        _pin({'path':str(home / 'preparation/worker-qualification/original' / name),'sha256':sha}).read()
+    for inventory in ('profile_files','worker_files'):
+        for name, sha in marker[inventory].items():
+            if name.startswith('/') or '..' in Path(name).parts:
+                raise HostUnavailable('foreign_installed_worker_file')
+            _pin({'path':str(home / name),'sha256':sha}).read()
+    if set(proof['credentials']) != {'.env','auth.json'}:
+        raise HostUnavailable('qualified_credentials_incomplete')
+    for name, sha in proof['credentials'].items():
+        if name not in ('.env','auth.json'): raise HostUnavailable('foreign_qualified_credential_store')
+        path = home / name
+        present = path.exists() or path.is_symlink()
+        if (sha is None and present) or (sha is not None and not present):
+            raise HostUnavailable('qualified_credentials_changed')
+        if sha is not None: _pin({'path':str(path),'sha256':sha}).read()
+    if 'bootstrap_custody' in proof:
+        from .a0_bootstrap import checked_custody
+        native_original = json.loads(_pin(proof['bootstrap_custody']['original']).read())
+        custody = checked_custody(home,native_original['binding'],native_original['generation'],
+                                 native_original['preparations'],proof['workers']['a0']['plan'])
+        if (custody != proof['bootstrap_custody'] or native_original['binding'].get('operation')!='installation'
+                or native_original.get('inherited_attempt')!=marker['original_attempt']
+                or native_original['config']!={'path':str(home/'config.yaml'),'sha256':before['files']['config.yaml']}):
+            raise HostUnavailable('installed_bootstrap_custody_changed')
+    return deployment_observations(c, proof, marker['original_attempt'], home / 'preparation/worker-qualification')
+
+
+def deployment_observations(c, proof, original_attempt, folder):
+    """Shared exact native result consumer for install and own-profile setup."""
+    from .worker_web import checked_network_observation, web_policy
+    import time
+    home = Path(c['runtime_home']); kind = 'a0' if 'a0' in c else 'dsh'
+    if kind == 'dsh':
+        web = _dsh_web(c['dsh'])
+        policy = web_policy(web,str(home),c['runtime_profile'],time.time())
+    obs = proof['workers'][kind]
+    if kind == 'dsh':
+        if (obs['policy_sha256'] != web.egress_evidence.sha256
+                or [r['kind'] for r in obs['smoke']] != ['version','help','headless-config','headless-help']
+                or any(r['observation'].get('returncode') != 0 or r['observation'].get('reaped') is not True
+                       or r['observation'].get('timeout') is not False for r in obs['smoke'])):
+            raise HostUnavailable('worker_native_smoke_unverified')
+        urls = [('https://mcp.exa.ai/' if web.profile == 'exa-keyless' else 'https://api.exa.ai/'),*policy['document_probes']]
+        checked_network_observation(json.dumps(obs['network']),urls)
+        executions = [r['observation'] for r in obs['smoke']] + [obs['network_execution']]
+        prefix = hashlib.sha256(str(folder / 'dsh-probe').encode()).hexdigest()[:24]
+        for index, execution in enumerate(executions, 1):
+            envelope = execution.get('resource_envelope', {})
+            if (execution.get('returncode') != 0 or execution.get('reaped') is not True
+                    or execution.get('timeout') is not False
+                    or set(envelope) != {'unit','memory_bytes','cpu_percent','tasks','boot_id','deadline'}
+                    or envelope['unit'] != 'friday-qualify-dsh-' + prefix + '-' + str(index) + '.scope'
+                    or any(envelope[k] != c['dsh'][k] for k in ('memory_bytes','cpu_percent','tasks'))
+                    or envelope['boot_id'] != proof['observed']['boot_id']
+                    or type(envelope['deadline']) not in (int,float)
+                    or not 0 < envelope['deadline'] <= original_attempt['deadline_mono']):
+                raise HostUnavailable('worker_native_resources_unverified')
+    else:
+        from .adapters.a0_web import checked_web
+        m = a0_runtime_module(c)
+        plan = json.loads(_pin(obs['plan']).read())
+        m.validate(plan,check_files=False)
+        if (plan.get('deployment') != c['a0']['deployment'] or plan.get('web') != c['a0']['web']
+                or plan.get('git_metadata') != c['a0']['git_metadata'] or plan['network'] == 'none'
+                or plan['code_sha256'] != c['a0']['runtime']['sha256']
+                or plan['docker_sha256'] != c['a0']['docker']['sha256']
+                or plan['daemon_unit_sha256'] != c['a0']['daemon_unit']['sha256']
+                or plan['network']['launcher_sha256'] != c['a0']['launcher']['sha256']
+                or plan['network']['policy_sha256'] != c['a0']['policy']['sha256']
+                or obs['route'].get('id') != plan['network']['id']
+                or not plan['accepted_unix'] <= proof['observed']['unix'] < plan['deadline_unix']):
+            raise HostUnavailable('qualified_native_plan_changed')
+        m.probe_report_checked(obs['native_probe'],c['a0']['deployment'])
+        checked_web(c['a0']['web'])
+        if (obs['web'].get('status') != 'CURRENT_NATIVE_WEB_SERVICE_CHECKED'
+                or obs['web'].get('version') != c['a0']['web']['version']
+                or obs['route'].get('status') != 'CURRENT_LOCAL_NETWORK_CHECKED'
+                or not re.fullmatch('[0-9a-f]{64}',obs['container_id'])
+                or not re.fullmatch('[0-9a-f]{32}',obs['invocation_id'])
+                or obs['native_resources'].get('running') is not True
+                or obs['native_resources'].get('unit_quiescent') is not False
+                or obs['native_resources'].get('caps') != {'memory.max':str(m.MEMORY),
+                    'memory.swap.max':'0','pids.max':str(m.PIDS),
+                    'cpu.max':obs['native_resources'].get('caps',{}).get('cpu.max')}):
+            raise HostUnavailable('worker_native_web_unverified')
+        quota,period = obs['native_resources']['caps']['cpu.max'].split()
+        if not quota.isdecimal() or not period.isdecimal() or int(period)<=0 or int(quota)!=2*int(period):
+            raise HostUnavailable('worker_native_resources_unverified')
+        processes = obs['web'].get('processes')
+        if (not isinstance(processes,list) or len(processes)!=2
+                or {p.get('name') for p in processes}!={'run_ui','run_searxng'}
+                or any(set(p)!={'name','pid','start','statename'} or p['statename']!='RUNNING'
+                       or type(p['pid']) is not int or p['pid']<=0 or type(p['start']) is not int
+                       or p['start']<=0 for p in processes)):
+            raise HostUnavailable('worker_native_web_processes_unverified')
+    return c
+
+
+class A0HostSession:
+    """One association's cached ownership, original KeyMaterial and boundary.
+
+    Construction/recovery are pure. The fresh host producer prepares the route;
+    only Controller.prepare creates and starts the worker container.
+    A restarted session has stop-only authority and never recovers secrets.
+    """
+    def __init__(self, config, store, row):
+        from .adapters.dsh import _identity
+        from .associations import _validate_store
+        _validate_store({'schema_version':1,'jobs':{row['existing_task_id']:row}})
+        if config != row['host']['binding']['runtime']:
+            raise HostUnavailable('foreign_a0_runtime_binding')
+        self.config, self.store, self.identity = config, store, copy.deepcopy(_identity(row))
+        self.state_home = Path(store.state.data_dir)
+        self.runtime = self.adapter = self.boundary = self.keys = None
+        self.cancelled = False
+        self.launching = False
+        self.unit = None
+        self.startup_active = False
+        self.native_cessation = False
+        self.no_create_confirmed = False
+        self.pre_grant_confirmed = False
+        self.created = copy.deepcopy((row['host']['a0']['launch'] or {}).get('created'))
+        observations = row['host']['a0'].get('observations')
+        # Legacy/missing observation evidence is unknown, not proof of no
+        # descendants. Construction remains pure and never restores secrets.
+        self.observation_pending = (observations is None or observations['pending']
+                                    or (row['host']['a0']['grant'] is not None and not observations['samples']))
+        self.retained_samples = copy.deepcopy([] if observations is None else observations['samples'])
+        self.key_preparation_attempted = False
+        self.capability_attempted = False
+        # Only the current producer owns cleanup for this attempt. A concurrent
+        # duplicate must fail before entering that producer's cleanup boundary.
+        from threading import Lock
+        self.capability_lock = Lock()
+        self.key_cleanup = row['host']['a0']['key_cleanup']
+        self.preparing = False
+        self.plan = copy.deepcopy((row['host']['a0']['launch'] or {}).get('plan'))
+        self.grant = copy.deepcopy(row['host']['a0']['grant'])
+        self.route = copy.deepcopy(row['host']['a0'].get('route'))
+        self.route_preparing = False
+        self.route_only_confirmed = False
+        self.route_module = None
+
+    def _same(self, row):
+        from .adapters.dsh import _identity
+        from hermes_constants import get_hermes_home
+        if (_identity(row) != self.identity or Path(self.store.state.data_dir) != self.state_home
+                or get_hermes_home() != Path(self.config['runtime_home'])):
+            raise HostUnavailable('foreign_a0_binding')
+
+    def _current(self, row):
+        self._same(row)
+        return self._eligible(self.store.get(row['existing_task_id'],row['owner']))
+
+    def _eligible(self, r):
+        # The locked producer seam supplies the actual durable row directly;
+        # it must not recursively acquire the existing admission flock.
+        self._same(r)
+        a = r['host']['a0']['acceptance']
+        import time
+        if (self.cancelled or r['stop_intent'] or self.store.clock() < a['accepted_unix']
+                or self.store.clock() >= r['deadline_unix']
+                or a['boot_id'] != Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+                or not 0 <= (time.monotonic_ns()-a['accepted_monotonic_ns'])/1e9 < r['budget_seconds']):
+            raise HostUnavailable('a0_stopped_or_original_budget_expired')
+        return r
+
+    def _module(self):
+        return a0_runtime_module(self.config)
+
+    def _capability(self, row, pin=None):
+        from .adapters.a0_native import strict_json
+        from .adapters.dsh import _identity
+        from .host_record import digest
+        pin = row['host']['a0']['capability'] if pin is None else pin
+        if pin is None: raise HostUnavailable('current_a0_capability_missing')
+        v = strict_json(_pin(pin).read())
+        if (not isinstance(v,dict) or set(v) != {'schema','association','acceptance','network','live_evidence'}
+                or v['schema'] != 'friday.a0.host-capability.v2' or v['association'] != _identity(row)
+                or v['acceptance'] != row['host']['a0']['acceptance']
+                or not isinstance(v['live_evidence'],list) or not v['live_evidence']
+                or v['network']['launcher_sha256'] != self.config['a0']['launcher']['sha256']):
+            raise HostUnavailable('foreign_or_stale_a0_capability')
+        # Current route authority is tied to the configured inference profile.
+        self._module().local_network(v['network'],
+            f"{self.config['a0']['owner_slot']}:{row['existing_task_id']}#1",
+            self.config['a0'].get('deployment'), self.config['a0'].get('web'))
+        checks = {'namespace_recheck','current_route'}
+        for p in v['live_evidence']:
+            proof = strict_json(_pin(p).read())
+            if (not isinstance(proof,dict) or set(proof) != {'schema','accepted','association_sha256',
+                    'acceptance_sha256','network_sha256','runtime_source_sha256','checks'}
+                    or proof['schema'] != 'friday.a0.host-current-route.v2' or proof['accepted'] is not True
+                    or proof['association_sha256'] != digest(_identity(row))
+                    or proof['acceptance_sha256'] != digest(row['host']['a0']['acceptance'])
+                    or proof['network_sha256'] != digest(v['network'])
+                    or proof['runtime_source_sha256'] != self.config['a0']['runtime']['sha256']
+                    or not isinstance(proof['checks'],dict) or set(proof['checks']) != checks
+                    or any(x is not True for x in proof['checks'].values())):
+                raise HostUnavailable('current_live_a0_readiness_missing')
+        return v
+
+    def validate_capability(self, row, pin):
+        """Trusted host producer seam; no user/model handler or launch authority."""
+        self._eligible(row)
+        check_a0_runtime(self.config, self.store)
+        return self._capability(row, pin)
+
+    def _startup_left(self, row):
+        import time
+        current = self._current(row)
+        a = current['host']['a0']['acceptance']
+        left = min(current['deadline_unix'] - self.store.clock(),
+                   current['budget_seconds'] - (time.monotonic_ns()-a['accepted_monotonic_ns'])/1e9) - 25
+        if left <= 1: raise HostUnavailable('a0_startup_original_budget_exhausted')
+        return left
+
+    def _begin_sample(self, row):
+        if self.observation_pending:
+            raise HostUnavailable('STOP_UNCONFIRMED; prior observation incomplete')
+        self.observation_pending = True
+        self.store.a0_observation(row['existing_task_id'], row['owner'])
+
+    def _finish_sample(self, row, sample):
+        # Keep the new identity in memory even if the durable write fails.
+        self.retained_samples.append(copy.deepcopy(sample))
+        self.store.a0_observation(row['existing_task_id'], row['owner'], sample)
+        self.observation_pending = False
+
+    def _retain_sample(self, m, r, sample):
+        # Cache both owners before receipt I/O or any other fallible observation.
+        r['observations'].append(copy.deepcopy(sample))
+        self.runtime.known = r
+        m.write_json(self.runtime.receipt_path, r, replace=True)
+
+    def _boundary(self, row, *, stop_only=False):
+        from .adapters.a0_native import A0NativeBoundary, NativeGrant
+        session = self
+
+        class RetainingBoundary(A0NativeBoundary):
+            def admit(boundary, current):
+                if boundary.stop_only:
+                    return super().admit(current)
+                session._current(current); session._capability(current)
+                session.runtime.check_network(container_id=boundary.grant.container_id)
+                session.runtime.check_web(boundary.grant.container_id)
+                return super().admit(current)
+
+            def _sample(boundary, obj, *, caps):
+                session._begin_sample(row)
+                super()._sample(obj, caps=caps)
+                root, processes = boundary.samples[-1]
+                session._finish_sample(row, {
+                    'group': '/' + str(root.relative_to('/sys/fs/cgroup')),
+                    'populated': True,
+                    'processes': [{'pid': pid, 'start_ticks': start} for pid, start in processes],
+                })
+
+        boundary = RetainingBoundary(self._deployment(self.plan), NativeGrant(**self.grant),
+                                     clock=self.store.clock, stop_only=stop_only)
+        boundary.samples.extend((Path('/sys/fs/cgroup') / s['group'].lstrip('/'),
+                                 [(v['pid'], v['start_ticks']) for v in s['processes']])
+                                for s in self.retained_samples)
+        return boundary
+
+    def _container_ready(self, m, row, r):
+        import time
+        # Finite native startup observations, never replaying create/start/POST.
+        for _ in range(row['budget_seconds']*10+1):
+            left = self._startup_left(row)
+            self.keys.ready(); self._capability(self._current(row))
+            obj = self.runtime.inspect(r, timeout=min(3, left))
+            if obj['State']['Running'] and obj['State']['Pid'] > 0:
+                sample = self.runtime.snapshot_container(obj)
+                self._retain_sample(m, r, sample)
+                return sample
+            unit = self.runtime.supervisor.observe(self.runtime.association(r))
+            if unit.quiescent or unit.invocation_id != r['invocation_id']:
+                raise HostUnavailable('a0_startup_unit_lost')
+            time.sleep(min(.1, self._startup_left(row)))
+        raise HostUnavailable('a0_startup_observation_limit')
+
+    def _api_ready(self, row):
+        import time
+        for _ in range(row['budget_seconds']*10+1):
+            left = self._startup_left(row)
+            # GuardedBoundary repeats current route, exact identity and keys.
+            if self.boundary.readiness(self._current(row), min(3, left)):
+                self._startup_left(row)
+                return
+            time.sleep(min(.1, self._startup_left(row)))
+        raise HostUnavailable('a0_startup_observation_limit')
+
+    def _deployment(self, plan):
+        from .adapters.a0_config import A0Deployment, LocalNetwork
+        # Exact reviewed startup and image are in the already checked bound plan.
+        from .adapters.a0_native import NativeGrant
+        a = self.config['a0'];n=plan['network']
+        if not isinstance(n,dict): raise HostUnavailable('missing_a0_local_route')
+        policy = _pin(a['policy'])
+        return A0Deployment(_pin(a['docker']),_pin(a['daemon_unit']),
+            '${PRIVATE_DOCKER_SOCKET_ROUTE}',plan['image'],
+            Path(plan['state_dir']),Path(plan['git_metadata']['source']),
+            ('-ceu', self._module().startup_script(plan)),
+            LocalNetwork(n['id'],
+                tuple(self._module().profile_module().endpoint_urls(a['deployment'])) if 'deployment' in a
+                else tuple('http://' + x['ip'] + ':' + str(x['port']) + '/v1' for x in n['endpoints']),
+                policy, a.get('deployment')), web=a.get('web'))
+
+    def _plan(self, m, row, network):
+        from .adapters.dsh import _identity
+        a = row['host']['a0']['acceptance']
+        p=m.plan(row['created_at_unix'],row['deadline_unix'],assignment=row['existing_task_id'],generation=1,
+            owner_slot=self.config['a0']['owner_slot'],original_budget_seconds=row['budget_seconds'],git_metadata=self.config['a0']['git_metadata'],
+            network=network,deployment=self.config['a0'].get('deployment'),web=self.config['a0'].get('web'),association_binding=_identity(row),accepted_monotonic_ns=a['accepted_monotonic_ns'],boot_id=a['boot_id'])
+        if (str(m.DOCKER) != self.config['a0']['docker']['path']
+                or p['docker_sha256'] != self.config['a0']['docker']['sha256']
+                or str(m.PROJECT/'.runtime/rootless-docker/supervisor/friday-rework-docker.service') != self.config['a0']['daemon_unit']['path']
+                or p['daemon_unit_sha256'] != self.config['a0']['daemon_unit']['sha256']
+                or str(m.LAUNCHER) != self.config['a0']['launcher']['path']):
+            raise HostUnavailable('a0_runtime_native_pin_mismatch')
+        return p
+
+    def _retain_route(self, row, route):
+        # Preserve actual native IDs before fallible metadata I/O. A lost ACK
+        # may not turn either a submitted operation or its stop into a retry.
+        self.route = copy.deepcopy(route)
+        return self.store.retain_a0_route(row['existing_task_id'], row['owner'], route)
+
+    def _route_module(self):
+        if self.route_module is None:
+            import types
+            pin = _pin(self.route['stop_source'])
+            m = types.ModuleType('frw_recorded_a0_route_stop');m.__file__=str(pin.path)
+            exec(compile(pin.read(),str(pin.path),'exec'),m.__dict__)
+            self.route_module=m
+        return self.route_module
+
+    def _stop_route(self, row):
+        if self.route is None:return
+        m=self._route_module()
+        def retain_stop(value):
+            try:self._retain_route(row,value)
+            except BaseException:
+                # Stop authority is the cached checked native identity. Damaged
+                # storage cannot withhold cleanup; it still cannot release a row.
+                pass
+        self.route=m.stop_route(self.route,retain=retain_stop,
+                               container_id=None if self.created is None else self.created['container_id'])
+        if self.route_preparing:
+            raise HostUnavailable('STOP_UNCONFIRMED; route preparation in flight')
+
+    def produce_capability(self, row):
+        """One real per-row preparation followed by the existing current probes.
+
+        Native pre-container deadline admission precedes request/daemon/bridge
+        effects; source completion never establishes deployment qualification.
+        """
+        from .adapters.dsh import _identity
+        from .host_record import digest
+        row = self._current(row)
+        a = row['host']['a0']
+        if (self.capability_attempted or a['capability'] is not None or a['launch'] is not None
+                or row['host']['inputs'] is None or row['preparation_reserved']
+                or row['submission_observation'] != 'NOT_SUBMITTED'
+                or row['host']['terminal'] is not None or row['host']['quiescence'] is not None
+                or a.get('route') is not None):
+            raise HostUnavailable('a0_capability_production_not_admitted')
+        self.capability_attempted = True
+        check_a0_runtime(self.config, self.store)
+        self._startup_left(row)
+        m = self._module()
+        native = self.config['a0']
+        # Check configured paths before invoking even read-only native probes.
+        if (str(m.LAUNCHER) != native['launcher']['path'] or str(m.DOCKER) != native['docker']['path']
+                or str(m.PROJECT/'.runtime/rootless-docker/supervisor/friday-rework-docker.service') != native['daemon_unit']['path']):
+            raise HostUnavailable('a0_runtime_native_pin_mismatch')
+        self.route_preparing=True
+        try:
+            m.prepare_route(_identity(row), a['acceptance'], native,
+                retain=lambda value:self._retain_route(row,value),budget=lambda:self._startup_left(row))
+        finally:
+            self.route_preparing=False
+        network = m.current_network(_identity(row), a['acceptance'],
+            owner_slot=native['owner_slot'], launcher_sha256=native['launcher']['sha256'],
+            docker_sha256=native['docker']['sha256'], deployment=native.get('deployment'), web=native.get('web'))
+        if self.route is not None and (self.route['pending'] is not None
+                or self.route['network'] != network or self.route['settlement'] is not None):
+            raise HostUnavailable('a0_route_custody_changed')
+        plan = self._plan(m, self._current(row), network)
+        runtime = m.Runtime(plan, budget=lambda: self._startup_left(row))
+        # Same current route consumer used by native preparation/API admission;
+        # this object performs no start and acquires no worker cleanup custody.
+        observed = runtime.check_network(budget=lambda: self._startup_left(row))
+        if observed != {'status': 'CURRENT_LOCAL_NETWORK_CHECKED', 'id': network['id']}:
+            raise HostUnavailable('current_live_a0_readiness_missing')
+        self._startup_left(row)
+        row = self._current(row)
+        root = private_directory(row['workspace_reference'])
+        proof = {'schema': 'friday.a0.host-current-route.v2', 'accepted': True,
+                 'association_sha256': digest(_identity(row)), 'acceptance_sha256': digest(a['acceptance']),
+                 'network_sha256': digest(network), 'runtime_source_sha256': native['runtime']['sha256'],
+                 'checks': {'namespace_recheck': True, 'current_route': True}}
+        proof_path = root/'a0-current-route.json'
+        m.write_json(proof_path, proof)
+        proof_pin = {'path': str(proof_path), 'sha256': hashlib.sha256(proof_path.read_bytes()).hexdigest()}
+        capability = {'schema': 'friday.a0.host-capability.v2', 'association': _identity(row),
+                      'acceptance': a['acceptance'], 'network': network, 'live_evidence': [proof_pin]}
+        path = root/'a0-capability.json'
+        m.write_json(path, capability)
+        self._current(row)
+        return {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+
+    def _launch(self, row):
+        from dataclasses import asdict
+        from .adapters.dsh import _identity
+        from .adapters.a0_config import prepare_keys
+        from .adapters.a0_native import A0NativeBoundary, NativeGrant
+        from .adapters.a0 import A0Adapter, A0HostConfig, ExpectedFile, job_prefix
+        from agent.secret_scope import current_secret_scope, current_secret_scope_home
+        from gateway.platforms._shared import get_scoped_secret
+        self._current(row)
+        if row['host']['a0']['launch'] is not None or self.launching:
+            raise HostUnavailable('a0_launch_requires_reconciliation')
+        m = self._module();cap=self._capability(row);a=row['host']['a0']['acceptance']
+        p = self._plan(m, row, cap['network'])
+        self.plan=p
+        plan_path=Path(row['workspace_reference'])/'a0-plan.json';m.write_json(plan_path,p)
+        self.runtime=m.Runtime(p)
+        native_snapshot = self.runtime.snapshot_container
+        def retained_snapshot(obj):
+            # Also covers pre-grant cleanup observations made by Runtime.
+            self._begin_sample(row)
+            sample = native_snapshot(obj)
+            self._finish_sample(row, sample)
+            return sample
+        self.runtime.snapshot_container = retained_snapshot
+        original_runner=self.runtime.runner
+        def startup_runner(argv,timeout):
+            if self.startup_active: timeout=min(timeout,self._startup_left(row))
+            return original_runner(argv,timeout)
+        self.runtime.runner=startup_runner
+        self.store.retain_a0(row['existing_task_id'],row['owner'],'launch',
+            {'plan':p,'plan_pin':{'path':str(plan_path),'sha256':m.sha(plan_path)},'keys_prepared_monotonic':None,'created':None})
+        self.launching=True
+        self.startup_active=True
+        def before_ui(usr):
+            self._current(row)
+            scope=current_secret_scope();names={'FRIDAY_LLM_API_KEY','FRIDAY_EMBEDDINGS_API_KEY'}
+            if 'web' in self.config['a0']: names.add('SEARXNG_SECRET')
+            if scope is None or current_secret_scope_home() != self.config['runtime_home'] or not names.issubset(scope):
+                raise HostUnavailable('a0_scoped_keys_unavailable')
+            def resolve(name):
+                value=get_scoped_secret(name)
+                if value != scope[name]:raise HostUnavailable('a0_scoped_keys_changed')
+                return value
+            self.key_preparation_attempted=True
+            self.keys=prepare_keys(usr,resolve)
+            if 'web' in self.config['a0']:
+                from .adapters.a0_config import prepare_web_keys
+                self.keys=prepare_web_keys(self.keys,usr,resolve)
+            self.key_cleanup='PREPARED'
+            self.store.retain_a0(row['existing_task_id'],row['owner'],'keys_prepared_monotonic',self.keys.prepared_monotonic)
+            self.store.retain_a0(row['existing_task_id'],row['owner'],'key_cleanup','PREPARED')
+            self.keys.ready();self._current(row)
+        def on_created(known):
+            # Creation already happened: cancellation/expiry cannot withhold
+            # checked exact-ID caching and stop-only ownership reconciliation.
+            self.startup_active=False
+            self.runtime.inspect(known,stop_owned=True,timeout=3)
+            self.created={'container_id':known['container_id'],'plan_sha256':m.digest(p)}
+            self.store.retain_a0(row['existing_task_id'],row['owner'],'created',self.created)
+            self._current(row)
+            self.startup_active=True
+        try:
+            self.runtime.start(plan_path,m.sha(plan_path),before_ui=before_ui,on_created=on_created)
+            self._current(row)
+            r=self.runtime.receipt();sample=self._container_ready(m,row,r)
+            # Dedicated daemon invocation is an actual independent observation.
+            reply=self.runtime.runner(['/usr/bin/systemctl','--user','show',m.DAEMON,'--property=ActiveState,InvocationID'],3)
+            fields=dict(x.split('=',1) for x in reply.splitlines())
+            if set(fields) != {'ActiveState','InvocationID'} or fields['ActiveState'] != 'active':raise HostUnavailable('daemon_identity_unknown')
+            self.runtime.check_network(container_id=r['container_id'])
+            g=NativeGrant(r['container_id'],p['container_name'],r['invocation_id'],m.labels(p),row['created_at_unix'],row['deadline_unix'],
+                sample['group'],a['boot_id'],True,self.keys.prepared_monotonic,fields['InvocationID'],a['accepted_monotonic_ns']/1e9)
+            self.grant=asdict(g)
+            self.runtime.check_web(r['container_id'])
+            self.boundary=self._boundary(row)
+            native_runner=self.boundary.runner
+            def bounded_api_runner(argv,data,timeout):
+                if self.startup_active: timeout=min(timeout,self._startup_left(row))
+                return native_runner(argv,data,timeout)
+            self.boundary.runner=bounded_api_runner
+            unit_command=getattr(self.boundary.supervisor,'_command',None)
+            if callable(unit_command):
+                def bounded_unit_command(arguments,timeout):
+                    if self.startup_active: timeout=min(timeout,self._startup_left(row))
+                    return unit_command(arguments,timeout)
+                self.boundary.supervisor._command=bounded_unit_command
+            self.store.retain_a0(row['existing_task_id'],row['owner'],'grant',self.grant)
+            def expected(current):
+                return tuple(ExpectedFile('/a0/usr/workdir/'+job_prefix(current)+'/'+job_prefix(current)+'-'+x['logical_name'],**x)
+                             for x in current['host']['a0']['expected_files'])
+            staging=Path(self.config['staging_root'])/row['existing_task_id'];outputs=staging/'a0-outputs'
+            outputs.mkdir(mode=0o700)
+            self.adapter=A0Adapter(A0HostConfig(Path(self.config['workspace_root']),staging,outputs,
+                lambda current:self.store.get(current['existing_task_id'],current['owner']),expected,self.keys,
+                max_file_bytes=min(self.config['max_file_bytes'],self.config['max_total_bytes'])),self.boundary,clock=self.store.clock)
+            self._api_ready(row)
+        except BaseException as error:
+            try:self.emergency_stop(row)
+            except BaseException:error.add_note('owned execution STOP_UNCONFIRMED')
+            raise
+        finally:
+            self.startup_active=False
+            self.launching=False
+
+    def prepare(self,row,brief,inputs):
+        self.preparing=True
+        try:
+            self._launch(row)
+            return self.adapter.prepare(row,brief,inputs)
+        finally:self.preparing=False
+
+    def submit(self,*args):
+        if self.adapter is None:raise HostUnavailable('a0_restart_stop_only')
+        return self.adapter.submit(*args)
+
+    def observe(self,row,prepared):
+        self._same(row)
+        if self.adapter is not None:return self.adapter.observe(row,prepared)
+        self.emergency_stop(row)
+        from .adapters.contract import NativeObservation
+        n=row['native'] or {'invocation_id':'','worker_reference':''}
+        if (Path(row['workspace_reference'])/'a0-result.json').exists():
+            from .adapters.a0 import read_retained_result, ExpectedFile, job_prefix
+            from .adapters.a0_native import NativeGrant
+            expected=tuple(ExpectedFile('/a0/usr/workdir/'+job_prefix(row)+'/'+job_prefix(row)+'-'+x['logical_name'],**x)
+                           for x in row['host']['a0']['expected_files'])
+            read_retained_result(row,prepared,NativeGrant(**self.grant),expected,
+                Path(self.config['staging_root'])/row['existing_task_id']/'a0-outputs',min(self.config['max_file_bytes'],self.config['max_total_bytes']))
+            return NativeObservation(n['invocation_id'],n['worker_reference'],
+                str(Path(row['workspace_reference'])/'a0-result.json'),row['elapsed_seconds'],'completed')
+        return NativeObservation(n['invocation_id'],n['worker_reference'],'association:'+row['existing_task_id']+'#recovered-stop',row['elapsed_seconds'],'unknown')
+
+    def stop(self,row,prepared,intent):
+        self.emergency_stop(row)
+        from .adapters.contract import NativeObservation
+        n=row['native'] or {'invocation_id':'','worker_reference':''}
+        return NativeObservation(n['invocation_id'],n['worker_reference'],'association:'+row['existing_task_id']+'#stop',row['elapsed_seconds'],'stopped')
+
+    def emergency_stop(self,row):
+        self._same(row);self.cancelled=True
+        self.startup_active=False # Owned stop is never withheld by an expired launch budget.
+        from .adapters.a0_native import A0NativeBoundary, NativeGrant
+        if self.route is not None and self.plan is None:
+            # A0 has not created a container, but the route may own effects.
+            # Even a missing worker unit says nothing about daemon custody.
+            self._stop_route(row)
+            unit=NativeSupervisor().observe(row)
+            if not unit.missing or not unit.quiescent:
+                raise HostUnavailable('STOP_UNCONFIRMED; unexpected pre-container worker')
+            self.unit=unit;self.route_only_confirmed=True;self.native_cessation=True
+            return unit
+        if self.boundary is None:
+            if self.grant is not None:
+                self.boundary=self._boundary(row,stop_only=True)
+            elif self.runtime is not None and self.runtime.known is not None:
+                stopped=self.runtime.stop()
+                unit=self.runtime.supervisor.observe(self.runtime.association(self.runtime.known))
+                if (self.launching or self.preparing or self.created is None or not unit.quiescent
+                        or self.observation_pending
+                        or stopped.get('status') != 'STOP_CONFIRMED'
+                        or stopped.get('container_id') != self.created['container_id']
+                        or stopped.get('current_sampling') == 'UNKNOWN'
+                        or len(stopped.get('descendant_checks',[])) < len(self.retained_samples)
+                        or any(x.get('confirmed') is not True for x in stopped.get('descendant_checks',[]))):
+                    raise HostUnavailable('STOP_UNCONFIRMED; pending or incomplete pre-grant cessation')
+                self.unit=unit;self.pre_grant_confirmed=True;self.native_cessation=True
+            elif (self.runtime is not None and not self.runtime.create_attempted
+                    and not self.launching and not self.preparing):
+                unit=self.runtime.supervisor.observe(self.runtime.association({}))
+                if not unit.missing or not unit.quiescent:
+                    raise HostUnavailable('STOP_UNCONFIRMED; unexpected native unit')
+                self.unit=unit;self.no_create_confirmed=True;self.native_cessation=True
+            else:raise HostUnavailable('STOP_UNCONFIRMED; pending or unknown create')
+        if self.boundary is not None:
+            unit=self.boundary.stop(row);self.unit=unit
+            if self.observation_pending or not self.retained_samples:
+                raise HostUnavailable('STOP_UNCONFIRMED; retained observations incomplete')
+            self.native_cessation=True
+        self._stop_route(row)
+        if self.keys is None:
+            if self.key_cleanup != 'REMOVED' and (not self.no_create_confirmed or self.key_preparation_attempted):
+                self.key_cleanup='RECONCILIATION_REQUIRED'
+        else:
+            try:self.keys.remove(cessation_confirmed=True);self.key_cleanup='REMOVED'
+            except BaseException:self.key_cleanup='RECONCILIATION_REQUIRED'
+        try:self.store.retain_a0(row['existing_task_id'],row['owner'],'key_cleanup',self.key_cleanup)
+        except BaseException:pass # Native cessation truth is independent of damaged metadata.
+        return unit
+
+    def quiescence(self,row):
+        from dataclasses import asdict
+        from .host_record import digest
+        if not self.native_cessation or self.unit is None:return None
+        if self.route is not None and self.route['settlement'] is None:return None
+        if self.route_only_confirmed:
+            return {'kind':'a0_route','at_unix':self.store.clock(),
+                    'observation':{'route_sha256':digest(self.route)}}
+        if self.no_create_confirmed:
+            return {'kind':'a0_no_create','at_unix':self.store.clock(),'observation':{
+                'unit':asdict(self.unit),'plan_sha256':self.runtime.p['identity'],
+                'create_attempted':False,'pending':False,'key_cleanup':self.key_cleanup}}
+        if self.pre_grant_confirmed:
+            return {'kind':'a0_pre_grant','at_unix':self.store.clock(),'observation':{
+                'unit':asdict(self.unit),**self.created,'native_cessation':True,'key_cleanup':self.key_cleanup}}
+        if self.grant is None:return None
+        return {'kind':'a0','at_unix':self.store.clock(),'observation':{'unit':asdict(self.unit),
+            'container_id':self.grant['container_id'],'grant_sha256':digest(self.grant),
+            'native_cessation':True,'key_cleanup':self.key_cleanup}}

@@ -1,0 +1,365 @@
+"""Plugin-owned durable state and namespaced settings helpers (split out of hermes_cli.plugins)."""
+
+from __future__ import annotations
+
+import json
+import errno
+import math
+import os
+import re
+import sys
+import threading
+import time
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+from typing import Any, Dict, Mapping
+
+from hermes_constants import get_hermes_home
+from hermes_cli.plugins_manifest import _portable_skill_namespace
+
+_PLUGIN_SETTING_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_PLUGIN_SETTING_RESERVED_ROOTS = frozenset({"model", "plugins", "security", "settings"})
+_PLUGIN_STATE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_PLUGIN_STATE_QUOTA_BYTES = 10 * 1024 * 1024
+_PLUGIN_STATE_LOCKS: Dict[str, threading.RLock] = {}
+_PLUGIN_STATE_LOCKS_GUARD = threading.Lock()
+
+
+def _plugin_relative_segments(key: str) -> tuple[str, ...]:
+    """Validate/split a plugin-relative settings key; global paths, traversal, and core roots are rejected
+    before any config read.
+
+    The public API accepts only relative keys (``endpoint`` or ``retry.policy``). See #64227.
+    """
+    if not isinstance(key, str):
+        raise ValueError("Expected a plugin-relative config key string")
+    segments = tuple(key.split("."))
+    invalid = not key or "/" in key or "\\" in key or segments[0].lower() in _PLUGIN_SETTING_RESERVED_ROOTS
+    if invalid or not all(_PLUGIN_SETTING_SEGMENT_RE.fullmatch(segment) for segment in segments):
+        raise ValueError(
+            "Expected a plugin-relative config key such as 'endpoint' or "
+            "'retry.policy'; global, cross-plugin, and traversal paths are forbidden"
+        )
+    return segments
+
+
+def _nested_plugin_value(root: object, segments: tuple[str, ...], default: Any) -> Any:
+    """Walk ``segments`` through nested mappings; ``default`` on the first miss."""
+    current = root
+    for segment in segments:
+        if not isinstance(current, Mapping) or segment not in current:
+            return default
+        current = current[segment]
+    return current
+
+
+def _nested_plugin_mapping(segments: tuple[str, ...], value: Any) -> dict[str, Any]:
+    """Wrap ``value`` in nested single-key dicts, outermost first."""
+    nested: Any = value
+    for segment in reversed(segments):
+        nested = {segment: nested}
+    return nested
+
+
+def _plugin_settings_entry(config: object, plugin_id: str) -> Mapping[str, Any] | None:
+    """``plugins.entries.<plugin_id>`` as a mapping, else ``None``."""
+    entry = _nested_plugin_value(config, ("plugins", "entries", plugin_id), None)
+    return entry if isinstance(entry, Mapping) else None
+
+
+def save_plugin_setting(plugin_id: str, segments: tuple[str, ...], value: Any) -> None:
+    """Atomically write one value under ``plugins.entries.<plugin_id>.settings``.
+
+    THE writer for plugin settings: ``PluginContext.set_config`` (the plugin itself) and the
+    Desktop/TUI ``plugins.manage settings`` action both land here so managed-install and
+    administrator-managed-key refusals, the cross-process lock and the fail-closed raw read
+    are enforced once. ``segments`` must already be validated by :func:`_plugin_relative_segments`.
+    """
+    from hermes_cli import config as config_mod
+    from hermes_cli import managed_scope
+
+    if config_mod.is_managed():
+        raise PermissionError("Plugin settings cannot be changed in a managed install")
+    full_path = ("plugins", "entries", plugin_id, "settings", *segments)
+    dotted_path = ".".join(full_path)
+    if managed_scope.is_key_managed(dotted_path):
+        raise PermissionError(f"Plugin setting {dotted_path!r} is administrator-managed")
+    partial = _nested_plugin_mapping(full_path[:4], _nested_plugin_mapping(segments, value))
+    # The lock covers merge-read plus atomic save so sibling plugin writes (threads or
+    # processes) cannot race between the two steps.
+    with _locked_plugin_state(config_mod.get_config_path()), config_mod._CONFIG_LOCK:
+        # Fail closed on malformed YAML: save_config degrades parse failures to {} — safe
+        # for reads, destructive for read-modify-write.
+        config_mod.read_user_config_raw()
+        config_mod.save_config(partial, preserve_keys={full_path}, merge_existing=True)
+
+
+def _plugin_data_namespace(plugin_id: str, skill_namespace: str) -> str:
+    """Return one Windows-safe directory component for plugin-owned data. Portable Agent Plugins already
+    receive this exact PLUGIN_DATA path; otherwise the fixed prefix avoids Windows reserved device names and
+    the digest prevents fold collisions."""
+    candidate = skill_namespace or plugin_id
+    portable = skill_namespace and candidate.startswith("agent-plugin-")
+    if portable and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,191}", candidate):
+        return candidate
+    return _portable_skill_namespace(candidate)
+
+
+class LockAcquisitionBudget:
+    """Cumulative acquisition allowance for sequential calls on one thread.
+
+    Time outside ``acquiring`` (including native work and filesystem I/O) is
+    excluded. A copied context cannot spend the same allowance concurrently:
+    cross-thread use and overlapping acquisition scopes fail closed, without
+    introducing another lock. Exhaustion persists for this object's lifetime.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+                or not math.isfinite(seconds) or seconds < 0):
+            raise ValueError("lock budget must be finite nonnegative seconds")
+        self._remaining = seconds
+        # Thread identifiers can be reused after exit; retain the creator itself.
+        self._owner_thread = threading.current_thread()
+        self._acquiring = False
+
+    @contextmanager
+    def acquiring(self):
+        if threading.current_thread() is not self._owner_thread or self._acquiring:
+            raise RuntimeError("lock budget requires sequential same-thread acquisition")
+        if self._remaining <= 0:
+            raise TimeoutError("Plugin state lock budget exceeded")
+        began = time.monotonic()
+        self._acquiring = True
+        try:
+            yield began + self._remaining
+        finally:
+            self._remaining = max(0.0, self._remaining - max(0.0, time.monotonic() - began))
+            self._acquiring = False
+
+
+@contextmanager
+def _acquisition_scope(deadline, budget, operation_deadline=None):
+    with (budget.acquiring() if budget is not None else nullcontext(deadline)) as acquired:
+        yield (operation_deadline if acquired is None else acquired if operation_deadline is None
+               else min(acquired, operation_deadline))
+
+
+def _state_operation_check(operation_deadline=None, commit_guard=None):
+    if operation_deadline is not None and (isinstance(operation_deadline, bool)
+            or not isinstance(operation_deadline, (int, float)) or not math.isfinite(operation_deadline)):
+        raise ValueError("operation_deadline must be a finite monotonic timestamp")
+    if commit_guard is not None and not callable(commit_guard):
+        raise ValueError("commit_guard must be callable")
+    if operation_deadline is not None and time.monotonic() >= operation_deadline:
+        raise TimeoutError("Plugin state operation deadline exceeded")
+    if commit_guard is not None:
+        commit_guard()
+    if operation_deadline is not None and time.monotonic() >= operation_deadline:
+        raise TimeoutError("Plugin state operation deadline exceeded")
+
+
+def _lock_remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Plugin state lock deadline exceeded")
+    return remaining
+
+
+def _state_lock_cleanup(release, *, primary=None):
+    """Keep only this lock body's explicit failure primary on cleanup."""
+    try:
+        release()
+    except Exception as cleanup:
+        if primary is None:
+            raise
+        primary.add_note("Plugin state lock cleanup unconfirmed: " + type(cleanup).__name__)
+        from utils import AtomicWriteUncertainError
+        if isinstance(primary, AtomicWriteUncertainError):
+            primary.lock_completion = "unconfirmed"
+
+
+@contextmanager
+def _thread_state_lock(lock, deadline, budget=None, operation_deadline=None):
+    with _acquisition_scope(deadline, budget, operation_deadline) as acquisition_deadline:
+        if acquisition_deadline is None:
+            lock.acquire()
+        elif not lock.acquire(timeout=_lock_remaining(acquisition_deadline)):
+            raise TimeoutError("Plugin state lock deadline exceeded")
+    _cleanup_primary_1 = None
+    try:
+        yield
+    except BaseException as _cleanup_error_1:
+        _cleanup_primary_1 = _cleanup_error_1
+        raise
+    finally:
+        _state_lock_cleanup(lock.release, primary=_cleanup_primary_1)
+
+
+def _acquire_state_file(handle, deadline):
+    if os.name == "nt":  # pragma: no cover - Windows CI
+        import msvcrt
+        def acquire():
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if deadline is None else msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        def acquire():
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (fcntl.LOCK_NB if deadline is not None else 0))
+    while True:
+        if deadline is not None:
+            _lock_remaining(deadline)
+        try:
+            acquire()
+            return
+        except OSError as exc:
+            if deadline is None or exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            time.sleep(min(.01, _lock_remaining(deadline)))
+
+
+@contextmanager
+def _locked_plugin_state(path: Path, *, lock_deadline: float | None = None,
+                         lock_budget: LockAcquisitionBudget | None = None, operation_deadline=None):
+    """Serialize state read-modify-write across threads/processes (fcntl / msvcrt). The lock lives in a
+    sibling file because atomic replacement changes the target's inode."""
+    if lock_deadline is not None and (isinstance(lock_deadline, bool)
+            or not isinstance(lock_deadline, (float, int)) or not math.isfinite(lock_deadline)):
+        raise ValueError("lock_deadline must be a finite monotonic timestamp")
+    if lock_budget is not None and (not isinstance(lock_budget, LockAcquisitionBudget)
+                                    or lock_deadline is not None):
+        raise ValueError("lock_budget must be a LockAcquisitionBudget, without lock_deadline")
+    _state_operation_check(operation_deadline)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with _thread_state_lock(_PLUGIN_STATE_LOCKS_GUARD, lock_deadline, lock_budget, operation_deadline):
+        thread_lock = _PLUGIN_STATE_LOCKS.setdefault(str(lock_path.resolve(strict=False)), threading.RLock())
+    with _thread_state_lock(thread_lock, lock_deadline, lock_budget, operation_deadline):
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+b")
+        _cleanup_primary_2 = None
+        try:
+            if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+                import msvcrt
+                if handle.seek(0, os.SEEK_END) == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+            with _acquisition_scope(lock_deadline, lock_budget, operation_deadline) as acquisition_deadline:
+                _acquire_state_file(handle, acquisition_deadline)
+            _cleanup_primary_3 = None
+            try:
+                yield
+            except BaseException as _cleanup_error_3:
+                _cleanup_primary_3 = _cleanup_error_3
+                raise
+            finally:
+                if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+                    def release():
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    _state_lock_cleanup(release, primary=_cleanup_primary_3)
+                else:
+                    import fcntl
+                    _state_lock_cleanup(lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN), primary=_cleanup_primary_3)
+        except BaseException as _cleanup_error_2:
+            _cleanup_primary_2 = _cleanup_error_2
+            raise
+        finally:
+            _state_lock_cleanup(handle.close, primary=_cleanup_primary_2)
+
+
+class PluginState:
+    """Atomic, quota-bounded JSON key/value state owned by one plugin."""
+
+    def __init__(self, plugin_id: str, skill_namespace: str = "") -> None:
+        self._plugin_id = plugin_id
+        self._data_namespace = _plugin_data_namespace(plugin_id, skill_namespace)
+
+    @property
+    def data_dir(self) -> Path:
+        """Profile-scoped directory matching portable plugins' PLUGIN_DATA."""
+        return get_hermes_home() / "plugin-data" / self._data_namespace
+
+    @property
+    def path(self) -> Path:
+        return self.data_dir / "state.json"
+
+    @property
+    def quota_bytes(self) -> int:
+        return _PLUGIN_STATE_QUOTA_BYTES
+
+    @staticmethod
+    def _validate_key(key: str) -> None:
+        if not isinstance(key, str) or not _PLUGIN_STATE_KEY_RE.fullmatch(key) or ".." in key:
+            raise ValueError(
+                "Plugin state keys must be 1-128 characters using letters, "
+                "numbers, '_', '-', '.', or ':' (without '..')"
+            )
+
+    def _read_unlocked(self) -> dict[str, Any]:
+        try:
+            with open(self.path, encoding="utf-8-sig") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Cannot parse plugin state {self.path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Cannot parse plugin state {self.path}: root must be an object")
+        return data
+
+    def get(self, key: str, default: Any = None, *, lock_deadline: float | None = None,
+            lock_budget: LockAcquisitionBudget | None = None, operation_deadline=None,
+            commit_guard=None) -> Any:
+        """Read JSON; opt into an absolute deadline or cumulative acquisition budget."""
+        self._validate_key(key)
+        _state_operation_check(operation_deadline, commit_guard)
+        with _locked_plugin_state(self.path, lock_deadline=lock_deadline, lock_budget=lock_budget,
+                                  operation_deadline=operation_deadline):
+            _state_operation_check(operation_deadline, commit_guard)
+            value = self._read_unlocked().get(key, default)
+            _state_operation_check(operation_deadline, commit_guard)
+        _state_operation_check(operation_deadline, commit_guard)
+        return value
+
+    def set(self, key: str, value: Any, *, lock_deadline: float | None = None,
+            lock_budget: LockAcquisitionBudget | None = None, operation_deadline=None,
+            commit_guard=None) -> None:
+        """Atomically set one JSON value without dropping concurrent updates."""
+        self._validate_key(key)
+        _state_operation_check(operation_deadline, commit_guard)
+        published = False
+        try:
+            with _locked_plugin_state(self.path, lock_deadline=lock_deadline, lock_budget=lock_budget,
+                                      operation_deadline=operation_deadline):
+                _state_operation_check(operation_deadline, commit_guard)
+                data = self._read_unlocked()
+                _state_operation_check(operation_deadline, commit_guard)
+                if self._plugin_id == "friday_rework" and key == "product_access.v1":
+                    from hermes_cli.friday_product_access import KEY, advance_access
+                    value = advance_access(data.get(KEY, {"schema": KEY, "users": {}}), value)
+                data[key] = value
+                try:
+                    encoded = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Plugin state value for {key!r} is not JSON-serializable") from exc
+                _state_operation_check(operation_deadline, commit_guard)
+                if len(encoded) > self.quota_bytes:
+                    raise ValueError(
+                        f"Plugin state quota exceeded: {len(encoded)} bytes is greater "
+                        f"than the {self.quota_bytes}-byte per-plugin quota"
+                    )
+                from utils import atomic_json_write
+                options = ({"write_deadline": operation_deadline, "commit_guard": commit_guard}
+                           if operation_deadline is not None or commit_guard is not None else {})
+                atomic_json_write(self.path, data, mode=0o600, **options)
+                published = True
+            _state_operation_check(operation_deadline, commit_guard)
+        except Exception as exc:
+            from utils import AtomicWriteUncertainError
+            if isinstance(exc, AtomicWriteUncertainError):
+                raise
+            if published:
+                raise AtomicWriteUncertainError("Plugin state published; lock completion uncertain",
+                                                stage="plugin_state_lock_exit") from exc
+            raise

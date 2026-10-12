@@ -1,0 +1,11 @@
+# Frozen kernel26 / CLI22 final Source refusals
+
+**CURRENT: kernel C55 REQUEST_CHANGES3; CLI C68 REQUEST_CHANGES5; GNU9.7 ACCEPT_SOURCE_DEPENDENCY_EVIDENCE_ONLY. Current controls are DEFINITIONS_ONLY_NOT_RUN, runtime UNACCEPTED.** This is a complete inert analysis archive on the declared main snapshot c080733b5802cdbdb2a102ed08e367fb92b76a87. No candidate is wired or installed.
+
+Kernel contains all26 current modules, connected schema, complete new41 definition module/contract and embedded current/original controls. CLI contains all22 current modules, all145 current definitions (24 positive/121 negative), exact archival six positive/direct/wrapped check programs and three prior actual-contract modules. Selected actual bootstrap/native/ledger/renderer/project dependencies and Python pathlib are complete bodies. GNU contains exact timeout9.7 Source/license, selected wait/build support and Ubuntu patch/build provenance.
+
+Read [final3 kernel findings](KERNEL26-FINAL3-FINDINGS.json), [final5 CLI findings](CLI22-FINAL5-FINDINGS.json), [current bindings and lineage](Evidence/CURRENT-BINDINGS-AND-LINEAGE.json), [complete Source index](Evidence/COMPLETE-SOURCE-INDEX.json), [GNU provenance](GNU97/PROVENANCE.json), [historical limits](Evidence/HISTORY-AND-LIMITS.md), and [normalization](Evidence/NORMALIZATION.md). Concrete line sites point into complete .py.txt/.c.txt bodies with preserved line numbers. All findings are Source deductions, not executed counterexamples.
+
+Parent dependency copies are selected historical lineage; current CLI/Source22 wins where logical modules overlap. No transitive runtime import closure or live fixture binding is established. Earlier author PASS/ACTIVE/PENDING is historical; no previous runtime result transfers to these bytes. Real fixed bootstrap/cleanup, original32/C45/FD8/H991/C59_28/C55_41 and original finite30 controls require corrected exact safety and fresh Root admission. Full native/install/release gates remain mandatory and unaccepted.
+
+[PUBLIC-MANIFEST.json](PUBLIC-MANIFEST.json) is self-excluded and covers exact candidate repository bytes. Private reversible maps, actual homes/endpoints/identities/native receipts and archive binaries are excluded. Independent public privacy acceptance is still required.

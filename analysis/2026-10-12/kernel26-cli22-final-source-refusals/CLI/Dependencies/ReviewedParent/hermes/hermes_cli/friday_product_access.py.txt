@@ -1,0 +1,298 @@
+"""Friday policy over native configuration/PluginState, not a user database.
+
+Read on every admission. Import has no registration, config or filesystem effect.
+Only an explicitly enabled product policy changes normal Hermes behavior.
+"""
+import hashlib
+import json
+import re
+import time
+
+KEY = "product_access.v1"
+
+
+def text(value, *, empty=False):
+    if (not isinstance(value, str) or (not empty and not value)
+            or len(value.encode()) > 512 or any(ord(c) < 32 for c in value)):
+        raise ValueError("invalid_product_identity")
+    return value
+
+
+def profile_name(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value):
+        raise ValueError("invalid_product_profile")
+    from hermes_cli.profiles import validate_profile_name
+    validate_profile_name(value)  # Preserve the exact native identity; never normalize one field.
+    return value
+
+
+def settings():
+    from hermes_cli.config import load_config_readonly, require_readable_config_before_write
+    # Diagnostic validation stops the permissive loader from erasing a corrupt policy.
+    require_readable_config_before_write()
+    value = (load_config_readonly().get("plugins") or {}).get("entries", {}).get("friday_rework", {})
+    return value.get("settings", {})
+
+
+def access_policy():
+    policy = settings().get("product_access")
+    if policy is None or (isinstance(policy, dict) and set(policy) == {"enabled"} and policy["enabled"] is False):
+        return None
+    if not isinstance(policy, dict) or set(policy) != {"enabled", "accounts"} or policy["enabled"] is not True:
+        raise ValueError("invalid_product_access_policy")
+    accounts = policy["accounts"]
+    if not isinstance(accounts, list) or not 0 < len(accounts) <= 64:
+        raise ValueError("invalid_product_accounts")
+    seen = set()
+    for account in accounts:
+        if not isinstance(account, dict) or set(account) != {"platform", "transport_profile", "account_id", "runtime_profiles"}:
+            raise ValueError("invalid_product_account")
+        for k in ["platform", "account_id"]:
+            text(account[k])
+        profile_name(account["transport_profile"])
+        if not isinstance(account["runtime_profiles"], list) or not account["runtime_profiles"]:
+            raise ValueError("invalid_product_runtime_profiles")
+        for p in account["runtime_profiles"]:
+            profile_name(p)
+        pair = (account["platform"], account["transport_profile"])
+        if pair in seen:
+            raise ValueError("ambiguous_product_account")
+        seen.add(pair)
+    return policy
+
+
+def principal_id(platform, transport_profile, account_id, user_id):
+    values = [text(platform), profile_name(transport_profile), text(account_id), text(user_id)]
+    return hashlib.sha256(json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+def validate_access(document):
+    if not isinstance(document, dict) or set(document) != {"schema", "users"} or document["schema"] != KEY:
+        raise ValueError("invalid_product_access_store")
+    if not isinstance(document["users"], dict) or len(document["users"]) > 10000:
+        raise ValueError("invalid_product_users")
+    for key, row in document["users"].items():
+        fields = {"platform", "transport_profile", "account_id", "user_id", "enabled", "role"}
+        if (not isinstance(row, dict) or set(row) not in (fields, fields | {"generation"})
+                or type(row["enabled"]) is not bool or row["role"] not in {"user", "admin"}
+                or ("generation" in row and (type(row["generation"]) is not int or row["generation"] < 1))
+                or key != principal_id(row["platform"], row["transport_profile"], row["account_id"], row["user_id"])):
+            raise ValueError("invalid_product_user")
+    return document
+
+
+def advance_access(previous, requested):
+    """Called inside the native PluginState write lock, never by a tool grant.
+
+    Legacy rows are readable for administrative migration but cannot mint a
+    retained capability until this authoritative write assigns a generation.
+    Omitted principals become disabled tombstones so delete/recreate cannot
+    recycle an old grant. Caller-supplied generations never reset native state.
+    """
+    validate_access(previous)
+    validate_access(requested)
+    result = {"schema": KEY, "users": {}}
+    for key in previous["users"].keys() | requested["users"].keys():
+        old = previous["users"].get(key)
+        row = dict(requested["users"].get(key) or (old | {"enabled": False}))
+        generation = old.get("generation", 0) if old else 0
+        if not generation or (old["enabled"] and not row["enabled"]) or (old and old["role"] != row["role"]):
+            generation += 1
+        row["generation"] = generation
+        result["users"][key] = row
+    return validate_access(result)
+
+
+def current_access(state=None):
+    if state is None:
+        from hermes_cli.plugins_state import PluginState
+        state = PluginState("friday_rework")
+    return validate_access(state.get(KEY, {"schema": KEY, "users": {}}, lock_deadline=time.monotonic() + 2))
+
+
+def gateway_allowed(source, *, transport_profile, runtime_profile):
+    """A product allow is necessary but never replaces native grant authorization."""
+    try:
+        policy = access_policy()
+        if policy is None:
+            return True
+        platform = source.platform.value
+        matches = [a for a in policy["accounts"] if a["platform"] == platform and a["transport_profile"] == transport_profile]
+        if len(matches) != 1 or runtime_profile not in matches[0]["runtime_profiles"]:
+            return False
+        account = matches[0]
+        key = principal_id(platform, transport_profile, account["account_id"], source.user_id)
+        row = current_access()["users"].get(key)
+        return row is not None and row["enabled"] is True
+    except Exception:  # health: allow BLE001 -- Deny channel admission on any policy, identity or state-read failure; never grant by fallback.
+        return False
+
+
+def admin_policy():
+    # Dashboard auth authority belongs to its launch home, never ?profile=.
+    from hermes_constants import get_process_hermes_home, set_hermes_home_override, reset_hermes_home_override
+    token = set_hermes_home_override(str(get_process_hermes_home()))
+    try:
+        policy = settings().get("admin")
+    finally:
+        reset_hermes_home_override(token)
+    if policy is None or (isinstance(policy, dict) and set(policy) == {"enabled"} and policy["enabled"] is False):
+        return None
+    if not isinstance(policy, dict) or set(policy) != {"enabled", "operators", "profiles"} or policy["enabled"] is not True:
+        raise ValueError("invalid_product_admin_policy")
+    if not isinstance(policy["operators"], list) or not policy["operators"]:
+        raise ValueError("invalid_product_operators")
+    for operator in policy["operators"]:
+        if not isinstance(operator, dict) or set(operator) != {"provider", "user_id", "org_id"}:
+            raise ValueError("invalid_product_operator")
+        text(operator["provider"]); text(operator["user_id"]); text(operator["org_id"], empty=True)
+    if not isinstance(policy["profiles"], list) or not policy["profiles"] or len(policy["profiles"]) > 32:
+        raise ValueError("invalid_product_profiles")
+    for p in policy["profiles"]:
+        profile_name(p)
+    return policy
+
+
+def operator_allowed(identity):
+    try:
+        policy = admin_policy()
+        if policy is None:
+            return True
+        return any(identity == op for op in policy["operators"])
+    except Exception:  # health: allow BLE001 -- Deny operator admission when policy or identity evaluation fails; do not expose auth data.
+        return False
+
+
+def session_allowed(session):
+    try:
+        if admin_policy() is None:
+            return True
+        from hermes_cli.dashboard_auth.base import Session
+        return (isinstance(session, Session) and session.expires_at > time.time()
+                and operator_allowed({k: getattr(session, k) for k in ("provider", "user_id", "org_id")}))
+    except Exception:  # health: allow BLE001 -- Deny a session when policy, expiry or identity validation fails.
+        return False
+
+
+def request_allowed(request):
+    """Deny unaudited native data/config routes in the product administration profile.
+
+    Native login/cookie/CSRF still owns authentication. The plugin provides the
+    scoped data surfaces; remaining privileged donor pages need explicit review.
+    """
+    try:
+        if admin_policy() is None:
+            return True
+        if not getattr(request.app.state, "auth_required", False) or not session_allowed(getattr(request.state, "session", None)):
+            return False
+        prefix = request.scope.get("root_path", "").rstrip("/")
+        path = request.url.path
+        if prefix and path.startswith(prefix + "/"):
+            path = path[len(prefix):]
+        requested_profile = request.query_params.get("profile")
+        if requested_profile is not None and requested_profile not in admin_policy()["profiles"]:
+            return False
+        if not path.startswith("/api/"):
+            return True
+        return (path.startswith("/api/plugins/friday_rework/")
+                or (request.method == "GET" and path in {"/api/auth/me", "/api/plugins", "/api/dashboard/plugins", "/api/host/identity"})
+                or (request.method == "POST" and path == "/api/auth/ws-ticket"))
+    except Exception:  # health: allow BLE001 -- Deny the HTTP route when policy, profile or request evaluation fails.
+        return False
+
+
+def product_websocket_allowed():
+    """Unaudited RPC/console/PTY/display surfaces are unavailable in product admin."""
+    try:
+        return admin_policy() is None
+    except Exception:  # health: allow BLE001 -- Deny the unaudited WebSocket surface on every policy-read failure.
+        return False
+
+
+class ProductDashboardBoundary:
+    """Narrow ASGI boundary; HTTP continues through native auth + plugin router."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "websocket":
+            return await self.app(scope, receive, send)
+        from starlette.websockets import WebSocketDisconnect
+        revoked = False
+
+        async def revoke():
+            nonlocal revoked
+            if not revoked:
+                revoked = True
+                await send({"type": "websocket.close", "code": 1008,
+                            "reason": "product_websocket_surface_unaudited"})
+
+        if not product_websocket_allowed():
+            await revoke()
+            return
+
+        async def current_receive():
+            if revoked or not product_websocket_allowed():
+                await revoke()
+                return {"type": "websocket.disconnect", "code": 1008}
+            message = await receive()
+            # Policy may change while a native socket waits for its next frame.
+            if revoked or not product_websocket_allowed():
+                await revoke()
+                return {"type": "websocket.disconnect", "code": 1008}
+            return message
+
+        async def current_send(message):
+            if revoked or not product_websocket_allowed():
+                await revoke()
+                if message.get("type") != "websocket.close":
+                    raise WebSocketDisconnect(code=1008)
+                return
+            await send(message)
+
+        try:
+            await self.app(scope, current_receive, current_send)
+        except WebSocketDisconnect:
+            if not revoked:
+                raise
+
+
+def source_account_origin(source):
+    """Stamp a NEW native row from its pinned receiving-transport authority only.
+
+    This is persisted evidence of the configured account at native creation,
+    never a lookup of current account configuration for historical rows.
+    """
+    from gateway.session_identity import identity_of
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    identity = identity_of(source)
+    if identity is None or identity.transport_inferred:
+        return None
+    token = set_hermes_home_override(str(identity.authorization_home))
+    try:
+        policy = access_policy()
+        matches = [] if policy is None else [a for a in policy["accounts"]
+            if a["platform"] == source.platform.value
+            and a["transport_profile"] == identity.transport_profile
+            and identity.runtime_profile in a["runtime_profiles"]]
+        if len(matches) != 1:
+            return None
+        return {"schema": "friday.account_origin.v1", "platform": source.platform.value,
+                "transport_profile": identity.transport_profile,
+                "account_id": matches[0]["account_id"]}
+    except Exception:  # health: allow BLE001 -- Leave account provenance unknown on failed validation; never stamp a guessed account.
+        return None
+    finally:
+        reset_hermes_home_override(token)
+
+
+def product_rpc_allowed(transport):
+    """Also refuse RPC on a retained WS transport after policy activation.
+
+    The native local stdio TUI keeps its existing authorization contract.
+    """
+    if product_websocket_allowed() or transport is None:
+        return True
+    from tui_gateway.ws import WSTransport
+    return (not isinstance(transport, WSTransport)
+            and getattr(transport, "auth_identity", None) is None)
