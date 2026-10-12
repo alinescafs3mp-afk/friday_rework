@@ -1,0 +1,13 @@
+# Honest history and cutoff
+
+This stable archive is tied to base main `9b88dda20f922e8a71a5fa7ce0414dac3f2c90a9`. The preceding root README is preserved byte-for-byte after one new archive paragraph; its prior physical failures and architecture remain.
+
+Kernel26 author output was PARTIAL_SOURCE_PREPARED_DIRECTORY_CONTRACT_DEVIATION. Three output directories were observed as 0775 although the child reported 0755. Root later changed only their metadata to 0700, verified all 67 payload bytes unchanged and checked 54 known births freshly absent. This happened after the original Source package expired; exact Root receipt was 733.57 seconds after its original final deadline. A fresh finite metadata-cleanup clock does not reset the Source clock, erase the deviation, establish on-time completion or supply Safety/runtime credit. First-helper births and aggregate raw wait/usage remained UNKNOWN, not zero. Expired cleanup exited97 without writes, a final verifier exited1 and the seal exited0.
+
+The current20 CLI Source was sealed before its original useful deadline. Native completion was 56 seconds after useful and before final; exact Root intake was 105.14 seconds after the original final deadline. Root received the partial bytes and closed lifecycle records without reset or on-time credit. Intermediate directory/mode assumption checks failed and were later reconciled; that history remains. Uninstrumented births, model tokens/tier and aggregate CPU/RSS/IO remain UNKNOWN, not zero.
+
+The CLI historical metadata negative had a 1-second budget and 1.470499-second observation with late DELIVERED. The renderer's scaled half-second CPU overrun was also a Source FAIL. They are preserved as historical failures, not rerun, not evidence of a physical whole30 run, and not transferred to changed dependencies. Original151/106/renderer memory or partial observations remain provenance only.
+
+The older public actual21/zombie and canonical gates, alias/full310 failures and genuine-entry refusals remain in the pinned root README and preceding archives. This archive does not replace them or transfer their acceptance. The consumed G7 failure and specifically admitted G8 diagnostic remain no-replay history; existing guard/kernel/browser/native stops remain.
+
+No Source execution, native API, network/model call, Git action, service/config/auth/goal change, private kernel/group/mount effect or product activation occurred during this archive preparation. Preparation helper metadata belongs to the private ledger; it is never published as raw native/goal/handoff/config data. Publication still requires an independent privacy review and the integrator's exact manifest check.

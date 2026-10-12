@@ -1,0 +1,481 @@
+"""Connected selected-source output checks; no OS/PTY/native console effects.
+
+Real private fixture FS/SQLite and actual native bridge/task-ledger bodies.
+FD syscalls and FileIO type are explicitly inert canary seams. No production
+initializer/MRO, real descriptor, model, worker, native queue, or IO grant.
+"""
+import ast, asyncio, base64, contextlib, copy, datetime, errno, gc, hashlib, io
+import json, os, pathlib, resource, stat, threading, time, types
+
+W = pathlib.Path(__file__).parent
+os.umask(0o077)
+START = time.monotonic()
+FD_START = len(list(pathlib.Path('/proc/self/fd').iterdir()))
+P = W / 'check_source.py'
+tree = ast.parse(P.read_text())
+first = next(i for i, node in enumerate(tree.body) if isinstance(node, ast.FunctionDef) and node.name == 'base_positive')
+n = {'__file__': str(P), '__name__': 'bound_source_scaffold'}
+exec(compile(ast.Module(body=tree.body[:first], type_ignores=[]), str(P), 'exec'), n)
+for name in ['runtime_fixture', 'claim_and_withdraw', 'source_result_fixture']:
+    node = next(v for v in tree.body if isinstance(v, ast.FunctionDef) and v.name == name)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(P), 'exec'), n)
+output = n['output']; work = n['work']; results = n['results']; rt = n['result_tool']
+setup = n['setup']; input_turn = n['input_turn']; joined = n['joined']; native = n['native']
+ids = n['ids']; claim = n['claim_and_withdraw']; assoc = n['associations']; users = n['users']
+OLD_OS, OLD_FCNTL, OLD_IO = output.os, output.fcntl, output.io
+CONTROLS = []; FAILURE = []; CANARIES = []; TIMINGS = []
+
+
+def test(name, fn):
+    start = time.monotonic()
+    try:
+        value = fn()
+    except BaseException as exc:
+        FAILURE.append({'name': name, 'type': type(exc).__name__, 'error': str(exc)})
+        raise
+    CONTROLS.append({'name': name, 'status': 'PASS', 'elapsed_seconds': time.monotonic()-start,
+                     'observation': value})
+    print(name, 'PASS', flush=True)
+
+
+class CanaryRaw(io.RawIOBase):
+    """Inert FileIO type/FD source seam; not an actual native descriptor."""
+    def __init__(self):
+        self.writes = 0; self.flushes = 0; self.monitor = True
+    def writable(self): return True
+    def fileno(self): return 91
+    def write(self, value):
+        if self.monitor:
+            self.writes += 1
+            raise AssertionError('original buffered write must not run')
+        return len(value)
+    def flush(self):
+        if self.monitor:
+            self.flushes += 1
+            # Reproduces a genuinely slow legacy flush if it is ever invoked.
+            threading.Event().wait(.04)
+
+
+class FDCanary:
+    """Actual nonblocking write contract simulated without opening an OS FD."""
+    def __init__(self, mode='ok', cap=None, cli=None, ctx=None, kind='pipe'):
+        self.mode = mode; self.cap = cap; self.cli = cli; self.ctx = ctx
+        self.flags = {91: os.O_WRONLY}; self.fdflags = {91: 0}; self.live = set()
+        self.stats = {91: types.SimpleNamespace(st_dev=100, st_ino=200,
+                     st_mode=(stat.S_IFIFO if kind == 'pipe' else stat.S_IFCHR if kind == 'tty' else stat.S_IFREG)|0o600,
+                     st_rdev=0)}
+        self.written = bytearray(); self.calls = []; self.opens = 0; self.closes = 0
+        self.write_calls = 0; self.blocked_until = time.monotonic()+1
+        self.kind = kind; self.next_fd = 92
+        self.os = types.SimpleNamespace(O_ACCMODE=os.O_ACCMODE, O_RDONLY=os.O_RDONLY,
+                  O_WRONLY=os.O_WRONLY, O_NONBLOCK=os.O_NONBLOCK, O_CLOEXEC=os.O_CLOEXEC,
+                  O_NOCTTY=os.O_NOCTTY, open=self.open, close=self.close, fstat=self.fstat,
+                  isatty=lambda fd:self.kind=='tty', write=self.write)
+        self.fcntl_api = types.SimpleNamespace(F_GETFL=OLD_FCNTL.F_GETFL, F_GETFD=OLD_FCNTL.F_GETFD,
+                           FD_CLOEXEC=OLD_FCNTL.FD_CLOEXEC, fcntl=self.fcntl)
+        CANARIES.append(self)
+    def fstat(self, fd):
+        if fd not in self.stats: raise OSError('inert missing descriptor')
+        return self.stats[fd]
+    def fcntl(self, fd, command):
+        self.calls.append(('fcntl', fd, command))
+        if command == OLD_FCNTL.F_GETFL: return self.flags[fd]
+        if command == OLD_FCNTL.F_GETFD: return self.fdflags[fd]
+        raise AssertionError('No F_SETFL or mutation of original descriptor allowed')
+    def open(self, path, flags):
+        assert path == '/proc/self/fd/91' and flags & os.O_NONBLOCK and flags & os.O_CLOEXEC and flags & os.O_NOCTTY
+        assert self.flags[91] == os.O_WRONLY
+        fd = self.next_fd; self.next_fd += 1
+        self.flags[fd] = os.O_WRONLY|os.O_NONBLOCK; self.fdflags[fd] = OLD_FCNTL.FD_CLOEXEC
+        self.stats[fd] = copy.copy(self.stats[91]); self.live.add(fd); self.opens += 1
+        self.calls.append(('open', path, flags, fd))
+        if self.mode == 'open_identity_drift': self.stats[fd].st_ino += 1
+        if self.mode == 'missing_nonblock': self.flags[fd] &= ~os.O_NONBLOCK
+        if self.mode == 'missing_cloexec': self.fdflags[fd] = 0
+        if self.mode == 'cancel_on_open':
+            task = asyncio.current_task(); asyncio.get_running_loop().call_soon(task.cancel)
+        return fd
+    def close(self, fd):
+        assert fd in self.live, 'must close only exact owned canary descriptor once'
+        self.live.remove(fd); self.closes += 1; self.calls.append(('close',fd))
+        if self.mode=='close_error_after_close':raise OSError('inert uncertain close result')
+    def write(self, fd, chunk):
+        assert fd in self.live and fd != 91 and self.flags[fd] & os.O_NONBLOCK
+        assert type(chunk) is bytes and 0 < len(chunk) <= output.WRITE_SLICE
+        self.write_calls += 1; self.calls.append(('write',fd,len(chunk),id(asyncio.current_task())))
+        if self.mode in {'slow_write','slow_flush','blocked'} or (self.mode=='partial_timeout' and self.written):
+            raise BlockingIOError(errno.EAGAIN, 'inert native output backpressure')
+        if self.mode=='error': raise OSError('inert native write error')
+        if self.mode=='zero': return 0
+        if self.mode=='bool_count': return True
+        count = min(17,len(chunk)) if self.mode in {'partial_complete','partial_timeout'} else len(chunk)
+        self.written.extend(chunk[:count])
+        if self.mode=='revoke': self.cap.revoked=True
+        if self.mode=='replace_stream': self.cli.console.file=io.StringIO()
+        if self.mode=='replace_console': self.cli.console=types.SimpleNamespace(file=self.cli.console.file,_lock=threading.RLock())
+        if self.mode=='replace_lifetime': self.cli._friday_cli_output=copy.copy(self.cli._friday_cli_output)
+        if self.mode=='frontend_close': self.cli._friday_cli_output.close()
+        if self.mode=='original_fd_drift': self.stats[91].st_ino += 1
+        if self.mode=='interrupt': self.cli.agent._interrupt_requested=True
+        if self.mode=='unload': self.ctx._manager._plugins.clear()
+        return count
+    def observation(self):
+        return {'mode':self.mode,'opens':self.opens,'closes':self.closes,'live_owned_fds':sorted(self.live),
+                'write_calls':self.write_calls,'accepted_bytes':len(self.written),'original_flags':self.flags[91],
+                'global_flag_mutations':0,'writer_task_ids':sorted({v[3] for v in self.calls if v[0]=='write'})}
+
+
+@contextlib.contextmanager
+def sink(cli,cap,ctx,mode='ok',kind='pipe'):
+    raw = CanaryRaw(); stream=io.TextIOWrapper(io.BufferedWriter(raw),encoding='utf-8')
+    canary=FDCanary(mode,cap,cli,ctx,kind)
+    original_stream=cli.console.file
+    cli.console.file=stream
+    output.os=canary.os;output.fcntl=canary.fcntl_api
+    output.io=types.SimpleNamespace(TextIOWrapper=io.TextIOWrapper,BufferedWriter=io.BufferedWriter,
+                                  FileIO=CanaryRaw,StringIO=io.StringIO)
+    try:
+        yield canary, raw
+    finally:
+        assert not canary.live, canary.observation()
+        output.os=OLD_OS;output.fcntl=OLD_FCNTL;output.io=OLD_IO
+        raw.monitor=False;stream.close()
+        cli.console.file=original_stream
+
+
+async def direct(cli,ctx,**kwargs):
+    return await ctx.deliver_cli_document(route=work.route_for(work.current_turn()),
+                    data=b'exact \x00 \xff bytes',file_name='answer.txt',caption='bounded caption',**kwargs)
+
+
+def positive(kind='pipe',mode='ok'):
+    f,cap,cli,ctx,adm,host=setup()
+    with sink(cli,cap,ctx,mode,kind) as (c,raw), input_turn(cli):
+        receipt=asyncio.run(direct(cli,ctx,timeout=10))
+        assert receipt['state']=='DELIVERED' and receipt['native_output']=='bounded-original-console-write'
+        body=json.loads(c.written)
+        assert base64.b64decode(body['data'])==b'exact \x00 \xff bytes' and body['bytes']==15
+        assert body['sha256']==hashlib.sha256(b'exact \x00 \xff bytes').hexdigest() and body['route']==receipt['route']
+        assert receipt['human_read']=='UNCONFIRMED' and c.opens==c.closes==1
+        assert c.flags[91]==os.O_WRONLY and not cli._friday_cli_output.busy.locked()
+        assert raw.writes==raw.flushes==0
+        assert len(c.observation()['writer_task_ids'])==1
+        return c.observation()
+
+
+test('original_frontend_pipe_capability_exact_bytes_route_no_flush_shared_flags_or_detached_writer',positive)
+test('original_frontend_terminal_capability_supported_source_contract',lambda:positive('tty'))
+test('truthful_native_partial_counts_complete_once_under_same_deadline',lambda:positive(mode='partial_complete'))
+
+
+def timed(mode,outer=None,cancel=False):
+    f,cap,cli,ctx,adm,host=setup()
+    with sink(cli,cap,ctx,mode) as (c,raw),input_turn(cli):
+        async def run():
+            start=time.monotonic();events=[]
+            task=asyncio.create_task(direct(cli,ctx,timeout=.12))
+            def control():
+                events.append({'at':time.monotonic()-start,'done':task.done()})
+                if cancel:task.cancel()
+            timer=asyncio.get_running_loop().call_later(.035,control)
+            try:
+                try:
+                    receipt=await (asyncio.wait_for(task,outer) if outer is not None else task)
+                    assert not cancel and outer is None
+                    assert receipt['state']=='UNKNOWN'
+                    state=receipt['state']
+                except (asyncio.CancelledError,TimeoutError):
+                    assert cancel or outer is not None
+                    state='CANCELLED_AND_JOINED'
+                elapsed=time.monotonic()-start
+                await asyncio.sleep(0)
+                assert task.done() and not c.live and c.opens==c.closes==1
+                assert raw.writes==raw.flushes==0 and not cli._friday_cli_output.busy.locked()
+                assert events and events[0]['done'] is False
+                assert elapsed < .35, (mode,elapsed)
+                assert elapsed < .16 if (cancel or outer is not None) else elapsed < .18
+                TIMINGS.append({'mode':mode,'output_timeout':.12,'outer_wait_for':outer,'cancel':cancel,
+                                'elapsed':elapsed,'state':state,'control':events,'accepted_bytes':len(c.written)})
+                return TIMINGS[-1]
+            finally:
+                timer.cancel()
+                if not task.done():task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):await task
+        return asyncio.run(run())
+
+
+test('slow_nonblocking_write_expires_without_loop_starvation_or_late_DELIVERED',lambda:timed('slow_write'))
+test('slow_original_flush_never_called_pending_sink_expires_and_joins',lambda:timed('slow_flush'))
+test('outer_wait_for_executes_on_time_and_joins_owned_descriptor',lambda:timed('blocked',outer=.05))
+test('cancel_control_executes_before_completion_and_closes_owned_descriptor',lambda:timed('blocked',cancel=True))
+test('partially_accepted_bytes_then_backpressure_UNKNOWN_no_late_output',lambda:timed('partial_timeout'))
+
+
+def faults(mode):
+    f,cap,cli,ctx,adm,host=setup()
+    with sink(cli,cap,ctx,mode) as (c,raw),input_turn(cli):
+        receipt=asyncio.run(direct(cli,ctx))
+        assert receipt['state']=='UNKNOWN', (mode,receipt)
+        assert c.opens==c.closes==1 and not c.live and raw.writes==raw.flushes==0
+        if mode=='close_error_after_close':
+            assert cli._friday_cli_output.closed.is_set() and cli._friday_cli_output.uncertain_descriptor is not None
+            n['deny'](cli._friday_cli_output.check)
+        return c.observation()
+
+
+for mode in ['error','zero','bool_count','revoke','replace_stream','replace_console','replace_lifetime',
+             'frontend_close','original_fd_drift','interrupt','unload','close_error_after_close']:
+    test('owned_output_'+mode+'_UNKNOWN_and_exact_descriptor_closed',lambda mode=mode:faults(mode))
+
+
+def open_refusal(mode='ok',kind='file'):
+    f,cap,cli,ctx,adm,host=setup()
+    with sink(cli,cap,ctx,mode,kind) as (c,raw),input_turn(cli):
+        receipt=asyncio.run(direct(cli,ctx))
+        assert receipt['state']=='FAILED' and c.write_calls==0 and not c.live
+        assert c.opens==c.closes and raw.writes==raw.flushes==0
+        return c.observation()
+
+
+test('unsupported_regular_file_no_descriptor_or_effect',open_refusal)
+for mode in ['open_identity_drift','missing_nonblock','missing_cloexec']:
+    test('descriptor_acquisition_'+mode+'_refuses_before_write_and_closes',lambda mode=mode:open_refusal(mode,'pipe'))
+
+
+class SlowLegacyStream(io.StringIO):
+    def __init__(self):super().__init__();self.writes=0;self.flushes=0
+    def write(self,value):self.writes+=1;threading.Event().wait(.04);return super().write(value)
+    def flush(self):self.flushes+=1;threading.Event().wait(.04)
+
+
+def unsupported_callback():
+    f,cap,cli,ctx,adm,host=setup();stream=SlowLegacyStream();cli.console.file=stream
+    with input_turn(cli):
+        receipt=asyncio.run(direct(cli,ctx))
+        assert receipt['state']=='FAILED' and stream.writes==stream.flushes==0 and stream.getvalue()==''
+        assert not cli._friday_cli_output.busy.locked()
+        return {'writes':0,'flushes':0,'all_legitimate_sinks_refused':False,'state':receipt['state']}
+
+
+test('arbitrary_slow_sync_write_flush_and_custom_async_hooks_refused_before_effect',unsupported_callback)
+
+
+def invalid_values():
+    f,cap,cli,ctx,adm,host=setup();observations=[]
+    with input_turn(cli):
+        route=work.route_for(work.current_turn())
+        async def run():
+            async def invoke(**kw):
+                args=dict(route=route,data=b'x',file_name='one.txt',caption='ok');args.update(kw)
+                receipt=await ctx.deliver_cli_document(**args)
+                assert receipt=={'state':'FAILED','error':'cli_document_preflight_rejected'},(kw,receipt)
+                assert cli.console.file.getvalue()==''
+            for value in [True,False,None,0,-1,31,float('nan'),float('inf'),-float('inf'),'1',[],2**1024]:
+                await invoke(timeout=value);observations.append('timeout:'+type(value).__name__)
+            for value in [True,False,0,-1,float('nan'),float('inf'),'1',[],asyncio.get_running_loop().time()-1]:
+                await invoke(deadline=value);observations.append('deadline:'+type(value).__name__)
+            for value in [True,{},[],b'a','x'*2049,'x'*(512*1024),'\ud800']:
+                await invoke(caption=value);observations.append('caption:'+type(value).__name__)
+            for value in [None,True,'','x'*256,'é'*128,'bad\x7fname','../outside','\ud800']:
+                await invoke(file_name=value);observations.append('filename:'+type(value).__name__)
+            for value in [b'x'*(256*1024+1),bytearray(b'x'),'x',None]:
+                await invoke(data=value);observations.append('data:'+type(value).__name__)
+            bad=copy.deepcopy(route);bad['runtime_home']='x'*(512*1024)
+            await invoke(route=bad);observations.append('unbounded-route')
+            class CustomString(str):
+                def encode(self,*a,**kw):raise AssertionError('custom encoding callback must not execute')
+            bad=copy.deepcopy(route);bad['runtime_home']=CustomString(route['runtime_home'])
+            await invoke(route=bad);observations.append('custom-route-encoder')
+            # The pre-encoding length gate must not invoke a costly encoder.
+            original=work.base64.b64encode
+            work.base64=types.SimpleNamespace(b64encode=lambda data:(_ for _ in ()).throw(AssertionError('must reject before encoding')))
+            try:await invoke(caption='x'*(512*1024))
+            finally:work.base64=base64
+        asyncio.run(run())
+    return {'variants':len(observations),'output_bytes':0,'rejected_before_expensive_encoder':True}
+
+
+test('timeout_deadline_types_bool_NaN_infinity_caption_filename_UTF8_data_route_preencoding_bounds',invalid_values)
+
+
+def maximum_envelope():
+    f,cap,cli,ctx,adm,host=setup()
+    with input_turn(cli):
+        async def run():
+            route=work.route_for(work.current_turn());data=bytes(range(256))*1024
+            receipt=await ctx.deliver_cli_document(route=route,data=data,file_name='界'*85,caption='🙂'*2048)
+            assert receipt['state']=='DELIVERED';encoded=cli.console.file.getvalue().encode('ascii')
+            assert len(encoded)<=output.MAX_ENVELOPE
+            body=json.loads(encoded);assert base64.b64decode(body['data'])==data
+            assert len(body['caption'].encode('utf-8'))==8192 and len(body['file_name'].encode('utf-8'))==255
+            return {'data_bytes':len(data),'ASCII_envelope_bytes':len(encoded),'envelope_limit':output.MAX_ENVELOPE}
+        return asyncio.run(run())
+
+
+test('maximum_binary_UTF8_caption_filename_exact_ASCII_frame_under_memory_and_CPU_limits',maximum_envelope)
+
+
+def absolute_budget():
+    f,cap,cli,ctx,adm,host=setup()
+    with sink(cli,cap,ctx,'blocked') as (c,raw),input_turn(cli):
+        async def run():
+            start=time.monotonic();deadline=asyncio.get_running_loop().time()+.08
+            receipt=await direct(cli,ctx,timeout=30,deadline=deadline)
+            elapsed=time.monotonic()-start
+            assert receipt['state']=='UNKNOWN' and elapsed<.15 and c.opens==c.closes==1
+            return {'caller_seconds':.08,'timeout_seconds':30,'elapsed':elapsed,'state':receipt['state']}
+        return asyncio.run(run())
+
+
+test('narrow_absolute_caller_budget_cannot_be_extended_by_timeout30',absolute_budget)
+
+
+@n['source_result_fixture']
+def connected(cli,ctx,adm,host,row):
+    c,mode=cli._bound_check_canary
+    root=pathlib.Path(row['workspace_reference'])/'workspace';root.mkdir(mode=0o700)
+    artifact=root/'own.txt';artifact.write_bytes(b'original immutable result');artifact.chmod(0o600)
+    tool=rt.ResultTool(host)
+    def action(args):return json.loads(native(cli,adm,lambda _:tool.handle(args,**ids(cli)),tool='friday_result'))
+    before=ctx.state.path.read_bytes();action({'action':'list','reference':row['existing_task_id']});assert before==ctx.state.path.read_bytes()
+    assert action({'action':'inspect','reference':row['existing_task_id'],'paths':['own.txt']})['accepted']
+    artifact.write_bytes(b'changed worker source')
+    # Original fixture association narrows the real consumer budget; no new grace.
+    if mode in {'blocked','partial_timeout','cancel','expired'}:
+        with host.store._locked() as data:
+            current=host.store._owned(data,row['existing_task_id'],row['owner'])
+            current['deadline_unix']=host.store.clock()+(.5 if mode!='expired' else -.01)
+            host.store._save(data)
+    cancelled=False
+    if mode=='cancel':
+        original=c.open
+        def cancel_open(path,flags):
+            fd=original(path,flags)
+            task=asyncio.current_task()
+            asyncio.get_running_loop().call_later(.025,task.cancel)
+            return fd
+        c.os.open=cancel_open;c.mode='blocked'
+    start=time.monotonic()
+    try:answer=action({'action':'deliver','reference':row['existing_task_id']})
+    except asyncio.CancelledError:cancelled=True;answer={'cancelled':True}
+    elapsed=time.monotonic()-start
+    current=host.store.get(row['existing_task_id'],row['owner'])
+    art=current['result']['artifacts'][0];attempts=current['result']['deliveries'][art['reference']]
+    if mode=='ok':
+        assert current['delivery']=='DELIVERED' and len(attempts)==1
+        assert base64.b64decode(json.loads(c.written)['data'])==b'original immutable result'
+        assert attempts[0]['receipt']['human_read']=='UNCONFIRMED'
+    elif mode=='expired':
+        assert answer['accepted'] is False and not attempts and not c.written and c.opens==0
+    else:
+        assert current['delivery']=='UNKNOWN' and len(attempts)==1 and attempts[0]['state']=='UNKNOWN', (mode,current['delivery'],attempts,answer,c.observation(),elapsed)
+        assert elapsed<(30 if mode=='original30' else .7) and (cancelled if mode=='cancel' else not cancelled)
+        if mode=='original30':assert elapsed>=29.4  # shared 30s minus .5s metadata reserve; upper bound strengthened to <=30
+        writes=c.write_calls;output_bytes=bytes(c.written)
+        action({'action':'deliver','reference':row['existing_task_id'],'retry':True})
+        assert c.write_calls==writes and bytes(c.written)==output_bytes
+        n['deny'](lambda:results.begin_delivery(host.store,row['existing_task_id'],row['owner'],art['reference'],retry=True))
+    assert not c.live and c.opens==c.closes
+    return {'mode':mode,'delivery':current['delivery'],'attempts':len(attempts),'elapsed':elapsed,
+            'cancelled_and_joined':cancelled,'custody_predicate_seam_NOT_SUBMITTED':True,
+            'native_ledger_active':sum(h.active for h in ctx.handles if h.kind=='background_task'),
+            'fd':c.observation()}
+
+
+def consumer(mode):
+    f,cap,cli,ctx,adm,host=setup()
+    sink_mode='ok' if mode in {'ok','expired','cancel'} else 'blocked' if mode=='original30' else mode
+    with sink(cli,cap,ctx,sink_mode) as (c,raw),input_turn(cli):
+        row,_=claim(cli,ctx,adm,host)
+        n['deny'](lambda:results.require_result_quiescence(row))
+        cli._bound_check_canary=(c,mode)
+        value=connected(cli,ctx,adm,host,row)
+        assert raw.writes==raw.flushes==0 and value['native_ledger_active']==0
+        assert not asyncio.all_tasks(n['model_tools']._tool_loop)
+        return value
+
+
+for mode in ['ok','blocked','partial_timeout','error','cancel','expired','original30']:
+    test('actual_ResultTool_native_bridge_ledger_results_immutable_output_'+mode+'_budget_join_and_no_replay',
+         lambda mode=mode:consumer(mode))
+
+
+def wrapped_frontend_intake():
+    f,cap,cli,ctx,adm,host=setup()
+    original=cli.console.file;owner=cli._friday_cli_output
+    proxy=SlowLegacyStream();cli.console.file=proxy
+    message='original receive under a wrapped native console'
+    with work.cli_turn(cli,message,received=work.capture_cli_receive(cli,message)):
+        n['persist_input'](cli,message)
+        original_owner,ingress,call=joined(cli,adm)
+        assert ingress['input']['sha256']==hashlib.sha256(message.encode()).hexdigest()
+        receipt=asyncio.run(direct(cli,ctx))
+        assert receipt['state']=='FAILED' and proxy.writes==proxy.flushes==0 and original.getvalue()==''
+        assert cli._friday_cli_output is owner
+    return {'existing_receive_and_five_call_join':'PASS','wrapped_sink_output':'KNOWN_REFUSAL_BEFORE_EFFECT',
+            'no_capability_remint':True,'prompt_toolkit_proxy_output':'UNSUPPORTED_REQUIRES_FRONTEND_QUALIFICATION_OR_SEPARATE_SOURCE_REPAIR'}
+
+
+test('native_wrapped_console_does_not_break_intake_or_silently_remint_output_capability',wrapped_frontend_intake)
+
+
+def actual_frontend_producer():
+    source=n['file']('cli.py').read_text();cls=next(v for v in ast.parse(source).body if isinstance(v,ast.ClassDef) and v.name=='HermesCLI')
+    init=next(v for v in cls.body if isinstance(v,ast.FunctionDef) and v.name=='__init__')
+    release=next(v for v in cls.body if isinstance(v,ast.FunctionDef) and v.name=='_release_active_session')
+    env={'initialize_cli':lambda:object(),'check_cli_resume':lambda _:None,'atexit':types.SimpleNamespace(),
+         'logger':n['logging'].getLogger('inert-native-init')}
+    for node in [init,release]:
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),node],type_ignores=[])),str(n['file']('cli.py')),'exec'),env)
+    class NativeInitFixture:
+        __init__=env['__init__'];_release_active_session=env['_release_active_session']
+        def _init_display_options(self,*a):self.console=types.SimpleNamespace(file=io.StringIO(),_lock=threading.RLock())
+        def _init_model_routing(self,*a):pass
+        def _init_runtime_state(self,*a):self._active_session_lease=None
+    cli=NativeInitFixture();owner=cli._friday_cli_output
+    assert type(owner) is output.ClassicConsoleOutput and owner.cli is cli and not owner.closed.is_set()
+    n['deny'](lambda:output.initialize_console_output(cli))
+    cli._active_session_lease=types.SimpleNamespace(release=lambda:None)
+    cli._release_active_session();assert owner.closed.is_set() and cli._active_session_lease is None
+    n['deny'](owner.check)
+    return {'actual_constructor_creates_opaque_output':True,'actual_release_expires_frontend':True,
+            'duplicate_initializer_refused':True,'initializer_OS_effects':0,'full_MRO':'NOT_RUN'}
+
+
+test('actual_native_constructor_and_release_define_output_lifetime_no_route_remint',actual_frontend_producer)
+
+
+# Close only this checker's original native tool-loop and its joined readers.
+loop=n['model_tools']._tool_loop
+pending=[]
+if loop is not None:
+    pending=[t.get_name() for t in asyncio.all_tasks(loop)];assert not pending
+    loop.run_until_complete(loop.shutdown_default_executor());loop.close()
+gc.collect()
+handles=[{'name':h.name,'active':h.active} for c in n['CONTEXTS'] for h in c.handles if h.kind=='background_task']
+assert not any(h['active'] for h in handles) and all(not c.live for c in CANARIES)
+usage=resource.getrusage(resource.RUSAGE_SELF)
+report={'schema':'friday.sol.cli-output-bound-source-controls.v1','status':'PASS_SELECTED_SOURCE_AUTHOR_ONLY',
+        'count':len(CONTROLS),'controls':CONTROLS,'failures':FAILURE,'timings':TIMINGS,
+        'program':{'path':str(pathlib.Path(__file__)),'sha256':hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()},
+        'scaffold':{'path':str(P),'sha256':hashlib.sha256(P.read_bytes()).hexdigest()},
+        'selected_source_nodes':n['SOURCE_NODES'],'dependencies':n['DEPENDENCIES'],
+        'wall_seconds':time.monotonic()-START,'resources':{'CPU_affinity':sorted(os.sched_getaffinity(0)),
+        'address_space_limit':resource.getrlimit(resource.RLIMIT_AS)[0],'CPU_limit_seconds':resource.getrlimit(resource.RLIMIT_CPU)[0],
+        'max_RSS_bytes':usage.ru_maxrss*1024,'user_CPU_seconds':usage.ru_utime,'system_CPU_seconds':usage.ru_stime,
+        'fd_start':FD_START,'fd_end':len(list(pathlib.Path('/proc/self/fd').iterdir())),
+        'threads':[{'name':t.name,'alive':t.is_alive(),'daemon':t.daemon} for t in threading.enumerate()]},
+        'owned_handles':handles,'pending_native_tasks':pending,'native_loop_closed':loop is None or loop.is_closed(),
+        'owned_canary_FDs':sum(len(c.live) for c in CANARIES),'real_output_FDs':0,'child_agents':0,'real_workers':0,
+        'seams':['Exact selected actual frontend/work/result/bridge/ledger source bodies; no production initializers/imports/native MRO',
+          'Actual UID/private fixture FS/SQLite/native schema; dictionary config and atomic JSON write fixture',
+          'FD OS calls/fcntl and FileIO type are inert canaries: NO real FD/OS/PTY/console effect; original flags never mutated',
+          'Canary original TextIOWrapper/BufferedWriter/Raw slow flush is genuine finite callback; zero target calls',
+          'Exact StringIO bounded memory sink is also exercised; does not qualify a real terminal',
+          'Actual custody predicate first refuses NOT_SUBMITTED; declared inert predicate permits selected result-consumer test only',
+          'Actual native CLI constructor/release bodies run with explicit inert display/model/runtime phase seams'],
+        'not_run':['Installed Linux /proc descriptor semantics and permission/type checks','Actual tty/pipe backpressure, rich/prompt_toolkit rendering/interleaving/close lifetime',
+          'Full startup/imports/MRO/native UI/tool execution','Real worker/runtime qualification/grants/quiescence','Independent final review/integration/release']}
+(W/'BOUND-CONTROL-REPORT.json').write_text(json.dumps(report,indent=2,ensure_ascii=False)+'\n')
+print(json.dumps({'status':report['status'],'count':len(CONTROLS),'wall_seconds':report['wall_seconds'],
+                 'resources':report['resources'],'active_handles':sum(h['active'] for h in handles),'pending_tasks':pending,'owned_canary_FDs':0}))
