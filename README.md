@@ -1,5 +1,7 @@
 # Friday_rework
 
+12.10.2026: [C39 genuine native-entry implementation and independent REFUSE](analysis/2026-10-12/native-genuine-entry-commit-c39-refusal-source/README.md) preserves the complete changed host/caller/updater Source, exact unchanged dependency references, 63 NOT_RUN runtime specifications and 724-module/41-resource capture schema. Three blocking findings remain: cached application code, first-birth/host hard reservation and relative stock deadline. Static AST/fault/regression coverage grants no native, receipt, kernel120, normal3600 or release acceptance. Changing C40/C41 successors are outside this cut.
+
 The [canonical Source297 first actual gate archive](analysis/2026-10-12/canonical-source297-first-actual-gate/README.md) preserves the independently accepted exact private Source and first physical failure: all41 input controls passed, then uutils guard-negative returned137 and failed the required adopted-caller direct-wait assertion. Four known actors were freshly closed; original233+supplemental23 were NOT_RUN and full297 is NOT_ACCEPTED. A distinct minimal GNU binary diagnostic observed wrapper/caller -9 direct waits and fresh4 closure, with no Source297/runtime credit. All14 Source dependencies are preserved as inert text or unchanged frozen public references. Changing GNU Source repair is outside the cutoff; runtime/native/kernel120/normal3600/canonical installation/release remain pending.
 
 

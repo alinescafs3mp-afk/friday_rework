@@ -1,0 +1,2463 @@
+#!/usr/bin/env python3
+"""Safely stage and activate the latest stable Codex standalone release.
+
+The Friday launchers call this only after the target TUI has exited.  A shared
+release is activated only while both native roots are quiescent; otherwise the
+update is staged and deferred while the already installed release is used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import binascii
+import contextlib
+from contextlib import ExitStack
+from datetime import UTC, datetime
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import secrets
+import selectors
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import tomllib
+import urllib.error
+import urllib.request
+
+from jsonschema import Draft7Validator
+from websockets.asyncio.client import unix_connect
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from native_endpoint import EndpointError, resolve_control_socket
+
+
+RUNTIME = Path("/SANITIZED_RUNTIME")
+STANDALONE = Path("/SANITIZED_CODEX/packages/standalone")
+RELEASES = STANDALONE / "releases"
+CURRENT = STANDALONE / "current"
+LOCK = RUNTIME / "friday-codex-auto-update.lock"
+VALIDATED = RUNTIME / "friday-codex-auto-update/validated"
+PROVENANCE = RUNTIME / "friday-codex-auto-update/provenance"
+ACTIVATION_JOURNAL = RUNTIME / "friday-codex-auto-update/activation-journal.json"
+RECONNECT = RUNTIME / "sol-link-native-reconnect.py"
+LIFECYCLE = RUNTIME / "subagent-lifecycle/lifecycle.py"
+NATIVE_QUEUE = RUNTIME / "subagent-lifecycle/native_queue.py"
+IDLE_GATE = RUNTIME / "sol-link-native-idle-check.py"
+ASTRA_PROFILE_HELPER = RUNTIME / "astra-https-transport-profile.py"
+VENV_PYTHON = Path("/SANITIZED_WORKSPACE/.venv/bin/python")
+TEAM_STATE = Path("/SANITIZED_CONFIG/codex-team-mode/current.json")
+REPO = Path("/SANITIZED_WORKSPACE")
+METADATA_URL = "https://releases.openai.com/codex/channels/latest"
+ASSET_NAME = "codex-package-x86_64-unknown-linux-musl.tar.gz"
+TARGET = "x86_64-unknown-linux-musl"
+COMPAT_SCHEMA = "friday.codex-compatible-release.v3"
+VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+MAX_METADATA_BYTES = 4 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
+MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024
+SLOTS = {
+    "astra": Path("/SANITIZED_CONFIG/profiles/ROLE_SOL"),
+    "sol": Path("/SANITIZED_CODEX"),
+}
+LEGACY_RELEASE_HASHES = {
+    "0.154.0": {
+        "binary_sha256": "3188814c35471432d4123203e0eb38e5bddc60226e3d7ddf0e59e649ea140022",
+        "code_mode_host_sha256": "0c57be435e73b70d9106c850d751cd259a7f04da958a453d7ef59090d82b70f1",
+        "manifest_sha256": "b039964d28d57b2a7e929ee9986303582501c7cc9787f6c018b6d3c7b35c87d7",
+    },
+}
+VALIDATION_CONTROL_PATHS = {
+    "updater": Path(__file__).resolve(),
+    "native_endpoint": RUNTIME / "native_endpoint.py",
+    "reconnect": RECONNECT,
+    "lifecycle": LIFECYCLE,
+    "idle_gate": IDLE_GATE,
+    "native_control": RUNTIME / "sol-link-native-control.py",
+    "native_send": RUNTIME / "sol-link-native-send.py",
+    "native_compact": RUNTIME / "sol-link-native-compact.py",
+    "team_pre_task_compact": RUNTIME / "team-native-pre-task-compact.py",
+    "sol_daemon_recover": RUNTIME / "sol-link-sol-daemon-recover.py",
+    "sol_precompact_requeue": RUNTIME / "kimi-sol-task-watcher/precompact-requeue.py",
+    "astra_profile": ASTRA_PROFILE_HELPER,
+    "native_queue": NATIVE_QUEUE,
+    "astra_watcher": RUNTIME / "kimi-astra-native-watch.py",
+    "sol_watcher": RUNTIME / "kimi-sol-task-watcher.py",
+    "astra_watcher_unit": Path("/SANITIZED_CONFIG/systemd/user/friday-kimi-astra-watch.service"),
+    "sol_watcher_unit": Path("/SANITIZED_CONFIG/systemd/user/friday-kimi-sol-watcher.service"),
+    "astra_launcher": Path("/SANITIZED_LOCAL/bin/friday-astra"),
+    "sol_launcher": Path("/SANITIZED_LOCAL/bin/friday-sol"),
+}
+REQUIRED_METHODS = {
+    "config/batchWrite",
+    "hooks/list",
+    "thread/archive",
+    "thread/compact/start",
+    "thread/goal/get",
+    "thread/list",
+    "thread/loaded/list",
+    "thread/queue/add",
+    "thread/queue/delete",
+    "thread/queue/list",
+    "thread/queue/start",
+    "thread/read",
+    "thread/resume",
+    "thread/turns/list",
+    "turn/interrupt",
+}
+RPC_COMPAT_PARAMS: dict[str, dict[str, object]] = {
+    "config/batchWrite": {
+        "edits": [
+            {
+                "keyPath": "hooks.state",
+                "value": {
+                    "/tmp/friday-compat-hook:pre_tool_use:0:0": {
+                        "trusted_hash": "sha256:" + "0" * 64,
+                    }
+                },
+                "mergeStrategy": "upsert",
+            }
+        ],
+        "filePath": None,
+        "expectedVersion": None,
+        "reloadUserConfig": True,
+    },
+    "hooks/list": {"cwds": [str(REPO)]},
+    "thread/archive": {"threadId": "00000000-0000-0000-0000-000000000001"},
+    "thread/compact/start": {"threadId": "00000000-0000-0000-0000-000000000001"},
+    "thread/goal/get": {"threadId": "00000000-0000-0000-0000-000000000001"},
+    "thread/list": {
+        "ancestorThreadId": "00000000-0000-0000-0000-000000000001",
+        "sourceKinds": ["subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther"],
+        "useStateDbOnly": True,
+        "archived": False,
+        "limit": 100,
+        "sortDirection": "asc",
+    },
+    "thread/loaded/list": {"limit": 100},
+    "thread/queue/add": {
+        "threadId": "00000000-0000-0000-0000-000000000001",
+        "input": [{"type": "text", "text": "compatibility probe", "text_elements": []}],
+        "clientUserMessageId": "00000000-0000-0000-0000-000000000002",
+    },
+    "thread/queue/delete": {
+        "threadId": "00000000-0000-0000-0000-000000000001",
+        "queuedSubmissionId": "00000000-0000-0000-0000-000000000003",
+    },
+    "thread/queue/list": {
+        "threadId": "00000000-0000-0000-0000-000000000001",
+        "limit": 100,
+    },
+    "thread/queue/start": {
+        "threadId": "00000000-0000-0000-0000-000000000001",
+        "queuedSubmissionId": "00000000-0000-0000-0000-000000000003",
+    },
+    "thread/read": {
+        "threadId": "00000000-0000-0000-0000-000000000001",
+        "includeTurns": False,
+    },
+    "thread/resume": {"threadId": "00000000-0000-0000-0000-000000000001"},
+    "thread/turns/list": {
+        "threadId": "00000000-0000-0000-0000-000000000001",
+        "limit": 1,
+        "itemsView": "notLoaded",
+        "sortDirection": "desc",
+    },
+    "turn/interrupt": {
+        "threadId": "00000000-0000-0000-0000-000000000001",
+        "turnId": "00000000-0000-0000-0000-000000000004",
+    },
+}
+RPC_COMPAT_VARIANTS: dict[str, list[dict[str, object]]] = {
+    "thread/list": [{
+        **RPC_COMPAT_PARAMS["thread/list"],
+        "cursor": "friday-compat-cursor",
+    }],
+    "thread/loaded/list": [{
+        **RPC_COMPAT_PARAMS["thread/loaded/list"],
+        "cursor": "friday-compat-cursor",
+    }],
+    "thread/turns/list": [{
+        "threadId": "00000000-0000-0000-0000-000000000001",
+        "limit": 1,
+        "itemsView": "full",
+    }],
+}
+READ_ONLY_PROBE_METHODS = {
+    2: "thread/list",
+    3: "thread/loaded/list",
+    4: "hooks/list",
+}
+
+
+
+_NATIVE_OWNER = None
+
+def _native_temporary(*,prefix,dir):
+    return _NATIVE_OWNER.native_temp(prefix) if _NATIVE_OWNER is not None else tempfile.TemporaryDirectory(prefix=prefix,dir=dir)
+
+class UpdateError(RuntimeError):
+    """A candidate or local installation failed a fail-closed check."""
+
+
+class FatalUpdateError(UpdateError):
+    """Activation changed live state and could not prove a complete rollback."""
+
+
+class DeferredActivation(UpdateError):
+    """A safe post-pause observation requires staging without activation."""
+
+
+def version_tuple(value: str) -> tuple[int, int, int]:
+    if not VERSION_RE.fullmatch(value):
+        raise UpdateError(f"invalid stable version: {value!r}")
+    return tuple(int(part) for part in value.split("."))  # type: ignore[return-value]
+
+
+def manifest_version(root: Path) -> str:
+    manifest = root / "codex-package.json"
+    try:
+        root_info = root.lstat()
+        info = manifest.lstat()
+        raw = manifest.read_bytes()
+        value = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise UpdateError(f"invalid Codex package manifest at {manifest}: {exc}") from None
+    if (
+        root.is_symlink()
+        or not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != os.getuid()
+        or root_info.st_mode & 0o022
+    ):
+        raise UpdateError(f"unsafe Codex package root at {root}")
+    if manifest.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise UpdateError(f"unsafe Codex package manifest at {manifest}")
+    expected = {
+        "layoutVersion": 1,
+        "version": value.get("version"),
+        "target": TARGET,
+        "variant": "codex",
+        "entrypoint": "bin/codex",
+        "resourcesDir": "codex-resources",
+        "pathDir": "codex-path",
+    }
+    if value != expected:
+        raise UpdateError(f"unexpected Codex package manifest at {manifest}")
+    version = value.get("version")
+    if not isinstance(version, str):
+        raise UpdateError(f"missing Codex version at {manifest}")
+    version_tuple(version)
+    return version
+
+
+def release_binary(root: Path) -> Path:
+    version = manifest_version(root)
+    binary = root / "bin/codex"
+    host = root / "bin/codex-code-mode-host"
+    required = (binary, host, root / "codex-resources/bwrap", root / "codex-path/rg")
+    for path in required:
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise UpdateError(f"missing Codex {version} package member {path}: {exc}") from None
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & (0o022 | stat.S_ISUID | stat.S_ISGID)
+        ):
+            raise UpdateError(f"unsafe Codex {version} package member {path}")
+        if not os.access(path, os.X_OK):
+            raise UpdateError(f"non-executable Codex {version} package member {path}")
+    return binary
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validation_control_hashes() -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for label, path in VALIDATION_CONTROL_PATHS.items():
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise UpdateError(f"validation control {label} is unavailable: {exc}") from None
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or info.st_mode & 0o022
+        ):
+            raise UpdateError(f"validation control {label} has an unsafe identity")
+        hashes[label] = sha256_file(path)
+    return hashes
+
+
+def profile_input_hashes(homes: dict[str, Path]) -> dict[str, str | None]:
+    """Bind every account input consumed by strict candidate probes."""
+    values: dict[str, str | None] = {}
+    for slot, home in homes.items():
+        for filename in ("config.toml", "hooks.json"):
+            path = home / filename
+            key = f"{slot}/{filename}"
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                if filename == "hooks.json":
+                    values[key] = None
+                    continue
+                raise UpdateError(f"{slot} config is unavailable") from None
+            except OSError as exc:
+                raise UpdateError(f"{slot} {filename} is unavailable: {exc}") from None
+            if (
+                path.is_symlink()
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or info.st_mode & 0o022
+            ):
+                raise UpdateError(f"{slot} {filename} has an unsafe identity")
+            values[key] = sha256_file(path)
+    return values
+
+
+def tree_digest(root: Path) -> str:
+    """Bind every extracted package member, including mode and unexpected files."""
+    root_info = root.lstat()
+    if (
+        root.is_symlink()
+        or not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != os.getuid()
+        or root_info.st_mode & 0o022
+    ):
+        raise UpdateError("release tree root is unsafe")
+    records: list[dict[str, object]] = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(root).as_posix()
+        info = path.lstat()
+        if path.is_symlink():
+            raise UpdateError(f"release tree contains a symlink: {relative}")
+        if path.is_dir():
+            if info.st_uid != os.getuid() or info.st_mode & 0o022:
+                raise UpdateError(f"release tree contains an unsafe directory: {relative}")
+            records.append({"path": relative, "kind": "directory", "mode": stat.S_IMODE(info.st_mode)})
+            continue
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & (0o022 | stat.S_ISUID | stat.S_ISGID)
+        ):
+            raise UpdateError(f"release tree contains an unsafe member: {relative}")
+        records.append({
+            "path": relative,
+            "kind": "file",
+            "mode": stat.S_IMODE(info.st_mode),
+            "bytes": info.st_size,
+            "sha256": sha256_file(path),
+        })
+    encoded = json.dumps(records, sort_keys=True, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def atomic_private_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    replaced = False
+    try:
+        os.fchmod(descriptor, 0o600)
+        raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+        view = memoryview(raw)
+        written = 0
+        while written < len(view):
+            count = os.write(descriptor, view[written:])
+            if count <= 0:
+                raise OSError("short write while creating private JSON")
+            written += count
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        replaced = True
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not replaced:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+
+def safe_private_receipt(path: Path) -> dict[str, object] | None:
+    try:
+        info = path.lstat()
+        payload = json.loads(path.read_text(encoding="ascii"))
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    except OSError as exc:
+        raise UpdateError(f"cannot inspect receipt {path}: {exc}") from None
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or not isinstance(payload, dict)
+    ):
+        raise UpdateError(f"unsafe receipt: {path}")
+    return payload
+
+
+def current_root() -> Path:
+    try:
+        info = CURRENT.lstat()
+        resolved = CURRENT.resolve(strict=True)
+    except OSError as exc:
+        raise UpdateError(f"managed Codex current link is unavailable: {exc}") from None
+    if not stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+        raise UpdateError("managed Codex current path is not one owned symlink")
+    try:
+        resolved.relative_to(RELEASES.resolve(strict=True))
+    except ValueError:
+        raise UpdateError("managed Codex current link escapes the release directory") from None
+    release_binary(resolved)
+    return resolved
+
+
+def fetch_json() -> tuple[str, str, str]:
+    request = urllib.request.Request(
+        METADATA_URL,
+        headers={"Accept": "application/json", "User-Agent": "friday-codex-auto-update/1"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                raise UpdateError("Codex release metadata has an invalid Content-Length") from None
+            if declared_length < 0 or declared_length > MAX_METADATA_BYTES:
+                raise UpdateError("Codex release metadata is unexpectedly large")
+        raw = response.read(MAX_METADATA_BYTES + 1)
+    if len(raw) > MAX_METADATA_BYTES:
+        raise UpdateError("Codex release metadata is unexpectedly large")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise UpdateError(f"Codex release metadata is malformed: {exc}") from None
+    tag = payload.get("tag_name") if isinstance(payload, dict) else None
+    if not isinstance(tag, str) or not tag.startswith("rust-v"):
+        raise UpdateError("Codex release metadata has no stable tag")
+    version = tag.removeprefix("rust-v")
+    version_tuple(version)
+    matches = [
+        item
+        for item in payload.get("assets", [])
+        if isinstance(item, dict) and item.get("name") == ASSET_NAME
+    ]
+    if len(matches) != 1:
+        raise UpdateError("Codex release metadata does not identify one platform package")
+    asset = matches[0]
+    digest = asset.get("digest")
+    url = asset.get("browser_download_url")
+    expected_url = f"https://releases.openai.com/codex/releases/{version}/{ASSET_NAME}"
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise UpdateError("Codex release metadata has an invalid digest")
+    if url != expected_url:
+        raise UpdateError("Codex release metadata has an unexpected download URL")
+    return version, digest.removeprefix("sha256:"), url
+
+
+def download(url: str, expected_digest: str, destination: Path) -> None:
+    request = urllib.request.Request(url, headers={"User-Agent": "friday-codex-auto-update/1"})
+    digest = hashlib.sha256()
+    total = 0
+    created = False
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            with destination.open("xb") as handle:
+                created = True
+                content_length = response.headers.get("Content-Length")
+                if content_length:
+                    try:
+                        declared_length = int(content_length)
+                    except ValueError:
+                        raise UpdateError(
+                            "Codex release archive has an invalid Content-Length"
+                        ) from None
+                    if declared_length < 0 or declared_length > MAX_ARCHIVE_BYTES:
+                        raise UpdateError("Codex release archive is unexpectedly large")
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_ARCHIVE_BYTES:
+                        raise UpdateError("Codex release archive is unexpectedly large")
+                    digest.update(chunk)
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+        if digest.hexdigest() != expected_digest:
+            raise UpdateError("Codex release archive digest mismatch")
+    except UpdateError:
+        if created:
+            with contextlib.suppress(FileNotFoundError):
+                destination.unlink()
+        raise
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
+        if created:
+            with contextlib.suppress(FileNotFoundError):
+                destination.unlink()
+        raise UpdateError(f"Codex release archive download failed: {exc}") from None
+
+
+def safe_members(archive: tarfile.TarFile) -> list[tarfile.TarInfo]:
+    members = archive.getmembers()
+    total = 0
+    seen: set[PurePosixPath] = set()
+    for member in members:
+        path = PurePosixPath(member.name)
+        if (
+            path == PurePosixPath(".")
+            or path.is_absolute()
+            or ".." in path.parts
+            or path in seen
+            or member.issym()
+            or member.islnk()
+        ):
+            raise UpdateError(f"unsafe member in Codex archive: {member.name}")
+        seen.add(path)
+        if not (member.isdir() or member.isfile()):
+            raise UpdateError(f"unsupported member in Codex archive: {member.name}")
+        if member.isfile():
+            total += member.size
+            if total > MAX_EXTRACTED_BYTES:
+                raise UpdateError("Codex release expands beyond the safe size limit")
+    return members
+
+
+def extract_release(archive_path: Path, destination: Path, version: str) -> None:
+    parent = destination.parent
+    temporary = parent / f".{destination.name}.install.{os.getpid()}.{secrets.token_hex(6)}"
+    temporary.mkdir(mode=0o755)
+    committed = False
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            members = safe_members(archive)
+            # Every member was constrained above to a unique relative regular
+            # file or directory. Returning the original TarInfo preserves the
+            # publisher's executable modes without accepting links or devices.
+            archive.extractall(temporary, members=members, filter=lambda member, _path: member)
+        if manifest_version(temporary) != version:
+            raise UpdateError("Codex archive version does not match release metadata")
+        release_binary(temporary)
+        try:
+            os.rename(temporary, destination)
+            committed = True
+        except FileExistsError:
+            if manifest_version(destination) != version:
+                raise UpdateError("an incompatible release directory appeared concurrently") from None
+        directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if not committed and temporary.exists():
+            shutil.rmtree(temporary)
+
+
+def extracted_tree_for_comparison(archive_path: Path, version: str) -> str:
+    with tempfile.TemporaryDirectory(prefix=f".codex-{version}-verify.", dir=STANDALONE) as name:
+        root = Path(name) / "root"
+        root.mkdir(mode=0o755)
+        with tarfile.open(archive_path, "r:gz") as archive:
+            members = safe_members(archive)
+            archive.extractall(root, members=members, filter=lambda member, _path: member)
+        if manifest_version(root) != version:
+            raise UpdateError("verification archive version does not match release metadata")
+        release_binary(root)
+        return tree_digest(root)
+
+
+def ensure_source_provenance(
+    candidate: Path,
+    version: str,
+    source_digest: str,
+    source_url: str,
+    *,
+    verified_archive: Path | None = None,
+) -> str:
+    """Prove an existing tree is byte-for-byte the published archive once."""
+    candidate_digest = tree_digest(candidate)
+    receipt_path = PROVENANCE / f"{version}.json"
+    receipt = safe_private_receipt(receipt_path)
+    expected = {
+        "schema": "friday.codex-source-provenance.v1",
+        "version": version,
+        "target": TARGET,
+        "release_root": str(candidate.resolve(strict=True)),
+        "source_url": source_url,
+        "source_archive_sha256": source_digest,
+        "tree_sha256": candidate_digest,
+    }
+    if receipt is not None and all(receipt.get(key) == value for key, value in expected.items()):
+        return candidate_digest
+
+    owned_archive = False
+    archive = verified_archive
+    if archive is None:
+        descriptor, archive_name = tempfile.mkstemp(
+            prefix=f".codex-{version}-provenance.", suffix=".tar.gz", dir=STANDALONE
+        )
+        os.close(descriptor)
+        archive = Path(archive_name)
+        archive.unlink()
+        download(source_url, source_digest, archive)
+        owned_archive = True
+    try:
+        published_digest = extracted_tree_for_comparison(archive, version)
+        if published_digest != candidate_digest:
+            raise UpdateError("installed release tree differs from the published-digest archive")
+    finally:
+        if owned_archive:
+            with contextlib.suppress(FileNotFoundError):
+                archive.unlink()
+    atomic_private_json(receipt_path, expected)
+    return candidate_digest
+
+
+def current_receipts_match(
+    candidate: Path, version: str, source_digest: str, source_url: str,
+    *, prepared_compatibility: dict[str, object] | None = None,
+) -> bool:
+    compatibility = (safe_private_receipt(VALIDATED / f"{version}.json")
+                     if prepared_compatibility is None else prepared_compatibility)
+    provenance = safe_private_receipt(PROVENANCE / f"{version}.json")
+    if compatibility is None or provenance is None:
+        return False
+    binary = candidate / "bin/codex"
+    host = candidate / "bin/codex-code-mode-host"
+    manifest = candidate / "codex-package.json"
+    actual_tree_digest = tree_digest(candidate)
+    expected_case_counts = {
+        method: 1 + len(RPC_COMPAT_VARIANTS.get(method, []))
+        for method in sorted(RPC_COMPAT_PARAMS)
+    }
+    expected_role_hashes = role_profile_hashes()
+    expected_profile_hashes = profile_input_hashes(SLOTS)
+    expected_compatibility = {
+        "schema": COMPAT_SCHEMA,
+        "version": version,
+        "target": TARGET,
+        "release_root": str(candidate.resolve(strict=True)),
+        "binary": str(binary.resolve(strict=True)),
+        "binary_sha256": sha256_file(binary),
+        "code_mode_host": str(host.resolve(strict=True)),
+        "code_mode_host_sha256": sha256_file(host),
+        "manifest_sha256": sha256_file(manifest),
+        "source_url": source_url,
+        "source_archive_sha256": source_digest,
+        "tree_sha256": actual_tree_digest,
+        "required_rpc_methods": sorted(REQUIRED_METHODS),
+        "rpc_contract_case_counts": expected_case_counts,
+        "strict_config_profiles": sorted(SLOTS),
+        "role_profile_probes": ["astra/main", "astra/goodman", "grok/main", "grok/goodman"],
+        "read_only_rpc_probes": ["initialize", *READ_ONLY_PROBE_METHODS.values()],
+        "isolated_daemon": "start/restart/version/stop matched",
+        "isolated_endpoint": "legacy-or-managed-symlink ownership matched",
+        "isolated_remote_rpc": "initialize/thread-list through stable endpoint matched",
+        "tui_resume_surface": ["SESSION_ID", "--remote", "--config", "--model", "--cd"],
+        "tui_resume_argv_cases": [
+            "astra:remote+config+model+cd+thread",
+            "sol:remote+config+cd+thread",
+        ],
+        "queue_cli_surface": ["--remote", "--thread", "--message", "remote thread/queue/add negative"],
+        "features_cli_surface": "Astra-clone features/list matched",
+        "validation_controls_sha256": validation_control_hashes(),
+        "role_profile_sha256": expected_role_hashes,
+        "account_input_sha256": expected_profile_hashes,
+    }
+    expected_provenance = {
+        "schema": "friday.codex-source-provenance.v1",
+        "version": version,
+        "target": TARGET,
+        "release_root": str(candidate.resolve(strict=True)),
+        "source_url": source_url,
+        "source_archive_sha256": source_digest,
+    }
+    return (
+        all(compatibility.get(key) == value for key, value in expected_compatibility.items())
+        and all(provenance.get(key) == value for key, value in expected_provenance.items())
+        and provenance.get("tree_sha256") == actual_tree_digest
+        and isinstance(compatibility.get("astra_candidate_profile"), dict)
+        and compatibility["astra_candidate_profile"].get("target_version") == version
+        and compatibility["astra_candidate_profile"].get("status") in {"unchanged", "repaired"}
+        and compatibility["astra_candidate_profile"].get("sha256")
+        == expected_profile_hashes.get("astra/config.toml")
+        and isinstance(compatibility["astra_candidate_profile"].get("drift_repaired"), list)
+    )
+
+
+def ensure_current_release_for_use(candidate: Path, version: str) -> dict[str, object]:
+    """Fail closed unless the selected release is audited or fully revalidated."""
+    try:
+        binary = release_binary(candidate)
+        legacy = LEGACY_RELEASE_HASHES.get(version)
+        if legacy is not None:
+            actual = {
+                "binary_sha256": sha256_file(binary),
+                "code_mode_host_sha256": sha256_file(candidate / "bin/codex-code-mode-host"),
+                "manifest_sha256": sha256_file(candidate / "codex-package.json"),
+            }
+            if actual != legacy:
+                raise FatalUpdateError(
+                    f"selected legacy Codex {version} differs from its audited hashes"
+                )
+            return {"status": "audited_legacy", "version": version}
+
+        provenance_path = PROVENANCE / f"{version}.json"
+        provenance = safe_private_receipt(provenance_path)
+        if provenance is None:
+            raise FatalUpdateError(
+                f"selected Codex {version} has no authenticated source-provenance receipt"
+            )
+        source_url = (
+            f"https://releases.openai.com/codex/releases/{version}/{ASSET_NAME}"
+        )
+        source_digest = provenance.get("source_archive_sha256")
+        if not isinstance(source_digest, str) or re.fullmatch(r"[0-9a-f]{64}", source_digest) is None:
+            raise FatalUpdateError(f"selected Codex {version} has an invalid source digest")
+        actual_tree_digest = tree_digest(candidate)
+        expected_provenance = {
+            "schema": "friday.codex-source-provenance.v1",
+            "version": version,
+            "target": TARGET,
+            "release_root": str(candidate.resolve(strict=True)),
+            "source_url": source_url,
+            "source_archive_sha256": source_digest,
+            "tree_sha256": actual_tree_digest,
+        }
+        if any(provenance.get(key) != value for key, value in expected_provenance.items()):
+            raise FatalUpdateError(
+                f"selected Codex {version} source provenance or full release tree changed"
+            )
+        if not current_receipts_match(candidate, version, source_digest, source_url):
+            validate_candidate(
+                candidate,
+                version,
+                source_digest=source_digest,
+                source_url=source_url,
+                source_tree_digest=actual_tree_digest,
+            )
+        if _NATIVE_OWNER is not None and _NATIVE_OWNER.pending_receipt is not None:
+            return {'status':'GATES_RETURNED_PENDING_EXTERNAL_CALLER_CLOSURE','version':version}
+        if not current_receipts_match(candidate, version, source_digest, source_url):
+            raise FatalUpdateError(
+                f"selected Codex {version} inputs differ from its current compatibility proof"
+            )
+        return {"status": "validated_current", "version": version}
+    except FatalUpdateError:
+        raise
+    except UpdateError as exc:
+        raise FatalUpdateError(
+            f"selected Codex {version} cannot be proven safe for use: {exc}"
+        ) from None
+
+
+def run(
+    command: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    cwd: Path | None = None,
+    input_text: str | None = None,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess[str]:
+    if _NATIVE_OWNER is not None:
+        return _NATIVE_OWNER.native_run(command,env=env,cwd=cwd,input_text=input_text,timeout=timeout)
+    try:
+        return subprocess.run(
+            command,
+            env=env,
+            cwd=cwd,
+            input=input_text,
+            stdin=subprocess.DEVNULL if input_text is None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise UpdateError(f"candidate check could not run {command[0]}: {exc}") from None
+
+
+def require_success(result: subprocess.CompletedProcess[str], label: str) -> str:
+    if result.returncode != 0:
+        detail = (result.stderr.strip() or result.stdout.strip())[-2000:]
+        raise UpdateError(f"{label} failed: {detail}")
+    return result.stdout
+
+
+def clone_config_home(home: Path, prefix: str, stack: ExitStack) -> Path:
+    name = stack.enter_context(_native_temporary(prefix=prefix, dir="/var/tmp"))
+    clone = Path(name)
+    for filename in ("config.toml", "hooks.json"):
+        source = home / filename
+        try:
+            info = source.lstat()
+        except FileNotFoundError:
+            if filename == "hooks.json":
+                continue
+            raise UpdateError(f"required config input is missing: {source}") from None
+        except OSError as exc:
+            raise UpdateError(f"cannot inspect config input {source}: {exc}") from None
+        if (
+            source.is_symlink()
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or info.st_mode & 0o022
+        ):
+            raise UpdateError(f"unsafe {filename} for candidate validation: {source}")
+        if _NATIVE_OWNER is not None:_NATIVE_OWNER.native_file_budget(source,1048576)
+        shutil.copyfile(source, clone / filename)
+        os.chmod(clone / filename, 0o600)
+    return clone
+
+
+def strict_protocol_probe(
+    binary: Path,
+    clone: Path,
+    label: str,
+    *,
+    config_args: list[str] | None = None,
+) -> None:
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(clone)
+    try:
+        process = (_NATIVE_OWNER.native_spawn([str(binary),*(config_args or []),'app-server','--strict-config','--listen','stdio://'],env=env,cwd=Path('/var/tmp'),input_pipe=True,role='STRICT') if _NATIVE_OWNER is not None else subprocess.Popen(
+            [
+                str(binary),
+                *(config_args or []),
+                "app-server", "--strict-config", "--listen", "stdio://",
+            ],
+            env=env,
+            cwd=Path("/var/tmp"),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        ))
+    except OSError as exc:
+        raise UpdateError(f"{label} strict app-server could not start: {exc}") from None
+    assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+    responses: dict[int, dict[str, object]] = {}
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    selector = selectors.DefaultSelector()
+    if _NATIVE_OWNER is not None:
+        native_selector_label='native_strict_selector_'+str(len(_NATIVE_OWNER.fds))
+        _NATIVE_OWNER.native_track(native_selector_label,selector.fileno())
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+
+    def send(item: dict[str, object]) -> None:
+        process.stdin.write((json.dumps(item, separators=(",", ":")) + "\n").encode("utf-8"))
+        process.stdin.flush()
+
+    def consume_lines() -> None:
+        while b"\n" in stdout_buffer:
+            raw, _, remainder = stdout_buffer.partition(b"\n")
+            stdout_buffer[:] = remainder
+            try:
+                item = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(item, dict) and isinstance(item.get("id"), int):
+                responses[int(item["id"])] = item
+
+    def await_ids(expected: set[int], timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while not expected.issubset(responses):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            events = selector.select(min(0.25, remaining))
+            if not events and process.poll() is not None:
+                break
+            for key, _ in events:
+                chunk = os.read(key.fileobj.fileno(), 131072)
+                if not chunk:
+                    with contextlib.suppress(KeyError):
+                        selector.unregister(key.fileobj)
+                    continue
+                target = stdout_buffer if key.data == "stdout" else stderr_buffer
+                if _NATIVE_OWNER is not None:_NATIVE_OWNER.native_charge(chunk)
+                target.extend(chunk)
+                if len(stdout_buffer) + len(stderr_buffer) > 8 * 1024 * 1024:
+                    raise UpdateError(f"{label} strict app-server output exceeded 8 MiB")
+                consume_lines()
+        if not expected.issubset(responses):
+            detail = stderr_buffer.decode("utf-8", "replace")[-2000:]
+            raise UpdateError(
+                f"{label} strict app-server probe returned incomplete responses; {detail}"
+            )
+
+    try:
+        send({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "friday_codex_update_validator", "version": "1"},
+                "capabilities": {"experimentalApi": True},
+            },
+        })
+        await_ids({1}, 15)
+        send({"method": "initialized"})
+        send({"id": 2, "method": "thread/list", "params": {"limit": 1, "useStateDbOnly": True}})
+        send({"id": 3, "method": "thread/loaded/list", "params": {"limit": 1}})
+        send({"id": 4, "method": "hooks/list", "params": {"cwds": [str(REPO)]}})
+        await_ids({2, 3, 4}, 15)
+    finally:
+        with contextlib.suppress(BrokenPipeError, OSError):
+            if _NATIVE_OWNER is not None:_NATIVE_OWNER.native_close_stream(process,'stdin')
+            else:process.stdin.close()
+        if _NATIVE_OWNER is not None:
+            import subprocess as _sp
+            try:_NATIVE_OWNER.native_wait(process,5)
+            except _sp.TimeoutExpired:_NATIVE_OWNER.native_wait(process,5,stop=True)
+            for _stream in ['stdin','stdout','stderr']:_NATIVE_OWNER.native_close_stream(process,_stream)
+        else:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        if _NATIVE_OWNER is not None:_NATIVE_OWNER.native_close_selector(selector,native_selector_label)
+        else:selector.close()
+    if process.returncode != 0:
+        detail = stderr_buffer.decode("utf-8", "replace")[-2000:]
+        raise UpdateError(f"{label} strict app-server exited {process.returncode}: {detail}")
+    for request_id, response in responses.items():
+        if "error" in response or not isinstance(response.get("result"), dict):
+            raise UpdateError(f"{label} strict app-server RPC {request_id} failed")
+    initialized = responses[1]["result"]
+    assert isinstance(initialized, dict)
+    if initialized.get("codexHome") != str(clone):
+        raise UpdateError(f"{label} strict app-server used the wrong account home")
+    for request_id in READ_ONLY_PROBE_METHODS:
+        result_payload = responses[request_id]["result"]
+        assert isinstance(result_payload, dict)
+        if not isinstance(result_payload.get("data"), list):
+            raise UpdateError(
+                f"{label} {READ_ONLY_PROBE_METHODS[request_id]} response shape changed"
+            )
+    hook_rows = responses[4]["result"]
+    assert isinstance(hook_rows, dict)
+    errors = [
+        error
+        for row in hook_rows.get("data", [])
+        if isinstance(row, dict)
+        for error in row.get("errors", [])
+    ]
+    if errors:
+        raise UpdateError(f"{label} hooks/list reported configuration errors")
+
+
+def toml_cli_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_cli_value(item) for item in value) + "]"
+    raise UpdateError(f"unsupported managed role value: {type(value).__name__}")
+
+
+def flattened_role(value: dict[str, object], prefix: tuple[str, ...] = ()):
+    for key, item in value.items():
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+            raise UpdateError(f"unsafe managed role key: {key!r}")
+        path = (*prefix, key)
+        if isinstance(item, dict):
+            yield from flattened_role(item, path)
+        else:
+            yield ".".join(path), item
+
+
+def role_profile_snapshot() -> tuple[dict[tuple[str, str], Path], dict[str, str]]:
+    try:
+        state_info = TEAM_STATE.lstat()
+        state_raw = TEAM_STATE.read_bytes()
+        state = json.loads(state_raw)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise UpdateError(f"managed role state is unavailable: {exc}") from None
+    if (
+        TEAM_STATE.is_symlink()
+        or not stat.S_ISREG(state_info.st_mode)
+        or state_info.st_uid != os.getuid()
+        or state_info.st_nlink != 1
+        or state_info.st_mode & 0o022
+    ):
+        raise UpdateError("managed role state is unsafe")
+    generation = Path(state.get("generation", ""))
+    expected_parent = TEAM_STATE.parent / "generations"
+    try:
+        generation_info = generation.lstat()
+        generation.resolve(strict=True).relative_to(expected_parent.resolve(strict=True))
+    except (OSError, ValueError):
+        raise UpdateError("managed role generation escapes its root") from None
+    if (
+        generation.is_symlink()
+        or not stat.S_ISDIR(generation_info.st_mode)
+        or generation_info.st_uid != os.getuid()
+        or generation_info.st_mode & 0o022
+    ):
+        raise UpdateError("managed role generation identity is unsafe")
+    profiles: dict[tuple[str, str], Path] = {}
+    snapshot_hashes = {"current.json": hashlib.sha256(state_raw).hexdigest()}
+    hashes = state.get("files") if isinstance(state.get("files"), dict) else {}
+    for mode in ("astra", "grok"):
+        for slot in ("main", "goodman"):
+            relative = f"profiles/{mode}-{slot}.toml"
+            path = generation / relative
+            try:
+                info = path.lstat()
+            except OSError as exc:
+                raise UpdateError(f"managed role profile is unavailable: {exc}") from None
+            digest = sha256_file(path)
+            if (
+                path.is_symlink()
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or info.st_mode & 0o022
+                or hashes.get(relative) != digest
+            ):
+                raise UpdateError(f"managed role profile failed integrity: {path}")
+            profiles[(mode, slot)] = path
+            snapshot_hashes[f"{mode}/{slot}"] = digest
+    if hashlib.sha256(TEAM_STATE.read_bytes()).hexdigest() != snapshot_hashes["current.json"]:
+        raise UpdateError("managed role state changed during snapshot")
+    for (mode, slot), path in profiles.items():
+        if sha256_file(path) != snapshot_hashes[f"{mode}/{slot}"]:
+            raise UpdateError("managed role profile changed during snapshot")
+    return profiles, snapshot_hashes
+
+
+def role_profile_paths() -> dict[tuple[str, str], Path]:
+    return role_profile_snapshot()[0]
+
+
+def role_profile_hashes() -> dict[str, str]:
+    return role_profile_snapshot()[1]
+
+
+def role_profile_probes(
+    binary: Path,
+    clones: dict[str, Path],
+    profiles: dict[tuple[str, str], Path],
+) -> list[str]:
+    passed: list[str] = []
+    clone_for_slot = {"main": clones["sol"], "goodman": clones["astra"]}
+    for (mode, slot), path in profiles.items():
+        try:
+            profile = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise UpdateError(f"managed role profile cannot be parsed: {path}: {exc}") from None
+        args: list[str] = []
+        for key, value in flattened_role(profile):
+            args.extend(["-c", f"{key}={toml_cli_value(value)}"])
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(clone_for_slot[slot])
+        marker = f"CODEX_TEAM_ID={mode}:{slot}:v3"
+        result = run(
+            [str(binary), *args, "debug", "prompt-input", "__friday_update_probe__"],
+            env=env,
+            cwd=Path("/var/tmp"),
+            timeout=30,
+        )
+        require_success(result, f"managed role {mode}/{slot} marker probe")
+        try:
+            rendered = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise UpdateError(f"managed role {mode}/{slot} returned malformed prompt data: {exc}") from None
+        if marker not in json.dumps(rendered, ensure_ascii=False):
+            raise UpdateError(f"managed role {mode}/{slot} identity marker was not loaded")
+        if re.search(r"unknown (?:field|configuration)|unrecognized (?:field|configuration)", result.stderr, re.I):
+            raise UpdateError(f"managed role {mode}/{slot} has unsupported configuration")
+        strict_protocol_probe(
+            binary,
+            clone_for_slot[slot],
+            f"managed role {mode}/{slot}",
+            config_args=args,
+        )
+        passed.append(f"{mode}/{slot}")
+    return passed
+
+
+def validate_rpc_contract(schema_path: Path) -> None:
+    if _NATIVE_OWNER is not None:_NATIVE_OWNER.native_file_budget(schema_path,8388608)
+    try:
+        root = json.loads(schema_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise UpdateError(f"candidate schema bundle is incomplete: {exc}") from None
+    variants = root.get("oneOf") if isinstance(root, dict) else None
+    definitions = root.get("definitions") if isinstance(root, dict) else None
+    if not isinstance(variants, list) or not isinstance(definitions, dict):
+        raise UpdateError("candidate ClientRequest schema has an unexpected root shape")
+    by_method: dict[str, dict[str, object]] = {}
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        properties = variant.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        method = properties.get("method")
+        params = properties.get("params")
+        enum = method.get("enum") if isinstance(method, dict) else None
+        reference = params.get("$ref") if isinstance(params, dict) else None
+        if isinstance(enum, list) and len(enum) == 1 and isinstance(enum[0], str) and isinstance(reference, str):
+            name = reference.removeprefix("#/definitions/")
+            schema = definitions.get(name)
+            if isinstance(schema, dict):
+                by_method[enum[0]] = schema
+    missing = sorted(REQUIRED_METHODS - set(by_method))
+    if missing:
+        raise UpdateError("candidate app-server removed required methods: " + ", ".join(missing))
+    for method, params in RPC_COMPAT_PARAMS.items():
+        schema = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "definitions": definitions,
+            **by_method[method],
+        }
+        cases = [params, *RPC_COMPAT_VARIANTS.get(method, [])]
+        for case_index, case in enumerate(cases, start=1):
+            errors = sorted(
+                Draft7Validator(schema).iter_errors(case), key=lambda item: list(item.path)
+            )
+            if errors:
+                raise UpdateError(
+                    f"candidate {method} request contract case {case_index} is incompatible: "
+                    f"{errors[0].message}"
+                )
+
+
+async def isolated_remote_rpc_probe(endpoint: Path, expected_home: Path) -> None:
+    """Prove the stable Unix endpoint used by the real reconnect path."""
+    connection = unix_connect(
+        str(endpoint),
+        uri="ws://localhost/",
+        compression=None,
+        open_timeout=5,
+        close_timeout=2,
+        max_size=8_000_000,
+    )
+    websocket = await connection.__aenter__()
+    sequence = 0
+
+    async def call(method: str, params: dict[str, object]) -> dict[str, object]:
+        nonlocal sequence
+        sequence += 1
+        request_id = sequence
+        await websocket.send(json.dumps({"id": request_id, "method": method, "params": params}))
+        async with asyncio.timeout(10):
+            while True:
+                response = json.loads(await websocket.recv())
+                if not isinstance(response, dict) or response.get("id") != request_id:
+                    continue
+                if "error" in response or not isinstance(response.get("result"), dict):
+                    raise UpdateError(f"isolated remote {method} failed")
+                return response["result"]
+
+    try:
+        initialized = await call(
+            "initialize",
+            {
+                "clientInfo": {"name": "friday_codex_update_remote_validator", "version": "1"},
+                "capabilities": {"experimentalApi": True},
+            },
+        )
+        if initialized.get("codexHome") != str(expected_home):
+            raise UpdateError("isolated remote app-server used the wrong account home")
+        await websocket.send(json.dumps({"method": "initialized"}))
+        rows = await call("thread/list", {"limit": 1, "useStateDbOnly": True})
+        if not isinstance(rows.get("data"), list):
+            raise UpdateError("isolated remote thread/list response shape changed")
+    finally:
+        await connection.__aexit__(None, None, None)
+
+
+async def read_only_queue_probe(
+    endpoint: Path, expected_home: Path, thread: str
+) -> dict[str, object]:
+    """Read one exact root queue without the mutation helper's active-TUI contract."""
+    connection = unix_connect(
+        str(endpoint),
+        uri="ws://localhost/",
+        compression=None,
+        open_timeout=5,
+        close_timeout=2,
+        max_size=8_000_000,
+    )
+    websocket = await connection.__aenter__()
+    sequence = 0
+
+    async def call(method: str, params: dict[str, object]) -> dict[str, object]:
+        nonlocal sequence
+        sequence += 1
+        request_id = sequence
+        await websocket.send(json.dumps({"id": request_id, "method": method, "params": params}))
+        async with asyncio.timeout(10):
+            while True:
+                response = json.loads(await websocket.recv())
+                if not isinstance(response, dict) or response.get("id") != request_id:
+                    continue
+                if "error" in response or not isinstance(response.get("result"), dict):
+                    raise UpdateError(f"read-only {method} failed")
+                return response["result"]
+
+    try:
+        initialized = await call(
+            "initialize",
+            {
+                "clientInfo": {"name": "friday_codex_update_queue_gate", "version": "1"},
+                "capabilities": {"experimentalApi": True},
+            },
+        )
+        if initialized.get("codexHome") != str(expected_home):
+            raise UpdateError("read-only queue gate used the wrong account home")
+        await websocket.send(json.dumps({"method": "initialized"}))
+        result = await call("thread/queue/list", {"threadId": thread, "limit": 100})
+        if not isinstance(result.get("data"), list):
+            raise UpdateError("read-only queue gate response shape changed")
+        return result
+    finally:
+        await connection.__aexit__(None, None, None)
+
+
+def validate_candidate(
+    root: Path,
+    version: str,
+    *,
+    source_digest: str,
+    source_url: str,
+    source_tree_digest: str,
+) -> dict[str, object]:
+    binary = release_binary(root)
+    host = root / "bin/codex-code-mode-host"
+    if manifest_version(root) != version:
+        raise UpdateError("candidate path contains a different Codex version")
+    output = require_success(run([str(binary), "--version"], timeout=10), "version check").strip()
+    if output != f"codex-cli {version}":
+        raise UpdateError(f"candidate reported unexpected version: {output!r}")
+    host_help = require_success(run([str(host), "--help"], timeout=10), "code-mode host check")
+    if "codex-code-mode-host" not in host_help or "--listen" not in host_help:
+        raise UpdateError("candidate code-mode host has an unexpected command surface")
+    resume_help = require_success(run([str(binary), "resume", "--help"], timeout=10), "TUI resume surface")
+    resume_markers = {
+        "SESSION_ID": "[SESSION_ID]",
+        "--remote": "--remote <ADDR>",
+        "--config": "--config <key=value>",
+        "--model": "--model <MODEL>",
+        "--cd": "--cd <DIR>",
+    }
+    missing_resume_markers = [label for label, marker in resume_markers.items() if marker not in resume_help]
+    if missing_resume_markers:
+        raise UpdateError("candidate TUI resume surface is incomplete: " + ", ".join(missing_resume_markers))
+    queue_help = require_success(run([str(binary), "queue", "--help"], timeout=10), "queue CLI surface")
+    queue_markers = {
+        "--remote": "--remote <ADDR>",
+        "--thread": "--thread <THREAD>",
+        "--message": "--message <TEXT>",
+    }
+    missing_queue_markers = [label for label, marker in queue_markers.items() if marker not in queue_help]
+    if "Usage: codex queue" not in queue_help or missing_queue_markers:
+        raise UpdateError("candidate queue CLI surface is incomplete: " + ", ".join(missing_queue_markers))
+    role_paths, probed_role_hashes = role_profile_snapshot()
+    with ExitStack() as stack:
+        clones = {
+            slot: clone_config_home(home, f"friday-{slot}-config-", stack)
+            for slot, home in SLOTS.items()
+        }
+        import runpy
+
+        profile_helper = runpy.run_path(str(ASTRA_PROFILE_HELPER))
+        profile_helper["_configure_target_version"](version)
+        candidate_profile_result = profile_helper["ensure_path"](clones["astra"] / "config.toml")
+        candidate_profile = {
+            "target_version": version,
+            "status": candidate_profile_result.get("status"),
+            "sha256": candidate_profile_result.get("sha256"),
+            "drift_repaired": candidate_profile_result.get("drift_repaired"),
+        }
+        candidate_account_inputs = profile_input_hashes(clones)
+        features = run(
+            [str(binary), "features", "list"],
+            env={**os.environ, "CODEX_HOME": str(clones["astra"])},
+            cwd=Path("/var/tmp"),
+            timeout=20,
+        )
+        require_success(features, "Astra features CLI/parser gate")
+        for slot, clone in clones.items():
+            strict_protocol_probe(binary, clone, slot)
+        reconnect = runpy.run_path(str(RECONNECT))
+        resume_argv_cases: list[str] = []
+        case_labels = {
+            "astra": "astra:remote+config+model+cd+thread",
+            "sol": "sol:remote+config+cd+thread",
+        }
+        for slot, (home, thread) in reconnect["SLOTS"].items():
+            endpoint = Path(home) / "app-server-control/app-server-control.sock"
+            exact_argv = reconnect["build_resume_command"](slot, endpoint, thread)
+            exact_argv[0] = str(binary)
+            exact_probe = run(
+                [*exact_argv, "--help"],
+                env={**os.environ, "CODEX_HOME": str(clones[slot])},
+                cwd=REPO,
+                timeout=20,
+            )
+            exact_output = require_success(
+                exact_probe, f"{slot} exact TUI resume argv parser gate"
+            )
+            if "Usage: codex resume" not in exact_output:
+                raise UpdateError(f"{slot} exact TUI resume argv returned unexpected help")
+            resume_argv_cases.append(case_labels[slot])
+        role_profiles = role_profile_probes(binary, clones, role_paths)
+    with _native_temporary(prefix="friday-codex-schema-", dir=RUNTIME) as schema_name:
+        schema = Path(schema_name)
+        require_success(
+            run(
+                [str(binary), "app-server", "generate-json-schema", "--experimental", "--out", str(schema)],
+                timeout=30,
+            ),
+            "app-server schema generation",
+        )
+        client_schema = schema / "ClientRequest.json"
+        validate_rpc_contract(client_schema)
+    smoke = Path(tempfile.mkdtemp(prefix="friday-codex-smoke-", dir=_NATIVE_OWNER.temp_root if _NATIVE_OWNER is not None else "/var/tmp"))
+    stopped = False
+    try:
+        os.chmod(smoke, 0o700)
+        standalone = smoke / "packages/standalone"
+        standalone.mkdir(parents=True, mode=0o755)
+        os.symlink(root, standalone / "current")
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(smoke)
+        require_success(
+            run([str(binary), "app-server", "daemon", "start"], env=env, timeout=45),
+            "isolated daemon start",
+        )
+        version_output = require_success(
+            run([str(binary), "app-server", "daemon", "version"], env=env, timeout=15),
+            "isolated daemon version",
+        )
+        try:
+            daemon = json.loads(version_output)
+        except json.JSONDecodeError as exc:
+            raise UpdateError(f"isolated daemon returned malformed version data: {exc}") from None
+        expected = (version, version, version, "pid")
+        actual = (
+            daemon.get("managedCodexVersion"),
+            daemon.get("cliVersion"),
+            daemon.get("appServerVersion"),
+            daemon.get("backend"),
+        )
+        if actual != expected:
+            raise UpdateError(f"isolated daemon version mismatch: {actual!r}")
+        endpoint = smoke / "app-server-control/app-server-control.sock"
+        try:
+            listener = resolve_control_socket(endpoint, required=True)
+        except EndpointError as exc:
+            raise UpdateError(f"isolated daemon endpoint is incompatible: {exc}") from None
+        if listener is None:
+            raise UpdateError("isolated daemon endpoint did not resolve")
+        import runpy
+
+        reconnect = runpy.run_path(str(RECONNECT))
+        topology = reconnect["slot_state"](
+            str(smoke), "00000000-0000-0000-0000-000000000099", endpoint
+        )
+        if len(topology["backend_pids"]) != 1 or topology["active_tui_pids"]:
+            raise UpdateError("isolated daemon endpoint ownership was not attributable")
+        try:
+            if _NATIVE_OWNER is not None:_NATIVE_OWNER.native_endpoint(endpoint)
+            asyncio.run(isolated_remote_rpc_probe(endpoint, smoke))
+        except UpdateError:
+            raise
+        except BaseException as exc:
+            raise UpdateError(f"isolated remote RPC transport failed: {exc}") from None
+        queue_negative = run(
+            [
+                str(binary),
+                "queue",
+                "--remote",
+                "unix://" + str(endpoint),
+                "--thread",
+                "00000000-0000-0000-0000-000000000099",
+                "--message",
+                "__friday_queue_cli_probe__",
+            ],
+            env=env,
+            cwd=Path("/var/tmp"),
+            timeout=20,
+        )
+        if queue_negative.returncode == 0 or "thread/queue/add" not in (
+            queue_negative.stdout + queue_negative.stderr
+        ):
+            raise UpdateError("candidate queue CLI did not reach the remote queue RPC safely")
+        require_success(
+            run([str(binary), "app-server", "daemon", "restart"], env=env, timeout=45),
+            "isolated daemon restart",
+        )
+        restarted_version = require_success(
+            run([str(binary), "app-server", "daemon", "version"], env=env, timeout=15),
+            "isolated daemon version after restart",
+        )
+        try:
+            restarted = json.loads(restarted_version)
+        except json.JSONDecodeError as exc:
+            raise UpdateError(f"isolated restarted daemon returned malformed version data: {exc}") from None
+        restarted_identity = (
+            restarted.get("managedCodexVersion"),
+            restarted.get("cliVersion"),
+            restarted.get("appServerVersion"),
+            restarted.get("backend"),
+        )
+        if restarted_identity != expected:
+            raise UpdateError(f"isolated daemon restart version mismatch: {restarted_identity!r}")
+        require_success(
+            run([str(binary), "app-server", "daemon", "stop"], env=env, timeout=30),
+            "isolated daemon stop",
+        )
+        stopped = True
+    finally:
+        if not stopped:
+            with contextlib.suppress(Exception):
+                env = os.environ.copy()
+                env["CODEX_HOME"] = str(smoke)
+                stopped = run(
+                    [str(binary), "app-server", "daemon", "stop"], env=env, timeout=15
+                ).returncode == 0
+        if stopped:
+            if _NATIVE_OWNER is not None:_NATIVE_OWNER.native_children_closed()
+            shutil.rmtree(smoke)
+    if role_profile_hashes() != probed_role_hashes:
+        raise UpdateError("managed role snapshot changed after candidate probes")
+    checks = {
+        "schema": COMPAT_SCHEMA,
+        "validated_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "version": version,
+        "target": TARGET,
+        "release_root": str(root.resolve(strict=True)),
+        "binary": str(binary.resolve(strict=True)),
+        "binary_sha256": sha256_file(binary),
+        "code_mode_host": str(host.resolve(strict=True)),
+        "code_mode_host_sha256": sha256_file(host),
+        "manifest_sha256": sha256_file(root / "codex-package.json"),
+        "source_url": source_url,
+        "source_archive_sha256": source_digest,
+        "tree_sha256": source_tree_digest,
+        "required_rpc_methods": sorted(REQUIRED_METHODS),
+        "rpc_contract_case_counts": {
+            method: 1 + len(RPC_COMPAT_VARIANTS.get(method, []))
+            for method in sorted(RPC_COMPAT_PARAMS)
+        },
+        "strict_config_profiles": sorted(SLOTS),
+        "astra_candidate_profile": candidate_profile,
+        "account_input_sha256": candidate_account_inputs,
+        "validation_controls_sha256": validation_control_hashes(),
+        "role_profile_sha256": probed_role_hashes,
+        "role_profile_probes": role_profiles,
+        "read_only_rpc_probes": ["initialize", *READ_ONLY_PROBE_METHODS.values()],
+        "isolated_daemon": "start/restart/version/stop matched",
+        "isolated_endpoint": "legacy-or-managed-symlink ownership matched",
+        "isolated_remote_rpc": "initialize/thread-list through stable endpoint matched",
+        "tui_resume_surface": list(resume_markers),
+        "tui_resume_argv_cases": resume_argv_cases,
+        "queue_cli_surface": [*queue_markers, "remote thread/queue/add negative"],
+        "features_cli_surface": "Astra-clone features/list matched",
+    }
+    receipt = VALIDATED / f"{version}.json"
+    if _NATIVE_OWNER is not None:
+        return _NATIVE_OWNER.native_stage_receipt(receipt,checks)
+    atomic_private_json(receipt, checks)
+    return checks
+
+
+def pre_activation_slots_safe() -> tuple[bool, str | None]:
+    """Check local ownership/lifecycle without requiring a running backend."""
+    import runpy
+
+    helper = runpy.run_path(str(RECONNECT))
+    for slot, (home, thread) in helper["SLOTS"].items():
+        endpoint = Path(home) / "app-server-control/app-server-control.sock"
+        try:
+            state = helper["slot_state"](home, thread, endpoint)
+        except SystemExit:
+            return False, f"{slot}_topology_unavailable"
+        if state["active_tui_pids"] or state["foreign_writer_pids"]:
+            return False, f"{slot}_frontend_or_foreign_writer_active"
+        if len(state["backend_pids"]) > 1:
+            return False, f"{slot}_multiple_backends"
+        if state["backend_pids"]:
+            check = run(
+                [str(IDLE_GATE), slot],
+                timeout=30,
+            )
+            if check.returncode != 0:
+                return False, f"{slot}_root_not_quiescent"
+        lifecycle = run(
+            [
+                str(VENV_PYTHON),
+                str(LIFECYCLE),
+                "status",
+                "--profile",
+                slot,
+            ],
+            timeout=20,
+        )
+        if lifecycle.returncode != 0:
+            return False, f"{slot}_lifecycle_status_unavailable"
+        try:
+            lifecycle_state = json.loads(lifecycle.stdout)
+        except json.JSONDecodeError:
+            return False, f"{slot}_lifecycle_status_malformed"
+        if lifecycle_state.get("active") or lifecycle_state.get("stop_unconfirmed"):
+            return False, f"{slot}_lifecycle_not_idle"
+    return True, None
+
+
+def both_slots_quiescent() -> tuple[bool, str | None]:
+    """Prove both zero-TUI roots idle with exact, bounded empty queues."""
+    import runpy
+
+    ready, reason = pre_activation_slots_safe()
+    if not ready:
+        return ready, reason
+    helper = runpy.run_path(str(RECONNECT))
+    for slot, (home, thread) in helper["SLOTS"].items():
+        endpoint = Path(home) / "app-server-control/app-server-control.sock"
+        try:
+            before = helper["slot_state"](home, thread, endpoint)
+        except SystemExit:
+            return False, f"{slot}_topology_unavailable"
+        if len(before["backend_pids"]) != 1:
+            return False, f"{slot}_backend_unavailable_for_queue_proof"
+        try:
+            queue_state = asyncio.run(
+                read_only_queue_probe(endpoint, Path(home), thread)
+            )
+        except BaseException:
+            return False, f"{slot}_queue_status_unavailable"
+        if queue_state.get("nextCursor") is not None:
+            return False, f"{slot}_queue_exceeds_bounded_window"
+        rows = queue_state.get("data")
+        if not isinstance(rows, list):
+            return False, f"{slot}_queue_status_malformed"
+        if rows:
+            return False, f"{slot}_queue_not_empty"
+        try:
+            after = helper["slot_state"](home, thread, endpoint)
+        except SystemExit:
+            return False, f"{slot}_topology_unavailable"
+        if (
+            after["backend_pids"] != before["backend_pids"]
+            or after["active_tui_pids"]
+            or after["foreign_writer_pids"]
+        ):
+            return False, f"{slot}_topology_changed_during_queue_proof"
+    return True, None
+
+
+def set_current(candidate: Path) -> None:
+    """Atomically select one already-validated release without trusting current."""
+    resolved = candidate.resolve(strict=True)
+    try:
+        resolved.relative_to(RELEASES.resolve(strict=True))
+    except ValueError:
+        raise UpdateError("Codex selector target escapes the release directory") from None
+    release_binary(resolved)
+    temporary = STANDALONE / f".current.update.{os.getpid()}.{secrets.token_hex(6)}"
+    os.symlink(resolved, temporary)
+    try:
+        os.replace(temporary, CURRENT)
+        directory_fd = os.open(STANDALONE, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+    if current_root() != resolved:
+        raise UpdateError("Codex current link did not activate the validated candidate")
+
+
+def activate(candidate: Path) -> Path:
+    previous = current_root()
+    if candidate == previous:
+        return previous
+    set_current(candidate)
+    return previous
+
+
+def acquire_reconnect_locks() -> list[int] | None:
+    descriptors: list[int] = []
+    acquired = False
+    try:
+        for slot in sorted(SLOTS):
+            path = RUNTIME / f"sol-link-{slot}.reconnect.lock"
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+            descriptors.append(descriptor)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return None
+        acquired = True
+        return descriptors
+    finally:
+        if not acquired:
+            for descriptor in descriptors:
+                os.close(descriptor)
+
+
+def release_locks(descriptors: list[int]) -> None:
+    for descriptor in reversed(descriptors):
+        os.close(descriptor)
+
+
+WATCHER_SERVICES = ("friday-kimi-astra-watch.service", "friday-kimi-sol-watcher.service")
+
+
+def active_watchers() -> list[str]:
+    active: list[str] = []
+    for service in WATCHER_SERVICES:
+        state = run(["systemctl", "--user", "is-active", service], timeout=10)
+        if state.returncode == 0 and state.stdout.strip() == "active":
+            active.append(service)
+        elif state.stdout.strip() not in {"inactive", "failed", "unknown"}:
+            raise UpdateError(f"watcher {service} is in an unsafe transition state")
+    return active
+
+
+def pause_watchers(services: list[str]) -> None:
+    if any(service not in WATCHER_SERVICES for service in services):
+        raise FatalUpdateError("activation journal named an unknown watcher")
+    try:
+        for service in services:
+            require_success(
+                run(["systemctl", "--user", "stop", service], timeout=30),
+                f"pause {service}",
+            )
+    except BaseException as stop_error:
+        try:
+            # A stop command can report failure after the service actually
+            # transitioned.  Recover every service proven active at entry,
+            # including ones not yet visited in this loop.
+            resume_watchers(services)
+        except BaseException as resume_error:
+            raise FatalUpdateError(
+                f"watcher pause failed ({stop_error}); recovery was unconfirmed: {resume_error}"
+            ) from None
+        raise
+
+
+def pause_active_watchers() -> list[str]:
+    active = active_watchers()
+    pause_watchers(active)
+    return active
+
+
+def stop_watchers_for_rollback(services: list[str]) -> None:
+    """Stop the original delivery set without auto-resume on uncertainty."""
+    try:
+        for service in services:
+            require_success(
+                run(["systemctl", "--user", "stop", service], timeout=30),
+                f"re-pause {service} for rollback",
+            )
+        still_active = set(active_watchers()).intersection(services)
+    except BaseException as exc:
+        raise FatalUpdateError(f"could not prove watchers stopped for rollback: {exc}") from None
+    if still_active:
+        raise FatalUpdateError(
+            "watchers remained active before rollback: " + ", ".join(sorted(still_active))
+        )
+
+
+def quiesce_managed_watchers(expected: list[str]) -> list[str]:
+    """Stop every observed managed watcher before trusting rollback metadata."""
+    if any(service not in WATCHER_SERVICES for service in expected):
+        raise FatalUpdateError("rollback expected an unknown watcher")
+    try:
+        observed = active_watchers()
+    except BaseException as observe_error:
+        try:
+            # A transitional/unknown systemd state cannot be used to select a
+            # subset safely.  Stop the complete bounded managed set and block.
+            stop_watchers_for_rollback(list(WATCHER_SERVICES))
+        except BaseException as stop_error:
+            raise FatalUpdateError(
+                f"watcher state observation failed ({observe_error}); "
+                f"full managed-set stop was unconfirmed: {stop_error}"
+            ) from None
+        raise FatalUpdateError(
+            f"watcher state observation failed; full managed set was stopped: {observe_error}"
+        ) from None
+    stop_watchers_for_rollback(sorted(set(observed).union(expected)))
+    return observed
+
+
+def write_activation_journal(payload: dict[str, object], phase: str) -> None:
+    updated = dict(payload)
+    updated["phase"] = phase
+    updated["updated_at"] = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    atomic_private_json(ACTIVATION_JOURNAL, updated)
+    payload.clear()
+    payload.update(updated)
+
+
+def clear_activation_journal() -> None:
+    try:
+        info = ACTIVATION_JOURNAL.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        ACTIVATION_JOURNAL.is_symlink()
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise FatalUpdateError("activation journal identity became unsafe")
+    ACTIVATION_JOURNAL.unlink()
+    directory_fd = os.open(ACTIVATION_JOURNAL.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def begin_activation_journal(
+    previous: Path,
+    candidate: Path,
+    version: str,
+    astra_profile_snapshot: bytes,
+    watchers: list[str],
+) -> dict[str, object]:
+    if ACTIVATION_JOURNAL.exists():
+        raise FatalUpdateError("an earlier activation journal must be recovered first")
+    payload: dict[str, object] = {
+        "schema": "friday.codex-activation-journal.v1",
+        "target": TARGET,
+        "previous_root": str(previous.resolve(strict=True)),
+        "previous_version": manifest_version(previous),
+        "candidate_root": str(candidate.resolve(strict=True)),
+        "candidate_version": version,
+        "astra_profile_snapshot_b64": base64.b64encode(astra_profile_snapshot).decode("ascii"),
+        "astra_profile_snapshot_sha256": hashlib.sha256(astra_profile_snapshot).hexdigest(),
+        "originally_active_watchers": sorted(watchers),
+        "created_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    write_activation_journal(payload, "prepared")
+    return payload
+
+
+def read_activation_journal() -> tuple[dict[str, object], Path, Path, bytes, list[str]] | None:
+    try:
+        ACTIVATION_JOURNAL.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise FatalUpdateError(f"activation journal cannot be inspected: {exc}") from None
+    payload = safe_private_receipt(ACTIVATION_JOURNAL)
+    if payload is None:
+        raise FatalUpdateError("existing activation journal is malformed")
+    phases = {
+        "prepared", "watchers_paused", "selector_switching", "selector_switched",
+        "daemons_converged", "watchers_restoring",
+    }
+    if (
+        payload.get("schema") != "friday.codex-activation-journal.v1"
+        or payload.get("target") != TARGET
+        or payload.get("phase") not in phases
+    ):
+        raise FatalUpdateError("activation journal schema or phase is invalid")
+    try:
+        previous = Path(str(payload["previous_root"])).resolve(strict=True)
+        candidate = Path(str(payload["candidate_root"])).resolve(strict=True)
+        previous.relative_to(RELEASES.resolve(strict=True))
+        candidate.relative_to(RELEASES.resolve(strict=True))
+    except (KeyError, OSError, ValueError):
+        raise FatalUpdateError("activation journal release roots are invalid") from None
+    previous_version = payload.get("previous_version")
+    candidate_version = payload.get("candidate_version")
+    if (
+        not isinstance(previous_version, str)
+        or not isinstance(candidate_version, str)
+        or manifest_version(previous) != previous_version
+        or manifest_version(candidate) != candidate_version
+        or previous.name != f"{previous_version}-{TARGET}"
+        or candidate.name != f"{candidate_version}-{TARGET}"
+    ):
+        raise FatalUpdateError("activation journal release identities changed")
+    watchers = payload.get("originally_active_watchers")
+    if (
+        not isinstance(watchers, list)
+        or any(not isinstance(item, str) or item not in WATCHER_SERVICES for item in watchers)
+        or watchers != sorted(set(watchers))
+    ):
+        raise FatalUpdateError("activation journal watcher set is invalid")
+    encoded = payload.get("astra_profile_snapshot_b64")
+    expected_snapshot_hash = payload.get("astra_profile_snapshot_sha256")
+    try:
+        snapshot = base64.b64decode(encoded, validate=True) if isinstance(encoded, str) else b""
+    except (ValueError, binascii.Error):
+        raise FatalUpdateError("activation journal profile snapshot is malformed") from None
+    if (
+        not snapshot
+        or not isinstance(expected_snapshot_hash, str)
+        or hashlib.sha256(snapshot).hexdigest() != expected_snapshot_hash
+    ):
+        raise FatalUpdateError("activation journal profile snapshot failed integrity")
+    return payload, previous, candidate, snapshot, watchers
+
+
+def resume_watchers(services: list[str]) -> None:
+    failures: list[str] = []
+    try:
+        for service in services:
+            result = run(["systemctl", "--user", "start", service], timeout=30)
+            if result.returncode != 0:
+                failures.append(service)
+                continue
+            deadline = time.monotonic() + 8
+            continuously_active_since: float | None = None
+            healthy = False
+            while time.monotonic() < deadline:
+                state = run(
+                    [
+                        "systemctl", "--user", "show", service,
+                        "--property=ActiveState", "--property=SubState", "--value",
+                    ],
+                    timeout=10,
+                )
+                fields = state.stdout.splitlines()
+                active = state.returncode == 0 and fields == ["active", "running"]
+                if active:
+                    if continuously_active_since is None:
+                        continuously_active_since = time.monotonic()
+                    if time.monotonic() - continuously_active_since >= 2:
+                        healthy = True
+                        break
+                else:
+                    continuously_active_since = None
+                    if "failed" in fields or "inactive" in fields:
+                        break
+                time.sleep(0.25)
+            if not healthy:
+                failures.append(service)
+    except BaseException as exc:
+        raise FatalUpdateError(
+            f"critical native task watcher restoration became uncertain: {exc}"
+        ) from None
+    if failures:
+        raise FatalUpdateError("critical native task watchers did not resume: " + ", ".join(failures))
+
+
+def resume_watchers_and_commit_journal(services: list[str], *, context: str) -> None:
+    """Make delivery live only if the durable activation marker also clears."""
+    try:
+        resume_watchers(services)
+    except BaseException as resume_error:
+        try:
+            stop_watchers_for_rollback(services)
+        except BaseException as stop_error:
+            raise FatalUpdateError(
+                f"{context}: watcher resume failed ({resume_error}); re-pause was unconfirmed: "
+                f"{stop_error}"
+            ) from None
+        raise FatalUpdateError(
+            f"{context}: watcher resume failed and delivery was re-paused: {resume_error}"
+        ) from None
+    try:
+        clear_activation_journal()
+    except BaseException as clear_error:
+        try:
+            stop_watchers_for_rollback(services)
+        except BaseException as stop_error:
+            raise FatalUpdateError(
+                f"{context}: activation journal clear failed ({clear_error}); "
+                f"watcher re-pause was unconfirmed: {stop_error}"
+            ) from None
+        raise FatalUpdateError(
+            f"{context}: activation journal clear failed and delivery was re-paused: "
+            f"{clear_error}"
+        ) from None
+
+
+def converge_all_daemons(version: str, *, force_restart: bool = True) -> dict[str, object]:
+    import runpy
+
+    helper = runpy.run_path(str(RECONNECT))
+    helper_binary = Path(helper["BIN"]).resolve(strict=True)
+    expected_binary = (current_root() / "bin/codex").resolve(strict=True)
+    if helper_binary != expected_binary:
+        raise UpdateError("reconnect helper did not resolve the active Codex release")
+
+    astra_env = os.environ.copy()
+    astra_env["CODEX_HOME"] = str(SLOTS["astra"])
+    require_success(
+        run([str(VENV_PYTHON), str(ASTRA_PROFILE_HELPER), "--ensure"], env=astra_env, timeout=20),
+        "Astra HTTPS profile version convergence",
+    )
+
+    daemon_reports: dict[str, object] = {}
+    for slot, (home, thread) in helper["SLOTS"].items():
+        endpoint = Path(home) / "app-server-control/app-server-control.sock"
+        env = os.environ.copy()
+        env["CODEX_HOME"] = home
+        try:
+            report = helper["ensure_managed_daemon"](
+                slot, home, thread, endpoint, env, force_restart=force_restart
+            )
+        except SystemExit as exc:
+            raise UpdateError(f"{slot} daemon convergence failed: {exc}") from None
+        if not helper["daemon_matches"](report, version, endpoint):
+            raise UpdateError(f"{slot} daemon did not report a coherent {version} package")
+        daemon_reports[slot] = report
+
+    for slot, (home, thread) in helper["SLOTS"].items():
+        endpoint = Path(home) / "app-server-control/app-server-control.sock"
+        state = helper["slot_state"](home, thread, endpoint)
+        if state["active_tui_pids"] or state["foreign_writer_pids"] or len(state["backend_pids"]) != 1:
+            raise UpdateError(f"{slot} topology changed during coordinated activation")
+        preflight = run(
+            [str(VENV_PYTHON), str(LIFECYCLE), "preflight", "--profile", slot],
+            env={**os.environ, "CODEX_HOME": home},
+            timeout=30,
+        )
+        require_success(preflight, f"{slot} lifecycle preflight after daemon convergence")
+    return daemon_reports
+
+
+def prepare_astra_profile_snapshot() -> bytes:
+    """Converge the old-version profile first, then retain exact rollback bytes."""
+    import runpy
+
+    astra_env = os.environ.copy()
+    astra_env["CODEX_HOME"] = str(SLOTS["astra"])
+    require_success(
+        run([str(VENV_PYTHON), str(ASTRA_PROFILE_HELPER), "--ensure"], env=astra_env, timeout=20),
+        "Astra HTTPS profile pre-activation convergence",
+    )
+    helper = runpy.run_path(str(ASTRA_PROFILE_HELPER))
+    snapshot = helper["snapshot_path"]()
+    if not isinstance(snapshot, bytes):
+        raise UpdateError("Astra HTTPS profile snapshot is malformed")
+    return snapshot
+
+
+def restore_astra_profile_snapshot(snapshot: bytes, candidate_version: str) -> None:
+    """Restore only the helper-owned candidate-version transition."""
+    import runpy
+
+    helper = runpy.run_path(str(ASTRA_PROFILE_HELPER))
+    helper["restore_exact_path"](snapshot, allowed_from_version=candidate_version)
+    if helper["snapshot_path"]() != snapshot:
+        raise UpdateError("Astra HTTPS profile rollback bytes did not match the snapshot")
+
+
+def coordinated_activate(
+    candidate: Path,
+    previous: Path,
+    version: str,
+    paused_watchers: list[str],
+    astra_profile_snapshot: bytes,
+    journal: dict[str, object],
+) -> dict[str, object]:
+    selector_change_attempted = False
+    try:
+        write_activation_journal(journal, "selector_switching")
+        selector_change_attempted = True
+        activate(candidate)
+        write_activation_journal(journal, "selector_switched")
+        reports = converge_all_daemons(version)
+        write_activation_journal(journal, "daemons_converged")
+        # Watcher health is part of the commit boundary: a candidate is not
+        # committed while queue delivery remains stopped or uncertain.
+        write_activation_journal(journal, "watchers_restoring")
+        resume_watchers_and_commit_journal(
+            paused_watchers, context="candidate activation commit"
+        )
+        return reports
+    except BaseException as activation_error:
+        rollback_errors: list[str] = []
+        previous_version = manifest_version(previous)
+        if selector_change_attempted:
+            try:
+                stop_watchers_for_rollback(paused_watchers)
+            except BaseException as exc:
+                rollback_errors.append(f"watcher re-pause: {exc}")
+        if selector_change_attempted and not rollback_errors:
+            try:
+                # Do not inspect or trust the possibly half-switched selector here.
+                # Repoint it from the known validated rollback target directly.
+                set_current(previous)
+            except BaseException as exc:
+                rollback_errors.append(f"selector: {exc}")
+            if not rollback_errors:
+                try:
+                    restore_astra_profile_snapshot(astra_profile_snapshot, version)
+                except BaseException as exc:
+                    rollback_errors.append(f"astra profile: {exc}")
+            if not rollback_errors:
+                try:
+                    converge_all_daemons(previous_version)
+                except BaseException as exc:
+                    rollback_errors.append(f"daemons: {exc}")
+        if not rollback_errors:
+            try:
+                resume_watchers_and_commit_journal(
+                    paused_watchers, context="candidate activation rollback"
+                )
+            except BaseException as exc:
+                rollback_errors.append(f"watchers/journal: {exc}")
+        if rollback_errors:
+            raise FatalUpdateError(
+                f"candidate activation failed ({activation_error}); rollback incomplete: "
+                + "; ".join(rollback_errors)
+            ) from None
+        if isinstance(activation_error, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise UpdateError(f"candidate activation failed and was rolled back: {activation_error}") from None
+
+
+def rollback_pre_activation_transaction(
+    previous: Path,
+    previous_version: str,
+    candidate_version: str,
+    astra_profile_snapshot: bytes,
+    paused_watchers: list[str],
+) -> dict[str, object]:
+    """Restore the exact old boundary after any post-journal pre-switch failure."""
+    try:
+        observed = quiesce_managed_watchers(paused_watchers)
+        unexpected = sorted(set(observed) - set(paused_watchers))
+        if unexpected:
+            raise FatalUpdateError(
+                "pre-activation rollback found unexpected active watchers: "
+                + ", ".join(unexpected)
+            )
+        # Even before the first intended selector switch, converge from the
+        # journal's authenticated rollback target.  Starting the old Astra
+        # daemon and then failing on Sol is already a multi-root mutation.
+        set_current(previous)
+        restore_astra_profile_snapshot(astra_profile_snapshot, candidate_version)
+        ensure_current_release_for_use(previous, previous_version)
+        reports = converge_all_daemons(previous_version, force_restart=False)
+        ready, reason = pre_activation_slots_safe()
+        if not ready:
+            raise FatalUpdateError(
+                f"pre-activation rollback did not prove the restored boundary: {reason}"
+            )
+        resume_watchers_and_commit_journal(
+            paused_watchers, context="pre-activation rollback"
+        )
+        return reports
+    except FatalUpdateError:
+        raise
+    except BaseException as exc:
+        raise FatalUpdateError(f"pre-activation rollback failed: {exc}") from None
+
+
+def recovery_offline_boundary() -> None:
+    """Prove no frontend/foreign writer and no local lifecycle work, without RPC."""
+    import runpy
+
+    helper = runpy.run_path(str(RECONNECT))
+    try:
+        processes = helper["process_snapshot"]()
+    except SystemExit as exc:
+        raise FatalUpdateError(f"interrupted activation process scan failed: {exc}") from None
+    allowed_backend_pids: set[int] = set()
+    slot_homes = {str(home) for home in SLOTS.values()}
+    for slot, (home, thread) in helper["SLOTS"].items():
+        endpoint = Path(home) / "app-server-control/app-server-control.sock"
+        try:
+            state = helper["slot_state"](home, thread, endpoint)
+        except SystemExit as exc:
+            raise FatalUpdateError(f"{slot} interrupted topology is unsafe: {exc}") from None
+        if (
+            state["active_tui_pids"]
+            or state["foreign_writer_pids"]
+            or len(state["backend_pids"]) > 1
+        ):
+            raise FatalUpdateError(f"{slot} interrupted topology is not rollback-safe")
+        allowed_backend_pids.update(int(pid) for pid in state["backend_pids"])
+        lifecycle = run(
+            [str(VENV_PYTHON), str(LIFECYCLE), "status", "--profile", slot],
+            timeout=20,
+        )
+        if lifecycle.returncode != 0:
+            raise FatalUpdateError(f"{slot} local lifecycle state is unavailable")
+        try:
+            lifecycle_state = json.loads(lifecycle.stdout)
+        except json.JSONDecodeError:
+            raise FatalUpdateError(f"{slot} local lifecycle state is malformed") from None
+        if lifecycle_state.get("active") or lifecycle_state.get("stop_unconfirmed"):
+            raise FatalUpdateError(f"{slot} local lifecycle state is not idle")
+    unexpected = sorted(
+        int(proc["pid"])
+        for proc in processes
+        if proc.get("home") in slot_homes and int(proc["pid"]) not in allowed_backend_pids
+    )
+    if unexpected:
+        raise FatalUpdateError(
+            "unattributable Codex processes exist during interrupted recovery: "
+            + ", ".join(str(pid) for pid in unexpected)
+        )
+
+
+def recover_incomplete_activation() -> dict[str, object] | None:
+    """Deterministically roll an interrupted activation back before any TUI use."""
+    try:
+        ACTIVATION_JOURNAL.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise FatalUpdateError(f"activation journal cannot be inspected: {exc}") from None
+    reconnect_locks = acquire_reconnect_locks()
+    if reconnect_locks is None:
+        raise FatalUpdateError(
+            "incomplete Codex activation exists and native reconnect locks are busy"
+        )
+    try:
+        # The journal itself is untrusted until parsed.  Stop the complete
+        # bounded managed delivery set under both reconnect locks before
+        # reading even its watcher list or phase; malformed bytes stay fatal
+        # and nothing is resumed.
+        observed = quiesce_managed_watchers(list(WATCHER_SERVICES))
+        journal_state = read_activation_journal()
+        if journal_state is None:
+            raise FatalUpdateError("activation journal disappeared during recovery")
+        payload, previous, candidate, snapshot, watchers = journal_state
+        unexpected = sorted(set(observed) - set(watchers))
+        if unexpected:
+            raise FatalUpdateError(
+                "incomplete activation has unexpected active watchers: " + ", ".join(unexpected)
+            )
+        selected = current_root()
+        if selected not in {previous, candidate}:
+            raise FatalUpdateError(
+                "active Codex selector is neither journal previous nor candidate release"
+            )
+        recovery_offline_boundary()
+        previous_version = str(payload["previous_version"])
+        candidate_version = str(payload["candidate_version"])
+        set_current(previous)
+        restore_astra_profile_snapshot(snapshot, candidate_version)
+        ensure_current_release_for_use(previous, previous_version)
+        early_phase = payload.get("phase") in {"prepared", "watchers_paused"}
+        reports = converge_all_daemons(
+            previous_version, force_restart=not early_phase
+        )
+        if early_phase:
+            # The durable selector-switching phase is fsynced before any
+            # selector attempt.  Earlier phases may legitimately have queued
+            # work; restore old delivery without consuming or requiring it empty.
+            ready, reason = pre_activation_slots_safe()
+        else:
+            ready, reason = both_slots_quiescent()
+        if not ready:
+            raise FatalUpdateError(
+                f"rolled-back daemons did not prove the phase-required safe boundary: {reason}"
+            )
+        resume_watchers_and_commit_journal(
+            watchers, context="interrupted activation rollback"
+        )
+        return {
+            "status": "rolled_back_interrupted_activation",
+            "version": previous_version,
+            "daemons": reports,
+            "watchers": watchers,
+        }
+    except FatalUpdateError:
+        raise
+    except BaseException as exc:
+        raise FatalUpdateError(f"interrupted activation rollback failed: {exc}") from None
+    finally:
+        release_locks(reconnect_locks)
+
+
+def main(argv: list[str] | None = None) -> int:
+    if True:raise FatalUpdateError('ordinary main is forbidden under existing native dual locks')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("slot", choices=sorted(SLOTS))
+    parser.add_argument("--stage-only", action="store_true", help="download and validate, but never switch current")
+    args = parser.parse_args(argv)
+    lock_fd = os.open(LOCK, os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    install_lock = STANDALONE / "install.lock"
+    install_lock_fd = os.open(
+        install_lock, os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        for descriptor, label in ((lock_fd, "update lock"), (install_lock_fd, "install lock")):
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+            ):
+                raise FatalUpdateError(f"unsafe {label}")
+            # Codex's pre-existing install.lock is commonly 0664.  Once its
+            # exact opened inode is proven user-owned, regular and single-link,
+            # narrow it through the FD before taking either update lock.
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                os.fchmod(descriptor, 0o600)
+                info = os.fstat(descriptor)
+                if stat.S_IMODE(info.st_mode) != 0o600:
+                    raise FatalUpdateError(f"could not secure {label}")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        fcntl.flock(install_lock_fd, fcntl.LOCK_EX)
+        recover_incomplete_activation()
+        previous = current_root()
+        previous_version = manifest_version(previous)
+        ensure_current_release_for_use(previous, previous_version)
+        try:
+            latest, digest, url = fetch_json()
+        except (
+            UpdateError,
+            urllib.error.URLError,
+            http.client.HTTPException,
+            TimeoutError,
+            OSError,
+        ) as exc:
+            print(json.dumps({
+                "status": "offline_current",
+                "slot": args.slot,
+                "version": previous_version,
+                "warning": str(exc),
+            }, sort_keys=True))
+            return 0
+        if version_tuple(latest) < version_tuple(previous_version):
+            raise UpdateError("latest channel attempted a downgrade")
+        candidate = RELEASES / f"{latest}-{TARGET}"
+        verified_archive: Path | None = None
+        if not candidate.exists():
+            archive_fd, archive_name = tempfile.mkstemp(
+                prefix=f".codex-{latest}.", suffix=".tar.gz", dir=STANDALONE
+            )
+            os.close(archive_fd)
+            archive = Path(archive_name)
+            archive.unlink()
+            try:
+                download(url, digest, archive)
+                extract_release(archive, candidate, latest)
+                verified_archive = archive
+                source_tree_digest = ensure_source_provenance(
+                    candidate,
+                    latest,
+                    digest,
+                    url,
+                    verified_archive=verified_archive,
+                )
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    archive.unlink()
+        elif candidate == previous and not args.stage_only and current_receipts_match(
+            candidate, latest, digest, url
+        ):
+            binary = release_binary(candidate)
+            output = require_success(run([str(binary), "--version"], timeout=10), "version check").strip()
+            if output != f"codex-cli {latest}":
+                raise UpdateError(f"current release reported unexpected version: {output!r}")
+            print(json.dumps({
+                "status": "already_current",
+                "slot": args.slot,
+                "version": latest,
+            }, sort_keys=True))
+            return 0
+        else:
+            source_tree_digest = ensure_source_provenance(candidate, latest, digest, url)
+        checks = validate_candidate(
+            candidate,
+            latest,
+            source_digest=digest,
+            source_url=url,
+            source_tree_digest=source_tree_digest,
+        )
+        if args.stage_only:
+            status = "already_current" if candidate == previous else "staged"
+            print(json.dumps({
+                "status": status,
+                "slot": args.slot,
+                "current": previous_version,
+                "latest": latest,
+                "candidate": str(candidate),
+                "checks": checks,
+            }, sort_keys=True))
+            return 0
+        ready, reason = pre_activation_slots_safe()
+        if not ready:
+            ensure_current_release_for_use(previous, previous_version)
+            print(json.dumps({
+                "status": "staged_deferred",
+                "slot": args.slot,
+                "current": previous_version,
+                "latest": latest,
+                "candidate": str(candidate),
+                "reason": reason,
+            }, sort_keys=True))
+            return 0
+        reconnect_locks = acquire_reconnect_locks()
+        if reconnect_locks is None:
+            ensure_current_release_for_use(previous, previous_version)
+            print(json.dumps({
+                "status": "staged_deferred",
+                "slot": args.slot,
+                "current": previous_version,
+                "latest": latest,
+                "candidate": str(candidate),
+                "reason": "native_reconnect_lock_busy",
+            }, sort_keys=True))
+            return 0
+        paused_watchers: list[str] = []
+        coordinator_owns_recovery = False
+        try:
+            ready, reason = pre_activation_slots_safe()
+            if not ready:
+                ensure_current_release_for_use(previous, previous_version)
+                print(json.dumps({
+                    "status": "staged_deferred",
+                    "slot": args.slot,
+                    "current": previous_version,
+                    "latest": latest,
+                    "candidate": str(candidate),
+                    "reason": reason,
+                }, sort_keys=True))
+                return 0
+            astra_profile_snapshot = prepare_astra_profile_snapshot()
+            paused_watchers = active_watchers()
+            journal = begin_activation_journal(
+                previous, candidate, latest, astra_profile_snapshot, paused_watchers
+            )
+            try:
+                pause_watchers(paused_watchers)
+                write_activation_journal(journal, "watchers_paused")
+                # A cold boot may have no daemons.  Start or retain the exact
+                # current-version pair under both reconnect locks before the
+                # read-only queue proof; never relax mutation helper contracts.
+                converge_all_daemons(previous_version, force_restart=False)
+                ready, reason = both_slots_quiescent()
+                if not ready:
+                    raise DeferredActivation(str(reason))
+                coordinator_owns_recovery = True
+                daemon_reports = coordinated_activate(
+                    candidate,
+                    previous,
+                    latest,
+                    paused_watchers,
+                    astra_profile_snapshot,
+                    journal,
+                )
+            except BaseException as transaction_error:
+                if not coordinator_owns_recovery:
+                    try:
+                        rollback_pre_activation_transaction(
+                            previous,
+                            previous_version,
+                            latest,
+                            astra_profile_snapshot,
+                            paused_watchers,
+                        )
+                    except BaseException as recovery_error:
+                        raise FatalUpdateError(
+                            f"pre-activation failure ({transaction_error}); recovery incomplete: "
+                            f"{recovery_error}"
+                        ) from None
+                raise
+        finally:
+            # Once coordinated_activate is entered it owns watcher recovery;
+            # on an incomplete rollback it intentionally leaves them stopped.
+            release_locks(reconnect_locks)
+        selected = current_root()
+        ensure_current_release_for_use(selected, manifest_version(selected))
+        print(json.dumps({
+            "status": "updated",
+            "slot": args.slot,
+            "previous": previous_version,
+            "version": latest,
+            "candidate": str(candidate),
+            "checks": checks,
+            "daemons": daemon_reports,
+        }, sort_keys=True))
+        return 0
+    except FatalUpdateError as exc:
+        print(json.dumps({
+            "status": "activation_blocked",
+            "slot": args.slot,
+            "error": str(exc),
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+    except DeferredActivation as exc:
+        ensure_current_release_for_use(previous, previous_version)
+        print(json.dumps({
+            "status": "staged_deferred",
+            "slot": args.slot,
+            "current": previous_version,
+            "latest": latest,
+            "candidate": str(candidate),
+            "reason": str(exc),
+        }, sort_keys=True))
+        return 0
+    except UpdateError as exc:
+        print(json.dumps({
+            "status": "candidate_rejected",
+            "slot": args.slot,
+            "error": str(exc),
+        }, sort_keys=True), file=sys.stderr)
+        try:
+            if read_activation_journal() is not None:
+                return 2
+            selected = current_root()
+            ensure_current_release_for_use(selected, manifest_version(selected))
+        except (UpdateError, FatalUpdateError):
+            return 2
+        return 0
+    finally:
+        os.close(install_lock_fd)
+        os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

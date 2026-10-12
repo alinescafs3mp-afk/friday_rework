@@ -1,0 +1,1041 @@
+"""INERT one-shot caller for Root's exact admitted stock finite host.
+
+Adapts C25 fixture_caller-v4; never authenticates Root from JSON, hashes or an
+owner object. Root controls the exact invocation externally BEFORE bootstrap.
+The supplied capability confines that already admitted request, one use only.
+"""
+import ctypes
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import resource
+import signal
+import stat
+import sys
+import time
+import types
+
+AS = 268435456
+MAX = 67108864
+LIMIT = 65536
+SELF = str(Path(__file__).resolve())
+PYTHON = '/SANITIZED_WORKSPACE/.venv/bin/python'
+
+
+def require(ok, reason):
+    if not ok:
+        raise ValueError(reason)
+
+
+def identity(pid):
+    v = Path('/proc/' + str(pid) + '/stat').read_text().rsplit(')', 1)[1].split()
+    return {'pid': pid, 'birth': v[19], 'ppid': int(v[1]), 'pgid': int(v[2]), 'sid': int(v[3])}
+
+
+def read_pin(ref, maximum=1048576):
+    require(type(ref) is dict and set(ref) == {'path', 'bytes', 'sha256'}, 'pin shape')
+    p = Path(ref['path'])
+    require(p.is_absolute() and '..' not in p.parts and str(p) == os.path.normpath(str(p)), 'pin path')
+    require(type(ref['bytes']) is int and 0 <= ref['bytes'] <= maximum, 'pin size')
+    for parent in reversed(p.parents):
+        require(stat.S_ISDIR(parent.lstat().st_mode), 'pin ancestor')
+    fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        a = os.fstat(fd)
+        require(stat.S_ISREG(a.st_mode) and a.st_nlink == 1 and a.st_uid == os.getuid()
+                and not a.st_mode & 0o077 and a.st_size <= maximum, 'private regular pin')
+        chunks, size = [], 0
+        while True:
+            b = os.read(fd, min(8192, maximum + 1 - size))
+            if not b:
+                break
+            chunks.append(b)
+            size += len(b)
+            require(size <= maximum, 'pin read bound')
+        raw = b''.join(chunks)
+        key = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mode, s.st_mtime_ns, s.st_ctime_ns)
+        require(key(a) == key(os.fstat(fd)) == key(p.lstat()), 'pin drift')
+        require(len(raw) == ref['bytes'] and hashlib.sha256(raw).hexdigest() == ref['sha256'], 'pin mismatch')
+        return raw
+    finally:
+        os.close(fd)
+
+
+def put(path, value):
+    raw = (json.dumps(value, sort_keys=True, allow_nan=False) + '\n').encode()
+    require(len(raw) <= LIMIT, 'evidence bound')
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, 'wb') as f:
+        f.write(raw)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def caller_limits():
+    for kind, cap in ((resource.RLIMIT_AS, AS), (resource.RLIMIT_CPU, 60), (resource.RLIMIT_FSIZE, MAX)):
+        require(resource.getrlimit(kind) == (cap, cap), 'hard caller resources before Source')
+    require(resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
+            and 0 < len(os.sched_getaffinity(0)) <= 2, 'caller core/affinity')
+    return {'pid': os.getpid(), 'birth': identity(os.getpid())['birth'],
+            'AS': [AS, AS], 'CPU': [60, 60], 'FSIZE': [MAX, MAX], 'CORE': [0, 0],
+            'affinity': sorted(os.sched_getaffinity(0))}
+
+
+class _Lease:
+    pass
+
+
+class _RootOneShotOwner:
+    """Confines Root's externally chosen exact request; supplies no new issuer.
+
+    Only the approved main below creates/uses this capability. The actual stock
+    parent retains caller closure. The SAME custody is held before any fork.
+    """
+    def __init__(self, spec, launch, clock):
+        self.spec, self.launch, self.clock = spec, launch, clock
+        self.lease = _Lease()
+        self.used = False
+        self.custody = None
+        self.events = []
+        self.observation_bytes = 0
+        self.observation_errors = []
+        self.caller = caller_limits()
+        self._live()
+
+    def _observe(self, phase):
+        # Only this actual caller and the SAME already held helper custody.
+        # Existing host stdout.log is the bounded output; no new channel/issuer.
+        try:
+            c = self.custody
+            frame = {'kind': 'FINITE_CALLER_OBSERVATION', 'phase': phase,
+                     'observed_unix': time.time(), 'observed_monotonic': time.monotonic(),
+                     'caller': identity(os.getpid()), 'actual_host': identity(os.getppid()),
+                     'capacity_release': False, 'custody': 'NOT_HELD_YET', 'errors': []}
+            require(frame['caller']['birth'] == self.caller['birth'] and frame['actual_host'] == self.launch['host'],
+                    'same actual caller and host births in observation')
+            if c is not None:
+                frame['custody'] = {'pid': c.pid, 'birth': c.ticks, 'waited': c.waited,
+                                    'state': c.state, 'retained_fds': {}, 'ambiguous': dict(c.fd_errors),
+                                    'direct_wait_observed': c.waited, 'fresh_birth_absent': c.child_absent,
+                                    'process_state_is_never_reap_or_release_authority': True}
+                require(len(c.fds) <= 24, 'bounded caller observation handles')
+                for name, fd in c.fds.items():
+                    if fd is None:
+                        continue
+                    row = {'fd': fd, 'cached_identity': c.fd_ids.get(name), 'current_identity': 'UNKNOWN',
+                           'target': 'UNKNOWN', 'fdinfo': 'UNKNOWN'}
+                    for key in ('current_identity', 'target', 'fdinfo'):
+                        try:
+                            if key == 'current_identity':
+                                s = os.fstat(fd)
+                                row[key] = [s.st_dev, s.st_ino, stat.S_IFMT(s.st_mode)]
+                                if c.fd_ids.get(name) is not None:
+                                    require(row[key] == list(c.fd_ids[name]), 'retained caller FD identity drift')
+                            elif key == 'target':
+                                row[key] = os.readlink('/proc/self/fd/' + str(fd))
+                            else:
+                                with open('/proc/self/fdinfo/' + str(fd), 'rb', buffering=0) as f:
+                                    raw = f.read(4097)
+                                require(len(raw) <= 4096, 'bounded caller fdinfo')
+                                row[key] = raw.decode('utf-8', 'replace')
+                        except BaseException as exc:
+                            frame['errors'].append({'label': name, 'field': key, 'class': type(exc).__name__})
+                    frame['custody']['retained_fds'][name] = row
+            raw = (json.dumps(frame, sort_keys=True, allow_nan=False) + '\n').encode()
+            require(len(raw) <= 16384 and self.observation_bytes + len(raw) <= LIMIT, 'whole caller observation output')
+            self.observation_bytes += len(raw)
+            offset = 0
+            while offset < len(raw):
+                n = os.write(1, raw[offset:])
+                require(n > 0, 'zero caller observation write')
+                offset += n
+            if frame['errors']:
+                self.observation_errors.extend(frame['errors'][:16])
+                return False
+            return True
+        except BaseException as exc:
+            self.observation_errors.append({'phase': phase, 'class': type(exc).__name__})
+            return False
+
+    def _observe_or_retain(self, phase):
+        try:
+            confirmed = self._observe(phase)
+        except BaseException:
+            confirmed = False
+        if not confirmed:
+            # No raw observation exception drops the SAME caller/custody. Actual
+            # already admitted host deadline/parent-death/stock guard remain live.
+            while True:
+                try:
+                    signal.pause()
+                except BaseException:
+                    pass  # Existing host/stock stop bounds the SAME caller.
+
+
+    def _live(self):
+        host = identity(os.getppid())
+        require(host == self.launch['host'], 'actual outside direct caller owner changed')
+        require(identity(self.launch['outer_guard']['pid']) == self.launch['outer_guard'], 'actual stock outer guard changed')
+        require(identity(os.getpid())['pgid'] == host['pgid'] == self.launch['outer_guard']['pgid'], 'same owned physical cohort')
+        require(time.monotonic() < self.launch['deadline_monotonic']
+                and time.time() < self.launch['deadline_unix'], 'actual outside deadline exhausted')
+        cmd = Path('/proc/' + str(host['pid']) + '/cmdline').read_bytes().split(b'\0')[:-1]
+        ref = self.launch['input']
+        require(cmd == [PYTHON.encode(), b'-I', b'-B', self.spec['host']['path'].encode(),
+                        ref['path'].encode(), str(ref['bytes']).encode(), ref['sha256'].encode()], 'pinned actual finite host invocation')
+        read_pin(self.spec['host'])
+
+    def require_authority(self, request):
+        if getattr(self,'native',False):return self.native_authority(request)
+
+        require(not self.used, 'one-shot capability already consumed')
+        self.used = True
+        self._live()
+        fields = {'caller', 'helper', 'entry', 'descriptor', 'clock_pin', 'authority_clock',
+                  'evidence', 'fixture_root', 'stop_monotonic', 'stop_unix',
+                  'final_monotonic', 'final_unix', 'sum_hard_AS_bytes',
+                  'outside_deadline_through_actual_caller_exit'}
+        require(type(request) is dict and set(request) == fields, 'exact helper request fields')
+        expected = {'caller': self.caller, 'helper': self.spec['helper'], 'entry': self.spec['entry'],
+                    'descriptor': self.spec['descriptor'], 'clock_pin': self.spec['clock'],
+                    'authority_clock': self.clock, 'evidence': self.spec['evidence'],
+                    'fixture_root': self.spec['fixture_root'], 'sum_hard_AS_bytes': 2 * AS,
+                    'outside_deadline_through_actual_caller_exit': True}
+        require(all(request[k] == v for k, v in expected.items()), 'exact admitted request scope mismatch')
+        require(request['outside_deadline_through_actual_caller_exit'] is True, 'actual outside ownership required')
+        useful_mono = self.clock['started_at_monotonic'] + self.clock['original_seconds'] - self.clock['cleanup_seconds']
+        final_mono = self.clock['started_at_monotonic'] + self.clock['original_seconds']
+        for key in ('stop_monotonic', 'stop_unix', 'final_monotonic', 'final_unix'):
+            require(type(request[key]) in (int, float) and math.isfinite(request[key]), 'exact finite request deadline')
+        require(time.monotonic() < request['stop_monotonic'] <= min(useful_mono, time.monotonic() + self.spec['wall_cap'])
+                and time.time() < request['stop_unix'] <= min(self.clock['useful_deadline_unix'], time.time() + self.spec['wall_cap'])
+                and request['final_monotonic'] == min(final_mono, request['stop_monotonic'] + 5)
+                and request['final_unix'] == min(self.clock['final_deadline_unix'], request['stop_unix'] + 5)
+                and self.launch['deadline_monotonic'] <= request['final_monotonic']
+                and self.launch['deadline_unix'] <= request['final_unix'], 'original physical clock/request bounds')
+        require(abs((request['stop_unix'] - self.clock['started_at_unix'])
+                    - (request['stop_monotonic'] - self.clock['started_at_monotonic'])) <= 2, 'dual-clock request consistency')
+        for key in ('helper', 'entry', 'descriptor', 'clock'):
+            read_pin(self.spec[key], LIMIT if key in ('descriptor', 'clock') else 1048576)
+        self.events.append({'event': 'require_authority', 'exact_scope_matched': True, 'issuer': 'EXTERNAL_ROOT_NOT_AUTHENTICATED_BY_JSON'})
+        return self.lease
+
+    def hold(self, lease, custody):
+        if getattr(self,'native',False):
+            require(lease is self.lease and custody is self and self.custody is None,'same native custody registered')
+            self.custody=custody;return
+
+        require(self.custody is None, 'no second custody')
+        self.custody = custody  # Retain SAME mutable object before fallible checks.
+        require(lease is self.lease and self.used and custody.pid is None and not custody.fds
+                and custody.caller == self.caller and custody.clock == self.clock, 'pre-fork exact custody registration')
+        self._observe_or_retain('same_custody_held_before_fork')
+        self.events.append({'event': 'hold', 'before_fork': True, 'same_mutable_object': True})
+
+    def before_go(self, lease, custody):
+        if getattr(self,'native',False):
+            require(lease is self.lease and custody is self.custody is self,'same native pre-registered custody')
+            self.native_check();return
+
+        require(lease is self.lease and custody is self.custody, 'same pre-registered custody')
+        self._live()
+        worker = identity(custody.pid)
+        require(worker['ppid'] == os.getpid() and worker['birth'] == custody.ticks
+                and worker['pgid'] == self.launch['host']['pgid'], 'owned current worker birth')
+        require(custody.worker['AS'] == [AS, AS] and custody.worker['CPU'] == [40, 40]
+                and custody.worker['CORE'] == [0, 0] and custody.worker['affinity'] == self.caller['affinity'], 'worker resources before GO')
+        os.fstat(custody.fds['pidfd'])
+        os.fstat(custody.fds['evidence'])
+        self._observe_or_retain('actual_worker_retained_before_GO')
+        self.events.append({'event': 'before_GO', 'worker': worker, 'sum_hard_AS_bytes': 2 * AS})
+
+    def pending(self, lease, custody):
+        if getattr(self,'native',False):return self.native_pending()
+
+        require(lease is self.lease and custody is self.custody, 'same pending custody')
+        self._observe_or_retain('helper_pending_same_custody')
+        self.events.append({'event': 'pending', 'snapshot': custody.snapshot(), 'capacity_release': False})
+
+    def helper_unwound(self, lease, custody):
+        if getattr(self,'native',False):
+            self.native_check();return
+
+        require(lease is self.lease and custody is self.custody, 'same unwound custody')
+        self._live()
+        self._observe_or_retain('helper_unwound_caller_scope_still_held')
+        self.events.append({'event': 'helper_unwound', 'caller_scope_retained': True})
+
+    def reconcile(self):
+        if getattr(self,'native',False):return self.native_children_closed()
+
+        c = self.custody
+        if c is None:
+            return None
+        self._live()
+        self._observe_or_retain('before_same_custody_reconcile')
+        before = c.snapshot()
+        if c.pid is not None and not c.waited:
+            fd = c.fds.get('pidfd')
+            require(fd is not None and not c.fd_errors, 'STOP_UNCONFIRMED no unambiguous owned pidfd')
+            s = os.fstat(fd)
+            require((s.st_dev, s.st_ino, stat.S_IFMT(s.st_mode)) == c.fd_ids['pidfd'], 'retained pidfd identity')
+            try:
+                self._observe_or_retain('before_reconcile_worker_pidfd_stop')
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            pid, status = os.waitpid(c.pid, 0)  # Actual direct wait; stock parent still bounds this syscall.
+            require(pid == c.pid, 'exact current direct child wait')
+            c.status, c.waited = status, True
+            try:
+                c.child_absent = identity(c.pid)['birth'] != c.ticks
+            except FileNotFoundError:
+                c.child_absent = True
+        if c.pid is not None and not (c.waited and c.child_absent is True):
+            self._observe_or_retain('direct_wait_or_fresh_absence_unconfirmed_before_any_close')
+            while True:
+                try:
+                    signal.pause()
+                except BaseException:
+                    pass  # SAME custody; existing host/stock stop remains armed.
+        for name in list(c.fds):
+            if c.fds.get(name) is not None:
+                self._observe_or_retain('before_helper_close_' + name)
+            c.close_fd(name)  # Never retries an ambiguous close or replaces a handle.
+        require(not c.fd_errors and all(fd is None for fd in c.fds.values()) and c.mask_restored
+                and (c.pid is None or (c.waited and c.child_absent)), 'STOP_UNCONFIRMED retained resources')
+        return {'before': before, 'after': c.snapshot(), 'same_object': True,
+                'caller_closure': 'outside stock Popen direct wait still required'}
+
+    def native_init(self, spec, launch, clock):
+        # Same existing owner. Actual Root controls this independently reviewed
+        # invocation; neither an input JSON nor this object issues permission.
+        import fcntl
+        self.native = True
+        self.spec, self.launch, self.clock = spec, launch, clock
+        self.lease, self.used, self.custody = _Lease(), False, None
+        self.events, self.direct, self.known, self.fds, self.fd_ids, self.ambiguous = [], {}, {}, {}, {}, {}
+        self.output_bytes, self.pending_receipt, self.unknown_spawn = 0, None, False
+        self.temp_root = Path(spec['native']['temp_root'])
+        self.group = Path(spec['native']['group'])
+        self.namespace = os.stat('/proc/self/ns/pid').st_ino
+        require(os.getpid() == 1 and self.namespace != launch['native']['host_pid_namespace'], 'private PID init required')
+        require(launch['native']['caller_birth'] == identity(1)['birth'], 'exact caller across PID namespace')
+        require(resource.getrlimit(resource.RLIMIT_AS) == (1073741824,1073741824)
+                and resource.getrlimit(resource.RLIMIT_CPU) == (120,120)
+                and resource.getrlimit(resource.RLIMIT_FSIZE) == (MAX,MAX)
+                and resource.getrlimit(resource.RLIMIT_CORE) == (0,0)
+                and sorted(os.sched_getaffinity(0)) == launch['native']['affinity'], 'native caller hard caps')
+        for key,fd in launch['native']['lock_fds'].items():
+            self.native_track('lock_'+key,fd)
+            require(list(self.fd_ids['lock_'+key]) == launch['native']['lock_ids'][key], 'same inherited dual lock FD')
+            require('lock:' in Path('/proc/self/fdinfo/'+str(fd)).read_text(), 'actual inherited flock missing')
+        self.native_track('native_host_pidfd',launch['native']['host_pidfd'])
+        self.native_check(reserve=1005)
+
+    def native_track(self,label,fd):
+        require(label not in self.fds, 'occupied native handle')
+        self.fds[label] = fd  # Retain before fallible fstat; never replace.
+        s=os.fstat(fd); self.fd_ids[label]=(s.st_dev,s.st_ino,stat.S_IFMT(s.st_mode))
+        return fd
+
+    def native_check(self,reserve=0,cleanup=False):
+        useful=self.clock['started_at_monotonic']+self.clock['original_seconds']-self.clock['cleanup_seconds']
+        final=self.clock['started_at_monotonic']+self.clock['original_seconds']
+        end=final if cleanup else useful
+        uend=self.clock['final_deadline_unix'] if cleanup else self.clock['useful_deadline_unix']
+        require(time.monotonic()+reserve < end and time.time()+reserve < uend, 'original dual native deadline/reserve')
+        elapsed=time.monotonic()-self.clock['started_at_monotonic']
+        require(elapsed>=0 and abs(time.time()-self.clock['started_at_unix']-elapsed)<=2
+                and self.clock['original_seconds']==1800 and self.clock['cleanup_seconds']==180
+                and self.clock['useful_deadline_unix']==self.clock['started_at_unix']+1620
+                and self.clock['final_deadline_unix']==self.clock['started_at_unix']+1800
+                and self.clock['boot_id']==Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'unchanged original native clock')
+        plan=self.spec['native']
+        s=self.group.stat(); require([s.st_dev,s.st_ino]==self.launch['native']['group_identity'],'private resource scope drift')
+        for name,value in {'memory.max':'2147483648','memory.swap.max':'0','pids.max':'128','cpu.max':'200000 100000'}.items():
+            require((self.group/name).read_text().strip()==value,'finite inherited controller '+name)
+        require(Path('/proc/self/cgroup').read_text().strip()=='0::'+plan['group_relative'],'caller inherited private group')
+        require(os.stat('/proc/self/ns/pid').st_ino==self.namespace, 'PID namespace escape')
+        require(int((self.group/'pids.current').read_text())<=128, 'Linux task bound; threads included')
+        for name,fd in self.fds.items():
+            require(name not in self.ambiguous,'retained native descriptor ambiguity')
+            if fd is None:continue
+            v=os.fstat(fd); require((v.st_dev,v.st_ino,stat.S_IFMT(v.st_mode))==self.fd_ids[name],'native retained FD drift')
+        for pin in plan['current_pins']: read_pin(pin,2097152)
+        # Actual tmpfs mount and inode/byte ceilings, rather than FSIZE fiction.
+        mounts=Path('/proc/self/mountinfo').read_text().splitlines()
+        row=[x for x in mounts if x.split()[4]==str(self.temp_root)]
+        require(len(row)==1 and ' - tmpfs ' in row[0], 'private hard-bounded tmpfs missing')
+        v=os.statvfs(self.temp_root)
+        require(v.f_blocks*v.f_frsize<=134217728 and v.f_files<=512, 'hard whole temp bytes/inodes')
+
+    def native_authority(self,request):
+        require(not self.used and type(request) is dict and request==self.spec['native']['request'], 'one-shot exact native request')
+        self.used=True
+        require(request['entry']=='ensure_current_release_for_use' and request['domain']=='native'
+                and request['source_audit_sha256']=='af7304a03c86d364b4b1898bd03bfb66d11ea1e53c92cbcdbf3191643cd7fd8b'
+                and request['native_admission']!='Source21', 'distinct genuine native route; Source audit intact')
+        self.native_check(reserve=1005)
+        return self.lease
+
+    def native_scan(self,reap=True):
+        # PID namespace is a kernel ownership boundary; no protected writer PID
+        # is visible here. Every task was already reserved by pids/memory/CPU.
+        self.native_check(cleanup=True)
+        entries=list(Path('/proc').iterdir()); pids=[int(p.name) for p in entries if p.name.isdecimal() and int(p.name)!=1]
+        require(len(pids)<=127,'finite native processes')
+        for pid in pids:
+            try:
+                raw=Path('/proc/'+str(pid)+'/stat').read_text(); v=raw.rsplit(')',1)[1].split()
+            except FileNotFoundError:
+                # Vanishing before registration is unknown, never zero/reap.
+                raise RuntimeError('STOP_UNCONFIRMED unregistered disappearing native birth')
+            row={'pid':pid,'birth':v[19],'state':v[0],'ppid':int(v[1]),'namespace':self.namespace}
+            if row['state']!='Z':
+                require(os.stat('/proc/'+str(pid)+'/ns/pid').st_ino==self.namespace,'descendant namespace escape')
+                require(Path('/proc/'+str(pid)+'/cgroup').read_text().strip()=='0::'+self.spec['native']['group_relative'],'descendant scope escape')
+            else:row['active_probes']='NOT_APPLICABLE_ZOMBIE_UNREAPED_NOT_CLOSURE'
+            key=(pid,row['birth'])
+            if key not in self.known:
+                self.known[key]=dict(row,waited=False,absent=False)
+                self.native_track('pidfd_'+str(pid)+'_'+row['birth'],os.pidfd_open(pid))
+            # Zombie has no active syscall/remote-FD sampling or closure credit.
+            if reap and row['ppid']==1 and row['state']=='Z' and pid not in self.direct:
+                waited,status=os.waitpid(pid,os.WNOHANG)
+                require(waited==pid,'exact adopted wait; ECHILD is not proof')
+                self.known[key].update(waited=True,status=status,absent=self.native_absent(pid,row['birth']))
+        return pids
+
+    def native_absent(self,pid,ticks):
+        try:return identity(pid)['birth']!=ticks
+        except FileNotFoundError:return True
+
+    def native_spawn(self,command,*,env=None,cwd=None,input_pipe=False,role='CLI'):
+        import subprocess,select
+        require(self.used and not self.unknown_spawn,'native lease/unknown previous birth')
+        self.native_check()
+        self.native_scan()
+        require(len(self.direct)<8 and 113<=112, 'reserve 16 Linux tasks before direct spawn')
+        require(type(command) is list and 0<len(command)<=96 and all(type(x)is str for x in command), 'bounded argv')
+        require(command[0] in self.spec['native']['executables'],'exact genuine executable')
+        env=dict(os.environ if env is None else env)
+        if 'CODEX_HOME' in env: require(Path(env['CODEX_HOME']).is_relative_to(self.temp_root), 'protected real home denied')
+        require('FRIDAY_NATIVE_OWNER' not in env,'no foreign owner token')
+        args=json.dumps(command,separators=(',',':')); require(len(args.encode())<=16384,'bounded barrier argv')
+        go_r,go_w=os.pipe();ready_r,ready_w=os.pipe()
+        tag='spawn_'+str(len(self.events))
+        for n,fd in [('go_r',go_r),('go_w',go_w),('ready_r',ready_r),('ready_w',ready_w)]:self.native_track(tag+'_'+n,fd)
+        self.unknown_spawn=True  # Before Popen; an exception never means no child.
+        proc=subprocess.Popen([PYTHON,'-I','-B',SELF,'--native-child',str(go_r),str(ready_w),args],
+             env=env,cwd=cwd,stdin=subprocess.PIPE if input_pipe else subprocess.DEVNULL,
+             stdout=subprocess.PIPE,stderr=subprocess.PIPE,close_fds=True,pass_fds=(go_r,ready_w),start_new_session=False)
+        self.direct[proc.pid]={'proc':proc,'tag':tag,'waited':False,'role':role} # Before pidfd/birth.
+        fd=self.native_track('direct_pidfd_'+str(proc.pid),os.pidfd_open(proc.pid))
+        row=identity(proc.pid);self.direct[proc.pid]['birth']=row['birth']
+        self.known[(proc.pid,row['birth'])]=dict(row,namespace=self.namespace,waited=False,absent=False)
+        for n,stream in [('stdout',proc.stdout),('stderr',proc.stderr),('stdin',proc.stdin)]:
+            if stream is not None:self.native_track(tag+'_'+n,stream.fileno())
+        require(select.select([ready_r],[],[],min(5,self.native_remaining()))[0] and os.read(ready_r,1)==b'R','actual native child ready barrier')
+        self.native_check(); require(identity(proc.pid)['birth']==row['birth'],'native birth drift before GO')
+        require(Path('/proc/'+str(proc.pid)+'/cgroup').read_text().strip()=='0::'+self.spec['native']['group_relative'],'child private scope before GO')
+        limits=Path('/proc/'+str(proc.pid)+'/limits').read_text()
+        require('1073741824' in limits and os.stat('/proc/'+str(proc.pid)+'/ns/pid').st_ino==self.namespace,'native hard cap/namespace before GO')
+        self.events.append({'event':'native_before_GO','identity':row,'role':role,'pidfd':fd,'kernel_reservation_before_birth':True})
+        self.before_go(self.lease,self)
+        require(os.write(go_w,b'G')==1,'exact one-byte existing GO barrier')
+        self.unknown_spawn=False
+        for n in ['go_r','go_w','ready_r','ready_w']:self.native_close_fd(tag+'_'+n)
+        return proc
+
+    def native_remaining(self,cleanup=False):
+        m=self.clock['started_at_monotonic']+self.clock['original_seconds']-(0 if cleanup else self.clock['cleanup_seconds'])
+        u=self.clock['final_deadline_unix'] if cleanup else self.clock['useful_deadline_unix']
+        return max(0,min(m-time.monotonic(),u-time.time()))
+
+    def native_charge(self,chunk):
+        self.output_bytes+=len(chunk)
+        require(self.output_bytes<=33554432,'cumulative CLI/strict output whole32MiB exhausted')
+        self.native_check()
+
+    def native_wait(self,proc,timeout=5,stop=False):
+        row=self.direct[proc.pid];fd=self.fds['direct_pidfd_'+str(proc.pid)]
+        self.native_check(cleanup=True)
+        if stop:
+            require(identity(proc.pid)['birth']==row['birth'],'owned native signal birth')
+            try:signal.pidfd_send_signal(fd,signal.SIGKILL)
+            except ProcessLookupError:pass
+        code=proc.wait(timeout=min(timeout,self.native_remaining(True)))
+        require(self.native_absent(proc.pid,row['birth']),'actual direct wait plus fresh absence')
+        row.update(waited=True,returncode=code)
+        self.known[(proc.pid,row['birth'])].update(waited=True,absent=True,returncode=code)
+        self.direct.pop(proc.pid)
+        self.native_scan()
+        return code
+
+    def native_run(self,command,*,env=None,cwd=None,input_text=None,timeout=30):
+        import subprocess,selectors
+        require(input_text is None or len(input_text.encode())<=65536,'bounded stdin')
+        proc=self.native_spawn(command,env=env,cwd=cwd,input_pipe=input_text is not None)
+        selector=selectors.DefaultSelector(); out,err=bytearray(),bytearray()
+        selector_label='native_selector_'+str(len(self.fds));self.native_track(selector_label,selector.fileno())
+        for stream,label in [(proc.stdout,'out'),(proc.stderr,'err')]:
+            os.set_blocking(stream.fileno(),False);selector.register(stream,selectors.EVENT_READ,label)
+        input_raw=b'' if input_text is None else input_text.encode(); pos=0
+        if proc.stdin is not None:os.set_blocking(proc.stdin.fileno(),False);selector.register(proc.stdin,selectors.EVENT_WRITE,'in')
+        end=min(time.monotonic()+timeout,time.monotonic()+self.native_remaining())
+        try:
+            while selector.get_map():
+                self.native_check();self.native_scan()
+                require(time.monotonic()<end,'native bounded collector original timeout')
+                for key,mask in selector.select(min(.05,end-time.monotonic())):
+                    if key.data=='in':
+                        if pos<len(input_raw):pos+=os.write(key.fd,input_raw[pos:pos+8192])
+                        if pos==len(input_raw):selector.unregister(key.fileobj);self.native_close_stream(proc,'stdin')
+                    else:
+                        chunk=os.read(key.fd,8192)
+                        if not chunk:selector.unregister(key.fileobj);continue
+                        self.native_charge(chunk);(out if key.data=='out' else err).extend(chunk)
+            code=self.native_wait(proc,min(5,self.native_remaining(True)))
+            return subprocess.CompletedProcess(command,code,out.decode('utf-8','replace'),err.decode('utf-8','replace'))
+        except BaseException:
+            if proc.pid in self.direct:self.native_wait(proc,5,stop=True)
+            raise
+        finally:
+            self.native_close_selector(selector,selector_label)
+            if proc.pid not in self.direct:
+                for label in ['stdin','stdout','stderr']:self.native_close_stream(proc,label)
+
+
+    def native_close_selector(self,selector,label):
+        fd=self.fds.get(label)
+        require(fd is not None and label not in self.ambiguous,'same retained selector before close')
+        try:
+            v=os.fstat(fd);require((v.st_dev,v.st_ino,stat.S_IFMT(v.st_mode))==self.fd_ids[label],
+                                 'selector descriptor identity')
+            selector.close();self.fds[label]=None
+        except BaseException:self.ambiguous[label]='SELECTOR_CLOSE_UNKNOWN';raise
+
+    def native_close_stream(self,proc,name):
+        stream=getattr(proc,name,None)
+        if stream is None:return
+        tag=next((v['tag'] for v in self.direct.values() if v['proc'] is proc),None)
+        if tag is None:
+            fd=stream.fileno() if not stream.closed else None
+            label=next((k for k,v in self.fds.items() if v==fd and k.endswith('_'+name)),None)
+        else:label=tag+'_'+name
+        if label and self.fds.get(label) is not None:
+            fd=self.fds[label]
+            require(label not in self.ambiguous,'no close retry')
+            try:
+                s=os.fstat(fd);require((s.st_dev,s.st_ino,stat.S_IFMT(s.st_mode))==self.fd_ids[label],'stream identity')
+                stream.close();self.fds[label]=None
+            except BaseException:
+                self.ambiguous[label]='STREAM_CLOSE_UNKNOWN';raise
+
+    def native_close_fd(self,label):
+        fd=self.fds.get(label)
+        if fd is None:return
+        require(label not in self.ambiguous,'no ambiguous close retry')
+        try:
+            s=os.fstat(fd);require((s.st_dev,s.st_ino,stat.S_IFMT(s.st_mode))==self.fd_ids[label],'retained descriptor identity')
+            os.close(fd);self.fds[label]=None
+        except BaseException:self.ambiguous[label]='CLOSE_UNKNOWN';raise
+
+    def native_children_closed(self):
+        self.native_scan()
+        require(not self.direct and not Path('/proc/self/task/1/children').read_text().strip(), 'live native child; stop CLI zero is insufficient')
+        require(not self.unknown_spawn and not self.ambiguous,'unknown spawn/close holds custody')
+        require(all(v['waited'] and self.native_absent(v['pid'],v['birth']) for v in self.known.values()), 'all direct/adopted actual waits and fresh absence')
+        return True
+
+    def native_temp(self,prefix):
+        import contextlib,tempfile
+        @contextlib.contextmanager
+        def managed():
+            self.native_check();t=tempfile.mkdtemp(prefix=prefix,dir=self.temp_root)
+            try:yield t
+            finally:
+                self.native_children_closed() # Never delete live daemon/custody evidence.
+                import shutil
+                shutil.rmtree(t)
+        return managed()
+
+    def native_endpoint(self,path):
+        p=Path(path);require(p.is_relative_to(self.temp_root),'private smoke endpoint only')
+        require(p.resolve(strict=True).is_relative_to(self.temp_root),'private endpoint target escape')
+
+    def native_stage_receipt(self,path,checks):
+        self.native_children_closed();self.native_check()
+        require(self.pending_receipt is None,'one staged genuine receipt')
+        require(str(path)==self.spec['native']['receipt_path'],'exact genuine compatibility receipt')
+        raw=json.dumps(checks,sort_keys=True,separators=(',',':')).encode()
+        require(len(raw)<=49152,'bounded complete genuine receipt')
+        self.pending_receipt={'path':str(path),'payload':checks,'sha256':hashlib.sha256(raw).hexdigest(),
+                             'status':'GATES_RETURNED_NOT_CALLER_CLOSURE_NOT_RECEIPT'}
+        # Parent commits the unchanged genuine payload only after THIS caller's
+        # actual wait and fresh whole resource closure. No fabricated match.
+        return checks
+
+    def native_pending(self):
+        self.events.append({'event':'STOP_UNCONFIRMED','capacity_release':False})
+        while True:
+            try:signal.pause()
+            except BaseException:pass # Existing independently admitted stock guard.
+
+
+    def native_capture_read(self,ref):
+        # Root pins the WHOLE Python import/data inventory. This is an existing
+        # owner capture extension, not sys.path/runpy lookup or a runtime grant.
+        self.capture_check()
+        require(type(ref) is dict and set(ref)=={'path','bytes','sha256'}
+                and type(ref['bytes']) is int and 0<=ref['bytes']<=16777216,'capture exact finite pin')
+        p=Path(ref['path'])
+        require(p.is_absolute() and '..' not in p.parts,'capture absolute path')
+        for parent in p.parents:require(stat.S_ISDIR(parent.lstat().st_mode),'capture no symlink ancestor')
+        fd=self.native_track('capture_input_'+str(len(self.fds)),os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK))
+        a=os.fstat(fd)
+        require(stat.S_ISREG(a.st_mode) and a.st_nlink==1 and a.st_uid in (0,os.getuid())
+                and not a.st_mode&0o022 and a.st_size==ref['bytes'],'capture regular owned nonwritable input')
+        raw=bytearray()
+        while True:
+            b=os.read(fd,min(65536,ref['bytes']+1-len(raw)))
+            if not b:break
+            raw.extend(b);require(len(raw)<=ref['bytes'],'capture read bound')
+        key=lambda s:(s.st_dev,s.st_ino,s.st_size,s.st_mode,s.st_mtime_ns,s.st_ctime_ns)
+        require(key(a)==key(os.fstat(fd))==key(p.lstat())
+                and hashlib.sha256(raw).hexdigest()==ref['sha256'],'capture same-read identity and digest')
+        self.native_close_fd(next(k for k,v in self.fds.items() if v==fd))
+        return bytes(raw)
+
+    def native_capture(self,descriptor,snapshot=None):
+        import builtins
+        import importlib.machinery
+        import _imp
+        catalog=descriptor['native_capture']
+        require(type(catalog) is dict and set(catalog)=={'modules','resources','applications','entry_module','bootstrap','builtins','frozen'},
+                'complete exact native capture catalog')
+        require(0<len(catalog['modules'])<=2048 and len(catalog['resources'])<=1024,'finite capture collection')
+        require(all(root in catalog['modules'] for root in
+                ['base64','binascii','http','jsonschema','secrets','selectors','shutil','tarfile','urllib']),
+                'all nine genuine roots captured')
+        require(set(catalog['builtins'])==set(sys.builtin_module_names),'exact interpreter builtin prerequisite')
+        self.capture_catalog=catalog;self.capture_raw={};self.capture_extensions={}
+        self.capture_check=getattr(self,'capture_check',self.native_check)
+        self.capture_saved_meta=None;self.capture_new_modules=set()
+        self.capture_sys=types.ModuleType('sys');self.capture_sys.__dict__.update(sys.__dict__)
+        self.capture_sys.path=list(sys.path)
+        self.capture_runpy=types.ModuleType('runpy');self.capture_runpy.run_path=self.native_run_path
+        refs={r['pin']['path']:r['pin'] for r in catalog['modules'].values() if r['kind']!='namespace'}
+        for p,r in catalog['resources'].items():
+            require(p==r['path'],'resource logical path');require(p not in refs or refs[p]==r,'resource pin collision');refs[p]=r
+        require(sum(r['bytes'] for r in refs.values())<=134217728,'whole capture raw128MiB cap')
+        if snapshot is None:self.capture_raw={p:self.native_capture_read(r) for p,r in refs.items()}
+        else:
+            require(type(snapshot) is dict and set(snapshot)==set(refs),'exact inherited capture closure')
+            for p,r in refs.items():
+                raw=snapshot[p];require(type(raw) is bytes and len(raw)==r['bytes']
+                        and hashlib.sha256(raw).hexdigest()==r['sha256'],'inherited same captured bytes')
+                self.capture_raw[p]=raw
+        for name,r in catalog['modules'].items():
+            require(all(x.isidentifier() for x in name.split('.')) and r['kind'] in ['module','package','extension','namespace'],
+                    'exact capture module name/kind')
+            if '.' in name:require(name.rsplit('.',1)[0] in catalog['modules'],'captured parent namespace')
+            if r['kind']!='namespace':
+                require(set(r)=={'kind','pin','logical_path'},'capture module fields')
+            else:require(set(r)=={'kind','paths'} and r['paths'] and all(Path(p).is_absolute() for p in r['paths']),
+                         'exact captured namespace paths')
+        for name,digest in catalog['frozen'].items():
+            require(_imp.is_frozen(name),'actual frozen interpreter prerequisite')
+            import marshal
+            require(hashlib.sha256(marshal.dumps(_imp.get_frozen_object(name))).hexdigest()==digest,'frozen code drift')
+        for path,name in catalog['applications'].items():
+            require(name in catalog['modules'] and catalog['modules'][name]['logical_path']==path,
+                    'closed application runpy inventory')
+        require(catalog['entry_module'] in catalog['modules'],'genuine entry captured')
+        # Bootstrap modules are a declared trusted interpreter prerequisite.
+        # Python application/thirdparty code is always captured fresh below.
+        for name,m in list(sys.modules.items()):
+            if m is None:continue
+            origin=getattr(getattr(m,'__spec__',None),'origin',None)
+            canonical=getattr(getattr(m,'__spec__',None),'name',name)
+            if origin in ('built-in','frozen',None):
+                require(canonical in catalog['builtins'] or canonical in catalog['frozen']
+                        or name in ('__main__','sys','builtins'),'undeclared bootstrap module')
+            elif name!='__main__':
+                require(name in catalog['bootstrap'] and name in catalog['modules']
+                        and origin==catalog['modules'][name]['logical_path'],'uncaptured cached module')
+        return self.capture_raw
+
+    def native_capture_install(self):
+        self.capture_check()
+        require(self.capture_saved_meta is None,'capture installed once')
+        self.capture_saved_meta=list(sys.meta_path)
+        sys.meta_path=[self] # NO PathFinder, disk loader or unknown-import fallback.
+        self.capture_sys.meta_path=sys.meta_path
+
+    def find_spec(self,fullname,path=None,target=None):
+        import importlib.machinery
+        self.capture_check()
+        cat=self.capture_catalog
+        if fullname in cat['builtins']:
+            return importlib.machinery.BuiltinImporter.find_spec(fullname,path,target)
+        if fullname in cat['frozen']:
+            return importlib.machinery.FrozenImporter.find_spec(fullname,path,target)
+        row=cat['modules'].get(fullname)
+        if row is None:raise ModuleNotFoundError('uncaptured native import: '+fullname,name=fullname)
+        package=row['kind'] in ('package','namespace')
+        spec=importlib.machinery.ModuleSpec(fullname,self,is_package=package)
+        spec.origin=row.get('logical_path')
+        if package:spec.submodule_search_locations=(row['paths'] if row['kind']=='namespace' else [str(Path(row['logical_path']).parent)])
+        return spec
+
+    def create_module(self,spec):
+        self.capture_check()
+        row=self.capture_catalog['modules'][spec.name]
+        if row['kind']!='extension':return None
+        import fcntl
+        import importlib.machinery
+        raw=self.capture_raw[row['pin']['path']]
+        fd=self.native_track('capture_extension_'+spec.name,os.memfd_create('friday-captured-'+spec.name,
+                                os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING))
+        offset=0
+        while offset<len(raw):
+            count=os.write(fd,raw[offset:offset+65536]);require(count>0,'capture extension short write');offset+=count
+        seals=fcntl.F_SEAL_SEAL|fcntl.F_SEAL_SHRINK|fcntl.F_SEAL_GROW|fcntl.F_SEAL_WRITE
+        fcntl.fcntl(fd,fcntl.F_ADD_SEALS,seals)
+        require(fcntl.fcntl(fd,fcntl.F_GET_SEALS)==seals,'immutable captured extension FD')
+        loader=importlib.machinery.ExtensionFileLoader(spec.name,'/proc/self/fd/'+str(fd))
+        es=importlib.machinery.ModuleSpec(spec.name,loader,origin=loader.path)
+        self.capture_extensions[spec.name]=(loader,es)
+        return loader.create_module(es) # Same sealed read; OS ELF dependencies remain external prerequisites.
+
+    def exec_module(self,module):
+        self.capture_check()
+        name=module.__spec__.name;row=self.capture_catalog['modules'][name]
+        self.capture_new_modules.add(name)
+        if row['kind']=='namespace':return
+        module.__file__=row['logical_path']
+        if row['kind']=='extension':
+            self.capture_extensions[name][0].exec_module(module);return
+        import builtins
+        module.__dict__['__builtins__']={**vars(builtins),'__import__':self.native_importer}
+        # Canonical names/registry permit circular imports, annotations,
+        # dataclasses and package/fromlist behavior in the SAME closure.
+        exec(compile(self.capture_raw[row['pin']['path']],row['logical_path'],'exec',dont_inherit=True),module.__dict__)
+
+    def native_importer(self,name,globals=None,locals=None,fromlist=(),level=0):
+        import builtins
+        self.capture_check()
+        if level==0 and name=='sys':return self.capture_sys
+        if level==0 and name=='runpy':return self.capture_runpy
+        return builtins.__import__(name,globals,locals,fromlist,level)
+
+    def native_module(self,name):
+        require(name in self.capture_catalog['modules'],'exact captured module requested')
+        require(self.capture_saved_meta is not None,'capture loader must be active')
+        import importlib
+        return importlib.import_module(name)
+
+    def native_run_path(self,path,init_globals=None,run_name=None):
+        require(init_globals is None and run_name in (None,'<run_path>'),'exact genuine captured runpy arguments')
+        name=self.capture_catalog['applications'].get(str(path))
+        require(name is not None,'uncaptured runpy path')
+        return self.native_module(name).__dict__
+
+
+    def find_distributions(self,context=None):
+        # Existing importlib.metadata consumers see captured distribution text,
+        # never sys.path metadata reopening. Same closed owner, no new service.
+        import importlib.metadata
+        owner=self
+        class CapturedDistribution(importlib.metadata.Distribution):
+            def __init__(self,path):self.path=path
+            def read_text(self,filename):
+                key=self.path+'/'+filename
+                if key not in owner.capture_catalog['resources']:return None
+                return owner.get_data(key).decode('utf-8')
+            def locate_file(self,path):raise FileNotFoundError('captured metadata has no reopened disk location')
+        wanted=getattr(context,'name',None)
+        normalize=lambda n:n.replace('-','_').replace('.','_').lower()
+        dirs={str(Path(p).parent) for p in self.capture_catalog['resources'] if p.endswith('/METADATA')
+              and Path(p).parent.name.endswith('.dist-info')}
+        for path in sorted(dirs):
+            dist=CapturedDistribution(path)
+            if wanted is None or normalize(dist.metadata['Name'])==normalize(wanted):yield dist
+
+    def get_filename(self,fullname):
+        return self.capture_catalog['modules'][fullname]['logical_path']
+
+    def get_source(self,fullname):
+        row=self.capture_catalog['modules'][fullname]
+        require(row['kind'] in ['module','package'],'source only captured Python')
+        return self.capture_raw[row['pin']['path']].decode('utf-8')
+
+    def get_code(self,fullname):
+        row=self.capture_catalog['modules'][fullname]
+        require(row['kind'] in ['module','package'],'code only captured Python')
+        return compile(self.capture_raw[row['pin']['path']],row['logical_path'],'exec',dont_inherit=True)
+
+    def get_data(self,path):
+        self.capture_check();require(path in self.capture_raw,'uncaptured resource data')
+        return self.capture_raw[path]
+
+    def get_resource_reader(self,fullname):
+        # jsonschema_specifications actually consumes package schemas via
+        # importlib.resources Traversable, with no disk reopen fallback.
+        owner=self;row=self.capture_catalog['modules'][fullname]
+        require(row['kind']=='package','resource package')
+        root=str(Path(row['logical_path']).parent)
+        class Entry:
+            def __init__(self,path):self.path=path;self.name=Path(path).name
+            def is_file(self):return self.path in owner.capture_catalog['resources']
+            def is_dir(self):return any(p.startswith(self.path+'/') for p in owner.capture_catalog['resources'])
+            def iterdir(self):
+                owner.capture_check();prefix=self.path+'/';names={p[len(prefix):].split('/')[0] for p in owner.capture_catalog['resources'] if p.startswith(prefix)}
+                return iter(Entry(prefix+n) for n in sorted(names))
+            def joinpath(self,*parts):
+                require(all(type(p)is str and p and '..' not in Path(p).parts and not Path(p).is_absolute() for p in parts),
+                        'captured resource relative traversal')
+                return Entry(str(Path(self.path).joinpath(*parts)))
+            def __truediv__(self,part):return self.joinpath(part)
+            def open(self,mode='r',*args,**kw):
+                import io
+                require(mode in ('r','rb') and not args,'captured resource readonly')
+                require(self.is_file(),'captured resource file')
+                raw=owner.get_data(self.path)
+                return io.BytesIO(raw) if mode=='rb' else io.StringIO(raw.decode(kw.get('encoding') or 'utf-8'),newline=kw.get('newline'))
+            def read_bytes(self):return owner.get_data(self.path)
+            def read_text(self,encoding='utf-8'):return owner.get_data(self.path).decode(encoding)
+        class Reader:
+            def files(self):return Entry(root)
+            def open_resource(self,name):return Entry(root).joinpath(name).open('rb')
+            def resource_path(self,name):raise FileNotFoundError('captured resources have no reopened disk path')
+            def is_resource(self,name):return Entry(root).joinpath(name).is_file()
+            def contents(self):return (p.name for p in Entry(root).iterdir())
+        return Reader()
+
+    def native_capture_restore(self):
+        if getattr(self,'capture_saved_meta',None) is not None:
+            sys.meta_path=self.capture_saved_meta;self.capture_saved_meta=None
+            for name in self.capture_new_modules:sys.modules.pop(name,None)
+        for label in list(self.fds):
+            if label.startswith('capture_') and self.fds[label] is not None:self.native_close_fd(label)
+
+    def native_put(self,path,value):
+        self.native_check(cleanup=True)
+        raw=(json.dumps(value,sort_keys=True,allow_nan=False)+'\n').encode()
+        require(len(raw)<=LIMIT,'finite native return evidence')
+        label='native_evidence_'+str(len(self.fds))
+        fd=self.native_track(label,os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400))
+        offset=0
+        while offset<len(raw):
+            n=os.write(fd,raw[offset:]);require(n>0,'native evidence short write');offset+=n
+        os.fsync(fd);self.native_close_fd(label)
+
+    def native_stop_children(self):
+        require(not self.unknown_spawn,'unknown Popen cannot become empty custody')
+        self.native_scan()
+        for pid,row in list(self.direct.items()):
+            self.native_wait(row['proc'],min(5,self.native_remaining(True)),stop=True)
+            for name in ['stdin','stdout','stderr']:self.native_close_stream(row['proc'],name)
+        self.native_scan()
+        for (pid,birth),row in list(self.known.items()):
+            if row['waited']:continue
+            require(identity(pid)['birth']==birth,'exact owned adopted stop birth')
+            fd=self.fds.get('pidfd_'+str(pid)+'_'+birth)
+            require(fd is not None and not self.ambiguous,'retained adopted pidfd before stop')
+            try:signal.pidfd_send_signal(fd,signal.SIGKILL)
+            except ProcessLookupError:pass
+        end=time.monotonic()+min(10,self.native_remaining(True))
+        while self.native_scan():
+            require(time.monotonic()<end,'finite adopted wait deadline')
+            # Runtime ownership collection; no PEER/model polling.
+            time.sleep(.01)
+        return self.native_children_closed()
+
+    def native_finish(self):
+        self.native_children_closed()
+        self.native_capture_restore()
+        for label in list(self.fds):
+            if not label.startswith('lock_') and self.fds[label] is not None:self.native_close_fd(label)
+        require(not self.ambiguous,'native caller unknown close retains custody')
+
+    def native_file_budget(self,path,maximum=8388608):
+        p=Path(path);v=p.lstat()
+        require(stat.S_ISREG(v.st_mode) and v.st_nlink==1 and v.st_size<=maximum,'bounded regular clone/schema input')
+        self.native_check()
+
+
+
+def main():
+    require(len(sys.argv) == 2, 'exact host launch input')
+    launch_path = Path(sys.argv[1])
+    require(launch_path.is_absolute() and launch_path.name == 'LAUNCH.json', 'launch path')
+    launch_stat = launch_path.lstat()
+    require(stat.S_ISREG(launch_stat.st_mode) and launch_stat.st_nlink == 1
+            and launch_stat.st_uid == os.getuid() and not launch_stat.st_mode & 0o077
+            and launch_stat.st_size <= LIMIT, 'private launch input')
+    launch = json.loads(launch_path.read_bytes())
+    require(set(launch) == {'input', 'host', 'outer_guard', 'deadline_monotonic', 'deadline_unix'}
+            or set(launch) == {'input', 'host', 'outer_guard', 'deadline_monotonic', 'deadline_unix', 'native'},
+            'launch fields')
+    spec = json.loads(read_pin(launch['input'], LIMIT))
+    if 'native' in launch:return native_caller(spec,launch)
+    require(spec['caller']['path'] == SELF and spec['record'] == str(launch_path.parent), 'exact pinned caller scope')
+    read_pin(spec['caller'])
+    caller_limits()
+    require(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL
+            and len(list(Path('/proc/self/task').iterdir())) == 1, 'one-thread default SIGCHLD caller')
+    parent = os.getppid()
+    libc = ctypes.CDLL(None, use_errno=True)
+    require(libc.prctl(1, signal.SIGKILL, 0, 0, 0) == 0 and os.getppid() == parent, 'caller parent-death before Source')
+    clock = json.loads(read_pin(spec['clock'], LIMIT))
+    owner = _RootOneShotOwner(spec, launch, clock)  # External scope already live before helper import.
+    record = launch_path.parent
+    put(record / 'CALLER-BEFORE-IMPORT.json', {'caller': identity(os.getpid()), 'actual_host': launch['host'],
+        'limits': caller_limits(), 'deadline_monotonic': launch['deadline_monotonic'],
+        'deadline_unix': launch['deadline_unix'], 'original_clock': clock,
+        'admission': 'Root externally approves exact invocation; input and owner object never mint authority'})
+    raw = read_pin(spec['helper'])
+    helper = types.ModuleType('<Root-admitted-current-helper>')
+    helper.__file__ = spec['helper']['path']
+    exec(compile(raw, spec['helper']['path'], 'exec'), helper.__dict__)
+    result = None
+    failure = None
+    try:
+        result = helper.run(spec['entry'], spec['descriptor'], spec['clock'], clock, spec['evidence'],
+                            owner=owner, helper_pin=spec['helper'], fixture_root=spec['fixture_root'],
+                            wall_cap=spec['wall_cap'])
+    except BaseException as exc:
+        failure = {'class': type(exc).__name__, 'detail': str(exc)[:300], 'attempt_outcome': 'UNKNOWN_NO_REPLAY'}
+    closure = owner.reconcile()
+    owner._observe_or_retain('caller_reconciled_before_return_evidence')
+    put(record / 'CALLER-RETURN-PREPARED.json', {'result': result, 'failure': failure,
+        'same_custody_closure': closure, 'events': owner.events, 'capacity_release': False,
+        'caller_exit': 'NOT_OBSERVED_INSIDE; actual outside direct wait required', 'original_clock': clock})
+    owner._observe_or_retain('caller_return_evidence_written_before_exit')
+    return 0 if failure is None and result is not None and result['attempt_outcome'] == 'ENTRY_RETURN_OBSERVED_NOT_OUTER_ACCEPTANCE' else 2
+
+
+
+
+def native_sandbox(temp_root):
+    # Kernel confinement, no fabricated Seccomp/namespace JSON authority.
+    import platform
+    require(platform.machine()=='x86_64','audited syscall table only x86_64')
+    libc=ctypes.CDLL(None,use_errno=True)
+    require(libc.prctl(38,1,0,0,0)==0,'actual no_new_privs')
+    abi=libc.syscall(444,0,0,1);require(abi>=3,'Landlock truncate/refer support required')
+    class Ruleset(ctypes.Structure):_fields_=[('handled_access_fs',ctypes.c_uint64)]
+    class PathRule(ctypes.Structure):
+        _pack_=1
+        _fields_=[('allowed_access',ctypes.c_uint64),('parent_fd',ctypes.c_int)]
+    mask=(1<<1)|sum(1<<i for i in range(4,15));rs=Ruleset(mask)
+    rules_fd=libc.syscall(444,ctypes.byref(rs),ctypes.sizeof(rs),0);require(rules_fd>=0,'Landlock ruleset actual create')
+    root_fd=os.open(temp_root,os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW)
+    rule=PathRule(mask&~((1<<6)|(1<<11)),root_fd)
+    require(libc.syscall(445,rules_fd,1,ctypes.byref(rule),0)==0,'private temp write rule')
+    require(libc.syscall(446,rules_fd,0)==0,'actual inherited Landlock restriction')
+    os.close(root_fd);os.close(rules_fd)
+    class Filter(ctypes.Structure):_fields_=[('code',ctypes.c_ushort),('jt',ctypes.c_ubyte),('jf',ctypes.c_ubyte),('k',ctypes.c_uint)]
+    class Prog(ctypes.Structure):_fields_=[('len',ctypes.c_ushort),('filter',ctypes.POINTER(Filter))]
+    code=[(0x20,0,0,4),(0x15,1,0,0xc000003e),(0x06,0,0,0x80000000),(0x20,0,0,0)]
+    for nr in [101,155,161,165,166,169,175,176,246,272,303,304,308,311,313,321]:
+        code.extend([(0x15,0,1,nr),(0x06,0,0,0x00050001)])
+    code.extend([(0x15,0,1,435),(0x06,0,0,0x00050026)]) # clone3 ENOSYS, preserve libc fallback.
+    code.extend([(0x15,0,4,56),(0x20,0,0,16),(0x45,0,1,0x7e020000),(0x06,0,0,0x00050001),(0x20,0,0,0)])
+    code.extend([(0x15,0,3,41),(0x20,0,0,16),(0x15,1,0,1),(0x06,0,0,0x00050001),(0x06,0,0,0x7fff0000)])
+    arr=(Filter*len(code))(*(Filter(*x) for x in code));prog=Prog(len(code),arr)
+    require(libc.prctl(22,2,ctypes.byref(prog),0,0)==0,'actual inherited namespace/network escape filter')
+
+
+def native_child_barrier():
+    require(len(sys.argv)==5,'bounded existing caller child mode')
+    go,ready=int(sys.argv[2]),int(sys.argv[3]);command=json.loads(sys.argv[4])
+    # Actual dispatch uses five argv values; no stdin used for GO, preserving
+    # genuine strict protocol stdin and original command semantics.
+    resource.setrlimit(resource.RLIMIT_CPU,(60,60))
+    resource.setrlimit(resource.RLIMIT_AS,(1073741824,1073741824))
+    resource.setrlimit(resource.RLIMIT_FSIZE,(MAX,MAX));resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+    libc=ctypes.CDLL(None,use_errno=True);parent=os.getppid()
+    require(libc.prctl(1,signal.SIGKILL,0,0,0)==0 and os.getppid()==parent,'barrier parent death')
+    require(os.write(ready,b'R')==1,'child bootstrap ready')
+    require(os.read(go,1)==b'G','one actual existing GO byte')
+    os.close(go);os.close(ready)
+    os.execve(command[0],command,os.environ.copy()) # Same PID/birth/Popen/pidfd.
+
+
+def native_caller(spec,launch):
+    import select
+    n=launch['native'];go=n['go_fd'];ready=n['ready_fd']
+    libc=ctypes.CDLL(None,use_errno=True)
+    require(libc.prctl(1,signal.SIGKILL,0,0,0)==0 and not select.select([n['host_pidfd']],[],[],0)[0],'native caller exact host live parent-death armed')
+    # Bootstrap is already finite and Root's host owns this exact Popen before
+    # native GO; no updater/dependency import or clone has happened.
+    require(os.write(ready,b'R')==1 and os.read(go,1)==b'G','one native caller barrier')
+    os.close(go);os.close(ready)
+    resource.setrlimit(resource.RLIMIT_AS,(1073741824,1073741824));resource.setrlimit(resource.RLIMIT_CPU,(120,120))
+    libc=ctypes.CDLL(None,use_errno=True)
+    require(libc.unshare(0x00020000)==0,'caller private proc mount namespace')
+    require(libc.mount(b'proc',b'/proc',b'proc',2|4|8,None)==0,'actual own PID namespace proc view')
+    birth_path=Path(spec['record'])/'CALLER-BIRTH.json';birth=json.loads(birth_path.read_text());n['caller_birth']=birth['birth']
+    native_sandbox(spec['native']['temp_root'])
+    clock=json.loads(read_pin(spec['clock'],LIMIT))
+    owner=object.__new__(_RootOneShotOwner);owner.native_init(spec,launch,clock)
+    owner.require_authority(spec['native']['request'])
+    owner.hold(owner.lease,owner)
+    descriptor=json.loads(read_pin(spec['descriptor'],2097152))
+    import zlib
+    capfd=owner.native_track('native_capture_capsule',n['capture_fd'])
+    require(list(owner.fd_ids['native_capture_capsule'])==n['capture_identity'],'same retained host capture FD')
+    import fcntl
+    seals=fcntl.F_SEAL_SEAL|fcntl.F_SEAL_SHRINK|fcntl.F_SEAL_GROW|fcntl.F_SEAL_WRITE
+    require(fcntl.fcntl(capfd,fcntl.F_GET_SEALS)==seals,'inherited sealed capture snapshot')
+    require(0<n['capture_bytes']<=MAX,'finite compressed captured input')
+    compressed=os.pread(capfd,n['capture_bytes']+1,0)
+    require(len(compressed)==n['capture_bytes'] and hashlib.sha256(compressed).hexdigest()==n['capture_sha256'],
+            'same sealed capture bytes')
+    decoder=zlib.decompressobj();expanded=decoder.decompress(compressed,285212672)
+    require(decoder.eof and not decoder.unused_data and not decoder.unconsumed_tail and len(expanded)<285212672,
+            'capture decompression bound')
+    snapshot={p:bytes.fromhex(v) for p,v in json.loads(expanded).items()}
+    owner.capture_check=owner.native_check
+    failure=None;result=None
+    try:
+        owner.native_capture(descriptor,snapshot)
+        owner.native_capture_install()
+        updater=owner.native_module(owner.capture_catalog['entry_module'])
+        updater._NATIVE_OWNER=owner
+        candidate=Path(spec['native']['release_root']);version=spec['native']['version']
+        require(str(updater.current_root())==str(candidate.resolve(strict=True))
+                and updater.manifest_version(candidate)==version,'exact genuine current-only release')
+        result=updater.ensure_current_release_for_use(candidate,version)
+        require(result['status'] in ['validated_current','GATES_RETURNED_PENDING_EXTERNAL_CALLER_CLOSURE'],
+                'current-only genuine entry returned')
+        owner.native_children_closed()
+    except BaseException as exc:
+        failure={'class':type(exc).__name__,'detail':str(exc)[:300],'outcome':'UNKNOWN_NO_REPLAY'}
+        try:owner.native_stop_children()
+        except BaseException:owner.native_pending()
+    try:
+        owner.native_children_closed()
+        prepared={'result':result,'failure':failure,'pending_receipt':owner.pending_receipt,
+                'whole_native_children_closed':True,'known_waits':list(owner.known.values()),
+                'direct_waits_and_adopted_waits':True,'output_bytes':owner.output_bytes,
+                'caller_exit':'NOT_OBSERVED_INSIDE_REQUIRE_ACTUAL_OUTSIDE_WAIT','capacity_release':False}
+        # The host holds BOTH same open descriptions through external commit.
+        # This caller closes only its copies when the actual process returns.
+        owner.native_finish()
+        owner.native_put(owner.temp_root/'CALLER-RETURN-PREPARED.json',prepared)
+        require(not owner.ambiguous and all(v is None for k,v in owner.fds.items()
+                if not k.startswith('lock_')),'normal caller capture/pipe/pidfd closure')
+    except BaseException:owner.native_pending()
+    return 0 if failure is None else 2
+
+
+if __name__ == '__main__':
+    if len(sys.argv)>1 and sys.argv[1]=='--native-child':native_child_barrier()
+    sys.exit(main())
