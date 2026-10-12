@@ -66,3 +66,7 @@ See `docs/mandatory-web-admin.md` and `validation/acceptance-web-admin.json` for
 ### Later actual Source310: 310 PASS / 0 FAIL, independent Source-only ACCEPT
 
 [Later actual results](analysis/2026-10-12/canonical-full310-accepted-source-results/README.md) preserve 233 + 41 + 23 + 13 ordered cases on exact Source14, original budgets/resources, direct waits, FD restoration and fresh82, with early helpers/aggregate usage UNKNOWN. Source-only final ACCEPT preserves the initial read-only binding refusal, two malformed-grant-only KeyError rows, reviewer boundary correction and late external bookkeeping. [The frozen predecessor](analysis/2026-10-12/canonical-full310-partial286-and-alias-source/README.md) is published at 804d046651919ba6c6e3442ba62b10b3cd757987 and retains its cutoff/status. Kernel120 is ungranted; genuine/installed runtime/full19, normal3600, all7 and release remain NOT_ACCEPTED. No live/native journey passed. Independent publication review pending.
+
+## 2026-10-12: kernel/fixture/Root source and refused reviews
+
+[Inert C44, memory harness and C45 archive](analysis/2026-10-12/kernel-fixture-and-root-adapter-source-refusals/README.md): current C44 280, complete harness12 and C45 76 logical payloads with exact public pins and shared-copy ledger. C44 REFUSE5 and harness MH-R1 remain. C45 facility/fit refusal is Source reasoning; independent review was pending at the cutoff. Root timing deviations are explicit. Source/tests were not executed; runtime/release acceptance is not granted.

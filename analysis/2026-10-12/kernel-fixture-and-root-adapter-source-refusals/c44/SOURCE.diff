@@ -1,0 +1,490 @@
+--- public-external/path-19678b9fe7ce73abfe18/kernel120_probe.py
++++ public-external/path-03459dabb901a47ed74d/kernel120_probe.py
+@@ -20,6 +20,42 @@
+ 
+ CONTROLLERS={'memory.max':'2147483648','memory.swap.max':'0','pids.max':'128','cpu.max':'200000 100000'}
+ MAX_WRITE=75497472
++
++# Explicit native stacks, one malloc arena, and conservative virtual headroom
++# precede EVERY thread stress birth. Actual mappings/controller refusal still
++# require independent Root observations; these bounds are never run credit.
++THREAD_STACK_BYTES=262144
++THREAD_GUARD_RESERVE=65536
++THREAD_RUNTIME_RESERVE=1048576
++THREAD_BASE_MAX=67108864
++THREAD_SHARED_RESERVE=16777216
++THREAD_MAX_NEW=126
++
++def bounded_thread_stacks():
++    assert len(list(Path('/proc/self/task').iterdir()))==1, 'configure before any stress thread'
++    assert resource.getrlimit(resource.RLIMIT_AS) in ((268435456,268435456),(1073741824,1073741824))
++    page=os.sysconf('SC_PAGE_SIZE')
++    assert type(page)is int and 0<page<=THREAD_GUARD_RESERVE and THREAD_STACK_BYTES%page==0
++    libc=ctypes.CDLL(None,use_errno=True)
++    # GNU libc M_ARENA_MAX=-8 is an explicitly supported fixture precondition.
++    # Unsupported allocator is concrete fixture refusal, never pids credit.
++    version=libc.gnu_get_libc_version;version.restype=ctypes.c_char_p
++    assert version(), 'exact supported GNU libc allocator required'
++    mallopt=libc.mallopt;mallopt.argtypes=[ctypes.c_int,ctypes.c_int];mallopt.restype=ctypes.c_int
++    assert mallopt(-8,1)==1, 'single malloc arena before thread birth'
++    threading.stack_size(THREAD_STACK_BYTES)
++    assert threading.stack_size()==THREAD_STACK_BYTES, 'explicit bounded pthread stack accepted'
++    fd=os.open('/proc/self/statm',os.O_RDONLY|os.O_NOFOLLOW)
++    try:raw=os.read(fd,257);assert len(raw)<=256
++    finally:os.close(fd)
++    base=int(raw.split()[0])*page
++    reserved=THREAD_BASE_MAX+THREAD_MAX_NEW*(THREAD_STACK_BYTES+THREAD_GUARD_RESERVE+THREAD_RUNTIME_RESERVE)+THREAD_SHARED_RESERVE
++    assert 0<base<=THREAD_BASE_MAX and reserved<=268435456, 'all128 tasks fit conservative AS256 reservation'
++    return {'stack_bytes':THREAD_STACK_BYTES,'allocator_max_arenas':1,'baseline_virtual_bytes':base,
++            'guard_reserve_each':THREAD_GUARD_RESERVE,'runtime_reserve_each':THREAD_RUNTIME_RESERVE,
++            'maximum_new_threads':THREAD_MAX_NEW,'conservative_virtual_upper':reserved,
++            'actual_maps_and_kernel_refusal_require_Root':True}
++
+ 
+ 
+ def require(ok,why):
+@@ -154,7 +190,10 @@
+ 
+ 
+ def task_count_limit(spec):
++    stack_plan=bounded_thread_stacks()
+     group=Path(spec['native']['group']);before=read_small(group/'pids.events',4096).decode()
++    baseline=int(read_small(group/'pids.current',4096))
++    require(baseline==2,'exact stock-init and probe tasks before thread stress')
+     release=threading.Event();threads=[];error=None
+     try:
+         for _ in range(129):
+@@ -164,32 +203,61 @@
+             threads.append(t)
+         peak=int(read_small(group/'pids.current',4096));after=read_small(group/'pids.events',4096).decode()
+         counters=lambda raw:dict((k,int(v)) for k,v in (x.split() for x in raw.splitlines()))
+-        require(error is not None and peak==128 and counters(after)['max']>counters(before)['max'],
++        require(error is not None and len(threads)==126 and peak==128 and counters(after)['max']>counters(before)['max'],
+                 'actual kernel pids128 task/thread refusal, not Python exception alone')
+     finally:
+         release.set()
+         for t in threads:t.join(timeout=5)
+     require(all(not t.is_alive() for t in threads),'all actual finite quota threads joined')
+-    return {'created_real_threads':len(threads),'actual_peak_tasks':peak,'actual_pids_events_before':before,
++    return {'stack_plan':stack_plan,'baseline_tasks':baseline,'created_real_threads':len(threads),'actual_peak_tasks':peak,'actual_pids_events_before':before,
+             'actual_pids_events_after':after,'intended_kernel_limit_observed':True}
+ 
+ 
++def quota_chunk(fd,chunk,written,call_budget=4096):
++    # Positive partial writes are ordinary POSIX progress. Only a REAL ENOSPC
++    # is quota cause evidence. Zero/invalid writes remain unknown fixture error.
++    require(type(chunk)is bytes and 0<len(chunk)<=1048576,'bounded quota request')
++    require(type(call_budget)is int and 0<call_budget<=4096,'remaining whole quota syscall reservation BEFORE write')
++    pos=0;short=0;calls=0
++    while pos<len(chunk):
++        require(written+len(chunk)-pos<=MAX_WRITE,'finite aggregate lifetime reservation')
++        calls+=1;require(calls<=call_budget,'finite remaining whole partial-write syscall reservation')
++        try:n=os.write(fd,chunk[pos:])
++        except OSError as e:
++            require(e.errno==errno.ENOSPC,'actual bounded tmpfs byte exhaustion')
++            return written,short,calls,e.errno
++        require(type(n)is int and 0<n<=len(chunk)-pos,'positive finite partial-write progress')
++        if n<len(chunk)-pos:short+=1
++        pos+=n;written+=n
++    return written,short,calls,None
++
++
+ def output_occupancy(spec):
+-    root=Path(spec['record']);files=[];written=0;bytes_errno=None;inode_errno=None;chunk=b'Q'*1048576
+-    try:
++    root=Path(spec['record']);files=[];written=0;short=0;calls=0;bytes_errno=None;inode_errno=None;chunk=b'Q'*1048576
++    seed_bytes=0;v=os.statvfs(root)
++    require(0<v.f_frsize<=65536 and 1048576%v.f_frsize==0,'supported finite tmpfs block layout')
++    try:
++        # Ensure this mandatory positive explicitly exercises a normal short
++        # write even when initial free bytes were exactly MiB-aligned.
++        if (v.f_bavail*v.f_frsize)%len(chunk)==0:
++            p=root/'bytes-partial-seed';fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o400);files.append(p)
++            try:
++                written,s,c,e=quota_chunk(fd,b'S'*v.f_frsize,written)
++                require(e is None,'actual bounded seed before exhaustion');short+=s;calls+=c;seed_bytes=v.f_frsize
++            finally:os.close(fd)
++        headroom=os.statvfs(root).f_bavail*v.f_frsize
++        require(0<headroom<=67108864 and headroom%len(chunk)!=0,'actual unaligned free-byte fixture')
+         for i in range(19):
+             p=root/('bytes-'+str(i));fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o400);files.append(p)
+             try:
+                 for _ in range(4):
+-                    require(written+len(chunk)<=MAX_WRITE,'finite aggregate lifetime write reservation')
+-                    try:n=os.write(fd,chunk)
+-                    except OSError as e:
+-                        require(e.errno==errno.ENOSPC,'actual bounded tmpfs byte exhaustion');bytes_errno=e.errno;break
+-                    written+=n;require(n==len(chunk),'finite complete chunk or explicit unknown')
++                    written,s,c,bytes_errno=quota_chunk(fd,chunk,written,4096-calls);short+=s;calls+=c
++                    require(calls<=4096,'whole bounded quota syscall inventory')
++                    if bytes_errno is not None:break
+             finally:os.close(fd)
+             if bytes_errno is not None:break
+         v=os.statvfs(root);byte_sample={'blocks':v.f_blocks,'available':v.f_bavail,'size':v.f_frsize}
+-        require(bytes_errno==errno.ENOSPC and v.f_bavail==0,'intended actual tmpfs byte boundary')
++        require(bytes_errno==errno.ENOSPC and v.f_bavail==0 and short>0,'actual short progress then tmpfs ENOSPC')
+     finally:
+         for p in files:p.unlink()
+     files=[]
+@@ -205,7 +273,9 @@
+     finally:
+         for p in files:p.unlink()
+     return {'actual_byte_errno':bytes_errno,'actual_inode_errno':inode_errno,'bytes_written':written,
+-            'lifetime_probe_write_upper':MAX_WRITE,'actual_byte_sample':byte_sample,'actual_inode_sample':inode_sample,
++            'positive_short_writes':short,'quota_write_syscalls':calls,'partial_seed_bytes':seed_bytes,
++            'actual_unaligned_headroom_bytes':headroom,'lifetime_probe_write_upper':MAX_WRITE,
++            'actual_byte_sample':byte_sample,'actual_inode_sample':inode_sample,
+             'occupancy_not_cumulative_IO_credit':True}
+ 
+ 
+@@ -230,6 +300,7 @@
+     spec=json.loads(pin(ref));require(spec['domain']=='kernel120_qualification','harmless qualification only')
+     require(os.getpid()==2 and os.getppid()==1,'actual stock-init/private probe PID ancestry')
+     root=Path(spec['record']);require(not root.exists(),'one private qualification no replay');root.mkdir(mode=0o700)
++    bounded_thread_stacks() # before bootstrap/opaque thread creation, not only stress
+     before=snapshot(spec,'first_probe_before_GO')
+     denial=deny_open(Path(spec['native']['group'])/'memory.max')
+     outside_denial=deny_open(spec['qualification_forbidden_private_file'])
+
+--- public-external/path-aa969a0178b41c083c16/test_kernel120_qualification.py
++++ public-external/path-2b6ea2cc8f0892a74e87/test_kernel120_qualification.py
+@@ -82,6 +82,10 @@
+     _positive(trace,'K120_TASKS128_REAL_LIMIT','actual_kernel_tasks128_and_pids_events_max_delta')
+     assert trace['raw_kernel_peak_tasks']==128 and trace['raw_pids_events_max_after']>trace['raw_pids_events_max_before']
+     assert trace['all_known_stress_threads_joined'] is True
++    assert trace['actual_thread_stack_bytes']==262144 and trace['actual_allocator_max_arenas']==1
++    assert trace['actual_stack_allocator_config_before_first_thread_ref'] is not None
++    assert trace['actual_stress_virtual_bytes']<=268435456
++    assert trace['unrelated_AS_exhaustion_as_controller_credit'] is False
+ 
+ def test_k120_controller_write_refusal(trace):
+     _positive(trace,'K120_CONTROLLER_WRITE_REFUSAL','actual_write_open_errno13or30_without_write')
+@@ -93,6 +97,10 @@
+     assert trace['actual_byte_errno']==28 and trace['actual_inode_errno']==28
+     assert trace['raw_tmpfs_free_blocks_at_refusal']==0 and trace['raw_tmpfs_free_inodes_at_refusal']==0
+     assert trace['actual_lifetime_probe_write_bytes']<=75497472
++    assert trace['actual_positive_short_write_count']>0 and trace['actual_unaligned_tmpfs_before_write_ref'] is not None
++    assert trace['actual_partial_write_then_real_ENOSPC_ref'] is not None
++    assert trace['ValueError_or_zero_write_as_quota_credit'] is False
++    assert trace['actual_quota_write_syscall_count']<=4096
+     assert trace['occupancy_as_unbounded_cumulative_IO_credit'] is False
+ 
+ def test_k120_zombie_adopted_wait(trace):
+
+--- public-external/path-9af9e25dbdc37d186559/native41_evidence.py
++++ public-external/path-7fc8ab7739785f2a4737/native41_evidence.py
+@@ -9,7 +9,50 @@
+ import stat
+ import zlib
+ 
++BIRTH_FIELDS={'pid','birth','state','ppid','waited','absent','returncode'}
++OWNED_FIELDS={'known','direct_pids','unknown_spawn','ambiguous','output_bytes','live_labels','pending_receipt'}
++DELTA_FIELDS={'owned_delta','owned_delta_deleted','known_birth_delta','known_birth_deleted','known_birth_order'}
++
++def strict_json(raw):
++    def pairs(rows):
++        value={}
++        for key,item in rows:
++            assert key not in value, 'duplicate JSON object key'
++            value[key]=item
++        return value
++    def constant(value):raise AssertionError('nonfinite JSON constant')
++    return json.loads(raw,object_pairs_hook=pairs,parse_constant=constant)
++
++def identity_key(row):
++    assert type(row)is dict and set(row)==BIRTH_FIELDS
++    assert type(row['pid'])is int and row['pid']>0
++    assert type(row['birth'])is str and row['birth'].isascii() and row['birth'].isdecimal()
++    assert 0<len(row['birth'])<=20 and str(int(row['birth']))==row['birth'] and int(row['birth'])>0
++    assert type(row['state'])is str and row['state'] in ('R','S','D','Z','T','t','X','x','K','W','P','I')
++    assert type(row['ppid'])is int and row['ppid']>=0
++    assert type(row['waited'])is bool and type(row['absent'])is bool
++    assert row['returncode'] is None or type(row['returncode'])is int
++    assert not row['absent'] or row['waited'], 'absence is not unobserved wait credit'
++    return json.dumps([row['pid'],row['birth']],separators=(',',':'),allow_nan=False)
++
++def owned_state(value):
++    assert type(value)is dict and set(value)==OWNED_FIELDS
++    rows=value['known'];assert type(rows)is list and len(rows)<=128
++    keys=[identity_key(row) for row in rows];assert len(keys)==len(set(keys))
++    direct=value['direct_pids'];assert type(direct)is list and len(direct)<=8
++    assert all(type(pid)is int and pid>0 for pid in direct) and len(direct)==len(set(direct))
++    for pid in direct:assert len([row for row in rows if row['pid']==pid and not row['waited']])==1
++    assert type(value['unknown_spawn'])is bool and type(value['pending_receipt'])is bool
++    assert type(value['ambiguous'])is dict and len(value['ambiguous'])<=128
++    assert type(value['output_bytes'])is int and 0<=value['output_bytes']<=33554432+8192
++    labels=value['live_labels'];assert type(labels)is list and len(labels)<=128
++    assert all(type(label)is str and 0<len(label)<=256 for label in labels) and len(labels)==len(set(labels))
++    return keys
++
++
+ def same_read(fd,pin,maximum=65536):
++    assert type(pin)is dict and set(pin)=={'path','bytes','sha256'}
++    assert type(pin['bytes'])is int and 0<pin['bytes']<=maximum
+     before=os.fstat(fd);p=Path(pin['path']);a=p.lstat()
+     key=lambda s:(s.st_dev,s.st_ino,s.st_mode,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+     assert stat.S_ISREG(before.st_mode) and before.st_nlink==1
+@@ -20,16 +63,25 @@
+     return raw
+ 
+ def caller_evidence(index_fd,index_pin,segment_fds):
+-    index=json.loads(same_read(index_fd,index_pin))
++    index=strict_json(same_read(index_fd,index_pin))
++    assert type(index)is dict and set(index)=={'schema','case','segments','compressed_bytes','compressed_sha256','raw_bytes','raw_sha256','event_count','owned_delta_initial','kernel','owned','observation_failed','failure_count','first_failure','last_failure','capacity_release','root_outside_wait'}
+     assert index['schema']=='friday.causal.lossless-index.v1'
+-    refs=index['segments'];assert 1<=len(refs)<=18
++    assert type(index['case'])is str and 0<len(index['case'])<=64
++    assert all(type(index[k])is int and index[k]>0 for k in ('compressed_bytes','raw_bytes','event_count'))
++    assert type(index['failure_count'])is int and index['failure_count']==0
++    assert index['first_failure'] is None and index['last_failure'] is None
++    assert type(index['kernel'])is dict
++    assert index['owned_delta_initial']=={}, 'producer begins from exact empty delta state'
++    owned_state(index['owned'])
++    refs=index['segments'];assert type(refs)is list and 1<=len(refs)<=18
+     assert len(segment_fds)==len(refs) and len({r['path'] for r in refs})==len(refs)
+     chunks=[];offset=0
+     for ordinal,(fd,pin) in enumerate(zip(segment_fds,refs)):
+-        leaf=json.loads(same_read(fd,pin))
++        leaf=strict_json(same_read(fd,pin))
+         assert set(leaf)=={'schema','case','index','offset','compressed_hex'}
+         assert leaf['schema']=='friday.causal.lossless-segment.v1'
+-        assert leaf['case']==index['case'] and leaf['index']==ordinal and leaf['offset']==offset
++        assert leaf['case']==index['case'] and type(leaf['index'])is int and leaf['index']==ordinal
++        assert type(leaf['offset'])is int and leaf['offset']==offset
+         chunk=bytes.fromhex(leaf['compressed_hex']);assert 0<len(chunk)<=24576
+         if ordinal<len(refs)-1:assert len(chunk)==24576
+         chunks.append(chunk);offset+=len(chunk)
+@@ -43,17 +95,36 @@
+     assert raw.endswith(b'\n')
+     events=[];owned={};births={};birth_order=[]
+     for ordinal,line in enumerate(raw.splitlines()):
+-        event=json.loads(line);assert event['case']==index['case'] and event['index']==ordinal
++        assert 0<len(line)<=65536, 'same finite per-event producer boundary'
++        event=strict_json(line);assert type(event)is dict
++        assert event['case']==index['case'] and type(event['index'])is int and event['index']==ordinal
++        assert 'owned' not in event, 'wire never mixes reconstructed state with delta state'
+         if 'owned_delta' in event:
+-            for name in event.pop('owned_delta_deleted'):assert name in owned;del owned[name]
+-            owned.update(event.pop('owned_delta'))
+-            for identity in event.pop('known_birth_deleted'):assert identity in births;del births[identity]
+-            births.update(event.pop('known_birth_delta'))
++            assert DELTA_FIELDS-{'known_birth_order'}<=set(event)
++            delta=event.pop('owned_delta');deleted=event.pop('owned_delta_deleted')
++            assert type(delta)is dict and set(delta)<=OWNED_FIELDS-{'known'}
++            assert type(deleted)is list and all(type(key)is str for key in deleted)
++            assert len(deleted)==len(set(deleted)) and set(deleted)<=set(owned)-{'known'}
++            assert not set(deleted)&set(delta)
++            for name in deleted:del owned[name]
++            owned.update(delta)
++            removed=event.pop('known_birth_deleted');updates=event.pop('known_birth_delta')
++            assert type(removed)is list and all(type(key)is str for key in removed)
++            assert len(removed)==len(set(removed)) and set(removed)<=set(births)
++            assert type(updates)is dict and len(updates)<=128 and not set(removed)&set(updates)
++            for key,row in updates.items():assert type(key)is str and key==identity_key(row), 'canonical key/pid/birth identity'
++            for identity in removed:del births[identity]
++            births.update(updates)
+             if 'known_birth_order' in event:birth_order=event.pop('known_birth_order')
++            assert type(birth_order)is list and all(type(key)is str for key in birth_order)
+             assert len(birth_order)==len(set(birth_order))==len(births)<=128 and set(birth_order)==set(births)
+             owned['known']=[births[key] for key in birth_order]
+-            event['owned']=json.loads(json.dumps(owned))
++            assert owned_state(owned)==birth_order
++            event['owned']=strict_json(json.dumps(owned,allow_nan=False))
++        else:assert not DELTA_FIELDS&set(event), 'orphan delta component'
+         events.append(event)
++    assert events and 'owned' in events[0], 'complete initial custody snapshot'
++    assert owned==index['owned'], 'terminal reconstructed custody equals independently pinned index'
+     assert len(events)==index['event_count'] and len(events)>0
+     assert events[0]['operation']=='fixture_attach'
+     assert index['capacity_release'] is False
+
+--- public-external/path-842e26e66eb9f2ba7ffe/native63_observe.py
++++ public-external/path-e19572d8a9561567afb5/native63_observe.py
+@@ -10,6 +10,46 @@
+ import stat
+ import time
+ import types
++BIRTH_FIELDS={'pid','birth','state','ppid','waited','absent','returncode'}
++OWNED_FIELDS={'known','direct_pids','unknown_spawn','ambiguous','output_bytes','live_labels','pending_receipt'}
++DELTA_FIELDS={'owned_delta','owned_delta_deleted','known_birth_delta','known_birth_deleted','known_birth_order'}
++
++def strict_json(raw):
++    def pairs(rows):
++        value={}
++        for key,item in rows:
++            assert key not in value, 'duplicate JSON object key'
++            value[key]=item
++        return value
++    def constant(value):raise AssertionError('nonfinite JSON constant')
++    return json.loads(raw,object_pairs_hook=pairs,parse_constant=constant)
++
++def identity_key(row):
++    assert type(row)is dict and set(row)==BIRTH_FIELDS
++    assert type(row['pid'])is int and row['pid']>0
++    assert type(row['birth'])is str and row['birth'].isascii() and row['birth'].isdecimal()
++    assert 0<len(row['birth'])<=20 and str(int(row['birth']))==row['birth'] and int(row['birth'])>0
++    assert type(row['state'])is str and row['state'] in ('R','S','D','Z','T','t','X','x','K','W','P','I')
++    assert type(row['ppid'])is int and row['ppid']>=0
++    assert type(row['waited'])is bool and type(row['absent'])is bool
++    assert row['returncode'] is None or type(row['returncode'])is int
++    assert not row['absent'] or row['waited'], 'absence is not unobserved wait credit'
++    return json.dumps([row['pid'],row['birth']],separators=(',',':'),allow_nan=False)
++
++def owned_state(value):
++    assert type(value)is dict and set(value)==OWNED_FIELDS
++    rows=value['known'];assert type(rows)is list and len(rows)<=128
++    keys=[identity_key(row) for row in rows];assert len(keys)==len(set(keys))
++    direct=value['direct_pids'];assert type(direct)is list and len(direct)<=8
++    assert all(type(pid)is int and pid>0 for pid in direct) and len(direct)==len(set(direct))
++    for pid in direct:assert len([row for row in rows if row['pid']==pid and not row['waited']])==1
++    assert type(value['unknown_spawn'])is bool and type(value['pending_receipt'])is bool
++    assert type(value['ambiguous'])is dict and len(value['ambiguous'])<=128
++    assert type(value['output_bytes'])is int and 0<=value['output_bytes']<=33554432+8192
++    labels=value['live_labels'];assert type(labels)is list and len(labels)<=128
++    assert all(type(label)is str and 0<len(label)<=256 for label in labels) and len(labels)==len(set(labels))
++    return keys
++
+ 
+ CONTROLLERS={'memory.max':'2147483648','memory.swap.max':'0','pids.max':'128','cpu.max':'200000 100000'}
+ METHODS=('native_authority','native_capture_read','native_capture','native_capture_install',
+@@ -115,11 +155,12 @@
+             value={'case':case_id,'index':owner._c40_count,**value}
+             if 'owned' in value:
+                 current=value.pop('owned')
++                owned_state(current)
+                 previous=owner._c40_previous_owned
+                 value['owned_delta']={k:v for k,v in current.items() if k!='known' and (k not in previous or previous[k]!=v)}
+                 value['owned_delta_deleted']=[k for k in previous if k not in current]
+-                before={json.dumps([r['pid'],r['birth']],separators=(',',':')):r for r in previous.get('known',[])}
+-                after={json.dumps([r['pid'],r['birth']],separators=(',',':')):r for r in current['known']}
++                before={identity_key(r):r for r in previous.get('known',[])}
++                after={identity_key(r):r for r in current['known']}
+                 if len(after)!=len(current['known']):raise RuntimeError('duplicate actual birth identity')
+                 value['known_birth_delta']={k:v for k,v in after.items() if k not in before or before[k]!=v}
+                 value['known_birth_deleted']=[k for k in before if k not in after]
+@@ -191,12 +232,15 @@
+             # Retains native_track-before-fstat and native_put actual fsync/close.
+             owner.native_put(leaf,value)
+             refs.append({'path':str(leaf),'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()})
++        final_owned=owned_snapshot(owner)
++        owned_state(final_owned)
++        if final_owned!=owner._c40_previous_owned:raise RuntimeError('terminal custody changed after last admitted event')
+         value={'schema':'friday.causal.lossless-index.v1','case':owner._c40_case,
+                'segments':refs,'compressed_bytes':len(compressed),
+                'compressed_sha256':hashlib.sha256(compressed).hexdigest(),
+                'raw_bytes':owner._c40_raw_bytes,'raw_sha256':owner._c40_raw_hash.hexdigest(),
+                'event_count':owner._c40_count,'owned_delta_initial':{},
+-               'kernel':kernel_snapshot(owner),'owned':owned_snapshot(owner),
++               'kernel':kernel_snapshot(owner),'owned':final_owned,
+                'observation_failed':owner._c40_observation_failed,
+                'failure_count':owner._c40_failure_count,
+                'first_failure':owner._c40_first_failure,'last_failure':owner._c40_last_failure,
+@@ -221,10 +265,29 @@
+     result=None;failure=None
+     try:result=owner.native_run(command,timeout=30)
+     except BaseException as exc:failure=exc
+-    after=kernel_snapshot(owner)
+-    owner._c40_add({'operation':'real_workload','phase':'actual','mode':mode,'before':before,'after':after,
+-                    'returncode':None if result is None else result.returncode,
+-                    'failure':None if failure is None else {'class':type(failure).__name__,'detail':str(failure)[:300]}})
++    # The original native_run exception object always wins over instrumentation
++    # exhaustion/latching, including errors while formatting or sampling it.
++    primary=None
++    if failure is not None:
++        primary={'class':type(failure).__name__,'detail':'UNAVAILABLE_WHEN_FORMATTING_FAILS'}
++    try:
++        after=kernel_snapshot(owner)
++        if failure is not None:primary['detail']=str(failure)[:300]
++        owner._c40_add({'operation':'real_workload','phase':'actual','mode':mode,'before':before,'after':after,
++                       'returncode':None if result is None else result.returncode,'failure':primary})
++    except BaseException as observation_error:
++        owner._c40_observation_failed=True
++        try:observation_failure(owner,observation_error,primary)
++        except BaseException:
++            fallback={'class':type(observation_error).__name__,'detail':'UNAVAILABLE_SECONDARY_LOGGER_ERROR',
++                      'primary':primary,'event_count':owner._c40_count}
++            if owner._c40_first_failure is None:owner._c40_first_failure=fallback
++            owner._c40_last_failure=fallback # truthful separate failure even when formatting broke
++        try:
++            reserved_failure(owner,primary if primary is not None else
++                {'class':type(observation_error).__name__,'detail':'ADAPTER_OBSERVATION_FAILED'})
++        except BaseException:pass # Existing reserved_attempted latch: once, no replay.
++        if failure is None:raise
+     if failure is not None:raise failure
+     return result
+ 
+
+--- public-external/path-b54e2dd4143239cdb5c6/native63_payload.py
++++ public-external/path-8b33449cd60cece15413/native63_payload.py
+@@ -2,6 +2,7 @@
+ No admission is issued here. Root must first bind/review these exact bytes and
+ launch only through the existing owner/native_spawn barrier and stock guards.
+ """
++import ctypes
+ import errno
+ import json
+ import os
+@@ -17,6 +18,42 @@
+ TMP = 134217728
+ INODES = 512
+ OUTPUT = 33554432
++
++# Explicit native stacks, one malloc arena, and conservative virtual headroom
++# precede EVERY thread stress birth. Actual mappings/controller refusal still
++# require independent Root observations; these bounds are never run credit.
++THREAD_STACK_BYTES=262144
++THREAD_GUARD_RESERVE=65536
++THREAD_RUNTIME_RESERVE=1048576
++THREAD_BASE_MAX=67108864
++THREAD_SHARED_RESERVE=16777216
++THREAD_MAX_NEW=126
++
++def bounded_thread_stacks():
++    assert len(list(Path('/proc/self/task').iterdir()))==1, 'configure before any stress thread'
++    assert resource.getrlimit(resource.RLIMIT_AS) in ((268435456,268435456),(1073741824,1073741824))
++    page=os.sysconf('SC_PAGE_SIZE')
++    assert type(page)is int and 0<page<=THREAD_GUARD_RESERVE and THREAD_STACK_BYTES%page==0
++    libc=ctypes.CDLL(None,use_errno=True)
++    # GNU libc M_ARENA_MAX=-8 is an explicitly supported fixture precondition.
++    # Unsupported allocator is concrete fixture refusal, never pids credit.
++    version=libc.gnu_get_libc_version;version.restype=ctypes.c_char_p
++    assert version(), 'exact supported GNU libc allocator required'
++    mallopt=libc.mallopt;mallopt.argtypes=[ctypes.c_int,ctypes.c_int];mallopt.restype=ctypes.c_int
++    assert mallopt(-8,1)==1, 'single malloc arena before thread birth'
++    threading.stack_size(THREAD_STACK_BYTES)
++    assert threading.stack_size()==THREAD_STACK_BYTES, 'explicit bounded pthread stack accepted'
++    fd=os.open('/proc/self/statm',os.O_RDONLY|os.O_NOFOLLOW)
++    try:raw=os.read(fd,257);assert len(raw)<=256
++    finally:os.close(fd)
++    base=int(raw.split()[0])*page
++    reserved=THREAD_BASE_MAX+THREAD_MAX_NEW*(THREAD_STACK_BYTES+THREAD_GUARD_RESERVE+THREAD_RUNTIME_RESERVE)+THREAD_SHARED_RESERVE
++    assert 0<base<=THREAD_BASE_MAX and reserved<=268435456, 'all128 tasks fit conservative AS256 reservation'
++    return {'stack_bytes':THREAD_STACK_BYTES,'allocator_max_arenas':1,'baseline_virtual_bytes':base,
++            'guard_reserve_each':THREAD_GUARD_RESERVE,'runtime_reserve_each':THREAD_RUNTIME_RESERVE,
++            'maximum_new_threads':THREAD_MAX_NEW,'conservative_virtual_upper':reserved,
++            'actual_maps_and_kernel_refusal_require_Root':True}
++
+ 
+ 
+ def bounded_environment(group, temp):
+@@ -92,6 +129,9 @@
+ 
+ 
+ def pids_threads(group,temp):
++    stack_plan=bounded_thread_stacks()
++    baseline=int((group/'pids.current').read_text());assert 2<=baseline<=128
++    assert TASKS-baseline<=THREAD_MAX_NEW
+     before=counters(group,'pids.events');release=threading.Event();threads=[];error=None
+     try:
+         for _ in range(TASKS+1):
+@@ -102,7 +142,9 @@
+             threads.append(t)
+         after=counters(group,'pids.events')
+         emit({'fixture':'pids_threads','before':before,'after':after,'threads_started':len(threads),
+-              'pids_current':int((group/'pids.current').read_text()),'error':error,'identity':birth()})
++              'pids_current':int((group/'pids.current').read_text()),'error':error,'identity':birth(),
++              'stack_plan':stack_plan,'baseline_tasks':baseline})
++        assert len(threads)==TASKS-baseline and int((group/'pids.current').read_text())==TASKS
+         assert after.get('max',0)>before.get('max',0), 'no actual kernel pids.max refusal'
+         assert error is not None, '129 threads unexpectedly admitted under whole128tasks'
+     finally:

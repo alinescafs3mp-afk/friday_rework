@@ -1,0 +1,233 @@
+"""Finite real Linux workload fixtures, never a Codex/daemon substitute.
+No admission is issued here. Root must first bind/review these exact bytes and
+launch only through the existing owner/native_spawn barrier and stock guards.
+"""
+import errno
+import json
+import os
+from pathlib import Path
+import resource
+import select
+import sys
+import threading
+import time
+
+MEMORY = 2147483648
+TASKS = 128
+TMP = 134217728
+INODES = 512
+OUTPUT = 33554432
+
+
+def bounded_environment(group, temp):
+    group, temp = Path(group), Path(temp)
+    assert os.getpid() > 1
+    # Caller PID1 and this child MUST share the independently admitted namespace.
+    assert os.stat('/proc/self/ns/pid').st_ino == os.stat('/proc/1/ns/pid').st_ino
+    assert group.is_absolute() and temp.is_absolute() and '..' not in group.parts + temp.parts
+    actual = Path('/proc/self/cgroup').read_text().strip()
+    assert actual == '0::/' + str(group.relative_to('/sys/fs/cgroup'))
+    for name, expected in [('memory.max', str(MEMORY)), ('memory.swap.max', '0'),
+                           ('pids.max', str(TASKS)), ('cpu.max', '200000 100000')]:
+        assert (group/name).read_text().strip() == expected
+    assert resource.getrlimit(resource.RLIMIT_AS) == (1073741824,1073741824)
+    assert resource.getrlimit(resource.RLIMIT_CPU) == (60,60)
+    assert resource.getrlimit(resource.RLIMIT_FSIZE) == (67108864,67108864)
+    assert resource.getrlimit(resource.RLIMIT_CORE) == (0,0)
+    assert 0 < len(os.sched_getaffinity(0)) <= 2
+    rows=[s for s in Path('/proc/self/mountinfo').read_text().splitlines() if s.split()[4]==str(temp)]
+    assert len(rows)==1 and ' - tmpfs ' in rows[0]
+    v=os.statvfs(temp)
+    assert v.f_blocks*v.f_frsize <= TMP and v.f_files <= INODES
+    return group,temp
+
+
+def emit(value):
+    raw=(json.dumps(value,sort_keys=True,separators=(',',':'))+'\n').encode()
+    assert len(raw)<=8192
+    pos=0
+    while pos<len(raw):
+        n=os.write(1,raw[pos:]);assert n>0;pos+=n
+
+
+def counters(group, name):
+    return {k:int(v) for k,v in (line.split() for line in (group/name).read_text().splitlines())}
+
+
+def birth():
+    v=Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()
+    return {'pid':os.getpid(),'birth':v[19],'ppid':int(v[1]),'sid':int(v[3]),
+            'namespace':os.stat('/proc/self/ns/pid').st_ino,
+            'group':Path('/proc/self/cgroup').read_text().strip()}
+
+
+def positive_eof(group,temp):
+    # Distinct exact streams including non-UTF8 bytes; no early-success marker.
+    raw=bytes(range(256))*1024
+    for fd in [1,2]:
+        for pos in range(0,len(raw),8192):
+            chunk=raw[pos:pos+8192];off=0
+            while off<len(chunk):n=os.write(fd,chunk[off:]);assert n>0;off+=n
+    return 0
+
+
+def output_exhaust(group,temp):
+    # Cross the EXISTING whole32MiB budget, not a smaller fixture threshold.
+    for i in range(OUTPUT//8192+1):
+        fd=1 if i%2==0 else 2;raw=b'C40_OUTPUT_'+b'x'*(8192-11)
+        assert len(raw)==8192
+        off=0
+        while off<len(raw):n=os.write(fd,raw[off:]);assert n>0;off+=n
+    raise AssertionError('existing whole-output collector did not refuse')
+
+
+def strict_buffer_exhaust(group,temp):
+    # Real oversized stdio, NOT an initialized Codex app-server. This only
+    # exercises its collector when separately bound to the strict fixture case.
+    raw=b'x'*8192
+    for _ in range(8388608//len(raw)+1):
+        off=0
+        while off<len(raw):n=os.write(1,raw[off:]);assert n>0;off+=n
+    return 0
+
+
+def pids_threads(group,temp):
+    before=counters(group,'pids.events');release=threading.Event();threads=[];error=None
+    try:
+        for _ in range(TASKS+1):
+            t=threading.Thread(target=release.wait,args=(12,),daemon=False)
+            try:t.start()
+            except (OSError,RuntimeError) as exc:
+                error={'type':type(exc).__name__,'errno':getattr(exc,'errno',None),'detail':str(exc)[:120]};break
+            threads.append(t)
+        after=counters(group,'pids.events')
+        emit({'fixture':'pids_threads','before':before,'after':after,'threads_started':len(threads),
+              'pids_current':int((group/'pids.current').read_text()),'error':error,'identity':birth()})
+        assert after.get('max',0)>before.get('max',0), 'no actual kernel pids.max refusal'
+        assert error is not None, '129 threads unexpectedly admitted under whole128tasks'
+    finally:
+        release.set()
+        for t in threads:t.join(timeout=1)
+        assert all(not t.is_alive() for t in threads)
+    return 0
+
+
+def memory_oom(group,temp):
+    # Four real 600MiB resident allocations stay below each AS1GiB but exceed
+    # the exact inherited2GiB total. Kernel memory.events/oom_kill and original
+    # outside wait must be collected by Root even if this producer is OOM-killed.
+    children=[];emit({'fixture':'memory_oom','before':counters(group,'memory.events'),'identity':birth()})
+    for _ in range(3):
+        pid=os.fork()
+        if pid==0:
+            children=[]
+            break
+        children.append(pid)
+    raw=bytearray(600*1024*1024)
+    for p in range(0,len(raw),4096):raw[p]=1
+    select.select([],[],[],8)
+    del raw
+    if not children:os._exit(0)
+    waits=[]
+    for pid in children:
+        got,status=os.waitpid(pid,0);assert got==pid;waits.append([pid,status])
+    emit({'fixture':'memory_oom','after':counters(group,'memory.events'),'waits':waits})
+    return 0
+
+
+def cpu_quota(group,temp):
+    before=counters(group,'cpu.stat');children=[]
+    for _ in range(3):
+        pid=os.fork()
+        if pid==0:
+            children=[]
+            break
+        children.append(pid)
+    end=time.monotonic()+10;count=0
+    while time.monotonic()<end:count=(count*1664525+1013904223)&0xffffffff
+    if not children:os._exit(0)
+    for pid in children:got,_=os.waitpid(pid,0);assert got==pid
+    after=counters(group,'cpu.stat')
+    emit({'fixture':'cpu_quota','before':before,'after':after,'identity':birth()})
+    assert after.get('nr_throttled',0)>before.get('nr_throttled',0), 'actual CPU throttling not observed'
+    return 0
+
+
+def detached_adopted(group,temp):
+    first=os.fork()
+    if first==0:
+        os.setsid();second=os.fork()
+        if second:os._exit(0)
+        emit({'fixture':'detached_adopted','identity':birth()})
+        # Intentionally outlives direct producer, yet finite and same kernel
+        # boundary. Existing PID-init MUST observe/register/wait this descendant.
+        select.select([],[],[],3);os._exit(0)
+    got,status=os.waitpid(first,0);assert got==first
+    emit({'fixture':'detached_adopted','direct_wait':[got,status]})
+    return 0
+
+
+def tmp_bytes(group,temp):
+    root=temp/'c40-tmp-bytes';root.mkdir(mode=0o700);failure=None;total=0
+    for i in range(3):
+        fd=os.open(root/str(i),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o400)
+        try:
+            for _ in range(45):
+                raw=b't'*1048576;pos=0
+                while pos<len(raw):n=os.write(fd,raw[pos:]);assert n>0;pos+=n;total+=n
+        except OSError as exc:failure=exc.errno;break
+        finally:os.close(fd)
+    emit({'fixture':'tmp_bytes','written':total,'errno':failure,'statvfs':os.statvfs(temp).f_bavail})
+    assert failure==errno.ENOSPC and total<=TMP,'actual tmpfs whole-cap cause absent'
+    return 0
+
+
+def tmp_inodes(group,temp):
+    root=temp/'c40-tmp-inodes';root.mkdir(mode=0o700);failure=None;made=0
+    for i in range(INODES+1):
+        try:fd=os.open(root/str(i),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o400)
+        except OSError as exc:failure=exc.errno;break
+        os.close(fd);made+=1
+    emit({'fixture':'tmp_inodes','files':made,'errno':failure,'remaining':os.statvfs(temp).f_favail})
+    assert failure==errno.ENOSPC and made<=INODES,'actual inode exhaustion absent'
+    return 0
+
+
+def schema_bytes(group,temp):
+    path=temp/'c40-oversize-schema.json';fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o400)
+    try:
+        os.write(fd,b'{"description":"')
+        for _ in range(9):
+            raw=b's'*1048576;off=0
+            while off<len(raw):n=os.write(fd,raw[off:]);assert n>0;off+=n
+        os.write(fd,b'"}')
+    finally:os.close(fd)
+    emit({'fixture':'schema_bytes','path':str(path),'bytes':path.stat().st_size})
+    return 0
+
+
+def clone_bytes(group,temp):
+    root=temp/'c40-clone-input';root.mkdir(mode=0o700)
+    for name in ['config.toml','auth.json']:
+        fd=os.open(root/name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o400)
+        try:
+            raw=b'x'*(1048576+1);pos=0
+            while pos<len(raw):n=os.write(fd,raw[pos:]);assert n>0;pos+=n
+        finally:os.close(fd)
+    emit({'fixture':'clone_bytes','path':str(root),'bytes':sum(x.stat().st_size for x in root.iterdir())})
+    return 0
+
+
+MODES={'positive_eof':positive_eof,'output_exhaust':output_exhaust,
+       'strict_buffer_exhaust':strict_buffer_exhaust,'pids_threads':pids_threads,
+       'memory_oom':memory_oom,'cpu_quota':cpu_quota,'detached_adopted':detached_adopted,
+       'tmp_bytes':tmp_bytes,'tmp_inodes':tmp_inodes,'schema_bytes':schema_bytes,'clone_bytes':clone_bytes}
+
+
+def main():
+    assert len(sys.argv)==4 and sys.argv[1] in MODES
+    group,temp=bounded_environment(sys.argv[2],sys.argv[3])
+    return MODES[sys.argv[1]](group,temp)
+
+
+if __name__=='__main__':raise SystemExit(main())

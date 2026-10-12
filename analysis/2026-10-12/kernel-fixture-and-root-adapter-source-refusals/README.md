@@ -1,0 +1,13 @@
+# Kernel, fixture memory harness and existing Root adapter: source and refusals
+
+This inert archive contains current C44 (280 logical payloads), the complete memory-harness package (12), and current C45 (76), plus exact final independent findings and Root observations at the pinned cutoff. Every Python body has a .py.txt suffix. No archived Source was imported or executed during publication preparation.
+
+C44 has five independent Source blockers: wrapped exception masking, genuine direct birth state incompatibility, a live-handle bound incompatible with 128-birth custody, incomplete strict JSON on normal and reserved paths, and a stale final qualification proposal pin. Task-stack and partial-write improvements have Source-only status. The memory harness is refused because encoded snapshot bytes reach a dictionary-only validator. Its 735 operations and 128 births are unexecuted declarations.
+
+C45 prepares an existing Root adapter and full32 assertion driver. Its facility and serial-fit refusal is conservative Source reasoning, with independent review pending at the cutoff; it is not a measured unsupported facility. Its Root receipt and closure were seven seconds late. C44 independent Root bookkeeping and the harness author useful-reserve/Root timing deviations remain visible without renewed clocks.
+
+SOURCE-PINS.json retains every logical original byte pin beside its canonical public byte pin. Identical bodies are deduplicated only with exact original SHA256 and a complete logical ledger. Original nested pins remain provenance values; DEPENDENCY-PIN-LEDGER.json.gz (deterministic gzip JSON) resolves exact archived bytes and marks historical, external catalogue or stale values explicitly. Earlier C44 280-file seal is immutable history and excluded from current credit. External captured library catalogues and control handoffs are not claimed as archived executable dependencies. Complete current active Source and exact C44 dependencies used by the memory harness are present.
+
+Private paths and session/routing identifiers use deterministic reversible public aliases. Private authority and full TASK/compact handoffs are explicit provenance projections. Every meaningful Source byte is unchanged under reversal; JSON types and non-string values are preserved. Private originals and the complete reversal ledger remain outside the public candidate.
+
+Previous accepted actual Source310 is unchanged and was not rerun. Later repair/review packages are outside this immutable cutoff. Kernel, genuine, native, full19, normal3600, installed, all7 and release remain unaccepted; mandatory scopes, clocks, usage, model/Fast settings and guards remain in force.

@@ -1,0 +1,1580 @@
+"""INERT until Root admits this exact stock finite host/caller invocation.
+
+Adapts C25 fixture_host-v5: one Popen direct child, wait(timeout), exact pidfd
+stop, direct wait and subreaper cleanup. Inputs/pins prove consistency only.
+No installed owner, daemon, authority protocol, automatic retry or C26 nesting.
+"""
+import ctypes
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import resource
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+AS = 268435456
+MAX = 67108864
+LIMIT = 65536
+SELF = str(Path(__file__).resolve())
+PYTHON = 'public-external/path-07a9bc55f19a582bf695/python'
+
+
+def require(ok, reason):
+    if not ok:
+        raise ValueError(reason)
+
+
+def identity(pid):
+    v = Path('/proc/' + str(pid) + '/stat').read_text().rsplit(')', 1)[1].split()
+    return {'pid': pid, 'birth': v[19], 'ppid': int(v[1]),
+            'pgid': int(v[2]), 'sid': int(v[3])}
+
+
+def absent(row):
+    try:
+        return identity(row['pid'])['birth'] != row['birth']
+    except FileNotFoundError:
+        return True
+
+
+def read_pin(ref, maximum=1048576):
+    require(type(ref) is dict and set(ref) == {'path', 'bytes', 'sha256'}, 'pin shape')
+    p = Path(ref['path'])
+    require(p.is_absolute() and '..' not in p.parts and str(p) == os.path.normpath(str(p)), 'pin path')
+    require(type(ref['bytes']) is int and 0 <= ref['bytes'] <= maximum, 'pin size')
+    for parent in reversed(p.parents):
+        require(stat.S_ISDIR(parent.lstat().st_mode), 'pin ancestor')
+    fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        a = os.fstat(fd)
+        require(stat.S_ISREG(a.st_mode) and a.st_nlink == 1 and a.st_uid == os.getuid()
+                and not a.st_mode & 0o077 and a.st_size <= maximum, 'private regular pin')
+        chunks, size = [], 0
+        while True:
+            b = os.read(fd, min(8192, maximum + 1 - size))
+            if not b:
+                break
+            chunks.append(b)
+            size += len(b)
+            require(size <= maximum, 'read bound')
+        raw = b''.join(chunks)
+        key = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mode, s.st_mtime_ns, s.st_ctime_ns)
+        require(key(a) == key(os.fstat(fd)) == key(p.lstat()), 'pin drift')
+        require(len(raw) == ref['bytes'] and hashlib.sha256(raw).hexdigest() == ref['sha256'], 'pin mismatch')
+        return raw
+    finally:
+        os.close(fd)
+
+
+def put(path, value):
+    raw = (json.dumps(value, sort_keys=True, allow_nan=False) + '\n').encode()
+    require(len(raw) <= LIMIT, 'evidence bound')
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, 'wb') as f:
+        f.write(raw)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def original(clock):
+    fields = ('started_at_unix', 'started_at_monotonic', 'original_seconds',
+              'cleanup_seconds', 'useful_deadline_unix', 'final_deadline_unix')
+    require(all(type(clock.get(k)) in (int, float) and math.isfinite(clock[k]) for k in fields), 'clock numeric')
+    elapsed = time.monotonic() - clock['started_at_monotonic']
+    require(3 <= clock['cleanup_seconds'] < clock['original_seconds'] and elapsed >= 0
+            and abs(time.time() - clock['started_at_unix'] - elapsed) <= 2
+            and clock['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            and clock['useful_deadline_unix'] == clock['started_at_unix'] + clock['original_seconds'] - clock['cleanup_seconds']
+            and clock['final_deadline_unix'] == clock['started_at_unix'] + clock['original_seconds'], 'original clock consistency')
+    return (clock['started_at_monotonic'] + clock['original_seconds'] - clock['cleanup_seconds'],
+            clock['started_at_monotonic'] + clock['original_seconds'])
+
+
+
+def proc_read(path, maximum=4096):
+    # Read proc metadata, never reopen/duplicate a retained custody handle.
+    with open(path, 'rb', buffering=0) as f:
+        raw = f.read(maximum + 1)
+    require(len(raw) <= maximum, 'bounded proc observation')
+    return raw.decode('utf-8', 'replace')
+
+
+def fd_observation(fd, cached=None, pid=None):
+    prefix = '/proc/' + ('self' if pid is None else str(pid))
+    row = {'fd': fd, 'cached_identity': cached if cached is not None else 'UNKNOWN', 'current_identity': 'UNKNOWN',
+           'target': 'UNKNOWN', 'fdinfo': 'UNKNOWN', 'errors': []}
+    for key, get in (
+            ('current_identity', lambda: os.fstat(fd) if pid is None else os.stat(prefix + '/fd/' + str(fd))),
+            ('target', lambda: os.readlink(prefix + '/fd/' + str(fd))),
+            ('fdinfo', lambda: proc_read(prefix + '/fdinfo/' + str(fd)))):
+        try:
+            value = get()
+            if key == 'current_identity':
+                value = [value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode)]
+                if cached is not None:
+                    require(value == list(cached), 'retained FD identity changed during observation')
+            row[key] = value
+        except BaseException as exc:
+            row['errors'].append({'field': key, 'class': type(exc).__name__, 'detail': str(exc)[:120]})
+    return row
+
+
+def process_snapshot(pid):
+    # Identity and state from ONE bounded stat read; never combine two births.
+    values = proc_read('/proc/' + str(pid) + '/stat').rsplit(')', 1)[1].split()
+    require(len(values) >= 20, 'complete worker stat snapshot')
+    return {'identity': {'pid': pid, 'birth': values[19], 'ppid': int(values[1]),
+                         'pgid': int(values[2]), 'sid': int(values[3])}, 'state': values[0]}
+
+
+def confirm_worker_sample(actual, after):
+    require(after['identity'] == actual, 'worker identity drift during observation')
+
+
+def worker_observation(c):
+    row = {'identity': 'UNKNOWN', 'state': 'UNKNOWN', 'wchan': 'UNKNOWN',
+           'syscall': 'UNKNOWN', 'lock_fds': [], 'physical_flock': 'UNKNOWN', 'errors': []}
+    try:
+        birth_path = Path(c['spec']['evidence']) / 'WORKER-BIRTH.json'
+        s = birth_path.lstat()
+        require(stat.S_ISREG(s.st_mode) and s.st_nlink == 1 and s.st_uid == os.getuid()
+                and not s.st_mode & 0o077 and s.st_size <= LIMIT, 'private worker birth observation')
+        raw = proc_read(str(birth_path), LIMIT)
+        after = birth_path.lstat()
+        require((s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns) ==
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns), 'worker birth observation drift')
+        saved = json.loads(raw)
+        require(type(saved.get('pid')) is int and type(saved.get('birth')) is str, 'observed worker birth shape')
+        row['recorded_birth'] = {'pid': saved['pid'], 'birth': saved['birth']}
+    except FileNotFoundError:
+        row['state'] = 'BIRTH_NOT_AVAILABLE_AT_THIS_OBSERVATION'
+        return row
+    except BaseException as exc:
+        row['errors'].append({'field': 'recorded_birth', 'class': type(exc).__name__})
+        return row
+    try:
+        sample = process_snapshot(saved['pid'])
+        actual = sample['identity']
+        if actual['birth'] != saved['birth']:
+            row['state'] = 'RECORDED_BIRTH_ABSENT_PID_REUSED'
+            return row
+        row['identity'] = actual
+        require(actual['ppid'] in (os.getpid(), c['proc'].pid) and actual['pgid'] == c['host']['pgid'],
+                'observed worker belongs to actual caller or finite subreaper')
+        row['state'] = sample['state']
+        c['observed_worker'] = {'pid': actual['pid'], 'birth': actual['birth'], 'kind': 'Source_worker'}
+    except FileNotFoundError:
+        row['state'] = 'RECORDED_BIRTH_FRESH_ABSENT'
+        return row
+    except BaseException as exc:
+        row['errors'].append({'field': 'owned_birth', 'class': type(exc).__name__})
+        return row
+    row['capacity_release'] = False
+    row['direct_wait_credit_from_state'] = False
+    row['sample_unix'], row['sample_monotonic'] = time.time(), time.monotonic()
+    last = c.get('last_live_worker_sample')
+    row['last_live_sample'] = last if last is not None and last['identity']['pid'] == actual['pid'] and last['identity']['birth'] == actual['birth'] else None
+    row['last_live_sample_is_historical_not_current_authority'] = True
+    if row['state'] == 'Z':
+        # A confirmed owned zombie has no executing syscall/open FD sample.
+        # The retained host pidfd is still sampled separately, including errors.
+        row['current_probe_status'] = 'NOT_APPLICABLE_ZOMBIE_NONRUNNING'
+        row['wchan'] = row['syscall'] = 'NOT_APPLICABLE_ZOMBIE_NONRUNNING'
+        row['physical_flock'] = 'NOT_APPLICABLE_ZOMBIE_NONRUNNING'
+        row['closure'] = 'UNREAPED; ACTUAL_DIRECT_WAIT_AND_FRESH_ABSENCE_REQUIRED'
+        try:
+            after = process_snapshot(actual['pid'])
+            confirm_worker_sample(actual, after)
+            require(after['state'] == 'Z', 'zombie state changed during observation')
+            row['same_birth_after_sample'] = True
+        except BaseException as exc:
+            row['same_birth_after_sample'] = 'UNKNOWN'
+            row['errors'].append({'field': 'zombie_sample_end_identity', 'class': type(exc).__name__})
+        return row  # No remote syscall/wchan/fd iteration on this exact branch.
+    row['current_probe_status'] = 'LIVE_SAMPLE_REQUIRED; ALL_REAL_ERRORS_REFUSE'
+    for key in ('wchan', 'syscall'):
+        try:
+            row[key] = proc_read('/proc/' + str(actual['pid']) + '/' + key).strip()
+        except BaseException as exc:
+            row['errors'].append({'field': key, 'class': type(exc).__name__})
+    lock = c['descriptor'].get('lock')
+    if c['descriptor'].get('case') != 'worker_flock' or lock is None:
+        row['physical_flock'] = 'NOT_REQUESTED'
+        return row
+    try:
+        target = Path(lock).lstat()
+        require(stat.S_ISREG(target.st_mode) and target.st_nlink == 1 and target.st_uid == os.getuid(), 'private fixture lock inode')
+        lock_key = [target.st_dev, target.st_ino, stat.S_IFMT(target.st_mode)]
+        for leaf in sorted(Path('/proc/' + str(actual['pid']) + '/fd').iterdir(), key=lambda p: int(p.name))[:32]:
+            fd = int(leaf.name)
+            try:
+                s = leaf.stat()
+                if [s.st_dev, s.st_ino, stat.S_IFMT(s.st_mode)] == lock_key:
+                    fd_row = fd_observation(fd, pid=actual['pid'])
+                    row['lock_fds'].append(fd_row)
+                    row['errors'].extend({'field': 'physical_lock_fd_' + str(fd), **error} for error in fd_row['errors'])
+            except FileNotFoundError:
+                continue
+        # Preserve actual kernel values. Root must judge them with the holder's
+        # kernel lock/FD evidence; a phase marker never supplies this observation.
+        row['physical_flock'] = 'KERNEL_SAMPLE_CAPTURED_ROOT_MUST_INTERPRET_BLOCK' if row['wchan'] not in ('UNKNOWN', '0', '') and row['syscall'] not in ('UNKNOWN', 'running', '') and row['lock_fds'] else 'UNKNOWN'
+    except BaseException as exc:
+        row['errors'].append({'field': 'physical_lock_fd', 'class': type(exc).__name__})
+    try:
+        after = process_snapshot(actual['pid'])
+        confirm_worker_sample(actual, after)
+        require(after['state'] != 'Z', 'live-to-zombie transition during active sample')
+        row['same_birth_after_sample'] = True
+    except BaseException as exc:
+        row['same_birth_after_sample'] = 'UNKNOWN'
+        row['errors'].append({'field': 'sample_end_birth', 'class': type(exc).__name__})
+    if not row['errors'] and row.get('same_birth_after_sample') is True:
+        # Link to the original complete frame; retain compact factual provenance.
+        c['last_live_worker_sample'] = {
+            'identity': dict(actual), 'state': row['state'], 'phase': c['phase'],
+            'host_sequence': c['observation_count'], 'observed_unix': row['sample_unix'],
+            'observed_monotonic': row['sample_monotonic'], 'wchan': row['wchan'], 'syscall': row['syscall'],
+            'physical_flock': row['physical_flock'],
+            'lock_fds': [{'fd': f['fd'], 'current_identity': f['current_identity']} for f in row['lock_fds']],
+            'historical_observation_only': True}
+    return row
+
+
+def actor_observation(c):
+    # Kernel-discovered outside actor is observed, never signalled or adopted as
+    # host ownership. Root separately owns its actual direct wait/fresh closure.
+    rows = []
+    if c['descriptor'].get('case') != 'worker_flock':
+        return rows
+    target = Path(c['descriptor']['lock']).lstat()
+    require(stat.S_ISREG(target.st_mode) and target.st_nlink == 1 and target.st_uid == os.getuid(), 'fixture lock inode')
+    key = [target.st_dev, target.st_ino, stat.S_IFMT(target.st_mode)]
+    for line in proc_read('/proc/locks', LIMIT).splitlines():
+        parts = line.split()
+        if len(parts) < 8 or parts[1:4] != ['FLOCK', 'ADVISORY', 'WRITE']:
+            continue  # blocked waiter (->) is not the holder.
+        dev = parts[5].split(':')
+        if len(dev) != 3 or [int(dev[0], 16), int(dev[1], 16), int(dev[2])] != [os.major(target.st_dev), os.minor(target.st_dev), target.st_ino]:
+            continue
+        require(len(rows) < 4, 'bounded actual stock lock holders')
+        pid = int(parts[4])
+        actual = identity(pid)
+        fds = []
+        for leaf in sorted(Path('/proc/' + str(pid) + '/fd').iterdir(), key=lambda p: int(p.name))[:32]:
+            try:
+                s = leaf.stat()
+                if [s.st_dev, s.st_ino, stat.S_IFMT(s.st_mode)] == key:
+                    fds.append(fd_observation(int(leaf.name), pid=pid))
+            except FileNotFoundError:
+                continue
+        command = proc_read('/proc/' + str(pid) + '/cmdline').split('\0')[:-1]
+        expected = ['/usr/bin/sleep', '15']
+        row = {'identity': actual, 'kernel_holder_row': line, 'lock_identity': key, 'lock_fds': fds,
+               'command': command, 'affinity': sorted(os.sched_getaffinity(pid)),
+               'limits': proc_read('/proc/' + str(pid) + '/limits'), 'readiness': 'UNKNOWN',
+               'owner': 'EXTERNAL_ROOT_STOCK_ACTOR; NOT_HOST_CHILD_OWNERSHIP'}
+        row['same_birth_after_sample'] = identity(pid)['birth'] == actual['birth']
+        if command == expected and fds and row['same_birth_after_sample'] and any('FLOCK' in f['fdinfo'] and 'lock:' in f['fdinfo'] for f in fds):
+            row['readiness'] = 'ACTUAL_KERNEL_FLOCK_HOLDER_AND_OPEN_LOCK_FD_OBSERVED'
+        rows.append(row)
+    return rows
+
+
+def _observe_impl(c, phase, include_worker=False):
+    # One bounded observation in this existing finite host; no observer process,
+    # thread, custody transfer, new grant, FD replacement, close or wait probe.
+    c['phase'] = phase
+    if c['observation_count'] >= 24:
+        c['observation_errors'].append({'phase': phase, 'class': 'ObservationBound'})
+        return False
+    c['observation_count'] += 1
+    errors = []
+    frame = {'kind': 'FINITE_HOST_OBSERVATION', 'sequence': c['observation_count'], 'phase': phase,
+             'observed_unix': time.time(), 'observed_monotonic': time.monotonic(),
+             'host': 'UNKNOWN', 'outer_guard': c['outer'], 'caller': 'UNKNOWN',
+             'caller_direct_wait': c['code'] is not None, 'caller_returncode': c['code'],
+              'adopted_direct_wait': list(c['adopted']), 'adopted_pending': list(c['adopted_pending']),
+              'custody_faults': c['faults'][:8],
+             'retained_fds': {}, 'ambiguous_closes': dict(c['ambiguous']),
+             'capacity_release': False, 'observations_are_not_authority_or_independent_acceptance': True}
+    try:
+        require(identity(os.getpid()) == c['host'], 'same actual finite host birth')
+        frame['host'] = c['host']
+        require(identity(c['outer']['pid']) == c['outer'], 'same actual existing stock guard birth')
+        frame['actual_stock_guard_same_birth'] = True
+        if c['proc'] is not None:
+            frame['caller_popen_pid'] = c['proc'].pid
+            try:
+                frame['caller'] = identity(c['proc'].pid)
+                if c['caller'] is not None:
+                    require(frame['caller']['birth'] == c['caller']['birth'], 'caller birth drift during observation')
+            except FileNotFoundError:
+                frame['caller'] = 'FRESH_PID_ABSENT; direct wait shown separately'
+        require(len(c['fds']) <= 24, 'bounded retained host FD set')
+        for name, fd in c['fds'].items():
+            if fd is not None:
+                row = fd_observation(fd, c['ids'].get(name))
+                frame['retained_fds'][name] = row
+                errors.extend({'fd_label': name, **e} for e in row['errors'])
+        if include_worker:
+            frame['worker'] = worker_observation(c)
+            # Permission/read failure is uncertainty; never claim physical block.
+            errors.extend(frame['worker']['errors'])
+            frame['stock_actor'] = actor_observation(c)
+            for actor in frame['stock_actor']:
+                for fd_row in actor['lock_fds']:
+                    errors.extend({'field': 'stock_actor_lock_fd', **error} for error in fd_row['errors'])
+    except BaseException as exc:
+        errors.append({'class': type(exc).__name__, 'detail': str(exc)[:180]})
+    frame['errors'] = errors[:16]
+    try:
+        raw = (json.dumps(frame, sort_keys=True, allow_nan=False) + '\n').encode()
+        require(len(raw) <= 16384 and c['observation_bytes'] + len(raw) <= LIMIT, 'whole bounded host observation output')
+        c['observation_bytes'] += len(raw)  # Charge before a fallible/partial write.
+        offset = 0
+        while offset < len(raw):
+            n = os.write(1, raw[offset:])  # Existing stock stdout, never reopen it.
+            require(n > 0, 'zero observation write')
+            offset += n
+    except BaseException as exc:
+        errors.append({'class': type(exc).__name__, 'detail': str(exc)[:180]})
+    if errors:
+        c['observation_errors'].extend({'phase': phase, **e} for e in errors[:16])
+    return not errors
+
+
+def observe(c, phase, include_worker=False):
+    # All construction/time/proc/write/error bookkeeping is covered here.
+    # No observation exception escapes the actual finite host custody.
+    try:
+        return _observe_impl(c, phase, include_worker)
+    except BaseException as exc:
+        try:
+            c['observation_errors'].append({'phase': phase, 'class': type(exc).__name__})
+        except BaseException:
+            pass
+        return False
+
+
+def retained_pause(c, phase):
+    observe(c, phase, include_worker=True)
+    retain_until_stock_guard()  # Actual same host keeps every uncertain handle.
+
+
+def wait_caller_observed(c, seconds):
+    # Sample once while the original caller deadline is live. Popen's direct
+    # wait, existing stock guard and final wait remain the physical owners.
+    started = time.monotonic()
+    first = min(seconds, 0.5)
+    try:
+        return c['proc'].wait(timeout=first)
+    except subprocess.TimeoutExpired:
+        if not observe(c, 'caller_wait_live_before_any_stop', include_worker=True):
+            retained_pause(c, 'caller_wait_observation_unconfirmed')
+        remaining = max(0, min(seconds - (time.monotonic() - started),
+                               c['caller_deadline_monotonic'] - time.monotonic(),
+                               c['caller_deadline_unix'] - time.time()))
+        return c['proc'].wait(timeout=remaining)
+
+
+def retain_fd(c, label, fd):
+    # Assign immediately after open, BEFORE fallible identity capture.
+    require(label not in c['fds'], 'occupied retained host FD label')
+    c['fds'][label] = fd
+    if label.startswith('adopted_pidfd_'):
+        observe(c, 'adopted_pidfd_registered_before_fstat', include_worker=True)
+    s = os.fstat(fd)
+    c['ids'][label] = (s.st_dev, s.st_ino, stat.S_IFMT(s.st_mode))
+    return fd
+
+
+def close_once(c, label):
+    fd = c['fds'].get(label)
+    if fd is None or label in c['ambiguous']:
+        return
+    if label in ('stdout', 'stderr', 'caller_pidfd') or label.startswith('adopted_pidfd_'):
+        if not observe(c, 'before_close_' + label):
+            c['ambiguous'][label] = 'OBSERVATION_UNCONFIRMED'
+            return
+    try:
+        s = os.fstat(fd)
+        require((s.st_dev, s.st_ino, stat.S_IFMT(s.st_mode)) == c['ids'].get(label), 'retained host FD drift')
+        os.close(fd)
+        c['fds'][label] = None
+    except BaseException as exc:
+        c['ambiguous'][label] = type(exc).__name__
+        observe(c, 'ambiguous_close_' + label)
+        try:
+            os.fstat(fd)
+        except OSError as probe:
+            if probe.errno == 9:  # EBADF confirms this FD number is absent; never retry close.
+                c['fds'][label] = None
+                c['ambiguous'].pop(label, None)
+        except BaseException:
+            pass
+
+
+def put_retained(path, value, c, label):
+    raw = (json.dumps(value, sort_keys=True, allow_nan=False) + '\n').encode()
+    require(len(raw) <= LIMIT, 'evidence bound')
+    fd = retain_fd(c, label, os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400))
+    try:
+        offset = 0
+        while offset < len(raw):
+            count = os.write(fd, raw[offset:])
+            require(count > 0, 'zero evidence write')
+            offset += count
+        os.fsync(fd)
+    finally:
+        close_once(c, label)
+    require(c['fds'].get(label) is None and label not in c['ambiguous'], 'retained evidence close unconfirmed')
+
+
+def retain_until_stock_guard():
+    # Do not voluntarily drop a live finite owner. Independently admitted stock
+    # timeout remains armed. This is no new retry/daemon/authority facility.
+    while True:
+        try:
+            signal.pause()
+        except BaseException:
+            pass  # Existing armed stock SIGKILL bounds the SAME finite host.
+
+
+def main():
+    require(len(sys.argv) == 4, 'exact input: path bytes SHA256')
+    ref = {'path': sys.argv[1], 'bytes': int(sys.argv[2]), 'sha256': sys.argv[3]}
+    spec = json.loads(read_pin(ref, LIMIT))
+    if spec.get('domain')=='native':return native_host(spec,ref)
+    keys = {'host', 'caller', 'helper', 'entry', 'descriptor', 'clock', 'evidence',
+            'fixture_root', 'record', 'wall_cap', 'caller_wall_seconds',
+            'host_cleanup_seconds', 'outer_timeout_seconds'}
+    require(set(spec) == keys and spec['host']['path'] == SELF, 'exact one-shot input fields')
+    for key in ('host', 'caller', 'helper', 'entry', 'descriptor'):
+        read_pin(spec[key])
+    require(spec['caller']['path'] == str(Path(SELF).with_name('stock_install_caller.py')), 'fixed caller')
+    descriptor = json.loads(read_pin(spec['descriptor'], LIMIT))
+    clock = json.loads(read_pin(spec['clock'], LIMIT))
+    useful, final = original(clock)
+    for key in ('wall_cap', 'caller_wall_seconds', 'host_cleanup_seconds', 'outer_timeout_seconds'):
+        require(type(spec[key]) in (int, float) and math.isfinite(spec[key]) and spec[key] > 0, 'finite launch caps')
+    require(spec['wall_cap'] <= 30 and spec['caller_wall_seconds'] <= spec['wall_cap']
+            and spec['host_cleanup_seconds'] <= 5
+            and spec['caller_wall_seconds'] + spec['host_cleanup_seconds'] + 2 <= spec['outer_timeout_seconds'] <= 60,
+            'shortening-only physical caps')
+    require(time.monotonic() + spec['outer_timeout_seconds'] < useful
+            and time.time() + spec['outer_timeout_seconds'] < clock['useful_deadline_unix'], 'outer guard fits original useful clock')
+    for kind, cap in ((resource.RLIMIT_AS, AS), (resource.RLIMIT_CPU, 60), (resource.RLIMIT_FSIZE, MAX)):
+        require(resource.getrlimit(kind) == (cap, cap), 'hard host resources before caller')
+    require(resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
+            and 0 < len(os.sched_getaffinity(0)) <= 2
+            and signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL
+            and len(list(Path('/proc/self/task').iterdir())) == 1, 'host custody boundary')
+    children = Path('/proc/self/task/' + str(os.getpid()) + '/children')
+    require(not children.read_text().strip(), 'finite host starts without children')
+    host = identity(os.getpid())
+    outer = identity(os.getppid())
+    expected_outer = [b'/usr/bin/timeout', b'-s', b'KILL',
+                      (str(spec['outer_timeout_seconds']) + 's').encode(),
+                      PYTHON.encode(), b'-I', b'-B', SELF.encode(),
+                      ref['path'].encode(), str(ref['bytes']).encode(), ref['sha256'].encode()]
+    require(Path('/proc/' + str(outer['pid']) + '/cmdline').read_bytes().split(b'\0')[:-1] == expected_outer,
+            'actual stock outer invocation differs')
+    require(host['pgid'] == outer['pgid'], 'whole cohort outer guard')
+    libc = ctypes.CDLL(None, use_errno=True)
+    require(libc.prctl(36, 1, 0, 0, 0) == 0, 'finite host subreaper')
+    require(libc.prctl(1, signal.SIGKILL, 0, 0, 0) == 0 and os.getppid() == outer['pid'], 'host parent death')
+    record = Path(spec['record'])
+    e = Path(spec['evidence'])
+    require(record.parent == e.parent and record != e and record.is_absolute()
+            and '..' not in record.parts and str(record) == os.path.normpath(str(record)), 'exact private records')
+    for parent in reversed(record.parents):
+        require(stat.S_ISDIR(parent.lstat().st_mode), 'record ancestor')
+    require(record.parent.stat().st_uid == os.getuid() and not record.parent.stat().st_mode & 0o077, 'private record parent')
+    require(not e.exists(), 'no attempt replay')
+    record.mkdir(mode=0o700)
+    deadline_mono = min(useful, time.monotonic() + spec['caller_wall_seconds'])
+    deadline_unix = min(clock['useful_deadline_unix'], time.time() + spec['caller_wall_seconds'])
+    launch = {'input': ref, 'host': host, 'outer_guard': outer,
+              'deadline_monotonic': deadline_mono, 'deadline_unix': deadline_unix}
+    put(record / 'LAUNCH.json', launch)
+    put(record / 'HOST-BIRTH.json', {'host': host, 'outer_guard': outer,
+        'limits': Path('/proc/self/limits').read_text(), 'affinity': sorted(os.sched_getaffinity(0)),
+        'Source_caller_worker_hard_AS_sum': 2 * AS, 'whole_timeout_host_caller_worker_hard_AS_sum': 4 * AS,
+        'original_clock': clock, 'unknown_initial_metadata_RSS': 'UNKNOWN',
+        'authority': 'Root actual independently admitted exact external invocation; this file is consistency only'})
+    # Local state of the already admitted finite host, established BEFORE Popen.
+    # Not a new issuer/protocol: exact external Root invocation is still required.
+    c = {'fds': {}, 'ids': {}, 'ambiguous': {}, 'proc': None, 'caller': None, 'fork_attempted': False,
+         'code': None, 'known': [], 'adopted': [], 'faults': [], 'timed_out': False,
+         'host': host, 'outer': outer, 'spec': spec, 'descriptor': descriptor, 'phase': 'OWNED_BEFORE_POPEN',
+         'caller_deadline_monotonic': deadline_mono, 'caller_deadline_unix': deadline_unix,
+         'observed_worker': None, 'last_live_worker_sample': None, 'adopted_pending': [],
+          'observation_count': 0, 'observation_bytes': 0, 'observation_errors': []}
+    def fault(phase, exc):
+        if len(c['faults']) < 32:
+            c['faults'].append({'phase': phase, 'class': type(exc).__name__, 'detail': str(exc)[:300]})
+    def wait_seconds(cleanup=False):
+        if cleanup:
+            return max(0, min(spec['host_cleanup_seconds'], final - time.monotonic(), clock['final_deadline_unix'] - time.time()))
+        return max(0, min(deadline_mono - time.monotonic(), deadline_unix - time.time()))
+    try:
+        outfd = retain_fd(c, 'stdout', os.open(record / 'stdout.log', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400))
+        errfd = retain_fd(c, 'stderr', os.open(record / 'stderr.log', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400))
+        c['fork_attempted'] = True
+        c['proc'] = subprocess.Popen([PYTHON, '-I', '-B', spec['caller']['path'], str(record / 'LAUNCH.json')],
+                                    stdout=outfd, stderr=errfd, close_fds=True, start_new_session=False)
+        proc = c['proc']  # Retain direct-child object/PID before any birth/fstat/write.
+        pfd = retain_fd(c, 'caller_pidfd', os.pidfd_open(proc.pid))
+        caller = identity(proc.pid)
+        c['caller'] = caller
+        c['known'].append(caller)
+        require(caller['ppid'] == os.getpid() and caller['pgid'] == host['pgid'], 'actual owned caller')
+        put_retained(record / 'CALLER-BIRTH.json', caller, c, 'caller_birth_leaf')
+        if not observe(c, 'caller_owned_after_birth_before_direct_wait'):
+            retained_pause(c, 'initial_caller_observation_unconfirmed')
+        try:
+            c['code'] = wait_caller_observed(c, wait_seconds())
+        except subprocess.TimeoutExpired:
+            c['timed_out'] = True
+            if not observe(c, 'caller_timeout_before_pidfd_stop', include_worker=True):
+                retained_pause(c, 'caller_timeout_observation_unconfirmed')
+            signal.pidfd_send_signal(pfd, signal.SIGKILL)
+            c['code'] = proc.wait(timeout=wait_seconds(True))
+    except BaseException as exc:
+        fault('caller_scope', exc)
+        if c['proc'] is not None and c['code'] is None and c['fds'].get('caller_pidfd') is not None:
+            try:
+                fd = c['fds']['caller_pidfd']
+                s = os.fstat(fd)
+                require((s.st_dev, s.st_ino, stat.S_IFMT(s.st_mode)) == c['ids'].get('caller_pidfd'), 'retained caller pidfd')
+                if not observe(c, 'caller_recovery_before_pidfd_stop', include_worker=True):
+                    retained_pause(c, 'caller_recovery_observation_unconfirmed')
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                c['code'] = c['proc'].wait(timeout=wait_seconds(True))
+            except BaseException as stop:
+                fault('caller_stop_direct_wait', stop)
+    # No finally closes actual custody while a direct wait/fresh absence is unknown.
+    whole_closed = False
+    closure = []
+    try:
+        cleanup_until = min(time.monotonic() + spec['host_cleanup_seconds'], final)
+        while c['code'] is not None:
+            values = children.read_text().split()
+            if not values:
+                break
+            require(time.monotonic() < cleanup_until and time.time() < clock['final_deadline_unix'], 'STOP_UNCONFIRMED adopted child')
+            for value in values:
+                row = identity(int(value))
+                require(row['ppid'] == os.getpid() and row['pgid'] == host['pgid'], 'owned adopted identity')
+                if row not in c['known']:
+                    c['known'].append(row)
+                if not any(p['pid'] == row['pid'] and p['birth'] == row['birth'] for p in c['adopted_pending']):
+                    c['adopted_pending'].append({'pid': row['pid'], 'birth': row['birth']})
+                label = 'adopted_pidfd_' + str(row['pid']) + '_' + row['birth']
+                if label not in c['fds']:
+                    retain_fd(c, label, os.pidfd_open(row['pid']))
+                fd = c['fds'][label]
+                if not observe(c, 'owned_adopted_before_pidfd_stop_and_wait', include_worker=True):
+                    retained_pause(c, 'adopted_observation_unconfirmed')
+                s = os.fstat(fd)
+                require((s.st_dev, s.st_ino, stat.S_IFMT(s.st_mode)) == c['ids'].get(label), 'retained adopted pidfd')
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                if not observe(c, 'before_adopted_direct_wait', include_worker=True):
+                    retained_pause(c, 'adopted_pre_wait_observation_unconfirmed')
+                try:
+                    pid, status = os.waitpid(row['pid'], os.WNOHANG)
+                    if pid:
+                        require(pid == row['pid'], 'exact adopted direct wait')
+                        require(absent(row), 'adopted direct wait without fresh absence')
+                        c['adopted'].append({'pid': pid, 'birth': row['birth'], 'direct_wait': True, 'returncode': os.waitstatus_to_exitcode(status)})
+                except BaseException as exc:
+                    fault('adopted_direct_wait', exc)
+                    retained_pause(c, 'adopted_direct_wait_unconfirmed')
+                    # Keep all pidfds until whole cohort closure is established.
+            select.select([], [], [], 0.01)
+        worker_file = e / 'WORKER-BIRTH.json'
+        if worker_file.exists():
+            s = worker_file.lstat()
+            require(stat.S_ISREG(s.st_mode) and s.st_nlink == 1 and s.st_uid == os.getuid() and not s.st_mode & 0o077 and s.st_size <= LIMIT, 'worker birth evidence inode')
+            worker = json.loads(worker_file.read_bytes())
+            require(type(worker['pid']) is int and type(worker['birth']) is str, 'worker birth evidence shape')
+            if not any(row['pid'] == worker['pid'] and row['birth'] == worker['birth'] for row in c['known']):
+                c['known'].append({'pid': worker['pid'], 'birth': worker['birth'], 'kind': 'Source_worker'})
+        closure = [dict(row, fresh_birth_absent=absent(row)) for row in c['known']]
+        adopted_waits_confirmed = all(any(a['pid'] == p['pid'] and a['birth'] == p['birth'] and a['direct_wait'] is True
+                                           for a in c['adopted']) for p in c['adopted_pending'])
+        whole_closed = c['code'] is not None and c['caller'] is not None and adopted_waits_confirmed and not children.read_text().strip() and all(r['fresh_birth_absent'] for r in closure)
+        # Missing Popen handle after an attempted spawn is never no-execution credit.
+        if c['fork_attempted'] and c['proc'] is None:
+            whole_closed = False
+    except BaseException as exc:
+        fault('whole_cohort_closure', exc)
+        whole_closed = False
+    if c['observed_worker'] is not None and not any(r['pid'] == c['observed_worker']['pid'] and r['birth'] == c['observed_worker']['birth'] for r in c['known']):
+        c['known'].append(c['observed_worker'])
+        closure.append(dict(c['observed_worker'], fresh_birth_absent='UNKNOWN; additional actual observed birth'))
+        whole_closed = False  # Additional known birth requires fresh actual closure, never omit it.
+    result = {'caller_direct_wait': c['code'] is not None, 'caller_returncode': c['code'],
+              'caller_timed_out': c['timed_out'], 'known_fresh_closure': closure,
+              'adopted_direct_wait': c['adopted'], 'whole_owned_directchild_cohort_closed': whole_closed,
+              'fault': c['faults'] or None, 'capacity_release': False,
+              'retained_resources_before_release': {'fds': {n:fd for n,fd in c['fds'].items() if fd is not None},
+                                                    'identities': c['ids'], 'ambiguous_closes': c['ambiguous']},
+              'attempt_outcome': 'UNKNOWN_NO_REPLAY' if c['faults'] or c['code'] != 0 or not whole_closed or c['observation_errors'] else 'CALLER_RETURN_OBSERVED_NOT_INSTALL_ACCEPTANCE',
+              'scope_release': 'Root decides only after actual host direct return and fresh closure',
+              'installed_admission': 'NOT_CLAIMED', 'original_clock': clock,
+              'observation_errors': c['observation_errors'][:32],
+              'observation_output': 'bounded JSON lines in existing stock stdout; not independent acceptance'}
+    if not observe(c, 'before_outside_closure_evidence'):
+        retained_pause(c, 'outside_observation_unconfirmed')
+    try:
+        put_retained(record / 'OUTSIDE-CLOSURE.json', result, c, 'outside_closure_leaf')
+    except BaseException as exc:
+        fault('outside_closure_evidence', exc)
+        retained_pause(c, 'outside_closure_evidence_unconfirmed')
+    if not whole_closed:
+        retained_pause(c, 'whole_cohort_STOP_UNCONFIRMED')  # No handle released.
+    if c['observation_errors']:
+        retained_pause(c, 'observations_unconfirmed_before_any_release')
+    # Whole actual child cohort closed first. Each close is attempted at most once.
+    for label in list(c['fds']):
+        if 'pidfd' not in label:
+            close_once(c, label)
+    if c['ambiguous']:
+        retained_pause(c, 'non_pidfd_final_close_ambiguous')  # Keep pidfds and ambiguous FD.
+    for label in list(c['fds']):
+        if 'pidfd' in label:
+            close_once(c, label)
+    if c['ambiguous'] or any(fd is not None for fd in c['fds'].values()):
+        retained_pause(c, 'pidfd_final_close_ambiguous')
+    try:
+        require(not children.read_text().strip() and all(absent(row) for row in c['known']), 'fresh whole closure before host exit')
+        if not observe(c, 'fresh_children_closed_before_host_return'):
+            retained_pause(c, 'final_host_observation_unconfirmed')
+        print(json.dumps(result, sort_keys=True))
+    except BaseException as exc:
+        fault('final_host_evidence', exc)
+        retained_pause(c, 'final_host_evidence_unconfirmed')
+    return 0 if c['code'] == 0 and not c['faults'] else 2
+
+
+
+def native_host(spec, ref):
+    # Extension of the existing finite host; no new supervisor/issuer/service.
+    import fcntl
+    n=spec['native'];clock=json.loads(read_pin(spec['clock'],LIMIT));useful,final=original(clock)
+    expected_limits={'whole_memory_bytes':2147483648,'whole_swap_bytes':0,'Linux_tasks':128,
+        'whole_cpu_max':'200000 100000','host_AS':1073741824,'caller_AS':1073741824,
+        'direct_AS':1073741824,'host_CPU':120,'caller_CPU':120,'direct_CPU':60,
+        'FSIZE':67108864,'CORE':0,'max_affinity_cpus':2,'temp_bytes':134217728,
+        'temp_inodes':512,'pipe_output_bytes':33554432,'capture_raw_bytes':134217728,
+        'capture_file_bytes':67108864,'schema_input_bytes':8388608,'clone_input_bytes':1048576}
+    require(n['resource_limits']==expected_limits,'complete exact finite native role/whole/lifetime resource declaration')
+    require(signal.getsignal(signal.SIGCHLD)==signal.SIG_DFL,'native direct/adopted actual wait disposition')
+    require(clock['original_seconds']==1800 and clock['cleanup_seconds']==180,'distinct original native scope')
+    require(time.monotonic()+1005<useful and time.time()+1005<clock['useful_deadline_unix'],'complete unchanged gate plus overhead reserve')
+    require(n['implementation_review']=='EXTERNAL_ROOT_MUST_ACCEPT_EXACT_BYTES','JSON consistency never grants runtime')
+    require(resource.getrlimit(resource.RLIMIT_AS)==(1073741824,1073741824)
+            and resource.getrlimit(resource.RLIMIT_CPU)==(120,120)
+            and resource.getrlimit(resource.RLIMIT_FSIZE)==(MAX,MAX)
+            and resource.getrlimit(resource.RLIMIT_CORE)==(0,0)
+            and 0<len(os.sched_getaffinity(0))<=2,'native host hard caps before effects')
+    for k in ['host','caller','helper','entry','descriptor']:read_pin(spec[k],2097152)
+    for pin in n['current_pins']:read_pin(pin,2097152)
+    require(spec['helper']['sha256']=='af7304a03c86d364b4b1898bd03bfb66d11ea1e53c92cbcdbf3191643cd7fd8b','Source audit byteexact')
+    host=identity(os.getpid());outer=identity(os.getppid())
+    require(not Path('/proc/self/task/'+str(os.getpid())+'/children').read_text().strip()
+            and len(list(Path('/proc/self/task').iterdir()))==1,'native host initially childless single thread')
+    guard_seconds=n['stock_guard_seconds'];outside_reserve=n['outside_closure_seconds']
+    require(type(guard_seconds) is int and 1005<guard_seconds<=1770
+            and outside_reserve==30,'fixed shortening-only stock guard; original reserve intact')
+    require(time.monotonic()+guard_seconds+outside_reserve<final
+            and time.time()+guard_seconds+outside_reserve<clock['final_deadline_unix'],
+            'actual supplied stock duration fits original dual final remainder')
+    stop_m=n['absolute_stop_monotonic'];stop_u=n['absolute_stop_unix']
+    require(type(stop_m) in (int,float) and type(stop_u) in (int,float)
+            and math.isfinite(stop_m) and math.isfinite(stop_u)
+            and stop_m<=final-30 and stop_u<=clock['final_deadline_unix']-30
+            and abs((stop_m-clock['started_at_monotonic'])-(stop_u-clock['started_at_unix']))<=2,
+            'original-clock shortening-only outside absolute stop')
+    require(time.monotonic()+1005<min(useful,stop_m)
+            and time.time()+1005<min(clock['useful_deadline_unix'],stop_u),
+            'full1005 useful actually fits armed absolute stop too')
+    expected=[b'/usr/bin/timeout',b'-s',b'KILL',(str(guard_seconds)+'s').encode(),PYTHON.encode(),b'-I',b'-B',SELF.encode(),ref['path'].encode(),str(ref['bytes']).encode(),ref['sha256'].encode()]
+    require(Path('/proc/'+str(outer['pid'])+'/cmdline').read_bytes().split(b'\0')[:-1]==expected,'exact actual externally admitted stock guard')
+    # Already entered by the SAME external one-shot owner via kernel
+    # clone3(CLONE_INTO_CGROUP|CLONE_NEWPID|CLONE_NEWUSER|CLONE_NEWNS).
+    # The stock parent is namespace init, so its outside exact stop tears down
+    # opaque host-import descendants too. No shared writer/controller migration.
+    require(outer['pid']==1 and host['pid']==2,'admitted private first-birth stock PID-init and host')
+    inherited=Path(n['group']);gs=inherited.stat()
+    require(Path('/proc/self/cgroup').read_text().strip()=='0::'+n['group_relative']
+            and [gs.st_dev,gs.st_ino]==n['first_birth_group_identity'],
+            'host inherited admitted exact whole scope BEFORE Python bootstrap')
+    for key,value in {'memory.max':'2147483648','memory.swap.max':'0','pids.max':'128','cpu.max':'200000 100000'}.items():
+        require((inherited/key).read_text().strip()==value,'host bootstrap hard whole controller '+key)
+    libc=ctypes.CDLL(None,use_errno=True)
+    require(libc.prctl(36,1,0,0,0)==0 and libc.prctl(1,signal.SIGKILL,0,0,0)==0 and os.getppid()==outer['pid'],'existing subreaper and parent death')
+    record=Path(spec['record']);require(not record.exists(),'one-shot native attempt no replay');record.mkdir(mode=0o700)
+    c={'fds':{},'ids':{},'ambiguous':{},'phase':'NATIVE_PRE_EFFECT','spec':spec,'host':host,'outer':outer,
+       'caller':None,'proc':None,'known':[],'adopted':[],'faults':[],'observation_count':0,'observation_bytes':0,
+       'observation_errors':[],'observed_worker':None,'last_live_worker_sample':None,'adopted_pending':[]}
+    locks={};group=inherited;temp=None;proc=None;attempted=False;closed=False
+    capture=None;group_created=False;mounted=False;receipt_may_changed=False;caller_waited=False
+    # Root owns/removes the whole group ONLY after actual stock/PID-init wait.
+    # Host cannot claim its own/stock bootstrap closure while still executing.
+    descriptor=json.loads(read_pin(spec['descriptor'],2097152))
+    def own(label,fd):
+        c['fds'][label]=fd
+        s=os.fstat(fd);c['ids'][label]=(s.st_dev,s.st_ino,stat.S_IFMT(s.st_mode));return fd
+    def check_time(cleanup=False):
+        require(time.monotonic()<(final if cleanup else useful)
+                and time.time()<(clock['final_deadline_unix'] if cleanup else clock['useful_deadline_unix']),'original native host deadline')
+    def close_native(label):
+        fd=c['fds'].get(label)
+        if fd is None:return
+        require(label not in c['ambiguous'],'native close never retries unknown descriptor')
+        try:
+            q=os.fstat(fd);require((q.st_dev,q.st_ino,stat.S_IFMT(q.st_mode))==c['ids'][label],
+                                 'native host retained FD identity')
+            os.close(fd);c['fds'][label]=None
+        except BaseException as exc:
+            c['ambiguous'][label]=type(exc).__name__;raise
+    def capture_guard():
+        check_time(cleanup=True)
+        require(identity(host['pid'])==host and identity(outer['pid'])==outer,'exact outside native host/stock births')
+        for name,fd in locks.items():
+            q=os.fstat(fd)
+            require((q.st_dev,q.st_ino,stat.S_IFMT(q.st_mode))==c['ids']['lock_'+name]
+                    and 'lock:' in Path('/proc/self/fdinfo/'+str(fd)).read_text(),'same uninterrupted actual dual lock')
+        require(len(locks)==2,'BOTH existing locks before capture/commit')
+        for pin in n['current_pins']:read_pin(pin,2097152)
+    def scope_empty():
+        q=group.stat();require([q.st_dev,q.st_ino]==n['first_birth_group_identity'],'exact whole scope inode')
+        for key,value in {'memory.max':'2147483648','memory.swap.max':'0','pids.max':'128','cpu.max':'200000 100000'}.items():
+            require((group/key).read_text().strip()==value,'whole hard controller still exact '+key)
+        require(sorted(int(p) for p in (group/'cgroup.procs').read_text().split())==[1,2]
+                and int((group/'pids.current').read_text())==2
+                and len(list(Path('/proc/1/task').iterdir()))==1
+                and len(list(Path('/proc/2/task').iterdir()))==1,
+                'only exact stock init and host remain; outside whole closure still required')
+        require(sorted(int(p.name) for p in Path('/proc').iterdir() if p.name.isdecimal())==[1,2]
+                and Path('/proc/1/task/1/children').read_text().split()==['2'],
+                'no opaque host zombie/adopted birth hidden by controller counters')
+        require(not Path('/proc/self/task/'+str(os.getpid())+'/children').read_text().strip(),
+                'actual native host has no unreaped direct/adopted child')
+    def targets_current():
+        capture_guard()
+        refs=n['installed_targets']
+        require(set(refs)=={'sol-link-native-send.py','sol-link-result-selector.py','sol-link-result-rpc.py'},
+                'exact actual THREE installed consumers')
+        installation=json.loads(read_pin(n['installation'],LIMIT))
+        require(installation['state']=='INSTALLED_DURABLE' and installation['no_replay'] is True
+                and installation['native_effects']==0,'genuine accepted547 durable installation receipt')
+        require(len(installation['files_descriptor'])==3 and len(installation['files'])==3,'exact installed coverage')
+        for f,actual in zip(installation['files_descriptor'],installation['files']):
+            name=f['name'];require(name in refs and actual['file']==f,'ordered actual installation proof')
+            ref=refs[name];require(ref['path']=='public-external/path-a2f6613a546f0ebde86a/runtime'+name
+                    and ref['bytes']==f['new']['bytes'] and ref['sha256']==f['new']['sha256'],
+                    'actual target bound to genuine installed bytes')
+            read_pin(ref,2097152);q=Path(ref['path']).lstat()
+            require(stat.S_IMODE(q.st_mode)==f['mode'] and [q.st_dev,q.st_ino,q.st_mtime_ns,q.st_ctime_ns,q.st_size,stat.S_IMODE(q.st_mode)]==actual['installed_identity'],
+                    'same installed mode and inode/current byte identity')
+    def normal_cleanup():
+        nonlocal mounted,group_created,closed
+        # Caller and kernel whole cohort are already actually closed, or no
+        # birth was attempted. Never use an ambiguous Popen/close as this proof.
+        require((not attempted or caller_waited) and not c['ambiguous'],'known outside wait before resource cleanup')
+        scope_empty()
+        if len(locks)==2:capture_guard()
+        else:
+            require(not attempted and capture is None,'partial lock failure before imports/birth only')
+            check_time(cleanup=True)
+        if capture is not None:capture.native_capture_restore()
+        if mounted:
+            require(libc.umount2(str(temp).encode(),0)==0,'normal owned tmpfs unmount; no lazy detach')
+            mounted=False
+            require(not any(x.split()[4]==str(temp) for x in Path('/proc/self/mountinfo').read_text().splitlines()),
+                    'fresh mount absence')
+        if temp is not None and temp.exists():
+            require(temp==record/'native-temp' and not list(temp.iterdir()),'empty owned mountpoint')
+            temp.rmdir();require(not temp.exists(),'owned mountpoint removed')
+        # Whole group remains Root-owned; actual removal follows stock-init wait.
+        for label in list(c['fds']):
+            if not label.startswith('lock_'):close_native(label)
+        require(not c['ambiguous'] and all(v is None for k,v in c['fds'].items() if not k.startswith('lock_')),
+                'all native resources closed with BOTH locks still held')
+        closed=True
+    def final_record(name,value):
+        raw=(json.dumps(value,sort_keys=True,allow_nan=False)+'\n').encode()
+        require(len(raw)<=LIMIT,'finite actual native host evidence')
+        label='native_final_'+name;fd=own(label,os.open(record/name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400))
+        offset=0
+        while offset<len(raw):
+            count=os.write(fd,raw[offset:]);require(count>0,'native host evidence write');offset+=count
+        os.fsync(fd);close_native(label)
+    def close_locks():
+        require(closed and not c['ambiguous'],'native resources/custody closed before final lock release')
+        for label in reversed(list(c['fds'])):
+            if label.startswith('lock_'):close_native(label)
+        require(all(v is None for v in c['fds'].values()) and not c['ambiguous'],'every retained native host FD closed')
+
+    try:
+        # Existing order. Keep the SAME open descriptions through actual caller
+        # return, native descendants, mount/resource closure and receipt fsync.
+        for name in ['friday-codex-auto-update.lock','sol-link-native-send.install.lock']:
+            fd=own('lock_'+name,os.open('public-external/path-a2f6613a546f0ebde86a/runtime'+name,os.O_RDWR|os.O_NOFOLLOW))
+            require(stat.S_ISREG(os.fstat(fd).st_mode) and os.fstat(fd).st_nlink==1,'existing actual lock inode')
+            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);locks[name]=fd
+        targets_current()
+        # Same existing caller class supplies the captured import/data closure.
+        # Compile this already pinned caller read exactly once; no disk importer.
+        import types,zlib,fcntl
+        raw=read_pin(spec['caller'],2097152)
+        caller_module=types.ModuleType('<native-existing-caller-owner>');caller_module.__file__=spec['caller']['path']
+        exec(compile(raw,spec['caller']['path'],'exec',dont_inherit=True),caller_module.__dict__)
+        capture=object.__new__(caller_module._RootOneShotOwner)
+        capture.fds=c['fds'];capture.fd_ids=c['ids'];capture.ambiguous=c['ambiguous']
+        capture.capture_check=capture_guard
+        snapshot=capture.native_capture(descriptor)
+        capsule=zlib.compress(json.dumps({p:v.hex() for p,v in snapshot.items()},sort_keys=True,
+                                       separators=(',',':')).encode(),level=6)
+        require(0<len(capsule)<=MAX,'capture compressed whole file cap')
+        capfd=own('capture_capsule',os.memfd_create('friday-genuine-capture',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING))
+        offset=0
+        while offset<len(capsule):
+            count=os.write(capfd,capsule[offset:offset+65536]);require(count>0,'capture snapshot write');offset+=count
+        seals=fcntl.F_SEAL_SEAL|fcntl.F_SEAL_SHRINK|fcntl.F_SEAL_GROW|fcntl.F_SEAL_WRITE
+        fcntl.fcntl(capfd,fcntl.F_ADD_SEALS,seals)
+        require(fcntl.fcntl(capfd,fcntl.F_GET_SEALS)==seals,'actual sealed same captured snapshot')
+        # Whole reservation belongs to existing outside owner and includes
+        # stock guard, host opaque imports, caller bootstrap and every task.
+        # No mkdir/controller write/migration from inside native host.
+        scope_empty();gs=group.stat();own('private_group',os.open(group,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW))
+        # Native namespace bootstrap only. Source helper/resources are unchanged.
+        uid,gid=os.getuid(),os.getgid()
+        require(libc.unshare(0x00020000)==0,'native host nested private mount namespace unavailable')
+        require(libc.mount(None,b'/',None,0x40000|0x4000,None)==0,'private mount propagation')
+        temp=Path(n['temp_root']);require(temp==record/'native-temp','exact private hard disk root');temp.mkdir(mode=0o700)
+        require(libc.mount(b'tmpfs',str(temp).encode(),b'tmpfs',2|4|8,b'size=134217728,nr_inodes=512,mode=700')==0,'native hard aggregate tmpfs unavailable')
+        mounted=True
+        host_ns=os.stat('/proc/self/ns/pid').st_ino
+        require(libc.unshare(0x20000000)==0,'native private child PID namespace unavailable')
+        go_r,go_w=os.pipe();ready_r,ready_w=os.pipe()
+        for label,fd in [('native_go_r',go_r),('native_go_w',go_w),('native_ready_r',ready_r),('native_ready_w',ready_w)]:own(label,fd)
+        host_pfd=own('native_host_pidfd',os.pidfd_open(host['pid']))
+        launch={'input':ref,'host':host,'outer_guard':outer,'deadline_monotonic':useful,'deadline_unix':clock['useful_deadline_unix'],
+          'native':{'host_pid_namespace':host_ns,'host_pidfd':host_pfd,'affinity':sorted(os.sched_getaffinity(0)),
+          'capture_fd':capfd,'capture_identity':list(c['ids']['capture_capsule']),'capture_bytes':len(capsule),
+          'capture_sha256':hashlib.sha256(capsule).hexdigest(),
+          'group_identity':[gs.st_dev,gs.st_ino],'go_fd':go_r,'ready_fd':ready_w,'lock_fds':locks,
+          'lock_ids':{k:list(c['ids']['lock_'+k]) for k in locks}}}
+        put(record/'LAUNCH.json',launch)
+        out=own('native_stdout',os.open(record/'stdout.log',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400))
+        err=own('native_stderr',os.open(record/'stderr.log',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400))
+        # Existing caller is the PID-init worker, confined BEFORE its GO. No
+        # copied updater runner, new daemon, process-group or protected-PID kill.
+        attempted=True
+        proc=subprocess.Popen([PYTHON,'-I','-B',spec['caller']['path'],str(record/'LAUNCH.json')],
+             stdout=out,stderr=err,close_fds=True,pass_fds=(go_r,ready_w,host_pfd,capfd,*locks.values()))
+        c['proc']=proc;own('native_caller_pidfd',os.pidfd_open(proc.pid));caller=identity(proc.pid);c['caller']=caller;c['known'].append(caller)
+        require(caller['ppid']==host['pid'],'actual direct native caller')
+        # Popen inherits the ALREADY whole-bounded host scope before birth.
+        require(Path('/proc/'+str(proc.pid)+'/cgroup').read_text().strip()=='0::'+n['group_relative'],'private inheritance before native GO')
+        require(os.stat('/proc/'+str(proc.pid)+'/ns/pid').st_ino!=host_ns,'fresh private native PID namespace')
+        # Immutable initial launch is not rewritten. Birth goes through existing
+        # private evidence leaf; exact pin is passed in the one-byte GO boundary.
+        put(record/'CALLER-BIRTH.json',caller)
+        require(select.select([ready_r],[],[],min(5,useful-time.monotonic()))[0] and os.read(ready_r,1)==b'R','caller barrier bootstrap')
+        check_time();require(os.write(go_w,b'G')==1,'one native caller GO')
+        code=proc.wait(timeout=max(0,min(useful-time.monotonic(),clock['useful_deadline_unix']-time.time())))
+        require(absent(caller),'actual caller direct wait and fresh global birth absence')
+        caller_waited=True
+        require(code==0,'actual genuine native caller returned success')
+        scope_empty() # Only stock init/host remain; caller cohort actually closed.
+        # Same-read actual private caller result; no self-hashed second reopen.
+        path=temp/'CALLER-RETURN-PREPARED.json';st=path.lstat()
+        require(stat.S_ISREG(st.st_mode) and st.st_nlink==1 and st.st_size<=LIMIT,'actual bounded caller result')
+        fd=own('native_prepared',os.open(path,os.O_RDONLY|os.O_NOFOLLOW))
+        before=os.fstat(fd);raw=os.read(fd,LIMIT+1)
+        key=lambda q:(q.st_dev,q.st_ino,q.st_size,q.st_mtime_ns,q.st_ctime_ns)
+        require(len(raw)==before.st_size and key(before)==key(os.fstat(fd))==key(path.lstat()),'same-read caller result')
+        prepared=json.loads(raw)
+        require(prepared['whole_native_children_closed'] is True and prepared['failure'] is None
+                and prepared['capacity_release'] is False
+                and prepared['direct_waits_and_adopted_waits'] is True
+                and all(v['waited'] and v['absent'] for v in prepared['known_waits']),
+                'actual caller complete direct/adopted closure evidence')
+        scope_empty();targets_current()
+        capture.native_capture_install()
+        updater=capture.native_module(capture.capture_catalog['entry_module'])
+        scope_empty() # Includes opaque host native-import threads/descendants.
+        root=Path(n['release_root']);version=n['version']
+        require(str(updater.current_root())==str(root.resolve(strict=True))
+                and updater.manifest_version(root)==version,'external exact genuine current root/version')
+        provenance=updater.safe_private_receipt(updater.PROVENANCE/(version+'.json'))
+        require(provenance is not None,'actual source provenance still present')
+        digest=provenance['source_archive_sha256']
+        url='https://releases.openai.com/codex/releases/'+version+'/'+updater.ASSET_NAME
+        staged=prepared['pending_receipt']
+        if staged is not None:
+            require(prepared['result']=={'status':'GATES_RETURNED_PENDING_EXTERNAL_CALLER_CLOSURE','version':version}
+                    and staged['status']=='GATES_RETURNED_NOT_CALLER_CLOSURE_NOT_RECEIPT'
+                    and staged['path']==n['receipt_path']==str(updater.VALIDATED/(version+'.json')),
+                    'same genuine staged payload and exact pending path')
+            encoded=json.dumps(staged['payload'],sort_keys=True,separators=(',',':')).encode()
+            require(len(encoded)<=49152 and hashlib.sha256(encoded).hexdigest()==staged['sha256'],
+                    'unchanged genuine payload bytes from captured updater')
+            targets_current();scope_empty()
+            require(updater.current_receipts_match(root,version,digest,url,prepared_compatibility=staged['payload']),
+                    'genuine exact current semantics BEFORE receipt commit')
+            scope_empty();targets_current() # AFTER genuine precheck, before writer.
+            receipt_may_changed=True # BEFORE rename/fsync; failure is UNKNOWN_NO_REPLAY.
+            updater.atomic_private_json(Path(staged['path']),staged['payload']) # SAME original genuine writer.
+        else:
+            require(prepared['result']=={'status':'validated_current','version':version},
+                    'matching receipt boundary; no new gates credit')
+        targets_current();scope_empty()
+        require(updater.current_receipts_match(root,version,digest,url),
+                'genuine ON-DISK current receipts AFTER actual caller/full closure')
+        normal_cleanup()
+        # Namespace lifetime ends at this host's actual outside return. Root
+        # must still wait this host/stock parent and check fresh birth absence.
+        final_record('NATIVE-HOST-RETURN-PREPARED.json',{'status':'CURRENT_GENUINE_RECEIPT_AND_NATIVE_RESOURCES_CLOSED',
+                'caller_direct_wait':True,'caller_fresh_absent':True,'kernel_whole_scope_empty':False,'only_stock_and_host_remain':True,
+                'same_genuine_writer':staged is not None,'matching_receipt_skipped_gates':staged is None,
+                'current_receipts_match':True,'mount_removed':True,'group_removal':'ROOT_AFTER_ACTUAL_STOCK_INIT_WAIT','locks_held_through_commit_cleanup':True,
+                'host_exit':'NOT_OBSERVED_INSIDE_REQUIRE_ROOT_DIRECT_WAIT','capacity_release':False})
+        close_locks()
+        return 0
+    except BaseException as exc:
+        # A failed known caller may be stopped ONLY through its retained pidfd.
+        # No process-group, controller kill, visible writer or shared-scope kill.
+        try:
+            final_record('NATIVE-STOP.json',{'class':type(exc).__name__,'detail':str(exc)[:300],
+                'attempted':attempted,'known':c['known'],'receipt_may_changed':receipt_may_changed,
+                'capacity_release':False,'replay':False})
+            if attempted and not caller_waited:
+                require(proc is not None and c['caller'] is not None,'unknown Popen birth retains whole custody')
+                caller=c['caller'];fd=c['fds']['native_caller_pidfd'];q=os.fstat(fd)
+                require((q.st_dev,q.st_ino,stat.S_IFMT(q.st_mode))==c['ids']['native_caller_pidfd'],
+                        'same retained caller pidfd stop')
+                if not absent(caller):
+                    require(identity(caller['pid'])==caller,'same actual caller before owned stop')
+                    try:signal.pidfd_send_signal(fd,signal.SIGKILL)
+                    except ProcessLookupError:pass
+                proc.wait(timeout=max(0,min(10,final-time.monotonic(),clock['final_deadline_unix']-time.time())))
+                require(absent(caller),'actual failed caller direct wait and fresh absence')
+                caller_waited=True
+            require(not receipt_may_changed,'uncertain genuine receipt commit retains custody; never replay')
+            normal_cleanup()
+            final_record('NATIVE-KNOWN-FAILURE-CLOSED.json',{'native_result':'FAIL','known_cohort_closed':True,
+                'private_resources_closed':True,'capacity_release':False,'root_actual_return_still_required':True})
+            close_locks()
+            return 2
+        except BaseException:
+            # Unknown close, failed wait/stop/unmount/receipt is not absence.
+            # Keep the SAME handles/locks; independently armed stock guard.
+            retain_until_stock_guard()
+
+
+
+
+def native_first_birth_write_confinement(spec):
+    """Existing Landlock primitive, before stock/host interpreter effects.
+    Hard whole limits cannot be widened/migrated through writable cgroup files
+    even if an opaque child changes its own private mount view. No controller
+    path receives a write rule. Exact original genuine writer remains allowed.
+    """
+    libc=ctypes.CDLL(None,use_errno=True)
+    require(libc.prctl(38,1,0,0,0)==0,'first-birth actual no_new_privs')
+    abi=libc.syscall(444,0,0,1);require(abi>=3,'first-birth inherited Landlock refer/truncate required')
+    class Ruleset(ctypes.Structure):_fields_=[('handled_access_fs',ctypes.c_uint64)]
+    class PathRule(ctypes.Structure):
+        _pack_=1
+        _fields_=[('allowed_access',ctypes.c_uint64),('parent_fd',ctypes.c_int)]
+    mask=(1<<1)|sum(1<<i for i in range(4,15));rs=Ruleset(mask)
+    fd=libc.syscall(444,ctypes.byref(rs),ctypes.sizeof(rs),0)
+    require(fd>=0,'actual first-birth write-confinement ruleset')
+    opened=[fd]
+    dirs=[Path(spec['record']).parent,Path(spec['native']['receipt_path']).parent]
+    require(dirs[0].is_absolute() and dirs[0]!=dirs[1]
+            and dirs[1]==Path('public-external/path-fda29607b79ce5add8b8/validated'),
+            'private bounded output and exact original validated writer directory only')
+    for directory in dirs:
+        require(directory.resolve(strict=True)==directory,'no writer-directory symlink')
+        root=os.open(directory,os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW);opened.append(root)
+        rule=PathRule(mask&~((1<<6)|(1<<11)),root)
+        require(libc.syscall(445,fd,1,ctypes.byref(rule),0)==0,'actual finite original writer directory rule')
+    for name in ('friday-codex-auto-update.lock','sol-link-native-send.install.lock'):
+        root=os.open('public-external/path-a2f6613a546f0ebde86a/runtime'+name,os.O_PATH|os.O_NOFOLLOW);opened.append(root)
+        q=os.fstat(root);require(stat.S_ISREG(q.st_mode) and q.st_nlink==1,'existing exact single-link lock inode')
+        rule=PathRule(1<<1,root) # O_RDWR flock handle only; no create/remove rule.
+        require(libc.syscall(445,fd,1,ctypes.byref(rule),0)==0,'same existing lock open permission')
+    require(libc.syscall(446,fd,0)==0,'actual inherited filesystem confinement before stock exec')
+    for opened_fd in reversed(opened):os.close(opened_fd)
+
+
+def native_stock_first_birth(spec,ref,clock,group_fd,slot_fd):
+    """One existing OUTSIDE owner entry, ONLY after independent Root admission.
+
+    No CLI, worker broker or new supervisor. Extends the same finite host's
+    externally owned stock launch/wait. Root reviews and calls it once in its
+    existing childless, single-thread stock actor, never in a TUI/backend.
+    All supplied input/clock/kernel/ELF/slot pins are freshly admitted BEFORE
+    this function. JSON is consistency data and does not issue authority.
+    """
+    import select,fcntl,platform
+    n=spec['native'];useful,final=original(clock)
+    require(platform.machine()=='x86_64','reviewed Linux x86_64 clone3 ABI only')
+    require(clock['original_seconds']==1800 and clock['cleanup_seconds']==180,
+            'original distinct runtime clock unchanged')
+    require(time.monotonic()+1005<useful and time.time()+1005<clock['useful_deadline_unix'],
+            'all mandatory705 plus300 useful before any first birth')
+    require(type(n['stock_guard_seconds']) is int and 1005<n['stock_guard_seconds']<=1770
+            and n['outside_closure_seconds']==30,'fixed supplied shortening-only stock duration')
+    def fit():
+        require(time.monotonic()+n['stock_guard_seconds']+30<final
+                and time.time()+n['stock_guard_seconds']+30<clock['final_deadline_unix'],
+                'supplied stock duration fits immutable original dualclock final')
+    stop_m=n['absolute_stop_monotonic'];stop_u=n['absolute_stop_unix']
+    require(type(stop_m) in (int,float) and type(stop_u) in (int,float)
+            and math.isfinite(stop_m) and math.isfinite(stop_u)
+            and stop_m<=final-30 and stop_u<=clock['final_deadline_unix']-30
+            and abs((stop_m-clock['started_at_monotonic'])-(stop_u-clock['started_at_unix']))<=2,
+            'fixed original-clock absolute parent stop, no timer renewal')
+    require(time.monotonic()+1005<min(useful,stop_m)
+            and time.time()+1005<min(clock['useful_deadline_unix'],stop_u),
+            'complete unchanged useful fits actual absolute parent timer')
+    # Relative child stock timer cannot precede the admitted absolute stop;
+    # SAME outside owner stops exact namespace init at that fixed deadline.
+    require(time.monotonic()+n['stock_guard_seconds']>=stop_m
+            and time.time()+n['stock_guard_seconds']>=stop_u,
+            'child relative timer lasts through actual fixed absolute stop')
+    fit();parent=identity(os.getpid());outside_guard=identity(os.getppid())
+    root_guard=n['outside_actor_stock_guard']
+    require(type(root_guard['seconds']) is int and n['stock_guard_seconds']+10<=root_guard['seconds']<=1770,
+            'outside actor physical stock boundary includes child wait margin')
+    require(time.monotonic()+root_guard['seconds']+30<final
+            and time.time()+root_guard['seconds']+30<clock['final_deadline_unix'],
+            'outside actor stock boundary also shortening-only ORIGINAL final')
+    root_command=[b'/usr/bin/timeout',b'-s',b'KILL',(str(root_guard['seconds'])+'s').encode(),
+                  PYTHON.encode(),b'-I',b'-B',root_guard['driver']['path'].encode(),
+                  ref['path'].encode(),str(ref['bytes']).encode(),ref['sha256'].encode()]
+    require(Path('/proc/'+str(outside_guard['pid'])+'/cmdline').read_bytes().split(b'\0')[:-1]==root_command,
+            'actual existing independently admitted outside actor stock timeout command')
+    read_pin(root_guard['driver'],2097152)
+    # Root's GNU timer began BEFORE this actor. Never pretend it begins NOW.
+    # Kernel start ticks use boot time; convert actual boot/monotonic offset
+    # conservatively (birth precedes timer arming). Same original dual frame.
+    guardian_birth_m=int(outside_guard['birth'])/os.sysconf('SC_CLK_TCK')-(
+        time.clock_gettime(time.CLOCK_BOOTTIME)-time.monotonic())
+    guardian_expiry_m=guardian_birth_m+root_guard['seconds']
+    guardian_expiry_u=clock['started_at_unix']+(guardian_expiry_m-clock['started_at_monotonic'])
+    require(stop_m+5<=guardian_expiry_m and stop_u+5<=guardian_expiry_u
+            and guardian_expiry_m+30<=final and guardian_expiry_u+30<=clock['final_deadline_unix'],
+            'actual existing guardian birth/shortening timer fits fixed original stop and closure')
+    require(time.monotonic()+n['stock_guard_seconds']+5<=guardian_expiry_m
+            and time.time()+n['stock_guard_seconds']+5<=guardian_expiry_u,
+            'child relative timer fits ALREADY ELAPSED actual outside guardian, no renewal')
+
+    require(len(list(Path('/proc/self/task').iterdir()))==1
+            and not Path('/proc/self/task/'+str(parent['pid'])+'/children').read_text().strip(),
+            'existing outside actor exclusively owns this one attempt')
+    require(resource.getrlimit(resource.RLIMIT_AS)==(1073741824,1073741824)
+            and resource.getrlimit(resource.RLIMIT_CPU)==(120,120)
+            and resource.getrlimit(resource.RLIMIT_FSIZE)==(MAX,MAX)
+            and resource.getrlimit(resource.RLIMIT_CORE)==(0,0)
+            and 0<len(os.sched_getaffinity(0))<=2,'outside stock actor separately hard bounded before load')
+    # Both descriptors are real existing Root-owned capabilities. They are not
+    # minted by a spec/receipt. Root's outside owner retains them until closure.
+    slot_identity=os.fstat(slot_fd)
+    require(stat.S_ISREG(slot_identity.st_mode)
+            and 'lock:' in Path('/proc/self/fdinfo/'+str(slot_fd)).read_text(),
+            'actual existing exclusive heavy slot held before every effect')
+    group=Path(n['group']);g=group.stat();q=os.fstat(group_fd)
+    require([g.st_dev,g.st_ino]==n['first_birth_group_identity']==[q.st_dev,q.st_ino]
+            and stat.S_ISDIR(q.st_mode),'exact retained externally admitted private group FD')
+    current=Path('/sys/fs/cgroup')/Path('/proc/self/cgroup').read_text().strip().split('::',1)[1].lstrip('/')
+    require(group!=current and not current.is_relative_to(group)
+            and group.name=='friday-native-'+n['action_id']
+            and len(n['action_id'])==36 and set(n['action_id'])<=set('0123456789abcdef-'),
+            'fresh action-specific reservation excludes existing actor and protected shared scope')
+    for key,value in {'memory.max':'2147483648','memory.swap.max':'0','pids.max':'128','cpu.max':'200000 100000'}.items():
+        require((group/key).read_text().strip()==value,'hard whole controller BEFORE first effect '+key)
+    require((group/'pids.current').read_text().strip()=='0'
+            and 'populated 0' in (group/'cgroup.events').read_text(),'private reservation empty before clone3')
+    mem=dict(line.split(':',1) for line in Path('/proc/meminfo').read_text().splitlines())
+    require(int(mem['MemAvailable'].split()[0])*1024>=5368709120,'actual whole2GiB plus outside2GiB and1GiB headroom')
+    output=Path(spec['record']).parent;v=os.statvfs(output)
+    require(v.f_blocks*v.f_frsize<=67108864 and v.f_files<=512
+            and any(x.split()[4]==str(output) and ' - tmpfs ' in x
+                    for x in Path('/proc/self/mountinfo').read_text().splitlines()),
+            'actual existing outside cumulative metadata/log hard64MiB512inode disk boundary')
+    for key in ['host','caller','helper','entry','descriptor']:read_pin(spec[key],2097152)
+    read_pin(spec['clock'],LIMIT)
+    for pin in n['current_pins']:read_pin(pin,2097152)
+    # Parent remains in its existing private outside actor. Kernel creates the
+    # FIRST stock process in the new whole group and private PID/user/mount
+    # namespace atomically. No post-fork cgroup.procs write or migration.
+    class CloneArgs(ctypes.Structure):
+        _fields_=[(key,ctypes.c_uint64) for key in
+                  ('flags','pidfd','child_tid','parent_tid','exit_signal','stack',
+                   'stack_size','tls','set_tid','set_tid_size','cgroup')]
+    require(ctypes.sizeof(CloneArgs)==88,'reviewed Linux clone_args v2 ABI')
+    libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
+    require(libc.prctl(36,1,0,0,0)==0 and libc.prctl(1,signal.SIGKILL,0,0,0)==0
+            and os.getppid()==outside_guard['pid'],'same outside actual subreaper/stock parent-death owner')
+    ready_r,ready_w=os.pipe();go_r,go_w=os.pipe();parent_fd=os.pidfd_open(parent['pid'])
+    child_fd=ctypes.c_int(-1);args=CloneArgs()
+    args.flags=0x200000000|0x1000|0x20000000|0x10000000|0x00020000
+    args.pidfd=ctypes.addressof(child_fd);args.exit_signal=signal.SIGCHLD;args.cgroup=group_fd
+    # Each actual attempted spawn/FD must be retained by the SAME outside owner;
+    # kernel ENOSYS/EPERM/EINVAL is a concrete no-fallback capability refusal.
+    fit();require(time.monotonic()+n['stock_guard_seconds']+5<=guardian_expiry_m
+            and time.time()+n['stock_guard_seconds']+5<=guardian_expiry_u,
+            'fresh actual original guardian remainder immediately before clone3');attempted=True
+    # Already pinned outside actor stock/PDEATH chain bounds unknown handles.
+    retained={'pid':None,'pidfd':None,'attempted':True,
+              'fds':[ready_r,ready_w,go_r,go_w,parent_fd],'whole_group_fd':group_fd,
+              'exclusive_slot_fd':slot_fd,'closure':False}
+    pid=libc.syscall(ctypes.c_long(435),ctypes.byref(args),ctypes.c_size_t(88))
+    if pid<0:
+        error=ctypes.get_errno()
+        # Failed clone3 is not retried. Existing owner resolves the known kernel
+        # no-child failure and closes retained pipes/parent pidfd itself.
+        try:
+            require((group/'pids.current').read_text().strip()=='0'
+                    and 'populated 0' in (group/'cgroup.events').read_text(),
+                    'actual failed kernel clone no-child cohort fresh empty')
+            for fd in list(retained['fds']):
+                os.close(fd);retained['fds'].remove(fd)
+            group.rmdir();require(not group.exists(),'known prebirth whole group removed')
+        except BaseException:retain_until_stock_guard()
+        raise OSError(error,'first-birth clone3 refused; NO fallback or replay')
+    if pid==0:
+        try:
+            # Already hard reserved even before this trusted bootstrap code.
+            require(os.getpid()==1,'kernel created actual private namespace init')
+            require(libc.prctl(1,signal.SIGKILL,0,0,0)==0
+                    and not select.select([parent_fd],[],[],0)[0],'exact outside owner live and parent death armed')
+            os.close(ready_r);os.close(go_w)
+            require(os.write(ready_w,b'R')==1 and os.read(go_r,1)==b'G','single owned uid-map barrier')
+            require(libc.mount(None,b'/',None,0x40000|0x4000,None)==0,'private first-birth mount propagation')
+            require(libc.mount(b'proc',b'/proc',b'proc',2|4|8,None)==0,'actual private stock PID namespace proc view')
+            # A read-only bind of the existing controller view prevents an
+            # opaque child from migrating itself or changing hard controllers.
+            require(libc.mount(b'/sys/fs/cgroup',b'/sys/fs/cgroup',None,4096|16384,None)==0,
+                    'private inherited cgroup read-only bind')
+            require(libc.mount(None,b'/sys/fs/cgroup',None,4096|32|1|2|4|8,None)==0,
+                    'private controller view actually read-only')
+            require(Path('/proc/self/cgroup').read_text().strip()=='0::'+n['group_relative'],
+                    'kernel first stock birth inherited exact whole reservation')
+            resource.setrlimit(resource.RLIMIT_AS,(1073741824,1073741824))
+            resource.setrlimit(resource.RLIMIT_CPU,(120,120))
+            resource.setrlimit(resource.RLIMIT_FSIZE,(MAX,MAX));resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+            # Do not expose Root/TUI/service descriptors or namespace handles.
+            for entry in list(Path('/proc/self/fd').iterdir()):
+                fd=int(entry.name)
+                if fd>2:
+                    try:os.close(fd)
+                    except OSError as e:
+                        if e.errno!=9:raise
+            native_first_birth_write_confinement(spec)
+            os.setsid();fit()
+            argv=['/usr/bin/timeout','-s','KILL',str(n['stock_guard_seconds'])+'s',PYTHON,'-I','-B',
+                  spec['host']['path'],ref['path'],str(ref['bytes']),ref['sha256']]
+            os.execve(argv[0],argv,{'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','LC_ALL':'C.UTF-8'})
+        except BaseException:os._exit(125) # Root observes actual failed init wait, never success.
+    # Kernel pidfd is returned atomically with the first birth; retain BEFORE
+    # any fallible fstat/identity/uid map/clock operation. No new Popen handle gap.
+    retained['pid']=int(pid);retained['pidfd']=child_fd.value
+    # Actual original absolute timer belongs to this SAME outside finite owner.
+    # At most the fixed supplied stock interval; reserve30 for direct wait and
+    # fresh namespace/group closure, always inside original final/cleanup180.
+    # stop_m/stop_u were supplied/pinned before first birth and NEVER renewed.
+    try:
+        pfd=retained['pidfd'];ps=os.fstat(pfd)
+        require(pfd>=0 and ps.st_ino>0,'atomic first-birth retained pidfd')
+        child=identity(pid);retained['child']=child
+        require(child['ppid']==parent['pid']
+                and Path('/proc/'+str(pid)+'/cgroup').read_text().strip()=='0::'+n['group_relative'],
+                'outside actual first birth already in hard group')
+        os.close(ready_w);retained['fds'].remove(ready_w)
+        os.close(go_r);retained['fds'].remove(go_r)
+        require(select.select([ready_r,pfd],[],[],min(5,stop_m-time.monotonic(),stop_u-time.time()))[0]==[ready_r]
+                and os.read(ready_r,1)==b'R','actual first-birth uid-map ready')
+        uid,gid=os.getuid(),os.getgid();base=Path('/proc')/str(pid)
+        (base/'setgroups').write_text('deny\n');(base/'uid_map').write_text('0 '+str(uid)+' 1\n')
+        (base/'gid_map').write_text('0 '+str(gid)+' 1\n')
+        require(identity(pid)==child,'exact retained first birth before map GO')
+        fit();require(os.write(go_w,b'G')==1,'one actual namespace bootstrap GO')
+        remaining=max(0,min(stop_m-time.monotonic(),stop_u-time.time()))
+        timed_out=not select.select([pfd],[],[],remaining)[0]
+        if timed_out:
+            # Exact owned namespace INIT only. Kernel tears down every opaque
+            # descendant/thread; never shared/controller/process-group kill.
+            signal.pidfd_send_signal(pfd,signal.SIGKILL)
+        remaining=max(0,min(final-time.monotonic(),clock['final_deadline_unix']-time.time()))
+        require(select.select([pfd],[],[],remaining)[0],'first-birth actual terminal within original final')
+        waited,status=os.waitpid(pid,0)
+        require(waited==pid and absent(child),'outside actual direct init wait and fresh exact birth absence')
+        require((group/'pids.current').read_text().strip()=='0'
+                and 'populated 0' in (group/'cgroup.events').read_text()
+                and not Path('/proc/self/task/'+str(parent['pid'])+'/children').read_text().strip(),
+                'actual whole host/bootstrap/opaque cohort empty after namespace init wait')
+        require([group.stat().st_dev,group.stat().st_ino]==n['first_birth_group_identity'],
+                'same admitted group at actual outside removal')
+        group.rmdir();require(not group.exists(),'Root actual private whole group fresh removed')
+        for fd in list(retained['fds']):os.close(fd);retained['fds'].remove(fd)
+        os.close(pfd);retained['pidfd']=None;retained['closure']=True
+        require(time.monotonic()<final and time.time()<clock['final_deadline_unix'],
+                'outside actual terminal/fresh closure before original final')
+        # Slot/group supplied handles remain Root-owned until its own wait and
+        # handle close. No internal capacity-release/receipt acceptance claim.
+        return {'status':status,'timed_out':timed_out,'actual_init_wait':True,'whole_kernel_empty':True,
+                'private_group_removed':True,'original_final_preserved':True,'capacity_release':False,
+                'outside_actor_final_wait_required':True}
+    except BaseException:
+        # Unknown first-birth/FD/map/receipt/closure keeps SAME pidfd/group/slot.
+        # Existing outside absolute guard must be independently proven before
+        # entry. No retry, respawn, scope migration, clock renewal or lost-handle
+        # guessed cleanup. It terminates this actor by ORIGINAL final; PDEATH
+        # kills exact owned private init and kernel closes its namespace cohort.
+        try:
+            if retained['pidfd']>=0:
+                remaining=max(0,min(stop_m-time.monotonic(),stop_u-time.time()))
+                select.select([retained['pidfd']],[],[],remaining)
+                signal.pidfd_send_signal(retained['pidfd'],signal.SIGKILL)
+        except BaseException:pass
+        retain_until_stock_guard()
+
+
+
+def kernel120_first_birth_write_confinement(spec):
+    """Before harmless stock/probe exec: only private bounded output writable.
+    Production receipt/lock/controller/service/config directories get NO rule.
+    Landlock denial is real kernel work; unsupported ABI refuses, no fallback.
+    """
+    libc=ctypes.CDLL(None,use_errno=True)
+    require(libc.prctl(38,1,0,0,0)==0,'qualification actual no_new_privs')
+    require(libc.syscall(444,0,0,1)>=3,'qualification actual Landlock ABI3 required')
+    class Ruleset(ctypes.Structure):_fields_=[('handled_access_fs',ctypes.c_uint64)]
+    class PathRule(ctypes.Structure):
+        _pack_=1
+        _fields_=[('allowed_access',ctypes.c_uint64),('parent_fd',ctypes.c_int)]
+    mask=(1<<1)|sum(1<<i for i in range(4,15));rs=Ruleset(mask)
+    fd=libc.syscall(444,ctypes.byref(rs),ctypes.sizeof(rs),0)
+    require(fd>=0,'qualification actual write ruleset');owned=[fd]
+    output=Path(spec['record']).parent
+    require(output.resolve(strict=True)==output and output!=Path('/'), 'private exact bounded output')
+    root=os.open(output,os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW);owned.append(root)
+    rule=PathRule(mask&~((1<<6)|(1<<11)),root)
+    require(libc.syscall(445,fd,1,ctypes.byref(rule),0)==0,'private output write rule only')
+    require(libc.syscall(446,fd,0)==0,'actual inherited qualification write confinement')
+    for x in reversed(owned):os.close(x)
+
+
+def kernel120_effect_boundary(spec,label,retained):
+    """Reviewed AFTER-real-operation uncertainty control, never kernel EIO credit.
+    No operation replacement. Same actor retains actual custody to its already
+    pinned original stock boundary; no retry, FD reuse or capacity release.
+    """
+    selected=spec.get('qualification_unknown_boundary')
+    require(selected in (None,'AFTER_REAL_PIDFD_FSTAT','AFTER_REAL_MAP_GO',
+                         'AFTER_REAL_INIT_WAIT','AFTER_REAL_PIPE_CLOSE'),'fixed four source controls')
+    if selected!=label:return
+    event={'site':label,'operation_already_attempted':True,'actual_pid':retained['pid'],
+        'actual_pidfd_retained':retained['pidfd'],'original_clock_pin':spec['clock'],
+        'at_unix':time.time(),'at_monotonic':time.monotonic(),'Source_injected_EIO_not_kernel_EIO':True,
+        'capacity_release':False,'replay':False}
+    raw=json.dumps(event,sort_keys=True).encode();require(len(raw)<=8192,'finite unknown boundary event')
+    p=Path(spec['record']).parent/('unknown-'+label+'.json')
+    fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400)
+    try:require(os.write(fd,raw)==len(raw),'actual source uncertainty event');os.fsync(fd)
+    finally:os.close(fd)
+    raise OSError(5,'qualification AFTER real operation source uncertainty; NOT kernel EIO')
+
+
+def kernel120_stock_first_birth(spec,ref,clock,group_fd,slot_fd):
+    """Finite kernel120 qualification of the SAME existing OUTSIDE owner.
+    PROPOSED120including30 only; kernel120 is NOT_GRANTED_NOT_RUN.
+    No ELF/application/receipt/queue/RPC/service/install invocation.
+    Original native1800 function is separate and remains unchanged.
+
+    No CLI, worker broker or new supervisor. Extends the same finite host's
+    externally owned stock launch/wait. Root reviews and calls it once in its
+    existing childless, single-thread stock actor, never in a TUI/backend.
+    All supplied input/clock/kernel/ELF/slot pins are freshly admitted BEFORE
+    this function. JSON is consistency data and does not issue authority.
+    """
+    import select,fcntl,platform
+    n=spec['native'];useful,final=original(clock)
+    require(platform.machine()=='x86_64','reviewed Linux x86_64 clone3 ABI only')
+    require(clock['original_seconds']==120 and clock['cleanup_seconds']==30,
+            'original distinct runtime clock unchanged')
+    require(time.monotonic()+45<useful and time.time()+45<clock['useful_deadline_unix'],
+            'finite qualification45 useful BEFORE first birth; no genuine invocation')
+    require(type(n['stock_guard_seconds']) is int and 45<n['stock_guard_seconds']<=90
+            and n['outside_closure_seconds']==10,'fixed supplied shortening-only stock duration')
+    def fit():
+        require(time.monotonic()+n['stock_guard_seconds']+10<final
+                and time.time()+n['stock_guard_seconds']+10<clock['final_deadline_unix'],
+                'supplied stock duration fits immutable original dualclock final')
+    stop_m=n['absolute_stop_monotonic'];stop_u=n['absolute_stop_unix']
+    require(type(stop_m) in (int,float) and type(stop_u) in (int,float)
+            and math.isfinite(stop_m) and math.isfinite(stop_u)
+            and stop_m<=final-10 and stop_u<=clock['final_deadline_unix']-10
+            and abs((stop_m-clock['started_at_monotonic'])-(stop_u-clock['started_at_unix']))<=2,
+            'fixed original-clock absolute parent stop, no timer renewal')
+    require(time.monotonic()+45<min(useful,stop_m)
+            and time.time()+45<min(clock['useful_deadline_unix'],stop_u),
+            'complete unchanged useful fits actual absolute parent timer')
+    # Relative child stock timer cannot precede the admitted absolute stop;
+    # SAME outside owner stops exact namespace init at that fixed deadline.
+    require(time.monotonic()+n['stock_guard_seconds']>=stop_m
+            and time.time()+n['stock_guard_seconds']>=stop_u,
+            'child relative timer lasts through actual fixed absolute stop')
+    fit();parent=identity(os.getpid());outside_guard=identity(os.getppid())
+    root_guard=n['outside_actor_stock_guard']
+    require(type(root_guard['seconds']) is int and n['stock_guard_seconds']+5<=root_guard['seconds']<=90,
+            'outside actor physical stock boundary includes child wait margin')
+    require(time.monotonic()+root_guard['seconds']+10<final
+            and time.time()+root_guard['seconds']+10<clock['final_deadline_unix'],
+            'outside actor stock boundary also shortening-only ORIGINAL final')
+    require(root_guard['gnu_timeout_pin']['path']=='/usr/bin/gnutimeout',
+            'Root exact independently reviewed GNU stock binary, never installed Rust timeout')
+    read_pin(root_guard['gnu_timeout_pin'],2097152)
+    root_command=[b'/usr/bin/gnutimeout',b'-s',b'KILL',(str(root_guard['seconds'])+'s').encode(),
+                  PYTHON.encode(),b'-I',b'-B',root_guard['driver']['path'].encode(),
+                  ref['path'].encode(),str(ref['bytes']).encode(),ref['sha256'].encode()]
+    require(Path('/proc/'+str(outside_guard['pid'])+'/cmdline').read_bytes().split(b'\0')[:-1]==root_command,
+            'actual existing independently admitted outside actor stock timeout command')
+    read_pin(root_guard['driver'],2097152)
+    # Root's GNU timer began BEFORE this actor. Never pretend it begins NOW.
+    # Kernel start ticks use boot time; convert actual boot/monotonic offset
+    # conservatively (birth precedes timer arming). Same original dual frame.
+    guardian_birth_m=int(outside_guard['birth'])/os.sysconf('SC_CLK_TCK')-(
+        time.clock_gettime(time.CLOCK_BOOTTIME)-time.monotonic())
+    guardian_expiry_m=guardian_birth_m+root_guard['seconds']
+    guardian_expiry_u=clock['started_at_unix']+(guardian_expiry_m-clock['started_at_monotonic'])
+    require(stop_m+5<=guardian_expiry_m and stop_u+5<=guardian_expiry_u
+            and guardian_expiry_m+10<=final and guardian_expiry_u+10<=clock['final_deadline_unix'],
+            'actual existing guardian birth/shortening timer fits fixed original stop and closure')
+    require(time.monotonic()+n['stock_guard_seconds']+5<=guardian_expiry_m
+            and time.time()+n['stock_guard_seconds']+5<=guardian_expiry_u,
+            'child relative timer fits ALREADY ELAPSED actual outside guardian, no renewal')
+
+    require(len(list(Path('/proc/self/task').iterdir()))==1
+            and not Path('/proc/self/task/'+str(parent['pid'])+'/children').read_text().strip(),
+            'existing outside actor exclusively owns this one attempt')
+    require(resource.getrlimit(resource.RLIMIT_AS)==(268435456,268435456)
+            and resource.getrlimit(resource.RLIMIT_CPU)==(30,30)
+            and resource.getrlimit(resource.RLIMIT_FSIZE)==(MAX,MAX)
+            and resource.getrlimit(resource.RLIMIT_CORE)==(0,0)
+            and 0<len(os.sched_getaffinity(0))<=2,'outside stock actor separately hard bounded before load')
+    # Both descriptors are real existing Root-owned capabilities. They are not
+    # minted by a spec/receipt. Root's outside owner retains them until closure.
+    slot_identity=os.fstat(slot_fd)
+    require(stat.S_ISREG(slot_identity.st_mode)
+            and 'lock:' in Path('/proc/self/fdinfo/'+str(slot_fd)).read_text(),
+            'actual existing exclusive heavy slot held before every effect')
+    group=Path(n['group']);g=group.stat();q=os.fstat(group_fd)
+    require([g.st_dev,g.st_ino]==n['first_birth_group_identity']==[q.st_dev,q.st_ino]
+            and stat.S_ISDIR(q.st_mode),'exact retained externally admitted private group FD')
+    current=Path('/sys/fs/cgroup')/Path('/proc/self/cgroup').read_text().strip().split('::',1)[1].lstrip('/')
+    require(group!=current and not current.is_relative_to(group)
+            and group.name=='friday-native-'+n['action_id']
+            and len(n['action_id'])==36 and set(n['action_id'])<=set('0123456789abcdef-'),
+            'fresh action-specific reservation excludes existing actor and protected shared scope')
+    for key,value in {'memory.max':'2147483648','memory.swap.max':'0','pids.max':'128','cpu.max':'200000 100000'}.items():
+        require((group/key).read_text().strip()==value,'hard whole controller BEFORE first effect '+key)
+    require((group/'pids.current').read_text().strip()=='0'
+            and 'populated 0' in (group/'cgroup.events').read_text(),'private reservation empty before clone3')
+    mem=dict(line.split(':',1) for line in Path('/proc/meminfo').read_text().splitlines())
+    require(int(mem['MemAvailable'].split()[0])*1024>=5368709120,'actual whole2GiB plus outside2GiB and1GiB headroom')
+    output=Path(spec['record']).parent;v=os.statvfs(output)
+    require(v.f_blocks*v.f_frsize<=67108864 and v.f_files<=512
+            and any(x.split()[4]==str(output) and ' - tmpfs ' in x
+                    for x in Path('/proc/self/mountinfo').read_text().splitlines()),
+            'actual existing outside cumulative metadata/log hard64MiB512inode disk boundary')
+    # Harmless qualification depends only on its reviewed probe/owner/input
+    # bodies. Genuine547 installation/receipt/current app pins are a separate
+    # mandatory native gate and MUST NOT circularly gate this qualification.
+    for key in ('qualification_probe','qualification_opaque_import','owner_host'):
+        read_pin(spec[key],2097152)
+    require(spec['domain']=='kernel120_qualification' and spec['host']==spec['qualification_probe'],
+            'harmless exact probe ONLY, no production host dispatch')
+    read_pin(spec['clock'],LIMIT)
+    require('qualification_input_pins' in n and type(n['qualification_input_pins']) is list
+            and 0<len(n['qualification_input_pins'])<=16,
+            'Root independently bound harmless input set, never genuine installation pins')
+    for pin in n['qualification_input_pins']:read_pin(pin,2097152)
+    # Parent remains in its existing private outside actor. Kernel creates the
+    # FIRST stock process in the new whole group and private PID/user/mount
+    # namespace atomically. No post-fork cgroup.procs write or migration.
+    class CloneArgs(ctypes.Structure):
+        _fields_=[(key,ctypes.c_uint64) for key in
+                  ('flags','pidfd','child_tid','parent_tid','exit_signal','stack',
+                   'stack_size','tls','set_tid','set_tid_size','cgroup')]
+    require(ctypes.sizeof(CloneArgs)==88,'reviewed Linux clone_args v2 ABI')
+    libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
+    require(libc.prctl(36,1,0,0,0)==0 and libc.prctl(1,signal.SIGKILL,0,0,0)==0
+            and os.getppid()==outside_guard['pid'],'same outside actual subreaper/stock parent-death owner')
+    ready_r,ready_w=os.pipe();go_r,go_w=os.pipe();parent_fd=os.pidfd_open(parent['pid'])
+    child_fd=ctypes.c_int(-1);args=CloneArgs()
+    args.flags=0x200000000|0x1000|0x20000000|0x10000000|0x00020000
+    args.pidfd=ctypes.addressof(child_fd);args.exit_signal=signal.SIGCHLD;args.cgroup=group_fd
+    # Each actual attempted spawn/FD must be retained by the SAME outside owner;
+    # kernel ENOSYS/EPERM/EINVAL is a concrete no-fallback capability refusal.
+    fit();require(time.monotonic()+n['stock_guard_seconds']+5<=guardian_expiry_m
+            and time.time()+n['stock_guard_seconds']+5<=guardian_expiry_u,
+            'fresh actual original guardian remainder immediately before clone3');attempted=True
+    # Already pinned outside actor stock/PDEATH chain bounds unknown handles.
+    retained={'pid':None,'pidfd':None,'attempted':True,
+              'fds':[ready_r,ready_w,go_r,go_w,parent_fd],'whole_group_fd':group_fd,
+              'exclusive_slot_fd':slot_fd,'closure':False}
+    pid=libc.syscall(ctypes.c_long(435),ctypes.byref(args),ctypes.c_size_t(88))
+    if pid<0:
+        error=ctypes.get_errno()
+        # Failed clone3 is not retried. Existing owner resolves the known kernel
+        # no-child failure and closes retained pipes/parent pidfd itself.
+        try:
+            require((group/'pids.current').read_text().strip()=='0'
+                    and 'populated 0' in (group/'cgroup.events').read_text(),
+                    'actual failed kernel clone no-child cohort fresh empty')
+            for fd in list(retained['fds']):
+                os.close(fd);retained['fds'].remove(fd)
+            require((group/'pids.current').read_text().strip()=='0','known no-child group retained for actual Root final read')
+        except BaseException:retain_until_stock_guard()
+        raise OSError(error,'first-birth clone3 refused; NO fallback or replay')
+    if pid==0:
+        try:
+            # Already hard reserved even before this trusted bootstrap code.
+            require(os.getpid()==1,'kernel created actual private namespace init')
+            require(libc.prctl(1,signal.SIGKILL,0,0,0)==0
+                    and not select.select([parent_fd],[],[],0)[0],'exact outside owner live and parent death armed')
+            os.close(ready_r);os.close(go_w)
+            require(os.write(ready_w,b'R')==1 and os.read(go_r,1)==b'G','single owned uid-map barrier')
+            require(libc.prctl(1,signal.SIGKILL,0,0,0)==0 and not select.select([parent_fd],[],[],0)[0],
+                    'parent death armed again after actual uid mapping')
+            require(libc.mount(None,b'/',None,0x40000|0x4000,None)==0,'private first-birth mount propagation')
+            require(libc.mount(b'proc',b'/proc',b'proc',2|4|8,None)==0,'actual private stock PID namespace proc view')
+            # A read-only bind of the existing controller view prevents an
+            # opaque child from migrating itself or changing hard controllers.
+            require(libc.mount(b'/sys/fs/cgroup',b'/sys/fs/cgroup',None,4096|16384,None)==0,
+                    'private inherited cgroup read-only bind')
+            require(libc.mount(None,b'/sys/fs/cgroup',None,4096|32|1|2|4|8,None)==0,
+                    'private controller view actually read-only')
+            require(Path('/proc/self/cgroup').read_text().strip()=='0::'+n['group_relative'],
+                    'kernel first stock birth inherited exact whole reservation')
+            resource.setrlimit(resource.RLIMIT_AS,(268435456,268435456))
+            resource.setrlimit(resource.RLIMIT_CPU,(30,30))
+            resource.setrlimit(resource.RLIMIT_FSIZE,(MAX,MAX));resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+            # Do not expose Root/TUI/service descriptors or namespace handles.
+            for entry in list(Path('/proc/self/fd').iterdir()):
+                fd=int(entry.name)
+                if fd>2:
+                    try:os.close(fd)
+                    except OSError as e:
+                        if e.errno!=9:raise
+            kernel120_first_birth_write_confinement(spec)
+            os.setsid();fit()
+            argv=['/usr/bin/gnutimeout','-s','KILL',str(n['stock_guard_seconds'])+'s',PYTHON,'-I','-B',
+                  spec['host']['path'],ref['path'],str(ref['bytes']),ref['sha256']]
+            os.execve(argv[0],argv,{'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','LC_ALL':'C.UTF-8'})
+        except BaseException:os._exit(125) # Root observes actual failed init wait, never success.
+    # Kernel pidfd is returned atomically with the first birth; retain BEFORE
+    # any fallible fstat/identity/uid map/clock operation. No new Popen handle gap.
+    retained['pid']=int(pid);retained['pidfd']=child_fd.value
+    # Actual original absolute timer belongs to this SAME outside finite owner.
+    # At most the fixed supplied stock interval; reserve30 for direct wait and
+    # fresh namespace/group closure, always inside original final/cleanup180.
+    # stop_m/stop_u were supplied/pinned before first birth and NEVER renewed.
+    try:
+        pfd=retained['pidfd'];ps=os.fstat(pfd)
+        kernel120_effect_boundary(spec,'AFTER_REAL_PIDFD_FSTAT',retained)
+        require(pfd>=0 and ps.st_ino>0,'atomic first-birth retained pidfd')
+        child=identity(pid);retained['child']=child
+        first_birth_observation={'child':child,'group':Path('/proc/'+str(pid)+'/cgroup').read_text(),
+            'controllers':{k:(group/k).read_text() for k in ('memory.max','memory.swap.max','pids.max','cpu.max')},
+            'tasks_current':(group/'pids.current').read_text(),
+            'pidfd_identity':[ps.st_dev,ps.st_ino],'at_unix':time.time(),'at_monotonic':time.monotonic()}
+        require(child['ppid']==parent['pid']
+                and Path('/proc/'+str(pid)+'/cgroup').read_text().strip()=='0::'+n['group_relative'],
+                'outside actual first birth already in hard group')
+        os.close(ready_w);retained['fds'].remove(ready_w)
+        os.close(go_r);retained['fds'].remove(go_r)
+        require(select.select([ready_r,pfd],[],[],min(5,stop_m-time.monotonic(),stop_u-time.time()))[0]==[ready_r]
+                and os.read(ready_r,1)==b'R','actual first-birth uid-map ready')
+        uid,gid=os.getuid(),os.getgid();base=Path('/proc')/str(pid)
+        (base/'setgroups').write_text('deny\n');(base/'uid_map').write_text('0 '+str(uid)+' 1\n')
+        (base/'gid_map').write_text('0 '+str(gid)+' 1\n')
+        require(identity(pid)==child,'exact retained first birth before map GO')
+        fit();require(os.write(go_w,b'G')==1,'one actual namespace bootstrap GO')
+        kernel120_effect_boundary(spec,'AFTER_REAL_MAP_GO',retained)
+        remaining=max(0,min(stop_m-time.monotonic(),stop_u-time.time()))
+        timed_out=not select.select([pfd],[],[],remaining)[0]
+        if timed_out:
+            # Exact owned namespace INIT only. Kernel tears down every opaque
+            # descendant/thread; never shared/controller/process-group kill.
+            signal.pidfd_send_signal(pfd,signal.SIGKILL)
+        remaining=max(0,min(final-time.monotonic(),clock['final_deadline_unix']-time.time()))
+        require(select.select([pfd],[],[],remaining)[0],'first-birth actual terminal within original final')
+        waited,status=os.waitpid(pid,0)
+        kernel120_effect_boundary(spec,'AFTER_REAL_INIT_WAIT',retained)
+        require(waited==pid and absent(child),'outside actual direct init wait and fresh exact birth absence')
+        require((group/'pids.current').read_text().strip()=='0'
+                and 'populated 0' in (group/'cgroup.events').read_text()
+                and not Path('/proc/self/task/'+str(parent['pid'])+'/children').read_text().strip(),
+                'actual whole host/bootstrap/opaque cohort empty after namespace init wait')
+        require([group.stat().st_dev,group.stat().st_ino]==n['first_birth_group_identity'],
+                'same admitted group at actual outside removal')
+        final_kernel_sample={k:(group/k).read_text() for k in ('pids.current','cgroup.events','memory.events','pids.events','cpu.stat')}
+        # SAME group remains Root-owned until Root actually waits this stock actor.
+        # Root then reads fresh kernel0 and removes it; this return is NOT closure.
+        for fd in list(retained['fds']):
+            os.close(fd);retained['fds'].remove(fd)
+            kernel120_effect_boundary(spec,'AFTER_REAL_PIPE_CLOSE',retained)
+        os.close(pfd);retained['pidfd']=None;retained['closure']=False
+        require(time.monotonic()<final and time.time()<clock['final_deadline_unix'],
+                'outside actual terminal/fresh closure before original final')
+        # Slot/group supplied handles remain Root-owned until its own wait and
+        # handle close. No internal capacity-release/receipt acceptance claim.
+        return {'first_birth_observation':first_birth_observation,'final_kernel_sample':final_kernel_sample,
+                'waited_init':child,'terminal_unix':time.time(),'terminal_monotonic':time.monotonic(),
+                'status':status,'timed_out':timed_out,'actual_init_wait':True,'whole_kernel_empty':True,
+                'private_group_removed':False,'Root_final_group_removal_required':True,'original_final_preserved':True,'capacity_release':False,
+                'outside_actor_final_wait_required':True}
+    except BaseException:
+        # Unknown first-birth/FD/map/receipt/closure keeps SAME pidfd/group/slot.
+        # Existing outside absolute guard must be independently proven before
+        # entry. No retry, respawn, scope migration, clock renewal or lost-handle
+        # guessed cleanup. It terminates this actor by ORIGINAL final; PDEATH
+        # kills exact owned private init and kernel closes its namespace cohort.
+        try:
+            if retained['pidfd']>=0:
+                remaining=max(0,min(stop_m-time.monotonic(),stop_u-time.time()))
+                select.select([retained['pidfd']],[],[],remaining)
+                signal.pidfd_send_signal(retained['pidfd'],signal.SIGKILL)
+        except BaseException:pass
+        retain_until_stock_guard()
+
+
+
+
+
+if __name__ == '__main__':
+    sys.exit(main())
