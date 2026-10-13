@@ -15,9 +15,13 @@ import re
 import stat
 
 from .adapters.dsh import DshAdapter, DshHostConfig, PinnedFile
-from .controller import WorkerBinding
-from .supervision import NativeSupervisor
 from .worker_web import DshWebInputs, WorkerWebError, scoped_environment, DshNetworkCheck
+
+
+def NativeSupervisor(*args, **kwargs):
+    """Keep pure installation validators usable before Hermes is installed."""
+    from .supervision import NativeSupervisor as native
+    return native(*args, **kwargs)
 
 
 class HostUnavailable(RuntimeError):
@@ -220,6 +224,7 @@ def dsh_binding(value, associations, *, web_network_check=None):
     Stop does not re-read readiness or launch pins. DSH's own stop and emergency
     native supervisor remain authoritative when those launch files drift.
     """
+    from .controller import WorkerBinding
     config = validate_runtime(value)
     dsh = config["dsh"]
     web = _dsh_web(dsh)

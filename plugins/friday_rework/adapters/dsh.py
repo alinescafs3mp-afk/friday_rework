@@ -21,7 +21,6 @@ from typing import Callable, Mapping
 
 from ..associations import _validate_store
 from ..boundary import WorkBrief, parse_brief
-from ..supervision import NativeSupervisor
 from .contract import NativeObservation, PreparedNative, VerifiedInput
 from ..worker_web import DshWebInputs, WorkerWebError, DSH_NETWORK_PROBE
 
@@ -230,7 +229,12 @@ _FINALIZE = b'''import os,sys,json,tempfile\nfrom pathlib import Path\nfrom cont
 class DshAdapter:
     def __init__(self, config: DshHostConfig, *, supervisor=None, clock=time.time):
         self.config = config
-        self.supervisor = supervisor or NativeSupervisor()
+        # Input validation runs before the installer has prepared Hermes.
+        # Load its native supervisor only when constructing an actual adapter.
+        if supervisor is None:
+            from ..supervision import NativeSupervisor
+            supervisor = NativeSupervisor()
+        self.supervisor = supervisor
         self.clock = clock
         self._invocations = {}
         for p in (config.workspace_root, config.payload_root, config.toolchain_root):

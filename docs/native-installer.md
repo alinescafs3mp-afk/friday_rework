@@ -1,5 +1,12 @@
 # Native Friday installation candidate
 
+Cold worker input validation defers native supervisor and controller loading
+until an actual adapter is constructed. The existing pin, path, network and
+budget checks remain in place; execution still uses the original supervisor.
+A fresh isolated regression verifies preparation without Hermes, changed and
+malformed input refusal, and the absence of a replacement native supervisor.
+This source change does not establish installation or runtime acceptance.
+
 11 October: [the final ordinary input has been prepared](../analysis/2026-10-11/NORMAL-INSTALL-FINAL134-PREPARATION.json) against the combined CLI/API candidate: 134 project files, 17,651 native files and 31 layers. Its verified later baseline has 109 project files, rather than the earlier 103-file preparation described below. The change adds 25 project files and changes 15, retaining the normal profile, credential references, donor identities and the original unstarted 3600-second installation budget. The exact native snapshot is recorded in an inert sidecar; no unsupported installer schema fields were added. Nine structural checks passed. Independent current-input review and actual consumer execution remain pending; the expired DSH declaration remains unchanged. This preparation does not authorize installation or startup.
 
 `scripts/friday_install.py {plan,install,check,dashboard-check,start,reconcile,resume-harness} --input <private JSON>`
