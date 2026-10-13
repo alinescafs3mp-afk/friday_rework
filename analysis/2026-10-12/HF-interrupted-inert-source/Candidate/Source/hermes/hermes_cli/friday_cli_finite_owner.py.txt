@@ -1,0 +1,819 @@
+"""Fixed native supervision for the original Hermes frontend.
+
+The bootstrap starts only this product role, with inherited native handles.
+There is no UI, principal, model, scheduler, service or worker reconstruction.
+The original frontend remains alive on normal finite completion. Its guardian
+physically covers synchronous frontend and observer I/O until FINISH.
+"""
+import array
+import hashlib
+import copy
+import fcntl
+import errno
+import json
+import os
+import select
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import termios
+import time
+from contextlib import contextmanager
+
+from hermes_cli.friday_cli_finite import (
+    MAX_PACKET, FiniteOwnerUnavailable, RetainedOwnerChannel,
+    NativeCertificateReader, existing_product_cli_port,
+    original_certificate_reader, canonical, digest, validate_proposal,
+    validate_certificate, _birth, _ids, _number, _pidfd)
+
+def _need(ok, why):
+    if not ok:
+        raise FiniteOwnerUnavailable(why)
+
+def _native_birth(pid):
+    b = _birth(pid)
+    return {k: b[k] for k in ('pid', 'birth', 'ppid')}
+
+def _identity(fd):
+    s = os.fstat(fd)
+    return [s.st_dev, s.st_ino, s.st_mode, s.st_rdev]
+
+def _native_sample(input_fd, output_fd):
+    return {
+        'input_identity': _identity(input_fd),
+        'output_identity': _identity(output_fd),
+        'input_flags': fcntl.fcntl(input_fd, fcntl.F_GETFL),
+        'output_flags': fcntl.fcntl(output_fd, fcntl.F_GETFL),
+        # Compare the original live mode, which can be prompt_toolkit raw mode.
+        'input_state': [x if type(x) is not list else [v.hex() if type(v) is bytes else v for v in x]
+                        for x in termios.tcgetattr(input_fd)] if os.isatty(input_fd) else None,
+    }
+
+def _state_generation(fd, directory, name):
+    st=os.fstat(fd);named=os.stat(name,dir_fd=directory,follow_symlinks=False)
+    fields=lambda x:(x.st_dev,x.st_ino,x.st_mode,x.st_uid,x.st_nlink,
+                     x.st_size,x.st_mtime_ns,x.st_ctime_ns)
+    _need(fields(st)==fields(named),'native_state_named_inode_changed')
+    return list(fields(st))
+
+def _read_private_at(directory, name, cap):
+    _need(name=='state.json','fixed_native_state_name')
+    ds=os.fstat(directory)
+    _need(stat.S_ISDIR(ds.st_mode) and ds.st_uid==os.getuid()
+          and stat.S_IMODE(ds.st_mode)==0o700,'original_private_record_directory')
+    fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=directory)
+    primary=None
+    try:
+        st=os.fstat(fd)
+        _need(stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid()
+              and st.st_nlink==1 and not st.st_mode&0o077
+              and st.st_size<=cap,'private_native_state_required')
+        generation=_state_generation(fd,directory,name)
+        chunks=[];used=0
+        while used<=cap:
+            part=os.read(fd,min(65536,cap+1-used))
+            if not part:break
+            chunks.append(part);used+=len(part)
+        data=b''.join(chunks)
+        _need(used==st.st_size and used<=cap
+              and _state_generation(fd,directory,name)==generation,
+              'stable_native_state_required')
+        from hermes_cli.friday_cli_native_capture import observe_original_io,NativeIOStage
+        observe_original_io(NativeIOStage.STATE_FILE_FSYNC,fd=fd)
+        os.fsync(fd)
+        _need(_state_generation(fd,directory,name)==generation,
+              'native_state_replaced_during_file_fsync')
+        observe_original_io(NativeIOStage.STATE_DIRECTORY_FSYNC,fd=directory)
+        os.fsync(directory)
+        _need(_state_generation(fd,directory,name)==generation,
+              'native_state_replaced_during_directory_fsync')
+        ds2=os.fstat(directory)
+        _need((ds.st_dev,ds.st_ino)==(ds2.st_dev,ds2.st_ino),
+              'native_record_directory_identity_changed')
+        binding={'directory':[ds.st_dev,ds.st_ino],
+                 'file':generation,'sha256':hashlib.sha256(data).hexdigest()}
+        return data,binding
+    except BaseException as failure:
+        primary=failure
+        raise
+    finally:
+        # Exactly one close, after both barriers. Ambiguity fails the observer.
+        try:os.close(fd)
+        except BaseException as failure:
+            if primary is None:raise
+            BaseException.add_note(primary,'Native state close unconfirmed:'+type(failure).__name__)
+
+def _named_directory_binding(path, binding):
+    named=os.stat(path,follow_symlinks=False)
+    _need(stat.S_ISDIR(named.st_mode) and named.st_uid==os.getuid()
+          and stat.S_IMODE(named.st_mode)==0o700
+          and [named.st_dev,named.st_ino]==binding['directory'],
+          'native_record_named_directory_substituted')
+
+def current_record_generation(context, end):
+    _need(time.monotonic()<end,'current_record_original_deadline')
+    path=os.fspath(context.state.data_dir)
+    fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    primary=None
+    try:
+        from hermes_cli.friday_cli_native_capture import observe_original_io,NativeIOStage
+        observe_original_io(NativeIOStage.RECORD_DIRECTORY_OPENED,owner=context,fd=fd)
+        data,binding=_read_private_at(fd,'state.json',10*1024*1024)
+        retained=os.fstat(fd)
+        _need([retained.st_dev,retained.st_ino]==binding['directory'],
+              'native_record_retained_directory_changed')
+        _need(os.fspath(context.state.data_dir)==path,
+              'native_record_context_directory_changed')
+        _named_directory_binding(path,binding)
+        # Final named check follows all file and directory read/fsync/close work.
+        # A retained D1 FD never authenticates a substituted named D2.
+        closing=fd;fd=None;os.close(closing)
+        _named_directory_binding(path,binding)
+        _need(os.fspath(context.state.data_dir)==path and time.monotonic()<end,
+              'current_record_read_late_or_context_changed')
+        return binding
+    except BaseException as failure:
+        primary=failure;raise
+    finally:
+        if fd is not None:
+            try:os.close(fd)
+            except BaseException as failure:
+                if primary is None:raise
+                BaseException.add_note(primary,'Native directory close unconfirmed:'+type(failure).__name__)
+
+def _observe_record(directory, proposals):
+    ds = os.fstat(directory)
+    _need(stat.S_ISDIR(ds.st_mode) and ds.st_uid == os.getuid()
+          and stat.S_IMODE(ds.st_mode) == 0o700, 'original_private_record_directory')
+    raw,generation = _read_private_at(directory, 'state.json', 10 * 1024 * 1024)
+    data = json.loads(raw)
+    _need(type(data) is dict and 'associations.v1' in data, 'original_native_namespace')
+    document = data['associations.v1']
+    _need(type(document) is dict and set(document) == {'schema_version', 'jobs'}
+          and type(document['schema_version']) is int and document['schema_version'] == 1
+          and type(document['jobs']) is dict, 'original_association_schema')
+    found = {}
+    wanted = {digest(p): p for p in proposals}
+    for row in document['jobs'].values():
+        if type(row) is not dict or row.get('owner', {}).get('platform') != 'cli' or 'result' not in row:
+            continue
+        for attempts in row['result']['deliveries'].values():
+            for attempt in attempts:
+                p = (attempt.get('receipt') or {}).get('proposal')
+                if p is None:
+                    continue
+                p = validate_proposal(p)
+                h = digest(p)
+                if h not in wanted:
+                    continue
+                _need(attempt['state'] == 'UNKNOWN' and attempt['receipt']['state'] == 'UNKNOWN',
+                      'serialized_state_cannot_promote_delivery')
+                artifacts = [a for a in row['result']['artifacts'] if a['reference'] == p['reference']]
+                _need(len(artifacts) == 1 and p == wanted[h]
+                      and p['number'] == attempt['number']
+                      and p['owner_sha256'] == digest(row['owner'])
+                      and p['admission_hash'] == row['admission_hash']
+                      and p['artifact_sha256'] == artifacts[0]['sha256']
+                      and p['artifact_bytes'] == artifacts[0]['size_bytes'],
+                      'actual_durable_proposal_binding')
+                _need(h not in found, 'duplicate_native_proposal')
+                found[h] = p
+    _need(found == wanted, 'native_durable_proposals_missing')
+    return {'durable_m':time.monotonic(),'record_generation':generation}
+
+def _observer_child(channel, keep, mode, input_fd, output_fd, directory, proposals, end):
+    """Only native sampling/record observation; no frontend objects or model."""
+    result = None
+    status = 1
+    try:
+        # Close all unrelated inherited custody before any observation. This is
+        # a clean, single-threaded product guardian, never a fork of live UI.
+        for name in os.listdir('/proc/self/fd'):
+            fd = int(name)
+            if fd not in keep:
+                try:
+                    os.close(fd)
+                except OSError as exc:
+                    # listdir's transient enumeration FD has already closed.
+                    # No FD is allocated between enumeration and this close loop.
+                    if exc.errno != errno.EBADF:
+                        raise FiniteOwnerUnavailable('observer_inherited_close_unconfirmed')
+        _need(time.monotonic() < end, 'observer_original_clock_expired')
+        # No sampling/fsync effects before parent retains this exact child pidfd.
+        ready=select.select([channel],[],[],max(0,end-time.monotonic()))[0]
+        _need(ready and channel.recv(64,socket.MSG_DONTWAIT)==b'NATIVE_OBSERVER_GO',
+              'native_observer_custody_before_effect')
+        _need(time.monotonic() < end, 'observer_GO_original_clock')
+        sample = _native_sample(input_fd, output_fd)
+        input_observed_m = time.monotonic()
+        observed = _observe_record(directory, proposals) if mode == 'settle' else None
+        durable = observed['durable_m'] if observed is not None else None
+        # Every observation-owned native FD closes before the final packet.
+        for fd in sorted(set((input_fd, output_fd) + ((directory,) if directory is not None else ()))):
+            os.close(fd)
+        result = {'mode': mode, 'sample': sample, 'durable_m': durable,
+                  'observer_cleanup_m': time.monotonic(), 'input_observed_m': input_observed_m,
+                  'record_generation':observed['record_generation'] if observed is not None else None}
+        _need(result['observer_cleanup_m'] < end, 'late_observer_cleanup')
+        data = canonical(result)
+        _need(len(data) <= MAX_PACKET and channel.send(
+            data, socket.MSG_DONTWAIT | socket.MSG_NOSIGNAL) == len(data),
+            'observer_result_unconfirmed')
+        channel.close()
+        status = 0
+    except BaseException:
+        # No status0 or receipt on an ambiguous read/fsync/close.
+        status = 1
+    os._exit(status)
+
+class ExistingCliOwner:
+    """One original product frontend; independent clocks for distinct operations."""
+    def __init__(self, native_socket, frontend, frontend_pidfd, input_fd, output_fd):
+        self.socket = native_socket
+        self.frontend = copy.deepcopy(frontend)
+        self.frontend_fd = frontend_pidfd
+        self.root = _native_birth(os.getpid())
+        _need(self.root['ppid'] == frontend['pid'] and self.root['pid'] != frontend['pid'],
+              'actual_product_bootstrap_parent')
+        _pidfd(frontend_pidfd, frontend)
+        self.input_fd, self.output_fd = input_fd, output_fd
+        self.timer = os.timerfd_create(time.CLOCK_MONOTONIC, flags=os.TFD_NONBLOCK | os.TFD_CLOEXEC)
+        self.sequence = 0
+        self.active = None
+        self.observer = None
+        self.stop_unconfirmed = False
+        self.certificates = {}
+        self.consumed_original_ids = set()
+        self.observer_history = []
+        self.received_rights = []
+        self._reply({'op': 'BOOTSTRAPPED', 'frontend': self.frontend, 'guardian': self.root})
+
+    def _reply(self, value):
+        if self.active is not None:
+            self._clock()
+        data = canonical(value)
+        _need(len(data) <= MAX_PACKET and self.socket.send(
+            data, socket.MSG_DONTWAIT | socket.MSG_NOSIGNAL) == len(data),
+            'bounded_native_guardian_reply')
+
+    def _clock(self):
+        _need(self.active is not None and time.monotonic() < self.active['end'],
+              'original_finite_operation_deadline')
+
+    def _recv(self):
+        data, anc, flags, _ = self.socket.recvmsg(
+            MAX_PACKET, socket.CMSG_SPACE(12) + socket.CMSG_SPACE(4),
+            socket.MSG_DONTWAIT)
+        rights, creds = [], []
+        try:
+            for level, kind, value in anc:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    a = array.array('i'); a.frombytes(value); rights.extend(a)
+                elif level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS and len(value) == 12:
+                    creds.append(struct.unpack('3i', value))
+                else:
+                    raise FiniteOwnerUnavailable('foreign_native_ancillary')
+            _need(data and not flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
+                  and len(creds) == 1 and creds[0] ==
+                  (self.frontend['pid'], os.getuid(), os.getgid()),
+                  'authenticated_original_frontend_packet')
+            _pidfd(self.frontend_fd, self.frontend)
+            value = json.loads(data)
+            _need(type(value) is dict, 'typed_native_frontend_packet')
+            return value, rights
+        except BaseException:
+            for fd in rights:
+                os.close(fd)
+            raise
+
+    def _start_observer(self, mode):
+        self._clock()
+        _need(self.observer is None, 'one_owned_finite_observer')
+        _need(len(self.observer_history) < 2048, 'observer_custody_history_full')
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        left.setblocking(False); right.setblocking(False)
+        o = {'pid': None, 'birth': None, 'pidfd': None, 'socket': left,
+             'child_endpoint': right, 'mode': mode, 'packet': None,
+             'raw_status': None, 'reaped': False, 'close_attempts': {},
+             'close_errors': {}, 'GO': False}
+        # Record endpoints before fork; record the direct PID immediately on
+        # the successful parent branch, before right.close/pidfd_open/birth IO.
+        self.observer = o
+        try:
+            pid = os.fork()
+            if pid == 0:
+                directory = self.active['record'] if mode == 'settle' else None
+                keep = {right.fileno(), self.input_fd, self.output_fd}
+                if directory is not None:
+                    keep.add(directory)
+                _observer_child(right, keep, mode, self.input_fd,
+                                self.output_fd, directory,
+                                self.active['proposals'], self.active['end'])
+                os._exit(1)
+            o['pid'] = pid
+            o['pidfd'] = os.pidfd_open(pid, 0)
+            o['birth'] = _birth(pid)
+            _need(o['birth']['ppid'] == os.getpid(), 'observer_actual_direct_child')
+            _pidfd(o['pidfd'], o['birth'])
+            self._close_observer_handle(o, 'child_endpoint')
+            self._clock()
+            data = b'NATIVE_OBSERVER_GO'
+            _need(left.send(data, socket.MSG_DONTWAIT | socket.MSG_NOSIGNAL) == len(data),
+                  'exact_native_observer_GO_unconfirmed')
+            o['GO'] = True
+        except BaseException as primary:
+            # No second fork/GO/pidfd acquisition attempt. Even a missing
+            # pidfd leaves the actual unreaped direct PID and endpoints owned.
+            self._stop_observer(primary)
+            raise
+
+    def _close_observer_handle(self, o, key):
+        if key in o['close_attempts']:
+            _need(key not in o['close_errors'], 'observer_close_ambiguous_retained')
+            return
+        value = o.get(key)
+        if value is None:
+            return
+        o['close_attempts'][key] = time.monotonic()
+        try:
+            if key == 'pidfd':
+                os.close(value)
+            else:
+                value.close()
+        except BaseException as failure:
+            o['close_errors'][key] = type(failure).__name__
+            self.stop_unconfirmed = True
+            raise
+        o[key] = None
+
+    def _wait_observer(self, o):
+        _need(o['pid'] is not None and not o['reaped'], 'owned_direct_observer_wait')
+        pid, raw = os.waitpid(o['pid'], os.WNOHANG)
+        if pid == 0:
+            return False
+        _need(pid == o['pid'], 'exact_observer_wait_owner')
+        # Save the raw outcome before validation or any close can fail.
+        o['raw_status'] = raw
+        o['wait_m'] = time.monotonic()
+        o['reaped'] = True
+        o['wait_pid']=pid
+        o['wait_parent']=copy.deepcopy(self.root)
+        return True
+
+    def _stop_observer(self, primary=None):
+        o = self.observer
+        if o is None:
+            return
+        failures = []
+        if o['pid'] is not None and not o['reaped'] and o['pidfd'] is not None:
+            try:
+                signal.pidfd_send_signal(o['pidfd'], signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # actual raw wait is still required
+            except BaseException as failure:
+                failures.append(failure)
+        # Closing the parent's GO endpoint also makes a no-pidfd, pre-GO child
+        # fail its finite receive. The direct PID cannot be recycled until our
+        # wait; it is never used as a numeric signal target.
+        for key in ('socket', 'child_endpoint'):
+            try:
+                self._close_observer_handle(o, key)
+            except BaseException as failure:
+                failures.append(failure)
+        end = self.active['end'] if self.active is not None else time.monotonic()
+        while o['pid'] is not None and not o['reaped'] and time.monotonic() < end:
+            try:
+                if self._wait_observer(o):
+                    break
+                watched = [self.timer]
+                if o['pidfd'] is not None:
+                    watched.append(o['pidfd'])
+                select.select(watched, [], [], min(0.01, max(0, end-time.monotonic())))
+            except BaseException as failure:
+                failures.append(failure)
+                break
+        if o['pid'] is not None and not o['reaped']:
+            self.stop_unconfirmed = True
+            failures.append(FiniteOwnerUnavailable('observer_actual_reap_unconfirmed'))
+        if o['pid'] is None or o['reaped']:
+            try:
+                self._close_observer_handle(o, 'pidfd')
+            except BaseException as failure:
+                failures.append(failure)
+        # Ambiguous handles/unreaped births remain in live custody; no clearing,
+        # retry or normal certificate. A gate must report STOP_UNCONFIRMED.
+        if not failures and not o['close_errors'] and (o['pid'] is None or o['reaped']):
+            self.observer_history.append(o)
+            self.observer = None
+        else:
+            self.stop_unconfirmed = True
+        if primary is not None:
+            for failure in failures:
+                BaseException.add_note(primary, 'Observer custody unconfirmed:'+type(failure).__name__)
+
+
+    def _observer_ready(self, ready):
+        o = self.observer
+        if o is None:
+            return
+        if o['socket'] in ready and o['packet'] is None:
+            data, anc, flags, _ = o['socket'].recvmsg(MAX_PACKET, 0, socket.MSG_DONTWAIT)
+            _need(data and not anc and not flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
+                  and o['packet'] is None, 'one_bounded_observer_observation')
+            o['packet'] = json.loads(data)
+        if o['pidfd'] not in ready:
+            return
+        # Drain the finite result after actual pidfd readiness, even when
+        # select returned only pidfd. This is not proof derived from absence.
+        if o['packet'] is None:
+            data, anc, flags, _ = o['socket'].recvmsg(MAX_PACKET, 0, socket.MSG_DONTWAIT)
+            _need(data and not anc and not flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC),
+                  'observer_packet_before_raw_join')
+            o['packet'] = json.loads(data)
+        _need(self._wait_observer(o), 'actual_observer_wait_not_ready')
+        pid, raw = o['pid'], o['raw_status']
+        _need(os.WIFEXITED(raw) and os.WEXITSTATUS(raw) == 0,
+              'actual_direct_observer_raw_wait0_required')
+        joined = time.monotonic()
+        packet = o['packet']
+        _need(type(packet) is dict and set(packet) ==
+              {'mode', 'sample', 'durable_m', 'observer_cleanup_m', 'input_observed_m','record_generation'}
+              and packet['mode'] == o['mode']
+              and self.active['start'] <= packet['observer_cleanup_m'] <= joined,
+              'actual_observer_cleanup_observation')
+        # Guardian closes its observer channel + pidfd before certification.
+        self._close_observer_handle(o, 'socket')
+        self._close_observer_handle(o, 'child_endpoint')
+        self._close_observer_handle(o, 'pidfd')
+        _need(o['GO'] and o['birth'] is not None and o['reaped']
+              and o['wait_pid']==o['pid']==o['birth']['pid']
+              and o['birth']['ppid']==self.root['pid']
+              and o['wait_parent']==self.root and not o['close_errors'],
+              'actual_direct_child_birth_raw_wait_and_closed_custody')
+        witness = {'pid': pid, 'birth': o['birth']['birth'],
+                   'raw_status': raw, 'wait_m': o['wait_m'],
+                   'cleanup_m': packet['observer_cleanup_m'],
+                   'direct_wait': {'parent_pid':self.root['pid'],
+                       'parent_birth':self.root['birth'],
+                       'wait_pid':o['wait_pid'],'retained_child_birth':o['birth']['birth'],
+                       'observed_child_ppid':o['birth']['ppid'],
+                       'method':'waitpid','exact_handles_closed':True}}
+        self.observer_history.append(o)
+        self.observer = None
+        self._clock()
+        if o['mode'] == 'arm':
+            self.active['baseline'] = packet['sample']
+            self.active['sampler'] = witness
+            self._reply({'op': 'ARMED', 'scope': self.active['scope'],
+                         'deadline_m': self.active['end'], 'native_handles': packet['sample']})
+            return
+        _need(packet['sample'] == self.active['baseline']
+              and type(packet['durable_m']) in (int, float)
+              and max(p['output_joined_m'] for p in self.active['proposals']) <=
+                  packet['input_observed_m'] <= packet['durable_m'] <= packet['observer_cleanup_m'],
+              'normal_original_input_OFD_and_durability_required')
+        os.close(self.active['record'])
+        self.active['record'] = None
+        certs = {}
+        for p in self.active['proposals']:
+            c = {'schema': 'friday.cli-delivery-certificate.v4',
+                 'proposal_sha256': digest(p), 'scope': p['scope'],
+                 'frontend_pid': self.frontend['pid'], 'frontend_birth': self.frontend['birth'],
+                 'guardian_pid': self.root['pid'], 'guardian_birth': self.root['birth'],
+                 'sampler': self.active['sampler'], 'observer': witness,
+                 'frontend_joined_m': self.active['frontend_joined_m'],
+                 'input_restored_m': packet['input_observed_m'],
+                 'proposal_durable_m': packet['durable_m'],
+                 'certified_m': time.monotonic(), 'record_generation':packet['record_generation']}
+            certs[digest(p)] = validate_certificate(c, p)
+        self.certificates = certs
+        self.active['settled'] = True
+        self._reply({'op': 'CERTIFIED', 'scope': self.active['scope'], 'certificates': certs})
+
+    def _packet(self, packet, rights):
+        retained = False
+        try:
+            if self.active is None:
+                _need(not rights and set(packet) ==
+                      {'op', 'schema', 'original_ids', 'started_m', 'deadline_m'}
+                      and packet['op'] == 'ARM'
+                      and packet['schema'] == 'friday.cli-finite-owner.v1',
+                      'new_distinct_original_operation_required')
+                start, end = _number(packet['started_m']), _number(packet['deadline_m'])
+                _need(start < time.monotonic() < end <= start + 30,
+                      'original_operation_clock_no_reset')
+                ids = _ids(packet['original_ids'])
+                operation_key = digest(ids)
+                _need(operation_key not in self.consumed_original_ids
+                      and len(self.consumed_original_ids) < 4096,
+                      'original_native_operation_reused_or_authority_exhausted')
+                # Burn before timer/fork/effects. Failure and closure never renew
+                # the same native call, and exhaustion refuses without eviction.
+                self.consumed_original_ids.add(operation_key)
+                self.sequence += 1
+                scope = digest({'frontend': self.frontend, 'guardian': self.root,
+                                'sequence': self.sequence, 'ids': ids, 'start': start, 'end': end})
+                self.active = {'start': start, 'end': end, 'scope': scope, 'ids': ids,
+                               'record': None, 'proposals': [], 'settled': False,
+                               'finish_sent': False, 'caller_completed_m': None}
+                # Physically armed before any baseline syscall or effect ACK.
+                os.timerfd_settime(self.timer, flags=os.TFD_TIMER_ABSTIME, initial=end, interval=0)
+                self._start_observer('arm')
+                return
+            self._clock()
+            a = self.active
+            _need(packet.get('scope') == a['scope'], 'exact_native_operation_scope')
+            op = packet.get('op')
+            _need(not a['finish_sent'] or op in ('CALLER_COMPLETED','CALLER_RETIRE','ABORT'),
+                  'no_effect_after_FINISH_before_actual_caller_completion')
+            if op == 'BIND_RECORD':
+                _need(set(packet) == {'op', 'scope'} and len(rights) == 1
+                      and a['record'] is None and self.observer is None,
+                      'one_actual_native_record_handle')
+                a['record'] = rights[0]; retained = True
+                self._reply({'op': 'RECORD_BOUND', 'scope': a['scope']})
+            elif op == 'SHORTEN':
+                _need(not rights and set(packet) == {'op', 'scope', 'deadline_m'},
+                      'strict_original_shortening')
+                end = _number(packet['deadline_m'])
+                _need(time.monotonic() < end <= a['end'], 'no_original_operation_renewal')
+                a['end'] = end
+                os.timerfd_settime(self.timer, flags=os.TFD_TIMER_ABSTIME, initial=end, interval=0)
+                self._reply({'op': 'SHORTENED', 'scope': a['scope'], 'deadline_m': end})
+            elif op == 'PROPOSE':
+                _need(not rights and self.observer is None and not a['settled']
+                      and set(packet) == {'op', 'scope', 'proposals'}
+                      and type(packet['proposals']) is list and len(packet['proposals']) == 1
+                      and len(a['proposals']) < 16, 'bounded_original_proposal')
+                p = validate_proposal(packet['proposals'][0])
+                _need(p['scope'] == a['scope'] and p['original_ids'] == a['ids']
+                      and p['started_m'] == a['start'] and p['deadline_m'] <= a['end']
+                      and not any((p['reference'], p['number']) == (x['reference'], x['number'])
+                                  for x in a['proposals']), 'no_scope_mismatch_or_proposal_replay')
+                a['proposals'].append(p)
+                self._reply({'op': 'PROPOSALS_RETAINED', 'scope': a['scope'],
+                             'proposal_hashes': [digest(p)]})
+            elif op == 'SETTLE':
+                _need(not rights and set(packet) == {'op', 'scope', 'frontend_joined_m'}
+                      and self.observer is None and not a['settled'] and a['proposals']
+                      and a['record'] is not None, 'real_effect_observer_required')
+                joined = _number(packet['frontend_joined_m'])
+                _need(max(p['output_joined_m'] for p in a['proposals']) <= joined
+                      <= time.monotonic(), 'original_frontend_cleanup_before_observer')
+                a['frontend_joined_m'] = joined
+                self._start_observer('settle')
+            elif op == 'FINISH':
+                _need(not rights and set(packet) == {'op', 'scope'}
+                      and self.observer is None
+                      and (not a['proposals'] or a['settled']), 'no_unsettled_finite_completion')
+                if a['record'] is not None:
+                    os.close(a['record']); a['record'] = None
+                _need(not a['finish_sent'], 'FINISH_cannot_replay')
+                # CLOSED is a scoped cleanup observation, NOT guard retirement.
+                # The same absolute timer stays armed over its receive, frontend
+                # checks, result/middleware return, and original native scope exit.
+                self._clock()
+                a['finish_sent'] = True
+                self._reply({'op': 'CLOSED', 'scope': a['scope'], 'closed_m': time.monotonic()})
+            elif op == 'CALLER_COMPLETED':
+                _need(not rights and set(packet) == {'op', 'scope', 'completed_m'}
+                      and a['finish_sent'] and self.observer is None
+                      and a['record'] is None, 'actual_original_caller_completion_required')
+                completed = _number(packet['completed_m'])
+                _need(a['start'] < completed <= time.monotonic() < a['end'],
+                      'caller_completion_same_original_deadline')
+                _need(a['caller_completed_m'] is None,'caller_completion_no_replay')
+                a['caller_completed_m']=completed
+                accepted=time.monotonic();self._clock()
+                a['retire_token']=digest({'scope':a['scope'],'ids':a['ids'],
+                    'guardian':self.root,'completed_m':completed,'accepted_m':accepted})
+                self._reply({'op':'CALLER_ACCEPTED','scope':a['scope'],
+                    'completed_m':completed,'accepted_m':accepted,
+                    'retire_token':a['retire_token']})
+                # Keep the same timer over actual frontend ACK receive.
+            elif op == 'CALLER_RETIRE':
+                _need(not rights and set(packet)=={'op','scope','retire_token'}
+                      and a['caller_completed_m'] is not None
+                      and packet['retire_token']==a['retire_token']
+                      and self.observer is None and a['record'] is None,
+                      'exact_accepted_current_caller_retirement')
+                self._clock()
+                os.timerfd_settime(self.timer,initial=0,interval=0)
+                self.active=None
+                self.certificates.clear()
+            elif op == 'ABORT':
+                raise FiniteOwnerUnavailable('original_frontend_cleanup_unconfirmed')
+            else:
+                raise FiniteOwnerUnavailable('unknown_or_replayed_native_operation')
+        finally:
+            if not retained:
+                for fd in rights:
+                    os.close(fd)
+
+    def _stop_exact(self):
+        self.stop_unconfirmed = True
+        # Stop the exact product effect process before waiting for observers.
+        try:
+            signal.pidfd_send_signal(self.frontend_fd, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self._stop_observer()
+        # Frontend parent owns its raw wait. This status grants no full cleanup.
+
+        # No late certificate or inference from GNU wrapper exit0. Product's
+        # parent owns frontend reap; adverse full cleanup remains unconfirmed.
+
+    def run_one(self):
+        """One bootstrap session; no assignment polling or independent task queue."""
+        try:
+            while True:
+                watched = [self.socket, self.frontend_fd, self.timer]
+                if self.observer is not None:
+                    if self.observer['pidfd'] is not None:
+                        watched += [self.observer['pidfd']]
+                    if self.observer['packet'] is None and self.observer['socket'] is not None:
+                        watched += [self.observer['socket']]
+                ready = select.select(watched, [], [], None)[0]
+                if self.frontend_fd in ready:
+                    self._stop_observer()
+                    # Never call observer/operation cleanup clean from frontend absence.
+                    return {'state': 'FRONTEND_EXITED_STOP_UNCONFIRMED',
+                            'raw_frontend_wait': 'UNBOUND_PARENT_OWNS_REAP'}
+                if self.timer in ready:
+                    raise TimeoutError('original_finite_operation_absolute_guard')
+                if self.active is not None:
+                    self._clock()
+                self._observer_ready(ready)
+                if self.socket in ready:
+                    packet, rights = self._recv()
+                    if (packet == {'op':'SHUTDOWN'} and not rights and self.active is None
+                            and self.observer is None and not self.stop_unconfirmed):
+                        self._reply({'op':'SHUTDOWN_CONFIRMED'})
+                        return {'state':'BOOTSTRAP_CLOSED'}
+                    self._packet(packet, rights)
+        except BaseException:
+            self.certificates.clear()
+            if self.active is not None:
+                self._stop_exact()
+            raise
+
+def _guardian_entry(channel_fd, input_fd, output_fd, frontend_pid, frontend_birth):
+    channel = socket.socket(fileno=channel_fd)
+    channel.setblocking(False)
+    channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    frontend = _native_birth(frontend_pid)
+    _need(frontend['birth'] == frontend_birth and frontend['pid'] == os.getppid(),
+          'fixed_product_bootstrap_birth')
+    frontend_fd = os.pidfd_open(frontend_pid, 0)
+    owner = ExistingCliOwner(channel, frontend, frontend_fd, input_fd, output_fd)
+    try:
+        owner.run_one()
+    finally:
+        # Guardian must not exit and orphan a known direct child. A native
+        # uninterruptible child stays STOP_UNCONFIRMED/red; guardian retains
+        # actual direct custody until it can reap, with no new effect or retry.
+        o=owner.observer
+        if o is not None and o['pid'] is not None and not o['reaped']:
+            owner.stop_unconfirmed=True
+            pid,raw=os.waitpid(o['pid'],0)
+            _need(pid==o['pid'],'retained_adverse_direct_wait')
+            o['raw_status']=raw;o['reaped']=True;o['wait_m']=time.monotonic()
+            if not o['close_errors']:
+                owner._close_observer_handle(o,'pidfd')
+        # Only fixed-role descriptors; no UI teardown in this process.
+        for fd in (input_fd, output_fd, frontend_fd, owner.timer):
+            os.close(fd)
+        channel.close()
+
+
+def _qualified_original_startup():
+    executable = os.path.realpath('/proc/self/exe')
+    _need(os.path.realpath(sys.executable) == executable,
+          'original_interpreter_path_mismatch')
+    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    # Independent final Source/dependency qualification is still mandatory.
+    # Reject unsafe import directories rather than using cwd/PYTHONPATH/user site.
+    for path in (executable, root, os.path.join(root, 'hermes_cli'),
+                 os.path.realpath(__file__),
+                 os.path.join(root, 'hermes_cli', 'friday_cli_finite.py'),
+                 os.path.join(root, 'hermes_cli', '__init__.py')):
+        st = os.stat(path, follow_symlinks=False)
+        _need((stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode))
+              and st.st_uid in (0, os.getuid()) and not st.st_mode & 0o022,
+              'qualified_original_interpreter_code_path_required')
+    # -I ignores all Python environment and user/CWD imports; -S excludes
+    # site startup hooks. Only the actual original, reviewed package root is
+    # appended, never an environment path or a candidate replacement principal.
+    launch = ("import sys,runpy;root=sys.argv.pop(1);"
+              "sys.path.append(root);"
+              "runpy.run_module('hermes_cli.friday_cli_finite_owner',run_name='__main__')")
+    return executable, root, launch
+
+@contextmanager
+def original_product_bootstrap():
+    """Actual cli.main installs this before original HermesCLI construction."""
+    if sys.platform != 'linux' or not all(hasattr(os, x) for x in (
+            'pidfd_open', 'timerfd_create', 'timerfd_settime')):
+        yield None
+        return  # capability UNBOUND; result effects refuse
+    frontend = _native_birth(os.getpid())
+    left = right = process = guardian_fd = channel = None
+    input_fd = output_fd = None
+    primary = None
+    try:
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        left.setblocking(False); right.setblocking(False)
+        left.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        input_fd = os.dup(0)
+        output_fd = os.dup(1)
+        executable, code_root, launch = _qualified_original_startup()
+        process = subprocess.Popen(
+            [executable, '-I', '-S', '-c', launch, code_root,
+             str(right.fileno()), str(input_fd), str(output_fd),
+             str(frontend['pid']), frontend['birth']],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            pass_fds=(right.fileno(), input_fd, output_fd), close_fds=True,
+            cwd='/', env={'LANG':'C.UTF-8','LC_ALL':'C.UTF-8'})
+        right.close(); right = None
+        fd, input_fd = input_fd, None; os.close(fd)
+        fd, output_fd = output_fd, None; os.close(fd)
+        guardian = _native_birth(process.pid)
+        _need(guardian['ppid'] == frontend['pid'], 'original_product_guardian_child')
+        guardian_fd = os.pidfd_open(process.pid, 0)
+        channel = RetainedOwnerChannel(left, guardian, guardian_fd)
+        end = time.monotonic() + 30
+        hello = channel.receive(end)
+        _need(hello == {'op': 'BOOTSTRAPPED', 'frontend': frontend, 'guardian': guardian},
+              'authenticated_bootstrap_ready')
+        with existing_product_cli_port(channel), original_certificate_reader(NativeCertificateReader(channel)):
+            yield channel
+    except BaseException as failure:
+        primary = failure
+        raise
+    finally:
+        # Separate bootstrap-session teardown, never a renewal/retry of a
+        # delivery operation. All delivery FINISH paths have already joined.
+        cleanup_end = time.monotonic() + 3
+        failures = []
+        shutdown_confirmed=False
+        try:
+            if channel is not None and not channel.closed:
+                ack = channel.exchange({'op':'SHUTDOWN'}, min(cleanup_end,time.monotonic()+1))
+                _need(ack == {'op':'SHUTDOWN_CONFIRMED'}, 'bootstrap_close_unconfirmed')
+                shutdown_confirmed=True
+                channel.closed = True
+        except BaseException as failure:
+            failures.append(failure)
+        for native in (left, right):
+            if native is not None:
+                try:
+                    native.close()
+                except BaseException as failure:
+                    failures.append(failure)
+        for fd in (input_fd, output_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except BaseException as failure:
+                    failures.append(failure)
+        if process is not None:
+            try:
+                process.wait(timeout=max(0, min(1, cleanup_end-time.monotonic())))
+            except subprocess.TimeoutExpired:
+                try:
+                    if shutdown_confirmed:
+                        # Only actual authenticated childless/idle shutdown
+                        # permits exact guardian stop. No owned observer can
+                        # be orphaned by a convenience bootstrap timeout.
+                        _need(guardian_fd is not None,'exact_guardian_stop_handle_unbound')
+                        signal.pidfd_send_signal(guardian_fd,signal.SIGKILL)
+                        process.wait(timeout=max(0,cleanup_end-time.monotonic()))
+                    else:
+                        failures.append(FiniteOwnerUnavailable(
+                            'STOP_UNCONFIRMED_retaining_actual_guardian_child'))
+                        # Original parent keeps direct guardian custody and
+                        # raw-waits; an uninterruptible observer is a red gate,
+                        # never dropped or retried to manufacture hard30 PASS.
+                        process.wait()
+                except BaseException as failure:
+                    failures.append(failure)
+            except BaseException as failure:
+                failures.append(failure)
+        if guardian_fd is not None:
+            try:
+                os.close(guardian_fd)
+            except BaseException as failure:
+                failures.append(failure)
+        if failures:
+            if primary is None:
+                raise FiniteOwnerUnavailable('product_bootstrap_cleanup_unconfirmed') from failures[0]
+            for failure in failures:
+                BaseException.add_note(primary,'Product bootstrap cleanup unconfirmed:'+type(failure).__name__)
+
+if __name__ == '__main__':
+    if len(sys.argv) != 6 or any(not value.isdecimal() for value in sys.argv[1:]):
+        raise SystemExit(2)
+    _guardian_entry(*(int(x) for x in sys.argv[1:5]), sys.argv[5])

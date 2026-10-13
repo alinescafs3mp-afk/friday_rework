@@ -1,0 +1,16 @@
+# C100 delta for the 2026-10-12 daily checkpoint
+
+C100 completed at 20:57:46 Moscow before the 21:00 daily cutoff. Its result is PARTIAL_SOURCE_INCOMPLETE_NOT_ACCEPTED. This new inert archive contains the complete completed50 source/definition/evidence scope: candidate35 Python files plus schema, six control contracts/definitions and eight Source evidence artifacts. The 14 changed files include four new Python files. All38 Python original/public pairs parse statically, preserve definition names/lines, and have exact forward/reverse byte proofs. These are archive checks; candidate code, test functions, imports and live execution were not run.
+
+The previous immutable166-file archive and all18 previously published commits from 546b4058cef42b0ae348ea25444cbab47e6e2f8e through 3f20e289d3806c9f6732ac15975520ac99a224c9 remain the other daily period components. This delta adds C100 without replacing that archive or granting approval to normalized bytes. Original57 C83 and137 C92 package pins, original32/C55/C75 fields and all mandatory thresholds remain represented without semantic acceptance. The guard-stopped, unsealed HF Source attempt is explicitly excluded and gets no future coverage credit.
+
+Six remaining Source causes:
+
+- R1: independent exact BOOTSTRAP and OPAQUE_IMPORT operation intervals and libc mallopt(-8,1) actual entry/return qualification/capture; explicit missing physical reads raise ObservationMissing, never manufactured values
+- R2: intrinsic114 scope supplied; current H991/FD8/C45/C59_28 real producers/reducers/full consumer execution aggregation remain absent. 114 coverage is explicitly not whole mandatory acceptance
+- R3: all66 named branches/fields exist but alias resources need exact semantic classification; FOUR_CUT_AUXILIARY_ZERO requires one12-attempt group (4 phases x3 kinds), current single case changes one actual phase/kind; C55_CURRENT_UNCLOSED_EFFECT/STOP/replay exact causal interval and known still-live resources remain unproven Source wiring
+- R4: Source callable roles and late hook provided; existing CLI main bypasses run_fixed_root_entry control installer. Exact final pinned control-spec encoder/decoder path between existing caller, main and observer is incomplete; no new protocol invented or live binding assumed
+- R5: own detach/terminal cleanup body and original pending signal forwarding provided; complete independent normal/failure target-owner STOP/guardian custody/wait/closure qualification still needs exact full Source review and driver wiring. Detach is not target terminal or capacity release
+- R6: full field-name coverage is structural Source evidence; broad phase-wide alias/once-only/wait selectors need narrower independently observed operation/control intervals. Source incomplete, no old safety transfer
+
+The original G7 failure/no-replay and G8 diagnostic6/retry=false remain unchanged. No new runtime/full physical2sfit, RootGO, capacity release, Source Safety or release acceptance is claimed. Whole independent privacy review on this exact final target manifest is required before publication. The integrator must combine the daily components and verify the actual remote checkpoint; this preparation is not a claim of completed daily upload.

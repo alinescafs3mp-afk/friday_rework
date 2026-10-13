@@ -1,0 +1,675 @@
+"""Independent real Linux ptrace/syscall observer; no simulated producers.
+
+Runs in an ALREADY-EXISTING, separately Source/action admitted outside observer.
+It never launches a process, changes a controller or releases target custody.
+SEIZE/INTERRUPT/RESUME are prospective effects requiring fresh specific RootGO.
+Missing ptrace permission/ABI/source/role/complete coverage is a hard blocker.
+"""
+import ctypes
+import errno
+import hashlib
+import os
+import select
+import signal
+import stat
+import time
+from dataclasses import dataclass
+from pathlib import Path
+import physical_observation_primitives as physical
+import physical_observation_markers as markers
+import physical_admission_qualification as admission
+
+PTRACE_SEIZE=0x4206
+PTRACE_INTERRUPT=0x4207
+PTRACE_SYSCALL=24
+PTRACE_GETREGS=12
+PTRACE_GET_SYSCALL_INFO=0x420e
+PTRACE_GETEVENTMSG=0x4201
+PTRACE_PEEKDATA=2
+PTRACE_DETACH=17
+PTRACE_O_TRACESYSGOOD=1
+PTRACE_O_TRACEFORK=2
+PTRACE_O_TRACEVFORK=4
+PTRACE_O_TRACECLONE=8
+PTRACE_O_TRACEEXEC=16
+PTRACE_O_TRACEEXIT=64
+PTRACE_EVENT_STOP=128
+WALL=0x40000000
+_REGS=('r15','r14','r13','r12','rbp','rbx','r11','r10','r9','r8',
+       'rax','rcx','rdx','rsi','rdi','orig_rax','rip','cs','eflags','rsp',
+       'ss','fs_base','gs_base','ds','es','fs','gs')
+class UserRegs(ctypes.Structure):
+    _fields_=[(name,ctypes.c_ulonglong) for name in _REGS]
+
+_SYSCALLS={0:'read',1:'write',2:'open',3:'close',9:'mmap',11:'munmap',
+    56:'clone',57:'fork',58:'vfork',59:'execve',60:'exit',61:'wait4',
+    72:'fcntl',73:'flock',82:'rename',84:'rmdir',87:'unlink',
+    101:'ptrace',157:'prctl',165:'mount',166:'umount2',186:'gettid',
+    231:'exit_group',257:'openat',263:'unlinkat',267:'readlinkat',
+    275:'splice',292:'dup3',322:'execveat',424:'pidfd_send_signal',
+    434:'pidfd_open',435:'clone3',436:'close_range',437:'openat2',
+    438:'pidfd_getfd'}
+_SEAL=object()
+
+@dataclass(frozen=True)
+class KernelEvent:
+    sequence: int
+    monotonic: float
+    unix: float
+    pid: int
+    birth: str
+    stage: str
+    syscall: int
+    arguments: tuple
+    result: object
+    raw_regs: tuple
+    wait_status: int
+    path: object
+    raw_input: object=None
+    raw_output: object=None
+    fd_before: object=None
+    fd_after: object=None
+    actual_process_sample: object=None
+    actual_wait_targets: tuple=()
+
+@dataclass(frozen=True)
+class MarkerRead:
+    sequence: int
+    pid: int
+    birth: str
+    event: str
+    values: tuple
+    kernel_sequence: int
+
+@dataclass(frozen=True)
+class BoundaryRead:
+    marker_sequence: int
+    pid: int
+    birth: str
+    name: str
+    process: object
+    all_fd_reads: tuple
+    phase_inventory: object
+    original_slot: object
+    ancestry: object
+    protected_reads: tuple
+    gnu_fd_reads: tuple
+    caller_fd_reads: tuple
+    role_lifecycle: tuple=()
+    slot_lifecycle: object=None
+    semantic_read: object=None
+
+class RawRun:
+    """Only the actual local capture loop can produce a completed instance."""
+    __slots__=('observer_pid','observer_birth','registration','case','kernel',
+        'markers','boundaries','complete','stop_reason','started','finished',
+        'counter_resets','known_subjects','terminals','raw_ref','seal','cleanup','birth_reads')
+    def __init__(self,seal,observer,registration,case,kernel,mark,bounds,
+                 complete,stop,started,finished,subjects,terminals,raw_ref,cleanup,birth_reads):
+        physical.need(seal is _SEAL,'RAW_CAPTURE_CONSTRUCTOR_FORBIDDEN')
+        self.observer_pid=observer.pid;self.observer_birth=observer.birth
+        self.registration=registration;self.case=case
+        self.kernel=tuple(kernel);self.markers=tuple(mark);self.boundaries=tuple(bounds)
+        self.complete=complete;self.stop_reason=stop
+        self.started=started;self.finished=finished;self.counter_resets=0
+        self.known_subjects=dict(subjects);self.terminals=tuple(terminals)
+        self.raw_ref=raw_ref;self.seal=seal;self.cleanup=tuple(cleanup);self.birth_reads=dict(birth_reads)
+
+def validate_raw_run(run):
+    physical.need(type(run)is RawRun and run.seal is _SEAL,'ACTUAL_RAW_CAPTURE_OBJECT_REQUIRED')
+    physical.need(run.observer_pid==os.getpid() and
+        physical.process_read(os.getpid()).birth==run.observer_birth,
+        'ACTUAL_INDEPENDENT_OBSERVER_LOCAL_CUSTODY')
+    physical.need(run.complete and run.stop_reason is None,'INCOMPLETE_RAW_COVERAGE_NO_ZERO')
+    physical.need(run.cleanup and all(r['detached_or_terminal'] for r in run.cleanup),
+                  'OBSERVER_ATTACHMENT_CLEANUP_UNCONFIRMED')
+    physical.need(run.counter_resets==0 and run.raw_ref is not None,
+                  'RAW_ORIGIN_OR_SEAL_UNKNOWN')
+    return run
+
+class ActualLinuxObserver:
+    """No launch/fallback. Registration is supplied by the real outer integrator.
+
+    The actual live outside grant object MUST be owned by the existing external
+    admission module and validate this invocation. A JSON/dictionary/bool/ref
+    cannot create it. That separate gate module/capability is explicitly UNBOUND
+    in this Source package; it is not invented or implemented by the fixture.
+    """
+    def __init__(self,registration,actual_external_grant):
+        physical.hard_caps()
+        physical.need(type(registration)is dict,'OUTSIDE_OBSERVER_REGISTRATION_UNBOUND')
+        self.gate_qualification=admission.qualify_external_live_grant(actual_external_grant,registration)
+        self.registration=registration;self.external_grant=actual_external_grant
+        self.observer=physical.process_read(os.getpid())
+        physical.need(self.observer.pid not in registration['subject_pids'],
+                      'EXISTING_INDEPENDENT_OBSERVER_ROLE_REQUIRED')
+        physical.need(registration['original_seconds']==120 and
+            registration['cleanup_seconds']==30 and registration['serial']==1,
+            'ORIGINAL_OBSERVATION_SCOPE')
+        physical.need(registration['event_limit']<=262144 and registration['event_limit']>0,
+                      'FINITE_RAW_EVENT_LIMIT')
+        physical.need(registration['source_safety_ref'] is not None and
+                      registration['specific_action_ref'] is not None,
+                      'SEPARATE_FINAL_SOURCE_AND_FRESH_ACTION_UNBOUND')
+        for pin in registration['complete_current_source_pins']:
+            physical.same_read_source(pin)
+        for pin in registration['exact_abi_pins']:
+            physical.same_read_source(pin)
+        physical.need(registration['machine']=='x86_64' and ctypes.sizeof(UserRegs)==216,
+                      'EXACT_LINUX_X86_64_PTRACE_ABI_UNBOUND')
+        self.lib=ctypes.CDLL(None,use_errno=True)
+        self.lib.ptrace.restype=ctypes.c_long
+        self.lib.ptrace.argtypes=(ctypes.c_uint,ctypes.c_uint,ctypes.c_void_p,ctypes.c_void_p)
+        self.kernel=[];self.marker_reads=[];self.boundaries=[];self.terminals=[]
+        self.birth_reads={};self.subjects={};self.pending={};self.attached=set();self.stopped=set()
+        self.began={};self.ended=set();self.stop_reason=None
+        self.started=(time.monotonic(),time.time())
+        self.finished=None;self.case=None
+        self.original_fd_sets={}
+        self.observational_fds={}
+        self.event_limit=registration['event_limit']
+        self.cleanup=[];self.cleanup_started=False;self.pending_signals={}
+        self.useful_deadline_m=registration['original_final_monotonic']
+        self.useful_deadline_u=registration['original_final_unix']
+        self.deadline_m=registration['original_final_monotonic']
+        self.deadline_u=registration['original_final_unix']
+        physical.need(self.deadline_m-self.started[0]<=120 and
+                      self.deadline_u-self.started[1]<=120,
+                      'OBSERVER_CANNOT_RENEW_COMMON_CLOCK')
+
+    def ptrace(self,request,pid,address=0,data=0):
+        ctypes.set_errno(0)
+        a=ctypes.c_void_p(address)
+        d=ctypes.cast(data,ctypes.c_void_p) if not isinstance(data,int) else ctypes.c_void_p(data)
+        result=self.lib.ptrace(request,pid,a,d)
+        error=ctypes.get_errno()
+        if result==-1 and error:
+            raise OSError(error,os.strerror(error))
+        return result
+
+    def _deadline(self,cleanup=False):
+        m=self.deadline_m if cleanup else self.useful_deadline_m
+        u=self.deadline_u if cleanup else self.useful_deadline_u
+        physical.need(time.monotonic()<m and time.time()<u,'ORIGINAL_RAW_OBSERVATION_DEADLINE')
+        physical.need(len(self.kernel)<self.event_limit,'RAW_EVENT_LIMIT_STOP_NO_ZERO')
+
+    def _register_subject(self,pid,role,expected_birth):
+        row=physical.process_read(pid)
+        physical.need(row.birth==str(expected_birth),'ACTUAL_SUBJECT_BIRTH_MISMATCH')
+        physical.need(row.uids==(os.getuid(),)*4,'ACTUAL_SUBJECT_UID')
+        physical.need(pid not in self.subjects,'SUBJECT_DOUBLE_REGISTRATION')
+        self.subjects[pid]=(row.birth,role);self.birth_reads[pid]=row
+        self.original_fd_sets[pid]=tuple(physical.all_remote_fds(row))
+        self.observational_fds[pid]=set()
+        return row
+
+    def attach_before_first_bind(self,case):
+        physical.need(self.case is None,'RAW_SESSION_REUSE_OR_RESET_FORBIDDEN')
+        self.external_grant.validate_exact_control(case,self.registration)
+        self.case=case
+        roles=self.registration['subjects']
+        physical.need(set(roles)=={'original_caller','actual_GNU','current_Root'},
+                      'ALL_ORIGINAL_CALLER_GNU_ROOT_ROLES_UNBOUND')
+        ancestry=physical.ancestry_read(
+            roles['original_caller']['pid'],roles['actual_GNU']['pid'],
+            roles['current_Root']['pid'],self.registration['gnu_pin'])
+        physical.need(ancestry[2].tracer in (0,self.observer.pid),'SUBJECT_FOREIGN_TRACER')
+        options=(PTRACE_O_TRACESYSGOOD|PTRACE_O_TRACEFORK|PTRACE_O_TRACEVFORK|
+                 PTRACE_O_TRACECLONE|PTRACE_O_TRACEEXEC|PTRACE_O_TRACEEXIT)
+        # All original resources/pre-existing envelope roles are already owned.
+        # No GNU/root/actor launch is performed by this observer.
+        try:
+            for role,row in roles.items():
+                self._deadline()
+                self._register_subject(row['pid'],role,row['birth'])
+                self.ptrace(PTRACE_SEIZE,row['pid'],0,options)
+                self.attached.add(row['pid'])
+                self.ptrace(PTRACE_INTERRUPT,row['pid'])
+            while self.stopped!=self.attached:
+                pid,status=self._wait()
+                physical.need(pid in self.attached and os.WIFSTOPPED(status),
+                              'INITIAL_PTRACE_STOP_UNCONFIRMED')
+                self.stopped.add(pid)
+            # Raw observation is active before ANY subject is resumed.
+            for pid in sorted(self.attached):
+                self.ptrace(PTRACE_SYSCALL,pid)
+                self.stopped.discard(pid)
+        except BaseException as error:
+            self.stop_reason='ATTACH_OR_INITIAL_STOP:'+type(error).__name__
+            self._settle_attachments(False)
+            raise
+        return ancestry
+
+    def _wait(self):
+        # Finite raw-event loop, no model/native-peer polling or new watcher.
+        # The real already-existing observer role owns the original GNU clock.
+        while True:
+            self._deadline()
+            for expected_pid in sorted(self.attached):
+                pid,status=os.waitpid(expected_pid,WALL|os.WNOHANG)
+                if pid:return pid,status
+            left=min(self.deadline_m-time.monotonic(),self.deadline_u-time.time(),0.002)
+            physical.need(left>0,'RAW_WAIT_ORIGINAL_DEADLINE')
+            select.select([],[],[],left)
+
+    def _regs(self,pid):
+        registers=UserRegs()
+        self.ptrace(PTRACE_GETREGS,pid,0,ctypes.byref(registers))
+        return registers
+
+    def _cstring(self,pid,address,maximum=4096):
+        physical.need(address>0,'KERNEL_SYSCALL_PATH_POINTER')
+        result=bytearray()
+        for offset in range(0,maximum,ctypes.sizeof(ctypes.c_long)):
+            word=self.ptrace(PTRACE_PEEKDATA,pid,address+offset)
+            b=(word&((1<<64)-1)).to_bytes(8,'little')
+            result.extend(b)
+            if 0 in b:
+                return bytes(result).split(b'\0',1)[0].decode('utf-8','strict')
+        raise physical.ObservationMissing('KERNEL_PATH_BOUND_EXCEEDED')
+
+    def _bytes(self,pid,address,size,maximum=1048576):
+        physical.need(type(size)is int and 0<=size<=maximum and (size==0 or address>0),
+                      'RAW_MEMORY_SIZE_OR_ADDRESS')
+        result=bytearray()
+        for offset in range(0,size,8):
+            word=self.ptrace(PTRACE_PEEKDATA,pid,address+offset)
+            result.extend((word&((1<<64)-1)).to_bytes(8,'little'))
+        return bytes(result[:size])
+
+    def _fd_at_entry(self,pid,nr,args):
+        if nr==435:
+            raw=self._bytes(pid,args[0],min(args[1],88),88)
+            if len(raw)>=88 and int.from_bytes(raw[:8],'little')&(1<<33):
+                return physical.fd_read(physical.process_read(pid),int.from_bytes(raw[80:88],'little'))
+            return None
+        if nr not in (0,1,3,5,72,73,74,75,77,78,138,217,275,292,438):return None
+        if args[0]<=2:return None
+        try:return physical.fd_read(physical.process_read(pid),args[0])
+        except FileNotFoundError:return {'fd':args[0],'state':'ABSENT_BEFORE_SYSCALL'}
+
+    def _process_sample(self,pid,nr,fd_before=None):
+        if nr not in (0,56,57,58,61,435):return None
+        if nr==0 and not (type(fd_before)is physical.FDRead and
+                fd_before.link.startswith('/sys/fs/cgroup/')):return None
+        process=physical.process_read(pid)
+        raw=(Path('/proc')/str(pid)/'cgroup').read_text()
+        rows=[r[3:] for r in raw.splitlines() if r.startswith('0::')]
+        physical.need(len(rows)==1,'RAW_SUBJECT_ACTUAL_CGROUP')
+        path=Path('/sys/fs/cgroup')/rows[0].lstrip('/')
+        q=path.stat()
+        controllers=tuple((name,(path/name).read_text()) for name in
+            ('memory.max','memory.swap.max','pids.max','cpu.max','pids.current','pids.events'))
+        return {'process':process,'cgroup_raw':raw,'group_path':str(path),
+                'group_identity':(q.st_dev,q.st_ino),'controllers':controllers}
+
+    def _wait_targets(self,pid,nr,args):
+        if nr!=61:return ()
+        parent=physical.process_read(pid)
+        nspid=[line.split()[1:] for line in parent.status_raw.splitlines() if line.startswith('NSpid:')]
+        physical.need(len(nspid)==1,'ACTUAL_WAIT_PARENT_PIDNS')
+        level=len(nspid[0])-1;wanted=ctypes.c_longlong(args[0]).value;result=[]
+        for target,birthrow in self.birth_reads.items():
+            if target==pid:continue
+            rows=[line.split()[1:] for line in birthrow.status_raw.splitlines() if line.startswith('NSpid:')]
+            if not rows or len(rows[0])<=level or wanted>0 and int(rows[0][level])!=wanted:continue
+            present=physical.exact_presence_read(target,birthrow.birth)
+            if present.same_birth:
+                child=physical.process_read(target,allow_terminal=True)
+                if child.ppid==pid:result.append(child)
+        return tuple(result)
+
+    def _input_bytes(self,pid,nr,args):
+        if nr in (1,18) and args[2]<=65536:return self._bytes(pid,args[1],args[2],65536)
+        if nr==435 and args[1]<=256:return self._bytes(pid,args[0],args[1],256)
+        if nr in (223,286):return self._bytes(pid,args[2],32,32)
+        return None
+
+    def _output_bytes(self,pid,entry,result):
+        args=entry.arguments;nr=entry.syscall
+        if result<0:return None
+        if nr in (0,17,217) and result<=65536:return self._bytes(pid,args[1],result,65536)
+        if nr==61 and result>0 and args[1]:return self._bytes(pid,args[1],4,4)
+        if nr==5 and result==0:return self._bytes(pid,args[1],144,144)
+        if nr in (137,138) and result==0:return self._bytes(pid,args[1],120,120)
+        if nr==262 and result==0:return self._bytes(pid,args[2],144,144)
+        return None
+
+    def _syscall_path(self,pid,nr,args):
+        if nr in (2,59,82,84,87,89,137,165,166):
+            return self._cstring(pid,args[0])
+        if nr in (257,263,267,322,437):
+            return self._cstring(pid,args[1])
+        return None
+
+    def _protected(self):
+        result=[]
+        for row in self.registration['protected_writers']:
+            process=physical.process_read(row['pid'])
+            physical.need(process.birth==str(row['birth']),'PROTECTED_WRITER_ACTUAL_BIRTH')
+            result.append((process.pid,process.birth,process.ppid,process.pgid,process.sid,
+                process.uids,process.gids,(Path('/proc')/str(process.pid)/'cgroup').read_text()))
+        for group in self.registration['protected_groups']:
+            directory=Path(group['path']);q=directory.lstat()
+            controllers=tuple((name,(directory/name).read_text())
+                for name in ('memory.max','memory.swap.max','pids.max','cpu.max'))
+            result.append((str(directory),q.st_dev,q.st_ino,controllers))
+        return tuple(result)
+
+    def _boundary(self,pid,name,marker_sequence,semantic_read=None):
+        process=physical.process_read(pid)
+        roles=self.registration['subjects']
+        lifecycle=tuple((role,physical.exact_presence_read(row['pid'],row['birth']))
+                        for role,row in roles.items())
+        terminal=name in ('attempt_end','original_caller_terminal','caller_closed',
+                         'phase_closed','batch_closed','owned_wait_complete') or (
+                         semantic_read is not None and semantic_read['kind'] in (4,5,12,15))
+        caller=physical.process_read(roles['original_caller']['pid'])
+        physical.need(caller.birth==str(roles['original_caller']['birth']),
+                      'ORIGINAL_CALLER_BIRTH_AT_BOUNDARY')
+        ancestry=()
+        if all(read.same_birth and read.state not in ('Z','X') for _,read in lifecycle):
+            ancestry=physical.ancestry_read(caller.pid,roles['actual_GNU']['pid'],
+                roles['current_Root']['pid'],self.registration['gnu_pin'])
+        else:
+            physical.need(terminal,'PRETERMINAL_ANCESTRY_DISAPPEARED')
+        caller_fds=physical.all_remote_fds(caller)
+        slot_fd=self.registration['original_slot_fd']
+        slot_rows=[r for r in caller_fds if r.fd==slot_fd]
+        slot=None;slot_lifecycle={'fd':slot_fd,'state':'UNKNOWN','closed_syscalls':()}
+        if slot_rows:
+            slot=physical.original_slot_read(caller,slot_fd,
+                self.registration['original_slot_identity'],
+                self.registration['original_slot_lock_owner_pid'])
+            slot_lifecycle={'fd':slot_fd,'state':'LIVE_ORIGINAL_FLOCK','closed_syscalls':()}
+        else:
+            closes=tuple(e.sequence for e in self.kernel if e.pid==caller.pid
+                and e.birth==caller.birth and e.stage=='exit' and e.syscall==3
+                and e.arguments[0]==slot_fd and e.result==0)
+            physical.need(terminal and self.case.kind=='positive' and len(closes)==1,
+                          'ORIGINAL_SLOT_UNEXPLAINED_ABSENCE')
+            slot_lifecycle={'fd':slot_fd,'state':'CLOSED_ONCE_OBSERVED','closed_syscalls':closes}
+        # Only original subjects have the current23 phase declarations.
+        phases=None
+        if pid in (self.case.caller_pid,self.case.root_pid):
+            phases=physical.phase_inventory_read(process,self.case.phase_caps_for_pid(pid),
+                allow_known_closed=(terminal and self.case.kind=='positive') or
+                    (self.case.kind=='stop' and name in ('STOP','refusal','attempt_end','semantic_read')))
+            if terminal and self.case.kind=='positive':
+                for phase in phases['phases']:
+                    for fd in phase['missing_declared_fds']:
+                        closed=[e for e in self.kernel if e.pid==pid and e.birth==process.birth
+                            and e.stage=='exit' and e.syscall==3 and e.arguments[0]==fd and e.result==0]
+                        physical.need(closed,'TERMINAL_FD_ABSENCE_WITHOUT_ACTUAL_CLOSE')
+        gnu_fds=()
+        gnu_presence=dict(lifecycle)['actual_GNU']
+        if gnu_presence.same_birth and gnu_presence.state not in ('Z','X'):
+            gnu_fds=physical.all_remote_fds(physical.process_read(gnu_presence.pid))
+        self.boundaries.append(BoundaryRead(marker_sequence,pid,process.birth,name,
+            process,physical.all_remote_fds(process),phases,slot,ancestry,
+            self._protected(),gnu_fds,caller_fds,lifecycle,slot_lifecycle,semantic_read))
+
+    def _marker(self,event):
+        args=event.arguments
+        physical.need(args[1]==self.registration['session_word'],'FOREIGN_RAW_SESSION_MARKER')
+        names={v:k for k,v in markers.EVENTS.items()}
+        physical.need(args[2] in names,'UNKNOWN_SOURCE_MARKER_STOP')
+        name=names[args[2]]
+        marker=MarkerRead(len(self.marker_reads)+1,event.pid,event.birth,
+                          name,args[3:],event.sequence)
+        self.marker_reads.append(marker)
+        if name=='semantic_read':
+            import json
+            raw=self._bytes(event.pid,args[3],args[4])
+            state=json.loads(raw)
+            physical.need(type(state)is dict,'ACTUAL_CONSUMER_STATE_SHAPE')
+            self._boundary(event.pid,name,marker.sequence,
+                           {'kind':args[5],'bytes':raw,'state':state})
+        if name=='attempt_begin':
+            physical.need(event.pid not in self.began,'COUNTER_RESTART_FORBIDDEN')
+            self.began[event.pid]=event.sequence
+        else:
+            physical.need(event.pid in self.began,'EVENT_BEFORE_ACTUAL_RAW_ORIGIN')
+        if name=='attempt_end':
+            physical.need(event.pid not in self.ended,'DUPLICATE_ATTEMPT_END')
+            self.ended.add(event.pid)
+        if name in ('attempt_begin','caller_prepare','Root_entry',
+                    'whole_preflight_complete','refusal','STOP','attempt_end',
+                    'auxiliary_consumer','original_caller_terminal','caller_closed',
+                    'phase_closed','batch_closed','owned_wait_complete'):
+            self._boundary(event.pid,name,marker.sequence)
+
+    def _observational_open(self,event,fd):
+        # Every exception to a target-close count is independently tied to an
+        # actual successful O_RDONLY source/proc/controller open and its live
+        # kernel FD. Arbitrary FDs are never silently excluded or adopted.
+        if event.syscall not in (2,257):return
+        flags=event.arguments[1] if event.syscall==2 else event.arguments[2]
+        if flags&os.O_ACCMODE!=os.O_RDONLY or flags&(os.O_CREAT|os.O_TRUNC):return
+        paths={p['path'] for p in self.registration['complete_current_source_pins']}
+        p=event.path
+        subjects=set(self.subjects)
+        proc=any(p and p.startswith('/proc/'+str(i)+'/') for i in subjects)
+        proc=proc or (p and p.startswith('/proc/self/'))
+        controllers=any(p and p.startswith(row['path']+'/') and
+            Path(p).name in ('memory.max','memory.swap.max','pids.max','cpu.max',
+                             'cgroup.events','cgroup.procs','pids.current')
+            for row in self.registration['admitted_groups'])
+        if p in paths or proc or controllers:
+            actual=physical.fd_read(physical.process_read(event.pid),fd)
+            self.observational_fds[event.pid].add((fd,actual.identity))
+
+    def capture_until_exact_end(self):
+        physical.need(self.case is not None,'CAPTURE_NOT_ATTACHED')
+        complete=False
+        try:
+            while True:
+                pid,status=self._wait()
+                physical.need(pid in self.subjects,'UNKNOWN_WAITED_OR_ADOPTED_SUBJECT_STOP')
+                birth,role=self.subjects[pid]
+                if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                    self.terminals.append((pid,birth,status,time.monotonic(),time.time()))
+                    self.attached.discard(pid)
+                    physical.need(pid in self.ended or role not in
+                        ('original_caller','current_Root'),'SUBJECT_EXIT_WITHOUT_FINAL_RAW_BOUNDARY')
+                    if self.registration['required_attempt_pids']<=self.ended:
+                        complete=True;break
+                    continue
+                physical.need(os.WIFSTOPPED(status),'UNKNOWN_PTRACE_WAIT_STATUS')
+                self.stopped.add(pid)
+                event_number=status>>16;sig=os.WSTOPSIG(status)
+                if event_number in (1,2,3):
+                    child=ctypes.c_ulonglong()
+                    self.ptrace(PTRACE_GETEVENTMSG,pid,0,ctypes.byref(child))
+                    # An observed real birth cannot become zero. Exact attribution
+                    # to the current canonical subject operation is mandatory.
+                    row=physical.process_read(int(child.value))
+                    self.subjects[row.pid]=(row.birth,'owned_descendant');self.birth_reads[row.pid]=row
+                    self.original_fd_sets[row.pid]=()
+                    self.observational_fds[row.pid]=set()
+                    self.attached.add(row.pid)
+                    if pid in self.began:self.began[row.pid]=self.began[pid]
+                    self.kernel.append(KernelEvent(len(self.kernel)+1,time.monotonic(),
+                        time.time(),pid,birth,'actual_birth',-1,(row.pid,),row.birth,(),status,None))
+                elif sig==signal.SIGTRAP|0x80:
+                    info=ctypes.create_string_buffer(88)
+                    got=self.ptrace(PTRACE_GET_SYSCALL_INFO,pid,88,ctypes.byref(info))
+                    physical.need(got>=24,'ACTUAL_SYSCALL_INFO_INCOMPLETE')
+                    op=info.raw[0]
+                    arch=int.from_bytes(info.raw[4:8],'little')
+                    physical.need(arch==0xc000003e and op in (1,2),'ACTUAL_SYSCALL_ENTRY_EXIT_OR_ARCH_UNKNOWN')
+                    regs=self._regs(pid)
+                    values=tuple(getattr(regs,name) for name in _REGS)
+                    args=(regs.rdi,regs.rsi,regs.rdx,regs.r10,regs.r8,regs.r9)
+                    if op==1:
+                        physical.need(pid not in self.pending,'SYSCALL_ENTRY_REPLAY')
+                        path=self._syscall_path(pid,regs.orig_rax,args)
+                        event=KernelEvent(len(self.kernel)+1,time.monotonic(),time.time(),
+                            pid,birth,'entry',regs.orig_rax,args,None,values,status,path,
+                            self._input_bytes(pid,regs.orig_rax,args),None,
+                            self._fd_at_entry(pid,regs.orig_rax,args),None,None,
+                            self._wait_targets(pid,regs.orig_rax,args))
+                        self.pending[pid]=event
+                        self.kernel.append(event)
+                        if regs.orig_rax==markers.SYS_GETTID and args[0]==markers.MAGIC:
+                            self._marker(event)
+                    else:
+                        if pid not in self.pending:
+                            physical.need(pid not in self.began,'SYSCALL_EXIT_WITHOUT_ENTRY_AFTER_ORIGIN')
+                            self.kernel.append(KernelEvent(len(self.kernel)+1,time.monotonic(),time.time(),pid,birth,'pre_origin_unpaired_exit',regs.orig_rax,args,ctypes.c_longlong(regs.rax).value,values,status,None))
+                            self.ptrace(PTRACE_SYSCALL,pid);self.stopped.discard(pid);continue
+                        entry=self.pending.pop(pid)
+                        returned=ctypes.c_longlong(regs.rax).value
+                        event=KernelEvent(len(self.kernel)+1,time.monotonic(),time.time(),
+                            pid,birth,'exit',entry.syscall,entry.arguments,returned,values,status,entry.path,
+                            entry.raw_input,self._output_bytes(pid,entry,returned),entry.fd_before,
+                            physical.fd_read(physical.process_read(pid),returned)
+                            if entry.syscall in (2,257,434,283,41,32,292) and returned>2 else None,
+                            self._process_sample(pid,entry.syscall,entry.fd_before),entry.actual_wait_targets)
+                        self.kernel.append(event)
+                        if entry.syscall in (2,257) and returned>=0:
+                            self._observational_open(entry,returned)
+                        if entry.syscall==3 and returned==0:
+                            self.observational_fds[pid]={r for r in self.observational_fds[pid]
+                                                       if r[0]!=entry.arguments[0]}
+                elif event_number in (4,6,PTRACE_EVENT_STOP):
+                    # exec/exit kernel event or inherited seize stop is recorded;
+                    # no candidate-provided exit success is substituted.
+                    self.kernel.append(KernelEvent(len(self.kernel)+1,time.monotonic(),
+                        time.time(),pid,birth,'ptrace_event',-1,(event_number,),None,(),status,None))
+                else:
+                    # Do not swallow or manufacture real signals. Unknown signals
+                    # invalidate complete zero/normal credit and leave exact custody.
+                    self.pending_signals[pid]=sig
+                    physical.need(sig in self.registration['admitted_original_signals'],
+                                  'UNEXPECTED_TRACED_SIGNAL:'+str(sig))
+                    self.kernel.append(KernelEvent(len(self.kernel)+1,time.monotonic(),time.time(),pid,birth,'actual_signal',-1,(sig,),None,(),status,None))
+                    self.ptrace(PTRACE_SYSCALL,pid,0,sig)
+                    self.pending_signals.pop(pid,None)
+                    self.stopped.discard(pid)
+                    continue
+                if self.registration['required_attempt_pids']<=self.ended and not any(
+                    p in self.pending and self.pending[p].syscall==markers.SYS_GETTID
+                    for p in self.registration['required_attempt_pids']):
+                    complete=True;break
+                self.ptrace(PTRACE_SYSCALL,pid)
+                self.stopped.discard(pid)
+        except BaseException as error:
+            self.stop_reason=type(error).__name__+':'+str(error)
+        self._settle_attachments(complete and self.stop_reason is None)
+        complete=complete and all(r['detached_or_terminal'] for r in self.cleanup)
+        self.finished=(time.monotonic(),time.time())
+        # Every exit path has a concrete original-clock detach/terminal ledger.
+        # Detach grants no target cleanup, wait, normal closure or capacity credit.
+        return self._seal(complete)
+
+    def _settle_attachments(self,normal):
+        if self.cleanup_started:return tuple(self.cleanup)
+        self.cleanup_started=True
+        # Exact own SEIZE custody only. No foreign subject, pid guessing, kill,
+        # second envelope or close of an original target capability.
+        for pid in tuple(sorted(self.attached)):
+            birth,role=self.subjects[pid]
+            row={'pid':pid,'birth':birth,'role':role,'normal':normal,
+                 'detached_or_terminal':False,'target_custody':'OWNER_RETAINS',
+                 'effects':[],'error':None}
+            self.cleanup.append(row)
+            try:
+                self._deadline(cleanup=True)
+                present=physical.exact_presence_read(pid,birth)
+                if not present.same_birth:
+                    physical.need(any(t[0]==pid and t[1]==birth for t in self.terminals),
+                                  'TRACE_TARGET_LOST_WITHOUT_RAW_TERMINAL')
+                    row['detached_or_terminal']=True;row['effects'].append('RAW_TERMINAL_ABSENCE')
+                    self.attached.discard(pid);continue
+                if pid not in self.stopped:
+                    self.ptrace(PTRACE_INTERRUPT,pid);row['effects'].append('INTERRUPT_OWN_SEIZE')
+                    while pid not in self.stopped:
+                        self._deadline(cleanup=True)
+                        got,status=os.waitpid(pid,WALL|os.WNOHANG)
+                        if not got:
+                            select.select([],[],[],min(0.002,self.deadline_m-time.monotonic()))
+                            continue
+                        if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                            self.terminals.append((pid,birth,status,time.monotonic(),time.time()))
+                            self.attached.discard(pid);row['detached_or_terminal']=True
+                            row['effects'].append('RAW_TERMINAL_WAIT');break
+                        physical.need(os.WIFSTOPPED(status),'CLEANUP_RAW_STOP_UNKNOWN')
+                        self.stopped.add(pid)
+                        observed_signal=os.WSTOPSIG(status)
+                        if status>>16==0 and observed_signal not in (signal.SIGTRAP,signal.SIGTRAP|0x80):
+                            self.pending_signals[pid]=observed_signal
+                if row['detached_or_terminal']:continue
+                now=physical.process_read(pid,allow_terminal=True)
+                physical.need(now.birth==birth and now.tracer==self.observer.pid,
+                              'CLEANUP_OWN_EXACT_TRACER_CUSTODY')
+                # Let the original GNU timer and real owner STOP/finally paths run.
+                # Markers fail closed once the tracer disappears. No synthetic
+                # target terminal/close or suppressed original signal is credited.
+                original_signal=self.pending_signals.pop(pid,0)
+                self.ptrace(PTRACE_DETACH,pid,0,original_signal)
+                row['effects'].append({'DETACH_OWN_SEIZE':True,'forwarded_original_signal':original_signal})
+                self.attached.discard(pid);self.stopped.discard(pid)
+                after=physical.exact_presence_read(pid,birth)
+                if after.same_birth:
+                    final=physical.process_read(pid,allow_terminal=True)
+                    physical.need(final.tracer!=self.observer.pid and final.state!='t',
+                                  'CLEANUP_PTRACE_STOP_REMAINS')
+                    row['after_state']=final.state
+                else:row['after_state']='EXACT_BIRTH_ABSENT'
+                row['detached_or_terminal']=True
+            except BaseException as error:
+                row['error']=type(error).__name__+':'+str(error)
+                self.stop_reason=self.stop_reason or 'OBSERVER_CLEANUP_UNCONFIRMED'
+        return tuple(self.cleanup)
+
+    def _seal(self,complete):
+        import dataclasses
+        import json
+        parent=self.registration['raw_output_parent_capability']
+        observer=physical.process_read(os.getpid())
+        physical.need(parent['policy']=={'uid':os.getuid(),'gid':os.getgid(),'mode':0o700},
+                      'RAW_PRIVATE_PARENT_DECLARATION')
+        q=os.fstat(parent['fd']);physical.need(stat.S_ISDIR(q.st_mode) and
+            [q.st_dev,q.st_ino]==parent['identity'] and
+            (q.st_uid,q.st_gid,stat.S_IMODE(q.st_mode))==(os.getuid(),os.getgid(),0o700),
+            'RAW_PRIVATE_PARENT_ACTUAL_IDENTITY_POLICY')
+        physical.need(os.readlink('/proc/self/fd/'+str(parent['fd']))==parent['path'],
+                      'RAW_PRIVATE_PARENT_ACTUAL_PATH')
+        # JSON is the output of independently owned real capture, not an input
+        # granting observation/admission. RawRun's live origin is retained.
+        document={'schema':'C92.independent.raw.syscall.and.boundary.v1',
+            'observer':dataclasses.asdict(observer),'source_pins':self.registration['complete_current_source_pins'],
+            'kernel':[dataclasses.asdict(r) for r in self.kernel],
+            'markers':[dataclasses.asdict(r) for r in self.marker_reads],
+            'boundaries':[dataclasses.asdict(r) for r in self.boundaries],
+            'terminals':self.terminals,'complete':complete,'stop_reason':self.stop_reason,
+            'started':self.started,'finished':self.finished,'counter_resets':0,
+            'actual_subject_birth_reads':{p:dataclasses.asdict(r) for p,r in self.birth_reads.items()},
+            'observer_cleanup':self.cleanup,'remaining_own_attachments':sorted(self.attached)}
+        # Encode captured cmdline bytes explicitly; never invent a textual origin.
+        def bytes_only(value):
+            if isinstance(value,bytes):return {'raw_bytes_hex':value.hex()}
+            raise TypeError(type(value).__name__)
+        raw=json.dumps(document,sort_keys=True,separators=(',',':'),
+                       default=bytes_only,allow_nan=False).encode()
+        physical.need(len(raw)<=67108864,'RAW_EVIDENCE_FS_BOUND')
+        name=self.registration['raw_component']
+        physical.need(type(name)is str and name and '/' not in name and name not in ('.','..'),
+                      'RAW_COMPONENT')
+        fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400,dir_fd=parent['fd'])
+        try:
+            physical.need(os.fstat(fd).st_nlink==1,'RAW_EXCLUSIVE_NLINK')
+            view=memoryview(raw)
+            while view:
+                n=os.write(fd,view);physical.need(n>0,'RAW_WRITE_PROGRESS');view=view[n:]
+            os.fsync(fd)
+        finally:
+            # Observer-owned evidence fd only; subject/original custody untouched.
+            os.close(fd)
+        os.fsync(parent['fd'])
+        ref={'path':str(Path(parent['path'])/name),'bytes':len(raw),
+             'sha256':hashlib.sha256(raw).hexdigest()}
+        return RawRun(_SEAL,self.observer,self.registration,self.case,
+            self.kernel,self.marker_reads,self.boundaries,complete,self.stop_reason,
+            self.started,self.finished,self.subjects,self.terminals,ref,self.cleanup,self.birth_reads)

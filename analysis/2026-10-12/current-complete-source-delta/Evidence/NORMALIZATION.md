@@ -1,0 +1,11 @@
+# Archive normalization and qualification
+
+This archive is an inert derivative. Source Safety/execution conclusions apply only to their exact original private snapshots and do not transfer to these normalized public bytes. Current Source150 has exact original/public SHA and byte counts in COMPLETE-SOURCE-INDEX.json.
+
+Every explicit private workspace/runtime or UID-specific endpoint is replaced by a qualified archive symbol. Source/comment literals and metadata references retain exact reverse byte proofs and line numbers. JSON qualification maps also qualify complete decoded private route strings, including spaces and Unicode. Upstream contributor names/contacts in logical resource/module identifiers are reversible anonymous references. No original input SHA, byte count, parent SHA, resource/module cardinality or control declaration is redefined. Ordinary API/control identifiers and upstream public code URLs remain source semantics.
+
+All mandatory upstream copyright/license/attribution texts remain byte-exact. Current24863 input pins preserve original hermes17655/project134/stdlib687/site6387 accounting; current maps preserve7643 modules/82 namespaces and123 ELF metadata. Dependency binaries and unrelated installed files are not distributed. These paths/symbols supply no runtime authority.
+
+Private qualification dictionaries, per-site offsets/context and inverse byte proofs remain private. Author controls prove exact forward/reverse reconstruction for all150 current Source artifacts, whole private paths with spaces/Unicode, personal logical identifiers, preservation of generic upstream loopback examples, refusal of unknown private routes and placeholder collisions, and rejection of a changed reconstruction symbol. These are Source archive checks, not product tests or independent privacy acceptance.
+
+Earlier route-only derivatives and the first scan that exposed contributor contacts remain private superseded snapshots. The final package was corrected coherently before handoff. Original late/failed/unknown helper history, current Source failures and all original clocks/stops remain intact. The integrator still needs independent whole-final privacy review on the exact final manifest before Git effects.
