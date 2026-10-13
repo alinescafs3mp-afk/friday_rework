@@ -1,0 +1,479 @@
+"""Bounded presentation through the retained native prompt, never proxy.write.
+
+The existing patch_stdout context alone owns global stdout/stderr. This module
+does not replace them, unwrap user writers, enqueue document text, add a thread,
+or invoke stock run_in_terminal's synchronous physical flush. Source candidate:
+independent final Safety and genuine installed qualification are still required.
+"""
+import asyncio
+import concurrent.futures
+from contextlib import contextmanager
+import hashlib
+import io
+import math
+import os
+import queue
+import stat
+import sys
+import threading
+import time
+
+CONTROL_LIMIT = 4096
+CLEANUP_RESERVE = .25
+UPSTREAM_SHA256 = {
+    'rich.console': '76828d8b804b48a642b7a45afba0178902be15a5802feedf0a51b664ee70eee4',
+    'prompt_toolkit.patch_stdout': '11454775067ba507f2c97e26f043e87e11ea15f30bf01d8baae8c47fa76dce67',
+    'prompt_toolkit.application.current': '232666329cce5842121bfa34e818f6bf381d0d3c48eee0109db4c71491ae2f4b',
+    'prompt_toolkit.application.application': '8938ef0a32a3b4fb2ce3f2fc31889d0451502ee99f1cb82b9054121aa1383b77',
+    'prompt_toolkit.output.vt100': '6bfbecc32bf4c34032599a08e4ed9ad77cbdab4163ddcc5d2b6c2ac22db34b45',
+    'prompt_toolkit.output.flush_stdout': '250f40714b21f662563f5149c71141d368aa209d8817a8156ee5a136007c0223',
+    'prompt_toolkit.renderer': '878afb6d285a9d0caf87d9eb4907f1bc76543d3e993d41f5903e4d6debb64706',
+}
+
+
+class PromptUnsupported(ValueError):
+    """An unknown binding cannot acquire a document presentation capability."""
+
+
+class PromptCleanupUnconfirmed(RuntimeError):
+    """Retain the exact pending callback; expire frontend, never clean-ACK."""
+
+
+def _verify_upstream():
+    # Pins qualify the selected source contract, not live code/whole imports.
+    # Root must additionally qualify actual loaded classes and native topology.
+    for name, expected in UPSTREAM_SHA256.items():
+        module = sys.modules.get(name)
+        path = getattr(module, '__file__', None)
+        if type(path) is not str:
+            raise PromptUnsupported('prompt_source_missing')
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 131072:
+                raise PromptUnsupported('prompt_source_not_bounded')
+            data = os.read(fd, before.st_size + 1)
+            after = os.fstat(fd)
+            if (len(data) != before.st_size
+                    or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                    != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                    or hashlib.sha256(data).hexdigest() != expected):
+                raise PromptUnsupported('prompt_source_changed')
+        finally:
+            os.close(fd)
+
+
+def _exact_controls(binding, ending):
+    """Capture only audited constant VT100 controls into exact C StringIO.
+
+    No original output method or physical synchronous flush is called.
+    No layout callbacks, after_render, arbitrary writer, get_size or CPR wait.
+    Renderer.reset has the pinned fixed control-only body; normal rendering
+    resumes through the original application's existing invalidate mechanism.
+    """
+    from prompt_toolkit.output.vt100 import Vt100_Output
+    from prompt_toolkit.renderer import Renderer
+    from prompt_toolkit.data_structures import Point
+    original = binding.renderer.output
+    if (type(original) is not Vt100_Output
+            or type(binding.renderer) is not Renderer
+            or original is not binding.renderer_output
+            or original.stdout is not binding.owner.stream
+            or type(original._cursor_shape_changed) is not bool
+            or (original._cursor_visible is not None and type(original._cursor_visible) is not bool)
+            or any(type(getattr(binding.renderer, name, None)) is not bool
+                   for name in ('_in_alternate_screen', '_mouse_support_enabled', '_bracketed_paste_enabled'))):
+        raise PromptUnsupported('prompt_renderer_contract_changed')
+    captured = object.__new__(Vt100_Output)
+    captured._buffer = []
+    captured.stdout = io.StringIO()
+    captured._cursor_shape_changed = original._cursor_shape_changed
+    captured._cursor_visible = original._cursor_visible
+    try:
+        if ending:
+            binding.renderer.output = captured
+            try:
+                # This body only resets renderer bookkeeping and emits the
+                # pinned bounded control methods to the memory-only output.
+                Renderer.reset(binding.renderer)
+            finally:
+                binding.renderer.output = original
+        else:
+            position = binding.renderer._cursor_pos
+            if (type(position) is not Point or type(position.x) is not int or type(position.y) is not int
+                    or not 0 <= position.x <= 4096 or not 0 <= position.y <= 4096):
+                raise PromptUnsupported('prompt_cursor_out_of_contract')
+            Vt100_Output.cursor_backward(captured, position.x)
+            Vt100_Output.cursor_up(captured, position.y)
+            Vt100_Output.erase_down(captured)
+            Vt100_Output.reset_attributes(captured)
+            Vt100_Output.enable_autowrap(captured)
+            Vt100_Output.flush(captured)
+        text = captured.stdout.getvalue()
+        if len(text) > CONTROL_LIMIT:
+            raise PromptUnsupported('prompt_controls_over_limit')
+        data = text.encode('ascii')
+        if len(data) > CONTROL_LIMIT:
+            raise PromptUnsupported('prompt_controls_over_limit')
+        original._cursor_shape_changed = captured._cursor_shape_changed
+        original._cursor_visible = captured._cursor_visible
+        return data
+    finally:
+        captured.stdout.close()
+
+
+class _Operation:
+    """One opaque operation, owned by the existing caller and native frontend."""
+    def __init__(self, binding, ordinal, end):
+        self.binding = binding
+        self.ordinal = ordinal
+        self.end = end
+        self.cancel = threading.Event()
+        self.begin = concurrent.futures.Future()
+        self.end_controls = concurrent.futures.Future()
+        self.finished = concurrent.futures.Future()
+        self.terminal_future = None
+        self.phase = 'RESERVED'
+        self.touched = False
+        self.handles = []
+        self.failure = None
+        self.failures = []
+        self.caller_task = self.caller_loop = None
+        self.descriptor = self.descriptor_identity = None
+        self.descriptor_closed = False
+        self.body_accepted = 0
+        self.closed_at = self.finished_within_deadline = None
+
+    def viable(self):
+        return not self.cancel.is_set() and time.monotonic() < self.end
+
+
+def _resolve(future, *, value=None, error=None):
+    if future.done():
+        return
+    if error is None:
+        future.set_result(value)
+    else:
+        future.set_exception(error)
+
+
+class NativePromptBinding:
+    def __init__(self, owner, app, proxy, session):
+        from prompt_toolkit.application.application import Application
+        from prompt_toolkit.output.vt100 import Vt100_Output
+        from prompt_toolkit.patch_stdout import StdoutProxy
+        from prompt_toolkit.renderer import Renderer
+        _verify_upstream()
+        if (owner.anchor is None or owner.frontend is None
+                or type(owner.stream) is not io.TextIOWrapper
+                or type(app) is not Application or app.full_screen is not False
+                or type(proxy) is not StdoutProxy or proxy.raw is not False
+                or type(proxy._flush_queue) is not queue.Queue
+                or type(proxy._buffer) is not list
+                or proxy.app_session is not session or proxy.closed is not False
+                or type(proxy._output) is not Vt100_Output
+                or proxy._output.stdout is not owner.stream
+                or type(app.output) is not Vt100_Output
+                or app.output.stdout is not owner.stream
+                or type(app.renderer) is not Renderer
+                or app.renderer.output is not app.output
+                or app.output.enable_cpr is not False
+                or getattr(proxy, "_finite_state", None) is not owner.frontend
+                or type(proxy._flush_thread) is not threading.Thread
+                or not proxy._flush_thread.is_alive()
+                or owner.console.file is not proxy
+                or getattr(owner.cli, '_app', None) is not app):
+            raise PromptUnsupported('unsupported_native_patch_stdout')
+        self.owner, self.app, self.proxy, self.session = owner, app, proxy, session
+        self.renderer = app.renderer
+        self.renderer_output = app.output
+        self.proxy_output = proxy._output
+        self.proxy_thread = proxy._flush_thread
+        self.proxy_queue = proxy._flush_queue
+        self.proxy_lock = proxy._lock
+        self.loop = self.loop_thread = self.app_future = self.app_context = None
+        self.active = False
+        self.closed = threading.Event()
+        self.pending = None
+        self.ordinal = 0
+        self.uncertain = None
+
+    def prepare(self):
+        # Original Application.run(pre_run=...) calls this on its own loop
+        # after set_app/future installation, not on the model_tools loop.
+        from prompt_toolkit.application.current import get_app_session
+        if (self.active or self.closed.is_set()
+                or get_app_session() is not self.session
+                or self.session.app is not self.app
+                or asyncio.get_running_loop() is not self.app.loop
+                or self.app._loop_thread is not threading.current_thread()
+                or not self.app.is_running):
+            raise PromptUnsupported('native_prompt_pre_run_lifetime')
+        self.loop = self.app.loop
+        self.loop_thread = threading.current_thread()
+        self.app_future = self.app.future
+        self.app_context = self.app.context
+        self.active = True
+        self.check()
+
+    def matches(self, stream):
+        return stream is self.proxy and self.owner.prompt is self
+
+    def check(self, *, cleanup=False):
+        self.owner.check_lifetime()
+        if (self.owner.prompt is not self or self.owner.console.file is not self.proxy
+                or self.proxy.closed is not False or self.proxy.app_session is not self.session
+                or self.proxy._output is not self.proxy_output
+                or self.proxy._flush_queue is not self.proxy_queue
+                or self.proxy._lock is not self.proxy_lock
+                or self.proxy.raw is not False
+                or self.proxy_output.stdout is not self.owner.stream
+                or getattr(self.proxy, "_finite_state", None) is not self.owner.frontend
+                or self.proxy._flush_thread is not self.proxy_thread
+                or not self.proxy_thread.is_alive()
+                or getattr(self.owner.cli, '_app', None) is not self.app
+                or self.app.output is not self.renderer_output
+                or self.app.renderer is not self.renderer
+                or self.renderer.output is not self.renderer_output):
+            raise PromptUnsupported('native_prompt_binding_changed')
+        if not cleanup and (not self.active or self.closed.is_set()
+                or self.session.app is not self.app or not self.app.is_running
+                or self.app.loop is not self.loop or self.app.future is not self.app_future
+                or self.app._loop_thread is not self.loop_thread
+                or self.app.context is not self.app_context
+                or self.loop is None or not self.loop.is_running()):
+            raise PromptUnsupported('native_prompt_lifetime_lost')
+
+    def reserve(self, deadline):
+        self.check()
+        local = asyncio.get_running_loop()
+        sampled_monotonic = time.monotonic()
+        remaining = deadline - local.time()
+        if remaining <= CLEANUP_RESERVE or self.pending is not None:
+            raise PromptUnsupported('native_prompt_no_useful_budget_or_busy')
+        self.ordinal += 1
+        op = _Operation(self, self.ordinal, sampled_monotonic + remaining)
+        self.pending = op
+        return op
+
+    def _dispatch(self, op, phase):
+        if op is not self.pending or op.binding is not self:
+            raise PromptCleanupUnconfirmed('foreign_prompt_operation')
+        if self.loop is None or self.loop.is_closed():
+            raise PromptCleanupUnconfirmed('native_prompt_loop_closed')
+        # Exact original Application context; does not manufacture AppSession.
+        caller = self.owner.frontend.caller
+        custody = None
+        if caller is not None:
+            phase_record = {"operation": op, "phase": phase}
+            custody = caller.custody.reserve_callback(
+                "prompt_phase:" + phase, phase_record, self.loop, self.app, min(op.end, caller.end))
+            caller.guard.own_native_prompt_phase(
+                caller, operation=op, phase=phase, app=self.app,
+                native_loop=self.loop, context=self.app_context,
+                deadline=min(op.end, caller.end))
+        if custody is None:
+            handle = self.loop.call_soon_threadsafe(self._phase, op, phase, context=self.app_context)
+        else:
+            handle = self.loop.call_soon_threadsafe(
+                caller.custody.call_callback, custody, self._phase, op, phase, context=self.app_context)
+            caller.custody.attach_handle(custody, handle)
+        op.handles.append(handle)
+
+    def _phase(self, op, phase):
+        # Every callback is retained in the same operation. No document writer
+        # or arbitrary callback is launched from the native prompt loop.
+        try:
+            if threading.current_thread() is not self.loop_thread or self.pending is not op:
+                raise PromptCleanupUnconfirmed('native_prompt_callback_identity')
+            if phase == 'cleanup':
+                self._cleanup(op)
+                return
+            self.check()
+            if (time.monotonic() >= op.end or (phase == 'begin' and op.cancel.is_set())):
+                raise TimeoutError('native_prompt_original_deadline_or_cancel')
+            if phase == 'begin':
+                if op.phase != 'RESERVED':
+                    raise PromptCleanupUnconfirmed('duplicate_prompt_begin')
+                previous = self.app._running_in_terminal_f
+                if self.app._running_in_terminal or (previous is not None and not previous.done()):
+                    raise PromptUnsupported('native_prompt_terminal_busy')
+                op.terminal_future = self.loop.create_future()
+                self.app._running_in_terminal_f = op.terminal_future
+                self.app._running_in_terminal = True
+                op.touched = True
+                controls = _exact_controls(self, False)
+                op.phase = 'HIDDEN'
+                _resolve(op.begin, value=controls)
+            elif phase == 'end':
+                if op.phase != 'HIDDEN' or not self.app._running_in_terminal:
+                    raise PromptCleanupUnconfirmed('native_prompt_phase_changed')
+                controls = _exact_controls(self, True)
+                op.phase = 'RESTORING'
+                _resolve(op.end_controls, value=controls)
+            else:
+                raise PromptCleanupUnconfirmed('unknown_prompt_phase')
+        except BaseException as exc:
+            op.failure = type(exc).__name__
+            op.failures.append({'phase':phase,'type':type(exc).__name__,'at':time.monotonic()})
+            target = op.begin if phase == 'begin' else op.end_controls
+            _resolve(target, error=exc)
+            # Restore retained native bookkeeping even on a pre-body failure.
+            # A body/repaint failure cannot become a successful document ACK.
+            if op.touched:
+                self.owner.closed.set()
+                self.uncertain = op
+            self._cleanup(op)
+
+    def _cleanup(self, op):
+        if self.pending is not op:
+            return
+        try:
+            if op.touched:
+                # Never mutate a subsequent Application/run or foreign renderer.
+                if (self.app.loop is not self.loop or self.app.future is not self.app_future
+                        or self.app.renderer is not self.renderer
+                        or self.renderer.output is not self.renderer_output):
+                    raise PromptCleanupUnconfirmed('prompt_cleanup_foreign_lifetime')
+                self.app._running_in_terminal = False
+                # Existing UI redraw has no document buffer or resend callback.
+                before_render = self.app.render_counter
+                self.app._redraw()
+                if self.app.render_counter != before_render + 1:
+                    raise PromptCleanupUnconfirmed("native_repaint_not_observed")
+                # Actual synchronous redraw returns after its physical flush;
+                # invalidate scheduling alone is never a completion witness.
+                if time.monotonic() >= op.end:
+                    raise PromptCleanupUnconfirmed("original_repaint_late")
+                op.repaint_at = time.monotonic()
+            if op.terminal_future is not None and not op.terminal_future.done():
+                op.terminal_future.set_result(None)
+            op.phase = 'CLOSED'
+            op.closed_at = time.monotonic()
+            op.finished_within_deadline = op.closed_at < op.end
+            self.pending = None
+            _resolve(op.finished, value=True)
+        except BaseException as exc:
+            op.failure = 'CLEANUP_' + type(exc).__name__
+            op.failures.append({'phase':'cleanup','type':type(exc).__name__,'at':time.monotonic()})
+            self.uncertain = op
+            self.owner.closed.set()
+            _resolve(op.finished, error=PromptCleanupUnconfirmed('prompt_cleanup_unconfirmed'))
+
+    async def wait(self, future, deadline):
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError('prompt_original_deadline')
+        async with asyncio.timeout_at(deadline):
+            return await asyncio.shield(asyncio.wrap_future(future))
+
+    async def drain_before(self, deadline):
+        self.check()
+        future = self.owner.frontend.barrier()
+        if await self.wait(future, deadline) is not True:
+            raise PromptCleanupUnconfirmed("normal_frontend_prefix_not_flushed")
+        self.check()
+
+    async def begin(self, op, deadline):
+        self._dispatch(op, 'begin')
+        return await self.wait(op.begin, deadline)
+
+    async def end(self, op, deadline):
+        self._dispatch(op, 'end')
+        return await self.wait(op.end_controls, deadline)
+
+    async def finish(self, op, deadline):
+        if op.finished.done():
+            return op.finished.result()
+        self._dispatch(op, 'cleanup')
+        return await self.wait(op.finished, deadline)
+
+    def abandon(self, op):
+        # This records uncertain custody; it never declares a joined callback.
+        op.cancel.set()
+        self.uncertain = op
+        self.owner.closed.set()
+        try:
+            self._dispatch(op, 'cleanup')
+        except BaseException:
+            op.failure = 'CLEANUP_NOT_DISPATCHED'
+        return op
+
+    def render_barrier(self, deadline):
+        self.check()
+        future = concurrent.futures.Future()
+        end = deadline
+        caller = self.owner.frontend.caller
+        record = {"future": future, "handle": None, "state": "RESERVED", "end": end}
+        if caller is None:
+            raise PromptCleanupUnconfirmed("native_repaint_original_caller_missing")
+        custody = caller.custody.reserve_callback("repaint", record, self.loop, self.app, end)
+        caller.guard.own_native_repaint_barrier(caller, binding=self, record=record,
+                                               app=self.app, loop=self.loop, deadline=end)
+        def redraw_original():
+            try:
+                self.check()
+                if time.monotonic() >= end or record.get("stop_requested"):
+                    raise PromptCleanupUnconfirmed("late_native_repaint_barrier")
+                if self.app._running_in_terminal:
+                    raise PromptCleanupUnconfirmed("native_terminal_tail_not_drained")
+                started = time.monotonic()
+                before = self.app.render_counter
+                self.app._redraw()
+                physical = self.owner.frontend.last_physical
+                if (self.app.render_counter != before + 1 or physical is None
+                        or physical["at"] < started or time.monotonic() >= end):
+                    raise PromptCleanupUnconfirmed("native_physical_repaint_not_confirmed")
+                record["state"] = "CLOSED"
+                _resolve(future, value=True)
+            except BaseException as exc:
+                record["state"] = "UNKNOWN_OWNED"
+                record["error"] = type(exc).__name__
+                _resolve(future, error=exc)
+        record["handle"] = self.loop.call_soon_threadsafe(
+            caller.custody.call_callback, custody, redraw_original, context=self.app_context)
+        caller.custody.attach_handle(custody, record["handle"])
+        try:
+            if future.result(timeout=max(0, end - time.monotonic())) is not True:
+                raise PromptCleanupUnconfirmed("native_repaint_barrier_unknown")
+        except BaseException:
+            record["stop_requested"] = True
+            self.owner.frontend.errors.append({"phase": "repaint_barrier", "record": record})
+            self.owner.record_poison = {"state": "UNKNOWN", "source": "repaint_barrier"}
+            raise
+
+    def close(self):
+        self.active = False
+        self.closed.set()
+        if self.pending is not None:
+            self.abandon(self.pending)
+
+
+@contextmanager
+def bind_prompt_output(cli, app):
+    # Preserve native partial/unavailable-prompt fallback: no import or unknown
+    # capability can turn UI startup into an arbitrary output adapter.
+    owner = getattr(cli, '_friday_cli_output', None)
+    binding = None
+    known_owner = False
+    try:
+        from hermes_cli.friday_cli_output import ClassicConsoleOutput
+        from prompt_toolkit.application.current import get_app_session
+        known_owner = type(owner) is ClassicConsoleOutput
+        if known_owner:
+            owner.check_lifetime()
+            if owner.prompt is not None:
+                raise PromptUnsupported('native_prompt_already_bound')
+            binding = NativePromptBinding(owner, app, sys.stdout, get_app_session())
+            owner.prompt = binding
+    except Exception as exc:
+        if known_owner:
+            owner.prompt_refusal = type(exc).__name__
+        binding = None
+    try:
+        yield binding
+    finally:
+        if binding is not None:
+            binding.close()
+            if binding.pending is None and binding.uncertain is None:
+                owner.prompt = None
