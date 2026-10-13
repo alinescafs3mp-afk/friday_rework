@@ -160,7 +160,7 @@ def stage_dashboard_tls(value, home):
     checked(home, dash['tls'], dash['host'], dash['port'], dash['public_url'])
 
 
-def complete(value, home, receipt, *, budget=None):
+def complete(value, home, receipt, *, budget=None, cli_host=False):
     from scripts.friday_install import require, owned_file, digest, publish
     from hermes_constants import get_hermes_home
     require(get_hermes_home() == home, 'foreign_native_home')
@@ -179,14 +179,15 @@ def complete(value, home, receipt, *, budget=None):
     records = tuple(r for role in ('serve', 'gateway')
                     if (r := read_record(role, include_stale=True)) is not None and not record_is_stale(r))
     native_profile_check(bundle, home, records=records)
-    from hermes_cli.source_build import (source_build_env, prepare_source_dependencies,
-                                         build_source_tui, build_source_web, source_product_current)
-    env = source_build_env(explicit=True)
-    prepare_source_dependencies(source, ('ui-tui', 'web'), env=env, explicit=True)
-    build_source_tui(source, env=env); build_source_web(source, env=env)
-    require(source_product_current(source, 'tui', source / 'ui-tui/dist')
-            and source_product_current(source, 'web', source / 'hermes_cli/web_dist'),
-            'native_frontend_freshness_not_verified')
+    if not cli_host:
+        from hermes_cli.source_build import (source_build_env, prepare_source_dependencies,
+                                             build_source_tui, build_source_web, source_product_current)
+        env = source_build_env(explicit=True)
+        prepare_source_dependencies(source, ('ui-tui', 'web'), env=env, explicit=True)
+        build_source_tui(source, env=env); build_source_web(source, env=env)
+        require(source_product_current(source, 'tui', source / 'ui-tui/dist')
+                and source_product_current(source, 'web', source / 'hermes_cli/web_dist'),
+                'native_frontend_freshness_not_verified')
     from hermes_cli._launchers import ensure_install_launchers, ENTRY_POINTS
     written = ensure_install_launchers(source, source / '.hermes/bin')
     require(len(written) == len(ENTRY_POINTS), 'native_launcher_publication_failed')
@@ -209,7 +210,7 @@ def complete(value, home, receipt, *, budget=None):
             os.chmod(path, 0o700)
     stage_worker_runtime(value, home)
     effective = value
-    if 'worker_install' in value:
+    if 'worker_install' in value and not cli_host:
         require(budget is not None, 'original_worker_install_budget_required')
         from scripts.worker_install import prepared_product, materialize
         product, evidence = budget.call(prepared_product, value, home, budget)
@@ -218,7 +219,7 @@ def complete(value, home, receipt, *, budget=None):
     if service_required(effective):
         require(budget is not None, 'original_a0_install_budget_required')
         budget.call(install_service, effective, home, budget)
-    if 'worker_install' in value:
+    if 'worker_install' in value and not cli_host:
         if product['web']['profile'] == 'exa-keyless':
             from scripts.friday_install import stage_keyless_provider
             keyless = budget.call(stage_keyless_provider, Path(value['dsh_donor']))
@@ -259,7 +260,7 @@ def stage_worker_runtime(value, home):
 def main():
     started = time.monotonic()
     parser = SafeParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('phase', choices=('install', 'start', 'qualify'))
+    parser.add_argument('phase', choices=('install', 'install-cli', 'start', 'qualify'))
     parser.add_argument('--input', required=True, type=Path)
     parser.add_argument('--deadline', required=True, type=float, help='Inherited original monotonic deadline')
     parser.add_argument('--a0-plan',type=Path)
@@ -274,28 +275,29 @@ def main():
     require((args.a0_plan is None) == (args.a0_plan_sha256 is None)
             and (args.a0_plan is None or args.phase in ('start','qualify')),
             'qualification_plan_arguments_required')
-    home, donors = budget.call(spec_checked, value); budget.call(directory, home)
+    home, donors = budget.call(spec_checked, value, cli_only=args.phase == 'install-cli'); budget.call(directory, home)
     from scripts.friday_install import MARKER, digest, owned_file, require, partial_claim
     if args.phase == 'install':
         require(read_json(home / MARKER) == partial_claim(digest(owned_file(args.input, private=True)), budget),
                 'fresh_install_claim_required')
+    elif args.phase == 'install-cli':
+        from scripts.friday_install import CLI_RESUME, CLI_SEGMENT, cli_segment_clock
+        segment=os.path.lexists(home/CLI_SEGMENT)
+        intent=read_json(home/(CLI_SEGMENT if segment else CLI_RESUME))
+        if segment: cli_segment_clock(intent['clock'],budget.deadline)
+        require(intent.get('state') == 'CONSUMED_NOT_COMPLETE'
+                and intent.get('original_attempt') == read_json(home/MARKER)
+                and intent['request']['current_input']['sha256'] == digest(owned_file(args.input,private=True))
+                and (segment or intent['original_attempt']['deadline_mono'] == budget.deadline), 'consumed_cli_host_intent_required')
     else:
         from scripts.friday_install import inspect
         budget.call(inspect, value, digest(owned_file(args.input, private=True)))
     source = home / 'hermes-agent'; receipt = read_json(home / 'hermes-agent.source.json')
     budget.call(composition_checked, value, source, receipt, donors['hermes'])
-    sys.path.insert(0, str(source))
-    import tools, plugins, scripts
-    # A cached project namespace must never stand in for the verified native
-    # regular package. Native __init__ executes before adding project modules.
-    for package in (tools, plugins):
-        expected = source / package.__name__ / '__init__.py'
-        require(Path(package.__file__ or '').resolve() == expected
-                and list(package.__path__) == [str(expected.parent)],
-                'native_package_provenance_required')
-        package.__path__.append(str(ROOT / package.__name__))
-    scripts.__path__.append(str(source / 'scripts'))
+    from scripts.friday_install import native_packages
+    budget.call(native_packages, source)
     if args.phase in ('start','qualify'):
+        require(read_json(home/MARKER).get('completion_stage') != 'CLI_HOST_ONLY', 'cli_host_full_start_refused')
         if args.a0_plan is not None or args.phase == 'qualify':
             result = budget.call(qualify,value,digest(owned_file(args.input,private=True)),
                 None if args.a0_plan is None else {'path':str(args.a0_plan),'sha256':args.a0_plan_sha256},budget)
@@ -315,7 +317,7 @@ def main():
         raise RuntimeError('native foreground ownership was not transferred')
     from scripts.dsh_prepare import StopUnconfirmed
     try:
-        result = budget.call(complete, value, home, receipt, budget=budget)
+        result = budget.call(complete, value, home, receipt, budget=budget, cli_host=args.phase == 'install-cli')
     except StopUnconfirmed:
         parser.exit(3, 'STOP_UNCONFIRMED: native install ownership requires reconciliation; do not retry\n')
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:

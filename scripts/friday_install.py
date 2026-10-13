@@ -228,7 +228,55 @@ def directory(path):
     return p
 
 
-def spec_checked(value):
+
+def project_plugin(name, value):
+    """Pure project validators have their own namespace; native plugins stay cold."""
+    prefix = 'plugins/friday_rework/'
+    for path, expected in value['project_files'].items():
+        if path.startswith(prefix):
+            require(digest(owned_file(ROOT/path)) == expected, 'project_source_changed')
+    alias = '_friday_install_validation_plugins'
+    if alias not in sys.modules:
+        module = importlib.util.module_from_spec(importlib.machinery.ModuleSpec(alias, loader=None, is_package=True))
+        module.__path__ = [str(ROOT/'plugins')]
+        sys.modules[alias] = module
+    require(list(sys.modules[alias].__path__) == [str(ROOT/'plugins')], 'foreign_validator_package')
+    module = importlib.import_module(alias + '.friday_rework.' + name)
+    for key, loaded in tuple(sys.modules.items()):
+        if key.startswith(alias + '.') and getattr(loaded, '__file__', None):
+            relative = 'plugins/' + key[len(alias)+1:].replace('.', '/') + '.py'
+            expected = ROOT/relative
+            if getattr(loaded, '__path__', None) is not None:
+                expected = ROOT/relative[:-3]/'__init__.py'
+            require(Path(loaded.__file__).resolve() == expected
+                    and digest(owned_file(expected)) == value['project_files'][str(expected.relative_to(ROOT))],
+                    'foreign_validator_module')
+    return module
+
+
+def native_packages(source):
+    """Execute verified regular native packages before extending their search path."""
+    sys.path.insert(0, str(source))
+    for name in ('tools', 'plugins'):
+        package = importlib.import_module(name)
+        expected = source/name/'__init__.py'
+        base, extension = str(expected.parent), str(ROOT/name)
+        require(Path(package.__file__ or '').resolve() == expected
+                and package.__spec__.origin == str(expected)
+                and list(package.__path__) in ([base], [base, extension]),
+                'native_package_provenance_required')
+        if extension not in package.__path__:
+            package.__path__.append(extension)
+    package = importlib.import_module('scripts')
+    allowed={str(ROOT/'scripts'),str(source/'scripts')}
+    require(set(package.__path__).issubset(allowed) and str(ROOT/'scripts') in package.__path__
+            and Path(sys.modules['scripts.friday_install'].__file__).resolve()==ROOT/'scripts/friday_install.py',
+            'project_scripts_provenance_required')
+    package.__path__=[str(ROOT/'scripts'),str(source/'scripts')]
+
+
+def spec_checked(value, *, cli_only=False):
+    require(type(cli_only) is bool, 'explicit_cli_declaration_mode_required')
     fields = {'home', 'bootstrap_python', 'hermes_donor', 'hermes_prepare',
               'sources_lock', 'dsh_donor', 'a0_donor', 'product', 'project_files', 'seconds', 'containment'}
     require(isinstance(value, dict) and set(value) == fields | (set(value) & {'dashboard_tls', 'credential_sources', 'worker_install'}), 'explicit_install_fields_required')
@@ -309,7 +357,7 @@ def spec_checked(value):
                 and selected['key_env'] == 'FRIDAY_LLM_API_KEY', 'a0_product_inference_profile_mismatch')
     if 'worker_install' in value:
         from scripts.worker_install import settings
-        settings(value)
+        settings(value, cli_only=cli_only)
     build_config(**product['inference'])
     require(product['web'].get('profile') in ('exa-paid','exa-keyless')
             and set(product['web']) == {'profile', 'extract_char_limit', 'extract_timeout'}
@@ -713,21 +761,14 @@ def resume_inputs(request):
     return value, paths, claim, budget
 
 
-def verify_completed_native(input_path, deadline):
+def verify_completed_native(input_path, deadline, *, cli_host=False):
     """Read-only preflight in the installed PM Python and native namespace."""
     from scripts.install_containment import Budget
     value = read_json(input_path); budget = Budget(value['seconds'], deadline=deadline)
-    home, donors = budget.call(spec_checked, value); source = home / 'hermes-agent'
+    home, donors = budget.call(spec_checked, value, cli_only=cli_host); source = home / 'hermes-agent'
     receipt = budget.call(read_json, home / 'hermes-agent.source.json')
     budget.call(composition_checked, value, source, receipt, donors['hermes'])
-    sys.path.insert(0, str(source))
-    import tools, plugins, scripts
-    for package in (tools, plugins):
-        expected = source / package.__name__ / '__init__.py'
-        require(Path(package.__file__ or '').resolve() == expected
-                and list(package.__path__) == [str(expected.parent)], 'native_package_provenance_required')
-        package.__path__.append(str(ROOT / package.__name__))
-    scripts.__path__.append(str(source / 'scripts'))
+    budget.call(native_packages, source)
     from pm.environments import project_python
     from pm.paths import repo_root
     require(repo_root() == source and Path(sys.executable) == project_python(source),
@@ -752,9 +793,10 @@ def verify_completed_native(input_path, deadline):
         require(budget.call(owned_file, path) == expected and os.access(path, os.X_OK),
                 'completed_native_launcher_changed')
     from hermes_cli.source_build import source_product_current
-    require(budget.call(source_product_current, source, 'tui', source / 'ui-tui/dist')
-            and budget.call(source_product_current, source, 'web', source / 'hermes_cli/web_dist'),
-            'native_frontend_freshness_not_verified')
+    if not cli_host:
+        require(budget.call(source_product_current, source, 'tui', source / 'ui-tui/dist')
+                and budget.call(source_product_current, source, 'web', source / 'hermes_cli/web_dist'),
+                'native_frontend_freshness_not_verified')
     return {'state': 'COMPLETED_NATIVE_REVALIDATED', 'ready': False}
 
 
@@ -851,12 +893,418 @@ def resume_pins_unchanged(request, claim, budget):
     require(budget.call(read_json, request['original_claim']['path']) == claim, 'install_claim_changed')
 
 
+CLI_RESUME = 'FRIDAY-INSTALL.cli-host.intent.json'
+CLI_STAGE = 'CLI_HOST_ONLY'
+CLI_OVERLAY = 'patches/hermes/cli-host-stage-manifest.json'
+
+
+def cli_resume_inputs(request, *, consumed=False, budget=None, validation_value=None):
+    """One exact normal install, one original clock, one explicitly consumed stage."""
+    require(isinstance(request, dict) and set(request) == {
+        'original_input', 'current_input', 'original_claim', 'original_supervision',
+        'completed_phases', 'failed_build'}, 'explicit_cli_resume_pins_required')
+    names = ('original_input', 'current_input', 'original_claim', 'original_supervision', 'failed_build')
+    paths = {k: pin(request[k]) for k in names}
+    old, value, claim, supervisor, failed = [read_json(paths[k]) for k in names]
+    home = canonical(old['home']); directory(home)
+    require('worker_install' in old and 'worker_install' in value
+            and old['product']['runtime'] == value['product']['runtime'] == {'enabled': False},
+            'normal_pending_workers_cli_stage_required')
+    require(paths['original_claim'] == home / MARKER and set(claim) == {
+        'schema', 'state', 'input_sha256', 'deadline_mono', 'boot_id'}
+        and claim == dict(claim, schema=SCHEMA, state='PARTIAL',
+                          input_sha256=request['original_input']['sha256']),
+        'exact_original_partial_claim_required')
+    require(claim['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            'original_install_boot_changed')
+    from scripts.install_containment import Budget
+    budget = budget or Budget(old['seconds'], deadline=claim['deadline_mono'])
+    require({k:v for k,v in old.items() if k != 'project_files'} ==
+            {k:v for k,v in value.items() if k != 'project_files'}, 'resume_operational_settings_changed')
+    added = {CLI_OVERLAY, 'patches/hermes/cli-host-stage.patch'}
+    require(set(value['project_files']) == set(old['project_files']) | added
+            and all(value['project_files'][n] == h for n,h in old['project_files'].items()
+                    if n not in {'scripts/friday_install.py', 'scripts/friday_native.py'}),
+            'resume_unrelated_source_changed')
+    require(set(supervisor) == {'schema', 'original_attempt', 'unit', 'invocation_id',
+            'cgroup', 'gnu_pid', 'gnu_starttime_ticks'}
+            and supervisor['schema'] == 'friday.install-native-supervision.v1'
+            and supervisor['original_attempt'] == claim
+            and isinstance(supervisor['unit'], str)
+            and re.fullmatch(r'friday-rework-[A-Za-z0-9-]+\.service', supervisor['unit'])
+            and re.fullmatch('[0-9a-f]{32}', supervisor['invocation_id'])
+            and type(supervisor['gnu_pid']) is int and supervisor['gnu_pid'] > 1
+            and type(supervisor['gnu_starttime_ticks']) is int and supervisor['gnu_starttime_ticks'] > 0,
+            'original_native_supervision_identity_required')
+    cgroup = Path(supervisor['cgroup'])
+    require(cgroup.is_absolute() and '..' not in cgroup.parts
+            and cgroup.is_relative_to('/sys/fs/cgroup') and cgroup != Path('/sys/fs/cgroup'),
+            'original_own_cgroup_required')
+    phases = request['completed_phases']
+    require(isinstance(phases, dict) and set(phases) == {
+        'compose', 'tools', 'dependencies', 'pm_python', 'harness_source', 'harness_toolchain'},
+        'exact_completed_phase_inventory_required')
+    original_root = Path(old['hermes_prepare']['path']).parents[1]
+    python = old['bootstrap_python']['path']
+    expected = {
+        'compose':[python,'-B',old['hermes_prepare']['path'],'--repository',str(original_root),
+                   '--donor',old['hermes_donor'],'--destination',str(home/'hermes-agent'),
+                   '--seconds',str(min(120,old['seconds']))],
+        'tools':[python,'-B','-m','pm.cli','install','--tools-only'],
+        'dependencies':[python,'-B','-m','pm.cli','install','--extra','all','--extra','telegram','--extra','web','--extra','exa'],
+        'pm_python':[python,'-B','-c','from pm.environments import project_python; from pathlib import Path; print(project_python(Path.cwd()))']}
+    for phase in ('source','toolchain'):
+        expected['harness_'+phase] = [python,'-B',str(original_root/'scripts/dsh_prepare.py'),phase,
+            '--donor',old['dsh_donor'],'--lock',old['sources_lock']['path'],'--evidence',str(home/'preparation/harness')]
+    for name, row in phases.items():
+        path = pin(row); receipt = read_json(path)
+        require(path == home/'preparation/native-install'/(name+'.json')
+                and receipt.get('returncode') == 0 and type(receipt.get('returncode')) is int
+                and receipt.get('timeout') is False and receipt.get('reaped') is True
+                and isinstance(receipt.get('argv'),list) and '--' in receipt['argv']
+                and receipt['argv'][receipt['argv'].index('--')+1:] == expected[name],
+                'successful_original_phase_required')
+    require(paths['failed_build'] == home/'preparation/harness/dsh-build.json'
+            and failed.get('reason') == 'command_nonzero_exit'
+            and type(failed.get('returncode')) is int and failed['returncode'] != 0
+            and failed.get('timeout') is False and failed.get('reaped') is True
+            and failed.get('argv') == ['corepack','pnpm','run','build'], 'retained_worker_build_failure_required')
+    require((home/CLI_RESUME).exists() is consumed and not (home/CLI_RESUME).is_symlink(),
+            'cli_host_resume_already_consumed')
+    if validation_value is not None:
+        require({k:v for k,v in value.items() if k!='project_files'} ==
+                {k:v for k,v in validation_value.items() if k!='project_files'}, 'cli_segment_operational_settings_changed')
+        allowed={'scripts/friday_install.py','scripts/friday_native.py','scripts/worker_install.py','plugins/friday_rework/worker_web.py',CLI_OVERLAY,'patches/hermes/cli-host-stage.patch'}
+        require(set(value['project_files'])==set(validation_value['project_files'])
+                and all(validation_value['project_files'][n]==h for n,h in value['project_files'].items() if n not in allowed),
+                'cli_segment_unrelated_source_changed')
+        value=validation_value
+    budget.call(spec_checked, value, cli_only=True)
+    return value, paths, claim, budget
+
+
+def cli_request_unchanged(request, claim, budget):
+    for key in ('original_input','current_input','original_claim','original_supervision','failed_build'):
+        budget.call(pin, request[key])
+    for row in request['completed_phases'].values(): budget.call(pin, row)
+    require(budget.call(read_json,request['original_claim']['path']) == claim, 'install_claim_changed')
+
+
+def cli_cessation_checked(supervisor, observation):
+    require(type(observation) is str and len(observation) <= 65536, 'native_cessation_observation_required')
+    rows = {}
+    for line in observation.splitlines():
+        require('=' in line, 'native_cessation_observation_required')
+        key, value = line.split('=',1); require(key not in rows, 'native_cessation_observation_required'); rows[key]=value
+    require(set(rows) == {'Id','InvocationID','ActiveState','SubState','MainPID','ControlPID','ControlGroup'}
+            and rows['Id'] == supervisor['unit'] and rows['InvocationID'] == supervisor['invocation_id']
+            and rows['ActiveState'] in ('inactive','failed') and rows['SubState'] in ('dead','failed')
+            and rows['MainPID'] == rows['ControlPID'] == '0' and rows['ControlGroup'] == '',
+            'original_native_unit_not_settled')
+    require(not os.path.lexists(supervisor['cgroup']), 'original_native_cgroup_still_present')
+    try:
+        actor=supervisor.get('owned_child',{'pid':supervisor.get('gnu_pid'),'starttime_ticks':supervisor.get('gnu_starttime_ticks')})
+        raw = Path('/proc')/str(actor['pid'])/'stat'
+        data = raw.read_text(); birth = int(data[data.rfind(')')+2:].split()[19])
+        require(birth != actor['starttime_ticks'], 'original_owned_birth_still_present')
+    except FileNotFoundError:
+        pass
+
+
+CLI_SEGMENT = 'FRIDAY-INSTALL.cli-segment.intent.json'
+
+
+def cli_segment_admission():
+    """The new budget starts at the actual direct GNU birth, never the old claim."""
+    pid = os.getppid()
+    proc = Path('/proc')/str(pid)
+    raw = (proc/'stat').read_text()
+    ticks = int(raw[raw.rfind(')')+2:].split()[19])
+    executable = (proc/'exe').resolve()
+    expected = Path('/usr/bin/gnutimeout')
+    info = expected.stat()
+    argv = (proc/'cmdline').read_bytes().split(b'\0')
+    require(executable == expected and stat.S_ISREG(info.st_mode) and info.st_uid == 0
+            and not info.st_mode & 0o022 and argv[1:4] ==
+            [b'--signal=TERM', b'--kill-after=2s', b'900s'], 'direct_bounded_gnu_admission_required')
+    start = ticks/os.sysconf('SC_CLK_TCK') + time.monotonic() - time.clock_gettime(time.CLOCK_BOOTTIME)
+    require(0 <= time.monotonic()-start < 5, 'fresh_cli_segment_admission_required')
+    return {'schema':'friday.cli-segment-clock.v1','seconds':900,'cleanup_seconds':90,
+            'started_mono':start,'deadline_mono':start+900,'useful_deadline_mono':start+810,
+            'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            'gnu_pid':pid,'gnu_starttime_ticks':ticks}
+
+
+def cli_segment_clock(clock, deadline=None):
+    require(type(clock) is dict and set(clock) == {'schema','seconds','cleanup_seconds',
+        'started_mono','deadline_mono','useful_deadline_mono','boot_id','gnu_pid','gnu_starttime_ticks'}
+        and clock['schema']=='friday.cli-segment-clock.v1' and clock['seconds']==900
+        and clock['cleanup_seconds']==90 and type(clock['started_mono']) in (int,float)
+        and math.isfinite(clock['started_mono']) and clock['started_mono'] <= time.monotonic()
+        and clock['deadline_mono']==clock['started_mono']+900
+        and clock['useful_deadline_mono']==clock['started_mono']+810
+        and clock['boot_id']==Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        and type(clock['gnu_pid']) is int and clock['gnu_pid']>1
+        and type(clock['gnu_starttime_ticks']) is int and clock['gnu_starttime_ticks']>0
+        and (deadline is None or deadline==clock['useful_deadline_mono']),
+        'exact_cli_segment_clock_required')
+    from scripts.install_containment import Budget
+    return Budget(900, started=clock['started_mono'], deadline=clock['useful_deadline_mono'])
+
+
+def cli_segment_inputs(request, budget):
+    require(type(request) is dict and set(request)=={'schema','assignment','generation',
+        'previous_request','previous_helper','previous_intent','failed_phase','failed_stdout','failed_stderr',
+        'previous_cli_supervision','current_input','original_source_receipt'}
+        and request['schema']=='friday.cli-segment-request.v1'
+        and type(request['assignment']) is str and re.fullmatch('[A-Za-z0-9-]{1,128}',request['assignment'])
+        and request['generation']==1 and type(request['generation']) is int,
+        'explicit_cli_segment_pins_required')
+    paths={k:budget.call(pin,request[k]) for k in ('previous_request','previous_helper','previous_intent',
+        'failed_phase','failed_stdout','failed_stderr','previous_cli_supervision',
+        'current_input','original_source_receipt')}
+    previous=read_json(paths['previous_request'])
+    value=read_json(paths['current_input'])
+    prepared=cli_resume_inputs(previous,consumed=True,budget=budget,validation_value=value)
+    prepared=(prepared[0],dict(prepared[1],current_input=paths['current_input']),prepared[2],prepared[3])
+    _, prior_paths, claim, _ = prepared
+    home=Path(value['home'])
+    require(time.monotonic()>=claim['deadline_mono'], 'original_attempt_must_remain_exhausted')
+    require(paths['previous_intent']==home/CLI_RESUME and read_json(paths['previous_intent'])==
+        {'state':'CONSUMED_NOT_COMPLETE','request':previous,'original_attempt':claim},
+        'exact_prior_consumed_cli_intent_required')
+    require(paths['original_source_receipt']==home/'hermes-agent.source.json',
+        'original_full_source_receipt_required')
+    for key,suffix in (('failed_phase','.json'),('failed_stdout','.stdout'),('failed_stderr','.stderr')):
+        require(paths[key]==home/'preparation/cli-host'/('source_continuation'+suffix),
+                'exact_preoverlay_failure_paths_required')
+    failure=read_json(paths['failed_phase'])
+    stderr=owned_file(paths['failed_stderr']); stdout=owned_file(paths['failed_stdout'])
+    previous_value=read_json(pin(previous['current_input']))
+    helper=paths['previous_helper']
+    require(helper.name=='friday_install.py' and helper.parent.name=='scripts'
+            and request['previous_helper']['sha256']==previous_value['project_files']['scripts/friday_install.py'],
+            'exact_previous_helper_source_required')
+    expected_code='import sys;sys.path.insert(0,'+repr(str(helper.parents[1]))+');from scripts.friday_install import continue_cli_source;continue_cli_source(sys.argv[1],float(sys.argv[2]))'
+    from scripts.install_containment import argv as containment_argv
+    direct=[value['bootstrap_python']['path'],'-B','-c',expected_code,str(paths['previous_request']),str(claim['deadline_mono'])]
+    argv=failure.get('argv',[])
+    require(type(argv) is list and len(argv)>3 and argv[0:2]==['/usr/bin/bwrap','--json-status-fd']
+            and re.fullmatch('[0-9]+',argv[2]) and argv[3:]==containment_argv('/usr/bin/bwrap',direct)[1:],
+            'exact_previous_contained_helper_argv_required')
+    code=expected_code
+    require(failure.get('returncode')==1 and type(failure.get('returncode')) is int
+        and failure.get('timeout') is False and failure.get('reaped') is True
+        and failure.get('reason')=='command_nonzero_exit'
+        and failure.get('stderr_sha256')==digest(stderr) and failure.get('stdout_sha256')==digest(stdout)
+        and failure.get('stderr_bytes')==len(stderr) and failure.get('stdout_bytes')==len(stdout)
+        and stdout==b'' and b"ModuleNotFoundError: No module named 'plugins.friday_rework'" in stderr
+        and b'worker_install.py' in stderr and b'spec_checked' in stderr
+        and isinstance(code,str) and ';from scripts.friday_install import continue_cli_source;' in code
+        and failure['argv'][-2:]==[str(paths['previous_request']),str(claim['deadline_mono'])]
+        and type(failure.get('pid')) is int and failure['pid']>1
+        and type(failure.get('starttime_ticks')) is int and failure['starttime_ticks']>0,
+        'exact_known_preoverlay_failure_required')
+    supervisor=read_json(paths['previous_cli_supervision'])
+    require(set(supervisor)=={'schema','original_attempt','unit','invocation_id','cgroup','owned_child','gnu_birth','witness'}
+        and supervisor['schema']=='friday.cli-native-cessation.v1' and supervisor['original_attempt']==claim
+        and re.fullmatch(r'friday-rework-[A-Za-z0-9-]+\.service',supervisor['unit'])
+        and re.fullmatch('[0-9a-f]{32}',supervisor['invocation_id'])
+        and supervisor['owned_child']=={'kind':'bwrap_pid_namespace','pid':failure['pid'],'starttime_ticks':failure['starttime_ticks']}
+        and supervisor['gnu_birth']=={'state':'UNKNOWN_NOT_RESOURCE_PROOF'}
+        and Path(supervisor['cgroup']).is_relative_to('/sys/fs/cgroup')
+        and Path(supervisor['cgroup'])!=Path('/sys/fs/cgroup') and '..' not in Path(supervisor['cgroup']).parts,
+        'prior_cli_native_supervision_required')
+    witness=read_json(pin(supervisor['witness']))
+    props=witness['actual_native_properties']; child=witness['genuine_known_child']
+    require(witness['state']=='VERIFIED_NATIVEUNIT_TERMINATED_CGROUP_GONE_DIRECT_BWRAP_CHILD_KNOWN_REAPED'
+            and props['Id']==supervisor['unit'] and props['InvocationID']==supervisor['invocation_id']
+            and props['MainPID']==props['ControlPID']=='0' and props['ControlGroup']==''
+            and props['ActiveState']=='failed' and props['SubState']=='failed'
+            and props['ExecMainCode']=='1' and props['ExecMainStatus']=='2'
+            and child['pid']==failure['pid'] and child['birth_ticks']==failure['starttime_ticks']
+            and child['kind']=='bwrap_PIDnamespace_owner' and child['returncode']==1 and child['reaped'] is True
+            and child['phase_json_path']==str(paths['failed_phase'])
+            and child['phase_json_sha256']==request['failed_phase']['sha256']
+            and witness['GNU_birth_ticks']=='UNKNOWN_not_derived_from_native_exec_timestamp',
+            'genuine_prior_cli_custody_witness_required')
+    closure=witness['closure']
+    require(digest(owned_file(closure['path'],private=True))==closure['sha256']
+            and read_json(closure['path'])['own_cgroup_absent'] is True,
+            'prior_cli_cgroup_closure_required')
+    require(supervisor['cgroup']==str(Path(read_json(prior_paths['original_supervision'])['cgroup']).with_name(supervisor['unit'])),
+            'exact_prior_cli_cgroup_required')
+    proxy=dict(previous,current_input=request['current_input'])
+    return proxy, prepared, supervisor
+
+
+def cli_segment_recheck(request, claim, budget):
+    for key in ('previous_request','previous_helper','previous_intent','failed_phase','failed_stdout',
+        'failed_stderr','previous_cli_supervision','current_input','original_source_receipt'):
+        # Source receipt is legitimately replaced by the exact overlay after admission.
+        if key!='original_source_receipt': budget.call(pin,request[key])
+    prior=read_json(pin(request['previous_cli_supervision']))
+    budget.call(pin,prior['witness'])
+    previous=read_json(pin(request['previous_request']))
+    cli_request_unchanged(dict(previous,current_input=request['current_input']),claim,budget)
+
+
+def continue_cli_segment_source(request_path, deadline):
+    request=read_json(request_path)
+    value=read_json(pin(request['current_input'])); home=Path(value['home'])
+    intent=read_json(home/CLI_SEGMENT)
+    require(intent.get('state')=='CONSUMED_NOT_COMPLETE' and intent.get('request')==request,
+            'consumed_cli_segment_intent_required')
+    budget=cli_segment_clock(intent['clock'],deadline)
+    proxy,prepared,_=cli_segment_inputs(request,budget)
+    require(intent['original_attempt']==prepared[2], 'original_attempt_changed')
+    return _continue_cli_source(proxy,prepared)
+
+
+def resume_cli_segment(request, request_path, *, admission):
+    budget=cli_segment_clock(admission)
+    proxy,prepared,supervisor=cli_segment_inputs(request,budget)
+    return resume_cli(proxy,request_path,prepared=prepared,
+        segment={'request':request,'clock':admission,'supervisor':supervisor})
+
+
+def continue_cli_source(request_path, deadline):
+    """Legitimate exact overlay plus full-byte receipt; no compose/PM replay."""
+    request = read_json(request_path)
+    value, paths, claim, budget = cli_resume_inputs(request, consumed=True)
+    require(deadline == budget.deadline, 'original_install_deadline_required')
+    home = Path(value['home']); old = read_json(paths['original_input'])
+    require(read_json(home/CLI_RESUME) == {'state':'CONSUMED_NOT_COMPLETE','request':request,
+                'original_attempt':claim}, 'cli_host_intent_changed')
+    return _continue_cli_source(request,(value,paths,claim,budget))
+
+
+def _continue_cli_source(request, prepared):
+    value,paths,claim,budget=prepared
+    home=Path(value['home']);old=read_json(paths['original_input'])
+    source = home/'hermes-agent'; receipt_path = home/'hermes-agent.source.json'
+    receipt = read_json(receipt_path)
+    donors = {r['id']:r for r in read_json(pin(value['sources_lock']))['repositories']}
+    budget.call(composition_checked,old,source,receipt,donors['hermes'])
+    manifest_path = ROOT/CLI_OVERLAY; manifest = read_json(manifest_path)
+    require(manifest['base_commit'] == receipt['commit']
+            and manifest['patch'] == 'patches/hermes/cli-host-stage.patch', 'cli_overlay_identity_changed')
+    for name, expected in manifest['prerequisites'].items():
+        require(old['project_files'].get(name) == expected, 'cli_overlay_prerequisite_changed')
+    require({r['path'] for r in manifest['files']} == {
+        'hermes_cli/friday_credential_admission.py','hermes_cli/friday_dashboard_owner.py'}, 'cli_overlay_scope_changed')
+    for row in manifest['files']:
+        require(digest(budget.call(owned_file,source/row['path'])) == row['before_sha256']
+                and receipt['files'][row['path']]['sha256'] == row['before_sha256'], 'cli_overlay_input_changed')
+    patch = pin({'path':str(ROOT/manifest['patch']),'sha256':manifest['patch_sha256']})
+    original = budget.call(owned_file,receipt_path,private=True)
+    preserved = home/'hermes-agent.source.json.original-cli'
+    fd=os.open(preserved,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as stream: stream.write(original);stream.flush();os.fsync(stream.fileno())
+    from scripts.dsh_prepare import run
+    env=clean_environment(home)
+    for checking in (True,False):
+        command=['git','--no-optional-locks','apply','--whitespace=nowarn']
+        if checking: command.append('--check')
+        command.append(str(patch))
+        run(command,source,timeout=min(30,budget.check(reserve=1)),env=env,deadline=budget.deadline)
+    for row in manifest['files']:
+        data=budget.call(owned_file,source/row['path'])
+        require(digest(data)==row['sha256'] and len(data)==row['bytes']
+                and not (source/row['path']).stat().st_mode & 0o111, 'cli_overlay_output_changed')
+        receipt['files'][row['path']]={k:row[k] for k in ('sha256','bytes','mode')}
+    receipt['layers'].append({'manifest':CLI_OVERLAY,
+        'manifest_sha256':value['project_files'][CLI_OVERLAY], 'patch_sha256':manifest['patch_sha256']})
+    budget.call(composition_checked,value,source,receipt,donors['hermes'])
+    cli_request_unchanged(request,claim,budget)
+    staged=home/'hermes-agent.source.json.cli-completed'
+    publish(staged,receipt,budget=budget);budget.call(os.replace,staged,receipt_path)
+    budget.call(composition_checked,value,source,read_json(receipt_path),donors['hermes'])
+    return {'state':'CLI_SOURCE_CONTINUED_FULL_BYTES_VERIFIED','ready':False}
+
+
+def resume_cli(request, request_path, *, prepared=None, segment=None):
+    value, paths, claim, budget = prepared or cli_resume_inputs(request)
+    require(read_json(request_path)==(segment['request'] if segment else request), 'resume_request_changed')
+    home=Path(value['home']); source=home/'hermes-agent'; supervisor=read_json(paths['original_supervision'])
+    require(not any(os.path.lexists(home/n) for n in ('FRIDAY-PROFILE.json','config.yaml','.env','auth.json',
+        'preparation/a0-service.intent.json','preparation/a0-service.receipt.json','workers',
+        MARKER+'.cli-completed','hermes-agent.source.json.original-cli')), 'cli_resume_effect_destination_exists')
+    from scripts.install_containment import Containment
+    custody=Containment(value['containment'],budget,clean_environment(home))
+    old=read_json(paths['original_input']); donors={r['id']:r for r in read_json(pin(value['sources_lock']))['repositories']}
+    budget.call(composition_checked,old,source,read_json(home/'hermes-agent.source.json'),donors['hermes'])
+    runtime=directory(Path('/run/user')/str(os.getuid()))
+    bus=runtime/'bus'; info=bus.lstat()
+    require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid()
+            and info.st_nlink == 1, 'owned_user_bus_required')
+    command=['/usr/bin/env','XDG_RUNTIME_DIR='+str(runtime),
+        'DBUS_SESSION_BUS_ADDRESS=unix:path='+str(bus), '/usr/bin/systemctl','--user','show',
+        supervisor['unit'],'--property=Id,InvocationID,ActiveState,SubState,MainPID,ControlPID,ControlGroup']
+    # User systemd owns the native host namespace. This fixed read-only query
+    # uses the existing directly reaped command runner; all effectful phases
+    # below still require the original PID-namespace Containment.
+    from scripts.dsh_prepare import run
+    observation=run(command,ROOT,timeout=min(15,budget.check(reserve=1)),
+        env=custody.env,deadline=budget.deadline)[0]
+    budget.call(cli_cessation_checked,supervisor,observation)
+    cli_request_unchanged(request,claim,budget)
+    if segment:
+        previous=segment['supervisor']
+        observation=run(command[:-2]+[previous['unit'],command[-1]],ROOT,timeout=min(15,budget.check(reserve=1)),env=custody.env,deadline=budget.deadline)[0]
+        budget.call(cli_cessation_checked,previous,observation)
+        cli_segment_recheck(segment['request'],claim,budget)
+        require(not os.path.lexists(home/CLI_SEGMENT) and not os.path.lexists(home/(MARKER+'.original-cli-segment'))
+                and not os.path.lexists(home/'preparation/cli-host-segment'), 'cli_segment_already_consumed')
+        publish(home/CLI_SEGMENT,{'state':'CONSUMED_NOT_COMPLETE','request':segment['request'],'clock':segment['clock'],'original_attempt':claim},budget=budget)
+        raw=budget.call(owned_file,home/MARKER,private=True)
+        fd=os.open(home/(MARKER+'.original-cli-segment'),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+        with os.fdopen(fd,'wb') as stream:
+            budget.check();stream.write(raw);stream.flush();os.fsync(stream.fileno());budget.check()
+    else:
+        publish(home/CLI_RESUME,{'state':'CONSUMED_NOT_COMPLETE','request':request,'original_attempt':claim},budget=budget)
+    def execute(phase, command, *, read_only=False, timeout=120):
+        cli_request_unchanged(request,claim,budget)
+        if segment: cli_segment_recheck(segment['request'],claim,budget)
+        return custody.run(command,source,timeout=timeout,read_only=read_only,
+            log=home/('preparation/cli-host-segment' if segment else 'preparation/cli-host')/phase)[0]
+    code='import sys;sys.path.insert(0,'+repr(str(ROOT))+');from scripts.friday_install import continue_cli_source;continue_cli_source(sys.argv[1],float(sys.argv[2]))'
+    if segment: code=code.replace('continue_cli_source','continue_cli_segment_source')
+    execute('source_continuation',[value['bootstrap_python']['path'],'-B','-c',code,str(request_path),str(budget.deadline)])
+    expression='from pm.environments import project_python; from pathlib import Path; print(project_python(Path.cwd()))'
+    selected=execute('pm_python',[value['bootstrap_python']['path'],'-B','-c',expression],read_only=True,timeout=15)
+    require(Path(selected).is_absolute() and Path(selected).is_file(), 'native_pm_python_missing')
+    execute('native_cli_completion',[selected,'-B',str(ROOT/'scripts/friday_native.py'),'install-cli',
+        '--input',str(paths['current_input']),'--deadline',str(budget.deadline)],timeout=300)
+    code='import sys;sys.path.insert(0,'+repr(str(ROOT))+');from scripts.friday_install import verify_completed_native;verify_completed_native(sys.argv[1],float(sys.argv[2]),cli_host=True)'
+    execute('completed_cli_check',[selected,'-B','-c',code,str(paths['current_input']),str(budget.deadline)],read_only=True)
+    receipt_path=home/'hermes-agent.source.json'; receipt=read_json(receipt_path)
+    marker={'schema':SCHEMA,'state':'INSTALLED_TEMPLATE_INCOMPLETE','completion_stage':CLI_STAGE,
+        'worker_state':'BOTH_WORKERS_PREPARATION_PENDING','worker_preparation_mode':'BOTH_WORKERS_REQUIRED',
+        'native_frontends':'PENDING','input_sha256':request['current_input']['sha256'],
+        'source_receipt_sha256':digest(owned_file(receipt_path)), 'home':str(home),'source':str(source),
+        'runtime_ready':False,'gateway_installed':False,'original_attempt':claim,
+        'remaining':gaps(),'invocation_completion':'NOT_PROVEN_BY_OUTPUT_RECEIPT',
+        'profile_files':{n:digest(owned_file(home/n,private=True)) for n in ('config.yaml','SOUL.md','FRIDAY-PROFILE.json')},
+        'plugin_files':{n:h for n,h in value['project_files'].items() if n.startswith('plugins/friday_rework/')}}
+    if segment:
+        marker['cli_segment']={'clock':segment['clock'],'request':segment['request'],'intent_sha256':digest(owned_file(home/CLI_SEGMENT,private=True)),'original_claim_sha256':digest(owned_file(home/(MARKER+'.original-cli-segment'),private=True))}
+    if 'tls' in value['product']['dashboard']:
+        marker['tls_files']={p:digest(owned_file(home/p,private=True)) for p in value['product']['dashboard']['tls'].values()}
+    cli_request_unchanged(request,claim,budget)
+    publish(home/(MARKER+'.cli-completed'),marker,budget=budget)
+    require(read_json(home/MARKER)==claim,'install_claim_changed')
+    budget.call(os.replace,home/(MARKER+'.cli-completed'),home/MARKER)
+    return budget.call(inspect,value,request['current_input']['sha256'])
+
+
 def inspect(value, input_hash):
-    home, donors = spec_checked(value); directory(home)
+    home = canonical(value['home']); directory(home)
     marker = read_json(home / MARKER)
     require(marker.get('schema') == SCHEMA and marker.get('home') == str(home)
             and marker.get('input_sha256') == input_hash
             and marker.get('state') == 'INSTALLED_TEMPLATE_INCOMPLETE', 'foreign_or_partial_install')
+    home, donors = spec_checked(value, cli_only=marker.get('completion_stage') == CLI_STAGE)
     if 'tls' in value['product']['dashboard']:
         expected = {path: value['dashboard_tls'][key]['sha256']
             for key, path in value['product']['dashboard']['tls'].items()}
@@ -879,6 +1327,13 @@ def inspect(value, input_hash):
     for name, sha in expected_plugins.items():
         require(digest(owned_file(home / name, private=True)) == sha, 'installed_plugin_changed')
     effective = value
+    if marker.get('completion_stage') == CLI_STAGE:
+        require(marker.get('worker_state') == 'BOTH_WORKERS_PREPARATION_PENDING'
+                and marker.get('runtime_ready') is False and value['product']['runtime'] == {'enabled':False}
+                and marker.get('gateway_installed') is False and marker.get('native_frontends') == 'PENDING',
+                'cli_host_pending_state_required')
+        return {'state':'CLI_HOST_WORKERS_PENDING','ready':False,'home':str(home),'effects':'NONE',
+                'per_job_authority':'NOT_GRANTED','full_start_allowed':False,'remaining':gaps()}
     if 'worker_install' in value:
         files = marker.get('worker_files')
         from scripts.worker_install import installed_files
@@ -908,6 +1363,7 @@ def start(value, input_hash, *, budget=None, input_path=None, plan_ref=None, pha
     budget = budget or Budget(value.get('seconds'))
     budget.call(inspect, value, input_hash)
     home = Path(value['home'])
+    require(budget.call(read_json,home/MARKER).get('completion_stage') != CLI_STAGE, 'cli_host_full_start_refused')
     marker = budget.call(read_json,home / MARKER) if 'worker_install' in value else {}
     pending = marker.get('worker_state') == 'BOTH_CONFIGURED_QUALIFICATION_PENDING'
     if phase == 'qualify' or (pending and plan_ref is not None):
@@ -949,7 +1405,7 @@ def start(value, input_hash, *, budget=None, input_path=None, plan_ref=None, pha
 def main():
     started = time.monotonic()  # before parser/input IO; never reset on dispatch
     parser = SafeParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'qualify', 'reconcile', 'resume-harness'))
+    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'qualify', 'reconcile', 'resume-harness', 'resume-cli', 'continue-cli-segment'))
     parser.add_argument('--input', required=True, type=Path, help='Private pinned JSON, no credential values')
     parser.add_argument('--a0-plan', type=Path, help='Existing owned live native probe plan; never a readiness report')
     parser.add_argument('--a0-plan-sha256')
@@ -965,11 +1421,17 @@ def main():
         value = json.loads(raw, object_pairs_hook=unique); sha = digest(raw)
         from scripts.install_containment import Budget
         require(isinstance(value, dict), 'explicit_install_fields_required')
-        prepared = resume_inputs(value) if args.phase == 'resume-harness' else None
-        budget = prepared[3] if prepared else Budget(value.get('seconds'), started=started)
+        admission = cli_segment_admission() if args.phase=='continue-cli-segment' else None
+        prepared = (resume_inputs(value) if args.phase == 'resume-harness' else
+                    cli_resume_inputs(value) if args.phase == 'resume-cli' else None)
+        budget = cli_segment_clock(admission) if admission else (prepared[3] if prepared else Budget(value.get('seconds'), started=started))
         budget.check()
-        if args.phase == 'resume-harness':
+        if args.phase == 'continue-cli-segment':
+            result = resume_cli_segment(value,args.input,admission=admission)
+        elif args.phase == 'resume-harness':
             result = resume_harness(value, args.input, prepared=prepared)
+        elif args.phase == 'resume-cli':
+            result = resume_cli(value,args.input,prepared=prepared)
         elif args.phase == 'reconcile':
             result = reconcile(value, sha)
         elif args.phase == 'plan':

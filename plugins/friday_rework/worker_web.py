@@ -159,8 +159,8 @@ try {
 """
 
 
-def web_policy(web, home, profile, now):
-    """An explicit protected operator declaration, not a readiness receipt."""
+def web_policy_declaration(web, home, profile):
+    """Validate protected declaration bytes; this never grants current egress."""
     import math
     import ipaddress
     import os
@@ -186,7 +186,7 @@ def web_policy(web, home, profile, now):
                 or v['runtime_home'] != home or v['runtime_profile'] != profile
                 or v['allow_public_https'] is not True
                 or type(v['expires_unix']) not in (int,float) or not math.isfinite(v['expires_unix'])
-                or v['expires_unix'] <= now
+                or v['expires_unix'] <= 0
                 or not isinstance(v['net_namespace'],list) or len(v['net_namespace']) != 2
                 or any(type(x) is not int or x <= 0 for x in v['net_namespace'])
                 or not isinstance(v['boot_id'],str)
@@ -208,6 +208,14 @@ def web_policy(web, home, profile, now):
     except (ValueError,TypeError,KeyError,UnicodeError):
         raise WorkerWebError('worker_web_policy_invalid') from None
     return v
+
+
+def web_policy(web, home, profile, now):
+    """Actual worker permission always requires current finite declaration."""
+    value = web_policy_declaration(web, home, profile)
+    if value['expires_unix'] <= now:
+        raise WorkerWebError('worker_web_policy_invalid')
+    return value
 
 
 class DshNetworkCheck:

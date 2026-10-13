@@ -14,8 +14,9 @@ from pathlib import Path
 from scripts.friday_install import canonical, directory, digest, owned_file, pin, publish, read_json, require
 
 
-def settings(value):
+def settings(value, *, cli_only=False):
     """Validate explicit deployment/resource declarations before install effects."""
+    require(type(cli_only) is bool, 'explicit_cli_declaration_mode_required')
     spec = value['worker_install']
     require(isinstance(spec, dict) and set(spec) == {'dsh', 'a0'}, 'both_worker_install_settings_required')
     require(value['product']['runtime'] == {'enabled': False}, 'generated_workers_require_unconfigured_input')
@@ -46,24 +47,30 @@ def settings(value):
             # the install budget. This is permission validation only; ordinary
             # qualification still proves current namespace and DNS/TLS access.
             from scripts.friday_install import ROOT
-            from plugins.friday_rework.host_runtime import _pin
-            from plugins.friday_rework.worker_web import DshWebInputs, WorkerWebError, web_policy
+            from scripts.friday_install import project_plugin
+            _pin=project_plugin('host_runtime',value)._pin
+            module=project_plugin('worker_web',value)
+            DshWebInputs,WorkerWebError,web_policy=module.DshWebInputs,module.WorkerWebError,module.web_policy
             web = DshWebInputs(**{k: _pin(v) for k, v in row['web'].items()},
                 research_policy=_pin({'path': str(ROOT / 'config/RESEARCH.md'),
                                      'sha256': value['project_files']['config/RESEARCH.md']}),
                 profile=value['product']['web']['profile'])
             try:
-                web_policy(web, value['home'], value['product']['profile'], time.time())
+                if cli_only:
+                    module.web_policy_declaration(web, value['home'], value['product']['profile'])
+                else:
+                    web_policy(web, value['home'], value['product']['profile'], time.time())
             except WorkerWebError:
                 require(False, 'current_dsh_web_policy_required')
         else:
-            from plugins.friday_rework.adapters.a0_web import checked_web
+            from scripts.friday_install import project_plugin
+            checked_web=project_plugin('adapters.a0_web',value).checked_web
             checked_web(row['web'])
             pin(row['docker']); pin(row['policy'])
             require(isinstance(row['network'], dict) and set(row['network']) == {'name', 'endpoints', 'policy'}
                     and row['network']['policy'] == row['policy'], 'explicit_a0_network_policy_required')
-            from plugins.friday_rework.adapters.a0_config import LocalNetwork
-            from plugins.friday_rework.host_runtime import _pin
+            LocalNetwork=project_plugin('adapters.a0_config',value).LocalNetwork
+            _pin=project_plugin('host_runtime',value)._pin
             LocalNetwork(row['network']['name'], tuple(row['network']['endpoints']), _pin(row['policy']),
                          value['product']['a0_deployment']).checked()
             require(isinstance(row['git_metadata'], dict) and set(row['git_metadata']) == {'source', 'manifest_sha256'},
