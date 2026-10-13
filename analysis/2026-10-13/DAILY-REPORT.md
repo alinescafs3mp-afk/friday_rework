@@ -1,6 +1,6 @@
 # Daily analysis checkpoint — 13 October 2026
 
-Exact completed published-source cut: ffc2bf78e787d6ff5da4464e9dfd3197e922773a → ae0b05253e87c63be7608476fd1f9b087fdf0354. All 17 main commits, 1,321 changed/touched paths and ten logical blocks are accounted for in [the exact period index](daily-period-index.json). The [integrity observations](publication-integrity.json) verify 3,061 hash references, 174 Markdown links, 3,708 JSON links and 590 JSON files, with zero publication gaps. The [manifest](MANIFEST.json) pins the exact generated files.
+Exact completed published-source cut: ffc2bf78e787d6ff5da4464e9dfd3197e922773a → ae0b05253e87c63be7608476fd1f9b087fdf0354. All 17 main commits, 1,321 changed/touched paths and ten logical blocks are accounted for in [the exact period index](final-daily/daily-period-index.json). The [integrity observations](final-daily/publication-integrity.json) verify 3,061 hash references, 174 Markdown links, 3,708 JSON links and 590 JSON files, with zero publication gaps. The [manifest](final-daily/MANIFEST.json) pins the exact generated files.
 
 Independent final review accepted these exact bytes for content, privacy and integrity. The generated writer's PROVISIONAL_NOT_DAILY_COMPLETE flags are retained; the integrator's separate daily publication receipt closes transport after actual remote verification. This is analysis acceptance. Source presence, wiring, offline checks, observed native behavior and runtime acceptance remain distinct.
 
