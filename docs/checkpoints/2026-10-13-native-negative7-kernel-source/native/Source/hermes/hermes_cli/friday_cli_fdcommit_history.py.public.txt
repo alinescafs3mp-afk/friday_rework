@@ -1,0 +1,525 @@
+"""NEW bounded DATA reducer, not a native history producer or authority.
+
+Only the native backend may supply authenticated frames and a matching fence.
+Passing bytes to this reducer never mints qualification, membership or epoch.
+No polling, callbacks, I/O, model calls or resource expansion occurs here.
+"""
+from dataclasses import dataclass
+import struct
+
+MAGIC = 0x46525731
+FRAME = struct.Struct("<IHH" + "Q" * 19 + "I" * 4)
+FIELDS = ("magic", "version", "kind", "epoch_hi", "epoch_lo", "seq", "mono_ns",
+          "task", "table", "ofd", "slot", "exec", "parent_task", "src_table",
+          "src_ofd", "src_slot", "before_ofd", "before_slot", "aux", "flags",
+          "coverage", "loss", "fd", "src_fd", "reason", "reserved")
+REQUIRED_COVERAGE = 0xffff
+MAX_TASKS, MAX_TABLES, MAX_OFDS = 64, 64, 1024
+MAX_SLOTS, MAX_RECORDS, MAX_RINGS, MAX_RETAINS = 4096, 8192, 64, 32
+MAX_FRAMES, MAX_FD, U64_MAX = 1024, 1048575, (1 << 64) - 1
+ARM, OFD_BIRTH, TABLE_BIRTH, TASK_BIRTH, INHERIT, INSTALL, REPLACE, CLOSE, FLAGS, SHARE, COPY_BEGIN, EXEC_BEGIN, EXEC_END, TASK_EXIT, OFD_END, TABLE_END, FENCE, LOSS, ADOPT, STATUS_FLAGS, RING_BIRTH, RING_INSTALL, RING_CLOSE, RETAIN, SCOPE = range(1, 26)
+NATIVE, SCM_RIGHTS, PIDFD_GETFD, IO_URING = 1, 2, 4, 8
+INHERITED, DUP, CLOEXEC, DIRECT, ROOT_SNAPSHOT = 16, 32, 64, 128, 256
+COPY_DONE, BIRTH_DONE, ARM_DONE, EXEC_DONE = 512, 1024, 2048, 4096
+RETAIN_RELEASE, RING_RETIRE = 8192, 16384
+# Deliberately finite policy, not an attestation of the missing kernel ABI.
+STATUS_MASK = 3 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x10000 | 0x20000 | 0x40000 | 0x100000 | 0x200000 | 0x400000
+SEMANTIC = ("task", "table", "ofd", "slot", "exec", "parent_task", "src_table",
+            "src_ofd", "src_slot", "before_ofd", "before_slot", "aux", "flags",
+            "fd", "src_fd", "reason")
+EVENT_FIELDS = {
+ ARM: {"task", "table"},
+ OFD_BIRTH: {"task", "table", "ofd", "flags"},
+ TABLE_BIRTH: {"task", "table", "src_table"},
+ TASK_BIRTH: {"task", "table", "parent_task", "src_table", "flags"},
+ INHERIT: {"task", "table", "ofd", "slot", "fd", "src_table", "src_ofd", "src_slot", "src_fd", "before_ofd", "before_slot", "aux", "flags"},
+ INSTALL: {"task", "table", "ofd", "slot", "fd", "src_table", "src_ofd", "src_slot", "src_fd", "before_ofd", "before_slot", "aux", "flags"},
+ REPLACE: {"task", "table", "ofd", "slot", "fd", "src_table", "src_ofd", "src_slot", "src_fd", "before_ofd", "before_slot", "aux", "flags"},
+ CLOSE: {"task", "table", "slot", "fd", "before_ofd", "before_slot", "flags"},
+ FLAGS: {"task", "table", "ofd", "slot", "fd", "before_ofd", "before_slot", "aux", "flags"},
+ SHARE: {"task", "table", "src_table", "flags"},
+ COPY_BEGIN: {"task", "table", "src_table", "aux"},
+ EXEC_BEGIN: {"task", "table", "exec"},
+ EXEC_END: {"task", "table", "exec"},
+ TASK_EXIT: {"task", "table"},
+ OFD_END: {"task", "table", "ofd"},
+ TABLE_END: {"task", "table"},
+ FENCE: {"task", "table", "flags"},
+ ADOPT: {"task", "table", "exec", "parent_task"},
+ STATUS_FLAGS: {"task", "table", "ofd", "slot", "before_ofd", "flags"},
+ RING_BIRTH: {"task", "table", "ofd", "aux", "src_table", "src_ofd", "src_slot", "src_fd", "flags"},
+ RING_INSTALL: {"task", "table", "ofd", "slot", "aux", "fd", "before_ofd", "before_slot", "src_table", "src_ofd", "src_slot", "src_fd", "flags"},
+ RING_CLOSE: {"task", "table", "slot", "aux", "fd", "before_ofd", "before_slot", "flags"},
+ RETAIN: {"task", "table", "ofd", "slot", "aux", "fd", "flags"},
+ SCOPE: {"task", "table", "reason"},
+}
+
+
+class HistoryRefusal(RuntimeError):
+    pass
+
+@dataclass(frozen=True)
+class Slot:
+    generation: int
+    ofd: int
+    flags: int
+
+class OrderedHistory:
+    """One retained epoch. Unknown/lost history is irreversible.
+
+    Dictionaries retain tombstones; their total generation count is bounded.
+    Python memory is not inferred from object counts: native admission also
+    requires a separately measured, charged reducer-memory limit.
+    """
+    def __init__(self, epoch_hi, epoch_lo):
+        if any(type(x) is not int or not 0 < x <= U64_MAX for x in (epoch_hi, epoch_lo)):
+            raise HistoryRefusal("invalid_data_epoch")
+        self.epoch = (epoch_hi, epoch_lo)
+        self.failure = None
+        self.seq = self.mono_ns = 0
+        self.state = "UNARMED"
+        self.owner = self.owner_table = None
+        self.tasks, self.tables, self.ofds, self.rings = {}, {}, {}, {}
+        self.used_generations = set()
+        self.slot_records = 0
+        self.copy = None
+        self.table_origins = {}
+        self.retained = {}
+        self.birth_pending = set()
+        self.fence = None
+
+    def refuse(self, reason):
+        self.fence = None
+        if self.failure is None:
+            self.failure = reason
+        raise HistoryRefusal(self.failure)
+
+    def _need(self, value, reason):
+        if not value:
+            self.refuse(reason)
+
+    def _generation(self, generation):
+        self._need(type(generation) is int and 0 < generation < U64_MAX
+                   and generation not in self.used_generations, "generation_reuse_or_saturation")
+        self._need(len(self.used_generations) < MAX_RECORDS, "record_capacity")
+        self.used_generations.add(generation)
+
+    def feed(self, raw):
+        self._need(self.failure is None, "prior_sticky_refusal")
+        self._need(type(raw) is bytes and 0 < len(raw) <= MAX_FRAMES * 176
+                   and len(raw) % 176 == 0, "frame_size_or_batch_capacity")
+        try:
+            for offset in range(0, len(raw), 176):
+                self._event(dict(zip(FIELDS, FRAME.unpack_from(raw, offset))))
+        except HistoryRefusal:
+            raise
+        except (KeyError, TypeError, ValueError, OverflowError, struct.error):
+            self.refuse("malformed_transition")
+        return self.seq
+
+    def _event(self, e):
+        self._need(e["magic"] == MAGIC and e["version"] == 1 and e["reserved"] == 0
+                   and (e["epoch_hi"], e["epoch_lo"]) == self.epoch,
+                   "framing_or_epoch_drift")
+        self._need(e["seq"] == self.seq + 1 and e["seq"] < U64_MAX
+                   and self.mono_ns <= e["mono_ns"] < U64_MAX, "sequence_gap_replay_or_clock")
+        self.seq, self.mono_ns = e["seq"], e["mono_ns"]
+        self._need(e["loss"] == 0 and e["kind"] != LOSS, "native_loss_or_unsupported")
+        self._need(e["coverage"] == REQUIRED_COVERAGE, "all_path_coverage_unproven")
+        k = e["kind"]
+        self._need(k in EVENT_FIELDS, "unsupported_kind")
+        self._shape(k, e)
+        # EVERY subsequent event invalidates the previous receipt. Only a
+        # complete ordinary FENCE may publish a new data receipt.
+        self.fence = None
+        self._need(self.copy is None or k == INHERIT or
+                   (k == FENCE and e["flags"] == COPY_DONE), "event_interleaved_atomic_copy")
+        if k == ARM:
+            self._need(self.state == "UNARMED" and self.seq == 1 and e["flags"] == 0,
+                       "late_or_repeated_arm")
+            self._generation(e["task"]); self._generation(e["table"])
+            self.owner, self.owner_table = e["task"], e["table"]
+            self.tables[self.owner_table] = {"slots": {}, "ready": False, "alive": True}
+            self.tasks[self.owner] = {"table": self.owner_table, "exec": 0, "alive": True,
+                                      "executing": False, "adopted": False, "parent": 0}
+            self.state = "ARMING"
+            return
+        self._need(self.state in {"ARMING", "ACTIVE"}, "event_before_arm")
+        if k == OFD_BIRTH:
+            self._owned_table(e["task"], e["table"], ready=self.state != "ARMING")
+            self._need(e["flags"] & ~STATUS_MASK == 0, "unknown_ofd_status_flags")
+            self._need(len(self.ofds) < MAX_OFDS, "ofd_capacity")
+            self._generation(e["ofd"])
+            self.ofds[e["ofd"]] = {"alive": True, "flags": e["flags"], "refs": 0,
+                                     "status_generation": e["ofd"]}
+        elif k == TABLE_BIRTH:
+            self._owned_table(e["task"], e["src_table"])
+            self._need(self.state == "ACTIVE" and e["table"] != e["src_table"],
+                       "table_birth_original_actor_lineage")
+            self._need(len(self.tables) < MAX_TABLES and self.copy is None, "table_capacity_or_copy")
+            self._generation(e["table"])
+            self.tables[e["table"]] = {"slots": {}, "ready": False, "alive": True}
+        elif k == COPY_BEGIN:
+            self._owned_table(e["task"], e["src_table"])
+            source, dest = self._table(e["src_table"]), self._table(e["table"], ready=False)
+            self._need(self.copy is None and source["ready"] and not dest["ready"]
+                       and not dest["slots"] and e["aux"] <= MAX_SLOTS, "copy_not_atomic")
+            occupied = sum(s is not None and s.ofd != 0 for s in source["slots"].values())
+            self._need(e["aux"] == occupied, "copy_expected_slot_count")
+            self.copy = {"task": e["task"], "source": e["src_table"], "dest": e["table"], "count": occupied,
+                         "seen": set()}
+        elif k == TASK_BIRTH:
+            self._need(self.state == "ACTIVE" and len(self.tasks) < MAX_TASKS,
+                       "task_capacity_or_late_birth")
+            parent = self._task(e["parent_task"])
+            table = self._table(e["table"])
+            self._need(parent["alive"] and table["ready"] and e["parent_task"] not in self.birth_pending
+                       and not parent["executing"] and e["src_table"] == parent["table"],
+                       "missing_true_birth_lineage")
+            if e["flags"] == 1:  # CLONE_FILES is a NEW semantic flag, not Linux bit value.
+                self._need(e["table"] == parent["table"], "clone_files_table_mismatch")
+            else:
+                self._need(e["flags"] == 0 and e["src_table"] == parent["table"]
+                           and e["table"] != parent["table"]
+                           and self.table_origins.get(e["table"]) == parent["table"], "private_fork_lineage")
+            self._generation(e["task"])
+            self.tasks[e["task"]] = {"table": e["table"], "exec": 0, "alive": True,
+                                      "executing": False, "adopted": False,
+                                      "parent": e["parent_task"]}
+            self.birth_pending.add(e["task"])
+        elif k in {INHERIT, INSTALL, REPLACE, CLOSE, FLAGS}:
+            self._slot_transition(k, e)
+        elif k == SHARE:
+            task = self._task(e["task"])
+            self._need(task["table"] == e["src_table"] and self.copy is None,
+                       "files_table_switch_old_generation")
+            self._table(e["table"])
+            self._need(self.table_origins.get(e["table"]) == e["src_table"],
+                       "unshare_or_exec_copy_lineage")
+            self._need(e["flags"] == (EXEC_DONE if task["executing"] else 0)
+                       and e["table"] != e["src_table"] and e["task"] not in self.birth_pending,
+                       "exec_files_switch_protocol")
+            task["table"] = e["table"]
+        elif k == EXEC_BEGIN:
+            task = self._task(e["task"])
+            self._need(not task["executing"] and e["task"] not in self.birth_pending
+                       and self.copy is None and task["table"] == e["table"], "exec_begin_state")
+            self._generation(e["exec"])
+            task["executing"] = True
+            task["exec"] = e["exec"]
+            task["adopted"] = False
+        elif k == EXEC_END:
+            task = self._task(e["task"])
+            self._need(task["executing"] and task["exec"] == e["exec"]
+                       and task["table"] == e["table"]
+                       and not any(s is not None and s.ofd != 0 and s.flags & 1
+                                   for s in self._table(e["table"])["slots"].values()),
+                       "exec_cloexec_or_generation_incomplete")
+            task["executing"] = False
+        elif k == ADOPT:
+            task = self._task(e["task"])
+            self._need(e["task"] != self.owner and task["parent"] == self.owner
+                       and not task["adopted"] and not task["executing"]
+                       and task["exec"] == e["exec"] != 0 and e["task"] not in self.birth_pending
+                       and task["table"] == e["table"] and e["parent_task"] == self.owner
+                       and self._task(self.owner)["alive"],
+                       "foreign_replayed_or_preexec_adoption")
+            task["adopted"] = True
+        elif k == TASK_EXIT:
+            task = self._task(e["task"])
+            self._need(self.copy is None and task["table"] == e["table"], "exit_inside_copy_or_foreign_table")
+            task["alive"] = False
+            # No implicit table/OFD close: commit events must supply each edge.
+        elif k == OFD_END:
+            self._need(e["task"] == self.owner, "foreign_ofd_retirement")
+            self._owned_table(e["task"], e["table"])
+            ofd = self._ofd(e["ofd"])
+            self._need(ofd["refs"] == 0 and not any(r["ofd"] == e["ofd"] for r in self.retained.values()),
+                       "ofd_end_with_alias_or_retained_custody")
+            ofd["alive"] = False
+        elif k == TABLE_END:
+            self._need(e["task"] == self.owner and self._task(self.owner)["alive"] and self.copy is None,
+                       "foreign_or_partial_table_retirement")
+            table = self._table(e["table"], ready=False)
+            self._need(not any(r["table"] == e["table"] for r in self.retained.values())
+                       and not any(r["alive"] and r["table"] == e["table"] for r in self.rings.values()),
+                       "table_end_with_retained_or_ring_custody")
+            self._need(not any(t["alive"] and t["table"] == e["table"] for t in self.tasks.values())
+                       and not any(s is not None and s.ofd != 0 for s in table["slots"].values()), "table_end_with_live_refs")
+            table["alive"] = False
+        elif k == FENCE:
+            self._fence(e)
+        elif k == STATUS_FLAGS:
+            self._owned_table(e["task"], e["table"])
+            self._need(self._actor_has_ofd(e["task"], e["table"], e["ofd"])
+                       and e["flags"] & ~STATUS_MASK == 0 and e["before_ofd"] & ~STATUS_MASK == 0,
+                       "status_flags_owner_or_unknown_bits")
+            ofd = self._ofd(e["ofd"])
+            self._need(ofd["flags"] == e["before_ofd"], "ofd_status_flag_previous_value")
+            self._generation(e["slot"])
+            ofd["flags"] = e["flags"]
+            ofd["status_generation"] = e["slot"]
+        elif k == RING_BIRTH:
+            self._owned_table(e["task"], e["table"])
+            self._need(e["flags"] == IO_URING and self.copy is None
+                       and e["task"] not in self.birth_pending, "ring_birth_path_or_state")
+            self._source(e, task=e["task"], table=e["table"])
+            self._need(e["ofd"] == e["src_ofd"] and len(self.rings) < MAX_RINGS, "ring_capacity_or_source")
+            self._generation(e["aux"])
+            self.rings[e["aux"]] = {"task": e["task"], "table": e["table"], "ofd": e["ofd"],
+                                    "slots": {}, "alive": True}
+            self._ofd(e["ofd"])["refs"] += 1  # original retained ring reference
+        elif k in {RING_INSTALL, RING_CLOSE}:
+            self._ring(k, e)
+        elif k == RETAIN:
+            if e["flags"] == RETAIN_RELEASE:
+                self._need(e["aux"] in self.retained, "retained_release_missing_or_duplicate")
+                old = self.retained[e["aux"]]
+                self._need(all(e[key] == old[key] for key in ("task", "table", "fd", "slot", "ofd")),
+                           "retained_release_original_capability")
+                self._need(e["task"] in self.tasks and e["table"] in self.tables,
+                           "foreign_retained_release_owner")
+                ofd = self._ofd(e["ofd"])
+                self._need(ofd["refs"] > 0, "retained_release_alias_underflow")
+                ofd["refs"] -= 1
+                del self.retained[e["aux"]]  # generation remains in fixed capped set
+            else:
+                self._need(e["flags"] == 0, "unsupported_retained_flags")
+                task = self._owned_table(e["task"], e["table"])
+                self._need(not task["executing"] and e["task"] not in self.birth_pending
+                           and self.copy is None, "retained_incomplete_original_task")
+                self._need(len(self.retained) < MAX_RETAINS, "retained_capacity")
+                slot = self._table(e["table"])["slots"].get(e["fd"])
+                self._need(slot is not None and slot.ofd != 0
+                           and (slot.generation, slot.ofd) == (e["slot"], e["ofd"]),
+                           "retained_original_generation")
+                self._generation(e["aux"])
+                self.retained[e["aux"]] = {key: e[key] for key in ("task", "table", "fd", "slot", "ofd")}
+                self._ofd(e["ofd"])["refs"] += 1
+        elif k == SCOPE:
+            self._need(e["task"] == self.owner and e["reason"] == 0,
+                       "owner_unit_cgroup_delegation_or_foreign_drift")
+            self._owned_table(e["task"], e["table"])
+
+    def _shape(self, kind, e):
+        self._need(all(e[name] == 0 for name in SEMANTIC if name not in EVENT_FIELDS[kind]),
+                   "extra_semantic_field")
+        self._need(e["fd"] <= MAX_FD and e["src_fd"] <= MAX_FD, "numeric_fd_bound")
+        if kind in {OFD_BIRTH, STATUS_FLAGS}:
+            self._need(e["flags"] & ~STATUS_MASK == 0, "unknown_status_flag")
+        elif kind == TASK_BIRTH:
+            self._need(e["flags"] in {0, 1}, "unsupported_clone_flags")
+        elif kind in {INSTALL, REPLACE}:
+            bases = {NATIVE | DIRECT, SCM_RIGHTS, PIDFD_GETFD, IO_URING | DIRECT}
+            self._need(e["flags"] == ROOT_SNAPSHOT or e["flags"] in bases
+                       or e["flags"] in {NATIVE | DIRECT | DUP}, "unsupported_slot_path")
+        elif kind == INHERIT:
+            self._need(e["flags"] == INHERITED, "unsupported_inherit_path")
+        elif kind == CLOSE:
+            self._need(e["flags"] in {NATIVE | DIRECT, NATIVE | CLOEXEC}, "unsupported_close_path")
+        elif kind == FLAGS:
+            self._need(e["flags"] == NATIVE | DIRECT, "unsupported_fd_flags_path")
+        elif kind == SHARE:
+            self._need(e["flags"] in {0, EXEC_DONE}, "unsupported_share_flags")
+        elif kind == FENCE:
+            self._need(e["flags"] in {0, ARM_DONE, COPY_DONE, BIRTH_DONE}, "unsupported_fence_flags")
+        elif kind == RING_BIRTH:
+            self._need(e["flags"] == IO_URING, "unsupported_ring_birth_flags")
+        elif kind == RING_INSTALL:
+            self._need(e["flags"] == IO_URING | DIRECT, "unsupported_ring_install_flags")
+        elif kind == RING_CLOSE:
+            self._need(e["flags"] in {IO_URING | DIRECT, RING_RETIRE}, "unsupported_ring_close_flags")
+        elif kind == RETAIN:
+            self._need(e["flags"] in {0, RETAIN_RELEASE}, "unsupported_retain_flags")
+        else:
+            self._need(e["flags"] == 0, "unsupported_event_flags")
+
+    def _owned_table(self, task_id, table_id, ready=True):
+        task = self._task(task_id)
+        self._table(table_id, ready=ready)
+        self._need(task["table"] == table_id, "original_task_table_owner_lineage")
+        return task
+
+    def _actor_has_ofd(self, task, table, ofd):
+        return any(s is not None and s.ofd == ofd for s in self._table(table)["slots"].values()) or any(
+            r["alive"] and r["task"] == task and r["table"] == table and
+            (r["ofd"] == ofd or any(s.ofd == ofd for s in r["slots"].values()))
+            for r in self.rings.values())
+
+    def _source(self, e, *, task, table):
+        self._owned_table(task, table)
+        self._need(e["src_table"] == table, "foreign_source_files_table")
+        source = self._table(table)["slots"].get(e["src_fd"])
+        self._need(source is not None and source.ofd != 0
+                   and (source.generation, source.ofd) == (e["src_slot"], e["src_ofd"]),
+                   "source_original_slot_and_ofd")
+        return source
+
+    def _task(self, generation):
+        self._need(generation in self.tasks, "unknown_task_generation")
+        task = self.tasks[generation]
+        self._need(task["alive"], "dead_or_foreign_task")
+        return task
+
+    def _table(self, generation, ready=True):
+        self._need(generation in self.tables, "unknown_table_generation")
+        table = self.tables[generation]
+        self._need(table["alive"] and (table["ready"] or not ready), "dead_unborn_or_incomplete_table")
+        return table
+
+    def _ofd(self, generation):
+        self._need(generation in self.ofds, "unknown_ofd_generation")
+        ofd = self.ofds[generation]
+        self._need(ofd["alive"], "dead_or_foreign_ofd")
+        return ofd
+
+    def _slot_transition(self, kind, e):
+        self._need(e["flags"] & ~0x1ff == 0, "unsupported_slot_path")
+        root = self.state == "ARMING" and e["flags"] & ROOT_SNAPSHOT
+        copy = kind == INHERIT and self.copy is not None
+        self._need(not (e["flags"] & ROOT_SNAPSHOT) or
+                   (root and kind == INSTALL and e["task"] == self.owner
+                    and e["table"] == self.owner_table), "late_or_foreign_root_snapshot")
+        self._need(kind != INHERIT or copy, "inherit_outside_atomic_copy")
+        table = self._table(e["table"], ready=not (root or copy))
+        self._need(e["fd"] <= MAX_FD, "numeric_fd_bound")
+        if self.copy is not None:
+            self._need(copy and e["table"] == self.copy["dest"], "mutation_interleaved_atomic_copy")
+            self._need(e["task"] == self.copy["task"], "copy_original_task")
+        elif not root:
+            task = self._task(e["task"])
+            self._need(task["table"] == e["table"], "task_files_table_generation")
+        previous = table["slots"].get(e["fd"])
+        old = previous if previous is not None and previous.ofd != 0 else None
+        self._need((old.ofd if old else 0) == e["before_ofd"]
+                   and (previous.generation if previous else 0) == e["before_slot"], "slot_previous_generation")
+        self._need((kind in {INSTALL, INHERIT} and old is None)
+                   or (kind in {REPLACE, CLOSE, FLAGS} and old is not None), "slot_transition_state")
+        if e["fd"] not in table["slots"]:
+            self._need(self.slot_records < MAX_SLOTS, "slot_capacity")
+            self.slot_records += 1
+        self._generation(e["slot"])
+        if old is not None:
+            self._need(self._ofd(old.ofd)["refs"] > 0, "alias_reference_underflow")
+            self._ofd(old.ofd)["refs"] -= 1
+        if kind == CLOSE:
+            if e["flags"] & CLOEXEC:
+                self._need(self._task(e["task"])["executing"] and old.flags & 1,
+                           "cloexec_close_outside_exec")
+            table["slots"][e["fd"]] = Slot(e["slot"], 0, 0)
+            self._need(e["ofd"] == 0 and e["aux"] == 0, "close_new_ofd_or_flags")
+            return
+        ofd = self._ofd(e["ofd"])
+        if kind == FLAGS:
+            self._need(e["ofd"] == old.ofd, "fd_flag_change_replaces_ofd")
+        alias = kind == INHERIT or e["flags"] & DUP or e["flags"] in {SCM_RIGHTS, PIDFD_GETFD, IO_URING | DIRECT}
+        if alias:
+            source = self._table(e["src_table"])["slots"].get(e["src_fd"])
+            self._need(source is not None and source.ofd != 0 and (source.generation, source.ofd) ==
+                       (e["src_slot"], e["src_ofd"]) and e["ofd"] == source.ofd,
+                       "alias_or_inherited_lineage")
+        if not alias:
+            self._need(all(e[name] == 0 for name in ("src_table", "src_fd", "src_slot", "src_ofd")),
+                       "unexpected_slot_source")
+        elif not copy:
+            self._need(e["src_table"] == e["table"], "foreign_transfer_source_table")
+        if copy:
+            self._need(e["src_table"] == self.copy["source"] and e["fd"] == e["src_fd"]
+                       and e["fd"] not in self.copy["seen"], "copy_slot_lineage")
+            self.copy["seen"].add(e["fd"])
+        self._need(e["aux"] & ~1 == 0, "unsupported_fd_flags")
+        table["slots"][e["fd"]] = Slot(e["slot"], e["ofd"], e["aux"])
+        ofd["refs"] += 1
+
+    def _fence(self, e):
+        if e["flags"] == ARM_DONE:
+            self._need(self.state == "ARMING" and e["table"] == self.owner_table
+                       and e["task"] == self.owner and self.copy is None and not self.birth_pending,
+                       "arm_fence_state")
+            self.tables[self.owner_table]["ready"] = True
+            self.state = "ACTIVE"
+        elif e["flags"] == COPY_DONE:
+            self._need(self.copy is not None and e["table"] == self.copy["dest"]
+                       and e["task"] == self.copy["task"]
+                       and len(self.copy["seen"]) == self.copy["count"], "copy_incomplete")
+            self.tables[e["table"]]["ready"] = True
+            self.table_origins[e["table"]] = self.copy["source"]
+            self.copy = None
+        elif e["flags"] == BIRTH_DONE:
+            self._need(e["task"] in self.birth_pending
+                       and self._task(e["task"])["table"] == e["table"],
+                       "birth_fence_without_original_task_table")
+            self.birth_pending.remove(e["task"])
+        else:
+            self._need(e["flags"] == 0 and self.state == "ACTIVE" and self.copy is None
+                       and not self.birth_pending and not any(t["executing"] for t in self.tasks.values())
+                       and not any(t["alive"] and not t["ready"] for t in self.tables.values()),
+                       "barrier_not_complete")
+            self._owned_table(e["task"], e["table"])
+            self.fence = (self.epoch, self.seq, e["task"], e["table"])
+
+    def _ring(self, kind, e):
+        self._need(e["aux"] in self.rings, "unknown_ring_generation")
+        ring = self.rings[e["aux"]]
+        self._need(ring["alive"] and (e["task"], e["table"]) == (ring["task"], ring["table"]),
+                   "ring_original_owner_and_table")
+        self._owned_table(e["task"], e["table"])
+        self._need(self.copy is None and e["task"] not in self.birth_pending, "ring_partial_lineage")
+        if e["flags"] == RING_RETIRE:
+            self._need(kind == RING_CLOSE and not any(s.ofd for s in ring["slots"].values())
+                       and all(e[name] == 0 for name in ("ofd", "slot", "fd", "before_ofd", "before_slot")),
+                       "ring_retire_with_alias_or_extra_data")
+            ofd = self._ofd(ring["ofd"])
+            self._need(ofd["refs"] > 0, "ring_retained_reference_underflow")
+            ofd["refs"] -= 1
+            ring["alive"] = False
+            return
+        slots = ring["slots"]
+        previous = slots.get(e["fd"])
+        old = previous if previous is not None and previous.ofd != 0 else None
+        self._need((old.ofd if old else 0) == e["before_ofd"]
+                   and (previous.generation if previous else 0) == e["before_slot"], "ring_previous_generation")
+        if kind == RING_INSTALL:
+            source = self._source(e, task=e["task"], table=e["table"])
+            self._need(source.ofd == e["ofd"], "ring_install_source_ofd_alias")
+        else:
+            self._need(old is not None and e["ofd"] == 0, "fixed_file_close_state")
+        if e["fd"] not in slots:
+            self._need(self.slot_records < MAX_SLOTS, "ring_slot_capacity")
+            self.slot_records += 1
+        self._generation(e["slot"])
+        if old is not None:
+            ofd = self._ofd(old.ofd)
+            self._need(ofd["refs"] > 0, "ring_alias_reference_underflow")
+            ofd["refs"] -= 1
+        if kind == RING_CLOSE:
+            slots[e["fd"]] = Slot(e["slot"], 0, 0)
+        else:
+            self._ofd(e["ofd"])["refs"] += 1
+            slots[e["fd"]] = Slot(e["slot"], e["ofd"], 0)
+
+    def assert_fence(self, sequence):
+        self._need(self.failure is None and self.state == "ACTIVE"
+                   and type(sequence) is int and self.seq == sequence
+                   and self.fence is not None and self.fence[:2] == (self.epoch, sequence)
+                   and self.copy is None and not self.birth_pending
+                   and not any(t["executing"] for t in self.tasks.values())
+                       and not any(t["alive"] and not t["ready"] for t in self.tables.values()),
+                   "native_fence_mismatch")
+        self._need(self._task(self.owner)["alive"], "original_owner_not_alive")
+        self._owned_table(self.fence[2], self.fence[3])
+        # This is a DATA receipt tied to an actual FENCE frame. Authentication
+        # must occur in the genuine native transport, which is still missing.
+
+    def descriptor_unchanged(self, task, table, fd, slot, ofd, status_flags, status_generation):
+        self.assert_fence(self.seq)  # sticky refusal precedes every equality
+        self._need(all(type(value) is int for value in
+                       (task, table, fd, slot, ofd, status_flags, status_generation))
+                   and 0 <= fd <= MAX_FD, "descriptor_query_shape")
+        self._need(self._task(task)["table"] == table, "original_files_table_changed")
+        current = self._table(table)["slots"].get(fd)
+        self._need(current is not None and current.ofd != 0 and (current.generation, current.ofd) == (slot, ofd)
+                   and self._ofd(ofd)["flags"] == status_flags
+                   and self._ofd(ofd)["status_generation"] == status_generation,
+                   "original_slot_or_ofd_history_changed")
+        return current

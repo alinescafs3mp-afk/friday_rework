@@ -1,0 +1,302 @@
+--- old/native/frw_fdcommit_python_bridge.c
++++ new/native/frw_fdcommit_python_bridge.c
+@@ -9,12 +9,31 @@
+ #include "frw_fdcommit_client_contract.h"
+ 
+ typedef struct { PyObject_HEAD struct frw_client_adoption a;
+- PyObject *session, *epoch, *qualification; } Adoption;
++ PyObject *session, *epoch, *qualification; int history_failed, history_pending; } Adoption;
+ typedef struct { PyObject_HEAD Adoption *owner; } Token;
+ typedef struct { PyObject_HEAD Adoption *owner;
+  struct frw_client_retained *ref; int released; } Retained;
+ static PyTypeObject AdoptionType, SessionType, EpochType, QualificationType;
+-static PyTypeObject RetainedChildType, RetainedDescriptorType;
++static PyTypeObject RetainedChildType, RetainedDescriptorType, RetainedReaderType, HistoryBatchType;
++typedef struct { PyObject_HEAD Adoption *owner; PyObject *bytes;
++ struct frw_client_delivery *receipt; int attempted; } HistoryBatch;
++static void history_loss(Adoption *a,int reason)
++{
++ a->history_failed=1; /* local sticky ORIGINAL adoption state, never cleared */
++ if(a->a.session && a->a.epoch)frw_client_history_loss(a->a.session,a->a.epoch,reason);
++}
++static int current_handles(Adoption *a)
++{
++ int rc;if(a->history_failed)return -256;
++ rc=frw_client_validate_current(a->a.session,a->a.epoch);
++ if(rc)history_loss(a,rc);return rc;
++}
++static void history_free(HistoryBatch *b)
++{
++ if(b->owner && !b->attempted)history_loss(b->owner,-256);
++ if(b->receipt)frw_client_put_delivery(b->receipt); /* never implicit ACK */
++ Py_XDECREF(b->bytes);Py_XDECREF(b->owner);Py_TYPE(b)->tp_free((PyObject *)b);
++}
+ static PyObject *refusal(int status)
+ {
+  PyErr_Format(PyExc_RuntimeError,"native_fdcommit_refusal:%d",status);return NULL;
+@@ -53,18 +72,20 @@
+  st=(Token *)s;et=(Token *)ep;
+  if(st->owner!=et->owner){PyErr_SetString(PyExc_RuntimeError,"native_epoch_handle_mismatch");return NULL;}
+  a=st->owner;rc=frw_client_validate_adoption(&a->a);
+- if(rc){refusal(rc);return NULL;}return a;
++ if(rc){history_loss(a,rc);refusal(rc);return NULL;}return a;
+ }
+ static PyObject *token(Adoption *a,PyTypeObject *type)
+ {
+- Token *t=(Token *)type->tp_alloc(type,0);if(!t)return NULL;
++ Token *t=(Token *)type->tp_alloc(type,0);if(!t){history_loss(a,-256);return NULL;}
+  Py_INCREF(a);t->owner=a;return (PyObject *)t;
+ }
+ static PyObject *adopt(int role)
+ {
+- Adoption *a=(Adoption *)AdoptionType.tp_alloc(&AdoptionType,0);int rc;
++ Adoption *a;int rc=frw_client_prevalidate_current(role);
++ if(rc)return refusal(rc); /* exact closed preflight precedes adoption */
++ a=(Adoption *)AdoptionType.tp_alloc(&AdoptionType,0);
+  if(!a)return NULL;
+- a->session=a->epoch=a->qualification=NULL;
++ a->session=a->epoch=a->qualification=NULL;a->history_failed=a->history_pending=0;
+  rc=frw_client_adopt_current(role,&a->a);
+  if(rc){Py_DECREF(a);return refusal(rc);}
+  rc=frw_client_validate_adoption(&a->a);
+@@ -123,12 +144,12 @@
+  PyObject *s,*ep;Adoption *a;int rc;(void)m;
+  if(!PyArg_ParseTuple(args,"OO",&s,&ep))return NULL;
+  a=pair(s,ep);if(!a)return NULL;
+- rc=frw_client_validate_current(a->a.session,a->a.epoch);if(rc)return refusal(rc);Py_RETURN_NONE;
++ rc=current_handles(a);if(rc)return refusal(rc);Py_RETURN_NONE;
+ }
+ static PyObject *retained(Adoption *a,struct frw_client_retained *ref,PyTypeObject *type)
+ {
+  Retained *r=(Retained *)type->tp_alloc(type,0);
+- if(!r){frw_client_put_retained(ref);return NULL;}
++ if(!r){history_loss(a,-256);frw_client_put_retained(ref);return NULL;}
+  Py_INCREF(a);r->owner=a;r->ref=ref;r->released=0;return (PyObject *)r;
+ }
+ static PyObject *reserve_birth(PyObject *m,PyObject *args)
+@@ -137,19 +158,21 @@
+  if(!PyArg_ParseTuple(args,"OO",&s,&ep))return NULL;
+  a=pair(s,ep);if(!a)return NULL;
+  if(a->a.role!=1)return refusal(-13);
++ rc=current_handles(a);if(rc)return refusal(rc);
+  rc=frw_client_reserve_birth(a->a.session,a->a.epoch,&ref);
+- if(rc || !ref)return refusal(rc?rc:-14);
++ if(rc || !ref){history_loss(a,rc?rc:-14);if(ref)frw_client_put_retained(ref);return refusal(rc?rc:-14);}
+  return retained(a,ref,&RetainedChildType);
+ }
+ static PyObject *bind_child(PyObject *m,PyObject *args)
+ {
+- PyObject *s,*ep,*v;Adoption *a;Retained *r;long pid;int fd,rc;(void)m;
+- if(!PyArg_ParseTuple(args,"OOOli",&s,&ep,&v,&pid,&fd))return NULL;
+- a=pair(s,ep);if(!a)return NULL;
+- if(Py_TYPE(v)!=&RetainedChildType || pid<=0 || fd<0)return refusal(-15);
++ PyObject *s,*ep,*v;Adoption *a;Retained *r;long pid;int fd,gate,error,rc;(void)m;
++ if(!PyArg_ParseTuple(args,"OOOliii",&s,&ep,&v,&pid,&fd,&gate,&error))return NULL;
++ a=pair(s,ep);if(!a)return NULL;
++ if(Py_TYPE(v)!=&RetainedChildType || pid<=0 || fd<0 || gate<0 || error<0)return refusal(-15);
++ rc=current_handles(a);if(rc)return refusal(rc);
+  r=(Retained *)v;if(r->owner!=a || r->released || !r->ref)return refusal(-16);
+- rc=frw_client_bind_child(a->a.session,a->a.epoch,r->ref,pid,fd);
+- if(rc)return refusal(rc);Py_RETURN_NONE;
++ rc=frw_client_bind_child(a->a.session,a->a.epoch,r->ref,pid,fd,gate,error);
++ if(rc){history_loss(a,rc);return refusal(rc);}Py_RETURN_NONE;
+ }
+ static PyObject *retain_child(PyObject *m,PyObject *args)
+ {
+@@ -157,7 +180,7 @@
+  if(!PyArg_ParseTuple(args,"OOli",&s,&ep,&pid,&fd))return NULL;
+  a=pair(s,ep);if(!a)return NULL;
+  rc=frw_client_retain_child(a->a.session,a->a.epoch,pid,fd,&ref);
+- if(rc || !ref)return refusal(rc?rc:-5);return retained(a,ref,&RetainedChildType);
++ if(rc || !ref){history_loss(a,rc?rc:-5);if(ref)frw_client_put_retained(ref);return refusal(rc?rc:-5);}return retained(a,ref,&RetainedChildType);
+ }
+ static PyObject *cleanup(PyObject *m,PyObject *args)
+ {
+@@ -171,41 +194,131 @@
+ }
+ static PyObject *retain_descriptor(PyObject *m,PyObject *args)
+ {
+- PyObject *s,*ep;Adoption *a;int fd,anchor,rc;struct frw_client_retained *ref=NULL;(void)m;
+- if(!PyArg_ParseTuple(args,"OOii",&s,&ep,&fd,&anchor))return NULL;
+- a=pair(s,ep);if(!a)return NULL;
+- rc=frw_client_retain_descriptor(a->a.session,a->a.epoch,fd,anchor,&ref);
+- if(rc || !ref)return refusal(rc?rc:-8);return retained(a,ref,&RetainedDescriptorType);
++ PyObject *s,*ep;Adoption *a;int fd,rc;struct frw_client_retained *ref=NULL;(void)m;
++ if(!PyArg_ParseTuple(args,"OOi",&s,&ep,&fd))return NULL;
++ a=pair(s,ep);if(!a)return NULL;
++ rc=current_handles(a);if(rc)return refusal(rc);
++ if(fd<0)return refusal(-8);
++ rc=frw_client_retain_descriptor(a->a.session,a->a.epoch,fd,&ref);
++ if(rc || !ref){history_loss(a,rc?rc:-8);if(ref)frw_client_put_retained(ref);return refusal(rc?rc:-8);}
++ return retained(a,ref,&RetainedDescriptorType);
++}
++static Retained *exact_retained(Adoption *a,PyObject *v,PyTypeObject *kind)
++{
++ Retained *r;if(Py_TYPE(v)!=kind){refusal(-9);return NULL;}
++ r=(Retained *)v;
++ if(r->owner!=a || r->released || !r->ref){refusal(-10);return NULL;}
++ return r;
+ }
+ static PyObject *descriptor_operation(PyObject *args,int release)
+ {
+  PyObject *s,*ep,*v;Adoption *a;Retained *r;int rc;
+  if(!PyArg_ParseTuple(args,"OOO",&s,&ep,&v))return NULL;
+- a=pair(s,ep);if(!a)return NULL;
+- if(Py_TYPE(v)!=&RetainedDescriptorType)return refusal(-9);
+- r=(Retained *)v;if(r->owner!=a || r->released || !r->ref)return refusal(-10);
++ a=pair(s,ep);if(!a)return NULL;r=exact_retained(a,v,&RetainedDescriptorType);if(!r)return NULL;
+  if(release) {
+-  r->released=1; /* No retry even when release is uncertain. */
++  r->released=1; /* before effect; any uncertainty forbids retry */
+   rc=frw_client_release_descriptor(a->a.session,a->a.epoch,r->ref);
+- } else rc=frw_client_validate_descriptor(a->a.session,a->a.epoch,r->ref);
+- if(rc)return refusal(rc);Py_RETURN_NONE;
++ } else {
++  rc=current_handles(a);if(rc)return refusal(rc);
++  rc=frw_client_validate_descriptor(a->a.session,a->a.epoch,r->ref);
++ }
++ if(rc){history_loss(a,rc);return refusal(rc);}Py_RETURN_NONE;
+ }
+ static PyObject *validate_descriptor(PyObject *m,PyObject *args){(void)m;return descriptor_operation(args,0);}
+ static PyObject *release_descriptor(PyObject *m,PyObject *args){(void)m;return descriptor_operation(args,1);}
++static PyObject *descriptor_view(PyObject *args,int reader)
++{
++ PyObject *s,*ep,*v;Adoption *a;Retained *r;int rc,fd=-1;
++ if(!PyArg_ParseTuple(args,"OOO",&s,&ep,&v))return NULL;
++ a=pair(s,ep);if(!a)return NULL;
++ r=exact_retained(a,v,reader?&RetainedReaderType:&RetainedDescriptorType);if(!r)return NULL;
++ rc=current_handles(a);if(rc)return refusal(rc);
++ rc=reader?frw_client_descriptor_reader_fd(a->a.session,a->a.epoch,r->ref,&fd):
++           frw_client_descriptor_anchor(a->a.session,a->a.epoch,r->ref,&fd);
++ if(rc || fd<0){history_loss(a,rc?rc:-8);return refusal(rc?rc:-8);}
++ return PyLong_FromLong(fd); /* descriptive numeric view, never release authority */
++}
++static PyObject *descriptor_anchor(PyObject *m,PyObject *args){(void)m;return descriptor_view(args,0);}
++static PyObject *descriptor_reader_fd(PyObject *m,PyObject *args){(void)m;return descriptor_view(args,1);}
++static PyObject *reopen_descriptor(PyObject *m,PyObject *args)
++{
++ PyObject *s,*ep,*v;Adoption *a;Retained *r;struct frw_client_retained *ref=NULL;int rc;(void)m;
++ if(!PyArg_ParseTuple(args,"OOO",&s,&ep,&v))return NULL;
++ a=pair(s,ep);if(!a)return NULL;r=exact_retained(a,v,&RetainedDescriptorType);if(!r)return NULL;
++ rc=current_handles(a);if(rc)return refusal(rc);
++ rc=frw_client_reopen_descriptor(a->a.session,a->a.epoch,r->ref,&ref);
++ if(rc || !ref){history_loss(a,rc?rc:-8);if(ref)frw_client_put_retained(ref);return refusal(rc?rc:-8);}
++ return retained(a,ref,&RetainedReaderType);
++}
++static PyObject *release_descriptor_reader(PyObject *m,PyObject *args)
++{
++ PyObject *s,*ep,*v;Adoption *a;Retained *r;int rc;(void)m;
++ if(!PyArg_ParseTuple(args,"OOO",&s,&ep,&v))return NULL;
++ a=pair(s,ep);if(!a)return NULL;r=exact_retained(a,v,&RetainedReaderType);if(!r)return NULL;
++ r->released=1;rc=frw_client_release_descriptor_reader(a->a.session,a->a.epoch,r->ref);
++ if(rc){history_loss(a,rc);return refusal(rc);}Py_RETURN_NONE;
++}
++static PyObject *release_child_handle(PyObject *m,PyObject *args)
++{
++ PyObject *s,*ep,*v;Adoption *a;Retained *r;int rc,kind;(void)m;
++ if(!PyArg_ParseTuple(args,"OOOi",&s,&ep,&v,&kind))return NULL;
++ a=pair(s,ep);if(!a)return NULL;r=exact_retained(a,v,&RetainedChildType);if(!r)return NULL;
++ if(kind<0 || kind>2)return refusal(-15);
++ /* client records each of exactly three original handle attempts BEFORE close */
++ rc=frw_client_release_child_handle(a->a.session,a->a.epoch,r->ref,kind);
++ if(rc){history_loss(a,rc);return refusal(rc);}Py_RETURN_NONE;
++}
++static HistoryBatch *exact_batch(Adoption *a,PyObject *v)
++{
++ HistoryBatch *b;
++ if(Py_TYPE(v)!=&HistoryBatchType){history_loss(a,-256);refusal(-12);return NULL;}
++ b=(HistoryBatch *)v;
++ if(b->owner!=a || b->attempted || !b->receipt || !b->bytes || !a->history_pending || a->history_failed){
++  history_loss(a,-256);refusal(-12);return NULL;
++ }return b;
++}
+ static PyObject *history(PyObject *m,PyObject *args)
+ {
+- PyObject *s,*ep,*raw;Adoption *a;size_t n=0;int rc;(void)m;
++ PyObject *s,*ep,*raw;Adoption *a;HistoryBatch *b;struct frw_client_delivery *delivery=NULL;
++ size_t n=0;int rc;(void)m;
+  if(!PyArg_ParseTuple(args,"OO",&s,&ep))return NULL;
+  a=pair(s,ep);if(!a)return NULL;
+- if(a->a.role!=1)return refusal(-11);
+- /* Single bounded buffer, charged by native adoption before allocation.
+-  * Native client must preflight bytes against existing guardian budget, include
+-  * allocation failure in sticky loss, and authenticate read/ACK/fence atomically. */
+- raw=PyBytes_FromStringAndSize(NULL,FRW_EVENTS*FRW_FRAME_BYTES);if(!raw)return NULL;
+- rc=frw_client_read_owner_history(a->a.session,a->a.epoch,
+-    (unsigned char *)PyBytes_AS_STRING(raw),FRW_EVENTS*FRW_FRAME_BYTES,&n);
+- if(rc || n>FRW_EVENTS*FRW_FRAME_BYTES || n%FRW_FRAME_BYTES){Py_DECREF(raw);return refusal(rc?rc:-12);}
+- if(_PyBytes_Resize(&raw,(Py_ssize_t)n))return NULL;return raw;
++ if(a->a.role!=1 || a->history_pending || a->history_failed){history_loss(a,-256);return refusal(-11);}
++ rc=current_handles(a);if(rc)return refusal(rc);
++ rc=frw_client_history_preflight(a->a.session,a->a.epoch,FRW_EVENTS*FRW_FRAME_BYTES);
++ if(rc){history_loss(a,rc);return refusal(rc);}
++ a->history_pending=1; /* set before ANY fallible allocation, no retry/reset */
++ raw=PyBytes_FromStringAndSize(NULL,FRW_EVENTS*FRW_FRAME_BYTES);
++ if(!raw){history_loss(a,-256);return NULL;}
++ rc=frw_client_peek_owner_history(a->a.session,a->a.epoch,
++    (unsigned char *)PyBytes_AS_STRING(raw),FRW_EVENTS*FRW_FRAME_BYTES,&n,&delivery);
++ if(rc || !delivery || !n || n>FRW_EVENTS*FRW_FRAME_BYTES || n%FRW_FRAME_BYTES) {
++  history_loss(a,rc?rc:-12);if(delivery)frw_client_put_delivery(delivery);Py_DECREF(raw);return refusal(rc?rc:-12);
++ }
++ if(_PyBytes_Resize(&raw,(Py_ssize_t)n)){
++  history_loss(a,-256);frw_client_put_delivery(delivery);return NULL;
++ }
++ b=(HistoryBatch *)HistoryBatchType.tp_alloc(&HistoryBatchType,0);
++ if(!b){history_loss(a,-256);frw_client_put_delivery(delivery);Py_DECREF(raw);return NULL;}
++ Py_INCREF(a);b->owner=a;b->bytes=raw;b->receipt=delivery;b->attempted=0;
++ return (PyObject *)b; /* NO queue consumption/ACK on allocation/export */
++}
++static PyObject *history_bytes(PyObject *m,PyObject *args)
++{
++ PyObject *s,*ep,*v;Adoption *a;HistoryBatch *b;(void)m;
++ if(!PyArg_ParseTuple(args,"OOO",&s,&ep,&v))return NULL;
++ a=pair(s,ep);if(!a)return NULL;b=exact_batch(a,v);if(!b)return NULL;
++ Py_INCREF(b->bytes);return b->bytes; /* export alone cannot acknowledge */
++}
++static PyObject *ack_owner_history(PyObject *m,PyObject *args)
++{
++ PyObject *s,*ep,*v;Adoption *a;HistoryBatch *b;int rc;(void)m;
++ if(!PyArg_ParseTuple(args,"OOO",&s,&ep,&v))return NULL;
++ a=pair(s,ep);if(!a)return NULL;b=exact_batch(a,v);if(!b)return NULL;
++ b->attempted=1; /* one attempt; backend must authenticate actual acceptance */
++ rc=frw_client_accept_owner_history(a->a.session,a->a.epoch,b->receipt);
++ if(rc){history_loss(a,rc);return refusal(rc);}
++ a->history_pending=0;Py_RETURN_NONE;
+ }
+ static PyMethodDef methods[]={
+  {"adopt_owner",adopt_owner,METH_NOARGS,NULL},{"adopt_child",adopt_child,METH_NOARGS,NULL},
+@@ -217,6 +330,13 @@
+  {"validate_current",validate_current,METH_VARARGS,NULL},{"retain_child",retain_child,METH_VARARGS,NULL},
+  {"validate_retained_cleanup",cleanup,METH_VARARGS,NULL},{"retain_descriptor",retain_descriptor,METH_VARARGS,NULL},
+  {"validate_descriptor",validate_descriptor,METH_VARARGS,NULL},{"release_descriptor",release_descriptor,METH_VARARGS,NULL},
++ {"descriptor_anchor",descriptor_anchor,METH_VARARGS,NULL},
++ {"reopen_descriptor",reopen_descriptor,METH_VARARGS,NULL},
++ {"descriptor_reader_fd",descriptor_reader_fd,METH_VARARGS,NULL},
++ {"release_descriptor_reader",release_descriptor_reader,METH_VARARGS,NULL},
++ {"release_child_handle",release_child_handle,METH_VARARGS,NULL},
++ {"history_bytes",history_bytes,METH_VARARGS,NULL},
++ {"ack_owner_history",ack_owner_history,METH_VARARGS,NULL},
+  {"read_owner_history",history,METH_VARARGS,NULL},{NULL,NULL,0,NULL}};
+ #define OPAQUE_TYPE(var,name,size,freefn) static PyTypeObject var={PyVarObject_HEAD_INIT(NULL,0) \
+  .tp_name="_frw_fdcommit_native." name,.tp_basicsize=size,.tp_flags=Py_TPFLAGS_DEFAULT, \
+@@ -227,14 +347,16 @@
+ OPAQUE_TYPE(QualificationType,"Qualification",sizeof(Token),token_free);
+ OPAQUE_TYPE(RetainedChildType,"RetainedChild",sizeof(Retained),retained_free);
+ OPAQUE_TYPE(RetainedDescriptorType,"RetainedDescriptor",sizeof(Retained),retained_free);
++OPAQUE_TYPE(RetainedReaderType,"RetainedReader",sizeof(Retained),retained_free);
++OPAQUE_TYPE(HistoryBatchType,"HistoryBatch",sizeof(HistoryBatch),history_free);
+ static struct PyModuleDef module={PyModuleDef_HEAD_INIT,"_frw_fdcommit_native",NULL,-1,methods};
+ PyMODINIT_FUNC PyInit__frw_fdcommit_native(void)
+ {
+- PyTypeObject *ts[]={&AdoptionType,&SessionType,&EpochType,&QualificationType,&RetainedChildType,&RetainedDescriptorType};
+- const char *names[]={"Adoption","Session","Epoch","Qualification","RetainedChild","RetainedDescriptor"};
++ PyTypeObject *ts[]={&AdoptionType,&SessionType,&EpochType,&QualificationType,&RetainedChildType,&RetainedDescriptorType,&RetainedReaderType,&HistoryBatchType};
++ const char *names[]={"Adoption","Session","Epoch","Qualification","RetainedChild","RetainedDescriptor","RetainedReader","HistoryBatch"};
+  PyObject *m;size_t i;
+- for(i=0;i<6;i++)if(PyType_Ready(ts[i]))return NULL;
++ for(i=0;i<8;i++)if(PyType_Ready(ts[i]))return NULL;
+  m=PyModule_Create(&module);if(!m)return NULL;
+- for(i=0;i<6;i++){Py_INCREF(ts[i]);if(PyModule_AddObject(m,names[i],(PyObject *)ts[i])){Py_DECREF(ts[i]);Py_DECREF(m);return NULL;}}
++ for(i=0;i<8;i++){Py_INCREF(ts[i]);if(PyModule_AddObject(m,names[i],(PyObject *)ts[i])){Py_DECREF(ts[i]);Py_DECREF(m);return NULL;}}
+  return m; /* Import creates type bodies, never capability/registry/_CURRENT. */
+ }
