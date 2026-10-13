@@ -1,0 +1,160 @@
+"""Retained-custody immutable private evidence pages, including observed empty bytes."""
+from __future__ import annotations
+import hashlib
+import json
+import math
+import os
+import time
+from driver.qualification import Unbound
+from .custody import canonical_path, safe_leaf
+from .runtime import NativeRuntime
+
+class ObservationPages:
+    def __init__(self, runtime, directory, *, case_id):
+        if type(runtime) is not NativeRuntime or type(case_id) is not str:
+            raise Unbound("artifact_runtime_or_case_not_exact_type")
+        target = canonical_path(directory)
+        allowed = runtime.protocol["case_observation_directories"]
+        if case_id not in allowed or allowed[case_id] != target:
+            raise Unbound("artifact_directory_not_exact_Root_protocol")
+        runtime.require_effect("observer_artifacts",useful=False)
+        self.runtime,self.directory = runtime,runtime.home_custody.create_child(target.rsplit("/",1)[1])
+        self.refs,self.pages,self.files,self.errors,self.ordinal = [],[],[],[],0
+        self.leaves,self.finished = 0,False
+
+    def write(self, name, body):
+        safe_leaf(name)
+        if type(body) is not bytes or len(body) > 65536 or self.finished:
+            raise Unbound("observation_body_limit_or_writer_closed")
+        self.runtime.check(useful=False)
+        self.directory.verify()
+        fd,accepted = None,0
+        fact = {"path":str(self.directory.path/name),"expected_bytes":len(body),"expected_sha256":hashlib.sha256(body).hexdigest()}
+        try:
+            fd = self.directory.open_leaf(name,os.O_WRONLY | os.O_CREAT | os.O_EXCL,0o400)
+            while accepted < len(body):
+                self.runtime.check(useful=False)
+                count = os.write(fd,body[accepted:])
+                if type(count) is not int or not 0 < count <= len(body)-accepted:
+                    raise Unbound("actual_artifact_write_not_positive_int")
+                accepted += count
+            os.fsync(fd)
+            info = os.fstat(fd)
+            named = os.stat(name,dir_fd=self.directory.fd,follow_symlinks=False)
+            self.directory.verify()
+            if (info.st_nlink != 1 or info.st_mode & 0o777 != 0o400 or info.st_uid != os.getuid() or info.st_size != len(body)
+                    or (info.st_dev,info.st_ino) != (named.st_dev,named.st_ino)):
+                raise Unbound("immutable_singlelink_leaf_custody_changed")
+            ref = {"path":fact["path"],"bytes":len(body),"sha256":hashlib.sha256(body).hexdigest()}
+            self.files.append({"status":"ACTUAL_WRITE_COMPLETE",**ref})
+            return ref
+        except BaseException as exc:
+            fact.update(status="PARTIAL_OR_UNKNOWN",actual_write_accepted=accepted,error=type(exc).__name__)
+            self.files.append(fact)
+            self.errors.append(fact)
+            raise
+        finally:
+            if fd is not None:
+                try:
+                    self.directory.close_leaf(fd)
+                except BaseException as exc:
+                    self.errors.append({"stage":"artifact_fd_close","path":fact["path"],"error":type(exc).__name__})
+
+    def _name(self, prefix, extension):
+        name = prefix+str(self.ordinal).zfill(6)+extension
+        self.ordinal += 1
+        return name
+
+    def leaf(self, location, value):
+        if type(value) is bytes:
+            if len(value) > 8388608:
+                raise Unbound("actual_capture_limit")
+            whole = hashlib.sha256(value).hexdigest()
+            if not value:
+                empty = self.write(self._name("capture-empty-",".bin"),b"")
+                self.refs.append({"location":list(location),"actual_type":"bytes","part":0,"total_bytes":0,
+                    "whole_sha256":whole,"empty_leaf":empty,"chunks":[]})
+                return
+            chunks = [self.write(self._name("capture-",".bin"),value[offset:offset+65536]) for offset in range(0,len(value),65536)]
+            for index in range(0,len(chunks),32):
+                self.refs.append({"location":list(location),"actual_type":"bytes","part":index//32,"total_bytes":len(value),
+                    "whole_sha256":whole,"chunks":chunks[index:index+32]})
+            return
+        body = json.dumps(value,ensure_ascii=True,sort_keys=True,allow_nan=False).encode()
+        if len(body) > 8192:
+            self.leaf(location+("UTF8_JSON_BYTES",),body)
+        else:
+            self.refs.append({"location":list(location),"actual_type":type(value).__name__,"actual":value})
+
+    def walk(self, value, location=()):
+        self.leaves += 1
+        if len(location) > 20 or self.leaves > 65536:
+            raise Unbound("observation_depth_or_leaf_capacity")
+        if type(value) is dict:
+            if any(type(k) is not str or len(k.encode()) > 256 for k in value):
+                raise Unbound("observation_key_type_or_bound")
+            if not value:
+                self.leaf(location,{})
+            for key,item in value.items():
+                self.walk(item,location+(key,))
+        elif type(value) in (tuple,list):
+            if len(value) > 65536:
+                raise Unbound("observation_sequence_bound")
+            if not value:
+                self.leaf(location,[])
+            for index,item in enumerate(value):
+                self.walk(item,location+(index,))
+        elif value is None or type(value) in (str,int,float,bool,bytes):
+            if type(value) is float and not math.isfinite(value):
+                raise Unbound("observation_not_finite")
+            self.leaf(location,value)
+        else:
+            raise Unbound("observation_contains_live_object_or_custom_method")
+        if len(self.refs) >= 32:
+            self.flush()
+
+    def flush(self):
+        pending,self.refs = self.refs,[]
+        while pending:
+            records = []
+            while pending:
+                probe = json.dumps({"schema":"CLI150-ACTUAL-OBSERVATION-PAGE-2","records":records+[pending[0]]},ensure_ascii=True,sort_keys=True,allow_nan=False).encode()
+                if len(probe) > 65536:
+                    if not records:
+                        raise Unbound("single_observation_record_page_limit")
+                    break
+                records.append(pending.pop(0))
+            body = json.dumps({"schema":"CLI150-ACTUAL-OBSERVATION-PAGE-2","records":records},ensure_ascii=True,sort_keys=True,allow_nan=False).encode()
+            self.pages.append(self.write(self._name("page-",".json"),body))
+
+    def finish(self):
+        try:
+            self.flush()
+            parts = []
+            for offset in range(0,len(self.pages),32):
+                body = json.dumps({"schema":"CLI150-ACTUAL-OBSERVATION-INDEX-PART-2","pages":self.pages[offset:offset+32]},ensure_ascii=True,sort_keys=True).encode()
+                parts.append(self.write(self._name("index-part-",".json"),body))
+            file_parts = []
+            # Every actual file, including empty/partial leaves, is explicit.
+            frozen_files = list(self.files)
+            for offset in range(0,len(frozen_files),32):
+                body = json.dumps({"schema":"CLI150-ACTUAL-OBSERVATION-FILES-PART-2","files":frozen_files[offset:offset+32]},ensure_ascii=True,sort_keys=True).encode()
+                file_parts.append(self.write(self._name("files-part-",".json"),body))
+            body = json.dumps({"schema":"CLI150-ACTUAL-OBSERVATION-INDEX-2","parts":parts,"file_parts":file_parts,"errors":self.errors,
+                "runtime_acceptance":"NOT_ISSUED_BY_SOURCE_OR_OBSERVER","actual_closed_at":time.monotonic()},ensure_ascii=True,sort_keys=True).encode()
+            result = self.write("INDEX.json",body)
+            self.finished = True
+            return result
+        finally:
+            self.directory.close()
+
+def write_runtime_observations(runtime, result, directory):
+    if type(runtime) is not NativeRuntime or type(result) is not dict or type(result.get("case_id")) is not str:
+        raise Unbound("artifact_public_boundary")
+    pages = ObservationPages(runtime,directory,case_id=result["case_id"])
+    try:
+        pages.walk(result)
+        return pages.finish()
+    except BaseException:
+        pages.directory.close()
+        raise

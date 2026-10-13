@@ -1,0 +1,297 @@
+"""Observe/stop an existing owned user-systemd boundary; never launch or retry.
+
+Quiescence here describes this cgroup only. In particular, terminating an A0
+HTTP client is not proof that its dedicated server/context or remote inference
+stopped; the A0 adapter must reconcile those separate native boundaries.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import os
+from pathlib import Path
+import re
+import subprocess
+import math
+import time
+
+def _supervisor(value):
+    if (type(value) is not dict or set(value) != {"scope", "unit"}
+            or value["scope"] not in {"user", "system"}
+            or type(value["unit"]) is not str
+            or not re.fullmatch(r"friday-rework-worker-[0-9a-f]{32}\.service", value["unit"])):
+        raise SupervisorError("invalid_supervisor_identity")
+    return dict(value)
+
+
+def _original_unit(association):
+    if (type(association) is not dict
+            or set(association) != {"schema", "purpose", "admission_hash", "supervisor", "native"}
+            or association["schema"] != "friday.original-cli-native-boundary.v1"
+            or association["purpose"] != "whole-original-cli"
+            or type(association["supervisor"]) is not dict
+            or set(association["supervisor"]) != {"scope", "unit"}
+            or association["supervisor"]["scope"] != "user"
+            or type(association["native"]) is not dict
+            or set(association["native"]) != {"invocation_id"}
+            or not re.fullmatch(r"[0-9a-f]{32}", association["native"]["invocation_id"])
+            or not re.fullmatch(r"friday-original-cli-[0-9a-f]{32}\.service", association["supervisor"]["unit"])):
+        raise SupervisorError("invalid_distinct_original_unit")
+    return association["supervisor"]["unit"]
+
+
+class SupervisorError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class UnitObservation:
+    unit: str
+    invocation_id: str
+    active_state: str
+    sub_state: str
+    result: str
+    main_pid: int
+    control_group: str
+    populated: bool | None
+    missing: bool = False
+
+    @property
+    def quiescent(self):
+        return (self.missing or self.active_state in {"inactive", "failed"}) and self.main_pid == 0 and self.populated is False
+
+
+class NativeSupervisor:
+    """Only the controller may pass a checked, durably owned association.
+
+    The launch must use Description=description(association), KillMode=control-group
+    and SendSIGKILL=yes. An observed invocation may never silently be replaced.
+    Stop intent is persisted by the controller first; persistence failure must
+    still attempt stop using its last checked association, retaining uncertainty.
+    """
+    properties = ("LoadState", "Transient", "Description", "InvocationID",
+                  "ActiveState", "SubState", "Result", "MainPID", "ControlGroup",
+                  "KillMode", "SendSIGKILL")
+    # Supported service observations. Future/unknown states require explicit
+    # reconciliation, never a fabricated successful stop. Zero MainPID is valid
+    # during pre/post commands, forking discovery and RemainAfterExit.
+    substates = {
+        "inactive": {"dead"},
+        "failed": {"failed"},
+        "active": {"running", "exited"},
+        "activating": {"condition", "start-pre", "start", "start-post"},
+        "reloading": {"reload", "reload-signal", "reload-notify"},
+        "deactivating": {"stop", "stop-watchdog", "stop-sigterm", "stop-sigkill",
+                         "stop-post", "final-watchdog", "final-sigterm", "final-sigkill"},
+    }
+    results = {"success", "resources", "protocol", "timeout", "exit-code", "signal",
+               "core-dump", "watchdog", "start-limit-hit", "exec-condition", "oom-kill"}
+
+    @staticmethod
+    def description(association):
+        digest = association.get("admission_hash")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise SupervisorError("invalid_admission_identity")
+        return ("Friday original CLI " if association.get("purpose") == "whole-original-cli" else "Friday rework ") + digest
+
+    @staticmethod
+    def _unit(association):
+        if association.get("purpose") == "whole-original-cli":
+            return _original_unit(association)
+        supervisor = _supervisor(association["supervisor"])
+        if supervisor["scope"] != "user":
+            raise SupervisorError("unsupported_supervisor_scope")
+        return supervisor["unit"]
+
+    def __init__(self, *, commands=None):
+        from hermes_cli.friday_native_control import CountedNativeCommands
+        self.commands = commands if commands is not None else CountedNativeCommands()
+
+    def _command(self, arguments, timeout, *, deadline=None):
+        runtime = f"/run/user/{os.getuid()}"
+        try:
+            return self.commands.run(
+                ["/usr/bin/systemctl", "--user", "--no-pager", *arguments], timeout,
+                absolute=deadline,
+                env={"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": runtime,
+                     "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime}/bus", "LC_ALL": "C"})
+        except BaseException as exc:
+            raise SupervisorError("native_control_STOP_UNCONFIRMED") from exc
+
+    @staticmethod
+    def _populated(group):
+        if not group:
+            return False
+        root = Path("/sys/fs/cgroup")
+        path = root / group.lstrip("/")
+        if not group.startswith("/") or path.resolve() != path or not path.is_relative_to(root):
+            raise SupervisorError("invalid_native_cgroup")
+        try:
+            entries = [line.split() for line in (path / "cgroup.events").read_text().splitlines()]
+            if any(len(entry) != 2 for entry in entries):
+                raise ValueError("malformed cgroup fields")
+            rows = dict(entries)
+            if len(rows) != len(entries):
+                raise ValueError("duplicate cgroup fields")
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError) as exc:
+            raise SupervisorError("native_cgroup_unreadable") from exc
+        if rows.get("populated") not in {"0", "1"}:
+            raise SupervisorError("invalid_native_cgroup_observation")
+        return rows["populated"] == "1"
+
+    @staticmethod
+    def _remaining(deadline, ceiling, reserve=0):
+        if deadline is None:
+            return ceiling
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise SupervisorError("invalid_original_supervisor_deadline")
+        remaining = deadline - time.monotonic() - reserve
+        if remaining <= 0:
+            raise SupervisorError("original_supervisor_deadline")
+        return min(ceiling, remaining)
+
+    def observe(self, association, *, deadline=None):
+        unit = self._unit(association)
+        expected = self.description(association)
+        arguments = ["show", unit, "--property=" + ",".join(self.properties)]
+        timeout = self._remaining(deadline, 3)
+        # Existing A0 wrappers accept exactly (arguments, timeout).
+        result = (self._command(arguments, timeout) if deadline is None
+                  else self._command(arguments, timeout, deadline=deadline))
+        if result.returncode != 0:
+            raise SupervisorError("native_unit_unreadable")
+        try:
+            entries = [line.split("=", 1) for line in result.stdout.splitlines()]
+            fields = dict(entries)
+            if len(fields) != len(entries) or set(fields) != set(self.properties):
+                raise ValueError("incomplete or duplicate unit fields")
+        except ValueError as exc:
+            raise SupervisorError("invalid_native_unit_observation") from exc
+        if fields["LoadState"] == "not-found":
+            missing = {"LoadState": "not-found", "Transient": "no", "Description": unit,
+                       "InvocationID": "", "ActiveState": "inactive", "SubState": "dead",
+                       "Result": "success", "MainPID": "0", "ControlGroup": "",
+                       "KillMode": "control-group", "SendSIGKILL": "yes"}
+            if fields != missing:
+                raise SupervisorError("inconsistent_missing_unit")
+            return UnitObservation(unit, "", fields["ActiveState"], fields["SubState"],
+                                   fields["Result"], 0, "", False, True)
+        if fields["LoadState"] != "loaded":
+            raise SupervisorError("invalid_native_load_state")
+        if (fields["SubState"] not in self.substates.get(fields["ActiveState"], set())
+                or fields["Result"] not in self.results):
+            raise SupervisorError("inconsistent_native_service_state")
+        if fields.get("Transient") != "yes" or fields.get("Description") != expected:
+            raise SupervisorError("native_unit_owner_mismatch")
+        invocation = fields.get("InvocationID", "")
+        if not re.fullmatch(r"[0-9a-f]{32}", invocation):
+            raise SupervisorError("invalid_native_invocation")
+        prior = association.get("native")
+        if prior is not None and prior["invocation_id"] != invocation:
+            raise SupervisorError("native_invocation_changed")
+        if fields.get("KillMode") != "control-group" or fields.get("SendSIGKILL") != "yes":
+            raise SupervisorError("native_stop_boundary_changed")
+        try:
+            if not re.fullmatch(r"0|[1-9][0-9]{0,19}", fields["MainPID"]):
+                raise ValueError("invalid pid")
+            pid = int(fields["MainPID"])
+            group = fields["ControlGroup"]
+            if group and not group.endswith("/" + unit):
+                raise SupervisorError("native_cgroup_owner_mismatch")
+            populated = self._populated(group)
+            if (pid and (not group or not populated)
+                    or fields["SubState"] == "running" and (not group or not populated)
+                    or pid and fields["ActiveState"] in {"inactive", "failed"}):
+                raise SupervisorError("inconsistent_native_process_state")
+            return UnitObservation(unit, invocation, fields["ActiveState"], fields["SubState"],
+                                   fields["Result"], pid, group, populated)
+        except (KeyError, ValueError) as exc:
+            raise SupervisorError("invalid_native_unit_observation") from exc
+
+    def stop(self, association, *, deadline=None):
+        before = self.observe(association, deadline=deadline)
+        if before.quiescent:
+            return before
+        # Reusing the observed invocation after this check is prevented by the
+        # controller's sole-writer/ownership boundary; do not add --all or killall.
+        arguments = ["stop", before.unit]
+        timeout = self._remaining(deadline, 15, reserve=3 if deadline is not None else 0)
+        result = (self._command(arguments, timeout) if deadline is None
+                  else self._command(arguments, timeout, deadline=deadline))
+        if result.returncode != 0:
+            raise SupervisorError("native_stop_unconfirmed")
+        after = self.observe(association, deadline=deadline)
+        if after.invocation_id and after.invocation_id != before.invocation_id:
+            raise SupervisorError("native_invocation_changed")
+        if not after.quiescent:
+            raise SupervisorError("native_stop_unconfirmed")
+        if deadline is not None:
+            self._remaining(deadline, 1)
+        return after
+
+
+    def verify_original_launch(self, association, *, binding, deadline):
+        from hermes_cli.friday_cli_birth import group
+        binding.require("before_original_native_launch")
+        observed = self.observe(association, deadline=deadline)
+        if (association is not binding.original_association
+                or observed.control_group != binding.exclusive_cgroup
+                or observed.invocation_id != association.get("native", {}).get("invocation_id")
+                or observed.main_pid != 0 or observed.populated is not False
+                or group(os.getpid()) == binding.exclusive_cgroup
+                or group(os.getpid()).startswith(binding.exclusive_cgroup + "/")):
+            raise SupervisorError("exclusive_empty_original_unit_UNBOUND_or_foreign")
+        return observed
+
+    def stop_original_cli(self, association, *, binding, native_birth, child, deadline):
+        from hermes_cli.friday_cli_birth import group
+        binding.require_retained_cleanup(
+            "before_whole_original_native_stop", native_boundary=native_birth,
+            child=child, deadline=deadline)
+        if (association is not binding.original_association
+                or group(os.getpid()) == binding.exclusive_cgroup
+                or group(os.getpid()).startswith(binding.exclusive_cgroup + "/")
+                or child is None or child.binding is not binding):
+            raise SupervisorError("original_stop_foreign_or_self_owner")
+        # The independently qualified retained-cleanup authority must validate
+        # the CURRENT unit invocation/cgroup/foreign-actor exclusion before
+        # this effect. Do not substitute an expired systemctl observation or
+        # cached association for that still-unbound native authority.
+        # Qualified exclusive delegated directory is retained. cgroup.kill
+        # covers every original native loop/proxy/control descendant.
+        fd = None
+        primary = None
+        secondary = []
+        try:
+            fd = os.open("cgroup.kill", os.O_WRONLY | os.O_CLOEXEC,
+                         dir_fd=binding.exclusive_cgroup_fd)
+            if os.write(fd, b"1") != 1:
+                raise OSError("short_original_cgroup_kill")
+        except BaseException as error:
+            primary = error
+        finally:
+            if fd is not None:
+                try: os.close(fd)
+                except BaseException as error: secondary.append(error)
+        try:
+            native_birth.stop(child, deadline=deadline)  # actual parent raw wait, never unit status alone
+        except BaseException as error:
+            if primary is None: primary = error
+            else: secondary.append(error)
+        try:
+            if time.monotonic() >= deadline:
+                raise SupervisorError("original_cleanup_cutoff_expired_no_new_control_or_wait")
+            after = self.stop(association, deadline=deadline)
+            if not after.quiescent or not self.commands.all_closed():
+                raise SupervisorError("original_unit_or_control_children_STOP_UNCONFIRMED")
+        except BaseException as error:
+            if primary is None: primary = error
+            else: secondary.append(error)
+        if primary is not None or secondary or time.monotonic() >= deadline:
+            error = SupervisorError("whole_original_STOP_UNCONFIRMED")
+            error.primary = primary
+            error.secondary = tuple(secondary)
+            error.original_child = child
+            raise error from primary
+        return child.raw_wait

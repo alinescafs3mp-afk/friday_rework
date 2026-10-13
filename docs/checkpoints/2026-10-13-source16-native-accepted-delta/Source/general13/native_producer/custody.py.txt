@@ -1,0 +1,387 @@
+"""Source-owned strict data and retained directory custody. No authorization here."""
+from __future__ import annotations
+import hashlib
+import json
+import math
+import os
+from pathlib import Path, PosixPath
+import re
+import stat
+import threading
+from driver.qualification import Unbound
+
+HEX = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+LEAF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z", re.ASCII)
+
+def text(value, name, limit=4096):
+    if type(value) is not str or not value or "\x00" in value or len(value.encode("utf-8")) > limit:
+        raise Unbound(name + "_strict_text")
+    return value
+
+def digest(value, name):
+    if type(value) is not str or HEX.fullmatch(value) is None:
+        raise Unbound(name + "_strict_sha256")
+    return value
+
+def integer(value, name, low, high):
+    if type(value) is not int or not low <= value <= high:
+        raise Unbound(name + "_strict_integer")
+    return value
+
+def number(value, name, low, high):
+    if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
+        raise Unbound(name + "_strict_number")
+    return value
+
+def pure(value, name="data", depth=0, budget=None):
+    # Reject custom methods/containers BEFORE JSON/hash/attribute traversal.
+    if budget is None:
+        budget = [65536]
+    budget[0] -= 1
+    if budget[0] < 0 or depth > 20:
+        raise Unbound(name + "_pure_capacity")
+    if value is None or type(value) in (bool, int):
+        if type(value) is int and abs(value) > 10**18:
+            raise Unbound(name + "_integer_capacity")
+        return value
+    if type(value) is float:
+        return number(value, name, -1e18, 1e18)
+    if type(value) is str:
+        if len(value.encode()) > 65536 or "\x00" in value:
+            raise Unbound(name + "_text_capacity")
+        return value
+    if type(value) is list:
+        if len(value) > 4096:
+            raise Unbound(name + "_list_capacity")
+        return [pure(x, name, depth+1, budget) for x in value]
+    if type(value) is dict:
+        if len(value) > 4096 or any(type(k) is not str or len(k.encode()) > 256 for k in value):
+            raise Unbound(name + "_mapping_capacity")
+        return {k: pure(v, name, depth+1, budget) for k, v in value.items()}
+    raise Unbound(name + "_not_exact_pure_data")
+
+def canonical(value):
+    body = json.dumps(pure(value), sort_keys=True, ensure_ascii=True, allow_nan=False,
+                      separators=(",", ":")).encode()
+    if len(body) > 65536:
+        raise Unbound("canonical_scope_page_capacity")
+    return body
+
+def reference(value, name):
+    if type(value) is not dict or set(value) != {"path", "bytes", "sha256"}:
+        raise Unbound(name + "_reference_shape")
+    canonical_path(value["path"])
+    integer(value["bytes"], name+"_bytes", 0, 67108864)
+    digest(value["sha256"], name)
+    return dict(value)
+
+def canonical_path(value):
+    if type(value) is PosixPath:
+        value = str(value)
+    text(value, "canonical_path", 4096)
+    # No lexical '..', '.', duplicate slash, trailing slash or alias normalization.
+    if not value.startswith("/") or value == "/" or value.endswith("/") or "//" in value:
+        raise Unbound("path_not_canonical_absolute")
+    parts = value.split("/")[1:]
+    if len(parts) > 64 or any(not p or p in (".", "..") for p in parts):
+        raise Unbound("path_traversal_or_depth")
+    if str(Path(value)) != value:
+        raise Unbound("path_alias")
+    return value
+
+def safe_leaf(value):
+    if type(value) is not str or LEAF.fullmatch(value) is None or value in (".", ".."):
+        raise Unbound("one_safe_leaf_required")
+    return value
+
+def identity(info):
+    return (info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode))
+
+class SourceFDAccount:
+    """One original <=32 account; failed/unknown closes never refund capacity."""
+    def __init__(self, maximum=32):
+        self.maximum = integer(maximum,"Source_FD_maximum",8,32)
+        self.held,self.serial,self.records = 0,0,[]
+        self.lock = threading.RLock()
+    def narrow(self, maximum):
+        integer(maximum,"declared_Source_FDs",8,32)
+        with self.lock:
+            if maximum > self.maximum or self.held > maximum:
+                raise Unbound("original_Source_FD_bound_cannot_increase_or_reset")
+            self.maximum = maximum
+    def reserve(self, count):
+        integer(count,"source_FD_reservation",1,32)
+        with self.lock:
+            if self.held+count > self.maximum:
+                raise Unbound("global_Source_FD_capacity_before_effect")
+            self.held += count
+    def release(self, count):
+        integer(count,"source_FD_release",1,32)
+        with self.lock:
+            if self.held < count:
+                raise Unbound("Source_FD_accounting_unknown_no_negative_zero")
+            self.held -= count
+    def open(self, path, flags, *, dir_fd=None, label="qualification"):
+        with self.lock:
+            if len(self.records) >= 8192:
+                raise Unbound("Source_FD_history_capacity_before_effect")
+            self.reserve(1)
+            self.serial += 1
+            row = {"generation":self.serial,"label":label,"fd":None,"identity":None,
+                   "closed":False,"acquisition":"RESERVED_BEFORE_EFFECT","owner":threading.current_thread(),"errors":[]}
+            self.records.append(row)
+            try:
+                fd = os.open(path,flags,dir_fd=dir_fd)
+            except BaseException as exc:
+                row.update(acquisition="FAILED_NO_FD",closed=True)
+                row["errors"].append("open:"+type(exc).__name__)
+                self.release(1)
+                raise
+            row.update(fd=fd,acquisition="ACTUAL_OPEN_RETURN")
+            try:
+                row["identity"] = identity(os.fstat(fd))
+            except BaseException as primary:
+                row["errors"].append("birth:"+type(primary).__name__)
+                # Exact private unpublished return, no consumer can release/reuse.
+                try:
+                    os.close(fd)
+                except BaseException as later:
+                    row["closed"] = None
+                    row["errors"].append("private_rollback:"+type(later).__name__)
+                else:
+                    row["closed"] = True
+                    self.release(1)
+                raise primary
+            return row
+    def close(self, row):
+        with self.lock:
+            if not any(row is old for old in self.records) or row["closed"] is not False:
+                raise Unbound("Source_FD_generation_missing_or_unknown_no_retry")
+            try:
+                if row["owner"] is not threading.current_thread() or identity(os.fstat(row["fd"])) != row["identity"]:
+                    raise Unbound("Source_FD_owner_or_generation_lost")
+                os.close(row["fd"])
+            except BaseException as exc:
+                row["closed"] = None
+                row["errors"].append("close_unknown:"+type(exc).__name__)
+                raise
+            row["closed"] = True
+            self.release(1)
+    def snapshot(self):
+        with self.lock:
+            active = [r for r in self.records if r["closed"] is not True]
+            closed = [r for r in self.records if r["closed"] is True]
+            fields = ("generation","label","fd","identity","closed","acquisition","errors")
+            return {"maximum":self.maximum,"held_or_unknown":self.held,"temporary_generation_count":len(self.records),
+                "active_or_unknown_temporary_generations":[{k:r[k] for k in fields} for r in active],
+                "last32_closed_temporary_generations":[{k:r[k] for k in fields} for r in closed[-32:]],
+                "complete_closed_history":"RETAINED_IN_ORIGINAL_ACCOUNT_NOT_RESET_NOT_SERIALIZED_AS_COMPLETE_LEDGER",
+                "native_VFS_and_kernel_descriptors":"UNBOUND_NOT_INCLUDED_IN_Source_COMPLETENESS"}
+
+
+class DirectoryCustody:
+    """Retain EVERY ancestor fd and immutable original identity; never repin."""
+    def __init__(self, path, *, private=True, max_fds=32, budget=None):
+        path = canonical_path(path)
+        integer(max_fds,"source_owned_fds",8,32)
+        self.path,self.chain,self.closed,self.errors = Path(path),[],False,[]
+        self._owns,self._leaf_fds = [],{}
+        if budget is not None and type(budget) is not SourceFDAccount:
+            raise Unbound("directory_budget_not_exact_Source_account")
+        self._budget = SourceFDAccount(max_fds) if budget is None else budget
+        if self._budget.maximum != max_fds:
+            raise Unbound("directory_original_Source_budget_mismatch")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        self.reserve_fds(1)
+        try:
+            fd = os.open("/",flags)
+        except BaseException:
+            self.release_fds(1)
+            raise
+        try:
+            self._retain(fd, None, None, private=False)
+            for leaf in path.split("/")[1:]:
+                parent = self.chain[-1]["fd"]
+                self.reserve_fds(1)
+                try:
+                    fd = os.open(leaf,flags,dir_fd=parent)
+                except BaseException:
+                    self.release_fds(1)
+                    raise
+                self._retain(fd, parent, leaf, private=False)
+            last = os.fstat(self.fd)
+            if private and (last.st_uid != os.getuid() or stat.S_IMODE(last.st_mode) != 0o700):
+                raise Unbound("isolated_directory_not_private_0700")
+            self.verify()
+        except BaseException:
+            # Only our exact not-yet-published directory fds; no foreign fd adoption.
+            for row in reversed(self.chain):
+                try:
+                    os.close(row["fd"])
+                    self.release_fds(1)
+                except BaseException as exc:
+                    self.errors.append(type(exc).__name__)
+            if not any(row["fd"] == fd for row in self.chain):
+                try:
+                    os.close(fd)
+                    self.release_fds(1)
+                except BaseException as exc:
+                    self.errors.append(type(exc).__name__)
+            self.closed = True
+            raise
+
+    @property
+    def fd(self):
+        if self.closed or not self.chain:
+            raise Unbound("directory_custody_closed")
+        return self.chain[-1]["fd"]
+
+    def _retain(self, fd, parent, leaf, *, private):
+        info = os.fstat(fd)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid())
+                or stat.S_IMODE(info.st_mode) & 0o022):
+            raise Unbound("ancestor_custody_not_private_or_trusted")
+        row = {"fd":fd,"parent":parent,"leaf":leaf,"identity":identity(info)}
+        self.chain.append(row)
+        self._owns.append(row)
+
+    def verify(self):
+        if self.closed:
+            raise Unbound("directory_custody_closed")
+        for row in self.chain:
+            current = os.fstat(row["fd"])
+            named = os.stat("/", follow_symlinks=False) if row["parent"] is None else os.stat(
+                row["leaf"], dir_fd=row["parent"], follow_symlinks=False)
+            if (not stat.S_ISDIR(named.st_mode) or identity(current) != row["identity"]
+                    or identity(named) != row["identity"]):
+                raise Unbound("ancestor_custody_changed_no_repin")
+        return self.fd
+
+    def reserve_fds(self, count):
+        self._budget.reserve(count)
+
+    def release_fds(self, count):
+        self._budget.release(count)
+
+    def _descendant(self, absolute, *, create):
+        absolute = canonical_path(absolute)
+        prefix = str(self.path)+"/"
+        if not absolute.startswith(prefix):
+            raise Unbound("descendant_not_in_retained_directory")
+        leaves = absolute[len(prefix):].split("/")
+        for leaf in leaves:
+            safe_leaf(leaf)
+        if create and len(leaves) != 1:
+            raise Unbound("fresh_single_child_only")
+        self.verify()
+        child = object.__new__(DirectoryCustody)
+        child.path,child.chain,child.closed,child.errors = Path(absolute),list(self.chain),False,[]
+        child._owns,child._leaf_fds,child._budget = [],{},self._budget
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            for leaf in leaves:
+                parent = child.chain[-1]["fd"]
+                self.reserve_fds(1)  # BEFORE mkdir/open
+                fd = None
+                try:
+                    if create:
+                        os.mkdir(leaf,0o700,dir_fd=parent)
+                    # Capture original named identity BEFORE opening; no repin.
+                    initial = os.stat(leaf,dir_fd=parent,follow_symlinks=False)
+                    if not stat.S_ISDIR(initial.st_mode) or initial.st_uid != os.getuid() or stat.S_IMODE(initial.st_mode) != 0o700:
+                        raise Unbound("descendant_custody_not_private_0700")
+                    fd = os.open(leaf,flags,dir_fd=parent)
+                    if identity(os.fstat(fd)) != identity(initial):
+                        raise Unbound("descendant_changed_between_stat_and_open")
+                    child._retain(fd,parent,leaf,private=True)
+                    fd = None  # now child owns exact generation
+                except BaseException as primary:
+                    child.errors.append("descendant_primary:"+type(primary).__name__)
+                    if fd is not None:
+                        try:
+                            os.close(fd)
+                            self.release_fds(1)
+                        except BaseException as later:
+                            child.errors.append("descendant_rollback:"+type(later).__name__)
+                    else:
+                        self.release_fds(1)
+                    raise
+            child.verify()
+            return child
+        except BaseException:
+            child.close()
+            raise
+
+    def create_child(self, leaf):
+        return self._descendant(str(self.path/safe_leaf(leaf)),create=True)
+
+    def open_descendant(self, absolute):
+        return self._descendant(absolute,create=False)
+
+
+    def open_leaf(self, leaf, flags, mode=0o400):
+        leaf = safe_leaf(leaf)
+        self.verify()
+        self.reserve_fds(1)
+        fd = None
+        try:
+            fd = os.open(leaf,flags | os.O_NOFOLLOW | os.O_CLOEXEC,mode,dir_fd=self.fd)
+            self.verify()
+            actual = os.fstat(fd)
+            named = os.stat(leaf,dir_fd=self.fd,follow_symlinks=False)
+            if (not stat.S_ISREG(actual.st_mode) or actual.st_uid != os.getuid() or actual.st_nlink != 1 or identity(actual) != identity(named)):
+                raise Unbound("leaf_custody_changed")
+            self._leaf_fds[fd] = {"identity":identity(actual),"owner_thread":threading.current_thread(),"leaf":leaf}
+            return fd
+        except BaseException as primary:
+            self.errors.append("leaf_open_primary:"+type(primary).__name__)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                    self.release_fds(1)
+                except BaseException as later:
+                    self.errors.append("leaf_open_rollback:"+type(later).__name__)
+            else:
+                self.release_fds(1)
+            raise
+
+    def transfer_leaf(self, fd):
+        if type(fd) is not int or fd not in self._leaf_fds:
+            raise Unbound("leaf_transfer_not_actual_owned_generation")
+        row = self._leaf_fds[fd]
+        if row["owner_thread"] is not threading.current_thread():
+            raise Unbound("leaf_transfer_not_original_owner_thread")
+        return self._leaf_fds.pop(fd)
+
+    def close_leaf(self, fd):
+        if type(fd) is not int or fd not in self._leaf_fds:
+            raise Unbound("leaf_close_generation_unknown_no_numeric_close")
+        row = self._leaf_fds[fd]
+        if row["owner_thread"] is not threading.current_thread() or identity(os.fstat(fd)) != row["identity"]:
+            raise Unbound("leaf_close_owner_or_generation_lost")
+        os.close(fd)
+        self._leaf_fds.pop(fd)
+        self.release_fds(1)
+
+
+    def close(self):
+        if self.closed:
+            return {"already_closed":True,"errors":list(self.errors)}
+        for fd in tuple(self._leaf_fds):
+            try:
+                self.close_leaf(fd)
+            except BaseException as exc:
+                self.errors.append("leaf_generation_retained:"+type(exc).__name__)
+        for row in reversed(self._owns):
+            try:
+                if identity(os.fstat(row["fd"])) != row["identity"]:
+                    self.errors.append("retained_directory_generation_unknown")
+                    continue
+                os.close(row["fd"])
+                self.release_fds(1)
+            except BaseException as exc:
+                self.errors.append("directory_close:"+type(exc).__name__)
+        self.closed = True
+        return {"closed":not self.errors,"errors":list(self.errors),"path":str(self.path),
+                "global_Source_FDs_held_or_unknown":self._budget.held}
+
