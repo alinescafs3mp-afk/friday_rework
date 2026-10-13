@@ -1,0 +1,165 @@
+None:
+        cache_key = f"{hermes_home_key()}|{cache_key}"
+    cached = _discovery_cache.get(cache_key)
+    if cached and (time.time() - cached["timestamp"]) < _DISCOVERY_CACHE_TTL_SECONDS:
+        return cached["models"]
+    try:
+        client = _get_bedrock_control_client(region)
+    except Exception as e:
+        logger.warning("Failed to create Bedrock client for model discovery: %s", e)
+        return []
+    models: List[Dict[str, Any]] = []
+    filter_set = {f.lower() for f in (provider_filter or [])}
+    for step, log, message in (
+        (_list_foundation_models, logger.warning, "Failed to list Bedrock foundation models: %s"),
+        (_list_inference_profiles, logger.debug, "Skipping inference profile discovery: %s"),
+    ):
+        try:
+            step(client, filter_set, models)
+        except Exception as e:
+            log(message, e)
+    models.sort(key=lambda m: (0 if m["id"].startswith("global.") else 1, m["name"].lower()))
+    _discovery_cache[cache_key] = {"timestamp": time.time(), "models": models}
+    return models
+
+
+def _extract_provider_from_arn(arn: str) -> str:
+    """``arn:aws:bedrock:...:foundation-model/anthropic.claude-v2`` → ``"anthropic"``."""
+    match = re.search(r"foundation-model/([^.]+)", arn)
+    return match.group(1) if match else ""
+
+
+# --- Bedrock model context lengths ---
+# Static fallback when the live probe is unavailable (agent/model_metadata.py). Keys match by longest
+# substring, so versioned entries win over the generic "anthropic.claude-opus-4".
+
+BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
+    # https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-xai-grok-4-6.html
+    "xai.grok-4.6": 500_000,
+    # Anthropic Claude: 1M GA vs 200K. The 1M entries must match agent/model_metadata.py
+    # DEFAULT_CONTEXT_LENGTHS or context compresses early — Opus 5 reached that table and not this
+    # one, so the offline path resolved 128K for a 1M model (#74263); the pairing is now tested.
+    **dict.fromkeys((
+        "anthropic.claude-fable-5", "anthropic.claude-fable", "anthropic.claude-sonnet-5", "anthropic.claude-opus-5",
+        "anthropic.claude-opus-4-8", "anthropic.claude-opus-4-7",
+        "anthropic.claude-opus-4-6", "anthropic.claude-sonnet-4-6",
+    ), 1_000_000),
+    **dict.fromkeys((
+        "anthropic.claude-sonnet-4-5", "anthropic.claude-haiku-4-5", "anthropic.claude-opus-4", "anthropic.claude-sonnet-4",
+        "anthropic.claude-3-5-sonnet", "anthropic.claude-3-5-haiku", "anthropic.claude-3-opus", "anthropic.claude-3-sonnet",
+        "anthropic.claude-3-haiku",
+    ), 200_000),
+    # Amazon Nova
+    **dict.fromkeys(("amazon.nova-pro", "amazon.nova-lite"), 300_000), "amazon.nova-micro": 128_000,
+    # Meta Llama / Mistral / DeepSeek
+    **dict.fromkeys((
+        "meta.llama4-maverick", "meta.llama4-scout", "meta.llama3-3-70b-instruct", "mistral.mistral-large", "deepseek.v3",
+    ), 128_000),
+    # OpenAI on Bedrock: docs.aws.amazon.com/bedrock/latest/userguide/model-cards-openai.html. GPT-6.1 Sol's
+    # card states "1M tokens"; the other cards state 1,050,000. 272K is the long-context PRICING tier
+    # boundary on these cards, not the window. Each entry stays <= model_metadata.DEFAULT_CONTEXT_LENGTHS.
+    "openai.gpt-6.1-sol": 1_000_000,
+    **dict.fromkeys((
+        "openai.gpt-6-astra", "openai.gpt-6-sol", "openai.gpt-6-luna",
+        "openai.gpt-5.5", "openai.gpt-5.6-sol", "openai.gpt-5.6-terra", "openai.gpt-5.6-luna",
+    ), 1_050_000),
+}
+
+BEDROCK_DEFAULT_CONTEXT_LENGTH = 128_000  # unknown Bedrock models
+_DEFAULT_WINDOW_WARNED: set = set()  # one fallback WARNING per model id per process
+
+# Probe padding tiers (tokens): a wildly oversized payload yields an opaque InternalServerException
+# instead of a clean ValidationException.
+_BEDROCK_PROBE_TIERS = (1_300_000, 2_200_000)
+_WORDS_PER_TOKEN = 0.9  # conservative: ensures the padded prompt clears the tier
+
+
+def probe_bedrock_context_length(model_id: str, region: str) -> Optional[int]:
+    """Discover a model's real context window by provoking a length error — the only authoritative source
+    ("prompt is too long: 1300032 tokens > 1000000 maximum"); length validation runs before inference so the
+    probe costs nothing. An accepted tier is a safe lower bound; None (no creds/network/unparseable) → static table."""
+    from agent.model_metadata import parse_context_limit_from_error
+    try:
+        client = _get_bedrock_runtime_client(region)
+    except Exception as exc:  # boto3 missing / credential resolution failure
+        logger.debug("Bedrock context probe skipped for %s: %s", model_id, exc)
+        return None
+    last_error = ""
+    for tier_tokens in _BEDROCK_PROBE_TIERS:
+        oversized = "data " * int(tier_tokens / _WORDS_PER_TOKEN)
+        try:
+            client.converse(modelId=model_id, messages=[{"role": "user", "content": [{"text": oversized}]}],
+                            inferenceConfig={"maxTokens": 8})
+            logger.debug("Bedrock context probe for %s accepted ~%s-token prompt; "
+                         "window is at least that", model_id, f"{tier_tokens:,}")
+            return tier_tokens
+        except Exception as exc:
+            last_error = str(exc)
+            limit = parse_context_limit_from_error(last_error)
+            if limit and limit >= 1024:
+                logger.info("Probed Bedrock context window for %s: %s tokens", model_id, f"{limit:,}")
+                return limit
+            # Opaque server error / auth / throttle at this tier — try the next.
+    logger.debug("Bedrock context probe for %s returned no parseable limit: %s", model_id, last_error[:200])
+    return None
+
+
+def get_bedrock_context_length(model_id: str, region: str = "", probe: bool = True) -> int:
+    """Context window: live probe (if ``probe`` and ``region``) → static table → default. The table is fallback
+    only: a stale substring match silently caps the window (a 1M Opus pinned to 200K via "opus-4").
+    An application-inference-profile ARN is first resolved to the model it wraps (#114476)."""
+    profile_arn = model_id if _APPLICATION_PROFILE_ARN_RE.search(model_id) else ""
+    if profile_arn:
+        model_id = _resolve_inference_profile_model_id(profile_arn, region)
+    if probe and region and (probed := probe_bedrock_context_length(model_id, region)):
+        return probed
+    matches = [key for key in BEDROCK_CONTEXT_LENGTHS if key in model_id.lower()]
+    if matches:
+        return BEDROCK_CONTEXT_LENGTHS[max(matches, key=len)]
+    if profile_arn:
+        logger.warning(
+            "Bedrock inference profile %s resolved no known model window; using the %s default. "
+            "Grant bedrock:GetInferenceProfile or set model.context_length explicitly if the "
+            "wrapped model has a larger window.",
+            profile_arn,
+            f"{BEDROCK_DEFAULT_CONTEXT_LENGTH:,}",
+        )
+    elif model_id not in _DEFAULT_WINDOW_WARNED:
+        _DEFAULT_WINDOW_WARNED.add(model_id)
+        logger.warning(
+            "Bedrock model %s has no known context window; using the static %s-token fallback "
+            "(not a detected limit). Set model.context_length in config.yaml if the model's window is larger.",
+            model_id, f"{BEDROCK_DEFAULT_CONTEXT_LENGTH:,}",
+        )
+    return BEDROCK_DEFAULT_CONTEXT_LENGTH
+
+
+# An application-inference-profile ARN (cost-allocation wrapper) carries an opaque id, so the probe
+# error text and the static substring table both miss and the 128k default silently applies
+# (#114476). System-defined `inference-profile/us.anthropic...` ARNs embed the model id and need no
+# lookup. The ARN's own region (field 4) is authoritative for the control-plane call: the runtime
+# region / base_url may differ, and an empty region must not skip the lookup because the
+# production caller (agent/model_metadata.py::_resolve_bedrock_context_length) passes none.
+_APPLICATION_PROFILE_ARN_RE = re.compile(r":application-inference-profile/")
+_ARN_REGION_RE = re.compile(r"^arn:[^:]+:bedrock:([a-z0-9-]+):", re.IGNORECASE)
+_inference_profile_model_cache: Dict[str, str] = {}
+
+
+def _resolve_inference_profile_model_id(profile_arn: str, region: str = "") -> str:
+    """Application-profile ARN → the wrapped model's ARN (its ``foundation-model/<id>`` tail satisfies the
+    static-table substring match); the profile ARN itself when ``bedrock:GetInferenceProfile`` is not
+    granted or unavailable, so callers keep the default-window behaviour. Both outcomes are cached per
+    process: this runs on every context-length resolution, not once per model."""
+    if profile_arn in _inference_profile_model_cache:
+        return _inference_profile_model_cache[profile_arn]
+    arn_region = _ARN_REGION_RE.match(profile_arn)
+    region = (arn_region.group(1) if arn_region else "") or region or resolve_bedrock_region()
+    resolved = profile_arn
+    try:
+        client = _get_bedrock_control_client(region)
+        models = client.get_inference_profile(inferenceProfileIdentifier=profile_arn).get("models") or []
+        resolved = next((m["modelArn"] for m in models if m.get("modelArn")), profile_arn)
+    except Exception as exc:  # no boto3 / credentials / GetInferenceProfile not granted
+        logger.debug("Inference profile resolution skipped for %s: %s", profile_arn, exc)
+    _inference_profile_model_cache[profile_arn] = resolved
+    return resolved

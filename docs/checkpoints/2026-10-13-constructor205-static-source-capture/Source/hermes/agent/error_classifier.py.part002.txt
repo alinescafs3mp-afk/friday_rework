@@ -1,0 +1,473 @@
+ c.code == _XAI_SPENDING_LIMIT_ERROR_CODE
+    billing = xai_spend or any(p in c.msg for p in ("key limit exceeded", "spending limit") + _BILLING_PATTERNS)
+    if billing:
+        return _V_BILLING
+    # A WAF/CDN in front of the provider answered, not the provider: the credential never
+    # reached it, so key guidance and credential rotation are wrong (#53099, #70566). Gated on
+    # 403 and on established block/challenge markers; any other 403 stays auth.
+    if any(p in c.msg for p in _UPSTREAM_BLOCKED_PATTERNS):
+        return _V_UPSTREAM_BLOCKED
+    return _V_AUTH_FALLBACK
+
+
+def _status_404(c: _Ctx) -> Verdict:
+    # Structured billing code first, as in _status_429: this handler always returns,
+    # so _by_error_code never sees it; a bare "Not Found" message has nothing to match.
+    if c.code in _BILLING_ERROR_CODES:
+        return _V_BILLING
+    verdict = _first_match(c.msg, _404_RULES)
+    if verdict is not None:
+        return verdict
+    # Bare id the catalogue only knows prefixed → malformed id (NVIDIA NIM "404
+    # page not found", #78796). A generic 404 (wrong path, proxy glitch) stays
+    # unknown so the real error surfaces instead of a silent misreported fallback.
+    return _V_MODEL_NOT_FOUND if _model_id_missing_known_prefix(c.model_slug, c.provider_slug) else _V_UNKNOWN
+
+
+def _status_429(c: _Ctx) -> Verdict:
+    # A structured billing code is decisive: LiteLLM stamps
+    # ``terminal_quota_exhausted`` (a hard cap, not throttling) on 429s, and
+    # this handler always returns, so _by_error_code never sees the code.
+    if c.code in _BILLING_ERROR_CODES:
+        return _V_BILLING
+    # Z.AI/Zhipu reuse 429 for server-wide overload: back off on the same
+    # key instead of burning the pool (#14038).
+    if any(p in c.msg for p in _OVERLOADED_PATTERNS):
+        return _V_OVERLOADED
+    # OpenRouter-wrapped upstream 429: the key is healthy — fall back, don't bench.
+    if _is_openrouter_upstream_error(c.body, c.provider_slug):
+        upstream = _extract_upstream_provider_name(c.body)
+        ctx = {"upstream_provider": upstream} if upstream else {}
+        return _v(_R.upstream_rate_limit, should_fallback=True, error_context=ctx)
+    # Quota walls as 429 (Anthropic ``usage_limit_reached``, "quota", billing
+    # phrases) are billing ONLY when the body is not itself a rate-limit phrase
+    # ("Rate limit exceeded" contains "limit exceeded") and carries no reset/
+    # retry signal (#93419, #39441).
+    quota_wall = c.code == "usage_limit_reached" or any(
+        p in c.msg for p in ("usage_limit_reached",) + _USAGE_LIMIT_PATTERNS + _BILLING_PATTERNS
+    )
+    explicit_rate_limit = any(p in c.msg for p in _RATE_LIMIT_PATTERNS)
+    if quota_wall and not explicit_rate_limit and not _has_usage_limit_transient_signal(c.msg, c.body, c.headers):
+        return _V_BILLING
+    # Carry the reset window so the terminal copy can name it instead of "wait a minute" (#89401).
+    reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
+    if reset:
+        return _v(_R.rate_limit, **_ROTATE_FALLBACK, error_context={"reset_at": time.time() + reset})
+    return _V_RATE_LIMIT
+
+
+def _status_5xx(c: _Ctx) -> Verdict:
+    # Request-validation errors as 5xx (codex.nekos.me) fail fast instead of
+    # retry-flooding — unless the parameter was injected server-side.
+    validation = any(p in c.msg for p in _REQUEST_VALIDATION_PATTERNS) or c.code in _5XX_VALIDATION_CODES
+    if validation and not _is_server_injected_param_rejection(c.msg, c.provider_slug):
+        return _V_FORMAT_ERROR
+    return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_SERVER_ERROR
+
+
+def _classify_402(error_msg: str, result_fn: Callable[..., Any]) -> Any:
+    """Disambiguate 402: "usage limit, try again in 5 minutes" is a periodic quota, not billing."""
+    transient = any(p in error_msg for p in _USAGE_LIMIT_PATTERNS) and any(
+        p in error_msg for p in _USAGE_LIMIT_TRANSIENT_SIGNALS
+    )
+    return result_fn(**(_V_RATE_LIMIT if transient else _V_BILLING))
+
+
+def _has_large_inline_image(content: Any) -> bool:
+    """True when a rejected ``content`` list carries a ``data:image/`` part the shrink pass would rewrite
+    (over ``conversation_compression._IMAGE_SHRINK_TARGET_BYTES``; below it a shrink retry is a no-op)."""
+    from agent.conversation_compression import _IMAGE_SHRINK_TARGET_BYTES
+
+    for part in content if isinstance(content, list) else ():
+        image = part.get("image_url") if isinstance(part, dict) else None
+        url = image.get("url") if isinstance(image, dict) else image
+        if isinstance(url, str) and url.startswith("data:image/") and len(url) > _IMAGE_SHRINK_TARGET_BYTES:
+            return True
+    return False
+
+
+def _oversized_message_content_rejection(body: Any) -> bool:
+    """400 rejecting a *message* ``content`` field whose rejected value carries a large inline image.
+
+    Nebius Token Factory caps a single image at 10 MiB and reports the violation through the field that
+    failed to coerce — pydantic ``{"type": "string_type", "loc": ["body","messages",N,"content","str"],
+    "msg": "Input should be a valid string", "input": [...]}`` — naming no size vocabulary, so the
+    keyword multimodal *tool*-content rule (#104731) claimed it and spent its retry stripping tool images
+    that were never there (#112473). The same list-shaped content with a small image succeeds, so the
+    image bytes are the trigger. Tool-scoped locs (``messages.N.tool.content.str``) stay with #104731.
+    """
+    details = body.get("detail") if isinstance(body, dict) else None
+    for detail in details if isinstance(details, list) else ():
+        loc = detail.get("loc") if isinstance(detail, dict) else None
+        if detail.get("type") != "string_type" or not isinstance(loc, list) or len(loc) < 2:
+            continue
+        parts = [str(x).lower() for x in loc]
+        if parts[:2] == ["body", "messages"] and parts[-2:] == ["content", "str"] and not any(
+            x.startswith("tool") for x in parts
+        ) and _has_large_inline_image(detail.get("input")):
+            return True
+    return False
+
+
+def _classify_400(c: _Ctx) -> Verdict:
+    """400 Bad Request — image/tool shapes, request-shape rejections, overflow, or generic."""
+    msg, code = c.msg, c.code
+    # A size cap reported *through* a message content field must beat the keyword
+    # multimodal rule, which would otherwise claim "input should be a valid string".
+    if _oversized_message_content_rejection(c.body):
+        return _V_IMAGE_TOO_LARGE
+    verdict = _first_match(msg, _IMAGE_TOOL_RULES)
+    if verdict is not None:
+        return verdict
+    # Codex ChatGPT-account model rejection: exact normalized text only, so arbitrary 400s never
+    # rotate. Before request-validation, whose "not supported" wording would abort as format_error (#71970).
+    if CODEX_ACCOUNT_MODEL_ENTITLEMENT_MARKER in msg:
+        return _V_MODEL_ENTITLEMENT
+    # Invalid encrypted reasoning replay blob (OpenAI Responses); before
+    # overflow because "encrypted content … could not be verified" trips it.
+    if code == "invalid_encrypted_content" or "invalid_encrypted_content" in msg or (
+        "encrypted content for item" in msg and "could not be verified" in msg
+    ) or "could not decrypt the provided encrypted_content" in msg or (
+        # Custom Responses endpoints wrap a replay rejection in a generic bad_request (#95834).
+        "encrypted content could not be decrypted or parsed" in msg
+    ) or (
+        # OpenCode Zen wraps this OpenAI replay rejection in ``invalid_request_error`` (#111309).
+        "encrypted_content" in msg and "was not issued to this caller" in msg
+    ) or (
+        # Azure Foundry (gpt-6-astra) rejects replayed reasoning from several prior responses this way (#105369).
+        "conflicting authenticated continuation identities" in msg
+    ):
+        return _V_INVALID_ENCRYPTED
+    # Route rejecting a reasoning disable: a reasoning-mandatory route (GLM-5.3 on Nous Portal /
+    # OpenRouter) or a chat-only relay that does not accept ``reasoning_effort: none`` at all
+    # (#114460). Deterministic for the request shape, but the only bad field is the disable — the
+    # loop drops it and retries once. Must precede request-validation, which would abort as format_error.
+    if _REASONING_MANDATORY_PATTERN in msg or is_reasoning_field_rejection(msg):
+        return _V_REASONING_MANDATORY
+    # 400 blaming a field this route never sent (Codex OAuth injects then rejects
+    # prompt_cache_retention ~20% of the time): transient, retry identical request.
+    if _is_server_injected_param_rejection(msg, c.provider_slug):
+        return _V_SERVER_ERROR
+    if any(p in msg for p in _MALFORMED_TOOL_ARGS_PATTERNS):
+        return _V_MALFORMED_TOOL_ARGS
+    if any(p in msg for p in _ROLE_ALTERNATION_PATTERNS):
+        return _V_ROLE_ALTERNATION
+    # Before overflow: GPT-5's "Unsupported parameter: 'max_tokens'" contains it.
+    if any(p in msg for p in _400_VALIDATION_PATTERNS) or code in _400_VALIDATION_CODES:
+        return _V_FORMAT_ERROR
+    # Malformed message array before overflow: input can be tiny and compression
+    # cannot fix it. litellm/Bedrock proxies use errorCode=INVALID_REQUEST_BODY.
+    if any(p in msg for p in _INVALID_MESSAGE_BODY_PATTERNS) or code == "invalid_request_body":
+        logger.warning(
+            "Malformed message array 400 (invalid request body) classified as format_error, NOT context "
+            "overflow — failing fast + falling back instead of entering the compression loop. This usually "
+            "means an empty-content assistant stub is in the transcript; num_messages=%s approx_tokens=%s. "
+            "error=%.200s", c.num_messages, c.approx_tokens, msg,
+        )
+        return _V_FORMAT_ERROR
+    # Memory ceiling by code: _by_status runs before _by_error_code, so a
+    # 400 whose wording a proxy stripped would fall through to format_error.
+    if code in _MEMORY_CEILING_ERROR_CODES:
+        return _V_OVERLOADED
+    verdict = _first_match(msg, _400_TAIL_RULES)
+    if verdict is not None:
+        return verdict
+    # Generic 400 + large session → probable overflow (Anthropic can return a
+    # bare "Error"); proxy shapes are read so a descriptive rejection isn't "bare".
+    body_msg = next((m for m in (str(x or "").strip().lower() for x in _body_message_candidates(c.body)) if m), "")
+    is_generic = len(body_msg) < 30 or body_msg in {"error", ""}
+    if is_generic and c.large_session(0.4, 80000, 80):
+        return _V_CONTEXT_OVERFLOW
+    return _V_FORMAT_ERROR
+
+
+def _classify_image_tool_422(c: _Ctx) -> Verdict:
+    """422: pydantic relays report the same content-field shapes as 400 (#104731, #112473)."""
+    if _oversized_message_content_rejection(c.body):
+        return _V_IMAGE_TOO_LARGE
+    return _first_match(c.msg, _IMAGE_TOOL_RULES) or _V_FORMAT_ERROR
+
+
+# 401 not retryable on its own: rotation/refresh run before the retryability
+# check, then the client-error abort path (fallback first) is correct. 408 is
+# retry-safe (RFC 9110 §15.5.9; proxies emit it when generation outruns the
+# read window). Unlisted 4xx → format_error, 5xx → server_error.
+_STATUS_HANDLERS: Dict[int, Callable[[_Ctx], Verdict]] = {
+    400: _classify_400, 401: lambda c: _V_AUTH_ROTATE, 402: lambda c: _classify_402(c.msg, dict),
+    403: _status_403, 404: _status_404, 408: lambda c: _V_TIMEOUT, 413: lambda c: _V_PAYLOAD_TOO_LARGE,
+    422: lambda c: _classify_image_tool_422(c),
+    429: _status_429, 500: _status_5xx, 502: _status_5xx,
+    503: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
+    529: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
+}
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────
+
+_RESET_FIELDS = ("resets_in_seconds", "resets_at", "reset_at", "retry_after")
+_RESET_HEADERS = ("retry-after", "Retry-After", "x-ratelimit-reset", "X-RateLimit-Reset")
+
+
+def _has_usage_limit_transient_signal(error_msg: str, body: dict, response_headers) -> bool:
+    """Whether a usage-limit response identifies a reset window (message, body fields, or headers)."""
+    if any(pattern in error_msg for pattern in _USAGE_LIMIT_TRANSIENT_SIGNALS):
+        return True
+    payloads = [p for p in (body, _error_obj(body)) if isinstance(p, dict)]
+    if any(payload.get(f) not in (None, "") for payload in payloads for f in _RESET_FIELDS):
+        return True
+    if response_headers and hasattr(response_headers, "get"):
+        return any(response_headers.get(h) not in (None, "") for h in _RESET_HEADERS)
+    return False
+
+
+def _rate_limit_reset_seconds(error_msg: str, body: dict, response_headers) -> Optional[float]:
+    """Seconds until a 429's window reopens, from the body's reset fields, ``Retry-After`` or the
+    message grammar (``retry after Ns`` / ``resets in 4hr``); None when the response names none."""
+    from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
+    for payload in (p for p in (body, _error_obj(body)) if isinstance(p, dict)):
+        for name in _RESET_FIELDS:
+            value = payload.get(name)
+            if value in (None, ""):
+                continue
+            if name.endswith("_at") and isinstance(value, (int, float)):
+                return max(0.0, float(value) - time.time())
+            if (seconds := parse_retry_after_seconds(value)) is not None:
+                return seconds
+    if (seconds := parse_retry_after_seconds(response_headers)) is not None:
+        return seconds
+    return reset_delay_from_message(error_msg)
+
+
+def _model_id_missing_known_prefix(model: str, provider: str) -> bool:
+    """True when a bare model id is only known to the provider as ``vendor/id``.
+
+    Never guesses: an id absent from the curated catalogue returns False so real
+    endpoint problems keep their retryable ``unknown`` classification.
+    """
+    name = (model or "").strip()
+    if not name or "/" in name:
+        return False
+    try:
+        from hermes_cli.model_normalize import suggest_prefixed_model_id
+        return bool(suggest_prefixed_model_id((provider or "").strip(), name))
+    except Exception:
+        return False
+
+
+def _is_server_injected_param_rejection(error_msg: str, provider: str) -> bool:
+    """True when a 400 blames a one-route-only parameter this route never sends.
+
+    Conservative: known parameters only, and only when ``provider`` is not a
+    sender, so a genuine bad parameter (``max_tokens`` on GPT-5) stays format_error.
+    """
+    provider_slug = (provider or "").strip().lower()
+    for param, senders in _SERVER_INJECTED_PARAM_SENDERS.items():
+        if error_msg and param in error_msg and any(w in error_msg for w in _PARAM_REJECTION_WORDS):
+            return not any(sender in provider_slug for sender in senders)
+    return False
+
+
+_CODEX_MASKED_REPLAY_MESSAGE = "request blocked."
+_CODEX_UNSUPPORTED_CONTENT_DETAIL = "unsupported content type"
+
+
+def _is_codex_masked_replay_rejection(c: "_Ctx") -> bool:
+    """HTTP 400 / status-less ``{code: invalid_prompt, message: "Request blocked."}`` from
+    ``openai-codex`` — as an SDK error body, a Responses ``error`` SSE frame, or the
+    ``response.failed`` text ``"invalid_prompt: Request blocked."`` — or the bare
+    ``{"detail": "Unsupported content type"}`` envelope the same backend returns for a rejected
+    encrypted-reasoning replay (#51512). Both are exact envelopes, provider-gated."""
+    if c.provider_slug != "openai-codex" or c.status_code not in (None, 400):
+        return False
+    body = c.body if isinstance(c.body, dict) else {}
+    if str(body.get("detail") or "").strip().lower() == _CODEX_UNSUPPORTED_CONTENT_DETAIL or (
+        not body and _CODEX_UNSUPPORTED_CONTENT_DETAIL in c.msg and "detail" in c.msg
+    ):
+        return True
+    # The OpenAI SDK unwraps ``body["error"]`` on status errors; stream frames keep the envelope.
+    body_msg = next((str(m).strip().lower() for m in _body_message_candidates(body) if m), "")
+    return (c.code == "invalid_prompt" and body_msg == _CODEX_MASKED_REPLAY_MESSAGE) or (
+        c.msg.strip() == f"invalid_prompt: {_CODEX_MASKED_REPLAY_MESSAGE}"
+    )
+
+
+def _error_obj(body: Any) -> dict:
+    """``body["error"]`` when it is a dict, else ``{}``."""
+    err = body.get("error") if isinstance(body, dict) else None
+    return err if isinstance(err, dict) else {}
+
+
+def _json_dict(text: Any) -> Optional[dict]:
+    """Parse a JSON object string; None for non-strings, blanks, invalid JSON or non-objects."""
+    if not (isinstance(text, str) and text.strip()):
+        return None
+    try:
+        inner = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return inner if isinstance(inner, dict) else None
+
+
+def _openrouter_wrapped_message(err_obj: dict) -> str:
+    """Lowercased inner message from OpenRouter's ``error.metadata.raw`` JSON wrapper."""
+    metadata = err_obj.get("metadata", {})
+    inner = _json_dict(metadata.get("raw")) if isinstance(metadata, dict) else None
+    return str(_error_obj(inner).get("message") or "").lower() if inner else ""
+
+
+def _build_error_msg(error: Exception, body: Any) -> str:
+    """Lowercased str(error) + body message + OpenRouter-wrapped upstream message
+    (OpenAI SDK's APIStatusError.__str__ omits the body, so it is appended)."""
+    raw_msg = str(error).lower()
+    body_msg = metadata_msg = ""
+    if isinstance(body, dict):
+        err_obj = _error_obj(body)
+        body_msg = str(err_obj.get("message") or "").lower() or str(body.get("message") or "").lower()
+        metadata_msg = _openrouter_wrapped_message(err_obj) if err_obj else ""
+    parts = [raw_msg]
+    if body_msg and body_msg not in raw_msg:
+        parts.append(body_msg)
+    if metadata_msg and metadata_msg not in raw_msg and metadata_msg not in body_msg:
+        parts.append(metadata_msg)
+    return " ".join(parts)
+
+
+def _body_message_candidates(body: dict) -> Iterator[Any]:
+    """Body message fields in priority order (OpenAI, flat, litellm/Bedrock proxy, FastAPI shapes)."""
+    yield _error_obj(body).get("message")
+    yield body.get("message")
+    yield body.get("errorMessage")
+    args = body.get("errorArgs")
+    yield args.get("reason") if isinstance(args, dict) else None
+    # FastAPI/Starlette relays and the Codex gateway answer {"detail": "..."} (or a nested
+    # OpenAI-ish object); without it a descriptive rejection reads as a bare 400 and the
+    # large-session heuristic sends it into compression (#81558). A list here is pydantic's
+    # validation shape, read by _oversized_message_content_rejection.
+    detail = body.get("detail")
+    yield detail.get("message") if isinstance(detail, dict) else detail if isinstance(detail, str) else None
+
+
+def _from_cause_chain(error: Exception, pick: Callable[[Any], Any], default: Any) -> Any:
+    """First non-None ``pick(exc)`` over the error and its __cause__/__context__ chain (max 5 deep)."""
+    current = error
+    for _ in range(5):
+        found = pick(current)
+        if found is not None:
+            return found
+        cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        if cause is None or cause is current:
+            break
+        current = cause
+    return default
+
+
+def _status_of(exc: Any) -> Optional[int]:
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        return code
+    code = getattr(exc, "status", None)  # some SDKs use .status
+    return code if isinstance(code, int) and 100 <= code < 600 else None
+
+
+def _body_of(exc: Any) -> Optional[dict]:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        return body
+    response = getattr(exc, "response", None)
+    try:
+        json_body = response.json() if response is not None else None
+    except Exception:
+        return None
+    return json_body if isinstance(json_body, dict) else None
+
+
+def _headers_of(exc: Any) -> Any:
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    return headers if headers and hasattr(headers, "get") else None
+
+
+def _status_code_from_body(body: Any) -> Optional[int]:
+    """Numeric HTTP error status (400-599) from ``error.code``/``code`` in a structured body.
+    An aggregator/relay can deliver the upstream failure only this way — as an
+    error object inside an HTTP-200 SSE stream — leaving the SDK to raise a
+    status-less ``APIError`` whose ``body`` carries the status (#121270). String
+    codes stay symbolic (``_code_from_payload``'s ``"400" is not a code``), unlike the
+    string-parsing text-SSE sibling ``chat_completion_helpers._status_code_from_payload``."""
+    if not isinstance(body, dict):
+        return None
+    error_obj = _error_obj(body)
+    candidates = [error_obj.get(k) for k in ("status_code", "status", "http_status", "code")] + [body.get("code")]
+    return next(
+        (c for c in candidates if isinstance(c, int) and not isinstance(c, bool) and 400 <= c < 600),
+        None,
+    )
+
+
+def _extract_status_code(error: Exception) -> Optional[int]:
+    """HTTP status code from the error or its cause chain; a body-carried numeric
+    ``code`` counts when the exception itself carries no status (#121270)."""
+    status = _from_cause_chain(error, _status_of, None)
+    if status is None:
+        status = _status_code_from_body(_from_cause_chain(error, _body_of, {}))
+    return status
+
+
+def _extract_error_body(error: Exception) -> dict:
+    """Structured error body from an SDK exception or its cause chain."""
+    return _from_cause_chain(error, _body_of, {})
+
+
+def _code_from_payload(payload: Any, top_keys: Sequence[str], peek_message: bool) -> str:
+    """Code/type from ``payload.error`` or a top-level key; ``"400"`` is not a code.
+    ``peek_message`` also parses a JSON ``error.message`` for a nested code
+    (Responses API surfaces ``invalid_encrypted_content`` this way). Gemini
+    puts the HTTP status in ``error.code`` and the symbolic code
+    (``UNAVAILABLE``) in ``error.status``, so a numeric code defers to it."""
+    if not isinstance(payload, dict):
+        return ""
+    error_obj = payload.get("error", {})
+    if isinstance(error_obj, dict):
+        code = error_obj.get("code") or error_obj.get("type") or ""
+        if not isinstance(code, str):
+            code = error_obj.get("status") or code
+        if isinstance(code, str) and code.strip() and code.strip() != "400":
+            return code.strip()
+        message = error_obj.get("message")
+        if peek_message and isinstance(message, str) and message.strip().startswith("{"):
+            nested_code = _code_from_payload(_json_dict(message), ("code", "error_code"), False)
+            if nested_code:
+                return nested_code
+    code = next((payload.get(k) for k in top_keys if payload.get(k)), "")
+    text = str(code).strip() if isinstance(code, (str, int)) else ""
+    return text if text and text != "400" else ""
+
+
+def _extract_error_code(body: dict) -> str:
+    """Extract an error code string from the response body."""
+    return _code_from_payload(body, ("code", "error_code", "errorCode"), True) if body else ""
+
+
+def _extract_message(error: Exception, body: dict) -> str:
+    """Extract the most informative error message (structured body first)."""
+    msg = next((m for m in _body_message_candidates(body or {}) if isinstance(m, str) and m.strip()), None)
+    return (msg.strip() if msg else str(error))[:500]
+
+
+def _is_openrouter_upstream_error(body: Any, provider: str) -> bool:
+    """OpenRouter's "Provider returned error" wrapper: the key is healthy, the
+    upstream failed, so credential rotation is the wrong recovery."""
+    err = _error_obj(body)
+    if str(err.get("message") or "").strip().lower() != "provider returned error":
+        return False
+    if (provider or "").strip().lower() == "openrouter":
+        return True
+    # Otherwise require the metadata shape only OpenRouter produces.
+    metadata = err.get("metadata")
+    return isinstance(metadata, dict) and ("raw" in metadata or "provider_name" in metadata)
+
+
+def _extract_upstream_provider_name(body: Any) -> Optional[str]:
+    """Pull the upstream provider name out of OpenRouter's error metadata."""
+    metadata = _error_obj(body).get("metadata")
+    name = metadata.get("provider_name") if isinstance(metadata, dict) else None
+    return name.strip() if isinstance(name, str) and name.strip() else None

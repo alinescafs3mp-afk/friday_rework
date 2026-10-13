@@ -1,0 +1,323 @@
+ commit.split_status
+        _compressed_est = _finish_compaction_boundary(
+            agent, compressed, new_system_prompt=new_system_prompt, old_session_id=commit.old_session_id,
+            in_place=in_place, compacted_in_place=commit.compacted_in_place,
+            session_commit_succeeded=commit.session_commit_succeeded,
+            defer_context_engine_notification=defer_context_engine_notification,
+            compression_made_progress=commit.made_progress, compression_used_fallback=_compression_used_fallback,
+            compression_feasibility_skip=_compression_feasibility_skip, task_id=task_id,
+        )
+        logger.info(
+            "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
+            agent.session_id or "none", _pre_msg_count, len(compressed), f"{_compressed_est:,}",
+        )
+        lifecycle.commit_status = (
+            "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
+        )
+        _emit_compression_attempt_telemetry(
+            agent, started_at=attempt.started_at, commit_status=lifecycle.commit_status, split_status=split_status,
+            failure_class=("session_split_failed" if split_status in {"failed_not_indexed", "aborted"} else None),
+            commit_started_at=commit.commit_started_at,
+        )
+        return compressed, new_system_prompt
+    finally:
+        # Release the OLD session's lock only after rotation and all post-rotation
+        # bookkeeping; a waking contender then sees the NEW id and acquires on that.
+        try:
+            lease.release()
+        finally:
+            if _commit_fence_entered:
+                commit_fence.finish_commit()
+
+
+def _codex_compaction_cooldown_remaining(agent: Any) -> float:
+    """Seconds left on this session's compaction-failure cooldown (0 = clear)."""
+    compressor = getattr(agent, "context_compressor", None)
+    getter = getattr(compressor, "get_active_compression_failure_cooldown", None)
+    if not callable(getter):
+        return 0.0
+    try:
+        state = getter(refresh=True)
+    except Exception:
+        logger.debug("codex compaction cooldown lookup failed", exc_info=True)
+        return 0.0
+    try:
+        return max(0.0, float(state.get("remaining_seconds") or 0.0)) if state else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _record_codex_compaction_failure(agent: Any, error: str) -> None:
+    """Arm the shared compression-failure cooldown after a failed codex compaction.
+    The codex path returns the transcript unchanged, so without a cooldown the still-over-threshold session
+    would retry every turn."""
+    from agent.context_compressor import _SUMMARY_FAILURE_COOLDOWN_SECONDS
+    compressor = getattr(agent, "context_compressor", None)
+    recorder = getattr(compressor, "_record_compression_failure_cooldown", None)
+    if not callable(recorder):
+        return
+    with _swallow('codex compaction cooldown persist failed', exc_info=True):
+        recorder(_SUMMARY_FAILURE_COOLDOWN_SECONDS, error)
+
+
+def _compress_context_via_codex_app_server(
+    agent: Any, messages: list, system_message: Optional[str], *, approx_tokens: Optional[int] = None,
+    task_id: str = "default", force: bool = False,
+) -> Tuple[list, str]:
+    """Route compaction to Codex app-server for Codex-owned threads.
+    Rewriting the local transcript would not shrink the Codex thread, so Codex compacts its own thread and
+    Hermes' transcript is left unchanged."""
+    _sid = getattr(agent, "session_id", None) or "none"
+    _tokens = f"{approx_tokens:,}" if approx_tokens else "unknown"
+    auto_mode = str(getattr(agent, "codex_app_server_auto_compaction", "native") or "native").lower()
+    if auto_mode not in {"native", "hermes", "off"}:
+        auto_mode = "native"
+    skip_reason = None
+    if not force and auto_mode != "hermes":
+        skip_reason = f"mode={auto_mode} force=false"
+    elif not force:
+        # Automatic entrypoints honor the compressor-owned cooldown: a recent compaction
+        # failed, and retrying every turn is what thrashes.
+        _cooldown_remaining = _codex_compaction_cooldown_remaining(agent)
+        if _cooldown_remaining > 0:
+            skip_reason = f"failure cooldown active for {_cooldown_remaining:.0f}s"
+    codex_session = getattr(agent, "_codex_session", None)
+    if skip_reason is None and codex_session is None:
+        skip_reason = "no active codex thread"
+    if skip_reason is not None:
+        logger.info(
+            "codex app-server compaction skipped: %s (session=%s messages=%d tokens=~%s)", skip_reason, _sid,
+            len(messages), _tokens,
+        )
+        return messages, _existing_system_prompt(agent, system_message)
+    logger.info("codex app-server compaction started: session=%s messages=%d tokens=~%s", _sid, len(messages), _tokens)
+    with contextlib.suppress(Exception):
+        agent._emit_status(COMPACTION_STATUS)
+    _activity_heartbeat = _CompressionActivityHeartbeat(agent, emit_client_status=True).start()
+    try:
+        result = codex_session.compact_thread()
+    except BaseException:
+        _activity_heartbeat.stop("context compression failed")
+        raise
+    failed = bool(getattr(result, "interrupted", False) or getattr(result, "error", None))
+    _activity_heartbeat.stop("context compression failed" if failed else "context compression completed")
+    if getattr(result, "should_retire", False):
+        with contextlib.suppress(Exception):
+            codex_session.close()
+        agent._codex_session = None
+    if failed:
+        with contextlib.suppress(Exception):
+            agent._emit_warning(f"⚠ Codex app-server compaction failed: {result.error}")
+        # The transcript is returned unchanged, so the session is still over
+        # threshold. Without a brake the next turn retries immediately.
+        _record_codex_compaction_failure(agent, str(getattr(result, "error", None) or "compaction interrupted"))
+        return messages, _existing_system_prompt(agent, system_message)
+    with _swallow('codex compaction bookkeeping failed', exc_info=True):
+        from agent.codex_runtime import _record_codex_app_server_compaction, _record_codex_app_server_usage
+        _record_codex_app_server_compaction(agent, result, approx_tokens=approx_tokens, force=True)
+        # An empty usage report must consume the pending verdict, not leave deferral
+        # armed until a later turn; minimal test engines may lack update_from_response.
+        if hasattr(agent.context_compressor, "update_from_response"):
+            _record_codex_app_server_usage(agent, result, messages=messages)
+    _reset_read_dedup_caches(task_id, session_id=agent.session_id or "")
+    logger.info(
+        "codex app-server compaction done: session=%s thread=%s turn=%s", _sid,
+        getattr(result, "thread_id", None) or "", getattr(result, "turn_id", None) or "",
+    )
+    existing_prompt = _existing_system_prompt(agent, system_message)
+    # Terminal edge only on success — failure/interrupt paths above return
+    # without it, matching the main compress_context() gating.
+    _emit_compaction_done(agent)
+    return messages, existing_prompt
+
+
+# 4 MB leaves headroom under Anthropic's 5 MB; shrinking loses quality but only
+# runs after a confirmed provider rejection, so the alternative is failure.
+_IMAGE_SHRINK_TARGET_BYTES = 4 * 1024 * 1024
+_IMAGE_SUFFIX_BY_MIME = {
+    "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+    "image/bmp": ".bmp",
+}
+
+
+def _data_url_mime(header: str, default: str = "image/jpeg") -> str:
+    """``image/*`` mime from a ``data:`` URL header, else ``default``."""
+    if header.startswith("data:"):
+        candidate = header[len("data:") :].split(";", 1)[0].strip()
+        if candidate.startswith("image/"):
+            return candidate
+    return default
+
+
+def _decode_pixels(data_url: str) -> Optional[tuple]:
+    """``(width, height)`` of a base64 data URL; None when Pillow is missing or the payload is corrupt."""
+    try:
+        import base64, io
+        _, _, data_d = data_url.partition(",")
+        if not data_d or not data_url.startswith("data:"):
+            return None
+        from PIL import Image
+        with Image.open(io.BytesIO(base64.b64decode(data_d))) as _img:
+            return _img.size
+    except Exception:
+        return None
+
+
+def _shrink_data_url(url: str, *, max_dimension: int, resize_fn: Any) -> tuple:
+    """Return ``(resized_url, unshrinkable)`` for a data URL.
+    ``resized_url`` is None when no rewrite applied. ``unshrinkable`` is True only when the image violated a
+    constraint and resizing failed to satisfy that same constraint, so the caller knows a retry is pointless.
+    The accept gate MUST use the axis that triggered the shrink: a pixel downscale can re-encode to MORE bytes
+    (PNG non-monotonic); a byte-only reject wedges."""
+    target_bytes = _IMAGE_SHRINK_TARGET_BYTES
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None, False
+    triggered_by = "bytes" if len(url) > target_bytes else None  # over byte budget
+    if triggered_by is None:
+        # Bytes fine; check pixels against the provider cap (tiny bytes, huge pixels).
+        dims = _decode_pixels(url)
+        if dims is None or max(dims) <= max_dimension:
+            return None, False
+        triggered_by = "dimension"
+    try:
+        header, _, data = url.partition(",")
+        mime = _data_url_mime(header)
+        import base64 as _b64
+        raw = _b64.b64decode(data)
+        tmp = tempfile.NamedTemporaryFile(
+            prefix="hermes_shrink_", suffix=_IMAGE_SUFFIX_BY_MIME.get(mime, ".jpg"), delete=False
+        )
+        try:
+            tmp.write(raw)
+            tmp.close()
+            resized = resize_fn(
+                Path(tmp.name), mime_type=mime, max_base64_bytes=target_bytes, max_dimension=max_dimension
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                Path(tmp.name).unlink(missing_ok=True)
+        if not resized:
+            return None, True  # Pillow couldn't help
+        new_dims = _decode_pixels(resized)
+        if triggered_by == "bytes":
+            # Byte budget is binding — bytes must shrink; and the resizer may return an
+            # over-cap blob (long side freezes at the 64px short-side floor) → still 400.
+            ok = len(resized) < len(url) and (new_dims is None or max(new_dims) <= max_dimension)
+        elif new_dims is not None:
+            # Dimension cap is binding: accept a byte-larger re-encode if now within cap.
+            ok = max(new_dims) <= max_dimension
+        else:
+            # Can't verify dimensions: fall back to the bytes-must-shrink gate so we never
+            # accept an unverifiable byte-larger blob.
+            ok = len(resized) < len(url)
+        return (resized, False) if ok else (None, True)
+    except Exception as exc:
+        logger.warning("image-shrink recovery: re-encode failed — %s", exc)
+        return None, triggered_by is not None
+
+
+def _source_to_data_url(source: Any) -> Optional[str]:
+    """Anthropic ``{"type": "base64", ...}`` image source → data URL, else None."""
+    if not isinstance(source, dict) or source.get("type") != "base64":
+        return None
+    data = source.get("data")
+    if not isinstance(data, str) or not data:
+        return None
+    media_type = str(source.get("media_type") or "image/jpeg").strip()
+    return f"data:{media_type if media_type.startswith('image/') else 'image/jpeg'};base64,{data}"
+
+
+def _write_data_url_to_source(source: dict, data_url: str) -> dict:
+    """Return a NEW source dict carrying the re-encoded payload.
+    Copy-on-write: parts may be shared with the persistent history, so mutating in place would store the
+    degraded image; the caller replaces the part."""
+    header, _, data = data_url.partition(",")
+    return {**source, "type": "base64", "media_type": _data_url_mime(header), "data": data}
+
+
+def try_shrink_image_parts_in_messages(api_messages: list, *, max_dimension: int = 8000) -> bool:
+    """Re-encode oversized native image parts to recover from image-too-large errors.
+    Mutates ``api_messages`` in place. Returns True if any part was replaced, False if nothing to shrink or
+    Pillow could not help. Targets data-URL parts over 4 MB or ``max_dimension`` (Anthropic's per-side pixel
+    cap, parsed from the rejection by the caller); http(s) image URLs are left untouched."""
+    if not api_messages:
+        return False
+    try:
+        from tools.vision_tools import _resize_image_for_vision
+    except Exception as exc:
+        logger.warning("image-shrink recovery: vision_tools unavailable — %s", exc)
+        return False
+    changed_count = 0
+    # Track over-target parts that could not be shrunk: if any remain, a retry
+    # re-sends the same payload and wastes the single retry budget.
+    unshrinkable_oversized = 0
+
+    def _shrink(url: Any) -> tuple:
+        return _shrink_data_url(url, max_dimension=max_dimension, resize_fn=_resize_image_for_vision)
+
+    for msg in api_messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        # Copy-on-write: part/source dicts can alias stored history, so build a new
+        # content list and reassign msg["content"] on the per-call copy.
+        new_content: list | None = None
+        for part_idx, part in enumerate(content):
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            replacement = None
+            if ptype == "image":
+                source = part.get("source")
+                resized, unshrinkable = _shrink(_source_to_data_url(source) or "")
+                if resized and isinstance(source, dict):
+                    replacement = {**part, "source": _write_data_url_to_source(source, resized)}
+            elif ptype in {"image_url", "input_image"}:
+                image_value = part.get("image_url")
+                # OpenAI chat.completions: {"image_url": {"url": "data:..."}}
+                # OpenAI Responses: {"image_url": "data:..."}
+                if isinstance(image_value, dict):
+                    resized, unshrinkable = _shrink(image_value.get("url", ""))
+                    if resized:
+                        replacement = {**part, "image_url": {**image_value, "url": resized}}
+                elif isinstance(image_value, str):
+                    resized, unshrinkable = _shrink(image_value)
+                    if resized:
+                        replacement = {**part, "image_url": resized}
+                else:
+                    continue
+            else:
+                continue
+            if replacement is not None:
+                if new_content is None:
+                    new_content = list(content)
+                new_content[part_idx] = replacement
+                changed_count += 1
+            elif unshrinkable:
+                unshrinkable_oversized += 1
+        if new_content is not None:
+            msg["content"] = new_content
+    target_mb = _IMAGE_SHRINK_TARGET_BYTES / (1024 * 1024)
+    if changed_count:
+        logger.info("image-shrink recovery: re-encoded %d image part(s) to fit under %.0f MB", changed_count, target_mb)
+    if unshrinkable_oversized:
+        # An unshrinkable oversized image makes retry pointless; signal no progress even
+        # if others shrank so the caller surfaces the original error.
+        logger.warning(
+            "image-shrink recovery: %d oversized image part(s) could not be "
+            "shrunk under %.0f MB — not retrying (would re-send rejected payload)", unshrinkable_oversized,
+            target_mb,
+        )
+        return False
+    return changed_count > 0
+
+
+__all__ = [
+    "COMPACTION_STATUS", "COMPACTION_DONE_STATUS", "COMPACTION_HEARTBEAT_STATUS", "COMPACTION_STATUS_MARKER", "is_compaction_progress_status",
+    "check_compression_model_feasibility", "ensure_compression_feasibility_checked",
+    "revalidate_compression_feasibility", "replay_compression_warning",
+    "compress_context",
+    "try_shrink_image_parts_in_messages",
+]

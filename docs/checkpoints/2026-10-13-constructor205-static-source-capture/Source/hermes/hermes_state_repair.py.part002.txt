@@ -1,0 +1,142 @@
+", f"could not stage a complete SQLite repair snapshot of {db_path}: {exc}", exc=exc)
+        try:
+            # Private marker for the outer wrapper: a strategy failure consumes the persistent budget; a
+            # promotion failure is classified separately.
+            report["_repair_attempted"] = True
+            _run_repair_strategies(scratch, report)
+            if report.get("repaired"):
+                # Never ``os.replace`` the live DB: Windows rejects replacement under open handles and POSIX would
+                # leave those handles on the old inode. The guard keeps writer exclusion throughout.
+                try:
+                    _copy_database_snapshot(scratch, db_path, destination_connection=live_guard)
+                except (OSError, sqlite3.Error, TimeoutError) as exc:
+                    report.update(repaired=False, strategy=None,
+                                  _repair_attempted=_repair_failure_consumes_attempt(exc))
+                    report["error"] = f"repaired snapshot could not be promoted transactionally: {exc}"
+                    logger.error("state.db repair promotion failed: %s", exc)
+                else:
+                    logger.warning("state.db repaired via '%s' and promoted transactionally: %s",
+                                   report.get("strategy"), db_path)
+                    _restore_journal_mode_after_repair(db_path, journal_mode_before, conn=live_guard)
+            if not report.get("repaired"):
+                # Logged HERE, not in the strategies: they see the scratch copy, and the message a human acts on
+                # must name a path that still exists.
+                logger.error("state.db schema repair could not recover %s automatically (no committed canonical data "
+                             "was modified or lost; backup: %s); manual restore from backup may be required.",
+                             db_path, report["backup_path"])
+            return report
+        finally:
+            # Never leave a half-repaired file beside the DB to be mistaken for the real thing.
+            if (cleanup_error := _unlink_db_triple(scratch)) is not None:
+                logger.warning("Could not remove state.db repair snapshot after repair: %s", cleanup_error)
+
+
+def _unlink_db_triple(path: Path) -> Optional[str]:
+    """Remove *path* and every SQLite sidecar; return any cleanup failure."""
+    from hermes_state import _IS_WINDOWS
+    failures: List[str] = []
+    for victim in (path, *_sidecars(path)):
+        for attempt in range(10):
+            try:
+                victim.unlink(missing_ok=True)
+            except OSError as exc:
+                # Windows may retain a just-closed SQLite handle for a few scheduler ticks; bounded retry.
+                if isinstance(exc, PermissionError) and _IS_WINDOWS and attempt < 9:
+                    time.sleep(0.05)
+                    continue
+                failures.append(f"{victim}: {exc}")
+            break
+    return "; ".join(failures) or None
+
+
+# ── Repair strategies, least destructive first (each mutates its connection's DB) ──
+
+def _edit_sqlite_master(conn: sqlite3.Connection, edit) -> None:
+    """Run *edit* under ``writable_schema=ON``; bump the schema cookie when it
+    reports a change so live peers discard their cached schema."""
+    conn.execute("PRAGMA writable_schema=ON")
+    if edit():
+        _bump_schema_cookie(conn)
+    conn.execute("PRAGMA writable_schema=OFF")
+    conn.commit()
+
+
+def _strategy_rebuild_fts(conn: sqlite3.Connection) -> None:
+    """FTS5 'rebuild' rewrites each index from the content table: the least-
+    destructive fix for an index that rejects writes while reads work."""
+    from hermes_state import load_fts5_cjk_extension
+    # The cjk index can only be rebuilt with its tokenizer loaded (best-effort).
+    load_fts5_cjk_extension(conn)
+    for table_name in _FTS_TABLES:
+        with contextlib.suppress(sqlite3.OperationalError):  # table absent (FTS disabled / trigram off / cjk absent)
+            conn.execute(f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')")
+
+
+def _strategy_reindex(conn: sqlite3.Connection) -> None:
+    """integrity_check reports "wrong # of entries in index" when a B-tree
+    index drifts from its base table; REINDEX rewrites it from canonical rows."""
+    # REINDEX rewrites every index b-tree; take the barriers now that the schema parses.
+    _reapply_durability_barriers(conn)
+    conn.execute("REINDEX")
+    conn.commit()
+
+
+def _strategy_dedup_schema(conn: sqlite3.Connection) -> None:
+    """De-duplicate sqlite_master (lowest rowid per type/name wins), keeping FTS."""
+    def _dedup() -> bool:
+        dupes = conn.execute(
+            "SELECT type, name, COUNT(*) AS c, MIN(rowid) AS keep FROM sqlite_master GROUP BY type, name HAVING c > 1"
+        ).fetchall()
+        for type_, name, _count, keep in dupes:
+            conn.execute("DELETE FROM sqlite_master WHERE type IS ? AND name IS ? AND rowid <> ?",
+                         (type_, name, keep))
+        return bool(dupes)
+
+    _edit_sqlite_master(conn, _dedup)
+
+
+def _strategy_drop_fts_vacuum(conn: sqlite3.Connection) -> None:
+    """Drop all FTS schema and VACUUM; indexes rebuild on the next open. The
+    destructive one, and why strategies run on a scratch copy: on a damaged
+    schema b-tree VACUUM silently drops every table hanging off the unreadable part."""
+    _edit_sqlite_master(conn, lambda: conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'") or True)
+    # The schema parses now, so the barriers can stick — VACUUM rewrites the whole file.
+    _reapply_durability_barriers(conn)
+    conn.execute("VACUUM")
+
+
+# (name, body, success log, failure log) in escalation order. failure log None =
+# final strategy: its failure lands in report["error"] instead of logged-and-skipped.
+_REPAIR_STRATEGIES = (
+    ("rebuild_fts", _strategy_rebuild_fts, "state.db FTS indexes rebuilt in place (schema preserved): %s",
+     "state.db FTS in-place rebuild pass failed: %s"),
+    ("reindex_btree", _strategy_reindex, "state.db B-tree indexes rebuilt via REINDEX: %s",
+     "state.db REINDEX pass failed: %s"),
+    ("dedup_schema", _strategy_dedup_schema,
+     "state.db schema repaired by de-duplicating sqlite_master (FTS index preserved): %s",
+     "state.db dedup repair pass failed: %s"),
+    ("drop_fts_rebuild", _strategy_drop_fts_vacuum,
+     "state.db schema repaired by dropping FTS schema; indexes will rebuild from messages on next open: %s", None),
+)
+
+
+def _run_repair_strategies(db_path: Path, report: Dict[str, Any]) -> Dict[str, Any]:
+    """Escalating repair attempts, applied to *db_path* IN PLACE — only ever a scratch copy nothing else holds open,
+    never the user's database. The "could not recover" log lives in the caller so it names the user's database."""
+
+    for name, body, success_msg, failure_msg in _REPAIR_STRATEGIES:
+        try:
+            with _repair_conn(db_path) as conn:
+                body(conn)
+            reason = _db_opens_cleanly(db_path)
+        except sqlite3.DatabaseError as exc:
+            reason = str(exc)
+            if failure_msg is not None:
+                logger.warning(failure_msg, exc)
+        if reason is None:
+            report["repaired"], report["strategy"] = True, name
+            logger.warning(success_msg, db_path)
+            return report
+        if failure_msg is None:
+            report["error"] = reason
+    return report

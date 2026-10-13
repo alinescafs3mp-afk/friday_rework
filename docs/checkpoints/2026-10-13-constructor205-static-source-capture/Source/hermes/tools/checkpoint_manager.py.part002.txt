@@ -1,0 +1,212 @@
+rent.mkdir(parents=True, exist_ok=True)
+
+        # Stage with per-project index.  Include a per-stage file-size filter
+        # via ``core.bigFileThreshold`` is not what we want — instead, we
+        # rely on the exclude file for broad patterns and post-stage prune
+        # any path whose size exceeds max_file_size_mb.
+        ok, _, err = _run_git(
+            ["add", "-A"], store, working_dir,
+            timeout=_GIT_TIMEOUT * 2, index_file=index_file,
+        )
+        if not ok:
+            logger.debug("Checkpoint git-add failed: %s", err)
+            return False
+
+        if self.max_file_size_mb > 0:
+            self._drop_oversize_from_index(store, working_dir, index_file)
+
+        # Compare against the current ref tip (not HEAD — HEAD points to a
+        # branch that doesn't exist on a bare store, so ``diff --cached``
+        # against HEAD would always show "new file" for every staged path).
+        ok_ref, ref_commit, _ = _run_git(
+            ["rev-parse", "--verify", ref + "^{commit}"],
+            store, working_dir,
+            allowed_returncodes={128},
+        )
+        has_ref = ok_ref and bool(ref_commit)
+
+        if has_ref:
+            ok_diff, _, _ = _run_git(
+                ["diff-index", "--cached", "--quiet", ref_commit],
+                store, working_dir,
+                allowed_returncodes={1},
+                index_file=index_file,
+            )
+            if ok_diff:
+                logger.debug("Checkpoint skipped: no changes in %s", working_dir)
+                return False
+        else:
+            # No ref yet — skip only if the index is empty.
+            ok_ls, ls_out, _ = _run_git(
+                ["ls-files", "--cached"],
+                store, working_dir,
+                index_file=index_file,
+            )
+            if ok_ls and not ls_out.strip():
+                logger.debug("Checkpoint skipped: empty tree in %s", working_dir)
+                return False
+
+        # Write tree from per-project index.
+        ok_tree, tree_sha, err = _run_git(
+            ["write-tree"], store, working_dir,
+            index_file=index_file,
+        )
+        if not ok_tree or not tree_sha:
+            logger.debug("Checkpoint write-tree failed: %s", err)
+            return False
+
+        # A nested repository is stored as a gitlink, not its files: say so in
+        # the checkpoint itself rather than only when a rollback is refused.
+        ok_ls, tree_out, _ = _run_git(["ls-tree", "-r", "-z", tree_sha], store, working_dir)
+        nested_repos = _gitlink_paths(tree_out) if ok_ls else []
+        if nested_repos:
+            logger.info("Checkpoint of %s does not capture nested git repositories: %s",
+                        working_dir, ", ".join(nested_repos))
+            # Listings read the subject (%s), which ends at the first blank
+            # line, so keep a multiline reason (a terminal command) on one
+            # line or the note falls outside every listing.
+            reason = " ".join(
+                line.strip() for line in reason.splitlines() if line.strip()
+            ) + _uncaptured_note(nested_repos)
+
+        # Build commit (parent = current ref tip, if any).
+        commit_args = ["commit-tree", tree_sha, "-m", reason, "--no-gpg-sign"]
+        if has_ref:
+            commit_args = ["commit-tree", tree_sha, "-p", ref_commit, "-m", reason, "--no-gpg-sign"]
+        ok_commit, new_sha, err = _run_git(
+            commit_args, store, working_dir,
+            index_file=index_file,
+        )
+        if not ok_commit or not new_sha:
+            logger.debug("Checkpoint commit-tree failed: %s", err)
+            return False
+
+        # Update the per-project ref.
+        update_args = ["update-ref", ref, new_sha]
+        if has_ref:
+            update_args = ["update-ref", ref, new_sha, ref_commit]
+        ok_update, _, err = _run_git(
+            update_args, store, working_dir,
+        )
+        if not ok_update:
+            logger.debug("Checkpoint update-ref failed: %s", err)
+            return False
+
+        logger.debug("Checkpoint taken in %s: %s (%s)", working_dir, reason, new_sha[:8])
+
+        # Count and size budgets share one failure boundary.
+        if prune:
+            self._prune(store, working_dir, ref)
+
+        return True
+
+    def _exceeds_size_cap(self, path: Path) -> bool:
+        """Whether *path* is larger than ``max_file_size_mb``.
+
+        The same test :meth:`_drop_oversize_from_index` applies when building a
+        checkpoint, so "excluded from the checkpoint" and "refused deletion at
+        restore" agree on one definition. A cap of 0 disables it, and an
+        unstattable path is not claimed to be oversize.
+        """
+        cap = self.max_file_size_mb * 1024 * 1024
+        if cap <= 0:
+            return False
+        try:
+            return path.stat().st_size > cap
+        except OSError:
+            return False
+
+    def _drop_oversize_from_index(
+        self, store: Path, working_dir: str, index_file: Path,
+    ) -> None:
+        """Remove any staged file larger than ``max_file_size_mb`` from the index.
+
+        Lets the agent keep snapshotting source code while refusing to
+        swallow generated assets (datasets, model weights, logs, videos).
+        """
+        if self.max_file_size_mb <= 0:
+            return
+        ok, stdout, _ = _run_git(
+            ["ls-files", "--cached", "-z"],
+            store, working_dir, index_file=index_file,
+        )
+        if not ok or not stdout:
+            return
+        # NUL separators preserve whitespace within each literal filename.
+        paths = [p for p in stdout.split("\x00") if p]
+        abs_workdir = _normalize_path(working_dir)
+        # Same predicate safe restore consults, called rather than restated:
+        # a threshold that drifted between the two would make a file both
+        # absent from the checkpoint and not recognised as capped at restore,
+        # which is precisely the deletion this change exists to prevent.
+        oversize = [
+            rel for rel in paths if self._exceeds_size_cap(abs_workdir / rel)
+        ]
+        if not oversize:
+            return
+        logger.debug(
+            "Checkpoint: dropping %d oversize file(s) (>%d MB) from index",
+            len(oversize), self.max_file_size_mb,
+        )
+        # Use --pathspec-from-file for safety with many paths.
+        # Chunk into manageable batches.
+        BATCH = 200
+        for i in range(0, len(oversize), BATCH):
+            chunk = oversize[i:i + BATCH]
+            _run_git(
+                ["rm", "--cached", "--quiet", "--"] + chunk,
+                store, working_dir, index_file=index_file,
+                allowed_returncodes={128},
+            )
+
+    def _prune(self, store: Path, working_dir: str, ref: str) -> None:
+        """Checkpoint-take path: snapshot-count budget plus one size round, gc deferred to the
+        periodic prune — a repack here held the tool call for the whole gc on a large store."""
+        from tools.checkpoint_pruning import Pruner, PruneError
+
+        pruner = Pruner(_run_git, store, working_dir, _GIT_TIMEOUT, _dir_size_bytes, _REFS_PREFIX)
+        try:
+            pruner.trim(ref, self.max_snapshots)
+            if pruner.drop_one_round(self.max_total_size_mb * 1024 * 1024):
+                logger.info("Checkpoint store exceeded %d MB — dropped the oldest snapshot per project; "
+                            "space is reclaimed by the next prune", self.max_total_size_mb)
+        except (PruneError, OSError) as exc:
+            logger.warning("Checkpoint pruning stopped: %s", exc)
+
+
+def format_checkpoint_list(checkpoints: List[Dict], directory: str) -> str:
+    """Format checkpoint list for display to user."""
+    if not checkpoints:
+        return f"No checkpoints found for {directory}"
+
+    lines = [f"📸 Checkpoints for {directory}:\n"]
+    for i, cp in enumerate(checkpoints, 1):
+        ts = cp["timestamp"]
+        if "T" in ts:
+            ts = ts.split("T")[1].split("+")[0].split("-")[0][:5]
+            date = cp["timestamp"].split("T")[0]
+            ts = f"{date} {ts}"
+
+        files = cp.get("files_changed", 0)
+        ins = cp.get("insertions", 0)
+        dele = cp.get("deletions", 0)
+        if files:
+            stat = f"  ({files} file{'s' if files != 1 else ''}, +{ins}/-{dele})"
+        else:
+            stat = ""
+
+        # Label per-project entries when showing the cross-project view
+        # (workdir key only present on list_all_checkpoints results).
+        workdir = cp.get("workdir", "")
+        if workdir and directory == "all directories":
+            workdir_short = Path(workdir).name or workdir
+            lines.append(
+                f"  {i}. {cp['short_hash']}  {ts}  [{workdir_short}]  {cp['reason']}{stat}"
+            )
+        else:
+            lines.append(f"  {i}. {cp['short_hash']}  {ts}  {cp['reason']}{stat}")
+
+    lines.append("\n  /rollback <N>             restore to checkpoint N")
+    lines.append("  /rollback diff <N>        preview changes since checkpoint N")
+    lines.append("  /rollback <N> <file>      restore a single file from checkpoint N")
+    return "\n".join(lines)

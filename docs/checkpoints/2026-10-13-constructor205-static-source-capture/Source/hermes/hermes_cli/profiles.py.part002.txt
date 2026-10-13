@@ -1,0 +1,1209 @@
+s: List[str]) -> set:
+        ignored = set(ignore(directory, names))
+        for name in names:
+            target = _junction_target(os.path.join(directory, name))
+            if target is not None:
+                junctions[os.path.join(directory, name)] = target
+                ignored.add(name)
+        return ignored
+
+    shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=dirs_exist_ok, ignore=_ignore)
+    if junctions:
+        import _winapi  # Windows-only stdlib module; only reachable once a junction was seen
+    for link, target in junctions.items():
+        try:
+            _winapi.CreateJunction(target, os.path.join(dst, os.path.relpath(link, src)))
+        except OSError as exc:
+            logger.warning("clone: skipped junction %s -> %s (%s)", link, target, exc)
+
+
+def _clone_all_into(source_dir: Path, profile_dir: Path, canon: str) -> None:
+    """--clone-all: full copytree minus infrastructure/history, then strip runtime files,
+    the backend-assigned role, and cloned single-use OAuth grants."""
+    _copytree_keep_junctions(source_dir, profile_dir, _clone_all_copytree_ignore(source_dir))
+    drop_profile_role(profile_dir)
+    materialized = _materialize_symlinked_files(profile_dir)
+    if materialized:
+        logger.info("profile %s: materialized symlinked %s so the clone never writes through to %s",
+                    canon, materialized, source_dir)
+    # Excluded history dirs (sessions/, cron/) must still exist as empty dirs so the clone runs.
+    for subdir in _PROFILE_DIRS:
+        (profile_dir / subdir).mkdir(parents=True, exist_ok=True)
+    for stale in _CLONE_ALL_STRIP:
+        (profile_dir / stale).unlink(missing_ok=True)
+    # auth.json / .anthropic_oauth.json copied verbatim fork single-use OAuth grants
+    # (Anthropic / Codex / xAI): one credential with two owners, and the first profile to
+    # refresh revokes the pair for every sibling. Drop the copies; the clone reads the root
+    # grant through the credential-pool fallback.
+    from hermes_cli.auth import strip_cloned_single_use_oauth_grants
+    stripped = strip_cloned_single_use_oauth_grants(profile_dir)
+    if any(stripped.values()):
+        logger.info(
+            "profile %s: dropped cloned single-use OAuth grants %s "
+            "(inherits the root grant instead)", canon, stripped,
+        )
+
+
+def _clone_plugins_ignore(plugins_root: Path):
+    """copytree ignore for a cloned ``plugins/``: :func:`_non_exportable_entries` everywhere, plus
+    the installer's in-flight ``.install-*`` / ``.update-*`` staging dirs at the root."""
+    root = str(plugins_root)
+
+    def _ignore(directory: str, names: List[str]) -> set:
+        ignored = _non_exportable_entries(directory, names)
+        if directory == root:
+            # Directories only: ``.install-metadata.json`` shares the prefix and must travel.
+            ignored.update(n for n in names if n.startswith((".install-", ".update-"))
+                           and os.path.isdir(os.path.join(directory, n)))
+        return ignored
+    return _ignore
+
+
+def _clone_plugins(source_dir: Path, profile_dir: Path) -> None:
+    """Copy the source's user-installed plugins (``plugins/`` with ``.install-metadata.json``).
+
+    ``config.yaml`` already carries ``plugins.enabled`` and ``memory.provider``; without the code a
+    catalog-installed memory provider resolves nowhere in the clone, so the clone silently runs
+    without its memory (or, with lazy installs on, re-fetches the latest catalog pin instead of the
+    revision the source runs). The copy keeps each plugin's tree, revision and catalog provenance
+    (the install record). Python dependencies live in the shared venv, where the source's
+    selection of the same plugin already put them."""
+    source_plugins = source_dir / "plugins"
+    if source_plugins.is_dir():
+        _copytree_keep_junctions(source_plugins, profile_dir / "plugins",
+                                 _clone_plugins_ignore(source_plugins), dirs_exist_ok=True)
+
+
+def cloned_plugin_names(profile_dir: Path) -> List[str]:
+    """Plugins a clone now carries in ``plugins/``, for the CLI notice."""
+    try:
+        return sorted(p.name for p in (profile_dir / "plugins").iterdir()
+                      if not p.name.startswith(".") and (p.is_dir() or p.is_symlink()))
+    except OSError:
+        return []
+
+
+def _bootstrap_profile_dir(profile_dir: Path, source_dir: Optional[Path],
+                           sync_imports: bool = False) -> None:
+    """Fresh layout: bootstrap dirs, then either seed a model block (no source) or clone
+    config files, installed skills (the dashboard's "clone from default" must keep bundled
+    AND user-installed skills), and memory/identity files from *source_dir*.
+
+    ``sync_imports`` also copies the source's ``import-sync.json`` (the ``hermes import-agent``
+    manifest) so the clone stays registered against the same external Claude Code / Codex trees
+    and ``hermes -p <clone> import-agent --sync`` keeps pulling from them. The link is to the
+    external tree, never to the source profile: both profiles stay independent islands."""
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    for subdir in _PROFILE_DIRS:
+        (profile_dir / subdir).mkdir(parents=True, exist_ok=True)
+    if source_dir is None:
+        _seed_model_config(profile_dir)
+        return
+    for relpath in _CLONE_CONFIG_FILES:
+        _clone_file(source_dir, profile_dir, relpath)
+    source_skills = source_dir / "skills"
+    if source_skills.is_dir():
+        _copytree_keep_junctions(source_skills, profile_dir / "skills", _non_exportable_entries, dirs_exist_ok=True)
+    for relpath in _CLONE_SUBDIR_FILES:
+        _clone_file(source_dir, profile_dir, relpath)
+    _clone_plugins(source_dir, profile_dir)
+    from hermes_cli.profile_memory_config import active_memory_provider, clone_memory_provider_config
+    clone_memory_provider_config(source_dir, profile_dir,
+                                 active_memory_provider(_load_yaml_dict(source_dir / "config.yaml")))
+    if sync_imports:
+        from hermes_cli.agent_import_sync import SYNC_MANIFEST_NAME  # lazy: keeps yaml/utils off the hot startup path
+        _clone_file(source_dir, profile_dir, SYNC_MANIFEST_NAME)
+
+
+def create_profile(
+    name: str, clone_from: Optional[str] = None, clone_all: bool = False, clone_config: bool = False,
+    no_alias: bool = False, no_skills: bool = False, description: Optional[str] = None,
+    clone_channels: bool = False, sync_imports: bool = False,
+) -> Path:
+    """Create a new profile directory and return its path.
+
+    ``clone_from`` defaults to the active profile when cloning. ``clone_all`` copies all state;
+    ``clone_config`` copies config.yaml/.env/SOUL.md, installed skills, and identity files.
+    Either clone strips the source's messaging channels — bot tokens, allowlists, platform
+    sections, pairing/session state — unless ``clone_channels`` opts in: a copied bot credential
+    makes two gateways fight over one bot (``hermes_cli.profile_channels``; callers list what
+    was left behind with ``channel_platforms_configured(source_dir)``).
+    ``no_skills`` creates an empty profile and writes a marker so ``hermes update`` skips
+    re-seeding its skills; it is mutually exclusive with the clone options, which copy skills.
+    ``sync_imports`` (``--clone`` only; ``--clone-all`` copies the file anyway) also copies the
+    ``import-agent`` sync manifest so the clone can keep pulling the same external agent trees."""
+    if no_skills and (clone_from is not None or clone_config or clone_all):
+        raise ValueError(
+            "--no-skills is mutually exclusive with --clone / --clone-from / --clone-all "
+            "(cloning explicitly copies skills from the source profile)."
+        )
+    if sync_imports and not (clone_config or clone_all):
+        raise ValueError("--sync-imports requires --clone or --clone-from (there is no import "
+                         "manifest to carry over without a source profile).")
+    cloning = clone_from is not None or clone_all or clone_config
+    if clone_channels and not cloning:
+        raise ValueError("--clone-channels only applies to a clone (--clone, --clone-from or --clone-all).")
+    canon = _canon_valid(name)
+    if canon == "default":
+        raise ValueError("Cannot create a profile named 'default' — it is the built-in profile (~/.hermes).")
+    profile_dir = get_profile_dir(canon)
+    if profile_dir.exists() and not named_profile_has_identity(profile_dir):
+        if named_profile_is_deleted(profile_dir):
+            # Empty shell left by a post-delete mkdir: invisible to ``profile list``, safe to replace.
+            shutil.rmtree(profile_dir)
+        else:
+            # A live marker-less dir is invisible to ``profile list`` but may still hold user
+            # files (skills/, memories/, cron/jobs.json): fail closed and name it, never rmtree.
+            raise FileExistsError(
+                f"Cannot create profile '{canon}': {profile_dir} exists but carries no profile identity "
+                "file, so it is not listed as a profile. Move or remove that directory first."
+            )
+    if profile_dir.exists():
+        raise _profile_exists_error(canon)
+    source_dir = _resolve_clone_source(clone_from) if cloning else None
+    if source_dir is not None and clone_channels:
+        from hermes_cli.profile_channels import clone_channels_refusal
+        refusal = clone_channels_refusal(source_dir, clone_from or get_active_profile_name() or "default")
+        if refusal:
+            raise ValueError(refusal)
+    clear_named_profile_deleted(profile_dir)
+    # Build in a hidden sibling and publish with one rename: a running multiplexer rescans profiles/
+    # on every create and every 30 s, and ``_iter_named_profile_dirs`` only lists valid ids (no leading
+    # dot), so it can never adopt the half-copied tree and start adapters on credentials the strip
+    # below has not removed yet.
+    staging = _clone_staging_dir(profile_dir)
+    try:
+        if clone_all and source_dir:
+            _clone_all_into(source_dir, staging, canon)
+        else:
+            _bootstrap_profile_dir(staging, source_dir, sync_imports=sync_imports)
+        if source_dir is not None and not clone_channels:
+            from hermes_cli.profile_channels import strip_channel_settings
+            stripped = strip_channel_settings(staging, include_state=clone_all, source_dir=source_dir)
+            if stripped:
+                logger.info("profile %s: cloned without messaging channels %s", canon, stripped)
+        _finish_profile_layout(staging, no_skills=no_skills, clone_all=clone_all, description=description)
+        os.rename(staging, profile_dir)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    # Inside a container under s6, register the gateway as a runtime s6 service so
+    # `hermes -p <profile> gateway start` supervises via `s6-svc -u` instead of a bare
+    # process. No-op on host (systemd/launchd/windows unit generation handles lifecycle).
+    _maybe_register_gateway_service(canon)
+    # A running multiplexer enumerates profiles/ at boot: ask it to serve this one now (it also
+    # rescans periodically, so a missed signal only delays serving).
+    _notify_multiplexer(canon)
+    return profile_dir
+
+
+def _clone_staging_dir(profile_dir: Path) -> Path:
+    """Fresh ``profiles/.<name>.staging-<pid>`` beside the final dir (same filesystem, so the publish
+    rename is atomic). A leftover from a crashed create is discarded."""
+    staging = profile_dir.parent / f".{profile_dir.name}.staging-{os.getpid()}"
+    profile_dir.parent.mkdir(parents=True, exist_ok=True)
+    if staging.is_symlink() or staging.is_file():
+        staging.unlink()
+    elif staging.is_dir():
+        shutil.rmtree(staging, ignore_errors=True)
+    return staging
+
+
+def _finish_profile_layout(profile_dir: Path, *, no_skills: bool, clone_all: bool,
+                           description: Optional[str]) -> None:
+    """Seed files a fresh profile owns from day one; runs on the staging tree before publish."""
+    # Seed an empty .env so the profile owns a credentials file from day one. Without it,
+    # profile-scoped env writes (dashboard Channels/Keys pages, `hermes -p <name> auth add`)
+    # had no file until first write and the profile silently inherited shell API keys —
+    # read by users as "the new profile reads the root .env". Skipped when a clone copied one.
+    _seed_file_if_missing(profile_dir / ".env", _PLACEHOLDER_ENV, 0o600)
+
+    # Default SOUL.md to customize immediately (skipped when a clone already provided one).
+    with contextlib.suppress(Exception):  # best-effort — don't fail profile creation over this
+        from hermes_cli.default_soul import DEFAULT_SOUL_MD
+        _seed_file_if_missing(profile_dir / "SOUL.md", DEFAULT_SOUL_MD)
+
+    # Opt-out marker read by seed_profile_skills() and `hermes update`'s all-profile sync
+    # (the feature still works via the empty skills/ dir if this fails).
+    if no_skills:
+        _seed_file_if_missing(
+            profile_dir / NO_BUNDLED_SKILLS_MARKER,
+            "This profile opted out of bundled-skill seeding (`hermes profile create --no-skills`).\n"
+            "Delete this file to re-enable sync on the next `hermes update`.\n",
+        )
+
+    # Migrate config-only clones now so desktop/status don't warn that a just-created
+    # profile is v0/outdated; --clone-all snapshots stay byte-for-byte apart from the
+    # explicit runtime/history stripping above.
+    if not clone_all:
+        _migrate_profile_config_if_outdated(profile_dir)
+
+    # Description last, so a partial-create failure doesn't strand a description file.
+    if description and description.strip():
+        with contextlib.suppress(Exception):  # non-fatal — `hermes profile describe` works later
+            write_profile_meta(profile_dir, description=description.strip(), description_auto=False)
+
+
+def _notify_multiplexer(canon: str) -> None:
+    from hermes_cli.gateway_multiplex_served import notify_multiplexer_profiles_changed
+    notify_multiplexer_profiles_changed(canon)
+
+
+def _purge_identity(canon: str) -> bool:
+    """Settle a deleted profile's durable identity (``profile_identity.purge_profile_identity``).
+
+    False means the filesystem delete happened but the identity settlement did not — the caller
+    reports that as a pending settlement rather than a clean success."""
+    from hermes_cli.profile_identity import purge_profile_identity
+    return purge_profile_identity(canon)
+
+
+def _live_default_multiplexer() -> bool:
+    """True when a live default gateway has recorded a served-profile set: every dir under
+    profiles/ is then served by it, so a profile-identity change must be unrouted first."""
+    try:
+        from hermes_cli.gateway_multiplex_served import recorded_served_profiles
+        return recorded_served_profiles() is not None
+    except Exception:
+        return False
+
+
+def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict]:
+    """Seed bundled skills into a profile via subprocess (sync_skills() caches HERMES_HOME at
+    module level). Returns the sync result dict, or None on failure. ``--no-skills`` profiles
+    still run the sync: ``sync_skills()`` detects the marker and seeds only essentials."""
+    project_root = Path(__file__).parent.parent.resolve()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import json; from tools.skills_sync import sync_skills; "
+             "r = sync_skills(quiet=True); print(json.dumps(r))"],
+            env={**os.environ, "HERMES_HOME": str(profile_dir)},
+            cwd=str(project_root),
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout.strip())
+        if not quiet:
+            print(f"⚠ Skill seeding returned exit code {result.returncode}")
+            if result.stderr.strip():
+                print(f"  {result.stderr.strip()[:200]}")
+        return None
+    except subprocess.TimeoutExpired:
+        if not quiet:
+            print("⚠ Skill seeding timed out (60s)")
+        return None
+    except Exception as e:
+        if not quiet:
+            print(f"⚠ Skill seeding failed: {e}")
+        return None
+
+
+def backfill_profile_envs(quiet: bool = False) -> List[str]:
+    """Give every named profile predating per-profile ``.env`` one (copy of the default's, or
+    the placeholder header). Never overwrites an existing profile ``.env``.
+
+    Profiles created before the dashboard/CLI started seeding a ``.env`` (PR #44792) have none, so once the
+    Channels/Keys endpoints became profile-scoped those profiles stopped inheriting the root install's
+    credentials and showed everything as unconfigured. To avoid breaking anyone on update, copy the DEFAULT
+    install's ``.env`` into each named profile that lacks one — that preserves the effective credentials
+    those profiles were already running with (they previously read the root ``.env`` via the process
+    environment). Users can then diverge per profile from there.
+    """
+    backfilled: List[str] = []
+    default_env = _get_default_hermes_home() / ".env"
+    for entry in _iter_named_profile_dirs():
+        env_path = entry / ".env"
+        if env_path.exists():
+            continue
+        try:
+            if default_env.is_file():
+                shutil.copy2(default_env, env_path)
+            else:
+                env_path.write_text(_PLACEHOLDER_ENV, encoding="utf-8")
+            os.chmod(str(env_path), 0o600)
+            backfilled.append(entry.name)
+        except OSError as e:
+            if not quiet:
+                print(f"⚠ Could not seed .env for profile '{entry.name}': {e}")
+    return backfilled
+
+
+_BACKEND_TOKENS = frozenset({"serve", "dashboard", "gateway"})
+_HERMES_ARGV_MARKERS = ("hermes_cli.main", "hermes-gateway", "tui_gateway")
+# python / python3 / python3.12 / pythonw(.exe): the interpreter basenames a
+# `#!/…/python3` console-script shim is exec'd through when something (e.g. Electron's
+# `findOnPath('hermes')`) spawns the shim by handing the interpreter its path — then the
+# OS-reported argv[0] is the interpreter, not "hermes".
+_PYTHON_INTERPRETER_RE = re.compile(r"^python[\d.]*w?(\.exe)?$")
+# Console-script entry points this project ships (pyproject.toml [project.scripts]).
+# argv[1] is matched against exact names, not ``startswith("hermes")``: with a bare
+# interpreter argv[0], argv[1] can be ANY user script ("hermes-notes.py").
+_HERMES_CONSOLE_SCRIPT_NAMES = frozenset({"hermes", "hermes-agent", "hermes-acp"})
+
+
+def _is_hermes_argv(argv: list) -> bool:
+    """True for a Hermes process: entrypoint marker in argv, executable named ``hermes*``,
+    or a python interpreter directly exec'ing a known ``hermes`` console-script shim."""
+    joined = " ".join(argv)
+    exe_name = os.path.basename(argv[0]).lower()
+    if any(marker in joined for marker in _HERMES_ARGV_MARKERS) or exe_name.startswith("hermes"):
+        return True
+    if len(argv) >= 2 and _PYTHON_INTERPRETER_RE.match(exe_name):
+        script_name = os.path.basename(str(argv[1])).lower()
+        return script_name.rsplit(".", 1)[0] in _HERMES_CONSOLE_SCRIPT_NAMES
+    return False
+
+
+def _argv_profile_selectors(argv: list):
+    """Yield every profile name selected via ``-p X`` / ``--profile X`` / ``--profile=X``."""
+    for i, tok in enumerate(argv):
+        if tok in {"--profile", "-p"} and i + 1 < len(argv):
+            yield argv[i + 1]
+        elif tok.startswith("--profile="):
+            yield tok.split("=", 1)[1]
+
+
+def _profile_bound_backend_pids(canon: str, profile_dir: Path) -> list[int]:
+    """PIDs of running Hermes *backends* bound to this profile (``gateway.pid`` only tracks
+    the messaging gateway). Tightly scoped: current-user processes, backend subcommands only
+    (never an interactive ``chat``/``tui``), never this process or its ancestors. Empty when
+    ``psutil`` can't inspect anything."""
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return []
+    try:
+        resolved_dir = profile_dir.resolve()
+    except OSError:
+        resolved_dir = profile_dir
+
+    # Never terminate ourselves or a parent (`hermes -p <canon> profile delete` runs under
+    # the very profile it's deleting).
+    skip: set[int] = {os.getpid()}
+    with contextlib.suppress(Exception):
+        parent = psutil.Process(os.getpid()).parent()
+        while parent is not None:
+            skip.add(parent.pid)
+            parent = parent.parent()
+    try:
+        current_user = psutil.Process(os.getpid()).username()
+    except Exception:
+        current_user = None
+    pids: list[int] = []
+    for proc in psutil.process_iter(["pid", "name", "username", "cmdline"]):
+        try:
+            info = proc.info
+            pid = info.get("pid")
+            if pid is None or pid in skip:
+                continue
+            if current_user is not None and info.get("username") != current_user:
+                continue
+            argv = info.get("cmdline") or []
+            if not argv or not _is_hermes_argv(argv):
+                continue
+            if not ({tok.lower() for tok in argv} & _BACKEND_TOKENS):
+                continue
+
+            # Bound to THIS profile by selector flag, or by HERMES_HOME pointing at its dir.
+            bound = any(normalize_profile_name(sel) == canon for sel in _argv_profile_selectors(argv))
+            if not bound:
+                with contextlib.suppress(Exception):  # environ() can raise AccessDenied even same-user
+                    env_home = (proc.environ() or {}).get("HERMES_HOME", "")
+                    bound = bool(env_home) and Path(env_home).resolve() == resolved_dir
+            if bound:
+                pids.append(pid)
+        except Exception:
+            continue  # NoSuchProcess / AccessDenied / ZombieProcess and anything else
+    return pids
+
+
+def _wait_then_force_kill(pids: List[int], start_times: dict, *, wait: float = 10.0) -> bool:
+    """After a graceful ``terminate_pid``, wait up to *wait* seconds (0.5s polls) for *pids*
+    to exit, then force-kill stragglers. True when every pid exited gracefully.
+    ``start_times`` pins each force kill to the same process incarnation (PID reuse guard)."""
+    from gateway.status import _pid_exists, get_process_start_time, terminate_pid
+    for _ in range(int(wait / 0.5)):
+        time.sleep(0.5)
+        if not any(_pid_exists(pid) for pid in pids):
+            return True
+    for pid in pids:
+        if _pid_exists(pid):
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                terminate_pid(pid, force=True, expected_start_time=start_times.get(pid, get_process_start_time(pid)))
+    return False
+
+
+def _stop_profile_backends(canon: str, profile_dir: Path) -> None:
+    """Terminate Desktop-spawned / stray backends bound to this profile. Complements
+    ``_stop_gateway_process`` (which only knows ``gateway.pid``): a live ``serve``/``dashboard``
+    keeps creating files while ``rmtree`` walks, so the final rmdir fails ENOTEMPTY."""
+    pids = _profile_bound_backend_pids(canon, profile_dir)
+    if not pids:
+        return
+    try:
+        from gateway.status import terminate_pid
+    except Exception:
+        return
+    for pid in pids:
+        try:
+            terminate_pid(pid)  # graceful first
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+    _wait_then_force_kill(pids, {})
+    print(f"✓ Stopped {len(pids)} profile backend process(es)")
+
+
+def _stop_bot_desktop(profile_dir: Path) -> None:
+    """Stop the profile's Bot Desktop (Xvnc + Xfce launcher) before its directory is removed or renamed;
+    gateway shutdown does not reach it (its own session, its own pid file). Scoped through the hermes-home
+    override so the runtime reads THIS profile's bot-desktop/ state, whichever profile invoked the op.
+    A failure here is logged, never fatal: the profile op is what the user asked for."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.bot_desktop import runtime
+    if not runtime.is_supported_host():
+        return
+    token = set_hermes_home_override(profile_dir)
+    try:
+        if runtime.stop():
+            print("✓ Bot Desktop stopped")
+            # The screen a human's exclusion protected is gone; on rename the directory (lease.json
+            # included) moves with the profile, and a human lease for a dead viewer would fence the
+            # agent out of the renamed profile's next screen until someone force-released it.
+            from tools.bot_desktop import lease
+            lease.release()
+    except Exception as e:
+        logger.warning("Could not stop the Bot Desktop of %s: %s", profile_dir, e)
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _rmtree_make_writable(func, path, exc):
+    """onexc/onerror handler: add +w on PermissionError so rmtree can proceed. Covers NixOS-
+    style read-only copies where the path itself (0444) or its parent (0555) isn't writable."""
+    # onexc(func, path, exc_instance) on 3.12+; onerror(func, path, exc_info_tuple) on 3.11.
+    if isinstance(exc, tuple):
+        exc = exc[1]
+    if not isinstance(exc, PermissionError):
+        raise
+    for target in (path, os.path.dirname(path)):  # parent needed for unlink/rmdir
+        if target:
+            with contextlib.suppress(OSError):
+                os.chmod(target, os.stat(target).st_mode | stat.S_IWUSR)
+    func(path)
+
+
+def _rmtree_with_retry(profile_dir: Path, onexc_handler) -> None:
+    """``shutil.rmtree`` with a short retry loop: a just-terminated process can leave in-flight
+    writes (SQLite -wal/-shm checkpoints, sandbox temp files) landing after rmtree walked
+    past a directory — ENOTEMPTY on POSIX, transient PermissionError on Windows."""
+    attempts = 3
+    last_exc: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            try:
+                shutil.rmtree(profile_dir, onexc=onexc_handler)
+            except TypeError:  # ``onexc`` is 3.12+; 3.11 has ``onerror``
+                shutil.rmtree(profile_dir, onerror=onexc_handler)
+            return
+        except OSError as e:
+            last_exc = e
+            if not profile_dir.exists():
+                return
+            if attempt < attempts - 1:
+                time.sleep(0.3 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+
+
+def _print_delete_summary(canon: str, profile_dir: Path, gw_running: bool, wrapper_path: Optional[Path]) -> None:
+    """Show what ``delete_profile`` is about to remove."""
+    model, provider = _read_config_model(profile_dir)
+    skill_count = _count_skills(profile_dir)
+    dist_name, dist_version, dist_source = _read_distribution_meta(profile_dir)
+    print(f"\nProfile: {canon}")
+    print(f"Path:    {profile_dir}")
+    if model:
+        print(f"Model:   {model}" + (f" ({provider})" if provider else ""))
+    if skill_count:
+        print(f"Skills:  {skill_count}")
+    if dist_name:
+        print(f"Distribution: {dist_name}@{dist_version or '?'}")
+        if dist_source:
+            print(f"Installed from: {dist_source}")
+    print("\nThis will permanently delete:")
+    print("  • All config, API keys, memories, sessions, skills, cron jobs")
+    if wrapper_path is not None:
+        print(f"  • Command alias ({wrapper_path})")
+    if gw_running:
+        print("  ⚠ Gateway is running — it will be stopped.")
+
+
+class ProfileIdentitySettlementPending(RuntimeError):
+    """The profile's directory was deleted, but its durable session/routing identity was not
+    settled (``hermes_cli.profile_identity.purge_profile_identity`` returned False).
+
+    Subclasses ``RuntimeError`` so delete-failure handling that treats the error as fatal (the
+    CLI's ``hermes profile delete``) keeps working unchanged; surfaces that can report a partial
+    success (the dashboard's ``DELETE /api/profiles/{name}``) catch this type — it carries the
+    profile, its now-removed path, and the retry command — instead of matching on the message.
+    """
+
+    def __init__(self, profile: str, path: Path):
+        self.profile = profile
+        self.path = path
+        self.retry_command = f"hermes profile purge-identity {profile}"
+        super().__init__(
+            f"Profile '{profile}' was deleted, but its session/routing identity settlement is "
+            f"still pending — run: {self.retry_command}")
+
+
+def delete_profile(name: str, yes: bool = False) -> Path:
+    """Delete a profile, its wrapper script, and its gateway service (service disabled first
+    to prevent auto-restart, gateway stopped if running)."""
+    canon = normalize_profile_name(name)
+    if canon == "default":
+        raise ValueError("Cannot delete the default profile (~/.hermes).\nTo remove everything, use: hermes uninstall")
+    canon, profile_dir = _existing_profile_dir(canon)
+    gw_running = _check_gateway_running(profile_dir)
+    wrapper_path = _get_wrapper_dir() / canon
+    has_wrapper = wrapper_path.exists()
+    _print_delete_summary(canon, profile_dir, gw_running, wrapper_path if has_wrapper else None)
+    if not yes:
+        print()
+        try:
+            confirm = input(f"Type '{canon}' to confirm: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            confirm = None
+            print()
+        if confirm != canon:
+            print("Cancelled.")
+            return profile_dir
+
+    # 1. Disable service (prevents auto-restart); drop the s6 slot on container (host no-op).
+    _cleanup_gateway_service(canon, profile_dir)
+    _maybe_unregister_gateway_service(canon)
+
+    # 2. Stop the gateway, then other backends bound to this profile (Desktop-spawned
+    # serve/dashboard the pid file never names): they hold the SQLite connection open and
+    # keep writing, which made rmtree fail ENOTEMPTY and resurrected the deleted tree.
+    if gw_running:
+        _stop_gateway_process(profile_dir)
+    _stop_profile_backends(canon, profile_dir)
+    _stop_bot_desktop(profile_dir)
+
+    # Tombstone before rmtree so a stale serve/logging mkdir cannot relist this name live.
+    mark_named_profile_deleted(profile_dir)
+    # The multiplexer sees the tombstone, stops this profile's adapters and releases its handles
+    # into the directory before we remove it. Identity settlement is a separate delete-only
+    # operation below: an ordinary unserve must preserve identity, because a rename's old name
+    # leaves the served set exactly like a deleted one does (#111926, delete side).
+    _notify_multiplexer(canon)
+    identity_settled = _purge_identity(canon)
+
+    # The main serve process survives this deletion. Stop only this profile's MCP
+    # transports and release cached stderr handles, including completed probes.
+    from hermes_constants import hermes_home_key
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    shutdown_mcp_servers(scope=hermes_home_key(profile_dir))
+
+    # Release this process's holographic memory-store connections into the profile. The
+    # Desktop's main serve process opens memory_store.db for every profile and is
+    # deliberately not stopped above; on Windows its handles fail rmtree with WinError 32.
+    # Inside serve (DELETE /api/profiles/<name>) the handles live here; from the CLI no-op.
+    with contextlib.suppress(Exception):  # best-effort: never block the delete on the release path
+        # 2c. See #88347.
+        from plugins.memory import import_provider_module
+        _released = import_provider_module("holographic", "store").MemoryStore.release_all_under(profile_dir)
+        if _released:
+            print(f"✓ Released {_released} memory-store connection(s) held by this process")
+    with contextlib.suppress(Exception):
+        from hermes_state_registry import close_all_under as _close_session_dbs_under
+        _closed = _close_session_dbs_under(profile_dir)
+        if _closed:
+            print(f"✓ Released {_closed} session database connection(s) held by this process")
+
+    # The Desktop serve process routes its agent/errors logs for every profile through one
+    # QueueListener. On Windows those ConcurrentRotatingFileHandler instances retain their
+    # ``.__*.lock`` files until explicitly closed, so rmtree otherwise fails with WinError 32.
+    with contextlib.suppress(Exception):
+        from hermes_logging import release_profile_log_handlers
+        _released_logs = release_profile_log_handlers(profile_dir)
+        if _released_logs:
+            print(f"✓ Released {_released_logs} profile log handler(s) held by this process")
+
+    # 3. Remove wrapper script
+    if has_wrapper and remove_wrapper_script(canon):
+        print(f"✓ Removed {wrapper_path}")
+
+    # 4. Remove profile directory
+    remove_error: Exception | None = None
+    try:
+        _rmtree_with_retry(profile_dir, _rmtree_make_writable)
+        print(f"✓ Removed {profile_dir}")
+    except Exception as e:
+        print(f"⚠ Could not remove {profile_dir}: {e}")
+        remove_error = e
+
+    # 5. Clear active_profile if it pointed to this profile
+    _retarget_active_profile(canon, "default", "✓ Active profile reset to default")
+    if remove_error is not None:
+        raise RuntimeError(f"Could not remove profile directory {profile_dir}: {remove_error}") from remove_error
+    print(f"\nProfile '{canon}' deleted.")
+    if not identity_settled:
+        # Filesystem work and runtime teardown are done; the durable identity is not. Report the
+        # partial settlement as a typed failure (still a RuntimeError for the CLI's handler)
+        # instead of a clean success; the type carries the path and the retry for surfaces that
+        # can report a partial success.
+        raise ProfileIdentitySettlementPending(canon, profile_dir)
+    return profile_dir
+
+
+def _s6_runtime_manager():
+    """The s6 service manager inside the container, else None. Silent on host: a failing/
+    absent detector must never print a confusing s6 warning to non-container users."""
+    try:
+        from hermes_cli.service_manager import detect_service_manager, get_service_manager
+        if detect_service_manager() != "s6":
+            return None
+        mgr = get_service_manager()
+    except Exception:
+        return None
+    return mgr if mgr.supports_runtime_registration() else None
+
+
+def _maybe_register_gateway_service(profile_name: str) -> None:
+    """Register a profile's gateway with s6 inside the container. Best-effort: profile
+    creation must not fail over a supervision-tree hiccup; `gateway start` re-registers.
+
+    Port selection: each supervised profile gateway loads its own ``HERMES_HOME`` and binds the port
+    resolved by ``gateway/config.py`` from that profile's environment — ``API_SERVER_PORT`` (or
+    ``platforms.api_server.extra.port`` in the profile's ``config.yaml``), defaulting to 8642. There is no
+    ``[gateway] port`` key and no Python-side allocator (PR #30136 review item I5 retired the
+    SHA-256-derived range [9200, 9800) as dead code), so two profiles that both leave the port at its
+    default will both try to bind 8642 — give each profile a distinct ``API_SERVER_PORT`` in its ``.env``.
+    """
+    mgr = _s6_runtime_manager()
+    if mgr is None:
+        return
+    try:
+        mgr.register_profile_gateway(profile_name, start_now=False)
+    except ValueError:
+        pass  # already registered (e.g. the container-boot reconciler brought up a stale slot)
+    except Exception as exc:
+        print(f"⚠ Could not register s6 gateway service: {exc}")
+
+
+def _maybe_unregister_gateway_service(profile_name: str) -> None:
+    """Tear down a profile's s6 gateway service inside the container; host no-op, idempotent."""
+    mgr = _s6_runtime_manager()
+    if mgr is None:
+        return
+    try:
+        mgr.unregister_profile_gateway(profile_name)
+    except Exception as exc:
+        print(f"⚠ Could not unregister s6 gateway service: {exc}")
+
+
+def _cleanup_gateway_service(name: str, profile_dir: Path) -> bool:
+    """Disable and remove systemd/launchd service for a profile; True when a unit was removed."""
+    import platform as _platform
+
+    # The service name follows get_hermes_home(): bind the override (the seam a multiplexed
+    # dashboard/tui-gateway process reads) and mirror the env for identity-file readers, so a
+    # DELETE from a multi-profile dashboard names THIS profile's unit, never the host's bare one.
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    old_home = os.environ.get("HERMES_HOME")
+    home_token = set_hermes_home_override(str(profile_dir))
+    try:
+        os.environ["HERMES_HOME"] = str(profile_dir)
+        from hermes_cli.gateway import get_service_name, get_launchd_plist_path, user_systemd_unit_dir
+
+        def _run(*cmd: str) -> None:
+            subprocess.run(list(cmd), capture_output=True, check=False, timeout=10)
+
+        from hermes_cli.profiles_service_cleanup import remove_system_systemd_unit, remove_windows_task
+
+        system = _platform.system()
+        removed = False
+        if system == "Linux":
+            svc_name = get_service_name()
+            svc_file = user_systemd_unit_dir() / f"{svc_name}.service"
+            if svc_file.exists():
+                _run("systemctl", "--user", "disable", svc_name)
+                _run("systemctl", "--user", "stop", svc_name)
+                svc_file.unlink(missing_ok=True)
+                _run("systemctl", "--user", "daemon-reload")
+                print(f"✓ Service {svc_name} removed")
+                removed = True
+            # `gateway install --system` writes the same name under /etc; a survivor there
+            # restarts the removed profile at boot exactly like the user unit at login.
+            removed = remove_system_systemd_unit() or removed
+        elif system == "Darwin":
+            plist_path = get_launchd_plist_path()
+            if plist_path.exists():
+                _run("launchctl", "unload", str(plist_path))
+                plist_path.unlink(missing_ok=True)
+                print("✓ Launchd service removed")
+                removed = True
+        elif system == "Windows":
+            removed = remove_windows_task()
+        return removed
+    except Exception as e:
+        print(f"⚠ Service cleanup: {e}")
+    finally:
+        reset_hermes_home_override(home_token)
+        os.environ.pop("HERMES_HOME", None)
+        if old_home is not None:
+            os.environ["HERMES_HOME"] = old_home
+    return False
+
+
+def _stop_gateway_process(profile_dir: Path) -> None:
+    """Stop a running gateway process via its PID file."""
+    pid_file = profile_dir / "gateway.pid"
+    if not pid_file.exists():
+        return
+    try:
+        raw = pid_file.read_text(encoding="utf-8-sig").strip()
+        data = json.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
+        pid = int(data["pid"])
+        # Cross-profile kill refusal: the record's hermes_home stamp names the gateway's TRUE
+        # owner. A poisoned gateway.pid in this dir can point at another profile's live
+        # gateway — killing it starts a mutual SIGTERM restart loop.
+        from gateway.status import get_process_start_time, recorded_gateway_home_conflicts, terminate_pid
+        if recorded_gateway_home_conflicts(data, expected_home=profile_dir):
+            print(
+                f"✗ Refusing to stop PID {pid}: its recorded HERMES_HOME "
+                f"belongs to a different profile than {profile_dir} "
+                "(stale/poisoned PID record, #89315)."
+            )
+            return
+        # terminate_pid picks the Windows primitive (taskkill /T cascades to children; raw
+        # os.kill with SIGKILL fails at import on Windows).
+        expected_start_time = data.get("start_time")
+        if expected_start_time is None:
+            expected_start_time = get_process_start_time(pid)
+        terminate_pid(pid)  # graceful first
+        if _wait_then_force_kill([pid], {pid: expected_start_time}):
+            print(f"✓ Gateway stopped (PID {pid})")
+        else:
+            print(f"✓ Gateway force-stopped (PID {pid})")
+    except (ProcessLookupError, PermissionError):
+        print("✓ Gateway already stopped")
+    except Exception as e:
+        print(f"⚠ Could not stop gateway: {e}")
+
+
+# Active profile (sticky default)
+
+def get_active_profile(root: Path | None = None) -> str:
+    """Read the sticky active profile name (of *root*, default: this process's Hermes root)."""
+    path = root / "active_profile" if root is not None else _get_active_profile_path()
+    try:
+        name = path.read_text(encoding="utf-8-sig").strip()
+        if not name:
+            return "default"
+        return name
+    except (FileNotFoundError, UnicodeDecodeError, OSError):
+        return "default"
+
+
+def set_active_profile(name: str) -> None:
+    """Set the sticky active profile (``default`` = remove the file)."""
+    canon = _canon_valid(name)
+    if canon != "default" and not profile_exists(canon):
+        raise _missing_profile_error(canon)
+    path = _get_active_profile_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if canon == "default":
+        path.unlink(missing_ok=True)
+    else:
+        tmp = path.with_suffix(".tmp")  # atomic write
+        tmp.write_text(canon + "\n", encoding="utf-8")
+        tmp.replace(path)
+
+
+def _retarget_active_profile(old: str, new: str, message: str) -> None:
+    """If the sticky active profile is *old*, point it at *new* and print *message*. Never raises."""
+    with contextlib.suppress(Exception):
+        if get_active_profile() == old:
+            set_active_profile(new)
+            print(message)
+
+
+def get_active_profile_name() -> str:
+    """Profile name inferred from HERMES_HOME: ``"default"`` when unset or ``~/.hermes``, the
+    name under ``~/.hermes/profiles/<name>``, ``"custom"`` for any other path."""
+    from hermes_constants import get_hermes_home
+    resolved = get_hermes_home().resolve()
+    if resolved == _get_default_hermes_home().resolve():
+        return "default"
+    profiles_root = _get_profiles_root().resolve()
+    try:
+        parts = resolved.relative_to(profiles_root).parts
+        if len(parts) == 1 and _PROFILE_ID_RE.match(parts[0]):
+            return parts[0]
+    except ValueError:
+        pass
+    return "custom"
+
+
+def current_profile_name(default: str | None = None) -> str | None:
+    """Identity of the profile the current task runs FOR: the ``HERMES_HOME`` override when one is
+    bound (a multiplexed cron tick, a routed gateway turn), else a launcher-pinned
+    ``HERMES_PROFILE_NAME``/``HERMES_PROFILE`` (the kanban dispatcher pins it on its workers), else
+    the name derived from the process's ``HERMES_HOME``; *default* when nothing names a profile.
+
+    The env pin is read only outside an override: ``os.environ`` is the LAUNCH profile's, so under
+    an override it would re-label a served profile's board writes with the host's identity.
+    """
+    from hermes_constants import get_hermes_home_override
+    if get_hermes_home_override() is None:
+        for env_name in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+            value = (os.environ.get(env_name) or "").strip()
+            if value:
+                return value
+    try:
+        return get_active_profile_name() or default
+    except Exception:
+        return default
+
+
+# Export / Import
+
+def _inside_git_checkout(path: Path) -> bool:
+    """True when *path* lies inside a Git checkout. Walks the path's OWN resolved ancestry
+    (not cwd) so the check holds when HERMES_HOME sits in a checkout but the process runs
+    elsewhere (cron, service manager). Resolution failure reports True (fail closed)."""
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):  # RuntimeError: symlink loops on Python <= 3.12
+        return True
+    return any((candidate / ".git").exists() for candidate in (resolved, *resolved.parents))
+
+
+def _profile_export_directory() -> Path:
+    """Choose an export directory that cannot become source-tree input."""
+    import tempfile
+    export_dir = _get_default_hermes_home() / "profile-exports"
+    if not _inside_git_checkout(export_dir):
+        return export_dir
+
+    # A custom deployment may point HERMES_HOME at its source checkout: use a sibling store,
+    # falling back to the OS temp dir only when the user's home itself is a checkout (dotfiles
+    # repo). Per-uid temp name: a fixed /tmp/hermes-profile-exports is a predictable shared
+    # path another local user could pre-create (or symlink) first.
+    uid_suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
+    candidates = (
+        Path.home() / ".hermes-profile-exports", Path(tempfile.gettempdir()) / f"hermes-profile-exports{uid_suffix}"
+    )
+    for candidate in candidates:
+        if not _inside_git_checkout(candidate):
+            return candidate
+    # Fail closed: writing a secret-bearing archive into a source tree is the incident this
+    # helper prevents; a stderr warning would not stop a scripted export.
+    raise ValueError(
+        # See #92457.
+        "No safe automatic export destination: every candidate directory is "
+        "inside a Git checkout. Provide an explicit output path outside the "
+        "checkout (CLI: -o /path/outside/repo/profile.tar.gz)."
+    )
+
+
+def get_profile_export_path(name: str, *, timestamp: Optional[str] = None) -> Path:
+    """Managed destination for an export with no explicit output — outside the cwd and every
+    profile, since a ``<name>.tar.gz`` default in a source checkout got committed by accident."""
+    canon = _canon_valid(name)
+    export_dir = _profile_export_directory()
+    export_dir.mkdir(parents=True, exist_ok=True)
+    # exist_ok=True silently accepts a directory (or symlink) another local user pre-created
+    # at a predictable path; refuse to write a secret-bearing archive anywhere we don't own.
+    if export_dir.is_symlink():
+        raise ValueError(
+            f"Export directory {export_dir} is a symlink; refusing to write "
+            "a profile archive through it. Provide an explicit output path."
+        )
+    if hasattr(os, "getuid") and export_dir.stat().st_uid != os.getuid():
+        raise ValueError(
+            f"Export directory {export_dir} is owned by another user; "
+            "refusing to write a profile archive there. Provide an explicit output path."
+        )
+    stamp = timestamp or time.strftime("%Y%m%d-%H%M%S")
+    return export_dir / f"{canon}-{stamp}.tar.gz"
+
+
+def _default_export_ignore(root_dir: Path):
+    """copytree ignore for the default-profile export: root-level allow-list
+    (``_DEFAULT_EXPORT_INCLUDE_ROOT``) plus universal exclusions. Surviving text files are
+    then force-redacted by :func:`_scrub_export_secrets`.
+
+    * **Root-level allow-list** — only entries whose name appears in ``_DEFAULT_EXPORT_INCLUDE_ROOT``
+    survive. Everything else (such as an unrelated ``x11-dev/`` directory in a Docker deployment where
+    HERMES_HOME equals the cwd) is excluded. Blacklisting was tried first and proved unable to anticipate
+    every non-Hermes file the user may have lying alongside HERMES_HOME (#58394). * **Universal exclusions
+    at any depth** — ``__pycache__``, sockets and other special files, temp files
+    (:func:`_non_exportable_entries`); plus npm lockfiles, which may appear at the root.
+    """
+
+    def _ignore(directory: str, contents: list) -> set:
+        # Universal exclusions and credential names (any depth) plus npm lockfiles that can appear at root.
+        ignored = _non_exportable_entries(directory, contents)
+        ignored.update({"package.json", "package-lock.json"} & set(contents))
+        ignored.update(_export_credential_entries(directory, contents))
+        if Path(directory) == root_dir:
+            ignored.update(entry for entry in contents if entry not in _DEFAULT_EXPORT_INCLUDE_ROOT)
+        return ignored
+
+    return _ignore
+
+
+# Credential names dropped at ANY depth of every profile export, on top of the root-relative
+# PROFILE_CREDENTIAL_PATHS. ``bot-desktop`` is the screen's runtime state:
+# its persistent Chromium profile (Cookies, Login Data — the bot's live web sessions), Xauthority, sockets.
+# The OS stores are dropped wherever they sit (a skill dir copied from a home carries its ``.ssh``).
+_EXPORT_CREDENTIAL_FILES = frozenset({"auth.json", ".env", "bot-desktop", *_OS_CREDENTIAL_STORES})
+_EXPORT_CREDENTIAL_PARTS = tuple(tuple(p.split("/")) for p in _EXPORT_CREDENTIAL_FILES)
+
+
+def _export_credential_entries(directory: str, contents: list) -> set:
+    """Entries of *directory* that are an _EXPORT_CREDENTIAL_FILES store: matched on trailing path
+    components, so ``.config/gh`` drops at any depth while the rest of ``.config`` ships."""
+    parts = Path(directory).parts
+    return {entry for entry in contents for store in _EXPORT_CREDENTIAL_PARTS
+            if entry == store[-1] and parts[len(parts) + 1 - len(store):] == store[:-1]}
+
+# Text/config suffixes secret-scrubbed on export; binary DBs, images etc. are left alone.
+_EXPORT_REDACT_SUFFIXES = frozenset({
+    ".md", ".txt", ".yaml", ".yml", ".json", ".jsonl", ".toml", ".ini", ".cfg", ".conf", ".py", ".sh",
+    ".bash", ".zsh", ".js", ".ts", ".tsx", ".jsx", ".css", ".html", ".xml", ".csv",
+})
+# ``Path(".cursorrules").suffix`` is "" — name-match; ``*.env.example`` uses endswith; a hand-named
+# config copy (``config.yaml.bak-my-note``) holds config.yaml's secrets under a suffix of its own.
+_EXPORT_REDACT_NAMES = frozenset({".cursorrules"})
+
+
+def _should_redact_export_file(path: Path) -> bool:
+    name = path.name
+    return (
+        name in _EXPORT_REDACT_NAMES
+        or name.lower().endswith(".env.example")
+        or name.lower().startswith("config.yaml.")
+        or path.suffix.lower() in _EXPORT_REDACT_SUFFIXES
+    )
+
+
+def _scrub_export_secrets(staged: Path) -> None:
+    """Force-redact secret-shaped strings in a staged export tree (same pass as ``hermes
+    sessions export --redact``). Runs on the staged copy only; symlinks to text files are
+    materialized when content changes so redaction never follows a link back into the source."""
+    from agent.redact import redact_sensitive_text
+    for path in staged.rglob("*"):
+        try:
+            is_link = path.is_symlink()
+            if not path.is_file():  # broken links, symlinked dirs, non-files
+                continue
+        except OSError:
+            continue
+        if not _should_redact_export_file(path):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except (UnicodeDecodeError, OSError):
+            continue
+        redacted = redact_sensitive_text(text, force=True)
+        if redacted == text:
+            continue
+        if is_link:
+            path.unlink()
+        path.write_text(redacted, encoding="utf-8")
+
+
+def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, str]] = None) -> Path:
+    """Export a profile to a tar.gz archive; credential files are excluded and staged text is
+    force-redacted first. Returns the output file path."""
+    import tempfile
+    canon, profile_dir = _existing_profile_dir(name)
+    # Archive base name without extension (.tar.gz appended by the writer).
+    base = str(Path(output_path)).removesuffix(".tar.gz").removesuffix(".tgz")
+
+    # The default profile IS ~/.hermes (dir name ".hermes"), so both paths stage a filtered
+    # copy under a temp dir named after the canonical id: root allow-list for default,
+    # credential exclusion for named profiles.
+    def _ignore_credentials(directory: str, contents: list) -> set:
+        ignored = _non_exportable_entries(directory, contents)
+        ignored.update(_export_credential_entries(directory, contents))
+        rel = Path(directory).relative_to(profile_dir).parts
+        ignored.update(e for e in contents if profile_path_is_private((*rel, e)))
+        if Path(directory) == profile_dir:
+            ignored |= PM_RUNTIME_ROOT_DIRS & set(contents)
+        return ignored
+
+    ignore = _default_export_ignore(profile_dir) if canon == "default" else _ignore_credentials
+    with tempfile.TemporaryDirectory() as tmpdir:
+        staged = Path(tmpdir) / canon
+        shutil.copytree(profile_dir, staged, symlinks=True, ignore=ignore)
+        for rel, content in (extra_files or {}).items():
+            target = staged.joinpath(*normalize_archive_parts(rel))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        _scrub_export_secrets(staged)
+        return Path(make_targz(base, tmpdir, canon))
+
+
+def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
+    """Import a profile from a tar.gz archive."""
+    import tempfile
+    archive = Path(archive_path)
+    if not archive.exists():
+        raise FileNotFoundError(f"Archive not found: {archive}")
+    top_dirs = archive_root_dirs(archive)
+    archive_root = top_dirs.pop() if len(top_dirs) == 1 else None
+    inferred_name = name or archive_root
+    if not inferred_name:
+        raise ValueError(
+            "Cannot determine profile name from archive. "
+            "Specify it explicitly: hermes profile import <archive> --name <name>"
+        )
+    if archive_root is None:
+        raise ValueError("Profile archive must contain exactly one top-level directory.")
+
+    # Default-profile archives have "default/" at top level; importing as "default" would
+    # target ~/.hermes itself.
+    canon = _canon_valid(inferred_name)
+    if canon == "default":
+        raise ValueError(
+            "Cannot import as 'default' — that is the built-in root profile (~/.hermes). "
+            "Specify a different name: hermes profile import <archive> --name <name>"
+        )
+    profile_dir = get_profile_dir(canon)
+    if profile_dir.exists():
+        raise _profile_exists_error(canon)
+    _get_profiles_root().mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="hermes_profile_import_") as tmpdir:
+        staging_root = Path(tmpdir)
+        safe_extract_targz(archive, staging_root)
+        extracted = staging_root / archive_root
+        if not extracted.is_dir():
+            raise ValueError(f"Profile archive root is missing or invalid: {archive_root}")
+        final_source = extracted
+        if archive_root != canon:
+            final_source = staging_root / canon
+            extracted.rename(final_source)
+        # Remove foreign runtime state before publishing, including file-shaped roots.
+        # A failed removal must abort import rather than install a stale PM selection.
+        for child in final_source.iterdir():
+            if child.name in PM_RUNTIME_ROOT_DIRS:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        drop_profile_role(final_source)
+        shutil.move(str(final_source), str(profile_dir))
+    return profile_dir
+
+
+# Rename
+
+def _atomic_write_json(path: Path, data: dict) -> bool:
+    """Atomic rewrite of a third-party JSON config; False on OSError (nothing partially written)."""
+    from utils import atomic_json_write
+    try:
+        atomic_json_write(path, data)
+        return True
+    except OSError:
+        return False
+
+
+def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) -> None:
+    """Rename Honcho host blocks for a renamed profile without changing peers."""
+    old_host = f"hermes_{old_name}"
+    legacy_old_host = f"hermes.{old_name}"
+    new_host = f"hermes_{new_name}"
+    candidates = [
+        new_dir / "honcho.json", _get_default_hermes_home() / "honcho.json", Path.home() / ".honcho" / "config.json"
+    ]
+    seen: set[Path] = set()
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved in seen or not path.is_file():
+            continue
+        seen.add(resolved)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        hosts = raw.get("hosts")
+        if not isinstance(hosts, dict):
+            continue
+        source_host = old_host if old_host in hosts else legacy_old_host
+        if source_host not in hosts:
+            continue
+        if new_host in hosts:
+            print(f"⚠ Honcho host block not migrated: {new_host} already exists in {path}")
+            continue
+        block = hosts[source_host]
+        if isinstance(block, dict) and "aiPeer" not in block:
+            block["aiPeer"] = old_name  # source_host is ``hermes_<old>`` or legacy ``hermes.<old>``
+        hosts[new_host] = hosts.pop(source_host)
+        if _atomic_write_json(path, raw):
+            print(f"✓ Honcho host updated: {source_host} → {new_host}")
+
+
+def _record_profile_rename(new_dir: Path, old_canon: str) -> None:
+    """Append ``old_canon`` to the renamed profile's ``previous_names`` history.
+    Best-effort: never raises, so a metadata write failure cannot fail the rename.
+
+    Only reached for a real slug change — ``rename_profile`` returns early for the
+    default profile (display-name only) and refuses ``old == new`` (target exists)."""
+    try:
+        history = read_profile_meta(new_dir).get("previous_names") or []
+        if old_canon not in history:
+            history = [*history, old_canon]
+        write_profile_meta(new_dir, previous_names=history)
+    except Exception as exc:  # unwritable / corrupt profile.yaml — history is advisory
+        logger.debug("profile rename: could not record previous name %r in %s: %s", old_canon, new_dir, exc)
+
+
+def rename_profile(old_name: str, new_name: str) -> Path:
+    """Rename a profile: directory, wrapper script, service, active_profile. The default
+    profile's home IS the installation root, so "renaming" it sets a presentation-only
+    ``display_name`` instead — the canonical id stays ``default``."""
+    old_canon = _canon_valid(old_name)
+    if old_canon == "default":
+        if not (new_name or "").strip():
+            raise ValueError("Display name cannot be empty.")
+        cleaned = set_profile_display_name("default", new_name)
+        print(f"✓ Display name set: {cleaned} (canonical id remains 'default')")
+        return _get_default_hermes_home()
+    new_canon = _canon_valid(new_name)
+    if new_canon == "default":
+        raise ValueError("Cannot rename to 'default' — it is reserved.")
+    old_dir = get_profile_dir(old_canon)
+    new_dir = get_profile_dir(new_canon)
+    if not old_dir.is_dir():
+        raise _unknown_profile_error(old_canon)
+    if new_dir.exists():
+        raise _profile_exists_error(new_canon)
+
+    # 1. Remove the old name's service even when its gateway is stopped: the unit is named after
+    # the old profile and runs ``--profile <old>``, so the service manager would crash-loop it on
+    # the next login or container boot. Then stop the gateway and the screen whose launcher
+    # holds paths under the old name.
+    gw_running = _check_gateway_running(old_dir)
+    service_removed = _cleanup_gateway_service(old_canon, old_dir)
+    _maybe_unregister_gateway_service(old_canon)
+    if gw_running:
+        _stop_gateway_process(old_dir)
+    _stop_bot_desktop(old_dir)
+
+    # 1b. Unroute the old name from a live multiplexer BEFORE the rename (same protocol as
+    # delete_profile). A multiplexed secondary has no gateway.pid of its own, so the check above
+    # reports it stopped while the default gateway still holds its adapters, cron ticker, logging
+    # and SQLite handles; those re-``mkdir`` the old home the moment it moves (no tombstone →
+    # ``mkdir_under_hermes_home`` does not refuse it) and the periodic reconcile re-adopts the
+   

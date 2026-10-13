@@ -1,0 +1,255 @@
+role search is the
+        # opt-in full-body path and scans canonical rows via LIKE.
+        if role_filter and "tool" in role_filter:
+            matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort, **filters)
+            return self._finalize_search_matches(matches, result_fields=result_fields)
+        self._refresh_fts_stale_state()
+        if self._fts_stale:
+            matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort, **filters)
+            return self._finalize_search_matches(matches, result_fields=result_fields)
+        if not self._fts_enabled:
+            return []
+
+        order_by_sql = _FTS_ORDER_BY.get(sort.strip().lower() if isinstance(sort, str) else None, "ORDER BY rank")
+        route = dict(order_by_sql=order_by_sql, limit=limit, offset=offset, **filters)
+        # Tool rows and FTS_TRIGRAM_EXCLUDED_SOURCES sessions are excluded from the trigram/cjk
+        # indexes (see FTS_TRIGRAM_SQL); an explicit filter for them must scan the base table.
+        wants_unindexed_rows = (bool(role_filter) and "tool" in role_filter) or (
+            bool(source_filter) and any(src in FTS_TRIGRAM_EXCLUDED_SOURCES for src in source_filter))
+        is_cjk = self._contains_cjk(query)
+        if is_cjk:
+            matches = self._search_cjk(query, wants_unindexed_rows, route)
+        else:
+            sql, params = self._fts_match_sql("messages_fts", query, **route)
+            try:
+                matches = [dict(row) for row in self._read_all(sql, params)]
+            except sqlite3.OperationalError:
+                return []  # FTS5 syntax error despite sanitization
+            except sqlite3.DatabaseError as exc:
+                # Corruption parent class: detach the derived indexes and answer from
+                # canonical rows; repair paths own the rebuild.
+                # A corrupt FTS index raises the malformed / "fts5: corrupt structure record" class on the
+                # MATCH read, the same class the write path handles (#66296). OperationalError (query
+                # syntax) is a subclass caught above; this arm is the corruption parent. The existing
+                # stale-open/repair paths retain rebuild ownership.
+                if not self._enter_fts_fail_open(exc):
+                    raise
+                matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort, **filters)
+
+        # Deferred-rebuild supplement: while the backfill is pending the FTS indexes miss
+        # the (progress, high_water] gap; top up with a bounded LIKE scan so old messages
+        # never vanish mid-rebuild. Cost decays to zero as the backfill advances.
+        if self.fts_rebuild_status() is not None and len(matches) < limit:
+            try:
+                gap_matches = self._search_unindexed_gap(query, limit - len(matches), **filters)
+                seen_ids = {m["id"] for m in matches}
+                matches.extend(m for m in gap_matches if m["id"] not in seen_ids)
+            except sqlite3.OperationalError as exc:
+                logger.debug("Unindexed-gap supplement skipped: %s", exc)
+
+        # unicode61 puts no boundary between Latin and adjacent CJK ("修改youer服务端" is
+        # one token, so MATCH "youer" misses). On a zero-result Latin miss retry the
+        # substring-capable indexes: cjk first (exact ranked match), then trigram (>=3-char
+        # tokens). Gated on a miss so hits keep their ranking ("cat" may then match
+        # "concatenate"). Skipped for role='tool' (both indexes exclude tool rows).
+        if not matches and not is_cjk and not (bool(role_filter) and "tool" in role_filter):
+            fb_query = _quote_fts_tokens(query.strip('"').strip())
+            # ── CJK-bigram route (messages_fts_cjk, cjk_unicode61) ────── When the bigram index is
+            # available it serves EVERY CJK query shape the legacy code split between trigram (>=3
+            # chars/token) and LIKE full scans (1-2 char tokens) — the whole point of the index (PR #65544).
+            # Exceptions stay on the legacy routes: - role_filter=['tool'] queries (tool rows aren't in the
+            # cjk index, same exclusion as trigram), - queries containing a LONE 1-char CJK run: the index
+            # stores bigrams for runs >=2, so a single-char term can only match isolated chars — LIKE
+            # substring semantics are broader.
+            if self._fts_cjk_available:
+                matches = self._match_rows("messages_fts_cjk", fb_query, **route) or matches
+            if not matches and self._trigram_available and self._trigram_eligible_tokens(query):
+                matches = self._match_rows("messages_fts_trigram", fb_query, **route) or matches
+
+        # OR-relaxed retry: the implicit AND between terms means a paraphrased multi-word query
+        # misses a stored sentence that lacks even ONE word ("when does Sarah like her standup
+        # scheduled" vs "Sarah prefers the standup meeting scheduled ... Thursday mornings"). Once
+        # the exact query and the substring fallbacks all miss, retry the unicode61 index matching
+        # ANY term. The caller's ``sort`` still applies (``route`` carries order_by_sql): rank order
+        # puts rows covering more terms first, newest/oldest keep their timestamp order. Gated on a
+        # zero-result miss so hits keep exact-match semantics; explicit OR/NOT, single-term and
+        # CJK-routed queries are left alone.
+        if not matches and not is_cjk and not self._fts_stale:
+            relaxed = self._or_relaxed_query(query)
+            if relaxed is not None:
+                matches = self._match_rows("messages_fts", relaxed, fail_open="OR-relaxed",
+                                           operational_debug="OR-relaxed FTS retry failed; keeping empty result",
+                                           **route) or matches
+        return self._finalize_search_matches(matches, result_fields=result_fields)
+
+    def _search_cjk(self, query: str, wants_unindexed_rows: bool, route: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """CJK routing: the unicode61 table splits CJK into single characters (false positives,
+        missed phrases). cjk-bigram serves every shape except queries wanting rows the
+        substring indexes exclude (role='tool', cron/subagent sources) and LONE
+        1-char CJK runs (bigrams only exist for runs >=2 — LIKE is broader); then trigram
+        (>=3 CJK chars per token); then a LIKE substring scan with one clause per
+        non-operator token so "广西 OR 桂林 OR 漓江" matches each term."""
+        raw_query = _strip_cjk_wildcards(query).strip('"').strip()
+        match_query = _quote_fts_tokens(raw_query)
+        if self._fts_cjk_available and not wants_unindexed_rows and not self._has_lone_cjk_run(raw_query):
+            matches = self._match_rows(
+                "messages_fts_cjk", match_query, fail_open="CJK-bigram",
+                operational_debug="messages_fts_cjk query failed; falling back to trigram/LIKE", **route)
+            if matches is not None:
+                return matches
+        if self._trigram_route_ok(raw_query) and not wants_unindexed_rows:
+            matches = self._match_rows("messages_fts_trigram", match_query, fail_open="Trigram", **route)
+            if matches is not None:
+                return matches
+        non_op_tokens = _non_operator_tokens(raw_query) or [raw_query]
+        like_params: list = [p for tok in non_op_tokens for p in _like_params(tok)]
+        like_where = [f"({' OR '.join([_LIKE_ANY_COLUMN_SQL] * len(non_op_tokens))})"]
+        filters = {k: route[k] for k in ("include_inactive", "source_filter", "exclude_sources", "role_filter",
+                                         "after_ts", "before_ts")}
+        _search_filter_clauses(like_where, like_params, **filters)
+        # instr() for the snippet uses the first search token.
+        return self._like_rows(like_where, [non_op_tokens[0], *like_params, route["limit"], route["offset"]],
+                               order_by="ORDER BY m.timestamp DESC", limit_sql="LIMIT ? OFFSET ?")
+
+    def _search_unindexed_gap(self, fts_query: str, limit: int, **filters) -> List[Dict[str, Any]]:
+        """LIKE-scan ids in (fts_rebuild_progress, fts_rebuild_high_water] — rows the deferred
+        rebuild hasn't indexed yet. The FTS query degrades to AND-joined substring terms
+        (quoted phrases kept whole): recall-over-precision mid-rebuild."""
+        status = self.fts_rebuild_status()
+        if status is None or limit <= 0:
+            return []
+        terms = [tok for tok in (t.strip('"').strip("*").strip() for t in _LIKE_TOKEN_RE.findall(fts_query))
+                 if tok and tok.upper() not in _LIKE_SKIP_TOKENS]
+        if not terms:
+            return []
+        where = ["m.id > ? AND m.id <= ?", *([_LIKE_ANY_COLUMN_SQL] * len(terms))]
+        params: list = [status["indexed"], status["total"], *(p for term in terms for p in _like_params(term))]
+        _search_filter_clauses(where, params, **filters)
+        return self._like_rows(where, [terms[0], *params, limit], order_by="ORDER BY m.timestamp DESC",
+                               limit_sql="LIMIT ?")
+
+    def search_sessions_by_id(
+        self, query: str, limit: int = 20, include_archived: bool = True, source: str = None,
+        sources: List[str] = None, exclude_sources: List[str] = None) -> List[Dict[str, Any]]:
+        """Search surfaced sessions by exact/prefix/substring session id. Also matches
+        ``_lineage_root_id`` so an old compression root id resolves to the live continuation."""
+        needle = (query or "").strip().lower()
+        if not needle or limit <= 0:
+            return []
+        # list_sessions_rich pushes the id LIKE filter (own id + forward compression
+        # chain) into SQL; over-fetch so the in-Python ranking has candidates.
+        candidates = self.list_sessions_rich(
+            source=source, sources=sources, exclude_sources=exclude_sources, limit=max(limit * 4, limit),
+            offset=0, include_archived=include_archived, order_by_last_active=True, id_query=needle)
+
+        def score(row: Dict[str, Any]) -> int:
+            normalized = [v.lower() for v in (str(row.get("id") or ""), str(row.get("_lineage_root_id") or "")) if v]
+            if any(value == needle for value in normalized):
+                return 0
+            return 1 if any(value.startswith(needle) for value in normalized) else 2
+        ranked = sorted(enumerate(candidates), key=lambda item: (score(item[1]), item[0]))
+        return [row for _, row in ranked[:limit]]
+
+    # ── FTS maintenance commands ───────────────────────────────────────────
+
+    def _fts_table_exists(self, name: str) -> bool:
+        """True if an FTS5 virtual table is queryable ("no such table" and "vtable
+        constructor failed" — missing tokenizer / mid-teardown — both count as not)."""
+        try:
+            self._conn.execute(f"SELECT 1 FROM {name} LIMIT 0")
+            return True
+        except sqlite3.DatabaseError:
+            return False
+
+    def _present_fts_tables(self) -> List[str]:
+        """Queryable FTS tables (caller holds ``self._lock``)."""
+        return [tbl for tbl in self._FTS_TABLES if self._fts_table_exists(tbl)]
+
+    def optimize_fts(self) -> int:
+        """Merge fragmented FTS5 segments into one per index (``'optimize'``). Pure
+        maintenance: changes neither results nor ``snippet()`` output, only layout and
+        speed; VACUUM then returns the freed pages. Returns the number optimized. A quarantined
+        handle never issues ``'optimize'``: it rewrites index segments in place and would compound
+        structural damage (or a split WAL generation) instead of leaving it diagnosable."""
+        self._raise_if_db_corrupt()
+        optimized = 0
+        with self._lock:
+            self._raise_if_db_replaced()
+            if self._conn is None:
+                self._reopen_after_close_locked(context="write")
+            for tbl in self._present_fts_tables():
+                try:
+                    self._conn.execute(f"INSERT INTO {tbl}({tbl}) VALUES('optimize')")
+                    optimized += 1
+                except sqlite3.OperationalError as exc:
+                    logger.warning("FTS optimize failed for %s: %s", tbl, exc)
+        return optimized
+
+    def rebuild_fts(self) -> int:
+        """Rebuild FTS5 indexes from ``messages`` (``'rebuild'``) — the recovery for a corrupt index
+        that rejects writes while reads succeed. Two processes rebuilding one state.db
+        concurrently corrupted production DBs, so this admits through
+        ``fts_rebuild_admission`` and FAILS CLOSED, returning 0 on deferral (callers treat 0
+        as "no progress" and use the stale-FTS breadcrumb path). Returns indexes rebuilt.
+
+        Uses the FTS5 ``'rebuild'`` command, which rewrites the internal b-tree segments from the content
+        rows. Unlike ``optimize_fts`` (which merges existing segments), ``rebuild`` discards and recreates
+        the index data entirely — the more destructive of the two, so it is quarantined the same way. See
+        #50502.
+        A full structural rebuild must never run concurrently in two processes sharing one state.db — that
+        interleaving has structurally corrupted the database in production (PR #93200) — so this admits
+        through the cross-process ``fts_rebuild_admission`` authority and FAILS CLOSED: if another process
+        holds the rebuild lock beyond the bounded wait, this call defers (returns 0) rather than racing it.
+        Callers already treat 0 as "rebuild made no progress" and fall back to the stale-FTS breadcrumb
+        path, which retries in-process from the gateway housekeeping tick (``retry_deferred_fts_recovery``)
+        and at next startup.
+        """
+        self._raise_if_db_corrupt()
+        rebuilt = 0
+        with fts_rebuild_admission(self.db_path) as admitted:
+            if not admitted:
+                logger.warning(
+                    "Deferred in-place FTS rebuild: another process holds the rebuild authority for this state.db.")
+                return 0
+            with self._lock:
+                self._raise_if_db_replaced()
+                if self._conn is None:
+                    self._reopen_after_close_locked(context="write")
+                for tbl in self._present_fts_tables():
+                    try:
+                        self._conn.execute(f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')")
+                        self._conn.commit()
+                        rebuilt += 1
+                    except sqlite3.OperationalError as exc:
+                        self._conn.rollback()
+                        logger.warning("FTS rebuild failed for %s: %s", tbl, exc)
+        return rebuilt
+
+    def _merge_fts_incrementally(self, *, max_pages: int, max_commands: Optional[int] = None) -> int:
+        """Run bounded FTS5 ``'merge'`` commands against each present index. A positive merge rank
+        stops after ~that many output pages, so each command holds the write lock for
+        milliseconds regardless of index size (``'optimize'`` takes 9-18 s per index on a
+        10 GB DB). ``usermerge`` is lowered to its minimum of 2 (persisted in ``%_config``,
+        once per instance) so a merge acts on ANY level with >= 2 segments; at the default
+        4 a fragmented index cannot converge. Up to *max_commands* per index, stopping on
+        the no-progress signal ``total_changes`` delta < 2 (the INSERT itself is 1). Each
+        command is its own implicit transaction, so processes interleave mid-pass. Missing
+        tables are skipped (optimize_fts_storage drops + backfills them live); other SQLite
+        errors propagate. Returns commands executed."""
+        _positive_int("max_pages", max_pages)
+        if max_commands is None:
+            max_commands = self._FTS_MERGE_COMMANDS_PER_PASS
+        _positive_int("max_commands", max_commands)
+        executed = 0
+        with self._lock:
+            for tbl in self._present_fts_tables():
+                if not self._fts_usermerge_floor_applied:
+                    self._conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('usermerge', 2)")
+                for _ in range(max_commands):
+                    before = self._conn.total_changes
+                    self._conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)", (max_pages,))
+                    executed += 1
+                    if self._conn.total_changes - before < 2:
+                        break
+            self._fts_usermerge_floor_applied = True
+        return executed

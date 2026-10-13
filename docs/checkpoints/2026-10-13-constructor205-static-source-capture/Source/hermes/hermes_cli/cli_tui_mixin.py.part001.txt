@@ -1,0 +1,1245 @@
+"""prompt_toolkit TUI construction, key-binding handlers, and overlay display fragments for the
+interactive CLI. Mixin bound onto ``HermesCLI`` via the MRO; cli.py-internal symbols are imported
+LAZILY inside each method (``from cli import ...``) — never at module load (import cycle)."""
+
+from __future__ import annotations
+
+import errno
+import json
+import os
+import queue
+import shutil
+import string
+import sys
+import threading
+import time
+
+from agent.i18n import t
+from agent.interrupt_compat import request_hard_interrupt
+from hermes_cli.commands_completion import SlashCommandAutoSuggest, SlashCommandCompleter
+from pathlib import Path
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import (
+    ConditionalContainer,
+    FormattedTextControl,
+    Layout,
+    Window,
+    WindowAlign)
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.layout.processors import (
+    ConditionalProcessor,
+    PasswordProcessor,
+    Processor,
+    Transformation)
+from prompt_toolkit.styles import Style as PTStyle
+from prompt_toolkit.widgets import TextArea
+from typing import Optional
+
+from hermes_cli.cli_footer_split import FooterSplit
+
+# Rows below an overlay panel taken by spinner/tool-progress, status bar, input, separators and
+# prompt symbol (measured ~6 during live PTY approval prompts) — shared by every panel budget.
+_PANEL_RESERVED_BELOW = 6
+# Enter within this many seconds of the last buffer change is a pasted/dictated newline, not a submit.
+_RAPID_INPUT_ENTER_WINDOW_S = 0.05
+_TYPING_CHARS = string.digits + string.ascii_letters + "-_.:/ "
+
+# Approval-choice identifiers (protocol tokens, never translated) → catalog keys for their labels.
+_APPROVAL_CHOICE_KEYS = {
+    "once": "cli.tui.approval_once",
+    "session": "cli.tui.approval_session",
+    "always": "cli.tui.approval_always",
+    "deny": "cli.tui.approval_deny",
+    "view": "cli.tui.approval_view"}
+
+
+def _approval_choice_label(choice: str) -> str:
+    """Localized label for an approval choice id; unknown ids render verbatim."""
+    key = _APPROVAL_CHOICE_KEYS.get(choice)
+    return t(key) if key else choice
+
+
+def _agent_name() -> str:
+    try:
+        from hermes_cli.skin_engine import get_active_skin
+        return get_active_skin().get_branding("agent_name", "Hermes")
+    except Exception:
+        return "Hermes"
+
+
+def _tn(key: str, count: int, **kwargs) -> str:
+    """Plural-aware lookup: ``<key>_one`` for exactly one, ``<key>_other`` otherwise."""
+    return t(f"{key}_one" if count == 1 else f"{key}_other", count=count, **kwargs)
+
+
+def _num_prefix(i: int) -> str:
+    """Quick-select key label: 1-9 for items 1-9, 0 for the 10th, blank beyond."""
+    return str(i + 1) if i < 9 else ("0" if i == 9 else " ")
+
+
+def _term_rows() -> int:
+    return shutil.get_terminal_size((100, 24)).lines
+
+
+class _Panel:
+    """Fragment accumulator for one bordered overlay panel (``(style, text)`` tuples)."""
+
+    def __init__(self, border: str, box_width: int, title: str = "", title_style: str = ""):
+        from cli import _append_blank_panel_line, _append_panel_line
+        self.lines, self.border, self.width = [], border, box_width
+        self._row, self._blank = _append_panel_line, _append_blank_panel_line
+        if title:
+            # Title inlined into the top rule: ``╭─ Title ───╮``.
+            self.lines.append((border, "╭─ "))
+            self.lines.append((title_style, title))
+            self.lines.append((border, " " + ("─" * max(0, box_width - len(title) - 3)) + "╮\n"))
+        else:
+            self.lines.append((border, "╭" + ("─" * box_width) + "╮\n"))
+
+    def row(self, style: str, text: str) -> None:
+        self._row(self.lines, self.border, style, text, self.width)
+
+    def blank(self) -> None:
+        self._blank(self.lines, self.border, self.width)
+
+    def close(self) -> list:
+        self.lines.append((self.border, "╰" + ("─" * self.width) + "╯\n"))
+        return self.lines
+
+
+def _wrap_rows(wrap, items, width, indent) -> list[tuple[int, str]]:
+    """``(index, wrapped_line)`` pairs so selected styling can be re-applied per row."""
+    return [(i, w) for i, label in enumerate(items) for w in wrap(label, width, subsequent_indent=indent)]
+
+
+def _prefix_wrapped_rows(wrap, label, width, first_prefix, indent) -> list[str]:
+    """Wrap ``label``, then prefix the rows with ``first_prefix`` / ``indent``.
+
+    The prefix is applied *after* wrapping on purpose. Folding it into the
+    string handed to the wrapper charges those columns against the label's own
+    width budget — so a selected row wraps one line early and strands the ``❯``
+    cursor on a row of its own — and whitespace-trimming wrappers drop the
+    leading indent entirely, leaving long unselected labels flush against the
+    panel border, out of alignment with every other row.
+    """
+    rows = wrap(label, width)
+    return [(first_prefix if i == 0 else indent) + row for i, row in enumerate(rows)]
+
+
+class CLITuiMixin:
+    """prompt_toolkit TUI construction, key-binding handlers, and overlay display fragments."""
+
+    def _tui_input_rule_height(self, position: str, width: Optional[int] = None) -> int:
+        """Visible height for the top/bottom input separator rules."""
+        if position not in {"top", "bottom"}:
+            raise ValueError(f"Unknown input rule position: {position}")
+        if getattr(self, "_status_bar_suppressed_after_resize", False):
+            return 0
+        if position == "top":
+            return 1
+        return 0 if self._use_minimal_tui_chrome(width=width) else 1
+
+    def _get_slash_confirm_display_fragments(self):
+        """Render the /new-/clear-style confirmation panel."""
+        from cli import _panel_box_width, _wrap_panel_text_keep_ws
+        state = self._slash_confirm_state
+        if not state:
+            return []
+        wrap = _wrap_panel_text_keep_ws
+        title = state.get("title") or t("cli.tui.confirm_title")
+        detail = state.get("detail") or ""
+        choices = state.get("choices") or []
+        selected = state.get("selected", 0)
+        footer = t("cli.tui.confirm_footer")
+        choice_labels = [
+            f"{'❯' if idx == selected else ' '} [{idx + 1}] {label} — {desc}"
+            for idx, (_value, label, desc) in enumerate(choices)]
+
+        preview_lines = [w for line in detail.splitlines() for w in wrap(line, 72)]
+        preview_lines.extend(w for _i, w in _wrap_rows(wrap, choice_labels, 72, "    "))
+        preview_lines.append(footer)
+        box_width = _panel_box_width(title, preview_lines, min_width=56, max_width=86)
+        inner_text_width = max(8, box_width - 2)
+        detail_wrapped = [w for line in detail.splitlines() for w in wrap(line, inner_text_width)]
+        choice_wrapped = _wrap_rows(wrap, choice_labels, inner_text_width, "    ")
+
+        chrome_full = 6
+        available = max(0, _term_rows() - _PANEL_RESERVED_BELOW)
+        max_detail_rows = min(8, max(1, available - chrome_full - len(choice_wrapped)))
+        if len(detail_wrapped) > max_detail_rows:
+            detail_wrapped = detail_wrapped[:max(1, max_detail_rows - 1)] + [t("cli.tui.detail_truncated")]
+
+        panel = _Panel('class:approval-border', box_width)
+        panel.row('class:approval-title', title)
+        panel.blank()
+        for wrapped in detail_wrapped:
+            panel.row('class:approval-desc', wrapped)
+        panel.blank()
+        for idx, wrapped in choice_wrapped:
+            style = 'class:approval-selected' if idx == selected else 'class:approval-choice'
+            panel.row(style, wrapped)
+        panel.blank()
+        panel.row('class:approval-cmd', footer)
+        return panel.close()
+
+    def _get_approval_display_fragments(self):
+        """Render the dangerous-command approval panel.
+
+        Layout priority: title + command + choices must always render, even in a short terminal
+        or with a long (tirith multi-paragraph) description. The description sits at the bottom
+        and is truncated to the remaining row budget, so HSplit never clips approve/deny off-screen.
+        """
+        from cli import _panel_box_width, _wrap_panel_text_keep_ws
+        state = self._approval_state
+        if not state:
+            return []
+        wrap = _wrap_panel_text_keep_ws
+        command = state["command"]
+        description = state["description"]
+        choices = state["choices"]
+        selected = state.get("selected", 0)
+        show_full = state.get("show_full", False)
+        title = t("cli.tui.approval_title")
+
+        preview_lines = wrap(description, 60)
+        preview_lines.extend(wrap(command, 60))
+        for i, choice in enumerate(choices):
+            prefix = '❯ ' if i == selected else '  '
+            label = _approval_choice_label(choice)
+            preview_lines.extend(wrap(f"{prefix}{label}", 60, subsequent_indent="  "))
+        box_width = _panel_box_width(title, preview_lines)
+        inner_text_width = max(8, box_width - 2)
+
+        # Pre-wrap the mandatory content — command + choices must always render.
+        cmd_wrapped = wrap(command, inner_text_width)
+        if not show_full and "view" in choices and len(cmd_wrapped) > 4:
+            cmd_wrapped = cmd_wrapped[:3] + wrap(
+                t("cli.tui.approval_choose_full", label=t("cli.tui.approval_view")), inner_text_width)
+        choice_labels = [
+            f"{'❯' if i == selected else ' '} {_num_prefix(i)}. {_approval_choice_label(choice)}"
+            for i, choice in enumerate(choices)]
+        choice_wrapped = _wrap_rows(wrap, choice_labels, inner_text_width, "    ")
+
+        # Row budget so HSplit never clips the command or choices. Full chrome = top border +
+        # title + blank + blank-between-cmd/choices + bottom border (5); when that doesn't fit,
+        # drop the separator blanks (3) so every choice stays on-screen in compact terminals.
+        available = max(0, _term_rows() - _PANEL_RESERVED_BELOW)
+        use_compact_chrome = 5 + len(cmd_wrapped) + len(choice_wrapped) > available
+        chrome_rows = 3 if use_compact_chrome else 5
+
+        # A command too long to leave room for the choices (e.g. "view" on a multi-hundred-char
+        # command) is truncated so approve/deny still render; keep at least 1 command row.
+        max_cmd_rows = max(1, available - chrome_rows - len(choice_wrapped))
+        if len(cmd_wrapped) > max_cmd_rows:
+            keep = max(1, max_cmd_rows - 1) if max_cmd_rows > 1 else 1
+            cmd_wrapped = cmd_wrapped[:keep] + wrap(
+                t("cli.tui.approval_command_truncated"), inner_text_width)
+
+        # Remaining rows go to the description (minus the blank separator in full mode), capped
+        # at 10 so the panel stays compact even on huge terminals.
+        mandatory_no_desc = chrome_rows + len(cmd_wrapped) + len(choice_wrapped)
+        available_for_desc = available - mandatory_no_desc - (0 if use_compact_chrome else 1)
+        available_for_desc = max(0, min(available_for_desc, 10))
+        desc_wrapped = wrap(description, inner_text_width) if description else []
+        if available_for_desc < 1 or not desc_wrapped:
+            desc_wrapped = []
+        elif len(desc_wrapped) > available_for_desc:
+            desc_wrapped = desc_wrapped[:max(1, available_for_desc - 1)] + [t("cli.tui.approval_description_truncated")]
+
+        # Render title → command → choices → description; description last so any overflow
+        # clips the least-critical content, never the command or choices.
+        panel = _Panel('class:approval-border', box_width)
+        panel.row('class:approval-title', title)
+        if not use_compact_chrome:
+            panel.blank()
+        for wrapped in cmd_wrapped:
+            panel.row('class:approval-cmd', wrapped)
+        if not use_compact_chrome:
+            panel.blank()
+        for i, wrapped in choice_wrapped:
+            style = 'class:approval-selected' if i == selected else 'class:approval-choice'
+            panel.row(style, wrapped)
+        if desc_wrapped:
+            if not use_compact_chrome:
+                panel.blank()
+            for wrapped in desc_wrapped:
+                panel.row('class:approval-desc', wrapped)
+        return panel.close()
+
+    def _get_tui_prompt_symbols(self) -> tuple[str, str]:
+        """Return ``(normal_prompt, state_suffix)`` for the active skin.
+
+        ``state_suffix`` is what special states (sudo/secret/approval/agent) render after their
+        leading icon. A non-default profile name is prepended (``coder ❯``).
+        """
+        try:
+            from hermes_cli.skin_engine import get_active_prompt_symbol
+            symbol = get_active_prompt_symbol("❯ ")
+        except Exception:
+            symbol = "❯ "
+        symbol = (symbol or "❯ ").rstrip() + " "
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name()
+            if profile not in {"default", "custom"}:
+                symbol = f"{profile} {symbol}"
+        except Exception:
+            pass
+        stripped = symbol.rstrip()
+        if not stripped:
+            return "❯ ", "❯ "
+        parts = stripped.split()
+        candidate = parts[-1] if parts else ""
+        if any(ch in candidate for ch in ("❯", ">", "$", "#", "›", "»", "→")):
+            return symbol, candidate.rstrip() + " "
+        # Icon-only custom prompts should still remain visible in special states.
+        return symbol, symbol
+
+    def _audio_level_bar(self) -> str:
+        """One-char audio level indicator from the recorder's current RMS."""
+        rec = getattr(self, "_voice_recorder", None)
+        if rec is None:
+            return ""
+        # RMS 0-32767 → index 0-7; typical speech is 500-5000, display caps at ~8000.
+        return " ▁▂▃▄▅▆▇"[min(rec.current_rms, 8000) * 7 // 8000]
+
+    def _get_tui_prompt_fragments(self):
+        """prompt_toolkit fragments for the current interactive state."""
+        symbol, state_suffix = self._get_tui_prompt_symbols()
+        compact = self._use_minimal_tui_chrome(width=self._get_tui_terminal_width())
+
+        def _state_fragment(style: str, icon: str, extra: str = ""):
+            if compact:
+                text = icon
+                if extra:
+                    text = f"{text} {extra.strip()}".rstrip()
+                return [(style, text + " ")]
+            if extra:
+                return [(style, f"{icon} {extra} {state_suffix}")]
+            return [(style, f"{icon} {state_suffix}")]
+
+        if self._voice_recording:
+            return _state_fragment("class:voice-recording", "●", self._audio_level_bar())
+        if self._voice_processing:
+            return _state_fragment("class:voice-processing", "◉")
+        if self._sudo_state:
+            return _state_fragment("class:sudo-prompt", "🔐")
+        if self._secret_state:
+            return _state_fragment("class:sudo-prompt", "🔑")
+        if self._connection_state:
+            return _state_fragment("class:prompt-working", "⚙")
+        if self._approval_state or getattr(self, "_slash_confirm_state", None):
+            return _state_fragment("class:prompt-working", "⚠")
+        if self._clarify_freetext:
+            return _state_fragment("class:clarify-selected", "✎")
+        if self._clarify_state:
+            return _state_fragment("class:prompt-working", "?")
+        if self._command_running:
+            return _state_fragment("class:prompt-working", self._command_spinner_frame())
+        if self._agent_running:
+            return _state_fragment("class:prompt-working", "☤")
+        if self._voice_mode:
+            return _state_fragment("class:voice-prompt", "🎤")
+        return [("class:prompt", symbol)]
+
+    def _get_tui_prompt_text(self) -> str:
+        """Visible prompt text for width calculations."""
+        return "".join(text for _, text in self._get_tui_prompt_fragments())
+
+    def _build_tui_style_dict(self) -> dict[str, str]:
+        """Layer the active skin's prompt_toolkit colors over the base TUI style.
+
+        On a light terminal, hex tokens in each style string are rewritten through the light-mode
+        remap so the chrome stays readable on cream Terminal.app backgrounds. CRITICAL: a style
+        that paints its own ``bg:`` (status bar, completion menu) is left alone — its fg was tuned
+        for that dark bg and remapping would give dark-on-dark; the terminal's mode is irrelevant.
+        """
+        from cli import _detect_light_mode, _maybe_remap_for_light_mode
+        style_dict = dict(getattr(self, "_tui_style_base", {}) or {})
+        try:
+            from hermes_cli.skin_engine import get_prompt_toolkit_style_overrides
+            style_dict.update(get_prompt_toolkit_style_overrides())
+        except Exception:
+            pass
+        try:
+            if _detect_light_mode():
+                def _remap_value(v: str) -> str:
+                    if not v:
+                        return v
+                    tokens = v.split()
+                    if any(t.startswith("bg:") for t in tokens):
+                        return v
+                    return " ".join(_maybe_remap_for_light_mode(t) if t.startswith("#") else t for t in tokens)
+                style_dict = {k: _remap_value(v or "") for k, v in style_dict.items()}
+        except Exception:
+            pass
+        return style_dict
+
+    def _apply_tui_skin_style(self) -> bool:
+        """Refresh prompt_toolkit styling for a running interactive TUI."""
+        if not getattr(self, "_app", None) or not getattr(self, "_tui_style_base", None):
+            return False
+        self._app.style = PTStyle.from_dict(self._build_tui_style_dict())
+        self._invalidate(min_interval=0.0)
+        return True
+
+    def _get_extra_tui_widgets(self) -> list:
+        """Extension hook: wrapper CLIs return widgets inserted between the spacer and status bar."""
+        return []
+
+    def _register_extra_tui_keybindings(self, kb, *, input_area) -> None:
+        """Extension hook: wrapper CLIs add bindings to ``kb`` (``input_area`` is the main TextArea)."""
+
+    def _build_tui_layout_children(
+        self,
+        *,
+        sudo_widget,
+        secret_widget,
+        connection_widget=None,
+        approval_widget,
+        slash_confirm_widget=None,
+        clarify_widget,
+        model_picker_widget=None,
+        command_palette_widget=None,
+        spinner_widget=None,
+        spacer,
+        status_bar,
+        input_rule_top,
+        image_bar,
+        input_area,
+        input_rule_bot,
+        voice_status_bar,
+        completions_menu) -> list:
+        """Ordered children of the root ``HSplit``; override only for full control over ordering
+        (wrappers normally override ``_get_extra_tui_widgets`` instead)."""
+        ordered = [
+            Window(height=0),
+            sudo_widget,
+            secret_widget,
+            connection_widget,
+            approval_widget,
+            slash_confirm_widget,
+            clarify_widget,
+            model_picker_widget,
+            command_palette_widget,
+            spinner_widget,
+            spacer,
+            *self._get_extra_tui_widgets(),
+            getattr(self, "_pet_widget", None),
+            getattr(self, "_stash_panel_widget", None),
+            getattr(self, "_subagent_dock_widget", None),
+            status_bar,
+            input_rule_top,
+            image_bar,
+            input_area,
+            input_rule_bot,
+            voice_status_bar,
+            completions_menu]
+        return [item for item in ordered if item is not None]
+
+    def _tui_spinner_loop(self):
+        while not self._should_exit:
+            if not self._app:
+                time.sleep(0.1)
+                continue
+            monitor = getattr(self, "_subagent_monitor", None)
+            if monitor is not None:
+                monitor.tick()
+            if self._command_running:
+                self._invalidate(min_interval=0.1)
+                time.sleep(0.1)
+            else:
+                # Never repaint the idle prompt on a timer: in non-full-screen mode background
+                # redraws fight tmux/Ghostty/cmux viewport restoration after focus changes and
+                # visually move the input area. Input/agent events invalidate explicitly.
+                time.sleep(0.2)
+
+    def _get_clarify_display_fragments(self):
+        """Batch (multi-question) clarify panel: "N questions" header, one status line per question
+        (✓ answered → answer / ▸ active / · pending), and the active question's numbered choices
+        (+ Other) expanded beneath its status line."""
+        from cli import _panel_box_width, _wrap_panel_text
+        state = self._clarify_state
+        if not state:
+            return []
+        questions_list = state.get("questions") or []
+        answers = state.get("answers") or {}
+        answer_meta = state.get("answer_meta") or {}
+        active = state.get("active", 0)
+        choices = state.get("choices") or []
+        selected = state.get("selected", 0)
+        multi_select = state.get("multi_select", False)
+        selected_indices = state.get("selected_indices", set()) if multi_select else set()
+        freetext = self._clarify_freetext
+        title = t("cli.tui.clarify_title", agent_name=_agent_name())
+        header = _tn("cli.tui.clarify_question_count", len(questions_list))
+
+        def _status_rows(width):
+            rows = []
+            # End of the active question block and the row span of its selected choice.
+            focus = {}
+            for idx, entry in enumerate(questions_list):
+                answered = entry["qid"] in answers
+                marker = "✓" if answered else ("▸" if idx == active else "·")
+                row_style = 'class:clarify-selected' if idx == active else 'class:clarify-choice'
+                for wrapped in _wrap_panel_text(f"{marker} {entry['question']}", width, subsequent_indent="  "):
+                    rows.append((row_style, wrapped))
+                if answered:
+                    # Locked answer on its own line/color so it stays readable while Tab-walking.
+                    locked = answers[entry['qid']]
+                    answer = f"    {'—' if locked is None else locked}"
+                    for wrapped in _wrap_panel_text(answer, width, subsequent_indent="    "):
+                        rows.append(('class:clarify-answer', wrapped))
+                if idx != active:
+                    continue
+                for i, choice in enumerate(choices):
+                    cursor = "❯" if i == selected and not freetext else " "
+                    cb = ("[x] " if i in selected_indices else "[ ] ") if multi_select else ""
+                    style = 'class:clarify-selected' if i == selected and not freetext else 'class:clarify-choice'
+                    label = f"  {cursor} {cb}{_num_prefix(i)}. {choice}"
+                    first = len(rows)
+                    for wrapped in _wrap_panel_text(label, width, subsequent_indent="      "):
+                        rows.append((style, wrapped))
+                    if i == selected and not freetext:
+                        focus["selected"] = (first, len(rows))
+                if choices:
+                    other_idx = len(choices)
+                    mid = _num_prefix(other_idx)
+                    if multi_select:
+                        mid = f"{'[x]' if other_idx in selected_indices else '[ ]'} {mid}"
+                    # An earlier typed answer stays visible next to Other; Enter on it edits
+                    # (the composer is prefilled).
+                    other_text = (answer_meta.get(entry["qid"]) or {}).get("other_text") or ""
+                    other_suffix = t("cli.tui.clarify_other_answer", text=other_text) if other_text else None
+                    if freetext:
+                        other_label = f"  ❯ {mid}. " + (other_suffix or t("cli.tui.clarify_other_type_below"))
+                        other_style = 'class:clarify-active-other'
+                    elif selected == other_idx:
+                        other_label = f"  ❯ {mid}. " + (other_suffix or t("cli.tui.clarify_other_type_answer"))
+                        other_style = 'class:clarify-selected'
+                    else:
+                        other_label = f"    {mid}. " + (other_suffix or t("cli.tui.clarify_other_type_answer"))
+                        other_style = 'class:clarify-choice'
+                    first = len(rows)
+                    for wrapped in _wrap_panel_text(other_label, width, subsequent_indent="      "):
+                        rows.append((other_style, wrapped))
+                    if freetext or selected == other_idx:
+                        focus["selected"] = (first, len(rows))
+                elif freetext:
+                    guidance = "  " + t("cli.tui.clarify_guidance")
+                    for wrapped in _wrap_panel_text(guidance, width):
+                        rows.append(('class:clarify-active-other', wrapped))
+                focus["end"] = len(rows)
+            return rows, focus
+
+        preview_rows, _ = _status_rows(60)
+        box_width = _panel_box_width(title, [header] + [text for _, text in preview_rows])
+        rows, focus = _status_rows(max(8, box_width - 2))
+        # The panel is an unsized Window, so rows past the viewport are clipped from the
+        # bottom, which is where the active question's choices sit. When the body does not
+        # fit, show the slice that ends with those choices and always holds the selected one.
+        # Top rule, header and bottom rule take three rows.
+        budget = max(1, _term_rows() - _PANEL_RESERVED_BELOW - 3)
+        if len(rows) > budget and "end" in focus:
+            sel_start, _sel_end = focus.get("selected", (focus["end"] - 1, focus["end"]))
+            first = min(sel_start, focus["end"] - budget)
+            first = max(0, min(first, len(rows) - budget))
+            rows = rows[first:first + budget]
+
+        panel = _Panel('class:clarify-border', box_width, title, 'class:clarify-title')
+        panel.row('class:clarify-question', header)
+        for style, text in rows:
+            panel.row(style, text)
+        return panel.close()
+
+    def _render_scroll_list_panel(self, state, title, hint, labels, *, min_width, max_width, indent):
+        """Titled panel with a hint row and a scrolling selectable list (model picker, palette).
+
+        The panel renders into a Window with no max height, so the visible slice is limited to
+        the terminal rows or the bottom border and trailing items get clipped on long lists
+        (e.g. Ollama Cloud's 36+ models). ``state["_scroll_offset"]`` is updated in place.
+        """
+        from cli import HermesCLI, _panel_box_width, _wrap_panel_text
+        box_width = _panel_box_width(title, [hint] + labels, min_width=min_width, max_width=max_width)
+        # ``_Panel.row`` pads every row to ``box_width - 2``, so that is the real
+        # body width. Keep the wrap budget in sync with it and reserve the
+        # leading cell for the cursor/indent applied below, rather than the old
+        # blanket ``- 6`` which wrapped long labels two columns early.
+        inner_text_width = max(8, box_width - 2)
+        label_width = max(8, inner_text_width - max(2, len(indent)))
+        selected = state.get("selected", 0)
+        try:
+            from prompt_toolkit.application import get_app
+            term_rows = get_app().output.get_size().rows
+        except Exception:
+            term_rows = _term_rows()
+        scroll_offset, visible = HermesCLI._compute_model_picker_viewport(
+            selected, state.get("_scroll_offset", 0), len(labels), term_rows)
+        state["_scroll_offset"] = scroll_offset
+
+        panel = _Panel('class:clarify-border', box_width, title, 'class:clarify-title')
+        panel.blank()
+        panel.row('class:clarify-hint', hint)
+        panel.blank()
+        for idx in range(scroll_offset, min(scroll_offset + visible, len(labels))):
+            style = 'class:clarify-selected' if idx == selected else 'class:clarify-choice'
+            # The cursor cell is always two columns wide, so unselected rows get two spaces
+            # regardless of ``indent`` (the palette's continuation indent is four) — otherwise
+            # the selected label starts two columns left of its neighbours.
+            lead = '❯ ' if idx == selected else '  '
+            for wrapped in _prefix_wrapped_rows(
+                _wrap_panel_text, labels[idx], label_width, lead, indent
+            ):
+                panel.row(style, wrapped)
+        panel.blank()
+        return panel.close()
+
+    def _get_model_picker_display_fragments(self):
+        state = self._model_picker_state
+        if not state:
+            return []
+        if state.get("stage", "provider") == "provider":
+            title = t("cli.tui.picker_title_provider")
+            choices = []
+            _providers = state.get("providers")
+            for p in _providers if isinstance(_providers, list) else []:
+                count = p.get("total_models", len(p.get("models", [])))
+                label = _tn("cli.tui.picker_provider_row", count, name=p['name'])
+                if p.get("is_current"):
+                    label += t("cli.tui.picker_current_marker")
+                choices.append(label)
+            choices.append(t("cli.shared.cancel"))
+            _unknown = t("cli.shared.unknown")
+            hint = t("cli.tui.picker_current_hint",
+                     model=state.get('current_model', _unknown),
+                     provider=state.get('current_provider', _unknown))
+        elif state.get("stage") == "reasoning":
+            from hermes_cli.cli_model_switch_mixin import _picker_reasoning_rows
+            result = state.get("switch_result")
+            picked = getattr(result, "new_model", "") or t("cli.shared.noun_model")
+            title = t("cli.tui.picker_title_effort", model=picked)
+            rc = self.reasoning_config
+            current = ("none" if isinstance(rc, dict) and rc.get("enabled") is False
+                       else (rc or {}).get("effort", "medium") if isinstance(rc, dict) else "medium")
+            choices = [t("cli.tui.picker_current_labeled", label=label) if value == current else label
+                       for value, label in _picker_reasoning_rows()]
+            choices += [t("cli.shared.back"), t("cli.shared.cancel")]
+            hint = t("cli.tui.picker_effort_hint")
+        else:
+            provider_data = state.get("provider_data") or {}
+            model_list = state.get("model_list") or []
+            title = t("cli.tui.picker_title_models", provider=provider_data.get(
+                'name', provider_data.get('slug', t("cli.tui.picker_provider_fallback"))))
+            # Fuzzy filter narrows the concrete list; selection still resolves to a real entry via
+            # the filtered_pairs index mapping, so this never makes model resolution ambiguous.
+            _query = state.get("filter", "") or ""
+            filtered_pairs = self._filter_model_picker_entries(model_list, _query)
+            state["_filtered_pairs"] = filtered_pairs
+            model_labels = [e for (_i, e) in filtered_pairs]
+            choices = list(model_labels) + [t("cli.shared.back"), t("cli.shared.cancel")]
+            if _query:
+                hint = t("cli.tui.picker_filter_hint", query=_query, shown=len(model_labels), total=len(model_list))
+            elif model_list:
+                hint = t("cli.tui.picker_select_hint", count=len(model_list))
+            else:
+                hint = t("cli.tui.picker_empty")
+        return self._render_scroll_list_panel(
+            state, title, hint, choices, min_width=46, max_width=84, indent='  ')
+
+    def _get_command_palette_display_fragments(self):
+        state = self._command_palette_state
+        if not state:
+            return []
+        rows = self._command_palette_visible_entries()
+        state["_visible_count"] = len(rows)
+        _query = state.get("filter", "") or ""
+        total = len(state.get("entries") or [])
+        if _query:
+            hint = t("cli.tui.palette_filter_hint", query=_query, shown=len(rows), total=total)
+        else:
+            hint = t("cli.tui.palette_hint", total=total)
+        labels = [f"{c}  —  {d}" if d else c for (c, _cat, d) in rows] or [t("cli.tui.palette_empty")]
+        return self._render_scroll_list_panel(
+            state, t("cli.tui.palette_title"), hint, labels, min_width=50, max_width=90, indent='    ')
+
+    def _render_sudo_style_panel(
+        self, title: str, body_lines: list[str], row_styles: list[str] | None = None
+    ):
+        """Bordered ``sudo-*`` panel: blank, each body line, blank, body-final line, blank."""
+        from cli import _panel_box_width
+        box_width = _panel_box_width(title, body_lines)
+        panel = _Panel('class:sudo-border', box_width, title, 'class:sudo-title')
+        panel.blank()
+        for i, text in enumerate(body_lines):
+            if i == len(body_lines) - 1 and i > 0:
+                panel.blank()
+            style = row_styles[i] if row_styles and i < len(row_styles) else 'class:sudo-text'
+            panel.row(style, text)
+        panel.blank()
+        return panel.close()
+
+    def _get_sudo_display_fragments(self):
+        if not self._sudo_state:
+            return []
+        # Panel bodies are one catalog value per panel (multi-line prose), split into rows here.
+        if code := self._sudo_state.get("vault_code"):
+            return self._render_sudo_style_panel(
+                t("cli.tui.vault_code_title", site=code["site"]),
+                t("cli.tui.vault_code_body", site=code["site"], agent_name=_agent_name()).split("\n"))
+        if save := self._sudo_state.get("vault_save"):
+            if save["step"] == "identifier":
+                return self._render_sudo_style_panel(
+                    t("cli.tui.vault_save_title", site=save["site"]),
+                    t("cli.tui.vault_save_body").split("\n"))
+            return self._render_sudo_style_panel(
+                t("cli.tui.vault_save_title", site=save["site"]),
+                t("cli.tui.vault_save_pw_body", origin=save["origin"]).split("\n"))
+        if backend := self._sudo_state.get("vault_backend"):
+            return self._render_sudo_style_panel(
+                t("cli.tui.vault_unlock_title", backend=backend),
+                t("cli.tui.vault_unlock_body", backend=backend).split("\n"))
+        return self._render_sudo_style_panel(t("cli.tui.sudo_title"), [t("cli.tui.sudo_body")])
+
+    def _get_secret_display_fragments(self):
+        state = self._secret_state
+        if not state:
+            return []
+        prompt = state.get("prompt") or t(
+            "cli.tui.secret_prompt", var_name=state.get('var_name', t("cli.tui.secret_fallback_name")))
+        help_text = (state.get("metadata") or {}).get("help")
+        content_lines = [prompt, t("cli.tui.secret_body")]
+        if help_text:
+            content_lines.insert(1, str(help_text))
+        return self._render_sudo_style_panel(t("cli.tui.secret_title"), content_lines)
+
+    def _get_connection_display_fragments(self):
+        state = self._connection_state
+        lines = self._connection_render_lines()
+        if not state or not lines:
+            return []
+        body_lines = lines[1:]
+        styles = ['class:sudo-text'] * len(body_lines)
+        phase = state.get("phase")
+        fields = state.get("fields") or []
+        instructions_offset = 1 if state.get("target", {}).get("instructions") else 0
+        if phase in {"form", "failed"}:
+            field_offset = instructions_offset + (1 if phase == "failed" else 0)
+            field_index = state.get("field_index", 0)
+            if 0 <= field_index < len(fields):
+                styles[field_offset + field_index] = 'class:clarify-selected'
+            elif body_lines:
+                action_index = len(body_lines) - 1
+                styles[action_index] = 'class:clarify-selected'
+                choices = [t("cli.tui.connection_connect"), t("cli.shared.cancel")]
+                selected = min(1, max(0, state.get("selected", 0)))
+                body_lines[action_index] = "    ".join(
+                    f"▸ {choice}" if i == selected else choice for i, choice in enumerate(choices)
+                )
+        elif phase == "authorized" and body_lines:
+            styles[-1] = 'class:clarify-selected'
+            body_lines[-1] = "▸ " + t("cli.tui.connection_continue")
+        return self._render_sudo_style_panel(lines[0], body_lines, styles)
+
+    # (state attr, deadline attr, hint catalog key) for the modal prompts with a countdown hint
+    # row. Keys, not text: the label is looked up at render time so a language switch applies.
+    _TUI_MODAL_HINTS = (
+        ("_sudo_state", "_sudo_deadline", "cli.tui.hint_sudo"),
+        ("_secret_state", "_secret_deadline", "cli.tui.hint_secret"),
+        ("_approval_state", "_approval_deadline", "cli.tui.hint_approval"),
+        ("_slash_confirm_state", "_slash_confirm_deadline", "cli.tui.hint_slash_confirm"),
+    )
+    # Connection-setup phase (protocol id) → hint catalog key.
+    _TUI_CONNECTION_HINT_KEYS = {
+        "form": "cli.tui.hint_connection_form",
+        "failed": "cli.tui.hint_connection_form",
+        "url": "cli.tui.hint_connection_url",
+        "authorized": "cli.tui.hint_connection_authorized",
+        "waiting": "cli.tui.hint_connection_waiting",
+    }
+
+    def _tui_hint_text(self):
+        if self._connection_state:
+            phase = self._connection_state.get("phase")
+            hint = "  " + t(self._TUI_CONNECTION_HINT_KEYS.get(phase, "cli.tui.hint_connection_default"))
+            deadline = float(self._connection_state.get("payload", {}).get("deadline_at") or 0)
+            countdown = f"  ({max(0, int(deadline - time.time()))}s)" if deadline else ""
+            return [('class:hint', hint), ('class:clarify-countdown', countdown)]
+        for state_attr, deadline_attr, hint_key in self._TUI_MODAL_HINTS:
+            if getattr(self, state_attr):
+                if state_attr == "_sudo_state" and ((self._sudo_state.get("vault_save") or {}).get("step") == "identifier"
+                                                    or self._sudo_state.get("vault_code")):
+                    hint_key = "cli.tui.hint_vault_username"
+                hint = "  " + t(hint_key)
+                remaining = max(0, int(getattr(self, deadline_attr) - time.monotonic()))
+                return [('class:hint', hint), ('class:clarify-countdown', f'  ({remaining}s)')]
+        if self._clarify_state:
+            # None deadline = unlimited wait → hide the countdown entirely.
+            if self._clarify_deadline is None:
+                countdown = ''
+            else:
+                countdown = f'  ({max(0, int(self._clarify_deadline - time.monotonic()))}s)'
+            if self._clarify_freetext:
+                hint = "  " + t("cli.tui.hint_clarify_freetext")
+            else:
+                hint = "  " + t("cli.tui.hint_clarify_batch")
+            return [('class:hint', hint), ('class:clarify-countdown', countdown)]
+        if self._command_running:
+            frame = self._command_spinner_frame()
+            if self._command_blocks_input:
+                detail = t("cli.tui.hint_input_disabled")
+            else:
+                detail = t("cli.tui.hint_input_queues")
+            return [('class:hint', "  " + t("cli.tui.hint_command_running", frame=frame, detail=detail))]
+        return []
+
+    def _tui_placeholder_text(self):
+        if self._voice_recording:
+            return t("cli.tui.placeholder_recording", shortcut=self._voice_record_key_label())
+        if self._voice_processing:
+            return t("cli.tui.placeholder_transcribing")
+        if self._sudo_state:
+            if (self._sudo_state.get("vault_save") or {}).get("step") == "identifier":
+                return t("cli.tui.placeholder_vault_username")
+            if self._sudo_state.get("vault_code"):
+                return t("cli.tui.placeholder_vault_code")
+            return t("cli.tui.placeholder_password")
+        if self._secret_state:
+            return t("cli.tui.placeholder_secret")
+        if self._approval_state:
+            return ""
+        if self._slash_confirm_state:
+            return t("cli.tui.placeholder_choice")
+        if self._clarify_freetext:
+            return t("cli.tui.placeholder_answer")
+        if self._clarify_state:
+            return ""
+        if self._command_running:
+            return f"{self._command_spinner_frame()} {self._command_status or t('cli.tui.placeholder_processing_command')}"
+        if self._agent_running:
+            return t("cli.tui.placeholder_busy")
+        if self._voice_mode:
+            return t("cli.tui.placeholder_voice_idle", shortcut=self._voice_record_key_label())
+        # Advertise a parked draft so the stash can never be silently forgotten.
+        try:
+            _stash_hint = self._prompt_stash.placeholder_hint()
+        except Exception:
+            _stash_hint = ""
+        if _stash_hint:
+            return _stash_hint
+        # Idle + empty composer: a task-oriented example chosen once per session
+        # (self._composer_placeholder) so it stays stable while being read, not flickering.
+        return getattr(self, "_composer_placeholder", "") or ""
+
+    def _get_stash_panel_display_fragments(self):
+        try:
+            _stash = self._prompt_stash
+            return self._render_stash_panel(
+                _stash.panel_rows(), _stash.panel_cursor, self._get_tui_terminal_width())
+        except Exception:
+            return []
+
+    def _tui_handle_voice_record(self, event):
+        """Toggle voice recording when voice mode is active.
+
+        Runs on prompt_toolkit's event-loop thread: any blocking call here (locks, sd.wait,
+        disk I/O) freezes the whole UI, so all heavy work goes to daemon threads.
+        """
+        from cli import _DIM, _RST, _cprint, logger
+        if not self._voice_mode:
+            return
+        if self._voice_recording:
+            # Always allow STOPPING (even while the agent runs); manual stop ends continuous
+            # mode. Flag clearing happens atomically inside _voice_stop_and_transcribe.
+            with self._voice_lock:
+                self._voice_continuous = False
+            event.app.invalidate()
+            threading.Thread(target=self._voice_stop_and_transcribe, daemon=True).start()
+            return
+        # Allow disarming continuous mode while the agent runs or transcribes — otherwise the
+        # user is stuck in an auto-restart loop until /voice off.
+        if self._agent_running or self._voice_processing:
+            with self._voice_lock:
+                self._voice_continuous = False
+            event.app.invalidate()
+            return
+        # Don't START recording during interactive prompts.
+        if (self._clarify_state or self._sudo_state or self._approval_state
+                or self._slash_confirm_state or self._connection_state):
+            return
+        # Cut TTS so the user can start talking: stop_playback() just terminates a subprocess;
+        # the stop event drains the streaming pipeline if one is live.
+        if not self._voice_tts_done.is_set():
+            try:
+                logger.info("TTS CUT: record key handler cutting TTS")
+                from tools.tts_streaming import mark_speech_interrupted
+                mark_speech_interrupted()
+                if self._voice_tts_stop is not None:
+                    self._voice_tts_stop.set()
+                from tools.voice_mode import stop_playback
+                stop_playback()
+                self._voice_tts_done.set()
+            except Exception:
+                pass
+        with self._voice_lock:
+            self._voice_continuous = True
+
+        # play_beep(sd.wait), AudioRecorder.start(lock) and config I/O must never block the loop.
+        def _start_recording():
+            try:
+                self._voice_start_recording()
+                if hasattr(self, '_app') and self._app:
+                    self._app.invalidate()
+            except Exception as e:
+                _cprint(f"\n{_DIM}{t('cli.tui.voice_recording_failed', error=e)}{_RST}")
+
+        threading.Thread(target=_start_recording, daemon=True).start()
+        event.app.invalidate()
+
+    def _tui_cancel_voice_recording(self, event) -> bool:
+        """Cancel an active recording; True when one was cancelled (caller stops there)."""
+        from cli import _DIM, _RST, _cprint
+        _recorder_ref = None
+        with self._voice_lock:
+            if self._voice_recording and self._voice_recorder:
+                _recorder_ref = self._voice_recorder
+                self._voice_recording = False
+                self._voice_continuous = False
+        if _recorder_ref is None:
+            return False
+        _cprint(f"\n{_DIM}{t('cli.tui.recording_cancelled')}{_RST}")
+        # cancel() may block on AudioRecorder._lock / CoreAudio — keep it off the event loop.
+        threading.Thread(target=_recorder_ref.cancel, daemon=True).start()
+        event.app.invalidate()
+        return True
+
+    def _tui_cancel_foreground_ui(self, event, *, closers) -> bool:
+        """Close the first active foreground UI (slash-confirm / picker / palette); True if any."""
+        for state_attr, close in closers:
+            if getattr(self, state_attr):
+                close()
+                event.app.current_buffer.reset()
+                event.app.invalidate()
+                return True
+        return False
+
+    def _tui_clear_blocking_overlays(self, event) -> bool:
+        """Clear every agent-blocking overlay (approval/clarify/sudo/secret) in one shot.
+
+        Callers must NOT return on True alone: they fall through so a stale/orphaned overlay
+        (left by an earlier interrupt) can't swallow the press before the agent-interrupt
+        branch, leaving the chat frozen (#14026).
+        """
+        if not (self._sudo_state or self._secret_state or self._approval_state
+                or self._clarify_state or self._connection_state):
+            return False
+        self._clear_active_overlays_for_interrupt()
+        event.app.current_buffer.reset()
+        event.app.invalidate()
+        return True
+
+    def _tui_clear_or_exit(self, event) -> None:
+        """Idle press: clear text/images like bash; exit when everything is already empty."""
+        if event.app.current_buffer.text or self._attached_images:
+            event.app.current_buffer.reset()
+            self._attached_images.clear()
+            event.app.invalidate()
+        else:
+            self._should_exit = True
+            event.app.exit()
+
+    def _tui_handle_ctrl_c(self, event):
+        """Ctrl+C priority: cancel voice recording → cancel foreground UI/overlay prompt →
+        interrupt the running agent (first press) → force exit (second press within 2s) → when
+        idle clear the draft or exit."""
+        now = time.time()
+        if self._tui_cancel_voice_recording(event):
+            return
+        if self._tui_cancel_foreground_ui(event, closers=(
+            ("_slash_confirm_state", lambda: self._submit_slash_confirm_response("cancel")),
+            ("_model_picker_state", self._close_model_picker),
+            ("_command_palette_state", self._close_command_palette))):
+            return
+        overlay_cleared = self._tui_clear_blocking_overlays(event)
+        if overlay_cleared and not (self._agent_running and self.agent):
+            return
+        if self._agent_running and self.agent:
+            if now - self._last_ctrl_c_time < 2.0:
+                print("\n" + t("cli.tui.force_exiting"))
+                self._should_exit = True
+                event.app.exit()
+                return
+            self._last_ctrl_c_time = now
+            print("\n" + t("cli.tui.interrupting_again_hint"))
+            request_hard_interrupt(self.agent)
+        else:
+            self._tui_clear_or_exit(event)
+
+    def _tui_handle_ctrl_q(self, event):
+        """Ctrl+Q: like Ctrl+C minus the double-press force exit (and it leaves the palette)."""
+        if self._tui_cancel_voice_recording(event):
+            return
+        if self._tui_cancel_foreground_ui(event, closers=(
+            ("_slash_confirm_state", lambda: self._submit_slash_confirm_response("cancel")),
+            ("_model_picker_state", self._close_model_picker))):
+            return
+        overlay_cleared = self._tui_clear_blocking_overlays(event)
+        if overlay_cleared and not (self._agent_running and self.agent):
+            return
+        if self._agent_running and self.agent:
+            print("\n" + t("cli.tui.interrupting"))
+            request_hard_interrupt(self.agent)
+        else:
+            self._tui_clear_or_exit(event)
+
+    def _tui_make_clarify_number_handler(self, idx):
+        def handler(event):
+            state = self._clarify_state
+            if not state or self._clarify_freetext:
+                return
+            choices = state.get("choices") or []
+            if idx > len(choices):
+                return
+            # Multi-select: number keys toggle checkboxes (incl. "Other") instead of submitting.
+            if state.get("multi_select"):
+                indices = state.get("selected_indices", set())
+                indices.symmetric_difference_update({idx})
+                event.app.invalidate()
+                return
+            if idx == len(choices):
+                # "Other" → freetext
+                self._clarify_freetext = True
+            else:
+                # Lock the numbered choice for the active question only.
+                self._clarify_batch_lock(state, choices[idx])
+            event.app.invalidate()
+        return handler
+
+    def _tui_restore_stash_payload(self, event, payload) -> None:
+        """Put a popped (text, images) payload back into the composer."""
+        if not payload:
+            return
+        text, images = payload
+        buf = event.app.current_buffer
+        buf.text = text
+        buf.cursor_position = len(text)
+        # Extend rather than replace attachments: the user may have attached something new since
+        # the stash was taken and dropping it silently would be data loss.
+        for img in images or ():
+            if img not in self._attached_images:
+                self._attached_images.append(img)
+
+    def _tui_handle_stash_panel_up(self, event):
+        self._prompt_stash.move_cursor(-1)
+        event.app.invalidate()
+
+    def _tui_handle_stash_panel_down(self, event):
+        self._prompt_stash.move_cursor(1)
+        event.app.invalidate()
+
+    def _tui_handle_stash_panel_delete(self, event):
+        """D in the browse panel discards the highlighted draft."""
+        self._prompt_stash.delete_at_cursor()
+        event.app.invalidate()
+
+    def _tui_handle_stash_panel_close(self, event):
+        self._prompt_stash.close_panel()
+        event.app.invalidate()
+
+    def _tui_handle_tab(self, event):
+        """Tab: accept the open completion, else the ghost auto-suggestion, else start completions.
+
+        After accepting a provider like 'anthropic:' the menu closes and complete_while_typing
+        doesn't fire (no keystroke); re-triggering here makes stage-2 models appear immediately.
+        """
+        buf = event.current_buffer
+        if buf.complete_state:
+            completion = buf.complete_state.current_completion
+            if completion is None:
+                # Menu open but nothing selected — select first then grab it
+                buf.go_to_completion(0)
+                completion = buf.complete_state and buf.complete_state.current_completion
+            if completion is None:
+                return
+            buf.apply_completion(completion)
+        elif buf.suggestion and buf.suggestion.text:
+            buf.insert_text(buf.suggestion.text)
+        else:
+            buf.start_completion()
+
+    def _tui_handle_double_escape(self, event):
+        """Double ESC discards the draft and attached images (Claude Code / Gemini CLI gesture).
+
+        Works while the agent streams — the gap Ctrl+C leaves (it interrupts the turn and only
+        clears the draft when idle). The draft is appended to history first so Up recalls it,
+        which is what makes a reflex key safe. Single ESC is the Alt-sequence prefix
+        (escape+enter/g/v) so the escape-timeout keeps those distinct; modal prompts bind ESC
+        eagerly and are excluded so cancel still wins.
+        """
+        buf = event.app.current_buffer
+        if not (buf.text or self._attached_images):
+            return
+        buf.reset(append_to_history=bool(buf.text))
+        self._attached_images.clear()
+        event.app.invalidate()
+
+    def _tui_handle_ignored_terminal_sequence(self, event):
+        """Consume parser-level ignored terminal sequences before self-insert.
+
+        hermes_cli.pt_input_extras registers focus reports (CSI I / CSI O) as Keys.Ignore at the
+        VT100 parser; without this no-op binding the default self-insert would still land the
+        bytes in the buffer. Focus-in additionally schedules a rate-limited full repaint: while
+        hidden, the emulator may have coalesced output or repainted, so prompt_toolkit's
+        incremental diff would stack a fresh prompt chrome on the stale one (#60920, #25337).
+        """
+        try:
+            for press in getattr(event, "key_sequence", None) or ():
+                if getattr(press, "data", None) == "\x1b[I":
+                    self._schedule_focus_regain_redraw()
+                    break
+        except Exception:
+            pass
+        return None
+
+    def _tui_handle_escape_modal(self, event):
+        """ESC cancels active secret/sudo/connection/slash-confirm prompts."""
+        if self._connection_state:
+            self._connection_cancel()
+            event.app.current_buffer.reset()
+            event.app.invalidate()
+        elif self._secret_state:
+            self._cancel_secret_capture()
+            event.app.current_buffer.reset()
+            event.app.invalidate()
+        elif self._sudo_state:
+            self._sudo_state["response_queue"].put("")
+            self._sudo_state = None
+            event.app.invalidate()
+        elif self._slash_confirm_state:
+            self._submit_slash_confirm_response("cancel")
+            event.app.current_buffer.reset()
+            event.app.invalidate()
+
+    def _tui_handle_ctrl_z(self, event):
+        """Ctrl+Z suspends the process (Unix only)."""
+        from cli import _DIM, _RST, _cprint
+        if sys.platform == 'win32':
+            _cprint(f"\n{_DIM}{t('cli.tui.suspend_unsupported')}{_RST}")
+            event.app.invalidate()
+            return
+        import signal as _sig
+        from prompt_toolkit.application import run_in_terminal
+        from hermes_cli.skin_engine import get_active_skin
+        agent_name = get_active_skin().get_branding("agent_name", "Hermes Agent")
+        msg = "\n" + t("cli.tui.suspended", agent_name=agent_name)
+
+        def _suspend():
+            os.write(1, msg.encode())
+            os.kill(0, _sig.SIGTSTP)
+        run_in_terminal(_suspend)
+
+    def _tui_handle_ctrl_d(self, event):
+        """Ctrl+D deletes under the cursor (readline); exits only on empty input, like bash/zsh.
+        Pending attached images count as input so the user doesn't lose them silently."""
+        buf = event.app.current_buffer
+        if buf.text:
+            buf.delete()
+        elif not self._attached_images:
+            self._should_exit = True
+            event.app.exit()
+
+    def _tui_recall_without_recollapse(self, buf, move):
+        """Run a history move with paste-collapse suppressed.
+
+        Recalled history can hold the full text of a paste collapsed at submit time; loading it
+        back looks like a fresh large paste to ``_on_text_changed``. If the move didn't change the
+        text (plain cursor movement) the flag is cleared so a later real paste still collapses.
+        """
+        before = buf.text
+        self._skip_paste_collapse = True
+        move()
+        if buf.text == before:
+            self._skip_paste_collapse = False
+
+    def _tui_handle_alt_v(self, event):
+        """Alt+V pastes an image from the clipboard. Alt combos pass through every terminal
+        (ESC + key), unlike Ctrl+V which terminals intercept — reliable on WSL2/VSCode/SSH.
+        Silent when no image (avoid noise on accidental press)."""
+        if self._try_attach_clipboard_image():
+            event.app.invalidate()
+
+    def _tui_handle_ctrl_v(self, event):
+        """Image paste for terminals without bracketed paste: GNOME Terminal/Konsole send raw
+        0x16. Terminals that intercept Ctrl+V (macOS Terminal, iTerm2, VSCode, Windows Terminal)
+        fire the bracketed-paste handler instead and never reach this."""
+        if self._try_attach_clipboard_image():
+            event.app.invalidate()
+
+    def _tui_handle_ctrl_l(self, event):
+        """Ctrl+L forces a clean repaint after terminal buffer drift (tmux/cmux tab switches,
+        ``clear`` from a subshell, SSH restores) that prompt_toolkit can't detect."""
+        self._force_full_redraw()
+
+    def _tui_insert_newline(self, event):
+        """Newline for multi-line input (Alt+Enter; Ctrl+J/Ctrl+Enter with multiline shortcuts).
+        Windows Terminal intercepts Alt+Enter (fullscreen) and delivers Ctrl+Enter as c-j."""
+        event.current_buffer.insert_text('\n')
+
+    def _tui_handle_open_in_editor(self, event):
+        """Ctrl+G (or Alt+G in VSCode/Cursor) opens the draft in an external editor."""
+        self._open_external_editor(event.current_buffer)
+
+    def _tui_connection_move(self, event, delta: int) -> None:
+        state = self._connection_state
+        if not state:
+            return
+        phase = state.get("phase")
+        if phase in {"form", "failed"}:
+            fields = state.get("fields") or []
+            current = state.get("field_index", 0)
+            if current < len(fields):
+                field = fields[current]
+                target_name = state.get("target", {}).get("name", "")
+                state["drafts"][target_name][field.get("name")] = event.app.current_buffer.text
+                state["field_index"] = min(len(fields), max(0, current + delta))
+            elif delta < 0 and fields:
+                state["field_index"] = len(fields) - 1
+            else:
+                state["selected"] = (state.get("selected", 0) + delta) % 2
+            self._connection_sync_input_buffer()
+        elif phase == "authorized":
+            state["selected"] = (state.get("selected", 0) + delta) % 2
+        self._paint_now()
+        event.app.invalidate()
+
+    def _tui_connection_up(self, event):
+        self._tui_connection_move(event, -1)
+
+    def _tui_connection_down(self, event):
+        self._tui_connection_move(event, 1)
+
+    def _tui_connection_side(self, event):
+        state = self._connection_state
+        if not state:
+            return
+        fields = state.get("fields") or []
+        if state.get("phase") == "authorized" or (
+            state.get("phase") in {"form", "failed"}
+            and state.get("field_index", 0) >= len(fields)
+        ):
+            state["selected"] = 1 - min(1, max(0, state.get("selected", 0)))
+            self._paint_now()
+            event.app.invalidate()
+
+    def _tui_model_picker_down(self, event):
+        state = self._model_picker_state
+        if not state:
+            return
+        if state.get("stage") == "provider":
+            max_idx = len(state.get("providers") or [])
+        elif state.get("stage") == "reasoning":
+            from hermes_cli.cli_model_switch_mixin import _picker_reasoning_rows
+            max_idx = len(_picker_reasoning_rows()) + 1  # + Back + Cancel
+ 

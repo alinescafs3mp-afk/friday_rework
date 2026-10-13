@@ -1,0 +1,100 @@
+ >= deadline:
+            return False, handle
+
+
+def _describe_lock_holder(record) -> str:
+    """Human-readable holder identity for deferral warnings."""
+    if not isinstance(record, dict) or "pid" not in record:
+        return "unknown (no holder record; pre-fix writer or non-Hermes)"
+    age = ""
+    with contextlib.suppress(TypeError, ValueError):
+        if record.get("acquired_at") is not None:
+            age = f", acquired {time.time() - float(record['acquired_at']):.0f}s ago"
+    return f"pid {record.get('pid')}{age}"
+
+
+def _acquire_msvcrt_lock(lock_path, handle, timeout):
+    """Windows counterpart of ``_acquire_db_flock`` (no orphan break); same True / False / None contract."""
+    import msvcrt
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except (BlockingIOError, OSError) as exc:
+            if not is_advisory_lock_contention(exc):
+                logger.warning("Could not acquire FTS rebuild lock %s (%s) — deferring on a non-contention error.",
+                               lock_path, exc)
+                return None
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_FTS_REBUILD_LOCK_POLL_SECONDS)
+
+
+@contextlib.contextmanager
+def fts_rebuild_admission(db_path, *, timeout_seconds=None):
+    """Serialize full structural FTS rebuilds on *db_path* across processes.  Yields True when this process
+    holds the authority, False when the bounded acquire timed out or the lock file could not be opened: the
+    caller must NOT rebuild (fail closed; the stale breadcrumb guarantees a retry).  ``db_path`` None
+    (in-memory) yields True.  In-process retries pass ``timeout_seconds=0`` so a live holder never stalls a
+    long-lived writer; the orphan break still applies."""
+    if db_path is None:
+        yield True
+        return
+    timeout = _FTS_REBUILD_LOCK_TIMEOUT_SECONDS if timeout_seconds is None else max(float(timeout_seconds), 0.0)
+    lock_path = f"{db_path}.fts_rebuild.lock"
+    try:
+        handle = open(lock_path, "a+b")
+    except OSError as exc:
+        # Fail closed like a timed-out acquire: an unopenable lock file means the FS is out of
+        # space/inodes/descriptors and a sibling that opened earlier may still be rebuilding — yielding True
+        # gave every process on a full disk a concurrent rebuild.  Deferring is free: the breadcrumb retries.
+        logger.warning("Could not open FTS rebuild lock %s (%s) — deferring this rebuild "
+                       "rather than running it without cross-process authority.", lock_path, exc)
+        yield False
+        return
+    acquired = False
+    try:
+        if _IS_WINDOWS:
+            acquired = _acquire_msvcrt_lock(lock_path, handle, timeout)
+        else:
+            acquired, handle = _acquire_db_flock(
+                lock_path, handle, timeout, _FTS_REBUILD_LOCK_POLL_SECONDS, "FTS rebuild lock")
+        if acquired is None:
+            # Already logged with the real errno; "held by another process" would be a lie.
+            acquired = False
+        elif not acquired:
+            record = None if _IS_WINDOWS else _read_lock_holder_record(handle)
+            if timeout <= 0:
+                # Non-blocking probe from an in-process retry: keep it quiet.
+                logger.info("FTS rebuild lock %s is busy — deferring this retry "
+                            "(the stale-FTS breadcrumb keeps it retryable). Recorded holder: %s.",
+                            lock_path, _describe_lock_holder(record))
+            else:
+                logger.warning("FTS rebuild lock %s held by another process for more than %.0fs — deferring "
+                               "this rebuild to avoid racing the holder (the stale-FTS breadcrumb keeps it "
+                               "retryable). Recorded holder: %s.", lock_path, timeout, _describe_lock_holder(record))
+        yield acquired
+    finally:
+        try:
+            with contextlib.suppress(OSError):  # best-effort release
+                if acquired and _IS_WINDOWS:
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                elif acquired:
+                    import fcntl
+                    _clear_lock_holder_record(handle)
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _json_or(raw: Any, fallback: Any, warning: str) -> Any:
+    """``json.loads(raw)``; on failure log *warning* and return *fallback*."""
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning(warning)
+        return fallback

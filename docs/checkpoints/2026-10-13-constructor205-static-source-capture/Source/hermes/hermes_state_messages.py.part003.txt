@@ -1,0 +1,144 @@
+,)).fetchall()
+                if [int(r[0]) for r in active_rows] != expected_active_ids:
+                    raise RuntimeError("active transcript changed before the rewind could be persisted")
+            row = conn.execute(
+                "SELECT * FROM messages WHERE id = ? AND session_id = ?", (target_message_id, session_id)).fetchone()
+            if row is None:
+                raise ValueError(f"message {target_message_id} not found in session {session_id}")
+            target_row = dict(row)
+            if target_row.get("role") != "user":
+                raise ValueError(
+                    f"rewind target must be a 'user' message (got role={target_row.get('role')!r}, id={target_message_id})")
+            replacement = None
+            if preserve_compaction_handoff or expected_target_content is not None:
+                replacement = self._split_rewind_target(target_row, expected_target_content, preserve_compaction_handoff)
+            ids = [r[0] for r in conn.execute("SELECT id FROM messages WHERE session_id = ? AND id >= ? AND active = 1",
+                                             (session_id, target_message_id)).fetchall()]
+            if ids:
+                conn.execute(f"UPDATE messages SET active = 0 WHERE id IN ({_placeholders(ids)})", ids)
+            if replacement is not None:
+                self._insert_message_rows(conn, session_id, [replacement])  # stamps _row_id and message_uid
+            conn.execute(
+                "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1 WHERE id = ?", (session_id,))
+            message_count, tool_call_count = self._active_transcript_counts(conn, session_id)
+            conn.execute(f"{_SET_COUNTERS_SQL} WHERE id = ?", (message_count, tool_call_count, session_id))
+            head_id = conn.execute(
+                "SELECT MAX(id) FROM messages WHERE session_id = ? AND active = 1", (session_id,)).fetchone()[0]
+            return target_row, ids, head_id, replacement
+        target_row, rewound, new_head_id, replacement = self._execute_write(_do)
+        # Decode for the prompt-buffer prefill without a second fallible DB operation.
+        target_row["content"] = self._decode_content(target_row.get("content"))
+        return {"rewound_count": len(rewound), "target_message": target_row, "new_head_id": new_head_id,
+                **({"replacement_message_id": replacement and replacement["_row_id"],
+                    "replacement_message_uid": replacement and message_uid_or_none(replacement)}
+                   if preserve_compaction_handoff else {})}
+
+    def message_count(self, session_id: str = None) -> int:
+        """Count messages, optionally for a specific session."""
+        sql = "SELECT COUNT(*) FROM messages" + (" WHERE session_id = ?" if session_id else "")
+        return self._read_one(sql, (session_id,) if session_id else ())[0]
+
+    def has_gateway_input_owner(self, session_id: str, owner: str) -> bool:
+        """Probe the accepted-input marker without allocating message bodies or archives."""
+        return self._read_one(
+            "SELECT 1 FROM messages WHERE session_id = ? AND role = 'user' "
+            "AND observed = 0 AND (active = 1 OR compacted = 1) "
+            "AND CASE WHEN json_valid(display_metadata) "
+            "THEN json_extract(display_metadata, '$.gateway_input_owner') END = ? LIMIT 1",
+            (session_id, owner)) is not None
+
+    def has_platform_message_id(self, session_id: str, platform_message_id: str) -> bool:
+        """True when *platform_message_id* exists (partial-index probe; the gateway's transient-failure dedupe).
+
+        Uses the idx_messages_platform_msg_id partial index for efficient lookup. Used by the gateway's
+        transient-failure dedupe guard (#47237) to skip re-persisting a user message that was already saved
+        on a prior retry of the same inbound platform message.
+        """
+        return self._read_one(
+            "SELECT 1 FROM messages WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
+            (session_id, platform_message_id)) is not None
+
+    def _is_explicit_fork_child_row(self, session: Dict[str, Any], *, include_reset: bool = False) -> bool:
+        """True when *session* is a branch, delegate, or tool child of its parent (``include_reset``: also a
+        reset fork). Markers only count when they point at ``parent_session_id``: compression copies
+        ``model_config`` onto the continuation, so presence-only matching would misclassify it (same binding
+        as ``_NON_CONTINUATION_CHILD_FILTER_SQL``)."""
+        if session.get("source") == "tool":
+            return True
+        cfg = session.get("model_config")
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg)
+            except json.JSONDecodeError:
+                return False
+        if not isinstance(cfg, dict):
+            return False
+        markers = (cfg.get("_branched_from"), cfg.get("_delegate_from"))
+        if include_reset:
+            markers += (cfg.get("_reset_from"),)
+        parent_id = session.get("parent_session_id")
+        return parent_id in markers if parent_id else any(m is not None for m in markers)
+
+    def is_explicit_fork_child(self, session_id: str) -> bool:
+        """Read-only :meth:`_is_explicit_fork_child_row`; a missing row is not a fork (prompt_cache_scope keeps
+        a declared conversation key from crossing the fork boundary)."""
+        session = self.get_session(session_id)
+        return bool(session and self._is_explicit_fork_child_row(session))
+
+    def latest_conversation_boundary(self, session_key: str, source: str) -> Optional[int]:
+        """Conversation boundaries (``_RESET_END_REASONS`` ends) this peer has crossed, or ``None`` if never
+        reset. The peer is ``(session_key, source)``, never the key alone (an API caller may legally reuse a
+        Telegram row's key). Read from ``conversation_generations`` (advanced in each boundary's txn), not an
+        aggregate over session rows: deletes/prunes would re-emit a retired pair. Rows are never GC'd
+        (dropping one re-issues generation 1: the ABA this prevents). Wall-clock-free, so a backwards NTP
+        correction cannot reorder it. DBs upgraded mid-conversation take their first generation from the
+        next boundary written (a pre-upgrade reset shares its predecessor's scope once: costs a warm
+        prompt-cache bucket, never crosses an identity)."""
+        if not session_key or not source:
+            return None
+        row = self._read_one(
+            "SELECT generation FROM conversation_generations WHERE source = ? AND session_key = ?",
+            (source, session_key))
+        generation = int(row["generation"]) if row is not None and row["generation"] is not None else 0
+        return generation if generation > 0 else None
+
+    def clear_messages(self, session_id: str) -> None:
+        """Delete all messages for a session and reset its counters."""
+        def _do(conn):
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute(_RESET_COUNTERS_SQL, (session_id,))
+        self._execute_write(_do)
+
+    def purge_stale_tool_call_markers(self, *, dry_run: bool = False, backup: bool = True) -> Dict[str, Any]:
+        """Permanently clear bare tool-call marker content ("[memory]") left by pre-fix sessions
+        (``_rows_to_conversation`` repairs it in memory; this stops the re-scan). Only ``content`` is touched.
+        ``backup``: ``VACUUM INTO`` snapshot first (none when nothing changes)."""
+        from hermes_state import _STALE_TOOL_CALL_MARKER_RE
+        def _find_affected(conn) -> List[int]:
+            cursor = conn.execute("SELECT id, content FROM messages "
+                "WHERE role = 'assistant' AND tool_calls IS NOT NULL AND tool_calls != ''")
+            return [row["id"] for row in cursor.fetchall()
+                if isinstance(row["content"], str) and _STALE_TOOL_CALL_MARKER_RE.fullmatch(row["content"].strip())]
+        def _result(affected, backup_path=None):
+            return {"dry_run": dry_run, "rows_affected": len(affected), "row_ids": affected, "backup_path": backup_path}
+        with self._read_ctx() as conn:
+            affected_ids = _find_affected(conn)
+        if dry_run or not affected_ids:
+            return _result(affected_ids)
+        backup_path: Optional[str] = None
+        if backup:
+            import datetime
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = str(self.db_path.with_name(f"{self.db_path.name}.pre-clean-markers-backup-{stamp}"))
+            with self._lock:
+                self._conn.execute("VACUUM INTO ?", (backup_path,))
+            logger.info("Backed up state.db to %s before clean-markers write", backup_path)
+        def _do(conn):
+            ids = _find_affected(conn)
+            if ids:
+                conn.execute(f"UPDATE messages SET content = '' WHERE id IN ({_placeholders(ids)})", ids)
+            return ids
+        affected_ids = self._execute_write(_do)
+        if affected_ids:
+            logger.info("Permanently cleared %d stale tool-call marker row(s) in state.db (#78148)", len(affected_ids))
+        return _result(affected_ids, backup_path)

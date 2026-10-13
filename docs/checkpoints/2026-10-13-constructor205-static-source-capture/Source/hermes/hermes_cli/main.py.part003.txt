@@ -1,0 +1,863 @@
+getattr(args, "since", None),
+        component=getattr(args, "component", None),
+    )
+
+
+def cmd_console(args):
+    """Open the safe Hermes command console."""
+    from hermes_cli.console_engine import run_console_repl
+
+    return run_console_repl()
+
+
+# Top-level subcommands known WITHOUT plugin discovery (which costs 500ms+ of
+# eager plugin imports). Keep in sync with the add_parser calls in
+# _build_cli_parser: a missing entry only costs a one-time discovery; an extra
+# entry would let a plugin command silently fail to parse.
+_BUILTIN_SUBCOMMANDS = frozenset(
+    {
+        "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "codex-runtime", "completion",
+        "computer-use",
+        "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
+        "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
+        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
+        "journey", "memory-graph", "learning",
+        "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
+        "project", "proxy",
+        "prompt-size",
+        "resume",
+        "send", "sessions", "setup",
+        "skin", "skills", "slack", "status", "tools", "uninstall", "update",
+        "usage", "vault",
+        "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
+        "browser",
+        "verify",
+        # Plugin commands missing from top-level --help is an accepted trade-off.
+        "help",
+    }
+)
+
+
+def _first_positional_argv() -> str | None:
+    """First non-flag, non-flag-value token in ``sys.argv[1:]`` (skips values of known flags).
+
+    Not a full argparse simulation: an unknown ``--foo bar`` may classify
+    ``bar`` as positional, which at worst forces a one-time plugin discovery.
+    """
+    from hermes_cli._parser import command_argv
+
+    args = command_argv(sys.argv[1:])
+    return args[0] if args else None
+
+
+def _plugin_cli_discovery_needed() -> bool:
+    """True when the CLI might be invoking a plugin-registered subcommand.
+
+    False skips plugin discovery at argparse setup (~500-650ms). An unknown
+    first token could be a plugin command OR a chat prompt — either way
+    discovery is needed; for a prompt its cost amortizes over the agent run.
+    """
+    first = _first_positional_argv()  # None = bare ``hermes`` → chat
+    return first is not None and first not in _BUILTIN_SUBCOMMANDS
+
+
+def _resolve_deferred_platform_cli_command(command_name: str | None) -> None:
+    """Materialize the deferred platform whose top-level CLI command matches.
+
+    Bundled platforms are *deferred* entries (no gateway SDK imports at
+    startup), so a platform's ``register_cli_command`` side effect only runs
+    on import; ``discover_plugins()`` alone leaves ``hermes photon`` failing
+    with ``invalid choice``. Importing just the matching platform keeps
+    startup cheap.
+
+    On the unknown-top-level-command slow path, ``discover_plugins()`` records the deferred loader but does
+    not import it, so the CLI registration never happens and ``hermes photon`` fails with argparse ``invalid
+    choice`` (issue #54678).
+    """
+    if not command_name:
+        return
+    try:
+        from gateway.platform_registry import platform_registry
+
+        platform_registry.get(command_name)
+    except Exception as exc:
+        logging.getLogger(__name__).debug(
+            "Deferred platform CLI resolution failed for %s: %s",
+            command_name,
+            exc,
+        )
+
+
+_AGENT_COMMANDS = {None, "chat", "acp", "rl"}
+_AGENT_SUBCOMMANDS = {
+    "cron": ("cron_command", {"run", "tick"}),
+    "gateway": ("gateway_command", {"run"}),
+    "mcp": ("mcp_action", {"serve"}),
+}
+
+
+def _is_tui_chat_launch(args) -> bool:
+    if getattr(args, "tui", False) or os.environ.get("HERMES_TUI") == "1":
+        return True
+    # The chat path decides TUI-vs-classic via _resolve_use_tui (--cli/--tui
+    # flags, TTY gate, HERMES_TUI env, display.interface config). Bare
+    # `hermes`/`hermes chat` with a TUI display config was previously missed
+    # here, so the wrapper pre-warmed its own MCP discovery while the TUI
+    # gateway (spawned moments later) ran a second one — an idle stdio MCP
+    # server copy held dead for the whole session. Only chat commands can
+    # launch the TUI; other commands (mcp serve, gateway, acp, cron) keep
+    # their own discovery behavior untouched.
+    if getattr(args, "command", None) not in {None, "chat"}:
+        return False
+    return _resolve_use_tui(args)
+
+
+def _agent_subcommand_selected(args) -> bool:
+    """True for ``cron run/tick``, ``gateway run``, ``mcp serve`` (see _AGENT_SUBCOMMANDS)."""
+    _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
+    return bool(_sub_attr and getattr(args, _sub_attr, None) in _sub_set)
+
+
+def _command_has_dedicated_mcp_startup(args) -> bool:
+    """acp / gateway run / cron run|tick own their MCP startup on the runtime path."""
+    return args.command == "acp" or (
+        args.command != "mcp" and _agent_subcommand_selected(args)
+    )
+
+
+def _should_background_mcp_startup(args) -> bool:
+    return not _is_tui_chat_launch(args) and args.command in {None, "chat", "rl"}
+
+
+def _prepare_agent_startup(args) -> None:
+    """Discover plugins/MCP/hooks for commands that can run an agent turn."""
+    if getattr(args, "command", None) in {None, "chat"}:
+        check_cli_args(args)
+    # --yolo chokepoint: HERMES_YOLO_MODE must be set before any discovery
+    # below imports tools.approval, which freezes _YOLO_MODE_FROZEN at import.
+    # main() sets it earlier too, but other launchers (Termux fast-CLI) reach
+    # here directly, so the guarantee lives where the import is triggered.
+    # See #7994.
+    if getattr(args, "command", None) in {None, "chat"}:
+        check_cli_args(args)
+    if getattr(args, "yolo", False):
+        os.environ["HERMES_YOLO_MODE"] = "1"
+    _apply_safe_mode(args)
+    _apply_user_config_bypass(args)
+    _guard_noninteractive_user_config(args)
+
+    if not (args.command in _AGENT_COMMANDS or _agent_subcommand_selected(args)):
+        return
+
+    _accept_hooks = bool(getattr(args, "accept_hooks", False))
+    if not _is_tui_chat_launch(args):
+        # The TUI backend does its own discovery; the launcher only spawns Node.
+        try:
+            from hermes_cli.plugins import start_background_plugin_discovery
+
+            # Daemon thread: ~150ms of manifest scanning overlaps the rest of
+            # startup. Every synchronous reader goes through discover_plugins(),
+            # which joins this thread first (incl. model_tools at import time).
+            start_background_plugin_discovery()
+        except Exception:
+            logger.warning(
+                "plugin discovery failed at CLI startup",
+                exc_info=True,
+            )
+    # -t/--toolsets narrows which configured MCP servers get spawned, on
+    # every discovery path (inline below, background thread, TUI/desktop
+    # deferred start). Built-in toolset names never match a server key, so
+    # `-t terminal` simply spawns nothing; `-t all` keeps the full set.
+    try:
+        from hermes_cli.mcp_startup import set_mcp_server_filter
+
+        set_mcp_server_filter(getattr(args, "toolsets", None))
+    except Exception:
+        logger.debug("MCP server filter setup failed", exc_info=True)
+
+    # TUI launches hand off to a startup path that backgrounds MCP discovery
+    # with a bounded join; acp/gateway/cron do their own on the runtime path.
+    _run_inline_mcp_discovery = not (
+        _is_tui_chat_launch(args) or _command_has_dedicated_mcp_startup(args)
+    )
+    if _run_inline_mcp_discovery and _should_background_mcp_startup(args):
+        try:
+            from hermes_cli.mcp_startup import start_background_mcp_discovery
+
+            start_background_mcp_discovery(
+                logger=logger,
+                thread_name="cli-mcp-discovery",
+            )
+        except Exception:
+            logger.debug(
+                "Background MCP tool discovery failed at CLI startup",
+                exc_info=True,
+            )
+        _run_inline_mcp_discovery = False
+    if _run_inline_mcp_discovery:
+        try:  # synchronous for entrypoints without a later bounded startup path
+            from hermes_cli.mcp_startup import get_mcp_server_filter
+            from tools.mcp_tool_discovery import discover_mcp_tools
+
+            _mcp_filter = get_mcp_server_filter()
+            if _mcp_filter is None:
+                discover_mcp_tools()
+            else:
+                discover_mcp_tools(allowed_mcp_names=_mcp_filter)
+        except Exception:
+            logger.debug(
+                "MCP tool discovery failed at CLI startup",
+                exc_info=True,
+            )
+    try:
+        from hermes_cli.config import load_config
+        from agent.shell_hooks import register_from_config
+
+        _hooks_cfg = load_config()
+        register_from_config(_hooks_cfg, accept_hooks=_accept_hooks)
+
+        from agent.outbound_webhooks import (
+            register_from_config as register_outbound_webhooks,
+        )
+
+        register_outbound_webhooks(_hooks_cfg)
+    except Exception:
+        logger.debug(
+            "shell-hook registration failed at CLI startup",
+            exc_info=True,
+        )
+
+
+def _apply_safe_mode(args) -> None:
+    if not getattr(args, "safe_mode", False):
+        return
+    os.environ["HERMES_SAFE_MODE"] = "1"
+    os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+    os.environ["HERMES_IGNORE_RULES"] = "1"
+
+
+def _apply_user_config_bypass(args) -> None:
+    """Apply the explicit config bypass before any startup config reads."""
+    if getattr(args, "ignore_user_config", False):
+        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+
+
+def _guard_noninteractive_user_config(args) -> None:
+    """Fail closed before a non-interactive invocation initializes providers."""
+    if getattr(args, "_noninteractive_config_validated", False):
+        return
+
+    is_noninteractive = (
+        bool(getattr(args, "oneshot", None))
+        or bool(getattr(args, "query", None))
+    )
+    if not is_noninteractive:
+        return
+
+    from hermes_cli.config import (
+        InvalidUserConfigError,
+        require_parseable_user_config,
+    )
+
+    try:
+        require_parseable_user_config(
+            ignore_user_config=bool(
+                getattr(args, "ignore_user_config", False)
+                or getattr(args, "safe_mode", False)
+            )
+        )
+    except InvalidUserConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    setattr(args, "_noninteractive_config_validated", True)
+
+
+def _set_chat_arg_defaults(args) -> None:
+    """Fill the chat-parser attrs cmd_chat reads when chat was not parsed."""
+    for attr, default in [
+        ("query", None),
+        ("model", None),
+        ("provider", None),
+        ("toolsets", None),
+        ("verbose", False),
+        ("resume", None),
+        ("continue_last", None),
+        ("worktree", False),
+    ]:
+        if not hasattr(args, attr):
+            setattr(args, attr, default)
+
+
+def _run_oneshot_from_args(args) -> None:
+    """Top-level --oneshot / -z: single-shot mode, stdout = final response only.
+
+    Bypasses cli.py entirely; _run_and_exit_oneshot never returns.
+    """
+    check_cli_args(args)
+    _confirm_startup_expensive_model_override(args)
+    # -z honors --resume/-c/--in exactly like chat (#105892): normalize BEFORE the
+    # oneshot exit path takes over, else the flags parse fine but silently do nothing
+    # and the turn starts a fresh session (every wire request loses all history).
+    _resolve_chat_session_args(args, use_tui=False)
+    _run_and_exit_oneshot(
+        args.oneshot,
+        model=getattr(args, "model", None),
+        provider=getattr(args, "provider", None),
+        toolsets=getattr(args, "toolsets", None),
+        skills=getattr(args, "skills", None),
+        usage_file=getattr(args, "usage_file", None),
+        resume=getattr(args, "resume", None),
+        reasoning=getattr(args, "reasoning", None),
+    )
+
+
+def _light_chat_parser():
+    """Top-level + chat parser only (no subcommand tree); chat dispatches to cmd_chat."""
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, _subparsers, chat_parser = build_top_level_parser()
+    chat_parser.set_defaults(func=cmd_chat)
+    return parser
+
+
+def _promote_top_level_resume(args) -> None:
+    """Top-level --resume/--continue with no subcommand is a chat shortcut."""
+    if (args.resume or args.continue_last) and args.command is None:
+        args.command = "chat"
+
+
+def _try_fast_serve_launch() -> bool:
+    """Dispatch an unambiguous built-in ``serve`` without the full CLI tree.
+
+    Desktop runs this on every cold start; building every other parser costs
+    thousands of filesystem-backed lookups on Windows. Unknown or global
+    arguments fall back to normal parsing so error reporting is unchanged.
+    """
+    if os.environ.get("HERMES_DISABLE_FAST_SERVE_LAUNCH") == "1":
+        return False
+
+    argv = sys.argv[1:]
+    if not argv or argv[0] != "serve" or "-h" in argv or "--help" in argv:
+        return False
+
+    # Container routing is top-level policy and must run before host dispatch.
+    try:
+        from hermes_cli.config import get_container_exec_info
+
+        if get_container_exec_info():
+            return False
+    except Exception:
+        return False
+
+    parser = build_serve_parser(
+        cmd_dashboard=cmd_dashboard,
+        add_help=False,
+        exit_on_error=False,
+    )
+    try:
+        args, unknown = parser.parse_known_args(argv[1:])
+    except (argparse.ArgumentError, ValueError):
+        return False
+    if unknown:
+        return False
+
+    cmd_dashboard(args)
+    return True
+
+
+def _try_fast_chat_launch() -> bool:
+    """Fast path for unambiguous interactive chat launches (all hosts).
+
+    Building all ~40 subcommand parsers costs ~140ms the chat path never
+    uses. Bails out (False) whenever the invocation is not certainly a chat
+    launch — subcommand positional, ``--help``, unknown flags. Mirrors
+    ``_try_termux_fast_cli_launch`` minus the Termux deferred startup; kept
+    separate so phone-tuned behavior doesn't leak to desktops.
+    """
+    if os.environ.get("HERMES_DISABLE_FAST_CHAT_LAUNCH") == "1":
+        return False
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        return False
+    # Container routing must win: NixOS container mode forwards EVERY invocation.
+    try:
+        from hermes_cli.config import get_container_exec_info
+        if get_container_exec_info():
+            return False
+    except Exception:
+        return False
+    # TUI launches keep full dispatch outside Termux (own startup path).
+    if _wants_tui_early(argv):
+        return False
+    if _first_positional_argv() not in {None, "chat"}:
+        return False
+
+    parser = _light_chat_parser()
+    try:
+        args, unknown = parser.parse_known_args(_coalesce_session_name_args(argv))
+    except SystemExit:
+        return False
+    if unknown:  # plugin subcommand or full-parser-only flag → full dispatch
+        return False
+    if getattr(args, "version", False):
+        return False
+    if getattr(args, "command", None) not in {None, "chat"}:
+        return False
+
+    if getattr(args, "command", None) in {None, "chat"}:
+        check_cli_args(args)
+    if getattr(args, "yolo", False):
+        os.environ["HERMES_YOLO_MODE"] = "1"
+    _prepare_agent_startup(args)
+
+    if getattr(args, "oneshot", None):
+        _run_oneshot_from_args(args)
+
+    _promote_top_level_resume(args)
+    _set_chat_arg_defaults(args)
+    cmd_chat(args)
+    return True
+
+
+def _try_termux_fast_cli_launch() -> bool:
+    """Run obvious Termux non-TUI chat/oneshot/version paths on a light parser."""
+    if not _is_termux_startup_environment():
+        return False
+    if os.environ.get("HERMES_TERMUX_DISABLE_FAST_CLI") == "1":
+        return False
+
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        return False
+    if _wants_tui_early(argv):  # TUI fast path / full dispatch owns those
+        return False
+
+    if _startup_fast.is_global_fast_version_argv(argv):
+        _print_version_info(check_updates=True)
+        return True
+
+    first = _first_positional_argv()
+    has_oneshot = any(
+        arg == "-z" or arg == "--oneshot" or arg.startswith("--oneshot=")
+        for arg in argv
+    )
+    if not has_oneshot and first not in {None, "chat"}:
+        return False
+
+    parser = _light_chat_parser()
+    args = parser.parse_args(_coalesce_session_name_args(argv))
+
+    if getattr(args, "version", False):
+        _print_version_info(check_updates=True)
+        return True
+
+    if getattr(args, "oneshot", None):
+        _prepare_agent_startup(args)
+        _run_oneshot_from_args(args)
+
+    _promote_top_level_resume(args)
+    if args.command in {None, "chat"}:
+        _set_chat_arg_defaults(args)
+        interactive_prompt = not getattr(args, "query", None) and not getattr(args, "image", None)
+        if interactive_prompt:
+            # Reach the prompt first; agent-only discovery on the first turn.
+            setattr(args, "compact", True)
+            os.environ["HERMES_DEFER_AGENT_STARTUP"] = "1"
+            os.environ["HERMES_FAST_STARTUP_BANNER"] = "1"
+            if getattr(args, "accept_hooks", False):
+                os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+        else:
+            _prepare_agent_startup(args)
+        cmd_chat(args)
+        return True
+
+    return False
+
+
+def _try_termux_fast_tui_launch() -> bool:
+    """Launch obvious Termux TUI invocations before building every subparser.
+
+    `hermes --tui` is the hot path on phones and the TUI immediately execs
+    Node, so the full parser's command-module imports are pure waste there.
+    """
+    if not _is_termux_startup_environment():
+        return False
+
+    if "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
+        return False
+
+    wants_tui = _wants_tui_early(sys.argv[1:])
+    if not wants_tui:
+        return False
+
+    first = _first_positional_argv()
+    if first not in {None, "chat"}:
+        return False
+
+    parser = _light_chat_parser()
+    args = parser.parse_args(_coalesce_session_name_args(sys.argv[1:]))
+
+    # Preserve top-level behaviours whose semantics are not "launch chat/TUI".
+    if getattr(args, "version", False) or getattr(args, "oneshot", None):
+        return False
+    if getattr(args, "command", None) not in {None, "chat"}:
+        return False
+    if not _resolve_use_tui(args):
+        return False
+
+    cmd_chat(args)
+    return True
+
+
+def _advertise_agent_env() -> None:
+    """Advertise the agent harness to child processes.
+
+    ``AI_AGENT`` is the cross-agent standard (huggingface_hub reads it); the
+    value must be our id in the public agent-harness registry
+    (``hermes-agent``) — matching is exact. ``HERMES_AGENT`` is the
+    Hermes-specific marker. setdefault: never clobber an outer harness.
+
+    ``AI_AGENT`` is the emerging cross-agent standard (huggingface_hub's agent detection reads it; pi and
+    other agents set it — earendil-works/pi#7493) so generic tooling can attribute subprocesses to the
+    harness that spawned them. Hermes running inside another agent's terminal).
+    """
+    os.environ.setdefault("AI_AGENT", "hermes-agent")
+    os.environ.setdefault("HERMES_AGENT", "true")
+
+
+def _attach_plugin_cli_command(subparsers, cmd_info) -> None:
+    """Register one plugin-provided top-level command from its descriptor."""
+    plugin_parser = subparsers.add_parser(
+        cmd_info["name"],
+        help=cmd_info["help"],
+        description=cmd_info.get("description", ""),
+        formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
+    )
+    cmd_info["setup_fn"](plugin_parser)
+    if cmd_info.get("handler_fn") is not None:
+        plugin_parser.set_defaults(func=cmd_info["handler_fn"])
+
+
+def _register_plugin_cli_commands(subparsers) -> None:
+    """Register plugin-provided top-level commands (each plugin builds its own argparse tree).
+
+    Skipped when the invocation targets a known built-in — eagerly importing
+    every bundled plugin module costs 500-650ms.
+    """
+    if not _plugin_cli_discovery_needed():
+        return
+    try:
+        from plugins.memory import discover_plugin_cli_commands
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        seen_plugin_commands = set()
+        for cmd_info in discover_plugin_cli_commands():
+            _attach_plugin_cli_command(subparsers, cmd_info)
+            seen_plugin_commands.add(cmd_info["name"])
+
+        discover_plugins()
+        # The invoked platform may still be a deferred entry; import it so its
+        # register_cli_command side effect runs before we read _cli_commands.
+        # See #54678.
+        _resolve_deferred_platform_cli_command(_first_positional_argv())
+        for cmd_info in get_plugin_manager()._cli_commands.values():
+            if cmd_info["name"] not in seen_plugin_commands:
+                _attach_plugin_cli_command(subparsers, cmd_info)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
+
+
+def _cmd_sessions_lazy(args, **kwargs):
+    """``hermes sessions`` handler; sessions_cmd imports only when the subcommand runs."""
+    from hermes_cli.sessions_cmd import cmd_sessions
+
+    return cmd_sessions(args, **kwargs)
+
+
+def _build_cli_parser():
+    """Build the full ``hermes`` argparse tree -> ``(parser, subparsers)``.
+
+    Registration ORDER is the ``hermes --help`` order; keep it stable. Groups
+    live in ``hermes_cli/subcommands/<group>.py`` with handlers injected so
+    those modules never import main.
+    """
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, subparsers, chat_parser = build_top_level_parser()
+    chat_parser.set_defaults(func=cmd_chat)
+
+    build_model_parser(subparsers, cmd_model=cmd_model)
+    build_moa_parser(subparsers)
+    build_fallback_parser(subparsers)
+    build_worktree_parser(subparsers)
+    build_browser_parser(subparsers)
+    build_secrets_parser(subparsers)
+    # OUTBOUND egress firewall; ``hermes proxy`` (gateway group) is the INBOUND one.
+    build_egress_parser(subparsers)
+    build_migrate_parser(subparsers)
+    build_codex_runtime_parser(subparsers)
+    build_gateway_parser(
+        subparsers, cmd_gateway=cmd_gateway, cmd_proxy=cmd_proxy, cmd_gateway_enroll=cmd_gateway_enroll
+    )
+
+    # LSP is optional — a registration failure must not break the CLI.
+    try:
+        from agent.lsp.cli import register_subparser as _lsp_register
+        _lsp_register(subparsers)
+    except Exception as _lsp_err:  # noqa: BLE001
+        logger.debug("LSP CLI registration failed: %s", _lsp_err)
+
+    build_setup_parser(subparsers, cmd_setup=cmd_setup)
+    build_whatsapp_parser(subparsers, cmd_whatsapp=cmd_whatsapp)
+    build_whatsapp_cloud_parser(subparsers, cmd_whatsapp_cloud=cmd_whatsapp_cloud)
+    build_slack_parser(subparsers, cmd_slack=cmd_slack)
+
+    from hermes_cli.send_cmd import register_send_subparser
+    register_send_subparser(subparsers)
+
+    build_login_parser(subparsers, cmd_login=cmd_login)
+    build_logout_parser(subparsers, cmd_logout=cmd_logout)
+    build_auth_parser(subparsers, cmd_auth=cmd_auth)
+    build_status_parser(subparsers, cmd_status=cmd_status)
+    build_pause_parser(subparsers)
+    build_cron_parser(subparsers, cmd_cron=cmd_cron)
+    build_webhook_parser(subparsers, cmd_webhook=cmd_webhook)
+
+    from hermes_cli.subcommands.peer import build_peer_parser
+    build_peer_parser(subparsers)
+
+    from hermes_cli.portal_cli import add_parser as _add_portal_parser
+    _add_portal_parser(subparsers)
+
+    from hermes_cli.kanban import build_parser as _build_kanban_parser
+    _build_kanban_parser(subparsers).set_defaults(func=cmd_kanban)
+
+    from hermes_cli.projects_cmd import build_parser as _build_project_parser
+    _build_project_parser(subparsers).set_defaults(func=cmd_project)
+
+    build_hooks_parser(subparsers, cmd_hooks=cmd_hooks)
+    build_doctor_parser(subparsers, cmd_doctor=cmd_doctor)
+    build_verify_parser(subparsers, cmd_verify=cmd_verify)
+    build_security_parser(subparsers, cmd_security=cmd_security)
+    build_approvals_parser(subparsers, cmd_approvals=cmd_approvals)
+    build_dump_parser(subparsers, cmd_dump=cmd_dump)
+    build_debug_parser(subparsers, cmd_debug=cmd_debug)
+    build_backup_parser(subparsers, cmd_backup=cmd_backup)
+    build_checkpoints_parser(subparsers)
+    build_import_cmd_parser(subparsers, cmd_import=cmd_import)
+    build_import_agent_parser(subparsers, cmd_import_agent=cmd_import_agent)
+    build_config_parser(subparsers, cmd_config=cmd_config)
+    build_skin_parser(subparsers, cmd_skin=cmd_skin)
+    build_console_parser(subparsers, cmd_console=cmd_console)
+    build_pairing_parser(subparsers, cmd_pairing=cmd_pairing)
+    build_skills_parser(subparsers, cmd_skills=cmd_skills)
+    build_bundles_parser(subparsers)
+    build_plugins_parser(subparsers, cmd_plugins=cmd_plugins)
+
+    _register_plugin_cli_commands(subparsers)
+
+    build_curator_parser(subparsers)
+    build_pets_parser(subparsers)
+    build_journey_parser(subparsers)
+    build_memory_parser(subparsers, cmd_memory=cmd_memory)
+    build_tools_parser(subparsers, cmd_tools=cmd_tools)
+    build_computer_use_parser(subparsers)
+    build_mcp_parser(subparsers, cmd_mcp=cmd_mcp)
+    build_sessions_parser(subparsers, cmd_sessions=_cmd_sessions_lazy)
+    build_insights_parser(subparsers, cmd_insights=cmd_insights)
+    build_usage_parser(subparsers)
+    build_monitoring_parser(subparsers, cmd_monitoring=cmd_monitoring)
+    build_claw_parser(subparsers, cmd_claw=cmd_claw)
+    build_vault_parser(subparsers)
+    build_update_parser(subparsers, cmd_update=cmd_update)
+    build_uninstall_parser(subparsers, cmd_uninstall=cmd_uninstall)
+    build_acp_parser(subparsers, cmd_acp=cmd_acp)
+    build_profile_parser(subparsers, cmd_profile=cmd_profile)
+    build_completion_parser(subparsers, cmd_completion=cmd_completion, parser=parser)
+    build_dashboard_parser(
+        subparsers,
+        cmd_dashboard=cmd_dashboard,
+        cmd_dashboard_register=cmd_dashboard_register,
+    )
+    # "desktop" is canonical (Hermes-Setup.exe tells users to run it, so it
+    # must be the name --help shows); "gui" is a deprecated alias.
+    build_gui_parser(subparsers, cmd_gui=cmd_gui)
+    build_logs_parser(subparsers, cmd_logs=cmd_logs)
+    build_prompt_size_parser(subparsers, cmd_prompt_size=cmd_prompt_size)
+    return parser, subparsers
+
+
+def _parse_cli_args(parser, subparsers, argv):
+    """Parse ``argv`` with the bpo-9338 subparser-routing workaround.
+
+    On Python <3.11 argparse fails to route subcommand tokens when the parent
+    has nargs='?' optionals (--continue): "unrecognized arguments: model". When
+    argv holds a known subcommand token, set subparsers.required=True to force
+    routing; if that fails (``hermes -c model`` — 'model' is the session name)
+    fall back to the default behaviour.
+    """
+    import io as _io
+
+    _processed_argv = _coalesce_session_name_args(argv)
+    _known_cmds = (
+        set(subparsers.choices.keys()) if hasattr(subparsers, "choices") else set()
+    )
+    _has_cmd_token = any(
+        t in _known_cmds for t in _processed_argv if not t.startswith("-")
+    )
+    if not _has_cmd_token:
+        subparsers.required = False
+        return parser.parse_args(_processed_argv)
+
+    subparsers.required = True
+    _saved_stderr = sys.stderr
+    try:
+        sys.stderr = _io.StringIO()
+        args = parser.parse_args(_processed_argv)
+        sys.stderr = _saved_stderr
+    except SystemExit as exc:
+        sys.stderr = _saved_stderr
+        if exc.code == 0:  # help/version already printed; don't print twice
+            raise
+        # Subcommand consumed as a flag value (e.g. -c model): normal parse.
+        subparsers.required = False
+        args = parser.parse_args(_processed_argv)
+    return args
+
+
+def _default_to_chat(args) -> None:
+    """No subcommand given: run chat."""
+    _promote_top_level_resume(args)
+    _set_chat_arg_defaults(args)
+    cmd_chat(args)
+
+
+def main():
+    """Main entry point for hermes CLI."""
+    _set_process_title()
+    _warn_if_unsupervised_pid1()
+    _advertise_agent_env()
+
+    # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
+    try:
+        from hermes_cli.stdio import configure_windows_stdio
+        configure_windows_stdio()
+    except Exception:
+        pass
+    # A non-UTF-8 locale that the package import had to repair would crash Python children the
+    # same way. Only on that host, so a healthy UTF-8 locale keeps its children untouched.
+    from hermes_cli import _stdio_repaired
+    if _stdio_repaired:
+        os.environ.setdefault("PYTHONUTF8", "1")
+        os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+    # One TLS authority: trust the OS store before any outbound call resolves a
+    # CA bundle (agent/ssl_verify.py). Never raises; False just means OpenSSL's paths.
+    from agent.ssl_verify import install_truststore
+
+    install_truststore()
+
+    # Sweep stale ``hermes.exe.old.*`` quarantine files from previous Windows
+    # updates. No-op elsewhere.
+    try:
+        _cleanup_quarantined_exes()
+    except Exception:
+        pass
+
+    # Checkout changed since last launch → sweep stale __pycache__ once so no
+    # process resolves fresh source against old bytecode. Never raises.
+    _sweep_stale_bytecode_if_checkout_changed()
+
+    # Dependency recovery already ran before imports. Report any fleet restart
+    # still owed by a previous update without restarting services here.
+    if "update" not in sys.argv[1:]:
+        try:
+            from hermes_cli.update_cmd_fleet import _warn_pending_fleet_restart_on_startup
+
+            _warn_pending_fleet_restart_on_startup()
+        except Exception:
+            pass
+
+    if _first_positional_argv() != "update":
+        from hermes_cli.boot_bootstrap import maybe_run_boot_bootstrap
+        from pm.paths import install_root
+        maybe_run_boot_bootstrap(install_root())
+
+    # Every dispatch, including fast chat/serve, gets one passive PM verdict.
+    try:
+        from hermes_cli.venv_sync import check_runtime
+        from pm.paths import install_root
+
+        problem = check_runtime(install_root())
+        if problem:
+            print(f"⚠ {problem}", file=sys.stderr)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).debug("pm startup check failed", exc_info=True)
+
+    if _try_termux_fast_tui_launch():
+        return
+    if _try_termux_fast_cli_launch():
+        return
+    if _try_fast_serve_launch():
+        return
+    if _try_fast_chat_launch():
+        return
+
+    parser, subparsers = _build_cli_parser()
+
+    # NixOS container mode routes ALL invocations into the managed container.
+    # MUST run before parse_args() so --help, unrecognised flags and every
+    # subcommand are forwarded instead of intercepted by argparse on the host.
+    from hermes_cli.config import get_container_exec_info
+
+    container_info = get_container_exec_info()
+    if container_info:
+        from hermes_cli.main_container import exec_in_container
+
+        exec_in_container(container_info, sys.argv[1:])
+        sys.exit(1)  # unreachable: execvp replaces the process or raises
+
+    args = _parse_cli_args(parser, subparsers, sys.argv[1:])
+
+    if args.version:
+        cmd_version(args)
+        return
+
+    # --yolo must be set *before* plugin discovery: tools.approval freezes
+    # _YOLO_MODE_FROZEN at import; set later (inside cmd_chat) it does nothing.
+    if getattr(args, "command", None) in {None, "chat"}:
+        check_cli_args(args)
+    if getattr(args, "command", None) in {None, "chat"}:
+        check_cli_args(args)
+    if getattr(args, "yolo", False):
+        os.environ["HERMES_YOLO_MODE"] = "1"
+
+    # Plugin discovery + shell hooks once, gated so introspection commands
+    # (hooks list, cron list, gateway status, ...) pay no discovery cost and
+    # trigger no consent prompts for hooks the user is still inspecting.
+    _prepare_agent_startup(args)
+
+    if getattr(args, "oneshot", None):
+        _run_oneshot_from_args(args)
+
+    from hermes_cli.observability.shared_metrics_disabled import set_process_surface
+    set_process_surface(args.command)
+    # No subcommand (optionally with top-level --resume / --continue) → chat.
+    if args.command is None:
+        _default_to_chat(args)
+        return
+
+    # A handler's int return code becomes the exit code (None = success).
+    if hasattr(args, "func"):
+        rc = args.func(args)
+        if isinstance(rc, int) and rc != 0:
+            sys.exit(rc)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

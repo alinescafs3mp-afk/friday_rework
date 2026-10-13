@@ -1,0 +1,496 @@
+ # switch and display paths used to fall back to 128K despite the user having a per-model context_length
+    # set. See #15779.
+    # Not gated on custom_providers: callers that never load the route list pass None and the
+    # helper self-resolves it from config (#69807).
+    if base_url and model:
+        with contextlib.suppress(Exception):  # fall through to probing
+            from hermes_cli.config import get_custom_provider_context_length
+            cp_ctx = get_custom_provider_context_length(model=model, base_url=base_url, custom_providers=custom_providers)
+            if cp_ctx:
+                return cp_ctx
+    return None
+
+
+def _resolve_provider_aware_context_length(model: str, base_url: str, api_key: str, provider: str, effective_provider: str) -> Optional[int]:
+    """Step 5: provider-specific sources, tried in order; None when all miss."""
+    # 5a. Copilot live /models — account-specific models (claude-opus-4.6-1m) absent from
+    # models.dev, and the provider-enforced limit for the rest.
+    if effective_provider in {"copilot", "copilot-acp", "github-copilot"}:
+        with contextlib.suppress(Exception):  # fall through to models.dev
+            from hermes_cli.models import get_copilot_model_context
+            ctx = get_copilot_model_context(model, api_key=api_key)
+            if ctx:
+                return ctx
+    # 5b/5c. Nous portal and Codex OAuth (lower limits than the direct API for the same slug; its
+    # own /models is authoritative). Persist ONLY the authoritative source ("portal" / "live"): an
+    # OR-fallback or static-table value cached on a blip would be frozen in by step 1 forever.
+    sourced = {
+        "nous": lambda: _resolve_nous_context_length(model, base_url=base_url or "", api_key=api_key or "") + ("portal",),
+        "openai-codex": lambda: _resolve_codex_oauth_context_length_with_source(model, access_token=api_key or "", base_url=base_url or "") + ("live",),
+    }.get(effective_provider)
+    if sourced is not None:
+        ctx, source, persist_on = sourced()
+        if ctx:
+            if base_url and source == persist_on:
+                save_context_length(model, base_url, ctx)
+            return ctx
+    if effective_provider in {"gmi", "commandcode", "commandcode-anthropic"} and base_url:
+        # GMI and CommandCode expose authoritative context_length via /models (e.g. muse-spark 1M) but are
+        # not in models.dev, and as known providers they skip step 2's probe — else they fell to 256K.
+        ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        if ctx is not None:
+            return ctx
+    # 5e. Ollama native /api/show for any base_url that is not a known non-Ollama provider (there
+    # the POST always 404s and cost ~300ms on the first turn).
+    if base_url:
+        inferred = _infer_provider_from_url(base_url)
+        ctx = _query_ollama_api_show(model, base_url, api_key=api_key) if inferred is None or "ollama" in inferred else None
+        if ctx is not None:
+            _save_unless_skipped(model, base_url, ctx, provider)
+            return ctx
+    # 5f. OpenRouter live /models — authoritative for OR-routed models, so it must win over models.dev
+    # and the family catch-all (a brand-new slug would otherwise fall to the generic "claude": 200K).
+    if effective_provider == "openrouter":
+        or_ctx = (fetch_model_metadata().get(model) or {}).get("context_length")
+        # Guard against the known OpenRouter Kimi-family 32k underreport.
+        if isinstance(or_ctx, int) and or_ctx > 0 and not (or_ctx == 32768 and _model_name_suggests_kimi(model)):
+            return or_ctx
+    if effective_provider:
+        from agent.models_dev import lookup_models_dev_context
+        ctx = lookup_models_dev_context(effective_provider, model)
+        if ctx:
+            # MiniMax M3: models.dev reports 512K but actual context is 1M — prefer the hardcoded catalog.
+            catalog = DEFAULT_CONTEXT_LENGTHS.get("minimax-m3") if _model_name_suggests_minimax_m3(model) else None
+            if catalog and ctx < catalog:
+                logger.info("Rejecting models.dev context=%s for %r (MiniMax-M3 underreport); using hardcoded default %s", ctx, model, f"{catalog:,}")
+                ctx = catalog
+            return ctx
+    return None
+
+
+def get_model_context_length(
+    model: str, base_url: str = "", api_key: str = "", config_context_length: int | None = None,
+    provider: str = "", custom_providers: list | None = None,
+) -> int:
+    """Context length for a model. Resolution order: 0 config override / MoA aggregator /
+    model_overrides / custom_providers / endpoint-scoped; 1 persistent cache (Nous, LM
+    Studio, Codex OAuth bypass it) and Bedrock; 2-3 custom endpoints (/models, local
+    probe, Ollama); 4 Anthropic /v1/models (API keys only); 5 provider-aware (Copilot,
+    Nous, Codex OAuth, GMI, Ollama, OpenRouter live, models.dev); 6 OpenRouter for
+    unknown providers; 7 local server; 8 hardcoded defaults; 9 256K fallback."""
+    # 0. Explicit config override — user knows best
+    if isinstance(config_context_length, int) and config_context_length > 0:
+        return config_context_length
+    if (provider or "").strip().lower() == "moa":
+        ctx = _resolve_moa_context_length(model, custom_providers)
+        if ctx is not None:
+            return ctx
+    ctx = _config_override_context_length(model, base_url, provider, custom_providers)
+    if ctx is not None:
+        return ctx
+    # Malformed URLs (unmatched IPv6 bracket) make urllib.parse raise; treat them as unknown so
+    # the inference layer reports the configuration error itself.
+    if base_url:
+        try:
+            _ = urlparse(_normalize_base_url(base_url)).port
+        except ValueError:
+            base_url = ""
+    # A blank model id would fuzzy-match an arbitrary catalog entry (`"" in key` is vacuously
+    # true) and persist it under a junk "@<base_url>" cache key.
+    if not str(model or "").strip():
+        logger.info("No model id provided for context length resolution — defaulting to %s tokens.", f"{DEFAULT_FALLBACK_CONTEXT:,}")
+        return DEFAULT_FALLBACK_CONTEXT
+    model = _strip_provider_prefix(model)  # "local:x" -> "x"; Ollama "model:tag" colons preserved
+    # OpenRouter routing variants (":nitro", ":floor", ...) are request-time
+    # modifiers, not catalog entries — resolve the window from the BASE id.
+    # Deliberately placed AFTER the explicit config overrides above (0b/0c) so
+    # a user who pinned the fully-suffixed id keeps winning, and BEFORE every
+    # cache/catalog lookup below so the base's real window is found instead of
+    # a generic family default. Mirrors the validation path's base/suffix split
+    # in hermes_cli.models.validate_requested_model.
+    model = _strip_openrouter_routing_variant(model, base_url=base_url, provider=provider)
+    # Endpoint-scoped metadata goes AHEAD of the persistent cache so a value learned on a
+    # multiplexed provider's other endpoint cannot override it.
+    endpoint_context = _endpoint_scoped_context_length(model, base_url)
+    if endpoint_context is not None:
+        return endpoint_context
+    # A profile that qualifies its own bound (external processes have no /models probe) wins
+    # over the generic caches below; explicit user/endpoint overrides above still take precedence.
+    from providers import get_provider_profile
+    profile = get_provider_profile(provider)
+    context = profile.get_model_context_length(model) if profile else None
+    if type(context) is int and context > 0:
+        return context
+    is_bedrock_context = _is_bedrock_context(base_url, provider)
+    # A Codex Responses route is keyed on its transport, not its host: behind a proxy
+    # (HERMES_CODEX_BASE_URL, model.base_url, custom api_mode: codex_responses) the URL looks
+    # generic while the window is still the Codex OAuth one (#116191).
+    codex_route = _is_codex_route(provider, base_url, custom_providers)
+    # 1. Persistent cache (LM Studio / Codex routes excluded — see _skip_persistent_context_cache).
+    cached = get_cached_context_length(model, base_url) if base_url and not is_bedrock_context and not codex_route and not _skip_persistent_context_cache(base_url, provider) else None
+    validated = _validate_cached_context_length(model, base_url, cached, api_key=api_key) if cached is not None else None
+    if validated is not None:
+        return validated
+    # 1b. AWS Bedrock. Must run BEFORE the custom-endpoint step: bedrock-runtime.* is not in
+    # _URL_TO_PROVIDER and would fail the /models probe into the default.
+    ctx = _resolve_bedrock_context_length(model, base_url) if is_bedrock_context else None
+    if ctx is not None:
+        return ctx
+    if provider == "novita" or (base_url and base_url_host_matches(base_url, "api.novita.ai")):
+        ctx = _resolve_endpoint_context_length(model, base_url or "https://api.novita.ai/openai/v1", api_key=api_key)
+        if ctx is not None:
+            if base_url:
+                save_context_length(model, base_url, ctx)
+            return ctx
+    # 2. Live /models for truly custom endpoints. Known providers skip this: their /models may
+    # report a provider-imposed limit (Copilot: 128k) rather than the window. The native
+    # openai-codex provider skips it too even on a proxy URL — step 5 runs its live catalog probe.
+    if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url) and (provider or "").strip().lower() != "openai-codex":
+        resolve = _resolve_custom_codex_route_context_length if codex_route else _resolve_custom_endpoint_context_length
+        return resolve(model, base_url, api_key, provider)
+    # 4. Anthropic /v1/models API (only for regular API keys, not OAuth)
+    if provider == "anthropic" or (base_url and base_url_hostname(base_url) == "api.anthropic.com"):
+        ctx = _query_anthropic_context_length(model, base_url or "https://api.anthropic.com", api_key)
+        if ctx:
+            return ctx
+    # 5. Provider-aware lookups — before the generic OR cache, since the same model has
+    # different limits per provider. Generic providers are inferred from the URL.
+    effective_provider = provider
+    if base_url and (not effective_provider or effective_provider in {"openrouter", "custom"}):
+        effective_provider = _infer_provider_from_url(base_url) or effective_provider
+    ctx = _resolve_provider_aware_context_length(model, base_url, api_key, provider, effective_provider)
+    if ctx is not None:
+        return ctx
+    # 6. OpenRouter metadata, provider-unaware fallback — only when the provider is unknown (OR
+    # data is community-maintained); 32K underreport guard.
+    if not effective_provider:
+        metadata = fetch_model_metadata()
+        if model in metadata:
+            or_ctx = metadata[model].get("context_length", DEFAULT_FALLBACK_CONTEXT)
+            if or_ctx == 32768 and _model_name_suggests_stale_32k_underreport(model):
+                logger.info("Rejecting OpenRouter metadata context=%s for %r (known 32K underreport); falling through to hardcoded defaults", or_ctx, model)
+            else:
+                return or_ctx
+    # 7. Local server before hardcoded defaults — ``Hermes-3-Llama-3.1-70B`` matches ``llama``
+    # (131072) even when vLLM runs at a lower ``--max-model-len``.
+    local_ctx = _probe_local_context_length(model, base_url, api_key, provider) if base_url and is_local_endpoint(base_url) else None
+    if local_ctx:
+        return local_ctx
+    # 8. Hardcoded defaults: `key in model` only — the reverse would let "claude-sonnet-4" match "claude-sonnet-4-6" and return 1M.
+    hit = _longest_key_match(DEFAULT_CONTEXT_LENGTHS, model.lower())
+    if hit:
+        return hit[1]
+    # 9. Default fallback — warn (deduped) so small-context models don't silently get 256K.
+    _warn_context_length_fallback(model, base_url)
+    return DEFAULT_FALLBACK_CONTEXT
+
+
+async def get_model_context_length_async(model: str, base_url: str = "", api_key: str = "", config_context_length: int | None = None, provider: str = "", custom_providers: list | None = None) -> int:
+    """get_model_context_length on a worker thread (its blocking HTTP would stall the event loop)."""
+    import asyncio
+    return await asyncio.to_thread(
+        get_model_context_length, model, base_url=base_url, api_key=api_key,
+        config_context_length=config_context_length, provider=provider, custom_providers=custom_providers)
+
+
+# CJK/Hangul/Kana codepoints (~1 token each), counted in one C-level regex pass: Hangul
+# Jamo (+Ext-A), CJK radicals/ideographs (+compat), Hangul syllables, fullwidth/halfwidth.
+# Rough chars-per-token ratio for ASCII text; the single source for every "N tokens ≈ N*4 chars"
+# budget conversion (context files, tool-output budgets, whisper prompt cap, compressor metadata).
+CHARS_PER_TOKEN = 4
+
+_CJK_DENSE_RE = re.compile("[\u1100-\u11ff\u2e80-\u9fff\ua960-\ua97f\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]")
+
+
+def _is_cjk_token_dense_char(ch: str) -> bool:
+    return _CJK_DENSE_RE.fullmatch(ch) is not None
+
+
+def estimate_tokens_rough(text: str) -> int:
+    """Rough token estimate: CJK/Hangul/Kana codepoints ~1 token each; everything else ceil(UTF-8 bytes/4).
+    Ceiling keeps short texts from estimating 0. Runs on every preflight walk, so all-ASCII stays O(1).
+
+    Byte-counting (not chars) is the corrective for non-CJK, non-ASCII text: Cyrillic/Greek/Arabic are 2
+    bytes/char so count ~chars/2, matching real BPE cost (~2-3 chars/token) where chars/4 under-counted
+    ~2x and let sessions ride the provider ceiling below the compaction threshold. Calibrated vs
+    cl100k/o200k/Qwen2.5 (estimate/real): Russian 0.67->1.24, Arabic 0.53->0.96, Hindi 0.34->0.90,
+    Greek 0.37->0.68; accented Latin barely moves (French 1.02->1.03). errors="replace": lone surrogates
+    (routine in tool output; see message_sanitization) must not turn an estimate into a raise."""
+    if not text:
+        return 0
+    text = str(text)
+    if text.isascii():  # flag check on CPython; ASCII cannot contain token-dense CJK
+        return (len(text) + 3) // CHARS_PER_TOKEN
+    stripped = _CJK_DENSE_RE.sub("", text)
+    dense = len(text) - len(stripped)
+    return dense + ((len(stripped.encode("utf-8", "replace")) + 3) // CHARS_PER_TOKEN)
+
+
+def estimate_messages_tokens_rough(messages: List[Dict[str, Any]], *, charge_stale_thinking: bool = True) -> int:
+    """Rough token estimate for a message list (pre-flight only). Images cost the per-image price
+    learned from provider usage (``agent.image_token_cost``; flat default before calibration)
+    rather than their base64 length. ``charge_stale_thinking=False`` mirrors the tail-budget
+    walk (``context_compressor._estimate_msg_budget_tokens``): on non-echo routes stale reasoning
+    rides the wire only for the NEWEST assistant turn, so excluding it keeps the compaction TRIGGER
+    in the same size class as the walk — otherwise reasoning-heavy sessions fire preflight forever."""
+    from agent.image_token_cost import current_image_token_cost
+
+    image_cost = current_image_token_cost()
+    if not charge_stale_thinking:
+        messages = _strip_stale_thinking_for_estimate(messages)
+    return sum(_estimate_message_tokens_cached(msg, image_cost) for msg in messages)
+
+
+def estimate_native_anthropic_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
+    """Estimate native Anthropic messages with replayed readable thinking charged exactly once."""
+    from agent.message_sanitization import native_anthropic_accounting_projection
+
+    projected, replayed_thinking = native_anthropic_accounting_projection(messages)
+    return estimate_messages_tokens_rough(projected) + sum(
+        estimate_tokens_rough(text) for text in replayed_thinking
+    )
+
+
+def estimate_native_anthropic_request_tokens_rough(
+    messages: List[Dict[str, Any]], *, system_prompt: str = "",
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """Request estimate for native Anthropic; opaque replay bytes never enter text accounting."""
+    from agent.message_sanitization import native_anthropic_accounting_projection
+
+    projected, replayed_thinking = native_anthropic_accounting_projection(messages)
+    return estimate_request_tokens_rough(
+        projected, system_prompt=system_prompt, tools=tools
+    ) + sum(estimate_tokens_rough(text) for text in replayed_thinking)
+
+
+# Thinking-text keys replayed for at most the newest assistant turn on non-echo routes — must stay
+# in lockstep with ``context_compressor._NEWEST_TURN_ONLY_BUDGET_KEYS``.
+_STALE_THINKING_ESTIMATE_KEYS = ("reasoning", "reasoning_content")
+
+
+def _strip_stale_thinking_for_estimate(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Copy of ``messages`` with stale thinking keys removed (newest kept). Shallow stripped copies
+    share the original value objects, so the per-message memo still hits for the stripped shape."""
+    def _is_assistant(m: Any) -> bool:
+        return isinstance(m, dict) and m.get("role") == "assistant"
+    newest = next((i for i in range(len(messages) - 1, -1, -1) if _is_assistant(messages[i])), -1)
+    return [
+        {k: v for k, v in m.items() if k not in _STALE_THINKING_ESTIMATE_KEYS}
+        if i != newest and _is_assistant(m) and any(m.get(k) for k in _STALE_THINKING_ESTIMATE_KEYS) else m
+        for i, m in enumerate(messages)
+    ]
+
+
+# Per-message token-estimate memo keyed by an exact value fingerprint: strings by ``id()`` AND
+# pinned (strong ref in the entry, so the id can't be reused and immutability makes id-equality
+# value-equality); numbers/bools/None by value; dicts/lists structurally in key order (``str(shadow)``
+# depends on it); any other type aborts the memo. api_messages shallow-copies dicts but shares the strings.
+# ``estimate_messages_tokens_rough`` is called on the full history every loop iteration (conversation_loop
+# preflight), repeatedly during compaction telemetry, and inside an O(n^2) shrink loop in moa_loop. The
+# per-message helpers are pure functions of the message's value, so a memo keyed on a fingerprint that
+# uniquely determines the value is exactly equivalent. Fingerprint design (soundness argument): While the
+# entry lives, that id cannot be reused by another object, so id-equality implies object-equality — strings
+# are immutable, so value-equality too (no #50372-style aliasing). Equal fingerprints therefore imply
+# deep-equal messages built from identical immutable leaves ⇒ identical ``str(shadow)`` bytes ⇒ identical
+# estimate. Because the api_messages build shallow-copies history dicts each iteration, the copies share the
+# same content strings — so unchanged history messages hit the memo even though the outer dicts are fresh
+# objects every turn.
+_MSG_TOKENS_CACHE: Dict[Any, Tuple[list, int, int]] = {}  # pins, text tokens, image count
+_MSG_TOKENS_CACHE_MAX = 4096
+
+
+def _msg_fingerprint(value: Any, pins: list) -> Any:
+    if value is None or value is True or value is False:
+        return value
+    t = type(value)
+    if t is str:
+        pins.append(value)
+        return ("s", id(value))
+    if t is int or t is float:
+        return ("n", t.__name__, value)
+    if t is dict:
+        return ("d", tuple((_msg_fingerprint(k, pins), _msg_fingerprint(v, pins)) for k, v in value.items()))
+    if t is list or t is tuple:
+        return ("l" if t is list else "t", tuple(_msg_fingerprint(v, pins) for v in value))
+    raise ValueError("unfingerprintable message value")
+
+
+def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
+    """Text tokens + images x ``image_cost``; the memo holds text and image COUNT so a recalibrated
+    per-image price re-prices cached rows without invalidating them."""
+    def _compute() -> Tuple[int, int]:
+        return _estimate_message_tokens_without_images(msg), _count_image_tokens(msg, 1)
+    try:
+        pins: list = []
+        # Persistence-only fields (identity, timestamps, display metadata) never reach the estimate: keep them
+        # out of the key so stamping them neither costs a walk nor misses the memo.
+        key = _msg_fingerprint(
+            without_persistence_fields(msg) if type(msg) is dict else msg, pins)
+        hash(key)
+    except Exception:
+        text, images = _compute()
+        return text + images * image_cost
+    cached = _MSG_TOKENS_CACHE.get(key)
+    if cached is not None:
+        return cached[1] + cached[2] * image_cost
+    text, images = _compute()
+    tokens = text + images * image_cost
+    _MSG_TOKENS_CACHE[key] = (pins, text, images)
+    while len(_MSG_TOKENS_CACHE) > _MSG_TOKENS_CACHE_MAX:
+        try:
+            _MSG_TOKENS_CACHE.pop(next(iter(_MSG_TOKENS_CACHE)))
+        except (StopIteration, KeyError, RuntimeError):
+            break
+    return tokens
+
+
+def _count_parts(parts: Any, types: set) -> int:
+    return sum(1 for part in parts if isinstance(part, dict) and part.get("type") in types) if isinstance(parts, list) else 0
+
+
+_IMAGE_PART_TYPES = frozenset({"image", "image_url", "input_image"})
+
+
+def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
+    """Count image-like content parts in a message; return their token cost."""
+    if not isinstance(msg, dict):
+        return 0
+    content = msg.get("content")
+    count = _count_parts(content, _IMAGE_PART_TYPES)
+    count += _count_parts(msg.get("_anthropic_content_blocks"), {"image"})
+    # Multimodal tool results that haven't been converted yet.
+    if isinstance(content, dict) and content.get("_multimodal"):
+        count += _count_parts(content.get("content"), {"image", "image_url"})
+    # Responses ``function_call_output`` items carry converted tool-result
+    # parts under ``output`` (the converter moves chat ``content`` there).
+    count += _count_parts(msg.get("output"), _IMAGE_PART_TYPES)
+    return count * cost_per_image
+
+
+def strip_opaque_replay_items(items: Any) -> Any:
+    """``codex_reasoning_items`` with ``encrypted_content`` blanked for local token estimation.
+    The ciphertext is priced by the provider's own count, never by its bytes (a compaction
+    checkpoint alone can be 5M chars, #100611); only real usage prices it."""
+    if not isinstance(items, list):
+        return items
+    return [
+        {k: ("" if k == "encrypted_content" else v) for k, v in item.items()} if isinstance(item, dict) else item
+        for item in items
+    ]
+
+
+def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Shadow of a message holding only what the provider actually receives.
+    * ``api_content`` SUBSTITUTES ``content`` (mirrors ``turn_context.substitute_api_content`` exactly):
+      only a non-empty STRING sidecar on a user/assistant row displaces content; substituting any
+      other shape would UNDERcount — the dangerous direction.
+    * Base64 images become a placeholder; ``_count_image_tokens`` charges them flat.
+    * ``reasoning`` never ships as-is (request builds pop it after optionally promoting it into
+      ``reasoning_content``); counting both inflated estimates up to +53%.
+    * Opaque provider blobs (``encrypted_content`` on codex reasoning / compaction items) are
+      ciphertext the provider prices by its OWN token count, never by bytes; a native compaction
+      checkpoint alone can be 5M chars (#100611). They contribute 0 here: only real usage ever
+      prices them, and the usage anchor carries that price forward."""
+    sidecar = msg.get("api_content")
+    sidecar_wins = isinstance(sidecar, str) and bool(sidecar) and msg.get("role") in ("user", "assistant")
+    _rc = msg.get("reasoning_content")
+    drop_reasoning_dup = isinstance(_rc, str) and bool(_rc.strip())
+    shadow: Dict[str, Any] = {}
+    for k, v in msg.items():
+        if k in ("_anthropic_content_blocks", "reasoning_details") or k in PERSISTENCE_ONLY_MESSAGE_FIELDS or (k == "reasoning" and drop_reasoning_dup):
+            continue
+        if k == "api_content":
+            if sidecar_wins:
+                shadow["content"] = v
+        elif k == "content" and sidecar_wins:
+            continue
+        elif k == "content" and isinstance(v, list):
+            shadow[k] = [
+                {"type": part.get("type"), "image": "[stripped]"}
+                if isinstance(part, dict) and part.get("type") in _IMAGE_PART_TYPES
+                else part
+                for part in v
+            ]
+        elif k == "content" and isinstance(v, dict) and v.get("_multimodal"):
+            shadow[k] = v.get("text_summary", "")
+        elif k == "output" and isinstance(v, list):
+            # Responses ``function_call_output`` output parts: strip the image
+            # payload like the ``content`` branch above so encoded bytes are
+            # priced by the flat per-image model, never as text.
+            shadow[k] = [
+                {"type": part.get("type"), "image": "[stripped]"}
+                if isinstance(part, dict) and part.get("type") in _IMAGE_PART_TYPES
+                else part
+                for part in v
+            ]
+        elif k == "codex_reasoning_items":
+            shadow[k] = strip_opaque_replay_items(v)
+        elif k == "encrypted_content":  # a Responses reasoning/compaction item passed as a row
+            shadow[k] = ""
+        else:
+            shadow[k] = v
+    return shadow
+
+
+def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:
+    """Token estimate for a message shadow with image payloads stripped."""
+    return estimate_tokens_rough(str(_wire_message_shadow(msg) if isinstance(msg, dict) else msg))
+
+
+def estimate_request_tokens_rough(
+    messages: List[Dict[str, Any]], *, system_prompt: str = "", tools: Optional[List[Dict[str, Any]]] = None, charge_stale_thinking: bool = True,
+) -> int:
+    """Rough token estimate for a full request: system prompt + messages + tool schemas (50+ tools
+    add 20-30K on their own). ``charge_stale_thinking`` is forwarded — pass False when the route
+    provably strips stale thinking (``message_sanitization.stale_thinking_reaches_wire``)."""
+    total = estimate_tokens_rough(system_prompt) if system_prompt else 0
+    if messages:
+        # Positional call: test seams and plugin engines monkeypatch estimate_messages_tokens_rough with (messages)-only signatures.
+        total += estimate_messages_tokens_rough(messages) if charge_stale_thinking else estimate_messages_tokens_rough(messages, charge_stale_thinking=False)
+    if tools:
+        total += _estimate_tools_tokens_rough(tools)
+    return total
+
+
+# Keyed by ``id(tools)``; bounded, oldest-first eviction. Repeated ``str(tools)`` on
+# large schemas stalls GUI event loops under GIL pressure.
+_TOOLS_TOKENS_CACHE: dict[int, Tuple[int, str, str, int]] = {}
+_TOOLS_TOKENS_CACHE_MAX = 256
+
+
+def _tool_name_for_cache(tool: Any) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    fn = tool.get("function")
+    name = fn.get("name") if isinstance(fn, dict) else None
+    name = name if isinstance(name, str) else tool.get("name")
+    return name if isinstance(name, str) else ""
+
+
+def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
+    if not tools:
+        return 0
+    key = id(tools)
+    signature = (len(tools), _tool_name_for_cache(tools[0]), _tool_name_for_cache(tools[-1]))
+    cached = _TOOLS_TOKENS_CACHE.get(key)
+    if cached is not None and cached[:3] == signature:
+        return cached[3]
+    # Sum the major schema fields (descriptions + parameters dominate).
+    total_chars = 0
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        src = fn if isinstance(fn, dict) else tool
+        params = src.get("parameters") or {}
+        total_chars += sum(len(v) for v in (src.get("name") or "", src.get("description") or "") if isinstance(v, str))
+        try:  # JSON is closer to wire size than repr()
+            total_chars += len(json.dumps(params, ensure_ascii=False, separators=(",", ":")))
+        except Exception:
+            total_chars += len(str(params))
+    tokens = (total_chars + 3) // 4
+    if len(_TOOLS_TOKENS_CACHE) >= _TOOLS_TOKENS_CACHE_MAX:
+        _TOOLS_TOKENS_CACHE.pop(next(iter(_TOOLS_TOKENS_CACHE)), None)
+    _TOOLS_TOKENS_CACHE[key] = (*signature, tokens)
+    return tokens

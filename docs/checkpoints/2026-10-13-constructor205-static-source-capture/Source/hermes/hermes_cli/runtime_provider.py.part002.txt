@@ -1,0 +1,172 @@
+et_model_config(),
+            requested_provider=requested_provider)
+    return runtime
+
+
+def _openrouter_fallback(requested_provider, explicit_api_key, explicit_base_url) -> Dict[str, Any]:
+    return _tag(_resolve_openrouter_runtime(requested_provider=requested_provider, explicit_api_key=explicit_api_key,
+                                            explicit_base_url=explicit_base_url), requested_provider)
+
+
+def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_key: Optional[str] = None,
+                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None) -> Dict[str, Any]:
+    """Resolve runtime provider credentials for agent execution. Ladder (order is behavior — each
+    rung returns or raises, else falls to the next):
+      1. disabled-provider guard (``providers.<name>.enabled: false``)
+      2. requested-name shortcuts: moa, anthropic@azure, azure-foundry, vertex
+      3. named custom provider / llamacpp alias / bare-custom direct alias
+      4. local-endpoint bypass (no explicit creds, config base_url at a non-cloud host)
+      5. ``auth.resolve_provider`` → explicit --api-key/--base-url path
+      6. credential pool (OpenRouter pool only without custom endpoint/override)
+      7. OAuth specs (nous/codex/xai/qwen; "auto" swallows AuthError, logs, and stamps it on a
+         keyless fallback as ``auth_error``) → minimax-oauth
+         → external-process → anthropic env → bedrock → registry api_key providers
+      8. OpenRouter / bare-custom fallback
+      9. ``model.openai_runtime`` overlay (openai/openai-codex, named custom providers): rewrites the picked rung's
+         api_mode to ``codex_app_server``; the rung's credential/endpoint is then not used
+    target_model overrides model_cfg["default"] when computing provider-specific api_mode (e.g.
+    OpenCode Zen/Go where different models route through different API surfaces)."""
+    from hermes_cli import friday_credential_admission as admission
+    admitted_route = admission.route_inputs(requested, explicit_base_url, explicit_api_key, target_model) if admission.managed() else None
+    # Friday's generic/implicit custom requests retain the admitted named
+    # identity; otherwise a separate entry named "custom" can win the ladder.
+    requested_provider = resolve_requested_provider(admitted_route[0] if admitted_route is not None else requested)
+    _raise_if_provider_disabled(requested_provider)
+    # Same alias expansion the auxiliary client applies, so ``provider: openai`` means one thing on
+    # every path (background review, curator, MoA slots, delegation) instead of "Unknown provider".
+    # The pre-expansion name is what the codex_app_server overlay judges: ``openai`` is eligible,
+    # the anonymous ``custom`` it expands to is not.
+    requested_alias = requested_provider
+    requested_provider, explicit_base_url = expand_direct_api_alias(requested_provider, explicit_base_url)
+    _raise_if_local_alias_missing_endpoint(requested_provider, explicit_base_url)
+    runtime = next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model) if r)
+    _raise_for_credentialless_bare_custom(requested_provider, runtime)
+    # model.openai_runtime is applied ONCE, after the ladder: every rung (pool, OAuth store,
+    # explicit --api-key/--base-url, env key) hardcodes the wire api_mode for openai/openai-codex,
+    # so applying the opt-in inside one rung left the others on codex_responses (#115169).
+    api_mode = _maybe_apply_codex_app_server_runtime(
+        provider=runtime.get("provider", ""), api_mode=runtime.get("api_mode", ""), model_cfg=_get_model_config(),
+        requested_provider=requested_alias)
+    if api_mode != runtime.get("api_mode"):
+        logger.info("model.openai_runtime=codex_app_server overrides the %s runtime (source=%s); its credential/endpoint "
+                    "is not used — the app-server authenticates with its own login", runtime.get("provider"), runtime.get("source"))
+    runtime["api_mode"] = api_mode
+    return admission.runtime_checked(runtime, admitted_route) if admitted_route is not None else runtime
+
+
+def _raise_for_credentialless_bare_custom(requested_provider: str, runtime: Dict[str, Any]) -> None:
+    """Reject a bare ``custom`` placeholder request that fell through the whole ladder to the
+    OpenRouter default endpoint with no credential. Every other custom rung (named entry, local
+    bypass, pool, ``key_cmd``) yields a key, a callable or the ``no-key-required`` placeholder, so
+    an EMPTY key on a ``custom`` runtime is exactly the dead shape that otherwise dies at agent
+    construction as ``No LLM provider configured``. Keyed on the literal request, not the resolved
+    shape: local aliases (``ollama``, ``vllm``) are resolved tolerantly by ``/model`` direct-alias
+    switching, which supplies the alias endpoint AFTER this call and must not fail here. Typed
+    ``AuthError`` so every caller's fallback chain (CLI, gateway, TUI, cron) still advances (#17929).
+    """
+    if requested_provider != "custom" or runtime.get("provider") != "custom" or runtime.get("api_key"):
+        return
+    raise AuthError(
+        f"provider '{requested_provider}' resolved without credentials (no endpoint or API key configured). "
+        "If this is a named custom provider, use its real name (see providers: in config.yaml).",
+        provider=requested_provider,
+        code="missing_api_key",
+    )
+
+
+def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model):
+    """Ladder rungs 2-8, yielded lazily so each is evaluated only when the previous one returned
+    nothing; the last rung (OpenRouter / bare-custom fallback) always yields a runtime."""
+    yield _resolve_requested_shortcuts(requested_provider, explicit_api_key, explicit_base_url, target_model)
+    yield _named_custom_rung(requested_provider, explicit_api_key, explicit_base_url, target_model)
+    # If provider is "auto" (or unset) but config.yaml has an explicit base_url pointing at a custom/local
+    # endpoint (e.g. Ollama at localhost:11434), route through the OpenAI-compatible resolver instead of
+    # letting resolve_provider() pick up an ANTHROPIC_API_KEY or OPENAI_API_KEY from the environment and
+    # send the request to a cloud API. Fixes #3846.
+    if not explicit_base_url and not explicit_api_key:
+        yield _local_endpoint_bypass(requested_provider, explicit_api_key, explicit_base_url)
+    provider = resolve_provider(requested_provider, explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url)
+    model_cfg = _get_model_config()
+    yield _resolve_explicit_runtime(provider=provider, requested_provider=requested_provider, model_cfg=model_cfg,
+                                    explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url,
+                                    target_model=target_model)
+    yield _resolve_from_pool(provider, requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model)
+    swallowed_auth_error = None
+    if provider in _OAUTH_RUNTIME_PROVIDERS:
+        try:
+            yield _resolve_oauth_runtime(provider, requested_provider, model_cfg, target_model)
+        except AuthError as exc:
+            # Auto-detected login with stale/revoked/benched credentials: fall through to the env-var
+            # providers, but keep the error so a keyless fallback can still say what is wrong.
+            if requested_provider != "auto":
+                raise
+            logger.info("%s; falling through to next provider.", _OAUTH_RUNTIME_PROVIDERS[provider].failure_msg)
+            swallowed_auth_error = exc
+    if provider == "minimax-oauth":
+        yield _minimax_oauth_runtime(provider, requested_provider)
+    if _is_external_process_provider(provider):
+        yield _resolve_external_process_runtime(provider, requested_provider)
+    if provider == "anthropic":
+        yield _anthropic_env_runtime(requested_provider, model_cfg, target_model)
+    if provider == "bedrock":
+        yield _resolve_bedrock_runtime(requested_provider, model_cfg, target_model)
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    if pconfig and pconfig.auth_type == "api_key":
+        yield _api_key_provider_runtime(provider, pconfig, requested_provider, model_cfg, target_model)
+    fallback = _openrouter_fallback(requested_provider, explicit_api_key, explicit_base_url)
+    if swallowed_auth_error is not None and not fallback.get("api_key"):
+        fallback["auth_error"] = swallowed_auth_error
+    yield fallback
+
+
+def format_runtime_provider_error(error: Exception) -> str:
+    return format_auth_error(error) if isinstance(error, AuthError) else str(error)
+
+
+def resolve_runtime_with_fallback(config: Optional[Dict[str, Any]], *, requested: Optional[str] = None,
+                                  target_model: Optional[str] = None, explicit_base_url: Optional[str] = None,
+                                  explicit_api_key: Optional[str] = None,
+                                  ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """``resolve_runtime_provider`` plus resolution-time fallback: ``(runtime, fallback_entry_or_None)``.
+
+    Only an ``AuthError`` from the primary (missing/expired credentials, exhausted quota, cooled-down pool)
+    walks ``get_fallback_chain(config)`` in order and returns the first entry that resolves — the single
+    resolution-time walker shared by the gateway and oneshot. ``ValueError``/other errors are genuine
+    misconfiguration (unknown ``--provider`` ...) and propagate unchanged, so a typo is never silently
+    rerouted onto a provider the operator did not ask for. When every entry fails, the *primary* error is
+    re-raised: a fallback entry's failure is not what the operator configured first (#81209). The entry's
+    ``model`` is the model the caller must send.
+    """
+    from hermes_cli.auth import AuthError, primary_failure_wording
+    try:
+        return resolve_runtime_provider(requested=requested, target_model=target_model,
+                                        explicit_base_url=explicit_base_url, explicit_api_key=explicit_api_key), None
+    except AuthError as primary_exc:
+        from hermes_cli.fallback_config import effective_runtime_provider, get_fallback_chain, resolve_entry_api_key
+        for entry in get_fallback_chain(config):
+            provider = (entry.get("provider") or "").strip().lower()
+            model = (entry.get("model") or "").strip()
+            if not provider or not model:
+                continue
+            kwargs: Dict[str, Any] = {"requested": provider, "target_model": model}
+            if entry.get("base_url"):
+                kwargs["explicit_base_url"] = entry["base_url"]
+            if entry_key := resolve_entry_api_key(entry):
+                kwargs["explicit_api_key"] = entry_key
+            try:
+                runtime = resolve_runtime_provider(**kwargs)
+            except AuthError as fb_exc:
+                logger.debug("Fallback entry %s/%s failed: %s", provider, model, fb_exc)
+                continue
+            except Exception as fb_exc:
+                # Not a credential problem: a mistyped provider/base_url must be visible, not silently skipped.
+                logger.warning("Fallback entry %s/%s is misconfigured and was skipped: %s", provider, model, fb_exc)
+                continue
+            # Named custom entries resolve to the bare "custom" class; persist the configured identity (#98739).
+            runtime["provider"] = effective_runtime_provider(entry, runtime)
+            # A rate-limit/quota cap is transient (credentials are fine, re-auth cannot help); the log must not
+            # mislabel it as an auth failure (#32790).
+            logger.warning("Primary provider %s (%s). Falling back to %s/%s",
+                           primary_failure_wording(primary_exc)[0], primary_exc, provider, model)
+            return runtime, entry
+        raise primary_exc

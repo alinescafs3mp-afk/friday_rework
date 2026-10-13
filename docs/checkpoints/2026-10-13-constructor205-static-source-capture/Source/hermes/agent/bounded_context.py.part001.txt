@@ -1,0 +1,447 @@
+"""Opt-in, text-only local TEST budgets; never a tokenizer or model-fit certificate.
+
+Accounting deliberately charges a token per serialized UTF-8 byte plus an explicit
+template reserve. This is conservative for common byte tokenizers, but unverified
+templates/tokenizers still require independent server acceptance. No global policy
+or context-length metadata is changed.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from contextlib import contextmanager
+from contextvars import ContextVar
+from ipaddress import ip_address, ip_network
+import json
+from typing import Any
+from urllib.parse import urlsplit
+
+from hermes_cli.route_identity import normalize_route_base_url
+
+_SUMMARY_POLICY: ContextVar[BoundedContextPolicy | None] = ContextVar("bounded_summary_policy", default=None)
+
+
+class BoundedContextError(ValueError):
+    """A bounded TEST request cannot be admitted; no physical call is permitted."""
+
+
+def _positive(value: Any, name: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise BoundedContextError(f"bounded_context: {name} must be a positive integer")
+    return value
+
+
+def validate_policy_fields(raw: Any, context_length: Any) -> dict:
+    """Validate native per-model config without changing or inferring capacity."""
+    fields = {
+        "server_max_input_tokens", "main_max_output_tokens", "compression_max_output_tokens",
+        "safety_margin_tokens", "template_overhead_tokens",
+    }
+    if not isinstance(raw, dict) or set(raw) != fields | {"mode"} or raw.get("mode") != "local_test":
+        raise BoundedContextError("bounded_context requires mode=local_test and all documented budget fields")
+    values = {key: _positive(raw[key], key) for key in fields}
+    capacity = _positive(context_length, "context_length")
+    if values["server_max_input_tokens"] > capacity:
+        raise BoundedContextError("bounded_context: server input ceiling exceeds context_length")
+    for key in ("main_max_output_tokens", "compression_max_output_tokens"):
+        usable = min(values["server_max_input_tokens"], capacity - values[key])
+        if usable <= values["safety_margin_tokens"] + values["template_overhead_tokens"]:
+            raise BoundedContextError("bounded_context: no usable input after output/template reservations")
+    return values
+
+
+@dataclass(frozen=True)
+class BoundedContextPolicy:
+    provider: str
+    model: str
+    base_url: str
+    context_length: int
+    server_max_input_tokens: int
+    main_max_output_tokens: int
+    compression_max_output_tokens: int
+    safety_margin_tokens: int
+    template_overhead_tokens: int
+    compression_output_tokens: int = 0
+
+    def assert_route(self, provider: str, model: str, base_url: str, api_mode: str) -> None:
+        actual = (provider, model, normalize_route_base_url(str(base_url)))
+        if actual != (self.provider, self.model, self.base_url) or api_mode != "chat_completions":
+            raise BoundedContextError("bounded_context: route/model/transport changed")
+
+    def input_budget(self, output_tokens: int) -> int:
+        return min(self.server_max_input_tokens, self.context_length - output_tokens) - self.safety_margin_tokens
+
+    @property
+    def trigger_tokens(self) -> int:
+        # This TEST lane uses the same byte-accounted units for preflight and
+        # dispatch; this is not provider-reported usage or a usage anchor.
+        budget = min(self.input_budget(self.main_max_output_tokens),
+                     self.input_budget(self.compression_max_output_tokens)) - self.template_overhead_tokens
+        return max(1, budget * 3 // 4)
+
+    @property
+    def tail_tokens(self) -> int:
+        # Compatibility name; the TEST tail walk prices complete rows in bytes.
+        # Leave most of the request for the frozen prompt/tools and summary;
+        # required user/tool-group anchors still win over this optional budget.
+        return max(1, (self.input_budget(self.main_max_output_tokens) - self.template_overhead_tokens) // 16)
+
+    def check_request(self, request: dict, *, compression: bool = False) -> dict:
+        body = wire_body(request)
+        if body.get("audio") or body.get("modalities", ["text"]) != ["text"]:
+            raise BoundedContextError("bounded_context: only text output is supported")
+        if body.get("model") != self.model:
+            raise BoundedContextError("bounded_context: wire model changed")
+        output = wire_output_tokens(request)
+        maximum = self.compression_max_output_tokens if compression else self.main_max_output_tokens
+        if output > maximum:
+            raise BoundedContextError("bounded_context: output cap exceeds policy reservation")
+        _require_text_messages(body.get("messages"))
+        estimate = serialized_bytes(body) + self.template_overhead_tokens
+        budget = self.input_budget(output)
+        if estimate > budget:
+            raise BoundedContextError(
+                f"bounded_context: conservative byte estimate {estimate} exceeds input budget {budget}; "
+                "tokenizer fit is unverified"
+            )
+        return {"accounting": "utf8_json_bytes_plus_template_reserve", "estimated_input": estimate,
+                "input_budget": budget, "output_reservation": output, "tokenizer_verified": False}
+
+
+def serialized_bytes(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise BoundedContextError("bounded_context: request is not finite UTF-8 JSON") from exc
+
+
+def request_pressure_units(agent: Any) -> str:
+    """Label preflight pressure without pretending the TEST byte proxy is token usage."""
+    return ("conservative bytes + template reserve" if isinstance(
+        getattr(agent, "_bounded_context_policy", None), BoundedContextPolicy) else "tokens")
+
+
+def wire_body(request: dict) -> dict:
+    # OpenAI SDK extra_body is merged at the top level after named arguments.
+    transport = {"extra_body", "extra_headers", "extra_query", "timeout"}
+    body = {key: value for key, value in request.items() if key not in transport}
+    extra = request.get("extra_body", {})
+    if not isinstance(extra, dict):
+        raise BoundedContextError("bounded_context: extra_body must be a mapping")
+    body.update(extra)
+    return body
+
+
+def wire_output_tokens(request: dict) -> int:
+    extra = request.get("extra_body", {})
+    if not isinstance(extra, dict):
+        raise BoundedContextError("bounded_context: extra_body must be a mapping")
+    keys = ("max_tokens", "max_completion_tokens")
+    present = [key for key in keys if key in request or key in extra]
+    if len(present) != 1:
+        raise BoundedContextError("bounded_context: exactly one explicit output cap is required")
+    key = present[0]
+    if key in request and key in extra and request[key] != extra[key]:
+        raise BoundedContextError("bounded_context: contradictory output override")
+    return _positive(extra.get(key, request.get(key)), key)
+
+
+def _require_text_messages(messages: Any) -> None:
+    if not isinstance(messages, list) or not messages:
+        raise BoundedContextError("bounded_context: nonempty text messages required")
+    for message in messages:
+        if not isinstance(message, dict):
+            raise BoundedContextError("bounded_context: invalid message")
+        if any(key in message for key in ("audio", "image_url", "input_audio", "video")):
+            raise BoundedContextError("bounded_context: multimodal messages are outside TEST scope")
+        content = message.get("content")
+        if content is None or isinstance(content, str):
+            continue
+        if not isinstance(content, list) or any(
+            not isinstance(block, dict) or block.get("type") != "text" or not isinstance(block.get("text"), str)
+            for block in content
+        ):
+            raise BoundedContextError("bounded_context: multimodal messages are outside TEST scope")
+
+
+def policy_from_config(config: dict) -> BoundedContextPolicy | None:
+    """Read only the selected native provider/model; no process-global config cache."""
+    main = config.get("model", {})
+    if not isinstance(main, dict):
+        return None
+    provider, model = main.get("provider", ""), main.get("default", "")
+    entries = config.get("providers", {})
+    name = provider.removeprefix("custom:") if isinstance(provider, str) else ""
+    entry = entries.get(name, {}) if isinstance(entries, dict) else {}
+    models = entry.get("models", {}) if isinstance(entry, dict) else {}
+    model_config = models.get(model, {}) if isinstance(models, dict) else {}
+    if not isinstance(model_config, dict) or "bounded_context" not in model_config:
+        return None
+    values = validate_policy_fields(model_config["bounded_context"], model_config.get("context_length"))
+    capacity = model_config["context_length"]
+    if not provider.startswith("custom:") or main.get("context_length", capacity) != capacity:
+        raise BoundedContextError("bounded_context requires a named custom provider and matching context pin")
+    if "context_length" in main:
+        _positive(main["context_length"], "model.context_length")
+    from hermes_cli.config_providers import _normalize_custom_provider_entry
+    normalized = _normalize_custom_provider_entry(entry, provider_key=name) or {}
+    base = normalized.get("base_url", "")
+    parsed = urlsplit(base)
+    try:
+        address = ip_address(parsed.hostname or "")
+        local = address.is_loopback or any(address in ip_network(network) for network in
+                                           ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+    except ValueError:
+        local = False
+    if not local or parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise BoundedContextError("bounded_context requires a literal loopback or RFC1918 HTTP(S) endpoint")
+    if (normalized.get("api_mode") != "chat_completions"
+            or normalize_route_base_url(main.get("base_url", base)) != normalize_route_base_url(base)):
+        raise BoundedContextError("bounded_context requires explicit chat_completions and matching main URL")
+    policy = BoundedContextPolicy(provider, model, normalize_route_base_url(base), capacity, **values)
+    output = _validate_profile(config, policy)
+    return replace(policy, compression_output_tokens=output)
+
+
+def _validate_profile(config: dict, policy: BoundedContextPolicy) -> int:
+    from hermes_cli.fallback_config import get_fallback_chain
+    if config.get("model", {}).get("ollama_num_ctx") is not None:
+        raise BoundedContextError("bounded_context does not support server context resizing")
+    if get_fallback_chain(config):
+        raise BoundedContextError("bounded_context does not support fallback chains")
+    if config.get("context", {}).get("engine", "compressor") != "compressor":
+        raise BoundedContextError("bounded_context requires the built-in compressor")
+    aux = config.get("auxiliary", {}).get("compression", {})
+    policy.assert_route(aux.get("provider", ""), aux.get("model", ""), aux.get("base_url", ""),
+                        aux.get("api_mode", ""))
+    if aux.get("fallback_chain"):
+        raise BoundedContextError("bounded_context does not support auxiliary fallbacks")
+    if "context_length" in aux and _positive(aux["context_length"], "aux context_length") != policy.context_length:
+        raise BoundedContextError("bounded_context: auxiliary capacity differs")
+    cap = wire_output_tokens({"extra_body": aux.get("extra_body", {})})
+    if cap > policy.compression_max_output_tokens:
+        raise BoundedContextError("bounded_context: configured compression output exceeds policy")
+    return cap
+
+
+def configured_policy() -> BoundedContextPolicy | None:
+    if _SUMMARY_POLICY.get() is not None:
+        return _SUMMARY_POLICY.get()
+    from hermes_cli.config import load_config_readonly
+    return policy_from_config(load_config_readonly())
+
+
+@contextmanager
+def summary_policy_scope(compressor: Any):
+    """A running compression keeps its admitted immutable policy across workers/config edits."""
+    token = _SUMMARY_POLICY.set(getattr(compressor, "bounded_context_policy", None))
+    try:
+        yield
+    finally:
+        _SUMMARY_POLICY.reset(token)
+
+
+def is_bounded_provider(provider: str) -> bool:
+    """Retain the explicit named route on the generic base_url auxiliary path."""
+    if not str(provider).startswith("custom:"):
+        return False
+    policy = configured_policy()
+    return policy is not None and policy.provider == provider
+
+
+def bind_agent_policy(agent: Any, config: dict) -> None:
+    policy = policy_from_config(config)
+    agent._bounded_context_policy = policy
+    if policy is None:
+        return
+    policy.assert_route(main_provider_identity(agent, policy), agent.model, agent.base_url, agent.api_mode)
+    if agent.context_compressor.context_length != policy.context_length or getattr(agent, "_fallback_chain", None):
+        raise BoundedContextError("bounded_context: runtime capacity or fallbacks differ from policy")
+    if agent.max_tokens is None:
+        agent.max_tokens = policy.main_max_output_tokens
+        agent.context_compressor.max_tokens = agent.max_tokens
+    if _positive(agent.max_tokens, "agent.max_tokens") > policy.main_max_output_tokens:
+        raise BoundedContextError("bounded_context: main output exceeds policy")
+    agent.context_compressor.bounded_context_policy = policy
+    agent.context_compressor._threshold_tokens = None
+    agent.context_compressor._tail_token_budget = None
+    # A summary failure must preserve original history, never commit deterministic loss.
+    agent.context_compressor.abort_on_summary_failure = True
+
+
+def guard_main_request(agent: Any, request: dict, client: Any = None) -> None:
+    policy = getattr(agent, "_bounded_context_policy", None)
+    if not isinstance(policy, BoundedContextPolicy):
+        return
+    base = str(client.base_url) if client is not None else agent.base_url
+    policy.assert_route(main_provider_identity(agent, policy), agent.model, base, agent.api_mode)
+    if agent.context_compressor.context_length != policy.context_length:
+        raise BoundedContextError("bounded_context: runtime capacity changed")
+    agent._bounded_context_last_accounting = policy.check_request(request)
+
+
+def main_provider_identity(agent: Any, policy: BoundedContextPolicy) -> str:
+    # Native runtime resolution intentionally returns generic "custom" while
+    # retaining the named identity in requested_provider.
+    requested = getattr(agent, "requested_provider", agent.provider)
+    if requested != policy.provider or agent.provider not in {policy.provider, "custom"}:
+        raise BoundedContextError("bounded_context: named main provider changed")
+    return requested
+
+
+def guard_aux_request(policy: BoundedContextPolicy | None, task: str, provider: str,
+                      api_mode: str, client: Any, request: dict) -> None:
+    if policy is None:
+        return
+    if task != "compression":
+        raise BoundedContextError("bounded_context TEST scope permits only compression auxiliary calls")
+    policy.assert_route(provider, request.get("model", ""), str(client.base_url), api_mode)
+    policy.check_request(request, compression=True)
+
+
+def auxiliary_callback(client: Any, callback: Any, provider: str | None, api_mode: str | None):
+    """Check every physical callback after Relay rewrites, including retries."""
+    from agent.auxiliary_client import _RELAY_AUX_CALL_CONTEXT
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    policy = context.get("bounded_context_policy") if context is not None else configured_policy()
+    context = context or {}
+
+    def checked(request):
+        guard_aux_request(policy, context.get("task", ""), provider or context.get("provider", ""),
+                          api_mode or context.get("api_mode", "chat_completions"), client, request)
+        return callback(request)
+
+    return checked
+
+
+def physical_aux_create(client: Any, request: dict):
+    """Last SDK boundary, also reached by progress streaming and parameter retries."""
+    from agent.auxiliary_client import _RELAY_AUX_CALL_CONTEXT
+    context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+    policy = context.get("bounded_context_policy") if context else configured_policy()
+    if policy is not None:
+        guard_aux_request(policy, context.get("task", ""),
+                          context.get("provider") or context.get("stream_provider") or policy.provider,
+                          context.get("api_mode") or "chat_completions", client, request)
+    return client.chat.completions.create(**request)
+
+
+def check_bounded_feasibility(agent: Any) -> bool:
+    policy = getattr(agent, "_bounded_context_policy", None)
+    if not isinstance(policy, BoundedContextPolicy):
+        return False
+    from agent.auxiliary_client import get_text_auxiliary_client, _resolve_task_provider_model
+    provider, _, _, _, mode = _resolve_task_provider_model("compression")
+    client, model = get_text_auxiliary_client("compression", main_runtime=agent._current_main_runtime())
+    if client is None:
+        raise BoundedContextError("bounded_context: compression client unavailable")
+    policy.assert_route(provider, model, str(client.base_url), mode)
+    if agent.context_compressor.context_length != policy.context_length:
+        raise BoundedContextError("bounded_context: compression capacity changed")
+    agent.context_compressor._aux_context_ceiling = policy.trigger_tokens
+    agent.context_compressor._apply_threshold_tokens_cap()
+    return True
+
+
+def build_bounded_summary_prompt(compressor: Any, turns: list, summary_budget: int,
+                                 focus: str | None, memory: str, has_user_turn: bool) -> str:
+    """Price mandatory content first, sample only the eligible transcript, then check all bytes."""
+    policy = compressor.bounded_context_policy
+    summary_budget = min(summary_budget, max(1, policy.compression_output_tokens // 2))
+    empty = compressor._build_summary_prompt("", summary_budget, focus, memory, has_user_turn)
+
+    def request(prompt):
+        return {"model": policy.model, "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": policy.compression_max_output_tokens}
+
+    accounting = policy.check_request(request(empty), compression=True)
+    available = accounting["input_budget"] - accounting["estimated_input"]
+    # One Unicode character can cost six JSON bytes (control-character escapes).
+    limit = min(compressor._SUMMARY_INPUT_MAX_CHARS, available // 6)
+    if limit < 1024:
+        raise BoundedContextError("bounded_context: mandatory summary content leaves no useful transcript budget")
+    if compressor.tail_mode == "lean":
+        records = compressor._serialize_records_for_summary(turns)
+        content, coverage = compressor._sample_summary_records(records, max_chars=limit)
+        compressor._record_summary_input_coverage(coverage)
+    else:
+        content = compressor._bound_summary_input(compressor._serialize_for_summary(turns), max_chars=limit)
+    prompt = compressor._build_summary_prompt(content, summary_budget, focus, memory, has_user_turn)
+    policy.check_request(request(prompt), compression=True)
+    return prompt
+
+
+def bounded_request_pressure(agent: Any, messages: list, system_prompt: str = "", tools: Any = None) -> int | None:
+    """Conservative preflight units, kept separate from native provider usage anchors.
+
+    The final callback still prices middleware/Relay/SDK overrides. This early
+    projection includes the frozen system/tools and request-only extra_body.
+    """
+    policy = getattr(agent, "_bounded_context_policy", None)
+    if not isinstance(policy, BoundedContextPolicy):
+        return None
+    policy.assert_route(main_provider_identity(agent, policy), agent.model, agent.base_url, agent.api_mode)
+    rows = [dict(message) for message in messages]
+    for row in rows:
+        if isinstance(row.get("api_content"), str):
+            row["content"] = row.pop("api_content")
+    if system_prompt and not any(row.get("role") == "system" for row in rows):
+        rows.insert(0, {"role": "system", "content": system_prompt})
+    body = {"model": agent.model, "messages": rows, "max_tokens": agent.max_tokens}
+    selected_tools = tools if tools is not None else getattr(agent, "tools", None)
+    if selected_tools:
+        body["tools"] = selected_tools
+    body.update(getattr(agent, "request_overrides", None) or {})
+    agent._request_pressure_anchored = False
+    return serialized_bytes(wire_body(body)) + policy.template_overhead_tokens
+
+
+def _enforce_minimum_context(agent):
+    from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, is_local_endpoint
+    # Reject windows below the 64K floor needed for reliable tool-calling; an explicit
+    # positive model.context_length on LM Studio is allowed below the floor.
+    _ctx = getattr(agent.context_compressor, "context_length", 0)
+    # A local Ollama server serves num_ctx, not the GGUF's advertised window: a Modelfile or
+    # model.ollama_num_ctx at 64K+ is a usable window even when the metadata says 40K (#100437).
+    # Only a local endpoint can honour num_ctx, so a stale override never admits a hosted model.
+    if agent._ollama_num_ctx and agent.base_url and is_local_endpoint(agent.base_url):
+        _ctx = max(_ctx or 0, agent._ollama_num_ctx)
+    _allow_lmstudio_explicit_below_floor = (
+        str(agent.provider or "").strip().lower() == "lmstudio"
+        and isinstance(agent._config_context_length, int)
+        and not isinstance(agent._config_context_length, bool)
+        and agent._config_context_length > 0
+    )
+    _bounded = isinstance(getattr(agent, "_bounded_context_policy", None), BoundedContextPolicy)
+    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH and not (_allow_lmstudio_explicit_below_floor or _bounded):
+        floor_k = MINIMUM_CONTEXT_LENGTH // 1000
+        if agent.base_url and is_local_endpoint(agent.base_url):
+            # Any OpenAI-compatible local server (llama.cpp, vLLM, Ollama, ...) — the window is the
+            # server's runtime setting, not the model's; never assume Ollama here (#87075).
+            remedy = (
+                f"Your local server is serving a {_ctx:,}-token window.  Start it with at least "
+                f"{floor_k}K context (llama.cpp: -c {MINIMUM_CONTEXT_LENGTH}; vLLM: --max-model-len; "
+                f"Ollama: OLLAMA_CONTEXT_LENGTH={MINIMUM_CONTEXT_LENGTH} or a Modelfile num_ctx), "
+                f"or set model.ollama_num_ctx in config.yaml to the window it really serves "
+                f"(at least {floor_k}K)."
+            )
+        else:
+            remedy = (
+                f"Choose a model with at least {floor_k}K context.  If your server "
+                f"reports a window smaller than the model's true window, set "
+                f"model.context_length in config.yaml to the real value "
+                f"(this must be at least {floor_k}K)."
+            )
+        raise ValueError(
+            f"Model {agent.model} has a context window of {_ctx:,} tokens, "
+            f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
+            f"by Hermes Agent.  {remedy}"
+        )
+
+
+def _aux_inherits_main_route(agent: Any, aux_model: str, aux_base_url: str) -> bool:
+    """True when the auxiliary compression client is the main model on the main endpoint."""
+    from hermes_cli.route_identity import normalize_route_base_url
+    if str(aux_model or "").strip().lower() != str(getattr(agent, "model", "") or "").strip().lower():
+        return False
+    main_base = normalize_route_base_url(str(getattr(agent, "base_url", "") or ""))
+    return not main_base or normalize_route_base_url(aux_base_url) == main_base

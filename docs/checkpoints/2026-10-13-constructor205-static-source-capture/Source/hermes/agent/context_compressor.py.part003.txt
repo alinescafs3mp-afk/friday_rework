@@ -1,0 +1,929 @@
+, "summary_generation_ms", "commit_ms"):
+            if not isinstance(phase_timings, dict) or key not in phase_timings:
+                continue
+            value = _safe_int(phase_timings[key])
+            # Wait and generation phases accumulate across retries; the rest are point readings.
+            accumulate = key in {"queue_wait_ms", "summary_generation_ms"} and value is not None
+            telemetry[key] = (telemetry.get(key) or 0) + value if accumulate else value
+
+    def _emit_init_summary_once(self) -> None:
+        """Emit the init log line once, on first context-length resolution (keeps __init__ non-blocking)."""
+        if not getattr(self, "_log_init_summary", False):
+            return
+        self._log_init_summary = False
+        logger.info(
+            "Context compressor initialized: model=%s context_length=%d threshold=%d (%.0f%%) "
+            "target_ratio=%.0f%% tail_budget=%d provider=%s base_url=%s",
+            self.model, self._resolved_context_length, self.threshold_tokens,
+            self.threshold_percent * 100, self.summary_target_ratio * 100,
+            self.tail_token_budget,
+            self.provider or "none", self.base_url or "none",
+        )
+
+    def _resolve_context_length(self) -> int:
+        """Resolve and cache the model's context length on first access."""
+        if self._resolved_context_length is None:
+            self._resolved_context_length = get_model_context_length(
+                self.model, base_url=self.base_url, api_key=self.api_key,
+                config_context_length=self._config_context_length, provider=self.provider,
+                custom_providers=self.custom_providers,
+            )
+            # Raise-only small-context floor; must run after context_length resolves and before threshold_tokens derives.
+            self.threshold_percent = self._effective_threshold_percent(self._resolved_context_length, self._base_threshold_percent)
+            self._emit_init_summary_once()
+        return self._resolved_context_length
+
+    @property
+    def context_length(self) -> int:
+        return self._resolve_context_length()
+
+    @context_length.setter
+    def context_length(self, value: int) -> None:
+        # Re-assigning the SAME window must not wipe runtime corrections to derived budgets.
+        if value == getattr(self, "_resolved_context_length", None):
+            return
+        self._resolved_context_length = value
+        # Re-apply the raise-only floor so percent and tokens derive from the same window.
+        _base = getattr(self, "_base_threshold_percent", None)
+        if _base is not None:
+            self.threshold_percent = self._effective_threshold_percent(value, _base)
+        self._threshold_tokens = self._tail_token_budget = self._max_summary_tokens = None
+        self._emit_init_summary_once()
+
+    @property
+    def threshold_tokens(self) -> int:
+        if self._threshold_tokens is None:
+            # Resolve the window first: it may floor threshold_percent as a side effect.
+            _ctx = self.context_length
+            self._threshold_tokens = self._compute_threshold_tokens(_ctx, self.threshold_percent, self.max_tokens)
+            self._apply_threshold_tokens_cap()
+        return self._threshold_tokens
+
+    @threshold_tokens.setter
+    def threshold_tokens(self, value: int) -> None:
+        self._threshold_tokens = value
+
+    @property
+    def tail_token_budget(self) -> int:
+        if self._tail_token_budget is None:
+            if getattr(self, "tail_mode", "lean") == "lean":
+                # Lean mode: tail is a small clamped recency window; the summary carries continuity.
+                budget = max(LEAN_TAIL_FLOOR_TOKENS, min(LEAN_TAIL_CAP_TOKENS, int(self.context_length * 0.025)))
+            else:
+                budget = int(self.threshold_tokens * self.summary_target_ratio)
+            if self.context_length > 0:
+                budget = min(budget, int(self.context_length * TAIL_MAX_CONTEXT_FRACTION))
+            if getattr(self, "bounded_context_policy", None) is not None:
+                budget = min(budget, self.bounded_context_policy.tail_tokens)
+            self._tail_token_budget = max(1, budget)
+        return self._tail_token_budget
+
+    @tail_token_budget.setter
+    def tail_token_budget(self, value: int) -> None:
+        self._tail_token_budget = value
+
+    @property
+    def max_summary_tokens(self) -> int:
+        if self._max_summary_tokens is None:
+            self._max_summary_tokens = min(int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+        return self._max_summary_tokens
+
+    @max_summary_tokens.setter
+    def max_summary_tokens(self, value: int) -> None:
+        self._max_summary_tokens = value
+
+    def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        """Clear all per-session compaction state at a real session boundary.
+        Session end (CLI exit, gateway expiry, id rotation) — NOT /new or /reset. Every per-session
+        flag/counter can contaminate the next live session (suppressed compression, stale cooldowns,
+        misleading warnings), so the whole surface is reset here.
+
+        Session end (CLI exit, gateway expiry, session-id rotation) goes through this method rather than
+        ``on_session_reset()`` (/new, /reset). The original fix (#38788) only cleared ``_previous_summary``,
+        but the same cross-session contamination risk applies to every per-session variable that
+        ``on_session_reset()`` clears: stale ``_ineffective_compression_count`` can suppress compression in
+        a subsequent live session; ``_summary_failure_cooldown_until`` can block summary generation;
+        ``_last_compress_aborted`` can make callers think compression is still aborted;
+        ``_last_aux_model_failure_*`` can surface stale error warnings; ``_last_summary_dropped_count`` /
+        ``_last_summary_fallback_used`` can produce misleading user warnings.
+        """
+        self._reset_session_compaction_state()
+
+    def _reset_real_usage_pairing(self) -> None:
+        """Forget the real-usage state read by real_usage_pending()."""
+        self.last_real_prompt_tokens = self.last_compression_rough_tokens = 0
+        self.awaiting_real_usage_after_compression = self._provider_omits_usage = False
+
+    def _reset_session_compaction_state(self) -> None:
+        """Shared per-session reset for /new, /reset and session end."""
+        # A handoff may carry role="user" only for alternation, so role alone can't prove a human turn existed.
+        self._previous_summary = self._summary_has_user_turn = self._last_summary_error = None
+        self._last_aux_model_failure_error = self._last_aux_model_failure_model = None
+        # The model the aux lane actually resolved for the most recent summary call (an ``auto`` route
+        # may differ from ``summary_model``/``model``). Recorded so a failed auto-resolved model is
+        # named in the user-visible warning and falls back to the main model (#116472).
+        self._last_aux_resolved_model = None
+        self._consecutive_timeout_failures = self._consecutive_truncation_failures = 0
+        # Sustained-overload escalation bookkeeping (#123167): per-session, reset by success.
+        self._consecutive_overload_aborts = 0
+        self._last_summary_overload_degraded = False
+        # Turns unrecoverably dropped by a static fallback, so callers can warn.
+        self._last_summary_dropped_count = 0
+        self._last_summary_fallback_used = self._last_feasibility_skip = False
+        self._last_compression_savings_pct = 100.0
+        self._ineffective_compression_count = 0
+        # Wall-clock probe deadline; 0.0 = unarmed (durable copy re-read via _load_anti_thrash_recovery_deadline).
+        self._anti_thrash_recovery_deadline = self._structural_no_op_backoff_until = 0.0
+        # Observability only; never feeds the strike latch or the fallback streak.
+        self._prellm_skip_count = 0
+        # Only a healthy completed summary resets this; ordinary fitting responses do not.
+        self._fallback_compression_streak = 0
+        # Wall-clock time of the next summary-model probe while the fallback streak benches it; 0.0 = unarmed.
+        self._fallback_probe_at = 0.0
+        # Armed at a completed boundary; consumed by the next real prompt count in update_from_response().
+        self._verify_compaction_cleared_threshold = False
+        # Lets the boundary wrapper tell a completed rewrite from a no-op without inferring from length.
+        self._last_compression_made_progress = False
+        # Transient summary errors must not block a fresh session.
+        self._summary_failure_cooldown_until = 0.0
+        # True while the local cooldown failed to persist: an empty durable row then means unknown, not cleared.
+        self._cooldown_persist_failed = False
+        # Callers read this to know compression was attempted but aborted (freeze until manual /compress).
+        self._last_compress_aborted = self._last_compress_refused_would_grow = False
+        self._context_probed = self._context_probe_persistable = False
+        self._reset_real_usage_pairing()
+        self._last_compression_telemetry = self._active_compression_telemetry = None
+        self._compression_telemetry_seed = None
+        self._reset_proactive_prune_rearm()
+
+    def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
+        """Bind the current session row so durable cooldowns can round-trip."""
+        self._session_db = session_db
+        self._session_id = session_id or ""
+        self._summary_failure_cooldown_until = 0.0
+        self._cooldown_persist_failed = False
+        self._last_summary_error = None
+        self._consecutive_timeout_failures = self._consecutive_truncation_failures = self._fallback_compression_streak = 0
+        self._consecutive_overload_aborts = 0
+        self._ineffective_compression_count = self._prellm_skip_count = 0
+        self._anti_thrash_recovery_deadline = self._structural_no_op_backoff_until = self._fallback_probe_at = 0.0
+        self._reset_proactive_prune_rearm()
+        self.get_active_compression_failure_cooldown()
+        self._load_fallback_compression_streak()
+        self._load_ineffective_compression_count()
+        self._load_anti_thrash_recovery_deadline()
+        self._load_fallback_probe_at()
+        self._load_consecutive_overload_aborts()
+        self._load_proactive_prune_rearm_tokens()
+
+    def on_session_start(self, session_id: str, **kwargs) -> None:
+        """Bind session-scoped compression state for a new or resumed session."""
+        super().on_session_start(session_id, **kwargs)
+        boundary_reason = kwargs.get("boundary_reason")
+        old_session_id = kwargs.get("old_session_id")
+        session_db = kwargs.get("session_db", getattr(self, "_session_db", None))
+        previous_fallback_streak = self._fallback_compression_streak
+        previous_ineffective_count = self._ineffective_compression_count
+        previous_overload_aborts = self._consecutive_overload_aborts
+        previous_probe_at = self._fallback_probe_at
+        if boundary_reason == "compression" and old_session_id:
+            # Parent row carries the streak/strike state across the rotation.
+            def _parent(method: str, label: str, current: int) -> int:
+                found, value = self._durable_read(method, label, int, 0, session_db=session_db, session_id=old_session_id)
+                return value if found and value is not None else current
+
+            previous_fallback_streak = _parent(
+                "get_compression_fallback_streak", "compression parent fallback streak", previous_fallback_streak,
+            )
+            previous_ineffective_count = _parent(
+                "get_compression_ineffective_count", "compression parent ineffective count", previous_ineffective_count,
+            )
+            previous_overload_aborts = _parent(
+                "get_compression_overload_streak", "compression parent overload streak", previous_overload_aborts,
+            )
+        self.bind_session_state(session_db, session_id)
+        if boundary_reason == "compression":
+            # Rotation creates a fresh child row first; carry the streak until boundary bookkeeping persists it.
+            self._fallback_compression_streak = previous_fallback_streak
+            # The bench probe deadline lives in the model-config blob, which the child row lacks.
+            self._set_fallback_probe_at(previous_probe_at)
+            # No later bookkeeping writes the strike counter, so persist it onto the child row now (#54923).
+            if self._ineffective_compression_count != previous_ineffective_count:
+                self._ineffective_compression_count = previous_ineffective_count
+                self._persist_ineffective_compression_count()
+            # Same for the sustained-overload budget: nothing else writes the child row at the boundary.
+            if self._consecutive_overload_aborts != previous_overload_aborts:
+                self._consecutive_overload_aborts = previous_overload_aborts
+                self._persist_consecutive_overload_aborts()
+
+    def _durable_read(
+        self, method: str, label: str, coerce, default, *args,
+        session_db: Any = None, session_id: Optional[str] = None,
+    ):
+        """Best-effort read of a durable per-session value; ``default`` when unbound/unsupported/failed.
+        Returns ``(found, value)``: ``found`` is False when no read happened; ``value`` is None when the
+        row held a non-numeric value. Defaults to the bound session row; pass
+        ``session_db``/``session_id`` to read another row (parent lineage)."""
+        session_db = getattr(self, "_session_db", None) if session_db is None else session_db
+        session_id = getattr(self, "_session_id", "") if session_id is None else session_id
+        getter = getattr(session_db, method, None)
+        if not session_id or not callable(getter):
+            return False, default
+        try:
+            stored = getter(session_id, *args)
+            if isinstance(stored, (int, float, str)):
+                return True, max(default, coerce(stored))
+            return True, None
+        except Exception as exc:
+            suffix = "" if isinstance(exc, (TypeError, ValueError, sqlite3.Error)) else " (non-sqlite)"
+            logger.debug("%s lookup failed%s: %s", label, suffix, exc)
+        return False, default
+
+    def _durable_write(self, method: str, label: str, *args) -> bool:
+        """Best-effort write of a durable per-session value; True only when the write succeeded."""
+        setter = getattr(getattr(self, "_session_db", None), method, None)
+        if not getattr(self, "_session_id", "") or not callable(setter):
+            return False
+        session_id = self._session_id
+        try:
+            setter(session_id, *args)
+            return True
+        except Exception as exc:
+            suffix = "" if isinstance(exc, sqlite3.Error) else " (non-sqlite)"
+            logger.debug("%s persist failed%s: %s", label, suffix, exc)
+        return False
+
+    def _load_durable(self, attr: str, method: str, label: str, coerce, default, *args) -> None:
+        """Restore ``self.<attr>`` from the bound row; a non-numeric row resets it to ``default``."""
+        found, value = self._durable_read(method, label, coerce, default, *args)
+        if found:
+            setattr(self, attr, default if value is None else value)
+
+    def _load_fallback_compression_streak(self) -> None:
+        self._load_durable("_fallback_compression_streak", "get_compression_fallback_streak", "compression fallback streak", int, 0)
+
+    def _load_proactive_prune_rearm_tokens(self) -> None:
+        """Restore the cache-boundary runway for a resumed durable session."""
+        self._load_durable(
+            "_proactive_prune_rearm_tokens", "get_session_model_config_value", "proactive prune runway",
+            int, 0, PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0,
+        )
+
+    def _clear_durable_proactive_prune_rearm(self) -> None:
+        """Best-effort removal of the persisted prune-runway key; transcript untouched."""
+        self._durable_write("patch_session_model_config", "proactive prune runway clear", {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None})
+
+    def _persist_fallback_compression_streak(self) -> None:
+        self._durable_write("set_compression_fallback_streak", "compression fallback streak", self._fallback_compression_streak)
+
+    def _load_consecutive_overload_aborts(self) -> None:
+        """Restore the sustained-overload budget so a fresh compressor bound to a resumed session
+        inherits it (#123167 review P1; same contract as the fallback streak, #100185)."""
+        self._load_durable("_consecutive_overload_aborts", "get_compression_overload_streak", "compression overload streak", int, 0)
+
+    def _persist_consecutive_overload_aborts(self) -> None:
+        self._durable_write("set_compression_overload_streak", "compression overload streak", self._consecutive_overload_aborts)
+
+    def _clear_terminal_summary_failures(self) -> None:
+        """Clear every terminal summary-failure flag."""
+        for flag, _class, _msg in _TERMINAL_SUMMARY_FAILURES:
+            setattr(self, flag, False)
+
+    def _reset_consecutive_overload_aborts(self) -> None:
+        """Zero the sustained-overload budget and ALWAYS write the row: the in-memory count is not
+        authoritative when two agents share a session, so skipping the write would let another
+        agent's streak survive a success or runtime switch."""
+        self._consecutive_overload_aborts = 0
+        self._persist_consecutive_overload_aborts()
+
+    def _increment_consecutive_overload_aborts(self) -> None:
+        """Count one overload abort. The bound row is bumped atomically and is authoritative, so two
+        agents on one session cannot lose a strike; memory-only when unbound or the row is missing."""
+        found, streak = self._durable_read(
+            "increment_compression_overload_streak", "compression overload streak increment", int, 0,
+        )
+        self._consecutive_overload_aborts = streak if found and streak else self._consecutive_overload_aborts + 1
+
+    def _load_ineffective_compression_count(self) -> None:
+        """Load the durable anti-thrash strike count so a restart never disarms a guard."""
+        self._load_durable("_ineffective_compression_count", "get_compression_ineffective_count", "compression ineffective count", int, 0)
+
+    def _persist_ineffective_compression_count(self) -> None:
+        self._durable_write("set_compression_ineffective_count", "compression ineffective count", self._ineffective_compression_count)
+
+    def _load_anti_thrash_recovery_deadline(self) -> None:
+        """Restore the durable recovery deadline (wall-clock epoch); missing storage leaves it disarmed.
+
+        See #100185.
+        """
+        self._load_durable("_anti_thrash_recovery_deadline", "get_compression_recovery_deadline", "compression recovery deadline", float, 0.0)
+
+    def _set_anti_thrash_recovery_deadline(self, deadline: float) -> None:
+        """Set the recovery deadline, persisting on change only (0 = disarmed)."""
+        if deadline == self._anti_thrash_recovery_deadline:
+            return
+        self._anti_thrash_recovery_deadline = deadline
+        self._durable_write("set_compression_recovery_deadline", "compression recovery deadline", deadline)
+
+    def _record_ineffective_compression_verdict(self, count: int) -> None:
+        """Set the anti-thrash strike counter; persists only on change."""
+        if count == self._ineffective_compression_count:
+            return
+        self._ineffective_compression_count = count
+        self._persist_ineffective_compression_count()
+
+    def _record_structural_no_op(self, reason: str) -> None:
+        """Defer retries after a structural no-op WITHOUT striking the anti-thrash breaker.
+        Nothing eligible existed, so nothing was "ineffective"; striking would permanently disarm
+        auto-compaction on short sessions. The backoff still stops per-turn re-scans."""
+        self._structural_no_op_backoff_until = time.monotonic() + self._STRUCTURAL_NO_OP_BACKOFF_SECONDS
+        if not self.quiet_mode:
+            logger.warning(
+                "Compression skipped (%s): retrying in %.0fs (structural no-op backoff)", reason,
+                self._STRUCTURAL_NO_OP_BACKOFF_SECONDS,
+            )
+
+    def record_rejected_compaction(self) -> None:
+        """One ineffective strike for a pre-commit rejection; no real-usage arming or streak change (nothing committed)."""
+        self._record_ineffective_compression_verdict(self._ineffective_compression_count + 1)
+        if not self.quiet_mode:
+            logger.warning(
+                "Compaction rejected before commit (would grow the transcript); ineffective_compression_count=%d",
+                self._ineffective_compression_count,
+            )
+
+    def record_completed_compaction(self, *, used_fallback: bool = False, feasibility_skip: bool = False) -> None:
+        """Record one completed boundary; ``feasibility_skip`` is streak-neutral but still arms the real-usage verdict."""
+        # A completed boundary proves compressibility: lift any structural no-op backoff.
+        self._structural_no_op_backoff_until = 0.0
+        self._verify_compaction_cleared_threshold = True
+        if feasibility_skip:
+            # A deliberate pre-LLM summary skip (#60451, benched model) is not a summary-quality verdict: it must
+            # neither extend a fallback streak (the streak decides whether the summary model is called)
+            # nor reset one (a skip proves nothing about the summary model's health).
+            if not self.quiet_mode:
+                logger.info(
+                    "Compaction completed via pre-LLM summary skip; fallback_compression_streak unchanged (%d)",
+                    self._fallback_compression_streak,
+                )
+            return
+        if used_fallback:
+            self._fallback_compression_streak += 1
+            if not self.quiet_mode:
+                logger.warning(
+                    "Compaction completed with a deterministic fallback summary. fallback_compression_streak=%d",
+                    self._fallback_compression_streak,
+                )
+        elif self._fallback_compression_streak:
+            self._fallback_compression_streak = 0
+        self._persist_fallback_compression_streak()
+        # Any completed boundary (incl. the degraded fallback) settles the overload budget (#123167).
+        self._reset_consecutive_overload_aborts()
+
+    def get_active_compression_failure_cooldown(self, *, refresh: bool = False) -> Optional[Dict[str, Any]]:
+        """Return the live compression-failure cooldown for the bound session."""
+        if refresh:
+            # Rollback must distinguish an authoritative empty row from a failed read; the return value can't.
+            self._last_cooldown_refresh_was_authoritative = None
+        now_mono = time.monotonic()
+        local_state = None
+        local_remaining = self._summary_failure_cooldown_until - now_mono
+        if local_remaining > 0:
+            local_state = {
+                "cooldown_until": time.time() + local_remaining, "remaining_seconds": local_remaining,
+                "error": self._last_summary_error,
+            }
+            if not refresh:
+                return local_state
+        session_db = getattr(self, "_session_db", None)
+        getter = getattr(session_db, "get_compression_failure_cooldown", None) if session_db else None
+        if not getattr(self, "_session_id", "") or getter is None:
+            return local_state
+        try:
+            state = getter(self._session_id)
+        except Exception as exc:
+            if refresh:
+                self._last_cooldown_refresh_was_authoritative = False
+            if isinstance(exc, sqlite3.Error):
+                logger.debug("compression failure cooldown lookup failed: %s", exc)
+            return local_state
+        if refresh:
+            self._last_cooldown_refresh_was_authoritative = True
+        remaining_seconds = float(state.get("remaining_seconds") or 0.0) if state else 0.0
+        if remaining_seconds <= 0:
+            # Local cooldown never reached the DB, so an empty row is not evidence it was cleared; keep local.
+            if refresh and local_state is not None and self._cooldown_persist_failed:
+                return local_state
+            if refresh:
+                self._summary_failure_cooldown_until, self._last_summary_error = 0.0, None
+            return None
+        # Hygiene-only cooldowns share the column but are not a 429/aux fault; the in-agent compressor may run.
+        # A hygiene write may have overwritten an aux-model row; drop the in-memory cooldown too.
+        # Hygiene watchdog timeouts and turn-hold deferrals persist the same column so the pre-agent pass
+        # can skip (#74136), but they are not evidence of a 429/aux-model fault. The in-conversation
+        # compressor has its own budget and must still be allowed to run (#86972).
+        if _is_hygiene_preagent_only_cooldown(state.get("error")):
+            self._summary_failure_cooldown_until, self._last_summary_error = 0.0, None
+            return None
+        self._summary_failure_cooldown_until = now_mono + remaining_seconds
+        self._last_summary_error = state.get("error")
+        self._cooldown_persist_failed = False
+        return {
+            "cooldown_until": float(state.get("cooldown_until") or 0.0), "remaining_seconds": remaining_seconds,
+            "error": self._last_summary_error,
+        }
+
+    def _record_compression_failure_cooldown(self, cooldown_seconds: float, error: Optional[str]) -> None:
+        # Never shorten a longer live deadline; record the latest error text only.
+        self._summary_failure_cooldown_until = max(self._summary_failure_cooldown_until, time.monotonic() + float(cooldown_seconds))
+        # A later stall or timeout records the latest error text but keeps the later of the two clocks. See
+        # #96775.
+        self._last_summary_error = error
+        cooldown_until = time.time() + max(0.0, self._summary_failure_cooldown_until - time.monotonic())
+        if not getattr(self, "_session_db", None) or not getattr(self, "_session_id", ""):
+            return
+        # A store without the recorder or a failed write both leave the durable row unauthoritative.
+        self._cooldown_persist_failed = not self._durable_write(
+            "record_compression_failure_cooldown", "compression failure cooldown", cooldown_until, error,
+        )
+
+    def record_timeout_failure(self, error: str, failure_kind: str = "timeout") -> None:
+        """Consecutive timeout/stall via the ladder; error persisted as ``backoff:<kind>:strategy=<tail_mode>`` for restarts."""
+        stamped = f"backoff:{failure_kind or 'timeout'}:strategy={getattr(self, 'tail_mode', None) or 'unknown'}: {error}"
+        seconds = float(_next_timeout_cooldown(self))
+        # The first rung (60s) is shorter than the default idle stall window (120s): the next oversized turn
+        # re-entered the same silent route ~1 min after burning the full window (#112420). A stall cooldown
+        # can never be shorter than the window that just failed to show progress.
+        with contextlib.suppress(Exception):
+            from agent.conversation_compression import resolve_context_compression_timeouts
+            idle, _ceiling = resolve_context_compression_timeouts()
+            seconds = max(seconds, float(idle))
+        self._record_compression_failure_cooldown(seconds, stamped)
+
+    def _clear_compression_failure_cooldown(self) -> None:
+        # Fence check BEFORE cooldown-clear: a late cancelled worker must not undo the host's timeout cooldown.
+        # Class-qualified helper calls: tests bind this single method onto a bare stub.
+        if ContextCompressor._compression_cancelled(self):
+            logger.info("Skipping compression cooldown clear: host already cancelled this compression attempt")
+            return
+        self._summary_failure_cooldown_until, self._last_summary_error = 0.0, None
+        self._consecutive_timeout_failures = self._consecutive_truncation_failures = 0
+        self._cooldown_persist_failed = False
+        ContextCompressor._durable_write(self, "clear_compression_failure_cooldown", "compression failure cooldown clear")
+
+    def _compression_cancelled(self) -> bool:
+        """Read the host-owned cooperative cancellation signal, if installed."""
+        # #76354 review F4: fence check BEFORE cooldown-clear. A late worker whose host already timed out
+        # (and recorded a timeout cooldown) must not undo that cooldown when its summary eventually
+        # succeeds. The hook is installed by compress_context for the duration of the fenced call; when it
+        # reports cancellation, keep the host's cooldown.
+        cancelled_check = getattr(self, "_compression_cancelled_check", None)
+        if not callable(cancelled_check):
+            return False
+        try:
+            return bool(cancelled_check())
+        except Exception:
+            logger.debug("compression cancellation check failed", exc_info=True)
+            return False
+
+    def _derive_trigger(self, model: str, context_length: int, provider: str) -> tuple[float, float, int]:
+        """``(base_percent, effective_percent, threshold_tokens)`` for a model/window, from the raw config
+        value so a switch away from an overridden model falls back correctly. Pure: the one place the
+        trigger math lives, shared by ``update_model`` and the switch guard's preview so the number the
+        guard quotes is the number the compressor installs (#83450). Excludes the auxiliary-summariser
+        ceiling, which the feasibility probe re-derives per runtime."""
+        base_percent = resolve_model_threshold(model, self.model_thresholds, self._config_threshold_percent, provider)
+        effective_percent = self._effective_threshold_percent(context_length, base_percent)
+        threshold = self._compute_threshold_tokens(context_length, effective_percent, self.max_tokens)
+        cap = self._effective_threshold_cap(context_length)
+        if cap is not None:
+            threshold = min(threshold, cap)
+        return base_percent, effective_percent, threshold
+
+    def _effective_threshold_cap(self, context_length: int) -> int | None:
+        """The configured ``threshold_tokens`` cap clamped to the window; None when no cap is configured."""
+        cap = self.threshold_tokens_cap
+        policy = getattr(self, "bounded_context_policy", None)
+        if policy is not None:
+            cap = min(cap, policy.trigger_tokens) if cap else policy.trigger_tokens
+        return min(cap, context_length) if cap is not None and cap > 0 else None
+
+    def preview_threshold_tokens(self, model: str, context_length: int, provider: str = "") -> int:
+        """The trigger ``update_model`` would install, without mutating state."""
+        return self._derive_trigger(model, context_length, provider)[2]
+
+    def update_model(
+        self, model: str, context_length: int, base_url: str = "", api_key: Any = "", provider: str = "",
+        api_mode: str = "", max_tokens: int | None = None,
+    ) -> None:
+        """Update model info after a model switch or fallback activation."""
+        runtime_changed = (model, provider, base_url, api_mode) != (self.model, self.provider, self.base_url, self.api_mode)
+        self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
+        self.context_length = context_length
+        # max_tokens=None means "unspecified": keep the existing output reservation.
+        # A switch that genuinely changes the output budget passes the new value explicitly. (#43547)
+        if max_tokens is not None:
+            self.max_tokens = self._coerce_max_tokens(max_tokens)
+        if runtime_changed:
+            # The aux ceiling was probed against the previous main runtime (an "auto" aux route follows the
+            # main model); the caller re-runs the feasibility probe. A same-runtime recompute (overflow-reported
+            # window, grown local window, tier cap) keeps it: the summariser did not change (#114707).
+            self._aux_context_ceiling = None
+        self._base_threshold_percent, self.threshold_percent, self.threshold_tokens = self._derive_trigger(
+            model, context_length, provider)
+        self._apply_threshold_tokens_cap()
+        # Reset to None so the property recomputes via the mode-aware path (not the legacy formula).
+        self._tail_token_budget = None
+        _ = self.tail_token_budget  # eager recompute, same timing as before
+        self.max_summary_tokens = min(int(context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+        # Old usage cannot price a new model. Clear it without arming the post-compaction
+        # latch: the next response supplies usage or enables the usage-less fallback.
+        self.last_prompt_tokens = self.last_completion_tokens = self.last_total_tokens = 0
+        self._reset_real_usage_pairing()
+        # Strikes were judged against the previous threshold; void them durably too.
+        self._record_ineffective_compression_verdict(0)
+        self._prellm_skip_count = 0
+        if runtime_changed:
+            self._fallback_compression_streak = 0
+            self._persist_fallback_compression_streak()
+            # Cooldowns are scoped to the failed model/provider; a switch gets an immediate attempt.
+            self._clear_compression_failure_cooldown()
+            # The overload budget rode those cooldowns; a new runtime restarts it too.
+            self._reset_consecutive_overload_aborts()
+        self._verify_compaction_cleared_threshold = self._last_compression_made_progress = False
+        # Runway was computed against the previous model's trigger; clear the durable copy too.
+        self._reset_proactive_prune_rearm()
+        self._clear_durable_proactive_prune_rearm()
+
+    # When the MINIMUM_CONTEXT_LENGTH floor binds on a small window, trigger near the top instead.
+    _MIN_CTX_TRIGGER_RATIO = 0.85
+
+    # Anti-thrash recovery: after this long blocked, allow ONE probe (counters drop to 1 strike).
+    # Anti-thrash recovery window (#14694): once the ineffective breaker trips, automatic
+    # compaction stays blocked for this long, then ONE probe attempt is allowed (the count drops to 1 strike,
+    # so another ineffective pass re-trips immediately). Long enough that a genuinely incompressible session
+    # isn't compacting in a loop; short enough that a session which has since grown real compressible
+    # material recovers well before it rides into the provider's hard context limit.
+    _ANTI_THRASH_RECOVERY_SECONDS = 300.0
+
+    # Structural no-op (nothing eligible) is not an ineffective attempt: defer retries instead of striking.
+    _STRUCTURAL_NO_OP_BACKOFF_SECONDS = 300.0
+
+    @staticmethod
+    def _coerce_max_tokens(value: Any) -> int | None:
+        """Normalize max_tokens to a positive int, or None for "no reservation"."""
+        try:
+            ivalue = int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return None
+        return ivalue if ivalue > 0 else None
+
+    # Same normalization: a threshold_tokens cap is a positive int, or None for "no cap".
+    _coerce_threshold_tokens_cap = _coerce_max_tokens
+
+    def _apply_threshold_tokens_cap(self) -> None:
+        """Clamp threshold_tokens to the configured cap (itself clamped to the context length) and to the
+        auxiliary summariser's window when the feasibility probe installed one."""
+        cap = self._effective_threshold_cap(self.context_length)
+        if cap is not None and cap < self.threshold_tokens:
+            self.threshold_tokens = cap
+        # Durable, so every recomputation honours it rather than a one-time assignment (#114707).
+        _aux_ceiling = getattr(self, "_aux_context_ceiling", None)
+        if isinstance(_aux_ceiling, int) and 0 < _aux_ceiling < self.threshold_tokens:
+            self.threshold_tokens = _aux_ceiling
+
+    @staticmethod
+    def _effective_threshold_percent(context_length: int, threshold_percent: float) -> float:
+        """Raise-only small-context threshold floor: models under 512K trigger at >= 75%."""
+        if context_length and context_length < _SMALL_CTX_WINDOW_LIMIT:
+            return max(threshold_percent, _SMALL_CTX_THRESHOLD_PERCENT)
+        return threshold_percent
+
+    @staticmethod
+    def _effective_input_window(context_length: int, max_tokens: int | None) -> int:
+        """Usable input budget: the window minus the output reservation, or the whole window when the reservation
+        is unset or leaves nothing."""
+        effective_window = context_length - (max_tokens or 0)
+        return effective_window if effective_window > 0 else context_length
+
+    @staticmethod
+    def _compute_threshold_tokens(
+        context_length: int, threshold_percent: float, max_tokens: int | None = None,
+    ) -> int:
+        """Compute the compaction trigger in tokens from the effective input budget.
+        Base is ``(context_length - max_tokens) * threshold_percent`` floored at MINIMUM_CONTEXT_LENGTH;
+        when the floor binds it is capped at 85% of the budget so small windows can still fire.
+
+        The base value is ``effective_input_budget * threshold_percent``, floored at
+        ``MINIMUM_CONTEXT_LENGTH`` so large-context models don't compress prematurely at 50%. BUT that floor
+        degenerates at small windows: for a model whose ``context_length`` is at/below the minimum (e.g. a
+        64K local model), ``max(0.5*64000, 64000) == 64000`` makes the threshold equal the ENTIRE window —
+        auto-compression can never fire because the provider rejects the request before usage reaches 100%
+        (#14690).
+        The provider reserves ``max_tokens`` of output space out of the same window, so the usable INPUT
+        budget is ``context_length - max_tokens``. With a large ``max_tokens`` (e.g. 65536 on a custom
+        provider) the input budget is materially smaller than the raw window, and a threshold based on the
+        full window lets the session hit a provider 400 before compaction fires (#43547). The percentage and
+        the degenerate-window check below both operate on the effective input budget. ``max_tokens=None``
+        (provider default) conservatively assumes no reservation (full window).
+        """
+        effective_window = ContextCompressor._effective_input_window(context_length, max_tokens)
+        pct_value = int(effective_window * threshold_percent)
+        floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
+        # The floor must not consume output headroom: cap at 85% when it is the binding term. Near-minimum windows
+        # otherwise trigger at ~98%, and providers that silently clip over-window prompts (ollama) never raise the
+        # overflow backstop, so the session wedges. An explicit threshold_percent above 85% is user intent; not capped.
+        trigger_cap = int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO)
+        if effective_window > 0 and floored > pct_value and floored > trigger_cap:
+            floored = max(pct_value, trigger_cap)
+        # A percentage at/above the window is unreachable; trigger at 85% instead.
+        if effective_window > 0 and floored >= effective_window:
+            return max(1, min(trigger_cap, effective_window - 1))
+        return floored
+
+    def __init__(
+        self, model: str, threshold_percent: float = 0.50, protect_first_n: int = 3, protect_last_n: int = 20,
+        summary_target_ratio: float = 0.20, quiet_mode: bool = False, summary_model_override: str = None,
+        base_url: str = "", api_key: str = "", config_context_length: int | None = None, provider: str = "",
+        api_mode: str = "", abort_on_summary_failure: bool = False, max_tokens: int | None = None,
+        model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
+        proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
+        proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
+        custom_providers: list | None = None,
+    ):
+        self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
+        # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
+        self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
+        # Per-model context_length overrides live in custom_providers; without them deferred
+        # resolution falls back to the hardcoded family catalog (#83324).
+        self.custom_providers = custom_providers or None
+        # Per-model overrides (longest substring match wins); floor applied on top.
+        self.model_thresholds = model_thresholds or {}
+        # Raw config value, before override/floor; fallback when switching to a model with no override.
+        self._config_threshold_percent = threshold_percent
+        self._base_threshold_percent = resolve_model_threshold(model, self.model_thresholds, threshold_percent, provider)
+        self.threshold_percent = self._base_threshold_percent
+        # Effective trigger = min(ratio threshold, cap); re-applied in update_model().
+        self.threshold_tokens_cap = self._coerce_threshold_tokens_cap(threshold_tokens_cap)
+        # Aux summariser window installed by the feasibility probe; None until it runs.
+        self._aux_context_ceiling: int | None = None
+        self.protect_first_n, self.protect_last_n = protect_first_n, protect_last_n
+        # Proactive prune runs independently of the full-compression trigger. 0 = disabled.
+        self.proactive_prune_tokens = int(proactive_prune_tokens or 0)
+        # Floor at 200 chars: below that a summary can exceed what it replaces and pass 2 re-summarizes
+        # its own output every turn. Configured 0 keeps the 8000 default via `or`.
+        self.proactive_prune_min_result_chars = max(_PRUNE_MIN_CHARS, int(proactive_prune_min_result_chars or 8000))
+        # Every commit breaks the prompt-cache prefix; require a meaningful reclaim batch so fires are episodic.
+        self.proactive_prune_min_reclaim_tokens = max(0, int(proactive_prune_min_reclaim_tokens or 0))
+        # A committed prune is a cache boundary: rearm only after the prompt regrows the reclaimed tokens.
+        self._proactive_prune_rearm_tokens: int = 0
+        # Dedup key for the over-threshold "reclamation no-oped" warning
+        # (#101889) so a tool loop riding above the threshold warns once per
+        # distinct reason + rearm snapshot instead of every iteration.
+        self._last_reclaim_block_warn: "tuple[str, int] | None" = None
+        self.min_tail_user_messages = min_tail_user_messages
+        self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
+        self.quiet_mode = quiet_mode
+        # Usable input = context_length - max_tokens; only a positive int counts as a reservation.
+        self.max_tokens = self._coerce_max_tokens(max_tokens)
+        # True: summary failure aborts (messages unchanged); False: insert deterministic handoff and drop middle.
+        # Output-token reservation: the provider carves max_tokens out of the context window, so the usable
+        # input budget is context_length - max_tokens. None = provider default => assume no reservation.
+        # (#43547) Coerce defensively: only a positive int is a real reservation; any other value (None,
+        # non-numeric, <=0) means "no reservation" so the threshold arithmetic never sees a non-int (e.g. a
+        # test MagicMock).
+        self.abort_on_summary_failure = abort_on_summary_failure
+
+        # Micro-compaction is OFF by default: each pass breaks the prompt-cache prefix every turn.
+        self._micro_compact_enabled = False
+        self._reset_micro_compact_cursor_state()
+        self._micro_compact_defrag_threshold_tokens = 2000
+        # Set when _defrag_rolling_summary pops _DB_PERSISTED_MARKER in place; finalize_turn resets the flush cursor.
+        # Set by _defrag_rolling_summary when it pops _DB_PERSISTED_MARKER from a live dict in place;
+        # consumed by finalize_turn to invalidate the agent's bounded flush-scan cursor (sibling of the
+        # #75170 site).
+        self._flush_scan_cursor_invalidated: bool = False
+        self._micro_compact_passes = self._micro_compact_tokens_saved_total = self._micro_compact_turns_since_pass = 0
+        # Cadence dial: how often the cache-breaking pass is paid. 1 = every turn.
+        self._micro_compact_every_n_turns: int = 1
+        # Deferred: get_model_context_length() may issue a sync HTTP probe that must not block construction.
+        # Floor and cap are applied on first resolution (see _resolve_context_length / threshold_tokens).
+        # The small-context threshold floor and the absolute threshold cap both need the resolved window, so
+        # they are applied on first resolution (see _resolve_context_length / the threshold_tokens property)
+        # instead of here. update_model() re-derives the floor for a new window from
+        # _config_threshold_percent (the raw config value snapshotted above), so switching small -> large
+        # correctly drops back to the configured value. See #32221.
+        self._config_context_length = config_context_length
+        self._configured_threshold_percent = self.threshold_percent
+        self._resolved_context_length: int | None = None
+        self._threshold_tokens = self._tail_token_budget = self._max_summary_tokens = None
+        self.compression_count = 0
+        # The init log reports resolved budgets; emit it on first resolution to keep construction non-blocking.
+        # The "initialized" log reports resolved token budgets, which would force the deferred
+        # get_model_context_length() probe to run inside __init__ and re-introduce the exact synchronous
+        # blocking this change removes (#32221). Emit it on first context-length resolution instead so
+        # construction stays non-blocking on every path (not just quiet).
+        self._log_init_summary = not quiet_mode
+        self._context_probed = False  # True after a step-down from context error
+        self.last_prompt_tokens = self.last_completion_tokens = 0
+        self._reset_real_usage_pairing()
+        self.summary_model = summary_model_override or ""
+        self._session_db: Any = None
+        self._session_id: str = ""
+        # Per-session state (also reset by /new, /reset and session end).
+        self._reset_session_compaction_state()
+        # Terminal summary failures (access/quota, network, empty content, finish_reason=length): compress()
+        # must ABORT and preserve the session regardless of abort_on_summary_failure (see _TERMINAL_SUMMARY_FAILURES).
+        self._clear_terminal_summary_failures()
+
+    def update_from_response(self, usage: Dict[str, Any]):
+        """Update tracked token usage from API response."""
+        self.last_prompt_tokens = usage.get("prompt_tokens", 0)
+        self.last_completion_tokens = usage.get("completion_tokens", 0)
+        self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
+        self._apply_real_prompt_verdict()
+        # Consume the flag once real usage arrives even without prompt_tokens, so it can't stay armed.
+        self._verify_compaction_cleared_threshold = self.awaiting_real_usage_after_compression = False
+
+    def _apply_real_prompt_verdict(self) -> None:
+        """Pair the real prompt count with its rough estimate and judge the armed compaction verdict."""
+        if self.last_prompt_tokens > 0:
+            self.last_real_prompt_tokens = self.last_prompt_tokens
+            self._provider_omits_usage = False
+            if self.last_prompt_tokens < self.threshold_tokens:
+                # Any real reading below the trigger proves the prompt fits: clear the latch. The fallback streak survives.
+                self._record_ineffective_compression_verdict(0)
+            # Anti-thrash verdict lives HERE: effectiveness is "prompt under threshold" per the provider's real count,
+            # not "messages shrank"; should_compress() runs twice per turn with mixed measures and would reset it.
+            # Anti-thrashing verdict, judged HERE because this is the only place that sees the provider's
+            # real prompt count for the just-compacted conversation. Effectiveness is "did the prompt get
+            # under the threshold?", not "did the message list shrink?": compaction can only shrink
+            # messages, while the system prompt and tool schemas are an incompressible floor (with 50+
+            # tools, 20-30K tokens — see #14695). When that floor alone meets the threshold, every pass
+            # shrinks messages by a healthy margin yet leaves the prompt over the line, so the next turn
+            # compacts again, forever. It must NOT live in should_compress(): that runs twice per turn with
+            # two different measures (a rough preflight estimate and the real post-response count, #36718),
+            # and the rough one can dip below the threshold and reset the strike every turn, re-opening the
+            # loop. Keying on real usage compares like with like and fires exactly once per compaction.
+            if self._verify_compaction_cleared_threshold:
+                if self.last_prompt_tokens >= self.threshold_tokens:
+                    self._record_ineffective_compression_verdict(self._ineffective_compression_count + 1)
+                    if not self.quiet_mode:
+                        logger.warning(
+                            "Compaction did not clear the threshold: %d real tokens still >= %d. The "
+                            "incompressible prompt (system prompt + tool schemas) may already exceed it, "
+                            "in which case shrinking messages cannot help. ineffective_compression_count=%d",
+                            self.last_prompt_tokens, self.threshold_tokens,
+                            self._ineffective_compression_count,
+                        )
+                else:
+                    self._record_ineffective_compression_verdict(0)
+
+    def maybe_seed_preflight_display_tokens(self, preflight_tokens: int) -> None:
+        """Display-only seed of ``last_prompt_tokens`` from the 0 state; the -1 sentinel and real readings are preserved."""
+        if self.last_prompt_tokens == 0 and preflight_tokens > 0:
+            self.last_prompt_tokens = preflight_tokens
+
+    def snapshot_preflight_display_tokens(self) -> int:
+        """Capture the display token count before a speculative preflight seed."""
+        return self.last_prompt_tokens
+
+    def rollback_interrupted_preflight_display_tokens(self, snapshot: int) -> None:
+        """Restore a speculative display seed without touching compaction state."""
+        if self.awaiting_real_usage_after_compression and self.last_prompt_tokens == -1:
+            return
+        self.last_prompt_tokens = snapshot
+
+    def note_usage_less_response(self) -> None:
+        """A completed response carried no usage: until a real reading arrives, this provider cannot
+        adjudicate context pressure, so rough estimates decide instead of waiting forever (#2153)."""
+        self._provider_omits_usage = True
+
+    def note_native_compaction_checkpoint(self) -> None:
+        """Wait for real usage before trusting a newly checkpointed request.
+
+        Native Responses compaction replaces durable history with an opaque
+        encrypted checkpoint. Its serialized size is unrelated to the token
+        count billed by the provider, so the first rough estimate after capture
+        can jump by more than the whole context window. Reuse the one-response
+        compaction latch and discard any stale local-compression baseline; the
+        next provider response then pairs its real usage with the rough estimate
+        for the checkpointed request.
+        """
+        self.awaiting_real_usage_after_compression = True
+        self.last_compression_rough_tokens = 0
+
+    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
+        """True when a whole-context ROUGH estimate over threshold must wait ONE request for the
+        provider's real usage. Callers skip this for usage-anchored figures (real prompt count +
+        delta of what was appended since), which never defer. A rough figure defers right after a
+        local or native compaction (the last real reading is stale — the latch) and on any
+        transcript the anchor does not cover (first request, rewind/edit-resend, reloaded history):
+        the next response re-anchors it. It never defers once the provider has proven it omits
+        usage, or the estimate would be the only signal and compression could never fire (#2153);
+        the overflow handler compacts reactively in every case."""
+        if getattr(self, "bounded_context_policy", None) is not None:
+            return False  # Explicit conservative TEST budget, never a claim of real usage.
+        if rough_tokens < self.threshold_tokens:
+            return False
+        if self.awaiting_real_usage_after_compression:
+            return True
+        # Estimate magnitude is not evidence of overflow, even past the full window.
+        # Let the provider adjudicate; its overflow error still triggers reactive recovery.
+        if self.last_real_prompt_tokens >= self.threshold_tokens:
+            return False
+        return not self._provider_omits_usage
+
+    def should_compress(self, prompt_tokens: int = None) -> bool:
+        """True when compression should run now (anti-thrash included; see :meth:`should_compress_info` for the reason)."""
+        return self.should_compress_info(prompt_tokens)[0]
+
+    def should_compress_info(self, prompt_tokens: int = None) -> "tuple[bool, str | None]":
+        """Return ``(should_compress, reason)``.
+        ``reason`` is None unless compression is needed but blocked: ``"cooldown:<seconds>"`` or
+        ``"ineffective"``. Callers should surface a warning when it is non-None."""
+        tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+        if tokens < self.threshold_tokens:
+            return False, None
+        if self._automatic_compression_blocked():
+            return False, self._compression_block_reason() or "blocked"
+        return True, None
+
+    def _compression_block_reason(self) -> "str | None":
+        """Block reason: ``"cooldown:<s>"``, ``"structural_backoff:<s>"``, ``"ineffective"``, or None."""
+        for label, until in (
+            ("cooldown", self._summary_failure_cooldown_until), ("structural_backoff", self._structural_no_op_backoff_until),
+        ):
+            remaining = until - time.monotonic()
+            if remaining > 0:
+                return f"{label}:{remaining:.0f}"
+        return "ineffective" if self._tripped() else None
+
+    def _tripped(self) -> bool:
+        """Only provider-confirmed ineffective compactions trip the breaker.
+
+        A static fallback still reclaims the window, so blocking on it lets the prompt run into the
+        provider's hard limit. The fallback streak instead benches the failing summary model
+        (``_fallback_streak_skip``), which is what stops a paid fallback loop (#63008).
+        """
+        return self._ineffective_compression_count >= 2
+
+    def _refresh_durable_guards(self) -> None:
+        """Re-read durable cooldown + breaker state; called only when a gate is about to block."""
+        for label, refresh in (
+            ("cooldown", lambda: self.get_active_compression_failure_cooldown(refresh=True)),
+            ("ineffective-count", self._load_ineffective_compression_count),
+        ):
+            try:
+                refresh()
+            except Exception as exc:
+                logger.debug("compression %s refresh failed: %s", label, exc)
+
+    def _automatic_compression_blocked(self, *, ignore_cooldown: bool = False) -> bool:
+        """Whether auto-compaction is in cooldown or tripped; ``ignore_cooldown`` skips only the summary-failure cooldown."""
+        if not self._automatic_compression_blocked_locally(ignore_cooldown=ignore_cooldown):
+            return False
+        # Blocked locally: durable rows may have been cleared by another agent, so refresh before honouring.
+        self._refresh_durable_guards()
+        return self._automatic_compression_blocked_locally(ignore_cooldown=ignore_cooldown)
+
+    def _automatic_compression_blocked_locally(self, *, ignore_cooldown: bool = False) -> bool:
+        """Evaluate the automatic-compaction gate on in-memory state only."""
+        # Summary-LLM cooldown: without this every turn re-fires and re-inserts the fallback marker (#11529).
+        # Manual /compress passes force=True, which clears the cooldown first. Structural no-op backoff is
+        # transient (in-memory, no strikes); auto-compaction resumes when it lapses.
+        for until, skip, what in (
+            (self._summary_failure_cooldown_until, ignore_cooldown, "summary LLM in cooldown"),
+            (self._structural_no_op_backoff_until, False, "structural no-op backoff"),
+        ):
+            remaining = until - time.monotonic()
+            if remaining > 0 and not skip:
+                if not self.quiet_mode:
+                    logger.debug("Compression deferred — %s for %.0fs more", what, remaining)
+                return True
+        # Anti-thrash back-off must not be permanent: after _ANTI_THRASH_RECOVERY_SECONDS blocked, allow ONE
+        # probe by dropping the ineffective count to 1 strike (persisted). Deadline is armed lazily and persisted on the row.
+        if self._tripped():
+            # Wall clock: the deadline is persisted so a rebuilt compressor resumes the SAME window.
+            # Wall clock, not monotonic: the deadline is persisted on the session row (#100185) so a fresh
+            # compressor bound to the same session — the gateway rebuilds the AIAgent on every cache
+            # eviction — resumes the SAME window instead of restarting it. Without that, a blocked messaging
+            # session never earned its probe and stayed blocked forever.
+            _now = time.time()
+            if self._anti_thrash_recovery_deadline <= 0.0 or (
+                # Clock jumped backwards: never wait longer than one window from now.
+                self._anti_thrash_recovery_deadline - _now > self._ANTI_THRASH_RECOVERY_SECONDS
+            ):
+                self._set_anti_thrash_recovery_deadline(_now + self._ANTI_THRASH_RECOVERY_SECONDS)
+            elif _now >= self._anti_thrash_recovery_deadline:
+                self._set_anti_thrash_recovery_deadline(0.0)
+                # Anti-thrashing: back off if recent compressions were ineffective. The back-off must not be
+                # permanent (#14694): the tripped state was judged against the transcript as it existed THEN
+                # (e.g. a middle region too small to matter), but the conversation keeps growing and can
+                # accumulate plenty of compressible material later. Without a recovery path the session
+                # never auto-compacts again and rides into the provider's hard context limit. Recovery is a
+                # probation probe: after _ANTI_THRASH_RECOVERY_SECONDS of continuous block, allow ONE
+                # attempt by dropping the ineffective counter to 1 strike (persisted, so sibling agents on
+                # the same session row unblock too). If the probe is ineffective again the very next verdict
+                # re-trips the guard, so the worst case in the truly-incompressible state is one compaction
+                # atte

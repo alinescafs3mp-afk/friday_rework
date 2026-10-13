@@ -1,0 +1,141 @@
+    force=True replay cannot bypass one check when only the other was shown to the user.
+    ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
+    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+        return _user_deny_block(command) or _approved()
+
+    blocked = _floor_block(command, sudo_guard=True)
+    if blocked is not None:
+        return blocked
+
+    from agent.terminal_approval_batch import consume_prepared_guard
+    prepared = consume_prepared_guard(command, env_type, has_host_access)
+    if prepared is not None:
+        return prepared
+
+    approval_mode = approval_context._get_approval_mode()
+    if _yolo_active() or approval_mode == "off":
+        return _approved()
+    if _command_matches_permanent_allowlist(command):
+        return _approved()
+
+    approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
+    # Outside CLI/gateway/ask flows we never block on approvals: each
+    # unattended context applies its configured deny/approve mode, else allow.
+    if not is_cli and not is_gateway and not is_ask:
+        for ctx in _unattended_contexts():
+            result = _unattended_deny(command, ctx)
+            if result is not None:
+                return result
+        return _approved()
+
+    # Gather findings: warnings = [(pattern_key, description, is_tirith)]. Tirith block AND warn both go through the
+    # approval flow (block used to be a hard stop) so users can inspect the findings and approve.
+    tirith_result = _tirith_scan(command)
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    warnings = []
+    session_key = get_current_session_key()
+    if tirith_result["action"] in {"block", "warn"}:
+        findings = tirith_result.get("findings") or []
+        rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
+        tirith_key = f"tirith:{rule_id}"
+        if not is_approved(session_key, tirith_key):
+            warnings.append((tirith_key, _format_tirith_description(tirith_result), True))
+    if is_dangerous and not is_approved(session_key, pattern_key):
+        warnings.append((pattern_key, description, False))
+    if not warnings:
+        return _approved()
+
+    combined_desc = "; ".join(desc for _, desc, _ in warnings)
+    primary_key = warnings[0][0]
+    all_keys = [key for key, _, _ in warnings]
+
+    # "Always" is offered when at least one warning is a dangerous-pattern key the persistence layer would actually
+    # allowlist permanently. Pure-tirith findings are session-max by design, so a tirith-only prompt hides Always;
+    # mixed prompts offer it (the pattern key persists, tirith downgrades to session — see _persist_choice).
+    return _human_decision(
+        _COMMAND_GATE, command=command, description=combined_desc,
+        pattern_key=primary_key, pattern_keys=all_keys, warnings=warnings,
+        session_key=session_key, approval_callback=approval_callback,
+        is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
+        permanent_capable=any(not is_t for _, _, is_t in warnings),
+    )
+
+
+_EXECUTE_CODE_DESCRIPTION = (
+    "execute_code script execution. The script can spawn subprocesses or "
+    "mutate files without passing through terminal command approval; approval is one-shot for this run."
+)
+
+
+def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = False) -> dict:
+    """Approve an execute_code script before its child process is spawned.
+
+    The script can call ``subprocess``/``os.system``/``ctypes`` directly, none of which pass
+    through ``terminal()`` / ``DANGEROUS_PATTERNS``; in gateway/ask contexts we fail closed by
+    approving the script as a whole. Same dict contract as ``check_all_command_guards``.
+    Documented limitation: a purely local non-interactive non-gateway session returns approved
+    (the terminal auto-approve contract); the hardline floor still blocks catastrophic
+    ``terminal()`` commands the script issues.
+
+    See #30882.
+    The hardline floor still blocks catastrophic ``terminal()`` commands the script issues; running
+    arbitrary code headlessly without any approval surface is trusted-by-config (set a gateway/ask surface
+    or ``approvals.cron_mode`` to require approval). See #30882.
+    """
+    pattern_key = "execute_code"
+    description = _EXECUTE_CODE_DESCRIPTION
+
+    # Isolated backends already sandbox the child. vercel_sandbox has no host-bind concept so it stays always-skipped.
+    if env_type == "vercel_sandbox":
+        return _approved()
+    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+        return _approved()
+    approval_mode = approval_context._get_approval_mode()
+    if _yolo_active() or approval_mode == "off":
+        return _approved()
+
+    # (-q clears the presence flags, but its unattended context resolves first anyway.)
+    approval_callback, is_cli, is_gateway, is_ask = _presence()
+    # No user is present to approve arbitrary code in -q / cron / unattended
+    # sessions: the first active context resolves instantly from its mode.
+    for ctx in _unattended_contexts():
+        if ctx.mode() == "deny":
+            return _denied(
+                "BLOCKED: execute_code runs arbitrary local Python (including "
+                "subprocess calls that bypass shell-string approval checks). " + ctx.exec_tail,
+                pattern_key=pattern_key, description=description, outcome="blocked", noun="code",
+            )
+        return _approved()
+
+    # Only gateway/ask contexts get the one-shot whole-script approval. In an interactive CLI the script's terminal()
+    # calls are guarded per-call (context propagates into the RPC thread, #33057), so a whole-script prompt would fire
+    # on every execute_code call. Ask-mode still takes this path even with INTERACTIVE set (how gateway/smart tests
+    # and messaging ask-mode drive whole-script approval); when that leaks into a CLI with no notify callback, the
+    # engine falls through to the CLI Dangerous Command panel instead of a silent pending_approval.
+    if not is_gateway and not is_ask:
+        return _approved()
+
+    session_key = get_current_session_key()
+    # Built only past the early-return gates so common paths don't copy a potentially-large script into this string.
+    command = f"execute_code <<'PY'\n{code}\nPY"
+
+    # Without this, "Approve session" / "Always" choices are stored but never
+    # consulted, so every execute_code call re-prompts (#39275).
+    if is_approved(session_key, pattern_key):
+        return _approved()
+
+    # Smart mode: an APPROVE only suppresses the redundant whole-script prompt; the per-call terminal() guards still
+    # run independently. The gateway renders the pending payload to Discord/Slack, so the script body is redacted for
+    # display; the raw code is what gets assessed and run.
+    from agent.redact import redact_sensitive_text
+    return _human_decision(
+        _EXECUTE_CODE_GATE, command=command, description=description, pattern_key=pattern_key,
+        pattern_keys=[pattern_key], warnings=[(pattern_key, None, False)], session_key=session_key,
+        approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+        smart=approval_mode == "smart",
+        pending_body=lambda: f"**Code:**\n```python\n{redact_sensitive_text(code)}\n```",
+    )
+
+
+# Load permanent allowlist from config on module import
+load_permanent_allowlist()

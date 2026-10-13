@@ -1,0 +1,1248 @@
+fb_entries = fb if isinstance(fb, list) else [fb]
+    if not any(isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb_entries):
+        parts.append(_FALLBACK_COMMENT)
+    return "".join(parts) or None
+
+
+def save_config(
+    config: Dict[str, Any], *, strip_defaults: bool = True,
+    preserve_keys: Optional[Set[Tuple[str, ...]]] = None, merge_existing: bool = False):
+    """Save configuration to ~/.hermes/config.yaml.
+    Schema defaults are not written unless the user explicitly set them (the path exists in the
+    raw config before normalisation), so config.yaml is never contaminated with defaults that
+    would hide future default changes. ``merge_existing`` deep-merges the on-disk raw config
+    under *config* so partial callers cannot drop sections they omitted."""
+    with _CONFIG_LOCK:
+        if is_managed():
+            managed_error("save configuration")
+            return
+
+        config_path = get_config_path()
+        with config_write_transaction(config_path):
+            _refuse_failed_read(config_path, config)
+            config = _strip_managed_keys_for_save(config)
+
+            ensure_hermes_home()
+            # Explicit user paths come from the RAW dict BEFORE normalisation (which may inject
+            # agent.max_turns) so _strip_default_values keeps exactly what the user set. The
+            # fail-closed read is the single authority here: ``read_raw_config()`` is cached and
+            # swallows transient stat/open errors into ``{}``, and a ``{}`` at this point makes the
+            # strip pass drop every user section whose value matches a default (#113301).
+            _raw_for_paths = require_readable_config_before_write(config_path)
+            if merge_existing and _raw_for_paths:
+                config = _merge_partial_save(_raw_for_paths, config)
+
+            current_normalized = _canonicalize_config(config)
+            normalized = current_normalized
+            if _raw_for_paths:
+                normalized = _preserve_env_ref_templates(
+                    normalized, _canonicalize_config(_raw_for_paths),
+                    _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)))
+
+            if strip_defaults:
+                # ``_strip_default_values`` always preserves ``_config_version`` itself.
+                effective_preserve_keys = _explicit_config_paths(_raw_for_paths) | set(preserve_keys or ())
+                normalized = _strip_default_values(normalized, DEFAULT_CONFIG, preserve_keys=effective_preserve_keys)
+
+            atomic_config_replace(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized))
+            _secure_file(config_path)
+            _RAW_CONFIG_CACHE.pop(str(config_path), None)
+            _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+    from hermes_cli.observability.shared_metrics_disabled import record_config_saved
+    record_config_saved(_raw_for_paths, current_normalized)
+
+
+def load_env() -> Dict[str, str]:
+    """Load ~/.hermes/.env as a dict. Memoised inside ``load_env_file`` (``get_env_value()`` runs
+    hundreds of times per interactive menu render). Each assignment's value is opaque data for
+    boundary discovery."""
+    from agent.secret_scope import load_env_file  # the one .env tokenizer; also installs profile scopes
+
+    from hermes_cli.friday_credential_admission import managed, owned_values
+    if managed():
+        return owned_values(get_hermes_home())
+    return load_env_file(get_env_path())
+
+
+def _parse_env_value(raw_value: str) -> str:
+    """Frozen compat surface name (tests/compat/old_updater_surface.json).
+
+    Pre-PM updaters lazy-import ``hermes_cli.config._parse_env_value`` after the
+    checkout swap. The tokenizer moved to ``agent.secret_scope._parse_env_value``
+    (c849bc383a), so this forwards there — behavior-preserving by construction.
+    """
+    from agent.secret_scope import _parse_env_value as _parse
+
+    return _parse(raw_value)
+
+
+def invalidate_env_cache() -> None:
+    """Drop the ``.env`` memo so the next ``load_env()`` sees a write even on coarse-mtime filesystems
+    (save_env_value / remove_env_value / sanitize_env_file call this)."""
+    from agent.secret_scope import invalidate_env_file_cache
+
+    invalidate_env_file_cache()
+
+
+def _sanitize_env_lines(lines: list) -> list:
+    """Normalize .env line endings/whitespace without changing assignment semantics.
+    Content after the first ``=`` is opaque value data: a known variable name embedded in a value
+    must never be reinterpreted as another assignment, so concatenated lines stay on one line."""
+    sanitized: list[str] = []
+    for line in lines:
+        raw = line.rstrip("\r\n")
+        stripped = raw.strip()
+        # Blank lines and comments are preserved verbatim.
+        sanitized.append((raw if not stripped or stripped.startswith("#") else stripped) + "\n")
+    return sanitized
+
+
+def sanitize_env_file() -> int:
+    """Rewrite ~/.hermes/.env with normalized line formatting; returns the number of changed lines."""
+    env_path = get_env_path()
+    if not env_path.exists():
+        return 0
+    with _env_write_lock(env_path):
+        with open(env_path, encoding="utf-8-sig", errors="replace") as f:
+            original_lines = f.readlines()
+        sanitized = _sanitize_env_lines(original_lines)
+        if sanitized == original_lines:
+            return 0
+        fixes = abs(len(sanitized) - len(original_lines)) or sum(
+            1 for a, b in zip(original_lines, sanitized) if a != b)
+        _write_env_lines(env_path, sanitized, preserve_mode=False)
+    invalidate_env_cache()
+    return fixes
+
+
+def _read_env_lines(env_path: Path) -> list:
+    """Read ``.env`` lines, normalized. Explicit UTF-8 (Windows defaults to cp1252) with BOM
+    tolerance (Notepad adds one)."""
+    with open(env_path, encoding="utf-8-sig", errors="replace") as f:
+        return _sanitize_env_lines(f.readlines())
+
+
+_ENV_WRITE_LOCK_HOLDERS: Dict[str, Any] = {}
+_ENV_WRITE_LOCK_HOLDERS_GUARD = threading.Lock()
+
+
+def _env_write_lock_holder(env_path: Path) -> Any:
+    """Reentrancy tracker for one canonical ``.env`` path (mirrors auth's
+    ``_auth_lock_holder_for``): multiplexed profiles each get their own tracker."""
+    key = str(env_path)
+    with _ENV_WRITE_LOCK_HOLDERS_GUARD:
+        return _ENV_WRITE_LOCK_HOLDERS.setdefault(key, threading.local())
+
+
+@contextmanager
+def _env_write_lock(env_path: Path):
+    """Serialize a whole ``.env`` read-modify-write cycle (#77187).
+
+    ``save_env_value`` / ``remove_env_value`` / ``sanitize_env_file`` read the file,
+    rewrite it in memory, then atomically replace it. Without a lock, two
+    concurrent writers (setup wizard + dashboard save, gateway + CLI) both
+    snapshot the pre-write file and the loser's replace silently drops the
+    winner's key. ``_CONFIG_LOCK`` cannot help: it guards in-memory config only.
+
+    Reuses ``hermes_cli.auth._file_lock`` (fcntl flock / msvcrt byte lock,
+    cross-process, reentrant per thread) rather than growing a second kernel-lock
+    implementation. The import is call-time: ``hermes_cli.auth`` imports this
+    module at import time, so a module-level import would be circular. Nothing
+    under this lock takes other locks, and the only nesting direction that exists
+    (credential_lifecycle takes ``_auth_store_lock`` around its own auth-store
+    writes, NOT around ``save_env_value``) keeps a single ordering — no cycle.
+    On a filesystem without flock the helper degrades to a depth-only guard
+    (same behavior as auth's locks), never to a crash.
+    """
+    from hermes_cli.auth import _file_lock
+
+    with _file_lock(
+        env_path.with_name(env_path.name + ".lock"),
+        _env_write_lock_holder(env_path),
+        15.0,
+        f"Timed out waiting for the environment file lock ({env_path})",
+    ):
+        yield
+
+
+def _write_env_lines(env_path: Path, lines: list, *, preserve_mode: bool) -> None:
+    """Atomically replace ``.env`` (tmp file + fsync + rename).
+    ``preserve_mode`` keeps the original file mode (e.g. 0640 for Docker volume mounts) instead of
+    letting ``_secure_file`` tighten to 0600; a new file is always secured."""
+    original_mode = None
+    try:
+        original_mode = stat.S_IMODE(env_path.stat().st_mode) if preserve_mode else None
+    except OSError:
+        pass
+    fd, tmp_path = mkstemp_beside(env_path, suffix=".tmp", prefix=".env_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        atomic_replace(tmp_path, env_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    if original_mode is not None:
+        try:
+            os.chmod(env_path, original_mode)
+        except OSError:
+            pass
+    else:
+        _secure_file(env_path)
+
+
+def _check_non_ascii_credential(key: str, value: str) -> str:
+    """Strip non-ASCII characters from a credential (HTTP header values must be ASCII) and warn.
+    Lookalike glyphs typically come from copy-pasting out of a PDF or rich-text editor."""
+    if value.isascii():
+        return value
+
+    bad_chars = [f"  position {i}: {ch!r} (U+{ord(ch):04X})" for i, ch in enumerate(value) if ord(ch) > 127]
+    sanitized = value.encode("ascii", errors="ignore").decode("ascii")
+
+    print(
+        f"\n  Warning: {key} contains non-ASCII characters that will break API requests.\n"
+        f"  This usually happens when copy-pasting from a PDF, rich-text editor,\n"
+        f"  or web page that substitutes lookalike Unicode glyphs for ASCII letters.\n\n"
+        + "\n".join(f"  {line}" for line in bad_chars[:5])
+        + ("\n  ... and more" if len(bad_chars) > 5 else "")
+        + "\n\n  The non-ASCII characters have been stripped automatically.\n"
+        "  If authentication fails, re-copy the key from the provider's dashboard.\n",
+        file=sys.stderr)
+    return sanitized
+
+
+def _quote_env_value(value: str) -> str:
+    """Quote .env values containing characters with special dotenv meaning. Any whitespace
+    (including internal runs) is quoted so ``set -a; . file`` word-splitting keeps paths intact."""
+    if value == "":
+        return value
+    if not ("#" in value or '"' in value or "'" in value or any(c.isspace() for c in value)):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _env_line_defines_key(line: str, key: str, *, is_windows: Optional[bool] = None) -> bool:
+    """True when a .env line assigns ``key`` — plain, ``export``-prefixed, or ``KEY = value``.
+    Must match exactly the shapes ``load_env()`` parses; otherwise a hand-added line is invisible
+    to save (duplicate appended) and remove (line survives -> the value resurrects on next load).
+
+    ``load_env()`` accepts the bash-compatible ``export KEY=value`` form (#6659), so the writers must
+    recognise the same shape.
+    """
+    stripped = line.strip()
+    if stripped.startswith("export "):
+        stripped = stripped[7:].lstrip()
+    assigned_key, separator, _value = stripped.partition("=")
+    if not separator:
+        return False
+    # load_env() strips whitespace around the parsed name, so `KEY = value` IS a live assignment. The
+    # writers must match the same shape, or a hand-edited spaced line is invisible to save (duplicate
+    # appended) and remove (line survives -> value resurrects on next load). #67488.
+    return _env_var_policy_name(
+        assigned_key.strip(), is_windows=is_windows
+    ) == _env_var_policy_name(key, is_windows=is_windows)
+
+
+def _publish_env_value(key: str, value: Optional[str]) -> None:
+    """Publish a just-persisted ``.env`` change to the live process.
+    Under a multiplexed gateway a routed profile's write must not land in the SHARED
+    ``os.environ`` where every profile sees it; the installed scope mapping is updated instead so
+    same-turn reads see the change. All other callers keep the legacy ``os.environ`` publish.
+
+    ``save_env_value`` / ``remove_env_value`` already target the right file (``get_env_path()`` honors the
+    profile-home override), but the in-process mirror historically went straight to ``os.environ``. See
+    #77490, #88441.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope, serves_routed_profile
+
+        scope, routed = current_secret_scope(), serves_routed_profile()
+    except Exception:
+        scope, routed = None, False
+    # The launch profile's own body runs under a scope snapshot even single-profile (the TUI /
+    # dashboard launch scope), so a same-request read after the write must see it there too; a
+    # routed profile's value never reaches the shared process env.
+    targets = [scope] if isinstance(scope, dict) else []
+    if not routed and (scope is None or isinstance(scope, dict)):
+        targets.append(os.environ)
+    for target in targets:
+        if value is None:
+            target.pop(key, None)
+        else:
+            target[key] = value
+
+
+def env_write_refusal(key: str, action: str) -> Optional[str]:
+    """The ``.env`` write-lock refusal for ``key``, or None when the write is allowed.
+    Two distinct locks: ``is_managed()`` (package-manager install) and the managed *scope*
+    (administrator-pinned env key — the managed .env wins at load anyway)."""
+    if is_managed():
+        return format_managed_message(f"{action} {key}")
+    if managed_scope.is_env_managed(key):
+        return (
+            f"Cannot {action} {key}: it is managed by your administrator ({_managed_source('.env')}) "
+            "and cannot be changed.")
+    return None
+
+
+def _env_write_blocked(key: str, action: str) -> bool:
+    """Shared write-lock check for ``.env`` writers; prints the refusal and returns True when blocked."""
+    refusal = env_write_refusal(key, action)
+    if refusal:
+        print(refusal, file=sys.stderr)
+    return refusal is not None
+
+
+def require_env_writable(key: str, action: str) -> None:
+    """Raise ``ValueError`` with the refusal when the ``.env`` write lock forbids ``key``.
+    ``save_env_value`` / ``remove_env_value`` refuse by returning, which their caller cannot tell
+    from success, so a writer that also touches config.yaml or the credential pool must ask first."""
+    refusal = env_write_refusal(key, action)
+    if refusal:
+        raise ValueError(refusal)
+
+
+def _managed_source(filename: str):
+    """``<managed dir>/<filename>`` for refusal messages, or a generic label without a managed dir."""
+    managed_dir = managed_scope.get_managed_dir()
+    return (managed_dir / filename) if managed_dir else "the managed scope"
+
+
+def save_env_value(key: str, value: str):
+    """Save or update a value in ~/.hermes/.env (also matching ``export KEY=`` lines, so a save
+    never appends a second line that a later delete would resurrect)."""
+    if _env_write_blocked(key, "set"):
+        return
+    validate_env_var_name_for_write(key)
+    value = value.replace("\n", "").replace("\r", "")
+    value = _check_non_ascii_credential(key, value)
+    ensure_hermes_home()
+    env_path = get_env_path()
+
+    with _env_write_lock(env_path):
+        lines = _read_env_lines(env_path) if env_path.exists() else []
+        serialized_value = _quote_env_value(value)
+
+        idx = next((i for i, line in enumerate(lines) if _env_line_defines_key(line, key)), None)
+        if idx is not None:
+            lines[idx] = f"{key}={serialized_value}\n"
+        else:
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+            lines.append(f"{key}={serialized_value}\n")
+
+        _write_env_lines(env_path, lines, preserve_mode=env_path.exists())
+    _publish_env_value(key, value)
+    invalidate_env_cache()
+
+
+def custom_endpoint_key_env(identity: str) -> str:
+    """Env var name holding a custom endpoint's API key.
+    ``identity`` is the endpoint's own id (Desktop endpoint id, or ``host:port`` for CLI setup),
+    so two endpoints on one host get separate slots. The fixed ``HERMES_CUSTOM_`` prefix keeps the
+    name POSIX-valid when the slug starts with a digit (``save_env_value`` rejects those)."""
+    slug = re.sub(r"[^A-Z0-9]+", "_", str(identity or "").upper()).strip("_")
+    return f"HERMES_CUSTOM_{slug}_API_KEY" if slug else "HERMES_CUSTOM_API_KEY"
+
+
+def remove_env_value(key: str) -> bool:
+    """Remove a key from ~/.hermes/.env and os.environ; True if it was found and removed."""
+    if _env_write_blocked(key, "remove"):
+        return False
+    if not _ENV_VAR_NAME_RE.match(key):
+        raise ValueError(f"Invalid environment variable name: {key!r}")
+    env_path = get_env_path()
+    if not env_path.exists():
+        _publish_env_value(key, None)
+        return False
+
+    with _env_write_lock(env_path):
+        lines = _read_env_lines(env_path)
+        new_lines = [line for line in lines if not _env_line_defines_key(line, key)]
+        found = len(new_lines) < len(lines)
+        if found:
+            _write_env_lines(env_path, new_lines, preserve_mode=True)
+    _publish_env_value(key, None)
+    invalidate_env_cache()
+    return found
+
+
+def _write_anthropic_slots(token: str, api_key: str, save_fn=None, *, token_first: bool = True):
+    """Write both Anthropic credential slots (one holds the value, the other is cleared)."""
+    writer = save_fn or save_env_value
+    order = (("ANTHROPIC_TOKEN", token), ("ANTHROPIC_API_KEY", api_key))
+    for name, value in order if token_first else reversed(order):
+        writer(name, value)
+
+
+def save_anthropic_oauth_token(value: str, save_fn=None):
+    """Persist an Anthropic OAuth/setup token and clear the API-key slot."""
+    _write_anthropic_slots(value, "", save_fn)
+
+
+def use_anthropic_claude_code_credentials(save_fn=None):
+    """Use Claude Code's own credential files instead of persisting env tokens."""
+    _write_anthropic_slots("", "", save_fn)
+
+
+def save_anthropic_api_key(value: str, save_fn=None):
+    """Persist an Anthropic API key and clear the OAuth/setup-token slot."""
+    _write_anthropic_slots("", value, save_fn, token_first=False)
+
+
+def save_env_value_secure(key: str, value: str) -> Dict[str, Any]:
+    """Save via the unified credential lifecycle (also refreshes any config.yaml mirror of the old
+    value and lifts a prior env-source suppression)."""
+    from hermes_cli.credential_lifecycle import save_provider_env_credential
+
+    # Route through the unified credential lifecycle so a rotation via the secret-capture path also
+    # refreshes any config.yaml mirror of the old value and lifts a prior env-source suppression (#62269 fix
+    # family).
+    save_provider_env_credential(key, value)
+    return {"success": True, "stored_as": key, "validated": False}
+
+
+def reload_env() -> int:
+    """Re-read ~/.hermes/.env into os.environ; returns count of vars changed.
+    Removes deleted vars only when known to Hermes (OPTIONAL_ENV_VARS and _EXTRA_ENV_KEYS) so
+    unrelated environment is never clobbered."""
+    env_vars = load_env()
+    count = 0
+    for key, value in env_vars.items():
+        if os.environ.get(key) != value:
+            os.environ[key] = value
+            count += 1
+    for key in (set(OPTIONAL_ENV_VARS) | _EXTRA_ENV_KEYS) - set(env_vars):
+        if key in os.environ:
+            del os.environ[key]
+            count += 1
+    return count
+
+
+def _scoped_environ_get(key: str) -> Optional[str]:
+    """Read ``key`` from ``os.environ`` through ``agent.secret_scope.get_secret`` so an active
+    profile scope (multiplexed gateway turn) never leaks another profile's raw value. Falls back to
+    a plain environ read when the scope module is unavailable; ``UnscopedSecretError`` and scope
+    failures propagate -- a failed scoped read must never borrow the ambient env."""
+    try:
+        from agent.secret_scope import get_secret as _get_secret
+    except Exception:
+        return os.environ.get(key)
+    return _get_secret(key)
+
+
+def get_env_value(key: str) -> Optional[str]:
+    """Get a value from ``os.environ`` (scope-aware) or ``~/.hermes/.env``.
+
+    The ``os.environ`` read routes through ``agent.secret_scope.get_secret`` so that, under an active
+    profile scope (multiplexed gateway turn), this is scope-checked rather than leaking another profile's
+    raw ``os.environ`` value. ``get_secret`` encodes the whole policy: global vars pass through; scope is
+    authoritative under multiplexing (miss -> None, no environ fallthrough); when multiplexing is off it
+    behaves exactly like the legacy ``os.environ`` read. Its siblings ``get_env_value_prefer_dotenv`` and
+    ``gateway.config._getenv`` already work this way — this was the last scope-blind reader of the trio
+    (#67027).
+    """
+    val = _scoped_environ_get(key)
+    return load_env().get(key) if val is None else val
+
+
+def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
+    """Resolve a Hermes-managed credential preferring ``~/.hermes/.env`` over ``os.environ``, so a
+    deliberate .env edit beats a stale value inherited from the parent shell.
+
+    An unresolved ``op://`` reference left in .env yields to the already-resolved value from the
+    active secret scope (set by the 1Password secret source) — otherwise a provider auth attempt
+    would receive a URL instead of a key. Same carve-out as
+    ``agent.credential_pool.get_env_prefer_dotenv``."""
+    raw = load_env().get(key) or ""
+    if str(raw).lstrip().startswith("op://"):
+        scoped = _scoped_environ_get(key)
+        if scoped:
+            return scoped
+    return raw or _scoped_environ_get(key)
+
+
+# ---- Config display ----
+
+def redact_key(key: str) -> str:
+    """Redact an API key for display."""
+    from agent.redact import mask_secret
+    return mask_secret(key, empty=color("(not set)", Colors.DIM))
+
+
+# Key names (case-insensitive, exact match) whose VALUE is a credential and must be masked
+# before printing any config dict. Exact-match so ``token_count`` / ``secret_santa`` stay visible.
+# Bare ``auth`` is deliberately absent: ``mcp_servers.<s>.auth: oauth`` is a documented mode enum.
+_SECRET_CONFIG_KEYS = frozenset({
+    "api_key", "apikey", "key", "token", "access_token", "refresh_token", "id_token",
+    "secret", "client_secret", "password", "passwd", "authorization",
+    "private_key", "bearer", "jwt"})
+# Env-map shapes (``mcp_servers.<s>.env.FOO_API_KEY``, ``FAL_KEY``, ``AWS_SECRET_ACCESS_KEY``) and
+# the suffixes ``_is_env_config_key`` routes to .env. Suffix-only so ``token_count`` stays visible.
+_SECRET_CONFIG_KEY_SUFFIXES = ("_api_key", "_token", "_secret", "_password", "_key", "_access_key")
+# .env-routed keys are credentials by default; these suffixes name the non-secret exceptions
+# (``TERMINAL_SSH_HOST``, ``TOOL_GATEWAY_URL``, ``BROWSERBASE_PROJECT_ID``).
+_NON_SECRET_KEY_SUFFIXES = ("_url", "_host", "_user", "_id", "_domain", "_scheme")
+_ENV_PLACEHOLDER_RE = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}$")
+
+
+def _is_secret_config_key(key: str) -> bool:
+    """Whether the LAST segment of a config key names a credential value. Header names
+    (``mcp_servers.<s>.headers.X-API-Key``) are folded to snake_case before matching."""
+    leaf = key.rsplit(".", 1)[-1].lower().replace("-", "_")
+    if _is_env_config_key(key):
+        return not leaf.endswith(_NON_SECRET_KEY_SUFFIXES)
+    return leaf in _SECRET_CONFIG_KEYS or leaf.endswith(_SECRET_CONFIG_KEY_SUFFIXES)
+
+
+def redact_config_value(value: Any, _depth: int = 0) -> Any:
+    """Copy of ``value`` with credential-shaped keys masked. ``print`` bypasses the logging
+    redactor and opaque tokens miss the vendor-prefix regexes, so structural masking is required."""
+    from agent.redact import mask_secret
+
+    if _depth > 20:  # bound recursion for pathological/cyclic configs
+        return value
+    if isinstance(value, dict):
+        return {
+            k: mask_secret(v)
+            if isinstance(k, str) and _is_secret_config_key(k) and isinstance(v, str) and v
+            and not _ENV_PLACEHOLDER_RE.match(v)
+            else redact_config_value(v, _depth + 1)
+            for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_config_value(v, _depth + 1) for v in value]
+    return value
+
+
+def _section(title: str) -> None:
+    print()
+    print(color(f"◆ {title}", Colors.CYAN, Colors.BOLD))
+
+
+def _show_managed_banner() -> None:
+    """Surface administrator-pinned settings so the user knows why a config.yaml value may not
+    be the effective one."""
+    managed_keys = managed_scope.managed_config_keys()
+    managed_env = managed_scope.load_managed_env()
+    if not managed_keys and not managed_env:
+        return
+    print()
+    print(color(
+        f"  ⚷ Some settings are managed by your administrator ({managed_scope.get_managed_dir()}) "
+        f"and cannot be changed", Colors.YELLOW, Colors.BOLD))
+    for label, keys in (("config", managed_keys), ("env", managed_env)):
+        if keys:
+            print(color(f"    Managed {label} keys: {', '.join(sorted(keys))}", Colors.YELLOW))
+
+
+_SHOW_CONFIG_API_KEYS = (
+    ("OPENROUTER_API_KEY", "OpenRouter"),
+    ("VOICE_TOOLS_OPENAI_KEY", "OpenAI (STT/TTS)"),
+    ("EXA_API_KEY", "Exa"),
+    ("PARALLEL_API_KEY", "Parallel"),
+    ("FIRECRAWL_API_KEY", "Firecrawl"),
+    ("TAVILY_API_KEY", "Tavily"),
+    ("PERPLEXITY_API_KEY", "Perplexity"),
+    ("BROWSERBASE_API_KEY", "Browserbase"),
+    ("BROWSER_USE_API_KEY", "Browser Use"),
+    ("FAL_KEY", "FAL"))
+
+
+def _show_model_section(config: Dict[str, Any]) -> None:
+    _section("Model")
+    print(f"  Model:        {redact_config_value(config.get('model', 'not set'))}")
+    cfg_max_turns = config.get('agent', {}).get('max_turns', DEFAULT_CONFIG['agent']['max_turns'])
+    print(f"  Max turns:    {cfg_max_turns}")
+    # Read the .env FILE directly so a stale HERMES_MAX_ITERATIONS ghost is caught even when the
+    # gateway bridge already overrode os.environ.
+    try:
+        env_ghost = load_env().get("HERMES_MAX_ITERATIONS")
+    except Exception:
+        env_ghost = None
+    if env_ghost is not None and str(env_ghost).strip() != str(cfg_max_turns).strip():
+        print(color(f"                ⚠ .env has stale HERMES_MAX_ITERATIONS={env_ghost} "
+                    f"(run 'hermes doctor --fix' to remove)", Colors.YELLOW))
+
+
+def _show_display_section(config: Dict[str, Any]) -> None:
+    _section("Display")
+    display = config.get('display', {})
+    try:
+        from hermes_cli.personality import active_personality_name
+        active_personality = active_personality_name(config) or 'none'
+    except Exception:
+        active_personality = display.get('personality') or 'none'
+    on_off = lambda flag: 'on' if flag else 'off'  # noqa: E731
+    print(f"  Personality:  {active_personality}")
+    print(f"  Reasoning:    {on_off(display.get('show_reasoning', True))}")
+    print(
+        f"  Bell:         complete={on_off(display.get('bell_on_complete', False))}, "
+        f"prompt={on_off(display.get('bell_on_prompt', False))}")
+    ump = display.get('user_message_preview', {})
+    ump = ump if isinstance(ump, dict) else {}
+    print(f"  User preview: first {ump.get('first_lines', 2)} line(s), last {ump.get('last_lines', 2)} line(s)")
+
+
+def _show_terminal_section(config: Dict[str, Any]) -> None:
+    _section("Terminal")
+    terminal = config.get('terminal', {})
+    print(f"  Backend:      {terminal.get('backend', 'local')}")
+    print(f"  Working dir:  {terminal.get('cwd', '.')}")
+    print(f"  Timeout:      {terminal.get('timeout', 60)}s")
+
+    configured = lambda *names: 'configured' if all(get_env_value(n) for n in names) else '(not set)'  # noqa: E731
+    from hermes_cli.config_defaults import DEFAULT_SANDBOX_IMAGE as default_img, DEFAULT_VERCEL_IMAGE as _DEFAULT_VERCEL_IMAGE
+    backend_lines = {
+        'docker': lambda: [f"  Docker image: {terminal.get('docker_image', default_img)}"],
+        'singularity': lambda: [f"  Image:        {terminal.get('singularity_image', 'docker://' + default_img)}"],
+        'modal': lambda: [
+            f"  Modal image:  {terminal.get('modal_image', default_img)}",
+            f"  Modal token:  {configured('MODAL_TOKEN_ID')}"],
+        'daytona': lambda: [
+            f"  Daytona image: {terminal.get('daytona_image', default_img)}",
+            f"  API key:      {configured('DAYTONA_API_KEY')}"],
+        'vercel_sandbox': lambda: [
+            f"  Vercel image:   {terminal.get('vercel_runtime') or terminal.get('vercel_image') or _DEFAULT_VERCEL_IMAGE}",
+            f"  Vercel auth:    {'configured' if get_env_value('VERCEL_OIDC_TOKEN') or (get_env_value('VERCEL_TOKEN') and get_env_value('VERCEL_PROJECT_ID') and get_env_value('VERCEL_TEAM_ID')) else '(not set)'}",
+        ],
+        'ssh': lambda: [
+            f"  SSH host:     {get_env_value('TERMINAL_SSH_HOST') or '(not set)'}",
+            f"  SSH user:     {get_env_value('TERMINAL_SSH_USER') or '(not set)'}"]}
+    for line in backend_lines.get(terminal.get('backend'), list)():
+        print(line)
+
+
+def _show_compression_section(config: Dict[str, Any]) -> None:
+    _section("Context Compression")
+    compression = config.get('compression', {})
+    enabled = compression.get('enabled', True)
+    print(f"  Enabled:      {'yes' if enabled else 'no'}")
+    if not enabled:
+        return
+    print(f"  Threshold:    {compression.get('threshold', 0.50) * 100:.0f}%")
+    tt = compression.get('threshold_tokens')
+    try:
+        if tt is not None and int(tt) > 0:
+            print(f"  Token cap:    {int(tt):,} tokens (takes lower of ratio vs absolute)")
+    except (TypeError, ValueError):
+        pass
+    print(f"  Target ratio: {compression.get('target_ratio', 0.20) * 100:.0f}% of threshold preserved")
+    print(f"  Protect last: {compression.get('protect_last_n', 20)} messages")
+    print(f"  Protect first: {compression.get('protect_first_n', 3)} non-system head messages")
+    aux_comp = config.get('auxiliary', {}).get('compression', {})
+    print(f"  Model:        {aux_comp.get('model', '') or '(auto)'}")
+    comp_provider = aux_comp.get('provider', 'auto')
+    if comp_provider and comp_provider != 'auto':
+        print(f"  Provider:     {comp_provider}")
+
+
+def _show_aux_overrides(config: Dict[str, Any]) -> None:
+    aux_tasks = {"Vision": config.get('auxiliary', {}).get('vision', {})}
+    overrides = {
+        label: (t.get('provider', 'auto'), t.get('model', ''))
+        for label, t in aux_tasks.items()
+        if t.get('provider', 'auto') != 'auto' or t.get('model', '')}
+    if not overrides:
+        return
+    _section("Auxiliary Models (overrides)")
+    for label, (prov, mdl) in overrides.items():
+        parts = [f"provider={prov}"] + ([f"model={mdl}"] if mdl else [])
+        print(f"  {label:12s}  {', '.join(parts)}")
+
+
+def _show_skill_settings() -> None:
+    try:
+        from agent.skill_utils import discover_all_skill_config_vars, resolve_skill_config_values
+        skill_vars = discover_all_skill_config_vars()
+        if not skill_vars:
+            return
+        resolved = resolve_skill_config_values(skill_vars)
+        _section("Skill Settings")
+        for var in skill_vars:
+            value = resolved.get(var["key"], "")
+            display_val = str(value) if value else color("(not set)", Colors.DIM)
+            skill_tag = color(f"[{var.get('skill', '')}]", Colors.DIM)
+            print(f"  {var['key']:<20s} {display_val}  {skill_tag}")
+    except Exception:
+        pass
+
+
+def show_config():
+    """Display current configuration."""
+    config = load_config()
+
+    print()
+    print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))
+    print(color("│              ☤ Hermes Configuration                    │", Colors.CYAN))
+    print(color("└─────────────────────────────────────────────────────────┘", Colors.CYAN))
+    _show_managed_banner()
+
+    _section("Paths")
+    print(f"  Config:       {get_config_path()}")
+    print(f"  Secrets:      {get_env_path()}")
+    print(f"  Install:      {get_project_root()}")
+
+    _section("API Keys")
+    for env_key, name in _SHOW_CONFIG_API_KEYS:
+        print(f"  {name:<14} {redact_key(get_env_value(env_key))}")
+    from hermes_cli.auth import get_anthropic_key
+    print(f"  {'Anthropic':<14} {redact_key(get_anthropic_key())}")
+
+    _show_model_section(config)
+    _show_display_section(config)
+    _show_terminal_section(config)
+
+    _section("Timezone")
+    tz = config.get('timezone', '')
+    print(f"  Timezone:     {tz or color('(server-local)', Colors.DIM)}")
+
+    _show_compression_section(config)
+    _show_aux_overrides(config)
+
+    _section("Messaging Platforms")
+    for label, env_key in (("Telegram", "TELEGRAM_BOT_TOKEN"), ("Discord", "DISCORD_BOT_TOKEN")):
+        state = 'configured' if get_env_value(env_key) else color('not configured', Colors.DIM)
+        print(f"  {label + ':':<13} {state}")
+
+    _show_skill_settings()
+
+    print()
+    print(color("─" * 60, Colors.DIM))
+    print(color("  hermes config edit     # Edit config file", Colors.DIM))
+    print(color("  hermes config set <key> <value>", Colors.DIM))
+    print(color("  hermes setup           # Run setup wizard", Colors.DIM))
+    print()
+
+
+def edit_config():
+    """Open config file in user's editor."""
+    if is_managed():
+        managed_error("edit configuration")
+        return
+    config_path = get_config_path()
+    if not config_path.exists():
+        seed_config_file(config_path)
+        print(f"Created {config_path}")
+
+    # Windows lands on notepad even without Git Bash/nano; POSIX prefers nano/vim, which headless
+    # servers are more likely to have.
+    candidates = (['notepad', 'code', 'vim', 'vi', 'nano'] if sys.platform == "win32"
+                  else ['nano', 'vim', 'vi', 'code', 'notepad'])
+    editor = os.getenv('EDITOR') or os.getenv('VISUAL') or next(
+        (cmd for cmd in candidates if shutil.which(cmd)), None)
+    if not editor:
+        print("No editor found. Config file is at:")
+        print(f"  {config_path}")
+        return
+
+    print(f"Opening {config_path} in {editor}...")
+    subprocess.run([editor, str(config_path)])
+
+
+def _default_value_for_key(dotted_key: str):
+    """Return the leaf value declared for *dotted_key* in ``DEFAULT_CONFIG`` (None for dicts/misses)."""
+    node = cfg_get(DEFAULT_CONFIG, *_split_key_path(dotted_key))
+    return None if isinstance(node, dict) else node
+
+
+# Top-level keys that accept arbitrary user-supplied child keys (schema declares the dict, the
+# user populates it): any path below is accepted without deep checking.
+_OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
+    "providers", "credential_pool_strategies", "mcp_servers", "hooks", "quick_commands",
+    "personalities", "command_allowlist", "model_catalog", "channel_prompts", "server_actions",
+    "secrets", "goals", "loops"})
+
+# Top-level keys whose sub-keys are partially schema-defined (e.g. a PlatformConfig dataclass) but
+# where users may add fields DEFAULT_CONFIG doesn't enumerate: validate the FIRST segment only.
+_SCHEMA_DEFINED_DICT_KEYS = frozenset({
+    # Platform configs — PlatformConfig dataclass + dynamic extras
+    "discord", "telegram", "slack", "whatsapp", "signal", "mattermost",
+    "matrix", "feishu", "wecom", "weixin", "bluebubbles", "qqbot", "yuanbao",
+    "email", "sms", "dingtalk",
+    # MCP server template / dynamic auth dicts
+    "sessions", "checkpoints",
+    # Plugin enable/disable lists + per-plugin entries; absent from DEFAULT_CONFIG.
+    "plugins"})
+
+# Top-level keys that can be ANY user-supplied name.
+_DYNAMIC_TOP_LEVEL_KEYS = frozenset({
+    "custom_providers",  # list-shaped, but indexed by position
+})
+
+# Containers whose immediate child IS a user-supplied platform name (``platforms.<name>.<field>``),
+# both top-level and under ``gateway``; anything below the name is accepted (open ``extra``).
+_PLATFORM_CONTAINER_KEYS = frozenset({"platforms"})
+
+
+# Top-level keys whose sub-keys are accepted without deep checking.
+_OPEN_SUBKEY_TOP_LEVEL_KEYS = _OPEN_DICT_TOP_LEVEL_KEYS | _DYNAMIC_TOP_LEVEL_KEYS | _SCHEMA_DEFINED_DICT_KEYS
+
+
+def _known_top_level_keys() -> set[str]:
+    """Return the union of known top-level config keys for validation.
+
+    ``_EXTRA_KNOWN_ROOT_KEYS`` are roots the runtime reads but DEFAULT_CONFIG deliberately
+    omits (``platform_toolsets``, ``smart_model_routing``, ...); without them every path under
+    such a root was flagged "not a recognized config key" with a difflib near-miss suggestion.
+    """
+    return set(DEFAULT_CONFIG) | _EXTRA_KNOWN_ROOT_KEYS | _OPEN_SUBKEY_TOP_LEVEL_KEYS
+
+
+def _suggest_closest_key(key: str, candidates: set[str], cutoff: float = 0.6) -> Optional[str]:
+    """Closest candidate key name for a typo'd ``key``, or None."""
+    return next(iter(difflib.get_close_matches(key, sorted(candidates), n=1, cutoff=cutoff)), None)
+
+
+def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
+    """Validate a dotted config-key path against the known schema -> ``(is_known, suggestion)``.
+
+    Headline case from #34067: ``gateway.discord.gateway_restart_notification`` was silently written, even
+    though ``gateway`` only has 4 known sub-keys (``strict``, ``media_delivery_allow_dirs``,
+    ``trust_recent_files``, ``trust_recent_files_seconds``). The correct path is
+    ``discord.gateway_restart_notification`` (platform configs live at the top level, not under a
+    ``platforms`` namespace).
+    """
+    if not key:
+        return False, None
+
+    segments = _split_key_path(key)
+    top = segments[0]
+
+    # A leading underscore on the FIRST segment marks an intentionally non-schema internal key
+    # (test harnesses/tooling); only the first segment is exempt so ``agent._max_turns`` is caught.
+    if top.startswith("_") or top in _PLATFORM_CONTAINER_KEYS:
+        return True, None
+
+    known = _known_top_level_keys()
+    if top not in known:
+        suggestion = _suggest_closest_key(top, known)
+        if suggestion is None:
+            return False, None
+        rest = ".".join(segments[1:])
+        return False, f"{suggestion}.{rest}" if rest else suggestion
+
+    if top in _OPEN_SUBKEY_TOP_LEVEL_KEYS:
+        return True, None
+
+    # Walk DEFAULT_CONFIG: a nested ``platforms`` container, a scalar leaf, or an EMPTY dict hit
+    # before the path is consumed all accept. An empty dict is a free-form mapping section
+    # (``compression.model_thresholds.<model>``, ``terminal.docker_env.<VAR>``,
+    # ``lsp.servers.<lang>``): its keys are user-chosen, so nothing under it can be a typo. An
+    # unknown sub-key of a populated section fails with a same-level "did you mean" suggestion.
+    node: Any = DEFAULT_CONFIG.get(top)
+    consumed = [top]
+    for seg in segments[1:]:
+        if seg in _PLATFORM_CONTAINER_KEYS or not isinstance(node, dict) or not node:
+            return True, None
+        if seg not in node:
+            # ``gateway.discord.<field>``: the path minus its wrong prefix is itself a known key.
+            # Checked BEFORE the fuzzy sibling: a structural match is proof, a fuzzy match is a
+            # guess, and ``agent.gateway.strict`` must be refused as ``gateway.strict`` rather
+            # than written with a misleading ``agent.gateway_timeout`` did-you-mean.
+            # Only DEFAULT_CONFIG / open-subkey roots qualify as the stripped prefix:
+            # ``_EXTRA_KNOWN_ROOT_KEYS`` also holds the top-level FORMS of nested gateway
+            # settings (``filter_silence_narration``, ``reset_triggers``, ...), and
+            # ``gateway.filter_silence_narration`` is a runtime-read path, not a wrong prefix.
+            rest = ".".join(segments[len(consumed):])
+            if (
+                _split_key_path(rest)[0] in set(DEFAULT_CONFIG) | _OPEN_SUBKEY_TOP_LEVEL_KEYS
+                and _validate_config_key(rest)[0]
+            ):
+                return False, rest
+            sibling = _suggest_closest_key(seg, set(node.keys()))
+            if sibling is not None:
+                return False, ".".join(consumed + [sibling])
+            return False, None
+        consumed.append(seg)
+        node = node[seg]
+    return True, None
+
+
+def _is_wrong_prefix_suggestion(key: str, suggestion: Optional[str]) -> bool:
+    """Whether *suggestion* proves that *key* has only an extra prefix.
+
+    ``DEFAULT_CONFIG`` is not a complete registry of runtime-read settings, so a
+    sibling spelling suggestion alone cannot prove an unseeded path is a typo.
+    A known suffix, such as ``gateway.discord.gateway_restart_notification``
+    -> ``discord.gateway_restart_notification``, is the narrow case where the
+    pre-write refusal is safe.
+    """
+    if not suggestion:
+        return False
+    key_segments = _split_key_path(key)
+    suggestion_segments = _split_key_path(suggestion)
+    return (
+        len(suggestion_segments) < len(key_segments)
+        and key_segments[-len(suggestion_segments):] == suggestion_segments
+        and _validate_config_key(suggestion)[0]
+    )
+
+
+def _looks_structured_value(value: str) -> bool:
+    """True when *value* plausibly encodes a YAML/JSON list or mapping. Deliberately conservative:
+    a bare leading ``-`` is not a trigger (``-5``, ``--flag`` must stay strings)."""
+    stripped = value.lstrip()
+    if stripped[:1] in ('[', '{'):
+        return True
+    if '\n' not in value:
+        return False
+    for line in value.splitlines():
+        item = line.strip()
+        if item == '-' or item.startswith('- '):
+            return True
+        # ``key: value`` / ``key:`` mapping-entry shape (no whitespace in the key).
+        head, sep, _rest = item.partition(': ')
+        if sep and head and ' ' not in head and not head.startswith('#'):
+            return True
+        if item.endswith(':') and ' ' not in item[:-1] and item[:-1]:
+            return True
+    return False
+
+
+def _coerce_int(value: str):
+    """int(value) for a clean integer literal (signs/whitespace/underscores OK), else None."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value: str):
+    """``float(value)`` only when the conversion preserves its decimal value; NaN/inf rejected.
+    Decimal-looking identifiers more precise than a binary float must stay strings."""
+    try:
+        f = float(value)
+        if f != f or f in (float("inf"), float("-inf")) or Decimal(value) != Decimal(str(f)):
+            return None
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+    return f
+
+
+_SCALAR_WORDS = {
+    'true': True, 'yes': True, 'on': True,
+    'false': False, 'no': False, 'off': False,
+    # YAML null. Many DEFAULT_CONFIG leaves are "null/absent = off"; without this,
+    # ``config set X null`` stored the truthy string "null" and the feature could never be cleared.
+    'null': None, 'none': None, '~': None}
+
+
+def _coerce_config_set_value(key: str, value: str) -> Any:
+    """Auto-coerce a ``hermes config set`` string to bool/None/int/float/list/dict.
+    String-typed settings (per ``DEFAULT_CONFIG``) are preserved verbatim so enum members such as
+    ``approvals.mode="off"`` never become booleans. List/mapping literals are parsed so
+    isinstance-gated readers see real structures; the trigger is conservative.
+    Bare ``model`` is the exception: its string default is the model-id shorthand, so a structured
+    literal there is parsed for the section guard to gate instead of riding into model.default
+    as a bogus id (#131435)."""
+    if isinstance(_default_value_for_key(key), str) and not (
+            key == "model" and _looks_structured_value(value)):
+        return value
+    stripped = value.strip()
+    lower = stripped.lower()
+    if lower in _SCALAR_WORDS:
+        return _SCALAR_WORDS[lower]
+    for coerce in (_coerce_int, _coerce_float):
+        coerced = coerce(stripped)
+        if coerced is not None:
+            return coerced
+    if not _looks_structured_value(value):
+        return value
+    try:
+        parsed = yaml.safe_load(value)
+    except yaml.YAMLError as exc:
+        # Storing the text as a string here used to be a warning; every isinstance-gated reader
+        # then ignored the value while `config get` echoed it back (#114471). Refuse instead.
+        detail = str(getattr(exc, "problem", None) or exc).splitlines()[0]
+        _exit_invalid(
+            f"✗ Value for '{key}' looks like a list/mapping but is not valid YAML/JSON "
+            f"({detail}) — nothing was written.\n"
+            "  Fix the literal, or quote it (e.g. \"'[text'\") to store a plain string.")
+    if isinstance(parsed, (list, dict)):
+        return parsed
+    # A quoted literal ("'[text'") parses to a scalar: that is the deliberate way to store one.
+    return value
+
+
+# Container roots absent from DEFAULT_CONFIG whose shape is nonetheless fixed by their readers,
+# so the guardrail holds before anything is on disk (#114471: `model.aliases notamap`).
+_KNOWN_CONTAINER_TYPES = {
+    "custom_providers": "list",
+    "providers": "mapping",
+    "model.aliases": "mapping",
+    "model_aliases": "mapping",
+    # Omitted from DEFAULT_CONFIG on purpose (an empty default would clobber a user allow-list),
+    # so without these rows `config set plugins.enabled foo` stored a string every reader ignored.
+    "plugins.enabled": "list",
+    "plugins.disabled": "list",
+    "model_catalog.excluded_providers": "list",
+}
+# List slots whose readers go through ``parse_config_string_list``: a bare name is one entry.
+_SCALAR_AS_ONE_ITEM_LIST_KEYS = frozenset({"agent.disabled_toolsets", "skills.disabled"})
+
+
+def _expected_container_type(key: str, user_config: Dict[str, Any]) -> Optional[str]:
+    """``"list"`` / ``"mapping"`` when the schema (``DEFAULT_CONFIG``, the known-container table,
+    or the value already on disk) fixes *key* to a container; ``None`` for scalars and open paths.
+    A single-segment key that is a mapping *section* in the schema skips the lookup: replacing a
+    whole section is ``_guard_section_overwrite``'s call (``--force``, the bare ``model`` shorthand)."""
+    parts = _split_key_path(key)
+    schema_node = cfg_get(DEFAULT_CONFIG, *parts)
+    if len(parts) == 1 and isinstance(schema_node, dict):
+        schema_node = None
+    existing = _get_nested(user_config, key)
+    for node in (schema_node, _KNOWN_CONTAINER_TYPES.get(key), existing):
+        if isinstance(node, dict) or node == "mapping":
+            return "mapping"
+        if isinstance(node, list) or node == "list":
+            return "list"
+    return None
+
+
+def _refuse_container_type_mismatch(key: str, value: Any, user_config: Dict[str, Any], force: bool) -> Any:
+    """Hard guardrail: never store a value of the wrong shape where the schema wants a list or a
+    mapping — every reader would ignore it while ``config get`` echoed it back. ``--force`` keeps
+    its documented meaning (replace a whole mapping section); a non-list in a list slot is never
+    readable, so it has no override. Returns the value to store: a bare name for a
+    ``parse_config_string_list``-read slot becomes a one-item list."""
+    expected = _expected_container_type(key, user_config)
+    if expected is None:
+        return value
+    if expected == "list" and isinstance(value, str) and key in _SCALAR_AS_ONE_ITEM_LIST_KEYS:
+        return [value]
+    ok = isinstance(value, list) if expected == "list" else isinstance(value, dict)
+    if ok or (expected == "mapping" and force):
+        return value
+    got = type(value).__name__ if not isinstance(value, str) else "string"
+    literal = "[item, ...]" if expected == "list" else "{key: value}"
+    _exit_invalid(
+        f"✗ Cannot set '{key}': it must be a {expected}, got a {got} — nothing was written.\n"
+        f"  Pass a YAML/JSON literal, e.g.:\n    hermes config set {key} '{literal}'\n"
+        "  or edit config.yaml directly.")
+
+
+def _redirect_platform_display_key(key: str) -> tuple[str, Optional[str]]:
+    """Canonicalize ``platforms.<name>.<display_setting>`` -> ``display.platforms.<name>.<setting>``.
+    The gateway resolves per-platform display settings (streaming, show_reasoning, ...) from
+    ``display.platforms``; the top-level ``platforms.<name>`` block holds only connection config.
+    Only known display settings (``OVERRIDEABLE_KEYS``) are redirected. Returns ``(key, note)``;
+    the gateway import is guarded so the CLI works where the gateway package is unavailable.
+
+    Before #71047 a write such as ``hermes config set platforms.telegram.streaming false`` landed on a key
+    the gateway never reads: ``config get`` echoed the new value back while the runtime kept the old
+    ``display.platforms`` one — a silent no-op that looks like a duplicated key to the user.
+
+    ``gateway.platforms.<name>.<field>`` is canonicalized to the top-level ``platforms.<name>.<field>``
+    first (#115212): ``merge_platform_sections`` reads both blocks but the top-level one wins on
+    shared keys, so a nested write beside an existing top-level value printed ``✓ Set`` while the
+    gateway kept the old value.
+    """
+    segs = _split_key_path(key)
+    note = None
+    if len(segs) >= 3 and segs[0] == "gateway" and segs[1] == "platforms":
+        segs = segs[1:]
+        key = ".".join(segs)
+        note = f"  (note: the top-level platforms.{segs[1]} block outranks gateway.platforms — saved as {key})"
+    if len(segs) != 3 or segs[0] != "platforms":
+        return key, note
+    try:
+        from gateway.display_config import OVERRIDEABLE_KEYS as _display_keys
+    except Exception:
+        return key, note
+    if segs[2] not in _display_keys:
+        return key, note
+    canonical = f"display.platforms.{segs[1]}.{segs[2]}"
+    return canonical, f"  (note: per-platform display setting — saved as {canonical})"
+
+
+def _legacy_gateway_platforms_key(requested_key: str) -> Optional[str]:
+    """The ``gateway.platforms.<name>.<field>`` spelling the user typed, when that is what they typed.
+    ``merge_platform_sections`` still honours a value that lives only there, so ``get`` must fall
+    back to it and ``unset``/``set`` must clear it, or the CLI reports "not set" / writes a value
+    while the gateway keeps reading the nested one."""
+    segs = _split_key_path(requested_key)
+    if len(segs) >= 3 and segs[0] == "gateway" and segs[1] == "platforms":
+        return ".".join(segs)
+    return None
+
+
+def _exit_if_key_managed(key: str, action: str) -> None:
+    """A key pinned by the managed layer cannot be set/unset (the next load would reinstate it):
+    hard-reject and name the source. Distinct from ``is_managed()``; env-shaped keys route to the
+    .env writers, which carry their own guard."""
+    if managed_scope.is_key_managed(key):
+        print(
+            f"Cannot {action} '{key}': it is managed by your administrator ({_managed_source('config.yaml')}) "
+            f"and cannot be changed. Contact your administrator to modify it.", file=sys.stderr)
+        sys.exit(1)
+
+
+def _touch_skin_file(key: str, value: Any) -> None:
+    """``display.skin`` set means "apply NOW": bump the skin file's mtime so the gateway watcher's
+    (name, mtime) signature moves even when the name is unchanged. Best-effort."""
+    if key == "display.skin" and isinstance(value, str) and value:
+        try:
+            skin_file = get_hermes_home() / "skins" / f"{value}.yaml"
+            if skin_file.exists():
+                skin_file.touch()
+        except Exception:
+            pass
+
+
+def _exit_invalid(msg: str) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def _write_user_config(config_path: Path, user_config: Dict[str, Any]) -> None:
+    """Write only the user's raw config back (never the merged defaults)."""
+    ensure_hermes_home()
+    from hermes_cli.observability.shared_metrics_disabled import recording_raw_config_write
+    recording_raw_config_write(config_path, user_config, atomic_config_replace)
+
+
+def _print_unknown_key_notice(key: str, suggestion: Optional[str]) -> None:
+    print(color(
+        f"⚠ '{key}' is not a recognized config key — it was saved anyway, "
+        "but Hermes may not read it.", Colors.YELLOW))
+    if suggestion:
+        print(color(f"  Did you mean: {suggestion}", Colors.YELLOW))
+    # The env bridge covers custom TOP-LEVEL keys only; an unseeded nested path (``stt.provider``)
+    # is written but not bridged, so the footer would be a false promise there.
+    if len(_split_key_path(key)) == 1:
+        print(color(
+            "  (Custom top-level keys are supported and bridged to the "
+            "environment for skills/external tools. Use --force to skip "
+            "this notice.)", Colors.DIM))
+    else:
+        print(color("  (Use --force to skip this notice.)", Colors.DIM))
+
+
+def _unknown_subkey_refusal(key: str, suggestion: Optional[str]) -> str:
+    lines = [color(f"✗ '{key}' is not a recognized config key — nothing was written.", Colors.RED)]
+    if suggestion:
+        lines.append(color(f"  Did you mean: {suggestion}", Colors.YELLOW))
+    lines.append(color(
+        "  (Custom top-level keys are supported; use --force to write this path anyway.)", Colors.DIM))
+    return "\n".join(lines)
+
+
+def set_config_value(key: str, value: str, force: bool = False):
+    """Set a configuration value at a dotted ``key``; ``value`` is auto-coerced to bool/int/float.
+    ``force`` writes a known key given under the wrong prefix (``gateway.discord.foo`` where
+    ``discord.foo`` is known; otherwise refused — any other unknown path under a known section
+    is written with a did-you-mean notice), skips the unknown-top-level-key notice AND
+    authorizes replacing a mapping section with a scalar. Without it, scalar writes over mappings are refused and bare ``model`` is redirected
+    to ``model.default``."""
+    if is_managed():
+        managed_error("set configuration values")
+        return
+    # Empty segments (``"agent."``) would write config["agent"][""] into a live schema section.
+    if key != key.strip() or not key.strip():
+        _exit_invalid(f"✗ Invalid config key: {key!r} (empty or surrounding whitespace).")
+    if "" in _split_key_path(key):
+        _exit_invalid(
+            f"✗ Invalid config key: {key!r} — contains an empty path segment "
+            "(leading, trailing, or doubled '.').")
+    _exit_if_key_managed(key, "set")
+    if _is_env_config_key(key):
+        from hermes_cli.credential_lifecycle import save_provider_env_credential
+
+        # Unified lifecycle: also rotates any config.yaml mirror of the old value so a stale
+        # higher-precedence copy can't win (#62269).
+        try:
+            save_provider_env_credential(key.upper(), value)
+        except ValueError as exc:
+            _exit_invalid(f"✗ {exc}")
+        print(f"✓ Set {key} in {get_env_path()}")
+        return
+    from hermes_cli.config_env_routing import is_env_setting_key, save_env_setting
+
+    if is_env_setting_key(key):
+        # Every UPPER_SNAKE name is an environment setting: same file the platform setup flows and
+        # /sethome write, and the only one os.getenv readers see. config.yaml never gets one from
+        # here, --force included (#111848). The env writer's denylist (HERMES_YOLO_MODE, PATH, ...)
+        # therefore also refuses the config.yaml detour that used to bridge those into os.environ.
+        try:
+            save_env_setting(key, value)
+        except ValueError as exc:
+            _exit_invalid(f"✗ {exc}")
+        print(f"✓ Set {key.upper()} in {get_env_path()}")
+        return
+
+    # Canonicalize per-platform display keys BEFORE validation/coercion so both see the path the
+    # runtime reads.
+    legacy_key = _legacy_gateway_platforms_key(key)
+    key, _redirect_note = _redirect_platform_display_key(key)
+    if _redirect_note:
+        print(_redirect_note)
+    is_known, suggestion = _validate_config_key(key)
+    # DEFAULT_CONFIG is an incomplete schema: runtime-read settings may deliberately have no
+    # seeded default. Refuse only the positive wrong-prefix case from #112003; other unknown
+    # paths keep the post-write warning so valid runtime settings remain configurable.
+    if not is_known and not force and _is_wrong_prefix_suggestion(key, suggestion):
+        _exit_invalid(_unknown_subkey_refusal(key, suggestion))
+
+    if key == "display.language":
+        from hermes_cli.config_language import display_language_error
+        language_error = display_language_error(value)
+        if language_error:
+            _exit_invalid(language_error)
+
+    # Read the RAW user config (not merged) so defaults are never dumped back; fail-closed.
+    config_path = get_config_path()
+    user_config = require_readable_config_before_write(config_path)
+    value = _coerce_config_set_value(key, value)
+    # A scalar ``model`` shorthand must become a dict before writing sub-keys, or _set_nested
+    # replaces it with an empty dict and the model id is lost.
+    _model_val = user_config.get("model")
+    if key.strip().lower().startswith("model.") and isinstance(_model_val, str) and _model_val:
+        user_config["model"] = {"default": _model_val}
+    from hermes_cli.config_section_guard import _guard_section_overwrite
+    key = _guard_section_overwrite(key, value, user_config, force)
+    value = _refuse_container_type_mismatch(key, value, user_config, force)
+    _old_provider = _model_val.get("provider") if isinstance(_model_val, dict) else None
+    try:
+        _set_nested(user_config, key, value)
+    except ValueError as e:
+        _exit_invalid(f"✗ {e}")
+    if legacy_key and _unset_nested(user_config, legacy_key):
+        print(f"  (removed the shadowed {legacy_key} duplicate)")
+    # A provider switch re-points ``model:`` at a new route; ``base_url``/``api_mode`` are route
+    # state of the OLD provider, and the runtime honours them for whatever provider the block now
+    # names — the new provider's key would be posted to the old endpoint (#113719, #40862). Sync
+    # them the way a persisted ``/model`` switch does: the previous route goes unless it is the
+    # new provider's own endpoint.
+    _route_notice = ""
+    _old_provider = str(_old_provider or "").strip() or "the previous provider"
+    if key == "model.provider" and _old_provider.lower() != str(value).strip().lower():
+        from hermes_cli.route_identity import drop_stale_model_route
+        _popped, _unverified = drop_stale_model_route(user_config.get("model"), value, user_config)
+        if _popped:
+            _route_notice = (
+                "  Cleared " + ", ".join(f"model.{k} ({v})" for k, v in _popped.items())
+                + f" — that route belonged to {_old_provider}, not {value}. {value}'s endpoint resolves "
+                "automatically; set model.base_url again if you meant a custom endpoint.")
+        elif _unverified:
+            _route_notice = color(
+                f"⚠ model.base_url ({user_config['model'].get('base_url')}) was set under {_old_provider} and "
+                f"still applies to {value} — requests go there. If it is not {value}'s endpoint: "
+                "`hermes config unset model.base_url` (and model.api_mode).", Colors.YELLOW)
+    # api_base -> base_url alias at set-time too (mirrors _normalize_root_model_keys).
+    if key.strip().lower() in ("model.api_base", "api_base"):
+        # Normalize the api_base → base_url alias at set-time too (issue #8919), so a fresh `hermes config
+        # set model.api_base ...` lands on the canonical key the runtime resolver actually reads, instead of
+        # being silently ignored.
+        user_config = _normalize_root_model_keys(user_config)
+        key = "model.base_url"
+        print("  (note: 'api_base' is an alias — saved as model.base_url)")
+    _write_user_config(config_path, user_config)
+
+    # Keep .env in sync: terminal_tool reads TERMINAL_ENV e

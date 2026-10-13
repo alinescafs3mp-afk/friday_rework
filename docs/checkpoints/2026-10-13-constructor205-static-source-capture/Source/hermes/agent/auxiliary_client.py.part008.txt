@@ -1,0 +1,304 @@
+r, Any]]:
+    """Shared head of both call impls: prepare the request and bundle the kwargs the recovery
+    drivers pass to ``_retry_same_provider_*`` / ``_call_fallback_candidate_*``. One immutable
+    runtime snapshot for keying/resolution/retries/fallbacks, so a concurrent /model switch
+    can't mix key and client from different runtimes."""
+    main_runtime = _normalize_main_runtime(main_runtime)
+    req = _prepare_aux_request(
+        task, provider=provider, model=model, base_url=base_url, api_key=api_key,
+        main_runtime=main_runtime, messages=messages, temperature=temperature,
+        max_tokens=max_tokens, tools=tools, timeout=timeout, extra_body=extra_body,
+        reasoning_config=reasoning_config, extra_headers=extra_headers,
+        api_mode=api_mode, route_info=route_info, async_mode=async_mode,
+    )
+    candidate_kwargs = dict(
+        task=task, messages=messages, temperature=temperature, max_tokens=max_tokens,
+        tools=tools, effective_timeout=req.effective_timeout,
+        effective_extra_body=req.effective_extra_body, reasoning_config=reasoning_config,
+    )
+    retry_kwargs = dict(
+        candidate_kwargs, resolved_base_url=req.resolved_base_url,
+        resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
+        main_runtime=main_runtime, final_model=req.final_model, extra_headers=extra_headers,
+    )
+    return req, retry_kwargs, candidate_kwargs
+
+
+def _should_retry_same_provider(task: Optional[str], exc: Exception, tag: str) -> bool:
+    """True when ``exc`` is a transient transport blip worth a same-provider retry; critical-path
+    tasks skip it on a full-budget timeout (``_should_skip_same_provider_retry``) and go straight
+    to fallback."""
+    if not _is_transient_transport_error(exc):
+        return False
+    if _should_skip_same_provider_retry(task, exc):
+        logger.info("Auxiliary %s%s: timeout on the critical path; "
+                    "skipping same-provider retry and falling back: %s", task, tag, exc)
+        return False
+    return True
+
+
+def _ladder_step_call(
+    step: _LadderStep, req: _PreparedAuxRequest, retry_kwargs: Dict[str, Any], candidate_kwargs: Dict[str, Any],
+) -> Tuple[str, tuple, Dict[str, Any]]:
+    """Resolve a ladder step into ``(kind, args, kwargs)`` for the sync/async performer."""
+    if step.kind == "call":
+        return "call", step.args, dict(provider=req.resolved_provider, api_mode=req.resolved_api_mode)
+    if step.kind == "retry_same_provider":
+        retry_provider, retry_model = step.args
+        return "retry", (), dict(retry_kwargs, resolved_provider=retry_provider, resolved_model=retry_model)
+    return "fallback", step.args, candidate_kwargs
+
+
+def _start_recovery_ladder(
+    first_err: Exception, req: _PreparedAuxRequest, retry_kwargs: Dict[str, Any], *,
+    task: Optional[str], async_mode: bool, route_info: Optional[Dict[str, str]],
+):
+    """Build the recovery-ladder generator for a failed primary request."""
+    return _aux_recovery_ladder(
+        first_err, client=req.client, kwargs=req.kwargs, task=task, async_mode=async_mode,
+        base_info=req.base_info, resolved_provider=req.resolved_provider,
+        resolved_model=req.resolved_model, resolved_base_url=req.resolved_base_url,
+        resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
+        final_model=req.final_model, max_tokens=retry_kwargs["max_tokens"],
+        main_runtime=retry_kwargs["main_runtime"], route_info=route_info)
+
+
+def _call_llm_impl(
+    task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
+    api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
+    temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
+    timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
+    extra_headers: Optional[Dict[str, str]] = None, api_mode: str = None, stream: bool = False,
+    stream_options: dict = None, route_info: Optional[Dict[str, str]] = None,
+) -> Any:
+    """Centralized synchronous LLM call: resolve provider/model, auth, kwargs, fallbacks.
+    task: aux task whose provider:model comes from config (ignored if provider set); api_mode
+    overrides task config; timeout=None reads auxiliary.{task}.timeout; extra_headers override
+    client defaults. stream=True returns the raw SDK stream (caller consumes/falls back)
+    instead of a validated response. RuntimeError if no provider is configured."""
+    req, retry_kwargs, candidate_kwargs = _plan_aux_call(
+        task, async_mode=False, provider=provider, model=model, base_url=base_url,
+        api_key=api_key, main_runtime=main_runtime, messages=messages,
+        temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=timeout,
+        extra_body=extra_body, reasoning_config=reasoning_config,
+        extra_headers=extra_headers, api_mode=api_mode, route_info=route_info,
+    )
+    client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
+    # Streaming path (MoA aggregator): return the raw SDK stream, skipping validation and
+    # the fallback chain (they assume a complete response); the caller owns reassembly/fallback.
+    if stream:
+        kwargs["stream"] = True
+        if stream_options:
+            kwargs["stream_options"] = stream_options
+        if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
+            # Responses-shim clients consume the stream internally and return a completed
+            # object Relay's managed stream would iterate; the MoA facade wraps it as one chunk.
+            return physical_aux_create(client, kwargs)
+        return _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
+
+    def _primary(**validate_kw: Any) -> Any:
+        # Retry on the same provider for a transient transport blip (connection reset / streaming-close /
+        # incomplete chunked read / 5xx / 408) before the except-chain below escalates to provider/model
+        # fallback. A dropped connection shouldn't abandon an otherwise-healthy provider — this especially
+        # matters for pinned auxiliary calls like MoA reference advisors, where "fallback to another
+        # provider" is not a meaningful recovery (the advisor is a specific model), so a transient blip that
+        # isn't retried simply loses that advisor for the turn (root of the run2 double-advisor "Connection
+        # error" collapse — a genuine upstream blip hitting both parallel advisors at once). Attempts are
+        # bounded and use exponential backoff. Count is configurable via auxiliary.transient_retries
+        # (default 2 retries → 3 total attempts); a second/third failure or any non-transient error falls
+        # through to ``first_err`` and the existing fallback handling unchanged. Unified home for the
+        # transient retry every auxiliary task shares. (PR #16587)
+        return _validate_llm_response(
+            _relay_sync_completion(
+                client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
+                create=lambda request: _create_with_progress(
+                    client, request, task,
+                    force_stream=_provider_requires_stream(
+                        request_provider, req.base_info or req.resolved_base_url),
+                ),
+            ),
+            task, **validate_kw,
+        )
+    try:
+        # Bounded same-provider retry (exponential backoff, auxiliary.transient_retries) for
+        # transient blips before escalating to fallback — a dropped connection shouldn't
+        # abandon a healthy provider (matters for pinned MoA advisors).
+        try:
+            return _primary(provider=request_provider, base_url=req.base_info)
+        except Exception as transient_err:
+            if not _should_retry_same_provider(task, transient_err, ""):
+                raise
+            _max_transient_retries = _transient_retry_count()
+            _last_transient = transient_err
+            for _attempt in range(1, _max_transient_retries + 1):
+                _backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), 8.0)
+                logger.info("Auxiliary %s: transient transport error (attempt %d/%d); "
+                            "retrying same provider after %.1fs before fallback: %s",
+                            task or "call", _attempt, _max_transient_retries, _backoff, _last_transient)
+                time.sleep(_backoff)
+                try:
+                    return _primary()
+                except Exception as retry_transient:
+                    if not _is_transient_transport_error(retry_transient):
+                        raise
+                    _last_transient = retry_transient
+            raise _last_transient
+    except Exception as first_err:
+        def _perform(step: _LadderStep) -> Any:
+            kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
+            if kind == "call":
+                return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
+            if kind == "retry":
+                return _retry_same_provider_sync(**kw)
+            return _call_fallback_candidate_sync(*args, **kw)
+        return _drive_ladder(
+            _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=False, route_info=route_info),
+            _perform)
+
+
+def _coerce_llm_message(response):
+    """Pull a message (dict, object, or str) out of a response-or-message value: dict-shaped
+    responses/bare messages (compression, proxies) and ChatCompletion objects; MagicMock
+    ``reasoning_*`` attrs are deliberately not strings."""
+    if response is None or isinstance(response, str):
+        return response
+    if isinstance(response, dict):
+        if "choices" not in response:
+            return response
+        choices = response.get("choices") or []
+    else:
+        choices = getattr(response, "choices", None)
+        if not choices:
+            return response
+    return _message_field(choices[0], "message") if choices else None
+
+
+def _message_field(msg, name):
+    return msg.get(name) if isinstance(msg, dict) else getattr(msg, name, None)
+
+
+def extract_content_or_reasoning(response, *, max_reasoning_chars: int | None = None) -> str:
+    """Extract content from an LLM response, falling back to reasoning fields.
+    Order: ``content`` (inline think blocks stripped) → ``reasoning``/``reasoning_content`` →
+    ``reasoning_details`` (OpenRouter array). Accepts a response or bare message;
+    ``max_reasoning_chars`` bounds a reasoning fallback so unbounded chain-of-thought can't
+    become the compaction summary. Returns ``""`` if nothing found."""
+    msg = _coerce_llm_message(response)
+    if msg is None:
+        return ""
+    if isinstance(msg, str):
+        return msg.strip()
+    raw = _message_field(msg, "content")
+    if not isinstance(raw, str):
+        raw = str(raw) if raw else ""
+    content = raw.strip()
+    if content:
+        # Same precompiled closed-pair patterns as strip_think_blocks.
+        from agent.agent_runtime_helpers import _REASONING_BLOCK_PATTERNS
+        cleaned = content
+        for pattern in _REASONING_BLOCK_PATTERNS:
+            cleaned = pattern.sub("", cleaned)
+        cleaned = cleaned.strip()
+        if cleaned:
+            return cleaned
+    # Content is empty or reasoning-only — try structured reasoning fields
+    reasoning_parts: list[str] = []
+    for field in ("reasoning", "reasoning_content"):
+        val = _message_field(msg, field)
+        if val and isinstance(val, str) and val.strip() and val not in reasoning_parts:
+            reasoning_parts.append(val.strip())
+    details = _message_field(msg, "reasoning_details")
+    if details and isinstance(details, list):
+        for detail in details:
+            if isinstance(detail, dict):
+                summary = detail.get("summary") or detail.get("content") or detail.get("text")
+                if summary and summary not in reasoning_parts:
+                    reasoning_parts.append(summary.strip() if isinstance(summary, str) else str(summary))
+    if not reasoning_parts:
+        return ""
+    text = "\n\n".join(reasoning_parts)
+    if max_reasoning_chars is not None and len(text) > max_reasoning_chars:
+        logger.warning("fell back to reasoning fields (%d chars); truncating to %d",
+                       len(text), max_reasoning_chars)
+        return text[:max_reasoning_chars]
+    return text
+
+
+@_relay_auxiliary_call_async
+async def async_call_llm(
+    task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
+    api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
+    temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
+    timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
+    route_info: Optional[Dict[str, str]] = None,
+) -> Any:
+    """Run an asynchronous auxiliary LLM request under the configured limit."""
+    semaphore = _acquire_async_aux_semaphore(task)
+    if semaphore is not None:
+        await semaphore.acquire()
+    try:
+        with scoped_runtime_main(main_runtime):
+            return await _async_call_llm_impl(
+                task=task, provider=provider, model=model, base_url=base_url, api_key=api_key,
+                main_runtime=main_runtime, messages=messages, temperature=temperature,
+                max_tokens=max_tokens, tools=tools, timeout=timeout, extra_body=extra_body,
+                reasoning_config=reasoning_config, route_info=route_info,
+            )
+    finally:
+        if semaphore is not None:
+            semaphore.release()
+
+
+async def _async_call_llm_impl(
+    task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
+    api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
+    temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
+    timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
+    route_info: Optional[Dict[str, str]] = None,
+) -> Any:
+    """Centralized asynchronous LLM call; see call_llm() for full documentation.
+    No per-request header / api_mode override on the async entry point."""
+    req, retry_kwargs, candidate_kwargs = _plan_aux_call(
+        task, async_mode=True, provider=provider, model=model, base_url=base_url,
+        api_key=api_key, main_runtime=main_runtime, messages=messages,
+        temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=timeout,
+        extra_body=extra_body, reasoning_config=reasoning_config,
+        extra_headers=None, api_mode=None, route_info=route_info,
+    )
+    client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
+    try:
+        # Retry ONCE on the same provider for a transient blip before fallback (see call_llm()).
+        # (PR #16587)
+        _force_stream_async = _provider_requires_stream(request_provider, req.base_info or req.resolved_base_url)
+
+        async def _acreate(_kwargs: Dict[str, Any]) -> Any:
+            return await _acreate_with_progress(client, _kwargs, task, force_stream=_force_stream_async)
+
+        async def _primary(**validate_kw: Any) -> Any:
+            return _validate_llm_response(
+                await _relay_async_completion(
+                    client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
+                    create=_acreate),
+                task, **validate_kw)
+        try:
+            return await _primary(provider=request_provider, base_url=req.base_info)
+        except Exception as transient_err:
+            # The async Codex adapter wraps the sync stream via to_thread: same TimeoutError here.
+            if not _should_retry_same_provider(task, transient_err, " (async)"):
+                raise
+            logger.info("Auxiliary %s (async): transient transport error; retrying "
+                        "once on the same provider before fallback: %s", task or "call", transient_err)
+            return await _primary()
+    except Exception as first_err:
+        async def _perform(step: _LadderStep) -> Any:
+            kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
+            if kind == "call":
+                return _validate_llm_response(await _relay_async_completion(*args, **kw), task)
+            if kind == "retry":
+                return await _retry_same_provider_async(**kw)
+            fb_client, fb_model, fb_label = args
+            fb_client, _ = _to_async_client(fb_client, fb_model or "", is_vision=(task == "vision"))
+            return await _call_fallback_candidate_async(fb_client, fb_model, fb_label, **kw)
+        return await _drive_ladder_async(
+            _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=True, route_info=route_info),
+            _perform)

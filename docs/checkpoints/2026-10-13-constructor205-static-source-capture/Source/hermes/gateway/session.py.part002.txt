@@ -1,0 +1,135 @@
+sion_id: str) -> int:
+        """Drop every routing entry pointing at *session_id* (hard delete) and persist the drop.
+
+        The routing index is written back by THIS process, so removing only the state.db rows
+        elsewhere in a delete flow is undone by the next whole-index save: the surviving entry
+        hands the same id to the next inbound message and run_agent's INSERT OR IGNORE
+        re-creates the row — the deleted conversation comes back (#42422). Idempotent; returns
+        the number of entries dropped.
+        """
+        if not session_id:
+            return 0
+        with self._lock:
+            self._ensure_loaded_locked()
+            dropped = [key for key, entry in self._entries.items() if entry.session_id == session_id]
+            for key in dropped:
+                self._entries.pop(key, None)
+            if dropped:
+                hints = getattr(self, "_session_owner_hints", None)
+                if hints is not None:
+                    hints.pop(session_id, None)
+                self._save()
+        if dropped:
+            logger.info("SessionStore removed %d routing entr%s for deleted session %s",
+                        len(dropped), "y" if len(dropped) == 1 else "ies", session_id)
+        return len(dropped)
+
+    # Compression repoint is store bookkeeping, not user activity — leave ``updated_at`` alone so a
+    # background compression on an idle session cannot make it look fresh to the
+    # restart-resume freshness gate (#85709).
+    def switch_session(
+        self, session_key: str, target_session_id: str, *, expected_session_id: Optional[str] = None,
+        preserve_prompt_pin: bool = True,
+    ) -> Optional[SessionEntry]:
+        """Point a session key at an existing session ID (``/resume``): ends the current row and
+        reopens the target so resume matches the CLI.
+
+        ``expected_session_id`` makes the repoint a compare-and-swap: ``None`` is returned when
+        the key no longer points at that session, so a caller that resolved against a snapshot
+        across an await (async-delegation re-pin) cannot overwrite a concurrent /new or /resume.
+        Prompt pins follow non-boundary repoints by default; /resume opts out explicitly because it
+        starts a different conversation on the same routing key.
+        """
+        with self._lock:
+            old_entry = self._entry_locked(session_key)
+            if old_entry is None:
+                return None
+            if expected_session_id is not None and old_entry.session_id != expected_session_id:
+                logger.info(
+                    "Session switch for %s refused: route moved from %s to %s after the caller's snapshot",
+                    session_key, expected_session_id, old_entry.session_id,
+                )
+                return None
+            if old_entry.session_id == target_session_id:
+                return old_entry
+            new_entry = self._replace_route_locked(
+                session_key, old_entry, target_session_id, _now(),
+                display_name=old_entry.display_name, model_override=old_entry.model_override,
+                prompt_pin=(
+                    dict(old_entry.prompt_pin)
+                    if preserve_prompt_pin and old_entry.prompt_pin is not None else None
+                ),
+            )
+
+        if self._db_for_key(session_key) and old_entry.session_id:
+            self._promote_session_reset(
+                session_key, old_entry.session_id, "session_switch",
+                log=lambda e: logger.debug("Session DB end_session failed: %s", e),
+            )
+        if self._db_for_key(session_key):
+            # An explicit /resume/handoff/branch repoint is real user activity: the row is
+            # reopened (a repoint onto a finalized row must resume it, not write into a dead row).
+            # Mount-time reads (TUI session.resume) no longer reopen (#85303) — only this path does.
+            self._reopen_session_row(
+                session_key, target_session_id, log_prefix="Session DB reopen_session failed"
+            )
+            self._record_gateway_session_peer(
+                target_session_id, session_key, new_entry.origin,
+                display_name=new_entry.display_name, include_compression_ancestors=True,
+                transport_profile=new_entry.transport_profile,
+            )
+        return new_entry
+
+    def list_sessions(self, active_minutes: Optional[int] = None) -> List[SessionEntry]:
+        """List all sessions, optionally filtered by activity."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entries = list(self._entries.values())
+        if active_minutes is not None:
+            cutoff = _now() - timedelta(minutes=active_minutes)
+            entries = [e for e in entries if e.updated_at >= cutoff]
+        entries.sort(key=lambda e: e.updated_at, reverse=True)
+        return entries
+
+    def lookup_by_session_id(self, session_id: str) -> Optional[SessionEntry]:
+        """Return the active session entry for a persisted session ID, if any."""
+        if not session_id:
+            return None
+        with self._lock:
+            self._ensure_loaded_locked()
+            return next((e for e in self._entries.values() if e.session_id == session_id), None)
+
+    def lookup_by_session_key(self, session_key: str) -> Optional[SessionEntry]:
+        """Return the persisted routing entry for an exact session key."""
+        if not session_key:
+            return None
+        with self._lock:
+            return self._entry_locked(session_key)
+
+    def peek_session_id(self, session_key: str) -> Optional[str]:
+        """Lock-held accessor for the key -> session_id mapping (None if unknown)."""
+        if not session_key:
+            return None
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return entry.session_id if entry else None
+
+
+def build_session_context(
+    source: SessionSource, config: GatewayConfig, session_entry: Optional[SessionEntry] = None
+) -> SessionContext:
+    """Build a full session context (for system prompt injection)."""
+    connected = config.get_connected_platforms()
+    shared = is_shared_multi_user_session(
+        source, group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
+        thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+    )
+    context = SessionContext(
+        source=source, connected_platforms=connected, shared_multi_user_session=shared,
+        home_channels={p: home for p in connected if (home := config.get_home_channel(p))},
+    )
+    if session_entry:
+        context.session_key = session_entry.session_key
+        context.session_id = session_entry.session_id
+        context.created_at, context.updated_at = session_entry.created_at, session_entry.updated_at
+    return context

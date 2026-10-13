@@ -1,0 +1,751 @@
+return where_sql, params
+        combined = " AND ".join(clauses)
+        return (f"{where_sql} AND {combined}" if where_sql else f"WHERE {combined}"), params
+
+    def _project_compression_tips(self, sessions: List[Dict[str, Any]], compact_rows: bool) -> List[Dict[str, Any]]:
+        """Replace each compression root's surfaced fields with its live tip's (root ``started_at`` kept
+        for stable ordering), one batched query. ``_lineage_ids`` carries every chain id (a tile may
+        hold a MIDDLE segment's id)."""
+        chain_by_root: Dict[str, List[str]] = {}  # only roots whose tip differs from themselves
+        for s in sessions:
+            if s.get("end_reason") == "compression":
+                chain = self.get_compression_chain(s["id"])
+                if chain and chain[-1] != s["id"]:
+                    chain_by_root[s["id"]] = chain
+        tip_rows = (
+            self._get_session_rich_rows_batch(
+                {chain[-1] for chain in chain_by_root.values()}, compact_rows=compact_rows,
+            ) if chain_by_root else {}
+        )
+        projected = []
+        for s in sessions:
+            chain = chain_by_root.get(s["id"])
+            tip_row = tip_rows.get(chain[-1]) if chain else None
+            if not tip_row:
+                projected.append(s)
+                continue
+            merged = dict(s)
+            for key in (
+                "id", "ended_at", "end_reason", "message_count", "tool_call_count", "title", "last_active",
+                "preview", "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
+            ):
+                if key in tip_row:
+                    merged[key] = tip_row[key]
+            if merged.get("title") is None:
+                # The title is carried root->tip AFTER the publish transaction; a rotation cut off in
+                # between leaves it on the ended root, and exact-title lookups (`hermes peer dm` ->
+                # canonical "Bot Chat") must still see the lineage under its name (#106165).
+                merged["title"] = s.get("title")
+            merged["_lineage_root_id"] = s["id"]
+            merged["_lineage_ids"] = chain
+            # #121148: the projected row IS an automatic continuation, not a fresh conversation and
+            # not a user branch. The server already classifies the edge (_COMPRESSION_CHILD_SQL) but
+            # only ever used it to hide rows — surface the kind so clients can label the provenance
+            # instead of rendering a sealed-and-rotated chat as a brand-new session.
+            merged["continuation_kind"] = "compression"
+            projected.append(merged)
+        return projected
+
+    def list_recent_sessions_bounded(
+        self,
+        *,
+        limit: int = 20,
+        exclude_sources: List[str] = None,
+        timeout_seconds: float = 3.0,
+        candidate_limit: int = None,
+        lineage_limit: int = None,
+    ) -> List[Dict[str, Any]]:
+        """Latency-bounded recent-conversation browse (``session_search()``): preselect a small candidate set
+        from the indexed durable activity timestamp (fallback ``started_at``), resolve only those across
+        compression ancestry/chains, then hydrate activity/previews for that bounded set. Lineage traversal
+        uses ``UNION`` plus a total-row ceiling so a corrupt cycle or a deep/branching lineage cannot defeat
+        the bound; a lineage that hits the ceiling before a terminal root/tip is omitted, not expanded.
+        A cooperative SQLite progress deadline interrupts sustained work past ``timeout_seconds`` and raises
+        ``TimeoutError`` (cheap statements may finish between callbacks). Supports only the agent-tool
+        browse filters; rich callers keep using :meth:`list_sessions_rich`."""
+        limit = max(1, int(limit))
+        timeout_seconds = max(0.0, float(timeout_seconds))
+        if candidate_limit is None:
+            candidate_limit = max(128, limit * 8)
+        candidate_limit = max(limit, min(int(candidate_limit), 2048))
+        if lineage_limit is None:
+            lineage_limit = min(8192, candidate_limit * 8)
+        lineage_limit = max(candidate_limit, min(int(lineage_limit), 8192))
+
+        candidate_clauses = [
+            "s.archived = 0",
+            "s.hidden = 0",
+            f"{_delegate_from_json('s.model_config')} IS NULL",
+        ]
+        candidate_params: List[Any] = []
+        if exclude_sources:
+            placeholders = ",".join("?" for _ in exclude_sources)
+            candidate_clauses.append(f"s.source NOT IN ({placeholders})")
+            candidate_params.extend(exclude_sources)
+        candidate_where = " AND ".join(candidate_clauses)
+
+        # A compression continuation is an implementation edge, unlike /new
+        # reset and /branch children which are independent user-visible
+        # conversations.  The same predicate is used in both directions so a
+        # candidate tip maps to its logical root and the root maps back to the
+        # freshest live tip.
+        compression_parent_edge = f"""
+            parent.end_reason = 'compression'
+            AND child.parent_session_id = parent.id
+            AND json_extract(
+                COALESCE(child.model_config, '{{}}'), '$._branched_from'
+            ) IS NULL
+            AND {_delegate_from_json('child.model_config')} IS NULL
+            AND COALESCE(child.source, '') != 'tool'
+        """
+
+        query = f"""
+            WITH RECURSIVE
+            recent_candidates(id) AS (
+                SELECT s.id
+                FROM sessions s
+                WHERE {candidate_where}
+                ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC,
+                         s.started_at DESC, s.id DESC
+                LIMIT ?
+            ),
+            ancestors(candidate_id, cur_id) AS (
+                SELECT id, id FROM recent_candidates
+                UNION
+                SELECT a.candidate_id, parent.id
+                FROM ancestors a
+                JOIN sessions child ON child.id = a.cur_id
+                JOIN sessions parent ON {compression_parent_edge}
+                LIMIT ?
+            ),
+            candidate_roots(root_id) AS (
+                SELECT DISTINCT a.cur_id
+                FROM ancestors a
+                JOIN sessions child ON child.id = a.cur_id
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM sessions parent
+                    WHERE {compression_parent_edge}
+                )
+            ),
+            chain(root_id, cur_id) AS (
+                SELECT root_id, root_id FROM candidate_roots
+                UNION
+                SELECT c.root_id, child.id
+                FROM chain c
+                JOIN sessions parent ON parent.id = c.cur_id
+                JOIN sessions child ON {compression_parent_edge}
+                LIMIT ?
+            ),
+            chain_rows AS (
+                SELECT
+                    c.root_id,
+                    c.cur_id,
+                    {_sql_session_last_active_by_id('c.cur_id')} AS activity,
+                    CASE WHEN EXISTS (
+                        SELECT 1
+                        FROM sessions parent
+                        JOIN sessions child ON {compression_parent_edge}
+                        WHERE parent.id = c.cur_id
+                    ) THEN 0 ELSE 1 END AS is_tip
+                FROM chain c
+            ),
+            ranked_tips AS (
+                SELECT root_id, cur_id, activity,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY root_id
+                           ORDER BY activity DESC, cur_id DESC
+                       ) AS rank_in_root
+                FROM chain_rows
+                WHERE is_tip = 1
+            )
+            SELECT
+                tip.id,
+                tip.source,
+                tip.model,
+                COALESCE(tip.title, s.title) AS title,
+                s.started_at AS started_at,
+                tip.ended_at,
+                tip.end_reason,
+                tip.message_count,
+                tip.tool_call_count,
+                rt.activity AS last_active,
+                {_sql_preview_raw('tip.id')},
+                CASE WHEN s.id != tip.id THEN s.id ELSE NULL END
+                    AS _lineage_root_id
+            FROM ranked_tips rt
+            JOIN sessions s ON s.id = rt.root_id
+            JOIN sessions tip ON tip.id = rt.cur_id
+            WHERE rt.rank_in_root = 1
+              AND s.archived = 0
+              AND s.hidden = 0
+              AND {_LISTABLE_CHILD_SQL}
+              AND {_delegate_from_json('s.model_config')} IS NULL
+            ORDER BY rt.activity DESC, s.started_at DESC, tip.id DESC
+            LIMIT ?
+        """
+        params = candidate_params + [
+            candidate_limit,
+            lineage_limit,
+            lineage_limit,
+            limit,
+        ]
+        deadline = time.monotonic() + timeout_seconds
+        interrupted_by_deadline = False
+
+        def _deadline_progress_handler() -> int:
+            nonlocal interrupted_by_deadline
+            if time.monotonic() >= deadline:
+                interrupted_by_deadline = True
+                return 1
+            return 0
+
+        try:
+            with self._read_ctx() as conn:
+                conn.set_progress_handler(_deadline_progress_handler, 1000)
+                try:
+                    rows = conn.execute(query, params).fetchall()
+                finally:
+                    conn.set_progress_handler(None, 0)
+        except sqlite3.OperationalError as exc:
+            if interrupted_by_deadline and "interrupt" in str(exc).lower():
+                raise TimeoutError(
+                    f"recent-session browse exceeded {timeout_seconds:g}s deadline"
+                ) from exc
+            raise
+
+        sessions = []
+        for row in rows:
+            session = self._session_row_dict(row)
+            session["preview"] = _shape_preview(session.pop("_preview_raw", ""))
+            session["unread"] = self.session_unread(session)
+            sessions.append(session)
+        return sessions
+
+    @classmethod
+    def _list_row(cls, row: sqlite3.Row) -> Dict[str, Any]:
+        """Project a list_sessions_rich row: shape the preview, drop internal ordering columns."""
+        s = cls._session_row_dict(row)
+        s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+        s.pop("_effective_last_active", None)
+        return s
+
+    def list_sessions_rich(
+        self, source: str = None, sources: List[str] = None, exclude_sources: List[str] = None,
+        cwd_prefix: str = None, limit: int = 20, offset: int = 0, include_children: bool = False,
+        min_message_count: int = 0, project_compression_tips: bool = True,
+        order_by_last_active: bool = False, include_archived: bool = False, archived_only: bool = False,
+        id_query: str = None, search_query: str = None, compact_rows: bool = False,
+        include_pinned: bool = False, session_key: str = None, include_hidden: bool = False,
+        include_subagents: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """List sessions with preview and ``last_active`` in one query. ``order_by_last_active`` sorts
+        by the chain TIP via a recursive CTE (the only path honouring ``id_query`` / ``search_query``);
+        ``include_pinned`` back-fills pins the page missed, still obeying the other
+        filters except archived: a pin is an explicit keep, so a pinned row stamped
+        archived must still return."""
+        self.flush_token_counts()  # rows carry token/cost totals
+        where_clauses, params = _session_filter_where(
+            exclude_children=not include_children, source=source, sources=sources, session_key=session_key,
+            exclude_sources=exclude_sources, cwd_prefix=cwd_prefix, min_message_count=min_message_count,
+            archived_only=archived_only, include_archived=include_archived, include_subagents=include_subagents,
+        )
+        # The archived-only view is the recovery surface for rows that dropped out of every
+        # default list: a session that is archived AND hidden (Bot Mode marks its sessions
+        # hidden) must still be reachable there, or nothing but direct DB access can bring
+        # it back (#90946).
+        if not include_hidden and not archived_only:
+            where_clauses.append("s.hidden = 0")
+        where_sql = _where_sql(where_clauses)
+        # Shared projection head of the three list queries (whitespace is part of the SQL text).
+        select_head = (
+            f"SELECT {self._compact_session_cols() if compact_rows else 's.*'}"
+            + ("" if compact_rows else ", COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved")
+            + f",\n                    {_sql_preview_raw()},\n                    "
+        )
+        prompt_join = (
+            "" if compact_rows else "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash"
+        )
+        from_sessions = f"FROM sessions s\n                {prompt_join}"
+        if order_by_last_active:
+            # The CTE walks compression-continuation edges forward from the admitted
+            # rows; MAX over the chain gives effective_last_active in SQL. Do NOT
+            # require child.started_at >= parent.ended_at: races insert the
+            # continuation before ended_at is written.
+            outer_where, id_params = self._chain_search_where(
+                where_sql, (id_query or "").strip().lower(), (search_query or "").strip().lower(),
+            )
+            query = f"""
+                WITH RECURSIVE chain(root_id, cur_id) AS (
+                    SELECT s.id, s.id FROM sessions s {where_sql}
+                    UNION ALL
+                    SELECT c.root_id, child.id
+                    FROM chain c
+                    JOIN sessions parent ON parent.id = c.cur_id
+                    JOIN sessions child ON child.parent_session_id = c.cur_id
+                    WHERE parent.end_reason = 'compression'
+                      AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
+                      AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL
+                      AND NOT ({_RESET_CHILD_SQL.format(a='child')})
+                      AND COALESCE(child.source, '') != 'tool'
+                ),
+                chain_max AS (
+                    SELECT
+                        root_id,
+                        MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
+                    FROM chain
+                    GROUP BY root_id
+                )
+                {select_head}{_sql_session_last_active("s")} AS last_active,
+                    COALESCE(cm.effective_last_active, {_sql_in_window("s.started_at")}) AS _effective_last_active
+                FROM sessions s
+                LEFT JOIN chain_max cm ON cm.root_id = s.id
+                {prompt_join}
+                {outer_where}
+                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+                LIMIT ? OFFSET ?
+            """
+            params = params + params + id_params + [limit, offset]  # WHERE binds twice (seed + outer)
+        else:
+            query = f"""
+                {select_head}{_sql_session_last_active("s")} AS last_active
+                {from_sessions}
+                {where_sql}
+                ORDER BY s.started_at DESC
+                LIMIT ? OFFSET ?
+            """
+            params.extend([limit, offset])
+        sessions = [self._list_row(row) for row in self._read_all(query, params)]
+        # Pinned back-fill runs BEFORE compression projection so a back-filled root
+        # projects to its tip like any other row. Do not inherit the archived
+        # constraint: the sidebar lists with include_archived=False, and a pin
+        # must stay reachable even when that row is also archived.
+        if include_pinned:
+            seen_ids = {s["id"] for s in sessions}
+            pinned_clauses, pinned_params = _session_filter_where(
+                exclude_children=not include_children, source=source, sources=sources,
+                session_key=session_key, exclude_sources=exclude_sources, cwd_prefix=cwd_prefix,
+                min_message_count=min_message_count, archived_only=False, include_archived=True,
+                include_subagents=include_subagents,
+            )
+            if not include_hidden and not archived_only:
+                pinned_clauses.append("s.hidden = 0")
+            pinned_clauses.append("s.pinned = 1")
+            pinned_where = _where_sql(pinned_clauses)
+            pinned_query = f"""
+                {select_head}{_sql_session_last_active("s")} AS last_active
+                {from_sessions}
+                {pinned_where}
+                ORDER BY s.started_at DESC
+            """
+            for row in self._read_all(pinned_query, pinned_params):
+                s = self._list_row(row)
+                if s["id"] not in seen_ids:
+                    seen_ids.add(s["id"])
+                    sessions.append(s)
+        if project_compression_tips and not include_children:
+            sessions = self._project_compression_tips(sessions, compact_rows)
+        # last_read_at is lineage-stamped, so root and tip watermarks agree.
+        for s in sessions:
+            s["unread"] = self.session_unread(s)
+        return sessions
+
+    def session_lifecycle_statuses(self, session_ids: List[str]) -> Dict[str, str]:
+        """``{session_id: status}`` from each session's LAST message row (``'empty'`` when none); one
+        query, MAX(id) per session joined back — never scans transcripts."""
+        ids = [sid for sid in (session_ids or []) if sid]
+        if not ids:
+            return {}
+        statuses: Dict[str, str] = {sid: "empty" for sid in ids}
+        rows = self._read_all(f"""
+            SELECT m.session_id, m.role,
+                   m.tool_calls IS NOT NULL AS has_tool_calls,
+                   m.finish_reason
+            FROM messages m
+            JOIN (
+                SELECT session_id, MAX(id) AS max_id
+                FROM messages
+                WHERE session_id IN ({_session_ids_placeholders(ids)})
+                GROUP BY session_id
+            ) latest ON m.id = latest.max_id
+        """, ids)
+        for row in rows:
+            statuses[row["session_id"]] = classify_session_status(
+                role=row["role"], has_tool_calls=bool(row["has_tool_calls"]),
+                finish_reason=row["finish_reason"],
+            )
+        return statuses
+
+    def assert_export_safe(self, session_id: str, max_messages: Optional[int] = None) -> int:
+        """Row count of this segment — every row, archived included, as the transfer export materializes
+        it — or raise SessionExportTooLargeError (the LIMITed subquery
+        stops once the bound is exceeded). ``None`` resolves ``sessions.max_export_messages``; 0 disables
+        the guard."""
+        from hermes_state import SessionExportTooLargeError, resolved_max_export_messages
+        if max_messages is None:
+            max_messages = resolved_max_export_messages()
+        if max_messages < 0:
+            raise ValueError("max_messages must be non-negative")
+        if max_messages == 0:
+            return 0
+        row = self._read_one(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM messages WHERE session_id = ? LIMIT ?)",
+            (session_id, max_messages + 1),
+        )
+        message_count = int(row[0] if row else 0)
+        if message_count > max_messages:
+            raise SessionExportTooLargeError(session_id, message_count, max_messages)
+        return message_count
+
+    def assert_exports_safe(self, session_ids, max_messages: Optional[int] = None) -> None:
+        """assert_export_safe for each id with the limit resolved once; 0 disables (no queries)."""
+        from hermes_state import resolved_max_export_messages
+        if max_messages is None:
+            max_messages = resolved_max_export_messages()
+        if max_messages == 0:
+            return
+        for session_id in session_ids:
+            self.assert_export_safe(session_id, max_messages=max_messages)
+
+    def _is_explicit_branch_session(self, session_id: str) -> bool:
+        """Copied user-facing branch (``_branched_from``)? Branches own a copied transcript;
+        compression continuations need the parent's archived rows."""
+        if not session_id:
+            return False
+        row = self._read_one("SELECT model_config FROM sessions WHERE id = ?", (session_id,))
+        return row is not None and bool(_parse_model_config(row[0]).get("_branched_from"))
+
+    def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
+        if not session_id:
+            return [session_id]
+        chain: List[str] = []
+        current = session_id
+        with self._read_ctx() as conn:
+            while current and current not in chain and len(chain) < 100:
+                chain.append(current)
+                row = conn.execute(
+                    "SELECT parent_session_id FROM sessions WHERE id = ?", (current,),
+                ).fetchone()
+                if row is None:
+                    break
+                current = row[0]
+        return list(reversed(chain)) or [session_id]
+
+    def search_sessions(
+        self, source: Union[str, Sequence[str], None] = None, limit: int = 20, offset: int = 0,
+        workspace_key: str = None,
+    ) -> List[Dict[str, Any]]:
+        """Sessions MRU-first with a computed ``last_active``; ``workspace_key`` scopes to one workspace
+        so ``hermes -c``/``--resume`` picks its last session. ``source`` may be one label or several."""
+        where_clauses = []
+        params: list = []
+        if source:
+            sources = [source] if isinstance(source, str) else list(source)
+            where_clauses.append(f"s.source IN ({','.join('?' * len(sources))})")
+            params.extend(sources)
+        if workspace_key:
+            ws_clause, ws_params = _workspace_key_clause(workspace_key)
+            where_clauses.append(ws_clause)
+            params.extend(ws_params)
+        return [self._session_row_dict(row) for row in self._read_all(
+            "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
+            f"{_sql_session_last_active('s')} AS last_active "
+            "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
+            f"{_where_sql(where_clauses, ' ')} "
+            "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        )]
+
+    def session_count(
+        self, source: str = None, sources: List[str] = None, cwd_prefix: str = None,
+        min_message_count: int = 0, include_archived: bool = False, archived_only: bool = False,
+        exclude_children: bool = False, exclude_sources: List[str] = None, include_subagents: bool = False,
+    ) -> int:
+        """Count sessions with list_sessions_rich's filters so a paired "load more" total matches."""
+        where_clauses, params = _session_filter_where(
+            exclude_children=exclude_children, source=source, sources=sources,
+            exclude_sources=exclude_sources, cwd_prefix=cwd_prefix, min_message_count=min_message_count,
+            archived_only=archived_only, include_archived=include_archived, include_subagents=include_subagents,
+        )
+        return self._read_one(f"SELECT COUNT(*) FROM sessions s{_where_sql(where_clauses, ' ')}", params)[0]
+
+    def session_count_ge(self, n: int = 1) -> bool:
+        """At least N sessions exist (archived included); LIMIT short-circuits session_count()'s scan."""
+        return len(self._read_all("SELECT 1 FROM sessions LIMIT ?", (n,))) >= n
+
+    def session_count_by_source(
+        self, *, include_archived: bool = False, archived_only: bool = False,
+        exclude_children: bool = False,
+    ) -> Dict[str, int]:
+        """``{source: count}`` via one GROUP BY; ``exclude_children`` mirrors listing visibility."""
+        where_clauses, params = _session_filter_where(
+            exclude_children=exclude_children, archived_only=archived_only,
+            include_archived=include_archived,
+        )
+        with self._read_ctx() as conn:
+            if self._conn is None:
+                raise RuntimeError("SessionDB connection is closed")
+            rows = conn.execute(
+                "SELECT COALESCE(NULLIF(s.source, ''), 'cli') AS source, COUNT(*) AS count "
+                f"FROM sessions s{_where_sql(where_clauses, ' ')} "
+                "GROUP BY COALESCE(NULLIF(s.source, ''), 'cli') ORDER BY count DESC", params,
+            ).fetchall()
+        return {str(row["source"]): int(row["count"] or 0) for row in rows}
+
+    def declared_scope_identity(self, session_id: str) -> Tuple[bool, str]:
+        """(is_fork_child, source) in ONE read (prompt_cache_scope needs both from the same row).
+        Missing row → (False, ""); DB errors propagate (fail closed).
+
+        ``agent/prompt_cache_scope.py`` needs both to resolve a host-declared conversation scope, and both
+        live on the same ``sessions`` row; asking for them separately read that row twice per resolution
+        (@teknium1 on 98811). The marker rules stay here, beside :meth:`is_explicit_fork_child`, instead of
+        being re-implemented by the caller. See #98811.
+        """
+        session = self.get_session(session_id)
+        if not session:
+            return False, ""
+        return self._is_explicit_fork_child_row(session), str(session.get("source") or "").strip()
+
+    @staticmethod
+    def _remove_session_files(sessions_dir: Optional[Path], session_id: str) -> None:
+        """Remove ``<id>.json``/``.jsonl``, the legacy ``session_<id>.json`` snapshot, and gateway
+        ``request_dump_<id>_*.json``; OSError is swallowed so a filesystem hiccup never blocks a
+        DB operation. Every historical writer name is swept because a "deleted" session's snapshot
+        can carry plaintext secrets (#20334, #60207)."""
+        if sessions_dir is None:
+            return
+        targets = [sessions_dir / f"{session_id}{suffix}" for suffix in (".json", ".jsonl")]
+        targets.append(sessions_dir / f"session_{session_id}.json")
+        try:
+            # glob.escape: a session id carrying ``[`` / ``?`` / ``*`` is a PATTERN otherwise, so the
+            # dump sweep either matches nothing or matches another session's files.
+            targets.extend(sessions_dir.glob(f"request_dump_{glob.escape(session_id)}_*.json"))
+        except OSError:
+            pass
+        for p in targets:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def get_session_delete_targets(self, session_id: str) -> List[str]:
+        """Rows :meth:`delete_session` would remove: the session, then its recursive delegate children
+        (branch/compression children are orphaned, not deleted)."""
+        with self._read_ctx() as conn:
+            if not conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone():
+                return []
+            # Use the borrowed read connection, never self._conn: handing the shared writer connection to a
+            # helper here executes on it without self._lock — the same unsynchronized-read class as
+            # #99349/#90734.
+            delegate_ids = _collect_delegate_child_ids(conn, [session_id])
+        return [session_id, *sorted(delegate_ids)]
+
+    def delete_session(
+        self, session_id: str, sessions_dir: Optional[Path] = None,
+        expected_delete_ids: Optional[List[str]] = None,
+        expected_display_messages: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+        exclude_active_write_guards: bool = False,
+    ) -> bool:
+        """Delete a session and its messages; delegate children cascade, branch/compression children
+        are orphaned. Optional expected ids fence delegate drift; expected display snapshots fence
+        transcript drift. Both checks run inside the same write transaction as deletion.
+        With ``exclude_active_write_guards``, raises :class:`SessionActiveWriteGuardError` if the row
+        is protected by an active turn lease or compression lock."""
+        removed_ids: List[str] = []
+        expected_ids = set(expected_delete_ids) if expected_delete_ids is not None else None
+        def _do(conn):
+            if conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone() is None:
+                return False
+            target_ids = (
+                [session_id, *_collect_delegate_child_ids(conn, [session_id])]
+                if exclude_active_write_guards or expected_ids is not None else None
+            )
+            if exclude_active_write_guards and self._guarded_ids(conn, target_ids):
+                # Delegate children cascade with the root, so a guard on any of them refuses too.
+                raise SessionActiveWriteGuardError(
+                    f"session '{session_id}' (or a delegate child) has an active turn lease or compression lock"
+                )
+            if expected_ids is not None and expected_ids != set(target_ids):
+                return False
+            if expected_display_messages is not None and any(
+                self._display_messages_from_conn(conn, covered_id) != expected
+                for covered_id, expected in expected_display_messages.items()
+            ):
+                return False
+            removed_ids.extend(_delete_delegate_children(conn, [session_id]))
+            conn.execute(  # orphan remaining children (branches) so FK is satisfied
+                "UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (session_id,),
+            )
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            self._delete_unreferenced_system_prompts(conn)
+            removed_ids.append(session_id)
+            return True
+        deleted = self._execute_write(_do)
+        for sid in removed_ids:
+            self._remove_session_files(sessions_dir, sid)
+        return bool(deleted)
+
+    def delete_session_if_empty(self, session_id: str, sessions_dir: Optional[Path] = None) -> bool:
+        """Delete *session_id* only if it has no messages, no title and no children; check and delete
+        share one transaction so a concurrent flush can't be lost. A row under an active turn lease
+        or compression lock is never a candidate: the emptiness predicate reads committed state, so a
+        row whose first turn is already leased but not yet flushed would be deleted mid-turn
+        (#123583). A guarded row is simply not deleted (returns ``False``), like any non-empty row."""
+        def _do(conn):
+            if self._guarded_ids(conn, [session_id]):
+                return False
+            cursor = conn.execute(
+                """
+                DELETE FROM sessions
+                WHERE id = ?
+                  AND title IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM messages WHERE messages.session_id = sessions.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sessions child
+                      WHERE child.parent_session_id = sessions.id
+                  )
+                """,
+                (session_id,),
+            )
+            if cursor.rowcount > 0:
+                self._delete_unreferenced_system_prompts(conn)
+            return cursor.rowcount > 0
+        deleted = self._execute_write(_do)
+        if deleted:
+            self._remove_session_files(sessions_dir, session_id)
+        return deleted
+
+    def delete_sessions(
+        self, session_ids: List[str], sessions_dir: Optional[Path] = None,
+        exclude_active_write_guards: bool = False, skipped_ids: Optional[List[str]] = None,
+    ) -> int:
+        """Bulk delete with :meth:`delete_session` semantics per row, in ONE transaction. Unknown ids
+        are skipped (UI selection can race another tab's delete). With ``exclude_active_write_guards``,
+        rows protected by an active turn lease or compression lock are skipped and, when given, appended
+        to ``skipped_ids`` so callers can tell the user. Returns the number deleted."""
+        unique_ids = list({sid for sid in session_ids or () if isinstance(sid, str) and sid})
+        if not unique_ids:
+            return 0
+        removed_ids: list[str] = []
+        def _do(conn):
+            existing = [row["id"] for chunk in _id_chunks(unique_ids) for row in conn.execute(
+                f"SELECT id FROM sessions WHERE id IN ({_session_ids_placeholders(chunk)})", chunk,
+            ).fetchall()]
+            if not existing:
+                return 0
+            if exclude_active_write_guards:
+                # A root is skipped when it or any delegate child it would cascade is guarded, so the
+                # cascade below never deletes a guarded row reported back as kept.
+                # One batched check first; per-root attribution only when something is guarded.
+                active_ids: set = set()
+                if self._guarded_ids(conn, [*existing, *_collect_delegate_child_ids(conn, existing)]):
+                    active_ids = {
+                        sid for sid in existing
+                        if self._guarded_ids(conn, [sid, *_collect_delegate_child_ids(conn, [sid])])
+                    }
+                existing = [sid for sid in existing if sid not in active_ids]
+                if skipped_ids is not None:
+                    skipped_ids.extend(sorted(active_ids))
+                if not existing:
+                    return 0
+            removed_ids.extend(_delete_delegate_children(conn, existing))
+            for chunk in _id_chunks(existing):
+                ph = _session_ids_placeholders(chunk)
+                conn.execute(  # orphan children whose parent is in the kill list (FK)
+                    f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", chunk,
+                )
+                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
+                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
+            self._delete_unreferenced_system_prompts(conn)
+            removed_ids.extend(existing)
+            return len(existing)
+        count = self._execute_write(_do)
+        for sid in removed_ids:
+            self._remove_session_files(sessions_dir, sid)
+        return count
+
+    # Shared by count_empty_sessions / delete_empty_sessions so badge and sweep agree. message_count
+    # counts live rows only (rewind/compaction keep dropped turns as active = 0): NOT EXISTS is authority.
+    # The ``NOT EXISTS`` probe is the authority; : ``message_count = 0`` stays as a cheap prefilter. Same
+    # shape as every : other emptiness guard in this module. (#95868)
+    _EMPTY_SESSION_WHERE = (
+        "message_count = 0 AND ended_at IS NOT NULL AND archived = 0 AND NOT EXISTS ("
+        "SELECT 1 FROM messages WHERE messages.session_id = sessions.id)"
+    )
+
+    def count_empty_sessions(self) -> int:
+        """Count of empty, ended, non-archived sessions; ended_at guards a fresh session's first message."""
+        return self._read_one(f"SELECT COUNT(*) FROM sessions WHERE {self._EMPTY_SESSION_WHERE}")[0]
+
+    def delete_empty_sessions(self, sessions_dir: Optional[Path] = None) -> int:
+        """Delete every empty, ended, non-archived session in one transaction, orphaning (not cascading)
+        children; transcript files are swept too."""
+        removed_ids: list[str] = []
+        def _do(conn):
+            session_ids = {row["id"] for row in conn.execute(
+                f"SELECT id FROM sessions WHERE {self._EMPTY_SESSION_WHERE}"
+            ).fetchall()}
+            if not session_ids:
+                return 0
+            for chunk in _id_chunks(session_ids):
+                ph = _session_ids_placeholders(chunk)
+                conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", chunk)
+                # DELETE FROM messages: a row inserted between the SELECT and here
+                # would otherwise dangle (clean FK state).
+                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
+                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
+                removed_ids.extend(chunk)
+            self._delete_unreferenced_system_prompts(conn)
+            return len(session_ids)
+        count = self._execute_write(_do)
+        for sid in removed_ids:
+            self._remove_session_files(sessions_dir, sid)
+        return count
+
+    def archive_sessions(
+        self, older_than_days: Optional[float] = None, source: str = None, **filters,
+    ) -> int:
+        """Bulk soft-hide with prune_sessions' filter surface, via set_session_archived so each lineage
+        flips as a unit; idempotent. Returns matches. A lineage is matched through its TIP only: an
+        old compression ancestor never qualifies on its own age, or the fan-out would hide an open,
+        recently active continuation (#115489)."""
+        filters.setdefault("archived", False)
+        filters["lineage_tips_only"] = True
+        rows = self.list_prune_candidates(older_than_days=older_than_days, source=source, **filters)
+        for row in rows:
+            self.set_session_archived(row["id"], True)
+        return len(rows)
+
+    def maybe_auto_archive(
+        self, idle_days: float = 3, min_interval_hours: int = 24, exclude_pinned: bool = True,
+    ) -> Dict[str, Any]:
+        """Idempotent, non-destructive auto-archive of sessions idle for ``idle_days``; state_meta
+        ``last_auto_archive`` gates runs within ``min_interval_hours``. Never raises."""
+        result: Dict[str, Any] = {"skipped": False, "archived": 0}
+        try:
+            now = time.time()
+            try:
+                last = float(self.get_meta("last_auto_archive") or 0.0)
+            except (TypeError, ValueError):
+                last = 0.0  # corrupt meta; treat as no prior run
+            if last and now - last < min_interval_hours * 3600:
+                result["skipped"] = True
+                return result
+            # Startup-watchdog lease: the archive sweep is I/O-bound (near-zero CPU),
+            # which the watchdog's CPU fallback misreads as a parked deadlock.
+            # No-op when the watchdog is not armed; never raises.
+            report_startup_progress(900.0, phase="state_db_auto_archive")
+            archived = result["archived"] = self.archive_stale_sessions(idle_days, exclude_pinned=exclude_pinned)
+            # Record even a zero-archive run so we don't re-sweep every call.
+            self.set_meta("last_auto_archive", str(now))
+            if archived > 0:
+                logger.info(
+                    "state.db auto-archive: archived %d session(s) idle >= %s days", archived, idle_days,
+                )
+        except Exception as exc:
+            logger.warning("state.db auto-archive failed: %s", exc)
+            result["error"] = str(exc)
+        return result

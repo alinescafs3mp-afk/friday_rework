@@ -1,0 +1,705 @@
+= time.monotonic()
+            return models
+    return None
+
+
+# ─── Copilot catalog context-window helpers ───
+
+# Module-level cache: {model_id: max_prompt_tokens}
+_copilot_context_cache: dict[str, int] = {}
+_copilot_context_cache_time: float = 0.0
+_copilot_context_cache_key: Optional[str] = None  # fingerprint of the api_key the entry was fetched with
+_COPILOT_CONTEXT_CACHE_TTL = 3600  # 1 hour
+
+
+def get_copilot_model_context(model_id: str, api_key: Optional[str] = None) -> Optional[int]:
+    """``max_prompt_tokens`` for a Copilot model from the live /models API (cached in-process 1h; a
+    miss on a fresh cache does not re-fetch), or None."""
+    global _copilot_context_cache, _copilot_context_cache_time, _copilot_context_cache_key
+
+    # Keyed on the credential like fetch_github_model_catalog: the catalog (and its limits) is
+    # per-account, so another profile's token must not be served this entry.
+    from agent.credential_persistence import fingerprint_secret_value
+    key_fp = fingerprint_secret_value(api_key)
+    if (_copilot_context_cache and _copilot_context_cache_key == key_fp
+            and (time.time() - _copilot_context_cache_time < _COPILOT_CONTEXT_CACHE_TTL)):
+        return _copilot_context_cache.get(model_id)
+
+    catalog = fetch_github_model_catalog(api_key=api_key)
+    if not catalog:
+        return None
+    cache: dict[str, int] = {}
+    for item in catalog:
+        mid = str(item.get("id") or "").strip()
+        max_prompt = ((item.get("capabilities") or {}).get("limits") or {}).get("max_prompt_tokens")
+        if mid and isinstance(max_prompt, int) and max_prompt > 0:
+            cache[mid] = max_prompt
+    _copilot_context_cache = cache
+    _copilot_context_cache_time = time.time()
+    _copilot_context_cache_key = key_fp
+    return cache.get(model_id)
+
+
+def _is_github_models_base_url(base_url: Optional[str]) -> bool:
+    return (base_url or "").strip().rstrip("/").lower().startswith(
+        (COPILOT_BASE_URL, "https://models.github.ai/inference", "https://models.inference.ai.azure.com")
+    )
+
+
+def _fetch_github_models(api_key: Optional[str] = None, timeout: float = 5.0) -> Optional[list[str]]:
+    catalog = fetch_github_model_catalog(api_key=api_key, timeout=timeout)
+    return [item.get("id", "") for item in catalog if item.get("id")] if catalog else None
+
+
+def _copilot_catalog_ids(
+    catalog: Optional[list[dict[str, Any]]] = None, api_key: Optional[str] = None) -> set[str]:
+    if catalog is None and api_key:
+        catalog = fetch_github_model_catalog(api_key=api_key)
+    return {mid for item in (catalog or []) if (mid := str(item.get("id") or "").strip())}
+
+
+def normalize_copilot_model_id(
+    model_id: Optional[str], *, catalog: Optional[list[dict[str, Any]]] = None,
+    api_key: Optional[str] = None) -> str:
+    raw = str(model_id or "").strip()
+    if not raw:
+        return ""
+
+    catalog_ids = _copilot_catalog_ids(catalog=catalog, api_key=api_key)
+    alias = _COPILOT_MODEL_ALIASES.get(raw)
+    if alias:
+        return alias
+
+    candidates = [raw]
+    if "/" in raw:
+        candidates.append(raw.split("/", 1)[1].strip())
+    if raw.endswith(("-mini", "-nano", "-chat")):
+        candidates.append(raw[:-5])
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate in _COPILOT_MODEL_ALIASES:
+            return _COPILOT_MODEL_ALIASES[candidate]
+        if candidate in catalog_ids:
+            return candidate
+
+    if "/" in raw:
+        stripped = raw.split("/", 1)[1].strip()
+        # Enterprise BYOK custom models expose ``owner/sub/model`` ids (two
+        # slashes). A strip guess that still contains "/" cannot be a Copilot
+        # id, so pass the input through untouched instead of corrupting it.
+        if stripped and "/" not in stripped:
+            return stripped
+    return raw
+
+
+def _github_reasoning_efforts_for_model_id(model_id: str) -> list[str]:
+    raw = (model_id or "").strip().lower()
+    if raw.startswith(("openai/o1", "openai/o3", "openai/o4", "o1", "o3", "o4")):
+        return list(COPILOT_REASONING_EFFORTS_O_SERIES)
+    normalized = normalize_copilot_model_id(model_id).lower()
+    if is_astra_model(normalized):
+        return list(CODEX_ASTRA_EFFORTS)
+    if normalized.startswith("gpt-5"):
+        return list(COPILOT_REASONING_EFFORTS_GPT5)
+    return []
+
+
+def _should_use_copilot_responses_api(model_id: str) -> bool:
+    """opencode's ``shouldUseCopilotResponsesApi``: GPT-5+ uses the Responses API except
+    ``gpt-5-mini``; non-GPT models (Claude, Gemini, ...) use Chat Completions."""
+    match = re.match(r"^gpt-(\d+)", model_id)
+    return bool(match) and int(match.group(1)) >= 5 and not model_id.startswith("gpt-5-mini")
+
+
+def copilot_model_api_mode(
+    model_id: Optional[str], *, catalog: Optional[list[dict[str, Any]]] = None,
+    api_key: Optional[str] = None) -> str:
+    """API mode for a Copilot model from the id pattern (opencode's approach). Copilot's Claude models
+    go through its OpenAI-compatible chat endpoint, not the native Anthropic adapter: the catalog may
+    advertise /v1/messages but the Copilot token/header scheme lives in the OpenAI client path."""
+    if catalog is None and api_key:  # fetch once so normalize + endpoint check share it
+        catalog = fetch_github_model_catalog(api_key=api_key)
+    normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
+    if normalized and _should_use_copilot_responses_api(normalized):
+        return "codex_responses"
+    return "chat_completions"
+
+
+def azure_foundry_model_api_mode(model_name: Optional[str]) -> Optional[str]:
+    """``"codex_responses"`` for families that only accept the Responses API on Azure Foundry (GPT-5.x
+    incl. gpt-5-mini, codex, o1/o3/o4), else None. Any ``vendor/`` prefix is stripped first."""
+    raw = str(model_name or "").strip().lower().rsplit("/", 1)[-1]
+    return "codex_responses" if raw and raw.startswith(tuple(_AZURE_FOUNDRY_RESPONSES_PREFIXES)) else None
+
+
+_OPENCODE_FAMILIES = ("opencode-go", "opencode-zen")
+
+
+def opencode_provider_family(provider_id: Optional[str]) -> Optional[str]:
+    """Resolve a provider id (canonical or prefixed) to its OpenCode family, or None.
+
+    Returns ``"opencode-zen"`` or ``"opencode-go"`` for the built-in providers AND for custom providers
+    whose name extends a family slug (e.g. ``opencode-go-bridge`` pointing at
+    ``https://opencode.ai/zen/go/v1``, issue #85589). Matching is case-insensitive. Custom family providers
+    need the same per-model api_mode routing and /v1 base-url normalization as the built-ins — this
+    predicate is the single owner of that family-membership question; do not re-implement it inline.
+    """
+    raw = str(provider_id or "").strip().lower()
+    if not raw:
+        return None
+    canonical = normalize_provider(provider_id)
+    if canonical in _OPENCODE_FAMILIES:
+        return canonical
+    return next((f for f in _OPENCODE_FAMILIES if raw.startswith(f)), None)
+
+
+def normalize_opencode_model_id(provider_id: Optional[str], model_id: Optional[str]) -> str:
+    """Normalize OpenCode config IDs to the bare model slug used in API requests."""
+    family = opencode_provider_family(provider_id)
+    current = str(model_id or "").strip()
+    if not current or family is None:
+        return current
+    for prefix in (f"{provider_id or family}/", f"{family}/"):
+        if current.lower().startswith(prefix.lower()):
+            return current[len(prefix):]
+    return current
+
+
+# Per-family (model-id prefix → api_mode) routing from OpenCode's published Zen/Go endpoint
+# tables, checked in order. GPT/Codex/Grok and Muse Spark use /v1/responses (Muse Spark 503s on
+# chat/completions); Claude (Zen), MiniMax (Go), Union Alpha, and Qwen use /v1/messages;
+# everything else falls through to /v1/chat/completions.
+_OPENCODE_API_MODE_PREFIXES: dict[str, tuple[tuple[tuple[str, ...], str], ...]] = {
+    "opencode-go": (
+        (("gpt-", "grok-", "muse-spark"), "codex_responses"),
+        (("minimax-", "qwen", "union-alpha"), "anthropic_messages")),
+    "opencode-zen": (
+        (("claude-", "union-alpha"), "anthropic_messages"), (("gpt-", "grok-", "muse-spark"), "codex_responses"),
+        (("qwen",), "anthropic_messages"))}
+
+
+def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str]) -> str:
+    """Determine the API mode for an OpenCode Zen / Go model (see ``_OPENCODE_API_MODE_PREFIXES``)."""
+    family = opencode_provider_family(provider_id)
+    normalized = normalize_opencode_model_id(provider_id, model_id).lower()
+    if normalized:
+        for prefixes, mode in _OPENCODE_API_MODE_PREFIXES.get(family or "", ()):
+            if normalized.startswith(prefixes):
+                return mode
+    return "chat_completions"
+
+
+# Relay path per OpenCode family on opencode.ai hosts.
+_OPENCODE_FAMILY_PATHS = {"opencode-zen": "/zen", "opencode-go": "/zen/go"}
+
+
+def normalize_opencode_base_url(
+    provider_id: Optional[str], api_mode: Optional[str], base_url: Optional[str]) -> str:
+    """Normalize an OpenCode Zen / Go base URL for the API mode. Must be SYMMETRIC: the anthropic-
+    stripped URL gets persisted to ``model.base_url`` after switching into an anthropic-routed model,
+    and chat/codex modes heal it by re-adding ``/v1`` — but only on opencode.ai hosts, so custom
+    ``OPENCODE_*_BASE_URL`` proxies are left alone. On those hosts the relay path segment follows
+    the resolved family too (``/zen`` vs ``/zen/go``): the two relays serve different model sets,
+    so a ``model.base_url`` carried over from the other family 401s ("Model ... is not supported").
+    The family heal applies to the BUILT-IN providers only: a custom provider merely named after a
+    family (``opencode-go-bridge``) declared its relay path explicitly in ``providers:`` and keeps it.
+    Only the path is edited, so a port, userinfo, query or fragment round-trips untouched."""
+    url = str(base_url or "").strip().rstrip("/")
+    family = opencode_provider_family(provider_id)
+    if not url or family is None:
+        return url
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    official = host == "opencode.ai" or host.endswith(".opencode.ai")
+    path = parsed.path.rstrip("/")
+    if official and normalize_provider(provider_id) in _OPENCODE_FAMILIES and re.fullmatch(r"/zen(/go)?(/v1)?", path):
+        path = _OPENCODE_FAMILY_PATHS[family] + ("/v1" if path.endswith("/v1") else "")
+    if api_mode == "anthropic_messages":
+        path = re.sub(r"/v1$", "", path)
+    elif official and not path.endswith("/v1"):
+        path += "/v1"
+    return urllib.parse.urlunparse(parsed._replace(path=path))
+
+
+def github_model_reasoning_efforts(
+    model_id: Optional[str], *, catalog: Optional[list[dict[str, Any]]] = None,
+    api_key: Optional[str] = None) -> list[str]:
+    """Return supported reasoning-effort levels for a Copilot-visible model."""
+    normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
+    if not normalized:
+        return []
+
+    if catalog is None and api_key:
+        catalog = fetch_github_model_catalog(api_key=api_key)
+    catalog_entry = next((item for item in catalog if item.get("id") == normalized), None) if catalog else None
+    if catalog_entry is not None:
+        capabilities = catalog_entry.get("capabilities")
+        if isinstance(capabilities, dict):
+            # Structured catalog: the advertised list is authoritative (empty when absent).
+            supports = capabilities.get("supports")
+            efforts = supports.get("reasoning_effort") if isinstance(supports, dict) else None
+            if not isinstance(efforts, list):
+                return []
+            return list(dict.fromkeys(e for effort in efforts if (e := str(effort).strip().lower())))
+        # Legacy list-shaped capabilities: only a "reasoning" tag unlocks the pattern defaults.
+        if "reasoning" not in {str(c).strip().lower() for c in catalog_entry.get("capabilities", [])}:
+            return []
+    return _github_reasoning_efforts_for_model_id(str(model_id or normalized))
+
+
+# Negative cache: monotonic timestamp of the last timed-out probe, keyed
+# by ``host:port`` so both URL candidates (``/v1`` + root) share one entry.
+# Without this, an unreachable endpoint (TCP blackhole — SYN draws no reply,
+# so every attempt burns its full connect timeout) makes every picker open /
+# chat turn re-pay the timeout per candidate, and the sequential stalls stack
+# past 10s while the Desktop sits on a spinner with no error (#81123). Short
+# TTL collapses the burst but still picks up recovery without a restart.
+# Mirrors _deepinfra_catalog_neg_cache.
+_probe_neg_cache: dict[str, float] = {}
+_PROBE_NEG_TTL = 60.0  # seconds
+
+
+def _probe_neg_key(base_url: str) -> Optional[str]:
+    """``host:port`` for *base_url* (both URL candidates share one entry), or None without a host."""
+    from utils import base_url_origin
+
+    _, host, port = base_url_origin(base_url)
+    return f"{host}:{port}" if host else None
+
+
+def _probe_result(
+    models, probed_url, resolved_base_url, suggested_base_url=None, used_fallback=False
+) -> dict[str, Any]:
+    return {
+        "models": models,
+        "probed_url": probed_url,
+        "resolved_base_url": resolved_base_url,
+        "suggested_base_url": suggested_base_url,
+        "used_fallback": used_fallback}
+
+
+def probe_api_models(
+    api_key: Optional[str], base_url: Optional[str], timeout: float = 5.0,
+    api_mode: Optional[str] = None, request_headers: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """Probe a ``/models`` endpoint with light URL heuristics (``base`` then ``base±/v1``).
+    ``anthropic_messages`` mode sends ``x-api-key`` + ``anthropic-version`` instead of a bearer; the
+    ``data[].id`` response shape is identical. ``models`` is None when no candidate answered."""
+    from hermes_cli.model_switch_providers import _picker_scope
+    _picker_scope()
+    cap = _picker_scope()
+    authority = _model_catalog_authority_guard(base_url, api_key)
+    def result(*args):
+        value = _probe_result(*args)
+        if authority is not None:
+            authority()
+        return value
+    if cap is not None:
+        from hermes_cli.friday_credential_admission import route_inputs, extensions
+        route_inputs(base_url=base_url, api_key=api_key)
+        extensions(request_headers)
+    normalized = (base_url or "").strip().rstrip("/")
+    if not normalized:
+        return result(None, None, "")
+    if _is_github_models_base_url(normalized):
+        models = _fetch_github_models(api_key=api_key, timeout=timeout)
+        return result(models, COPILOT_MODELS_URL, COPILOT_BASE_URL)
+
+    # Managed admission is for the configured catalog only. Legacy heuristics
+    # must never turn a local timeout into an unadmitted alternate-path effect.
+    alternate_base = None if cap is not None else (normalized[:-3].rstrip("/") if normalized.endswith("/v1") else normalized + "/v1")
+    candidates: list[tuple[str, bool]] = [(normalized, False)]
+    if alternate_base and alternate_base != normalized:
+        candidates.append((alternate_base, True))
+
+    tried: list[str] = []
+    _neg_key = _probe_neg_key(normalized)
+    if _neg_key is not None:
+        _neg_seen = _probe_neg_cache.get(_neg_key)
+        if _neg_seen is not None and (time.monotonic() - _neg_seen) < _PROBE_NEG_TTL:
+            return result(
+                None, normalized.rstrip("/") + "/models", normalized,
+                alternate_base if alternate_base != normalized else None)
+    headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
+    if urllib.parse.urlparse(normalized).hostname == "generativelanguage.googleapis.com":
+        headers["X-Goog-Api-Client"] = f"hermes-agent/{get_version_info().base_version}"
+    if api_key and api_mode == "anthropic_messages":
+        headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
+    elif api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if normalized.startswith(COPILOT_BASE_URL):
+        headers.update(copilot_default_headers())
+    if isinstance(request_headers, dict):
+        # Per-provider custom headers can contain secrets: merge last so endpoint config wins; never log.
+        from hermes_cli.config import normalize_extra_headers
+
+        headers.update(normalize_extra_headers(request_headers))
+
+    # Only thread ssl_context when a per-provider TLS override applies; public endpoints keep the
+    # original 2-arg call so existing call-seam mocks stay valid.
+    _open_kwargs: dict[str, Any] = {}
+    if authority is not None:
+        authority()
+    request_guard = _model_catalog_request_guard(base_url, api_key, headers)
+    _ssl_context = _custom_provider_ssl_context(normalized)
+    if _ssl_context is not None:
+        _open_kwargs["ssl_context"] = _ssl_context
+    if request_guard is not None:
+        _open_kwargs["request_guard"] = request_guard
+    all_timed_out = True
+    for candidate_base, is_fallback in candidates:
+        _picker_scope()
+        url = candidate_base.rstrip("/") + "/models"
+        tried.append(url)
+        try:
+            data = _get_json(url, timeout=timeout, headers=headers, **_open_kwargs)
+        except Exception as exc:
+            if request_guard is not None:
+                request_guard()
+                from hermes_cli.friday_user_scope import ScopeDenied
+                from hermes_cli.friday_credential_admission import CredentialDenied
+                if isinstance(exc, (ScopeDenied, CredentialDenied)):
+                    raise
+            # TLS, authentication and parsing failures must not hide corrected settings.
+            cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            all_timed_out = all_timed_out and isinstance(cause, TimeoutError)
+            continue
+        _picker_scope()
+        if request_guard is not None:
+            request_guard()
+        if _neg_key is not None:
+            _probe_neg_cache.pop(_neg_key, None)
+        from hermes_cli.chat_catalog import note_catalog_item
+
+        probed = []
+        for item in data.get("data", []):
+            observed = isinstance(item, dict) and note_catalog_item(item)
+            if authority is not None:
+                authority()
+            if not observed:
+                probed.append(item.get("id", ""))
+                if authority is not None:
+                    authority()
+        return result(
+            probed, url, candidate_base.rstrip("/"),
+            alternate_base if alternate_base != candidate_base else normalized, is_fallback)
+
+    if request_guard is not None:
+        request_guard()
+    if _neg_key is not None and all_timed_out:
+        _probe_neg_cache[_neg_key] = time.monotonic()
+    return result(
+        None, tried[0] if tried else normalized.rstrip("/") + "/models", normalized,
+        alternate_base if alternate_base != normalized else None)
+
+
+# Legacy id-regex filter for items with no surface tag; unreachable (deletable) once every catalog
+# entry carries an explicit ``chat``/``embed``/``image-gen``/``tts``/``stt`` tag.
+_DEEPINFRA_EXCLUDE_RE = re.compile(
+    r"(?i)(embed|rerank|whisper|stable-diffusion|flux|sdxl|"
+    r"tts|bark|speech|image-gen|clip|vit-|dpt-)")
+
+# Surface tags say *what kind of model* this is. Absent all of them, the tags array only carries
+# capability tags (``reasoning``, ``vision``, …) and the chat surface falls back to id-regex inference.
+_DEEPINFRA_SURFACE_TAGS: frozenset[str] = frozenset({
+    "chat", "embed", "image-gen", "tts", "stt", "video-gen"})
+
+_DEEPINFRA_DEFAULT_BASE_URL = "https://api.deepinfra.com/v1/openai"
+_DEEPINFRA_MODELS_QUERY = "filter=true&sort_by=hermes"
+
+# Full tagged catalog keyed by base URL; every surface filter reads it so one round-trip serves all.
+_deepinfra_catalog_cache: dict[str, list[dict]] = {}
+
+# Negative cache (monotonic time of the last failed fetch per base URL) so an unreachable catalog
+# doesn't make every surface helper eat the full timeout in turn. Short TTL so connectivity recovers.
+_deepinfra_catalog_neg_cache: dict[str, float] = {}
+_DEEPINFRA_CATALOG_NEG_TTL = 60.0  # seconds
+
+
+def _deepinfra_env(key: str) -> str:
+    """Profile-scoped ``.env``/environ read: under a multiplexed turn the launch env is not this profile's."""
+    from hermes_cli.config import get_env_value_prefer_dotenv
+    return (get_env_value_prefer_dotenv(key) or "").strip()
+
+
+def _deepinfra_catalog_url() -> tuple[str, str]:
+    """Return ``(cache_key, full_url)`` for the DeepInfra catalog endpoint. The key carries the
+    api-key fingerprint: the catalog is user-scoped (private fine-tunes), so two profiles with
+    different keys must not share an entry."""
+    base = (_deepinfra_env("DEEPINFRA_BASE_URL") or _DEEPINFRA_DEFAULT_BASE_URL).rstrip("/")
+    from agent.credential_persistence import fingerprint_secret_value
+    fp = fingerprint_secret_value(_deepinfra_env("DEEPINFRA_API_KEY")) or "anon"
+    return f"{base}#{fp}", f"{base}/models?{_DEEPINFRA_MODELS_QUERY}"
+
+
+def _fetch_deepinfra_catalog(
+    *, timeout: float = 5.0, force_refresh: bool = False) -> Optional[list[dict]]:
+    """Raw DeepInfra catalog list (chat, embed, image-gen, TTS, STT in one response), cached per base
+    URL. A Bearer token is attached when available so user-scoped catalogs (private fine-tunes) show."""
+    cache_key, url = _deepinfra_catalog_url()
+    if not force_refresh:
+        if cache_key in _deepinfra_catalog_cache:
+            return _deepinfra_catalog_cache[cache_key]
+        last_fail = _deepinfra_catalog_neg_cache.get(cache_key)
+        if last_fail is not None and (time.monotonic() - last_fail) < _DEEPINFRA_CATALOG_NEG_TTL:
+            return None
+
+    headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
+    api_key = _deepinfra_env("DEEPINFRA_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        payload = _get_json(url, timeout=timeout, headers=headers)
+    except Exception:
+        _deepinfra_catalog_neg_cache[cache_key] = time.monotonic()
+        return None
+    data = payload.get("data")
+    if not isinstance(data, list):
+        _deepinfra_catalog_neg_cache[cache_key] = time.monotonic()
+        return None
+    _deepinfra_catalog_cache[cache_key] = data
+    _deepinfra_catalog_neg_cache.pop(cache_key, None)
+    return data
+
+
+def _fetch_deepinfra_models_by_tag(
+    tag: str, *, timeout: float = 5.0, force_refresh: bool = False) -> Optional[list[dict]]:
+    """DeepInfra ``{"id", "metadata"}`` items whose ``metadata.tags`` includes *tag*. Items with no
+    surface tag fall through to the legacy id-regex exclusion (chat surface only — embed/image-gen/
+    tts/stt cannot be inferred from an id). ``None`` on network failure."""
+    data = _fetch_deepinfra_catalog(timeout=timeout, force_refresh=force_refresh)
+    if data is None:
+        return None
+    matched: list[dict] = []
+    for item in data:
+        mid = item.get("id")
+        raw_metadata = item.get("metadata")
+        if not mid or raw_metadata is None:  # metadata None = listed-but-not-served stub
+            continue
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        raw_tags = metadata.get("tags")
+        tags = raw_tags if isinstance(raw_tags, list) else []
+        if any(t in _DEEPINFRA_SURFACE_TAGS for t in tags):
+            hit = tag in tags
+        else:
+            hit = tag == "chat" and not _DEEPINFRA_EXCLUDE_RE.search(mid)
+        if hit:
+            matched.append({"id": mid, "metadata": metadata})
+    return matched
+
+
+def _fetch_deepinfra_models(
+    timeout: float = 5.0, *, force_refresh: bool = False) -> Optional[list[str]]:
+    """DeepInfra chat-model ids (string-list contract for :func:`provider_model_ids`); ``None`` on
+    network failure or when no chat-tagged id exists."""
+    items = _fetch_deepinfra_models_by_tag("chat", timeout=timeout, force_refresh=force_refresh)
+    return ([item["id"] for item in items] or None) if items is not None else None
+
+
+def deepinfra_model_ids(tag: str, *, force_refresh: bool = False) -> list[str]:
+    """Return DeepInfra model ids carrying surface *tag* (``[]`` on failure)."""
+    items = _fetch_deepinfra_models_by_tag(tag, force_refresh=force_refresh)
+    return [item["id"] for item in items] if items else []
+
+
+def deepinfra_base_url(section: Optional[dict] = None) -> str:
+    """DeepInfra base URL: config-section ``base_url`` → ``DEEPINFRA_BASE_URL`` env → default; stripped."""
+    candidate = section.get("base_url") if isinstance(section, dict) else None
+    value = candidate or _deepinfra_env("DEEPINFRA_BASE_URL") or _DEEPINFRA_DEFAULT_BASE_URL
+    return str(value).strip().rstrip("/")
+
+
+def _fetch_ai_gateway_models(timeout: float = 5.0) -> Optional[list[str]]:
+    """Fetch available language models with tool-use from AI Gateway."""
+    api_key = os.getenv("AI_GATEWAY_API_KEY", "").strip()
+    if not api_key:
+        return None
+    base_url = os.getenv("AI_GATEWAY_BASE_URL", "").strip()
+    if not base_url:
+        from hermes_constants import AI_GATEWAY_BASE_URL
+        base_url = AI_GATEWAY_BASE_URL
+
+    headers = {"Authorization": f"Bearer {api_key}", "User-Agent": _HERMES_USER_AGENT}
+    try:
+        url = base_url.rstrip("/") + "/models"
+        data = _get_json(url, timeout=timeout, headers=headers)
+        return [
+            m["id"] for m in data.get("data", [])
+            if m.get("id") and m.get("type") == "language" and "tool-use" in (m.get("tags") or [])]
+    except Exception:
+        return None
+
+
+def fetch_api_models(
+    api_key: Optional[str], base_url: Optional[str], timeout: float = 5.0,
+    api_mode: Optional[str] = None, headers: Optional[dict[str, str]] = None,
+) -> Optional[list[str]]:
+    """Fetch the list of available model IDs from the provider's ``/models`` endpoint."""
+    result = probe_api_models(api_key, base_url, timeout=timeout, api_mode=api_mode, request_headers=headers)
+    return result.get("models")
+
+
+def _custom_endpoint_fingerprint(
+    api_key: Any, api_mode: Optional[str], headers: Optional[dict[str, str]]) -> str:
+    """Custom endpoints have no ``PROVIDER_REGISTRY`` slug, so hash exactly what callers pass to
+    :func:`fetch_api_models`: a rotated ``api_key``, changed ``api_mode`` or edited ``extra_headers``
+    each bust the cache entry. blake2b for the same CodeQL rationale as ``_credential_fingerprint``."""
+    import hashlib
+
+    from agent.command_token_source import CommandTokenSource
+    identity = api_key.cache_identity if isinstance(api_key, CommandTokenSource) else api_key
+    blob = "|".join((identity or "", api_mode or "", json.dumps(headers or {}, sort_keys=True)))
+    return hashlib.blake2b(blob.encode("utf-8", errors="replace"), digest_size=8).hexdigest()
+
+
+def _cache_entry_valid(
+    entry: Any, fp: str, *, allow_empty: bool = False) -> "TypeGuard[dict[str, Any]]":
+    """Well-formed cache row for fingerprint *fp*. Requires a numeric ``at`` so corrupt disk state
+    degrades to a cache miss instead of raising; empty model lists are valid only when the caller
+    opts into an authoritative empty catalog."""
+    return (
+        isinstance(entry, dict)
+        and entry.get("fp") == fp
+        and isinstance(entry.get("models"), list)
+        and (allow_empty or bool(entry["models"]))
+        and isinstance(entry.get("at"), (int, float))
+        and not isinstance(entry.get("at"), bool))
+
+
+def _disk_serve_tier(entry: Any, fp: str, now: float, *, is_ollama: bool,
+                     ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL) -> Optional[str]:
+    """How :func:`cached_provider_model_ids` serves *entry* without the network.
+
+    ``"fresh"`` inside the row's TTL (a curated fallback row only for
+    ``_PROVIDER_MODELS_FALLBACK_TTL``), ``"stale"`` for a non-empty, non-fallback row inside
+    ``_PROVIDER_MODELS_STALE_SERVE_MAX`` (served while an SWR thread revalidates), else ``None``:
+    the call would block on a live fetch. Empty native catalogs are authoritative only inside the
+    short native TTL, never through the stale window."""
+    if is_ollama:
+        ttl_seconds = min(ttl_seconds, _OLLAMA_LOCAL_MODELS_CACHE_TTL)
+    if not _cache_entry_valid(entry, fp, allow_empty=is_ollama):
+        return None
+    age = now - entry["at"]
+    if age < (_PROVIDER_MODELS_FALLBACK_TTL if entry.get("fallback") else ttl_seconds):
+        return "fresh"
+    if entry["models"] and not entry.get("fallback") and age < _PROVIDER_MODELS_STALE_SERVE_MAX:
+        return "stale"
+    return None
+
+
+def cached_fetch_api_models(
+    api_key: Any, base_url: Optional[str], *, timeout: float = 5.0,
+    api_mode: Optional[str] = None, headers: Optional[dict[str, str]] = None,
+    force_refresh: bool = False, cache_only: bool = False,
+    fetch_models=None,
+    ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL) -> Optional[list[str]]:
+    """Disk-cached :func:`fetch_api_models` for custom endpoints. ``cache_only`` callers (GUI picker
+    opens that must not block on a stopped local endpoint) still get a warm catalog instead of
+    collapsing to the config-declared subset. ``fetch_models`` supplies native-aware discovery
+    without minting a command token before cache admission."""
+    from hermes_cli.model_switch_providers import _picker_scope
+    _picker_scope()
+    cap = _picker_scope()
+    authority = _model_catalog_authority_guard(base_url, api_key)
+    if authority is not None and fetch_models is not None:
+        from hermes_cli.friday_user_scope import ScopeDenied
+        raise ScopeDenied()
+    def check():
+        if authority is not None:
+            authority()
+        else:
+            _picker_scope()
+    if cap is not None:
+        from hermes_cli.friday_credential_admission import route_inputs, extensions
+        route_inputs(base_url=base_url, api_key=api_key)
+        extensions(headers)
+    from hermes_cli.model_switch_providers import _NativePickerModelList
+
+    def _catalog(entry):
+        rows = (_NativePickerModelList if entry.get("native_catalog") else list)(entry["models"])
+        result = _chat_catalog_rows(rows)
+        check()
+        return result
+
+    def _entry(live, at=None):
+        entry = {**_cache_entry(fp, live, at), "native_catalog": isinstance(live, _NativePickerModelList)}
+        check()
+        return entry
+
+    def _live():
+        check()
+        if fetch_models is not None:
+            live = fetch_models()
+        else:
+            from agent.command_token_source import materialize_probe_api_key
+            key = materialize_probe_api_key(api_key)
+            check()
+            live = fetch_api_models(key, base_url, timeout=timeout, api_mode=api_mode, headers=headers)
+        check()
+        return live
+
+    normalized_url = str(base_url or "").strip().rstrip("/").lower()
+    if not normalized_url:  # nothing to key the cache on
+        return None if cache_only else _chat_catalog_rows(_live())
+
+    # Key on URL AND credential fingerprint: N ``custom_providers`` rows can share one proxy URL
+    # with distinct keys (#106184). A URL-only key let the last probe overwrite its siblings'
+    # slot, so every other same-URL row failed the fingerprint check, got an empty catalog and
+    # vanished from the no-probe pickers.
+    fp = _custom_endpoint_fingerprint(api_key, api_mode, headers)
+    cache_key = f"custom:{normalized_url}#{fp}"
+    check()
+    cache = _load_provider_models_cache()
+    check()
+    entry = cache.get(cache_key)
+    check()
+    now = time.time()
+    native_row = isinstance(entry, dict) and entry.get("native_catalog") is True
+    valid = not force_refresh and _cache_entry_valid(entry, fp, allow_empty=native_row)
+    check()
+
+    if valid:
+        age = now - entry["at"]
+        if age < ttl_seconds:
+            return _catalog(entry)
+        # An empty native catalog is authoritative only inside the TTL (as in
+        # cached_provider_model_ids): never stale-serve it, or an Ollama that was model-less at
+        # first open keeps an empty row for the whole stale window after models are pulled.
+        if entry["models"] and age < _PROVIDER_MODELS_STALE_SERVE_MAX:
+            # Stale-while-revalidate: serve now, refresh off-thread for the next open. cache_only
+            # opens (GUI pickers that must not block on a stopped local server) take the same
+            # non-blocking refresh: without it a locally loaded model stayed invisible for the
+            # whole 7-day stale window unless the user found "Refresh Models" (#71169 class).
+            def _refresh_custom():
+                live = _live()
+                return _entry(live) if live or isinstance(live, _NativePickerModelList) else None
+
+            _spawn_swr_refresh(cache_key, _refresh_custom)
+            return _catalog(entry)
+
+    if cache_only:
+        check()
+        return None
+
+    live = _live()
+    check()
+    if live or isinstance(live, _NativePickerModelList):
+        stored = _entry(live, now)
+        check()
+        _store_cache_entry(cache_key, stored, cache)
+        check()
+        return _catalog(stored)
+    # Live returned nothing (offline, timeout, auth hiccup): a stale same-fingerprint entry beats it
+    # (non-empty only: an empty native row is not worth resurrecting over the generic fallback).
+    valid = _cache_entry_valid(entry, fp)
+    check()
+    if valid:
+        return _catalog(entry)
+    result = _chat_catalog_rows(live)
+    check()
+    return result

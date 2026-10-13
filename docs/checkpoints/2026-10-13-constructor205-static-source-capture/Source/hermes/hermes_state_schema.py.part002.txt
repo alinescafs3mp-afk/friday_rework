@@ -1,0 +1,320 @@
+nalError):
+                cursor.execute(_SESSION_MODEL_USAGE_V20_SEED_SQL)
+        if current_version < 22:
+            self._migrate_v22_session_model_usage(cursor)
+        # v23: FTS storage redesign (external-content tables). OPT-IN, NOT AUTOMATIC: the
+        # transition is disk-heavy (~2x transient) and long (hours on 25 GB), so an existing
+        # install only gets a flag; `hermes sessions optimize-storage` performs it. The FTS
+        # layout is tracked by the independent `fts_storage_version` marker, so
+        # schema_version still advances for legacy-FTS users.
+        if current_version < 23 and fts5_available and self._db_needs_fts_storage_upgrade(cursor):
+            self.set_meta("fts_optimize_available", "1", cursor=cursor)
+        if current_version < 25:
+            # v25: de-duplicate system prompt snapshots (old column stays a read fallback).
+            self._dedupe_legacy_system_prompts(cursor)
+        self._advance_message_uid_backfill(cursor)
+        fts_migrations_complete = True
+        if current_version < 30 and fts5_available:
+            # v29: cron sessions leave the trigram substring index (they stay in the word index);
+            # v30: delegate-child transcripts too (FTS_TRIGRAM_EXCLUDED_SOURCES + _delegate_from).
+            # Rebuild once so rows indexed by older view/trigger definitions do not linger.
+            fts_migrations_complete = self._migrate_trigram_cron_exclusion(cursor)
+
+        # Stamp the FTS layout version (fresh/optimized DBs); a legacy DB keeps its absent/0
+        # marker until optimize-storage runs. An INTERRUPTED optimize (markers, trash, or an
+        # empty external index against non-empty messages) is NOT stamped: the marker is the
+        # source of truth for "fully optimized" and keeps the resume offer alive.
+        # v23: FTS storage redesign (issues #22478, #43690, #55233). The v11 inline-mode FTS tables each
+        # store a full private copy of every message (content || tool_name || tool_calls), and the trigram
+        # index additionally covers role='tool' rows (~90% of message bytes: base64 payloads, file dumps) at
+        # ~2.6x amplification — together ~75% of state.db on heavy installs (observed: 18.9 GB of a 25 GB
+        # DB). OPT-IN, NOT AUTOMATIC. The transition (demote old vtables → new external-content schema →
+        # backfill → teardown → VACUUM) is disk-heavy (transient ~2x file size to fully reclaim via VACUUM)
+        # and long (~1-2h background on a 25 GB DB). Doing it silently on every big user's next open — with
+        # a completeness guarantee that depends on the process staying alive long enough — is the wrong
+        # default. So on an EXISTING install we touch nothing here: the v22 inline FTS keeps working exactly
+        # as before, and we only record a flag advertising that the optimization is available. `hermes
+        # sessions optimize-storage` performs the whole transition as one deliberate, disk-checked,
+        # progress-reported foreground operation. DECOUPLED VERSIONING. Crucially, this does NOT hold back
+        # the main schema_version. The FTS storage LAYOUT is tracked by an independent `fts_storage_version`
+        # marker (see _fts_storage_version / SETTLE below), so schema_version advances to SCHEMA_VERSION
+        # here like every other migration — future v24+ migrations land automatically for legacy-FTS users
+        # too. Only the FTS *layout* waits for opt-in.
+        if (
+            fts5_available
+            and not self._db_needs_fts_storage_upgrade(cursor)
+            and cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key = 'fts_rebuild_high_water' LIMIT 1"
+            ).fetchone() is None
+            and not self._has_fts_trash(cursor)
+            and not self._fts_external_index_empty_with_messages(cursor)
+        ):
+            # Stamp only when it would change something: on a settled DB every condition above
+            # already holds, and re-writing the same value takes the write lock on every open.
+            if cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key = 'fts_storage_version' AND value = ? LIMIT 1",
+                (str(FTS_STORAGE_VERSION),),
+            ).fetchone() is None:
+                self.set_meta("fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor)
+
+        # Advance schema_version — deliberately NOT gated on the FTS opt-in (that would block
+        # every future migration for a user who never optimizes). FTS5 unavailable is the
+        # one skip: claiming current would lie.
+        if current_version < SCHEMA_VERSION and fts_migrations_complete and fts5_available:
+            cursor.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+
+    def _advance_message_uid_backfill(self, cursor: sqlite3.Cursor) -> None:
+        """Mint ``message_uid`` onto rows written before the column existed, one bounded slice per open.
+
+        A single full-table UPDATE held the write lock for 261 s on an 835k-row / 4.8 GB store, so every
+        sibling process timed out with "database is locked". Id-range chunks commit one at a time (the
+        writer connection is autocommit) and an open spends at most ``_MESSAGE_UID_BACKFILL_BUDGET_S``
+        after its first chunk, so a large store converges over later opens. Until then a legacy row
+        simply has no uid, which every reader already treats as "no identity yet"."""
+        if _meta_row(cursor, _MESSAGE_UID_BACKFILL_DONE) is not None:
+            return
+        row = _meta_row(cursor, _MESSAGE_UID_BACKFILL_CURSOR)
+        done_through = int(row[0]) if row else 0
+        high = cursor.execute("SELECT MAX(id) FROM messages").fetchone()[0] or 0
+        deadline = time.monotonic() + _MESSAGE_UID_BACKFILL_BUDGET_S
+        while done_through < high:
+            upper = done_through + _MESSAGE_UID_BACKFILL_CHUNK
+            cursor.execute(
+                "UPDATE messages SET message_uid = lower(hex(randomblob(16))) "
+                "WHERE id > ? AND id <= ? AND message_uid IS NULL", (done_through, upper))
+            done_through = upper
+            if done_through < high and time.monotonic() >= deadline:
+                self.set_meta(_MESSAGE_UID_BACKFILL_CURSOR, str(done_through), cursor=cursor)
+                return
+        self.set_meta(_MESSAGE_UID_BACKFILL_DONE, "1", cursor=cursor)
+        _delete_meta(cursor, _MESSAGE_UID_BACKFILL_CURSOR)
+
+    def _migrate_v22_session_model_usage(self, cursor: sqlite3.Cursor) -> None:
+        """v22: ``task`` joins the session_model_usage PRIMARY KEY ('' = main loop; aux calls
+        named). SQLite cannot ALTER a PK, so rebuild; existing rows → task=''."""
+        try:
+            # v22: task-dimension usage attribution (issue #23270). session_model_usage gains a ``task``
+            # column ('' = main agent loop; 'vision'/'compression'/'title_generation'/... = auxiliary calls)
+            # so aux model spend is visible in analytics. The reconciler will have already ADDed the plain
+            # column on legacy DBs (harmless); the rebuild bakes it into the PK properly.
+            legacy_pk = cursor.execute(
+                "SELECT COUNT(*) FROM pragma_table_info('session_model_usage') WHERE name = 'task' AND pk > 0"
+            ).fetchone()[0]
+            if legacy_pk:
+                return
+            self._rebuild_table(
+                cursor, "session_model_usage", "session_model_usage_v21", _SESSION_MODEL_USAGE_V22_DDL,
+                """INSERT INTO session_model_usage (
+                                   session_id, model, billing_provider, billing_base_url,
+                                   billing_mode, task, api_call_count, input_tokens,
+                                   output_tokens, cache_read_tokens, cache_write_tokens,
+                                   reasoning_tokens, estimated_cost_usd, actual_cost_usd,
+                                   cost_status, cost_source, first_seen, last_seen
+                               )
+                               SELECT session_id, model, billing_provider, billing_base_url,
+                                      billing_mode, '', api_call_count, input_tokens,
+                                      output_tokens, cache_read_tokens, cache_write_tokens,
+                                      reasoning_tokens, estimated_cost_usd, actual_cost_usd,
+                                      cost_status, cost_source, first_seen, last_seen
+                               FROM session_model_usage_v21""",
+                _SESSION_MODEL_USAGE_INDEX_SQL,
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug("v22 session_model_usage rebuild skipped: %s", exc)
+
+    def _ensure_unique_title_index(self, cursor: sqlite3.Cursor) -> None:
+        """Unique title index. Older DBs may hold duplicate titles from before the constraint.
+        Per title a user-owned (user/NULL) row beats llm > derived (``_title_rank``). User rows are
+        never dropped: the oldest keeps the title and newer ones become ``Title #k`` in started_at
+        order, so the "#N"-preferring lookup still opens the newest (#126764). Among auto titles
+        only, the newest highest-ranked keeps it; lower-ranked auto titles are cleared. Each change
+        is logged. Must never abort opening the DB, so the repair is guarded."""
+        try:
+            cursor.execute(_TITLE_UNIQUE_INDEX_SQL)
+        except sqlite3.IntegrityError:
+            # Savepoint: a failure part-way must not leave a half-repaired store for
+            # _init_schema to commit without the index.
+            cursor.execute("SAVEPOINT title_repair")
+            try:
+                rows = cursor.execute(
+                    "SELECT rowid, title, title_source, started_at FROM sessions WHERE title IN "
+                    "(SELECT title FROM sessions WHERE title IS NOT NULL GROUP BY title HAVING COUNT(*) > 1)"
+                ).fetchall()
+                groups: Dict[str, list] = {}
+                for row in sorted(rows, key=lambda r: (self._title_rank(r[2]), r[3], r[0]), reverse=True):
+                    groups.setdefault(row[1], []).append(row)
+                user_rank = self._TITLE_SOURCE_RANK[self.TITLE_SOURCE_USER]
+                for title, group in groups.items():
+                    # User titles: the OLDEST keeps the base and newer ones get "#k" in
+                    # chronological order, so resolve_session_by_title (which prefers the
+                    # latest "#N") still lands on the newest session.
+                    users = [r for r in reversed(group) if self._title_rank(r[2]) == user_rank]
+                    keep = users[0] if users else group[0]
+                    for rowid, *_ in users[1:]:
+                        renamed = next_title_in_lineage(cursor.connection, title)
+                        cursor.execute("UPDATE sessions SET title = ? WHERE rowid = ?", (renamed, rowid))
+                        logger.warning("Renamed duplicate user session title %r to %r", title, renamed)
+                    for rowid, _title, source, _started in group:
+                        if rowid != keep[0] and self._title_rank(source) != user_rank:
+                            cursor.execute("UPDATE sessions SET title = NULL WHERE rowid = ?", (rowid,))
+                            logger.warning("Cleared duplicate %s session title %r", source, title)
+                cursor.execute(_TITLE_UNIQUE_INDEX_SQL)
+                cursor.execute("RELEASE title_repair")
+            except sqlite3.Error:
+                cursor.execute("ROLLBACK TO title_repair")
+                cursor.execute("RELEASE title_repair")
+                logger.exception("Could not repair duplicate session titles; unique title index not created")
+        except sqlite3.OperationalError:
+            pass  # Index already exists
+
+    def _init_fts(self, cursor: sqlite3.Cursor) -> None:
+        """Create/repair the FTS objects on an FTS5-capable runtime. The DDL runs even when the
+        vtable exists so CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation.
+        OPT-IN v23 boundary: a legacy v22 inline install keeps its inline schema + triggers
+        (the v23 DDL would create the trigram source VIEW and leave a mixed state)."""
+        legacy_fts = self._db_has_legacy_inline_fts(cursor)
+        # A `.recover`-restored image keeps the shadow tables but not the vtable rows; the DDL
+        # below would fail on the first shadow. Drop only orphaned families, then rebuild the
+        # recreated (empty) index like a missing-trigger repair (#103840).
+        orphan_repaired = _drop_orphan_fts_shadow_tables(
+            cursor, ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"),
+        )
+        if not self._fts_stale:
+            self._migrate_misaligned_fts_source(cursor, legacy=legacy_fts)
+        if self._fts_stale:
+            if self._recover_stale_fts(cursor, legacy=legacy_fts):
+                # CJK was detached alongside the base indexes; its ensure path decides when it returns.
+                self._ensure_fts_cjk_schema(cursor)
+            else:
+                self._fts_enabled = self._trigram_available = self._fts_cjk_available = False
+        else:
+            base_sql, trigram_sql = _FTS_DDL[legacy_fts]
+            # Measure before any DDL. Publishing missing base triggers before rebuild admission lets
+            # another process write through an index whose bootstrap/repair has no owner (#105790).
+            base_triggers_missing = (
+                self._fts_triggers_missing(cursor, _FTS_BASE_TRIGGERS) or "messages_fts" in orphan_repaired
+            )
+            trigram_triggers_missing = (
+                self._fts_triggers_missing(cursor, _FTS_TRIGRAM_TRIGGERS) or "messages_fts_trigram" in orphan_repaired
+            )
+
+            def ensure_and_rebuild() -> None:
+                self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", base_sql)
+                if not self._fts_enabled:
+                    return
+                self._trigram_available = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
+                self._rebuild_fts_indexes(
+                    cursor, legacy=legacy_fts, include_trigram=self._trigram_available,
+                )
+                if not legacy_fts:
+                    self._ensure_fts_cjk_schema(cursor)
+
+            if base_triggers_missing:
+                # The authority covers the whole first-publication sequence, not merely the final rebuild.
+                # ``executescript`` commits DDL statement-by-statement, so acquiring after ensure exposed a
+                # partially initialized FTS family while another opener held the rebuild lock.
+                self._run_admitted_startup_rebuild(cursor, ensure_and_rebuild)
+            else:
+                self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", base_sql)
+                if self._fts_enabled:
+                    # Trigram is optional; without it CJK search falls back to LIKE.
+                    trigram_enabled = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
+                    self._trigram_available = trigram_enabled
+                    if trigram_enabled and trigram_triggers_missing:
+                        self._run_admitted_startup_rebuild(
+                            cursor,
+                            lambda: self._rebuild_fts_indexes(
+                                cursor, legacy=legacy_fts, include_trigram=trigram_enabled,
+                            ),
+                        )
+            if self._fts_enabled and not legacy_fts and not base_triggers_missing:
+                # CJK-bigram index: strictly additive, gated on the loadable tokenizer.
+                self._ensure_fts_cjk_schema(cursor)
+        # IF NOT EXISTS cannot rewrite pre-existing broad AFTER UPDATE triggers.
+        if self._fts_enabled:
+            self._migrate_broad_fts_update_triggers(cursor)
+
+    def _run_admitted_startup_rebuild(self, cursor, rebuild_fn) -> None:
+        """Run FTS bootstrap or trigger-repair rebuild under cross-process admission.
+
+        The fresh/base-missing path includes DDL in ``rebuild_fn`` so no process can publish
+        triggers before it owns the rebuild. Other repair paths may already have recreated an
+        optional trigger; deferral therefore still drops every trigger and persists the stale
+        breadcrumb. A later recovery path restores the complete family.
+
+        See #93200.
+        See #105790.
+        """
+        with fts_rebuild_admission(self.db_path) as admitted:
+            if admitted:
+                rebuild_fn()
+                return
+        logger.warning(
+            "Deferred startup FTS rebuild: another process holds the "
+            "rebuild authority for this state.db; detaching FTS sync until the stale-index recovery path rebuilds it."
+        )
+        cursor.execute(_STALE_KEY_UPSERT_SQL, (FTS_STALE_KEY,))
+        self._drop_all_fts_triggers(cursor)
+        self._fts_stale = True
+        self._fts_enabled = self._trigram_available = self._fts_cjk_available = False
+
+    def _backfill_gateway_metadata_from_sessions_json(self, cursor: sqlite3.Cursor) -> None:
+        """One-time v18 backfill of gateway metadata from sessions.json. Only fills NULL
+        columns — never overwrites data written by newer code."""
+        sessions_file = get_hermes_home() / "sessions" / "sessions.json"
+        if not sessions_file.exists():
+            return
+        with open(sessions_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        for key, entry in data.items():
+            if str(key).startswith("_") or not isinstance(entry, dict):
+                continue
+            session_id = entry.get("session_id")
+            if not session_id:
+                continue
+            origin = entry.get("origin")
+            origin_dict = origin if isinstance(origin, dict) else None
+            cursor.execute(
+                """UPDATE sessions
+                   SET session_key = COALESCE(session_key, ?),
+                       chat_id = COALESCE(chat_id, ?),
+                       chat_type = COALESCE(chat_type, ?),
+                       thread_id = COALESCE(thread_id, ?),
+                       display_name = COALESCE(display_name, ?),
+                       origin_json = COALESCE(origin_json, ?),
+                       expiry_finalized = CASE
+                           WHEN COALESCE(expiry_finalized, 0) = 0 AND ? = 1 THEN 1
+                           ELSE expiry_finalized
+                       END
+                   WHERE id = ?""",
+                (
+                    entry.get("session_key") or key, origin_dict.get("chat_id") if origin_dict is not None else None,
+                    entry.get("chat_type"), origin_dict.get("thread_id") if origin_dict is not None else None,
+                    entry.get("display_name"), json.dumps(origin) if origin_dict is not None else None,
+                    1 if entry.get("expiry_finalized") or entry.get("memory_flushed") else 0, str(session_id),
+                ),
+            )
+
+
+def reconcile_state_schema(conn: sqlite3.Connection) -> None:
+    """Bring a raw ``state.db`` connection to the canonical SCHEMA_SQL shape.
+
+    Single durable-shape authority for callers that open ``state.db``
+    outside SessionDB. The async-delegation tool used to carry its own
+    CREATE TABLE and ALTER column list for ``async_delegations``; it drifted
+    from SCHEMA_SQL (same-name columns with different nullability/defaults
+    depending on which authority touched the database first, #94691). This
+    helper instead replays the canonical DDL (every statement is
+    IF NOT EXISTS/idempotent) and reuses SessionDB's declarative column
+    reconciliation, so out-of-band openers can never grow a second
+    hand-maintained shape for the same durable tables.
+    """
+    conn.executescript(SCHEMA_SQL)
+    # _reconcile_columns only touches the staticmethod _parse_schema_columns,
+    # so a bare instance works; reusing it keeps one reconciliation
+    # implementation (one authority) instead of a near-copy on raw
+    # connections.
+    shim = object.__new__(SessionSchemaMixin)
+    shim._reconcile_columns(conn.cursor())

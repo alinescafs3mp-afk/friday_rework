@@ -1,0 +1,994 @@
+above > 0 and est_tokens >= disable_above and ttfb_timeout < idle_default:
+            logger.info("Scaling codex-responses no-event TTFB watchdog from %.0fs to %.0fs "
+                "for large request (context=~%s tokens >= %.0f). "
+                "Set HERMES_CODEX_TTFB_STRICT=1 to keep the smaller cutoff.", ttfb_timeout, idle_default,
+                f"{est_tokens:,}", disable_above)
+            ttfb_timeout = idle_default
+        # Opt-in ceiling (0 = off): a 120s default here silently undid the scale-up above (#91621).
+        ttfb_cap = env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 0.0)
+        if ttfb_cap > 0 and ttfb_timeout > ttfb_cap:
+            logger.info("Capping codex-responses no-event TTFB timeout from %.0fs to %.0fs "
+                "(context=~%s tokens) per HERMES_CODEX_TTFB_MAX_SECONDS.", ttfb_timeout, ttfb_cap,
+                f"{est_tokens:,}")
+            ttfb_timeout = ttfb_cap
+    elif not ttfb_explicit and local:
+        # A local server prefills for minutes before its first event; the chat-completions
+        # siblings already grant local endpoints the local stale ceiling, so the Responses
+        # transport gets the same grace instead of the 120s hosted cutoff (#92302).
+        local_ceiling = _local_stream_stale_timeout_default()
+        if local_ceiling > ttfb_timeout:
+            logger.info("Local provider detected (%s) — no-event TTFB watchdog raised from %.0fs to %.0fs "
+                "(agent.local_stream_stale_timeout); set HERMES_CODEX_TTFB_TIMEOUT_SECONDS for an explicit cutoff.",
+                base_url, ttfb_timeout, local_ceiling)
+            ttfb_timeout = local_ceiling
+    if ttfb_enabled and not ttfb_explicit:
+        # High-effort thinking precedes the first event; the floor outranks the cap.
+        ttfb_timeout = max(ttfb_timeout, effort_floor)
+
+    # An operator-set idle timeout keeps first-event semantics; only the implicit
+    # default defers arming until model progress. Sentinel: env_float returns the
+    # default for unset AND unparseable values, so both count as implicit.
+    idle_explicit = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", -1.0) != -1.0
+    idle_timeout = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_default)
+    progress_gated = codex and openai_codex_backend and codex_floor > 0 and not idle_explicit
+    return _NonStreamWatchdogs(stale_timeout=stale_timeout, codex=codex, est_tokens=est_tokens,
+        ttfb_enabled=ttfb_enabled, ttfb_timeout=ttfb_timeout, idle_enabled=codex and idle_timeout > 0,
+        idle_timeout=idle_timeout, idle_requires_progress=progress_gated,
+        # A lifecycle frame proves transport liveness, not model progress. Bound that phase
+        # from the physical-attempt start; events cannot restart the grace period.
+        progress_timeout=CODEX_FIRST_PROGRESS_TIMEOUT_SECONDS if progress_gated else 0.0)
+
+
+def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:
+    hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
+    with contextlib.suppress(Exception):
+        if callable(hint_fn):
+            return hint_fn(model=api_kwargs.get("model"))
+    return None
+
+
+
+def interruptible_api_call(agent, api_kwargs: dict):
+    """Run the API call on a worker thread so the caller can detect interrupts
+    without waiting for the full HTTP round-trip. Each worker gets its own
+    per-request client (interrupts close only that one); a stale-call detector
+    kills the connection and raises so the main retry loop can back off / rotate
+    credentials / fall back."""
+    # Nested-pool contexts (cron, delegated children) wedge on a worker thread
+    # (#62151): run inline. See should_use_direct_api_call.
+    if should_use_direct_api_call(agent):
+        return direct_api_call(agent, api_kwargs)
+    _check_stale_giveup(agent)  # cross-turn stale breaker (#58962), non-streaming sibling
+    from agent.chat_completion_nonstream import _NonStreamRequest
+
+    return _NonStreamRequest(agent, api_kwargs).run()
+
+
+def _consume_ephemeral_reasoning_off(agent) -> bool:
+    """Consume the one-shot "answer without thinking" continuation flag.
+
+    Set by the length-continuation path when a request returned reasoning but NO
+    visible content (thinking ate the output cap); continuation turns never replay
+    prior reasoning, so thinking ON would re-burn the budget. When True the caller
+    overrides the wire reasoning_config with ``{"enabled": False, "effort": "none"}``
+    for exactly the next call. Prompt-cache cost is bounded to ONE cold prefix write
+    on config-sensitive providers (Anthropic, OpenAI) — far cheaper than four futile
+    full-budget continuations.
+    """
+    consumed = bool(getattr(agent, "_ephemeral_reasoning_off", False))
+    if consumed:
+        agent._ephemeral_reasoning_off = False
+    return consumed
+
+
+def _reasoning_config_for_wire(agent):
+    """``agent.reasoning_config`` with the one-shot reasoning-off override applied.
+
+    Once the route has answered a disable with "reasoning is mandatory"
+    (``agent._reasoning_disable_rejected``), every disable — configured or
+    the one-shot continuation override — is dropped for the rest of the
+    session: the request goes out without a reasoning config and the route
+    applies its own default.
+    """
+    cfg = agent.reasoning_config
+    ephemeral_off = _consume_ephemeral_reasoning_off(agent)
+    if getattr(agent, "_reasoning_effort_rejected", False):
+        # The route rejected the configured reasoning LEVEL itself (#100536: ``reasoning.effort:
+        # max`` on an enabled config). Omit the reasoning fields for the rest of the session —
+        # the route default — as the auxiliary ladder does; resending would 400 identically.
+        agent._wire_reasoning_config = None
+        return None
+    if cfg is None:
+        # Unset effort: the profile's default (custom/OpenAI-compatible: medium) rather than the
+        # route's own, recorded below as what went out so a rejection of it lands in the branch above.
+        from agent.reasoning_params import unset_reasoning_default
+        cfg = unset_reasoning_default(agent)
+    if getattr(agent, "_reasoning_disable_rejected", False):
+        # The route rejects disables. Resend exactly what the session has
+        # been sending — the user's own config — so the retry lands on the
+        # same provider cache key as every prior request. Only a config that
+        # is itself a disable changes, and that session has never sent
+        # anything else, so nothing warm is lost: a route that said the
+        # disable is *mandatory-on* gets the floor effort (closest to what
+        # the user asked for); a relay that does not know the field gets
+        # nothing (route default).
+        if isinstance(cfg, dict) and (
+            cfg.get("enabled") is False or cfg.get("effort") == "none"
+        ):
+            if getattr(agent, "_reasoning_floor_required", False):
+                from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
+                floored = {**cfg, "enabled": True, "effort": REASONING_FLOOR_EFFORT}
+                agent._wire_reasoning_config = floored
+                return floored
+            agent._wire_reasoning_config = None
+            return None
+        agent._wire_reasoning_config = cfg
+        return cfg
+    if ephemeral_off:
+        cfg = {**(cfg or {}), "enabled": False, "effort": "none"}
+    # What actually went out: the reasoning-rejection rung reads it to tell a rejected
+    # disable (drop the disable) from a rejected level (drop the reasoning fields).
+    agent._wire_reasoning_config = cfg
+    return cfg
+
+
+def _alias_tool_search_bridge_for_xai(agent, transport, tools_for_api):
+    """xAI chat-completions reserves ``tool_search`` and 400s when the bridge declares
+    it (#95003): rename the wire declaration; ``normalize_response`` maps calls back
+    via the transport's ``_last_wire_aliases`` (reset here so a stale map can't
+    reverse-map a name this request never aliased). Deep-copy first (#27907)."""
+    if transport is not None and hasattr(transport, "_last_wire_aliases"):
+        transport._last_wire_aliases = {}
+    is_xai_chat = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
+    if not (is_xai_chat and tools_for_api):
+        return tools_for_api
+    try:
+        import copy as _copy_xai
+        from agent.transports.chat_completions import _rename_tool_search_bridge_for_xai
+        has_bridge = any(
+            (t.get("function") or {}).get("name") == "tool_search" for t in tools_for_api if isinstance(t, dict)
+        )
+        if has_bridge:
+            tools_for_api = _copy_xai.deepcopy(tools_for_api)
+            tools_for_api, alias_map = _rename_tool_search_bridge_for_xai(tools_for_api)
+            if transport is not None:
+                transport._last_wire_aliases = alias_map
+    except Exception as exc:
+        logger.warning("%s⚠️ Failed to alias tool_search bridge for xAI: %s", getattr(agent, "log_prefix", ""), exc)
+    return tools_for_api
+
+
+def _consume_ephemeral_max_output(agent):
+    """Pop the one-shot ephemeral output cap; whichever path builds the request consumes it."""
+    ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
+    if ephemeral_out is not None:
+        agent._ephemeral_max_output_tokens = None
+    return ephemeral_out
+
+
+def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides):
+    ctx_len = getattr(agent, "context_compressor", None)
+    ephemeral_out = _consume_ephemeral_max_output(agent)
+    anthropic_kwargs = agent._get_transport().build_kwargs(model=agent.model,
+        messages=agent._prepare_anthropic_messages_for_api(api_messages), tools=tools_for_api,
+        max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
+        reasoning_config=reasoning_config, is_oauth=agent._is_anthropic_oauth,
+        preserve_dots=agent._anthropic_preserve_dots(),
+        context_length=ctx_len.context_length if ctx_len else None,
+        base_url=getattr(agent, "_anthropic_base_url", None),
+        fast_mode=request_overrides.get("speed") == "fast",
+        drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)))
+    # Portal reads ``tags`` / ``session_id`` on its Messages route too, but the profile hook
+    # is only consulted by the OpenAI-wire transport — merge here to keep sticky routing.
+    return _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs)
+
+
+def _build_bedrock_kwargs(agent, api_messages, tools_for_api):
+    # Bedrock Converse — the adapter converts messages/tools and calls boto3 directly.
+    return agent._get_transport().build_kwargs(model=agent.model, messages=api_messages, tools=tools_for_api,
+        max_tokens=agent.max_tokens, region=getattr(agent, "_bedrock_region", None) or "us-east-1",
+        guardrail_config=getattr(agent, "_bedrock_guardrail_config", None))
+
+
+def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id):
+    from agent.codex_responses_adapter import classify_responses_route
+    from agent.native_compaction import native_compaction_context_management
+    is_codex_backend, is_xai_responses, is_github_responses = classify_responses_route(agent)
+    # Native server-side compaction (gpt-5.6 on direct OpenAI / ChatGPT Codex routes
+    # only) — None on every other route/model, leaving the request unchanged.
+    context_management = native_compaction_context_management(agent, is_codex_backend=is_codex_backend,
+        is_xai_responses=is_xai_responses, is_github_responses=is_github_responses)
+    # xAI's /responses endpoint 400s on ``pattern``/``format`` schema keywords and on
+    # ``enum`` values containing ``/`` — strip them (#27197). Deep-copy first: the
+    # sanitizers mutate in place and tools_for_api aliases agent.tools (#27907).
+    if is_xai_responses:
+        try:
+            import copy as _copy
+            from tools.schema_sanitizer import strip_pattern_and_format, strip_slash_enum
+            tools_for_api = _copy.deepcopy(tools_for_api)
+            tools_for_api, _ = strip_pattern_and_format(tools_for_api)
+            tools_for_api, _ = strip_slash_enum(tools_for_api)
+        except Exception as exc:
+            logger.warning("%s⚠️ Failed to sanitize tool schemas for xAI: %s", getattr(agent, "log_prefix", ""), exc)
+    ephemeral_out = _consume_ephemeral_max_output(agent)
+    return agent._get_transport().build_kwargs(model=agent.model,
+        messages=agent._prepare_messages_for_non_vision_model(api_messages), tools=tools_for_api,
+        reasoning_config=reasoning_config, session_id=getattr(agent, "session_id", None),
+        cache_scope_id=cache_scope_id, base_url=agent.base_url,
+        max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
+        timeout=agent._resolved_api_call_timeout(), request_overrides=request_overrides,
+        provider=getattr(agent, "provider", None), is_github_responses=is_github_responses,
+        is_codex_backend=is_codex_backend, is_xai_responses=is_xai_responses,
+        github_reasoning_extra=agent._github_models_reasoning_extra_body() if is_github_responses else None,
+        replay_encrypted_reasoning=bool(getattr(agent, "_codex_reasoning_replay_enabled", True)),
+        context_management=context_management, text_verbosity=getattr(agent, "text_verbosity", None))
+
+
+
+def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id):
+    transport = agent._get_transport()
+    tools_for_api = _alias_tool_search_bridge_for_xai(agent, transport, tools_for_api)
+
+    _is_qwen = agent._is_qwen_portal()
+    _is_or = agent._is_openrouter_url()
+    _host = agent._base_url_lower
+    _is_gh = base_url_host_matches(_host, "models.github.ai") or base_url_host_matches(_host, "githubcopilot.com")
+    _is_lmstudio = (agent.provider or "").strip().lower() == "lmstudio"
+
+    # _fixed_temperature_for_model may return the OMIT_TEMPERATURE sentinel
+    # (temperature omitted entirely), a numeric override, or None.
+    _omit_temp, _fixed_temp = False, None
+    with contextlib.suppress(Exception):
+        from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE
+        _ft = _fixed_temperature_for_model(agent.model, agent.base_url)
+        _omit_temp = _ft is OMIT_TEMPERATURE
+        _fixed_temp = None if _omit_temp else _ft
+
+    _prefs = _provider_preferences_for_agent(agent)
+
+    _qwen_meta = {"sessionId": agent.session_id or "hermes", "promptId": str(uuid.uuid4())} if _is_qwen else None
+    _profile = None
+    with contextlib.suppress(Exception):
+        from providers import get_provider_profile
+        _profile = get_provider_profile(agent.provider)
+
+    _ephemeral_out = _consume_ephemeral_max_output(agent)
+    # Strip image parts for non-vision models on BOTH paths (registered
+    # providers with profiles used to bypass it).
+    _common = dict(model=agent.model, messages=agent._prepare_messages_for_non_vision_model(api_messages),
+        tools=tools_for_api, base_url=agent.base_url, timeout=agent._resolved_api_call_timeout(),
+        max_tokens=agent.max_tokens, ephemeral_max_output_tokens=_ephemeral_out,
+        max_tokens_param_fn=agent._max_tokens_param, reasoning_config=reasoning_config,
+        request_overrides=request_overrides, session_id=getattr(agent, "session_id", None),
+        cache_scope_id=cache_scope_id, ollama_num_ctx=agent._ollama_num_ctx,
+        provider_preferences=_prefs or None, openrouter_min_coding_score=agent.openrouter_min_coding_score,
+        supports_reasoning=agent._supports_reasoning_extra_body(),
+        qwen_session_metadata=_qwen_meta)
+    if _profile:
+        # Profiles handle per-provider quirks via hooks fed the context above.
+        return transport.build_kwargs(provider_profile=_profile, **_common)
+
+    # Legacy flag path: only for a provider absent from the providers/ registry.
+    return transport.build_kwargs(
+        **_common,
+        model_lower=(agent.model or "").lower(),
+        is_openrouter=_is_or,
+        is_nous=base_url_host_matches(_host, "nousresearch.com"),
+        is_qwen_portal=_is_qwen,
+        is_github_models=_is_gh,
+        is_nvidia_nim=base_url_host_matches(_host, "integrate.api.nvidia.com"),
+        is_kimi=any(base_url_host_matches(agent.base_url, h) for h in ("api.kimi.com", "moonshot.ai", "moonshot.cn")),
+        is_tokenhub=base_url_host_matches(_host, "tokenhub.tencentmaas.com"),
+        is_lmstudio=_is_lmstudio,
+        is_custom_provider=agent.provider == "custom",
+        qwen_prepare_fn=agent._qwen_prepare_chat_messages if _is_qwen else None,
+        qwen_prepare_inplace_fn=agent._qwen_prepare_chat_messages_inplace if _is_qwen else None,
+        fixed_temperature=_fixed_temp,
+        omit_temperature=_omit_temp,
+        github_reasoning_extra=agent._github_models_reasoning_extra_body() if _is_gh else None,
+        lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
+        provider_name=agent.provider,
+    )
+
+
+def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+    """Build the keyword arguments dict for the active API mode.
+
+    Wraps the per-api_mode builder so the conversation-affinity headers (OpenCode's
+    ``x-opencode-session``, a custom provider's opt-in ``session_affinity_header``) ride on
+    every request regardless of transport (chat_completions / codex_responses /
+    anthropic_messages). No-op for every other provider.
+    """
+    from agent.opencode_affinity import merge_session_affinity_headers
+
+    kwargs = _build_api_kwargs_for_mode(agent, api_messages, tools_for_api)
+    return merge_session_affinity_headers(
+        kwargs,
+        getattr(agent, "provider", None),
+        getattr(agent, "base_url", None),
+        getattr(agent, "session_id", None),
+    )
+
+
+def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+    # One-shot continuation override — consumed exactly once, on the FIRST
+    # request this call builds (only one api_mode branch runs per invocation).
+    reasoning_config = _reasoning_config_for_wire(agent)
+    if tools_for_api is None:
+        tools_for_api = agent.tools
+    # The one place request_overrides are consumed: static /fast values are already pinned
+    # in agent.request_overrides; auto/cold windows layer the fast override per request.
+    request_overrides = effective_request_overrides(agent)
+    if agent.api_mode == "anthropic_messages":
+        return _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides)
+    if agent.api_mode == "bedrock_converse":
+        return _build_bedrock_kwargs(agent, api_messages, tools_for_api)
+    # Rotation-stable logical cache scope shared by every OpenAI-wire branch
+    # (memoized on the agent); anthropic/bedrock above don't use it.
+    cache_scope_id = _prompt_cache_scope_for_agent(agent)
+    builder = _build_codex_kwargs if agent.api_mode == "codex_responses" else _build_chat_completions_kwargs
+    return builder(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id)
+
+
+def _model_dump_safe(obj):
+    """``model_dump(warnings=False)`` (avoids pydantic serializer UserWarnings on
+    generic-union SDK models), falling back for shims that reject the kwarg."""
+    try:
+        return obj.model_dump(warnings=False)
+    except TypeError:
+        return obj.model_dump()
+
+
+def _dump_if_model(value):
+    return _model_dump_safe(value) if hasattr(value, "model_dump") else value
+
+
+def _assistant_reasoning_text(agent, assistant_message) -> Optional[str]:
+    """Structured reasoning, else inline ``<think>`` blocks embedded in content."""
+    reasoning_text = agent._extract_reasoning(assistant_message)
+    if not reasoning_text:
+        content = flatten_message_text(getattr(assistant_message, "content", None))
+        think_blocks = re.findall(r'<think>(.*?)</think>', content, flags=re.DOTALL)
+        if think_blocks:
+            reasoning_text = "\n\n".join(b.strip() for b in think_blocks if b.strip()) or None
+    if reasoning_text and agent.verbose_logging:
+        logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {reasoning_text}")
+    # When streaming is active the reasoning was already displayed during the
+    # stream (structured deltas or <think> tag extraction); fire only for
+    # non-streaming modes (gateway, batch, quiet). Anything not shown during
+    # streaming is caught by the CLI post-response fallback.
+    if reasoning_text and agent.reasoning_callback and not agent.stream_delta_callback and not agent._stream_callback:
+        with contextlib.suppress(Exception):
+            agent.reasoning_callback(reasoning_text)
+    return _sanitize_surrogates(reasoning_text) if reasoning_text else reasoning_text
+
+
+def _assistant_content_for_storage(agent, assistant_message):
+    # Sanitize surrogates (Kimi/GLM via Ollama emit code points that crash json.dumps),
+    # strip inline <think> tags at the storage boundary (they leaked to platforms and
+    # polluted titles), then redact inlined credentials before the message enters
+    # history / state.db / gateway delivery (no-op with HERMES_REDACT_SECRETS off).
+    content = _sanitize_surrogates(flatten_message_text(getattr(assistant_message, "content", None)))
+    if isinstance(content, str) and content:
+        content = agent._strip_think_blocks(content).strip()
+        if content:
+            from agent.redact import redact_sensitive_text
+            content = redact_sensitive_text(content)
+    return content
+
+
+def _assistant_tool_call_dict(agent, tool_call, index: int) -> dict:
+    raw_id = getattr(tool_call, "id", None)
+    call_id = getattr(tool_call, "call_id", None)
+    if not isinstance(call_id, str) or not call_id.strip():
+        call_id, _ = agent._split_responses_tool_id(raw_id)
+    if not isinstance(call_id, str) or not call_id.strip():
+        if isinstance(raw_id, str) and raw_id.strip():
+            call_id = raw_id.strip()
+        else:
+            _fn = getattr(tool_call, "function", None)
+            call_id = agent._deterministic_call_id(getattr(_fn, "name", "") if _fn else "",
+                getattr(_fn, "arguments", "{}") if _fn else "{}", index)
+    call_id = call_id.strip()
+
+    response_item_id = getattr(tool_call, "response_item_id", None)
+    if not isinstance(response_item_id, str) or not response_item_id.strip():
+        _, response_item_id = agent._split_responses_tool_id(raw_id)
+    response_item_id = agent._derive_responses_function_call_id(call_id,
+        response_item_id if isinstance(response_item_id, str) else None)
+    # Arguments are deliberately NOT redacted: this dict is replayed to the model every
+    # turn, so a ``***`` mask would break credential-dependent commands (#43083).
+    tc_dict = {"id": call_id, "call_id": call_id, "response_item_id": response_item_id,
+        "type": tool_call.type,
+        "function": {"name": tool_call.function.name, "arguments": tool_call.function.arguments}}
+    # Preserve extra_content (Gemini thought_signature) or Gemini 3 thinking
+    # models 400 on the next request.
+    # Tool-call arguments are intentionally NOT redacted here. This dict enters the in-memory conversation
+    # history that is replayed to the model on every subsequent turn AND persisted to state.db, which is
+    # itself replayed verbatim on session resume (get_messages_as_conversation). Masking a credential to
+    # `***` here poisons that replay: the model reads back its own `PGPASSWORD='***' psql ...` call and
+    # copies the placeholder into the next tool call, breaking every credential-dependent command on the
+    # second turn (#43083). The masking also provided no real protection — the same secret still leaks
+    # verbatim through tool OUTPUT (file contents, command output, diffs, the compaction block), none of
+    # which this pass ever touched. Keeping secrets out of the replayable store is a separate
+    # tokenization/vault concern, not something arg-redaction can deliver without breaking replay.
+    # Storage-time redaction remains governed by the `security.redact_secrets` toggle. (#19798 introduced
+    # this; #43083 removed it.) Preserve extra_content (e.g. Gemini thought_signature) so it is sent back on
+    # subsequent API calls. Without this, Gemini 3 thinking models reject the request with a 400 error.
+    extra = getattr(tool_call, "extra_content", None)
+    if extra is not None:
+        tc_dict["extra_content"] = _dump_if_model(extra)
+    return tc_dict
+
+
+def build_assistant_message(agent, assistant_message, finish_reason: str) -> dict:
+    """Build a normalized assistant message dict (reasoning, reasoning_details,
+    optional tool_calls) shared by the tool-call and final-response paths.
+    Textless turns are NOT padded here: ``repair_empty_non_final_messages`` is the
+    single owner — write-time padding broke codex commentary turns and cannot
+    survive ``_rows_to_conversation``."""
+    assistant_tool_calls = getattr(assistant_message, "tool_calls", None)
+    reasoning_text = _assistant_reasoning_text(agent, assistant_message)
+    msg = stamp_message_timestamp({"role": "assistant",
+        "content": _assistant_content_for_storage(agent, assistant_message), "reasoning": reasoning_text,
+        "finish_reason": finish_reason})
+
+    raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
+    if raw_reasoning_content is None:
+        model_extra = getattr(assistant_message, "model_extra", None) or {}
+        if isinstance(model_extra, dict) and "reasoning_content" in model_extra:
+            raw_reasoning_content = model_extra["reasoning_content"]
+    if raw_reasoning_content is not None:
+        msg["reasoning_content"] = _sanitize_surrogates(raw_reasoning_content)
+    elif assistant_tool_calls and agent._needs_thinking_reasoning_pad():
+        # DeepSeek v4 / Kimi thinking modes 400 on a replayed tool-call message without
+        # reasoning_content; pad with a single space (empty string is rejected too).
+        # Without it, replaying the persisted message causes HTTP 400 ("The reasoning_content in the
+        # thinking mode must be passed back to the API"). Include streamed reasoning text when captured;
+        # otherwise pad with a single space — DeepSeek V4 Pro tightened validation and rejects empty string
+        # ("The reasoning content in the thinking mode must be passed back to the API"). A space satisfies
+        # non-empty checks everywhere without leaking fabricated reasoning. Refs #15250, #17400, #17341.
+        msg["reasoning_content"] = reasoning_text or " "
+    elif reasoning_text:
+        # Streaming-only providers accumulate reasoning via deltas and never set
+        # it on the message; replaying through a thinking model then 400s.
+        # Promote ONLY when nothing set the field: SDK reasoning_content and the
+        # tool-call pad win, and reasoning-less turns leave the field absent so
+        # the replay-time leak guard and promotion tiers still apply.
+        # Additive fallback (refs #16844, #16884). Streaming-only providers (glm, MiniMax, gpt-5.x via aigw,
+        # Anthropic via openai-compat shims) accumulate reasoning through ``delta.reasoning_content`` chunks
+        # but never land it on the message object as a top-level attribute, so neither branch above fires
+        # and the chain-of-thought is stored only under the internal ``reasoning`` key. When the user later
+        # replays that history through a DeepSeek-v4 / Kimi thinking model, the missing
+        # ``reasoning_content`` causes HTTP 400 ("The reasoning_content in the thinking mode must be passed
+        # back to the API."). Promote the already-sanitized streamed ``reasoning_text`` to
+        # ``reasoning_content`` at write time, but ONLY when no prior branch already set it AND we actually
+        # captured reasoning text. This preserves every existing behavior: - SDK-exposed
+        # ``reasoning_content`` (OpenAI/Moonshot/DeepSeek SDK) still wins.
+        msg["reasoning_content"] = reasoning_text
+
+    if getattr(assistant_message, "reasoning_details", None):
+        # Preserve reasoning_details exactly (opaque signature /
+        # encrypted_content fields) for cross-turn reasoning continuity.
+        preserved = []
+        for d in assistant_message.reasoning_details:
+            if isinstance(d, dict):
+                preserved.append(d)
+            elif hasattr(d, "__dict__"):
+                preserved.append(d.__dict__)
+            elif hasattr(d, "model_dump"):
+                preserved.append(_model_dump_safe(d))
+        if preserved:
+            msg["reasoning_details"] = preserved
+
+    # Provider-native carriers replayed verbatim on later turns:
+    # anthropic_content_blocks keeps interleaved thinking + tool_use order
+    # (reconstruction reorders signed blocks -> HTTP 400); codex_* items are
+    # the encrypted reasoning / exact message items Responses prefix caching
+    # needs.
+    for attr in ("anthropic_content_blocks", "bedrock_content_blocks", "codex_reasoning_items", "codex_message_items"):
+        value = getattr(assistant_message, attr, None)
+        if value:
+            msg[attr] = value
+            if attr == "codex_reasoning_items":
+                from agent.codex_responses_adapter import (
+                    has_replayable_native_compaction_checkpoint,
+                )
+
+                if has_replayable_native_compaction_checkpoint(agent, [msg]):
+                    note_checkpoint = getattr(
+                        agent.context_compressor, "note_native_compaction_checkpoint", None
+                    )
+                    if callable(note_checkpoint):
+                        note_checkpoint()
+                        # The response priced the pre-checkpoint input, not the next
+                        # compacted request. A matching durable prefix is now stale.
+                        from agent.usage_anchor import set_usage_anchor
+
+                        set_usage_anchor(agent, None)
+                    # The next request drops every item before this checkpoint, so a repeat
+                    # read must serve content again, not an "unchanged" stub (#32106).
+                    # Without a task id the reset would clear every task's caches.
+                    if task_id := getattr(agent, "_current_task_id", None):
+                        from agent.conversation_compression import _reset_read_dedup_caches
+
+                        _reset_read_dedup_caches(task_id, session_id=getattr(agent, "session_id", None) or "")
+
+    if assistant_tool_calls:
+        msg["tool_calls"] = [_assistant_tool_call_dict(agent, tc, i) for i, tc in enumerate(assistant_tool_calls)]
+    return msg
+
+
+def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
+    """Rewrite the cached prompt's ``Model:``/``Provider:`` lines after a provider switch.
+
+    Not persisted: the stored row keeps the primary's labels so a restored primary replays a
+    byte-identical prompt (prefix cache intact). Only the LAST occurrence of each line is touched —
+    earlier matches may be user content (memory snapshots, context files)."""
+    sp = getattr(agent, "_cached_system_prompt", None)
+    if not isinstance(sp, str) or not sp:
+        return
+    for label, value in (("Model", model), ("Provider", provider)):
+        if not value:
+            continue
+        matches = list(re.finditer(rf"(?m)^{label}: .*$", sp))
+        if matches:
+            last = matches[-1]
+            sp = f"{sp[:last.start()]}{label}: {value}{sp[last.end():]}"
+    agent._cached_system_prompt = sp
+
+
+def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
+    return (str(fb.get("provider") or "").strip().lower(), str(fb.get("model") or "").strip(),
+            str(fb.get("base_url") or "").strip().rstrip("/"))
+
+
+def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
+    """Return a skip reason for fallback entries known to be unusable locally."""
+    if (fb.get("provider") or "").strip().lower() != "nous":
+        return None
+    try:
+        from hermes_cli.auth import get_provider_auth_state
+        state = get_provider_auth_state("nous") or {}
+    except Exception as exc:
+        return f"nous_auth_unreadable:{type(exc).__name__}"
+    has_token = any(isinstance(t, str) and t.strip() for t in (state.get("access_token"), state.get("refresh_token")))
+    return None if has_token else "nous_token_missing"
+
+
+_FALLBACK_REASON_LABELS = {
+    FailoverReason.auth: "authentication failed",
+    FailoverReason.auth_permanent: "authentication permanently failed",
+    FailoverReason.billing: "billing or quota exhausted",
+    FailoverReason.rate_limit: "rate limit",
+    FailoverReason.upstream_rate_limit: "upstream model rate limit",
+    FailoverReason.overloaded: "provider overloaded",
+    FailoverReason.server_error: "provider server error",
+    FailoverReason.timeout: "request timeout",
+    FailoverReason.ssl_cert_verification: "TLS certificate verification failed",
+    FailoverReason.context_overflow: "context window exceeded",
+    FailoverReason.payload_too_large: "request payload too large",
+    FailoverReason.image_too_large: "image payload too large",
+    FailoverReason.model_not_found: "model not found",
+    FailoverReason.provider_policy_blocked: "provider policy blocked the request",
+    FailoverReason.content_policy_blocked: "content policy blocked the request",
+    FailoverReason.format_error: "request format rejected",
+    FailoverReason.role_alternation: "adjacent same-role messages rejected",
+    FailoverReason.invalid_encrypted_content: "encrypted reasoning state rejected",
+    FailoverReason.multimodal_tool_content_unsupported: "multimodal tool content unsupported",
+    FailoverReason.thinking_signature: "thinking signature rejected",
+    FailoverReason.long_context_tier: "long-context tier unavailable",
+    FailoverReason.oauth_long_context_beta_forbidden: "OAuth long-context beta unavailable",
+    FailoverReason.llama_cpp_grammar_pattern: "grammar pattern rejected",
+    FailoverReason.unknown: "provider failure",
+}
+
+
+def _fallback_reason_text(reason: "FailoverReason | None") -> str:
+    """Return a concise operator-facing explanation for a fallback switch."""
+    label = _FALLBACK_REASON_LABELS.get(reason)
+    return label or str(getattr(reason, "value", None) or reason or "provider failure").replace("_", " ")
+
+
+def _is_anthropic_wire_url(url: str) -> bool:
+    """Same Messages-only host match as determine_api_mode() / _detect_api_mode_for_url(): api.anthropic.com,
+    a /anthropic suffix, or Kimi Code's api.kimi.com/coding (its /chat/completions 404s — #77256)."""
+    from hermes_cli.providers import host_mandated_api_mode
+    return host_mandated_api_mode(url) == "anthropic_messages"
+
+
+def _fallback_api_mode_hint(fb: dict, fb_provider: str, fb_base_url_hint: Optional[str]) -> tuple[bool, str]:
+    """(explicit, api_mode) for a fallback entry from its ORIGINAL base_url: resolve_provider_client()
+    rewrites a dual-surface /anthropic base to /v1, losing the Anthropic wire signal. An explicit
+    ``api_mode`` always wins (even "chat_completions") and suppresses later re-detection;
+    ``provider: anthropic`` without a base_url still resolves to anthropic_messages."""
+    from hermes_cli.runtime_provider import _get_named_custom_provider, _parse_api_mode
+    # Entries accept the same ``api_mode`` / ``transport`` spellings as ``providers.<name>``.
+    explicit = _parse_api_mode(fb.get("api_mode") or fb.get("transport"))
+    if explicit:
+        return True, explicit
+    # A named ``providers.<name>`` block declares its wire once (``api_mode``/``transport``); a
+    # fallback entry naming that provider inherits it instead of being re-detected from the host
+    # (#33062, #81932: an Anthropic-Messages or Responses-only relay on a plain host was downgraded
+    # to chat_completions while resolve_provider_client had already built the declared client).
+    if fb_provider and fb_provider not in {"custom", "moa"}:
+        declared = (_get_named_custom_provider(fb_provider) or {}).get("api_mode")
+        if declared:
+            return True, declared
+    if fb_provider == "anthropic" or (fb_base_url_hint and _is_anthropic_wire_url(fb_base_url_hint)):
+        return False, "anthropic_messages"
+    return False, "chat_completions"
+
+
+def _fallback_api_mode_resolved(agent, fb_provider: str, fb_model: str, fb_base_url: str) -> str:
+    """Re-detect api_mode from provider / resolved base URL / model when the hint pass
+    landed on the chat_completions default (never called for an explicit api_mode)."""
+    if fb_provider == "openai-codex":
+        return "codex_responses"
+    from hermes_cli.models import opencode_model_api_mode
+    from hermes_cli.runtime_provider_custom import _opencode_family_for_custom
+    opencode_family = _opencode_family_for_custom(fb_provider, fb_base_url)
+    if opencode_family is not None:
+        # OpenCode Zen/Go/free serve Responses-only (muse-spark, gpt-*, grok-*), anthropic_messages
+        # (minimax, qwen) and chat_completions models behind one provider; the primary /model path
+        # already re-derives per model — the fallback wire must agree (#102148).
+        return opencode_model_api_mode(opencode_family, fb_model)
+    if fb_provider in {"nous", "nous-portal", "nousresearch"}:
+        # Portal is dual-wire: anthropic/* must land on /v1/messages (the swap rebuilds the native client).
+        from hermes_cli.providers import nous_api_mode
+        return nous_api_mode(fb_model)
+    if _is_anthropic_wire_url(fb_base_url):
+        # Named custom providers (cron-anthropic) resolve base_url from config; the hint pass never saw it.
+        return "anthropic_messages"
+    if agent._is_azure_openai_url(fb_base_url):
+        return "chat_completions"  # Azure serves gpt-5.x on /chat/completions — no Responses API.
+    # Provider exceptions (Copilot gpt-5-mini) stay inside the requires-responses predicate.
+    if agent._is_direct_openai_url(fb_base_url) or agent._provider_model_requires_responses_api(fb_model, provider=fb_provider):
+        return "codex_responses"
+    host = base_url_hostname(fb_base_url)
+    if fb_provider == "bedrock" or (host.startswith("bedrock-runtime.") and base_url_host_matches(fb_base_url, "amazonaws.com")):
+        return "bedrock_converse"
+    return "chat_completions"
+
+
+def _rebind_fallback_credential_pool(agent, fb_provider: str, fb_model: str) -> None:
+    """Rebind the credential pool when the provider changes (else rate_limit/billing/auth recovery
+    mutates the wrong credentials and overwrites the fallback's base_url). Same-provider pool: kept."""
+    existing_pool = getattr(agent, "_credential_pool", None)
+    if existing_pool is not None:
+        pool_provider = (getattr(existing_pool, "provider", "") or "").strip().lower()
+        if pool_provider and pool_provider != fb_provider:
+            logger.info(
+                "Fallback to %s/%s: clearing primary credential pool (pool_provider=%s) to prevent cross-provider contamination",
+                fb_provider, fb_model, pool_provider)
+            agent._credential_pool = agent._credential_pool_entry_id = None
+    if getattr(agent, "_credential_pool", None) is None:
+        try:
+            from agent.credential_pool import load_pool
+            fallback_pool = load_pool(fb_provider)
+            if fallback_pool and fallback_pool.has_credentials():
+                agent._credential_pool = fallback_pool
+                logger.info("Fallback to %s/%s: attached fallback credential pool", fb_provider, fb_model)
+        except Exception as exc:
+            logger.debug("Fallback to %s/%s: could not attach credential pool: %s", fb_provider, fb_model, exc)
+
+
+def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider) -> None:
+    """A billing switch is a WARNING naming the profile, both models and the remedy: the gateway
+    persists the turn as a transient failure otherwise, and nothing in the log says the paid
+    model was refused for credits or how to fix it (#115702). Other reasons stay INFO."""
+    if reason != FailoverReason.billing:
+        logger.info("Fallback activated: %s → %s (%s)", old_model, fb_model, fb_provider)
+        return
+    from hermes_constants import get_hermes_home, profile_name_for_home
+    profile = profile_name_for_home(get_hermes_home()) or "default"
+    remedy = "hermes model" if profile == "default" else f"hermes -p {profile} model"
+    logger.warning(
+        "Profile %s: %s via %s refused for billing/credits — using fallback %s via %s. "
+        "Top up credits, or run `%s` to pick a model this account can use.",
+        profile, old_model, old_provider, fb_model, fb_provider, remedy,
+    )
+
+
+def _fallback_chain_exhausted(agent, reason: "FailoverReason | None") -> bool:
+    """Chain exhausted (always False). A non-empty chain walked on a non-rate-limit failure arms a
+    short cooldown so next turn's restore_primary_runtime stays gated instead of replaying the whole
+    context across every provider again."""
+    from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS
+    if agent._fallback_chain and reason not in _RATE_LIMIT_FAILOVER_REASONS:
+        agent._rate_limited_until = max(
+            getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
+    return False
+
+
+def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
+    """True when every credential the candidate would use sits in an exhaustion cooldown longer
+    than the retry loop's longest wait (the 600s Retry-After cap): switching to it only fails the
+    turn the same way the primary just did (#89401). A short throttle still gets its chance."""
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is None or (getattr(pool, "provider", "") or "").strip().lower() != fb_provider:
+        try:
+            from agent.credential_pool import load_pool
+            pool = load_pool(fb_provider)
+        except Exception:
+            return False
+    if pool is None or not pool.has_credentials() or pool.has_available(model=fb_model):
+        return False
+    until = pool.next_available_at(model=fb_model)
+    return until is None or until - time.time() > 600
+
+
+def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
+    """True when the entry is already unavailable, malformed, locally unusable, or resolves
+    to the backend that just failed (falling back to it would loop the failure)."""
+    if fb_key in unavailable:
+        logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
+        return True
+    if not fb_provider or not fb_model:
+        return True
+    from agent.fallback_cooldown import _is_entitlement_rejected
+    if _is_entitlement_rejected(agent, fb_provider, fb_model):
+        logger.info("Fallback skip: %s/%s was rejected as unentitled for this account", fb_provider, fb_model)
+        return True
+    if _candidate_pool_exhausted(agent, fb_provider, fb_model):
+        logger.warning("Fallback skip: %s/%s credential pool is exhausted (every entry in cooldown)", fb_provider, fb_model)
+        return True
+    local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
+    if local_skip_reason:
+        unavailable.add(fb_key)
+        logger.warning("Fallback skip: %s/%s is not locally usable (%s); suppressing for this session", fb_provider, fb_model, local_skip_reason)
+        return True
+    # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
+    # are owned by agent.backend_identity — do not re-implement comparisons here.
+    # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.
+    # See #22548, #62984, #70893.
+    from agent.backend_identity import BackendIdentity, should_skip_candidate
+    current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
+        model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
+    fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
+    if should_skip_candidate(fb_ident, current_ident):
+        logger.warning(
+            "Fallback skip: chain entry %s/%s resolves to the same backend as the current one (%s)",
+            fb_provider, fb_model, current_ident.base_url or current_ident.provider)
+        return True
+    return False
+
+
+def _update_fallback_context_compressor(agent) -> None:
+    """Point compression limits at the fallback model's context window (not the primary's),
+    respecting the explicit model.context_length config override."""
+    compressor = getattr(agent, "context_compressor", None)
+    if not compressor:
+        return
+    from agent.model_metadata import get_model_context_length
+    fb_context_length = get_model_context_length(
+        agent.model, base_url=agent.base_url,
+        api_key=agent.api_key if isinstance(agent.api_key, str) else "",  # callable (Entra ID) → probes need str
+        provider=agent.provider,
+        config_context_length=getattr(agent, "_config_context_length", None),
+        custom_providers=getattr(agent, "_custom_providers", None),
+    )
+    compressor.update_model(  # callable api_key preserved → call_llm
+        model=agent.model, context_length=fb_context_length, base_url=agent.base_url,
+        api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode,
+    )
+    # Fallback activation is an error path: refresh an EXISTING verdict eagerly (the ceiling was voided by
+    # update_model()), but a session that never probed keeps its lazy compaction-time probe rather than
+    # resolving an auxiliary client while the primary route is failing (#114707).
+    if getattr(agent, "_compression_feasibility_checked", False) is True:
+        from agent.conversation_compression import revalidate_compression_feasibility
+        revalidate_compression_feasibility(agent)
+
+
+def _reresolve_fallback_reasoning_config(agent) -> None:
+    """Per-model override > global reasoning_effort (YAML False = disabled); a config load
+    failure keeps the current reasoning_config rather than killing the swap."""
+    try:
+        # Re-resolve reasoning_config for the new fallback model (Closes #21256). Wrapped in try/except
+        # because a config load failure must not kill the swap.
+        from hermes_cli.config import load_config
+        from hermes_constants import resolve_reasoning_config
+        agent.reasoning_config = resolve_reasoning_config(load_config() or {}, agent.model)
+        logger.info("Fallback %s: reasoning_config resolved: %s", agent.model, agent.reasoning_config)
+    except Exception as _reasoning_err:
+        logger.debug("Failed to resolve reasoning_config for fallback %s; keeping current: %s", agent.model, _reasoning_err)
+
+
+def _rescope_fallback_extra_body(agent, old_model: str, old_provider: str, old_base_url: str) -> None:
+    """Drop the OLD provider's custom_providers-contributed extra_body keys, then merge the fallback
+    provider's own. KEY-SCOPED: a key is dropped only if its value still equals what the old provider's
+    config injected — a caller override of the same key won at init and differs, so it survives;
+    keys the new provider redefines are re-added by the merge."""
+    try:
+        from agent.agent_init import _custom_provider_extra_body_for_agent, _merge_custom_provider_extra_body
+        custom_providers = getattr(agent, "_custom_providers", None) or []
+        old_provider_eb = _custom_provider_extra_body_for_agent(provider=old_provider, model=old_model, base_url=old_base_url, custom_providers=custom_providers) or {}
+        overrides = dict(getattr(agent, "request_overrides", {}) or {})
+        existing_eb = overrides.get("extra_body")
+        if isinstance(existing_eb, dict) and old_provider_eb:
+            scrubbed = {k: v for k, v in existing_eb.items() if not (k in old_provider_eb and v == old_provider_eb[k])}
+            if scrubbed:
+                overrides["extra_body"] = scrubbed
+            else:
+                overrides.pop("extra_body", None)
+            agent.request_overrides = overrides
+        _merge_custom_provider_extra_body(agent, custom_providers)
+        logger.info("Fallback %s: extra_body resolved: %s", agent.model, (getattr(agent, "request_overrides", {}) or {}).get("extra_body"))
+    except Exception as _eb_err:
+        logger.debug("Failed to resolve extra_body for fallback %s; keeping current: %s", agent.model, _eb_err)
+
+
+def _buffer_fallback_notice(agent, notice: str) -> None:
+    """Buffer the switch notice for terminal failure AND retain it as a durable one-shot for
+    _emit_pending_fallback_notice (a successful fallback clears retry chatter)."""
+    agent._buffer_diagnostic_status(notice)
+    pending = getattr(agent, "_pending_fallback_notice", None)
+    if isinstance(pending, list):
+        pending.append(notice)
+    else:
+        agent._pending_fallback_notice = [str(pending), notice] if pending else [notice]
+
+
+def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_at=None) -> bool:
+    """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
+    model slug and provider in place so the retry loop continues on the new backend; client
+    construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    if switch_deferred_by_reset(agent, reason, reset_at):
+        return False
+    cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
+    while True:
+        if agent._fallback_index >= len(agent._fallback_chain):
+            return _fallback_chain_exhausted(agent, reason)
+        fb = agent._fallback_chain[agent._fallback_index]
+        agent._fallback_index += 1
+        fb_key = _fallback_entry_key(fb)
+        if getattr(agent, "_unavailable_fallback_keys", None) is None:
+            agent._unavailable_fallback_keys = set()
+        unavailable = agent._unavailable_fallback_keys
+        fb_provider = (fb.get("provider") or "").strip().lower()
+        fb_model = (fb.get("model") or "").strip()
+        if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
+            continue
+
+        try:
+            from agent.auxiliary_client import resolve_provider_client
+            from hermes_cli.fallback_config import resolve_entry_api_key
+            # Pass the entry's base_url/api_key so custom endpoints (Ollama Cloud) resolve instead
+            # of falling through to OpenRouter defaults.
+            fb_base_url_hint = (fb.get("base_url") or "").strip() or None
+            fb_api_key_hint = resolve_entry_api_key(fb)
+            fb_api_mode_explicit, fb_api_mode = _fallback_api_mode_hint(fb, fb_provider, fb_base_url_hint)
+            # Ollama Cloud: OLLAMA_API_KEY from env when the entry has no key. Host match, not
+            # substring — GHSA-76xc-57q6-vm5m.
+            if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
+                from agent.secret_scope import get_secret
+                fb_api_key_hint = get_secret("OLLAMA_API_KEY") or None
+            # raw_codex=True: the main agent needs direct responses.stream() access for Codex providers.
+            fb_client, _resolved_fb_model = resolve_provider_client(
+                fb_provider, model=fb_model, raw_codex=True, explicit_base_url=fb_base_url_hint, explicit_api_key=fb_api_key_hint, api_mode=fb_api_mode)
+            if fb_client is None:
+                logger.warning("Fallback to %s failed: provider not configured", fb_provider)
+                unavailable.add(fb_key)
+                continue
+            if fb_provider == "moa":
+                # A MoA entry means the preset itself, exactly like ``provider: moa`` in config or
+                # ``/model <preset> --provider moa``. The chokepoint's client is the preset's
+                # aggregator: it only proves the preset resolves and the aggregator has credentials.
+                # Installing it as the acting client with the virtual identity is a hybrid nobody
+                # handles (#112525: preset name sent as model id → 404; #112623: every
+                # ``provider == "moa"`` guard and key misfires and the next rebuild swaps in the
+                # facade anyway). Bind the facade with the same pins every other MoA build site uses.
+                fb_base_url, fb_api_mode = "moa://local", "chat_completions"
+            else:
+                try:
+                    from hermes_cli.model_normalize import normalize_model_for_provider
+                    fb_model = normalize_model_for_provider(fb_model, fb_provider)
+                except Exception as _norm_err:
+                    logger.warning("Could not normalize fallback model %r for provider %r: %s", fb_model, fb_provider, _norm_err)
+
+                fb_base_url = str(fb_client.base_url)
+                from hermes_cli.providers import is_actual_route
+                if is_actual_route(fb_provider, fb_base_url):
+                    fb_api_mode = "chat_completions"
+                elif not fb_api_mode_explicit and fb_api_mode == "chat_completions":
+                    fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
+
+            old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+
+            # Clear the per-config context_length override so the fallback model's own context
+            # window is resolved instead of the previous model's stale value.
+            # See #22387.
+            agent._config_context_length = None
+            agent.model, agent.provider, agent.requested_provider = fb_model, fb_provider, fb_provider
+            agent.base_url, agent.api_mode = fb_base_url, fb_api_mode
+            # reasoning_content echo opt-in travels with the active provider; restore_primary_runtime reverts it.
+            agent._reasoning_echo_flag = bool(fb.get("reasoning_echo", False))
+            if hasattr(agent, "_transport_cache"):
+                agent._transport_cache.clear()
+            from agent.turn_recovery import reset_codex_reasoning_replay
+            reset_codex_reasoning_replay(agent)
+            agent._fallback_activated = True
+
+            _rebind_fallback_credential_pool(agent, fb_provider, fb_model)
+            if fb_provider == "moa":
+                from agent.moa_loop import bind_moa_runtime
+                bind_moa_runtime(agent, fb_model)
+            else:
+                from agent.client_lifecycle import _swap_fallback_clients
+                _swap_fallback_clients(agent, fb_client, fb_provider, fb_model, fb_base_url, fb_api_mode)
+
+            from agent.agent_runtime_helpers import sync_credential_pool_entry_id
+            sync_credential_pool_entry_id(agent)
+
+            agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
+                provider=fb_provider, base_url=fb_base_url, api_mode=fb_api_mode, model=fb_model)
+            agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
+            _update_fallback_context_compressor(agent)
+            _reresolve_fallback_reasoning_config(agent)
+            _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
+            rewrite_prompt_model_identity(agent, fb_model, fb_provider)
+
+            notice = (
+                f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
+                f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}.")
+            if cooldown_seconds is not None:
+                remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
+                notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
+            _buffer_fallback_notice(agent, notice)
+            # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
+            # provenance so the restore path only emits a recovery notice after a real fallback.
+            agent._provider_fallback_active = True
+            agent._provider_fallback_route = (str(fb_model), str(fb_provider))
+            _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider)
+            from hermes_cli.observability.shared_metrics_events import record_fallback
+            record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
+            # The stale-call streak measured the OLD provider; carrying it over would
+            # short-circuit the fresh fallback before its first stream attempt.
+            _reset_stale_streak(agent)
+            from agent.native_compaction import resolve_native_compaction_capabilities
+            agent.runtime_capabilities = resolve_native_compaction_capabilities(
+                model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
+            return True
+        except Exception as e:
+            if fb_provider == "nous":
+                unavailable.add(fb_key)
+            logger.error("Failed to activate fallback %s: %s", fb_model, e)
+            continue  # try next in chain
+
+
+# Keys outside the Chat Completions schema that strict gateways (Fireworks-backed OpenCode
+# Go, Mistral, Moonshot/Kimi) reject with 422. The transport's convert_messages() drops them
+# in the main loop; the summary path calls chat.completions.create() directly, so mirror it.
+_SUMMARY_FOREIGN_MESSAGE_KEYS = PERSISTENCE_ONLY_MESSAGE_FIELDS | {"reasoning", "finish_reason", "tool_name",
+    "codex_reasoning_items", "codex_message_items", "platform_message_id"}
+_EMPTY_SUMMARY_RESPONSE = "I reached the iteration limit and couldn't generate a summary."
+
+
+def _iteration_summary_api_messages(agent, messages: list) -> list:
+    """Wire-ready messages for the summary call, mirroring the main loop's api_messages build
+    (sidecar substitution, tool-call repair, thinking-only drop, underscore-key sweep).
+
+    ``reasoning_details`` is kept: the anthropic_messages converter rebuilds signed thinking
+    blocks from it, and the chat-completions transport already drops it on the wire for routes
+    that do not replay it (``_chat_summary_attempt`` -> ``_build_api_kwargs``)."""
+    needs_sanitize = agent._should_sanitize_tool_calls()
+    sanitize_model = agent.model
+    if needs_sanitize and agent.provider == "moa":
+        # MoA: agent.model is the virtual preset; use the real aggregator so Gemini keeps thought_signature.
+        agg_slot = getattr(getattr(agent, "client", None), "last_aggregator_slot", None)
+        sanitize_model = (agg_slot or {}).get("model") or sanitize_model
+    api_messages = []
+    for msg in messages:
+        api_msg = msg.copy()
+        agent._copy_reasoning_content_for_api(msg, api_msg)
+        for key in _SUMMARY_FOREIGN_MESSAGE_KEYS:
+            api_msg.pop(key, None)
+        # Mirror of the transport's role-qualified strip: ``name`` is
+        # schema-foreign on tool results only (strict providers reject with
+        # "contains item with unknown key name"); it stays on user/assistant.
+        if api_msg.get("role") == "tool":
+            api_msg.pop("name", None)
+        # api_content holds the exact bytes the main loop sent; substituting (not popping)
+        # keeps the summary's prefix identical instead of re-prefilling the largest context.
+        # Strict OpenAI-compatible gateways (Fireworks-back

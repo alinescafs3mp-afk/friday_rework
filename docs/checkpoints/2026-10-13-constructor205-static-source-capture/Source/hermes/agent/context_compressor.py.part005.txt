@@ -1,0 +1,1035 @@
+False):
+            self._fallback_to_main_for_compression(e, kind.fallback_reason(), failed_model=_route_model)
+            # Retry immediately on the main model.
+            return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
+
+        # Transient errors: short cooldown for JSON-decode/streaming-closed/empty-content. Timeouts escalate
+        # 60s→300s→900s (structural repeat offenders) and take precedence over the short rung; truncation
+        # escalates on its own counter (see _TIMEOUT_COOLDOWN_LADDER).
+        if kind.timeout:
+            _transient_cooldown = _next_timeout_cooldown(self)
+        elif kind.truncated:
+            _transient_cooldown = _next_timeout_cooldown(self, "_consecutive_truncation_failures")
+        else:
+            _transient_cooldown = 30 if (kind.json_decode or kind.streaming_closed or kind.empty_content) else 60
+        err_text = _short_error_text(e)
+        self._record_compression_failure_cooldown(_transient_cooldown, err_text)
+        self._last_summary_error = err_text
+        # Terminal network/empty-content failure after any fallback: flag so compress() ABORTS
+        # and preserves the session; independent of abort_on_summary_failure.
+        if kind.streaming_closed:
+            # A terminal connection/network failure or empty-content response from a degraded provider (we
+            # reach this branch only after any main-model fallback has already been tried or is
+            # unavailable). Flag it so compress() ABORTS and preserves the session unchanged instead of
+            # destroying the middle window for a placeholder marker — retrying once the provider recovers is
+            # strictly better than dropping context (#29559, #25585, #94448).
+            self._last_summary_network_failure = True
+        elif kind.truncated:
+            self._last_summary_truncated_failure = True
+        elif kind.empty_content:
+            self._last_summary_empty_content_failure = True
+        elif kind.overloaded and not access_error:
+            # A 403/402 that also says "overloaded" is an auth/quota abort (#29559), not an
+            # overload strike: counting it would let the next real 503 skip its grace (#115906).
+            self._increment_consecutive_overload_aborts()
+            # Sustained overload stops being terminal after N strikes (#123167; see the constant).
+            self._last_summary_overload_failure = (
+                self._consecutive_overload_aborts < _CONSECUTIVE_OVERLOAD_ABORT_ESCALATION
+            )
+            self._last_summary_overload_degraded = not self._last_summary_overload_failure
+            if self._last_summary_overload_degraded:
+                # The latest failure class decides: a stale network/empty/truncated/auth flag from
+                # an earlier failure (only a success clears those) must not keep aborting forever.
+                self._clear_terminal_summary_failures()
+        logger.warning(
+            "Failed to generate context summary: %s. Further summary attempts paused for %d seconds.", e,
+            _transient_cooldown,
+        )
+        return None
+
+    @staticmethod
+    def _strip_summary_prefix(summary: str) -> str:
+        """Return the summary body without the current, legacy, or any historical prefix."""
+        text = (summary or "").strip()
+        # Drop merged prior-tail content up to the delimiter so it never leaks into the next prompt.
+        if _MERGED_SUMMARY_DELIMITER in text:
+            text = text.split(_MERGED_SUMMARY_DELIMITER, 1)[1].strip()
+        for prefix in (SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES):
+            if text.startswith(prefix):
+                text = text[len(prefix):].lstrip()
+                break
+        # Strip the end marker (re-appended on insertion); forced merged summaries may keep
+        # live tail content after it, so truncate at the marker wherever it sits.
+        marker_idx = text.find(_SUMMARY_END_MARKER)
+        if marker_idx >= 0:
+            text = text[:marker_idx].rstrip()
+        return text
+
+    @classmethod
+    def _with_summary_prefix(cls, summary: str) -> str:
+        """Normalize summary text to the current compaction handoff format."""
+        text = cls._strip_summary_prefix(summary)
+        return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
+
+    @staticmethod
+    def _starts_with_summary_prefix(text: str) -> bool:
+        """Return True if *text* begins with any known handoff prefix."""
+        return text.startswith((SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES))
+
+    @classmethod
+    def classify_summary_content(cls, content: Any) -> Optional[str]:
+        """Classify how *content* relates to a compaction summary.
+        Returns ``"standalone"`` (whole message is a handoff), ``"merged"`` (preserved content +
+        delimiter + summary body), or None."""
+        text = _content_text_for_contains(content).lstrip()
+        # Merged summaries carry the handoff prefix after the delimiter; detect it there too.
+        if _MERGED_SUMMARY_DELIMITER in text:
+            after = text.split(_MERGED_SUMMARY_DELIMITER, 1)[1].lstrip()
+            return "merged" if cls._starts_with_summary_prefix(after) else None
+        return "standalone" if cls._starts_with_summary_prefix(text) else None
+
+    @classmethod
+    def _is_context_summary_content(cls, content: Any) -> bool:
+        return cls.classify_summary_content(content) is not None
+
+    @staticmethod
+    def _has_compressed_summary_metadata(message: Any) -> bool:
+        """Return True if *message* carries the in-process compressed-summary flag."""
+        return isinstance(message, dict) and bool(message.get(COMPRESSED_SUMMARY_METADATA_KEY))
+
+    @classmethod
+    def _transcript_has_real_user_turn(cls, messages: List[Dict[str, Any]]) -> bool:
+        """Return whether *messages* contain a user-authored (not synthetic summary) turn."""
+        return any(
+            isinstance(m, dict) and m.get("role") == "user" and not cls._is_synthetic_compression_user_turn(m)
+            for m in messages
+        )
+
+    @classmethod
+    def _is_synthetic_compression_user_turn(cls, message: Any) -> bool:
+        """Recognize internal user-role rows by content marker (SessionDB drops metadata)."""
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return False
+        if cls._is_context_summary_message(message):
+            return True
+        text = _content_text_for_contains(message.get("content")).strip()
+        # Recovery nudges are scaffolding, not human turns; lazy import avoids an import cycle.
+        from agent.conversation_loop import (
+            _CODEX_ACK_CONTINUATION_NUDGE, _CODEX_INCOMPLETE_NUDGE, _DEGENERATE_FINAL_NUDGE,
+            _DROPPED_TOOLCALL_NUDGE_CONTENT, _EMPTY_TOOL_RESPONSE_NUDGE, _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX,
+            _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB, _LENGTH_CONTINUATION_NETWORK_STUB,
+            _LENGTH_CONTINUATION_OUTPUT_LIMIT,
+        )
+        return text in {
+            COMPRESSION_CONTINUATION_USER_CONTENT, _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
+            MAX_ITERATIONS_SUMMARY_REQUEST, _CODEX_INCOMPLETE_NUDGE, _CODEX_ACK_CONTINUATION_NUDGE,
+            _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT, _EMPTY_TOOL_RESPONSE_NUDGE,
+            _LENGTH_CONTINUATION_NETWORK_STUB, _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB,
+            _LENGTH_CONTINUATION_OUTPUT_LIMIT,
+        } or text.startswith((
+            _BACKGROUND_PROCESS_NOTIFICATION_PREFIX, TODO_INJECTION_HEADER + "\n", _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX,
+        ))
+
+    @staticmethod
+    def _validate_summary_user_provenance(summary: str, has_user_turn: bool) -> None:
+        """Reject user attribution when the source transcript has no user."""
+        if has_user_turn:
+            return
+        match = _HISTORICAL_TASK_SECTION_RE.search(summary)
+        task_snapshot = match.group(0).split("\n", 1)[-1].strip() if match else ""
+        # The "User asked:" scan can false-positive on quoted tool output; acceptable, since
+        # the RuntimeError only costs one retry on the existing fallback path.
+        if task_snapshot != _NO_USER_TASK_SENTINEL or re.search(r"\bUser\s+asked\s*:", summary, re.IGNORECASE):
+            raise RuntimeError(
+                "Context compression summary invented user attribution for a session with no user-authored turns",
+            )
+
+    @classmethod
+    def _is_context_summary_message(cls, message: Any) -> bool:
+        """Return True for summary handoff messages by metadata or content."""
+        if not isinstance(message, dict):
+            return False
+        return cls._has_compressed_summary_metadata(message) or cls._is_context_summary_content(message.get("content"))
+
+    @classmethod
+    def _is_blank_user_turn(cls, message: Any) -> bool:
+        """Return whether *message* is an empty, non-summary user-role echo."""
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return False
+        if cls._is_context_summary_message(message):
+            return False
+        content = message.get("content")
+        if content is None or (isinstance(content, str) and not content.strip()):
+            return True
+        if not isinstance(content, list):
+            return False
+
+        def _blank_part(part: Any) -> bool:
+            if isinstance(part, str):
+                return not part.strip()
+            if isinstance(part, dict) and part.get("type") in {"text", "input_text"}:
+                return isinstance(part.get("text"), str) and not part["text"].strip()
+            return False
+
+        return all(map(_blank_part, content))
+
+    @classmethod
+    def _is_actionable_user_turn(cls, message: Any) -> bool:
+        """Return whether *message* contains user input worth anchoring."""
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return False
+        # display_kind rows (internal notifications, hidden scaffolding) are not human input
+        # and must not anchor the tail or seed auto-focus. Mirrors is_user_originated_turn.
+        # A /steer row is typed for the renderer and the alternation repair, but it IS human input.
+        display_kind = message.get("display_kind")
+        if (display_kind and display_kind != STEER_DISPLAY_KIND) or cls._is_context_summary_message(message):
+            return False
+        return not cls._is_blank_user_turn(message)
+
+    @classmethod
+    def _blank_echo_indices_after(cls, messages: List[Dict[str, Any]], user_idx: int) -> set[int]:
+        """Return contiguous blank echoes after a user event; removable only if an assistant follows."""
+        if user_idx < 0:
+            return set()
+        idx = user_idx + 1
+        while idx < len(messages) and cls._is_blank_user_turn(messages[idx]):
+            idx += 1
+        if idx == user_idx + 1 or idx >= len(messages) or messages[idx].get("role") != "assistant":
+            return set()
+        return set(range(user_idx + 1, idx))
+
+    @classmethod
+    def _derive_auto_focus_topic(cls, messages: List[Dict[str, Any]]) -> Optional[str]:
+        """Infer a compact focus hint from the most recent real user turns."""
+        candidates: list[str] = []
+        for msg in reversed(messages):
+            # display_kind notices are operational traffic, not user intent.
+            if msg.get("role") != "user" or cls._is_synthetic_compression_user_turn(msg) or msg.get("display_kind"):
+                continue
+            text = _redact_compaction_text(_content_text_for_contains(msg.get("content")).strip())
+            if not text:
+                continue
+            text = " ".join(text.split())
+            if len(text) > _AUTO_FOCUS_TURN_MAX_CHARS:
+                text = text[: _AUTO_FOCUS_TURN_MAX_CHARS - 1].rstrip() + "…"
+            candidates.append(text)
+            if len(candidates) >= _AUTO_FOCUS_MAX_TURNS:
+                break
+        if not candidates:
+            return None
+        candidates.reverse()
+        focus = "Recent user focus:\n" + "\n".join(f"- {item}" for item in candidates)
+        if len(focus) > _AUTO_FOCUS_MAX_CHARS:
+            focus = focus[: _AUTO_FOCUS_MAX_CHARS - 1].rstrip() + "…"
+        return focus
+
+    @classmethod
+    def _latest_user_task_snapshot(cls, messages: List[Dict[str, Any]]) -> Optional[str]:
+        """Return a deterministic task-snapshot line from the newest real user turn.
+        The summarizer must not invent the active-task anchor from a prompt example or a stale prior
+        summary; this grounds it in the exact compacted turns."""
+        # Reuse the runtime's real-user predicate so scaffolding rows can never anchor.
+        from agent.conversation_compression import _is_real_user_message
+        for msg in reversed(messages):
+            if msg.get("role") != "user" or not _is_real_user_message(msg):
+                continue
+            text = _redact_compaction_text(_content_text_for_contains(msg.get("content")).strip())
+            if not text:
+                continue
+            if len(text) > _ACTIVE_TASK_MAX_CHARS:
+                # Past the cap, drop a gateway reply quote first so elision cannot keep the quote
+                # and cut the request.
+                text = _redact_compaction_text(_authored_request_text(msg.get("content"))) or text
+            text = re.sub(r"\s+", " ", text)
+            # Elide AFTER repr: repr would escape the marker's "Hermes's" and hide a copy from the
+            # guard. Authored text within the cap stays whole; a longer request split out of an
+            # oversized turn is restated verbatim by _reappend_inflight_user_task, not by this snapshot.
+            text = repr(text) if len(text) <= _ACTIVE_TASK_MAX_CHARS else elide(repr(text), _ACTIVE_TASK_MAX_CHARS)
+            return (
+                f"User asked (deterministic, from compacted turns): {text}\n"
+                "Historical only; newer protected-tail messages after this summary win."
+            )
+        return None
+
+    @classmethod
+    def _ground_historical_task_snapshot(cls, summary: str, messages: List[Dict[str, Any]]) -> str:
+        """Force the task snapshot section to match a real user turn when possible."""
+        snapshot = cls._latest_user_task_snapshot(messages)
+        if not snapshot:
+            return summary
+
+        body = cls._strip_summary_prefix(summary)
+        # Keep the trailing blank line: re.sub eats it, and a glued "## " heading breaks
+        # this regex on the next compaction (deleting every following section).
+        replacement = f"{HISTORICAL_TASK_HEADING}\n{snapshot}\n\n"
+        if _HISTORICAL_TASK_SECTION_RE.search(body):
+            # Replace the first task section and drop every later one: a summarizer that emits both the
+            # canonical heading and the legacy alias would otherwise leave a second, undisclaimed task section.
+            seen = False
+
+            def _collapse(_m: re.Match) -> str:
+                nonlocal seen
+                if seen:
+                    return ""
+                seen = True
+                return replacement
+
+            return _HISTORICAL_TASK_SECTION_RE.sub(_collapse, body).strip()
+        return f"{replacement}{body}".strip()
+
+    @classmethod
+    def _find_context_summaries(cls, messages: List[Dict[str, Any]], start: int, end: int) -> list[tuple[int, str]]:
+        """Find handoff summaries inside a compression window."""
+        n = len(messages)
+        # Clamp: callers may pass end = len(messages)+1.
+        # Defensive: clamp bounds so a caller passing an out-of-range end (e.g. tail-cut returning
+        # len(messages)+1 when head_end >= n) cannot trigger IndexError. (#75588)
+        start = max(0, min(start, n))
+        end = max(start, min(end, n))
+        return [
+            (idx, cls._strip_summary_prefix(_content_text_for_contains(messages[idx].get("content"))))
+            for idx in range(start, end) if cls._is_context_summary_message(messages[idx])
+        ]
+
+    @classmethod
+    def _find_latest_context_summary(
+        cls, messages: List[Dict[str, Any]], start: int, end: int,
+    ) -> tuple[Optional[int], str]:
+        """Find the newest handoff summary inside a compression window."""
+        summaries = cls._find_context_summaries(messages, start, end)
+        return summaries[-1] if summaries else (None, "")
+
+    @classmethod
+    def _strip_context_summary_handoff_message(cls, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Drop stale handoff data while preserving merged prior-tail content.
+        Returns a copy for non-handoff rows, the unwrapped prior-tail content for merged handoffs
+        (delimiter form, or legacy end-marker form), and ``None`` for standalone ones."""
+        if not isinstance(message, dict):
+            return message
+        if not cls._is_context_summary_message(message):
+            return message.copy()
+        content = message.get("content")
+
+        def _unwrapped(new_content: Any) -> Dict[str, Any]:
+            unwrapped = {**message, "content": new_content}
+            unwrapped.pop(COMPRESSED_SUMMARY_METADATA_KEY, None)
+            return unwrapped
+
+        if isinstance(content, str):
+            if _MERGED_SUMMARY_DELIMITER in content:
+                prior = content.split(_MERGED_SUMMARY_DELIMITER, 1)[0].strip()
+                if prior.startswith(_MERGED_PRIOR_CONTEXT_HEADER):
+                    prior = prior[len(_MERGED_PRIOR_CONTEXT_HEADER):].lstrip()
+            elif _SUMMARY_END_MARKER in content:
+                prior = content.split(_SUMMARY_END_MARKER, 1)[1].lstrip()
+            else:
+                prior = ""
+            return _unwrapped(prior) if prior else None
+        if isinstance(content, list):
+            prior_blocks: list[Any] = []
+            found_delimiter = False
+            for item in content:
+                text = _part_text(item)
+                if isinstance(text, str) and _MERGED_SUMMARY_DELIMITER in text:
+                    before = text.split(_MERGED_SUMMARY_DELIMITER, 1)[0]
+                    if before.strip():
+                        prior_blocks.append(_with_part_text(item, before))
+                    found_delimiter = True
+                    break
+                prior_blocks.append(item.copy() if isinstance(item, dict) else item)
+            if not found_delimiter:
+                # Legacy end-marker form: live content follows the marker inside/after one part.
+                for index, item in enumerate(content):
+                    text = _part_text(item)
+                    if isinstance(text, str) and _SUMMARY_END_MARKER in text:
+                        remainder = text.split(_SUMMARY_END_MARKER, 1)[1].lstrip()
+                        legacy_blocks = [_with_part_text(item, remainder)] if remainder else []
+                        legacy_blocks += [later.copy() if isinstance(later, dict) else later for later in content[index + 1:]]
+                        return _unwrapped(legacy_blocks) if legacy_blocks else None
+                return None
+
+            # Strip the PRIOR CONTEXT header from the first block that carries it.
+            for index, item in enumerate(prior_blocks):
+                text = _part_text(item)
+                if isinstance(text, str) and text.lstrip().startswith(_MERGED_PRIOR_CONTEXT_HEADER):
+                    leading = text.lstrip()[len(_MERGED_PRIOR_CONTEXT_HEADER):].lstrip()
+                    if leading:
+                        prior_blocks[index] = _with_part_text(item, leading)
+                    else:
+                        prior_blocks.pop(index)
+                    break
+            return _unwrapped(prior_blocks) if prior_blocks else None
+        return None
+
+    @staticmethod
+    def _get_tool_call_id(tc) -> str:
+        """Canonical call ID for logging only; matching must use _tool_call_id_variants."""
+        return (_tc_get(tc, "call_id") or _tc_get(tc, "id") or "").strip()
+
+    @staticmethod
+    def _tool_call_id_variants(tc) -> set:
+        """Return every id variant a result might reference *tc* by (forwards to message_sanitization).
+
+        Thin forwarder — the policy owner is ``agent.message_sanitization.tool_call_id_variants``, which
+        also expands ``response_item_id`` and composite ``call|item`` bridge spellings (#63000), so the
+        compressor's pairing tolerance matches the pre-call sanitizer's exactly and the two can never drift.
+        """
+        from agent.message_sanitization import tool_call_id_variants
+        return set(tool_call_id_variants(tc))
+
+    def _sanitize_tool_pairs(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove orphaned tool results and strip orphaned tool_calls after compression.
+        Stubs would be dropped by repair_message_sequence when call_id != id."""
+        from agent.agent_runtime_helpers import _classify_tool_call_orphans
+        _, result_call_ids, orphaned_result_msgs, missing_tool_calls = _classify_tool_call_orphans(messages)
+        orphaned_results = {id(m) for m in orphaned_result_msgs}
+        if orphaned_results:
+            messages = [m for m in messages if id(m) not in orphaned_results]
+            if not self.quiet_mode:
+                logger.info("Compression sanitizer: removed %d orphaned tool result(s)", len(orphaned_results))
+        # Strip orphaned tool_calls (not stub them: stubs get dropped by repair_message_sequence
+        # when call_id != id). A call survives if ANY id variant still has a result.
+        if not missing_tool_calls:
+            return messages
+        # In-flight protection: compression can fire before the executor appends the result, so the last non-tool
+        # assistant's calls are presumed pending and kept verbatim (skip trailing tool results first: a multi-call
+        # batch between appends is still in flight). Unanswered survivors are stubbed pre-API by sanitize_api_messages.
+        idx = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") != "tool"), -1)
+        trailing_inflight = messages[idx] if idx >= 0 and messages[idx].get("role") == "assistant" else None
+        stripped_count = 0
+        for msg in messages:
+            tcs = msg.get("tool_calls")
+            if msg.get("role") != "assistant" or msg is trailing_inflight or not tcs:
+                continue
+            kept = [tc for tc in tcs if self._tool_call_id_variants(tc) & result_call_ids]
+            if len(kept) == len(tcs):
+                continue
+            stripped_count += len(tcs) - len(kept)
+            if kept:
+                msg["tool_calls"] = kept
+            else:
+                msg.pop("tool_calls", None)
+                # Keep visible content so the API does not reject an empty turn.
+                content = msg.get("content")
+                if not content or (isinstance(content, str) and not content.strip()):
+                    msg["content"] = "(tool call removed)"
+        if stripped_count and not self.quiet_mode:
+            logger.info("Compression sanitizer: stripped %d orphaned tool_call(s) from assistant messages", stripped_count)
+        return messages
+
+    def _align_boundary_forward(self, messages: List[Dict[str, Any]], idx: int) -> int:
+        """Push a compress-start boundary forward past any orphan tool results."""
+        while idx < len(messages) and messages[idx].get("role") == "tool":
+            idx += 1
+        return idx
+
+    def _restart_handoff_probe_bounds(self, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+        """Return the bounded transcript region that can indicate restart decay."""
+        if not messages or self.protect_first_n <= 0:
+            return 0, 0
+        first_non_system = 1 if messages[0].get("role") == "system" else 0
+        return first_non_system, min(len(messages), first_non_system + self.protect_first_n + _RESTART_HANDOFF_PROBE_EXTRA_MESSAGES)
+
+    def _effective_protect_first_n(self, messages: Optional[List[Dict[str, Any]]] = None) -> int:
+        """``protect_first_n``, decayed to 0 once the session has been compressed so early turns don't fossilize.
+        After a restart the decayed state is inferred from handoff summaries in the resumed head."""
+        if self.compression_count >= 1 or self._previous_summary:
+            return 0
+        if messages and self.protect_first_n > 0:
+            # Probe only the early resumed-handoff shape; summary-like tail content must not decay protection.
+            probe_start, probe_end = self._restart_handoff_probe_bounds(messages)
+            if any(map(self._is_context_summary_message, messages[probe_start:probe_end])):
+                return 0
+        return self.protect_first_n
+
+    def _protect_head_size(self, messages: List[Dict[str, Any]]) -> int:
+        """Head messages to protect: the system prompt (if present) plus the decaying ``protect_first_n`` extra rows.
+
+        The ``protect_first_n`` portion DECAYS after the first compression (see _effective_protect_first_n)
+        so early user turns don't fossilize across repeated compactions (#11996).
+        """
+        head = 1 if messages and messages[0].get("role") == "system" else 0
+        return head + self._effective_protect_first_n(messages)
+
+    def _align_boundary_backward(self, messages: List[Dict[str, Any]], idx: int) -> int:
+        """Pull a compress-end boundary back so a tool group is not split (orphaned tail results would be dropped)."""
+        if idx <= 0 or idx >= len(messages):
+            return idx
+        check = next((i for i in range(idx - 1, -1, -1) if messages[i].get("role") != "tool"), -1)
+        # Landed on the parent assistant: move before it so the group is summarised together.
+        if check >= 0 and messages[check].get("role") == "assistant" and messages[check].get("tool_calls"):
+            return check
+        return idx
+
+    @classmethod
+    def _is_real_user_turn(cls, message: Dict[str, Any]) -> bool:
+        """Actionable user turn that is not synthetic scaffolding — the row test both index scans share.
+
+        Weaker than ``agent.conversation_compression._is_real_user_message``, which also rejects
+        metadata-flagged scaffolding this pair cannot see; use that one when the question is
+        "is this a genuine inbound user message".
+        """
+        return cls._is_actionable_user_turn(message) and not cls._is_synthetic_compression_user_turn(message)
+
+    @classmethod
+    def _real_user_indices_desc(cls, messages: List[Dict[str, Any]], head_end: int) -> list[int]:
+        """Newest-first indices of actionable, non-synthetic user turns at or after *head_end* (no handoffs/blank echoes)."""
+        return [
+            i for i in range(len(messages) - 1, head_end - 1, -1)
+            if cls._is_real_user_turn(messages[i])
+        ]
+
+    def _find_last_user_message_idx(self, messages: List[Dict[str, Any]], head_end: int) -> int:
+        """Return the latest actionable user turn at or after *head_end*, or -1."""
+        # Early-exit generator: callers want the newest hit only, and collecting every index
+        # (``_real_user_indices_desc``) costs a full backward scan per call.
+        return next(
+            (i for i in range(len(messages) - 1, head_end - 1, -1) if self._is_real_user_turn(messages[i])),
+            -1,
+        )
+
+    def _find_last_assistant_message_idx(self, messages: List[Dict[str, Any]], head_end: int) -> int:
+        """Last text-bearing non-summary assistant reply at/after *head_end* (else last non-summary assistant), or -1."""
+        last_any = -1
+        for i in range(len(messages) - 1, head_end - 1, -1):
+            msg = messages[i]
+            if msg.get("role") != "assistant" or self._is_context_summary_message(msg):
+                continue
+            if last_any < 0:
+                last_any = i
+            content = msg.get("content")
+            # Multimodal content: any non-empty text block counts.
+            if (isinstance(content, str) and content.strip()) or (isinstance(content, list) and any(
+                isinstance(p, dict) and isinstance(t := (p.get("text") or p.get("content")), str) and t.strip()
+                for p in content
+            )):
+                return i
+        return last_any
+
+    def _ensure_last_assistant_message_in_tail(
+        self, messages: List[Dict[str, Any]], cut_idx: int, head_end: int,
+    ) -> int:
+        """Keep the most recent assistant reply in the protected tail, re-aligned back so a tool group is not split."""
+        last_asst_idx = self._find_last_assistant_message_idx(messages, head_end)
+        if last_asst_idx < 0 or last_asst_idx >= cut_idx:
+            return cut_idx
+        new_cut = self._align_boundary_backward(messages, last_asst_idx)
+        if not self.quiet_mode:
+            logger.debug(
+                "Anchoring tail cut to last assistant message at index %d (was %d, aligned to %d) to keep "
+                "the previously-visible reply out of the compaction summary (#29824)",
+                last_asst_idx, cut_idx, new_cut,
+            )
+        return max(new_cut, head_end + 1)
+
+    def _ensure_last_user_message_in_tail(self, messages: List[Dict[str, Any]], cut_idx: int, head_end: int) -> int:
+        """Guarantee the most recent user message is in the protected tail.
+        Tool-group alignment can pull the cut past the last user message; once summarized, the prefix
+        tells the model to answer only messages AFTER the summary, so the active ask silently vanishes.
+        If the head_end clamp would strand the user without its reply, the cut is pushed forward past
+        the whole turn-pair instead so it is summarised as completed."""
+        last_user_idx = self._find_last_user_message_idx(messages, head_end)
+        if last_user_idx < 0 or last_user_idx >= cut_idx:
+            return cut_idx
+        # A user message is already a clean boundary; _align_boundary_backward would
+        # needlessly pull the cut into the preceding tool group.
+        if not self.quiet_mode:
+            logger.debug(
+                "Anchoring tail cut to last user message at index %d (was %d) to prevent active-task loss after compression",
+                last_user_idx, cut_idx,
+            )
+        adjusted = max(last_user_idx, head_end + 1)
+        if adjusted > last_user_idx:
+            # Clamp would strand the user without its reply: push forward past the whole pair.
+            pair_end = self._find_turn_pair_end(messages, last_user_idx)
+            if not self.quiet_mode:
+                logger.debug(
+                    "Causal Coupling: cut would split turn-pair at user %d; pushing cut forward to "
+                    "pair_end %d so the completed pair is summarised together (#22523)", last_user_idx, pair_end,
+                )
+            return max(pair_end, head_end + 1)
+        return adjusted
+
+    @classmethod
+    def _has_merged_inflight_replay(cls, message: Any) -> bool:
+        """Recognize the active request on a handoff, including after DB reload.
+
+        Detection is content-only, anchored on the last summary end marker: the
+        explicit replay after it is authoritative; a request quoted inside the
+        historical summary is not.
+        """
+        if not cls._is_context_summary_message(message):
+            return False
+        text = _content_text_for_contains(message.get("content"))
+        # The LAST end marker is the real handoff boundary: a merged-into-tail
+        # carrier can embed an older carrier (marker + replay) in its prior
+        # context, ahead of the new summary's own marker.
+        _, boundary, remainder = text.rpartition(_SUMMARY_END_MARKER)
+        rest = remainder.lstrip()
+        return bool(
+            boundary
+            and rest.startswith(_INFLIGHT_TASK_REPLAY_HEADER)
+            and rest.removeprefix(_INFLIGHT_TASK_REPLAY_HEADER).strip()
+        )
+
+    @classmethod
+    def _find_inflight_user_task(
+        cls, messages: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Return the user turn that is still awaiting completion, or ``None``.
+
+        Scans the WHOLE transcript, not just the compressible region: a cron
+        run's only user turn is the job prompt sitting in the protected head
+        (``protect_first_n`` keeps system + first user), which is exactly the
+        turn ``_find_last_user_message_idx`` cannot see (#100818).
+
+        A turn is in-flight when the transcript does not already end with a
+        completed assistant reply — i.e. a text-bearing assistant message with
+        no pending ``tool_calls``.  A trailing ``tool`` result or an assistant
+        message that still has ``tool_calls`` outstanding means the run was
+        interrupted mid-task and the instruction is still owed an answer.
+
+        Handoff carriers and synthetic scaffolding rows are excluded via the
+        same filter pair as ``_find_last_user_message_idx``, so an idle session
+        whose only user-role row is an inherited summary yields ``None`` and is
+        never re-animated (#80622).
+        """
+        from agent.conversation_compression import _is_real_user_message
+
+        last_user_idx = -1
+        # Find the newest user message that carries at least one image part. We anchor on image-bearing user
+        # messages (not all user messages) so a plain text follow-up after a big-image turn still strips the
+        # old image — matching the problem kilocode#9434 set out to solve.
+        # Newest tool message carrying an image. Tool-result images (``vision_analyze``,
+        # screenshot-returning tools) accumulate on their own timeline and the user anchor never protects
+        # the stale ones: a session whose only image-bearing user message is the FIRST one leaves ``anchor
+        # <= 0`` and strips nothing at all, so twenty tool results keep multi-MB of base64 in every request
+        # body until the provider answers 413 -- and the 413 handler's recovery compaction lands right back
+        # here and frees nothing, which is the wedge in #89938. Keep the newest tool image, since that is
+        # the one the model is reasoning about, and drop every older one wherever it sits.
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            # _is_real_user_message also rejects metadata-flagged scaffolding
+            # (_todo_snapshot_synthetic, recovery nudges, ...) that
+            # _is_actionable_user_turn cannot see.
+            if cls._is_actionable_user_turn(msg) and _is_real_user_message(msg):
+                last_user_idx = i
+                break
+            if cls._has_merged_inflight_replay(msg):
+                # A previous cycle merged the live request onto this summary
+                # carrier; it is the only copy left, so it is still the task.
+                last_user_idx = i
+                break
+        if last_user_idx < 0:
+            return None
+
+        for msg in reversed(messages[last_user_idx + 1:]):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                # Trailing tool result (or anything else): still mid-task.
+                break
+            if msg.get("tool_calls"):
+                break
+            if _content_text_for_contains(msg.get("content")).strip():
+                # Final answer already delivered — replaying the ask would
+                # hand the model finished work as a fresh instruction.
+                return None
+            # Empty assistant row (a bare reasoning/stub turn): keep looking.
+        return messages[last_user_idx]
+
+    def _reappend_inflight_user_task(
+        self,
+        compressed: List[Dict[str, Any]],
+        inflight: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Restate an unfinished user task after the compaction handoff.
+
+        ``SUMMARY_PREFIX`` instructs the model to act only on a user message
+        that appears AFTER the summary, and to do nothing when none does.  When
+        the single in-flight instruction lived in the protected head, the
+        assembled transcript orders it before the handoff and the run ends in a
+        ``[SILENT]`` no-op that the scheduler records as success (#100818).
+
+        Re-append a copy of that turn after the surviving tail so the prefix's
+        "latest user message" pointer resolves to it again.  If the transcript
+        already ends on a template-visible user row, appending a second one
+        would break user/assistant alternation, so the restatement is merged
+        onto the handoff carrier instead — after ``_SUMMARY_END_MARKER``, which
+        is the boundary the prefix's rule is written against.
+        """
+        if inflight is None or not compressed:
+            return compressed
+
+        carrier_idx = -1
+        for idx in range(len(compressed) - 1, -1, -1):
+            if self._is_context_summary_message(compressed[idx]):
+                carrier_idx = idx
+                break
+        if carrier_idx < 0:
+            # No handoff was emitted — nothing reordered the instruction.
+            return compressed
+
+        for msg in compressed[carrier_idx + 1:]:
+            if self._is_real_user_turn(msg):
+                # A real request already follows the summary.
+                return compressed
+
+        carrier = compressed[carrier_idx]
+        carrier_text = _content_text_for_contains(carrier.get("content"))
+        if _SUMMARY_END_MARKER not in carrier_text:
+            return compressed
+        if carrier_text.split(_SUMMARY_END_MARKER, 1)[1].strip():
+            # The _force_user_leading layout keeps the live request on the
+            # carrier itself, after the marker. Already actionable.
+            return compressed
+
+        # Keep any reply pointer: the restated task still needs its disambiguation.
+        task_text = _restated_request_text(inflight.get("content"))
+        if not task_text:
+            return compressed
+
+        if not self.quiet_mode:
+            logger.info(
+                "Re-appending the in-flight user task after the compaction "
+                "handoff so it stays actionable (#100818)"
+            )
+
+        last_visible_role = _last_template_visible_role(compressed)
+        if self._has_merged_inflight_replay(inflight):
+            # Never copy a summary carrier (metadata would mark the replay
+            # synthetic): restate as a plain user row.
+            replay = {"role": "user", "content": task_text}
+        else:
+            replay = _fresh_compaction_message_copy(inflight)
+        replay.pop(_COMPACTION_TAIL_MARKER, None)
+        # A restated row is NEW at the compaction boundary: never persist the
+        # in-flight turn's original timestamp, or timestamp-ordered views show
+        # the question after its own answer (#121064). Dropping it lets the
+        # store stamp compaction time (its monotonic now_ts orders it last).
+        replay.pop("timestamp", None)
+        if isinstance(replay.get("content"), str):
+            # Plain text: rebuild from the header-stripped task text so a
+            # task surviving several compactions never stacks headers.
+            replay["content"] = _INFLIGHT_TASK_REPLAY_HEADER + "\n" + task_text
+        else:
+            # Multimodal parts: keep them, prepend the header text part.
+            replay["content"] = _append_text_to_content(
+                replay.get("content"),
+                _INFLIGHT_TASK_REPLAY_HEADER + "\n",
+                prepend=True,
+            )
+        drop_stale_api_content(replay)
+
+        # The replay is a replacement for the in-flight row, not an additional
+        # occurrence of it. When the original survived in the protected head,
+        # retaining it gives the durable transcript two active rows with the
+        # same message_uid and renders the request twice after reload.
+        from agent.message_metadata import MESSAGE_UID, message_uid_or_none, record_absorbed_message
+
+        if replay_uid := message_uid_or_none(replay):
+            before = len(compressed)
+            kept = list(compressed)
+            compressed[:] = [
+                msg
+                for msg in compressed
+                if not (
+                    msg is not carrier
+                    and msg.get("role") == "user"
+                    and msg.get(MESSAGE_UID) == replay_uid
+                )
+            ]
+            # When the removed row opened the window, the head's tool flow
+            # (assistant tool_calls) would now lead; native Gemini rejects a
+            # leading model functionCall turn. Open the window on the carrier.
+            first = next(i for i, msg in enumerate(compressed) if msg.get("role") != "system")
+            if len(compressed) != before and compressed[first].get("role") != "user":
+                if _template_visible_role(carrier) is None:
+                    # Carrier merged into a tail assistant(tool_calls) row:
+                    # moving it would split it from its tool results. Keep
+                    # the head row this cycle (pre-dedup layout).
+                    compressed[:] = kept
+                else:
+                    compressed.insert(first, compressed.pop(compressed.index(carrier)))
+            # The summary role was picked against a head that ended on the row
+            # just removed: an assistant carrier would now open the visible
+            # sequence (or follow an assistant). Use the _force_user_leading
+            # layout instead — carrier role=user, request after its end marker.
+            if len(compressed) != before and _template_visible_role(carrier) == "assistant" and (
+                _last_template_visible_role(compressed[: compressed.index(carrier)]) != "user"
+            ):
+                carrier["role"] = "user"
+                last_visible_role = _last_template_visible_role(compressed)
+
+        if last_visible_role == "user":
+            # Alternation is judged on template-visible rows only (tool_calls /
+            # tool rows are exempt), so a user-pinned summary followed by a
+            # tool tail still "ends on user": a standalone user row would break
+            # the Mistral-style pre-flight check (#58753). Merge onto the
+            # carrier instead — its own metadata marks it synthetic, and the
+            # header after its end marker lets _has_merged_inflight_replay
+            # (used by _ensure_compressed_has_user_turn) see intent as present
+            # instead of inserting a second copy of the same request.
+            carrier["content"] = _append_text_to_content(
+                carrier.get("content"),
+                "\n\n" + _INFLIGHT_TASK_REPLAY_HEADER + "\n" + task_text,
+            )
+            drop_stale_api_content(carrier)
+            # The carrier absorbed a durable user turn: record its uid (merge witness).
+            record_absorbed_message(carrier, inflight)
+            return compressed
+
+        compressed.append(replay)
+        return compressed
+
+    def _ensure_last_n_user_messages_in_tail(
+        self, messages: List[Dict[str, Any]], cut_idx: int, head_end: int, n: int,
+    ) -> int:
+        """Keep the last N actionable user messages in the tail; n <= 1 delegates to the single-message method.
+
+        Only REAL actionable user turns count toward N — the collector uses the same
+        ``_is_actionable_user_turn`` / ``_is_synthetic_compression_user_turn`` pair as
+        ``_find_last_user_message_idx``, so blank platform echoes, compaction handoffs, continuation
+        markers, and todo-snapshot rows never consume a slot (#69291 bug class).
+        A user message is already a clean boundary — there is no tool_call/result group that spans across
+        it, so ``_align_boundary_backward`` is intentionally NOT called. Calling it can pull the cut past
+        the user message into the preceding assistant(tool_calls)→tool group and split it (#22566).
+        """
+        if n <= 1:
+            return self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
+
+        # A user message is already a clean boundary: deliberately NO _align_boundary_backward
+        # here, it would pull the cut into the preceding tool group and split it.
+        user_indices = self._real_user_indices_desc(messages, head_end)
+        if not user_indices or user_indices[min(n, len(user_indices)) - 1] >= cut_idx:
+            return cut_idx
+        return max(user_indices[min(n, len(user_indices)) - 1], head_end + 1)
+
+    def _find_turn_pair_end(self, messages: List[Dict[str, Any]], user_idx: int) -> int:
+        """Index after the turn-pair (user -> assistant -> tools) at *user_idx*; ``user_idx + 1`` when no reply yet."""
+        idx = user_idx + 1
+        if idx >= len(messages) or messages[idx].get("role") != "assistant":
+            return idx  # no assistant reply immediately following
+        return self._align_boundary_forward(messages, idx + 1)
+
+    def _stale_thinking_on_wire(self) -> bool:
+        """Whether the route replays stale thinking every turn; tail walks and preflight MUST agree or compaction loops."""
+        try:
+            from agent.message_sanitization import stale_thinking_reaches_wire
+            return stale_thinking_reaches_wire(
+                *(getattr(self, attr, "") or "" for attr in ("api_mode", "provider", "model", "base_url"))
+            )
+        except Exception:
+            return False
+
+    def _native_anthropic_budget(self):
+        """Per-message tail budget on a preserved-thinking native Anthropic route, else None. That route
+        replays exactly the projected carriers minus this session's rejected signatures — what the
+        preflight estimate prices — never the canonical ``reasoning`` keys."""
+        from agent.anthropic_thinking_policy import native_anthropic_preserves_prior_thinking
+
+        if (getattr(self, "api_mode", "") or "") != "anthropic_messages" or not native_anthropic_preserves_prior_thinking(
+            getattr(self, "base_url", ""), getattr(self, "model", "")
+        ):
+            return None
+        from agent.anthropic_thinking_replay import session_rejected_thinking, strip_rejected_thinking
+        from agent.message_sanitization import native_anthropic_accounting_projection
+
+        rejected = session_rejected_thinking(self, getattr(self, "_session_db", None), getattr(self, "_session_id", ""))
+
+        def budget(msg: Dict[str, Any]) -> int:
+            request_copy = dict(msg)
+            if rejected:
+                strip_rejected_thinking(request_copy, rejected)
+            (projected,), readable = native_anthropic_accounting_projection([request_copy])
+            return _estimate_msg_budget_tokens(projected) + sum(estimate_tokens_rough(text) for text in readable)
+
+        return budget
+
+    def _find_tail_cut_by_tokens(
+        self, messages: List[Dict[str, Any]], head_end: int, token_budget: int | None = None,
+        *, allow_split_turn: bool = True,
+    ) -> int:
+        """Walk backward accumulating tokens until the budget; return the tail start index.
+        Optional rows are bounded by a 1.5x soft ceiling. Required last-user/last-assistant (and
+        multi-user) anchors and their atomic tool groups may exceed it; tool groups are never split.
+        ``allow_split_turn`` is disabled by rolling micro-compaction, which consumes complete
+        exchanges only; batch/manual compaction enables it so an oversized active turn can progress."""
+        if token_budget is None:
+            token_budget = self.tail_token_budget
+        n = len(messages)
+        # Bounded recent-message floor: protect_last_n is a minimum up to a cap so bulky tool runs
+        # aren't all kept.
+        available_tail = max(0, n - head_end - 1)
+        min_tail_floor = max(3, min(self.protect_last_n, _MAX_TAIL_MESSAGE_FLOOR))
+        # Keep >= 2 non-head messages summarizable so a tiny middle still saves messages.
+        compressible_tail_cap = max(3, available_tail - 2)
+        min_tail = min(min_tail_floor, compressible_tail_cap, available_tail) if available_tail > 1 else 0
+        soft_ceiling = self._tail_soft_ceiling(token_budget)
+        # The count floor is opportunistic: oversized optional rows must not ride it past the token
+        # ceiling (#108647), so the walk runs floorless whenever the ceiling can hold at least the wire
+        # overhead of that many empty rows. Only when it cannot does the continuity floor win — no
+        # token-respecting floor exists then. Required user/assistant anchors and atomic tool groups
+        # are applied below and may still necessarily exceed the ceiling.
+        walk_floor = 0 if soft_ceiling >= min_tail * _estimate_msg_budget_tokens({}) else min_tail
+        cut_idx, accumulated = self._walk_tail_budget(messages, head_end, soft_ceiling, walk_floor, cut_at_break=False)
+        # Whole transcript fits soft_ceiling: re-cut with the raw budget so a worthwhile middle
+        # exists (else #40803 loop).
+        if cut_idx <= head_end and 0 < accumulated <= soft_ceiling:
+            cut_idx, _ = self._walk_tail_budget(messages, head_end, token_budget, min_tail, cut_at_break=True)
+
+        fallback_cut = n - min_tail
+        # The newest row never leaves the tail, whatever its role. When it alone exceeds the ceiling the walk accepts
+        # nothing, and a cut at ``n`` summarised e.g. the pending tool round the model had not read (the split below
+        # then took the whole turn); aligning from ``n - 1`` keeps that row's group whole, as atomic groups may
+        # exceed the ceiling.
+        cut_idx = min(cut_idx, n - max(walk_floor, 1))
+        # Small conversations: force a cut after the head so compression still removes something.
+        if cut_idx <= head_end:
+            cut_idx = max(fallback_cut, head_end + 1)
+        cut_idx = self._align_boundary_backward(messages, cut_idx)
+        # Anchors below keep the most recent user turn (active task, #10896) and the latest visible
+        # assistant reply (#29824) in the tail; each only walks the cut backward, so chaining them is
+        # normally monotonic. One bounded exception: when a single in-progress turn alone exceeds the
+        # soft ceiling, anchoring its opening request retains the whole turn and blows the budget by
+        # design — then the clean tool-group boundary above wins and that request rides the handoff
+        # (#80449). The N-user promise (#70250) is never relaxed.
+        last_user_idx = self._find_last_user_message_idx(messages, head_end)
+        user_anchored_cut = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
+        split_oversized_turn = False
+        # ``user_anchored_cut < cut_idx`` means the anchor found a real user turn strictly inside the
+        # compressible region (see ``_ensure_last_user_message_in_tail``), so ``last_user_idx`` is a
+        # valid index into that region from here on.
+        if (
+            allow_split_turn
+            and user_anchored_cut < cut_idx
+            # The handoff can restate text, but cannot replace an audio, image,
+            # or unknown structured input with its text-only projection.
+            and _is_text_only_content(messages[last_user_idx].get("content"))
+            # A single oversized user message is indivisible and must stay verbatim in the tail; this
+            # exception is only for aggregate turn growth after a normally sized opening request.
+            and _estimate_msg_budget_tokens(messages[last_user_idx]) <= soft_ceiling
+            # The token ceiling is the only size guard: the request is restated verbatim after the
+            # handoff, so a character cap only pinned long requests (e.g. /goal prompts) in place.
+            # Only split when there is real turn body to summarize: if the oversized weight is the
+            # active turn's own newest group, the pre-anchor cut retains it anyway, so taking the
+            # active request out of the tail buys no reclaim and loses the #10896 anchor.
+            and any(messages[i].get("tool_calls") for i in range(last_user_idx, cut_idx))
+            # ...and only when the anchored region really is over the ceiling: a short transcript
+            # (whole session under the budget) anchors for free, so the exception must not fire.
+            # Measured with the walk's own accounting (#84371), not a second thought-charge rule.
+            and self._walk_tail_budget(
+                messages, user_anchored_cut, soft_ceiling, 0, cut_at_break=False
+            )[0] > user_anchored_cut
+        ):
+            split_oversized_turn = True
+            if not self.quiet_mode:
+                logger.debug(
+                    "Active turn exceeds protected-tail soft ceiling; keeping tool-group-aligned "
+                    "mid-turn cut at index %d instead of anchoring user message %d (#80449)",
+                    cut_idx, last_user_idx,
+                )
+        else:
+            cut_idx = user_anchored_cut
+        # An older visible assistant reply can precede the active user turn; under the split above,
+        # pulling back to it would undo the bounded exception.
+        if not split_oversized_turn:
+            asst_anchored_cut = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
+            # The assistant anchor needs the same bound the user anchor got in #80449. In a long
+            # agentic turn whose assistant rows only carry tool_calls (no text reply yet), the
+            # newest text-bearing assistant is the PREVIOUS turn's closer: anchoring to it retains
+            # the whole oversized active turn, the middle collapses to nothing, and the session
+            # wedges in no_progress (#131412). When the anchored region holds tool-call bodies and is
+            # over the soft ceiling, keep the walk's tool-group-aligned cut instead.
+            if (
+                asst_anchored_cut < cut_idx
+                and allow_split_turn
+                and any(messages[i].get("tool_calls") for i in range(asst_anchored_cut, cut_idx))
+                # Priced like the walk (#84371): stale thinking the wire never carries must not trip it.
+                and sum(map(self._tail_row_pricer(messages), range(asst_anchored_cut, cut_idx))) > soft_ceiling
+            ):
+                if not self.quiet_mode:
+                    logger.debug(
+                        "Assistant reply anchor would retain an over-ceiling region; keeping "
+                        "tool-group-aligned cut at index %d instead of anchoring to %d (#131412)",
+                        cut_idx, asst_anchored_cut,
+                    )
+            else:
+                cut_idx = asst_anchored_cut
+
+        # Optional multi-user anchor; n<=1 is gated here (not delegated): re-running the single-user anchor after
+        # the assistant anchor could re-trigger its forward turn-pair push. Runs even under the split: the
+        # N-user promise (#70250) is a user-facing setting and must outrank the budget, so it pulls the cut
+        # back to the Nth user turn — which is why the split only ever relaxes the single-user anchor.
+        # getattr: plugin engines and __new__ doubles skip __init__.
+        _min_tail_users = getattr(self, "min_tail_user_messages", 1)
+        if isinstance(_min_tail_users, int) and not isinstance(_min_tail_users, bool) and _min_tail_users > 1:
+            cut_idx = self._ensure_last_n_user_messages_in_tail(messages, cut_idx, head_end, _min_tail_users)
+
+        # Floor guarantees progress (>= 1 message claimed); re-align FORWARD only so a raised cut
+        # can't split a tool group (backward would give the floor's message back).
+        return min(n, self._align_boundary_forward(messages, max(cut_idx, head_end + 1)))
+
+    def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
+        """True if a non-empty middle region exists (lets the gateway ``/compress`` guard skip the LLM call)."""
+        compress_start = self._align_boundary_forward(messages, self._protect_head_size(messages))
+        compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+        return compress_start < compress_end
+
+    def _scan_window_handoffs(
+        self, messages: List[Dict[str, Any]], compress_start: int, compress_end: int,
+        turns_to_summarize: List[Dict[str, Any]],
+    ) -> "_HandoffScan":
+        """Rehydrate ``_previous_summary`` / user-turn provenance from in-transcript handoffs.
+        Handoff rows are removed from the summarizer window (merged handoffs unwrap to their prior-tail
+        content) and ``tail_start`` advances past a handoff beyond the window. The pre-scan state is
+        captured so an aborted attempt can roll the mutation back (#57835)."""
+        scan = _HandoffScan(
+            turns_to_summarize=turns_to_summarize, summary_indices=set(), tail_start=compress_end,
+            # Snapshot so an aborted attempt can roll back the self-heal mutation (#57835).
+            previous_summary_before=self._previous_summary,
+            has_user_turn_before=getattr(self, "_summary_has_user_turn", None),
+        )
+        # Always scan the full transcript for handoffs: a narrow scan could hide a same-session
+        # handoff and wrongly trigger the cross-session discard (#57835, #83248).
+        summary_search_start = 1 if messages and messages[0].get("role") == "system" else 0
+        summary_hits = self._find_context_summaries(messages, summary_search_start, len(messages))
+        real_user_present = self._transcript_has_real_user_turn(messages)
+        if not summary_hits:
+            # No handoff anywhere but _previous_summary is set: it came from another session —
+            # discard. Never decide this from a compress_end-bounded miss (#83248).
+            if self._previous_summary:
+                self._previous_summary = None
+            self._summary_has_user_turn = real_user_present
+            return scan
+
+        summary_idx, summary_body = summary_hits[-1]
+        if not self._previous_summary:
+            self._previous_summary = "\n\n".join(body for _, body in summary_hits if body) or self._previous_summary
+        # Zero-user provenance (#64650) rides on the newest handoff hit.
+        provenance = messages[summary_idx].get(COMPRESSED_SUMMARY_HAS_USER_TURN_KEY)
+        if real_user_present:
+            self._summary_has_user_turn = True
+        elif isinstance(provenance, bool):
+            self._summary_has_user_turn = provenance
+        elif self._summary_has_user_turn is None:
+            # Legacy handoffs lack provenance: assume a user turn unless the exact no-user sentinel is present.
+            self._summary_has_user_turn = not (summary_body and _NO_USER_TASK_SENTINEL in summary_body)
+        scan.summary_indices = {idx for idx, _ in summary_hits}
+
+        # Summary rows are excluded from summarizer input, but a merged handoff carries genuine
+        # prior-tail user content — unwrap it into the window (#47274); standalone ones drop (None).
+        # The newest hit (summary_idx) may itself be a merged handoff — recover its prior tail too.
+        def _window_row(idx: int, msg: Dict[str, Any]):
+            if idx not in scan.summary_indices:
+                return msg
+            return self._strip_context_summary_handoff_message(_fresh_compaction_message_copy(msg))
+
+        window = [_window_row(idx, msg) for idx, msg in enumerate(messages[compress_start:summary_idx], start=compress_start)]
+        window.append(_window_row(summary_idx, messages[summary_idx]))
+        scan.turns_to_summarize = [row for row in window if row is not None] + messages[summary_idx + 1:compress_end]
+        if summary_idx >= compress_end:
+            scan.tail_start = summary_idx + 1
+        return scan
+
+    def _begin_compress_attempt(self, current_tokens: Optional[int], force: bool) -> Dict[str, Any]:
+        """Reset per-call result state (callers read it after compress()) and open telemetry."""
+        self._last_summary_dropped_co

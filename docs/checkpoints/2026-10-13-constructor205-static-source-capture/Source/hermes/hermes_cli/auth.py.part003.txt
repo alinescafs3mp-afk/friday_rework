@@ -1,0 +1,152 @@
+ess"}
+
+
+# ── CLI Commands — login / logout ───────────────────────────────────────────────────────────────────
+
+def _update_config_for_provider(
+    provider_id: str, inference_base_url: str, default_model: Optional[str] = None,
+    *, clear_default: bool = False) -> Path:
+    """Update config.yaml and auth.json to reflect the active provider.
+
+    *default_model*, when given, is written as ``model.default`` in the same step so the gateway
+    (which re-reads config per message) can't pick up the new provider before model selection
+    finishes and send an OpenRouter-style ``vendor/model`` name to a direct API. *clear_default*
+    removes ``model.default`` in that same write, for a caller that has no model to offer and must
+    not leave the previous provider's model paired with the new host."""
+    with _auth_store_lock():  # so auto-resolution picks this provider
+        auth_store = _load_auth_store()
+        auth_store["active_provider"] = provider_id
+        _save_auth_store(auth_store)
+
+    config_path = get_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    require_readable_config_before_write(config_path)
+    config = read_raw_config()
+    current_model = config.get("model")
+    if isinstance(current_model, dict):
+        model_cfg = dict(current_model)
+    else:
+        model_cfg = {"default": current_model.strip()} if _nonempty_str(current_model) else {}
+    model_cfg["provider"] = provider_id
+    if inference_base_url and inference_base_url.strip():
+        model_cfg["base_url"] = inference_base_url.rstrip("/")
+    else:
+        model_cfg.pop("base_url", None)  # clear stale base_url when switching providers
+
+    # Built-in providers resolve credentials from env/auth state, not inline model.api_key left
+    # over from a previous custom provider.
+    from hermes_cli.config import clear_model_endpoint_credentials
+    clear_model_endpoint_credentials(model_cfg)
+
+    # An OpenRouter-formatted default like "anthropic/claude-opus-4.6" fails on direct-API
+    # providers.
+    if default_model:
+        cur_default = model_cfg.get("default", "")
+        if not cur_default or "/" in cur_default:
+            model_cfg["default"] = default_model
+    elif clear_default:
+        model_cfg.pop("default", None)
+    config["model"] = model_cfg
+    atomic_config_replace(config_path, config)
+    return config_path
+
+
+def _get_config_provider() -> Optional[str]:
+    """Return model.provider from config.yaml, normalized, if present."""
+    try:
+        config = read_raw_config()
+    except Exception:
+        return None
+    model = config.get("model") if config else None
+    provider = model.get("provider") if isinstance(model, dict) else None
+    return (provider.strip().lower() or None) if isinstance(provider, str) else None
+
+
+def _should_reset_config_provider_on_logout(provider_id: Optional[str]) -> bool:
+    """True when logout should reset model.provider (a registry provider config.yaml selects)."""
+    normalized = (provider_id or "").strip().lower()
+    return normalized in PROVIDER_REGISTRY and _get_config_provider() == normalized
+
+
+def _logout_default_provider_from_config() -> Optional[str]:
+    """Fallback logout target when auth.json has no active provider but config.yaml still selects an
+    OAuth provider (e.g. openai-codex) — otherwise logout said "No provider is currently logged in"
+    and never reset model.provider."""
+    provider = _get_config_provider()
+    flow = OAUTH_PROVIDER_FLOWS.get(provider or "")
+    return provider if flow and flow.logout_from_config else None
+
+
+def _reset_config_provider() -> Path:
+    """Reset config.yaml provider back to auto after logout."""
+    config_path = get_config_path()
+    if not config_path.exists():
+        return config_path
+    require_readable_config_before_write(config_path)
+    config = read_raw_config()
+    if not config:
+        return config_path
+    model = config.get("model")
+    if isinstance(model, dict):
+        model["provider"] = "auto"
+        if "base_url" in model:
+            model["base_url"] = OPENROUTER_BASE_URL
+    atomic_config_replace(config_path, config)
+    return config_path
+
+
+def login_command(args) -> None:
+    """Deprecated: use 'hermes model' or 'hermes setup' instead."""
+    print("The 'hermes login' command has been removed.\nUse 'hermes auth' to manage credentials,\n"
+          "'hermes model' to select a provider, or 'hermes setup' for full setup.")
+    raise SystemExit(0)
+
+
+def get_minimax_oauth_auth_status() -> Dict[str, Any]:
+    """Return auth status dict for MiniMax OAuth provider."""
+    state = get_provider_auth_state("minimax-oauth")
+    if not state or not state.get("access_token"):
+        return {"logged_in": False, "provider": "minimax-oauth"}
+    try:
+        token_valid = datetime.fromisoformat(state.get("expires_at", "")).timestamp() > time.time()
+    except Exception:
+        token_valid = True  # access_token is known non-empty here
+    return {
+        "logged_in": token_valid, "provider": "minimax-oauth",
+        "region": state.get("region", "global"), "expires_at": state.get("expires_at")}
+
+
+def logout_command(args) -> None:
+    """Clear auth state for a provider."""
+    provider_id = getattr(args, "provider", None)
+    if provider_id and not is_known_auth_provider(provider_id):
+        print(f"Unknown provider: {provider_id}")
+        raise SystemExit(1)
+    target = provider_id or get_active_provider() or _logout_default_provider_from_config()
+    if not target:
+        print("No provider is currently logged in.")
+        return
+    if target == "nous":
+        from hermes_cli.anon_auth import FREE_TIER_NOT_SIGNED_IN, is_guest_state
+        if is_guest_state(get_provider_auth_state("nous")):
+            # Free tier is not a login; there is nothing to log out of and nothing is cleared.
+            print(FREE_TIER_NOT_SIGNED_IN)
+            return
+    should_reset_config = _should_reset_config_provider_on_logout(target)
+    provider_name = get_auth_provider_display_name(target)
+    if not (clear_provider_auth(target) or should_reset_config):
+        print(f"No auth state found for {provider_name}.")
+        return
+    if target == "nous":
+        # A profile logout must not be re-adopted from the cross-profile store on the next boot.
+        from hermes_cli.auth_nous import _clear_shared_nous_state
+        _clear_shared_nous_state("logout")
+    if should_reset_config:
+        _reset_config_provider()
+    print(f"Logged out of {provider_name}.")
+    if not should_reset_config:
+        print("Model provider configuration was unchanged.")
+    elif os.getenv("OPENROUTER_API_KEY"):
+        print("Hermes will use OpenRouter for inference.")
+    else:
+        print("Run `hermes model` or configure an API key to use Hermes.")

@@ -1,0 +1,1264 @@
+"""Shared auxiliary client router for side tasks (compression, search, vision, ...).
+
+Text auto chain: main provider+model → OpenRouter → Nous Portal → custom endpoint →
+native Anthropic → direct API-key providers → None. Vision auto chain: main
+provider (if a supported vision backend) → OpenRouter → Nous → Anthropic → custom.
+``auxiliary.free_only`` restricts the OpenRouter lane to ``:free`` SKUs. Codex OAuth is
+in neither chain (undocumented, shifting allow-list): main provider or explicit
+``auxiliary.<task>.provider`` only. HTTP 402 in call_llm() falls through the chain.
+"""
+
+import contextlib
+from agent.bounded_context import physical_aux_create
+import contextvars
+import functools
+import hashlib
+import inspect
+import json
+import logging
+import os
+import re
+import threading
+import time
+import uuid
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING, Union
+from urllib.parse import urlparse, parse_qs, urlunparse
+
+from agent.error_classifier import (
+    _BILLING_PATTERNS,
+    _OVERLOADED_PATTERNS,
+    UNSUPPORTED_PARAM_MARKERS,
+    is_reasoning_field_rejection,
+    is_reasoning_required_rejection,
+)
+from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
+from agent.auxiliary_structured_output import remember_structured_output_rejection
+from agent.codex_headers import (
+    CODEX_AUX_BASE_URL as _CODEX_AUX_BASE_URL,
+    apply_required_codex_headers as _apply_required_codex_headers,
+    codex_cloudflare_headers as _codex_cloudflare_headers,
+    is_official_codex_base_url as _is_official_codex_base_url,
+)
+from agent.codex_runtime import _codex_event_has_content
+from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
+
+# `openai.OpenAI` is imported lazily (~240 ms cold); `OpenAI` below is a proxy
+# so in-module calls, `auxiliary_client.OpenAI` reads and
+# `patch("agent.auxiliary_client.OpenAI")` all keep working.
+if TYPE_CHECKING:
+    from openai import OpenAI  # noqa: F401 — type hints only
+
+_OPENAI_CLS_CACHE: Optional[type] = None
+
+
+def _load_openai_cls() -> type:
+    """Import and cache ``openai.OpenAI``."""
+    global _OPENAI_CLS_CACHE
+    if _OPENAI_CLS_CACHE is None:
+        from openai import OpenAI as _cls
+        _OPENAI_CLS_CACHE = _cls
+    return _OPENAI_CLS_CACHE
+
+
+class _OpenAIProxy:
+    """Lazy stand-in for ``openai.OpenAI``: forwards calls and isinstance checks, importing on first use."""
+    __slots__ = ()
+
+    def __call__(self, *args, **kwargs):
+        from hermes_cli.friday_credential_admission import sdk_class
+        return sdk_class(_load_openai_cls())(*args, **kwargs)
+
+    def __instancecheck__(self, obj):
+        return isinstance(obj, _load_openai_cls())
+
+    def __repr__(self):
+        return "<lazy openai.OpenAI proxy>"
+
+
+OpenAI = _OpenAIProxy()
+
+
+# Availability probe mode: check_fns only need to know whether a client is RESOLVABLE, so
+# inside `aux_probe_mode()` constructors return a stub instead of importing openai + building
+# httpx/SSL (~0.3s on CLI startup). Stubs are never cached (see _store_cached_client).
+_aux_probe_state = threading.local()
+
+
+class _AuxProbeClientStub:
+    """Non-functional placeholder returned while `aux_probe_mode` is active."""
+    __slots__ = ("api_key", "base_url")
+
+    def __init__(self, api_key: str = "", base_url: str = "") -> None:
+        self.api_key = api_key
+        self.base_url = base_url
+
+    def __getattr__(self, name: str) -> Any:
+        # Loud failure if a probe stub ever leaks into a runtime call path.
+        raise RuntimeError(
+            f"_AuxProbeClientStub used as a real client (attribute {name!r}); "
+            "aux_probe_mode is for availability checks only")
+
+    def __repr__(self) -> str:
+        return "<aux availability-probe client stub>"
+
+
+def _aux_probe_active() -> bool:
+    return bool(getattr(_aux_probe_state, "active", False))
+
+
+@contextlib.contextmanager
+def aux_probe_mode():
+    """Resolve provider availability without constructing real SDK clients."""
+    prev = getattr(_aux_probe_state, "active", False)
+    _aux_probe_state.active = True
+    try:
+        yield
+    finally:
+        _aux_probe_state.active = prev
+
+
+from agent.credential_pool import load_pool
+from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
+from hermes_cli.config import get_hermes_home
+from hermes_cli.config_providers import _canonical_api_mode
+from agent.auxiliary_health import (
+    _custom_health_base_url, _unhealthy_cache_key, fallback_candidate_quarantine_ttl,
+    fallback_candidate_unavailable_reason,
+)
+from agent.auxiliary_unavailable import (
+    AuxiliaryClientUnavailable, clear_nous_credential_failure, missing_provider_credentials_message,
+    nous_credential_failure_detail, record_nous_credential_failure)
+from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key
+from utils import base_url_host_matches, base_url_hostname, base_url_origin, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
+
+logger = logging.getLogger(__name__)
+
+
+# resolve_provider_client fall-through dedup: misconfigured-provider warnings fire on every
+# retry, so only the first per process surfaces. Separate sets let tests clear each branch.
+_LOGGED_UNKNOWN_PROVIDER_KEYS: set = set()
+_LOGGED_UNHANDLED_AUTHTYPE_KEYS: set = set()
+_LOGGED_UNSUPPORTED_EXTPROC_KEYS: set = set()
+_LOGGED_UNSUPPORTED_OAUTH_KEYS: set = set()
+
+
+def _resolve_aux_verify(base_url: Optional[str]) -> Any:
+    """httpx ``verify`` for an aux base_url, mirroring the main client (per-provider ``ssl_ca_cert`` /
+    ``ssl_verify``; otherwise the OS trust store); any failure → httpx default (``True``)."""
+    try:
+        from agent.ssl_verify import resolve_httpx_verify
+        from hermes_cli.config import get_custom_provider_tls_settings, load_config_readonly
+        tls = get_custom_provider_tls_settings(str(base_url or ""), config=load_config_readonly())
+        return resolve_httpx_verify(
+            ca_bundle=tls.get("ssl_ca_cert"), ssl_verify=tls.get("ssl_verify"), base_url=str(base_url or ""))
+    except Exception:
+        return True
+
+
+_WARNED_KEEPALIVE_IMPORT_SKEW = False
+
+
+def _openai_http_client_kwargs(base_url: Optional[str], *, async_mode: bool = False) -> Dict[str, Any]:
+    """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
+    try:
+        from agent.process_bootstrap import build_keepalive_http_client
+        client = build_keepalive_http_client(
+            str(base_url or ""), async_mode=async_mode, verify=_resolve_aux_verify(base_url))
+    except (ImportError, AttributeError):
+        # Version-skewed install (Desktop runtime lagging a git tree) lacks this helper:
+        # degrade to the SDK default httpx client rather than kill the job; warn once.
+        global _WARNED_KEEPALIVE_IMPORT_SKEW
+        if not _WARNED_KEEPALIVE_IMPORT_SKEW:
+            _WARNED_KEEPALIVE_IMPORT_SKEW = True
+            logger.warning(
+                "agent.process_bootstrap.build_keepalive_http_client is "
+                "unavailable — mixed/stale install detected (#64333). Falling "
+                "back to the SDK default HTTP client. Run `hermes update` (or "
+                "reinstall the Desktop app) to resync the runtime.")
+        client = None
+    return {"http_client": client} if client is not None else {}
+
+
+def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
+    if _aux_probe_active():
+        # Availability probe: resolved credentials/base_url are the answer.
+        return _AuxProbeClientStub(api_key=api_key, base_url=base_url)
+    kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
+    _apply_required_codex_headers(kwargs, access_token=api_key, base_url=base_url)
+    # Hermes owns aux retry/fallback policy; the SDK default (max_retries=2) would triple
+    # wall time on a hung endpoint before Hermes sees one failure.
+    # Hermes owns auxiliary retry + provider/model fallback policy (the same-provider transient retry in
+    # call_llm plus the except-chain fallback). The OpenAI SDK's own default (max_retries=2 → up to 3
+    # attempts) silently multiplies the effective wall time of every aux call by 3× on a slow/hung endpoint,
+    # so a 120s timeout can stall ~360s before Hermes sees a single failure (issue #54465). Disable
+    # SDK-internal retries by default and let Hermes control the budget; explicit callers can still override
+    # via kwargs.
+    kwargs.setdefault("max_retries", 0)
+    return OpenAI(api_key=api_key, base_url=base_url, **kwargs)
+
+
+# Interrupt protection for atomic aux tasks: a compression summary killed by an ordinary
+# gateway interrupt degrades to a static marker, so a thread-local flag marks such calls
+# protected. Explicit host cancel (Ctrl+C, /stop) still overrides it, timeouts still fire.
+# ── Interrupt protection for atomic auxiliary tasks ────────────────────── Some auxiliary tasks must NOT be
+# aborted mid-flight by a gateway interrupt (e.g. an incoming user message while the agent is busy). Context
+# compression is the prime case: if the summary LLM call is interrupted part-way, compression falls back to
+# a static "summary unavailable" marker and the real handoff is lost (#23975). A thread-local flag lets such
+# a task mark its in-flight LLM call as interrupt-protected; the Codex Responses stream's cancellation check
+# honors it. TIMEOUTS still fire (a hung call must die), and all OTHER aux tasks (vision, web_extract,
+# title_generation, …) remain freely interruptible.
+_aux_interrupt_protection = threading.local()
+
+
+class AuxiliaryExplicitCancellation(BaseException):
+    """Frozen signal that an auxiliary attempt was explicitly hard-cancelled. ``BaseException`` so broad
+    ``except Exception`` retry/fallback code never treats a host stop as a transport failure; ``cause``
+    is immutable class data so nothing re-queries a mutable host Event after the transport unwound."""
+    cause = "explicit_host_cancel"
+
+    def __init__(self) -> None:
+        super().__init__("auxiliary request explicitly cancelled by host")
+
+
+def _aux_interrupt_protected() -> bool:
+    return bool(getattr(_aux_interrupt_protection, "active", False))
+
+
+def _aux_interrupt_cancel_requested() -> bool:
+    """Return whether an explicit host cancel overrides aux protection."""
+    check = _capture_aux_cancel_check()
+    return _captured_aux_cancel_requested(check) if check is not None else False
+
+
+@contextlib.contextmanager
+def aux_interrupt_protection(active: bool = True, cancel_check=None, cancel_event=None):
+    """Mark this thread's aux LLM call interrupt-protected (re-entrant-safe). ``cancel_check`` /
+    ``cancel_event`` keep an explicit host hard-cancel path (Event preferred); nested scopes inherit both."""
+    prev = getattr(_aux_interrupt_protection, "active", False)
+    prev_cancel_check = getattr(_aux_interrupt_protection, "cancel_check", None)
+    prev_cancel_event = getattr(_aux_interrupt_protection, "cancel_event", None)
+    _aux_interrupt_protection.active = active
+    if callable(cancel_check):
+        _aux_interrupt_protection.cancel_check = cancel_check
+    if cancel_event is not None and callable(getattr(cancel_event, "is_set", None)):
+        _aux_interrupt_protection.cancel_event = cancel_event
+    try:
+        yield
+    finally:
+        _aux_interrupt_protection.active = prev
+        _aux_interrupt_protection.cancel_check = prev_cancel_check
+        _aux_interrupt_protection.cancel_event = prev_cancel_event
+
+
+def _capture_aux_cancel_check() -> Optional[Callable[[], Any]]:
+    """Capture the current explicit-cancel source on the owning request thread."""
+    is_set = getattr(getattr(_aux_interrupt_protection, "cancel_event", None), "is_set", None)
+    if callable(is_set):
+        return is_set
+    # Return the callable itself so attempt-local decision objects keep begin_timeout_cleanup().
+    check = getattr(_aux_interrupt_protection, "cancel_check", None)
+    return check if callable(check) else None
+
+
+def _captured_aux_cancel_requested(cancel_check: Callable[[], Any]) -> bool:
+    """Read a request-thread cancellation source without leaking its failures."""
+    try:
+        return bool(cancel_check())
+    except Exception:
+        logger.debug("captured aux cancel check failed", exc_info=True)
+        return False
+
+
+class _AuxiliaryCancellationDecision:
+    """Atomically choose explicit cancellation or provider timeout per attempt."""
+
+    def __init__(self, source_cancel_check: Callable[[], Any]) -> None:
+        self._source_cancel_check = source_cancel_check
+        self._lock = threading.Lock()
+        self._outcome = "active"
+
+    def __call__(self) -> bool:
+        with self._lock:
+            if self._outcome == "active" and _captured_aux_cancel_requested(self._source_cancel_check):
+                self._outcome = "cancelled"
+            return self._outcome == "cancelled"
+
+    def begin_timeout_cleanup(self) -> bool:
+        """Return whether timeout won and destructive cleanup is permitted."""
+        with self._lock:
+            if self._outcome == "active":
+                cancelled = _captured_aux_cancel_requested(self._source_cancel_check)
+                self._outcome = "cancelled" if cancelled else "timed_out"
+            return self._outcome == "timed_out"
+
+
+# Forward-progress hooks for streamed aux calls: a fixed host deadline kills a SLOW model
+# streaming a big summary as hard as a HUNG one, so wire consumers tick the progress hook only
+# for non-empty payloads and the host extends its deadline while tokens move. Thread-local:
+# the call and its stream consumption run on the installing thread.
+_aux_progress = threading.local()
+_aux_dispatch = threading.local()
+_aux_provider_response = threading.local()
+# Absolute monotonic deadline of the waiting HOST. The stream's own ceiling
+# (_aux_stream_total_ceiling, >= the host's and started later) would otherwise leave an
+# orphaned stream still billing after every host-ceiling timeout.
+# Absolute wall-clock deadline (time.monotonic) of the HOST waiting for this auxiliary call, when it has one
+# (#99692). Liveness alone is not enough: a host also stops waiting at its own total ceiling, and the
+# streamed consumer below bounds itself only by _aux_stream_total_ceiling() — a budget derived from the aux
+# request timeout, which is >= the host ceiling for every configured value AND starts counting later. So the
+# stream that outlives its abandoned host is not an edge case; it is the guaranteed outcome of every
+# total-ceiling timeout.
+_aux_stream_deadline = threading.local()
+
+
+def _tick_hook(local: threading.local, label: str) -> None:
+    """Call the thread-local hook installed on ``local``, if any. Never raises."""
+    hook = getattr(local, "hook", None)
+    if hook is None:
+        return
+    try:
+        hook()
+    except Exception:
+        logger.debug("aux %s hook failed", label, exc_info=True)
+
+
+def _notify_aux_progress() -> None:
+    """Tick the installed forward-progress hook, if any."""
+    _tick_hook(_aux_progress, "progress")
+
+
+def _notify_aux_dispatch() -> None:
+    """Record an actual provider dispatch without claiming response progress."""
+    _tick_hook(_aux_dispatch, "dispatch")
+
+
+def _notify_aux_timing_response() -> None:
+    """Record a content-free frame (keepalive/empty delta): counts toward
+    ``time_to_first_progress_ms`` but must not reset a compression inactivity fence."""
+    _tick_hook(_aux_provider_response, "provider response")
+
+
+def _notify_aux_provider_response() -> None:
+    """Record a provider response/chunk, then preserve the liveness signal."""
+    _notify_aux_timing_response()
+    _notify_aux_progress()
+
+
+def _aux_progress_active() -> bool:
+    return getattr(_aux_progress, "hook", None) is not None
+
+
+def _field(obj: Any, key: str, default: Any = None) -> Any:
+    """Field access for wire objects that may be dicts or SDK/SimpleNamespace objects."""
+    val = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+    return default if val is None else val
+
+
+def _anthropic_event_has_content(event: Any) -> bool:
+    """Whether an Anthropic stream event carries a non-empty payload."""
+    event_type = _field(event, "type")
+    if event_type == "content_block_delta":
+        delta = _field(event, "delta")
+        return any(bool(_field(delta, f)) for f in ("text", "thinking", "partial_json", "signature", "citation"))
+    if event_type == "content_block_start":
+        block = _field(event, "content_block")
+        return _field(block, "type") == "tool_use" and any(bool(_field(block, f)) for f in ("id", "name"))
+    return False
+
+
+def _anthropic_aux_stream_event_hook() -> Callable[[Any], None]:
+    """Per-event callback for the Anthropic aux wire: progress only for substantive payloads
+    (keepalives must not keep a stalled summary alive), stop at the host deadline or explicit
+    cancel. The ``TimeoutError`` text must say "timed out" so ``_is_timeout_error`` classifies it."""
+    host_deadline = _current_aux_stream_deadline()
+    started = time.monotonic()
+
+    def _on_event(event: Any) -> None:
+        if _anthropic_event_has_content(event):
+            _notify_aux_provider_response()
+        else:
+            _notify_aux_timing_response()
+        if _aux_interrupt_cancel_requested():
+            raise AuxiliaryExplicitCancellation()
+        if host_deadline is not None and time.monotonic() >= host_deadline:
+            raise TimeoutError(
+                "Anthropic auxiliary stream timed out at the host compression "
+                f"deadline after {time.monotonic() - started:.0f}s (the caller already stopped waiting)")
+
+    return _on_event
+
+
+# A dead stream fails at the no-progress window (first token AND between tokens); a live
+# stream re-arms per event, bounded by _aux_stream_total_ceiling().
+_AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS = 60.0
+
+
+@contextlib.contextmanager
+def _aux_thread_local_hook(local: threading.local, hook):
+    """Install one thread-local hook, restoring the prior on exit (non-callable = passthrough)."""
+    previous = getattr(local, "hook", None)
+    local.hook = hook if callable(hook) else previous
+    try:
+        yield
+    finally:
+        local.hook = previous
+
+
+@contextlib.contextmanager
+def aux_progress_hook(hook):
+    """Install *hook* as the current thread's aux forward-progress callback (None = passthrough)."""
+    with _aux_thread_local_hook(_aux_progress, hook):
+        yield
+
+
+def _current_aux_stream_deadline() -> Optional[float]:
+    """The waiting host's absolute monotonic deadline, if one is installed."""
+    return getattr(_aux_stream_deadline, "value", None)
+
+
+@contextlib.contextmanager
+def aux_stream_deadline(deadline: Optional[float]):
+    """Publish the host's absolute ``time.monotonic()`` deadline to the stream consumer.
+
+    ``None`` is a passthrough; re-entrant-safe. Host->worker return leg of the progress hook:
+    without it the isolated provider daemon streams to its own ceiling after the host stopped
+    waiting, billing a summary the commit fence refuses.
+
+    ``8207862212`` releases the compression OWNER when the fence is cancelled, but the isolated provider
+    daemon (:func:`_run_protected_sync_provider_call`) that holds the socket keeps streaming to its own
+    ``_aux_stream_total_ceiling`` budget — >= the host's ceiling by construction — billing an abandoned
+    summary the commit fence is already guaranteed to refuse, and stacking one fresh orphan per turn on a
+    session that compression never managed to shrink. See #99692.
+    """
+    previous = getattr(_aux_stream_deadline, "value", None)
+    _aux_stream_deadline.value = deadline if isinstance(deadline, (int, float)) else previous
+    try:
+        yield
+    finally:
+        _aux_stream_deadline.value = previous
+
+
+def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any], kwargs: dict[str, Any]) -> Any:
+    """Run one protected provider callback in an attempt-isolated daemon thread.
+
+    Aux clients are process-shared and cannot be closed to wake one request, so the callback (incl.
+    stream aggregation) runs in a daemon while the owner polls cancellation; on cancel the owner
+    unwinds at once and the daemon finishes under the provider timeout in ``kwargs`` (it owns no
+    transcript/commit state, never holds the session lock). Unprotected / no cancel source: direct.
+    """
+    source_cancel_check = _capture_aux_cancel_check()
+    if not _aux_interrupt_protected() or not callable(source_cancel_check):
+        return callback(kwargs)
+    # One linearized outcome per attempt: the host Event is reused/cleared on later turns and
+    # the Codex timeout Timer may race owner polling — same lock for both.
+    cancel_check = _AuxiliaryCancellationDecision(source_cancel_check)
+    if cancel_check():
+        raise AuxiliaryExplicitCancellation()
+    # Thread-locals do not cross into the daemon: timing hooks fire from the thread running
+    # the callback, and the host deadline is inert unless carried along.
+    progress_hook = getattr(_aux_progress, "hook", None)
+    dispatch_hook = getattr(_aux_dispatch, "hook", None)
+    provider_response_hook = getattr(_aux_provider_response, "hook", None)
+    host_deadline = _current_aux_stream_deadline()
+    # #99692: the stream is consumed on the daemon below, and thread-locals do not cross that boundary — an
+    # owner-thread-only deadline would leave the fix inert on exactly the path large-session compression
+    # takes (protected call + hard-cancel source installed).
+    provider_context = contextvars.copy_context()
+    done = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def _provider_worker() -> None:
+        try:
+            with (
+                aux_progress_hook(progress_hook),
+                _aux_thread_local_hook(_aux_dispatch, dispatch_hook),
+                _aux_thread_local_hook(_aux_provider_response, provider_response_hook),
+                aux_stream_deadline(host_deadline),
+                aux_interrupt_protection(cancel_check=cancel_check),
+            ):
+                outcome["result"] = callback(kwargs)
+        except BaseException as exc:
+            outcome["exception"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(
+        target=provider_context.run, args=(_provider_worker,), name="hermes-protected-aux-provider",
+        daemon=True).start()
+    while True:
+        # Check cancel before AND after each wait so it wins when result publication and the
+        # host Event land in the same polling interval.
+        if _captured_aux_cancel_requested(cancel_check):
+            raise AuxiliaryExplicitCancellation()
+        if not done.wait(0.02):
+            continue
+        if _captured_aux_cancel_requested(cancel_check):
+            raise AuxiliaryExplicitCancellation()
+        exception = outcome.get("exception")
+        if exception is not None:
+            raise exception
+        return outcome.get("result")
+
+
+def _client_declares(client_obj: Any, flag: str) -> bool:
+    """Whether ``client_obj`` (or its class) sets ``flag`` truthy; absent → False. Capability declaration,
+    not isinstance, so out-of-tree clients can opt out of wrappers unimported (cf. SUPPORTS_HERMES_TOOL_CALLS)."""
+    try:
+        return bool(getattr(client_obj, flag, False))
+    except Exception:
+        return False
+
+
+def _safe_isinstance(obj: Any, maybe_type: Any) -> bool:
+    """Return False instead of raising when a patched symbol is not a type."""
+    try:
+        return isinstance(obj, maybe_type)
+    except TypeError:
+        return False
+
+
+def _extract_url_query_params(url: str):
+    """Extract query params from URL, return (clean_url, default_query dict or None)."""
+    parsed = urlparse(url)
+    if parsed.query:
+        return urlunparse(parsed._replace(query="")), {k: v[0] for k, v in parse_qs(parsed.query).items()}
+    return url, None
+
+
+# Warn only once per process about stale OPENAI_BASE_URL.
+_stale_base_url_warned = False
+
+# Local OpenAI-compatible servers (Ollama, vLLM, llama.cpp) route through the generic custom
+# provider — mirrors hermes_cli.auth._PROVIDER_ALIASES. Without this group an explicit
+# ``provider: ollama`` aux lane matches no registry entry and raises a misleading
+# ``OLLAMA_API_KEY`` error instead of using the lane's base_url (#106010).
+_LOCAL_SERVER_ALIASES = {
+    "ollama": "custom", "vllm": "custom", "llamacpp": "custom",
+    "llama.cpp": "custom", "llama-cpp": "custom",
+}
+
+_ALIAS_TABLE: Optional[Dict[str, str]] = None
+
+
+def _provider_alias_table() -> Dict[str, str]:
+    """The same alias table the main provider path resolves against (hermes_cli.auth).
+
+    A hand-copied mirror here rots silently every time auth grows a family — the local
+    servers (#106010) and the OpenCode entries were both missed that way. Local-server
+    names stay pinned on top: that set doubles as the guard for the /v1 tail and the
+    no-key-borrow rule in the custom branch below.
+    """
+    global _ALIAS_TABLE
+    if _ALIAS_TABLE is None:
+        merged: Dict[str, str] = dict(_LOCAL_SERVER_ALIASES)
+        with contextlib.suppress(Exception):
+            from hermes_cli.auth import _PROVIDER_ALIASES as _auth_table
+            merged.update(_auth_table)
+        _ALIAS_TABLE = merged
+    return _ALIAS_TABLE
+
+def _normalize_aux_provider(provider: Optional[str]) -> str:
+    normalized = (provider or "auto").strip().lower()
+    if normalized.startswith("custom:"):
+        suffix = normalized.split(":", 1)[1].strip()
+        if not suffix:
+            return "custom"
+        normalized = suffix
+    if normalized == "codex":
+        return "openai-codex"
+    if normalized == "main":
+        # Resolve to the actual main provider so named custom providers work.
+        main_prov = (_read_main_provider() or "").strip().lower()
+        if not main_prov or main_prov in {"auto", "main"}:
+            return "custom"
+        normalized = main_prov
+    return _provider_alias_table().get(normalized, normalized)
+
+
+# Sentinel from _fixed_temperature_for_model(): callers strip ``temperature`` entirely.
+# Kimi/Moonshot manage it server-side — any value can conflict with gateway mode selection.
+OMIT_TEMPERATURE: object = object()
+
+
+def _bare_model(model: Optional[str]) -> str:
+    """Lowercased model slug with any ``vendor/`` prefix stripped."""
+    return (model or "").strip().lower().rsplit("/", 1)[-1]
+
+
+def _is_kimi_model(model: Optional[str]) -> bool:
+    """True for any Kimi / Moonshot model that manages temperature server-side."""
+    bare = _bare_model(model)
+    return bare.startswith("kimi-") or bare == "kimi"
+
+
+def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
+    """True for Arcee Trinity Large Thinking (direct or via OpenRouter)."""
+    return _bare_model(model) == "trinity-large-thinking"
+
+
+# Codex OAuth hard-caps gpt-5.4/5.5/5.6 and gpt-6 Astra at 272K (raw API/OpenRouter expose 1.05M);
+# the default 50% trigger would compact at ~136K, so raise to 85% (~231K).
+_CODEX_GPT54_GPT55_COMPACTION_THRESHOLD = 0.85
+# gpt-5.3-codex-spark: Codex-OAuth-only, native 128K; 70% (~90K) leaves summary headroom.
+_CODEX_SPARK_COMPACTION_THRESHOLD = 0.70
+
+
+def _is_codex_gpt54_or_gpt55(model: Optional[str], provider: Optional[str] = None) -> bool:
+    """True for gpt-5.4/5.5/5.6, gpt-6 Sol/Terra/Luna, gpt-6 Astra (and the Daybreak Sol alias) on the Codex OAuth route only.
+
+    Other routes expose a larger window for the same slug and keep the user's threshold.
+    Prefix-matched so ``-pro`` and dated snapshots track every 272K-capped family; ``-900k``
+    picker variants are excluded. Astra is substring-matched (any slug containing ``astra``
+    without ``900k``). Name kept for the ``compression.codex_gpt55_autoraise`` key.
+    """
+    bare = _codex_route_bare_model(model, provider)
+    if bare is None:
+        return False
+    from agent.model_metadata import is_codex_context_variant
+    if is_codex_context_variant(bare):
+        return False
+    if "astra" in bare:
+        return "900k" not in bare
+    return bare == "gpt-daybreak-blue-latest" or any(
+        bare == fam or bare.startswith(fam + "-") or bare.startswith(fam + ".")
+        for fam in ("gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"))
+
+
+def _codex_route_bare_model(model: Optional[str], provider: Optional[str]) -> Optional[str]:
+    """Lowercased bare model slug when ``provider`` is the Codex OAuth route, else None."""
+    return _bare_model(model) if (provider or "").strip().lower() == "openai-codex" else None
+
+
+def _is_codex_spark(model: Optional[str], provider: Optional[str] = None) -> bool:
+    """True for ``gpt-5.3-codex-spark`` on the Codex OAuth route (the slug exists nowhere else)."""
+    return _codex_route_bare_model(model, provider) == "gpt-5.3-codex-spark"
+
+
+def _is_openai_default_temperature_only(model: Optional[str]) -> bool:
+    """True for OpenAI reasoning families that 400 (``unsupported_value``) on any non-default
+    ``temperature``: gpt-5.x (incl. dated snapshots, ``-pro``, ``-codex``), o1/o3/o4. The
+    ``gpt-5-chat`` non-reasoning line still accepts it (#51083)."""
+    bare = _bare_model(model)
+    return bare.startswith(("gpt-5", "o1", "o3", "o4")) and not bare.startswith("gpt-5-chat")
+
+
+# Routes (host + model) that rejected ``temperature`` at runtime; the next call omits it up front
+# instead of paying the 400 round-trip again (the retry alone left #51083's first call to time out).
+_TEMPERATURE_REJECTED_ROUTES: set = set()
+
+
+def remember_temperature_rejection(
+    provider: Optional[str], base_url: Optional[str], rejected_kwargs: Dict[str, Any], error: BaseException,
+) -> None:
+    from agent.auxiliary_structured_output import _route_key
+    _TEMPERATURE_REJECTED_ROUTES.add((_route_key(provider, base_url), _bare_model(rejected_kwargs.get("model"))))
+
+
+def _fixed_temperature_for_model(
+    model: Optional[str], base_url: Optional[str] = None, provider: Optional[str] = None,
+) -> "Optional[float] | object":
+    """``OMIT_TEMPERATURE`` (drop the key; Kimi/Moonshot, OpenAI reasoning families, routes that
+    already rejected it), a fixed ``float``, or ``None``."""
+    if _is_kimi_model(model):
+        logger.debug("Omitting temperature for Kimi model %r (server-managed)", model)
+        return OMIT_TEMPERATURE
+    if _is_openai_default_temperature_only(model):
+        logger.debug("Omitting temperature for %r (accepts only the default)", model)
+        return OMIT_TEMPERATURE
+    from agent.auxiliary_structured_output import _route_key
+    if (_route_key(provider, base_url), _bare_model(model)) in _TEMPERATURE_REJECTED_ROUTES:
+        logger.debug("Omitting temperature for %r (route rejected it earlier)", model)
+        return OMIT_TEMPERATURE
+    return 0.5 if _is_arcee_trinity_thinking(model) else None
+
+
+def _compression_threshold_for_model(
+    model: Optional[str], provider: Optional[str] = None, *,
+    allow_codex_gpt55_autoraise: bool = True,
+) -> Optional[float]:
+    """Per-model/route compression threshold override (fraction of context used), or None.
+
+    Arcee Trinity Large Thinking → 0.75 (preserve reasoning context); Codex-route gpt-5.4/5.5/5.6/Astra
+    → 0.85, gated by ``allow_codex_gpt55_autoraise``; Codex-route gpt-5.3-codex-spark → 0.70, ungated.
+    """
+    if _is_arcee_trinity_thinking(model):
+        return 0.75
+    if allow_codex_gpt55_autoraise and _is_codex_gpt54_or_gpt55(model, provider):
+        return _CODEX_GPT54_GPT55_COMPACTION_THRESHOLD
+    if _is_codex_spark(model, provider):
+        return _CODEX_SPARK_COMPACTION_THRESHOLD
+    return None
+
+
+# Aux "fast tier" families, fastest first (measured p50 titling latency). Matched as substrings
+# against the LIVE /v1/models catalog because pinned ids rot; rolling "-latest" aliases lead.
+_FAST_MODEL_FAMILIES: tuple = (
+    "gpt-mini-latest", "gpt-nano-latest", "claude-haiku-latest", "gemini-flash-latest",
+    "gpt-5.4-nano", "gpt-5.4-mini", "gpt-5-mini", "haiku-4.5", "gemini-3.6-flash", "flash-lite",
+    "-nano", "-mini", "-flash", "haiku",
+)
+
+# Disqualifiers: reasoning variants think before answering; ":batch" is a queue; ":free" tiers
+# are rate-limited and slowest; embedders/modality endpoints match a rung but cannot answer.
+_FAST_MODEL_EXCLUDE: tuple = (
+    "thinking", "reason", "-r1", "minilm", ":batch", ":free",
+    "o1-", "o3-", "o4-", "codex", "audio", "-vl", "embed",
+    "-tts", "-transcribe", "-realtime", "-image", "-search-preview",
+)
+
+
+def _model_recency_key(model_id: str) -> tuple:
+    """Sort key putting a family's newest release first: digit runs compare numerically (plain
+    string order picks ``gpt-3.5-mini`` over ``gpt-5.4-mini`` and breaks at 9 vs 10)."""
+    # re.split with one capturing group alternates text, number, text, …
+    return tuple(
+        (1, float(part), "") if index % 2 else (0, 0.0, part)
+        for index, part in enumerate(re.split(r"(\d+(?:\.\d+)?)", model_id.lower())) if part)
+
+
+def _fast_model_from_catalog(provider_id: str) -> str:
+    """Newest ``_FAST_MODEL_FAMILIES`` match from the provider's live (cached) catalog.
+
+    "" when the catalog is unavailable or holds no small model (caller falls through to the
+    curated default). Never raises; the fetch is memory+disk cached.
+    """
+    is_nous = provider_id.strip().lower() == "nous"
+    try:
+        from hermes_cli.auth import resolve_api_key_provider_credentials
+        from hermes_cli.models_pricing import fetch_models_with_pricing
+        from providers import get_provider_profile
+        # Most /v1/models endpoints are authenticated; an anonymous 401 would read as "no small
+        # model" and pin the curated default forever.
+        api_key, base_url = "", ""
+        try:
+            creds = resolve_api_key_provider_credentials(provider_id) or {}
+            api_key = str(creds.get("api_key", "")).strip()
+            base_url = str(creds.get("base_url", "")).strip()
+        except Exception:
+            # Not an API-key provider, or nothing configured; anonymous fetch may still work.
+            logger.debug("No credentials for %s catalog", provider_id, exc_info=True)
+        if not api_key and is_nous:
+            # Nous is OAuth (resolver raises); anonymous reads return the full catalog.
+            try:
+                from hermes_cli.models_pricing import _resolve_nous_pricing_credentials
+                api_key, base_url = _resolve_nous_pricing_credentials()
+            except Exception:
+                logger.debug("No Nous credentials for catalog", exc_info=True)
+        if not base_url:
+            base_url = str(getattr(get_provider_profile(provider_id), "base_url", "") or "")
+        base_url = base_url.rstrip("/")
+        if not base_url:
+            return ""
+        if base_url.endswith("/v1"):  # fetch_models_with_pricing appends /v1/models
+            base_url = base_url[:-3]
+        # Nous-only args must match the pickers' or the seeded cache loses sale chrome and
+        # policy-catalog expiry.
+        _nous_kwargs = {}
+        if is_nous:
+            from hermes_cli.models_pricing import _NOUS_CATALOG_TTL_SECONDS
+            _nous_kwargs = {"include_sale_original": True, "cache_ttl_seconds": _NOUS_CATALOG_TTL_SECONDS}
+        catalog = fetch_models_with_pricing(
+            api_key=api_key or None, base_url=base_url, timeout=3.0, **_nous_kwargs) or {}
+    except Exception:
+        logger.debug("Fast-model catalog lookup failed for %s", provider_id, exc_info=True)
+        return ""
+    ids = sorted((str(m) for m in catalog), key=_model_recency_key, reverse=True)
+    if is_nous:
+        # Narrow catalog ids by org policy, as the pickers do.
+        try:
+            from hermes_cli.models_pricing import nous_policy_allowed_ids, restrict_to_nous_policy
+            ids = restrict_to_nous_policy(ids, nous_policy_allowed_ids())
+        except Exception:
+            logger.debug("Nous policy filter unavailable", exc_info=True)
+    for family in _FAST_MODEL_FAMILIES:
+        for model_id in ids:
+            lowered = model_id.lower()
+            if family in lowered and not any(x in lowered for x in _FAST_MODEL_EXCLUDE):
+                return model_id
+    return ""
+
+
+# Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
+def _get_aux_model_for_provider(provider_id: str, *, prefer_fast: bool = False) -> str:
+    """Cheap auxiliary model for a provider.
+
+    Ladder: (``prefer_fast`` only) live-catalog family match, then ``ProviderProfile.resolve_aux_model``;
+    then ``default_aux_model`` (curated); then the legacy dict. ``prefer_fast`` is opt-in (titling)
+    so other callers keep their static behaviour and cache keys.
+    """
+    profile = None
+    with contextlib.suppress(Exception):
+        from providers import get_provider_profile
+        profile = get_provider_profile(provider_id)
+    picked = ""
+    if prefer_fast:
+        picked = _fast_model_from_catalog(provider_id)
+        if not picked and profile is not None:
+            try:
+                picked = profile.resolve_aux_model() or ""
+            except Exception:
+                logger.debug("resolve_aux_model failed for %s", provider_id, exc_info=True)
+    if not picked and profile is not None and profile.default_aux_model:
+        picked = profile.default_aux_model
+    if not picked:
+        picked = _API_KEY_PROVIDER_AUX_MODELS_FALLBACK.get(provider_id, "")
+    # Rungs 2-4 are policy-blind; a blocked pick is refused at request time, so drop it and
+    # let the caller keep the main model.
+    if picked and provider_id.strip().lower() == "nous":
+        try:
+            from hermes_cli.models_pricing import nous_policy_allowed_ids, restrict_to_nous_policy
+            allowed = nous_policy_allowed_ids()
+            if allowed and not restrict_to_nous_policy([picked], allowed):
+                return ""
+        except Exception:
+            logger.debug("Nous policy check unavailable", exc_info=True)
+    return picked
+
+
+# Fallback for providers without ProviderProfile.default_aux_model (plus some pinned here).
+# New providers should set default_aux_model instead.
+_API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
+    "gemini": "gemini-3.6-flash", "zai": "glm-4.5-flash", "kimi-coding": "kimi-k2-turbo-preview",
+    "stepfun": "step-3.5-flash", "kimi-coding-cn": "kimi-k2-turbo-preview",
+    "gmi": "google/gemini-3.1-flash-lite-preview", "anthropic": "claude-haiku-4-5-20251001",
+    "ai-gateway": "google/gemini-3-flash", "opencode-zen": "gemini-3-flash", "opencode-go": "glm-5",
+    "kilocode": "google/gemini-3.6-flash", "ollama-cloud": "nemotron-3-nano:30b",
+    "tencent-tokenhub": "hy4-preview", "tencent-tokenplan": "hy4-preview",
+    # No "deepinfra": its aux model lives on the ProviderProfile (read first).
+}
+
+# Legacy alias for callers not yet using _get_aux_model_for_provider().
+_API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALLBACK
+
+# Tasks that may opt into ``auxiliary.<task>.prefer_fast_model``.
+_FAST_MODEL_TASKS: frozenset = frozenset({"title_generation"})
+
+
+def _task_prefers_fast_model(task: Optional[str]) -> bool:
+    """Return whether an eligible task explicitly opts into fast-model routing."""
+    return task in _FAST_MODEL_TASKS and is_truthy_value(
+        _get_auxiliary_task_config(task).get("prefer_fast_model"), default=False)
+
+
+# Dedicated vision models for direct providers whose main chat model differs. zai: glm-5.3-flash
+# is the only image-capable GLM id served on every Z.AI surface (pay-as-you-go and Coding Plan,
+# global and CN); the former glm-5v-turbo pin 404s / 1211 "Unknown Model" on the coding endpoints
+# (#111429). ZaiProfile has no default_vision_model(), so dropping the pin would route vision to
+# the user's text-only chat model and skip Z.AI entirely.
+_PROVIDER_VISION_MODELS: Dict[str, str] = {"xiaomi": "mimo-v2.5", "zai": "glm-5.3-flash"}
+
+
+def _resolve_provider_vision_default(provider: str) -> Optional[str]:
+    """Provider default vision model id, or None: static ``_PROVIDER_VISION_MODELS`` (vision-only
+    names absent from any catalog) win, else ``ProviderProfile.default_vision_model()``."""
+    static = _PROVIDER_VISION_MODELS.get(provider)
+    if static:
+        return static
+    try:
+        from providers import get_provider_profile
+        profile = get_provider_profile(provider)
+        return profile.default_vision_model() if profile is not None else None
+    except Exception:
+        return None
+
+
+# Endpoints that reject image input: vision auto-detect skips these to the aggregator chain
+# instead of returning a client that 404s (Kimi Coding Plan Anthropic wire has no image_in).
+_PROVIDERS_WITHOUT_VISION: frozenset = frozenset({"kimi-coding", "kimi-coding-cn"})
+
+# OpenRouter app attribution (always sent). `X-Title` is what the dashboard reads.
+_OR_HEADERS_BASE = {
+    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+    "X-Title": "Hermes Agent",
+    "X-OpenRouter-Categories": "productivity,cli-agent",
+}
+
+
+def _apply_user_default_headers(headers: dict | None) -> dict | None:
+    """Merge user ``model.default_headers`` onto resolved headers (user wins; ``model.extra_headers``
+    alias wins over both). Mirrors ``AIAgent._apply_user_default_headers`` so a custom endpoint behind a
+    WAF rejecting ``User-Agent`` / ``X-Stainless-*`` works for aux calls. SECURITY: never log values."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        _cfg = load_config()
+        user_headers = cfg_get(_cfg, "model", "default_headers")
+        alias_headers = cfg_get(_cfg, "model", "extra_headers")
+        if isinstance(alias_headers, dict) and alias_headers:
+            user_headers = {**(user_headers if isinstance(user_headers, dict) else {}), **alias_headers}
+    except Exception:
+        return headers
+    if not isinstance(user_headers, dict) or not user_headers:
+        return headers
+    merged = dict(headers or {})
+    merged.update({str(k): str(v) for k, v in user_headers.items() if v is not None})
+    return merged or headers
+
+
+def build_or_headers(or_config: dict | None = None) -> dict:
+    """OpenRouter headers, plus response-cache headers when enabled.
+
+    Precedence env > config > default: ``HERMES_OPENROUTER_CACHE`` overrides
+    ``openrouter.response_cache``; ``HERMES_OPENROUTER_CACHE_TTL`` (1-86400 s) overrides
+    ``openrouter.response_cache_ttl``. ``or_config=None`` reads from disk.
+    """
+    headers = dict(_OR_HEADERS_BASE)
+    if or_config is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+            or_config = load_config_readonly().get("openrouter", {})
+        except Exception:
+            or_config = {}
+    env_cache = os.environ.get("HERMES_OPENROUTER_CACHE", "").strip().lower()
+    if not (env_cache in {"1", "true", "yes", "on"} if env_cache else or_config.get("response_cache", False)):
+        return headers
+    headers["X-OpenRouter-Cache"] = "true"
+    env_ttl = os.environ.get("HERMES_OPENROUTER_CACHE_TTL", "").strip()
+    if env_ttl:
+        if env_ttl.isdigit() and 1 <= int(env_ttl) <= 86400:
+            headers["X-OpenRouter-Cache-TTL"] = str(int(env_ttl))
+    else:
+        ttl = or_config.get("response_cache_ttl", 300)
+        if isinstance(ttl, (int, float)) and 1 <= ttl <= 86400:
+            headers["X-OpenRouter-Cache-TTL"] = str(int(ttl))
+    return headers
+
+
+# NVIDIA NIM cloud billing attribution; host-gated because NVIDIA_BASE_URL may be a local NIM.
+_NVIDIA_NIM_CLOUD_HEADERS = {"X-BILLING-INVOKE-ORIGIN": "HermesAgent"}
+
+
+def build_nvidia_nim_headers(base_url: str | None) -> dict:
+    """Return NVIDIA NIM cloud attribution headers for build.nvidia.com traffic."""
+    return dict(_NVIDIA_NIM_CLOUD_HEADERS) if base_url_host_matches(str(base_url or ""), "integrate.api.nvidia.com") else {}
+
+
+# Vercel AI Gateway attribution (HTTP-Referer → referrerUrl, X-Title → appName).
+from hermes_cli.version_info import get_version_info
+
+_AI_GATEWAY_HEADERS = {
+    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+    "X-Title": "Hermes Agent",
+    "User-Agent": f"HermesAgent/{get_version_info().base_version}",
+}
+
+# Nous Portal attribution extra_body. Tags come from agent.portal_tags so the client= marker
+# tracks the canonical base version — never inline a literal here.
+from agent.portal_tags import nous_portal_tags as _nous_portal_tags
+
+
+def _nous_extra_body() -> dict:
+    """Fresh Nous Portal ``extra_body`` (per call, so a hot-reloaded version is reflected)."""
+    return {"tags": _nous_portal_tags()}
+
+
+# Set at resolve time — True if the auxiliary client points to Nous Portal
+auxiliary_is_nous: bool = False
+
+# _OPENROUTER_MODEL MUST stay a :free SKU (matching the free_only warning): this lane engages
+# silently, and a paid default meant spend the user never opted into. User-configured values
+# are honored untouched (_warn_paid_lane_once fires).
+_OPENROUTER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+_NOUS_MODEL = "google/gemini-3.6-flash"
+_NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
+_ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
+_AUTH_JSON_PATH = get_hermes_home() / "auth.json"
+_AUTH_JSON_PATH_AT_IMPORT = _AUTH_JSON_PATH
+
+
+def _auth_json_path():
+    """Active profile's ``auth.json`` at call time (a patched ``_AUTH_JSON_PATH`` still wins). The
+    import-time constant is the LAUNCH profile's; under multiplexing a secondary's auxiliary calls
+    would otherwise authenticate to Nous with the default profile's token."""
+    from hermes_cli.auth import _auth_file_path
+    return _AUTH_JSON_PATH if _AUTH_JSON_PATH != _AUTH_JSON_PATH_AT_IMPORT else _auth_file_path()
+
+# Hosts exposing BOTH ``…/anthropic`` and a sibling OpenAI ``…/v1``. Matched on the URL *host*
+# only: unconditional rewrites break Anthropic-only gateways.
+_DUAL_SURFACE_ANTHROPIC_HOST_SUFFIXES = ("minimax.io", "minimax.chat", "minimaxi.com")
+_DUAL_SURFACE_ANTHROPIC_HOST_PREFIXES = ("api.minimax.",)
+
+
+def _is_dual_surface_anthropic_host(url: str) -> bool:
+    """True when the URL's host is a known dual-surface (MiniMax-family) host."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(
+        host == suffix or host.endswith("." + suffix) for suffix in _DUAL_SURFACE_ANTHROPIC_HOST_SUFFIXES
+    ) or any(host.startswith(prefix) for prefix in _DUAL_SURFACE_ANTHROPIC_HOST_PREFIXES)
+
+
+def _to_openai_base_url(base_url: str) -> str:
+    """Normalize dual-surface Anthropic URLs to their OpenAI-compatible sibling.
+
+    MiniMax-family: ``/anthropic`` → ``/v1``; ZAI Coding Plan → ``/coding/paas/v4`` (the general
+    endpoint bills separately); Kimi Code ``/coding`` → ``/coding/v1`` (the OpenAI SDK path 404s
+    without it). Anthropic-only gateways keep their path.
+    """
+    url = str(base_url or "").strip().rstrip("/")
+    if base_url_hostname(url) == "api.actual.inc":
+        from hermes_cli.auth import normalize_actual_base_url
+        return normalize_actual_base_url(url)
+    if url.endswith("/anthropic"):
+        if base_url_host_matches(url, "open.bigmodel.cn") or base_url_host_matches(url, "api.z.ai"):
+            rewritten = url[: -len("/anthropic")] + "/coding/paas/v4"
+            logger.debug("Auxiliary client: rewrote ZAI base URL %s → %s", url, rewritten)
+            return rewritten
+        if _is_dual_surface_anthropic_host(url):
+            rewritten = url[: -len("/anthropic")] + "/v1"
+            logger.debug("Auxiliary client: rewrote dual-surface base URL %s → %s", url, rewritten)
+            return rewritten
+        logger.debug(
+            "Auxiliary client: keeping Anthropic-only base URL %s (no dual-surface host match)", url)
+        return url
+    if base_url_host_matches(url, "api.kimi.com") and url.endswith("/coding"):
+        rewritten = url + "/v1"
+        logger.debug("Auxiliary client: rewrote Kimi base URL %s → %s", url, rewritten)
+        return rewritten
+    return url
+
+
+def _load_pool_with_credentials(provider: str, note: str = "") -> Optional[Any]:
+    """``load_pool(provider)`` when it has credentials, else None (never raises)."""
+    try:
+        pool = load_pool(provider)
+    except Exception as exc:
+        logger.debug("Auxiliary client: could not load pool for %s%s: %s", provider, note, exc)
+        return None
+    return pool if pool and pool.has_credentials() else None
+
+
+def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
+    """Return (pool_exists_for_provider, selected_entry)."""
+    pool = _load_pool_with_credentials(provider)
+    if pool is None:
+        return False, None
+    try:
+        return True, pool.select()
+    except Exception as exc:
+        logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
+        return True, None
+
+
+def _peek_pool_entry(provider: str, pool: Any = None) -> Optional[Any]:
+    """Best-effort current/next pool entry without mutating selection order.
+
+    ``pool`` skips the disk re-read when the caller already loaded it.
+    """
+    if pool is None:
+        pool = _load_pool_with_credentials(provider, " (peek)")
+    if pool is None:
+        return None
+    try:
+        current_fn = getattr(pool, "current", None)
+        current = current_fn() if callable(current_fn) else None
+        if current is not None:
+            return current
+        peek_fn = getattr(pool, "peek", None)
+        if callable(peek_fn):
+            return peek_fn()
+    except Exception as exc:
+        logger.debug("Auxiliary client: could not peek pool entry for %s: %s", provider, exc)
+    return None
+
+
+def _pool_runtime_api_key(entry: Any) -> str:
+    # runtime_api_key handles provider-specific fallback (e.g. agent_key for nous); None entry → "".
+    key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
+    return str(key or "").strip()
+
+
+def _pool_runtime_base_url(entry: Any, fallback: str = "") -> str:
+    if entry is None:
+        return str(fallback or "").strip().rstrip("/")
+    if getattr(entry, "provider", None) == "nous":
+        # Canonical auth-layer reader so the env override shares one normalization path.
+        from hermes_cli.auth import _nous_inference_env_override
+        env_url = _nous_inference_env_override()
+        if env_url:
+            return env_url
+    # runtime_base_url is provider-aware; fall back for non-PooledCredential entries.
+    url = (getattr(entry, "runtime_base_url", None) or getattr(entry, "inference_base_url", None)
+           or getattr(entry, "base_url", None) or fallback)
+    return str(url or "").strip().rstrip("/")
+
+
+# Hosts the aux Anthropic path may be pointed at via model.base_url; anything else falls back
+# to the Anthropic default so a foreign host never leaks in.
+_ANTHROPIC_COMPATIBLE_HOSTS = frozenset({"api.anthropic.com"})
+
+
+def _is_anthropic_compatible_host(url: str) -> bool:
+    """True for native Anthropic hosts and gateways serving Messages under a ``/anthropic`` path
+    (same convention as runtime_provider / ``_wrap_if_needed``), so a configured ``model.base_url``
+    whose gateway holds auth is not discarded. A bare non-Anthropic base_url is False."""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+        if (parsed.hostname or "").strip().lower().rstrip(".") in _ANTHROPIC_COMPATIBLE_HOSTS:
+            return True
+        path = (parsed.path or "").rstrip("/").lower()
+        return path.endswith("/anthropic") or path.endswith("/anthropic/v1")
+    except Exception:
+        return False
+
+
+def _nous_min_key_ttl_seconds() -> int:
+    try:
+        return max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800")))
+    except (TypeError, ValueError):
+        return 1800
+
+
+def _scoped_key_env(name: str) -> str:
+    """Read a provider API key (or its paired base-URL) env var through the profile secret scope.
+
+    In agent turns the scope's verdict is authoritative (a scoped miss must not borrow another
+    profile's key); only the unscoped default-profile path (``UnscopedSecretError``) reads
+    ``os.environ`` -- any other scope failure propagates instead of borrowing the ambient env.
+    """
+    if not name:
+        return ""
+    from agent.secret_scope import UnscopedSecretError, get_secret
+
+    try:
+        return (get_secret(name) or "").strip()
+    except UnscopedSecretError:
+        return (os.getenv(name) or "").strip()
+
+
+def _attempt_stream_socket(stream: Any) -> Any:
+    """The raw socket under an SDK event stream (``stream.response`` is the ``httpx.Response``;
+    httpcore publishes its connection as the ``network_stream`` extension), or None."""
+    from agent.agent_runtime_helpers import _socket_from_stream
+    extensions = getattr(getattr(stream, "response", None), "extensions", None)
+    network_stream = extensions.get("network_stream") if isinstance(extensions, dict) else None
+    return _socket_from_stream(network_stream) if network_stream is not None else None
+
+
+def _close_quietly(target: Any, failure_note: Optional[str]) -> None:
+    """Call ``target.close()`` if present; a failure is debug-logged under ``failure_note`` (silent when None)."""
+    close = getattr(target, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            if failure_note:
+                logger.debug("Codex auxiliary: %s", failure_note, exc_info=True)
+
+
+# The context compressor keys its retry-ladder classification on this text (#124077).
+CODEX_STREAM_STALL_MARKER = "stream stalled"
+
+
+class _CodexStreamGuard:
+    """Progress-aware deadline + FD-safe timeout watchdog for one Codex aux stream attempt.
+
+    (1) The first substantive payload must arrive within ``no_progress_timeout`` or we fail fast into
+    the caller's retry/fallback chain (a dead or keepalive-only zombie must not hold the budget);
+    (2) each substantive event re-arms that window (keepalive/lifecycle frames do NOT, mirroring
+    commit-fence gating) so a live stream is never killed by an absolute total; (3) a hard ceiling
+    from ``_aux_stream_total_ceiling`` still terminates a pathological drip.
+    """
+
+    def __init__(
+        self, client: Any, total_timeout: Optional[float],
+        no_progress_timeout: Optional[float] = None,
+    ):
+        self._client = client
+        self.total_timeout = total_timeout
+        self._start = time.monotonic()
+        # Task-scoped override (auxiliary.<task>.no_progress_timeout, #108104); falls back to the
+        # built-in default when unset or not a positive number.
+        if isinstance(no_progress_timeout, (int, float)) and no_progress_timeout > 0:
+            self.no_progress_timeout = float(no_progress_timeout)
+        else:
+            self.no_progress_timeout = _AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS
+        # Progress-aware stream deadlines (supersedes the old single absolute kill at ``total_timeout``).
+        # Three regimes: 1. First token: the stream must produce its first substantive payload within
+        # ``no_progress_timeout`` (60s default) or we fail fast and let the caller's normal retry/fallback
+        # chain run — a dead (or keepalive-only zombie) Codex stream no longer holds the full 300s
+        # compression budget before falling back (masoria report, Aug 2026: 3 stacked 300s waits -> 20+ min
+        # stuck on "Summarizing"). 2. Streaming: every substantive event re-arms the deadline by
+        # ``no_progress_timeout`` — a live stream is never killed by an absolute total, so a long reasoning
+        # summary that is actually producing tokens completes instead of timing out at 300s and falling back
+        # (#54915's original complaint, fixed properly). Keepalive/lifecycle frames do NOT re-arm, mirroring
+        # the commit-fence progress gating (#96707). 3. Hard ceiling: an absolute backstop from
+        # ``_aux_stream_total_ceiling`` (max(600s, 4x configured timeout) — the same bound the streamed
+        # chat.completions path uses) so a pathological one-token-per-59s drip still terminates.
+        if total_timeout is not None:
+            self.no_progress_timeout = min(self.no_progress_timeout, float(total_timeout))
+        self.hard_deadline = self._start + _aux_stream_total_ceiling(total_timeout)
+        # The waiting host's absolute deadline clamps the ceiling so the watchdog Timer severs
+        # the socket the instant the host stops waiting — a stream blocked between events
+        # can't be stopped by a per-event check.
+        host_deadline = _current_aux_stream_deadline()
+        if isinstance(host_deadline, (int, float)) and host_deadline < self.hard_deadline:
+            self.hard_deadline = float(host_deadline)
+        self._deadline_lock = threading.Lock()
+        self._progress_deadline = self._start + self.no_progress_timeout
+        self.saw_content = threading.Event()
+        self.timed_out = threading.Event()
+        # Set only when the timeout WON (not when the owner hard-cancelled first): tells the
+        # owner's ``finally`` the shared client's FDs still need a real close.
+        self.timeout_release_pending = threading.Event()
+        self.stream_finished = threading.Event()
+        self._timer = None
+        # The owner may return on hard cancel while this attempt is still blocked in the SDK
+        # stream. Timer threads don't inherit the worker's thread-local protection state, so
+        # freeze the hard-cancel source before creating the timer.
+        self._protected_cancel_check = _capture_aux_cancel_check() if _aux_interrupt_protected() else None
+        self._attempt_stream_lock = threading.Lock()
+        self._attempt_stream: Any = None
+        # The request-driving thread owns the transport FDs — see _close_client_on_timeout.
+        self._owner_tid = threading.get_ident()
+
+    def effective_deadline(self) -> float:
+        with self._deadline_lock:
+            return min(self.hard_deadline, self._progress_deadline)
+
+    def cancel_requested(self) -> bool:
+        """True when the frozen hard-cancel source says the owner already cancelled."""
+        check = self._protected_cancel_check
+        return callable(check) and _captured_aux_cancel_requested(check)
+
+    def adopt_stream(self, stream: Any) -> None:
+        with self._attempt_stream_lock:
+            self._attempt_stream = stream
+
+    def release_stream(self, stream: Any) -> None:
+        """Owner-side: close the attempt stream silently and forget it."""
+        _close_quietly(stream, None)
+        with self._attempt_stream_lock:
+            self._attempt_stream = None
+
+    def close_attempt_stream(self, failure_note: str) -> None:
+        """Wake only this attempt's stream, never the shared client. The owner thread closes it;
+        any other thread only ``shutdown()``s its socket, since ``Stream.close()`` would release the FD
+        under the owner's ``SSL_read`` (#70773, #130115). Socketless streams are closed as before."""
+        with self._attempt_stream_lock:
+            stream = self._attempt_stream
+        if stream is None:
+            return
+        if threading.get_ident() != self._owner_tid:
+            sock = _attempt_stream_socket(stream)
+            if sock is not None:
+                from agent.agent_runtime_helpers import _shutdown_socket
+                _shutdown_socket(sock)
+                return
+        _close_quietly(stream, failure_note)
+
+    def record_progress(self) -> None:
+        """Substantive payload re-arms the no-progress window; the hard ceiling never moves."""
+        with self._deadline_lock:
+            self._progress_deadline = time.monotonic() + self.no_progress_timeout
+
+    def timeout_message(self) -> str:
+        elapsed = time.monotonic() - self._start
+        if time.monotonic() >= self.hard_deadline:
+            return f"Codex auxiliary Responses stream exceeded {self.hard_deadline - self._start:.1f}s hard ceiling"
+        if not self.saw_content.is_set():
+      
