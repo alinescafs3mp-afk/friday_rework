@@ -1,0 +1,223 @@
+"""Strict total actual envelope oracle; malformed bytes remain evidence, never success."""
+from __future__ import annotations
+import base64
+import binascii
+import hashlib
+import json
+import re
+from driver.qualification import Unbound
+
+SHA = re.compile(r"[0-9a-f]{64}\Z",re.ASCII)
+ENVELOPE_REQUIRED = frozenset({"schema","data","file_name","route","bytes","sha256","caption","encoding"})
+ENVELOPE_OPTIONAL = frozenset()
+EXPECTED_REQUIRED = frozenset({"bytes","sha256","file_name","route"})
+
+def _duplicate_safe(pairs):
+    value = {}
+    for key,item in pairs:
+        if key in value:
+            raise ValueError("duplicate_json_key")
+        value[key] = item
+    return value
+
+def _no_constant(value):
+    raise ValueError("nonfinite_json_constant")
+
+ROUTE_FIELDS = frozenset({"schema","platform","session_id","runtime_profile","transport_profile","account_id","user_id","authority","runtime_home","output"})
+AUTHORITY_FIELDS = frozenset({"schema","uid","principal_id","generation","admission_sha256"})
+
+def _route_shape(route):
+    if type(route) is not dict or any(type(k) is not str for k in route) or set(route) != ROUTE_FIELDS:
+        return "route_mapping_shape"
+    if (type(route["schema"]) is not str or route["schema"] != "friday.cli-output-route.v1"
+            or type(route["platform"]) is not str or route["platform"] != "cli"
+            or type(route["output"]) is not str or route["output"] != "original-classic-cli-stream"):
+        return "route_schema_platform_output"
+    for key in ("session_id","runtime_profile","transport_profile","account_id","user_id","runtime_home"):
+        value = route[key]
+        if type(value) is not str or not value or "\x00" in value or len(value) > 2048:
+            return "route_text_type_or_bound:"+key
+        try:
+            if len(value.encode()) > 2048:
+                return "route_utf8_bound:"+key
+        except UnicodeError:
+            return "route_utf8_invalid:"+key
+    authority = route["authority"]
+    if type(authority) is not dict or any(type(k) is not str for k in authority) or set(authority) != AUTHORITY_FIELDS:
+        return "route_authority_mapping_shape"
+    if type(authority["schema"]) is not str or authority["schema"] != "friday.cli-os-authority.v1":
+        return "route_authority_schema"
+    if type(authority["uid"]) is not int or not 0 <= authority["uid"] <= 4294967294:
+        return "route_uid_not_exact_int"
+    if type(authority["generation"]) is not int or not 1 <= authority["generation"] <= 10**18:
+        return "route_generation_not_exact_int"
+    if type(authority["principal_id"]) is not str or not 0 < len(authority["principal_id"]) <= 256:
+        return "route_principal_type_or_bound"
+    if type(authority["admission_sha256"]) is not str or SHA.fullmatch(authority["admission_sha256"]) is None:
+        return "route_admission_digest"
+    return None
+
+def _shape(record, *, envelope):
+    if type(record) is not dict or any(type(k) is not str for k in record):
+        return "not_exact_mapping_with_text_keys"
+    keys = set(record)
+    required = ENVELOPE_REQUIRED if envelope else EXPECTED_REQUIRED
+    allowed = required | (ENVELOPE_OPTIONAL if envelope else {"caption"})
+    if not required <= keys or not keys <= allowed:
+        return "missing_or_unknown_fields"
+    if type(record["bytes"]) is not int or not 0 <= record["bytes"] <= 262144:
+        return "bytes_not_exact_integer_bool_excluded_or_over_bound"
+    if type(record["sha256"]) is not str or SHA.fullmatch(record["sha256"]) is None:
+        return "invalid_sha256"
+    value = record["file_name"]
+    if type(value) is not str or not 0 < len(value) <= 255 or any(ord(c) < 32 or ord(c) == 127 or c in '/\\' for c in value):
+        return "file_name_type_bound_or_control"
+    try:
+        if len(value.encode("utf-8")) > 255:
+            return "file_name_utf8_bound"
+    except UnicodeError:
+        return "file_name_utf8_invalid"
+    reason = _route_shape(record["route"])
+    if reason is not None:
+        return reason
+    caption = record.get("caption")
+    if caption is not None:
+        if type(caption) is not str or len(caption) > 2048:
+            return "caption_type_or_character_bound"
+        try:
+            if len(caption.encode("utf-8")) > 8192:
+                return "caption_utf8_bound"
+        except UnicodeError:
+            return "caption_utf8_invalid"
+    if envelope:
+        if type(record["schema"]) is not str or record["schema"] != "friday.cli-document-output.v1":
+            return "schema_mismatch"
+        if type(record["encoding"]) is not str or record["encoding"] != "base64":
+            return "encoding_not_base64"
+        if type(record["data"]) is not str or len(record["data"]) > 349528:
+            return "data_type_or_bound"
+    return None
+
+
+def actual_envelopes(captured, expected):
+    if type(captured) is not bytes or len(captured) > 8388608:
+        raise Unbound("actual_capture_not_finite_bytes_missing_is_not_zero")
+    if type(expected) not in (tuple,list) or len(expected) > 256:
+        raise Unbound("expected_records_not_exact_bounded_sequence")
+    wanted,invalid_expected = [],[]
+    for ordinal,record in enumerate(expected):
+        reason = _shape(record,envelope=False)
+        if reason is None:
+            wanted.append((ordinal,dict(record)))
+        else:
+            # Custom values are not serialized or hashed by arbitrary methods.
+            invalid = {"ordinal":ordinal,"reason":reason,"record_type":type(record).__name__,"accepted":False}
+            from .custody import pure
+            try:
+                invalid["actual_expected_record"] = pure(record,"invalid_expected_record")
+            except (Unbound,UnicodeError,ValueError,TypeError,RecursionError):
+                invalid["actual_expected_record"] = "REFUSED_CUSTOM_OR_OVER_BOUND_DATA_NO_METHOD_CALLED"
+            invalid_expected.append(invalid)
+    documents,fragments = [],[]
+    lines = captured.splitlines(keepends=True)
+    for index,raw in enumerate(lines):
+        if index >= 4096:
+            tail = b"".join(lines[index:])
+            fragments.append({"line":index,"bytes":len(tail),"sha256":hashlib.sha256(tail).hexdigest(),"actual_fragment":tail,"reason":"bounded_parser_remaining_real_tail"})
+            break
+        marker = raw.find(b'{"')
+        if marker < 0 or b"friday.cli-document-output.v1" not in raw:
+            continue
+        candidate = raw[marker:]
+        fact = {"line":index,"bytes":len(candidate),"sha256":hashlib.sha256(candidate).hexdigest(),"actual_fragment":candidate}
+        if not candidate.endswith(b"\n"):
+            fragments.append(dict(fact,reason="actual_incomplete_line"))
+            continue
+        if len(candidate) > 393216:
+            fragments.append(dict(fact,reason="actual_envelope_over_limit"))
+            continue
+        try:
+            body = json.loads(candidate.decode("ascii"),object_pairs_hook=_duplicate_safe,parse_constant=_no_constant)
+        except (ValueError,UnicodeError,TypeError,RecursionError,MemoryError) as exc:
+            fragments.append(dict(fact,reason="actual_JSON_refused:"+type(exc).__name__))
+            continue
+        reason = _shape(body,envelope=True)
+        if reason is not None:
+            fragments.append(dict(fact,reason=reason))
+            continue
+        try:
+            data = base64.b64decode(body["data"],validate=True)
+            if len(data) > 262144 or base64.b64encode(data).decode("ascii") != body["data"]:
+                raise ValueError("body_bound_or_base64_alias")
+        except (KeyError,TypeError,ValueError,binascii.Error,UnicodeError,MemoryError) as exc:
+            fragments.append(dict(fact,reason="actual_body_invalid:"+type(exc).__name__))
+            continue
+        actual_sha = hashlib.sha256(data).hexdigest()
+        facts = {"line":index,"wire_bytes":len(candidate),"wire_sha256":fact["sha256"],"bytes":len(data),"sha256":actual_sha,
+            "file_name":body["file_name"],"route":body["route"],"caption":body.get("caption"),
+            "actual_body_matches_own_envelope":type(body["bytes"]) is int and body["bytes"] == len(data) and body["sha256"] == actual_sha}
+        documents.append(facts)
+        if not facts["actual_body_matches_own_envelope"]:
+            fragments.append(dict(fact,reason="own_envelope_count_or_digest_mismatch"))
+    comparisons = []
+    for ordinal,record in wanted:
+        matched = [row for row in documents if all(row.get(k) == record.get(k) for k in ("bytes","sha256","file_name","route","caption"))]
+        comparisons.append({"expected_ordinal":ordinal,"expected":record,"actual_matching_envelopes":len(matched),
+            "exactly_one_actual_intact_body":len(matched) == 1 and matched[0]["actual_body_matches_own_envelope"]})
+    return {"actual_documents":documents,"unparsed_actual_document_prefixes":fragments,"invalid_expected_records":invalid_expected,
+        "comparisons":comparisons,"expected_records_accepted":not invalid_expected,"human_read":"UNCONFIRMED",
+        "delivery_acceptance":"REQUIRES_ACTUAL_NATIVE_LEDGER_CLOSE_AND_ORIGINAL_FULL_CALLER"}
+
+def original_clock(observation):
+    failures = []
+    if type(observation) is not dict or type(observation.get("observer")) is not dict or type(observation["observer"].get("callers")) is not list:
+        return {"actual_clock_failures":[],"unknown":["original_caller_observation_missing"],"old30_elapsed":30.113563198945485,"old30_credit":"FAIL_NO_CURRENT_CREDIT_NOT_ERASED","current_acceptance":"NOT_ISSUED"}
+    callers = observation["observer"]["callers"]
+    for caller in callers:
+        end = caller["closed_after_joins"]
+        if end is None or end > caller["deadline"] or end-caller["entered"] > 30:
+            failures.append({"ordinal": caller["ordinal"], "actual_entered": caller["entered"],
+                             "actual_closed": end, "actual_original_deadline": caller["deadline"]})
+    whole_limit = observation["whole_native_case_original_deadline"]
+    whole_end = observation["whole_native_case_closed"]
+    if whole_limit is None or whole_end > whole_limit:
+        failures.append({"whole_case_closed": whole_end, "whole_original_deadline": whole_limit})
+    return {"actual_clock_failures": failures, "old30_elapsed": 30.113563198945485,
+            "old30_credit": "FAIL_NO_CURRENT_CREDIT_NOT_ERASED", "current_acceptance": "NOT_ISSUED"}
+
+def actual_count_contract(events):
+    counts = [row for row in events if row["kind"] == "physical_write_return"]
+    return {"actual_returns": counts,
+            "zero_observed": any(row.get("count_type") == "int" and row.get("actual_count") == 0 for row in counts),
+            "bool_observed": any(row.get("count_type") == "bool" for row in counts),
+            "positive_prefix_observed": any(row.get("count_type") == "int" and type(row.get("actual_count")) is int
+                                            and 0 < row["actual_count"] < row.get("requested_bytes", 0) for row in counts),
+            "invalid_count_is_success": False,
+            "unsupported_probe_rejection_is_native_zero_or_bool_return": False}
+
+def custody_observations(observation):
+    rows = observation["observer"]["events"]
+    constructors = observation["observer"]["constructor_objects"]
+    proxy_document = [row for row in rows if row["kind"] == "proxy_write" and row.get("document_marker_present")]
+    result = {"actual_constructor_objects": constructors,
+              "actual_native_writes": [row for row in rows if row["kind"] == "physical_write_return"],
+              "actual_native_closes": [row for row in rows if row["kind"] == "physical_close_return"],
+              "actual_proxy_document_enqueue": proxy_document,
+              "actual_foreign_sink_bytes": len(observation["captured_foreign_bytes"]) if type(observation.get("captured_foreign_bytes")) is bytes else None,
+              "normal_and_adverse_closure": observation["native_closure"],
+              "actual_cancel_intent": observation["controller"]["cancel_intent"],
+              "current_or_historical_delivery_credit": "NOT_ISSUED_FROM_OBSERVER_OR_HISTORY"}
+    return result
+
+def significant_adverse_facts(observation):
+    events = observation["observer"]["events"]
+    closure = observation["fixture_closure"]
+    return {"physical_prefix_counts": actual_count_contract(events),
+            "actual_borrowed_descriptor_faults": closure["borrowed_descriptor_faults"],
+            "actual_typed_contract_calls": closure["actual_contract_calls"],
+            "actual_native_exceptions": [x for row in observation["observer"]["callers"] for x in row["exceptions"]],
+            "actual_caller_failures": [x for row in observation["observer"]["callers"] for x in row["failures"]],
+            "unobserved_or_late_control": observation["controller"]["unknown"],
+            "observer_unknown": observation["observer"]["unknown"],
+            "negative_significance_requires_observed_trigger_and_native_refusal_or_UNKNOWN": True,
+            "all150_complete": False}

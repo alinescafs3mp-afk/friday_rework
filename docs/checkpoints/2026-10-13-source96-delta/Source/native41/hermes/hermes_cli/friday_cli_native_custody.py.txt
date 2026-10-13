@@ -1,0 +1,223 @@
+"""Concrete cooperative custody of the already existing original participants.
+
+Registers objects before scheduling, observes callback exit and real task/thread
+settlement, and retains uncertain custody after stop. This cannot preempt a
+blocking syscall or a running callback and does not implement a hard guardian.
+"""
+import asyncio
+from dataclasses import dataclass, field
+import threading
+import time
+
+
+class ParticipantUnconfirmed(RuntimeError):
+    pass
+
+
+@dataclass(eq=False)
+class _Callback:
+    ledger: object
+    kind: str
+    record: dict
+    loop: object
+    app: object
+    loop_thread: object
+    deadline: float
+    state: str = "RESERVED"
+    handle: object = None
+    stop_requested: bool = False
+    error: object = None
+
+
+@dataclass(eq=False)
+class _Task:
+    ledger: object
+    context: object
+    coroutine: object
+    loop: object
+    deadline: float
+    task: object = None
+    cancel_requested: bool = False
+
+
+class OriginalParticipantCustody:
+    def __init__(self, span):
+        self.span = span
+        self.condition = threading.Condition(threading.RLock())
+        self.activities = []
+        self.callbacks = []
+        self.tasks = []
+        self.stop_requested = False
+        self.cancel_dispatches = []
+        self.errors = []
+
+    def _capacity(self):
+        if len(self.activities) + len(self.callbacks) + len(self.tasks) >= 4096:
+            raise ParticipantUnconfirmed("original_participant_evidence_limit")
+
+    def _budget(self, deadline, *, cleanup=False):
+        if (deadline > self.span.end or deadline <= time.monotonic()
+                or (self.stop_requested and not cleanup)):
+            raise ParticipantUnconfirmed("original_participant_budget_or_stop")
+        self.span.owner.check_lifetime()
+        self.span.owner.anchor.validate()
+
+    def reserve_activity(self, record):
+        with self.condition:
+            self._budget(self.span.useful)
+            thread = record["thread"]
+            stop = record["stop"]
+            if (type(thread) is not threading.Thread or type(stop) is not threading.Event
+                    or thread.ident is not None or record in self.activities):
+                raise ParticipantUnconfirmed("activity_not_original_unstarted")
+            self._capacity()
+            self.activities.append(record)
+
+    def reserve_callback(self, kind, record, loop, app, deadline):
+        with self.condition:
+            self._budget(deadline, cleanup=kind == "prompt_phase:cleanup")
+            if (app.loop is not loop or not app.is_running
+                    or app._loop_thread is None or not loop.is_running()
+                    or loop.is_closed() or any(r.record is record for r in self.callbacks)):
+                raise ParticipantUnconfirmed("native_callback_not_original")
+            item = _Callback(self, kind, record, loop, app, app._loop_thread, deadline)
+            self._capacity()
+            self.callbacks.append(item)
+            return item
+
+    def call_callback(self, item, function, *args):
+        with self.condition:
+            if item.ledger is not self or item not in self.callbacks or item.state != "RESERVED":
+                raise ParticipantUnconfirmed("native_callback_foreign_or_duplicate")
+            if ((item.stop_requested or self.stop_requested)
+                    and item.kind != "prompt_phase:cleanup"):
+                item.state = "SKIPPED_OBSERVED"
+                self.condition.notify_all()
+                return
+            if (threading.current_thread() is not item.loop_thread
+                    or item.app.loop is not item.loop or not item.app.is_running
+                    or time.monotonic() >= min(item.deadline, self.span.end)):
+                item.state = "UNKNOWN"
+                self.errors.append("native_callback_late_or_foreign")
+                self.condition.notify_all()
+                raise ParticipantUnconfirmed("native_callback_late_or_foreign")
+            item.state = "RUNNING"
+        try:
+            return function(*args)
+        except BaseException as exc:
+            with self.condition:
+                item.error = exc
+            raise
+        finally:
+            with self.condition:
+                # Actual wrapper exit, not a Future-set or cancel request.
+                item.state = "EXIT_OBSERVED"
+                self.condition.notify_all()
+
+    def attach_handle(self, item, handle):
+        with self.condition:
+            if item.ledger is not self or item.handle is not None:
+                raise ParticipantUnconfirmed("native_callback_handle_replaced")
+            item.handle = handle
+            self.condition.notify_all()
+
+    def reserve_task(self, context, coroutine, loop, deadline):
+        with self.condition:
+            self._budget(deadline)
+            if (not asyncio.iscoroutine(coroutine) or not loop.is_running()
+                    or loop.is_closed() or any(t.coroutine is coroutine for t in self.tasks)):
+                raise ParticipantUnconfirmed("foreground_task_not_original")
+            item = _Task(self, context, coroutine, loop, deadline)
+            self._capacity()
+            self.tasks.append(item)
+            return item
+
+    def attach_task(self, item, task):
+        with self.condition:
+            if (item.ledger is not self or item not in self.tasks or item.task is not None
+                    or not isinstance(task, asyncio.Task) or task.get_loop() is not item.loop
+                    or task.get_coro() is not item.coroutine):
+                raise ParticipantUnconfirmed("foreground_task_attachment_changed")
+            item.task = task
+            task.add_done_callback(self._task_done)
+            self.condition.notify_all()
+
+    def _task_done(self, task):
+        with self.condition:
+            self.condition.notify_all()
+
+    def _naturally_settled(self):
+        return (not self.errors
+                and all(r["joined"] and not r["thread"].is_alive() for r in self.activities)
+                and all(c.state == "EXIT_OBSERVED" and c.error is None for c in self.callbacks)
+                and all(t.task is not None and t.task.done() for t in self.tasks))
+
+    def wait_natural_settlement(self, deadline):
+        with self.condition:
+            while not self._naturally_settled():
+                remaining = min(deadline, self.span.end) - time.monotonic()
+                if remaining <= 0 or self.stop_requested or self.errors:
+                    raise ParticipantUnconfirmed("original_participant_settlement_unconfirmed")
+                self.condition.wait(timeout=remaining)
+            # A cancelled foreground task is physically settled, but cannot be
+            # projected as a successful ordinary result.
+            if any(t.task.cancelled() or t.task.exception() is not None for t in self.tasks):
+                raise ParticipantUnconfirmed("original_foreground_task_failed")
+
+    def _cancel_tasks_on_loop(self, loop):
+        with self.condition:
+            for item in self.tasks:
+                if item.loop is loop and item.task is not None and not item.task.done():
+                    if not item.cancel_requested:
+                        item.cancel_requested = True
+                        item.task.cancel()
+            self.condition.notify_all()
+
+    def request_stop(self):
+        with self.condition:
+            if self.stop_requested:
+                return
+            self.stop_requested = True
+            for record in self.activities:
+                record["stop"].set()
+            for item in self.callbacks:
+                if item.kind != "prompt_phase:cleanup":
+                    item.stop_requested = True
+                    item.record["stop_requested"] = True
+            # Cancellation itself is only a request. A blocked native loop or
+            # kernel call remains UNKNOWN; nothing fabricates EXIT_OBSERVED.
+            loops = {item.loop for item in self.tasks
+                     if item.task is not None and not item.task.done()}
+            for loop in loops:
+                if loop.is_closed():
+                    self.errors.append("original_cancel_loop_closed")
+                    continue
+                record = {"loop": loop, "state": "RESERVED", "handle": None}
+                self.cancel_dispatches.append(record)
+                def cancel_owned(record=record):
+                    try:
+                        self._cancel_tasks_on_loop(record["loop"])
+                        record["state"] = "CALLBACK_EXIT_OBSERVED"
+                    except BaseException as exc:
+                        record["state"] = "UNKNOWN"
+                        self.errors.append(type(exc).__name__)
+                try:
+                    record["handle"] = loop.call_soon_threadsafe(cancel_owned)
+                except BaseException as exc:
+                    record["state"] = "UNKNOWN"
+                    self.errors.append(type(exc).__name__)
+            self.condition.notify_all()
+
+    def stop_observation(self):
+        with self.condition:
+            return {
+                "state": "STOP_REQUESTED",
+                "activities_alive": sum(r["thread"].is_alive() for r in self.activities),
+                "callbacks_unclosed": sum(c.state not in {"EXIT_OBSERVED", "SKIPPED_OBSERVED"}
+                                         for c in self.callbacks),
+                "tasks_unsettled": sum(t.task is None or not t.task.done() for t in self.tasks),
+                "control_unclosed": sum(r["state"] != "CALLBACK_EXIT_OBSERVED"
+                                       for r in self.cancel_dispatches),
+                "errors": tuple(self.errors),
+                "kernel_preemption": "NOT_IMPLEMENTED",
+            }

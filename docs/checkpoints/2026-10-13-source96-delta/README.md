@@ -1,0 +1,22 @@
+# Inert source96 analysis delta — 13 October 2026
+
+This prepared snapshot contains all 96 selected logical payloads: native41 (40 Python files and one unbuilt, unqualified C source), general13 (13 Python files), and kernel42 (41 Python files and one schema). All code is UTF-8 inert `.txt` source or ordered `.partNNN.txt` fragments. Nothing is connected or executed.
+
+The previous native41 whole-source review is **REQUEST_CHANGES3**. Its S1–S3 corrections are included in current manifest `51a7440f529237ed2876e427ad51d7bc3cbf417c0a2f39eb6f14de6d4b3a7772`; this changed whole41 is **UNREVIEWED**, with new independent Source review required. The original Root R7 cause claim was **INVALID_INFERRED**: original ordinal-only ACTIVITY client/server agreed; intervening client-only deadline widening introduced S1 and was then reverted. Wrong prior evidence remains historical. Author S2 gates the actual POSIX console initializer; author S3 restores the full original public PluginState.set body. These author corrections are not acceptance.
+
+General13 remains **REQUEST_CHANGES3**: original output expiry blocks independent bounded Application exit; frontend before-start capacity refusal is swallowed; shared cli_bound wrapper code misidentifies the original frontend. Kernel42 is **CONNECTED_PARTIAL**, with R2 incomplete: C58 **REQUEST_CHANGES3** remains, and the genuine current C59_28 producer is absent and explicitly refused. New whole kernel Source review is still required. Complete final findings and boundaries are in [REVIEW-FINDINGS.json](REVIEW-FINDINGS.json) and [PUBLIC-RESULT.json](PUBLIC-RESULT.json).
+
+R04 pathname SQLite audit was refused before opening; genuine original retained DB/VFS/sidecar audit remains **UNBOUND_NOT_COMPLETED**. Original106 + new44 has **0 completed current whole paths / NOT_RUN**. Historical **FAIL 30.113563198945485 seconds** remains. Native, Resource, Go, full150, kernel, admission, runtime, installed journeys and release are **NOT_GRANTED_NOT_RUN / UNBOUND**. Memory-only history grants no kernel authority. Original32 (10 positive, 18 negative, 4 uncertain), C55_41, C75_25, C83_16 and all full mandatory H991/FD8/current19/C59_28/all69/reserved2/full67/import547/CLI150 obligations are retained; this archive supplies no runtime credit.
+
+## Byte reconstruction and privacy
+
+[SOURCE-INDEX-native41.json](SOURCE-INDEX-native41.json), [SOURCE-INDEX-general13.json](SOURCE-INDEX-general13.json) and [SOURCE-INDEX-kernel42.json](SOURCE-INDEX-kernel42.json) list every logical payload, original bytes/SHA, public derivative bytes/SHA and ordered fragments. Concatenate each `parts` array in order as bytes, then check `public_reconstruction`. Each physical file is at most 65,536 bytes; fragment boundaries preserve UTF-8 and line endings.
+
+91 payloads retain exact original bytes. Five contain a total of 14 distinct concrete private runtime/profile/cgroup bindings, replaced through one finite private dictionary by `__PRIVATE_BINDING_NNN__` tokens. The dictionary and exact private provenance are retained outside public targets. Applying that finite inverse dictionary reconstructs every original payload with its original SHA. The derivative paths and placeholders cannot supply actual binding, semantic acceptance, execution credit or admission. Generic platform path examples and synthetic negative-control tokens are ordinary source, not actual private homes or credentials.
+
+## Publication boundary
+
+Base main: `b6a0ec5eaff5a907a3e43e4a06b8db6aa77ded9f`. Previous daily baseline: `ffc2bf78e787d6ff5da4464e9dfd3197e922773a`, unchanged for the 13 October 21:00 Moscow daily checkpoint. This is intermediate analysis preparation, **PENDING independent Root privacy/content review**, and is not published. The existing root README is preserved byte-for-byte before a new appendix. No publisher framework, rig, Git state or runtime was changed; old failed preparation contracts remain history.
+
+
+Publication review note: the preparation/PENDING/not-published labels in this frozen archive describe its capture before independent Root publication review. Root has now checked exact source reconstruction, private-binding removal and the content of this snapshot for publication. This accepts publication content only; Source, native, Resource, Go, runtime and release acceptance remain absent. The actual publication outcome is recorded after the ordinary main commit and remote verification.

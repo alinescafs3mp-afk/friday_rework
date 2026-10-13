@@ -1,0 +1,144 @@
+"""Source audit IO is reserved before acquisition in the original shared account.
+Driver qualification semantics stay exact; no monkeypatch of the original driver.
+"""
+from __future__ import annotations
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import types
+from driver.qualification import Unbound, code_digest
+from .custody import SourceFDAccount
+
+def stamp(info):
+    return (info.st_dev,info.st_ino,info.st_mode,info.st_size,info.st_mtime_ns,info.st_ctime_ns,info.st_nlink)
+
+class MeteredQualification:
+    def __init__(self, budget):
+        if type(budget) is not SourceFDAccount:
+            raise Unbound("qualification_requires_original_Source_FD_account")
+        self.budget = budget
+    def exact_file(self, reference, *, limit=8*1024*1024):
+        path = Path(reference["path"])
+        if not path.is_absolute() or path.resolve() != path:
+            raise Unbound("noncanonical_or_symlink_path")
+        directory = leaf = None
+        primary,data,custody,errors = None,None,None,[]
+        try:
+            directory = self.budget.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,label="qualification_parent")
+            parent_fd = directory["fd"]
+            parent_before = os.fstat(parent_fd)
+            if stamp(parent_before) != stamp(os.stat(path.parent,follow_symlinks=False)):
+                raise Unbound("directory_replaced_before_read")
+            leaf = self.budget.open(path.name,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=parent_fd,label="qualification_leaf")
+            fd = leaf["fd"]
+            before = os.fstat(fd)
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0<=before.st_size<=limit
+                    or stamp(before) != stamp(os.stat(path.name,dir_fd=parent_fd,follow_symlinks=False))):
+                raise Unbound("file_not_exact_bounded_record")
+            chunks,remaining = [],before.st_size
+            while remaining:
+                chunk = os.read(fd,min(65536,remaining))
+                if not chunk:
+                    raise Unbound("short_record")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if os.read(fd,1):
+                raise Unbound("record_grew")
+            data = b"".join(chunks)
+            if (len(data) != reference["bytes"] or hashlib.sha256(data).hexdigest() != reference["sha256"]
+                    or stamp(os.fstat(fd)) != stamp(before)
+                    or stamp(os.stat(path.name,dir_fd=parent_fd,follow_symlinks=False)) != stamp(before)):
+                raise Unbound("record_replaced_or_changed")
+            os.fsync(fd)
+            os.fsync(parent_fd)
+            if (stamp(os.fstat(fd)) != stamp(before)
+                    or stamp(os.stat(path.name,dir_fd=parent_fd,follow_symlinks=False)) != stamp(before)
+                    or stamp(os.fstat(parent_fd)) != stamp(parent_before)
+                    or stamp(os.stat(path.parent,follow_symlinks=False)) != stamp(parent_before)):
+                raise Unbound("record_or_directory_substituted_during_durability")
+            custody = {"record":stamp(before),"directory":stamp(parent_before)}
+        except BaseException as exc:
+            primary = exc
+        finally:
+            for row in (leaf,directory):
+                if row is not None:
+                    try:
+                        self.budget.close(row)
+                    except BaseException as later:
+                        errors.append(type(later).__name__)
+        if primary is not None:
+            raise primary
+        if errors:
+            raise Unbound("qualification_close_unknown_original_capacity_retained")
+        return data,custody
+    def exact_json(self, reference):
+        data,custody = self.exact_file(reference,limit=65536)
+        value = json.loads(data)
+        if type(value) is not dict:
+            raise Unbound("record_not_object")
+        return value,custody
+    def real_function(self, function, qualification):
+        if isinstance(function,types.MethodType):
+            function = function.__func__
+        if type(function) is not types.FunctionType:
+            raise Unbound("unknown_callable")
+        code = function.__code__
+        if (code_digest(code) != qualification["code_sha256"] or code.co_filename != qualification["filename"]
+                or code.co_qualname != qualification["qualname"]):
+            raise Unbound("loaded_function_substituted")
+        self.exact_file(qualification["source"])
+        return function
+    def verify_loaded(self, layout):
+        if layout.get("status") != "ROOT_ACCEPTED_WHOLE_IMPORT_LAYOUT":
+            raise Unbound("whole_import_layout_not_accepted")
+        expected,actual = layout["modules"],{}
+        for name,module in tuple(sys.modules.items()):
+            if module is None or name not in expected:
+                raise Unbound("unqualified_or_partially_imported_module:"+name)
+            row = expected[name]
+            origin = getattr(getattr(module,"__spec__",None),"origin",None)
+            if origin != row["origin"]:
+                raise Unbound("module_origin_drift:"+name)
+            custody = None if origin in (None,"built-in","frozen") else self.exact_file(row["source"])[1]
+            for attr,qualification in row.get("functions",{}).items():
+                value = module
+                for part in attr.split("."):
+                    value = getattr(value,part)
+                self.real_function(value,qualification)
+            actual[name] = {"origin":origin,"custody":custody}
+        if set(layout["required_modules"])-actual.keys():
+            raise Unbound("required_modules_not_loaded")
+        if tuple(sys.path) != tuple(layout["sys_path"]):
+            raise Unbound("import_path_order_changed")
+        if (sys.version != layout["python_version"] or sys.implementation.cache_tag != layout["cache_tag"]
+                or os.path.realpath(sys.executable) != layout["interpreter"]["path"]):
+            raise Unbound("interpreter_mismatch")
+        self.exact_file(layout["interpreter"])
+        return actual
+    def proc_birth(self, pid):
+        observations = []
+        for path in ("/proc/"+str(pid)+"/stat","/proc/sys/kernel/random/boot_id"):
+            row = self.budget.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,label="actual_birth_proc_read")
+            primary,data,later = None,None,None
+            try:
+                data = os.read(row["fd"],65537)
+                if len(data)>65536:
+                    raise Unbound("birth_observation_capacity")
+            except BaseException as exc:
+                primary = exc
+            finally:
+                try:
+                    self.budget.close(row)
+                except BaseException as exc:
+                    later = exc
+            if primary is not None:
+                raise primary
+            if later is not None:
+                raise Unbound("birth_reader_close_unknown_no_refund")
+            observations.append(data.decode("utf-8"))
+        raw,boot = observations
+        values = raw[raw.rfind(")")+2:].split()
+        return {"pid":pid,"starttime":int(values[19]),"state":values[0],"raw":raw,"boot_id":boot.strip()}

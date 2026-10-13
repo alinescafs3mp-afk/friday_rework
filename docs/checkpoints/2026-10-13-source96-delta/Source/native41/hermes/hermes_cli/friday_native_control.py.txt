@@ -1,0 +1,216 @@
+"""Counted native control children; no subprocess.run timeout/untimed wait.
+
+This replaces only the fixed NativeSupervisor systemctl/systemd-run seam.
+Pre-PID spawn, D-state, pipe closure or late raw reap uncertainty is retained.
+Source does not prove that the outside owner itself is kernel deadline-safe.
+"""
+from dataclasses import dataclass, field
+import os
+from pathlib import Path
+import select
+import signal
+import subprocess
+import threading
+import time
+
+
+class ControlUnconfirmed(RuntimeError):
+    def __init__(self, record, primary):
+        super().__init__("STOP_UNCONFIRMED:native_control")
+        self.record = record
+        self.primary = primary
+        self.secondary = tuple(record.errors)
+
+
+@dataclass(eq=False)
+class ControlChild:
+    argv: tuple
+    owner_pid: int
+    owner_thread: object
+    entered_at: float
+    deadline: float
+    state: str = "SPAWN_PREPID_UNKNOWN"
+    pid: int | None = None
+    rawstat: str | None = None
+    boot_id: str | None = None
+    pidfd: int | None = None
+    process: object = None
+    raw_wait: int | None = None
+    stdout: bytearray = field(default_factory=bytearray)
+    stderr: bytearray = field(default_factory=bytearray)
+    eof: set = field(default_factory=set)
+    closed: bool = False
+    kill_sent: bool = False
+    errors: list = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ControlResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    custody: ControlChild
+
+
+_CHILDREN = []
+_LOCK = threading.RLock()
+MAX_CHILDREN = 4096
+MAX_CAPTURE = 65536
+
+
+def _birth(pid):
+    raw = Path(f"/proc/{pid}/stat").read_text()
+    return (Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            int(raw.rsplit(")", 1)[1].split()[19]), raw)
+
+
+def _remaining(end):
+    left = end - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("native_control_original_cutoff")
+    return left
+
+
+class CountedNativeCommands:
+    def __init__(self):
+        self.owner_pid = os.getpid()
+        self.owner_thread = threading.current_thread()
+        self.owner_birth = _birth(self.owner_pid)[:2]
+        self.records = []
+
+    def _reap(self, record):
+        if record.raw_wait is not None:
+            return True
+        pid, status = os.waitpid(record.pid, os.WNOHANG)
+        if pid:
+            if pid != record.pid:
+                raise RuntimeError("foreign_control_raw_wait")
+            record.raw_wait = status
+            record.process.returncode = os.waitstatus_to_exitcode(status)
+            record.state = "RAW_REAP_OBSERVED"
+            return True
+        return False
+
+    def _drain(self, record, ready):
+        for fd, name in ready:
+            try:
+                block = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
+            if not block:
+                record.eof.add(name)
+                continue
+            buf = getattr(record, name)
+            if len(buf) + len(block) > MAX_CAPTURE:
+                raise ValueError("native_control_capture_quota")
+            buf.extend(block)
+
+    def _close(self, record):
+        for label in ("stdout", "stderr"):
+            handle = getattr(record.process, label, None)
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException as error:
+                    record.errors.append((label + "_close", error))
+        if record.pidfd is not None:
+            fd = record.pidfd; record.pidfd = None
+            try:
+                os.close(fd)
+            except BaseException as error:
+                record.errors.append(("pidfd_close", error))
+        record.closed = not record.errors
+
+    def _kill_once(self, record):
+        if record.kill_sent or record.pidfd is None or record.raw_wait is not None:
+            return
+        record.kill_sent = True
+        try:
+            signal.pidfd_send_signal(record.pidfd, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except BaseException as error:
+            record.errors.append(("control_kill", error))
+
+    def run(self, argv, timeout, *, absolute=None, env=None):
+        end = time.monotonic() + timeout
+        if absolute is not None:
+            end = min(end, absolute)
+        if not _LOCK.acquire(timeout=max(0, end-time.monotonic())):
+            raise TimeoutError("native_control_serialization_original_cutoff")
+        try:
+            return self._run_locked(argv, timeout, absolute=end, env=env)
+        finally:
+            _LOCK.release()
+
+    def _run_locked(self, argv, timeout, *, absolute=None, env=None):
+        if (os.getpid() != self.owner_pid
+                or _birth(self.owner_pid)[:2] != self.owner_birth):
+            raise RuntimeError("native_control_owner_changed")
+        if (type(argv) not in (list, tuple) or not argv
+                or argv[0] not in {"/usr/bin/systemctl", "/usr/bin/systemd-run"}
+                or any(type(a) is not str or "\x00" in a or len(a.encode()) > 4096 for a in argv)):
+            raise ValueError("native_control_not_fixed_argv")
+        end = time.monotonic() + timeout
+        if absolute is not None:
+            end = min(end, absolute)
+        _remaining(end)
+        with _LOCK:
+            if len(_CHILDREN) >= MAX_CHILDREN or any(not r.closed or r.raw_wait is None for r in _CHILDREN):
+                raise RuntimeError("prior_native_control_STOP_UNCONFIRMED")
+            record = ControlChild(tuple(argv), self.owner_pid, threading.current_thread(), time.monotonic(), end)
+            _CHILDREN.append(record)
+            self.records.append(record)  # intent BEFORE Popen, including unknown pre-PID effects
+        try:
+            record.process = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                               close_fds=True)
+            record.pid = record.process.pid
+            record.boot_id, ticks, record.rawstat = _birth(record.pid)
+            record.pidfd = os.pidfd_open(record.pid, 0)
+            if _birth(record.pid)[:2] != (record.boot_id, ticks):
+                raise RuntimeError("control_child_birth_changed")
+            record.state = "LIVE_RETAINED"
+            pairs = [(record.process.stdout.fileno(), "stdout"), (record.process.stderr.fileno(), "stderr")]
+            for fd, name in pairs:
+                os.set_blocking(fd, False)
+            # Preserve the existing command ceiling and original absolute
+            # cutoff. A timeout leaves actual late reap UNKNOWN; never shrink
+            # mandatory positive latency thresholds or create another budget.
+            stop_at = end
+            while time.monotonic() < stop_at:
+                self._reap(record)
+                fds = [fd for fd, name in pairs if name not in record.eof]
+                ready = select.select(fds, [], [], min(.01, max(0, stop_at - time.monotonic())))[0]
+                self._drain(record, [(fd, name) for fd, name in pairs if fd in ready])
+                if record.raw_wait is not None and record.eof == {"stdout", "stderr"}:
+                    self._close(record)
+                    if record.errors:
+                        raise RuntimeError("native_control_explicit_close_UNKNOWN")
+                    _remaining(end)
+                    record.state = "CLOSED"
+                    return ControlResult(record.process.returncode, record.stdout.decode("utf-8"),
+                                         record.stderr.decode("utf-8"), record)
+            raise TimeoutError("native_control_useful_cutoff")
+        except BaseException as primary:
+            if record.pid is not None and record.process is not None:
+                self._kill_once(record)
+                try:
+                    self._reap(record)
+                except BaseException as error:
+                    record.errors.append(("control_immediate_raw_reap", error))
+                while record.raw_wait is None and time.monotonic() < end:
+                    try:
+                        if self._reap(record):
+                            break
+                        select.select([], [], [], min(.01, max(0, end - time.monotonic())))
+                    except BaseException as error:
+                        record.errors.append(("control_raw_reap", error))
+                        break
+                self._close(record)
+            # Even late successful reap preserves the observed original failure.
+            record.state = "STOP_UNCONFIRMED" if record.raw_wait is None or not record.closed or time.monotonic() >= end else "FAILED_RAW_REAP_CLOSED"
+            raise ControlUnconfirmed(record, primary) from primary
+
+    def all_closed(self):
+        return all(r.raw_wait is not None and r.closed and r.state == "CLOSED" for r in self.records)

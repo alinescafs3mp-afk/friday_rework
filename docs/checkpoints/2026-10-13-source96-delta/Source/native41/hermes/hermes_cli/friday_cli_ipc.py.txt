@@ -1,0 +1,113 @@
+"""One authenticated fixed-purpose outside-owner channel; NEW Source."""
+import json
+import math
+import os
+import select
+import socket
+import struct
+import threading
+import time
+
+MAX_PACKET = 65536
+OPS = frozenset({"CLAIM","CHECK","NARROW","ACTIVITY","PROXY","REPAINT","PROMPT",
+                 "TASK_RESERVE","TASK_ATTACH","RECEIPTS","FINISH","STOP"})
+
+
+class IPCUnconfirmed(RuntimeError):
+    pass
+
+
+def encode(value):
+    body = json.dumps(value, sort_keys=True, separators=(",",":"), ensure_ascii=False, allow_nan=False).encode()
+    if len(body) > MAX_PACKET:
+        raise IPCUnconfirmed("original_IPC_packet_quota")
+    return body
+
+
+def decode(body):
+    def pairs(rows):
+        value = {}
+        for k,v in rows:
+            if k in value:
+                raise IPCUnconfirmed("original_IPC_duplicate_key")
+            value[k]=v
+        return value
+    if len(body) > MAX_PACKET:
+        raise IPCUnconfirmed("original_IPC_packet_quota")
+    return json.loads(body.decode("utf-8"),object_pairs_hook=pairs,
+                      parse_constant=lambda x: (_ for _ in ()).throw(IPCUnconfirmed("nonfinite_IPC")))
+
+
+def request(value):
+    if (type(value) is not dict or set(value)!={"v","seq","lease","operation","body"}
+            or type(value["v"]) is not int or value["v"]!=1
+            or type(value["seq"]) is not int or not 1<=value["seq"]<=4096*32
+            or value["operation"] not in OPS or type(value["body"]) is not dict
+            or value["lease"] is not None and (type(value["lease"]) is not str or len(value["lease"])!=32)):
+        raise IPCUnconfirmed("original_IPC_request_schema")
+    return value
+
+
+def recv_credentialed(sock, *, expected_pid, expected_uid):
+    body, ancillary, flags, address=sock.recvmsg(MAX_PACKET+1,socket.CMSG_SPACE(struct.calcsize("3i")))
+    if not body or flags & (socket.MSG_TRUNC|socket.MSG_CTRUNC):
+        raise IPCUnconfirmed("original_IPC_closed_or_truncated")
+    credentials=[struct.unpack("3i",b) for level,kind,b in ancillary
+                 if level==socket.SOL_SOCKET and kind==socket.SCM_CREDENTIALS and len(b)==struct.calcsize("3i")]
+    if len(credentials)!=1 or credentials[0][0]!=expected_pid or credentials[0][1]!=expected_uid:
+        raise IPCUnconfirmed("original_IPC_foreign_actual_sender")
+    return decode(body)
+
+
+class OriginalIPCClient:
+    def __init__(self, sock, binding, owner_pid):
+        if sock.family!=socket.AF_UNIX or sock.type & 0xF != socket.SOCK_SEQPACKET:
+            raise IPCUnconfirmed("original_IPC_not_native_seqpacket")
+        self.sock=sock
+        self.binding=binding
+        self.owner_pid=owner_pid
+        self.uid=os.getuid()
+        self.seq=0
+        self.lock=threading.RLock()
+        self.poison=None
+        sock.setsockopt(socket.SOL_SOCKET,socket.SO_PASSCRED,1)
+        sock.setblocking(False)
+
+    def call(self, operation, body, *, lease=None, deadline):
+        self.binding.require("original_IPC_before_"+operation)
+        if self.poison is not None:
+            raise IPCUnconfirmed("original_IPC_prior_UNKNOWN")
+        if not self.lock.acquire(timeout=max(0,deadline-time.monotonic())):
+            raise IPCUnconfirmed("original_IPC_lock_cutoff")
+        try:
+            self.seq+=1
+            value=request({"v":1,"seq":self.seq,"lease":lease,"operation":operation,"body":body})
+            packet=encode(value)
+            while True:
+                left=deadline-time.monotonic()
+                if left<=0:raise TimeoutError("original_IPC_send_cutoff")
+                try:
+                    if self.sock.send(packet)!=len(packet):raise IPCUnconfirmed("original_IPC_short_send")
+                    break
+                except BlockingIOError:
+                    select.select([],[self.sock],[],left)
+            while True:
+                left=deadline-time.monotonic()
+                if left<=0:raise TimeoutError("original_IPC_receive_cutoff")
+                try:
+                    response=recv_credentialed(self.sock,expected_pid=self.owner_pid,expected_uid=self.uid)
+                    break
+                except BlockingIOError:
+                    select.select([self.sock],[],[],left)
+            if (type(response) is not dict or set(response)!={"v","seq","lease","state","body"}
+                    or type(response["v"]) is not int or response["v"]!=1 or response["seq"]!=self.seq
+                    or response["lease"] != lease and operation!="CLAIM"
+                    or response["state"]!="OBSERVED" or type(response["body"]) is not dict):
+                raise IPCUnconfirmed("original_IPC_response_unknown_or_foreign")
+            if time.monotonic()>=deadline:raise TimeoutError("original_IPC_late_final_return")
+            return response
+        except BaseException as error:
+            self.poison=error
+            raise
+        finally:
+            self.lock.release()

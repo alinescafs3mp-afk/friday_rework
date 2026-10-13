@@ -1,0 +1,177 @@
+"""Fixed original CLI clone/exec and actual raw wait, loaded only after Go."""
+from dataclasses import dataclass, field
+import ctypes
+import errno
+import os
+from pathlib import Path
+import select
+import signal
+import socket
+import struct
+import time
+
+
+@dataclass(eq=False)
+class OriginalNativeChild:
+    binding: object
+    stage: str = "PREPID_UNKNOWN"
+    pid: int | None = None
+    pidfd: int | None = None
+    gatefd: int | None = None
+    errorfd: int | None = None
+    rawstat: str | None = None
+    boot_id: str | None = None
+    raw_wait: int | None = None
+    started_at: float | None = None
+    kill_sent: bool = False
+    stop_attempted: bool = False
+    closed: bool = False
+    errors: list = field(default_factory=list)
+    primary: object = None
+
+
+class BirthUnconfirmed(RuntimeError):
+    def __init__(self, child, primary):
+        super().__init__("STOP_UNCONFIRMED:original_native_birth")
+        self.child = child
+        self.primary = primary
+
+
+class _NativeBirth(ctypes.Structure):
+    _fields_ = [("pid",ctypes.c_int),("pidfd",ctypes.c_int),
+                ("gate_write",ctypes.c_int),("error_read",ctypes.c_int),("parent_close_errno",ctypes.c_int)]
+
+
+def birth(pid):
+    raw = Path(f"/proc/{pid}/stat").read_text()
+    return (Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            int(raw.rsplit(")",1)[1].split()[19])), raw
+
+
+def group(pid):
+    rows = [x.split(":",2) for x in Path(f"/proc/{pid}/cgroup").read_text().splitlines()]
+    values = [x[2] for x in rows if len(x)==3 and x[:2]==["0",""]]
+    if len(values)!=1:
+        raise RuntimeError("native_original_cgroup_unconfirmed")
+    return values[0]
+
+
+class OriginalBirthBoundary:
+    def __init__(self, binding):
+        self.binding = binding.require("before_native_birth_library")
+        self.library = ctypes.CDLL(binding.native_library, use_errno=True)
+        self.spawn = self.library.friday_cli_spawn
+        self.spawn.argtypes = [ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_char_p,
+                               ctypes.POINTER(ctypes.c_char_p),ctypes.POINTER(_NativeBirth)]
+        self.spawn.restype = ctypes.c_int
+        self.children = []
+
+    def launch(self, inputfd, ipcfd):
+        b = self.binding.require("before_clone_into_exclusive_original_cgroup")
+        child = OriginalNativeChild(b, started_at=time.monotonic())
+        self.children.append(child)  # includes a native call that never returns
+        values = [x.encode() for x in b.environment]
+        environment = (ctypes.c_char_p*(len(values)+1))(*values,None)
+        result = _NativeBirth()
+        try:
+            if self.spawn(b.exclusive_cgroup_fd,inputfd,ipcfd,b.interpreter.encode(),environment,
+                          ctypes.byref(result)) != 0:
+                raise OSError(ctypes.get_errno(),"native_clone_unconfirmed")
+            child.pid=result.pid; child.pidfd=result.pidfd
+            child.gatefd=result.gate_write; child.errorfd=result.error_read
+            if result.parent_close_errno:
+                child.errors.append(OSError(result.parent_close_errno,"native_parent_close_UNKNOWN"))
+                raise RuntimeError("native_birth_parent_descriptors_close_UNKNOWN")
+            first, raw=birth(child.pid); child.boot_id=first[0];child.rawstat=raw
+            if group(child.pid) != b.exclusive_cgroup or group(os.getpid()).startswith(b.exclusive_cgroup+"/") or group(os.getpid())==b.exclusive_cgroup:
+                raise RuntimeError("original_birth_owner_not_outside")
+            if birth(child.pid)[0] != first:
+                raise RuntimeError("original_native_birth_changed")
+            b.require("before_original_exec_gate")
+            if os.write(child.gatefd,b"G") != 1:
+                raise OSError("original_exec_gate_short_write")
+            fd=child.gatefd; child.gatefd=None; os.close(fd)
+            child.stage="ORIGINAL_LIVE_EXEC_UNCONFIRMED"
+            return child
+        except BaseException as primary:
+            child.primary=primary
+            # No imaginary PID, spawned absence, retry, replacement or new clock.
+            raise BirthUnconfirmed(child,primary) from primary
+
+    def observe_exec(self, child):
+        if child.errorfd is None:
+            return child.stage == "EXEC_PIPE_CLOSED_EXEC_OR_EXIT_UNCONFIRMED"
+        try:
+            body=os.read(child.errorfd,4)
+        except BlockingIOError:
+            return False
+        if body:
+            child.primary=OSError(struct.unpack("i",body)[0],"original_exec_failed")
+            child.stage="STOP_UNCONFIRMED"
+            raise BirthUnconfirmed(child,child.primary)
+        fd=child.errorfd;child.errorfd=None;os.close(fd)
+        child.stage="EXEC_PIPE_CLOSED_EXEC_OR_EXIT_UNCONFIRMED"
+        return True
+
+    def reap(self, child):
+        if child.pid is None:
+            return False
+        if child.raw_wait is not None:
+            return True
+        pid,status=os.waitpid(child.pid,os.WNOHANG)
+        if pid:
+            if pid != child.pid:
+                raise RuntimeError("foreign_original_raw_wait")
+            child.raw_wait=status;child.stage="ORIGINAL_RAW_REAP_OBSERVED"
+            return True
+        return False
+
+    def stop(self, child, *, deadline):
+        if child.stop_attempted:
+            raise BirthUnconfirmed(child, RuntimeError("original_direct_stop_not_repeated"))
+        child.stop_attempted=True
+        # A whole-unit refusal does not license bypassing retained pidfd
+        # custody. This separate direct action needs the same native authority.
+        self.binding.require_retained_cleanup(
+            "before_original_direct_stop", native_boundary=self, child=child,
+            deadline=deadline)
+        if child.pid is None:
+            raise BirthUnconfirmed(child,child.primary or RuntimeError("original_PREPID_UNKNOWN"))
+        if child.raw_wait is None and not child.kill_sent:
+            child.kill_sent=True
+            try:
+                signal.pidfd_send_signal(child.pidfd,signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except BaseException as error:
+                child.errors.append(error)
+        try:
+            # One direct WNOHANG observation is attempted even when the
+            # original cutoff expired; expiry never licenses a later wait.
+            if child.raw_wait is None:
+                self.reap(child)
+            while child.raw_wait is None and time.monotonic() < deadline:
+                if self.reap(child):
+                    break
+                select.select([],[],[],min(.01,max(0,deadline-time.monotonic())))
+        except BaseException as error:
+            child.errors.append(error)
+        finally:
+            self.close(child)
+        if child.raw_wait is None or child.errors or time.monotonic() >= deadline:
+            child.stage="STOP_UNCONFIRMED"
+            raise BirthUnconfirmed(child,child.primary or TimeoutError("late_original_raw_reap_or_close"))
+        child.stage="ORIGINAL_RAW_REAP_CLOSED"
+        return child.raw_wait
+
+    def close(self, child):
+        for name in ("gatefd","errorfd","pidfd"):
+            fd=getattr(child,name)
+            if fd is None:
+                continue
+            setattr(child,name,None)
+            try:
+                os.close(fd)
+            except BaseException as error:
+                child.errors.append(error)
+        child.closed=not child.errors

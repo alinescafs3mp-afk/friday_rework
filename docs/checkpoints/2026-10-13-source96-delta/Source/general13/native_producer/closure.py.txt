@@ -1,0 +1,224 @@
+"""Bounded exact owned-resource settlement; independent errors preserve primary facts."""
+from __future__ import annotations
+import asyncio
+from contextvars import copy_context
+import queue
+import threading
+import time
+from driver.qualification import Unbound
+from driver.native import object_key
+from .custody import number
+from .history import read_native_history
+
+def actual_task_state(task):
+    if type(task) is not asyncio.Task:
+        return {"object":object_key(task),"alive":None,"unknown":"not_exact_observed_native_task"}
+    row = {"object":object_key(task),"alive":None,"unknown":None}
+    try:
+        done = task.done()
+        row.update(loop=object_key(task.get_loop()),alive=not done,done=done,cancelled=task.cancelled())
+        if done and not task.cancelled():
+            exc = task.exception()
+            row["exception_type"] = None if exc is None else type(exc).__name__
+    except BaseException as error:
+        row["unknown"] = "actual_task_state_error:"+type(error).__name__
+    return row
+
+def join_actual_threads(threads, deadline, *, exclude=(), witnesses=()):
+    if type(threads) not in (tuple,list) or type(exclude) not in (tuple,list) or type(witnesses) not in (tuple,list):
+        raise Unbound("join_requires_exact_Source_sequences")
+    number(deadline,"join_deadline",0,1e12)
+    rows,seen = [],set()
+    for thread in threads:
+        if id(thread) in seen or any(thread is x for x in exclude):
+            continue
+        seen.add(id(thread))
+        witness = next((w for w in witnesses if type(w) is dict and w.get("object") is thread and w.get("kind") in {"thread","frontend_thread"}),None)
+        if type(thread) is not threading.Thread or witness is None:
+            rows.append({"object":object_key(thread),"alive":None,"unknown":"no_exact_retained_thread_generation_no_join"})
+            continue
+        row = {"object":object_key(thread),"generation":witness["generation"],"tid":thread.native_id,"alive":None,"unknown":None}
+        try:
+            if thread is threading.current_thread():
+                row.update(alive=True,unknown="cannot_join_original_self")
+            elif thread.ident is None:
+                row.update(alive=False,unknown="thread_start_not_observed")
+            else:
+                entered = time.monotonic()
+                thread.join(max(0,deadline-entered))
+                row.update(entered=entered,returned=time.monotonic(),alive=thread.is_alive())
+                if row["returned"] > deadline or row["alive"]:
+                    row["unknown"] = "original_join_deadline_or_thread_alive"
+        except BaseException as exc:
+            row["unknown"] = "actual_join_error:"+type(exc).__name__
+        rows.append(row)
+    return rows
+
+class OriginalClosureAdapter:
+    def __init__(self, runtime, observer, bus):
+        from .runtime import NativeRuntime
+        from .observation import OriginalObserver
+        from .controller import EventBus
+        if type(runtime) is not NativeRuntime or type(observer) is not OriginalObserver or type(bus) is not EventBus:
+            raise Unbound("closure_inputs_not_exact_Source")
+        self.runtime,self.observer,self.bus = runtime,observer,bus
+        self.stop,self.thread = threading.Event(),None
+        self.unknown,self.errors,self.closed = [],[],[]
+    def start(self):
+        self.runtime.require_effect("owned_actor")
+        if self.thread is not None:
+            raise Unbound("original_closure_actor_replay")
+        context = copy_context()
+        self.thread = threading.Thread(target=context.run,args=(self.run,),name="cli150-original-caller-reaper")
+        self.observer.register_Source_actor(self.thread,"reaper",self,context)
+        try:
+            self.thread.start()
+        except BaseException as exc:
+            self.observer.record_Source_start(self.thread,error=exc)
+            raise
+        else:
+            self.observer.record_Source_start(self.thread)
+    def run(self):
+        events = self.bus.queues["reaper"]
+        while not self.stop.is_set():
+            final = self.runtime.original_deadline(final=True)
+            if self.observer.case_deadline is not None:
+                final = min(final,self.observer.case_deadline)
+            now = time.monotonic()
+            if now >= final:
+                self.unknown.append("reaper_original_case_deadline")
+                break
+            try:
+                row = events.get(timeout=min(.05,final-now))
+            except queue.Empty:
+                continue
+            try:
+                if row.get("kind") != "outer_input_return":
+                    continue
+                ordinal,generation = row.get("caller"),row.get("caller_generation")
+                matches = [x for x in self.observer.callers if x.ordinal == ordinal and x.generation == generation]
+                if len(matches) != 1 or ordinal in self.closed:
+                    self.unknown.append("original_caller_closure_identity_generation_ambiguous")
+                    continue
+                self.close_original(matches[0])
+            except BaseException as exc:
+                self.errors.append({"stage":"reaper_row","type":type(exc).__name__})
+                self.bus.stop.set()
+
+    def close_original(self, caller):
+        from .observation import OriginalCaller
+        if type(caller) is not OriginalCaller or caller.ordinal in self.closed or caller.returned is None:
+            raise Unbound("original_closure_not_exact_or_duplicate_or_unreturned")
+        resources,history = [],None
+        try:
+            resources.extend(join_actual_threads(list(caller.threads),caller.deadline,exclude=(self.thread,),witnesses=list(self.observer.owner_witnesses)))
+        except BaseException as exc:
+            resources.append({"alive":None,"unknown":"caller_thread_settlement:"+type(exc).__name__})
+        for task in caller.tasks:
+            resources.append(actual_task_state(task))
+        try:
+            self.runtime.require_effect("history_read",useful=False)
+            history = read_native_history(caller)
+        except BaseException as exc:
+            history = dict(caller.history_partial) if type(caller.history_partial) is dict else {}
+            history["unknown"] = list(history.get("unknown",[]))+["actual_history_error:"+type(exc).__name__]
+        try:
+            caller.close_after_actual_joins(resources,history,time.monotonic())
+        except BaseException as exc:
+            caller.unknown.append("caller_closure_record_error:"+type(exc).__name__)
+            self.errors.append({"stage":"caller_closure_record","type":type(exc).__name__})
+            raise
+        self.closed.append(caller.ordinal)
+        for witness in self.observer.owner_witnesses:
+            if witness.get("generation") == caller.generation and witness.get("kind") in {"thread","task"}:
+                witness["retired"] = True
+        self.bus.emit("caller_closed",{"caller":caller.ordinal,"caller_generation":caller.generation,"caller_deadline":caller.deadline,
+            "raw_return":caller.returned,"closed_at":caller.closed_at,"actual_failures":list(caller.failures),"actual_unknown":list(caller.unknown)})
+
+    def close(self, deadline):
+        self.stop.set()
+        if self.thread is not None:
+            try:
+                self.observer.join_Source_actor(self.thread,deadline)
+            except BaseException as exc:
+                self.errors.append({"stage":"reaper_join","type":type(exc).__name__})
+        if self.thread is None or not self.thread.is_alive():
+            for caller in self.observer.callers:
+                if caller.returned is not None and caller.closed_at is None:
+                    try:
+                        self.close_original(caller)
+                    except BaseException as exc:
+                        self.errors.append({"stage":"final_caller_closure","type":type(exc).__name__})
+        else:
+            self.unknown.append("original_reaper_unjoined_no_parallel_reap")
+        return {"closed_callers":list(self.closed),"unknown":list(self.unknown),"errors":list(self.errors),
+            "thread_id":None if self.thread is None else self.thread.native_id,"thread_alive":None if self.thread is None else self.thread.is_alive()}
+
+def final_native_closure(runtime, observer, *, own_threads=()):
+    deadline = min(runtime.original_deadline(final=True),observer.case_deadline if observer.case_deadline is not None else runtime.original_deadline(final=True))
+    # own_threads is a supplied inventory, never blanket exclusion authority.
+    unknown_own = [t for t in own_threads if observer.source_actor_for(t) is None]
+    source_actors = observer.Source_actor_snapshot()
+    source_controls_settled = all(r["settled"] is True for r in source_actors if r["role"] in {"controller","reaper"})
+    threads = join_actual_threads(list(observer.created_threads),deadline,witnesses=list(observer.owner_witnesses))
+    tasks = [actual_task_state(x) for x in observer.created_tasks]
+    loops,errors = [],[]
+    for witness in observer.loops:
+        loop = witness["loop"]
+        row = {"object":object_key(loop),"owner_tid":witness["owner_tid"],"caller_generation":witness["caller_generation"],"unknown":None}
+        try:
+            row.update(closed=loop.is_closed(),running=loop.is_running(),pending_actual_tasks=[])
+            if row["running"]:
+                row["unknown"] = "original_persistent_loop_still_running"
+            elif not row["closed"]:
+                pending = [x for x in asyncio.all_tasks(loop) if not x.done()]
+                row["pending_actual_tasks"] = [object_key(x) for x in pending]
+                row["unknown"] = "native_persistent_loop_owner_teardown_requires_Root"
+        except BaseException as exc:
+            row["unknown"] = "loop_observation_error:"+type(exc).__name__
+        loops.append(row)
+    late_threads = [t for t in threading.enumerate() if not any(t is old for old in observer.preexisting_threads)
+        and not any(t is old for old in observer.created_threads) and observer.source_actor_for(t) is None]
+    handles = []
+    for handle in observer.handles:
+        row = {"object":object_key(handle),"cancelled":None,"executed_or_joined":"EXACT_NATIVE_DISPATCH_PROOF_REQUIRED"}
+        try:
+            if isinstance(handle,asyncio.Handle):
+                row["cancelled"] = handle.cancelled()
+        except BaseException as exc:
+            row["unknown"] = type(exc).__name__
+        handles.append(row)
+    leases = []
+    for retained in observer.leases:
+        lease,caller = retained["lease"],retained["caller"]
+        row = {"object":object_key(lease),"caller":None if caller is None else caller.ordinal,"unknown":None}
+        try:
+            if caller is None or type(lease) is not runtime.classes["descriptor_lease"]:
+                row["unknown"] = "lease_original_caller_generation_UNCONFIRMED"
+            else:
+                row.update(active=lease.active,retained_fd=lease.fd,owner_uncertain_descriptor=lease.owner.uncertain_descriptor)
+                if lease.active is not False or lease.fd is not None or lease.owner.uncertain_descriptor is not None:
+                    row["unknown"] = "lease_writer_release_UNCONFIRMED"
+        except BaseException as exc:
+            row["unknown"] = "lease_state_error:"+type(exc).__name__
+        leases.append(row)
+    prompt_settled = observer.prompt_witness is None
+    if observer.prompt_witness is not None:
+        try:
+            prompt_settled = observer.prompt_witness.future.done() and not observer.prompt_witness.app.is_running
+        except BaseException as exc:
+            errors.append({"stage":"prompt_settlement","type":type(exc).__name__})
+    # Never infer settled native writers from the main frontend return alone.
+    writers = (observer.native_frontend_returned is not None and observer.output_owner_close_returned is not None
+        and prompt_settled and source_controls_settled and not unknown_own and not observer.output_owner_close_errors and not observer.foreign_resources and not late_threads
+        and all(not x.get("unknown") for x in leases)
+        and all(x.get("alive") is False and not x.get("unknown") for x in threads+tasks)
+        and all(not x.get("running",True) and not x.get("pending_actual_tasks") for x in loops))
+    return {"Source_actors":source_actors,"unregistered_own_threads":[object_key(t) for t in unknown_own],
+        "Source_capture_reader_role":"KNOWN_NON_NATIVE_WRITERS_JOINED_AND_FD_RELEASED_IN_LATER_FIXTURE_STAGE",
+        "original_threads":threads,"original_tasks":tasks,"original_persistent_loops":loops,"actual_descriptor_leases":leases,
+        "unobserved_new_threads":[{"object":object_key(t),"tid":t.native_id,"alive":t.is_alive(),"attribution":"UNKNOWN_NO_JOIN"} for t in late_threads],
+        "foreign_or_unattributed_resources":list(observer.foreign_resources),"original_handles":handles,"errors":errors,
+        "writers_qualified_quiescent":writers,"output_owner_actual_close_return":observer.output_owner_close_returned,"output_owner_close_errors":list(observer.output_owner_close_errors),
+        "native_frontend_actual_return":observer.native_frontend_returned,"final_clock":time.monotonic(),
+        "postreturn_process_tree_and_fd_absence":"ROOT_REQUIRED_UNKNOWN_NOT_ZERO","acceptance":"NOT_ISSUED_BY_OBSERVATION"}
