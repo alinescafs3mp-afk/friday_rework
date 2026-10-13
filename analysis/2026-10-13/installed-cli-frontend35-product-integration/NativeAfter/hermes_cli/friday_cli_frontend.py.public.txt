@@ -1,0 +1,337 @@
+"""Finite physical output on the retained frontend, not a replacement AppSession.
+
+Source proposal only. OS scheduling, rendering callbacks and whole caller
+hard stop remain separate qualification requirements. The existing proxy
+thread stays the sole queue reader and retains every scheduled native Future.
+"""
+import asyncio
+import concurrent.futures
+from contextlib import contextmanager
+import os
+import queue
+import select
+import threading
+import time
+
+_REGISTRY = {}
+MAX_TEXT = 384 * 1024
+MAX_PENDING = 1024 * 1024
+
+class FrontendUnconfirmed(RuntimeError):
+    pass
+
+class _Barrier:
+    def __init__(self):
+        self.future = concurrent.futures.Future()
+
+class FiniteFrontend:
+    def __init__(self, owner):
+        self.owner = owner
+        self.stream = owner.stream
+        self.lock = threading.RLock()
+        self.caller = None
+        self.closed = False
+        self.pending = {}
+        self.errors = []
+        self.ordinal = 0
+        self.flushed = 0
+        self.pending_bytes = 0
+        self.proxy = None
+        self.close_started = False
+        self.last_physical = None
+        self._registry_close = None
+
+    def deadline(self):
+        caller = self.caller
+        if caller is not None:
+            caller.check("frontend_budget", cleanup=True)
+            return caller.end
+        # Independent normal UI transaction only. No caller can remint this
+        # deadline while its active finite operation owns this frontend.
+        return time.monotonic() + 30.0
+
+    @contextmanager
+    def state_lock(self):
+        end = self.deadline()
+        if not self.lock.acquire(timeout=max(0, end - time.monotonic())):
+            raise FrontendUnconfirmed("frontend_state_lock_deadline")
+        try:
+            yield
+        finally:
+            self.lock.release()
+
+    def physical(self, text):
+        if type(text) is not str:
+            raise FrontendUnconfirmed("physical_text_not_exact")
+        data = text.encode(getattr(self.stream, "encoding", None) or "utf-8", "replace")
+        if len(data) > MAX_TEXT:
+            raise FrontendUnconfirmed("physical_text_limit")
+        end = self.deadline()
+        if self.closed or not self.owner.busy.acquire(timeout=max(0, end - time.monotonic())):
+            raise FrontendUnconfirmed("physical_owner_busy_or_closed")
+        fd = None
+        offset = 0
+        try:
+            self.owner.check_lifetime()
+            self.owner.anchor.validate()
+            if self.owner.anchor.memory:
+                if (self.stream.tell() + len(data) > 2 * MAX_TEXT
+                        or self.stream.tell() != len(self.stream.getvalue())):
+                    raise FrontendUnconfirmed("physical_memory_limit")
+                self.stream.write(text)
+                offset = len(data)
+            else:
+                fd = self.owner.anchor.reopen()
+                while offset < len(data):
+                    if time.monotonic() >= end:
+                        raise TimeoutError("physical_original_deadline")
+                    self.owner.anchor.validate()
+                    try:
+                        n = os.write(fd, data[offset:offset + 4096])
+                        if type(n) is not int or not 0 < n <= min(4096, len(data) - offset):
+                            raise FrontendUnconfirmed("physical_acceptance_unknown")
+                        offset += n
+                    except BlockingIOError:
+                        select.select([], [fd], [], min(.01, max(0, end - time.monotonic())))
+                    except InterruptedError:
+                        pass
+                    self.owner.anchor.validate()
+            if time.monotonic() >= end:
+                raise TimeoutError("physical_original_deadline")
+            self.last_physical = {"ordinal": self.ordinal, "bytes": offset,
+                                  "at": time.monotonic(), "deadline": end}
+        except BaseException as exc:
+            self.errors.append({"phase": "physical", "error": type(exc).__name__,
+                                "accepted_bytes": offset, "requested_bytes": len(data)})
+            # No new document can inherit an uncertain frontend stream.
+            self.owner.record_poison = {"state": "UNKNOWN", "source": "physical_frontend",
+                                        "accepted": offset, "next_document": "REFUSED"}
+            raise
+        finally:
+            try:
+                if fd is not None:
+                    self.owner.anchor.release(fd)
+            finally:
+                self.owner.busy.release()
+
+    @contextmanager
+    def proxy_lock(self, proxy):
+        end = self.deadline()
+        if not proxy._lock.acquire(timeout=max(0, end - time.monotonic())):
+            raise FrontendUnconfirmed("proxy_lock_deadline")
+        try:
+            yield
+        finally:
+            proxy._lock.release()
+
+    def enqueue(self, proxy, item):
+        if self.closed or proxy.closed:
+            raise FrontendUnconfirmed("proxy_closed")
+        if type(item) is str:
+            size = len(item.encode("utf-8"))
+            if size > MAX_TEXT:
+                raise FrontendUnconfirmed("proxy_item_limit")
+        else:
+            size = 0
+        with self.state_lock():
+            if self.pending_bytes + size > MAX_PENDING:
+                raise FrontendUnconfirmed("proxy_pending_limit")
+            self.pending_bytes += size
+            try:
+                proxy._flush_queue.put_nowait(item)
+            except BaseException:
+                self.pending_bytes -= size
+                raise
+
+    def proxy_write(self, proxy, loop, text, write):
+        end = self.deadline()
+        with self.state_lock():
+            self.ordinal += 1
+            serial = self.ordinal
+            future = concurrent.futures.Future()
+            record = {"future": future, "deadline": end, "serial": serial,
+                      "handle": None, "native_task": None, "state": "RESERVED"}
+            self.pending[serial] = record
+        if loop is None:
+            try:
+                write()
+                future.set_result(True)
+            except BaseException as exc:
+                future.set_exception(exc)
+        else:
+            app = proxy.app_session.app
+            if app is None or app.loop is not loop or not app.is_running:
+                raise FrontendUnconfirmed("proxy_original_app_changed")
+            from prompt_toolkit.application import run_in_terminal
+            async def original_tail():
+                if (self.closed or time.monotonic() >= end
+                        or proxy.app_session.app is not app or app.loop is not loop):
+                    raise FrontendUnconfirmed("late_or_foreign_native_proxy")
+                # Includes original erase, render/reset and physical flush.
+                await run_in_terminal(write, in_executor=False)
+                if time.monotonic() >= end:
+                    raise TimeoutError("proxy_native_tail_late")
+                return True
+            admitted_caller = self.caller
+            custody = None
+            if admitted_caller is not None:
+                custody = admitted_caller.custody.reserve_callback(
+                    "proxy_dispatch", record, loop, app, min(end, admitted_caller.end))
+                admitted_caller.guard.own_native_proxy_tail(
+                    admitted_caller, record=record, proxy=proxy, app=app,
+                    native_loop=loop, deadline=min(end, admitted_caller.end))
+            def dispatch():
+                if future.done() or record.get("stop_requested"):
+                    return
+                try:
+                    coroutine = original_tail()
+                    task_custody = None
+                    if admitted_caller is not None:
+                        task_custody = admitted_caller.custody.reserve_task(
+                            app.context, coroutine, loop, min(end, admitted_caller.end))
+                    task = loop.create_task(coroutine, context=app.context)
+                    if task_custody is not None:
+                        admitted_caller.custody.attach_task(task_custody, task)
+                    record["native_task"] = task  # before callback delivery
+                    def complete(t):
+                        if future.done():
+                            return
+                        if t.cancelled():
+                            future.set_exception(FrontendUnconfirmed("proxy_native_cancelled"))
+                        else:
+                            error = t.exception()
+                            if error is None:
+                                future.set_result(t.result())
+                            else:
+                                future.set_exception(error)
+                    task.add_done_callback(complete)
+                except BaseException as exc:
+                    future.set_exception(exc)
+            if custody is None:
+                record["handle"] = loop.call_soon_threadsafe(dispatch, context=app.context)
+            else:
+                record["handle"] = loop.call_soon_threadsafe(
+                    admitted_caller.custody.call_callback, custody, dispatch, context=app.context)
+                admitted_caller.custody.attach_handle(custody, record["handle"])
+        try:
+            value = future.result(timeout=max(0, end - time.monotonic()))
+            if value is not True or time.monotonic() >= end:
+                raise FrontendUnconfirmed("proxy_completion_late_or_invalid")
+            record["state"] = "CLOSED"
+            self.flushed = serial
+            with self.state_lock():
+                self.pending.pop(serial)
+            return value
+        except BaseException as exc:
+            record["state"] = "UNKNOWN_OWNED"
+            record["stop_requested"] = True
+            self.errors.append({"phase": "proxy_tail", "serial": serial, "error": type(exc).__name__})
+            self.owner.record_poison = {"state": "UNKNOWN", "source": "proxy_tail", "serial": serial}
+            # Retain exact task/Future/handle; timeout of .result is not reap.
+            raise
+
+    def proxy_loop(self, proxy):
+        from prompt_toolkit.patch_stdout import _Done
+        self.proxy = proxy
+        try:
+            while True:
+                item = proxy._flush_queue.get()
+                if isinstance(item, _Done):
+                    return
+                if type(item) is _Barrier:
+                    if self.pending or self.errors:
+                        item.future.set_exception(FrontendUnconfirmed("proxy_barrier_unconfirmed"))
+                    else:
+                        item.future.set_result(True)
+                    continue
+                if type(item) is not str:
+                    raise FrontendUnconfirmed("foreign_proxy_queue_item")
+                with self.state_lock():
+                    self.pending_bytes -= len(item.encode("utf-8"))
+                if item:
+                    proxy._write_and_flush(proxy._get_app_loop(), item)
+        except BaseException as exc:
+            self.errors.append({"phase": "proxy_loop", "error": type(exc).__name__})
+            self.owner.record_poison = {"state": "UNKNOWN", "source": "proxy_loop"}
+            # Every queued output/barrier is retained; no silent drain/drop.
+
+    def barrier(self):
+        proxy = self.proxy
+        if proxy is None or proxy.closed or not proxy._flush_thread.is_alive():
+            raise FrontendUnconfirmed("original_proxy_thread_not_live")
+        item = _Barrier()
+        with self.proxy_lock(proxy):
+            # Include any preceding incomplete ordinary line in this barrier.
+            proxy._flush()
+            self.enqueue(proxy, item)
+        return item.future
+
+    def close_proxy(self, proxy):
+        from prompt_toolkit.patch_stdout import _Done
+        end = self.deadline()
+        if proxy.closed:
+            return
+        if self.close_started:
+            raise FrontendUnconfirmed("prior_proxy_close_UNCONFIRMED_no_repeat")
+        self.close_started = True
+        with self.proxy_lock(proxy):
+            text = "".join(proxy._buffer)
+            proxy._buffer = []
+            if text:
+                self.enqueue(proxy, text)
+            self.enqueue(proxy, _Done())
+        # Joining from the application loop is safe only after its original
+        # terminal task chain settled; an active chain refuses clean closure.
+        proxy._flush_thread.join(timeout=max(0, end - time.monotonic()))
+        if proxy._flush_thread.is_alive() or self.pending or self.errors:
+            raise FrontendUnconfirmed("proxy_close_not_confirmed")
+        proxy.closed = True
+        self.closed = True
+
+def register(owner):
+    key = id(owner.stream)
+    if key in _REGISTRY:
+        raise FrontendUnconfirmed("original_frontend_already_registered")
+    state = FiniteFrontend(owner)
+    _REGISTRY[key] = state
+    return state
+
+def lookup(stream):
+    state = _REGISTRY.get(id(stream))
+    return state if state is not None and state.stream is stream else None
+
+def finite_flush(stream, text):
+    state = lookup(stream)
+    if state is None:
+        return False
+    state.physical(text)
+    return True
+
+
+def unregister(owner):
+    state = lookup(owner.stream)
+    repeated = state is None
+    if repeated:
+        # Normal CLI release and its original atexit callback share one owner.
+        # Only a witnessed successful removal permits the missing registration;
+        # proxy.closed/state.closed alone never proves registry closure.
+        state = getattr(owner, "_admitted_frontend", None)
+        receipt = getattr(state, "_registry_close", None)
+        if (id(owner.stream) in _REGISTRY or type(state) is not FiniteFrontend
+                or state.owner is not owner or state.stream is not owner.stream
+                or getattr(owner, "frontend", None) is not state
+                or type(receipt) is not tuple or len(receipt) != 2
+                or receipt[0] is not owner or receipt[1] is not owner.anchor
+                or owner.anchor is not getattr(owner, "_admitted_anchor", None)):
+            raise FrontendUnconfirmed("foreign_registry_close")
+    elif state.owner is not owner:
+        raise FrontendUnconfirmed("foreign_registry_close")
+    proxy = state.proxy
+    if (not owner.anchor.closed or state.pending
+            or proxy is not None and (not proxy.closed or proxy._flush_thread.is_alive())):
+        raise FrontendUnconfirmed("frontend_lifecycle_close_not_confirmed")
+    if repeated:
+        return
+    state.closed = True
+    _REGISTRY.pop(id(owner.stream))
+    state._registry_close = (owner, owner.anchor)
