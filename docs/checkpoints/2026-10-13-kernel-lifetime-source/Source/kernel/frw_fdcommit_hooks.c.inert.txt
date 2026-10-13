@@ -1,0 +1,505 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/* Connected direct-call SOURCE, not a loaded facility. See exact gaps. */
+#include <linux/frw_fdcommit_hooks.h>
+#include <linux/fdtable.h>
+#include <linux/cgroup.h>
+#include <linux/sched/task.h>
+#include <linux/ktime.h>
+#include <linux/rcupdate.h>
+#include <linux/jiffies.h>
+#include <linux/wait.h>
+#include <linux/string.h>
+#include "frw_fdcommit_kernel_core.h"
+#define FRWKH_EPOCHS 8
+#define FRWKH_ESCROW (FRWK_TASKS+FRWK_TABLES+FRWK_OFDS+FRWK_RINGS)
+#define FRWKH_WORK_LIMIT 16777216ULL
+#define FRWKH_HISTORY_FRAMES 64U
+static const u64 frwkh_loaded_qualification=0; /* cannot selfqualify */
+enum kh_kind {KH_TASK=1,KH_TABLE,KH_FILE}; /* TABLE/FILE are MEMORY pins */
+enum kh_hold_state {KH_RESERVED=0,KH_HELD,KH_TRANSFERRED,KH_CLOSING,KH_PUTTING,KH_ISSUED};
+enum kh_close_state {KH_CLOSE_NEW=0,KH_CLOSE_DRAINING,KH_CLOSE_READY,KH_CLOSE_PUTTING,KH_CLOSE_ISSUED,KH_CLOSE_PARTIAL};
+struct kh_hold {u32 kind,state;union {struct task_struct *task;struct files_struct *files;struct file *file;} ref;};
+struct kh_ring {struct io_ring_ctx *ctx;struct file *prepared;u64 id;u32 escrow_index,source_fd;bool used,closing,native_done;};
+struct kh_registry {struct frwk_epoch *epoch;struct task_struct *owner;
+ struct cgroup *scope;struct files_struct *root_files;u64 hi,lo,final_ns;
+ bool occupied,accepting,detached;atomic_t inflight;wait_queue_head_t drain;
+ u32 escrow_n,rings_n,escrow_owned,escrow_issued;
+ enum kh_close_state close_state;bool rcu_queued,rcu_done,escrow_taken;
+ u64 escrow_hi,escrow_lo,escrow_final_ns,work_left;
+ struct rcu_head close_rcu;
+ /* Fixed precharged correspondence scratch; no kmalloc under native locks. */
+ bool physical_copy; /* marked before the native loop; drained before original close */
+ struct kh_hold escrow[FRWKH_ESCROW];struct kh_ring rings[FRWK_RINGS];};
+static DEFINE_RAW_SPINLOCK(registry_lock);
+static DEFINE_RAW_SPINLOCK(commit_lock);
+unsigned long frwkh_commit_begin(void)
+{unsigned long flags;raw_spin_lock_irqsave(&commit_lock,flags);return flags;}
+void frwkh_commit_end(unsigned long flags)
+{raw_spin_unlock_irqrestore(&commit_lock,flags);}
+/* Never recycled. Original issuer must charge/pin storage before prearm.
+ * Issuer is missing: no actual registry enrollment is currently possible. */
+static struct kh_registry registry[FRWKH_EPOCHS];
+static bool bound(struct kh_registry *r)
+{
+ struct frwk_epoch *e=r->epoch;
+ return e && r->hi==e->hi && r->lo==e->lo && r->final_ns==e->final_ns &&
+  r->owner==(e->owner_ref?e->owner_ref:e->final_refs.owner) &&
+  r->scope==(e->scope_ref?e->scope_ref:e->final_refs.scope);
+}
+
+static bool matches(struct frwk_epoch *e,struct task_struct *p,struct files_struct *f)
+{u32 i;if(e->tasks_n>FRWK_TASKS || e->tables_n>FRWK_TABLES)return false;for(i=0;i<e->tasks_n;i++)if(p && e->tasks[i].ref==p)return true;for(i=0;i<e->tables_n;i++)if(f && e->tables[i].ref==f)return true;return false;}
+/* Order native file_lock -> files.frwkh_lock -> registry_lock -> core.lock.
+ * Hooks drop registry before core work; close uses registry -> core only.
+ * No core body acquires files/registry/uring/cgroup locks. */
+static struct kh_registry *enter(struct task_struct *p,struct files_struct *f)
+{
+ struct kh_registry *r=NULL;unsigned long flags;u32 i;
+ rcu_read_lock();raw_spin_lock_irqsave(&registry_lock,flags);
+ for(i=0;i<FRWKH_EPOCHS;i++){struct kh_registry *x=&registry[i];struct frwk_epoch *e=x->epoch;
+  if(!x->occupied || !x->accepting || !e)continue;raw_spin_lock(&e->lock);
+  if(bound(x) && e->close_state==FRWK_EPOCH_OPEN && matches(e,p,f)){atomic_inc(&x->inflight);r=x;raw_spin_unlock(&e->lock);break;}raw_spin_unlock(&e->lock);}
+ raw_spin_unlock_irqrestore(&registry_lock,flags);rcu_read_unlock();return r;
+}
+static void leave(struct kh_registry *r)
+{if(atomic_dec_and_test(&r->inflight))wake_up_all(&r->drain);}
+static void lose(struct frwk_epoch *e,u32 why){frwk_transport_loss_locked(e,why);}
+static bool charge(struct kh_registry *r,u64 work)
+{
+ if (!work || work>r->work_left || ktime_get_ns()>=r->epoch->useful_ns) {
+  lose(r->epoch,2);return false;
+ }
+ r->work_left-=work;return true;
+}
+static bool admit(struct kh_registry *r)
+{
+ if(!bound(r) || !charge(r,FRWK_TASKS+FRWK_TABLES+FRWK_OFDS+FRWK_RINGS+FRWK_RETAINS+FRWK_SLOTS) ||
+    frwk_observer_admission_locked(r->epoch)){lose(r->epoch,4);return false;}
+ return true;
+}
+
+static bool scope(struct kh_registry *r,struct task_struct *p)
+{bool ok;rcu_read_lock();ok=p && task_dfl_cgroup(p)==r->scope && task_dfl_cgroup(r->owner)==r->scope;rcu_read_unlock();if(!ok)frwk_scope_drift_locked(r->epoch,32);return ok;}
+static struct frwk_table *table(struct frwk_epoch *e,struct files_struct *f)
+{u32 i;for(i=0;i<e->tables_n;i++)if(e->tables[i].ref==f)return &e->tables[i];return NULL;}
+static struct frwk_slot *slot(struct frwk_epoch *e,u64 t,u32 fd)
+{u32 i;for(i=0;i<e->slots_n;i++)if(!e->slots[i].ring && e->slots[i].table==t && e->slots[i].fd==fd)return &e->slots[i];return NULL;}
+static struct frwk_ofd *ofd(struct frwk_epoch *e,struct file *f)
+{u32 i;for(i=0;i<e->ofds_n;i++)if(e->ofds[i].ref==f)return &e->ofds[i];return NULL;}
+/* Reserve precharged failure escrow BEFORE acquiring each separate hold.
+ * Same pointer values are independent acquisitions; never deduplicated. */
+static struct kh_hold *reserve(struct kh_registry *r,u32 kind)
+{struct kh_hold *h;if(r->escrow_n==FRWKH_ESCROW){lose(r->epoch,2);return NULL;}h=&r->escrow[r->escrow_n++];h->kind=kind;h->state=KH_RESERVED;return h;}
+int frwkh_prearm_original(struct frwk_epoch *e)
+{
+ unsigned long flags;u32 i;struct kh_registry *r=NULL;int rc=-ENOSPC;
+ if(frwkh_loaded_qualification!=FRWK_REQUIRED)return -EOPNOTSUPP;
+ if(!e || !e->owner_ref || !e->scope_ref)return -EINVAL;
+ raw_spin_lock_irqsave(&registry_lock,flags);raw_spin_lock(&e->lock);
+ rc=frwk_observer_admission_locked(e);
+ if(rc || !e->prearmed || !e->armed || e->tasks_n!=1 || e->tables_n!=1 ||
+  e->tasks[0].ref!=e->owner_ref || e->tasks[0].parent ||
+  e->tables[0].ref!=e->owner_ref->files || !e->tables[0].ready ||
+  !e->tables[0].assignment_consumed || e->tables[0].copy_operation ||
+  ktime_get_ns()>=e->useful_ns){rc=-EOPNOTSUPP;goto out;}
+ for(i=0;i<FRWKH_EPOCHS;i++){struct kh_registry *x=&registry[i];
+  if(!x->occupied){if(!r)r=x;continue;}
+  if(x->epoch==e || x->owner==e->owner_ref || x->root_files==e->tables[0].ref){rc=-EEXIST;goto out;}}
+ if(!r){rc=-ENOSPC;goto out;}
+ r->epoch=e;r->owner=e->owner_ref;r->scope=e->scope_ref;r->root_files=e->tables[0].ref;
+ r->hi=e->hi;r->lo=e->lo;r->final_ns=e->final_ns;atomic_set(&r->inflight,0);init_waitqueue_head(&r->drain);r->work_left=FRWKH_WORK_LIMIT;r->close_state=KH_CLOSE_NEW;r->occupied=true;r->accepting=true;rc=0;
+ out:raw_spin_unlock(&e->lock);raw_spin_unlock_irqrestore(&registry_lock,flags);return rc;
+}
+void frwkh_loss(struct task_struct *p,struct files_struct *f,u32 why)
+{struct kh_registry *r=enter(p,f);unsigned long flags;if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);lose(r->epoch,why);raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);}
+void frwkh_ofd_created(struct file *file)
+{
+ struct kh_registry *r=enter(current,current->files);struct kh_hold *h;unsigned long flags;
+ if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);
+ /* init_file has initialized f_ref and flags, but the file has not returned
+  * to any publisher. Precharged escrow owns the extra hold on failure. */
+ if(!admit(r) || !scope(r,current))goto out;
+ h=reserve(r,KH_FILE);if(!h)goto out;h->ref.file=frwkh_file_pin_get(file);h->state=KH_HELD;
+ if(frwk_ofd_birth_locked(r->epoch,current,current->files,file,READ_ONCE(file->f_flags)&FRWK_STATUS_MASK))goto out;
+ h->ref.file=NULL;h->state=KH_TRANSFERRED;
+ out:raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);
+}
+void frwkh_capture(struct files_struct *f,u32 fd,struct file *file,struct frwkh_origin *o)
+{
+ struct kh_registry *r;struct frwk_table *t;struct frwk_slot *s;struct frwk_ofd *a;struct fdtable *ft;unsigned long flags;
+ memset(o,0,sizeof(*o));if(!file)return;lockdep_assert_held(&f->frwkh_lock);r=enter(current,f);if(!r)return;
+ raw_spin_lock_irqsave(&r->epoch->lock,flags);t=table(r->epoch,f);s=t?slot(r->epoch,t->id,fd):NULL;a=ofd(r->epoch,file);ft=rcu_dereference_raw(f->fdt);
+ if(admit(r) && t && s && a && s->ofd==a->id && a->live && fd<ft->max_fds && rcu_dereference_raw(ft->fd[fd])==file)
+  *o=(struct frwkh_origin){.file=file,.files=f,.hi=r->hi,.lo=r->lo,.table=t->id,.slot=s->id,.ofd=a->id,.fd=fd,.captured=true};else lose(r->epoch,128);
+ raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);
+}
+void frwkh_slot(struct task_struct *p,struct files_struct *f,u32 fd,struct file *before,struct file *after,u32 oldflags,u32 newflags,u16 kind,u64 path,const struct frwkh_origin *origin)
+{
+ struct kh_registry *r=enter(p,f);struct frwk_epoch *e;unsigned long flags;u64 st=0,ss=0;u32 sf=0;if(!r)return;lockdep_assert_held(&f->frwkh_lock);e=r->epoch;raw_spin_lock_irqsave(&e->lock,flags);
+ if(!admit(r) || !scope(r,p))goto out;
+ if(path==161 || path==2 || path==4 || path==136){if(!origin || !origin->captured || origin->file!=after || origin->files!=f || origin->hi!=r->hi || origin->lo!=r->lo){lose(e,128);goto out;}st=origin->table;ss=origin->slot;sf=origin->fd;}
+ /* Actual init_file birth must already own the exact OFD generation. */
+ if(after && !ofd(e,after)){lose(e,128);goto out;}
+ if(frwk_slot_commit_locked(e,p,f,fd,before,after,oldflags,newflags,kind,path,st,sf,ss)){lose(e,128);goto out;}
+ /* Bind actual ring birth to this exact installation commit BEFORE the FD
+  * pointer becomes visible. No after-publication numeric-fd lookup can mint
+  * the original ring source generation. Prepared extra hold already exists. */
+ if(after && kind==6 && !origin){u32 i;for(i=0;i<r->rings_n;i++){
+  struct kh_ring *ring=&r->rings[i];if(!ring->used || ring->prepared!=after)continue;
+  if(frwk_ring_birth_locked(e,p,f,ring->prepared,fd,&ring->id)){lose(e,128);break;}
+  ring->source_fd=fd;r->escrow[ring->escrow_index].ref.file=NULL;r->escrow[ring->escrow_index].state=KH_TRANSFERRED;ring->prepared=NULL;break;
+ }}
+ out:raw_spin_unlock_irqrestore(&e->lock,flags);leave(r);
+}
+unsigned int frwkh_copy_operation(struct task_struct *p)
+{struct kh_registry *r=enter(p,p->files);u32 i,op=FRWKH_COPY_UNSHARE;unsigned long flags;if(!r)return op;raw_spin_lock_irqsave(&r->epoch->lock,flags);for(i=0;i<r->epoch->tasks_n;i++)if(r->epoch->tasks[i].ref==p && r->epoch->tasks[i].executing)op=FRWKH_COPY_EXEC;raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);return op;}
+
+static struct kh_registry *object_enter(struct files_struct *,struct file *);
+void frwkh_copy(struct task_struct *p,struct files_struct *old,struct files_struct *new,unsigned int op,const struct fd_range *punch,u32 physical_live,u32 physical_extent)
+{
+ struct kh_registry *r=object_enter(old,NULL);struct frwk_epoch *e;struct kh_hold *h;
+ struct fdtable *src,*dst;struct frwk_table *t;u32 i,expected=0;unsigned long flags;
+ if(!r)return;e=r->epoch;lockdep_assert_held(&old->file_lock);
+ lockdep_assert_held(&old->frwkh_lock);lockdep_assert_held(&commit_lock);
+ raw_spin_lock_irqsave(&e->lock,flags);
+ if(!admit(r) || !scope(r,p))goto out;
+ src=files_fdtable(old);dst=rcu_dereference_raw(new->fdt);t=table(e,old);
+ if(!t || !r->physical_copy || op<1 || op>3 || !src->max_fds || !dst->max_fds ||
+    src->max_fds>FRWKH_FD_SCAN_CAP || dst->max_fds>FRWKH_FD_SCAN_CAP ||
+    !physical_extent || physical_extent>dst->max_fds || physical_live>FRWK_SLOTS || !charge(r,2ULL*(e->slots_n+1)*(e->ofds_n+1))){lose(e,128);goto out;}
+ /* Native dup_fd actually visited every copied physical pointer under the
+  * source exclusion and counted each non-NULL entry. No caller/user can supply
+  * this witness. Each known logical slot is then checked by direct sparse FD
+  * lookup; matching cardinality excludes an extra copied physical alias. */
+ for(i=0;i<e->slots_n;i++){
+  struct frwk_slot *s=&e->slots[i];struct frwk_ofd *a=NULL;struct file *f;u32 j;
+  if(s->ring || s->table!=t->id || !s->ofd)continue;
+  if(s->fd>=src->max_fds){lose(e,128);goto out;}
+  f=rcu_dereference_raw(src->fd[s->fd]);
+  for(j=0;j<e->ofds_n;j++)if(e->ofds[j].id==s->ofd){a=&e->ofds[j];break;}
+  if(!a || !a->live || a->ref!=f || !f || s->flags!=test_bit(s->fd,src->close_on_exec)){lose(e,128);goto out;}
+  if(s->fd<physical_extent){
+   if(rcu_dereference_raw(dst->fd[s->fd])!=f ||
+      test_bit(s->fd,dst->close_on_exec)!=test_bit(s->fd,src->close_on_exec)){lose(e,128);goto out;}
+   expected++;
+  }else if(!punch || s->fd<punch->from || s->fd>punch->to){lose(e,128);goto out;}
+ }
+ if(expected!=physical_live){lose(e,128);goto out;}
+ h=reserve(r,KH_TABLE);if(!h)goto out;
+ h->ref.files=frwkh_files_pin_get(new);h->state=KH_HELD;
+ if(frwk_table_birth_locked(e,p,new,old,op))goto out;
+ h->ref.files=NULL;h->state=KH_TRANSFERRED;
+ if(frwk_copy_table_locked(e,p,old,new,physical_extent))lose(e,128);
+ out:r->physical_copy=false;raw_spin_unlock_irqrestore(&e->lock,flags);wake_up_all(&r->drain);leave(r);
+}
+
+void frwkh_switch(struct task_struct *p,struct files_struct *old,struct files_struct *new)
+{struct kh_registry *r=enter(p,old);unsigned long flags;u32 i;u64 path=0;if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);for(i=0;i<r->epoch->tasks_n;i++)if(r->epoch->tasks[i].ref==p && r->epoch->tasks[i].executing)path=4096;if(admit(r) && scope(r,p) && frwk_switch_table_locked(r->epoch,p,old,new,path))lose(r->epoch,128);raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);}
+void frwkh_fork_commit(struct task_struct *parent,struct task_struct *child,bool shared)
+{struct kh_registry *r=enter(parent,parent->files);struct kh_hold *h;struct frwk_table *t;unsigned long flags;if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);if(!admit(r) || !scope(r,parent))goto out;t=table(r->epoch,parent->files);if(!t || !child->files){lose(r->epoch,64);goto out;}h=reserve(r,KH_TASK);if(!h)goto out;get_task_struct(child);h->ref.task=child;h->state=KH_HELD;if(frwk_task_birth_locked(r->epoch,child,parent,child->files,shared,t->id))goto out;h->ref.task=NULL;h->state=KH_TRANSFERRED;out:raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);}
+void frwkh_fork_complete(struct task_struct *parent,struct task_struct *child)
+{struct kh_registry *r=enter(parent,parent->files);unsigned long flags;u32 i;if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);if(admit(r) && scope(r,child))for(i=0;i<r->epoch->tasks_n;i++)if(r->epoch->tasks[i].ref==child && frwk_fence_locked(r->epoch,1024,r->epoch->tasks[i].id,r->epoch->tasks[i].table))lose(r->epoch,64);raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);}
+void frwkh_exec(struct task_struct *p,bool begin)
+{struct kh_registry *r=enter(p,p->files);unsigned long flags;if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);if(admit(r) && scope(r,p) && frwk_exec_locked(r->epoch,p,begin))lose(r->epoch,64);raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);}
+void frwkh_exit(struct task_struct *p)
+{struct kh_registry *r=enter(p,p->files);unsigned long flags;if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);if(admit(r) && frwk_task_exit_locked(r->epoch,p))lose(r->epoch,64);raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);}
+void frwkh_status(struct task_struct *p,struct file *file,u32 before,u32 after)
+{struct kh_registry *r=enter(p,p->files);unsigned long flags;if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);if(admit(r) && scope(r,p) && frwk_status_flags_locked(r->epoch,p,p->files,file,before&FRWK_STATUS_MASK,after&FRWK_STATUS_MASK))lose(r->epoch,128);raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);}
+void frwkh_scope_change(struct task_struct *p)
+{struct kh_registry *r=enter(p,p->files);unsigned long flags;if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);frwk_scope_drift_locked(r->epoch,32);raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);}
+static struct kh_registry *ring_enter(struct io_ring_ctx *ctx,struct kh_ring **out)
+{
+ struct kh_registry *r=NULL;unsigned long flags;u32 i,j;
+ raw_spin_lock_irqsave(&registry_lock,flags);
+ for(i=0;i<FRWKH_EPOCHS && !r;i++)if(registry[i].occupied && registry[i].epoch){
+  struct kh_registry *x=&registry[i];raw_spin_lock(&x->epoch->lock);
+  if(x->rings_n<=FRWK_RINGS)for(j=0;j<x->rings_n;j++)
+   if(x->rings[j].used && x->rings[j].ctx==ctx){r=x;*out=&x->rings[j];atomic_inc(&x->inflight);break;}
+  raw_spin_unlock(&x->epoch->lock);
+ }
+ raw_spin_unlock_irqrestore(&registry_lock,flags);return r;
+}
+
+void frwkh_ring_prepare(struct io_ring_ctx *ctx,struct file *file)
+{struct kh_registry *r=enter(current,current->files);struct kh_hold *h;struct kh_ring *ring;unsigned long flags;if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);if(!admit(r))goto out;if(r->rings_n==FRWK_RINGS){lose(r->epoch,2);goto out;}h=reserve(r,KH_FILE);if(!h)goto out;h->ref.file=frwkh_file_pin_get(file);h->state=KH_HELD;ring=&r->rings[r->rings_n++];ring->ctx=ctx;ring->prepared=file;ring->escrow_index=r->escrow_n-1;ring->used=true;out:raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);}
+void frwkh_ring_installed(struct io_ring_ctx *ctx,int fd,bool has_fd)
+{struct kh_ring *ring;struct kh_registry *r=ring_enter(ctx,&ring);unsigned long flags;if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);if(!admit(r))goto out;if(fd<0 || !has_fd || !ring->id || ring->prepared || ring->source_fd!=(u32)fd){lose(r->epoch,4);goto out;} /* Already bound before actual FD publication. */out:raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);}
+void frwkh_ring_slot(struct io_ring_ctx *ctx,u32 index,struct file *file,bool close,const struct frwkh_origin *origin)
+{
+ struct kh_ring *ring;struct kh_registry *r=ring_enter(ctx,&ring);unsigned long flags;
+ struct frwk_task *actor=NULL;u32 i;u32 sf=0;
+ if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);
+ if(r->epoch->close_state!=FRWK_EPOCH_OPEN)goto out;
+ if(close){
+  if(ring->id && frwk_native_ring_slot_close_locked(r->epoch,ring->id,index,file))lose(r->epoch,128);
+  else if(!ring->id)lose(r->epoch,128);
+  goto out;
+ }
+ if(!admit(r) || ring->closing)goto out;
+ /* Actual source acquisition witness, not worker task/files inference. */
+ if(!origin || !origin->captured || origin->file!=file ||
+    origin->hi!=r->hi || origin->lo!=r->lo){lose(r->epoch,128);goto out;}
+ for(i=0;i<r->epoch->tasks_n;i++)if(r->epoch->tasks[i].id){
+  struct frwk_task *t=&r->epoch->tasks[i];
+  if(t->live && t->table==origin->table && t->ref==current){actor=t;break;}
+ }
+ if(!actor){lose(r->epoch,128);goto out;}
+ {struct frwk_slot *s=slot(r->epoch,origin->table,origin->fd);
+  if(!s || s->id!=origin->slot || s->ofd!=origin->ofd){lose(r->epoch,128);goto out;}}
+ sf=origin->fd;
+ if(frwk_ring_slot_locked(r->epoch,actor->ref,ring->id,index,sf,false))lose(r->epoch,128);
+ out:raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);
+}
+
+void frwkh_ring_end(struct io_ring_ctx *ctx)
+{
+ struct kh_ring *ring;struct kh_registry *r=ring_enter(ctx,&ring);unsigned long flags;
+ if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);
+ if(!ring->closing){
+  ring->closing=true;
+  if(r->epoch->close_state==FRWK_EPOCH_OPEN && ring->id &&
+     frwk_native_ring_end_locked(r->epoch,ring->id))lose(r->epoch,64);
+ }
+ raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);
+ /* Native io_ring_ctx_wait_and_kill now kills refs and cancels requests.
+  * No observer get_file/percpu_ref prevents reaching that original body. */
+}
+
+static void original_rcu_done(struct rcu_head *head)
+{
+ struct kh_registry *r=container_of(head,struct kh_registry,close_rcu);
+ WRITE_ONCE(r->rcu_done,true);wake_up_all(&r->drain);
+}
+static bool escrow_layout(struct kh_registry *r)
+{
+ u32 i;if(r->escrow_n>FRWKH_ESCROW)return false;
+ for(i=0;i<FRWKH_ESCROW;i++){
+  struct kh_hold *h=&r->escrow[i];bool owns=!!h->ref.file;
+  if(i>=r->escrow_n){if(h->kind || h->state || owns)return false;continue;}
+  if(h->kind<KH_TASK || h->kind>KH_FILE || h->state>KH_ISSUED)return false;
+  if(owns!=(h->state==KH_HELD || h->state==KH_CLOSING))return false;
+ }
+ return true;
+}
+int frwkh_close_original(struct frwk_epoch *e)
+{
+ struct kh_registry *r=NULL;unsigned long flags,commit_flags;u32 i;u64 now;int rc;
+ if(!e)return -EINVAL;
+ raw_spin_lock_irqsave(&registry_lock,flags);
+ for(i=0;i<FRWKH_EPOCHS;i++)if(registry[i].occupied && registry[i].epoch==e){r=&registry[i];break;}
+ if(!r || r->close_state!=KH_CLOSE_NEW){raw_spin_unlock_irqrestore(&registry_lock,flags);return -EALREADY;}
+ r->accepting=false;r->detached=true;r->close_state=KH_CLOSE_DRAINING;
+ raw_spin_lock(&e->lock);rc=frwk_begin_epoch_close_locked(e);raw_spin_unlock(&e->lock);
+ raw_spin_unlock_irqrestore(&registry_lock,flags);if(rc)goto partial;
+ /* One actual RCU callback, original-bound storage, and deadline-clipped wait.
+  * No synchronize_rcu unbounded wait is re-labelled as bounded completion. */
+ r->rcu_queued=true;call_rcu(&r->close_rcu,original_rcu_done);
+ now=ktime_get_ns();if(now>=r->final_ns){rc=-ETIME;goto partial;}
+ if(!wait_event_timeout(r->drain,READ_ONCE(r->rcu_done) && !atomic_read(&r->inflight) && !READ_ONCE(r->physical_copy),
+      nsecs_to_jiffies(r->final_ns-now))){rc=-ETIME;goto partial;}
+ /* Hooks may have left inflight before native pointer publication. The shared
+  * actual-commit lock closes that physical window after revocation/drain. */
+ commit_flags=frwkh_commit_begin();frwkh_commit_end(commit_flags);
+ raw_spin_lock_irqsave(&e->lock,flags);
+ if(!escrow_layout(r) || r->escrow_taken || ktime_get_ns()>=r->final_ns){rc=-EUCLEAN;goto unlock_partial;}
+ rc=frwk_take_epoch_refs_locked(e);if(rc)goto unlock_partial;
+ /* In-place transfer to the separately precharged 1216-slot close ledger.
+  * No second refs array, reacquisition, pointer deduplication or counter reset. */
+ r->escrow_hi=r->hi;r->escrow_lo=r->lo;r->escrow_final_ns=r->final_ns;
+ for(i=0;i<r->escrow_n;i++)if(r->escrow[i].state==KH_HELD){
+  r->escrow[i].state=KH_CLOSING;r->escrow_owned++;
+ }
+ r->escrow_taken=true;r->close_state=KH_CLOSE_READY;
+ raw_spin_unlock_irqrestore(&e->lock,flags);
+ /* Core calls escrow drain after concrete native completion and BEFORE any
+  * task/original-owner/source lifetime custody can be released. */
+ rc=frwk_put_reference_batch(e,&e->final_refs);if(rc)goto partial;
+ if(r->close_state!=KH_CLOSE_ISSUED){rc=-EUCLEAN;goto partial;}
+ return 0; /* issued ledger only; NO ResourceGo/runtime qualification */
+ unlock_partial:raw_spin_unlock_irqrestore(&e->lock,flags);
+ partial:r->close_state=KH_CLOSE_PARTIAL;return rc;
+}
+
+
+static struct kh_registry *object_enter(struct files_struct *files,struct file *file)
+{
+ struct kh_registry *r=NULL;unsigned long flags;u32 i,j;
+ raw_spin_lock_irqsave(&registry_lock,flags);
+ for(i=0;i<FRWKH_EPOCHS && !r;i++)if(registry[i].occupied && registry[i].epoch){
+  struct kh_registry *x=&registry[i];struct frwk_epoch *e=x->epoch;bool match=false;
+  raw_spin_lock(&e->lock);
+  if(e->tables_n<=FRWK_TABLES && e->ofds_n<=FRWK_OFDS && x->escrow_n<=FRWKH_ESCROW){
+   if(files)for(j=0;j<e->tables_n;j++)if(e->tables[j].ref==files)match=true;
+   if(file)for(j=0;j<e->ofds_n;j++)if(e->ofds[j].ref==file)match=true;
+   for(j=0;j<x->escrow_n;j++)if(x->escrow[j].state==KH_HELD &&
+     ((files && x->escrow[j].kind==KH_TABLE && x->escrow[j].ref.files==files) ||
+      (file && x->escrow[j].kind==KH_FILE && x->escrow[j].ref.file==file)))match=true;
+   if(e->close_state==FRWK_EPOCH_TRANSFERRED && e->final_refs.files_n<=FRWK_OFDS+FRWK_RINGS+FRWK_RETAINS){
+    if(file)for(j=0;j<e->final_refs.files_n;j++)if(e->final_refs.files[j]==file)match=true;
+    if(files && e->final_refs.tables_n<=FRWK_TABLES)for(j=0;j<e->final_refs.tables_n;j++)if(e->final_refs.tables[j]==files)match=true;
+   }
+  }
+  if(match){r=x;atomic_inc(&x->inflight);}
+  raw_spin_unlock(&e->lock);
+ }
+ raw_spin_unlock_irqrestore(&registry_lock,flags);return r;
+}
+void frwkh_file_native_end(struct file *file)
+{
+ struct kh_registry *r=object_enter(NULL,file);unsigned long flags;
+ if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);
+ if(r->epoch->close_state==FRWK_EPOCH_OPEN && ofd(r->epoch,file) &&
+    frwk_native_file_end_locked(r->epoch,file))lose(r->epoch,128);
+ raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);
+}
+void frwkh_table_native_end(struct files_struct *files)
+{
+ struct kh_registry *r=object_enter(files,NULL);unsigned long flags;
+ if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);
+ if(r->epoch->close_state==FRWK_EPOCH_OPEN && table(r->epoch,files) &&
+    frwk_native_table_end_locked(r->epoch,files))lose(r->epoch,128);
+ raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);
+}
+void frwkh_ring_loss(struct io_ring_ctx *ctx,u32 why)
+{
+ struct kh_ring *ring;struct kh_registry *r=ring_enter(ctx,&ring);unsigned long flags;
+ if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);lose(r->epoch,why);
+ raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);
+}
+void frwkh_ring_quiesced(struct io_ring_ctx *ctx)
+{
+ struct kh_ring *ring;struct kh_registry *r=ring_enter(ctx,&ring);unsigned long flags;
+ if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);
+ ring->native_done=true;ring->used=false;
+ raw_spin_unlock_irqrestore(&r->epoch->lock,flags);wake_up_all(&r->drain);leave(r);
+}
+bool frwkh_copy_guard(struct task_struct *p,struct files_struct *files,const struct fdtable *src,const struct fdtable *dst)
+{
+ struct kh_registry *r=enter(p,files);unsigned long flags;bool ok=false;
+ if(!r)return false;lockdep_assert_held(&files->file_lock);
+ raw_spin_lock_irqsave(&r->epoch->lock,flags);
+ if(src->max_fds && dst->max_fds && src->max_fds<=FRWKH_FD_SCAN_CAP &&
+    dst->max_fds<=FRWKH_FD_SCAN_CAP && !r->physical_copy && admit(r) &&
+    charge(r,4ULL*(src->max_fds+dst->max_fds))){r->physical_copy=true;ok=true;}
+ else lose(r->epoch,2);
+ raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);return ok;
+}
+bool frwkh_resize_guard(struct task_struct *p,struct files_struct *files,const struct fdtable *src,const struct fdtable *dst)
+{
+ struct kh_registry *r;unsigned long flags;bool ok=frwkh_copy_guard(p,files,src,dst);
+ if(!ok)return false;r=object_enter(files,NULL);if(!r)return false;
+ raw_spin_lock_irqsave(&r->epoch->lock,flags);r->physical_copy=false;
+ raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);return true;
+}
+void frwkh_range_cloexec(struct task_struct *p,struct files_struct *files,u32 first,u32 last)
+{
+ struct kh_registry *r=enter(p,files);struct frwk_table *t;struct fdtable *ft;
+ unsigned long flags;u32 i;
+ if(!r)return;raw_spin_lock_irqsave(&r->epoch->lock,flags);
+ ft=files_fdtable(files);t=table(r->epoch,files);
+ if(!admit(r) || !t || ft->max_fds>FRWKH_FD_SCAN_CAP ||
+    !charge(r,(u64)ft->max_fds + (u64)r->epoch->slots_n*
+      (r->epoch->ofds_n+r->epoch->slots_n+FRWK_TASKS+FRWK_TABLES+FRWK_OFDS+FRWK_RINGS+FRWK_RETAINS+1))){lose(r->epoch,2);goto out;}
+ for(i=0;i<r->epoch->slots_n;i++){
+  struct frwk_slot *s=&r->epoch->slots[i];struct file *f;
+  if(s->ring || s->table!=t->id || !s->ofd || s->fd<first || s->fd>last)continue;
+  f=rcu_dereference_raw(ft->fd[s->fd]);
+  if(!f || frwk_slot_commit_locked(r->epoch,p,files,s->fd,f,f,s->flags,1,9,129,0,0,0)){lose(r->epoch,128);break;}
+ }
+ out:raw_spin_unlock_irqrestore(&r->epoch->lock,flags);leave(r);
+}
+int frwkh_wait_file_native_done(struct file *file,u64 final_ns)
+{
+ u64 now=ktime_get_ns();if(!file || !final_ns || now>=final_ns)return -ETIME;
+ if(smp_load_acquire(&file->frwkh_native_done))return 0;
+ return wait_event_timeout(file->frwkh_wait,smp_load_acquire(&file->frwkh_native_done),
+    nsecs_to_jiffies(final_ns-now)) && ktime_get_ns()<final_ns ? 0 : -ETIME;
+}
+int frwkh_wait_table_native_done(struct files_struct *files,u64 final_ns)
+{
+ u64 now=ktime_get_ns();if(!files || !final_ns || now>=final_ns)return -ETIME;
+ if(smp_load_acquire(&files->frwkh_native_done))return 0;
+ return wait_event_timeout(files->frwkh_wait,smp_load_acquire(&files->frwkh_native_done),
+    nsecs_to_jiffies(final_ns-now)) && ktime_get_ns()<final_ns ? 0 : -ETIME;
+}
+static bool rings_done(struct kh_registry *r)
+{
+ u32 i;unsigned long flags;bool done=true;
+ raw_spin_lock_irqsave(&r->epoch->lock,flags);
+ if(r->rings_n>FRWK_RINGS)done=false;
+ else for(i=0;i<r->rings_n;i++)if(!r->rings[i].native_done)done=false;
+ raw_spin_unlock_irqrestore(&r->epoch->lock,flags);return done;
+}
+int frwkh_wait_rings_native_done(struct frwk_epoch *e)
+{
+ struct kh_registry *r=NULL;unsigned long flags;u32 i;u64 now;
+ raw_spin_lock_irqsave(&registry_lock,flags);
+ for(i=0;i<FRWKH_EPOCHS;i++)if(registry[i].occupied && registry[i].epoch==e){r=&registry[i];break;}
+ raw_spin_unlock_irqrestore(&registry_lock,flags);
+ if(!r)return -EOPNOTSUPP;now=ktime_get_ns();if(now>=r->final_ns)return -ETIME;
+ return wait_event_timeout(r->drain,rings_done(r),nsecs_to_jiffies(r->final_ns-now)) &&
+    ktime_get_ns()<r->final_ns ? 0 : -ETIME;
+}
+int frwkh_drain_escrow_before_owner(struct frwk_epoch *e)
+{
+ struct kh_registry *r=NULL;unsigned long flags;u32 i,kind;u64 now;int rc=0;
+ raw_spin_lock_irqsave(&registry_lock,flags);
+ for(i=0;i<FRWKH_EPOCHS;i++)if(registry[i].occupied && registry[i].epoch==e){r=&registry[i];break;}
+ raw_spin_unlock_irqrestore(&registry_lock,flags);
+ if(!r)return -EOPNOTSUPP;
+ raw_spin_lock_irqsave(&e->lock,flags);
+ if(!r->escrow_taken || r->close_state!=KH_CLOSE_READY || !escrow_layout(r) ||
+    r->escrow_hi!=e->hi || r->escrow_lo!=e->lo || r->escrow_final_ns!=e->final_ns){rc=-EUCLEAN;goto unlock;}
+ r->close_state=KH_CLOSE_PUTTING;raw_spin_unlock_irqrestore(&e->lock,flags);
+ /* Memory pins wait for native completion. Original code/task custody survives
+  * until ALL file/table/ring completion and cleanup callback drain below. */
+ for(i=0;i<r->escrow_n;i++)if(r->escrow[i].state==KH_CLOSING){
+  struct kh_hold *h=&r->escrow[i];
+  if(h->kind==KH_FILE)rc=frwkh_wait_file_native_done(h->ref.file,r->final_ns);
+  else if(h->kind==KH_TABLE)rc=frwkh_wait_table_native_done(h->ref.files,r->final_ns);
+  if(rc)goto partial;
+ }
+ now=ktime_get_ns();if(now>=r->final_ns){rc=-ETIME;goto partial;}
+ if(!wait_event_timeout(r->drain,!atomic_read(&r->inflight),nsecs_to_jiffies(r->final_ns-now))){rc=-ETIME;goto partial;}
+ /* Pass 1 FILE pins, pass 2 TABLE pins, pass 3 task memory refs. Equal pointer
+  * values never collapse acquisitions. Clear owned slot BEFORE each void put. */
+ for(kind=KH_FILE;kind>=KH_TASK;kind--)for(i=0;i<r->escrow_n;i++){
+  struct kh_hold *h=&r->escrow[i];struct kh_hold put;
+  raw_spin_lock_irqsave(&e->lock,flags);
+  if(r->close_state!=KH_CLOSE_PUTTING || ktime_get_ns()>=r->final_ns){rc=-ETIME;goto unlock;}
+  if(h->state!=KH_CLOSING || h->kind!=kind){raw_spin_unlock_irqrestore(&e->lock,flags);continue;}
+  put=*h;h->ref.file=NULL;h->state=KH_PUTTING;
+  raw_spin_unlock_irqrestore(&e->lock,flags);
+  if(kind==KH_FILE)frwkh_file_pin_put(put.ref.file);
+  else if(kind==KH_TABLE)frwkh_files_pin_put(put.ref.files);
+  else put_task_struct(put.ref.task);
+  raw_spin_lock_irqsave(&e->lock,flags);
+  if(h->state!=KH_PUTTING){rc=-EUCLEAN;goto unlock;}
+  h->state=KH_ISSUED;r->escrow_issued++;
+  raw_spin_unlock_irqrestore(&e->lock,flags);
+ }
+ raw_spin_lock_irqsave(&e->lock,flags);
+ if(r->escrow_issued!=r->escrow_owned || !escrow_layout(r)){rc=-EUCLEAN;goto unlock;}
+ r->close_state=KH_CLOSE_ISSUED;
+ unlock:if(rc)r->close_state=KH_CLOSE_PARTIAL;raw_spin_unlock_irqrestore(&e->lock,flags);return rc;
+ partial:r->close_state=KH_CLOSE_PARTIAL;return rc;
+}
+int frwkh_copy_history_original(struct frwk_epoch *e,u8 *out,u32 capacity,u32 *bytes,struct frwk_delivery *receipt)
+{
+ struct kh_registry *r;unsigned long flags,commit_flags;struct frwk_task *owner=NULL;u32 i;int rc=-EOPNOTSUPP;
+ /* This is safe internal connection only. Genuine closed transport/adoption/
+  * code authentication and receipt issuer remain absent and refuse admission. */
+ if(frwkh_loaded_qualification!=FRWK_REQUIRED || !e || !out || !bytes || !receipt ||
+    capacity>FRWKH_HISTORY_FRAMES*FRWK_WIRE_BYTES)return -EOPNOTSUPP;
+ r=enter(current,current->files);if(!r || r->epoch!=e){if(r)leave(r);return -EPERM;}
+ commit_flags=frwkh_commit_begin();raw_spin_lock_irqsave(&e->lock,flags);
+ if(!admit(r) || current!=r->owner || !scope(r,current) || atomic_read(&r->inflight)!=1 || r->physical_copy)goto unlock;
+ for(i=0;i<e->tasks_n;i++)if(e->tasks[i].ref==r->owner)owner=&e->tasks[i];
+ if(!owner || !charge(r,FRWK_TASKS+FRWK_TABLES+capacity)){rc=-EUCLEAN;goto unlock;}
+ for(i=0;i<r->rings_n;i++)if(r->rings[i].closing){rc=-ESHUTDOWN;goto unlock;}
+ rc=frwk_fence_locked(e,0,owner->id,owner->table);
+ if(!rc)rc=frwk_copy_read_locked(e,current,out,capacity,bytes,receipt);
+ /* Core consumer/count is unchanged. NO ACK wrapper or authentication token is
+  * fabricated; only a genuine missing transport may ever consume this receipt. */
+ unlock:raw_spin_unlock_irqrestore(&e->lock,flags);frwkh_commit_end(commit_flags);leave(r);return rc;
+}
