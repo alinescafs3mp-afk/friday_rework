@@ -1,0 +1,9 @@
+# Archive qualification and reconstruction
+
+Source bodies use exact, enumerated substitutions, with private per-site byte offsets, line numbers, original/public pins and successful inverse reconstruction. No blanket regular expression rewrites were used. The one explicit UID-specific native unit cgroup route is replaced as a whole by a stable archive symbol. Generic Linux runtime construction `/run/user/{os.getuid()}`, generic upstream endpoints and public examples retain their semantics; they serialize no private host UID or endpoint.
+
+Metadata is curated from explicit semantic fields. Prior finding content and logical source locations, current author repair claims, boundary/interface declarations and all original control declarations are retained. Private process proofs and unrelated fields are omitted. In the original150 declarations, complete decoded private proof reference strings are replaced by exact symbols, including their whole-route scope. Original input SHA/bytes pins are separate from the projected metadata SHA/bytes and from public SHA/bytes; no input is redefined. Private inverse checks reconstruct the exact selected projection, and original inputs are separately rehashed.
+
+A finite trusted byte/JSON qualification check covers whole private routes with spaces and Unicode, escaped JSON strings, unknown private-route refusal, placeholder collision, changed reverse symbol rejection, personal contact detection and generic public loopback preservation. These are archive checks only, not candidate code tests, runtime qualification or independent privacy acceptance. The private qualification dictionary is excluded from publication.
+
+All required component copyright/license notices remain byte-exact. Original Source acceptance does not transfer to normalized public bytes. Root still requires independent privacy/content review of the exact frozen target manifest before ordinary direct-main publication.

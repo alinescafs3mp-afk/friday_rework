@@ -1,0 +1,454 @@
+            self._queue_loaded_skills(msg, _t("cli.skills.loading_skill", name=skill_info['name']), None)
+        else:
+            ChatConsole().print(f"[bold red]{_t('cli.skills.skill_load_failed', command=base_cmd)}[/]")
+
+    def _expand_slash_prefix(self, cmd_original: str, cmd_lower: str, skill_commands, skill_bundles) -> bool:
+        """Unique-prefix expansion against built-in COMMANDS + skill commands/bundles (agrees with tab-completion)."""
+        from hermes_cli.commands import COMMANDS
+        typed_base = cmd_lower.split()[0]
+        all_known = set(COMMANDS) | set(skill_commands) | set(skill_bundles)
+        matches = [c for c in all_known if c.startswith(typed_base)]
+        if len(matches) > 1:
+            if typed_base in matches:
+                matches = [typed_base]
+            else:
+                # Unique shortest match wins: /qui -> /quit (5) over /quint-pipeline (15)
+                min_len = min(len(c) for c in matches)
+                shortest = [c for c in matches if len(c) == min_len]
+                if len(shortest) == 1:
+                    matches = shortest
+        if len(matches) == 1 and matches[0] != typed_base:
+            # Expand to the full name, preserving arguments.
+            return self.process_command(matches[0] + cmd_original.strip()[len(typed_base):], redispatch=True)
+        if len(matches) > 1:
+            _cprint(f"{_ACCENT}{_t('cli.command.ambiguous', command=cmd_lower)}{_RST}")
+            _cprint(f"{_DIM}{_t('cli.command.did_you_mean_many', candidates=', '.join(sorted(matches)))}{_RST}")
+        else:
+            # Exact token with no handler (never re-dispatch the same token: recursion), or no match.
+            from hermes_cli.cli_unknown_command import unknown_command_lines
+            lead, pointer = unknown_command_lines(cmd_lower, all_known)
+            _cprint(f"\033[1;31m{lead}{_RST}")
+            _cprint(f"{_DIM}{_ACCENT}{pointer}{_RST}")
+        return True
+
+    def _drain_interrupt_queue_to_pending_input(self) -> None:
+        """Move stray ``_interrupt_queue`` messages into ``_pending_input`` after every turn.
+
+        Busy-time input lands in ``_interrupt_queue`` and is only drained by the explicit
+        interrupt path; a turn that finishes naturally would otherwise strand it and the
+        CLI appears to hang. Never raises.
+
+        Called once at the end of every turn from ``process_loop``'s ``finally`` block. Catches and swallows
+        ``Exception`` because the drain must never break the main loop. (#20271)
+        """
+        try:
+            while not self._interrupt_queue.empty():
+                stray = self._interrupt_queue.get_nowait()
+                if stray:
+                    self._pending_input.put(stray)
+        except Exception:
+            pass
+
+    def _on_reasoning(self, reasoning_text: str):
+        """Callback for intermediate reasoning display during tool-call loops."""
+        if not reasoning_text:
+            return
+        self._reasoning_preview_buf = getattr(self, "_reasoning_preview_buf", "") + reasoning_text
+        self._flush_reasoning_preview(force=False)
+
+    # Inline tokens that bypass the destructive-slash confirmation modal (scripting, or
+    # when the modal can't be marshaled onto the app loop).
+    # A general escape hatch for non-interactive use (scripting/automation) and for the degraded path where
+    # the modal can't be marshaled onto the app loop — lets users self-serve without flipping
+    # approvals.destructive_slash_confirm in config. (Native Windows now drives the modal normally — see
+    # #33961.)
+    _DESTRUCTIVE_SKIP_TOKENS = frozenset({"now", "--yes", "-y"})
+
+
+    @cli_bound
+    def run(self):
+        """Run the interactive CLI loop with persistent input at bottom."""
+        if not self._claim_active_session("cli"):
+            return
+
+        self._tui_print_startup()
+        self._tui_init_run_state()
+        kb = self._tui_build_key_bindings()
+        layout, style = self._tui_build_layout(kb)
+
+        app = self._tui_build_application(layout, kb, style)
+        _disable_prompt_toolkit_cpr_warning(app)
+        app.after_render += self._pet_flush_kitty_frame
+        from hermes_cli.observability.shared_metrics_startup import cli_prompt_ready_handler
+        app.after_render += cli_prompt_ready_handler()
+        self._app = app
+
+        # Ghost status-bar lines on resize: pt's renderer scrolls the terminal after each
+        # paint, pushing chrome into scrollback where a column-shrink reflows it into
+        # duplicates. Wrapping _output_screen_diff keeps its reserve-space branch from firing.
+        try:
+            # Background: prompt_toolkit's renderer (renderer.py L232-242) explicitly moves the cursor to
+            # the bottom of the canvas after painting "to make sure the terminal scrolls up, even when the
+            # lower lines of the canvas just contain whitespace". In non-fullscreen mode this scrolls chrome
+            # content (status bar, input rules) into terminal scrollback on every render. When the terminal
+            # column-shrinks, the emulator reflows the previously rendered full-width rows into multiple
+            # narrower rows that get pushed up — leaving ghost duplicates AND polluting scrollback. Same
+            # issue as pt #29 (open since 2014), #1675, #1933. Surgical fix: wrap _output_screen_diff so
+            # that when its internal `if current_height > previous_screen.height` branch fires (the one that
+            # does the bottom-cursor-move), we make it fall through by inflating previous_screen.height
+            # first.
+            import prompt_toolkit.renderer as _pt_renderer
+            from prompt_toolkit.renderer import _output_screen_diff as _orig_osd
+
+            if not getattr(_pt_renderer, "_hermes_osd_patched", False):
+                _pt_renderer._output_screen_diff = functools.partial(
+                    _hermes_call_output_screen_diff, _orig_osd
+                )
+                _pt_renderer._hermes_osd_patched = True
+        except Exception:
+            pass
+
+        _apply_bracketed_paste_timeout_patch()
+
+        self._install_resize_recovery(app)
+
+        context_thread(target=self._tui_spinner_loop, daemon=True).start()
+        context_thread(target=self._tui_process_loop, daemon=True).start()
+        # Wake word listener off-thread so a first-run engine install never blocks the prompt.
+        context_thread(target=self._tui_wake_startup, daemon=True, name="wake-startup").start()
+
+        atexit.register(_run_cleanup)
+        self._tui_install_signal_handlers()
+
+        if not self._tui_stdin_usable():
+            _run_cleanup()
+            self._print_exit_summary()
+            return
+
+        try:
+            from hermes_cli.friday_cli_prompt import bind_prompt_output
+            with patch_stdout(), bind_prompt_output(self, app) as prompt_output:
+                try:
+                    # run_in_terminal() may return either: • a coroutine / Future (prompt_toolkit ≥ 3.0) —
+                    # must be scheduled via ensure_future so the coroutine is actually awaited; calling it
+                    # bare would leave it unawaited and silently drop the output (fixes #23185 Bug A). •
+                    # None (some mocks / older PT builds) — just call the inner function directly since PT
+                    # already executed it synchronously. Do NOT fall back to a bare _pt_print when
+                    # ensure_future raises, because run_in_terminal already invoked the lambda in that case
+                    # (the mock path), which would double-print the line.
+                    import asyncio as _aio
+                    _aio.get_running_loop().set_exception_handler(self._tui_suppress_closed_loop_errors)
+                except Exception:
+                    pass  # no running loop -- nothing to patch
+                # Record that the app enables focus reporting + mouse tracking so _run_cleanup
+                # resets them; extended key modes are popped by the same reset.
+                # When multiline shortcuts are on, also ask supported terminals (e.g. iTerm2) to report
+                # modified keys distinctly (kitty protocol + modifyOtherKeys); the cleanup reset pops both
+                # modes. See #36823.
+                _mark_tui_input_modes_active()
+                if self._tui_multiline_shortcuts:
+                    _enable_extended_enter_keys(app.output)
+                self._pet_start_anim()
+                app.run(pre_run=prompt_output.prepare if prompt_output is not None else None)
+        except (EOFError, KeyboardInterrupt, BrokenPipeError):
+            pass
+        except (KeyError, OSError) as _stdin_err:
+            # Selector registration failures from broken stdin and I/O errors from a
+            # broken stdout during interrupt (EIO is suppressed).
+            _errno = getattr(_stdin_err, "errno", None) if isinstance(_stdin_err, OSError) else None
+            _msg = str(_stdin_err)
+            if _errno == errno.EIO:
+                pass
+            elif _errno in {errno.EINVAL, errno.EBADF} or any(
+                s in _msg for s in ("is not registered", "Bad file descriptor", "Invalid argument")
+            ):
+                print(_t("cli.startup.stdin_unusable", error=str(_stdin_err)))
+            else:
+                raise
+        finally:
+            # A resize right before exit leaves its recovery (and the paints it held) unrun.
+            _release_paints()
+            self._tui_shutdown()
+
+        # /update relaunch happens here, after prompt_toolkit restored terminal modes, on the
+        # main thread (the process_loop thread would skip cleanup / only exit itself on Windows).
+        if self._pending_relaunch:
+            from hermes_cli.relaunch import relaunch
+            relaunch(self._pending_relaunch, preserve_inherited=False)
+
+
+def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills):
+    """Resolve the toolset list (explicit / coding posture / platform default), construct HermesCLI, and start the background skills preload."""
+    toolsets_list = None
+    if isinstance(toolsets, str) and toolsets:
+        toolsets_list = [t.strip() for t in toolsets.split(",")]
+    elif isinstance(toolsets, (list, tuple)) and toolsets:
+        # Fire may pass multiple --toolsets as a tuple
+        toolsets_list = []
+        for t in toolsets:
+            toolsets_list.extend([x.strip() for x in t.split(",")] if isinstance(t, str) else [str(t)])
+    elif not toolsets:
+        # Coding posture inside a code workspace, else the shared platform resolver.
+        try:
+            from agent.coding_context import coding_selection
+            toolsets_list = coding_selection(platform="cli", config=CLI_CONFIG)
+        except Exception:
+            toolsets_list = None
+        if toolsets_list is None:
+            from hermes_cli.tools_config import _get_platform_tools
+            toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
+
+    parsed_skills = _parse_skills_argument(skills)
+
+    try:
+        cli = HermesCLI(
+            model=model,
+            toolsets=toolsets_list,
+            provider=provider,
+            reasoning=reasoning,
+            api_key=api_key,
+            base_url=base_url,
+            max_turns=max_turns,
+            run_budget=run_budget,
+            verbose=verbose,
+            compact=compact,
+            resume=resume,
+            checkpoints=checkpoints,
+            pass_session_id=pass_session_id,
+            ignore_rules=ignore_rules,
+        )
+    except ImportError as e:
+        # Direct `python cli.py` bypasses cmd_chat's partial-update ImportError handler.
+        from hermes_constants import emit_partial_update_hint
+
+        if emit_partial_update_hint(e):
+            sys.exit(1)
+        raise
+
+    # skills.auto_load rides the same background preload as -s; --ignore-rules skips it with
+    # the rest of the auto-injected context. Resolved here (not lazily in the agent) so the
+    # session id is real for ${HERMES_SESSION_ID} and -s can dedupe against it.
+    from agent.skill_commands import build_auto_load_prompt, resolve_auto_load_skills
+    auto_load_names = [] if getattr(cli, "ignore_rules", ignore_rules) else resolve_auto_load_skills(CLI_CONFIG)
+    if not auto_load_names:
+        cli._auto_load_skills_result = ("", [], [])
+    if parsed_skills or auto_load_names:
+        # Load the skill payloads in the background: skill_view walks the full skills
+        # tree per skill (~0.5s for a large library) and the result is only consumed
+        # at agent init, not by the banner. finalize_preloaded_skills() joins the
+        # thread before any consumer reads cli.system_prompt.
+        def _load_preloaded_skills() -> None:
+            try:
+                if auto_load_names:
+                    cli._auto_load_skills_result = build_auto_load_prompt(task_id=cli.session_id, user_config=CLI_CONFIG)
+                if parsed_skills:
+                    cli._preload_skills_result = build_preloaded_skills_prompt(
+                        parsed_skills, task_id=cli.session_id, excluded_loaded_names=set(cli._auto_load_skills_result[1]))
+            except Exception as exc:  # surfaced by finalize
+                cli._preload_skills_error = exc
+
+        cli._preload_skills_requested = [*auto_load_names, *(s for s in parsed_skills if s not in auto_load_names)]
+        cli._preload_skills_thread = context_thread(target=_load_preloaded_skills, name="skills-preload", daemon=True)
+        cli._preload_skills_thread.start()
+    return cli
+
+
+def _run_legacy_gateway():
+    """Legacy `cli.py --gateway` entry: arm the startup watchdog (before importing the gateway graph), then run it."""
+    import asyncio
+    with suppress(Exception):
+        from hermes_startup_watchdog import arm_startup_watchdog
+        arm_startup_watchdog()
+    from gateway.run import start_gateway
+    print(_t("cli.gateway.starting"))
+    asyncio.run(start_gateway())
+
+
+def _start_worktree_setup(list_tools, list_toolsets, worktree, w):
+    """Start isolated-worktree creation (+ tool prewarm) in the background.
+
+    Returns a join callable that publishes ``_active_worktree``/TERMINAL_CWD and
+    schedules stale-worktree GC, or None when no worktree is wanted.
+    """
+    if list_tools or list_toolsets or not (worktree or w or CLI_CONFIG.get("worktree", False)):
+        return None
+    # Overlap tool discovery with the I/O-bound worktree setup so show_banner() hits a warm
+    # cache (~0.4s). Only on the -w path: plain `hermes` has no I/O wait to hide.
+    def _prewarm_tools() -> None:
+        try:
+            import model_tools as _mt
+            _mt.get_tool_definitions(quiet_mode=True)
+        except Exception:
+            logger.debug("tool prewarm failed", exc_info=True)
+
+    context_thread(target=_prewarm_tools, name="tool-prewarm", daemon=True).start()
+    _sync_base = CLI_CONFIG.get("worktree_sync", True)
+    _wt_result: dict = {}
+
+    def _create_worktree() -> None:
+        try:
+            _wt_result["info"] = _setup_worktree(sync_base=_sync_base)
+        except Exception:
+            logger.debug("worktree setup failed", exc_info=True)
+            _wt_result["info"] = None
+
+    _wt_thread = context_thread(target=_create_worktree, name="worktree-setup", daemon=True)
+    _wt_thread.start()
+
+    def _worktree_maintenance(repo: str) -> None:
+        _prune_stale_worktrees(repo)
+        _maintain_pack_health(repo)
+
+    def _join_worktree() -> Optional[Dict[str, str]]:
+        _wt_thread.join(timeout=120)
+        info = _wt_result.get("info")
+        if not info:
+            return info
+        global _active_worktree
+        _active_worktree = info
+        os.environ["TERMINAL_CWD"] = info["path"]
+        atexit.register(_cleanup_worktree, info)
+        # GC stale worktrees AFTER _setup_worktree so they never race on git's worktree
+        # metadata (the new tree is immune: <24h age gate + live pid lock); then repack
+        # once refs are final so lookups stay fast on multi-agent boxes.
+        _repo = _git_repo_root()
+        if _repo:
+            context_thread(target=_worktree_maintenance, args=(_repo,), name="worktree-prune", daemon=True).start()
+        return info
+
+    return _join_worktree
+
+
+def main(
+    query: str = None,
+    q: str = None,
+    oneshot: bool = False,
+    image: str = None,
+    toolsets: str = None,
+    skills: str | list[str] | tuple[str, ...] = None,
+    model: str = None,
+    provider: str = None,
+    reasoning: str = None,
+    api_key: str = None,
+    base_url: str = None,
+    max_turns: int = None,
+    run_budget: float = None,
+    verbose: Optional[bool] = None,
+    quiet: bool = False,
+    compact: bool = False,
+    list_tools: bool = False,
+    list_toolsets: bool = False,
+    gateway: bool = False,
+    resume: str = None,
+    worktree: bool = False,
+    w: bool = False,
+    checkpoints: bool = False,
+    pass_session_id: bool = False,
+    output_format: str = "text",
+    ignore_user_config: bool = False,
+    ignore_rules: bool = False,
+):
+    """
+    Hermes Agent CLI - Interactive AI Assistant
+    
+    Args:
+        query: Query to run. On a real TTY this seeds an interactive session
+            (submitted literally as the first turn); with --oneshot/-Q or a
+            non-TTY it answers and exits. Alias: -q
+        q: Shorthand for --query
+        oneshot: With -q: force the legacy answer-and-exit single-query mode
+            even on a TTY.
+        image: Optional local image path to attach to a single query
+        toolsets: Comma-separated list of toolsets to enable (e.g., "web,terminal")
+        skills: Comma-separated or repeated list of skills to preload for the session
+        model: Model to use (default: anthropic/claude-opus-4-20250514)
+        provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
+        reasoning: Reasoning effort for this run (none|minimal|low|medium|high|xhigh|max|ultra). Overrides agent.reasoning_effort.
+        api_key: API key for authentication
+        base_url: Base URL for the API
+        max_turns: Maximum tool-calling iterations (default: 60)
+        verbose: Enable verbose logging
+        compact: Use compact display mode
+        list_tools: List available tools and exit
+        list_toolsets: List available toolsets and exit
+        resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
+        worktree: Run in an isolated git worktree (for parallel agents). Alias: -w
+        w: Shorthand for --worktree
+    
+    Examples:
+        python cli.py                            # Start interactive mode
+        python cli.py --toolsets web,terminal    # Use specific toolsets
+        python cli.py --skills hermes-agent-dev,github-auth
+        python cli.py -q "What is Python?"       # Single query mode
+        python cli.py -q "Describe this" --image ~/storage/shared/Pictures/cat.png
+        python cli.py --list-tools               # List tools and exit
+        python cli.py --resume 20260225_143052_a1b2c3  # Resume session
+        python cli.py -w                         # Start in isolated git worktree
+        python cli.py -w -q "Fix issue #123"     # Single query in worktree
+    """
+    check_cli_main_options(gateway=gateway, worktree=worktree or w, ignore_user_config=ignore_user_config, resume=resume)
+    # UTF-8 stdio on Windows before any print (Rich box-drawing would UnicodeEncodeError on cp1252).
+    with suppress(Exception):
+        from hermes_cli.stdio import configure_windows_stdio
+        configure_windows_stdio()
+
+    os.environ["HERMES_INTERACTIVE"] = "1"  # terminal_tool: interactive sudo prompts with timeout
+
+    if gateway:
+        _run_legacy_gateway()
+        return
+
+    if not (list_tools or list_toolsets):
+        from hermes_cli.process_identity import register_self
+        from hermes_cli.shared_profile_warning import shared_profile_warning
+
+        register_self("cli")
+        warning = shared_profile_warning()
+        if warning:
+            print(_t("cli.startup.warning", warning=warning), file=sys.stderr)
+
+    _join_worktree = _start_worktree_setup(list_tools, list_toolsets, worktree, w)
+    query = query or q
+    # ``hermes chat`` already validated this; the direct Fire entry point gets the same contract.
+    if output_format == "stream-json":
+        if not query:
+            raise ValueError("--format stream-json requires -q/--query")
+        quiet = True
+    cli = _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
+                               verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills)
+
+    # Join the background worktree creation before anything consumes TERMINAL_CWD.
+    # A requested worktree whose setup failed aborts: never silently run without isolation.
+    wt_info = _join_worktree() if _join_worktree is not None else None
+    if _join_worktree is not None and not wt_info:
+        return
+
+    # Inject worktree context into agent's system prompt
+    if wt_info:
+        wt_note = (
+            f"\n\n[System note: You are working in an isolated git worktree at "
+            f"{wt_info['path']}. Your branch is `{wt_info['branch']}`. "
+            f"Changes here do not affect the main working tree or other agents. "
+            f"Remember to commit and push your changes, and create a PR if appropriate. "
+            f"The original repo is at {wt_info['repo_root']}.]"
+        )
+        cli.system_prompt = (cli.system_prompt or "") + wt_note
+
+    if list_tools or list_toolsets:
+        cli.show_banner()
+        (cli.show_tools if list_tools else cli.show_toolsets)()
+        sys.exit(0)
+
+    atexit.register(_run_cleanup)  # interactive mode registers again in run() (idempotent)
+    _install_single_query_signal_handlers(cli)
+
+    if query or image:
+        _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json=output_format == "stream-json")
+        return
+    cli.run()
+
+
+if __name__ == "__main__":
+    import fire
+
+    fire.Fire(main)

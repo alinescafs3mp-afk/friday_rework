@@ -1,0 +1,589 @@
+"""Exact original frame observer and full-caller closure adapter.
+
+It starts before native constructors; the actual input entry clock precedes
+activity, DB/history writes and output. Native exception/return facts are never
+replaced. No user callback can be installed into this observer.
+"""
+from __future__ import annotations
+import asyncio
+from contextvars import copy_context, Context
+import hashlib
+import os
+from pathlib import Path
+import sys
+import threading
+import time
+from driver.qualification import Unbound, proc_birth
+from driver.native import LiveBinding, object_key
+from driver.ledger import witness_actual_return
+from .fixtures import fd_state
+from .custody import canonical_path, DirectoryCustody
+from .runtime import NativeRuntime
+
+CONSTRUCTOR_KIND = {"cli_constructed": "cli", "agent_constructed": "agent",
+                    "context_constructed": "context", "host_constructed": "host",
+                    "database_constructed": "database", "session_constructed": "session",
+                    "result_tool_constructed": "result_tool", "proxy_constructed": "proxy", "lease_constructed": "descriptor_lease"}
+TAIL_KIND = {"activity_join_return", "metadata_callback_return", "session_flush_return", "ui_completed_return"}
+
+class OriginalCaller:
+    def __init__(self, runtime, ordinal, frame, site, cli, observed_at):
+        self.runtime, self.ordinal, self.frame, self.qualification = runtime, ordinal, frame, site.qualification
+        self.generation = ordinal
+        self.retired = False
+        self.owner_thread = threading.current_thread()
+        try:
+            self.owner_task = asyncio.current_task()
+        except RuntimeError:
+            self.owner_task = None
+        self.context_items = tuple(copy_context().items())
+        self.resource_witnesses = {}
+        self.cli, self.agent, self.binding = cli, None, None
+        self.host = runtime.birth
+        self.entered = observed_at
+        self.deadline = min(observed_at+30.0, runtime.grant["useful_deadline_monotonic"])
+        self.returned = self.closed_at = None
+        self.actor_tid = threading.get_native_id()
+        self.stop_intent = None
+        self.failures, self.unknown, self.tail, self.exceptions = [], [], [], []
+        self.tasks, self.threads, self.loops, self.handles = [], [], [], []
+        self.operation_refs = []
+        self.history = None
+        source_input = frame.f_locals.get(site.qualification.get("input_argument", "user_input"))
+        self.original_input = source_input
+        raw = source_input.encode("utf-8") if type(source_input) is str else None
+        self.actual_input_fact = {"type": type(source_input).__name__, "bytes": None if raw is None else len(raw),
+                                 "sha256": None if raw is None else hashlib.sha256(raw).hexdigest()}
+
+    def bind_actual(self, binding):
+        if self.binding is not None or binding.cli is not self.cli:
+            raise Unbound("caller_binding_replaced_or_not_original_constructor")
+        self.agent, self.binding = binding.agent, binding
+        binding.caller_witness = self
+        self.context_items = tuple(copy_context().items())
+
+    def require_original(self, binding):
+        if (self.binding is not binding or binding.cli is not self.cli or binding.agent is not self.agent
+                or binding.host_birth["pid"] != self.host["pid"]
+                or binding.host_birth["starttime"] != self.host["starttime"]
+                or self.returned is not None or time.monotonic() >= self.deadline):
+            raise Unbound("original_caller_identity_clock_or_lifetime_lost")
+        return self
+
+    def observe_tail(self, site, *, monotonic, actor, observation):
+        self.tail.append({"site": site, "monotonic": monotonic, "actor": actor, "observation": observation})
+        if self.returned is not None:
+            self.unknown.append("actual_tail_after_original_return")
+
+    def original_return(self, frame, observed_at):
+        if frame is not self.frame or self.returned is not None:
+            raise Unbound("wrong_or_duplicate_original_input_return")
+        self.returned = observed_at
+        if observed_at > self.deadline:
+            self.failures.append("whole_original_caller_exceeded30")
+        # An exception event followed by return(None) is not a successful return.
+        if self.exceptions:
+            self.unknown.append("native_exception_observed_preserve_adverse_outcome")
+
+    def close_after_actual_joins(self, observations, history, closed_at):
+        if self.closed_at is not None:
+            raise Unbound("original_caller_closed_twice")
+        self.history, self.closed_at = history, closed_at
+        if self.returned is None:
+            self.unknown.append("original_caller_return_missing")
+        if closed_at > self.deadline:
+            self.failures.append("original30_including_posthandle_joins_exceeded")
+        for row in observations:
+            if row.get("alive") is not False or row.get("unknown"):
+                self.unknown.append("posthandle_resource_not_proven_closed")
+        if self.binding is None:
+            self.unknown.append("no_actual_original_turn_and_native_binding")
+        required = set(self.runtime.protocol["required_tail_sites"])
+        actual = {row["site"] for row in self.tail}
+        if not required <= actual:
+            self.unknown.append("required_original_tail_not_observed:" + ",".join(sorted(required-actual)))
+        if history is None or history.get("unknown"):
+            self.unknown.append("durable_original_history_read_unconfirmed")
+        self.retired = True
+        # This is raw closure evidence. Source/run presence never issues PASS.
+
+    def observation(self):
+        return {"ordinal": self.ordinal, "generation":self.generation,"retired":self.retired,"qualified_site": self.qualification, "host": self.host,
+                "cli": object_key(self.cli), "agent": object_key(self.agent), "actor_tid": self.actor_tid,
+                "entered": self.entered, "deadline": self.deadline, "original_returned": self.returned,
+                "closed_after_joins": self.closed_at,
+                "elapsed_including_joins": None if self.closed_at is None else self.closed_at-self.entered,
+                "actual_original_input": self.actual_input_fact,
+                "stop_intent": self.stop_intent, "tail": list(self.tail), "exceptions": list(self.exceptions),
+                "failures": list(self.failures), "unknown": list(self.unknown),
+                "durable_history": self.history, "postreturn_owned_tree_absence": "ROOT_REQUIRED_UNKNOWN_NOT_ZERO"}
+
+class ConstructorRegistry:
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.objects = {key: [] for key in runtime.classes}
+        self.original_cli = None
+        self.original_session = None
+        self.original_proxy = None
+    def retain(self, kind, value):
+        key = CONSTRUCTOR_KIND[kind]
+        if type(value) is not self.runtime.classes[key]:
+            raise Unbound("constructor_not_actual_class:" + key)
+        if not any(value is x for x in self.objects[key]):
+            self.objects[key].append(value)
+        if sum(len(x) for x in self.objects.values()) > 256:
+            raise Unbound("constructor_registry_capacity")
+        if key == "cli":
+            if self.original_cli is not None and self.original_cli is not value:
+                raise Unbound("second_native_cli_constructor_not_original")
+            self.original_cli = value
+        elif key == "session" and self.original_session is None:
+            self.original_session = value
+        elif key == "proxy" and self.original_proxy is None:
+            self.original_proxy = value
+
+    def observed(self, key, value):
+        return type(value) is self.runtime.classes[key] and any(value is x for x in self.objects[key])
+
+    def binding_from_actual_turn(self, turn):
+        if type(turn) is not dict or not turn.get("active"):
+            raise Unbound("not_actual_active_original_turn_return")
+        cli, agent = turn["cli"], turn["agent"]
+        if cli is not self.original_cli or not self.observed("agent", agent):
+            raise Unbound("original_cli_agent_constructor_missing")
+        database = turn["database"]
+        if not self.observed("database", database):
+            raise Unbound("actual_SessionDB_constructor_not_observed")
+        from prompt_toolkit.application.current import get_app_session
+        session = get_app_session()
+        if not self.observed("session", session):
+            raise Unbound("actual_AppSession_constructor_not_observed")
+        contexts = [ctx for ctx in self.objects["context"]
+                    if ctx.plugin_id == "friday_rework" and ctx._manager._cli_ref is cli]
+        hosts = [host for host in self.objects["host"] if any(host.ctx is ctx for ctx in contexts)]
+        if len(hosts) != 1:
+            raise Unbound("original_WorkerHost_not_unambiguous")
+        host = hosts[0]
+        tools = [tool for tool in self.objects["result_tool"] if tool.host is host]
+        if len(tools) != 1:
+            raise Unbound("original_ResultTool_not_unambiguous")
+        if cli.agent is not agent or agent._session_db is not database:
+            raise Unbound("constructor_owned_references_changed")
+        # This adapter consumes real opaque objects only. It never sets _TURN,
+        # _TOOL, admission, authority, DB rows, results, quiescence or output.
+        binding = LiveBinding(cli=cli, app_session=session, context=host.ctx, host=host,
+                              whole_layout=self.runtime.layout, classes=self.runtime.classes,
+                              function_qualifications=self.runtime.grant["function_rows"])
+        binding.original_result_tool = tools[0]
+        state_path = canonical_path(host.store._cli_directory)
+        if not state_path.startswith(str(self.runtime.home)+"/"):
+            raise Unbound("native_state_directory_outside_canonical_isolated_home")
+        state_custody = self.runtime.home_custody.open_descendant(state_path)
+        binding.original_state_directory_custody = state_custody
+        directory_info = os.fstat(state_custody.fd)
+        binding.original_state_directory_identity = (directory_info.st_dev,directory_info.st_ino)
+        binding.constructor_registry = self
+        return binding
+
+class PromptWitness:
+    """Exact original Application context/thread and immutable prompt generation."""
+    def __init__(self, observer, prompt, generation, observed_at):
+        if type(prompt.app_context) is not Context or prompt.app_context is not prompt.app.context or prompt.loop_thread is not threading.current_thread():
+            raise Unbound("retained_native_Application_context_thread_missing")
+        self.generation,self.prompt,self.context = generation,prompt,prompt.app_context
+        self.thread,self.observed_at,self.retired = prompt.loop_thread,observed_at,False
+        self.app,self.loop,self.future = prompt.app,prompt.loop,prompt.app_future
+        self.owner,self.session,self.proxy = prompt.owner,prompt.session,prompt.proxy
+        self.cli = observer.registry.original_cli
+        if not isinstance(self.future,asyncio.Future) or self.future.get_loop() is not self.loop:
+            raise Unbound("prompt_future_loop_generation_not_original")
+    def require_original(self, observer, *, dispatch):
+        if (self.retired or observer.prompt_witness is not self or observer.native_prompt is not self.prompt
+                or observer.registry.original_cli is not self.cli or self.cli._app is not self.app
+                or self.cli._friday_cli_output is not self.owner or self.prompt.owner is not self.owner
+                or self.prompt.session is not self.session or self.prompt.proxy is not self.proxy
+                or self.prompt.loop is not self.loop or self.prompt.app_future is not self.future
+                or self.app.loop is not self.loop or self.app.future is not self.future
+                or self.prompt.app_context is not self.context or self.app.context is not self.context
+                or self.prompt.loop_thread is not self.thread or self.app._loop_thread is not self.thread
+                or self.owner.prompt is not self.prompt or self.prompt.closed.is_set() or self.owner.closed.is_set()):
+            raise Unbound("original_prompt_owner_context_generation_lost")
+        if self.future.done() or not self.app.is_running:
+            raise Unbound("original_prompt_generation_no_longer_running")
+        if dispatch:
+            if threading.current_thread() is not self.thread:
+                raise Unbound("native_callback_not_original_owner_thread")
+            current = copy_context()
+            if any(current.get(var) is not value for var,value in self.context.items()):
+                raise Unbound("native_callback_not_exact_original_context")
+        return self
+
+class OriginalObserver:
+    def __init__(self, runtime, event_bus):
+        if type(runtime) is not NativeRuntime:
+            raise Unbound("observer_runtime_not_exact_Source")
+        self.runtime, self.bus = runtime, event_bus
+        self.registry = ConstructorRegistry(runtime)
+        self.callers = []
+        self.current_caller = None
+        self.case_entered = None
+        self.case_deadline = None
+        self.events, self.unknown = [], []
+        self.created_threads, self.created_tasks, self.loops, self.handles = [], [], [], []
+        self.native_frames = []
+        self.leases = []
+        self.native_prompt = None
+        self.prompt_witness = self.prompt_text_fact = None
+        self.prompt_serial = 0
+        self.native_frontend_frame = self.native_frontend_returned = None
+        self.native_frontend_exception = []
+        self.output_owner_close_frame = self.output_owner_close_returned = None
+        self.output_owner_close_errors = []
+        self.foreign_resources,self.owner_witnesses,self.hook_errors = [],[],[]
+        self.sys_installed = self.threads_installed = False
+        self._trace_callback = self.trace
+        self.installed = False
+        self.preexisting_threads = tuple(threading.enumerate())
+        self.by_code = {}
+        for site in runtime.sites:
+            self.by_code.setdefault(site.code, []).append(site)
+
+    def caller_for(self, frame):
+        thread = threading.current_thread()
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        ancestors,parent = [],frame
+        while parent is not None and len(ancestors) < 64:
+            ancestors.append(parent)
+            parent = parent.f_back
+        matches = [c for c in self.callers if not c.retired and c.owner_thread is thread
+                   and c.owner_task is task and any(f is c.frame for f in ancestors)]
+        if len(matches) == 1:
+            return matches[0]
+        current,loc,witnessed = copy_context(),frame.f_locals,[]
+        value,agent = loc.get("self"),loc.get("agent")
+        for caller in self.callers:
+            if caller.retired or caller.binding is None:
+                continue
+            native_ref = (value is caller.cli or value is caller.agent or agent is caller.agent
+                or any(value is x for x in (caller.binding.ctx,caller.binding.host,caller.binding.original_result_tool)))
+            if not native_ref or not caller.context_items or any(current.get(var) is not x for var,x in caller.context_items):
+                continue
+            tw = caller.resource_witnesses.get(id(thread))
+            kw = None if task is None else caller.resource_witnesses.get(id(task))
+            if task is None and (tw is None or tw.get("kind") != "thread"):
+                continue  # Original main-thread identity alone is NOT ownership.
+            if (tw is not None and tw["object"] is thread and tw["generation"] == caller.generation
+                    and (task is None or kw is not None and kw["object"] is task and kw["generation"] == caller.generation)):
+                witnessed.append(caller)
+        return witnessed[0] if len(witnessed) == 1 else None
+
+    def retain_owned_resource(self, caller, value, kind, frame):
+        if caller is None or caller.retired or self.caller_for(frame) is not caller or kind == "thread" and any(value is x for x in self.preexisting_threads):
+            return False
+        if kind == "thread" and type(value) is not threading.Thread or kind == "task" and type(value) is not asyncio.Task:
+            return False
+        context = copy_context()
+        witness = {"object":value,"kind":kind,"generation":caller.generation,"context":context,
+            "source_frame":frame,"owner_thread":threading.current_thread(),"retired":False}
+        previous = caller.resource_witnesses.get(id(value))
+        if previous is not None and previous["object"] is not value:
+            raise Unbound("owned_resource_identity_reused")
+        caller.resource_witnesses[id(value)] = witness
+        self.owner_witnesses.append(witness)
+        return True
+
+
+    def trace(self, frame, event, returned):
+        try:
+            close_code = self.runtime.functions["frontend_output_close"].__code__
+            cli = self.registry.original_cli
+            if frame.f_code is close_code and cli is not None and frame.f_locals.get("self") is cli._friday_cli_output:
+                if event == "call":
+                    self.output_owner_close_frame = frame
+                elif event == "exception" and frame is self.output_owner_close_frame:
+                    self.output_owner_close_errors.append(returned[0].__name__ if type(returned) is tuple else "UNOBSERVED")
+                elif event == "return" and frame is self.output_owner_close_frame and not self.output_owner_close_errors:
+                    self.output_owner_close_returned = time.monotonic()
+            frontend_codes = (self.runtime.functions["frontend_run"].__code__,self.runtime.functions["single_query_frontend"].__code__)
+            if any(frame.f_code is code for code in frontend_codes):
+                if event == "call" and self.native_frontend_frame is None:
+                    self.native_frontend_frame = frame
+                    self.case_entered = time.monotonic()
+                    self.case_deadline = min(self.case_entered+30,self.runtime.grant["useful_deadline_monotonic"])
+                elif frame is self.native_frontend_frame and event == "exception":
+                    self.native_frontend_exception.append(returned[0].__name__ if type(returned) is tuple else "UNOBSERVED")
+                elif frame is self.native_frontend_frame and event == "return":
+                    self.native_frontend_returned = time.monotonic()
+            for site in self.by_code.get(frame.f_code,()):
+                if event == site.event and (site.line is None or frame.f_lineno == site.line):
+                    self.observe(site,frame,event,returned,time.monotonic())
+        except BaseException as exc:
+            self.unknown.append("observer_error:"+type(exc).__name__)
+            self.bus.stop.set()
+        return self._trace_callback
+
+
+    def observe(self, site, frame, event, returned, at):
+        if len(self.events) >= 4096 or len(self.foreign_resources) >= 4096 or len(self.owner_witnesses) >= 512:
+            self.unknown.append("native_observer_capacity_exhausted")
+            self.bus.stop.set()
+            return
+        loc = frame.f_locals
+        kind = site.kind
+        caller = self.caller_for(frame)
+        detail = {"site": site.name, "kind": kind, "event": event, "monotonic": at,
+                  "frame": id(frame), "actor_tid": threading.get_native_id(),
+                  "caller": None if caller is None else caller.ordinal,
+                  "return_type": type(returned).__module__ + "." + type(returned).__qualname__}
+        if kind in CONSTRUCTOR_KIND:
+            self.registry.retain(kind, loc.get("self"))
+            detail["object"] = object_key(loc.get("self"))
+            if kind == "lease_constructed":
+                lease = loc["self"]
+                if type(lease.fd) is int and lease.fd >= 0:
+                    self.leases.append({"lease": lease, "caller": caller, "birth": fd_state(lease.fd), "fault_attempted": False})
+        elif kind == "frontend_ready":
+            prompt = loc.get("self")
+            cli = self.registry.original_cli
+            if (type(prompt) is not self.runtime.classes["prompt_binding"] or cli is None
+                    or prompt.app is not cli._app or prompt.owner is not cli._friday_cli_output
+                    or not self.registry.observed("session", prompt.session)
+                    or not self.registry.observed("proxy", prompt.proxy)):
+                raise Unbound("frontend_ready_not_original_native_prompt")
+            if self.native_prompt is not None and self.native_prompt is not prompt:
+                raise Unbound("native_prompt_binding_replaced")
+            self.native_prompt = prompt
+            if self.prompt_witness is None:
+                self.prompt_serial += 1
+                self.prompt_witness = PromptWitness(self,prompt,self.prompt_serial,at)
+            proxy_thread = prompt.proxy_thread
+            if type(proxy_thread) is threading.Thread and not any(proxy_thread is t for t in self.preexisting_threads):
+                if not any(proxy_thread is t for t in self.created_threads):
+                    self.created_threads.append(proxy_thread)
+                    self.owner_witnesses.append({"object":proxy_thread,"kind":"frontend_proxy_thread","generation":self.prompt_serial,"retired":False,"prompt":self.prompt_witness})
+            detail.update(prompt=object_key(prompt), app=object_key(prompt.app), loop=object_key(prompt.loop),
+                          future=object_key(prompt.app_future), proxy_thread=object_key(prompt.proxy_thread))
+        elif kind == "outer_input_entry":
+            cli = loc.get(site.qualification.get("cli_argument", "self"))
+            if cli is not self.registry.original_cli:
+                raise Unbound("actual_outer_input_not_original_constructor_cli")
+            if self.current_caller is not None and self.current_caller.returned is None:
+                raise Unbound("overlapping_original_input_callers")
+            caller = OriginalCaller(self.runtime, len(self.callers)+1, frame, site, cli, at)
+            if self.case_entered is None:
+                self.case_entered = at
+                self.case_deadline = min(at+30.0, self.runtime.grant["useful_deadline_monotonic"])
+            caller.deadline = min(caller.deadline, self.case_deadline)
+            self.callers.append(caller)
+            self.current_caller = caller
+            caller.resource_witnesses[id(caller.owner_thread)] = {"object":caller.owner_thread,"generation":caller.generation,"kind":"original_input_thread"}
+            if caller.owner_task is not None:
+                caller.resource_witnesses[id(caller.owner_task)] = {"object":caller.owner_task,"generation":caller.generation,"kind":"original_input_task"}
+            detail.update(caller=caller.ordinal, caller_deadline=caller.deadline)
+            self.native_frames.append(frame)
+        elif kind == "outer_input_return":
+            matches = [x for x in self.callers if x.frame is frame]
+            if len(matches) != 1:
+                raise Unbound("original_outer_input_return_frame_missing")
+            caller = matches[0]
+            caller.original_return(frame, at)
+            detail.update(caller=caller.ordinal, caller_deadline=caller.deadline)
+        elif kind == "current_turn_return":
+            if caller is None or caller.returned is not None:
+                raise Unbound("actual_turn_not_inside_original_caller")
+            if caller.binding is None:
+                caller.bind_actual(self.registry.binding_from_actual_turn(returned))
+            elif returned["cli"] is not caller.cli or returned["agent"] is not caller.agent:
+                raise Unbound("actual_original_turn_replaced")
+            detail["actual_turn"] = object_key(returned)
+        elif kind == "thread_entry":
+            thread = loc.get("self")
+            if type(thread) is not threading.Thread:
+                raise Unbound("unqualified_native_thread_type")
+            owned = self.retain_owned_resource(caller,thread,"thread",frame)
+            if owned and not any(thread is old for old in self.created_threads):
+                self.created_threads.append(thread)
+            if not owned:
+                self.foreign_resources.append({"kind":"thread","object":object_key(thread),"attribution":"UNCONFIRMED_NO_OWNER_GENERATION"})
+            if len(self.created_threads) > 64:
+                raise Unbound("native_thread_capacity")
+            detail["thread"] = object_key(thread)
+            detail["tid"] = thread.native_id
+            if owned and not any(thread is old for old in caller.threads):
+                caller.threads.append(thread)
+        elif kind == "thread_return":
+            thread = loc.get("self")
+            detail.update(thread=object_key(thread), tid=thread.native_id, native_bootstrap_return=True)
+        elif kind == "ledger_task_return":
+            context = loc.get("self")
+            if not self.registry.observed("context", context) or not isinstance(returned, asyncio.Task):
+                raise Unbound("task_not_actual_original_PluginContext_return")
+            owned = self.retain_owned_resource(caller,returned,"task",frame)
+            if owned and not any(returned is x for x in self.created_tasks):
+                self.created_tasks.append(returned)
+            if not owned:
+                self.foreign_resources.append({"kind":"task","object":object_key(returned),"attribution":"UNCONFIRMED_NO_ORIGINAL_CONTEXT_GENERATION"})
+            if len(self.created_tasks) > 256:
+                raise Unbound("native_task_capacity")
+            detail["task"] = object_key(returned)
+            if owned:
+                caller.tasks.append(returned)
+                detail["caller"] = caller.ordinal
+                if caller.binding is None:
+                    raise Unbound("actual_original_ledger_before_native_binding")
+                witness = witness_actual_return(event=event, frame=frame, returned=returned,
+                                                qualification=site.qualification, binding=caller.binding)
+                caller.binding.ledger_witness = witness
+                detail["actual_original_ledger_witness"] = witness.observation()
+        elif kind == "loop_return":
+            if not isinstance(returned, asyncio.AbstractEventLoop):
+                raise Unbound("native_async_bridge_loop_return_wrong_type")
+            row = {"loop":returned,"owner_tid":threading.get_native_id(),"owner_thread":threading.current_thread(),"caller_generation":None if caller is None else caller.generation,"context":copy_context(),"at":at}
+            if caller is None:
+                self.foreign_resources.append({"kind":"loop","object":object_key(returned),"attribution":"UNCONFIRMED_NO_ORIGINAL_CONTEXT_GENERATION"})
+            if caller is not None and not any(returned is x["loop"] for x in self.loops):
+                self.loops.append(row)
+            if caller is not None and not any(returned is x["loop"] for x in caller.loops):
+                caller.loops.append(row)
+            detail["loop"] = object_key(returned)
+        elif kind == "activity_started":
+            thread = loc["thread"]
+            if type(thread) is not threading.Thread or thread.native_id is None:
+                raise Unbound("activity_thread_birth_not_actual")
+            detail.update(thread=object_key(thread), tid=thread.native_id, alive=thread.is_alive())
+            owned = self.retain_owned_resource(caller,thread,"thread",frame)
+            if owned and not any(thread is x for x in caller.threads):
+                caller.threads.append(thread)
+                if not any(thread is x for x in self.created_threads):
+                    self.created_threads.append(thread)
+            elif not owned:
+                self.foreign_resources.append({"kind":"activity_thread","object":object_key(thread),"attribution":"UNCONFIRMED_NO_CREATION_GENERATION"})
+        elif kind == "activity_join_return":
+            thread = loc["thread"]
+            detail.update(thread=object_key(thread), tid=thread.native_id, alive_after_join=thread.is_alive())
+        elif kind == "physical_write_return":
+            chunk = loc.get("chunk")
+            detail["actual_count"] = returned if type(returned) is int else None
+            detail["count_type"] = type(returned).__name__
+            if type(chunk) is bytes:
+                detail.update(requested_bytes=len(chunk), requested_sha256=hashlib.sha256(chunk).hexdigest())
+                if type(returned) is int and 0 < returned <= len(chunk):
+                    detail["accepted_sha256"] = hashlib.sha256(chunk[:returned]).hexdigest()
+            lease = loc.get("self")
+            detail["lease"] = object_key(lease)
+            if lease is not None:
+                detail["retained_fd"] = getattr(lease, "fd", None)
+                detail["accepted_total"] = getattr(lease, "accepted", None)
+        elif kind == "physical_close_return":
+            lease = loc.get("self")
+            detail.update(lease=object_key(lease), retained_fd=getattr(lease, "fd", None),
+                          actual_close_return_type=type(returned).__name__)
+        elif kind == "prompt_text_changed":
+            cli = self.registry.original_cli
+            if cli is None or loc.get("self") is not cli or cli._app is None:
+                raise Unbound("actual_text_change_not_original_frontend")
+            buffer = cli._app.current_buffer
+            text = buffer.text
+            if type(text) is not str or len(text.encode("utf-8")) > 65536:
+                raise Unbound("actual_original_prompt_text_capacity")
+            if self.prompt_witness is None or cli._app is not self.prompt_witness.app:
+                raise Unbound("prompt_text_generation_not_retained")
+            detail.update(buffer_id=id(buffer),prompt_generation=self.prompt_witness.generation,actual_text_bytes=len(text.encode("utf-8")),
+                          actual_text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                          actual_cursor_position=buffer.cursor_position,
+                          actual_selection_type=type(buffer.selection_state).__name__)
+            self.prompt_text_fact = dict(detail)
+        elif kind == "proxy_write":
+            text = loc.get("data", loc.get("text"))
+            if type(text) is str:
+                raw = text.encode("utf-8")
+                detail.update(text_bytes=len(raw), text_sha256=hashlib.sha256(raw).hexdigest(),
+                              document_marker_present="friday.cli-document-output.v1" in text)
+        elif kind == "callback_exception":
+            detail["exception_type"] = returned[0].__name__ if type(returned) is tuple else "UNOBSERVED"
+            if caller is not None:
+                caller.exceptions.append(detail["exception_type"])
+        elif kind == "native_handle_created":
+            if caller is not None:
+                self.handles.append(returned)
+                caller.handles.append(returned)
+            else:
+                self.foreign_resources.append({"kind":"handle","object":object_key(returned),"attribution":"UNCONFIRMED_NO_OWNER_GENERATION"})
+            detail["native_handle"] = object_key(returned)
+        if event == "exception" and caller is not None:
+            caller.exceptions.append(returned[0].__name__ if type(returned) is tuple else "UNOBSERVED")
+        if caller is not None and kind in TAIL_KIND:
+            caller.observe_tail(kind, monotonic=at, actor=detail["actor_tid"], observation=detail)
+        if caller is not None:
+            detail["caller_deadline"] = caller.deadline
+            detail["caller_generation"] = caller.generation
+        elif kind not in CONSTRUCTOR_KIND and kind not in {"frontend_ready","prompt_text_changed"}:
+            detail["attribution"] = "UNCONFIRMED_NO_EXACT_CONTEXT_THREAD_TASK_GENERATION"
+        self.events.append(detail)
+        self.bus.emit(kind, {k: v for k, v in detail.items() if k != "kind"})
+        if caller is not None and event == "return" and kind == "native_bridge_return":
+            # The persistent native loop is observed, never asyncio.run/replaced.
+            detail["original_persistent_bridge_return"] = True
+
+    def install(self):
+        self.runtime.require_effect("observer_hooks")
+        if self.installed or self.sys_installed or self.threads_installed or sys.gettrace() is not None or threading.gettrace() is not None:
+            raise Unbound("unknown_trace_guard_or_duplicate_observer")
+        self.original_sys,self.original_threads = sys.gettrace(),threading.gettrace()
+        try:
+            threading.settrace(self._trace_callback)
+            self.threads_installed = True
+            sys.settrace(self._trace_callback)
+            self.sys_installed = True
+            self.installed = True
+        except BaseException as primary:
+            self.hook_errors.append({"stage":"install_primary","type":type(primary).__name__})
+            self.detach()
+            raise
+
+
+    def detach(self):
+        for name in ("sys","threads"):
+            flag = self.sys_installed if name == "sys" else self.threads_installed
+            if not flag:
+                continue
+            try:
+                actual = sys.gettrace() if name == "sys" else threading.gettrace()
+                if actual is not self._trace_callback:
+                    self.unknown.append("foreign_trace_replacement_retained:"+name)
+                    continue
+                if name == "sys":
+                    sys.settrace(self.original_sys)
+                    self.sys_installed = False
+                else:
+                    threading.settrace(self.original_threads)
+                    self.threads_installed = False
+            except BaseException as exc:
+                self.hook_errors.append({"stage":"detach:"+name,"type":type(exc).__name__})
+        self.installed = self.sys_installed or self.threads_installed
+        if self.prompt_witness is not None:
+            self.prompt_witness.retired = True
+        for witness in self.owner_witnesses:
+            witness["retired"] = True
+        for caller in self.callers:
+            caller.retired = True
+        for thread in self.created_threads:
+            if thread.is_alive():
+                self.unknown.append("per_thread_trace_lifetime_still_unknown:"+str(thread.native_id))
+
+
+    def snapshot(self):
+        return {"constructor_objects": {key: [object_key(x) for x in values]
+                                        for key, values in self.registry.objects.items()},
+                "events":list(self.events),"unknown":list(self.unknown),"hook_errors":list(self.hook_errors),
+                "foreign_or_unattributed_resources":list(self.foreign_resources),
+                "native_frontend_actual_return":self.native_frontend_returned,"native_frontend_exception":list(self.native_frontend_exception),
+                "output_owner_actual_close_return":self.output_owner_close_returned,
+                "prompt_generation":None if self.prompt_witness is None else self.prompt_witness.generation,
+                "installed": self.installed, "case_original_entered": self.case_entered,
+                "case_original_deadline": self.case_deadline, "callers": [x.observation() for x in self.callers],
+                "original_full150_control_orchestration": "NOT_COMPLETED_BY_GENERAL_PRODUCER",
+                "acceptance": "INDEPENDENT_ROOT_REQUIRED"}

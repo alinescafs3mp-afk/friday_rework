@@ -1,0 +1,196 @@
+            result = request_tool_approval(tool_name, details.message or "", rule_key=details.rule_key or tool_name)
+        finally:
+            if approval_tokens is not None:
+                with suppress(Exception):
+                    reset_current_observability_context(approval_tokens)
+    except Exception:
+        # Fail-closed: if the gate itself errors, block rather than silently execute an action a
+        # plugin flagged for approval.
+        return f"BLOCKED: plugin approval gate failed for {tool_name}"
+    if not result.get("approved"):
+        return str(result.get("message") or f"BLOCKED: plugin approval required for {tool_name}")
+    return None
+
+
+def _dispatch_pre_tool_call_hooks(
+    tool_name: str, args: Optional[Dict[str, Any]], **hook_kwargs: Any
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Invoke ``pre_tool_call`` hooks once; return ``(block_message, modified_args)`` — the resolved
+    block/approve message (``None`` to proceed) and merged ``modify`` args (``None`` if none)."""
+    details = _get_pre_tool_call_directive_details(tool_name, args, **hook_kwargs)
+    block_msg = _resolve_block_from_details(
+        details, tool_name, **{k: hook_kwargs.get(k, "") for k in ("turn_id", "tool_call_id", "session_id")})
+    return (block_msg, details.modified_args)
+
+
+def get_pre_verify_continue_message(
+    *, session_id: str = "", platform: str = "", model: str = "", coding: bool = False,
+    attempt: int = 0, final_response: str = "", changed_paths: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Check ``pre_verify`` hooks for ``{"action": "continue", "message"}`` (or Claude-Code Stop
+    ``{"decision": "block", "reason"}``) to keep the turn going; first non-empty message wins, any
+    other return lets the turn finish. ``coding``/``attempt`` let hooks scope and self-throttle."""
+    hook_results = invoke_hook(
+        "pre_verify", session_id=session_id, platform=platform, model=model, coding=coding,
+        attempt=attempt, final_response=final_response, changed_paths=list(changed_paths or []),
+    )
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        action = str(result.get("action") or result.get("decision") or "").strip().lower()
+        message = result.get("message") or result.get("reason")
+        if action in ("continue", "block") and isinstance(message, str) and message.strip():
+            return message.strip()
+    return None
+
+
+def get_plugin_error_classification(
+    *, provider: str = "", model: str = "", status_code: Optional[int] = None, error_type: str = "",
+    error_code: str = "", error_message: str = "", error_body: Optional[Dict[str, Any]] = None,
+    error: Optional[BaseException] = None, approx_tokens: int = 0, context_length: int = 0,
+    num_messages: int = 0,
+) -> Optional[Dict[str, Any]]:
+    """Consult ``transform_api_error_classification`` hooks BEFORE the built-in classifier.
+    Run-all-then-pick-first: the first valid result in registration order wins, losing valid results
+    warn (conflicts visible, not shadowed). Returns a sanitized dict (``reason`` -> ``FailoverReason``,
+    hint flags -> bool, ``message`` capped at 500) or ``None``. Privacy: inputs may be unredacted.
+
+    A callback returns ``None`` to decline, or a dict with a required ``"reason"`` (a
+    :class:`agent.error_classifier.FailoverReason` member or its string name) plus optional recovery-hint
+    overrides. Dispatch is run-all-then-pick-first: ``invoke_hook`` runs every registered callback with
+    failures isolated, then the first result carrying a valid reason wins in registration order — mirroring
+    :func:`get_pre_tool_call_block_message`, invalid or irrelevant returns are silently ignored so a
+    misbehaving plugin degrades to a no-op. When more than one callback returns a valid classification, the
+    losing results are skipped with a runtime warning (the #64714 skipped-transform rule) so conflicting
+    provider plugins are visible in logs instead of silently shadowed.
+    """
+    from agent.error_classifier import FailoverReason
+    hook_results = invoke_hook(
+        "transform_api_error_classification", provider=provider, model=model,
+        status_code=status_code, error_type=error_type, error_code=error_code,
+        error_message=error_message, error_body=error_body if isinstance(error_body, dict) else {},
+        error=error, approx_tokens=approx_tokens, context_length=context_length,
+        num_messages=num_messages,
+    )
+
+    def _reason(result: Any) -> Any:
+        reason = result.get("reason") if isinstance(result, dict) else None
+        if isinstance(reason, str):
+            with suppress(ValueError):
+                return FailoverReason(reason.strip().lower())
+            return None
+        return reason if isinstance(reason, FailoverReason) else None
+
+    valid = [(result, reason) for result in hook_results if (reason := _reason(result)) is not None]
+    if not valid:
+        return None
+    result, reason = valid[0]
+    winner: Dict[str, Any] = {"reason": reason}
+    for key in ("retryable", "should_compress", "should_rotate_credential", "should_fallback"):
+        if key in result:
+            winner[key] = bool(result[key])
+    message = result.get("message")
+    if isinstance(message, str) and message.strip():
+        winner["message"] = message.strip()[:500]
+    if isinstance(result.get("error_context"), dict):
+        winner["error_context"] = result["error_context"]
+    if len(valid) > 1:
+        logger.warning("transform_api_error_classification: skipped %d valid classification(s) after the "
+                       "first result in registration order won (run-all-then-pick-first)", len(valid) - 1)
+    return winner
+
+
+def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
+    """Return the global manager after idempotent (or ``force``d) discovery."""
+    manager = get_plugin_manager()
+    manager.discover_and_load(force=force)
+    return manager
+
+
+def get_plugin_context_engine():
+    """Return the plugin-registered context engine, or None."""
+    return _ensure_plugins_discovered()._context_engine
+
+
+def get_plugin_command_handler(name: str) -> Optional[Callable]:
+    """Return the handler for a plugin-registered slash command, or ``None``."""
+    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+    return entry["handler"] if entry else None
+
+
+_PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
+
+
+def resolve_plugin_command_result(result: Any) -> Any:
+    """Resolve a plugin command result, awaiting async handlers: ``asyncio.run`` when no loop is
+    running, else a helper thread with its own loop (30s bound so a hung handler cannot wedge the
+    terminal)."""
+    if not inspect.isawaitable(result):
+        return result
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(result)
+    outcome: Dict[str, Any] = {}
+    failure: Dict[str, BaseException] = {}
+    done = threading.Event()
+
+    def _runner() -> None:
+        try:
+            outcome["value"] = asyncio.run(result)
+        except BaseException as exc:  # pragma: no cover - re-raised below
+            failure["exc"] = exc
+        finally:
+            done.set()
+
+    # copy_context: the helper thread must see the caller's profile/secret scope, else an
+    # async hook under a running loop reads the default HERMES_HOME and get_secret raises.
+    threading.Thread(target=contextvars.copy_context().run, args=(_runner,),
+                     name="hermes-plugin-command-await", daemon=True).start()
+    if not done.wait(timeout=_PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS):
+        raise TimeoutError("Plugin command async handler did not complete within "
+                           f"{_PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS:.0f}s")
+    if "exc" in failure:
+        raise failure["exc"]
+    return outcome.get("value")
+
+
+def get_plugin_commands() -> Dict[str, dict]:
+    """Plugin commands dict (name -> {handler, description, plugin}) after idempotent discovery."""
+    return _ensure_plugins_discovered()._plugin_commands
+
+
+def get_plugin_auxiliary_tasks() -> List[Dict[str, Any]]:
+    """Plugin auxiliary-task registration dicts sorted by ``key`` (after idempotent discovery)."""
+    manager = _ensure_plugins_discovered()
+    return [manager._aux_tasks[k] for k in sorted(manager._aux_tasks)]
+
+
+def get_plugin_toolsets() -> List[tuple]:
+    """Plugin toolsets as ``(key, label, description)`` tuples for the ``hermes tools`` TUI."""
+    manager = get_plugin_manager()
+    if not manager._plugin_tool_names:
+        return []
+    try:
+        from tools.registry import registry
+    except Exception:
+        return []
+    # Group plugin tool names by their toolset, then map each toolset back to the plugin that
+    # registered it (first owner wins) for the description.
+    toolset_tools: Dict[str, List[str]] = {}
+    for tool_name in manager._plugin_tool_names:
+        entry = registry.get_entry(tool_name)
+        if entry:
+            toolset_tools.setdefault(entry.toolset, []).append(entry.name)
+    toolset_plugin: Dict[str, LoadedPlugin] = {}
+    for loaded in manager._plugins.values():
+        for tool_name in loaded.tools_registered:
+            entry = registry.get_entry(tool_name)
+            if entry and entry.toolset in toolset_tools:
+                toolset_plugin.setdefault(entry.toolset, loaded)
+    result = []
+    for ts_key in sorted(toolset_tools):
+        plugin = toolset_plugin.get(ts_key)
+        desc = (plugin.manifest.description if plugin else "") or ", ".join(sorted(toolset_tools[ts_key]))
+        result.append((ts_key, f"🔌 {ts_key.replace('_', ' ').title()}", desc))
+    return result

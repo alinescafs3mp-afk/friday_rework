@@ -1,0 +1,421 @@
+"""Finite output owned by the original classic frontend and its calling task.
+
+No executor, writer thread, buffered document, or detached pump. On Linux a
+terminal/pipe is reopened through its retained /proc/self/fd entry: this creates
+a separate nonblocking open file description, NOT dup() or a shared flag change.
+The original stream/FD/flags stay intact; the temporary description belongs to
+the existing PluginContext coroutine and closes before it returns or cancels.
+Installed console/renderer qualification remains required before activation.
+"""
+import asyncio
+import fcntl
+import io
+import math
+import os
+import stat
+import sys
+import threading
+from hermes_cli.friday_cli_fd import OriginalDescriptor, DescriptorUnconfirmed
+
+MAX_ENVELOPE = 384 * 1024
+WRITE_SLICE = 4096
+
+
+class OutputRejected(ValueError):
+    """Proven refusal before any document write; safe FAILED acknowledgement."""
+
+
+class OutputCleanupUnconfirmed(RuntimeError):
+    """Retain custody and stop this frontend; never acknowledge a clean close."""
+
+
+def output_deadline(timeout, deadline=None):
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 30:
+        raise ValueError('invalid_cli_output_timeout')
+    now = asyncio.get_running_loop().time()
+    end = now + timeout
+    if deadline is not None:
+        if type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline <= now:
+            raise ValueError('invalid_cli_output_deadline')
+        end = min(end, deadline)
+    return end
+
+
+def _identity(value):
+    return value.st_dev, value.st_ino, value.st_mode, value.st_rdev
+
+
+class ClassicConsoleOutput:
+    """Opaque frontend lifetime, created once by HermesCLI.__init__.
+
+    Admission retains one private duplicate of the original open description.
+    It never writes/flushes or changes the original FD flags. Lifecycle closure
+    owns the anchor; a later acquisition can never remint its original route.
+    Direct exact standard streams and the explicitly bound native prompt are supported; user supplied async/write hooks
+    cannot acquire a capability. The console's existing lock protects its output.
+    """
+    def __init__(self, cli):
+        self.cli = cli
+        self.console = cli.console
+        self.stream = self.console.file
+        self.console_lock = getattr(self.console, '_lock', None)
+        self.cap = getattr(cli, '_friday_cli_scope', None)
+        self.closed = threading.Event()
+        self.busy = threading.Lock()
+        self.uncertain_descriptor = None
+        self.prompt = None
+        self.prompt_refusal = None
+        self.record_poison = None
+        self.anchor = None
+        self.anchor_refusal = None
+        self.frontend = None
+        try:
+            self.anchor = OriginalDescriptor(self.stream)
+        except Exception as exc:
+            self.anchor_refusal = type(exc).__name__
+            custody = getattr(exc, "descriptor_custody", None)
+            if custody is not None:
+                self.uncertain_descriptor = custody
+            # Unsupported output does not break unrelated native UI/status.
+            # This original capability is never reminted at a later acquire.
+        if self.anchor is not None:
+            from hermes_cli.friday_cli_frontend import register
+            self.frontend = register(self)
+        self._admitted_anchor = self.anchor
+        self._admitted_frontend = self.frontend
+
+    def check_lifetime(self):
+        if (self.closed.is_set() or getattr(self.cli, '_friday_cli_output', None) is not self
+                or self.cli.console is not self.console
+                or getattr(self.console, '_lock', None) is not self.console_lock
+                or getattr(self.cli, '_friday_cli_scope', None) is not self.cap
+                or self.anchor is not self._admitted_anchor
+                or self.frontend is not self._admitted_frontend):
+            self.closed.set()
+            if self.record_poison is None:
+                self.record_poison = {"state": "UNKNOWN", "source": "observed_lifetime_replacement"}
+            raise RuntimeError('original_cli_output_lifetime_lost')
+
+    def check(self, *, cleanup=False):
+        self.check_lifetime()
+        if self.anchor is None:
+            raise OutputRejected("original_fd_admission_unavailable")
+        self.anchor.validate()
+        if self.record_poison is not None and not cleanup:
+            raise OutputCleanupUnconfirmed("original_record_boundary_unknown")
+        if not self.matches_stream(self.console.file):
+            raise RuntimeError('original_cli_output_stream_changed')
+
+    def matches_stream(self, stream):
+        if stream is self.stream and self.prompt is None:
+            return True
+        if self.prompt is not None:
+            from hermes_cli.friday_cli_prompt import NativePromptBinding
+            if type(self.prompt) is not NativePromptBinding:
+                raise RuntimeError('unknown_cli_prompt_capability')
+            if self.prompt.matches(stream):
+                self.prompt.check()
+                return True
+        return False
+
+    def close(self):
+        # The existing task/ledger remains the sole FD custodian. Closing the
+        # frontend prevents its next write; cancellation/finally joins cleanup.
+        # Do not close/reuse a coroutine's descriptor from another thread.
+        self.closed.set()
+        if self.prompt is not None:
+            self.prompt.close()
+        if (self.prompt is not None and (self.prompt.pending is not None or self.prompt.uncertain is not None)
+                or self.frontend is not None and self.frontend.pending):
+            self.uncertain_descriptor = {"reason": "native_frontend_tail_not_closed"}
+            raise OutputCleanupUnconfirmed("native_frontend_lifecycle_close_unconfirmed")
+        if self.anchor is None:
+            if self.uncertain_descriptor is not None:
+                raise OutputCleanupUnconfirmed("initial_original_fd_close_unconfirmed")
+            return
+        if self.busy.acquire(blocking=False):
+            try:
+                self.anchor.close()
+                from hermes_cli.friday_cli_frontend import unregister
+                unregister(self)
+            finally:
+                self.busy.release()
+        else:
+            self.uncertain_descriptor = {"reason": "original_lease_still_owns_anchor"}
+
+    def acquire(self):
+        self.check()
+        if not self.busy.acquire(blocking=False):
+            raise RuntimeError('original_cli_output_busy')
+        locked = False
+        try:
+            if self.console_lock is None or not self.console_lock.acquire(blocking=False):
+                raise RuntimeError('original_cli_console_busy')
+            locked = True
+            self.check()
+            return _ConsoleWrite(self)
+        except BaseException:
+            if locked:
+                self.console_lock.release()
+            self.busy.release()
+            raise
+
+
+class _ConsoleWrite:
+    def __init__(self, owner):
+        self.owner = owner
+        self.fd = None
+        self.original_fd = None
+        self.original_identity = None
+        self.original_flags = None
+        self.accepted = 0
+        self.active = True
+        stream = owner.stream
+        if type(stream) is io.StringIO:
+            # Exact C implementation only; no custom slow write/flush method.
+            # A bounded append avoids copying an unbounded old transcript.
+            if stream.closed or stream.tell() != len(stream.getvalue()) or stream.tell() > MAX_ENVELOPE:
+                raise ValueError('unsupported_cli_memory_output')
+            self.memory_position = stream.tell()
+            self.kind = 'bounded-memory'
+            return
+        if (sys.platform != 'linux' or type(stream) is not io.TextIOWrapper
+                or stream.closed or stream.encoding.lower().replace('_', '-') not in {'utf-8', 'ascii'}):
+            raise ValueError('unsupported_cli_output_stream')
+        buffer = stream.buffer
+        raw = buffer.raw if type(buffer) is io.BufferedWriter else buffer
+        if type(raw) is not io.FileIO or raw.closed:
+            raise ValueError('unsupported_cli_output_buffer')
+        owner.anchor.validate()
+        self.original_fd = owner.anchor.number
+        self.original_identity = owner.anchor.stat
+        self.original_flags = owner.anchor.flags
+        fd = owner.anchor.reopen()
+        try:
+            owner.check()
+            self.fd = fd
+            self.kind = 'native-nonblocking-fd'
+        except BaseException:
+            try:
+                owner.anchor.release(fd)
+            except Exception as exc:
+                owner.uncertain_descriptor = {'fd':fd,'identity':self.original_identity}
+                owner.closed.set()
+                raise OutputCleanupUnconfirmed('cli_output_close_unconfirmed') from exc
+            raise
+
+    def check(self, *, cleanup=False):
+        self.owner.check(cleanup=cleanup)
+        if not self.active:
+            raise RuntimeError('cli_output_write_closed')
+        if self.fd is not None:
+            stream = self.owner.stream
+            raw = stream.buffer.raw if type(stream.buffer) is io.BufferedWriter else stream.buffer
+            if (raw.closed or raw.fileno() != self.original_fd
+                    or _identity(os.fstat(self.original_fd)) != self.original_identity
+                    or fcntl.fcntl(self.original_fd, fcntl.F_GETFL) != self.original_flags
+                    or _identity(os.fstat(self.fd)) != self.original_identity
+                    or not fcntl.fcntl(self.fd, fcntl.F_GETFL) & os.O_NONBLOCK):
+                raise RuntimeError('original_cli_output_descriptor_changed')
+        elif (self.owner.stream.closed or self.owner.stream.tell() != self.memory_position
+                or len(self.owner.stream.getvalue()) != self.memory_position
+                or self.memory_position > 2 * MAX_ENVELOPE):
+            raise RuntimeError('original_cli_memory_output_changed')
+
+    def write(self, chunk, *, cleanup=False):
+        self.check(cleanup=cleanup)
+        if self.fd is None:
+            count = self.owner.stream.write(chunk.decode('ascii'))
+        else:
+            count = os.write(self.fd, chunk)
+        if type(count) is not int or not 0 < count <= len(chunk):
+            raise RuntimeError('uncertain_cli_output_write')
+        self.accepted += count
+        if self.fd is None:
+            self.memory_position += count
+        return count
+
+    def close(self):
+        if not self.active:
+            return
+        self.active = False
+        try:
+            if self.fd is not None:
+                fd, self.fd = self.fd, None
+                try:
+                    self.owner.anchor.release(fd)
+                except BaseException as exc:
+                    self.owner.uncertain_descriptor = {'fd':fd,'identity':self.original_identity}
+                    self.owner.closed.set()
+                    if not isinstance(exc, Exception):
+                        raise
+                    raise OutputCleanupUnconfirmed('cli_output_close_unconfirmed') from exc
+        finally:
+            try:
+                self.owner.console_lock.release()
+            finally:
+                self.owner.busy.release()
+
+
+def initialize_console_output(cli):
+    if getattr(cli, '_friday_cli_output', None) is not None:
+        raise RuntimeError('cli_output_already_initialized')
+    cli._friday_cli_output = ClassicConsoleOutput(cli)
+
+
+def retained_console_output(turn):
+    owner = getattr(turn['cli'], '_friday_cli_output', None)
+    if (type(owner) is not ClassicConsoleOutput or owner is not turn.get('output')
+            or owner.console is not turn['console'] or not owner.matches_stream(turn['stream'])
+            or owner.cap is not turn['cap']):
+        raise RuntimeError('original_cli_output_missing')
+    owner.check()
+    return owner
+
+
+def retained_console_lifetime(turn):
+    # Native patch_stdout can wrap the console between input turns. Its
+    # existing intake/status/stop contracts remain usable. Such a wrapped sink
+    # cannot silently replace the captured output producer or receive bytes.
+    owner = getattr(turn['cli'], '_friday_cli_output', None)
+    if (type(owner) is not ClassicConsoleOutput or owner is not turn.get('output')
+            or owner.cli is not turn['cli'] or owner.cap is not turn['cap']):
+        raise RuntimeError('original_cli_output_missing')
+    owner.check_lifetime()
+    return owner
+
+
+async def write_console_envelope(owner, payload, *, deadline, check, stop):
+    """Original native ledger caller owns every document/control write and FD.
+
+    A proved native prompt binding only hides/restores its existing renderer
+    through bounded memory controls on the actual app loop. It never receives
+    a document or starts a second writer. Unknown late cleanup stays retained.
+    """
+    if type(payload) is not bytes or len(payload) > MAX_ENVELOPE:
+        raise ValueError('cli_output_envelope_limit')
+    loop = asyncio.get_running_loop()
+    if type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline <= loop.time():
+        raise ValueError('cli_output_expired_before_write')
+    await asyncio.sleep(0)
+    check()
+    if stop() or loop.time() >= deadline:
+        raise ValueError('cli_output_stopped_before_write')
+    binding = owner.prompt
+    if binding is not None:
+        await binding.drain_before(deadline)
+    try:
+        lease = owner.acquire()
+    except OutputCleanupUnconfirmed:
+        raise
+    except Exception:
+        raise OutputRejected('unsupported_or_unavailable_original_cli_output') from None
+    binding = owner.prompt
+    op = None
+    primary = cleanup_error = None
+    body_entered = False
+    kind = lease.kind
+
+    async def emit(data, end, *, cleanup=False):
+        if type(data) is not bytes or len(data) > (4096 if cleanup else MAX_ENVELOPE):
+            raise ValueError('cli_output_owned_phase_limit')
+        offset = 0
+        while offset < len(data):
+            if not cleanup:
+                check()
+            lease.check(cleanup=cleanup)
+            if (not cleanup and stop()) or loop.time() >= end:
+                raise TimeoutError('cli_output_deadline_or_stop')
+            try:
+                written = lease.write(data[offset:offset + WRITE_SLICE], cleanup=cleanup)
+                offset += written
+                if op is not None and not cleanup:
+                    op.body_accepted += written
+            except BlockingIOError:
+                if lease.fd is None:
+                    raise
+            except InterruptedError:
+                pass
+            if offset < len(data):
+                await asyncio.sleep(min(.001, max(0, end - loop.time())))
+
+    try:
+        await asyncio.sleep(0)
+        useful_end = deadline
+        if binding is not None:
+            from hermes_cli.friday_cli_prompt import CLEANUP_RESERVE, PromptUnsupported
+            try:
+                op = binding.reserve(deadline)
+                op.caller_task = asyncio.current_task()
+                op.caller_loop = loop
+                op.descriptor = lease.fd
+                op.descriptor_identity = lease.original_identity
+            except PromptUnsupported:
+                raise OutputRejected('unsupported_or_unavailable_native_prompt') from None
+            useful_end = deadline - CLEANUP_RESERVE
+            controls = await binding.begin(op, useful_end)
+            await emit(controls, useful_end, cleanup=True)
+        body_entered = True
+        await emit(payload, useful_end)
+        check()
+        lease.check()
+        if stop() or loop.time() >= useful_end:
+            raise TimeoutError('cli_output_deadline_or_stop')
+    except BaseException as exc:
+        primary = exc
+        if body_entered:
+            owner.record_poison = {
+                "state": "UNKNOWN", "accepted_total": lease.accepted,
+                "accepted_body": None if op is None else op.body_accepted,
+                "error": type(exc).__name__, "record_recovery": "NOT_CONFIRMED",
+                "next_document": "REFUSED_UNTIL_EXACT_FRONTEND_LIFECYCLE_CLOSED"}
+        if op is not None:
+            op.cancel.set()
+            op.failures.append({'phase':'document','type':type(exc).__name__,
+                                'accepted_body_bytes':op.body_accepted,'at':loop.time()})
+    finally:
+        try:
+            if binding is not None and op is not None:
+                if op.touched and not op.finished.done():
+                    controls = await binding.end(op, deadline)
+                    await emit(controls, deadline, cleanup=True)
+        except BaseException as exc:
+            cleanup_error = exc
+            op.failures.append({'phase':'caller_cleanup','type':type(exc).__name__,'at':loop.time()})
+            binding.abandon(op)
+        finally:
+            try:
+                lease.close()
+                if op is not None:
+                    op.descriptor_closed = True
+            except BaseException as exc:
+                cleanup_error = exc
+                if op is not None:
+                    op.failures.append({'phase':'descriptor_close','type':type(exc).__name__,'at':loop.time()})
+        try:
+            if binding is not None and op is not None:
+                await binding.finish(op, deadline)
+        except BaseException as exc:
+            cleanup_error = exc
+            binding.abandon(op)
+        # Cancellation/interrupt intent survives an uncertain cleanup. The
+        # original owner retains exact descriptor/presentation uncertainty.
+        if isinstance(primary, BaseException) and not isinstance(primary, Exception):
+            raise primary
+        if isinstance(cleanup_error, BaseException) and not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        if cleanup_error is not None:
+            raise OutputCleanupUnconfirmed('cli_output_prompt_or_fd_cleanup_unconfirmed') from cleanup_error
+    if primary is not None:
+        if binding is not None and op is not None:
+            from hermes_cli.friday_cli_prompt import PromptUnsupported
+            if (isinstance(primary, PromptUnsupported) and not op.touched
+                    and op.body_accepted == 0 and op.descriptor_closed
+                    and op.phase == 'CLOSED' and op.finished.done()):
+                raise OutputRejected('native_prompt_refused_before_effect') from None
+        raise primary
+    check()
+    owner.check()
+    if stop() or loop.time() >= deadline:
+        raise TimeoutError('cli_output_original_deadline_after_cleanup')
+    return kind

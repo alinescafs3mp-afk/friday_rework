@@ -1,0 +1,340 @@
+"""Finite native input actor; all failure funnels request one qualified cleanup."""
+from __future__ import annotations
+from dataclasses import dataclass
+import asyncio
+from contextvars import copy_context
+import hashlib
+import queue
+import threading
+import time
+from driver.qualification import Unbound, real_function
+from .custody import digest, integer, number
+
+TRIGGERS = frozenset({"frontend_ready","outer_input_entry","outer_input_return","prompt_text_changed","document_preflight","physical_bytes",
+    "physical_write_return","physical_close_return","delivery_begin","delivery_finish","callback_entry","callback_return","caller_closed","lease_before_close","ledger_task_return"})
+ACTIONS = frozenset({"type_text","submit","ctrl_c","ctrl_d","hold_reader","release_reader","close_sink","replace_output_fd","close_observed_lease_fd",
+    "request_exit","cancel_owned_task","native_app_exit","close_original_output"})
+
+@dataclass(frozen=True)
+class Trigger:
+    kind: str
+    occurrence: int = 1
+    caller: int | None = None
+    minimum_bytes: int = 0
+    text_sha256: str | None = None
+    def validate(self):
+        if type(self) is not Trigger or type(self.kind) is not str or self.kind not in TRIGGERS:
+            raise Unbound("trigger_not_exact_Source_kind")
+        integer(self.occurrence,"trigger_occurrence",1,256)
+        if self.caller is not None:
+            integer(self.caller,"trigger_caller",1,64)
+        integer(self.minimum_bytes,"trigger_bytes",0,8388608)
+        if self.text_sha256 is not None:
+            digest(self.text_sha256,"trigger_text")
+        return self
+
+@dataclass(frozen=True)
+class Action:
+    trigger: Trigger
+    kind: str
+    data: bytes = b""
+    delay_seconds: float = 0
+    def validate(self):
+        if type(self) is not Action or type(self.trigger) is not Trigger:
+            raise Unbound("action_or_nested_trigger_not_exact_Source")
+        if type(self.kind) is not str or self.kind not in ACTIONS or type(self.data) is not bytes or len(self.data) > 65536:
+            raise Unbound("action_kind_or_data_shape")
+        number(self.delay_seconds,"action_delay",0,1)
+        Trigger.validate(self.trigger)
+        if self.kind == "type_text":
+            if not self.data or b"\x00" in self.data:
+                raise Unbound("empty_or_NUL_original_input")
+            try:
+                self.data.decode("utf-8","strict")
+            except UnicodeError as exc:
+                raise Unbound("original_input_not_utf8") from exc
+        elif self.data:
+            raise Unbound("payload_not_allowed_for_fixed_action")
+        if self.kind == "submit" and (self.trigger.kind != "prompt_text_changed" or self.trigger.text_sha256 is None or self.delay_seconds <= .05):
+            raise Unbound("submit_requires_actual_buffer_hash_after_rapid_window")
+        return self
+
+class EventBus:
+    def __init__(self, capacity=4096):
+        integer(capacity,"event_capacity",1,4096)
+        self.capacity, self.ordinal, self.seen = capacity, 0, {}
+        self.queues = {"controller":queue.Queue(capacity),"reaper":queue.Queue(capacity)}
+        self.queue = self.queues["controller"]
+        self.counter_lock, self.stop = threading.Lock(), threading.Event()
+        self.overflow, self.errors = False, []
+    def emit(self, kind, value):
+        if type(kind) is not str or type(value) is not dict:
+            self.errors.append("event_not_Source_fact")
+            self.stop.set()
+            return None
+        if not self.counter_lock.acquire(False):
+            self.overflow = True
+            self.stop.set()
+            return None
+        try:
+            self.ordinal += 1
+            self.seen[kind] = self.seen.get(kind,0)+1
+            row = {**value,"kind":kind,"occurrence":self.seen[kind],"ordinal":self.ordinal,"monotonic":value.get("monotonic",time.monotonic()),"event_emitted_at":time.monotonic()}
+            for target in self.queues.values():
+                try:
+                    target.put_nowait(dict(row))
+                except queue.Full:
+                    self.overflow = True
+                    self.stop.set()
+            return row
+        finally:
+            self.counter_lock.release()
+
+class NativeCommand:
+    """One fixed Source callback, exact retained native owner context/generation."""
+    def __init__(self, controller, kind, witness):
+        self.controller, self.kind, self.witness = controller, kind, witness
+        self.handle = None
+        self.fact = {"kind":kind,"requested_at":time.monotonic(),"enqueue":"NOT_ATTEMPTED","dispatch":"UNCONFIRMED","return":"UNCONFIRMED",
+                     "generation":witness.generation,"app_id":id(witness.app),"future_id":id(witness.future),"loop_id":id(witness.loop)}
+    def dispatch(self):
+        self.fact["dispatch_at"] = time.monotonic()
+        try:
+            self.witness.require_original(self.controller.fixture.observer,dispatch=True)
+            if self.fact["dispatch_at"] >= self.controller.shared_deadline(final=True):
+                raise Unbound("command_dispatch_after_original_clock")
+            runtime = self.controller.runtime
+            runtime.require_effect("native_cleanup" if self.kind == "exit" else "owned_frontend_fault",useful=False)
+            key = "application_exit" if self.kind == "exit" else "frontend_output_close"
+            function = real_function(runtime.functions[key],runtime.grant["function_rows"][key])
+            self.fact["dispatch"] = "OBSERVED_EXACT_ORIGINAL_OWNER"
+            if self.kind == "exit":
+                # Keyword belongs to Application.exit, NOT call_soon_threadsafe.
+                result = function(self.witness.app,exception=EOFError())
+            else:
+                result = function(self.witness.owner)
+            self.fact["return"] = "OBSERVED"
+            self.fact["actual_return_type"] = type(result).__name__
+        except BaseException as exc:
+            self.fact.update(dispatch_error=type(exc).__name__)
+            self.controller.errors.append({"stage":"native_command_dispatch","type":type(exc).__name__,"kind":self.kind})
+            self.controller.bus.stop.set()
+        finally:
+            self.fact["closed_at"] = time.monotonic()
+
+class NativeController:
+    def __init__(self, runtime, fixture, event_bus, actions):
+        from .runtime import NativeRuntime
+        from .fixtures import NativeFixture
+        if type(runtime) is not NativeRuntime or type(fixture) is not NativeFixture or type(event_bus) is not EventBus:
+            raise Unbound("controller_inputs_not_exact_Source_types")
+        if type(actions) not in (tuple,list) or len(actions) > 64 or any(type(x) is not Action or type(x.trigger) is not Trigger for x in actions):
+            raise Unbound("finite_exact_action_sequence_required")
+        for action in actions:
+            Action.validate(action)
+        self.runtime, self.fixture, self.bus, self.actions = runtime, fixture, event_bus, tuple(actions)
+        fixture.input_actor = self
+        self.next_action, self.observations, self.unknown, self.errors = 0, [], [], []
+        self.stop, self.thread, self.cancel_intent = threading.Event(), None, None
+        self.cleanup_attempted, self.cleanup_reason, self.commands = False, None, []
+        self.native_return_seen = False
+
+    def start(self):
+        self.runtime.require_effect("owned_actor")
+        if self.thread is not None:
+            raise Unbound("controller_not_replayable")
+        context = copy_context()
+        self.thread = threading.Thread(target=context.run,args=(self.run,),name="cli150-fixture-input-controller")
+        self.thread.start()
+
+    def shared_deadline(self, *, final=False):
+        observer = self.fixture.observer
+        limit = self.runtime.grant["final_deadline_monotonic" if final else "useful_deadline_monotonic"]
+        if observer is not None and observer.case_deadline is not None:
+            limit = min(limit,observer.case_deadline if final else observer.case_deadline-self.runtime.protocol["cleanup_reserve_seconds"])
+        return limit
+
+    def matching(self, trigger, row):
+        return (row.get("kind") == trigger.kind and type(row.get("occurrence")) is int and row["occurrence"] >= trigger.occurrence
+            and (trigger.caller is None or row.get("caller") == trigger.caller)
+            and type(row.get("count",0)) is int and row.get("count",0) >= trigger.minimum_bytes
+            and (trigger.text_sha256 is None or row.get("actual_text_sha256") == trigger.text_sha256))
+
+    def run(self):
+        reason = None
+        try:
+            while True:
+                observer = self.fixture.observer
+                if observer.native_frontend_returned is not None:
+                    self.native_return_seen = True
+                    break
+                if self.stop.is_set() or self.bus.stop.is_set() or self.bus.overflow:
+                    reason = "actor_stop_or_bus_failure_or_overflow"
+                    break
+                useful = self.shared_deadline()
+                now = time.monotonic()
+                if now >= useful:
+                    reason = "original_useful_or_case_cutoff"
+                    break
+                try:
+                    row = self.bus.queue.get(timeout=min(.05,useful-now))
+                except queue.Empty:
+                    continue
+                if self.next_action >= len(self.actions):
+                    # Last written Enter is NOT dispatch or native return.
+                    continue
+                action = self.actions[self.next_action]
+                if not self.matching(action.trigger,row):
+                    continue
+                cutoff = min(useful,row.get("caller_deadline",useful))
+                if action.delay_seconds:
+                    if self.stop.wait(min(action.delay_seconds,max(0,cutoff-time.monotonic()))):
+                        reason = "stop_during_action_delay"
+                        break
+                if time.monotonic() >= cutoff or self.bus.stop.is_set():
+                    reason = "action_caller_cutoff_or_observation_failure"
+                    break
+                before = time.monotonic()
+                detail = self.perform(action,cutoff,row)
+                self.observations.append({"action":action.kind,"trigger":row,"started":before,"returned":time.monotonic(),"actual":detail})
+                self.next_action += 1
+        except BaseException as exc:
+            self.errors.append({"stage":"controller_primary","type":type(exc).__name__,"at":time.monotonic()})
+            self.bus.stop.set()
+            reason = "controller_primary_failure"
+        finally:
+            # EVERY failure/overflow/stop/cutoff takes this same bounded funnel.
+            if reason is not None:
+                self.unknown.append(reason)
+                try:
+                    self.native_cleanup_exit(reason)
+                except BaseException as exc:
+                    self.errors.append({"stage":"cleanup_enqueue","type":type(exc).__name__})
+            if self.next_action < len(self.actions):
+                self.unknown.append("remaining_actions_not_executed:"+str(len(self.actions)-self.next_action))
+            if not self.native_return_seen:
+                self.unknown.append("native_return_not_observed_at_actor_exit_guardian_still_required")
+            if time.monotonic() > self.shared_deadline(final=True):
+                self.unknown.append("controller_original_final_boundary_exceeded")
+
+    def _queue_command(self, kind):
+        self.runtime.require_effect("native_cleanup" if kind == "exit" else "owned_frontend_fault",useful=False)
+        if time.monotonic() >= self.shared_deadline(final=True):
+            raise Unbound("cleanup_enqueue_after_original_deadline")
+        observer = self.fixture.observer
+        witness = observer.prompt_witness
+        if witness is None:
+            raise Unbound("original_prompt_owner_generation_not_observed")
+        witness.require_original(observer,dispatch=False)
+        command = NativeCommand(self,kind,witness)
+        self.commands.append(command)
+        try:
+            # Valid native signature: callback plus ONLY context keyword.
+            handle = witness.loop.call_soon_threadsafe(command.dispatch,context=witness.context)
+        except BaseException as exc:
+            command.fact.update(enqueue="FAILED",enqueue_error=type(exc).__name__)
+            raise
+        command.handle = handle
+        command.fact.update(enqueue="OBSERVED_NATIVE_HANDLE_RETURN",handle_id=id(handle),enqueued_at=time.monotonic())
+        observer.handles.append(handle)
+        return command
+
+    def native_cleanup_exit(self, reason="explicit_native_app_exit"):
+        if self.cleanup_attempted:
+            return next((x for x in self.commands if x.kind == "exit"),None)
+        self.cleanup_attempted, self.cleanup_reason = True, reason
+        try:
+            return self._queue_command("exit")
+        except BaseException as exc:
+            self.unknown.append("qualified_cleanup_refused_or_failed:"+type(exc).__name__)
+            self.errors.append({"stage":"cleanup_request_once","type":type(exc).__name__})
+            raise
+
+    def _submit(self, action, row, deadline):
+        observer = self.fixture.observer
+        fact = observer.prompt_text_fact
+        if (fact is None or fact["actual_text_sha256"] != action.trigger.text_sha256
+                or fact["buffer_id"] != row.get("buffer_id") or fact["prompt_generation"] != row.get("prompt_generation")
+                or fact["monotonic"] != row.get("monotonic")):
+            raise Unbound("submit_original_buffer_generation_changed")
+        witness = observer.prompt_witness
+        witness.require_original(observer,dispatch=False)
+        if time.monotonic()-fact["monotonic"] <= self.runtime.protocol["rapid_input_seconds"]:
+            raise Unbound("submit_inside_original_rapid_input_window")
+        return {"input_bytes_accepted":self.fixture.write_input(b"\r",deadline),"actual_buffer":dict(fact),"original_enter_dispatch":"UNCONFIRMED_FROM_WRITE"}
+
+    def request_exit(self, deadline):
+        # Convenience path still uses separate REAL text + later Enter observation.
+        started = time.monotonic()
+        accepted = self.fixture.write_input(b"/exit",deadline)
+        expected = hashlib.sha256(b"/exit").hexdigest()
+        while time.monotonic() < deadline:
+            if self.stop.is_set() or self.bus.stop.is_set():
+                raise Unbound("exit_text_observation_aborted")
+            fact = self.fixture.observer.prompt_text_fact
+            if fact is not None and fact["monotonic"] >= started and fact["actual_text_sha256"] == expected:
+                wait = .06-(time.monotonic()-fact["monotonic"])
+                if wait > 0 and self.stop.wait(min(wait,max(0,deadline-time.monotonic()))):
+                    raise Unbound("exit_submit_delay_stopped")
+                if time.monotonic() >= deadline:
+                    raise Unbound("exit_submit_original_deadline")
+                action = Action(Trigger("prompt_text_changed",text_sha256=expected),"submit",delay_seconds=.06)
+                submit = self._submit(action,fact,deadline)
+                return {"exit_text_accepted_bytes":accepted,"separate_enter":submit,"exit_dispatch":"UNCONFIRMED"}
+            self.stop.wait(min(.01,max(0,deadline-time.monotonic())))
+        raise Unbound("exit_actual_buffer_not_observed_before_original_deadline")
+
+    def perform(self, action, deadline, row):
+        if type(action) is not Action or type(action.trigger) is not Trigger:
+            raise Unbound("perform_requires_exact_Source_action")
+        Action.validate(action)
+        if action.kind == "type_text":
+            # Constructor already required model/network; each useful effect is
+            # rechecked BEFORE non-slash input as well, never after native submit.
+            if not action.data.lstrip().startswith(b"/"):
+                self.runtime.require_effects(("model_inference","network","owned_worker"))
+            return {"input_bytes_accepted":self.fixture.write_input(action.data,deadline),"dispatch":"UNCONFIRMED"}
+        if action.kind == "submit":
+            return self._submit(action,row,deadline)
+        if action.kind == "request_exit":
+            return self.request_exit(deadline)
+        if action.kind in {"ctrl_c","ctrl_d"}:
+            self.cancel_intent = {"kind":action.kind,"at":time.monotonic()}
+            return {"input_bytes_accepted":self.fixture.write_input(b"\x03" if action.kind == "ctrl_c" else b"\x04",deadline),"dispatch":"UNCONFIRMED"}
+        if action.kind == "hold_reader":
+            self.fixture.arm_reader_hold()
+            return {"capture_at_arm":len(self.fixture.capture)}
+        if action.kind == "release_reader":
+            self.fixture.drain_release.set()
+            return {"capture_at_release":len(self.fixture.capture)}
+        if action.kind == "close_sink":
+            return self.fixture.close_sink(deadline)
+        if action.kind == "close_observed_lease_fd":
+            return self.fixture.fault_close_observed_lease()
+        if action.kind == "replace_output_fd":
+            return self.fixture.replace_original_output_fd()
+        if action.kind == "native_app_exit":
+            self.runtime.require_effect("owned_frontend_fault")
+            command = self.native_cleanup_exit()
+            return {"command":None if command is None else dict(command.fact),"native_dispatch":"UNCONFIRMED_FROM_ENQUEUE"}
+        if action.kind == "close_original_output":
+            command = self._queue_command("output_close")
+            return {"command":dict(command.fact),"native_dispatch":"UNCONFIRMED_FROM_ENQUEUE"}
+        if action.kind == "cancel_owned_task":
+            self.runtime.require_effect("owned_task_cancel")
+            # No guessed context/TID. Cancellation requires a dedicated exact
+            # original task/loop owner-generation handoff, still UNBOUND here.
+            self.unknown.append("qualified_original_task_cancel_handoff_UNBOUND_no_cancel_effect")
+            raise Unbound("qualified_original_task_cancel_handoff_UNBOUND")
+        raise Unbound("fixed_action_exhaustive_refusal")
+
+    def close(self, deadline):
+        self.stop.set()
+        if self.thread is not None and self.thread.ident is not None:
+            self.thread.join(max(0,deadline-time.monotonic()))
+        return {"executed_actions":self.next_action,"requested_actions":len(self.actions),"observations":list(self.observations),
+            "unknown":list(self.unknown),"errors":list(self.errors),"cancel_intent":self.cancel_intent,"cleanup_attempted_once":self.cleanup_attempted,
+            "cleanup_reason":self.cleanup_reason,"commands":[dict(x.fact,handle_cancelled=None if x.handle is None else x.handle.cancelled()) for x in self.commands],
+            "native_frontend_actual_return":self.fixture.observer.native_frontend_returned,
+            "thread_id":None if self.thread is None else self.thread.native_id,"thread_alive":None if self.thread is None else self.thread.is_alive(),
+            "event_bus_overflow":self.bus.overflow,"event_bus_errors":list(self.bus.errors),"guardian":"ROOT_EXACT_NATIVE_GUARDIAN_UNBOUND_MANDATORY"}

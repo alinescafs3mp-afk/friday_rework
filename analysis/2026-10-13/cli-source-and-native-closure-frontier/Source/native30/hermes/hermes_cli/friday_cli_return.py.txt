@@ -1,0 +1,157 @@
+"""A direct post-return observer for the existing original sequential call.
+
+This is in-process observation, not kernel stop/reap or native authority.
+Only invoke_original's real synchronous return mints a witness. No trace,
+monitoring, task factory, global hook, replacement thread or AppSession is used.
+The original caller keeps the same clock; failures retain the armed span.
+"""
+from contextvars import ContextVar
+from dataclasses import dataclass
+import math
+import sys
+import threading
+import time
+import types
+
+_BOUNDARY = ContextVar("friday_original_direct_return", default=None)
+
+
+class ReturnUnconfirmed(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, eq=False)
+class _ReturnWitness:
+    custody: object
+    frame: object
+    thread: object
+    native_tid: int
+    entry: float
+    returned_at: float
+
+
+class _DirectReturn:
+    def __init__(self, function):
+        if type(function) is not types.FunctionType:
+            raise ReturnUnconfirmed("original_callee_not_exact_function")
+        if function.__code__.co_flags & (0x20 | 0x80 | 0x200):
+            raise ReturnUnconfirmed("original_callee_not_synchronous")
+        self.function = function
+        self.code = function.__code__
+        self.thread = threading.current_thread()
+        self.native_tid = threading.get_native_id()
+        self.invocation_frame = None
+        self.frame = None
+        self.entry = None
+        self.span = None
+        self.callback = None
+        self.witness = None
+        self.state = "RESERVED"
+
+    def same_thread(self):
+        if (threading.current_thread() is not self.thread
+                or threading.get_native_id() != self.native_tid):
+            raise ReturnUnconfirmed("original_direct_return_foreign_thread")
+
+    def entered(self, frame, entry):
+        self.same_thread()
+        if (self.state != "RESERVED" or frame.f_code is not self.code
+                or frame.f_back is not self.invocation_frame
+                or self.function.__code__ is not self.code
+                or type(entry) not in (int, float) or not math.isfinite(entry)
+                or not 0 < entry <= time.monotonic()):
+            raise ReturnUnconfirmed("original_direct_entry_not_retained")
+        self.frame = frame
+        self.entry = entry
+        self.state = "ENTERED"
+
+    def arm(self, span, frame_site, deadline, callback):
+        self.same_thread()
+        if (self.state != "ENTERED" or self.span is not None
+                or self.frame is None or self.code.co_name != frame_site
+                or span.thread is not self.thread or span.thread_id != self.native_tid
+                or span.entry != self.entry or span.end != deadline
+                or type(callback) is not types.MethodType
+                or callback.__self__ is not span
+                or callback.__func__ is not type(span).accept_observed_return
+                or not span.tail_ready):
+            raise ReturnUnconfirmed("original_return_arm_identity_or_lifetime")
+        self.span = span
+        self.callback = callback
+        self.state = "ARMED"
+
+    def after_real_return(self):
+        # Called only after the direct function call in invoke_original returned.
+        self.same_thread()
+        if self.state == "ENTERED" and self.span is None:
+            self.state = "RETURNED_WITHOUT_FRIDAY_SPAN"
+            return
+        if self.state != "ARMED" or self.witness is not None:
+            raise ReturnUnconfirmed("original_return_missing_or_duplicate_arm")
+        span = self.span
+        observed = time.monotonic()
+        if observed >= span.end:
+            self.state = "UNKNOWN_LATE_RETURN"
+            raise ReturnUnconfirmed("actual_original_return_after_deadline")
+        self.witness = _ReturnWitness(
+            self, self.frame, self.thread, self.native_tid, self.entry, observed)
+        self.state = "OBSERVED"
+        # Metadata/DB/UI and proxy/repaint have already completed in the callee.
+        # Receipt work is inside that same original deadline, after its return.
+        self.callback(self.witness)
+        self.state = "OBSERVATION_CALLBACK_RETURNED"
+
+
+def invoke_original(function, *args, **kwargs):
+    if _BOUNDARY.get() is not None:
+        raise ReturnUnconfirmed("nested_original_direct_call")
+    custody = _DirectReturn(function)
+    token = _BOUNDARY.set(custody)
+    custody.invocation_frame = sys._getframe()
+    try:
+        value = function(*args, **kwargs)
+        custody.after_real_return()
+        return value
+    except BaseException as exc:
+        custody.state = "UNKNOWN"
+        # The original span/registry owns its participants and durable UNKNOWN.
+        # No callback error is converted into a clean function result.
+        if custody.span is not None:
+            custody.span.abandon(exc)
+        raise
+    finally:
+        _BOUNDARY.reset(token)
+
+
+def retain_original_entry(entry):
+    custody = _BOUNDARY.get()
+    if type(custody) is not _DirectReturn:
+        raise ReturnUnconfirmed("original_direct_call_boundary_missing")
+    custody.entered(sys._getframe(1), entry)
+
+
+def arm_original_return(span, *, frame_site, phases, deadline, observed_return):
+    custody = _BOUNDARY.get()
+    if type(custody) is not _DirectReturn or tuple(span.phases) != phases:
+        raise ReturnUnconfirmed("original_return_phase_or_boundary_changed")
+    custody.arm(span, frame_site, deadline, observed_return)
+
+
+def validate_original_return(span, *, proof, original_entry, deadline,
+                             original_thread, original_native_tid):
+    custody = _BOUNDARY.get()
+    if (type(custody) is not _DirectReturn or type(proof) is not _ReturnWitness
+            or custody.witness is not proof or proof.custody is not custody
+            or custody.span is not span or custody.state != "OBSERVED"
+            or proof.frame is not custody.frame
+            or proof.frame.f_code is not custody.code
+            or custody.function.__code__ is not custody.code
+            or proof.thread is not original_thread or original_thread is not custody.thread
+            or proof.native_tid != original_native_tid
+            or original_native_tid != custody.native_tid
+            or proof.entry != original_entry or original_entry != custody.entry
+            or deadline != span.end or not original_entry <= proof.returned_at < deadline
+            or time.monotonic() >= deadline):
+        raise ReturnUnconfirmed("actual_original_return_witness_not_current")
+    custody.same_thread()
+    custody.state = "WITNESS_CONSUMED"

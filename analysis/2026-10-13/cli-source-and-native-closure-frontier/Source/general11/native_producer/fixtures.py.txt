@@ -1,0 +1,508 @@
+"""Real future private fixtures with transactional FD generations and bounded drains."""
+from __future__ import annotations
+from contextlib import contextmanager
+from dataclasses import dataclass
+import errno
+import fcntl
+import io
+import os
+import selectors
+import sys
+import threading
+import time
+from driver.qualification import Unbound
+from .custody import DirectoryCustody, integer
+from .runtime import NativeRuntime
+
+@dataclass(frozen=True)
+class FixtureSpec:
+    kind: str
+    reader_mode: str = "drain"
+    prefix_limit: int = 0
+    capture_limit: int = 2097152
+    contract: str = "exact"
+    pipe_capacity: int = 4096
+    rows: int = 24
+    columns: int = 80
+
+    def validate(self):
+        if type(self) is not FixtureSpec:
+            raise Unbound("fixture_not_exact_Source_record")
+        if type(self.kind) is not str or self.kind not in {"pty", "pipe", "stringio", "regular_file"}:
+            raise Unbound("unknown_finite_fixture")
+        if type(self.reader_mode) is not str or self.reader_mode not in {"drain", "hold", "prefix_then_hold"}:
+            raise Unbound("unknown_reader_mode")
+        for name, lo, hi in (("prefix_limit",0,1048576),("capture_limit",1,8388608),("pipe_capacity",4096,65536),("rows",1,4096),("columns",1,4096)):
+            integer(getattr(self, name), name, lo, hi)
+        if type(self.contract) is not str or self.contract not in {"exact", "zero", "bool", "short", "close_error", "unknown_wrapper"}:
+            raise Unbound("unknown_typed_contract_probe")
+        if self.contract != "exact" and self.kind != "stringio":
+            raise Unbound("unsupported_probe_requires_real_memory")
+        if self.reader_mode == "prefix_then_hold" and self.prefix_limit < 1:
+            raise Unbound("prefix_hold_requires_positive_limit")
+        return self
+
+class ContractProbe(io.StringIO):
+    """Actual unsupported-type negative. Never credited as native zero/bool."""
+    def __init__(self, mode):
+        super().__init__()
+        self.mode, self.calls = mode, []
+    def write(self, text):
+        self.calls.append({"operation":"write", "characters":len(text), "mode":self.mode})
+        if self.mode == "zero":
+            return 0
+        if self.mode == "bool":
+            return True
+        if self.mode == "short":
+            return super().write(text[:max(0,len(text)-1)])
+        return super().write(text)
+    def close(self):
+        self.calls.append({"operation":"close", "mode":self.mode})
+        result = super().close()
+        if self.mode == "close_error":
+            raise OSError(errno.EIO, "owned_memory_close_error_after_real_close")
+        return result
+
+def fd_state(fd):
+    integer(fd, "fd", 0, 10**9)
+    info = os.fstat(fd)
+    return {"fd":fd, "identity":(info.st_dev,info.st_ino,info.st_mode,info.st_rdev),
+            "status_flags":fcntl.fcntl(fd,fcntl.F_GETFL), "fd_flags":fcntl.fcntl(fd,fcntl.F_GETFD)}
+
+class NativeFixture:
+    def __init__(self, runtime, spec, directory):
+        if type(runtime) is not NativeRuntime or type(spec) is not FixtureSpec or type(directory) is not DirectoryCustody:
+            raise Unbound("fixture_inputs_not_exact_Source_types")
+        spec.validate()
+        self.runtime, self.spec, self.directory = runtime, spec, directory
+        self.fd_lock = threading.RLock()
+        self.owned_fds, self.fd_births, self.fd_closure = {}, [], []
+        self.serial, self.opened = 0, False
+        self.readers, self.reader_rows = [], []
+        self.reader_stop, self.drain_release = threading.Event(), threading.Event()
+        self.capture,self.foreign_capture = bytearray(),bytearray()
+        self.capture_observed = self.foreign_capture_observed = False
+        self.capture_lock = threading.Lock()
+        self.unknown, self.errors, self.borrowed_faults = [], [], []
+        self.stdin = self.stdout = self.input_writer = self.output_reader = None
+        self.foreign_reader = self.foreign_writer = self.original_descriptor = None
+        self.saved_stdio, self.restore_stdio_facts = {}, []
+        self.streams_restored = False
+        self.input_closed, self.native_returned, self.writers_quiescent = False, False, False
+        self.memory_value,self.events,self.hold_after_total,self.observer = None,None,None,None
+        self.input_actor,self.native_borrow_started = None,False
+        self.stdio_done = set()
+        self.terminal_slave_release_confirmed = False
+
+    def _error(self, stage, exc):
+        self.errors.append({"stage":stage, "type":type(exc).__name__, "errno":getattr(exc,"errno",None), "at":time.monotonic()})
+
+    def _row(self, fd):
+        row = self.owned_fds.get(fd)
+        if row is None or row["closed"] is not False:
+            raise Unbound("active_owned_FD_generation_missing")
+        return row
+
+    def _allocate(self, kind, roles):
+        """Allocation+registration+configuration transaction; never publish half pair."""
+        self.runtime.require_effect("private_pty" if kind == "pty" else "private_pipe")
+        with self.fd_lock:
+            if len(self.owned_fds)+2 > self.runtime.resources["owned_fds"]:
+                raise Unbound("FD_capacity_before_acquisition")
+            self.directory.reserve_fds(2)
+            try:
+                pair = os.openpty() if kind == "pty" else os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+            except BaseException as exc:
+                self.directory.release_fds(2)
+                self._error("kernel_pair_acquisition",exc)
+                raise
+            # Direct kernel returns are private to THIS allocation transaction.
+            rows = []
+            for fd, role in zip(pair, roles):
+                self.serial += 1
+                rows.append({"fd":fd, "generation":self.serial, "role":role, "birth":None, "closed":False,
+                             "published":False, "reader":None, "reader_stop":threading.Event(), "reader_done":threading.Event(),
+                             "drain_complete":False, "terminal":None})
+            try:
+                if len(set(pair)) != 2 or any(type(fd) is not int or fd < 0 for fd in pair):
+                    raise Unbound("kernel_pair_invalid")
+                for row in rows:
+                    if row["fd"] in self.owned_fds:
+                        old = self.owned_fds.pop(row["fd"])
+                        old["closed"] = None
+                        self.fd_closure.append({"fd":old["fd"],"generation":old["generation"],"role":old["role"],"unknown":"old_active_generation_reused_outside_fixture"})
+                        raise Unbound("active_generation_lost_before_kernel_reuse")
+                    row["birth"] = fd_state(row["fd"])
+                if kind == "pty":
+                    import struct
+                    import termios
+                    os.set_blocking(pair[0],False)
+                    fcntl.ioctl(pair[1],termios.TIOCSWINSZ,struct.pack("HHHH",self.spec.rows,self.spec.columns,0,0))
+                else:
+                    actual = fcntl.fcntl(pair[1],fcntl.F_SETPIPE_SZ,self.spec.pipe_capacity)
+                    if type(actual) is not int or not 4096 <= actual <= 65536:
+                        raise Unbound("actual_pipe_capacity_outside_bound")
+                for row in rows:
+                    row["birth"] = fd_state(row["fd"])
+                # Both rows commit together while unpublished to every other actor.
+                for row in rows:
+                    row["published"] = True
+                    self.owned_fds[row["fd"]] = row
+                    self.fd_births.append({k:row[k] for k in ("fd","generation","role","birth")})
+                return pair
+            except BaseException as primary:
+                for row in reversed(rows):
+                    self.owned_fds.pop(row["fd"],None)
+                    fact = {"fd":row["fd"],"generation":row["generation"],"role":row["role"],"transaction_rollback":True,"birth":row["birth"]}
+                    try:
+                        # No published consumer or release/reuse can exist yet.
+                        os.close(row["fd"])
+                    except BaseException as later:
+                        row["closed"] = None
+                        fact.update(error=type(later).__name__,errno=getattr(later,"errno",None))
+                        self._error("allocation_rollback",later)
+                    else:
+                        row["closed"] = True
+                        self.directory.release_fds(1)
+                        fact["close_returned"] = True
+                    self.fd_closure.append(fact)
+                self._error("allocation_primary",primary)
+                raise
+
+    def _register_file(self, fd, role):
+        # fd is a fresh unpublished DirectoryCustody.open_leaf return.
+        with self.fd_lock:
+            self.serial += 1
+            generation = self.serial
+            try:
+                if fd in self.owned_fds or len(self.owned_fds) >= self.runtime.resources["owned_fds"]:
+                    raise Unbound("file_generation_or_capacity")
+                birth = fd_state(fd)
+                row = {"fd":fd,"generation":generation,"role":role,"birth":birth,"closed":False,"published":True,
+                       "reader":None,"reader_stop":threading.Event(),"reader_done":threading.Event(),"drain_complete":False,"terminal":None}
+                self.owned_fds[fd] = row
+                self.fd_births.append({k:row[k] for k in ("fd","generation","role","birth")})
+                self.directory.transfer_leaf(fd)
+                return fd
+            except BaseException as primary:
+                self.owned_fds.pop(fd,None)
+                fact = {"fd":fd,"generation":generation,"role":role,"transaction_rollback":True}
+                try:
+                    if fd in self.directory._leaf_fds:
+                        self.directory.close_leaf(fd)
+                    else:
+                        # Exact fresh transaction generation, never borrowed.
+                        os.close(fd)
+                        self.directory.release_fds(1)
+                except BaseException as later:
+                    fact["error"] = type(later).__name__
+                    self._error("file_allocation_rollback",later)
+                else:
+                    fact["close_returned"] = True
+                self.fd_closure.append(fact)
+                raise primary
+
+    def open(self):
+        if self.opened:
+            raise Unbound("fixture_open_not_replayable")
+        self.opened = True
+        self.directory.verify()
+        # EVERY kind creates the foreign pipe; StringIO also has actual input pipe.
+        required = {"private_pipe", {"pty":"private_pty","pipe":"private_pipe","stringio":"private_memory","regular_file":"private_file"}[self.spec.kind]}
+        self.runtime.require_effects(required)
+        if self.spec.kind == "pty":
+            master, slave = self._allocate("pty",("private-terminal-master","original-terminal-slave"))
+            self.input_writer = self.output_reader = master
+            self.stdin = io.TextIOWrapper(io.FileIO(slave,"r",closefd=False),encoding="utf-8")
+            self.stdout = io.TextIOWrapper(io.FileIO(slave,"w",closefd=False),encoding="utf-8",write_through=True)
+        else:
+            input_read, self.input_writer = self._allocate("pipe",("frontend-input","fixture-input-controller"))
+            self.stdin = io.TextIOWrapper(io.FileIO(input_read,"r",closefd=False),encoding="utf-8")
+            if self.spec.kind == "pipe":
+                self.output_reader, writefd = self._allocate("pipe",("private-output-capture","original-stdout-pipe"))
+                self.stdout = io.TextIOWrapper(io.FileIO(writefd,"w",closefd=False),encoding="utf-8",write_through=True)
+            elif self.spec.kind == "regular_file":
+                fd = self.directory.open_leaf("unsupported-output.bin",os.O_WRONLY | os.O_CREAT | os.O_EXCL,0o600)
+                self._register_file(fd,"unsupported-regular-output")
+                self.stdout = io.TextIOWrapper(io.FileIO(fd,"w",closefd=False),encoding="utf-8",write_through=True)
+            else:
+                self.stdout = io.StringIO() if self.spec.contract == "exact" else ContractProbe(self.spec.contract)
+        if self.spec.kind != "stringio":
+            self.original_descriptor = dict(self._row(self.stdout.fileno())["birth"])
+        self.foreign_reader, self.foreign_writer = self._allocate("pipe",("foreign-sink-capture","owned-foreign-sink"))
+        self.drain_release.set()
+        return self
+
+    def restore_stdio(self):
+        for name,(original,installed) in self.saved_stdio.items():
+            if name in self.stdio_done:
+                continue
+            try:
+                if getattr(sys,name) is installed:
+                    setattr(sys,name,original)
+                    self.restore_stdio_facts.append({"name":name,"restored":getattr(sys,name) is original})
+                    self.stdio_done.add(name)
+                else:
+                    self.restore_stdio_facts.append({"name":name,"restored":False,"unknown":"foreign_stdio_replacement_retained"})
+                    self.unknown.append("foreign_stdio_replacement:"+name)
+            except BaseException as exc:
+                self._error("restore_stdio:"+name,exc)
+        self.streams_restored = bool(self.saved_stdio) and all(getattr(sys,k) is v[0] for k,v in self.saved_stdio.items())
+
+    @contextmanager
+    def stdio(self):
+        self.runtime.require_effect("stdio_bind")
+        if threading.current_thread() is not threading.main_thread() or self.saved_stdio:
+            raise Unbound("stdio_requires_main_owner_once")
+        primary = None
+        try:
+            for name, installed in (("stdin",self.stdin),("stdout",self.stdout),("stderr",self.stdout)):
+                self.saved_stdio[name] = (getattr(sys,name),installed)
+                setattr(sys,name,installed)
+            yield
+        except BaseException as exc:
+            primary = exc
+            raise
+        finally:
+            # Protected independently; cleanup never replaces the active primary.
+            self.restore_stdio()
+
+    def start_readers(self, event_bus):
+        self.runtime.require_effect("owned_actor")
+        self.events = event_bus
+        for fd, foreign in ((self.output_reader,False),(self.foreign_reader,True)):
+            if fd is None:
+                continue
+            row = self._row(fd)
+            thread = threading.Thread(target=self._read,args=(row,foreign),name="cli150-fixture-foreign-reader" if foreign else "cli150-fixture-reader")
+            row["reader"] = thread
+            self.readers.append(thread)
+            self.reader_rows.append(row)
+            try:
+                thread.start()
+            except BaseException as exc:
+                self._error("reader_start",exc)
+                row["reader_done"].set()
+                raise
+
+    def _read(self, row, foreign):
+        total, selector = 0, None
+        final = self.runtime.grant["final_deadline_monotonic"]
+        try:
+            selector = selectors.DefaultSelector()
+            selector.register(row["fd"],selectors.EVENT_READ)
+            if foreign:
+                self.foreign_capture_observed = True
+            else:
+                self.capture_observed = True
+            while not self.reader_stop.is_set() and not row["reader_stop"].is_set():
+                deadline = min(final,self.observer.case_deadline) if self.observer is not None and self.observer.case_deadline is not None else final
+                now = time.monotonic()
+                if now >= deadline:
+                    row["terminal"] = "original_drain_deadline"
+                    break
+                if not foreign and not self.drain_release.is_set() and (self.hold_after_total is None or total >= self.hold_after_total):
+                    self.drain_release.wait(min(.05,deadline-now))
+                    continue
+                for _, _ in selector.select(min(.05,deadline-now)):
+                    remaining = self.spec.capture_limit-total
+                    if not foreign and not self.drain_release.is_set() and self.hold_after_total is not None:
+                        remaining = min(remaining,max(0,self.hold_after_total-total))
+                    if remaining <= 0:
+                        self.unknown.append("real_capture_capacity_exhausted")
+                        row["terminal"] = "capture_capacity"
+                        if self.events is not None:
+                            self.events.stop.set()
+                        return
+                    with self.fd_lock:
+                        if self.owned_fds.get(row["fd"]) is not row or row["closed"] is not False:
+                            row["terminal"] = "reader_generation_lost"
+                            raise Unbound("reader_generation_lost_no_numeric_read")
+                        try:
+                            chunk = os.read(row["fd"],min(4096,remaining))
+                        except BlockingIOError:
+                            continue
+                        except OSError as exc:
+                            self._error("actual_reader_read",exc)
+                            row["terminal"] = "read_error:"+str(exc.errno)
+                            if exc.errno == errno.EIO and self.spec.kind == "pty" and not foreign and self.writers_quiescent and self.terminal_slave_release_confirmed:
+                                row["drain_complete"] = True
+                                row["terminal"] = "PTY_EIO_after_qualified_slave_release"
+                            return
+                    if not chunk:
+                        row["terminal"], row["drain_complete"] = "actual_EOF", True
+                        return
+                    with self.capture_lock:
+                        (self.foreign_capture if foreign else self.capture).extend(chunk)
+                    total += len(chunk)
+                    # A reader has no original caller context: no temporal attribution.
+                    if self.events is not None:
+                        self.events.emit("foreign_bytes" if foreign else "physical_bytes",
+                            {"count":total,"fd_generation":row["generation"],"caller":None,"attribution":"fixture_bytes_unattributed_to_caller"})
+        except BaseException as exc:
+            self._error("actual_reader",exc)
+            self.unknown.append("actual_reader_error:"+type(exc).__name__)
+        finally:
+            if selector is not None:
+                try:
+                    selector.close()
+                except BaseException as exc:
+                    self._error("reader_selector_close",exc)
+            row["reader_done"].set()
+            if not row["drain_complete"]:
+                self.unknown.append("capture_drain_incomplete:g"+str(row["generation"]))
+
+    def write_input(self, data, deadline):
+        if type(data) is not bytes or not 1 <= len(data) <= 65536 or self.input_closed:
+            raise Unbound("finite_original_input_bytes_required")
+        row, sent, selector = self._row(self.input_writer), 0, selectors.DefaultSelector()
+        try:
+            selector.register(row["fd"],selectors.EVENT_WRITE)
+            while sent < len(data):
+                now = time.monotonic()
+                if now >= deadline or self.reader_stop.is_set() or self.events is not None and self.events.stop.is_set():
+                    raise Unbound("original_input_deadline_or_actor_stop")
+                for _, _ in selector.select(min(.05,deadline-now)):
+                    with self.fd_lock:
+                        if self.owned_fds.get(row["fd"]) is not row or row["closed"] is not False:
+                            raise Unbound("input_generation_lost")
+                        try:
+                            count = os.write(row["fd"],data[sent:sent+4096])
+                        except BlockingIOError:
+                            continue
+                    if type(count) is not int or not 0 < count <= len(data)-sent:
+                        raise Unbound("actual_input_write_not_positive_int")
+                    sent += count
+            return sent
+        finally:
+            # Partial actual input is retained even when the primary syscall fails.
+            if self.events is not None:
+                self.events.emit("input_write_fact",{"accepted_bytes":sent,"requested_bytes":len(data),"fd_generation":row["generation"],"dispatch":"UNCONFIRMED"})
+            selector.close()
+
+    def arm_reader_hold(self):
+        if self.output_reader is None or self.spec.reader_mode == "drain":
+            raise Unbound("hold_requires_declared_physical_adverse_reader")
+        self.hold_after_total = len(self.capture)+(self.spec.prefix_limit if self.spec.reader_mode == "prefix_then_hold" else 0)
+        self.drain_release.clear()
+
+    def fault_close_observed_lease(self):
+        self.runtime.require_effect("owned_descriptor_fault")
+        fact = {"kind":"close_observed_lease_fd","effect":"NOT_PERFORMED","unknown":"qualified_original_lease_owner_handoff_excluding_concurrent_release_UNBOUND"}
+        self.borrowed_faults.append(fact)
+        raise Unbound(fact["unknown"])
+
+    def replace_original_output_fd(self):
+        self.runtime.require_effect("owned_descriptor_fault")
+        fact = {"kind":"replace_output_fd","effect":"NOT_PERFORMED","unknown":"qualified_original_output_owner_handoff_excluding_concurrent_release_UNBOUND"}
+        self.borrowed_faults.append(fact)
+        raise Unbound(fact["unknown"])
+
+    def _release(self, row, *, quiescent=False):
+        with self.fd_lock:
+            if self.owned_fds.get(row["fd"]) is not row or row["closed"] is not False:
+                raise Unbound("exact_active_generation_not_owned")
+            reader = row["reader"]
+            if reader is not None and (reader.is_alive() or not row["reader_done"].is_set()):
+                raise Unbound("reader_not_detached_before_FD_release")
+            actor = self.input_actor
+            if self.input_writer == row["fd"] and actor is not None and actor.thread is not None and actor.thread.is_alive() and threading.current_thread() is not actor.thread:
+                raise Unbound("input_actor_unjoined_FD_generation_retained")
+            if not quiescent:
+                raise Unbound("generation_release_without_qualified_quiescence")
+            fact = {"fd":row["fd"],"generation":row["generation"],"role":row["role"],"birth":row["birth"]}
+            try:
+                before = fd_state(row["fd"])
+                fact["before"] = before
+                if before["identity"] != row["birth"]["identity"]:
+                    raise Unbound("owned_generation_identity_changed_no_numeric_close")
+                # All borrowers settled; reader joined; fixture sole release authority.
+                os.close(row["fd"])
+            except BaseException as exc:
+                row["closed"] = None
+                fact.update(error=type(exc).__name__,errno=getattr(exc,"errno",None),closure="UNKNOWN_NO_RETRY_OR_REPIN")
+                self._error("FD_release",exc)
+            else:
+                row["closed"] = True
+                self.owned_fds.pop(row["fd"])
+                self.directory.release_fds(1)
+                fact["close_returned"] = True
+                if row["role"] == "original-terminal-slave":
+                    self.terminal_slave_release_confirmed = True
+            self.fd_closure.append(fact)
+            return fact
+
+    def close_sink(self, deadline):
+        self.runtime.require_effect("owned_descriptor_fault")
+        if self.input_actor is None or self.input_actor.thread is not threading.current_thread():
+            raise Unbound("sink_close_not_exact_sole_fixture_actor")
+        if self.output_reader is None:
+            raise Unbound("physical_sink_required")
+        row = self._row(self.output_reader)
+        row["reader_stop"].set()
+        self.drain_release.set()
+        thread = row["reader"]
+        if thread is not None:
+            thread.join(max(0,deadline-time.monotonic()))
+        if thread is not None and thread.is_alive():
+            raise Unbound("sink_reader_unjoined_generation_retained")
+        if self.input_writer == self.output_reader:
+            self.input_closed = True
+        # Sole reader detached and sole controller is THIS actor; native owns no
+        # fixture master/read fd. It may own distinct dup generations, not this fd.
+        return self._release(row,quiescent=True)
+
+    def close(self, deadline, *, writers_quiescent=False):
+        self.input_closed = True
+        self.writers_quiescent = writers_quiescent is True
+        self.drain_release.set()
+        # Writer settlement precedes real EOF/PTY drain. No early reader stop.
+        if self.writers_quiescent or not self.native_borrow_started:
+            for stream in (self.stdout,self.stdin):
+                if stream is None:
+                    continue
+                try:
+                    if type(stream) in (io.StringIO,ContractProbe) and not stream.closed:
+                        self.memory_value = stream.getvalue()
+                    stream.close()  # physical wrappers deliberately closefd=False
+                except BaseException as exc:
+                    self._error("actual_stream_close",exc)
+            for row in tuple(self.owned_fds.values()):
+                if row["reader"] is None and row["closed"] is False:
+                    try:
+                        self._release(row,quiescent=True)
+                    except BaseException as exc:
+                        self._error("settled_writer_release",exc)
+        else:
+            self.unknown.append("native_writer_quiescence_UNCONFIRMED_streams_and_FDs_retained")
+        for row in self.reader_rows:
+            thread = row["reader"]
+            if thread.ident is not None:
+                try:
+                    thread.join(max(0,deadline-time.monotonic()))
+                except BaseException as exc:
+                    self._error("bounded_drain_join",exc)
+            if thread.is_alive() or not row["drain_complete"]:
+                row["reader_stop"].set()
+                self.unknown.append("bounded_drain_incomplete:g"+str(row["generation"]))
+            if thread.is_alive():
+                try:
+                    thread.join(max(0,deadline-time.monotonic()))
+                except BaseException as exc:
+                    self._error("reader_detach_join",exc)
+            if thread.is_alive():
+                self.unknown.append("fixture_reader_unjoined_generation_retained:g"+str(row["generation"]))
+                continue
+            if row["closed"] is False and self.owned_fds.get(row["fd"]) is row:
+                try:
+                    self._release(row,quiescent=True)
+                except BaseException as exc:
+                    self._error("detached_reader_release",exc)
+        self.restore_stdio()
+        return {"fixture_kind":self.spec.kind,"streams_restored":self.streams_restored,"stdio_restoration":list(self.restore_stdio_facts),
+            "original_descriptor":self.original_descriptor,"fd_births":list(self.fd_births),"fd_closure":list(self.fd_closure),
+            "active_or_unknown_generations":[{k:r[k] for k in ("fd","generation","role","birth","closed")} for r in self.owned_fds.values()],
+            "reader_threads":[{"id":id(r["reader"]),"tid":r["reader"].native_id,"alive":r["reader"].is_alive(),"generation":r["generation"],"drain_complete":r["drain_complete"],"terminal":r["terminal"]} for r in self.reader_rows],
+            "writers_qualified_quiescent":self.writers_quiescent,"original_capture_observed":self.capture_observed,"foreign_capture_observed":self.foreign_capture_observed,"capture_bytes":len(self.capture) if self.capture_observed else None,"foreign_bytes":len(self.foreign_capture) if self.foreign_capture_observed else None,
+            "memory_characters":None if self.memory_value is None else len(self.memory_value),"actual_contract_calls":list(self.stdout.calls) if type(self.stdout) is ContractProbe else [],
+            "borrowed_descriptor_faults":list(self.borrowed_faults),"errors":list(self.errors),"unknown":list(self.unknown)}
