@@ -1,0 +1,718 @@
+"""Future full-scope Root grant binding. Source presence grants no native effects."""
+from __future__ import annotations
+from dataclasses import dataclass
+import hashlib
+import ast
+from contextlib import _GeneratorContextManager
+import os
+import resource
+import select
+import threading
+import sys
+import time
+import types
+from types import MappingProxyType
+from driver.qualification import Unbound, code_digest
+from .qualification_io import MeteredQualification
+from .custody import canonical, canonical_path, digest, integer, number, pure, reference, text, DirectoryCustody, SourceFDAccount
+
+CLASS_KEYS = frozenset({"cli", "agent", "context", "host", "database", "session", "result_tool", "proxy", "descriptor_lease", "prompt_binding"})
+CLASS_NAMES = {"cli": "HermesCLI", "agent": "AIAgent", "context": "PluginContext", "host": "WorkerHost", "database": "SessionDB",
+    "session": "AppSession", "result_tool": "ResultTool", "proxy": "StdoutProxy", "descriptor_lease": "_ConsoleWrite", "prompt_binding": "NativePromptBinding"}
+CONSTRUCTOR_KEYS = frozenset({"model", "toolsets", "provider", "reasoning", "api_key", "base_url", "max_turns", "run_budget", "verbose", "compact", "resume", "checkpoints", "pass_session_id", "ignore_rules"})
+EFFECTS = frozenset({"private_pty", "private_pipe", "private_memory", "private_file", "original_frontend", "session_db", "plugin_state",
+    "provider_discovery", "local_model_discovery", "model_inference", "network", "owned_worker", "stdio_bind", "observer_hooks",
+    "owned_actor", "native_cleanup", "history_read", "owned_descriptor_fault", "owned_frontend_fault", "owned_task_cancel", "observer_artifacts"})
+# Intact constructor/provider discovery is NOT known to be side-effect free.
+# A narrow grant is refused BEFORE any constructor; no replacement/mocking path.
+CONSTRUCTOR_EFFECTS = frozenset({"original_frontend", "session_db", "plugin_state", "provider_discovery", "local_model_discovery",
+    "network", "model_inference", "owned_worker", "stdio_bind", "private_pipe", "observer_hooks", "owned_actor", "native_cleanup", "history_read"})
+SITE_KINDS = frozenset({"cli_constructed", "agent_constructed", "context_constructed", "host_constructed", "database_constructed", "session_constructed",
+    "result_tool_constructed", "proxy_constructed", "frontend_ready", "outer_input_entry", "outer_input_return", "current_turn_return", "ledger_task_return",
+    "activity_started", "activity_join_return", "metadata_callback_return", "session_flush_return", "ui_completed_return", "native_bridge_entry", "native_bridge_return",
+    "loop_return", "thread_entry", "thread_return", "physical_write_return", "physical_close_return", "document_preflight", "delivery_begin", "delivery_finish",
+    "proxy_write", "proxy_close_return", "callback_entry", "callback_return", "callback_exception", "prompt_text_changed", "native_handle_created", "lease_constructed", "lease_before_close", "frontend_thread_create"})
+
+def strict_number(value, name, low, high):
+    return number(value, name, low, high)
+
+def resolve_attribute(row):
+    # Entire row has already passed pure exact JSON validation.
+    module = sys.modules.get(text(row["module"], "module", 256))
+    if module is None:
+        raise Unbound("qualified_module_not_loaded")
+    value = module
+    for part in text(row["attribute"], "attribute", 1024).split("."):
+        if not part.isidentifier() or part.startswith("__"):
+            raise Unbound("qualified_attribute_shape")
+        value = getattr(value, part)
+    return value
+
+def nested_code(function, qualname):
+    function = function.__func__ if type(function) is types.MethodType else function
+    if type(function) is not types.FunctionType:
+        raise Unbound("site_not_original_python_function")
+    pending, found = [function.__code__], []
+    while pending:
+        code = pending.pop()
+        if code.co_qualname == qualname:
+            found.append(code)
+        pending.extend(x for x in code.co_consts if type(x) is types.CodeType)
+    if len(found) != 1:
+        raise Unbound("exact_nested_site_ambiguous")
+    return found[0]
+
+@dataclass(frozen=True)
+class FrontendFunctionIdentity:
+    """Exact original callable, decorator cells and body; code is not custody."""
+    function: object
+    body: object
+    factory: object | None
+    activity: object | None
+    activity_target: object | None
+    cell: object | None
+    activity_cell: object | None
+    row: dict
+    codes: tuple
+    globals: object
+    body_globals: object
+    recovery: tuple | None = None
+
+    def verify(self):
+        function,body = self.function,self.body
+        if (resolve_attribute(self.row) is not function or function.__code__ is not self.codes[0]
+                or function.__globals__ is not self.globals or body.__code__ is not self.codes[1]
+                or body.__globals__ is not self.body_globals):
+            raise Unbound("original_frontend_function_body_identity_lost")
+        if self.factory is not None:
+            spec = self.row["decorator"]
+            if (resolve_attribute(spec["factory"]) is not self.factory
+                    or resolve_attribute(spec["activity"]) is not self.activity
+                    or self.factory.__code__ is not self.codes[2] or self.activity.__code__ is not self.codes[3]
+                    or self.activity_target.__code__ is not self.codes[4]
+                    or self.factory.__globals__ is not self.globals or self.globals.get("cli_activity") is not self.activity
+                    or function.__code__.co_freevars != ("method",) or type(function.__closure__) is not tuple or len(function.__closure__) != 1 or function.__closure__[0] is not self.cell
+                    or self.cell.cell_contents is not body or function.__wrapped__ is not body
+                    or self.activity.__code__.co_freevars != ("func",) or type(self.activity.__closure__) is not tuple or len(self.activity.__closure__) != 1 or self.activity.__closure__[0] is not self.activity_cell
+                    or self.activity_cell.cell_contents is not self.activity_target
+                    or self.activity.__wrapped__ is not self.activity_target
+                    or nested_code(self.factory,function.__code__.co_qualname) is not function.__code__):
+                raise Unbound("original_cli_bound_and_activity_closure_identity_lost")
+        if self.recovery is not None:
+            function,row,code,globals,body_span,call_span = self.recovery
+            if (resolve_attribute(row) is not function or function.__code__ is not code
+                    or function.__globals__ is not globals):
+                raise Unbound("original_recovery_helper_callable_identity_lost")
+        return self
+
+    def entry_matches(self, frame, cli):
+        self.verify()
+        argument = "self" if self.factory is not None else "cli"
+        if (frame.f_code is not self.codes[0] or frame.f_globals is not self.globals
+                or frame.f_locals.get(argument) is not cli):
+            return False
+        return self.factory is None or frame.f_locals.get("method") is self.body
+
+    def body_matches(self, frame, cli, *, entry_frame):
+        # The raw invocation belongs to the one prepared dispatch, never to
+        # another wrapper that shares the same code, globals and closure.
+        if entry_frame is None or not self.entry_matches(entry_frame,cli):
+            return False
+        if self.factory is None:
+            return frame is entry_frame
+        self.verify()
+        return (frame.f_code is self.codes[1] and frame.f_globals is self.body_globals
+            and frame.f_locals.get("self") is cli and frame.f_back is entry_frame)
+
+    def site_matches(self, frame, cli, *, wrapper, entry_frame, body_frame):
+        if entry_frame is None:
+            return False
+        if wrapper:
+            return frame is entry_frame and self.entry_matches(frame,cli)
+        if body_frame is None or not self.body_matches(body_frame,cli,entry_frame=entry_frame):
+            return False
+        if frame is body_frame:
+            return True
+        if frame.f_code is self.codes[1] or frame.f_globals is not self.body_globals:
+            return False
+        functions = [v for v in body_frame.f_locals.values() if type(v) is types.FunctionType
+            and v.__code__ is frame.f_code and v.__globals__ is frame.f_globals
+            and all(c.cell_contents is frame.f_locals.get(n)
+                for n,c in zip(v.__code__.co_freevars,v.__closure__ or ()))]
+        if len(functions) != 1:
+            return False
+        callback = functions[0]
+        if frame.f_code.co_name == "_nonquiet_recover_turn":
+            # The original raw body PASSES its actual local callable to the
+            # pinned helper. Its immediate parent is that helper, not raw F0.
+            if self.recovery is None:
+                raise Unbound("original_recovery_helper_body_and_invocation_chain_UNBOUND")
+            function,row,code,globals,body_span,call_span = self.recovery
+            helper = frame.f_back
+            return (helper is not None and helper.f_code is code and helper.f_globals is globals
+                and helper.f_back is body_frame and body_span[0] <= body_frame.f_lineno <= body_span[1]
+                and call_span[0] <= helper.f_lineno <= call_span[1]
+                and body_frame.f_locals.get("recover_failed_kanban_turns") is function
+                and body_frame.f_locals.get("_nonquiet_recover_turn") is callback
+                and helper.f_locals.get("turn_fn") is callback)
+        # Other direct local calls retain the original immediate raw parent;
+        # neither copied code nor an older raw/wrapper ancestor is a route.
+        return frame.f_back is body_frame
+
+
+def source_call_span(qualification, function, row, name):
+    """One exact call statement in the already qualified immutable body."""
+    qualification.real_function(function,row)
+    data,_ = qualification.exact_file(reference(row["source"],"invocation_source"))
+    tree = ast.parse(data,filename=row["filename"])
+    nodes = [n for n in ast.walk(tree) if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef))
+        and n.name == function.__code__.co_name
+        and min([n.lineno]+[d.lineno for d in n.decorator_list]) <= function.__code__.co_firstlineno <= n.lineno]
+    if len(nodes) != 1:
+        raise Unbound("original_invocation_body_AST_UNBOUND")
+    calls = [n for n in ast.walk(nodes[0]) if isinstance(n,ast.Call)
+        and (isinstance(n.func,ast.Name) and n.func.id == name
+             or isinstance(n.func,ast.Attribute) and n.func.attr == name)]
+    if len(calls) != 1:
+        raise Unbound("original_single_invocation_callsite_AST_UNBOUND:"+name)
+    return calls[0].lineno,calls[0].end_lineno
+
+
+@dataclass(frozen=True)
+class ContextManagerFunctionIdentity:
+    function: object
+    body: object
+    factory: object
+    enter: object
+    constructor: object
+    cell: object
+    row: dict
+    codes: tuple
+    globals: object
+    body_globals: object
+    root_span: tuple
+    constructor_span: tuple
+    constructor_name: str
+    class_key: str
+    root_lookup: str
+
+    def verify(self):
+        spec = self.row["contextmanager"]
+        if (resolve_attribute(self.row) is not self.function
+                or resolve_attribute(spec["factory"]) is not self.factory
+                or self.function.__code__ is not self.codes[0] or self.body.__code__ is not self.codes[1]
+                or self.factory.__code__ is not self.codes[2] or self.enter.__code__ is not self.codes[3]
+                or self.constructor.__code__ is not self.codes[4]
+                or self.function.__globals__ is not self.globals or self.body.__globals__ is not self.body_globals
+                or self.factory.__globals__ is not self.globals or self.enter.__globals__ is not self.globals
+                or self.constructor.__globals__ is not self.globals
+                or self.function.__code__.co_freevars != ("func",)
+                or type(self.function.__closure__) is not tuple or len(self.function.__closure__) != 1
+                or self.function.__closure__[0] is not self.cell or self.cell.cell_contents is not self.body
+                or self.function.__wrapped__ is not self.body
+                or nested_code(self.factory,self.function.__code__.co_qualname) is not self.codes[0]
+                or self.globals.get("_GeneratorContextManager") is not _GeneratorContextManager
+                or _GeneratorContextManager.__init__ is not self.constructor
+                or _GeneratorContextManager.__enter__ is not self.enter):
+            raise Unbound("original_contextmanager_callable_cells_or_class_lost")
+        return self
+
+
+def qualify_contextmanager_function(qualification,function,row,frontend,*,class_key,constructor_name,root_lookup):
+    function = qualification.real_function(function,row)
+    spec = row.get("contextmanager")
+    if type(spec) is not dict or set(spec) != {"factory","target","enter","manager_constructor"}:
+        raise Unbound("original_contextmanager_target_factory_enter_constructor_rows_REQUIRED")
+    factory = qualification.real_function(resolve_attribute(spec["factory"]),spec["factory"])
+    if (function.__code__.co_freevars != ("func",) or type(function.__closure__) is not tuple
+            or len(function.__closure__) != 1):
+        raise Unbound("original_contextmanager_closure_shape_UNBOUND")
+    body = qualification.real_function(function.__closure__[0].cell_contents,spec["target"])
+    # Target and special methods are qualified as the actual retained objects,
+    # never through forbidden __wrapped__/__init__/__enter__ traversal.
+    enter = qualification.real_function(_GeneratorContextManager.__enter__,spec["enter"])
+    constructor = qualification.real_function(_GeneratorContextManager.__init__,spec["manager_constructor"])
+    if (factory.__code__.co_qualname != "contextmanager" or factory.__module__ != "contextlib"
+            or body.__code__.co_name != function.__name__
+            or function.__code__.co_freevars != ("func",) or type(function.__closure__) is not tuple
+            or len(function.__closure__) != 1):
+        raise Unbound("original_contextmanager_shape_UNBOUND")
+    root_row = frontend.row["decorator"]["target"]
+    root_span = source_call_span(qualification,frontend.body,root_row,function.__name__)
+    constructor_span = source_call_span(qualification,body,spec["target"],constructor_name)
+    witness = ContextManagerFunctionIdentity(function,body,factory,enter,constructor,function.__closure__[0],dict(row),
+        (function.__code__,body.__code__,factory.__code__,enter.__code__,constructor.__code__),function.__globals__,body.__globals__,
+        root_span,constructor_span,constructor_name,class_key,root_lookup)
+    return witness.verify()
+
+
+
+def qualify_frontend_function(qualification, function, row, *, decorated):
+    function = qualification.real_function(function,row)
+    if not decorated:
+        if getattr(function,"__wrapped__",None) is not None:
+            raise Unbound("unqualified_direct_frontend_decorator")
+        helper_row = row.get("recovery_helper")
+        if (type(helper_row) is not dict or helper_row.get("module") != "agent.kanban_turn_recovery"
+                or helper_row.get("attribute") != "recover_failed_kanban_turns"
+                or helper_row.get("source",{}).get("sha256") != "c654aed03c88d45ca99ff0376e9e01bf2254033cf0bfb42f7187c68bd28b9e9d"):
+            raise Unbound("exact_frozen_original_recovery_helper_row_UNBOUND")
+        helper = qualification.real_function(resolve_attribute(helper_row),helper_row)
+        recovery = (helper,dict(helper_row),helper.__code__,helper.__globals__,
+            source_call_span(qualification,function,row,"recover_failed_kanban_turns"),
+            source_call_span(qualification,helper,helper_row,"turn_fn"))
+        return FrontendFunctionIdentity(function,function,None,None,None,None,None,dict(row),
+            (function.__code__,function.__code__),function.__globals__,function.__globals__,recovery)
+    spec = row.get("decorator")
+    if type(spec) is not dict or set(spec) != {"factory","activity","activity_target","target"}:
+        raise Unbound("exact_original_cli_bound_activity_and_target_rows_REQUIRED")
+    factory = qualification.real_function(resolve_attribute(spec["factory"]),spec["factory"])
+    activity = qualification.real_function(resolve_attribute(spec["activity"]),spec["activity"])
+    if (factory.__name__ != "cli_bound" or activity.__name__ != "cli_activity"
+            or function.__code__.co_freevars != ("method",) or type(function.__closure__) is not tuple or len(function.__closure__) != 1
+            or activity.__code__.co_freevars != ("func",) or type(activity.__closure__) is not tuple or len(activity.__closure__) != 1):
+        raise Unbound("original_frontend_decorator_cell_shape")
+    cell,activity_cell = function.__closure__[0],activity.__closure__[0]
+    body = qualification.real_function(cell.cell_contents,spec["target"])
+    activity_target = qualification.real_function(activity_cell.cell_contents,spec["activity_target"])
+    if (function.__wrapped__ is not body or body.__qualname__ != "HermesCLI.run"
+            or body.__module__ != function.__module__ or function.__globals__ is not factory.__globals__
+            or function.__globals__.get("cli_activity") is not activity
+            or activity.__wrapped__ is not activity_target or activity_target.__qualname__ != "cli_activity"
+            or activity_target.__globals__ is not factory.__globals__
+            or nested_code(factory,function.__code__.co_qualname) is not function.__code__):
+        raise Unbound("decorator_does_not_own_original_run_and_activity_bodies")
+    witness = FrontendFunctionIdentity(function,body,factory,activity,activity_target,cell,activity_cell,dict(row),
+        (function.__code__,body.__code__,factory.__code__,activity.__code__,activity_target.__code__),function.__globals__,body.__globals__)
+    return witness.verify()
+
+@dataclass(frozen=True)
+class QualifiedSite:
+    name: str
+    kind: str
+    event: str
+    code: object
+    filename: str
+    qualname: str
+    line: int | None
+    qualification: dict
+    frontend_identity: object | None = None
+    frontend_wrapper: bool = False
+
+class NativeRuntime:
+    def __setattr__(self, name, value):
+        if self.__dict__.get("_sealed",False):
+            raise Unbound("runtime_binding_sealed_against_scope_reassignment")
+        object.__setattr__(self,name,value)
+
+    def __init__(self, *, grant_reference, authorization_reference, safety_reference,
+                 protocol_reference, guardian_reference, expected_scope_sha256, assignment, generation,
+                 collection_reference, producer_reference):
+        # All externally supplied fields are exact data BEFORE supplied methods,
+        # canonical/hash, file readers, qualification or any native effect.
+        refs = {name: reference(value, name) for name, value in (
+            ("grant", grant_reference), ("authorization", authorization_reference), ("safety", safety_reference),
+            ("protocol", protocol_reference), ("guardian", guardian_reference), ("collection", collection_reference), ("producer", producer_reference))}
+        text(assignment, "assignment", 256)
+        integer(generation, "generation", 1, 10**9)
+        digest(expected_scope_sha256, "expected_scope")
+        if "SOURCE" in assignment or "PREPARATION" in assignment:
+            raise Unbound("Source_assignment_has_no_runtime_grant")
+        self._fd_budget = SourceFDAccount(32)
+        self._qualification = MeteredQualification(self._fd_budget)
+        grant, self.grant_custody = self._qualification.exact_json(refs["grant"])
+        grant = pure(grant, "grant")
+        required = {"schema", "status", "assignment", "generation", "root_event", "root_authorization", "collection", "producer_source", "product_source",
+            "independent_safety", "whole_layout", "caller_protocol", "native_guardian", "host", "start_monotonic", "useful_deadline_monotonic", "final_deadline_monotonic",
+            "original_caller_seconds", "effects", "constructor_effects", "resources", "allowed_cases", "isolated_home", "class_rows", "function_rows", "site_rows", "constructor_kwargs"}
+        if type(grant) is not dict or set(grant) != required or grant["schema"] != "CLI150-NATIVE-PRODUCER-GRANT-PROPOSAL-2":
+            raise Unbound("native_grant_exact_v2_schema_required")
+        for key in ("root_authorization", "collection", "producer_source", "product_source", "independent_safety", "whole_layout", "caller_protocol", "native_guardian"):
+            reference(grant[key], key)
+        if (grant["status"] != "ROOT_AUTHORIZED_NEW_EXACT_NATIVE_EXECUTION" or grant["assignment"] != assignment
+                or type(grant["generation"]) is not int or grant["generation"] != generation
+                or grant["collection"] != refs["collection"] or grant["producer_source"] != refs["producer"]
+                or grant["root_authorization"] != refs["authorization"] or grant["independent_safety"] != refs["safety"]
+                or grant["caller_protocol"] != refs["protocol"] or grant["native_guardian"] != refs["guardian"] or type(grant["original_caller_seconds"]) is not int
+                or grant["original_caller_seconds"] != 30):
+            raise Unbound("native_grant_not_exact_assignment_or_pinned_scope")
+        if type(grant["resources"]) is not dict:
+            raise Unbound("resources_not_exact_mapping")
+        self._fd_budget.narrow(integer(grant["resources"].get("owned_fds"),"owned_fds",8,32))
+        text(grant["root_event"], "root_event", 256)
+        # Only the two cross-reference backlinks are excluded to avoid recursive
+        # hashes; their EXACT independent refs are caller-pinned above and below.
+        scope = {k: v for k, v in grant.items() if k not in ("root_authorization", "independent_safety")}
+        scope_sha = hashlib.sha256(canonical(scope)).hexdigest()
+        if scope_sha != expected_scope_sha256:
+            raise Unbound("whole_native_scope_differs_from_Root_pin")
+        root, _ = self._qualification.exact_json(refs["authorization"])
+        safety, _ = self._qualification.exact_json(refs["safety"])
+        root, safety = pure(root, "root"), pure(safety, "safety")
+        root_keys = {"schema", "decision", "event", "assignment", "generation", "grant_scope_sha256", "caller_protocol", "independent_safety"}
+        if (type(root) is not dict or set(root) != root_keys or root["schema"] != "CLI150-NATIVE-ROOT-AUTHORIZATION-2"
+                or root["decision"] != "AUTHORIZE_EXACT_NATIVE_PRODUCER" or root["event"] != grant["root_event"]
+                or root["assignment"] != assignment or type(root["generation"]) is not int or root["generation"] != generation
+                or root["grant_scope_sha256"] != scope_sha or root["caller_protocol"] != refs["protocol"]
+                or root["independent_safety"] != refs["safety"]):
+            raise Unbound("fresh_exact_whole_Root_authorization_UNBOUND")
+        safety_keys = {"schema", "decision", "reviewer_role", "grant_scope_sha256", "collection", "producer_source", "product_source", "caller_protocol"}
+        if (type(safety) is not dict or set(safety) != safety_keys or safety["schema"] != "CLI150-INDEPENDENT-NATIVE-SAFETY-2"
+                or safety["decision"] != "ACCEPT_EXACT_NATIVE_PRODUCER_SOURCE" or safety["reviewer_role"] != "INDEPENDENT"
+                or safety["grant_scope_sha256"] != scope_sha
+                or any(safety[k] != grant[k] for k in ("collection", "producer_source", "product_source", "caller_protocol"))):
+            raise Unbound("independent_whole_native_Safety_UNBOUND")
+        self.grant, self.scope_sha256 = grant, scope_sha
+        self.birth = self._qualification.proc_birth(os.getpid())
+        if type(grant["host"]) is not dict or set(grant["host"]) != {"pid", "starttime", "boot_id"}:
+            raise Unbound("host_birth_schema")
+        integer(grant["host"]["pid"], "host_pid", 1, 10**9)
+        integer(grant["host"]["starttime"], "host_starttime", 1, 10**15)
+        text(grant["host"]["boot_id"], "boot_id", 64)
+        if any(self.birth[k] != grant["host"][k] for k in ("pid", "starttime", "boot_id")):
+            raise Unbound("native_grant_host_birth_lost")
+        a, b, c = (number(grant[k], k, 0, 1e12) for k in ("start_monotonic", "useful_deadline_monotonic", "final_deadline_monotonic"))
+        if not a < b < c or time.monotonic() >= b:
+            raise Unbound("original_parent_clock_expired")
+        self._original_clock = (a,b,c)
+        for key in ("effects", "constructor_effects", "allowed_cases"):
+            if type(grant[key]) is not list or not 1 <= len(grant[key]) <= 256 or any(type(x) is not str for x in grant[key]) or len(set(grant[key])) != len(grant[key]):
+                raise Unbound(key + "_exact_unique_sequence")
+        if not set(grant["effects"]) <= EFFECTS or set(grant["constructor_effects"]) != CONSTRUCTOR_EFFECTS:
+            raise Unbound("unsupported_or_incomplete_native_effect_scope")
+        guardian,_ = self._qualification.exact_json(refs["guardian"])
+        guardian = pure(guardian,"guardian")
+        guardian_keys = {"schema","status","assignment","generation","root_event","host","supervisor_birth","source","independent_safety","useful_deadline_monotonic","final_deadline_monotonic"}
+        if (type(guardian) is not dict or set(guardian) != guardian_keys or guardian["schema"] != "CLI150-EXACT-NATIVE-GUARDIAN-RECEIPT-1"
+                or guardian["status"] != "ROOT_VERIFIED_ARMED_EXACT_NATIVE_GUARDIAN" or guardian["assignment"] != assignment
+                or type(guardian["generation"]) is not int or guardian["generation"] != generation
+                or guardian["root_event"] != grant["root_event"] or guardian["host"] != grant["host"]
+                or guardian["useful_deadline_monotonic"] != b or guardian["final_deadline_monotonic"] != c):
+            raise Unbound("fresh_exact_native_guardian_UNBOUND_mandatory_before_effects")
+        reference(guardian["source"],"guardian_source")
+        guardian_safety,_ = self._qualification.exact_json(reference(guardian["independent_safety"],"guardian_safety"))
+        guardian_safety = pure(guardian_safety,"guardian_safety")
+        if (type(guardian_safety) is not dict or guardian_safety.get("decision") != "ACCEPT_EXACT_NATIVE_GUARDIAN_CONTRACT"
+                or guardian_safety.get("reviewer_role") != "INDEPENDENT" or guardian_safety.get("source") != guardian["source"]):
+            raise Unbound("independent_native_guardian_Safety_UNBOUND")
+        supervisor = guardian["supervisor_birth"]
+        if type(supervisor) is not dict or set(supervisor) != {"pid","starttime","boot_id"}:
+            raise Unbound("guardian_birth_shape")
+        integer(supervisor["pid"],"guardian_pid",1,10**9)
+        integer(supervisor["starttime"],"guardian_starttime",1,10**15)
+        text(supervisor["boot_id"],"guardian_boot",64)
+        actual_guardian = self._qualification.proc_birth(supervisor["pid"])
+        if actual_guardian["state"] not in {"R","S","D","I"} or supervisor["pid"] == self.birth["pid"] or any(actual_guardian[k] != supervisor[k] for k in supervisor):
+            raise Unbound("actual_distinct_guardian_birth_UNBOUND")
+        self.guardian = guardian
+        self.guardian_sha256 = hashlib.sha256(canonical(guardian)).hexdigest()
+        self.effects = frozenset(grant["effects"])
+        if not CONSTRUCTOR_EFFECTS <= self.effects:
+            raise Unbound("unavoidable_constructor_effects_not_granted")
+        resources = grant["resources"]
+        if type(resources) is not dict or set(resources) != {"AS_bytes", "CPU_seconds", "FS_bytes", "CORE_bytes", "affinity", "owned_fds", "owned_threads"}:
+            raise Unbound("complete_resource_schema_required")
+        self.resources = resources
+        for key, limit, upper in (("AS_bytes",resource.RLIMIT_AS,1610612736),("CPU_seconds",resource.RLIMIT_CPU,30),
+                                 ("FS_bytes",resource.RLIMIT_FSIZE,67108864),("CORE_bytes",resource.RLIMIT_CORE,0)):
+            integer(resources[key], key, 0, upper)
+            soft, hard = resource.getrlimit(limit)
+            if soft == resource.RLIM_INFINITY or hard == resource.RLIM_INFINITY or soft > resources[key] or hard > resources[key]:
+                raise Unbound("actual_resource_cap_UNBOUND:" + key)
+        integer(resources["owned_fds"], "owned_fds", 8, 32)
+        # Two Source readers/controller/reaper plus the original native
+        # spinner/process/wake-startup/StdoutProxy births. Reject four-slot
+        # grants before any native constructor; reserve both actor domains.
+        integer(resources["owned_threads"], "owned_threads", 8, 64)
+        self.thread_reservation = MappingProxyType({"source":4,"frontend":4})
+        if resources["affinity"] != [0, 1] or any(type(x) is not int for x in resources["affinity"]) or sorted(os.sched_getaffinity(0)) != [0, 1]:
+            raise Unbound("native_topology_UNBOUND")
+        self.home = None
+        self.home_custody = None
+        home = canonical_path(grant["isolated_home"])
+        args = grant["constructor_kwargs"]
+        if type(args) is not dict or not set(args) <= CONSTRUCTOR_KEYS or args.get("resume") is not None:
+            raise Unbound("native_constructor_arguments_or_historical_resume")
+        for key in ("model", "provider", "reasoning", "api_key", "base_url"):
+            if key in args and args[key] is not None:
+                text(args[key], key, 4096)
+        for key in ("compact", "checkpoints", "pass_session_id", "ignore_rules"):
+            if key in args and type(args[key]) is not bool:
+                raise Unbound("constructor_flag_type")
+        if args.get("verbose") is not None and type(args["verbose"]) is not bool:
+            raise Unbound("verbose_flag_type")
+        if args.get("toolsets") is not None:
+            if type(args["toolsets"]) is not list or len(args["toolsets"]) > 64:
+                raise Unbound("toolsets_sequence_type")
+            for item in args["toolsets"]:
+                text(item, "toolset", 256)
+        if args.get("max_turns") is not None:
+            integer(args["max_turns"], "max_turns", 1, 256)
+        if args.get("run_budget") is not None:
+            number(args["run_budget"], "run_budget", .001, 300)
+        self.constructor_kwargs = dict(args)
+        protocol, _ = self._qualification.exact_json(refs["protocol"])
+        protocol = pure(protocol, "protocol")
+        self.protocol_sha256 = hashlib.sha256(canonical(protocol)).hexdigest()
+        if type(protocol) is not dict or set(protocol) != {"schema", "status", "case_plan_sha256", "case_output_directories", "case_observation_directories", "required_tail_sites", "rapid_input_seconds", "cleanup_reserve_seconds"}:
+            raise Unbound("caller_protocol_v2_exact_schema")
+        if protocol["schema"] != "CLI150-GENUINE-CALLER-PROTOCOL-2" or protocol["status"] != "ROOT_ACCEPTED_EXACT_GENUINE_CALLER_PROTOCOL":
+            raise Unbound("original_full_caller_protocol_UNBOUND")
+        cases = grant["allowed_cases"]
+        for key in ("case_plan_sha256", "case_output_directories", "case_observation_directories"):
+            if type(protocol[key]) is not dict or set(protocol[key]) != set(cases):
+                raise Unbound("protocol_cases_not_complete_exact")
+        for case in cases:
+            text(case, "case_id", 128)
+            digest(protocol["case_plan_sha256"][case], "case_plan")
+            target = canonical_path(protocol["case_output_directories"][case])
+            if target.rsplit("/", 1)[0] != home:
+                raise Unbound("only_fresh_direct_home_child_supported")
+        if type(protocol["required_tail_sites"]) is not list or any(type(x) is not str for x in protocol["required_tail_sites"]) or set(protocol["required_tail_sites"]) != {"activity_join_return", "metadata_callback_return", "session_flush_return", "ui_completed_return"}:
+            raise Unbound("mandatory_original_tail_protocol")
+        for case in cases:
+            artifact = canonical_path(protocol["case_observation_directories"][case])
+            if artifact.rsplit("/",1)[0] != home or artifact == protocol["case_output_directories"][case]:
+                raise Unbound("fresh_distinct_artifact_home_child_required")
+        directories = list(protocol["case_output_directories"].values())+list(protocol["case_observation_directories"].values())
+        if len(set(directories)) != len(directories):
+            raise Unbound("unique_case_and_artifact_directories_required")
+        number(protocol["rapid_input_seconds"], "rapid_input", .05, .05)
+        number(protocol["cleanup_reserve_seconds"],"cleanup_reserve",.25,.25)
+        self._cleanup_reserve = protocol["cleanup_reserve_seconds"]
+        self.protocol = protocol
+        self._qualification.exact_file(refs["producer"])
+        self._qualification.exact_file(grant["product_source"])
+        layout, _ = self._qualification.exact_json(grant["whole_layout"])
+        self._qualification.verify_loaded(pure(layout, "layout"))
+        self.layout = layout
+        if ("select" not in layout["modules"] or layout["modules"]["select"].get("origin") in (None,"built-in","frozen")
+                or type(select.select) is not types.BuiltinFunctionType or select.select.__module__ != "select"
+                or select.select.__name__ != "select"):
+            raise Unbound("descriptor_free_select_extension_interpreter_pin_UNBOUND")
+        self._select_module,self._select_primitive = select,select.select
+        self._select_origin = layout["modules"]["select"]["origin"]
+        if type(grant["class_rows"]) is not dict or set(grant["class_rows"]) != CLASS_KEYS or type(grant["function_rows"]) is not dict:
+            raise Unbound("complete_native_map_shape")
+        self.classes, self.functions, self.sites = {}, {}, []
+        constructors = {}
+        for name, row in grant["class_rows"].items():
+            if type(row) is not dict or not {"module", "attribute", "constructor"} <= set(row):
+                raise Unbound("class_qualification_shape")
+            value = resolve_attribute(row)
+            if type(value) is not type or value.__name__ != CLASS_NAMES[name]:
+                raise Unbound("not_exact_native_class:" + name)
+            constructor = self._qualification.real_function(value.__init__, row["constructor"])
+            constructors[name] = (constructor,constructor.__code__,constructor.__globals__)
+            self.classes[name] = value
+        self.constructor_identities = MappingProxyType(constructors)
+        self.thread_start_identity = (threading.Thread.start,threading.Thread.start.__code__,threading.Thread.start.__globals__)
+        self.thread_constructor_identity = (threading.Thread.__init__,threading.Thread.__init__.__code__,threading.Thread.__init__.__globals__)
+        required_functions = {"create_input", "create_output", "create_app_session", "frontend_run", "single_query_frontend", "application_exit", "frontend_output_close", "get_hermes_home", "native_input_close", "patch_stdout", "bind_prompt_output", "proxy_thread_creator", "proxy_thread_target", "recover_failed_kanban_turns", "context_thread", "standard_thread_constructor"}
+        if not required_functions <= set(grant["function_rows"]):
+            raise Unbound("connected_original_function_map_incomplete")
+        for name, row in grant["function_rows"].items():
+            if type(row) is not dict:
+                raise Unbound("function_qualification_shape")
+            actual = threading.Thread.__init__ if name == "standard_thread_constructor" else resolve_attribute(row)
+            self.functions[name] = self._qualification.real_function(actual, row)
+        if self._qualification.real_function(self.classes["cli"].run, grant["function_rows"]["frontend_run"]) is not self.functions["frontend_run"]:
+            raise Unbound("frontend_run_not_original")
+        self.frontend_identities = MappingProxyType({
+            "frontend_run":qualify_frontend_function(self._qualification,self.functions["frontend_run"],grant["function_rows"]["frontend_run"],decorated=True),
+            "single_query_frontend":qualify_frontend_function(self._qualification,self.functions["single_query_frontend"],grant["function_rows"]["single_query_frontend"],decorated=False)})
+        if self.functions["standard_thread_constructor"] is not self.thread_constructor_identity[0]:
+            raise Unbound("exact_standard_Thread_constructor_row_UNBOUND")
+        factory = self.functions["context_thread"]
+        factory_row = grant["function_rows"]["context_thread"]
+        if (factory_row.get("module") != "hermes_cli.friday_cli_principal" or factory_row.get("attribute") != "context_thread"
+                or factory.__code__.co_qualname != "context_thread"
+                or self.frontend_identities["frontend_run"].body_globals.get("context_thread") is not factory):
+            raise Unbound("original_raw_context_thread_factory_slot_UNBOUND")
+        self.frontend_thread_factory_identity = (factory,factory.__code__,factory.__globals__)
+        self.frontend_thread_constructor_span = source_call_span(self._qualification,factory,factory_row,"Thread")
+        if self.frontend_identities["single_query_frontend"].recovery[0] is not self.functions["recover_failed_kanban_turns"]:
+            raise Unbound("original_recovery_helper_map_disagrees_with_callback_identity")
+        self.contextmanager_identities = MappingProxyType({
+            "patch_stdout":qualify_contextmanager_function(self._qualification,self.functions["patch_stdout"],grant["function_rows"]["patch_stdout"],
+                self.frontend_identities["frontend_run"],class_key="proxy",constructor_name="StdoutProxy",root_lookup="globals"),
+            "bind_prompt_output":qualify_contextmanager_function(self._qualification,self.functions["bind_prompt_output"],grant["function_rows"]["bind_prompt_output"],
+                self.frontend_identities["frontend_run"],class_key="prompt_binding",constructor_name="NativePromptBinding",root_lookup="locals")})
+        if (self.classes["proxy"]._start_write_thread is not self.functions["proxy_thread_creator"]
+                or self.classes["proxy"]._write_thread is not self.functions["proxy_thread_target"]):
+            raise Unbound("original_proxy_creator_target_callable_map_UNBOUND")
+        self.proxy_creator_identity = (self.functions["proxy_thread_creator"],self.functions["proxy_thread_creator"].__code__,self.functions["proxy_thread_creator"].__globals__)
+        self.proxy_target_identity = (self.functions["proxy_thread_target"],self.functions["proxy_thread_target"].__code__,self.functions["proxy_thread_target"].__globals__)
+        self.proxy_creator_call_span = source_call_span(self._qualification,self.classes["proxy"].__init__,grant["class_rows"]["proxy"]["constructor"],"_start_write_thread")
+        self.proxy_start_call_span = source_call_span(self._qualification,self.functions["proxy_thread_creator"],grant["function_rows"]["proxy_thread_creator"],"start")
+        if type(grant["site_rows"]) is not list or not 1 <= len(grant["site_rows"]) <= 256:
+            raise Unbound("sites_finite_exact_list")
+        seen = set()
+        for row in grant["site_rows"]:
+            if type(row) is not dict or not {"name", "kind", "event", "module", "attribute", "qualname", "source", "filename", "code_sha256"} <= set(row):
+                raise Unbound("site_qualification_shape")
+            if type(row["kind"]) is not str or row["kind"] not in SITE_KINDS or row["event"] not in {"call", "line", "return", "exception"}:
+                raise Unbound("unknown_original_site")
+            text(row["name"], "site_name", 256)
+            digest(row["code_sha256"], "site_code")
+            site_function = resolve_attribute(row)
+            identity = next((x for x in self.frontend_identities.values() if site_function is x.function),None)
+            wrapper_site = identity is not None and row["qualname"] == identity.codes[0].co_qualname
+            # Expose only this qualified decorator's retained target. Attribute
+            # traversal still cannot follow arbitrary __wrapped__ chains.
+            owner_function = site_function if identity is None or wrapper_site else identity.body
+            code = nested_code(owner_function,row["qualname"])
+            self._qualification.exact_file(reference(row["source"], "site_source"))
+            if code_digest(code) != row["code_sha256"] or code.co_filename != row["filename"]:
+                raise Unbound("observation_code_not_exact")
+            if row.get("line") is not None:
+                integer(row["line"], "site_line", 1, 10**7)
+            key = (code, row["event"], row.get("line"), row["kind"])
+            if key in seen:
+                raise Unbound("duplicate_site")
+            seen.add(key)
+            self.sites.append(QualifiedSite(row["name"], row["kind"], row["event"], code, row["filename"], row["qualname"], row.get("line"), dict(row),identity,wrapper_site))
+        mandatory = {"cli_constructed", "agent_constructed", "context_constructed", "host_constructed", "database_constructed", "session_constructed",
+            "result_tool_constructed", "proxy_constructed", "frontend_ready", "outer_input_entry", "outer_input_return", "current_turn_return", "ledger_task_return",
+            "thread_entry", "thread_return", "native_bridge_entry", "native_bridge_return", "loop_return", "activity_started", "activity_join_return",
+            "metadata_callback_return", "session_flush_return", "ui_completed_return", "delivery_begin", "delivery_finish", "physical_write_return", "physical_close_return",
+            "proxy_close_return", "prompt_text_changed"}
+        if not mandatory <= {s.kind for s in self.sites}:
+            raise Unbound("original_full_native_site_map_incomplete")
+        thread_start = [s for s in self.sites if s.kind == "thread_entry"]
+        if not thread_start or any(s.event != "call" or s.code is not threading.Thread.start.__code__ for s in thread_start):
+            raise Unbound("before_start_exact_standard_Thread_site_REQUIRED")
+        self.frontend_thread_sites = tuple(s for s in self.sites if s.kind == "frontend_thread_create")
+        if not self.frontend_thread_sites or any(s.event != "line" or s.line is None for s in self.frontend_thread_sites):
+            raise Unbound("exact_pre_input_frontend_creator_before_start_sites_UNBOUND")
+        proxy_sites = [s for s in self.frontend_thread_sites if s.code is self.proxy_creator_identity[1]]
+        if (len(proxy_sites) != 1 or proxy_sites[0].line != self.proxy_start_call_span[0]
+                or proxy_sites[0].frontend_identity is not None):
+            raise Unbound("exact_original_proxy_creator_before_start_site_REQUIRED")
+        # Retain immutable home chain before any resource/constructor effects.
+        self.home_custody = DirectoryCustody(home,max_fds=self.resources["owned_fds"],budget=self._fd_budget)
+        self.home = self.home_custody.path
+        try:
+            if canonical_path(self._qualification.real_function(self.functions["get_hermes_home"],self.grant["function_rows"]["get_hermes_home"])()) != home:
+                raise Unbound("native_effective_home_not_exact_Root_home")
+        except BaseException:
+            self.home_custody.close()
+            raise
+        self.classes = MappingProxyType(dict(self.classes))
+        self.functions = MappingProxyType(dict(self.functions))
+        self.constructor_kwargs = MappingProxyType(dict(self.constructor_kwargs))
+        self.used_cases = set()
+        self._sealed = True
+
+    def check(self, *, useful=True):
+        if type(self) is not NativeRuntime:
+            raise Unbound("runtime_not_exact_Source_type")
+        current_scope = {k:v for k,v in self.grant.items() if k not in ("root_authorization","independent_safety")}
+        if (hashlib.sha256(canonical(current_scope)).hexdigest() != self.scope_sha256
+                or hashlib.sha256(canonical(self.protocol)).hexdigest() != self.protocol_sha256
+                or frozenset(self.grant["effects"]) != self.effects):
+            raise Unbound("qualified_whole_scope_or_protocol_mutated")
+        if hashlib.sha256(canonical(self.guardian)).hexdigest() != self.guardian_sha256:
+            raise Unbound("guardian_receipt_mutated")
+        supervisor = self.guardian["supervisor_birth"]
+        actual_guardian = self._qualification.proc_birth(supervisor["pid"])
+        if actual_guardian["state"] not in {"R","S","D","I"} or any(actual_guardian[k] != supervisor[k] for k in supervisor):
+            raise Unbound("native_guardian_birth_lost_before_effect")
+        now_birth = self._qualification.proc_birth(os.getpid())
+        if any(now_birth[k] != self.birth[k] for k in ("pid", "starttime", "boot_id")):
+            raise Unbound("native_host_birth_changed")
+        limit = self.original_deadline(final=not useful)
+        if time.monotonic() >= limit:
+            raise Unbound("original_native_parent_deadline")
+        if self.classes["cli"].run is not self.frontend_identities["frontend_run"].function:
+            raise Unbound("original_CLI_run_attribute_replaced")
+        for identity in self.frontend_identities.values():
+            identity.verify()
+        for identity in self.contextmanager_identities.values():
+            identity.verify()
+        for key,(function,code,globals) in self.constructor_identities.items():
+            if self.classes[key].__init__ is not function or function.__code__ is not code or function.__globals__ is not globals:
+                raise Unbound("retained_original_constructor_callable_lost:"+key)
+        for name,identity,actual in (("Thread.start",self.thread_start_identity,threading.Thread.start),
+                ("Thread.__init__",self.thread_constructor_identity,threading.Thread.__init__),
+                ("context_thread",self.frontend_thread_factory_identity,resolve_attribute(self.grant["function_rows"]["context_thread"])),
+                ("proxy_creator",self.proxy_creator_identity,self.classes["proxy"]._start_write_thread),
+                ("proxy_target",self.proxy_target_identity,self.classes["proxy"]._write_thread)):
+            function,code,globals = identity
+            if actual is not function or function.__code__ is not code or function.__globals__ is not globals:
+                raise Unbound("retained_original_creator_or_start_callable_lost:"+name)
+        self.home_custody.verify()
+        return limit
+
+    def original_deadline(self, *, final=False):
+        clock = self._original_clock
+        if (type(clock) is not tuple or len(clock) != 3 or any(type(v) not in (int,float) for v in clock)
+                or not clock[0] < clock[1] < clock[2]):
+            raise Unbound("original_cleanup_clock_unknown_no_new_deadline")
+        return number(clock[2] if final else clock[1],"retained_original_deadline",0,1e12)
+
+    def cleanup_reserve(self):
+        return number(self._cleanup_reserve,"retained_cleanup_reserve",.25,.25)
+
+    def readiness(self, fd, *, writable, timeout):
+        integer(fd,"original_readiness_FD",0,10**9)
+        number(timeout,"bounded_readiness_wait",0,.05)
+        if (type(writable) is not bool or sys.modules.get("select") is not self._select_module
+                or self._select_module.select is not self._select_primitive
+                or self._select_module.__spec__.origin != self._select_origin):
+            raise Unbound("descriptor_free_select_original_primitive_lost")
+        # Exact loaded C select primitive creates no Source FD. Native extension
+        # bytes and interpreter belong to the already exact whole layout pin.
+        readable,writes,_ = self._select_primitive([] if writable else [fd],[fd] if writable else [],[],timeout)
+        return bool(writes if writable else readable)
+
+    def source_FD_state(self):
+        return self._fd_budget.snapshot()
+
+    def original_function(self, name):
+        return self._qualification.real_function(self.functions[name],self.grant["function_rows"][name])
+
+    def require_effect(self, name, *, useful=True):
+        text(name, "effect", 128)
+        self.check(useful=useful)
+        if name not in self.effects:
+            raise Unbound("effect_not_explicitly_granted:" + name)
+
+    def require_effects(self, names, *, useful=True):
+        if type(names) not in (frozenset, tuple, list, set) or any(type(x) is not str for x in names):
+            raise Unbound("effect_sequence_type")
+        for name in sorted(names):
+            self.require_effect(name, useful=useful)
+
+    def qualified_function(self, name):
+        text(name,"qualified_function_name",256)
+        self.check(useful=False)
+        if name not in self.functions:
+            raise Unbound("native_function_not_in_sealed_whole_map")
+        return self._qualification.real_function(self.functions[name],self.grant["function_rows"][name])
+
+    def qualified_class(self, name):
+        text(name,"qualified_class_name",256)
+        self.check()
+        if name not in self.classes:
+            raise Unbound("native_class_not_in_sealed_whole_map")
+        value = self.classes[name]
+        original,code,globals = self.constructor_identities[name]
+        if value.__init__ is not original or original.__code__ is not code or original.__globals__ is not globals:
+            raise Unbound("qualified_original_constructor_callable_replaced")
+        self._qualification.real_function(original,self.grant["class_rows"][name]["constructor"])
+        return value
+
+    def constructor_parameters(self):
+        self.check()
+        if canonical(dict(self.constructor_kwargs)) != canonical(self.grant["constructor_kwargs"]):
+            raise Unbound("actual_constructor_parameters_differ_from_frozen_scope")
+        return pure(self.grant["constructor_kwargs"],"constructor_parameters")
+
+    def begin(self, case_id):
+        text(case_id, "case_id", 128)
+        self.check()
+        if case_id not in self.grant["allowed_cases"] or case_id in self.used_cases:
+            raise Unbound("case_not_granted_or_replayed")
+        self.require_effects(CONSTRUCTOR_EFFECTS)
+        self.used_cases.add(case_id)

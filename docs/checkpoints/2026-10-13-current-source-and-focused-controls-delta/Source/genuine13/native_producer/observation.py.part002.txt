@@ -1,0 +1,136 @@
+            if owned and not any(thread is x for x in caller.threads):
+                caller.threads.append(thread)
+                if not any(thread is x for x in self.created_threads):
+                    self.created_threads.append(thread)
+            elif not owned:
+                self.foreign_resources.append({"kind":"activity_thread","object":object_key(thread),"attribution":"UNCONFIRMED_NO_CREATION_GENERATION"})
+        elif kind == "activity_join_return":
+            thread = loc["thread"]
+            detail.update(thread=object_key(thread), tid=thread.native_id, alive_after_join=thread.is_alive())
+        elif kind == "physical_write_return":
+            chunk = loc.get("chunk")
+            detail["actual_count"] = returned if type(returned) is int else None
+            detail["count_type"] = type(returned).__name__
+            if type(chunk) is bytes:
+                detail.update(requested_bytes=len(chunk), requested_sha256=hashlib.sha256(chunk).hexdigest())
+                if type(returned) is int and 0 < returned <= len(chunk):
+                    detail["accepted_sha256"] = hashlib.sha256(chunk[:returned]).hexdigest()
+            lease = loc.get("self")
+            detail["lease"] = object_key(lease)
+            if lease is not None:
+                detail["retained_fd"] = getattr(lease, "fd", None)
+                detail["accepted_total"] = getattr(lease, "accepted", None)
+        elif kind == "physical_close_return":
+            lease = loc.get("self")
+            detail.update(lease=object_key(lease), retained_fd=getattr(lease, "fd", None),
+                          actual_close_return_type=type(returned).__name__)
+        elif kind == "prompt_text_changed":
+            cli = self.registry.original_cli
+            if cli is None or loc.get("self") is not cli or cli._app is None:
+                raise Unbound("actual_text_change_not_original_frontend")
+            buffer = cli._app.current_buffer
+            text = buffer.text
+            if type(text) is not str or len(text.encode("utf-8")) > 65536:
+                raise Unbound("actual_original_prompt_text_capacity")
+            if self.prompt_witness is None or cli._app is not self.prompt_witness.app:
+                raise Unbound("prompt_text_generation_not_retained")
+            detail.update(buffer_id=id(buffer),prompt_generation=self.prompt_witness.generation,actual_text_bytes=len(text.encode("utf-8")),
+                          actual_text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                          actual_cursor_position=buffer.cursor_position,
+                          actual_selection_type=type(buffer.selection_state).__name__)
+            self.prompt_text_fact = dict(detail)
+        elif kind == "proxy_write":
+            text = loc.get("data", loc.get("text"))
+            if type(text) is str:
+                raw = text.encode("utf-8")
+                detail.update(text_bytes=len(raw), text_sha256=hashlib.sha256(raw).hexdigest(),
+                              document_marker_present="friday.cli-document-output.v1" in text)
+        elif kind == "callback_exception":
+            detail["exception_type"] = returned[0].__name__ if type(returned) is tuple else "UNOBSERVED"
+            if caller is not None:
+                caller.exceptions.append(detail["exception_type"])
+        elif kind == "native_handle_created":
+            if caller is not None:
+                self.handles.append(returned)
+                caller.handles.append(returned)
+            else:
+                self.foreign_resources.append({"kind":"handle","object":object_key(returned),"attribution":"UNCONFIRMED_NO_OWNER_GENERATION"})
+            detail["native_handle"] = object_key(returned)
+        if event == "exception" and caller is not None:
+            caller.exceptions.append(returned[0].__name__ if type(returned) is tuple else "UNOBSERVED")
+        if caller is not None and kind in TAIL_KIND:
+            caller.observe_tail(kind, monotonic=at, actor=detail["actor_tid"], observation=detail)
+        if caller is not None:
+            detail["caller_deadline"] = caller.deadline
+            detail["caller_generation"] = caller.generation
+        elif kind not in CONSTRUCTOR_KIND and kind not in {"frontend_ready","prompt_text_changed"}:
+            detail["attribution"] = "UNCONFIRMED_NO_EXACT_CONTEXT_THREAD_TASK_GENERATION"
+        self.events.append(detail)
+        self.bus.emit(kind, {k: v for k, v in detail.items() if k != "kind"})
+        if caller is not None and event == "return" and kind == "native_bridge_return":
+            # The persistent native loop is observed, never asyncio.run/replaced.
+            detail["original_persistent_bridge_return"] = True
+
+    def install(self):
+        self.runtime.require_effect("observer_hooks")
+        if self.installed or self.sys_installed or self.threads_installed or sys.gettrace() is not None or threading.gettrace() is not None:
+            raise Unbound("unknown_trace_guard_or_duplicate_observer")
+        self.original_sys,self.original_threads = sys.gettrace(),threading.gettrace()
+        try:
+            threading.settrace(self._trace_callback)
+            self.threads_installed = True
+            sys.settrace(self._trace_callback)
+            self.sys_installed = True
+            self.installed = True
+        except BaseException as primary:
+            self.hook_errors.append({"stage":"install_primary","type":type(primary).__name__})
+            self.detach()
+            raise
+
+
+    def detach(self):
+        for name in ("sys","threads"):
+            flag = self.sys_installed if name == "sys" else self.threads_installed
+            if not flag:
+                continue
+            try:
+                actual = sys.gettrace() if name == "sys" else threading.gettrace()
+                if actual is not self._trace_callback:
+                    self.unknown.append("foreign_trace_replacement_retained:"+name)
+                    continue
+                if name == "sys":
+                    sys.settrace(self.original_sys)
+                    self.sys_installed = False
+                else:
+                    threading.settrace(self.original_threads)
+                    self.threads_installed = False
+            except BaseException as exc:
+                self.hook_errors.append({"stage":"detach:"+name,"type":type(exc).__name__})
+        self.installed = self.sys_installed or self.threads_installed
+        if self.prompt_witness is not None:
+            self.prompt_witness.retired = True
+        for witness in self.owner_witnesses:
+            witness["retired"] = True
+        for caller in self.callers:
+            caller.retired = True
+        for thread in self.created_threads:
+            if thread.is_alive():
+                self.unknown.append("per_thread_trace_lifetime_still_unknown:"+str(thread.native_id))
+
+
+    def snapshot(self):
+        return {"constructor_objects": {key: [object_key(x) for x in values]
+                                        for key, values in self.registry.objects.items()},
+                "events":list(self.events),"unknown":list(self.unknown),"hook_errors":list(self.hook_errors),
+                "Source_actors":self.Source_actor_snapshot(),
+                "thread_start_attempts":[{"object":object_key(r["object"]),"generation":r["generation"],"entered":r["entered"],"admission":r["admission"],"start_body_prevented":r["start_body_prevented"],"start_returned":r["start_returned"],"start_errors":list(r["start_errors"]),"refusal_type":r.get("refusal_type")} for r in self.thread_start_attempts],
+                "fatal_admission_refusal":None if self.admission_failure is None else type(self.admission_failure).__name__,
+                "frontend_actor_generations":[{"object":object_key(r["object"]),"generation":r["generation"],"registered_before_start":r["registered_before_start"],"start_returned":r["start_returned"],"start_errors":list(r["start_errors"]),"admission":r.get("admission"),"start_body_prevented":r.get("start_body_prevented",False)} for r in self.frontend_actors],
+                "foreign_or_unattributed_resources":list(self.foreign_resources),
+                "native_frontend_actual_return":self.native_frontend_returned,"native_frontend_exception":list(self.native_frontend_exception),
+                "output_owner_actual_close_return":self.output_owner_close_returned,
+                "prompt_generation":None if self.prompt_witness is None else self.prompt_witness.generation,
+                "installed": self.installed, "case_original_entered": self.case_entered,
+                "case_original_deadline": self.case_deadline, "callers": [x.observation() for x in self.callers],
+                "original_full150_control_orchestration": "NOT_COMPLETED_BY_GENERAL_PRODUCER",
+                "acceptance": "INDEPENDENT_ROOT_REQUIRED"}

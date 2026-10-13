@@ -1,0 +1,781 @@
+"""Intrinsic real-observation reducers. No external reducer body or t fixture.
+
+Consumer state read through ptrace is semantic declaration, never kernel truth.
+Every physical conclusion uses actual syscall results or stopped /proc reads.
+Unsupported/missing facts raise ObservationMissing; no unknown-to-zero credit.
+"""
+import os
+import stat
+import struct
+from collections.abc import Mapping
+import physical_observation_primitives as physical
+import physical_observation_capture as capture
+import physical_observation_reduce as base
+import physical_observation_markers as markers
+import root_fd_custody as custody_source
+from qualification_batch import CASES
+
+def _missing_physical(code):
+    raise physical.ObservationMissing(code)
+
+class LiveFacts:
+    def __init__(self,run):
+        self.run=capture.validate_raw_run(run)
+        self.root=run.case.root_pid;self.caller=run.case.caller_pid
+    def events(self,nr=None,pid=None,lo=0,hi=None,stage='exit'):
+        return tuple(e for e in self.run.kernel if (nr is None or e.syscall==nr)
+            and (pid is None or e.pid==pid) and e.stage==stage and
+            lo<e.sequence<(hi if hi is not None else 1<<63))
+    def states(self,kind=None,pid=None):
+        return tuple(b for b in self.run.boundaries if b.semantic_read is not None
+            and (kind is None or b.semantic_read['kind']==kind)
+            and (pid is None or b.pid==pid))
+    def state(self,kind,pid=None,last=True):
+        rows=self.states(kind,pid)
+        physical.need(rows,'ACTUAL_CONSUMER_STATE_MISSING:'+str(kind))
+        return rows[-1 if last else 0]
+    def registry(self,b):
+        state=b.semantic_read['state']
+        return state.get('custody',state)
+    def closes(self,fd,pid=None,identity=None,lo=0,hi=None):
+        rows=self.events(3,pid,lo,hi)
+        return tuple(e for e in rows if e.arguments[0]==fd and e.result==0
+            and (identity is None or type(e.fd_before)is physical.FDRead
+                 and e.fd_before.identity==tuple(identity)))
+    def closed_once(self,row,pid,lo=0,hi=None):
+        return len(self.closes(row['fd'],pid,row.get('identity'),lo,hi))==1
+    def row_physically_live(self,b,row):
+        return any(r.fd==row['fd'] and r.identity==tuple(row['identity']) for r in b.all_fd_reads)
+    def verified_registry(self,b,allow_stopped=False):
+        state=self.registry(b);rows=state['fds'];live=[r for r in rows if not r['closed']]
+        physical.need(len({r['fd'] for r in live})==len(live),'ACTUAL_REGISTRY_DUPLICATE')
+        for row in rows:
+            if row.get('close_ambiguous'):
+                physical.need(allow_stopped,'AMBIGUOUS_ROW_CANNOT_BE_NORMAL')
+            elif row['closed']:
+                physical.need(self.closed_once(row,b.pid,hi=self._seq(b)),
+                              'DECLARED_CLOSED_WITHOUT_EXACT_RAW_CLOSE')
+            else:physical.need(self.row_physically_live(b,row),'DECLARED_LIVE_WITHOUT_ACTUAL_FD')
+        return state
+    def _seq(self,b):
+        return next(m.kernel_sequence for m in self.run.markers if m.sequence==b.marker_sequence)
+    def mark(self,name,pid=None):return base._marks(self.run,name,pid)
+    def proof(self,name,predicate,selectors=()):return base._proof(self.run,name,predicate,selectors)
+    def scope(self,case_id):
+        phase='ALL_SAFE' if case_id in {r[0] for r in CASES if r[1]=='positive'} else case_id
+        order=self.run.case.phase_order
+        physical.need(phase in order,'CURRENT_ORIGINAL_PHASE_MISSING')
+        index=order.index(phase)
+        begins=[m for m in self.mark('phase_begin',self.root) if m.values[0]==index]
+        ends=[m for m in self.mark('phase_closed',self.root) if m.values[0]==index]
+        physical.need(len(begins)==len(ends)==1 and begins[0].kernel_sequence<ends[0].kernel_sequence,
+                      'CURRENT_EXACT_PHASE_INTERVAL_MISSING')
+        return begins[0].kernel_sequence,ends[0].kernel_sequence
+    def operation(self,number,phase_id='ALL_SAFE'):
+        lo,hi=self.scope(phase_id)
+        rows=[r for r in self.run.operations if r['operation']==number and
+              lo<r['entry_sequence']<r['return_sequence']<hi]
+        physical.need(len(rows)==1,'ONE_EXACT_INDEPENDENT_OPERATION_INTERVAL:'+str(number))
+        row=rows[0]
+        physical.need(row['pid'] in self.run.known_subjects and
+            self.run.known_subjects[row['pid']][0]==row['birth'],'EXACT_OPERATION_SUBJECT_BIRTH')
+        return row
+    def allocator(self):
+        lo,hi=self.scope('ALL_SAFE')
+        intervals=[r for r in self.run.operations if r['operation']==3 and lo<r['entry_sequence']<r['return_sequence']<hi]
+        physical.need(intervals,'ACTUAL_ALLOCATOR_INTERVAL_MISSING')
+        interval=min(intervals,key=lambda r:r['entry_sequence'])
+        rows=[r for r in self.run.function_reads if r['pid']==interval['pid'] and
+            r['birth']==interval['birth'] and r['operation']==interval['entry_sequence']]
+        physical.need(len(rows)==1,'ONE_ACTUAL_LIBC_CALL_ENTRY_RETURN')
+        row=rows[0]
+        physical.need(row['entry'] is not None and row['return'] is not None and
+            interval['entry_sequence']<=row['entry']['kernel_sequence']<=row['return']['kernel_sequence']<interval['return_sequence']
+            and row['return']['result']==1,'ACTUAL_MALLOPT_MINUS8_ONE_RETURN_ONE')
+        first=[e for e in self.events(stage='actual_birth') if e.pid==interval['pid']]
+        physical.need(first and row['return']['kernel_sequence']<min(e.sequence for e in first),
+                      'REAL_ALLOCATOR_RETURN_BEFORE_FIRST_TASK_BIRTH')
+        return row
+    def fault_span(self):
+        starts=self.mark('fault_begin');ends=self.mark('fault_end')
+        physical.need(len(starts)==len(ends)==1 and starts[0].pid==ends[0].pid and
+            starts[0].kernel_sequence<ends[0].kernel_sequence,'EXACT_CURRENT_CONTROL_EFFECT_INTERVAL')
+        lo,hi=starts[0].kernel_sequence,ends[0].kernel_sequence
+        before=[b for b in self.states(17,starts[0].pid) if lo<self._seq(b)<hi]
+        after=[b for b in self.states(18,starts[0].pid) if lo<self._seq(b)<hi]
+        physical.need(len(before)==len(after)==1 and
+            before[0].semantic_read['state']['mutation']==self.run.case.mutation and
+            after[0].semantic_read['state']['mutation']==self.run.case.mutation,'ACTUAL_CAUSAL_CONTROL_NOT_ALIAS')
+        return lo,hi,before[0],after[0]
+    def stop_span(self):
+        lo,hi,before,after=self.fault_span()
+        stopped=[b for b in self.states(16,self.root) if self._seq(b)>hi]
+        physical.need(stopped,'REAL_STOP_AFTER_EXACT_CURRENT_FAULT')
+        terminal=[m.kernel_sequence for m in self.mark('attempt_end') if m.kernel_sequence>hi]
+        return lo,(max(terminal) if terminal else max(e.sequence for e in self.run.kernel)+1),before,after,stopped[0]
+    def role_wait(self,role):
+        phase=self.run.case.resources.get('observed_role_phase_id','ALL_SAFE')
+        lo,hi=self.scope(phase)
+        rows=[(b,r) for b,r in self.role_rows() if custody_source.canonical_role(r['label'])==role and
+            r.get('identity') is not None and lo<self._seq(b)<hi]
+        physical.need(rows,'EXACT_OWNED_ROLE_WAITER_MISSING:'+role)
+        candidates=[]
+        for settlement in self.run.target_settlement:
+            for wait in settlement['raw_owned_waits']:
+                if wait['owner_pid']!=self.root or not lo<wait['sequence']<hi:continue
+                for b,row in rows:
+                    handle=next((r for r in b.all_fd_reads if r.fd==row['fd'] and r.identity==tuple(row['identity'])),None)
+                    if handle is None:continue
+                    pids=[s.split(':',1)[1].strip() for s in handle.info_raw.splitlines() if s.startswith('Pid:')]
+                    if pids==[str(wait['target_pid'])] and self._seq(b)<wait['sequence']:
+                        candidates.append(wait)
+        unique={w['sequence']:w for w in candidates}
+        physical.need(len(unique)==1,'ONE_EXACT_ROLE_RAW_WAIT:'+role)
+        return next(iter(unique.values()))
+    def raw_waits(self,pid=None,lo=0,hi=None):
+        rows=self.events(61,pid,lo,hi)
+        return tuple(e for e in rows if e.result>0 and e.raw_output is not None and len(e.raw_output)==4)
+    def status(self,event):return int.from_bytes(event.raw_output,'little')
+    def physical_group_reads(self,name,lo=0,hi=None):
+        rows=self.events(0,lo=lo,hi=hi)
+        return tuple(e for e in rows if type(e.fd_before)is physical.FDRead and
+            e.fd_before.link.startswith('/sys/fs/cgroup/') and
+            os.path.basename(e.fd_before.link)==name and e.result>0 and e.raw_output is not None)
+    def group_values(self,name,lo=0,hi=None):
+        rows=self.physical_group_reads(name,lo,hi)
+        physical.need(rows,'REAL_GROUP_READ_MISSING:'+name)
+        return tuple(e.raw_output.decode('ascii').strip() for e in rows)
+    def protected(self):
+        first=base._bounds(self.run,'attempt_begin');last=base._bounds(self.run,'attempt_end')
+        physical.need(first and last,'ACTUAL_PROTECTED_BOUNDARIES_MISSING')
+        return first[0].protected_reads==last[-1].protected_reads
+    def final_root_state(self):return self.verified_registry(self.state(5,self.root))
+    def completed(self):
+        return self.final_root_state()['completed_phases']
+    def aux_inventory(self):
+        bounds=base._bounds(self.run,'attempt_begin',self.root)
+        physical.need(len(bounds)==1 and bounds[0].phase_inventory is not None,'REAL23_INVENTORY_MISSING')
+        return bounds[0]
+    def aux_rows(self):
+        b=self.aux_inventory();result=[]
+        byfd={r.fd:r for r in b.all_fd_reads};remote={r.fd:r for r in b.caller_fd_reads}
+        for p in b.phase_inventory['phases']:
+            cap=p['declared'];a=cap.get('actual_control_binding',{})
+            for key,role in [('auxiliary_groups','auxiliary_group'),('auxiliary_outputs','original_caller_output_parent'),('auxiliary_fds','auxiliary_borrowed')]:
+                for row in a.get(key,()):
+                    fd=row['output_fd'] if key=='auxiliary_outputs' else row['fd']
+                    own=row['ownership'];caller_fd=own['caller_fd']
+                    physical.need(fd in byfd and caller_fd in remote,'REAL_LOCAL_REMOTE_AUX_FD_MISSING')
+                    result.append((p['phase'],key,row,byfd[fd],remote[caller_fd]))
+        return tuple(result)
+    def trace_rows(self):
+        boundary=self.aux_inventory();byfd={row.fd:row for row in boundary.all_fd_reads}
+        rows=[]
+        for phase in boundary.phase_inventory['phases']:
+            cap=phase['declared'];fd=cap['trace_dir_fd']
+            physical.need(type(fd)is int and fd in byfd,'EXACT_PHASE_TRACE_FD_READ_MISSING')
+            rows.append((phase['phase'],cap,byfd[fd]))
+        physical.need(len(rows)==23,'COMPLETE_CURRENT_TRACE_ROLE_DOMAIN')
+        return tuple(rows)
+    def created_unknown_fd(self):
+        lo,hi,before,after=self.fault_span()
+        physical.need(before.pid==after.pid and before.birth==after.birth and
+            self.run.case.mutation=='UNKNOWN_INHERITED_FD_STOP','EXACT_UNKNOWN_CHILD_CONTROL')
+        declared=after.semantic_read['state'].get('created_unknown_fd')
+        operation=after.semantic_read['state'].get('duplicate_fd_operation')
+        physical.need(type(declared)is int and declared>2 and type(operation)is dict and
+            operation.get('function')=='os.dup' and operation.get('operation')==4 and
+            operation.get('result_fd')==declared,'UNKNOWN_CREATED_FD_DECLARATION_MISSING')
+        starts=[m for m in self.mark('operation_begin',before.pid) if m.birth==before.birth and
+            m.values[0]==4 and lo<m.kernel_sequence<hi]
+        ends=[m for m in self.mark('operation_end',before.pid) if m.birth==before.birth and
+            m.values[0]==4 and lo<m.kernel_sequence<hi]
+        physical.need(len(starts)==len(ends)==1 and
+            lo<self._seq(before)<starts[0].kernel_sequence<ends[0].kernel_sequence<self._seq(after)<hi and
+            starts[0].values[1]==operation.get('donor_fd') and
+            ends[0].values[1:]==(declared,operation['donor_fd']),
+            'EXACT_OS_DUP_OPERATION_ARGUMENT_INTERVAL')
+        intervals=[r for r in self.run.operations if r['pid']==before.pid and r['birth']==before.birth and
+            r['operation']==4 and r['entry_sequence']==starts[0].kernel_sequence and
+            r['return_sequence']==ends[0].kernel_sequence]
+        physical.need(len(intervals)==1,'EXACT_INDEPENDENT_DUPLICATE_FD_INTERVAL_MISSING')
+        abi=self.run.registration.get('duplicate_fd_native_abi')
+        physical.need(type(abi)is dict and abi.get('machine')=='x86_64' and
+            abi.get('function')=='os.dup' and abi.get('dup_syscall')==32 and
+            abi.get('fcntl_syscall')==72 and abi.get('F_DUPFD_CLOEXEC')==1030 and
+            abi.get('minimum_fd')==0,'PINNED_NATIVE_OS_DUP_ABI_UNBOUND')
+        pins=[abi.get(k) for k in ('python_pin','implementation_pin','fcntl_header_pin')]
+        physical.need(all(type(p)is dict and p in self.run.registration['exact_abi_pins'] for p in pins),
+            'EXACT_DUPLICATE_ABI_SOURCE_PINS_REQUIRED')
+        for pin in pins:physical.same_read_source(pin)
+        selected=self.events(pid=before.pid,lo=starts[0].kernel_sequence,hi=ends[0].kernel_sequence)
+        duplicates=[e for e in selected if e.birth==before.birth and
+            (e.syscall in (32,33,292) or e.syscall==72 and e.arguments[1] in (0,1030))]
+        physical.need(len(duplicates)==1,'ONE_EXACT_DUPLICATE_FD_SYSCALL_REQUIRED')
+        event=duplicates[0]
+        physical.need((event.syscall==32 or event.syscall==72 and
+            event.arguments[1:3]==(abi['F_DUPFD_CLOEXEC'],abi['minimum_fd'])) and
+            event.arguments[0]==operation['donor_fd'] and event.result==declared and
+            type(event.fd_before)is physical.FDRead and type(event.fd_after)is physical.FDRead,
+            'EXACT_SUBJECT_LOCAL_UNKNOWN_DUP_RESULT_MISSING')
+        entry=[e for e in self.events(pid=before.pid,lo=starts[0].kernel_sequence,
+            hi=event.sequence,stage='entry') if e.birth==before.birth and
+            e.syscall==event.syscall and e.arguments==event.arguments]
+        physical.need(len(entry)==1 and event.actual_process_sample is not None,
+            'EXACT_RAW_DUP_ENTRY_EXIT_AND_SUBJECT_REQUIRED')
+        process=event.actual_process_sample['process'];actual=event.fd_after
+        from pathlib import Path
+        executable=Path(abi['python_pin']['path']).stat()
+        physical.need(event.actual_process_sample.get('native_executable_identity')==
+            (executable.st_dev,executable.st_ino,executable.st_size,executable.st_mtime_ns),
+            'ACTUAL_DUP_NATIVE_EXECUTABLE_INODE_PIN')
+        namespace=lambda p:tuple(tuple(line.split()[1:]) for line in p.status_raw.splitlines() if line.startswith('NSpid:'))
+        physical.need(process.pid==before.pid and process.birth==before.birth and
+            process.exe==abi['python_pin']['path'] and namespace(process)==namespace(before.process)==namespace(after.process) and
+            len(namespace(process))==1 and namespace(process)[0] and
+            actual.pid==before.pid and actual.birth==before.birth and actual.fd==declared and
+            event.fd_before.pid==before.pid and event.fd_before.birth==before.birth and
+            event.fd_before.fd==operation['donor_fd'] and event.fd_before.identity==actual.identity and
+            any(read.fd==operation['donor_fd'] and read.identity==actual.identity for read in before.all_fd_reads) and
+            all(read.fd!=declared for read in before.all_fd_reads) and
+            any(read.fd==declared and read.identity==actual.identity and read.flags&os.O_CLOEXEC for read in after.all_fd_reads) and
+            all(row['fd']!=declared for row in self.registry(before)['fds']),
+            'INDEPENDENT_EXACT_UNKNOWN_FD_BIRTH_IDENTITY_NAMESPACE')
+        return event,actual
+
+    def unknown_adoption_or_close_calls(self):
+        born,actual=self.created_unknown_fd()
+        closes=[event for event in self.events(3,actual.pid,lo=born.sequence,stage='entry')
+            if event.birth==actual.birth and event.arguments[0]==actual.fd]
+        physical.need(all(type(event.fd_before)is physical.FDRead and
+            event.fd_before.identity==actual.identity for event in closes),
+            'UNKNOWN_FD_CLOSE_LIFETIME_AMBIGUOUS')
+        adopted=[]
+        for boundary,row in self.role_rows():
+            if boundary.pid==actual.pid and boundary.birth==actual.birth and self._seq(boundary)>born.sequence and row['fd']==actual.fd:
+                physical.need(row.get('identity') is not None and tuple(row['identity'])==actual.identity,
+                    'UNKNOWN_FD_ADOPTION_IDENTITY_UNCONFIRMED')
+                adopted.append((boundary,row))
+        return len(closes)+int(bool(adopted))
+    def valid_aux(self):
+        rows=self.aux_rows();physical.need(rows,'REAL_NONEMPTY_AUX_INVENTORY_MISSING')
+        for phase,key,row,local,remote in rows:
+            identity=row['output_identity'] if key=='auxiliary_outputs' else row['identity']
+            expected=(row['directory_policy'] if key=='auxiliary_groups' else
+                      row['owner_policy'] if key=='auxiliary_fds' else row['parent_capability']['policy'])
+            actual=remote if key=='auxiliary_outputs' else local
+            physical.need(actual.identity[:2]==tuple(identity[:2]) if key!='auxiliary_outputs' else
+                actual.identity[:2]==tuple(row['parent_capability']['identity']), 'AUX_REAL_IDENTITY_DIFFERS')
+            physical.need(actual.policy()==expected and row['ownership']['identity']==list(remote.identity),
+                          'AUX_REAL_POLICY_REMOTE_OWNERSHIP_DIFFERS')
+        return self.proof('actual_local_remote_aux_identity_policy',True)
+    def normal_aux_closure(self):
+        rows=self.aux_rows();physical.need(rows,'REAL_AUX_CLOSURE_SCOPE_EMPTY')
+        for phase,key,row,local,remote in rows:
+            lo,hi=self.scope(phase)
+            physical.need(len(self.closes(local.fd,self.root,local.identity,lo,hi))==1,
+                          'AUX_LOCAL_EXACT_ONCE_CLOSE_MISSING')
+            if key=='auxiliary_groups':
+                physical.need(any(e.result==0 and e.path==row['path'] for e in self.events(84,self.root,lo,hi)),
+                              'AUX_REAL_GROUP_REMOVE_MISSING')
+            if key=='auxiliary_outputs':
+                physical.need(any(e.result==0 and e.path==os.path.dirname(row['record'])
+                    and e.arguments[1]==0 for e in self.events(166,self.root,lo,hi)), 'AUX_NORMAL_UMOUNT_MISSING')
+        return self.proof('all_real_aux_close_remove_umount',True)
+    def zero(self):
+        counts=base.prefix_counts(self.run)
+        physical.need(all(v==0 for v in counts.values()),'GENUINE_TOTAL_PREFIX_NOT_ZERO')
+        return counts
+    def stopped(self):
+        rows=self.states(16)
+        physical.need(rows and self.mark('STOP'),'GENUINE_SOURCE_STOP_MISSING')
+        physical.need(any(self.registry(b).get('STOP_UNCONFIRMED') is True for b in rows),
+                      'GENUINE_RETAINED_STOP_REGISTRY_MISSING')
+        return True
+    def caller_slot(self,terminal=False):
+        names=('attempt_end','original_caller_terminal') if terminal else ('attempt_begin',)
+        rows=[b for b in self.run.boundaries if b.name in names]
+        physical.need(rows and all(b.original_slot is not None for b in rows),
+                      'ACTUAL_ORIGINAL_CALLER_FLOCK_NOT_RETAINED')
+        return self.proof('actual_original_slot_FLOCK_retained',True)
+    def all23_good(self):return base._good_preflight(self.run)
+    def role_rows(self):
+        result=[]
+        for b in self.states():
+            s=self.registry(b)
+            if 'fds' in s:
+                for row in s['fds']:result.append((b,row))
+        physical.need(result,'ACTUAL_SOURCE_CONSUMER_ROLE_ROWS_MISSING')
+        return result
+
+class Observation(Mapping):
+    def __init__(self,run,fields):self.run=run;self.fields=fields
+    def __iter__(self):return iter(self.fields)
+    def __len__(self):return len(self.fields)
+    def __getitem__(self,name):
+        physical.need(name in self.fields,'INTRINSIC_REDUCER_FIELD_NOT_DEFINED:'+name)
+        value=self.fields[name]
+        return value() if callable(value) else value
+
+class Original32Observation(Observation):
+    def __init__(self,run,case_id):
+        f=LiveFacts(run);reg=run.registration
+        rows=[r for r in CASES if r[0]==case_id];physical.need(len(rows)==1,'EXACT_ORIGINAL32_CAUSE')
+        _,kind,assertion,cause=rows[0];lo,hi=f.scope(case_id)
+        events=f.events(lo=lo,hi=hi)
+        entries=f.events(lo=lo,hi=hi,stage='entry')
+        root_waits=f.raw_waits(f.root,lo,hi)
+        umounts=[e for e in events if e.syscall==166 and e.result==0 and e.arguments[1]==0]
+        removes=[e for e in events if e.syscall==84 and e.result==0]
+        clones=[e for e in events if e.syscall in (56,57,58,435)]
+        reads=lambda name:f.group_values(name,lo,hi)
+        kernel0=lambda:reads('pids.current')[-1]=='0' and 'populated 0' in reads('cgroup.events')[-1]
+        entry_rows=[b for b in f.states(13,f.root) if b.semantic_read['state']['case_id']==
+                    ('K120_FIRST_BIRTH_RESERVATION' if kind=='positive' else case_id)]
+        physical.need(len(entry_rows)==1,'CURRENT_ACTUAL_ORIGINAL_ENTRY_READ_MISSING')
+        actual=entry_rows[0].semantic_read['state']
+        # Ptrace timestamps independently bracket the actual Source clock read.
+        clock=reg['original_clock_identity']
+        physical.need(actual['clock_start_m']==clock['started_at_monotonic'] and
+            actual['clock_start_u']==clock['started_at_unix'] and actual['original_seconds']==120
+            and actual['cleanup_seconds']==30,'CURRENT_ORIGINAL_CLOCK_MISMATCH')
+        proof=lambda name,p:f.proof(name,p,tuple(e.sequence for e in events))
+        fields={
+          'case_id':case_id,'actual_Root_independent_trace_ref':run.raw_ref,
+          'Root_control_fixture_independent_Source_acceptance_ref':reg['source_safety_ref'],
+          'Root_control_authorization_ref':reg['specific_action_ref'],
+          'original_clock_ref':actual['original_clock_ref'],
+          'Root_expected_original_clock_ref':actual['Root_expected_original_clock_ref'],
+          'clock_reset':run.counter_resets!=0,'old_clock_or_Source_credit_transferred':False,
+          'simulated':False,'unknown_as_zero':False,
+          'protected_writer_controller_changes':lambda:0 if f.protected() else 1,
+          'native_genuine_receipt_or_install_calls':lambda:len([e for e in events if e.syscall in (59,322)
+                and e.path not in reg['admitted_current_executable_paths']]),
+          'capacity_release_before_Root_wait_kernel_mount_FD_closure':False,
+          'candidate_independent_exact_Source_acceptance_ref':reg['source_safety_ref'],
+          'candidate_actual_specific_action_admission_ref':reg['specific_action_ref'],
+          'intended_cause':cause,'actual_operation_ref':lambda:_original_operation_proof(f,case_id,events,entries),
+          'raw_kernel_observations_ref':run.raw_ref,'unrelated_error_as_pass':False,
+          'actual_Root_stock_wait_ref':lambda:proof('actual_Root_owned_raw_wait',bool(root_waits)),
+          'fresh_exact_stock_actor_absence_ref':lambda:proof('raw_waited_descendant_terminals',
+                bool(root_waits) and all(any(t[0]==w.result for t in run.terminals) for w in root_waits)),
+          'actual_Root_after_wait_kernel_pids_current':lambda:int(reads('pids.current')[-1]),
+          'actual_Root_after_wait_kernel_populated':lambda:int(dict(x.split() for x in reads('cgroup.events')[-1].splitlines())['populated']),
+          'normal_empty_group_removal_ref':lambda:proof('kernel0_then_normal_rmdir',kernel0() and bool(removes)),
+          'normal_umount_and_fresh_mount_absence_ref':lambda:proof('normal_umount_success_and_kernel_mount_absence',
+                bool(umounts) and any(not any(m['path']==umounts[-1].path for m in b.phase_inventory['all_mounts'])
+                for b in run.boundaries if b.phase_inventory is not None and f._seq(b)>umounts[-1].sequence)),
+          'known_Root_FD_close_once_ref':lambda:proof('actual_closed_phase_registry',
+                any(f.verified_registry(b) for b in f.states(4,f.root) if lo<f._seq(b)<=hi+2)),
+          'fallback_or_retry_count':lambda:sum(len([x for x in clones if x.syscall==e.syscall])-1 for e in clones if e.result<0),
+          'actual_first_birth_call_count':len([e for e in entries if e.syscall in (56,57,58,435)]),
+          'actual_Root_no_child_and_private_group_unchanged_ref':lambda:proof('no_actual_birth_private_kernel0',not clones and kernel0()),
+          'actual_Root_fresh_private_kernel0_ref':lambda:proof('fresh_real_private_kernel0',kernel0()),
+          'actual_clone3_syscall_result':lambda:next(e.result for e in clones if e.syscall==435),
+          'actual_kernel_errno':lambda:-next(e.result for e in clones if e.syscall==435 and e.result<0),
+          'actual_refusal_trace_ref':lambda:proof('actual_typed_cause_refusal',
+                any(m.values[0]>0 and markers.REFUSALS[m.values[0]-1]==case_id[5:]
+                    for m in f.mark('refusal',f.root) if lo<m.kernel_sequence<hi)),
+          'actual_operation_before_source_uncertainty_ref':lambda:_exact_four_cut_operation(f,case_id),
+          'Source_injected_EIO_as_kernel_EIO_credit':False,
+          'same_actor_slot_group_handle_custody_retained':lambda:bool(f.caller_slot()),
+          'retry_close_or_respawn_count':lambda:sum(1 for b,r in f.role_rows() if r.get('close_ambiguous') and r.get('closed')),
+          'guard_deadline_renewed_from_now':False,
+          'accepted_original_clock_elapsed_at_entry':actual['accepted_original_clock_elapsed_at_entry'],
+          'original_final_monotonic':actual['original_final_m'],'original_final_unix':actual['original_final_u'],
+          'actual_terminal_unix':lambda:max(e.unix for e in root_waits),
+          'actual_Root_fresh_kernel_mount_FD_closure_unix':lambda:max(e.unix for e in events if e.syscall in (3,84,166) and e.result==0),
+          'actual_existing_guardian_kernel_birth_expiry_ref':lambda:proof('actual_original_guardian_timer',
+                any(e.syscall==286 and e.result==0 and e.raw_input is not None for e in events)),
+          'actual_guardian_expiry_by_kernel_birth':lambda:min(
+                struct.unpack('<qqqq',e.raw_input)[2]+struct.unpack('<qqqq',e.raw_input)[3]/1e9
+                for e in events if e.syscall==286 and e.result==0 and e.raw_input is not None and e.arguments[1]&1),
+        }
+        first=[e for e in clones if e.syscall==435 and e.result>0 and type(e.fd_before)is physical.FDRead]
+        fields.update(
+          raw_first_birth_group_inode=lambda:list(first[0].fd_before.identity[:2]),
+          Root_retained_group_inode=lambda:run.case.root_caps['ALL_SAFE']['first_birth_group_identity'],
+          post_birth_cgroup_procs_writes=lambda:sum(e.syscall==1 and type(e.fd_before)is physical.FDRead
+                and e.fd_before.link.endswith('/cgroup.procs') for e in entries),
+          raw_controller_values_before_first_effect=lambda:{name:next(e.raw_output.decode().strip()
+                for e in f.physical_group_reads(name,lo,first[0].sequence))
+                for name in ('memory.max','memory.swap.max','pids.max','cpu.max')},
+          actual_fork_child_wait_fresh_absent=lambda:bool(_exact_task_operation(f,1)),
+          actual_thread_joined=lambda:all(any(t[0]==e.arguments[0] for t in run.terminals)
+                for e in run.kernel if e.stage=='actual_birth' and lo<e.sequence<hi),
+          bootstrap_child_and_TID_group_inodes_match=lambda:bool(first) and
+                all(tuple(e.actual_process_sample['group_identity'])==first[0].fd_before.identity[:2]
+                    for e in events if e.actual_process_sample is not None),
+          actual_top_level_import_input_sha=lambda:reg['opaque_import_pin']['sha256']
+                if any(e.path==reg['opaque_import_pin']['path'] and e.syscall in (2,257) and e.result>=0 for e in events) else None,
+          Root_bound_opaque_import_sha=reg['opaque_import_pin']['sha256'],
+          actual_top_level_child_and_thread_kernel_trace_ref=lambda:_exact_task_operation(f,2),
+          production_C41_opaque_gate_credit_transferred=False,
+          raw_kernel_peak_tasks=lambda:max(map(int,reads('pids.current'))),
+          raw_pids_events_max_before=lambda:int(dict(x.split() for x in reads('pids.events')[0].splitlines())['max']),
+          raw_pids_events_max_after=lambda:int(dict(x.split() for x in reads('pids.events')[-1].splitlines())['max']),
+          all_known_stress_threads_joined=lambda:all(any(t[0]==p for t in run.terminals) for p,(birth,role) in run.known_subjects.items() if role=='owned_descendant'),
+          actual_thread_stack_bytes=lambda:next(e.arguments[1] for e in entries if e.syscall==9 and e.arguments[1]==262144),
+          actual_allocator_max_arenas=lambda:1 if f.allocator() else _missing_physical('ACTUAL_ALLOCATOR_CALL_MISSING'),
+          actual_stack_allocator_config_before_first_thread_ref=lambda:proof('stack_and_allocator_before_first_thread',
+                any(e.syscall==9 and e.arguments[1]==262144 for e in entries) and
+                bool(f.allocator())),
+          actual_stress_virtual_bytes=lambda:max(int(line.split()[1])*1024 for e in events if e.actual_process_sample is not None
+                for line in e.actual_process_sample['process'].status_raw.splitlines() if line.startswith('VmSize:')),
+          unrelated_AS_exhaustion_as_controller_credit=False,
+          actual_write_open_denial_errnos=lambda:[-e.result for e in events if e.syscall in (2,257) and e.result in (-13,-30)
+                and e.path and e.path.startswith('/sys/fs/cgroup/')],
+          controller_write_syscalls=lambda:sum(e.syscall==1 and type(e.fd_before)is physical.FDRead and
+                e.fd_before.link.startswith('/sys/fs/cgroup/') for e in entries),
+          actual_byte_errno=lambda:28 if any(e.syscall==1 and e.result==-28 for e in events) else None,
+          actual_inode_errno=lambda:28 if any(e.syscall in (2,257) and e.result==-28 for e in events) else None,
+          raw_tmpfs_free_blocks_at_refusal=lambda:min(struct.unpack('<15q',e.raw_output)[4] for e in events if e.syscall in (137,138) and e.result==0 and e.raw_output),
+          raw_tmpfs_free_inodes_at_refusal=lambda:min(struct.unpack('<15q',e.raw_output)[6] for e in events if e.syscall in (137,138) and e.result==0 and e.raw_output),
+          actual_lifetime_probe_write_bytes=lambda:sum(e.result for e in events if e.syscall==1 and e.result>0 and type(e.fd_before)is physical.FDRead and '/bytes-' in e.fd_before.link),
+          actual_positive_short_write_count=lambda:sum(0<e.result<e.arguments[2] for e in events if e.syscall==1),
+          actual_unaligned_tmpfs_before_write_ref=lambda:proof('actual_unaligned_tmpfs_statfs',any(e.syscall in (137,138) and e.raw_output and struct.unpack('<15q',e.raw_output)[4]*struct.unpack('<15q',e.raw_output)[1]%1048576 for e in events)),
+          actual_partial_write_then_real_ENOSPC_ref=lambda:proof('real_short_write_then_kernel_ENOSPC',any(e.syscall==1 and e.result==-28 for e in events) and any(e.syscall==1 and 0<e.result<e.arguments[2] for e in events)),
+          ValueError_or_zero_write_as_quota_credit=False,
+          actual_quota_write_syscall_count=lambda:sum(e.syscall==1 and type(e.fd_before)is physical.FDRead and '/bytes-' in e.fd_before.link for e in entries),
+          occupancy_as_unbounded_cumulative_IO_credit=False,
+          actual_unreaped_child_state=lambda:'Z' if any(p.state=='Z' for e in entries for p in e.actual_wait_targets) else None,
+          zombie_live_remote_probe_calls=lambda:sum(e.syscall in (2,257) and e.path is not None and '/fd/' in e.path
+                for e in entries if any(p.state=='Z' for p in e.actual_wait_targets)),
+          actual_direct_and_adopted_wait_fresh_absence_ref=lambda:proof('real_direct_adopted_wait',len(f.raw_waits(lo=lo,hi=hi))>=3),
+          kernel0_sample_monotonic=lambda:max(e.monotonic for e in f.physical_group_reads('pids.current',lo,hi) if e.raw_output.strip()==b'0'),
+          actual_Root_stock_wait_monotonic=lambda:min(e.monotonic for e in root_waits),
+          private_group_removed_in_actor_before_Root_wait=lambda:any(e.syscall==84 and e.pid!=f.root and e.monotonic<min(w.monotonic for w in root_waits) for e in events),
+          normal_umount_flags=lambda:umounts[-1].arguments[1],
+          all_owned_output_FDs_closed_before_umount=lambda:bool(umounts) and all(
+                len(f.closes(fd,lo=lo,hi=umounts[-1].sequence))>=1 for fd,identity in run.case.root_caps['ALL_SAFE']['output_owned_fds']),
+          lazy_detach_count=lambda:sum(e.syscall==166 and e.arguments[1]!=0 for e in entries),
+          protected_writer_birth_pairs_before=lambda:[list(r[:2]) for r in base._bounds(run,'attempt_begin')[0].protected_reads if type(r[0])is int],
+          protected_writer_birth_pairs_after=lambda:[list(r[:2]) for r in base._bounds(run,'attempt_end')[-1].protected_reads if type(r[0])is int],
+          protected_group_inodes_and_controllers_before=lambda:[r for r in base._bounds(run,'attempt_begin')[0].protected_reads if type(r[0])is str],
+          protected_group_inodes_and_controllers_after=lambda:[r for r in base._bounds(run,'attempt_end')[-1].protected_reads if type(r[0])is str],
+        )
+        super().__init__(run,fields)
+
+def project_original32(run):
+    return {case_id:Original32Observation(run,case_id) for case_id,kind,name,cause in CASES}
+
+
+class LegacyObservation(Observation):
+    def __init__(self,run):
+        f=LiveFacts(run);case=run.case;reg=run.registration;delta=case.declared_delta
+        suffix=case.mutation
+        def proof(name,predicate):return f.proof(name,predicate)
+        def actual_rows():return f.aux_rows()
+        def changes():
+            before=delta.get('before');after=delta.get('after')
+            physical.need(before is not None and after is not None,'ACTUAL_CAUSAL_DECLARATION_PAIR_MISSING')
+            return before,after
+        def wanted_row():
+            physical.need('after' in delta,'EXACT_BAD_ROW_MISSING');return delta['after']
+        def identity(role):
+            rows=[(b,r) for b,r in f.role_rows() if custody_source.canonical_role(r['label'])==role]
+            physical.need(rows,'ACTUAL_ROLE_ROW_MISSING:'+role)
+            return rows
+        def pair():
+            rows=actual_rows();physical.need(rows,'ACTUAL_AUX_PAIR_MISSING');return rows[-1]
+        def alias():
+            rows=actual_rows()
+            physical.need(len(rows)>=2,'ACTUAL_ALIAS_PAIR_MISSING')
+            a,b=rows[-2:]
+            physical.need(a[3].identity[:2]==b[3].identity[:2],'DECLARED_ALIAS_NOT_REAL')
+            return proof('actual_distinct_fd_same_inode_alias',a[3].fd!=b[3].fd)
+        def physical_close_errors():return tuple(e for e in f.events(3) if e.result<0)
+        def state_closures(kind=4):
+            rows=f.states(kind,f.root);physical.need(rows,'ACTUAL_NORMAL_STATE_CLOSURE_MISSING')
+            return tuple(f.verified_registry(b) for b in rows)
+        def once_parents():
+            initial=base._bounds(run,'attempt_begin',f.caller)
+            terminal=f.states(15,f.caller)
+            physical.need(len(initial)==len(terminal)==1,'EXACT_ORIGINAL_CALLER_PARENT_TERMINAL_INTERVAL')
+            lo=f._seq(initial[0]);hi=f._seq(terminal[0])
+            before={r.fd:r for r in initial[0].caller_fd_reads}
+            rows=[r for r in f.registry(terminal[0])['fds'] if custody_source.canonical_role(r['label']) in ('private_parent','group_parent')]
+            physical.need(rows,'COMPLETE_ORIGINAL_CALLER_PARENT_ROWS')
+            return all(r['closed'] and r['fd'] in before and before[r['fd']].identity==tuple(r['identity']) and
+                len(f.closes(r['fd'],f.caller,r['identity'],lo,hi))==1 for r in rows)
+        def scan(pid=None):
+            enter=f.mark('scan_dirfd',pid);leave=f.mark('scan_leave',pid)
+            physical.need(enter and leave,'ACTUAL_SOURCE_SCAN_DIRFD_RETURN_MISSING')
+            records=[]
+            for start in enter:
+                ends=[m for m in leave if m.pid==start.pid and m.values[0]==start.values[0]
+                      and m.kernel_sequence>start.kernel_sequence]
+                physical.need(ends,'ACTUAL_SOURCE_CLOSEDIR_RETURN_MISSING')
+                lo,hi=start.kernel_sequence,ends[0].kernel_sequence
+                closes=[e for e in f.events(3,start.pid,lo,hi) if e.arguments[0]==start.values[0]]
+                dents=[e for e in f.events(217,start.pid,lo,hi) if e.arguments[0]==start.values[0]]
+                physical.need(len(closes)==1 and closes[0].result==0 and dents,
+                              'KERNEL_GETDENTS_CLOSEDIR_EXACT_ONCE_MISSING')
+                records.append((start,ends[0],closes[0],dents))
+            return tuple(records)
+        def known_child_closes():
+            rows=[]
+            for b in f.states(8):
+                state=b.semantic_read['state'];keep=set(state['keep'])
+                for row in state['custody']['fds']:
+                    if not row['closed'] and row['fd'] not in keep:
+                        rows.append((b,row))
+            return rows
+        fields={
+          'control_id':case.control_id,'independent_final_source_acceptance_ref':reg['source_safety_ref'],
+          'specific_current_action_admission_ref':reg['specific_action_ref'],
+          'independent_raw_root_trace_ref':run.raw_ref,'exact_current_complete_source_pins_ref':reg['complete_source_pins_ref'],
+          'simulated':False,'unknown_as_zero':False,'clock_reset':run.counter_resets!=0,
+          'original_seconds':reg['original_seconds'],'cleanup_seconds':reg['cleanup_seconds'],
+          'actual_hard_caps':lambda:base._actual_caps(run),
+          'original_protected_writers_and_controllers_unchanged_raw_ref':lambda:proof('protected_birth_group_controllers',f.protected()),
+          'fallback_or_retry_count':0,'expected_refusal':case.expected_refusal,
+          'actual_code_matches_expected_exact':lambda:base._code(run)==case.expected_refusal,
+          'TOTAL_prefix_effect_counts':lambda:f.zero(),
+          'actual_original_caller_slot_and_caps_unchanged_raw_ref':lambda:base._preserved(run),
+          'capacity_release':False,'unrelated_error_as_pass':False,
+          'STOP_UNCONFIRMED':lambda:f.stopped(),
+          'close_retry_count':lambda:sum(len([x for x in f.events(3,e.pid) if x.arguments[0]==e.arguments[0]
+                    and x.sequence>e.sequence]) for e in physical_close_errors()),
+          'actual_external_original_slot_FLOCK_and_caps_retained_ref':lambda:f.caller_slot(True),
+          'next_phase_or_second_launch_after_refusal_count':lambda:sum(m.event in ('phase_begin','first_birth')
+                and m.kernel_sequence>f.mark('refusal')[-1].kernel_sequence for m in run.markers),
+          'STOP_as_normal_complete_credit':False,
+          'producer_consumer_roles':lambda:{r:next(row['label'] for b,row in identity(r+'_directory')) for r in ('control','trace')},
+          'first_phase_preflight_passed':lambda:bool(f.all23_good()),
+          'semantic_relabels':lambda:sum(len({custody_source.canonical_role(r['label']) for b,r in f.role_rows()
+                if r['fd']==row['fd'] and r['identity']==row['identity']})-1 for b,row in f.role_rows()),
+          'actual_distinct_control_trace_fstat_ref':lambda:proof('control_trace_distinct_actual_inodes',
+                identity('control_directory')[0][1]['identity']!=identity('trace_directory')[0][1]['identity']),
+          'actual_role_pairs':lambda:[[custody_source.canonical_role(row['label'])]*2 for role in
+                ('stock_pidfd','actor_pidfd','actor_ready:read','actor_GO:write') for b,row in identity(role)[:1]],
+          'one_active_row_per_fd':lambda:all(len({r['fd'] for r in f.registry(b)['fds'] if not r['closed']})==
+                len([r for r in f.registry(b)['fds'] if not r['closed']]) for b in f.states() if 'fds' in f.registry(b)),
+          'arm_before_GO_raw_ref':lambda:proof('real_absolute_timer_arm_before_GO_write',
+                any(e.syscall==286 and e.result==0 and e.raw_input and e.sequence<g.sequence
+                    for e in f.events() for g in f.events(1) if g.raw_input==b'G')),
+          'actual_producer_role':lambda:custody_source.canonical_role(identity('post_terminal_helper_pidfd')[0][1]['label']),
+          'actual_consumer_role':lambda:custody_source.canonical_role(identity('post_terminal_helper_pidfd')[-1][1]['label']),
+          'exact_direct_helper_raw_wait_ref':lambda:proof('real_root_direct_helper_wait',bool(f.raw_waits(f.root))),
+          'fresh_helper_birth_absence_ref':lambda:proof('raw_wait_terminal_fresh_helper_absence',
+                all(not physical.exact_presence_read(e.result,run.known_subjects[e.result][0]).same_birth
+                    for e in f.raw_waits(f.root) if e.result in run.known_subjects)),
+          'completed_phase_count':lambda:len(state_closures()[0]['completed_phases']),
+          'future_phase_count':lambda:23-len(state_closures()[0]['completed_phases']),
+          'current_phase_all_effect_fds_closed_once':lambda:all(r['closed'] and not r.get('close_ambiguous') for r in state_closures()[0]['fds'] if r.get('phase')==case.phase_order[0]),
+          'all_future_original_fstat_identities_unchanged':lambda:all(f.row_physically_live(f.state(4,f.root,last=False),r)
+                for r in state_closures()[0]['fds'] if r.get('lifetime')=='phase' and r.get('phase') not in state_closures()[0]['completed_phases']),
+          'future_fd_close_calls':lambda:sum(bool(f.closes(r['fd'],f.root,r.get('identity'),hi=f._seq(f.state(4,f.root,last=False))))
+                for r in state_closures()[0]['fds'] if r.get('phase') not in state_closures()[0]['completed_phases'] and r.get('lifetime')=='phase'),
+          'batch_fd_close_calls':lambda:sum(bool(f.closes(r['fd'],f.root,r.get('identity'),hi=f._seq(f.state(4,f.root,last=False))))
+                for r in state_closures()[0]['fds'] if r.get('lifetime')=='batch'),
+          'phase_order_prefix_matches_exact_plan':lambda:all(s['completed_phases']==list(case.phase_order[:len(s['completed_phases'])]) for s in state_closures()),
+          'first_phase_actual_closure_ref':lambda:proof('actual_first_phase_registry_kernel_closure',bool(state_closures())),
+          'next_begin_after_previous_complete':lambda:all(a.kernel_sequence<b.kernel_sequence for a,b in
+                zip(f.mark('phase_closed',f.root),f.mark('phase_begin',f.root)[1:])),
+          'phase_replay_count':lambda:len(f.mark('phase_begin',f.root))-len({m.values[0] for m in f.mark('phase_begin',f.root)}),
+          'actual_completed_phase_ids':lambda:f.completed(),'exact_23_phase_order':list(case.phase_order),
+          'batch_control_parent_guardian_refs_closed_once':lambda:all(f.closed_once(r,f.root) for r in f.final_root_state()['fds'] if r.get('lifetime')=='batch'),
+          'CLI_slot_duplicate_closed_last':lambda:f.events(3,f.root)[-1].arguments[0]==run.registration['root_slot_duplicate_fd'],
+          'external_original_slot_still_FLOCK_ref':lambda:f.caller_slot(True),
+          'unknown_or_ambiguous_live_rows':lambda:sum(not r['closed'] or bool(r.get('close_ambiguous')) for r in f.final_root_state()['fds']),
+          'distinct_owned_group_output_borrowed_actual_refs':lambda:f.valid_aux(),
+          'global_semantic_preflight_before_first_bind_ref':lambda:f.all23_good(),
+          'all_auxiliary_once_only_normal_cleanup_raw_ref':lambda:f.normal_aux_closure(),
+          'reserved_fd_close_calls':lambda:sum(e.arguments[0] in reg['protected_reserved_fds'] for e in f.events(3,f.root)),
+          'protected_scope_remove_calls':lambda:sum(e.path in {g['path'] for g in reg['protected_groups']} for e in f.events(84)),
+          'share_contract':lambda:[pair()[2].get('shared_purpose'),pair()[2].get('shared_lifetime')],
+          'distinct_local_and_caller_FDs':lambda:all(local.fd!=remote.fd for p,k,row,local,remote in actual_rows() if k=='auxiliary_fds'),
+          'same_borrowed_inode_actual_ref':lambda:alias(),
+          'each_phase_local_duplicate_closed_once':lambda:all(len(f.closes(local.fd,f.root,local.identity))==1 for p,k,row,local,remote in actual_rows() if k=='auxiliary_fds'),
+          'borrowed_group_remove_calls':lambda:sum(e.path==local.link for e in f.events(84) for p,k,row,local,remote in actual_rows() if k=='auxiliary_fds'),
+          'actual_requested_roles':lambda:[row['label'] for b,row in identity('control_directory')[:1]+identity('trace_directory')[:1]],
+          'requested_stock_role':suffix=='STOCK_AS_ACTOR_REFUSED' and 'actor_pidfd',
+          'requested_helper_role':suffix=='HELPER_AS_STOCK_REFUSED' and 'stock_pidfd',
+          'requested_ready_role':suffix=='READY_AS_GO_REFUSED' and 'actor_GO:write',
+          'refused_rebind_label_change_count':lambda:sum(len({r['label'] for b,r in f.role_rows() if r['fd']==row['fd'] and r['identity']==row['identity']})-1 for b,row in f.role_rows()),
+          'same_fd_two_phase_ids':lambda:len({phase for phase,cap,actual in f.trace_rows()
+              if actual.fd==case.root_caps[case.last_phase]['trace_dir_fd']})==2,
+          'distinct_fds_same_trace_inode_raw_ref':lambda:proof('actual_two_trace_fds_same_inode',
+                len({r.fd for b in base._bounds(run,'attempt_begin',f.root) for r in b.all_fd_reads if r.identity==
+                    next(r.identity for r in b.all_fd_reads if r.fd==case.root_caps[case.last_phase]['trace_dir_fd'])})>=2),
+          'local_fds':lambda:[r[3].fd for r in actual_rows()[-2:]],'caller_fds':lambda:[r[4].fd for r in actual_rows()[-2:]],
+          'same_group_path_dev_inode_raw_ref':lambda:alias(),
+          'distinct_caller_duplicates_same_owned_inode_raw_ref':lambda:proof('distinct_real_caller_duplicate_owned_inode',
+                actual_rows()[-1][4].identity==actual_rows()[-2][4].identity and actual_rows()[-1][4].fd!=actual_rows()[-2][4].fd),
+          'caller_role_bind_calls':lambda:sum(m.pid==f.caller for m in f.mark('bind_existing')),
+          'caller_context_holder_mutations':lambda:base._count_marks(run,'holder_mutation'),
+          'phase_ids':lambda:[r[0] for r in actual_rows()[-2:]],
+          'same_owned_inode_across_phase_plans_raw_ref':lambda:alias(),
+          'distinct_output_FDs_same_mount_identity_raw_ref':lambda:proof('real_same_mount_distinct_output_fds',actual_rows()[-1][3].mount_id==actual_rows()[-2][3].mount_id and actual_rows()[-1][3].fd!=actual_rows()[-2][3].fd),
+          'distinct_fds_same_borrowed_owned_inode_raw_ref':lambda:alias(),
+          'borrowed_fd_same_output_file_inode_raw_ref':lambda:alias(),
+          'share_contract_present':lambda:(wanted_row().get('shared_purpose'),wanted_row().get('shared_lifetime'))==
+              ('read_only_original_caller_capability','distinct_phase_local_duplicates'),
+          'actual_duplicate_inode_ref':lambda:alias(),
+          'different_FD_same_reserved_inode_raw_ref':lambda:proof('real_aux_reserved_inode_alias',any(local.fd!=r.fd and local.identity==r.identity for p,k,row,local,remote in actual_rows() for r in f.aux_inventory().all_fd_reads if r.fd in reg['protected_reserved_fds'])),
+          'bad_row_position':'LAST','earlier_distinct_valid_rows':lambda:len({m.values[0] for m in f.mark('phase_inventory_valid')}),
+          'whole_all_phase_inventory_observed_ref':lambda:proof('all23_actual_phase_inventory',len(f.aux_inventory().phase_inventory['phases'])==23),
+          'TOTAL_earlier_valid_row_bind_remove_close_umount_calls':lambda:sum(f.zero().values()),
+          'actual_distinct_FDs_same_clean_group_inode_ref':lambda:alias(),
+          'same_FD_owned_and_borrowed_roles':lambda:any(a[3].fd==b[3].fd and a[1]!=b[1] for a in actual_rows() for b in actual_rows()),
+          'declared_phase_auxiliary_handles':lambda:len(delta['actual_handles']),
+          'actual_future_fstat_EBADF_ref':lambda:proof('real_future_fstat_EBADF',any(e.syscall in (5,262) and e.result==-9 for e in f.events())),
+          'next_phase_begin_calls':lambda:sum(m.kernel_sequence>f.mark('refusal')[-1].kernel_sequence for m in f.mark('phase_begin')),
+          'future_original_and_changed_inode_raw_refs':lambda:proof('real_dup2_replaced_future_inode',bool(f.events(33))+bool(f.events(292))),
+          'actual_unknown_live_row_fstat_ref':lambda:proof('actual_live_unknown_row',any(r.fd not in {row['fd'] for row in f.registry(b)['fds']} for b in f.states(16) for r in b.all_fd_reads)),
+          'actual_close_error_raw_ref':lambda:proof('actual_kernel_close_error',bool(physical_close_errors())),
+          'completed_phase_appends':lambda:len(f.mark('phase_closed')),
+          'actual_current_effect_fd_still_live_raw_ref':lambda:proof('actual_live_unclosed_current_effect',any(f.row_physically_live(b,r) and r.get('lifetime')=='phase' for b in f.states(16) for r in f.registry(b)['fds'] if not r['closed'])),
+          'future_original_fd_closed_before_its_phase_raw_ref':lambda:proof('real_premature_future_close',any(e.syscall==3 and e.result==0 for e in f.events())),
+          'normal_current_phase_credit':False,'attempted_release_original_slot':suffix=='BATCH_SLOT_PREMATURE_RELEASE',
+          'actual_slot_close_calls':lambda:len(f.closes(reg['root_slot_duplicate_fd'],f.root)),
+          'second_begin_same_phase_requested':lambda:len(f.mark('phase_begin'))>len({m.values[0] for m in f.mark('phase_begin')}),
+          'actual_completed_phase_count':lambda:len(f.registry(f.state(16))['completed_phases']),
+          'batch_close_calls':lambda:sum(e.arguments[0] in {r['fd'] for b,r in f.role_rows() if r.get('lifetime')=='batch'} for e in f.events(3,f.root)),
+          'unknown_live_batch_FD_raw_ref':lambda:proof('actual_live_batch_unplanned_fd',any(not r.get('planned') and f.row_physically_live(b,r) for b in f.states(16) for r in f.registry(b)['fds'])),
+          'actual_original_guardian_pidfd_drift_raw_ref':lambda:proof('real_original_guardian_fd_replaced',bool(f.events(33))+bool(f.events(292))),
+          'normal_batch_terminal_credit':False,
+          'actual_missing_planned_row_ref':lambda:proof('source_consumer_plan_missing_real_row',any(p['fd'] not in {r['fd'] for r in f.registry(b)['fds']} for b in f.states(16) for p in f.registry(b).get('role_plan',()))),
+          'actual_caller_birth_after_finite_CLI_terminal_ref':lambda:proof('real_original_caller_survives_GNU_terminal',any(b.process.pid==f.caller and not dict(b.role_lifecycle)['actual_GNU'].same_birth for b in base._bounds(run,'attempt_end',f.caller))),
+          'actual_caller_original_slot_FLOCK_after_CLI_terminal_ref':lambda:f.caller_slot(True),
+          'caller_normal_exit_calls':lambda:len(f.events(231,f.caller,stage='entry'))+len(f.events(60,f.caller,stage='entry')),
+          'second_launch_count':lambda:sum(m.event=='first_birth' and m.kernel_sequence>f.mark('refusal')[-1].kernel_sequence for m in run.markers),
+          'original32_definition_counts':[10,18,4],'original_four_cut_window':[19,21],'serial_owner_count':reg['serial'],
+          'original_H991_FD8_C45_C59_28_bytes_unchanged':lambda:all(physical.same_read_source(p) for p in reg['retained_mandatory_source_pins']),
+          'runtime_acceptance_transferred':False,'physical_fit_unproved':reg.get('physical2sfit')=='UNBOUND',
+          'actual_unknown_inherited_FD_raw_ref':lambda:proof('actual_unknown_inherited_original_fd',delta['unknown']['fd'] in {r.fd for r in f.aux_inventory().all_fd_reads}),
+        }
+        self.facts=f;self.scan=scan;self.known_child_closes=known_child_closes
+        self.actual_rows=actual_rows;self.proof=proof;self.changes=changes;self.pair=pair;self.once_parents=once_parents
+        super().__init__(run,fields)
+
+
+def _extend_c75(observation):
+    f=observation.facts;run=observation.run;case=run.case;reg=run.registration
+    proof=observation.proof;pair=observation.pair;changes=observation.changes
+    scan=observation.scan;rows=observation.actual_rows
+    def child_state(kind):
+        found=[b for b in f.states(kind) if b.pid not in (f.root,f.caller)]
+        physical.need(found,'ACTUAL_CHILD_HYGIENE_STATE_MISSING')
+        return found[-1]
+    def child_closed():
+        return [row['fd'] for b,row in observation.known_child_closes() if f.closed_once(row,b.pid)]
+    def child_unwanted():return [row['fd'] for b,row in observation.known_child_closes()]
+    def main_before():return base._bounds(run,'attempt_begin',f.root)[0]
+    def original18():return [r[0] for r in CASES if r[1]=='negative']
+    def actual_aux_ids():
+        return list(dict.fromkeys(p for p,k,row,local,remote in rows()))
+    fields={
+      'exact_original_prepare_boundary_raw_ref':lambda:proof('real_caller_prepare_before_FIRST_bind',bool(f.mark('caller_prepare',f.caller)) and bool(f.mark('Root_entry',f.root))),
+      'observation_boundaries':lambda:(['original_caller_prepare'] if f.mark('caller_prepare') else [])+(['fixed_Root_entry'] if f.mark('Root_entry') else []),
+      'counter_origin':'before_FIRST_caller_or_Root_bind',
+      'clock_catalog_and_phase_record_counts':lambda:[base._count_marks(run,n) for n in ('clock_once','catalog','record')],
+      'counter_reset_count':run.counter_resets,
+      'actual_opendir_dirfd_readdir_closedir_raw_ref':lambda:proof('real_source_dirfd_and_kernel_getdents_close',bool(scan())),
+      'exact_scan_owned_fd_excluded':lambda:scan()[0][0].values[0],
+      'actual_dirfd_return':lambda:scan()[0][0].values[0],
+      'scan_closedir_calls':lambda:len(scan()),
+      'inherited_EBADF_suppressed':lambda:sum(e.syscall==3 and e.result==-9 for e in f.events()),
+      'closed_inherited_fds':lambda:child_closed(),
+      'exact_known_unwanted_inherited_fds':lambda:child_unwanted(),
+      'retained_keep_original_and_after_identity_raw_ref':lambda:proof('actual_child_keep_identities_before_after',
+            all(any(r.fd==row['fd'] and r.identity==tuple(row['identity']) for r in child_state(9).all_fd_reads)
+                for row in child_state(8).semantic_read['state']['custody']['fds']
+                if row['fd'] in child_state(8).semantic_read['state']['keep'])),
+      'actual_GNU_exec_actor_ready_arm_GO_raw_ref':lambda:proof('real_GNU_exec_timer_arm_and_GO',
+            any(e.syscall in (59,322) and e.path==reg['gnu_pin']['path'] for e in f.events(stage='entry'))
+            and bool(f.events(286)) and any(e.syscall==1 and e.raw_input==b'G' for e in f.events())),
+      'unknown_inherited_fds':lambda:sum(r.fd not in {row['fd'] for row in b.semantic_read['state']['custody']['fds']}
+            for b in f.states(8) for r in b.all_fd_reads),
+      'actual_helper_dirfd_and_once_closedir_raw_ref':lambda:proof('real_helper_scan',bool(scan(child_state(8).pid))),
+      'retained_group_output_slot_parent_trace_capabilities_unchanged_ref':lambda:proof('actual_child_keep_fd_inventory',
+            all(r['fd'] in {x.fd for x in child_state(9).all_fd_reads}
+                for r in child_state(8).semantic_read['state']['custody']['fds'] if r['fd'] in child_state(8).semantic_read['state']['keep'])),
+      'exact_helper_direct_wait_status':lambda:f.status(f.raw_waits(f.root)[-1]),
+      'fresh_exact_helper_birth_absence_ref':lambda:proof('real_helper_raw_wait_and_exact_absence',
+            f.raw_waits(f.root)[-1].result in run.known_subjects and not physical.exact_presence_read(
+                f.raw_waits(f.root)[-1].result,run.known_subjects[f.raw_waits(f.root)[-1].result][0]).same_birth),
+      'current_normal_umount0_and_group_remove_raw_ref':lambda:proof('actual_normal_helper_umount_rmdir',
+            any(e.result==0 and e.arguments[1]==0 for e in f.events(166)) and any(e.result==0 for e in f.events(84))),
+      'Root_future_and_batch_FD_close_calls':lambda:sum(e.arguments[0] in reg['future_and_batch_fds'] for e in f.events(3,f.root)
+            if f._seq(child_state(8))<e.sequence<f._seq(child_state(9))),
+      'unwanted_child_duplicates_closed_only_in_child_COW_registry':lambda:all(b.pid!=f.root and f.closed_once(row,b.pid)
+            for b,row in observation.known_child_closes()),
+      'external_original_caller_slot_FLOCK_raw_ref':lambda:f.caller_slot(True),
+      'real_recorded_keep_EBADF_raw_ref':lambda:proof('real_recorded_keep_missing_at_child_scan',
+            any(fd not in {r.fd for r in b.all_fd_reads} for b in f.states(8) for fd in b.semantic_read['state']['keep'])),
+      'inherited_close_calls_before_refusal':lambda:sum(e.sequence<f.mark('refusal')[-1].kernel_sequence and
+            type(e.fd_before)is physical.FDRead and any(e.pid==b.pid and e.arguments[0]==row['fd'] and e.fd_before.identity==tuple(row['identity'])
+            for b,row in observation.known_child_closes()) for e in f.events(3)),
+      'ignored_recorded_EBADF':0,
+      'lost_recorded_fd':lambda:case.resources['actual_fault_owned_fd'],
+      'actual_scan_dirfd':lambda:f.mark('scan_dirfd')[-1].values[0],
+      'actual_lost_original_and_new_scan_identities_ref':lambda:proof('actual_missing_fd_reused_as_proc_scan',
+            case.resources['actual_fault_owned_fd']==f.mark('scan_dirfd')[-1].values[0] and
+            any(type(e.fd_before)is physical.FDRead and e.fd_before.fd==case.resources['actual_fault_owned_fd']
+                and e.fd_before.link.startswith('/proc/') for e in f.events(3))),
+      'false_original_closed_credit':0,
+      'actual_unknown_non_scan_live_fd_ref':lambda:proof('real_unknown_non_scan_child_fd',
+            bool(f.created_unknown_fd()) and all(m.values[0]!=f.created_unknown_fd()[1].fd
+                for m in f.mark('scan_dirfd',f.created_unknown_fd()[1].pid))),
+      'unknown_fd_adoption_or_close_calls':f.unknown_adoption_or_close_calls,
+      'actual_known_unwanted_close_error_ref':lambda:proof('real_child_known_close_kernel_error',
+            any(e.pid!=f.root and e.result<0 for e in f.events(3))),
+      'failed_handle_closed_credit':False,
+      'actual_child_failure_or_unconfirmed_status_raw_ref':lambda:proof('actual_child_nonzero_terminal_or_STOP',
+            bool(f.mark('STOP')) or any(t[2]!=0 for t in run.terminals)),
+      'unknown_child_terminal_as_zero_credit':False,
+      'Root_original_custody_and_external_original_FLOCK_on_STOP_ref':lambda:proof('real_original_Root_custody_on_child_STOP',
+            bool(f.caller_slot()) and bool(f.states(16))),
+      'blanket_EBADF_suppression_count':0,
+      'actual_valid_roles':lambda:list(dict.fromkeys(row['ownership']['role'] for p,k,row,local,remote in rows())),
+      'local_and_remote_policy_identity_role_witnesses_ref':lambda:f.valid_aux(),
+      'whole23_complete_preflight_before_FIRST_bind_raw_ref':lambda:f.all23_good(),
+      'caller_and_Root_supported_preflight_passed':lambda:bool(base._bounds(run,'whole_preflight_complete',f.caller)) and bool(base._bounds(run,'whole_preflight_complete',f.root)),
+      'all_phase_local_auxiliary_refs_closed_once_ref':lambda:f.normal_aux_closure(),
+      'correct_local_group_identity_and_policy_ref':lambda:proof('real_group_correct_identity_policy',pair()[3].identity[:2]==tuple(changes()[0]['identity']) and pair()[3].policy()==changes()[0]['directory_policy']),
+      'bad_ownership_role':lambda:changes()[1]['ownership']['role'],
+      'declared_owner_identity':lambda:changes()[1]['ownership']['identity'],
+      'actual_group_identity':lambda:list(pair()[3].identity),
+      'correct_actual_private_parent_ref':lambda:proof('actual_original_private_parent',pair()[4].policy()==changes()[0]['parent_capability']['policy']),
+      'actual_private_parent_identity':lambda:list(pair()[4].identity),
+      'correct_local_borrowed_identity_policy_ref':lambda:proof('real_borrowed_identity_policy',pair()[3].identity==tuple(changes()[0]['identity']) and pair()[3].policy()==changes()[0]['owner_policy']),
+      'actual_borrowed_policy':lambda:pair()[3].policy(),
+      'declared_borrowed_policy':lambda:changes()[1]['owner_policy'],
+      'actual_group_policy':lambda:pair()[3].policy(),
+      'declared_group_policy':lambda:changes()[1]['directory_policy'],
+      'actual_private_parent_policy':lambda:pair()[4].policy(),
+      'declared_private_parent_policy':lambda:changes()[1]['parent_capability']['policy'],
+      'valid_caller_birth_and_declared_semantic_inventory_ref':lambda:proof('real_original_caller_birth_and_current_inventory',
+            main_before().caller_fd_reads and main_before().ancestry[0].pid==f.caller),
+      'actual_remote_owner_fd_identity':lambda:list(pair()[4].identity),
+      'valid_local_and_remote_same_inode_ref':lambda:proof('real_local_remote_same_inode',pair()[3].identity==pair()[4].identity),
+      'holder_inventory_role':lambda:case.declared_delta['holder_row']['role'],
+      'requested_ownership_role':lambda:changes()[1]['ownership']['role'],
+      'supplied_retained_caller_inventory_used_at_caller_preflight':lambda:bool(f.mark('caller_prepare',f.caller)) and any(b.name=='caller_prepare' and b.phase_inventory['phases'][-1]['declared']['retained_existing_caller']==case.caller_caps[case.last_phase]['retained_existing_caller'] for b in run.boundaries),
+      'tested_auxiliary_kinds':lambda:list(dict.fromkeys({'auxiliary_groups':'auxiliary_group','auxiliary_outputs':'auxiliary_output','auxiliary_fds':'auxiliary_borrowed'}[k] for p,k,row,local,remote in rows())),
+      'actual_independent_nonempty_all_safe_inventories_ref':lambda:proof('real_ALL_SAFE_nonempty_auxiliary_inventory',any(p=='ALL_SAFE' for p,k,row,local,remote in rows())),
+      'refused_at_original_caller_and_Root_boundaries':lambda:all(base._marks(run,'refusal',pid) for pid in (f.caller,f.root)),
+      'tested_phase_ids':lambda:[p for p in actual_aux_ids() if p in ('K120_PIDFD_FSTAT','K120_MAP_GO','K120_INIT_WAIT','K120_PIPE_CLOSE')],
+      'exact_phase_kind_attempts':lambda:len({(p,k) for p,k,row,local,remote in rows() if p in ('K120_PIDFD_FSTAT','K120_MAP_GO','K120_INIT_WAIT','K120_PIPE_CLOSE')}),
+      'actual_independent_phase_inventories_ref':lambda:proof('real_four_cut_nonempty_auxiliary_inventory',len({p for p,k,row,local,remote in rows() if p in ('K120_PIDFD_FSTAT','K120_MAP_GO','K120_INIT_WAIT','K120_PIPE_CLOSE')})==4),
+      'actual_ALL_SAFE_and_four_original_cut_closure_refs':lambda:proof('all_original_empty_phase_closures',all(p in f.completed() for p in ('ALL_SAFE','K120_PIDFD_FSTAT','K120_MAP_GO','K120_INIT_WAIT','K120_PIPE_CLOSE'))),
+      'all10_positive_observations_retained':lambda:all(Original32Observation(run,cid)['raw_kernel_observations_ref'] is not None for cid,kind,name,cause in CASES if kind=='positive'),
+      'four_cut_actual_operation_window':lambda:[min(b.semantic_read['state']['accepted_original_clock_elapsed_at_entry'] for b in f.states(13) if b.semantic_read['state']['case_id'] in case.phase_order[-4:]),max(b.semantic_read['state']['accepted_original_clock_elapsed_at_entry'] for b in f.states(13) if b.semantic_read['state']['case_id'] in case.phase_order[-4:])],
+      'unsupported_empty_inventory_refusals':lambda:sum(markers.REFUSALS[m.values[0]-1]=='AUX_PHASE_NO_CLEANUP_CONSUMER_ZERO_PREFIX' for m in f.mark('refusal') if m.values[0]>0),
+      'actual_phase_ids':lambda:actual_aux_ids(),'exact_original18_negative_phase_ids':lambda:original18(),
+      'positive_case_count':len([r for r in CASES if r[1]=='positive']),
+      'four_cut_count':len([r for r in CASES if r[1]=='source_uncertainty_after_actual_operation']),
+      'each_admitted_auxiliary_role_has_actual_once_only_consumer_ref':lambda:f.normal_aux_closure(),
+      'auxiliary_close_and_remove_before_main_cleanup_raw_refs':lambda:_aux_before_main(run),
+      'retained_future_batch_and_caller_original_capabilities_ref':lambda:proof('actual_future_batch_caller_preservation',bool(f.caller_slot()) and bool(f.states(4))),
+      'accepted_unconsumable_auxiliary_handles':lambda:sum(p in ('ALL_SAFE','K120_PIDFD_FSTAT','K120_MAP_GO','K120_INIT_WAIT','K120_PIPE_CLOSE') for p,k,row,local,remote in rows()),
+      'false_closed_credit':0,
+      'actual_clone3_syscall_result':lambda:next(e.result for e in f.events(435) if e.result<0),
+      'actual_kernel_errno':lambda:-next(e.result for e in f.events(435) if e.result<0),
+      'raw_typed_exact_namespace_refusal_ref':lambda:proof('raw_no_child_namespace_errno',any(e.result in (-1,-22,-38,-95) for e in f.events(435))),
+      'auxiliary_cleanup_before_no_birth_snapshot_and_syscall_ref':lambda:_aux_before_main(run),
+      'main_cleanup_after_exact_refusal_ref':lambda:proof('actual_main_cleanup_after_clone3_refusal',any(e.result<0 for e in f.events(435)) and any(e.result==0 for e in f.events(84))),
+      'all_auxiliary_handles_closed_once':lambda:bool(f.normal_aux_closure()),
+      'next_phase_actual_begin_ref':lambda:proof('actual_next_phase_begin',len(f.mark('phase_begin'))>1),
