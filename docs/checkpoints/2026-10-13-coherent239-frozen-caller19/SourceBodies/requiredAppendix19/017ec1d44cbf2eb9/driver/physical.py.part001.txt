@@ -1,0 +1,262 @@
+"""Actual Linux terminal/pipe observer proposal; never executed in this task.
+
+Only a separately granted private fixture may allocate these descriptors.
+There is no document writer here. Native product caller writes its own FD.
+"""
+from __future__ import annotations
+import asyncio
+import base64
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import termios
+import time
+from .qualification import Unbound
+from .native import descriptor
+
+MAX_CAPTURE = 1024 * 1024
+MAX_ENVELOPE = 393216
+
+
+class PhysicalCapture:
+    def __init__(self, read_fd, *, original_write_fd, original_deadline,
+                 owns_read=False):
+        if type(original_deadline) not in (int, float):
+            raise Unbound("invalid_observer_deadline")
+        if original_deadline <= time.monotonic():
+            raise Unbound("observer_expired_before_arm")
+        self.read_fd = read_fd
+        self.write_fd = original_write_fd
+        self.owns_read = owns_read
+        self.deadline = original_deadline
+        self.read_identity = descriptor(read_fd)
+        self.write_identity = descriptor(original_write_fd)
+        if not self.read_identity["flags"] & os.O_NONBLOCK:
+            raise Unbound("observer_must_have_own_nonblocking_descriptor")
+        self.chunks = []
+        self.bytes = 0
+        self.closed = False
+        self.eof = False
+        self.failures = []
+        self.unknown = []
+
+    @classmethod
+    def private_pty(cls, *, deadline):
+        master, slave = os.openpty()
+        try:
+            # This affects only a newly allocated private PTY, never owner stdio.
+            attributes = termios.tcgetattr(slave)
+            attributes[1] &= ~termios.OPOST
+            termios.tcsetattr(slave, termios.TCSANOW, attributes)
+            original = fcntl.fcntl(master, fcntl.F_GETFL)
+            fcntl.fcntl(master, fcntl.F_SETFL, original | os.O_NONBLOCK)
+            return cls(master, original_write_fd=slave,
+                       original_deadline=deadline, owns_read=True), slave
+        except BaseException:
+            os.close(master)
+            os.close(slave)
+            raise
+
+    @classmethod
+    def private_pipe(cls, *, deadline):
+        read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            return cls(read_fd, original_write_fd=write_fd,
+                       original_deadline=deadline, owns_read=True), write_fd
+        except BaseException:
+            os.close(read_fd)
+            os.close(write_fd)
+            raise
+
+    def check_reader(self):
+        now = descriptor(self.read_fd)
+        if (now["identity"] != self.read_identity["identity"]
+                or now["flags"] != self.read_identity["flags"]):
+            raise Unbound("observer_read_descriptor_replaced")
+
+    def read_available(self):
+        if self.closed:
+            raise Unbound("observer_already_closed")
+        self.check_reader()
+        received = 0
+        # Finite memory/iteration bound even if the unrelated frontend is noisy.
+        for _ in range(32):
+            if time.monotonic() >= self.deadline:
+                break
+            try:
+                chunk = os.read(self.read_fd, min(4096, MAX_CAPTURE - self.bytes + 1))
+            except BlockingIOError:
+                break
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                self.failures.append({"phase": "physical_read",
+                                      "errno": exc.errno, "at": time.monotonic()})
+                raise
+            if not chunk:
+                self.eof = True
+                break
+            if self.bytes + len(chunk) > MAX_CAPTURE:
+                self.unknown.append("capture_limit_exhausted")
+                raise Unbound("capture_limit_exhausted")
+            self.chunks.append((time.monotonic(), bytes(chunk)))
+            self.bytes += len(chunk)
+            received += len(chunk)
+        return received
+
+    async def observe_until(self, caller_task):
+        """Observe one original caller; no second writer or retry task.
+
+        caller_task is the actual task already in the native product ledger.
+        This observer does not cancel it or synthesize completion. Absence of a
+        done caller at the original limit is UNKNOWN and Root retains cleanup.
+        """
+        if type(caller_task) is not asyncio.Task:
+            raise Unbound("not_actual_native_ledger_task")
+        try:
+            while not caller_task.done() and time.monotonic() < self.deadline:
+                self.read_available()
+                await asyncio.sleep(min(.001, max(0, self.deadline-time.monotonic())))
+            if not caller_task.done():
+                self.unknown.append("original_caller_still_live_at_deadline")
+            self.read_available()
+        except BaseException as exc:
+            self.failures.append({"phase": "observer", "type": type(exc).__name__,
+                                  "at": time.monotonic()})
+            raise
+        return self.snapshot()
+
+    def snapshot(self):
+        wire = b"".join(data for _, data in self.chunks)
+        return {"wire": wire, "bytes": len(wire),
+                "sha256": hashlib.sha256(wire).hexdigest(),
+                "chunks": [{"at": at, "bytes": len(data),
+                            "sha256": hashlib.sha256(data).hexdigest()}
+                           for at, data in self.chunks],
+                "reader": self.read_identity, "original_writer": self.write_identity,
+                "eof": self.eof, "unknown": list(self.unknown),
+                "failures": list(self.failures)}
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.owns_read:
+            try:
+                self.check_reader()
+                os.close(self.read_fd)
+            except BaseException as exc:
+                self.unknown.append("observer_descriptor_close_unconfirmed")
+                self.failures.append({"phase": "close",
+                                      "type": type(exc).__name__,
+                                      "at": time.monotonic()})
+                raise
+
+
+def document_frames(wire):
+    """Extract complete exact native JSON envelopes from actual terminal bytes.
+
+    No incomplete record is interpreted as a completed delivery. VT100 controls
+    remain separately observed, never converted into document payload.
+    """
+    if type(wire) is not bytes or len(wire) > MAX_CAPTURE:
+        raise Unbound("unbounded_or_nonbytes_wire")
+    marker = b'{"'
+    frames, partials = [], []
+    position = 0
+    while True:
+        start = wire.find(marker, position)
+        if start < 0:
+            break
+        end = wire.find(b"\n", start)
+        if end < 0:
+            partials.append({"offset": start, "bytes": len(wire)-start})
+            break
+        data = wire[start:end+1]
+        if len(data) > MAX_ENVELOPE:
+            raise Unbound("physical_envelope_over_limit")
+        try:
+            row = json.loads(data.decode("ascii"))
+        except (UnicodeError, ValueError):
+            position = end+1
+            continue
+        if type(row) is dict and row.get("schema") == "friday.cli-document-output.v1":
+            required = {"schema", "route", "file_name", "bytes", "sha256",
+                        "encoding", "data", "caption"}
+            if set(row) != required or row["encoding"] != "base64":
+                raise Unbound("physical_document_schema_drift")
+            if type(row["data"]) is not str or type(row["bytes"]) is not int:
+                raise Unbound("physical_document_type_drift")
+            decoded = base64.b64decode(row["data"], validate=True)
+            if (len(decoded) != row["bytes"]
+                    or hashlib.sha256(decoded).hexdigest() != row["sha256"]):
+                raise Unbound("physical_document_content_mismatch")
+            frames.append({"offset": start, "end": end+1, "wire": data,
+                           "row": row, "decoded": decoded})
+        position = end+1
+    return frames, partials
+
+
+def require_exact_document(snapshot, *, data, route, file_name, caption):
+    if snapshot["unknown"] or snapshot["failures"]:
+        raise Unbound("unknown_physical_observation")
+    frames, partials = document_frames(snapshot["wire"])
+    matching = [f for f in frames if (f["row"]["route"] == route
+                and f["row"]["file_name"] == file_name)]
+    if len(matching) != 1 or partials:
+        raise AssertionError("document_missing_partial_or_duplicated")
+    frame = matching[0]
+    if frame["decoded"] != data or frame["row"]["caption"] != caption:
+        raise AssertionError("document_bytes_or_caption_changed")
+    if len(frame["wire"]) > MAX_ENVELOPE:
+        raise AssertionError("document_wire_over_bound")
+    return {"document_bytes": len(data), "wire_bytes": len(frame["wire"]),
+            "sha256": hashlib.sha256(data).hexdigest(), "copies": 1}
+
+
+def original_flags_unchanged(before):
+    now = descriptor(before["fd"])
+    if now != before:
+        raise AssertionError("original_descriptor_flags_or_identity_changed")
+    return now
+
+
+def exact_reap(known):
+    """Read exact declared births/FDs. Unknown is retained, never zeroed."""
+    observed = []
+    for row in known:
+        if row["kind"] == "thread":
+            thread = row["reference"]
+            native_id = row["native_id"]
+            if getattr(thread, "native_id", None) != native_id:
+                observed.append({"kind": "thread", "state": "UNKNOWN_IDENTITY_CHANGED"})
+                continue
+            path = Path(f"/proc/self/task/{native_id}/stat")
+            try:
+                raw = path.read_text()
+                birth = int(raw[raw.rfind(")")+2:].split()[19])
+                state = "STILL_LIVE" if birth == row["starttime"] else "OLD_BIRTH_ABSENT_REUSED"
+            except FileNotFoundError:
+                state, raw = "ABSENT", None
+            observed.append({"kind": "thread", "native_id": native_id,
+                             "expected_birth": row["starttime"],
+                             "state": state, "raw": raw})
+        elif row["kind"] == "descriptor":
+            try:
+                now = descriptor(row["fd"])
+                state = "STILL_SAME_IDENTITY" if now["identity"] == row["identity"] else "OLD_IDENTITY_ABSENT_REUSED"
+            except OSError as exc:
+                if exc.errno != 9:
+                    observed.append({"kind": "descriptor", "state": "UNKNOWN",
+                                     "errno": exc.errno})
+                    continue
+                state, now = "ABSENT", None
+            observed.append({"kind": "descriptor", "fd": row["fd"],
+                             "expected_identity": row["identity"],
+                             "state": state, "observation": now})
+        else:
+            observed.append({"kind": row["kind"], "state": "UNKNOWN_UNIMPLEMENTED_REAP"})
+    return observed

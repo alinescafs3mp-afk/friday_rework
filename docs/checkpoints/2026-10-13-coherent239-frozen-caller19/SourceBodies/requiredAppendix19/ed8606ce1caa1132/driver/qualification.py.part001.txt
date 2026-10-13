@@ -1,0 +1,237 @@
+"""Future qualification gate. Source only: never run by the preparation task.
+
+A frozen overlay and a validation venv are inputs, not a runtime grant.
+The caller must supply the separately accepted Root GO and its whole import map.
+Unknown modules, unknown code identities and missing native caller custody refuse.
+"""
+from __future__ import annotations
+import hashlib
+import json
+import marshal
+import math
+import os
+import resource
+from pathlib import Path
+import stat
+import sys
+import time
+import types
+
+MAX_RECORD = 65536
+MAX_SOURCE = 8 * 1024 * 1024
+
+
+class Unbound(RuntimeError):
+    pass
+
+
+def stamp(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+
+
+def exact_file(reference, *, limit=MAX_SOURCE):
+    path = Path(reference["path"])
+    if not path.is_absolute() or path.resolve() != path:
+        raise Unbound("noncanonical_or_symlink_path")
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    fd = None
+    try:
+        directory_before = os.fstat(directory)
+        named_directory_before = os.stat(path.parent, follow_symlinks=False)
+        if stamp(directory_before) != stamp(named_directory_before):
+            raise Unbound("directory_replaced_before_read")
+        fd = os.open(path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                     dir_fd=directory)
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or not 0 <= before.st_size <= limit
+                or stamp(before) != stamp(os.stat(path.name, dir_fd=directory,
+                                                follow_symlinks=False))):
+            raise Unbound("file_not_exact_bounded_record")
+        chunks = []
+        remaining = before.st_size
+        while remaining:
+            data = os.read(fd, min(65536, remaining))
+            if not data:
+                raise Unbound("short_record")
+            chunks.append(data)
+            remaining -= len(data)
+        if os.read(fd, 1):
+            raise Unbound("record_grew")
+        data = b"".join(chunks)
+        if (len(data) != reference["bytes"]
+                or hashlib.sha256(data).hexdigest() != reference["sha256"]
+                or stamp(os.fstat(fd)) != stamp(before)
+                or stamp(os.stat(path.name, dir_fd=directory,
+                                 follow_symlinks=False)) != stamp(before)):
+            raise Unbound("record_replaced_or_changed")
+        # Content is bound to the still-current named record AND directory after
+        # fsync. Equal-content replacement is rejected, not silently repinned.
+        os.fsync(fd)
+        os.fsync(directory)
+        if (stamp(os.fstat(fd)) != stamp(before)
+                or stamp(os.stat(path.name, dir_fd=directory,
+                                 follow_symlinks=False)) != stamp(before)
+                or stamp(os.fstat(directory)) != stamp(directory_before)
+                or stamp(os.stat(path.parent, follow_symlinks=False))
+                   != stamp(directory_before)):
+            raise Unbound("record_or_directory_substituted_during_durability")
+        return data, {"record": stamp(before), "directory": stamp(directory_before)}
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(directory)
+
+
+def exact_json(reference):
+    data, custody = exact_file(reference, limit=MAX_RECORD)
+    value = json.loads(data)
+    if type(value) is not dict:
+        raise Unbound("record_not_object")
+    return value, custody
+
+
+def code_digest(code):
+    if type(code) is not types.CodeType:
+        raise Unbound("unknown_loaded_code")
+    return hashlib.sha256(marshal.dumps(code)).hexdigest()
+
+
+def real_function(function, qualification):
+    # No accepting a wrapper merely because its module/name looks native.
+    if isinstance(function, types.MethodType):
+        function = function.__func__
+    if type(function) is not types.FunctionType:
+        raise Unbound("unknown_callable")
+    code = function.__code__
+    if (code_digest(code) != qualification["code_sha256"]
+            or code.co_filename != qualification["filename"]
+            or code.co_qualname != qualification["qualname"]):
+        raise Unbound("loaded_function_substituted")
+    exact_file(qualification["source"])
+    return function
+
+
+def verify_loaded(layout):
+    """Check ALL currently loaded modules against Root's accepted whole map.
+
+    This checks .py, extension modules, zip origins and interpreter images by
+    their exact Root-qualified origin; an unknown origin is never ignored.
+    Namespace/builtin/frozen modules require explicit accepted entries.
+    Function code hashes are independent of source-file hashes.
+    """
+    if layout.get("status") != "ROOT_ACCEPTED_WHOLE_IMPORT_LAYOUT":
+        raise Unbound("whole_import_layout_not_accepted")
+    expected = layout["modules"]
+    actual = {}
+    for name, module in tuple(sys.modules.items()):
+        if module is None:
+            raise Unbound("partially_imported_module")
+        if name not in expected:
+            raise Unbound("unqualified_module:" + name)
+        row = expected[name]
+        spec = getattr(module, "__spec__", None)
+        origin = getattr(spec, "origin", None)
+        if origin != row["origin"]:
+            raise Unbound("module_origin_drift:" + name)
+        if origin not in (None, "built-in", "frozen"):
+            _, custody = exact_file(row["source"])
+        else:
+            custody = None
+        code_rows = row.get("functions", {})
+        for attr, qualification in code_rows.items():
+            value = module
+            for part in attr.split("."):
+                value = getattr(value, part)
+            real_function(value, qualification)
+        actual[name] = {"origin": origin, "custody": custody}
+    missing_required = set(layout["required_modules"]) - actual.keys()
+    if missing_required:
+        raise Unbound("required_modules_not_loaded:" + repr(sorted(missing_required)))
+    for path in sys.path:
+        if path not in layout["sys_path"]:
+            raise Unbound("unqualified_import_search_path")
+    if tuple(sys.path) != tuple(layout["sys_path"]):
+        raise Unbound("import_path_order_changed")
+    if (sys.version != layout["python_version"]
+            or sys.implementation.cache_tag != layout["cache_tag"]
+            or os.path.realpath(sys.executable) != layout["interpreter"]["path"]):
+        raise Unbound("interpreter_mismatch")
+    exact_file(layout["interpreter"])
+    return actual
+
+
+def proc_birth(pid):
+    text = Path(f"/proc/{pid}/stat").read_text()
+    closing = text.rfind(")")
+    values = text[closing + 2:].split()
+    return {"pid": pid, "starttime": int(values[19]), "state": values[0],
+            "raw": text,
+            "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+
+
+def verify_go(reference, *, assignment, generation, collection_ref, source_ref):
+    """A schema is a proposal. Only a new separately authorized Root GO works."""
+    go, custody = exact_json(reference)
+    if assignment == "FRW-ORDINARY-CLI-PATCHSTDOUT-GENUINE150-DRIVER-SOURCE-SOL":
+        raise Unbound("current_SOURCE_ONLY_task_has_no_runtime_grant")
+    required = {"schema", "status", "assignment", "generation", "event",
+                "collection", "driver_source", "product_source", "whole_layout",
+                "independent_safety", "host", "start_monotonic",
+                "useful_deadline_monotonic", "final_deadline_monotonic",
+                "operation_seconds", "cleanup_included_seconds", "allowed_cases",
+                "effects", "resources", "caller_protocol"}
+    if set(go) != required:
+        raise Unbound("go_exact_fields_required")
+    if (go["schema"] != "FRIDAY-CLI150-ROOT-GO-1"
+            or go["status"] != "ROOT_AUTHORIZED_NEW_EXACT_ISOLATED_EXECUTION"
+            or go["assignment"] != assignment or go["generation"] != generation
+            or go["collection"] != collection_ref or go["driver_source"] != source_ref):
+        raise Unbound("go_wrong_source_or_assignment")
+    safety, _ = exact_json(go["independent_safety"])
+    if (safety.get("decision") != "ACCEPT_EXACT_EXECUTION_SOURCE"
+            or safety.get("reviewer_role") != "INDEPENDENT"
+            or safety.get("driver_source") != source_ref
+            or safety.get("collection") != collection_ref
+            or safety.get("product_source") != go["product_source"]):
+        raise Unbound("independent_whole_safety_unbound")
+    host = proc_birth(os.getpid())
+    if any(host[k] != go["host"][k] for k in ("pid", "starttime", "boot_id")):
+        raise Unbound("go_host_birth_mismatch")
+    start, useful, final = (go[k] for k in (
+        "start_monotonic", "useful_deadline_monotonic", "final_deadline_monotonic"))
+    if (any(type(v) not in (int, float) or not math.isfinite(v) for v in (start, useful, final))
+            or not start < useful < final or time.monotonic() >= useful
+            or go["operation_seconds"] != 30
+            or type(go["cleanup_included_seconds"]) is not int
+            or not 0 < go["cleanup_included_seconds"] < final-start):
+        raise Unbound("go_original_clock_invalid")
+    prohibited = {"network", "model_inference", "kernel", "systemd",
+                  "native_peer", "install", "release", "global_writer"}
+    if prohibited & set(go["effects"]):
+        raise Unbound("outside_isolated_source_fixture")
+    resources = go["resources"]
+    bounds = {"AS_bytes": (resource.RLIMIT_AS, 1610612736),
+              "CPU_seconds": (resource.RLIMIT_CPU, 30),
+              "FS_bytes": (resource.RLIMIT_FSIZE, 67108864),
+              "CORE_bytes": (resource.RLIMIT_CORE, 0)}
+    for key, (limit, upper) in bounds.items():
+        declared = resources.get(key)
+        soft, hard = resource.getrlimit(limit)
+        if (type(declared) is not int or declared < 0 or declared > upper
+                or soft == resource.RLIM_INFINITY or hard == resource.RLIM_INFINITY
+                or soft > declared or hard > declared):
+            raise Unbound("actual_resource_cap_UNBOUND:" + key)
+    if (resources.get("affinity") != [0, 1]
+            or sorted(os.sched_getaffinity(0)) != [0, 1]
+            or resources.get("outer_original30_seconds") != 30
+            or type(resources.get("total_declared_request_upper_bytes")) is not int
+            or not 0 < resources["total_declared_request_upper_bytes"] <= 1610612736):
+        raise Unbound("actual_whole_request_resources_UNBOUND")
+    protocol, _ = exact_json(go["caller_protocol"])
+    if protocol.get("status") != "ROOT_ACCEPTED_EXACT_GENUINE_CALLER_PROTOCOL":
+        raise Unbound("actual_genuine_caller_protocol_UNBOUND")
+    layout, _ = exact_json(go["whole_layout"])
+    verify_loaded(layout)
+    return go, custody
