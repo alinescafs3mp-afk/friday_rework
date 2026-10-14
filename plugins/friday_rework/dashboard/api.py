@@ -6,7 +6,9 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, SecretStr
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, SecretStr, model_validator
 from hermes_cli.friday_product_access import admin_policy, session_allowed
 
 # The dashboard importer loads api.py by file location, outside the agent plugin
@@ -37,7 +39,30 @@ def require_admin(request: Request):
     return request.state.session
 
 
-router = APIRouter(dependencies=[Depends(require_admin)])
+class ProductAPIRoute(APIRoute):
+    """Reject invalid product input without reflecting request values or secrets."""
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def validate(request: Request):
+            try:
+                return await handler(request)
+            except RequestValidationError:
+                # FastAPI's default errors include input, including the entire
+                # credential body when a required field is missing.
+                raise HTTPException(422, "invalid_product_request") from None
+
+        return validate
+
+
+class ProductRequestError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    detail: Literal["invalid_product_request"]
+
+
+router = APIRouter(route_class=ProductAPIRoute, dependencies=[Depends(require_admin)],
+                   responses={422: {"model": ProductRequestError, "description": "Invalid product request"}})
 _admin = Administration()
 
 
@@ -200,6 +225,13 @@ class OnboardingIdentity(BaseModel):
 class OnboardingPrepare(OnboardingIdentity):
     template: str = Field(min_length=1, max_length=64)
     runtime_profile: str = Field(pattern="^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    uid: StrictInt | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def local_cli_uid(self):
+        if (self.platform == "cli") != (self.uid is not None):
+            raise ValueError("explicit_numeric_uid_required_only_for_cli")
+        return self
 
 
 class OnboardingActivate(OnboardingIdentity):

@@ -42,7 +42,12 @@ def _file_name(value):
 
 
 def _expected_receipt(row, artifact):
-    message = row["host"]["binding"]["ingress"]["message"]
+    ingress=row['host']['binding']['ingress']
+    if ingress['platform'] == 'cli':
+        from .admission import delivery_route
+        return {'kind':'local-output','sha256':artifact['sha256'],'bytes':artifact['size_bytes'],
+                'file_name':artifact['logical_name'],'route':delivery_route(ingress)}
+    message = ingress["message"]
     return {"kind": "document", "sha256": artifact["sha256"],
             "bytes": artifact["size_bytes"], "file_name": artifact["logical_name"],
             "bot_id": message["bot_id"], "chat_id": message["chat_id"],
@@ -55,11 +60,24 @@ def _receipt(row, artifact, value):
         return {"state": "UNKNOWN"}
     if value["state"] == "FAILED":
         # Only these native pre-send refusals establish that no send happened.
-        if value.get("error") in {"gateway_delivery_preflight_rejected", "gateway_document_route_rejected",
-                                  "invalid_document", "document_bytes_unsupported"}:
-            return {"state": "FAILED", "error": value["error"]}
-        return {"state": "UNKNOWN"}
+        allowed = {'cli_document_preflight_rejected'} if row['owner'].get('platform') == 'cli' else {
+            'gateway_delivery_preflight_rejected','gateway_document_route_rejected','invalid_document','document_bytes_unsupported'}
+        if value.get('error') in allowed:
+            return {'state':'FAILED','error':value['error']}
+        return {'state':'UNKNOWN'}
     expected = _expected_receipt(row, artifact)
+    if row['owner'].get('platform') == 'cli':
+        from hermes_cli.friday_cli_work import validate_route
+        try:
+            validate_route(value.get('route'))
+        except Exception:
+            return {'state':'UNKNOWN'}
+        if type(value.get('bytes')) is not int:
+            return {'state':'UNKNOWN'}
+        if (value['state']=='DELIVERED' and all(value.get(k)==v for k,v in expected.items())
+                and value.get('native_output')=='bounded-original-console-write' and value.get('human_read')=='UNCONFIRMED'):
+            return {'state':'DELIVERED',**expected,'native_output':'bounded-original-console-write','human_read':'UNCONFIRMED'}
+        return {'state':'UNKNOWN'}
     if value["state"] == "DELIVERED" and all(value.get(k) == v for k, v in expected.items()):
         message = value.get("message_id")
         if isinstance(message, str) and message.isascii() and message.isdecimal() and int(message) > 0:
@@ -397,12 +415,12 @@ def retain_artifacts(store, task_id, owner, artifacts, source_paths):
         if "result" in row:
             if row["result"]["artifacts"] != values or row["result"]["source_paths"] != source_paths:
                 raise AssociationError("result_already_retained")
-            return copy.deepcopy(row)
+            return store.consumer_copy(row)
         row["result"] = {"artifacts": values, "source_paths": copy.deepcopy(source_paths),
                          "deliveries": {a["reference"]: [] for a in values},
                          "observations": {}, "assessment": None}
         store._save(data)
-        return copy.deepcopy(row)
+        return store.consumer_copy(row)
 
 
 def begin_delivery(store, task_id, owner, reference, *, retry=False):
@@ -412,6 +430,14 @@ def begin_delivery(store, task_id, owner, reference, *, retry=False):
         if "result" not in row or reference not in row["result"]["deliveries"]:
             raise AssociationError("unknown_result_artifact")
         attempts = row["result"]["deliveries"][reference]
+        if attempts and row["owner"].get("platform") == "cli" and retry is True:
+            # Only current ACTUALLY accepted pre-send refusal can resolve a
+            # prior UNKNOWN to FAILED for canonical explicit retry. Its original
+            # immutable UNKNOWN journal remains forever; no uncertain send is retried.
+            view = store.consumer_copy(row)
+            prior = view["result"]["deliveries"][reference][-1]
+            if attempts[-1]["state"] == "UNKNOWN" and prior["state"] == "FAILED":
+                attempts[-1].update(state="FAILED", receipt=copy.deepcopy(prior["receipt"]))
         if attempts and (attempts[-1]["state"] != "FAILED" or retry is not True):
             raise AssociationError("delivery_requires_reconciliation")
         if len(attempts) >= MAX_DELIVERY_ATTEMPTS:
@@ -419,11 +445,23 @@ def begin_delivery(store, task_id, owner, reference, *, retry=False):
         attempt = {"number": len(attempts) + 1, "state": "UNKNOWN", "at_unix": store.clock(), "receipt": None}
         attempts.append(attempt)
         row["delivery"] = delivery_state(row["result"]["deliveries"])
-        store._save(data)
+        selection = None
+        if row["owner"].get("platform") == "cli":
+            from hermes_cli.friday_cli_caller import current
+            from .cli_receipt_selection import OriginalReceiptSelection
+            span = current(required=True)
+            selection = OriginalReceiptSelection(store, span, row, reference, attempt["number"])
+            key = (id(store), task_id, reference, attempt["number"])
+            if key in span.receipt_selections:
+                raise AssociationError("duplicate_original_receipt_selection")
+            span.receipt_selections[key] = selection
+        returned = store._save(data, journals=(("unknown", selection.unknown_history),) if selection is not None else ())
+        if selection is not None:
+            selection.unknown_save_returned(returned)
         return copy.deepcopy(attempt), copy.deepcopy(row)
 
 
-def finish_delivery(store, task_id, owner, reference, number, receipt):
+def finish_delivery(store, task_id, owner, reference, number, receipt, selection=None):
     with store._locked() as data:
         row = store._owned(data, task_id, owner)
         result = row.get("result", {})
@@ -431,36 +469,95 @@ def finish_delivery(store, task_id, owner, reference, number, receipt):
         if not attempts or type(number) is not int or number != attempts[-1]["number"]:
             raise AssociationError("foreign_delivery_attempt")
         artifact = next(a for a in result["artifacts"] if a["reference"] == reference)
+        if row["owner"].get("platform") == "cli":
+            from hermes_cli.friday_cli_caller import current
+            from .cli_receipt_selection import OriginalReceiptSelection
+            span = current(required=True)
+            if type(selection) is not OriginalReceiptSelection:
+                raise AssociationError("original_receipt_selection_missing")
+            span.check("receipt_selection_before_commit", cleanup=True)
+            selection.begin_commit(store, span, row, reference, number)
         checked = _receipt(row, artifact, receipt)
         attempt = attempts[-1]
+        if row["owner"].get("platform") == "cli":
+            # Actual UNKNOWN is NEVER overwritten, including native rename,
+            # fsync, close, outer caller or supervision acknowledgement failure.
+            candidate = selection.prepare_candidate(checked)
+            returned = store._save(data, journals=(("candidate", candidate),))
+            selection.save_returned(returned)
+            return copy.deepcopy(row)
         if attempt["receipt"] is not None and attempt["receipt"] != checked:
             raise AssociationError("delivery_receipt_conflict")
         attempt.update(state=checked["state"], receipt=checked)
         row["delivery"] = delivery_state(result["deliveries"])
         store._save(data)
-        return copy.deepcopy(row)
+        return store.consumer_copy(row)
 
 
-async def deliver_artifact(ctx, store, row, reference, *, retry=False):
+
+async def deliver_artifact(ctx, store, row, reference, *, retry=False, deadline=None):
     """One explicit send of retained bytes to the retained original destination."""
     from .admission import delivery_route
-    row = store.get(row["existing_task_id"], row["owner"])
+    from hermes_cli.friday_cli_caller import current as current_original_caller
+    span = current_original_caller()
+    local = row["owner"].get("platform") == "cli"
+    if local:
+        span = current_original_caller(required=True)
+        span.check("artifact_entry")
+        row = span.sync("artifact_store_get", store.get, row["existing_task_id"], row["owner"])
+    else:
+        row = store.get(row["existing_task_id"], row["owner"])
+    from hermes_cli.friday_user_scope import check_retained_job
+    check_retained_job(row)
+    local = row['owner'].get('platform') == 'cli'
+    if local:
+        from hermes_cli.friday_cli_output import output_deadline
+        remaining = row['deadline_unix'] - store.clock()
+        if remaining <= 0:
+            raise AssociationError('original_delivery_budget_exhausted')
+        deadline = output_deadline(min(30, remaining), deadline)
     artifact = next((a for a in row.get("result", {}).get("artifacts", []) if a["reference"] == reference), None)
     if artifact is None:
         raise AssociationError("unknown_result_artifact")
     # Recheck bytes BEFORE reserving a send. A changed staging file never sends.
-    payload = await asyncio.to_thread(read_staged, staging_root=output_root(row), artifact=StagedArtifact(**artifact),
-                                      max_bytes=row["host"]["binding"]["runtime"]["max_file_bytes"])
-    attempt, row = begin_delivery(store, row["existing_task_id"], row["owner"], reference, retry=retry)
+    if local:
+        # Refuse oversize before even opening a staged payload. The ORIGINAL
+        # caller owns this read; no cancelled to_thread reader can survive it.
+        if type(artifact["size_bytes"]) is not int or artifact["size_bytes"] > 256 * 1024:
+            raise AssociationError("cli_staged_document_limit")
+        payload = span.sync("staged_original_read", read_staged,
+                            staging_root=output_root(row), artifact=StagedArtifact(**artifact),
+                            max_bytes=min(256 * 1024, row["host"]["binding"]["runtime"]["max_file_bytes"]))
+    else:
+        payload = await asyncio.to_thread(read_staged, staging_root=output_root(row), artifact=StagedArtifact(**artifact),
+                                        max_bytes=row["host"]["binding"]["runtime"]["max_file_bytes"])
+    check_retained_job(row)
+    attempt, row = (begin_delivery(store, row["existing_task_id"], row["owner"], reference, retry=retry) if not local else
+                    span.sync("begin_durable_UNKNOWN", begin_delivery, store, row["existing_task_id"],
+                              row["owner"], reference, retry=retry))
+    if local:
+        span.receipt_selections[(id(store), row["existing_task_id"], reference,
+                                 attempt["number"])].observe_unknown_boundary_return()
     terminal = row["host"]["terminal"]
     partial = row["stop_intent"] is not None or terminal is None or terminal["state"] != "completed"
     check = {"NOT_RUN": "Проверка цели не выполнена.", "UNKNOWN": "Проверка цели не завершена.",
              "FAIL": "Проверка цели не пройдена.", "PASS": "Проверено чтением файлов; запуск тестов этим не подтверждается."}[row["goal_verification"]]
     caption = ("Частичный результат. " if partial else "Результат исполнителя. ") + check
     try:
-        receipt = await ctx.deliver_gateway_document(route=delivery_route(row["host"]["binding"]["ingress"]),
-                    data=payload, file_name=artifact["logical_name"], caption=caption, timeout=30)
+        check_retained_job(row)
+        send = ctx.deliver_cli_document if row['owner'].get('platform') == 'cli' else ctx.deliver_gateway_document
+        kwargs = {'deadline':deadline} if local else {}
+        receipt = await send(route=delivery_route(row["host"]["binding"]["ingress"]),
+                    data=payload, file_name=artifact["logical_name"], caption=caption, timeout=30, **kwargs)
     except Exception:
         receipt = {"state": "UNKNOWN"}
     # Cancellation/BaseException leaves durable UNKNOWN; no false FAILED/retry.
+    check_retained_job(row)
+    if local:
+        span.check("artifact_observed_before_native_tail")
+        span.defer_receipt(finish_delivery, store, row["existing_task_id"], row["owner"],
+                           reference, attempt["number"], receipt,
+                           span.receipt_selections[(id(store), row["existing_task_id"],
+                                                    reference, attempt["number"])])
+        return row  # persisted UNKNOWN; never early DELIVERED/false FAILED
     return finish_delivery(store, row["existing_task_id"], row["owner"], reference, attempt["number"], receipt)

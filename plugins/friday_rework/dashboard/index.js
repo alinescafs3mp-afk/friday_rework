@@ -23,7 +23,7 @@
     const [data, setData] = R.useState(null), [error, setError] = R.useState("");
     const [session, setSession] = R.useState(null), [busy, setBusy] = R.useState(false);
     const [control, setControl] = R.useState(null), [edit, setEdit] = R.useState({kind: "model", slot: "main", route: "0", web: "exa-paid", timeout: "30", chars: "15000", name: "", enabled: true, key: "agent.max_turns", value: "30"});
-    const [setup, setSetup] = R.useState({platform: "telegram", account_id: "", user_id: "", runtime_profile: "", template: ""});
+    const [setup, setSetup] = R.useState({platform: "telegram", account_id: "", user_id: "", runtime_profile: "", template: "", uid: ""});
     const [prepared, setPrepared] = R.useState(null), [secretName, setSecretName] = R.useState("");
     const [secretValue, setSecretValue] = R.useState("");
     R.useEffect(() => { let active = true;
@@ -69,12 +69,20 @@
     }
     async function onboard(action) {
       if (!profile || busy) return;
+      let uid;
+      if (action === "prepare" && setup.platform === "cli") {
+        if (!/^(0|[1-9][0-9]*)$/.test(setup.uid) || !Number.isSafeInteger(Number(setup.uid))) {
+          setError("Enter an explicit numeric OS user ID for the local CLI profile."); return;
+        }
+        uid = Number(setup.uid);
+      }
       setBusy(true); setError("");
       try {
         const identity = {platform: setup.platform, transport_profile: profile, account_id: setup.account_id,
           user_id: setup.user_id, expected_config_sha256: prepared ? prepared.config_sha256 : data.config_sha256};
         let body = action === "prepare" ? {...identity, runtime_profile: setup.runtime_profile, template: setup.template}
           : {...identity, generation: prepared.generation};
+        if (action === "prepare" && setup.platform === "cli") body.uid = uid;
         if (action === "credentials") body = {...body, name: secretName, value: secretValue};
         const result = await fetchJSON(base + "/onboarding/" + action + "?" + new URLSearchParams({profile}), {
           method: action === "credentials" ? "PUT" : "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
@@ -169,6 +177,9 @@
         ...["platform", "account_id", "user_id", "runtime_profile"].map(k => h("label", {key: k}, k + " ",
           h("input", {value: setup[k], disabled: busy || !!prepared, maxLength: k.includes("profile") ? 64 : 512,
             onChange: e => setSetup({...setup, [k]: e.target.value})}))),
+        setup.platform === "cli" ? h("label", null, "Local CLI OS user ID ",
+          h("input", {value: setup.uid, disabled: busy || !!prepared, inputMode: "numeric", maxLength: 16,
+            onChange: e => setSetup({...setup, uid: e.target.value})})) : null,
         h("label", null, "Approved configuration ", h("select", {value: setup.template, disabled: busy || !!prepared,
           onChange: e => setSetup({...setup, template: e.target.value})}, h("option", {value: ""}, "Select"),
           ...data.templates.map(t => h("option", {key: t, value: t}, t)))),
@@ -176,7 +187,7 @@
         !prepared ? h("ul", null, ...(data.pending || []).map(row => h("li", {key: row.principal_id},
           row.runtime_profile + ": " + row.state + " ", row.recoverable ? button("Continue existing disabled setup", () => {
             setSetup({platform: row.platform, account_id: row.account_id, user_id: row.user_id,
-              runtime_profile: row.runtime_profile, template: row.template}); setPrepared(row);
+              runtime_profile: row.runtime_profile, template: row.template, uid: row.uid === undefined ? "" : String(row.uid)}); setPrepared(row);
             setSecretName((row.required_names || [])[0] || ""); setSecretValue("");
           }) : null))) : null,
         prepared ? h("div", null,

@@ -36,6 +36,12 @@ def bound_owner(*, session_id=None):
     # Only values bound in this execution context can be routing observations.
     # This is not authorization/admission proof; bot/update/input provenance
     # must be joined at the trusted gateway boundary before any future launch.
+    from hermes_cli.friday_cli_work import is_cli, current_turn, ingress_for, owner_from_receipt
+    if is_cli():
+        owner = owner_from_receipt(ingress_for(current_turn()))
+        if session_id is not None and session_id != owner['session_id']:
+            raise ValueError('session_mismatch')
+        return owner
     names = ("PLATFORM", "CHAT_ID", "CHAT_TYPE", "THREAD_ID", "USER_ID",
              "KEY", "ID", "MESSAGE_ID", "PROFILE")
     wanted = {"HERMES_SESSION_" + name for name in names}

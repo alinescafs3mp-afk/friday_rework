@@ -27,6 +27,10 @@ async def notify_finished(host, row):
     """
     from hermes_cli.friday_user_scope import check_retained_job
     check_retained_job(row)
+    if row['owner'].get('platform') == 'cli':
+        from hermes_cli.friday_cli_work import check_local_job
+        check_local_job(host, row)
+        return  # foreground return is the retained original parent result, no queue injection
     if host.ctx.get_config("results") != {"enabled": True} or host._closed:
         return
     def reserve():
@@ -71,12 +75,26 @@ def owned_result(host, reference, kwargs):
     # every supplied ID, never invent omitted IDs from arguments/environment.
     if (call is None or call[:2] != (kwargs.get("task_id"), kwargs.get("session_id"))
             or any(k in kwargs and kwargs[k] != call[i] for i, k in enumerate(CALL_FIELDS))
-            or call[0] != call[1] or call[1] != owner["id"]):
+            or call[0] != call[1] or call[1] != (owner['session_id'] if owner.get('platform') == 'cli' else owner["id"])):
         raise AssociationError("unproved_result_call")
     row = host.store.snapshot().get(reference)
     if not row or "host" not in row:
         raise AssociationError("unknown_result")
     binding, original = row["host"]["binding"], row["owner"]
+    if owner.get('platform') == 'cli':
+        from hermes_cli.friday_cli_work import check_owner, validate_owner
+        from hermes_cli.friday_user_scope import check_retained_job
+        if (host._closed or Path(host.store.state.data_dir) != host._state_directory
+                or get_hermes_home() != Path(binding['runtime']['runtime_home'])
+                or any(owner[k] != original[k] for k in validate_owner(original) if k != 'ingress_message_id')):
+            raise AssociationError('foreign_result_owner')
+        if any(kwargs.get(k) != call[i] for i,k in enumerate(CALL_FIELDS)):
+            raise AssociationError('missing_native_cli_call')
+        from hermes_cli.friday_cli_work import check_local_job
+        check_local_job(host, row)
+        check_owner(original, binding['ingress'])
+        check_retained_job(row)
+        return row
     if (host._closed or Path(host.store.state.data_dir) != host._state_directory
             or get_hermes_home() != Path(binding["runtime"]["runtime_home"])
             or owner["platform"] != "telegram" or owner["key"] != original["session_key"]
@@ -147,7 +165,12 @@ class ResultTool:
                     or args.get("action") not in {"list", "inspect", "assess", "status", "deliver"}
                     or ("retry" in args and type(args["retry"]) is not bool)):
                 raise AssociationError("invalid_result_request")
-            row = owned_result(self.host, args.get("reference"), kwargs)
+            from hermes_cli.friday_cli_caller import current as current_original_caller
+            span = current_original_caller()
+            row = (owned_result(self.host, args.get("reference"), kwargs) if span is None else
+                   span.sync("result_owner_and_store_read", owned_result, self.host, args.get("reference"), kwargs))
+            if span is not None and args["action"] == "deliver":
+                span.narrow(row["deadline_unix"] - self.host.store.clock())
             action = args["action"]
             if action == "list":
                 return json.dumps({**status(row), "files": list_outputs(row, self.host.store)})
@@ -166,6 +189,18 @@ class ResultTool:
             if action == "deliver":
                 if "result" not in row:
                     raise AssociationError("result_not_collected")
+                if row['owner'].get('platform') == 'cli':
+                    route = delivery_route(row['host']['binding']['ingress'])
+                    span = current_original_caller(required=True)
+                    span.check("original_foreground_admission")
+                    self.host.ctx.require_cli_work(route)
+                    delivery = self.host.ctx.run_cli_work(self.deliver(row, retry=args.get('retry',False)),
+                                  route=route,name='friday-result:'+row['existing_task_id'])
+                    span.check("foreground_return")
+                    # The native caller tail still owns durable completion.
+                    # No post-handle store.get can silently escape its budget.
+                    return json.dumps({**status(row),
+                                       'delivery_requested':True,'delivery_observation':delivery})
                 self.host.ctx.schedule_gateway_work(
                     self.deliver(row, retry=args.get("retry", False)),
                     route=delivery_route(row["host"]["binding"]["ingress"]),
@@ -178,15 +213,37 @@ class ResultTool:
 
     async def deliver(self, row, *, retry=False):
         from hermes_cli.friday_user_scope import check_retained_job
+        from hermes_cli.friday_cli_caller import current as current_original_caller
+        span = current_original_caller()
+        deadline = None
+        if row["owner"].get("platform") == "cli":
+            span = current_original_caller(required=True)
+            span.check("result_delivery_entry")
+            deadline = span.loop_deadline()
+        pending_output = any(not row['result']['deliveries'][a['reference']]
+                      or row['result']['deliveries'][a['reference']][-1]['state'] not in {'DELIVERED','UNKNOWN'}
+                      for a in row['result']['artifacts'])
+        if row['owner'].get('platform') == 'cli' and pending_output:
+            from hermes_cli.friday_cli_output import output_deadline
+            remaining = row['deadline_unix'] - self.host.store.clock()
+            if remaining <= 0:
+                raise AssociationError('original_delivery_budget_exhausted')
+            deadline = output_deadline(min(30, remaining), deadline)
         for artifact in row["result"]["artifacts"]:
-            current = self.host.store.get(row["existing_task_id"], row["owner"])
+            current = (self.host.store.get(row["existing_task_id"], row["owner"]) if span is None else
+                       span.sync("delivery_current_store", self.host.store.get, row["existing_task_id"], row["owner"]))
             check_retained_job(current)
+            from hermes_cli.friday_cli_work import check_local_job
+            check_local_job(self.host, current)
             attempts = current["result"]["deliveries"][artifact["reference"]]
             if attempts and attempts[-1]["state"] in {"DELIVERED", "UNKNOWN"}:
                 continue  # Never duplicate a delivered or uncertain native send.
             if self.host._closed or self.host.ctx.get_config("results") != {"enabled": True}:
                 return
-            row = await deliver_artifact(self.host.ctx, self.host.store, current, artifact["reference"], retry=retry)
+            row = await deliver_artifact(self.host.ctx, self.host.store, current, artifact["reference"], retry=retry, deadline=deadline)
+        if span is not None:
+            span.check("delivery_body_return")
+            return row["delivery"]  # UNKNOWN until real native publication finishes
         return self.host.store.get(row["existing_task_id"], row["owner"])["delivery"]
 
 

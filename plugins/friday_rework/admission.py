@@ -33,6 +33,9 @@ def _encoded(value):
 
 
 def _snapshot(value):
+    if isinstance(value, dict) and value.get('platform') == 'cli':
+        from hermes_cli.friday_cli_work import validate_ingress
+        return validate_ingress(value)
     top = {"platform", "session_key", "source_profile", "transport_profile", "runtime_profile", "message"}
     fields = {"bot_id", "user_id", "chat_id", "thread_id", "message_id", "platform_update_id", "reply_to_message_id", "media"}
     if (not isinstance(value, dict) or set(value) not in (top, top | {"chat_type"})
@@ -82,6 +85,9 @@ def _snapshot(value):
 
 def _receipt_key(value):
     # One routed message cannot silently acquire another bot/update identity.
+    if value.get('platform') == 'cli':
+        return hashlib.sha256(_encoded(['cli', value['session_id'], value['runtime_home'],
+                                      value['input']['native_message_id']])).hexdigest()
     return hashlib.sha256(_encoded([
         value["session_key"], value["source_profile"], value["message"]["message_id"]
     ])).hexdigest()
@@ -94,6 +100,8 @@ def delivery_route(matched_ingress):
     chat type. The gateway rechecks current authorization and actual adapter.
     """
     value = _snapshot(matched_ingress)
+    if value['platform'] == 'cli':
+        return copy.deepcopy(value['route'])
     if "chat_type" not in value:
         raise ValueError("missing_admitted_delivery_route")
     message = value["message"]
@@ -119,10 +127,18 @@ def native_call_scope(*, tool_name, args, next_call, **context):
     # Mask an outer invocation before allocation/validation can fail. Hermes
     # falls through after middleware exceptions, so no such fallback may use
     # the parent's correlation as proof for this call.
+    outer = _call.get()
     token = _call.set(None)
     try:
         try:
-            identity = tuple(_text(context.get(key)) for key in CALL_FIELDS)
+            if outer is not None:
+                raise ValueError('nested_native_call')
+            from hermes_cli.friday_cli_work import is_cli, admitted_call
+            if is_cli():
+                _, verified = admitted_call(context)
+                identity = tuple(verified[key] for key in CALL_FIELDS)
+            else:
+                identity = tuple(_text(context.get(key)) for key in CALL_FIELDS)
         except Exception:
             identity = None
         _call.set(identity)
@@ -176,8 +192,25 @@ class IngressAdmissions:
 
     def match(self, owner, *, task_id, session_id):
         call = _call.get()
-        if call is None or call[:2] != (task_id, session_id) or session_id != owner["id"]:
+        original_session = owner['session_id'] if owner.get('platform') == 'cli' else owner['id']
+        if call is None or call[:2] != (task_id, session_id) or session_id != original_session:
             raise ValueError("missing_native_correlation")
+        if owner.get('platform') == 'cli':
+            from hermes_cli.friday_cli_work import admitted_call, check_owner
+            snapshot, native = admitted_call(dict(zip(CALL_FIELDS, call)))
+            check_owner(owner, snapshot)
+            with self.associations._locked():
+                document = self._read()
+                key = _receipt_key(snapshot)
+                prior = document['receipts'].get(key)
+                if prior is not None and prior != snapshot:
+                    raise ValueError('ingress_identity_conflict')
+                if prior is None:
+                    document['receipts'][key] = snapshot
+                    self.associations.state_set(KEY, document)
+                _sync_directory(Path(self.state.data_dir))
+            check_owner(owner, snapshot)
+            return copy.deepcopy(snapshot), native
         lookup = {"session_key": owner["key"], "source_profile": owner["profile"],
                   "message": {"message_id": owner["message_id"]}}
         with self.associations._locked():

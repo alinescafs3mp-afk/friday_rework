@@ -46,6 +46,7 @@ class WorkerHost:
         # Cached *checked* associations permit emergency stop after store damage.
         # They are not an admission authority, task database or execution queue.
         self._owned = {}
+        self._local_owners = {}  # retained native objects; never reconstructed from rows
         self._a0_controllers = {}
         self._a0_admissions = set()
         self._closed = False
@@ -77,6 +78,8 @@ class WorkerHost:
             scope = current()
             ingress, correlation = self.admission.match(
                 owner, task_id=kwargs.get("task_id"), session_id=kwargs.get("session_id"))
+            if owner.get('platform') == 'cli' and any(kwargs.get(k) != correlation[k] for k in correlation):
+                raise HostUnavailable('missing_native_cli_call')
             if scope is not None:
                 scope.require_owner(owner, ingress)
         except (ValueError, RuntimeError, OSError):
@@ -93,6 +96,8 @@ class WorkerHost:
             if old is not None:
                 from hermes_cli.friday_user_scope import check_retained_job
                 check_retained_job(old)
+                from hermes_cli.friday_cli_work import check_local_job
+                check_local_job(self, old)
                 # Exact duplicate is read-only: no budget reset, preparation,
                 # new scheduler task, cache restaging or implicit continuation.
                 binding = old.get("host", {}).get("binding", {})
@@ -103,8 +108,12 @@ class WorkerHost:
             configured = self.ctx.get_config("runtime")
             if not isinstance(configured, dict) or configured.get("enabled") is not True:
                 return json.dumps({"accepted": False, "error": "worker_not_admitted"})
-            if any(not callable(getattr(self.ctx, api, None))
-                   for api in ("get_command_context", "schedule_gateway_work")):
+            if ingress['platform'] == 'cli':
+                if any(not callable(getattr(self.ctx, api, None)) for api in ('require_cli_work','run_cli_work')):
+                    raise HostUnavailable('cli_foreground_unavailable')
+                self.ctx.require_cli_work(delivery_route(ingress))
+            elif any(not callable(getattr(self.ctx, api, None))
+                     for api in ("get_command_context", "schedule_gateway_work")):
                 raise HostUnavailable("worker_not_available")
             runtime = check_runtime(select_runtime(configured, brief.worker), self.store)
             if ('a0' in runtime) != (brief.worker == 'a0'):
@@ -131,13 +140,26 @@ class WorkerHost:
                 acceptance=acceptance,
                 host_binding=host_binding)
             if not fresh:
+                from hermes_cli.friday_user_scope import check_retained_job
+                from hermes_cli.friday_cli_work import check_local_job
+                check_retained_job(row)
+                check_local_job(self, row)
+                if row['host']['binding'] != host_binding:
+                    raise AssociationError('admission_conflict')
                 return json.dumps(status(row))
             self._owned[address] = copy.deepcopy(row)
+            if ingress['platform'] == 'cli':
+                from hermes_cli.friday_cli_work import retain_local_owner
+                self._local_owners[address] = retain_local_owner(self.ctx, ingress)
             if brief.worker == 'a0': self._a0_admissions.add(address)
             # No fallback to a shared directory, no clobber of earlier artifacts.
             workspace = Path(row["workspace_reference"])
             staging = Path(runtime["staging_root"]) / address
             for directory in (workspace, staging):
+                from hermes_cli.friday_user_scope import check_retained_job
+                from hermes_cli.friday_cli_work import check_local_job
+                check_retained_job(row)
+                check_local_job(self, row)
                 private_directory(directory.parent)
                 directory.mkdir(mode=0o700)
                 private_directory(directory)
@@ -158,6 +180,9 @@ class WorkerHost:
                 # Only the host's native producer can provide current evidence,
                 # after durable reservation and byte-verified input retention.
                 return json.dumps(self.produce_a0_capability(address, owner))
+            if ingress['platform'] == 'cli':
+                answer = self.ctx.run_cli_work(self._run(row), route=route, name='friday:' + address)
+                return json.dumps({**answer, 'scheduling': 'FINITE_FOREGROUND'})
             self.ctx.schedule_gateway_work(self._run(row), route=route, name="friday:" + address)
             return json.dumps(status(row))
         except (ValueError, RuntimeError, OSError, TypeError, KeyError) as error:
@@ -178,6 +203,8 @@ class WorkerHost:
         row = self.store.get(task_id, owner)
         from hermes_cli.friday_user_scope import check_retained_job
         check_retained_job(row)
+        from hermes_cli.friday_cli_work import check_local_job
+        check_local_job(self, row)
         runtime = row['host']['binding']['runtime']
         if row['worker_kind'] != 'a0' or select_runtime(self.ctx.get_config('runtime'), 'a0') != runtime:
             raise HostUnavailable('foreign_a0_runtime_binding')
@@ -226,11 +253,17 @@ class WorkerHost:
         stop-only: it cannot redispatch a precrash reservation or attachment.
         """
         row, session = self._a0_producer_session(task_id, owner)
+        if row['owner'].get('platform') == 'cli':
+            self.ctx.require_cli_work(delivery_route(row['host']['binding']['ingress']))
         row, fresh = self.store.attach_a0_capability(task_id, owner, pin, session.validate_capability)
         self._remember(row)
         if fresh:
-            self.ctx.schedule_gateway_work(self._run(row), route=delivery_route(row['host']['binding']['ingress']),
-                                           name='friday:'+task_id)
+            route = delivery_route(row['host']['binding']['ingress'])
+            if row['owner'].get('platform') == 'cli':
+                self.ctx.require_cli_work(route)
+                self.ctx.run_cli_work(self._run(row), route=route,name='friday:'+task_id)
+            else:
+                self.ctx.schedule_gateway_work(self._run(row), route=route,name='friday:'+task_id)
         return status(row)
 
     def _remember(self, row):
@@ -270,6 +303,10 @@ class WorkerHost:
 
     def _retain_settlement(self, row, observation):
         row = self._remember(self.store.get(row["existing_task_id"], row["owner"]))
+        from hermes_cli.friday_user_scope import check_retained_job
+        check_retained_job(row)
+        from hermes_cli.friday_cli_work import check_local_job
+        check_local_job(self, row)
         terminal = quiet = None
         if isinstance(observation, NativeObservation) and observation.state in {"completed", "failed", "stopped"}:
             terminal = {"state": observation.state, "evidence_reference": observation.evidence_reference,
@@ -299,8 +336,11 @@ class WorkerHost:
         row = self._remember(self.store.get(row["existing_task_id"], row["owner"]))
         from hermes_cli.friday_user_scope import check_retained_job
         check_retained_job(row)
+        from hermes_cli.friday_cli_work import check_local_job
+        check_local_job(self, row)
         controller = self._controller(row)
-        if self._closed or row["stop_intent"]:
+        from hermes_cli.friday_cli_work import should_stop
+        if self._closed or row["stop_intent"] or (row['owner'].get('platform') == 'cli' and should_stop()):
             return self._stop(row, row["stop_intent"] or "cancel")
         if self.store.clock() >= row["deadline_unix"]:
             # Withdrawal precedes prepare; expiry never gets a fresh budget.
@@ -311,7 +351,11 @@ class WorkerHost:
         check_runtime(runtime, self.store)
         brief = parse_brief(row["host"]["binding"]["brief"])
         inputs = tuple(VerifiedInput(**v) for v in row["host"]["inputs"])
+        check_retained_job(row)
+        check_local_job(self, row)
         controller.prepare(row["existing_task_id"], row["owner"], brief, inputs)
+        check_retained_job(row)
+        check_local_job(self, row)
         return self._settle(row, controller.start(row["existing_task_id"], row["owner"], brief, inputs))
 
     def _reconcile(self, row):
@@ -340,6 +384,8 @@ class WorkerHost:
             return row  # Restart/status never prepares or launches.
         from hermes_cli.friday_user_scope import check_retained_job
         check_retained_job(row)
+        from hermes_cli.friday_cli_work import check_local_job
+        check_local_job(self, row)
         return self._settle(row, self._controller(row).reconcile(row["existing_task_id"], row["owner"]))
 
     def _stop(self, row, intent):
@@ -359,7 +405,9 @@ class WorkerHost:
                          and row['host']['a0'].get('route') is None))):
                 return self._settle(row, NativeObservation("", "", "association:" + row["existing_task_id"] + "#stop_intent",
                                                          row["elapsed_seconds"], "stopped"))
-            principal = {k: row["owner"][k] for k in PRINCIPAL}
+            principal = ({k: row['owner'][k] for k in ('platform','session_id','profile','transport_profile',
+                           'account_id','user_id','os_uid','authority','home')}
+                         if row['owner'].get('platform') == 'cli' else {k: row["owner"][k] for k in PRINCIPAL})
             value = self._controller(row).stop(row["existing_task_id"], principal, intent)
             return self._settle(row, value)
         except BaseException as error:
@@ -378,7 +426,9 @@ class WorkerHost:
             current = await asyncio.shield(execution)
             while current["host"]["quiescence"] is None:
                 await asyncio.sleep(min(1.0, max(.01, current["deadline_unix"] - self.store.clock())))
-                if self._closed or select_runtime(self.ctx.get_config("runtime"), row["worker_kind"]) != row["host"]["binding"]["runtime"]:
+                from hermes_cli.friday_cli_work import should_stop
+                if (self._closed or (row['owner'].get('platform') == 'cli' and should_stop())
+                        or select_runtime(self.ctx.get_config("runtime"), row["worker_kind"]) != row["host"]["binding"]["runtime"]):
                     current = await asyncio.to_thread(self._stop, current, "cancel")
                 else:
                     current = await asyncio.to_thread(self._reconcile, current)
@@ -411,6 +461,11 @@ class WorkerHost:
     def _principal(self, receipt, command):
         if not isinstance(receipt, dict):
             raise HostUnavailable("unproved_control")
+        if receipt.get('schema') == 'friday.cli-control.v1':
+            from hermes_cli.friday_cli_work import get_cli_control, principal_from_route
+            if self.ctx.get_command_context() != receipt or receipt['command'] != command:
+                raise HostUnavailable('unproved_cli_control')
+            return principal_from_route(receipt['route'])
         operation = receipt.get("native_operation")
         if operation is not None:
             if (command != "friday-stop" or operation not in ("stop", "new")
@@ -476,6 +531,10 @@ class WorkerHost:
 
     @staticmethod
     def _matches_control(row, principal, receipt):
+        if principal.get('platform') == 'cli':
+            return ('host' in row and row['host']['quiescence'] is None
+                    and all(row['owner'].get(k) == v for k,v in principal.items())
+                    and row['host']['binding']['ingress']['route'] == receipt['route'])
         return ("host" in row and row["host"]["quiescence"] is None
                 and all(row["owner"][k] == principal[k] for k in PRINCIPAL)
                 and row["host"]["binding"]["ingress"]["transport_profile"]
@@ -493,6 +552,11 @@ class WorkerHost:
             if not isinstance(raw_args, str) or (builtin and raw_args != ""):
                 raise HostUnavailable("unproved_control")
             reference = raw_args.strip()
+            if principal.get('platform') == 'cli':
+                from hermes_cli.friday_cli_work import check_local_job
+                for owned in tuple(self._owned.values()):
+                    if (not reference or owned['existing_task_id'] == reference):
+                        check_local_job(self, owned)
             candidates = [r for r in tuple(self._owned.values())
                           if (not reference or r["existing_task_id"] == reference)
                           and self._matches_control(r, principal, receipt)]
@@ -510,10 +574,12 @@ class WorkerHost:
                 # a subsequent metadata wait cannot withhold this checked stop.
                 cached = copy.deepcopy(rows[0])
             row = self.store.get_for_control(reference, principal)
+            from hermes_cli.friday_cli_work import check_local_job
+            check_local_job(self, row)
             if "host" not in row:
                 raise HostUnavailable("missing_host_binding")
-            if (row["host"]["binding"]["ingress"]["transport_profile"]
-                    != receipt["admitted_ingress"]["transport_profile"]):
+            transport = receipt['route']['transport_profile'] if receipt.get('schema') == 'friday.cli-control.v1' else receipt['admitted_ingress']['transport_profile']
+            if (row["host"]["binding"]["ingress"]["transport_profile"] != transport):
                 raise HostUnavailable("foreign_control_profile")
             self._remember(row)
             cached = row
@@ -578,6 +644,8 @@ def register_host(ctx, admission):
         for command in ("friday-stop", "friday-pause", "friday-status"):
             def handler(raw_args, name=command):
                 return host.control(name, raw_args)
-            ctx.register_command(command, handler, args_hint="[reference]", gateway_control=True,
-                                 native_controls=("stop", "new") if command == "friday-stop" else ())
+            from hermes_cli.friday_cli_work import is_cli
+            local = is_cli()
+            ctx.register_command(command, handler, args_hint="[reference]", gateway_control=not local,
+                                 native_controls=("stop", "new") if command == "friday-stop" and not local else ())
     return host

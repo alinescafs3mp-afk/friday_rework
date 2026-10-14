@@ -243,6 +243,49 @@ def _new_file(path, value):
     _sync_directory(path.parent)
 
 
+def _cli_admission(root, binding):
+    """Read the frozen local helper's exact map; never infer a local grant.
+
+    Native private-file ownership currently supports the process's own UID
+    only. Foreign UID provisioning needs a separate owner-file contract.
+    """
+    from hermes_cli.friday_cli_principal import cli_policy, numeric_os_uid
+    from hermes_cli.friday_product_access import access_policy
+    key = principal_id(*(binding[k] for k in IDENTITY))
+    rows = [r for r in cli_policy(root)['principals'] if
+            principal_id('cli', r['transport_profile'], r['account_id'], r['user_id']) == key]
+    if len(rows) != 1 or rows[0]['uid'] != numeric_os_uid():
+        raise PermissionError('explicit_local_cli_owner_mapping_required')
+    with scope.authority(root):
+        accounts = access_policy()['accounts']
+    matches = [a for a in accounts if tuple(a[k] for k in IDENTITY[:3]) ==
+               tuple(binding[k] for k in IDENTITY[:3]) and binding['runtime_profile'] in a['runtime_profiles']]
+    if len(matches) != 1:
+        raise PermissionError('foreign_product_account')
+    return rows[0]
+
+
+def _prepare_cli_admission(root, settings, transport_profile, account_id, user_id, uid):
+    from hermes_cli.friday_cli_principal import cli_policy, numeric_os_uid
+    from hermes_constants import get_default_hermes_root
+    # The frozen helper resolves authority from the runtime profile's native
+    # default root. A named gateway authorization home cannot stand in for it.
+    if transport_profile != 'default' or root != get_default_hermes_root(home=root):
+        raise PermissionError('native_cli_default_authorization_home_required')
+    if type(uid) is not int or uid < 0:
+        raise ValueError('explicit_numeric_cli_uid_required')
+    if uid != numeric_os_uid():
+        raise PermissionError('foreign_cli_uid_owner_contract_unsupported')
+    previous = settings.get('cli_admission')
+    rows = [] if previous is None else copy.deepcopy(cli_policy(root)['principals'])
+    key = principal_id('cli', transport_profile, account_id, user_id)
+    if len(rows) >= 10000 or any(r['uid'] == uid or
+            principal_id('cli', r['transport_profile'], r['account_id'], r['user_id']) == key for r in rows):
+        raise ValueError('existing_or_ambiguous_cli_mapping_not_adopted')
+    row = dict(uid=uid, transport_profile=transport_profile, account_id=account_id, user_id=user_id)
+    return {'enabled': True, 'principals': [*rows, row]}, row
+
+
 class Onboarding:
     def __init__(self, administration):
         self.admin = administration
@@ -255,6 +298,14 @@ class Onboarding:
         if scope._CURRENT.get() is not None:
             raise PermissionError('operator_source_scope_required')
         self.admin._verify_session(profile, session)
+
+    @staticmethod
+    def _native_grant(root, binding):
+        if binding['platform'] == 'cli':
+            _cli_admission(root, binding)
+            return True  # Explicit operator map; product enable remains separate.
+        from gateway.pairing import PairingStore
+        return PairingStore().is_approved(binding['platform'], binding['user_id'])
 
     @contextmanager
     def transaction(self, profile, expected_config_sha256, session=None):
@@ -317,13 +368,14 @@ class Onboarding:
                 'principal_id': key, 'template': proof['template'], 'generation': user['generation'],
                 'required_names': proof['required_secrets'], 'enabled': False,
                 'state': 'DISABLED_SETUP_PENDING', 'recoverable': True, 'config_sha256': digest(root / 'config.yaml')})
+            if binding['platform'] == 'cli': result[-1]['uid'] = _cli_admission(root, binding)['uid']
             from hermes_cli.config import require_readable_config_before_write
             result[-1].update(self._worker_summary(home,binding,user['generation'],proof,
                 require_readable_config_before_write(root / 'config.yaml')))
         return result
 
     def prepare(self, profile, *, session=None, expected_config_sha256, template, platform,
-                transport_profile, account_id, user_id, runtime_profile):
+                transport_profile, account_id, user_id, runtime_profile, uid=None):
         if transport_profile != profile: raise PermissionError('receiving_transport_authority_required')
         key = principal_id(platform, transport_profile, account_id, user_id)
         profile_name(runtime_profile)
@@ -341,6 +393,11 @@ class Onboarding:
             matches = [a for a in accounts if tuple(a[k] for k in IDENTITY[:3]) ==
                        (platform, transport_profile, account_id)]
             if len(matches) != 1: raise ValueError('foreign_product_account')
+            cli_policy, cli_row = None, None
+            if platform == 'cli':
+                cli_policy, cli_row = _prepare_cli_admission(root, settings, transport_profile, account_id, user_id, uid)
+            elif uid is not None:
+                raise ValueError('cli_uid_only_for_local_transport')
             from hermes_constants import get_default_hermes_root
             home = get_default_hermes_root(home=root) / 'profiles' / runtime_profile
             if home.exists() or home.is_symlink(): raise ValueError('existing_home_not_adopted')
@@ -357,13 +414,16 @@ class Onboarding:
             if isolation['enabled'] is not True or any(b['runtime_profile'] == runtime_profile or
                     principal_id(*(b[k] for k in IDENTITY)) == key for b in isolation['bindings']):
                 raise ValueError('existing_binding_not_adopted')
-            gateway = config.setdefault('gateway', {})
-            if gateway.get('multiplex_profiles') is not True:
-                raise ValueError('native_multiplex_installation_required')
-            routes = gateway.setdefault('profile_routes', [])
-            if any(r.get('platform') == platform and (r.get('bot_profile') or 'default') == profile
-                   and r.get('user_id') == user_id for r in routes):
-                raise ValueError('conflicting_native_route')
+            if platform != 'cli':
+                gateway = config.setdefault('gateway', {})
+                if gateway.get('multiplex_profiles') is not True:
+                    raise ValueError('native_multiplex_installation_required')
+                routes = gateway.setdefault('profile_routes', [])
+                if any(r.get('platform') == platform and (r.get('bot_profile') or 'default') == profile
+                       and r.get('user_id') == user_id for r in routes):
+                    raise ValueError('conflicting_native_route')
+            elif any(r.get('platform') == 'cli' for r in config.get('gateway', {}).get('profile_routes', [])):
+                raise ValueError('cli_cannot_use_gateway_messaging_routes')
             # Disabled tombstone is persisted FIRST, before any route/home setup.
             self._verify_operator(profile, session)
             user = access._write_user_locked(key, dict(platform=platform, transport_profile=profile,
@@ -371,8 +431,9 @@ class Onboarding:
             isolation['bindings'].append(binding)
             matches[0]['runtime_profiles'].append(runtime_profile)
             settings['admin']['profiles'].append(runtime_profile)
-            routes.append(dict(name='friday-' + key, platform=platform, bot_profile=profile,
-                               user_id=user_id, profile=runtime_profile, enabled=True))
+            if platform == 'cli': settings['cli_admission'] = cli_policy
+            else: routes.append(dict(name='friday-' + key, platform=platform, bot_profile=profile,
+                                    user_id=user_id, profile=runtime_profile, enabled=True))
             from hermes_cli.config import atomic_config_write
             if digest(root / 'config.yaml') != expected_config_sha256:
                 raise ValueError('onboarding_config_conflict_reload')
@@ -406,12 +467,14 @@ class Onboarding:
                 config_sha256=digest(home / 'config.yaml'), soul_sha256=digest(home / 'SOUL.md'),
                 required_secrets=names, directory_identity=[st.st_dev, st.st_ino], template=template,
                 authorization_home=str(root))
+            if cli_row is not None: receipt['cli_admission_sha256'] = scope._fingerprint(cli_row)
             self._verify_operator(profile, session)
             _new_file(home / scope.ONBOARDING, (json.dumps(receipt, sort_keys=True) + '\n').encode())
             return dict(state='DISABLED_INCOMPLETE', enabled=False, principal_id=key,
                         runtime_profile=runtime_profile, generation=user['generation'],
                         config_sha256=digest(root / 'config.yaml'), required_names=names,
                         admission='NATIVE_GRANT_AND_COMPLETE_SETUP_REQUIRED',
+                        **({'uid': cli_row['uid'], 'local_authority': 'EXPLICIT_OPERATOR_MAPPING_PRODUCT_DISABLED'} if cli_row is not None else {}),
                         **self._worker_summary(home,binding,user['generation'],receipt,config))
 
     def _prepared(self, root, state, platform, transport_profile, account_id, user_id, generation):
@@ -421,8 +484,10 @@ class Onboarding:
         if not row or row['generation'] != generation or row['role'] != 'user':
             raise ValueError('onboarding_access_generation_conflict')
         bindings = settings()['user_isolation']['bindings']
-        binding = next((b for b in bindings if principal_id(*(b[k] for k in IDENTITY)) == key), None)
-        if not binding: raise ValueError('onboarding_binding_missing')
+        matches = [b for b in bindings if principal_id(*(b[k] for k in IDENTITY)) == key]
+        if not matches: raise ValueError('onboarding_binding_missing')
+        if len(matches) != 1: raise ValueError('onboarding_binding_ambiguous')
+        binding = matches[0]
         from hermes_constants import get_default_hermes_root
         home = get_default_hermes_root(home=root) / 'profiles' / binding['runtime_profile']
         st = scope._private(home, directory=True)
@@ -433,6 +498,8 @@ class Onboarding:
                 or proof['config_sha256'] != digest(home / 'config.yaml')
                 or proof['soul_sha256'] != digest(home / 'SOUL.md')):
             raise PermissionError('prepared_home_changed')
+        if platform == 'cli' and proof.get('cli_admission_sha256') != scope._fingerprint(_cli_admission(root, binding)):
+            raise PermissionError('prepared_cli_admission_changed')
         return home, binding, row, proof
 
     def credentials(self, profile, *, session=None, expected_config_sha256, generation, platform,
@@ -574,11 +641,10 @@ class Onboarding:
             result['can_qualify_workers']=len(present)==2 and not partial and not attempted and not probe_attempted
             if result['can_activate']:
                 result['worker_execution']='OWN_DEPLOYMENTS_QUALIFIED_LIVE_JOURNEYS_NOT_RUN'
-                from gateway.pairing import PairingStore
                 try:
                     with scope.authority(Path(proof['authorization_home'])):
                         scope.check_onboarding_home(Path(proof['authorization_home']),home,binding)
-                        if not PairingStore().is_approved(binding['platform'],binding['user_id']):
+                        if not self._native_grant(Path(proof['authorization_home']), binding):
                             raise PermissionError('native_grant_missing')
                 except (OSError,ValueError,PermissionError):
                     result['can_activate']=False
@@ -644,13 +710,12 @@ class Onboarding:
         from .host_runtime import check_runtime, HostUnavailable
         from hermes_cli.config import require_readable_config_before_write,config_write_transaction,atomic_config_write
         from hermes_cli.plugins_state import PluginState
-        from gateway.pairing import PairingStore
         with self.transaction(profile,expected_config_sha256,session) as (root,access,config):
             home,binding,row,proof=self._prepared(root,access.state,platform,transport_profile,account_id,user_id,generation)
             if row['enabled'] or (home / scope.MARKER).exists() or (home / scope.MARKER).is_symlink():
                 raise PermissionError('disabled_fresh_worker_setup_required')
             scope.check_onboarding_home(root,home,binding)
-            if not PairingStore().is_approved(platform,user_id):
+            if not self._native_grant(root, binding):
                 return {'state':'DISABLED_NATIVE_GRANT_MISSING','enabled':False}
             with scope.authority(home),config_write_transaction(home / 'config.yaml'):
                 own=require_readable_config_before_write(home / 'config.yaml')
@@ -667,7 +732,7 @@ class Onboarding:
                         self._verify_operator(profile,session)
                         self._prepared(root,access.state,platform,transport_profile,account_id,user_id,generation)
                         scope.check_onboarding_home(root,home,binding)
-                        if not PairingStore().is_approved(platform,user_id): raise PermissionError('native_grant_revoked')
+                        if not self._native_grant(root, binding): raise PermissionError('native_grant_revoked')
                 try: runtimes=join.qualify(home,binding,generation,prepared,verify=verify,
                     accepted_monotonic=accepted_monotonic)
                 except HostUnavailable as exc:
@@ -715,8 +780,7 @@ class Onboarding:
             if worker == 'a0' and not normal:
                 return {'state': 'DISABLED_A0_RECONCILIATION_REQUIRED', 'enabled': False}
             scope.check_onboarding_home(root, home, binding)
-            from gateway.pairing import PairingStore
-            if not PairingStore().is_approved(platform, user_id):
+            if not self._native_grant(root, binding):
                 return {'state': 'DISABLED_NATIVE_GRANT_MISSING', 'enabled': False}
             with scope.authority(home), config_write_transaction(home / 'config.yaml'):
                 self._verify_operator(profile, session)
@@ -763,8 +827,7 @@ class Onboarding:
                 if any(not load_env_file(path).get(k) for k in proof['required_secrets']):
                     return {'state': 'DISABLED_SCOPED_KEYS_MISSING', 'enabled': False}
                 scope.check_onboarding_home(root, home, binding)
-                from gateway.pairing import PairingStore
-                if not PairingStore().is_approved(platform, user_id):
+                if not self._native_grant(root, binding):
                     return {'state': 'DISABLED_NATIVE_GRANT_MISSING', 'enabled': False}
                 from hermes_cli.config import load_config_readonly
                 with scope.authority(home):

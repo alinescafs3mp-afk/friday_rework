@@ -22,6 +22,12 @@ def stage_inputs(*, matched_ingress, admitted_reference, cache_roots,
     Old receipts lacking content remain readable, but cannot authorize bytes.
     """
     ingress = _snapshot(matched_ingress)
+    if ingress['platform'] == 'cli':
+        from hermes_cli.friday_cli_work import check_owner, owner_from_receipt
+        check_owner(owner_from_receipt(ingress), ingress)
+        if ingress['input']['attachments'] != []:
+            raise ArtifactError('cli_file_receive_unsupported')
+        return ()
     if (type(max_file_bytes) is not int or max_file_bytes <= 0
             or type(max_total_bytes) is not int or max_total_bytes <= 0):
         raise ArtifactError("invalid_input_limits")

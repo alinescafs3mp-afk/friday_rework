@@ -50,6 +50,9 @@ def _text(value, limit=512, empty=False):
 
 
 def _owner(value):
+    if isinstance(value,dict) and value.get('platform') == 'cli':
+        from hermes_cli.friday_cli_work import validate_owner
+        return validate_owner(value)
     if not isinstance(value, dict) or set(value) != OWNER_FIELDS:
         raise AssociationError("invalid_owner")
     return {k: _text(v, empty=k in {"thread_id", "profile"}) for k, v in value.items()}
@@ -179,31 +182,61 @@ class Associations:
     """
     def __init__(self, native_state, *, clock=time.time):
         self.state = native_state
+        from hermes_cli.friday_cli_work import is_cli, check_store
+        from hermes_cli.friday_cli_principal import current_cli
+        self._cli_authority = current_cli(required=True) if is_cli() else None
+        check_store(self._cli_authority, self.state)
+        self._cli_state = self.state
+        self._cli_directory = Path(self.state.data_dir)
+        self._cli_namespace = self.state._data_namespace if self._cli_authority is not None else None
         self.clock = clock
         self._thread_lock = threading.RLock()
         self._lock_allowance = ContextVar("association_lock_allowance", default=None)
+        self._native_expected = ContextVar("association_native_expected", default=None)
+
+    def _check_local_state(self):
+        from hermes_cli.friday_cli_work import check_store
+        check_store(self._cli_authority, self.state)
+        if self._cli_authority is not None and (self.state is not self._cli_state
+                or Path(self.state.data_dir) != self._cli_directory
+                or self.state._data_namespace != self._cli_namespace):
+            raise AssociationError('foreign_cli_state')
 
     @contextmanager
     def lock_budget(self):
         """One cumulative acquisition allowance, excluding native work and I/O."""
         from hermes_cli.plugins_state import LockAcquisitionBudget
         budget = self._lock_allowance.get()
-        token = self._lock_allowance.set(budget if budget is not None else LockAcquisitionBudget(.25))
+        from hermes_cli.friday_cli_caller import current as current_original_caller
+        span = current_original_caller()
+        allowance = .25
+        if span is not None:
+            span.check("association_lock_entry", cleanup=True)
+            allowance = min(allowance, span.end - time.monotonic())
+            if allowance <= 0:
+                raise TimeoutError("original_caller_association_lock_deadline")
+        token = self._lock_allowance.set(budget if budget is not None else LockAcquisitionBudget(allowance))
         try:
             yield
         finally:
             self._lock_allowance.reset(token)
 
     def state_get(self, key, default=None):
+        self._check_local_state()
         with self.lock_budget():
-            return self.state.get(key, default, lock_budget=self._lock_allowance.get())
+            value = self.state.get(key, default, lock_budget=self._lock_allowance.get())
+            self._check_local_state()
+            return value
 
     def state_set(self, key, value):
+        self._check_local_state()
         with self.lock_budget():
             self.state.set(key, value, lock_budget=self._lock_allowance.get())
+        self._check_local_state()
 
     @contextmanager
     def _locked(self):
+        self._check_local_state()
         # Unload and coroutine cancellation use the same owned store through
         # different executor threads. Their contention is not a foreign writer.
         with self.lock_budget():
@@ -211,14 +244,17 @@ class Associations:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or not self._thread_lock.acquire(timeout=remaining):
                     raise TimeoutError("association_lock_deadline")
+            prior_native_expected = self._native_expected.set(None)
             try:
                 with self._locked_file() as data:
                     yield data
             finally:
+                self._native_expected.reset(prior_native_expected)
                 self._thread_lock.release()
 
     @contextmanager
     def _locked_file(self):
+        self._check_local_state()
         directory = Path(self.state.data_dir)
         if not directory.is_absolute() or directory.resolve() != directory:
             raise AssociationError("unsafe_state_directory")
@@ -227,6 +263,7 @@ class Associations:
         if ds.st_uid != os.getuid() or stat.S_IMODE(ds.st_mode) != 0o700:
             raise AssociationError("state_directory_not_private")
         fd = os.open(directory / "admission.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        primary_error = None
         try:
             ls = os.fstat(fd)
             if (not stat.S_ISREG(ls.st_mode) or ls.st_uid != os.getuid()
@@ -258,6 +295,8 @@ class Associations:
                 data = {"schema_version": 1, "jobs": {}}
                 self._save(data)
             _validate_store(data)
+            expected_token = self._native_expected.set(copy.deepcopy(data))
+            self._check_local_state()
             if not marker:
                 if os.pwrite(fd, b"v1\n", 0) != 3:
                     raise OSError("short_admission_marker_write")
@@ -267,17 +306,51 @@ class Associations:
             # initialization, before returning access or an external grant.
             for parent in (directory, *directory.parents):
                 _sync_directory(parent)
-            yield data
+            try:
+                yield data
+            finally:
+                self._native_expected.reset(expected_token)
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except BaseException as cleanup:
+                if primary_error is not None:
+                    raise BaseExceptionGroup("association_primary_and_admission_close_UNKNOWN",
+                                             [primary_error, cleanup])
+                raise
 
-    def _save(self, data):
+    def _save(self, data, *, journals=()):
+        from hermes_cli.friday_cli_caller import current as current_original_caller
+        span = current_original_caller()
+        if span is not None:
+            span.check("native_store_save_before", cleanup=True)
         _validate_store(data)
+        self._check_local_state()
+        if self._cli_authority is not None:
+            from hermes_cli.friday_native_state import observe_commit_return
+            cutoff = span.end if span is not None else None
+            with self.lock_budget():
+                witness = self.state.set_commit(
+                    KEY, data, lock_budget=self._lock_allowance.get(), cutoff=cutoff,
+                    expected_value=self._native_expected.get(),
+                    compare=True, journals=journals)
+                returned = observe_commit_return(self.state, witness, cutoff=cutoff)
+            self._native_expected.set(copy.deepcopy(data))
+            self._check_local_state()
+            if span is not None:
+                span.check("native_store_exact_directory_file_generation_closed", cleanup=True)
+            return returned
         self.state_set(KEY, data)
-        # PluginState fsyncs its temporary file, but not the replacement's
-        # directory. Keep its native writer/store; finish the commit under our
-        # compound-operation lock and propagate an uncertain durability error.
         _sync_directory(Path(self.state.data_dir))
+        return None
+
+    def consumer_copy(self, row):
+        from .cli_receipt_selection import project_row
+        self._check_local_state()
+        return project_row(self, row)
 
     @staticmethod
     def _owned(data, task_id, owner):
@@ -315,7 +388,7 @@ class Associations:
                         raise AssociationError("admission_conflict")
                     if host_binding is not None and row.get("host", {}).get("binding") != host_binding:
                         raise AssociationError("admission_conflict")
-                    return copy.deepcopy(row), False
+                    return self.consumer_copy(row), False
                 if row.get("supervisor") == identity["supervisor"]:
                     raise AssociationError("supervisor_already_owned")
             if host_binding is not None and any(
@@ -355,12 +428,12 @@ class Associations:
                     row['host']['a0']['route'] = None
             data["jobs"][task_id] = row
             self._save(data)
-            return copy.deepcopy(row), True
+            return self.consumer_copy(row), True
 
     def snapshot(self):
         """Checked profile snapshot; callers still enforce ownership per control."""
         with self._locked() as data:
-            return copy.deepcopy(data["jobs"])
+            return {k: self.consumer_copy(v) for k, v in data["jobs"].items()}
 
     def attach_a0_capability(self, task_id, owner, pin, validate):
         """Once-only trusted producer attachment in the existing durable row.
@@ -373,7 +446,7 @@ class Associations:
             a = row['host']['a0']
             if a['capability'] is not None:
                 if a['capability'] != pin: raise AssociationError('a0_capability_conflict')
-                return copy.deepcopy(row), False
+                return self.consumer_copy(row), False
             if (row['stop_intent'] or row['preparation_reserved'] or row['native'] is not None
                     or row['submission_observation'] != 'NOT_SUBMITTED'
                     or row['host']['terminal'] is not None or row['host']['quiescence'] is not None
@@ -382,7 +455,7 @@ class Associations:
             validate(copy.deepcopy(row), copy.deepcopy(pin))
             a['capability'] = copy.deepcopy(pin)
             self._save(data)
-            return copy.deepcopy(row), True
+            return self.consumer_copy(row), True
 
     def a0_observation(self, task_id, owner, sample=None):
         """Persist intent before sampling and the full sample before acknowledging it.
@@ -430,7 +503,7 @@ class Associations:
                 raise AssociationError('a0_retention_conflict')
             target[field] = copy.deepcopy(value)
             self._save(data)
-            return copy.deepcopy(row)
+            return self.consumer_copy(row)
 
     def retain_a0_route(self, task_id, owner, value):
         """One-shot route custody in this row, before every native submission.
@@ -465,7 +538,7 @@ class Associations:
                     raise AssociationError('a0_route_history_changed')
             a['route'] = copy.deepcopy(value)
             self._save(data)
-            return copy.deepcopy(row)
+            return self.consumer_copy(row)
 
     def retain_inputs(self, task_id, owner, inputs):
         with self._locked() as data:
@@ -474,7 +547,7 @@ class Associations:
                 raise AssociationError("inputs_already_retained_or_unowned")
             row["host"]["inputs"] = copy.deepcopy(inputs)
             self._save(data)
-            return copy.deepcopy(row)
+            return self.consumer_copy(row)
 
     def retain_outcome(self, task_id, owner, *, observation=None, terminal=None, quiescence=None):
         """First terminal truth is immutable; UNKNOWN alone never releases capacity."""
@@ -488,11 +561,11 @@ class Associations:
                 if value is not None and row["host"][key] is None:
                     row["host"][key] = copy.deepcopy(value)
             self._save(data)
-            return copy.deepcopy(row)
+            return self.consumer_copy(row)
 
     def get(self, task_id, owner):
         with self._locked() as data:
-            return copy.deepcopy(self._owned(data, task_id, owner))
+            return self.consumer_copy(self._owned(data, task_id, owner))
 
     def get_for_control(self, task_id, principal):
         """Resolve a new authorized control message to the original owner.
@@ -501,16 +574,20 @@ class Associations:
         message/session never changes the retained delivery destination.
         """
         fields = {"bot_id", "user_id", "chat_id", "thread_id", "profile"}
-        if not isinstance(principal, dict) or set(principal) != fields:
-            raise AssociationError("invalid_control_principal")
-        principal = {k: _text(v, empty=k in {"thread_id", "profile"}) for k, v in principal.items()}
+        if isinstance(principal,dict) and principal.get('platform') == 'cli':
+            from hermes_cli.friday_cli_work import validate_principal
+            principal = validate_principal(principal)
+        else:
+            if not isinstance(principal, dict) or set(principal) != fields:
+                raise AssociationError("invalid_control_principal")
+            principal = {k: _text(v, empty=k in {"thread_id", "profile"}) for k, v in principal.items()}
         _text(task_id, 128)
         with self._locked() as data:
             row = data["jobs"].get(task_id)
             if (not isinstance(row, dict) or not isinstance(row.get("owner"), dict)
                     or any(row["owner"].get(k) != v for k, v in principal.items())):
                 raise AssociationError("unknown_or_foreign_task")
-            return copy.deepcopy(row)
+            return self.consumer_copy(row)
 
     def begin_submission(self, task_id, owner):
         """Persist uncertainty BEFORE the external native submission call."""
@@ -523,7 +600,7 @@ class Associations:
                 raise AssociationError("submission_requires_reconciliation")
             row["submission_observation"] = "UNKNOWN"
             self._save(data)
-            return copy.deepcopy(row)
+            return self.consumer_copy(row)
 
     def attach_native(self, task_id, owner, native):
         """Record real identity after submission; retain any concurrent stop."""
@@ -537,7 +614,7 @@ class Associations:
             self._save(data)
             # Caller must immediately stop this identity if stop_intent exists;
             # persisting identity is not authority for another effect.
-            return copy.deepcopy(row)
+            return self.consumer_copy(row)
 
     def request_stop(self, task_id, owner, intent):
         if intent not in ("cancel", "pause"):
@@ -547,7 +624,7 @@ class Associations:
             if row["stop_intent"] != "cancel":
                 row["stop_intent"] = intent
             self._save(data)
-            return copy.deepcopy(row)
+            return self.consumer_copy(row)
 
     def observe(self, task_id, owner, *, native, evidence_reference, elapsed_seconds):
         """Store an evidence reference, never infer completion/quiescence."""
@@ -560,4 +637,4 @@ class Associations:
             row["elapsed_seconds"] = max(row["elapsed_seconds"], elapsed_seconds)
             row["execution_observation"] = evidence_reference
             self._save(data)
-            return copy.deepcopy(row)
+            return self.consumer_copy(row)

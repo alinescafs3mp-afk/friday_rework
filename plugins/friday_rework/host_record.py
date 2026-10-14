@@ -24,6 +24,9 @@ def association_address(correlation, ingress):
 
 
 def owner_from_ingress(correlation, ingress):
+    if ingress.get('platform') == 'cli':
+        from hermes_cli.friday_cli_work import owner_from_receipt
+        return owner_from_receipt(ingress)
     message = ingress["message"]
     return {**{k: message[k] for k in ("bot_id", "user_id", "chat_id", "thread_id", "message_id")},
             "session_id": correlation["session_id"], "session_key": ingress["session_key"],
@@ -322,7 +325,8 @@ def validate_host_record(row):
             if (not isinstance(authority, dict) or set(authority) != {"principal_id", "generation"}
                     or type(authority["generation"]) is not int or authority["generation"] < 1
                     or authority["principal_id"] != principal_id(ingress["platform"], ingress["transport_profile"],
-                        ingress["message"]["bot_id"], ingress["message"]["user_id"])):
+                        (ingress['account_id'] if ingress['platform'] == 'cli' else ingress["message"]["bot_id"]),
+                        (ingress['user_id'] if ingress['platform'] == 'cli' else ingress["message"]["user_id"]))):
                 raise ValueError()
         brief = parse_brief(binding["brief"])
         runtime = validate_runtime(binding["runtime"])
