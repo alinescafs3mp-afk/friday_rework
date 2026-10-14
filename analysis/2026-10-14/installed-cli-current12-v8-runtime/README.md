@@ -1,0 +1,11 @@
+# Installed CLI V8: real read, no final answer
+
+The new V8 task executed once over [accepted installed layer41](../installed-cli-current12-actual41/README.md). The complete614-byte query produced a genuine read of the saved915-byte artifact. Native exit2/76.234s and child exit1/74.163s were reaped without timeout. There is no final answer or native result.json; a persisted compaction summary is not an answer. Full Runtime/Resource/Release Go=false.
+
+Actual compaction persisted an11814-byte summary. The next complete SDK request was refused: conservative byte estimate41077 exceeds input budget35840. Bounded tokenizer fit remains unverified. Original message payloads, foreign rows and artifact are intact; active continuation clones and a CLI close were saved. Four known own process births ended, unit/cgroup closed and the shared heavy lock returned at76.492s inside the original180-second clock. The consumed task is NO_RETRY.
+
+Namespace-exit and model-call-count evidence remain UNKNOWN because no final result field supplies them. Independent partial-result review and Root acceptance confirm only the actual read and cleanup. The summary alleges missing tool text despite the complete retained current read; summary fidelity is not accepted. The review preserved its300-second total budget but exceeded its210-second useful-work allowance; this is not a Resource PASS. Source synthetic short-summary success did not establish real model-summary fidelity or runtime fit. The next source correction must validate the complete candidate before durable SQL commit; it still requires independent acceptance and actual installed integration before a genuinely new ordinary runtime task.
+
+[OUTCOMES.json](OUTCOMES.json) retains this failed result and its limits. [Source41](../installed-cli-current12-source41/README.md) identifies the exact public source bytes. Private logs, summary/artifact bodies, identifiers, configuration, native locations and proof references/hashes are omitted. Full architecture, all seven journeys, intact workers, web/admin/Telegram and final gates remain required. Daily publication timing is cancelled; ordinary meaningful main blocks continue.
+
+Evidence cut: 2026-10-14T21:17:14.039342+03:00.
