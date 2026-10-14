@@ -1,0 +1,1215 @@
+diff --git a/agent/bounded_context.py b/agent/bounded_context.py
+--- a/agent/bounded_context.py
++++ b/agent/bounded_context.py
+@@ -276,6 +276,7 @@
+     policy.assert_route(main_provider_identity(agent, policy), agent.model, base, agent.api_mode)
+     if agent.context_compressor.context_length != policy.context_length:
+         raise BoundedContextError("bounded_context: runtime capacity changed")
++    assert_bounded_protected_wire(agent, request)
+     agent._bounded_context_last_accounting = policy.check_request(request)
+ 
+ 
+@@ -445,3 +446,165 @@
+         return False
+     main_base = normalize_route_base_url(str(getattr(agent, "base_url", "") or ""))
+     return not main_base or normalize_route_base_url(aux_base_url) == main_base
++
++
++def bounded_tool_groups(messages: list, *, allow_pending_tail: bool = False):
++    """Validate text tool exchanges without repairing or dropping their evidence.
++
++    A pending group is allowed only at the transcript end. Foreign, repeated,
++    malformed or interleaved results invalidate the entire observation.
++    """
++    if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
++        return None
++    groups, seen_ids = [], set()
++    i = 0
++    while i < len(messages):
++        row = messages[i]
++        if row.get("role") == "tool":
++            return None
++        calls = row.get("tool_calls")
++        if not calls:
++            i += 1
++            continue
++        if row.get("role") != "assistant" or not isinstance(calls, list):
++            return None
++        ids = []
++        for call in calls:
++            if not isinstance(call, dict) or call.get("type") != "function":
++                return None
++            call_id, function = call.get("id"), call.get("function")
++            if not isinstance(call_id, str) or not call_id.strip() or not isinstance(function, dict):
++                return None
++            if not isinstance(function.get("name"), str) or not function["name"].strip():
++                return None
++            try:
++                if not isinstance(function.get("arguments"), str) or not isinstance(json.loads(function["arguments"]), dict):
++                    return None
++            except (ValueError, TypeError):
++                return None
++            ids.append(call_id)
++        if len(set(ids)) != len(ids) or seen_ids.intersection(ids):
++            return None
++        seen_ids.update(ids)
++        end = i + 1
++        while end < len(messages) and messages[end].get("role") == "tool":
++            end += 1
++        results = messages[i + 1:end]
++        result_ids = [m.get("tool_call_id") for m in results]
++        if (any(not isinstance(v, str) or not v for v in result_ids)
++                or len(set(result_ids)) != len(result_ids) or not set(result_ids).issubset(ids)
++                or any(not isinstance(m.get("content"), str) for m in results)):
++            return None
++        complete = len(results) == len(ids)
++        if not complete and not (allow_pending_tail and end == len(messages)):
++            return None
++        material = complete and all(m["content"].strip() for m in results)
++        groups.append((i, end, tuple(ids), complete, bool(material)))
++        i = end
++    return groups
++
++
++def bounded_preflight_tool_progress(agent: Any, messages: list) -> bool:
++    """Reconsider a no-op only for appended, newly completed material exchanges.
++
++    Compare immutable row fingerprints, retain consumed call IDs across compacted
++    snapshots, and permit only complete appended groups or completion of the one
++    previously pending tail. Attempts, deadlines and cooldowns are never reset.
++    """
++    import hashlib
++    if not isinstance(getattr(agent, "_bounded_context_policy", None), BoundedContextPolicy):
++        return False
++    turn = getattr(agent, "_current_turn_timestamp", None)
++    previous = getattr(agent, "_bounded_preflight_tool_progress", None)
++    try:
++        fingerprints = tuple(hashlib.sha256(json.dumps(row, ensure_ascii=False,
++            separators=(",", ":"), sort_keys=True, allow_nan=False).encode("utf-8")).hexdigest()
++            for row in messages)
++    except (TypeError, ValueError):
++        return False
++    groups = bounded_tool_groups(messages, allow_pending_tail=True)
++    same_turn = isinstance(previous, dict) and previous.get("turn") == turn and turn is not None
++    consumed = set(previous["completed_ids"]) if same_turn else set()
++    previous_consumed = set(consumed)
++    if groups is not None:
++        consumed.update(call_id for _, _, ids, complete, _ in groups if complete for call_id in ids)
++    agent._bounded_preflight_tool_progress = {
++        "turn": turn, "rows": fingerprints, "groups": groups,
++        "completed_ids": frozenset(consumed),
++    }
++    if not same_turn or groups is None or previous["groups"] is None:
++        return False
++    old_rows = previous["rows"]
++    if len(fingerprints) <= len(old_rows) or fingerprints[:len(old_rows)] != old_rows:
++        return False
++    start = len(old_rows)
++    if previous["groups"] and not previous["groups"][-1][3]:
++        start = previous["groups"][-1][0]
++    appended = [group for group in groups if group[0] >= start]
++    cursor, progress = start, False
++    for begin, end, ids, complete, material in appended:
++        if begin != cursor or not complete or previous_consumed.intersection(ids):
++            return False
++        cursor = end
++        progress = progress or material
++    return progress and cursor == len(messages)
++
++
++def assert_bounded_protected_rows(original: list, assembled: list, start: int, end: int) -> None:
++    """Check immutable eligibility bounds and exact protected rows after assembly."""
++    if not (0 <= start < end <= len(original)):
++        raise BoundedContextError("bounded_context: invalid immutable compression window")
++    # Native persistence bookkeeping is deliberately swept on compaction so a
++    # child-session flush cannot skip carried rows. All payload/provenance fields
++    # and nested call arguments remain exact; no marker or summary rewrites them.
++    payload = lambda rows: [{k: v for k, v in row.items() if k != "_db_persisted"} for row in rows]
++    tail = original[end:]
++    if (payload(assembled[:start]) != payload(original[:start]) or len(assembled) < start + len(tail)
++            or (tail and payload(assembled[-len(tail):]) != payload(tail))
++            or bounded_tool_groups(assembled) is None):
++        raise BoundedContextError("bounded_context: compression changed protected authority/user/tool evidence")
++
++
++def remember_bounded_protected_rows(compressor: Any, original: list, start: int, end: int) -> None:
++    import copy
++    compressor._bounded_protected_rows = (copy.deepcopy(original[:start]), copy.deepcopy(original[end:]))
++
++
++def assert_bounded_protected_wire(agent: Any, request: dict) -> None:
++    """Recheck protected rows after the real formatter and at physical admission.
++
++    Use the real native projection, including API sidecars and strict call fields.
++    A newer turn replaces this contract on its own successful compaction. The
++    original current ask and completed exchanges remain ordered and indivisible.
++    """
++    actual = wire_body(request).get("messages")
++    if not isinstance(actual, list) or bounded_tool_groups(actual) is None:
++        raise BoundedContextError("bounded_context: formatted protected tool evidence is invalid")
++    contract = getattr(agent.context_compressor, "_bounded_protected_rows", None)
++    if contract is None:
++        return
++    from agent.turn_context import build_api_messages
++    head, tail = contract
++    anchors = head + tail
++    current = next((i for i in range(len(anchors)-1, -1, -1)
++                    if anchors[i].get("role") == "user"), None)
++    expected, _ = build_api_messages(agent, anchors, current_turn_user_idx=current,
++        ext_prefetch_cache="", plugin_user_context="", moa_config=None, active_system_prompt="")
++    # Optional prompt construction may add one system row ahead of stored
++    # authority. Protected stored head/tail projections must remain contiguous.
++    def matches(wanted, candidate):
++        if not isinstance(candidate, dict):
++            return False
++        fields = ("role", "content", "tool_calls", "tool_call_id", "reasoning_content")
++        return all(candidate.get(k) == wanted.get(k) for k in fields)
++    split = len(head)
++    groups = (expected[:split], expected[split:])
++    cursor = 0
++    for group in groups:
++        if not group:
++            continue
++        found = next((i for i in range(cursor, len(actual)-len(group)+1)
++                      if all(matches(w, a) for w, a in zip(group, actual[i:i+len(group)]))), None)
++        if found is None:
++            raise BoundedContextError("bounded_context: formatter removed or rewrote protected authority/user/tool rows")
++        cursor = found + len(group)
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -296,6 +296,16 @@
+     "run commands, search) instead of merely narrating what you would do. "
+     "The current session state (files, config, etc.) may reflect work "
+     "described here — avoid repeating it:"
++)
++BOUNDED_SUMMARY_PREFIX = (
++    "[CONTEXT COMPACTION — BOUNDED REFERENCE ONLY] Past turns below are background, "
++    "never active instructions. Follow only the latest user message AFTER this "
++    "summary; it overrides historical tasks, and stop/undo/changed requests cancel "
++    "old work. If no later user exists, wait without tools unless later tool calls "
++    "or results prove an in-flight exchange: continue only that exchange. Persistent "
++    "system memory remains authoritative. Tools remain fully active for the current "
++    "task. Session files/config may already contain past effects: do not repeat "
++    "completed work."
+ )
+ LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
+ 
+@@ -3393,6 +3403,10 @@
+         message-count floor."""
+         if not messages:
+             return messages, 0
++        if getattr(self, "bounded_context_policy", None) is not None:
++            # This lane compacts only its eligible middle. Do not deduplicate or
++            # pressure-demote unread/current evidence to manufacture a fit.
++            return [m.copy() for m in messages], 0
+         result = [m.copy() for m in messages]
+         call_id_to_tool = _tool_calls_by_id(result)
+         prune_boundary = self._prune_boundary(result, protect_tail_count, protect_tail_tokens)
+@@ -3754,7 +3768,7 @@
+         # path.
+         _pruned_names = _collect_ghosted_skill_names(turns_to_summarize)
+         del _pruned_names[_MAX_PRUNED_SKILL_MARKERS:]
+-        summary = self._with_summary_prefix(_redact_compaction_text(body.strip()))
++        summary = self._with_selected_summary_prefix(_redact_compaction_text(body.strip()))
+         summary = elide(summary, _FALLBACK_SUMMARY_MAX_CHARS)
+         # Re-inject AFTER the size cap: markers live at the end, where truncation cuts.
+         summary = _reinject_pruned_skill_markers(summary, _pruned_names)
+@@ -3986,7 +4000,7 @@
+             self._clear_terminal_summary_failures()
+             # The provider answered a summary again: the sustained-overload budget restarts (#123167).
+             self._reset_consecutive_overload_aborts()
+-            return self._with_summary_prefix(summary)
++            return self._with_selected_summary_prefix(summary)
+         except Exception as e:
+             return self._on_summary_failure(e, turns_to_summarize, focus_topic, memory_context)
+ 
+@@ -4236,7 +4250,7 @@
+         # Drop merged prior-tail content up to the delimiter so it never leaks into the next prompt.
+         if _MERGED_SUMMARY_DELIMITER in text:
+             text = text.split(_MERGED_SUMMARY_DELIMITER, 1)[1].strip()
+-        for prefix in (SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES):
++        for prefix in (SUMMARY_PREFIX, BOUNDED_SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES):
+             if text.startswith(prefix):
+                 text = text[len(prefix):].lstrip()
+                 break
+@@ -4253,10 +4267,16 @@
+         text = cls._strip_summary_prefix(summary)
+         return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
+ 
++    def _with_selected_summary_prefix(self, summary: str) -> str:
++        if getattr(self, "bounded_context_policy", None) is None:
++            return self._with_summary_prefix(summary)
++        text = self._strip_summary_prefix(summary)
++        return f"{BOUNDED_SUMMARY_PREFIX}\n{text}" if text else BOUNDED_SUMMARY_PREFIX
++
+     @staticmethod
+     def _starts_with_summary_prefix(text: str) -> bool:
+         """Return True if *text* begins with any known handoff prefix."""
+-        return text.startswith((SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES))
++        return text.startswith((SUMMARY_PREFIX, BOUNDED_SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES))
+ 
+     @classmethod
+     def classify_summary_content(cls, content: Any) -> Optional[str]:
+@@ -4622,6 +4642,14 @@
+             probe_start, probe_end = self._restart_handoff_probe_bounds(messages)
+             if any(map(self._is_context_summary_message, messages[probe_start:probe_end])):
+                 return 0
++        # The explicit byte-bounded local lane protects the opening user intent,
++        # rather than fossilizing its completed tool exchange inside a tiny window.
++        # The existing boundary aligner still keeps assistant/tool groups atomic;
++        # the current user turn and pending tool round remain mandatory tail anchors.
++        if getattr(self, "bounded_context_policy", None) is not None and messages:
++            first = next((m for m in messages if m.get("role") != "system"), None)
++            if first is not None and first.get("role") == "user":
++                return min(self.protect_first_n, 1)
+         return self.protect_first_n
+ 
+     def _protect_head_size(self, messages: List[Dict[str, Any]]) -> int:
+@@ -4630,6 +4658,15 @@
+         The ``protect_first_n`` portion DECAYS after the first compression (see _effective_protect_first_n)
+         so early user turns don't fossilize across repeated compactions (#11996).
+         """
++        if getattr(self, "bounded_context_policy", None) is not None:
++            head = 0
++            while head < len(messages) and messages[head].get("role") in {"system", "developer"}:
++                head += 1
++            first_user = next((i for i in range(head, len(messages))
++                               if messages[i].get("role") == "user"
++                               and messages[i].get(COMPRESSED_SUMMARY_METADATA_KEY) is not True), None)
++            # Authority and the original user intent never decay in this lane.
++            return first_user + 1 if first_user is not None else head
+         head = 1 if messages and messages[0].get("role") == "system" else 0
+         return head + self._effective_protect_first_n(messages)
+ 
+@@ -5121,7 +5158,17 @@
+             # the whole oversized active turn, the middle collapses to nothing, and the session
+             # wedges in no_progress (#131412). When the anchored region holds tool-call bodies and is
+             # over the soft ceiling, keep the walk's tool-group-aligned cut instead.
+-            if (
++            bounded_previous_reply = (
++                getattr(self, "bounded_context_policy", None) is not None
++                and asst_anchored_cut < last_user_idx
++                and cut_idx == last_user_idx
++            )
++            if bounded_previous_reply:
++                # Keep the current request verbatim. Its previous completed reply
++                # belongs to the summarized past, together with complete tool groups;
++                # it must not pin the entire small byte-bounded transcript forever.
++                pass
++            elif (
+                 asst_anchored_cut < cut_idx
+                 and allow_split_turn
+                 and any(messages[i].get("tool_calls") for i in range(asst_anchored_cut, cut_idx))
+@@ -5152,8 +5199,11 @@
+ 
+     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
+         """True if a non-empty middle region exists (lets the gateway ``/compress`` guard skip the LLM call)."""
+-        compress_start = self._align_boundary_forward(messages, self._protect_head_size(messages))
+-        compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
++        if getattr(self, "bounded_context_policy", None) is not None:
++            compress_start, compress_end = self._compress_window(messages)
++        else:
++            compress_start = self._align_boundary_forward(messages, self._protect_head_size(messages))
++            compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+         return compress_start < compress_end
+ 
+     def _scan_window_handoffs(
+@@ -5170,6 +5220,27 @@
+             previous_summary_before=self._previous_summary,
+             has_user_turn_before=getattr(self, "_summary_has_user_turn", None),
+         )
++        if getattr(self, "bounded_context_policy", None) is not None:
++            # Eligibility is exactly the selected middle. A protected-row handoff
++            # must never expand summary input or move the immutable tail boundary.
++            hits = [(i, self._strip_summary_prefix(_content_text_for_contains(m.get("content"))))
++                    for i, m in enumerate(messages[compress_start:compress_end], compress_start)
++                    if m.get("role") in {"user", "assistant"} and not m.get("tool_calls")
++                    and m.get(COMPRESSED_SUMMARY_METADATA_KEY) is True
++                    and self._is_context_summary_content(m.get("content"))]
++            scan.summary_indices = {i for i, _ in hits}
++            self._previous_summary = "\n\n".join(body for _, body in hits if body) or None
++            self._summary_has_user_turn = any(
++                m.get("role") == "user" and m.get(COMPRESSED_SUMMARY_METADATA_KEY) is not True
++                for m in messages)
++            scan.turns_to_summarize = []
++            for i in range(compress_start, compress_end):
++                row = _fresh_compaction_message_copy(messages[i])
++                if i in scan.summary_indices:
++                    row = self._strip_context_summary_handoff_message(row)
++                if row is not None:
++                    scan.turns_to_summarize.append(row)
++            return scan
+         # Always scan the full transcript for handoffs: a narrow scan could hide a same-session
+         # handoff and wrongly trigger the cross-session discard (#57835, #83248).
+         summary_search_start = 1 if messages and messages[0].get("role") == "system" else 0
+@@ -5249,6 +5320,17 @@
+         """Return ``(compress_start, compress_end)`` for the summarizable middle."""
+         compress_start = self._align_boundary_forward(messages, self._protect_head_size(messages))
+         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
++        if getattr(self, "bounded_context_policy", None) is not None:
++            latest_user = next((i for i in range(len(messages)-1, -1, -1)
++                                if messages[i].get("role") == "user"
++                                and messages[i].get(COMPRESSED_SUMMARY_METADATA_KEY) is not True), -1)
++            # Content markers never turn a current human instruction into control.
++            # Retain the current request and every exchange it owns even when
++            # their mandatory bytes alone cannot fit. The physical guard denies
++            # that request rather than dropping an unread or malformed group.
++            if latest_user < compress_start:
++                return compress_start, compress_start
++            return compress_start, min(compress_end, latest_user)
+         # A role collision can merge the summary into the first tail row; keep an actionable user
+         # event out of that slot by retaining an older assistant/tool bridge.
+         latest_actionable_idx = self._find_last_user_message_idx(messages, 0)
+@@ -5317,6 +5399,8 @@
+ 
+     def _assemble_head(self, messages: List[Dict[str, Any]], compress_start: int) -> List[Dict[str, Any]]:
+         """Protected head with the compaction note on the system prompt and stale handoffs stripped."""
++        if getattr(self, "bounded_context_policy", None) is not None:
++            return [_fresh_compaction_message_copy(msg) for msg in messages[:compress_start]]
+         compressed = []
+         for i in range(compress_start):
+             # Head handoff already lives in _previous_summary: strip it (standalone dropped, merged
+@@ -5364,6 +5448,11 @@
+         self, messages: List[Dict[str, Any]], compress_end: int, tail_start: int, summary_indices: set,
+     ) -> List[Dict[str, Any]]:
+         """Protected tail with already-folded handoff rows dropped and merged handoffs unwrapped."""
++        if getattr(self, "bounded_context_policy", None) is not None:
++            if tail_start != compress_end or any(i >= compress_end for i in summary_indices):
++                from agent.bounded_context import BoundedContextError
++                raise BoundedContextError("bounded_context: handoff scan crossed protected boundary")
++            return [_fresh_compaction_message_copy(msg) for msg in messages[compress_end:]]
+         tail_messages: List[Dict[str, Any]] = []
+         # Start at tail_start, not compress_end: the rehydration scan may have advanced it (#57835).
+         for i in range(max(compress_end, tail_start), len(messages)):
+@@ -5440,9 +5529,12 @@
+         # handoff, and SUMMARY_PREFIX reads that as "nothing to do" — restate it past the boundary
+         # (#100818). Sanitize FIRST: the trailing-in-flight exemption (#79278) walks back from the list
+         # end, and a replay user row there would strip a genuinely pending assistant(tool_calls).
+-        compressed = self._sanitize_tool_pairs(compressed)
++        bounded = getattr(self, "bounded_context_policy", None) is not None
++        if not bounded:
++            compressed = self._sanitize_tool_pairs(compressed)
+         spared = _pending_tool_round(compressed) if spare_pending_images else range(0)
+-        compressed = self._reappend_inflight_user_task(compressed, self._find_inflight_user_task(messages))
++        if not bounded:
++            compressed = self._reappend_inflight_user_task(compressed, self._find_inflight_user_task(messages))
+         self.compression_count += 1
+         # Replace historical image payloads with placeholders; multi-MB base64 blobs otherwise
+         # exceed body limits.
+@@ -5450,7 +5542,8 @@
+         # short text placeholder. Without this, tail messages keep their original multi-MB base-64 image
+         # payloads forever, which can push every subsequent API request past the provider's body-size limit
+         # and wedge the session. Port of Kilo-Org/kilocode#9434.
+-        compressed = _strip_historical_media(compressed, spared=spared)
++        if not bounded:
++            compressed = _strip_historical_media(compressed, spared=spared)
+ 
+         # Like-for-like savings: current_tokens includes system prompt/tool schemas, new_estimate is
+         # messages-only; comparing them fakes ~96% savings and kills the anti-thrashing guard.
+@@ -5467,7 +5560,7 @@
+         _strip_persistence_markers(compressed)
+         # Prior-turn codex_reasoning_items are re-billed dead weight (#71058); the cache prefix is
+         # already broken here.
+-        _pruned_replay = _prune_stale_reasoning_replay(compressed)
++        _pruned_replay = 0 if bounded else _prune_stale_reasoning_replay(compressed)
+         if _pruned_replay and not self.quiet_mode:
+             logger.info("Pruned stale replay items from %d assistant message(s) during compaction", _pruned_replay)
+         self._last_compression_made_progress = True
+@@ -5516,6 +5609,14 @@
+         _raise_if_stale_attempt(self)
+         telemetry = self._begin_compress_attempt(current_tokens, force)
+         n_messages = len(messages)
++        if getattr(self, "bounded_context_policy", None) is not None:
++            from agent.bounded_context import bounded_tool_groups
++            if bounded_tool_groups(messages) is None:
++                # Incomplete/foreign exchanges remain available for executor
++                # completion or diagnosis; compaction must not sanitize them away.
++                self._structural_no_op_result(telemetry, "invalid_or_pending_tool_group",
++                                               "tool evidence is incomplete or unpaired")
++                return messages
+         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
+         _min_for_compress = self._protect_head_size(messages) + 3 + 1
+         if n_messages <= _min_for_compress:
+@@ -5527,14 +5628,26 @@
+         spare_pending_images = bool(self._spared_pending_tool_round(messages))
+         # Unpruned copy for no-op/abort returns (history stays lossless) and finalize; head/tail are
+         # assembled and measured from the pruned copy (#61932).
+-        canonical_messages = self._drop_blank_echoes(messages)
++        bounded = getattr(self, "bounded_context_policy", None) is not None
++        if bounded:
++            import copy
++            canonical_messages = copy.deepcopy(messages)
++            messages = copy.deepcopy(messages)
++        else:
++            canonical_messages = self._drop_blank_echoes(messages)
+         # Phase 1: Prune old tool results (cheap, no LLM call)
+-        messages, pruned_count = self._prune_old_tool_results(
+-            messages, protect_tail_count=self.protect_last_n, protect_tail_tokens=self.tail_token_budget,
+-        )
++        if bounded:
++            # Boundaries are chosen on immutable original rows; even cheap pruning
++            # and blank-echo removal may not alter protected evidence.
++            pruned_count = 0
++        else:
++            messages, pruned_count = self._prune_old_tool_results(
++                messages, protect_tail_count=self.protect_last_n, protect_tail_tokens=self.tail_token_budget,
++            )
+         if pruned_count and not self.quiet_mode:
+             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
+-        messages = self._drop_blank_echoes(messages)
++        if not bounded:
++            messages = self._drop_blank_echoes(messages)
+         n_messages = len(messages)
+         # Phase 2: Determine boundaries (on the pruned copy so a pressure-demoted tail can compress, #61932)
+         compress_start, compress_end = self._compress_window(messages)
+@@ -5549,7 +5662,8 @@
+             return canonical_messages
+         turns_to_summarize = messages[compress_start:compress_end]
+         # Lean mode demotes stale tail tool results before summary generation so stubs exist even if it aborts.
+-        if getattr(self, "tail_mode", "lean") == "lean":
++        if (getattr(self, "tail_mode", "lean") == "lean"
++                and getattr(self, "bounded_context_policy", None) is None):
+             messages = self._demote_stale_tail_tools(messages, compress_end)
+         scan = self._scan_window_handoffs(messages, compress_start, compress_end, turns_to_summarize)
+         turns_to_summarize = scan.turns_to_summarize
+@@ -5596,7 +5710,14 @@
+             )
+         # Phase 4: Assemble compressed message list
+         compressed = self._assemble_compressed(messages, compress_start, compress_end, scan, summary)
+-        return self._finalize_compressed(compressed, canonical_messages, n_messages, spare_pending_images)
++        if bounded:
++            from agent.bounded_context import assert_bounded_protected_rows, remember_bounded_protected_rows
++            assert_bounded_protected_rows(canonical_messages, compressed, compress_start, compress_end)
++        result = self._finalize_compressed(compressed, canonical_messages, n_messages, spare_pending_images)
++        if bounded:
++            assert_bounded_protected_rows(canonical_messages, result, compress_start, compress_end)
++            remember_bounded_protected_rows(self, canonical_messages, compress_start, compress_end)
++        return result
+ 
+     def _assemble_compressed(
+         self, messages: List[Dict[str, Any]], compress_start: int, compress_end: int, scan: "_HandoffScan", summary: str,
+@@ -5605,6 +5726,12 @@
+         head/tail compress at all (#61932); tool-call arguments are never rewritten by pruning."""
+         compressed = self._assemble_head(messages, compress_start)
+         tail_messages = self._assemble_tail(messages, compress_end, scan.tail_start, scan.summary_indices)
++        if getattr(self, "bounded_context_policy", None) is not None:
++            # A separate carrier cannot rewrite the protected current user/tool
++            # rows, even when template alternation would otherwise merge them.
++            return compressed + [{"role": "assistant", "content": summary + "\n\n" + _SUMMARY_END_MARKER,
++                COMPRESSED_SUMMARY_METADATA_KEY: True,
++                COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: bool(self._summary_has_user_turn)}] + tail_messages
+         summary_role, merge_into_tail, force_user_leading, first_tail_visible_idx = (
+             self._summary_placement(compressed, tail_messages, compress_start)
+         )
+@@ -5780,6 +5907,13 @@
+ 
+     last_driving_handoff = -1
+     for index, message in enumerate(messages):
++        # Tool exchanges carry evidence, even when literal content or persisted metadata
++        # resembles a compaction summary. They cannot drive a reference-only handoff.
++        if isinstance(message, dict) and (
++            message.get("role") == "tool"
++            or (message.get("role") == "assistant" and message.get("tool_calls"))
++        ):
++            continue
+         if not is_compaction_summary_message(message):
+             continue
+         merged_completed_assistant = (
+diff --git a/agent/turn_preflight_gate.py b/agent/turn_preflight_gate.py
+--- a/agent/turn_preflight_gate.py
++++ b/agent/turn_preflight_gate.py
+@@ -57,6 +57,13 @@
+         v.action = "break"
+         return v
+ 
++    from agent.bounded_context import bounded_preflight_tool_progress
++    if bounded_preflight_tool_progress(agent, messages):
++        # The previous no-op described a smaller transcript. A completed new tool
++        # round may create a compressible middle; keep the shared finite attempt
++        # budget and every cooldown/anti-thrash/physical admission guard intact.
++        v._preflight_compression_blocked = False
++
+     # Pre-API pressure check: tool results grow a turn and last_prompt_tokens lags
+     # them. Mirror the turn-prologue guard chain: defer on noisy estimate, skip in
+     # failure cooldown, then should_compress().
+diff --git a/hermes_cli/friday_credential_admission.py b/hermes_cli/friday_credential_admission.py
+--- a/hermes_cli/friday_credential_admission.py
++++ b/hermes_cli/friday_credential_admission.py
+@@ -329,6 +329,8 @@
+         def _build_request(self, options, *, retries_taken=0):
+             from hermes_constants import get_hermes_home
+             require(get_hermes_home() == self._friday_home, 'client_scope_changed')
++            if _ORDINARY_READONLY is not None:
++                cli_ordinary_readonly_current(*_ORDINARY_READONLY)
+             route = route_inputs(api_key=self.api_key)
+             extensions(options.headers, options.extra_json)
+             # httpx auth/hooks and redirects run AFTER SDK construction; none may
+@@ -547,10 +549,12 @@
+         raw = read_owned(path, private=True)
+         return json.loads(raw), hashlib.sha256(raw).hexdigest()
+     require(request['schema'] in ('friday.installed-cli-request.v1','friday.installed-cli-request.v2',
+-                                 'friday.installed-cli-request.v3','friday.installed-cli-request.v4'), 'cli_runtime_supported_request_required')
++                                 'friday.installed-cli-request.v3','friday.installed-cli-request.v4',
++                                 'friday.installed-cli-request.v5'), 'cli_runtime_supported_request_required')
+     require(('postinstall_native_bootstrap_repair' in marker) ==
+-            (request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4'))
+-            and ('postinstall_session_artifact_repair' in marker) == (request['schema'] == 'friday.installed-cli-request.v4')
++            (request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5'))
++            and ('postinstall_session_artifact_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v4','friday.installed-cli-request.v5'))
++            and ('postinstall_context_continuation_repair' in marker) == (request['schema'] == 'friday.installed-cli-request.v5')
+             and ('postinstall_frontend_repair' in marker) == (request['schema'] != 'friday.installed-cli-request.v1'),
+             'cli_runtime_supported_chain_required')
+     original = load(request['installation_input'])
+@@ -565,6 +569,12 @@
+     head = marker
+     snapshots = {}
+     for field, folder, token, schema, manifest_name, source_name, count, prior_token, prior_schema in (
++        ('postinstall_context_continuation_repair','context-continuation-repair','FRIDAY-INSTALL.context-continuation-repair.intent.json',
++         'friday.context-continuation-repair-intent.v1','installed-context-continuation-manifest.json',
++         ('agent/bounded_context.py','agent/context_compressor.py','agent/turn_preflight_gate.py',
++          'hermes_cli/friday_credential_admission.py','hermes_cli/friday_user_scope.py',
++          'tests/agent/test_post_tool_context_fit.py'),38,
++         'FRIDAY-INSTALL.session-artifact-repair.intent.json','friday.session-artifact-repair-intent.v1'),
+         ('postinstall_session_artifact_repair','session-artifact-repair','FRIDAY-INSTALL.session-artifact-repair.intent.json',
+          'friday.session-artifact-repair-intent.v1','installed-session-artifact-manifest.json',
+          ('hermes_cli/friday_credential_admission.py','hermes_cli/friday_user_scope.py'),37,
+@@ -615,7 +625,7 @@
+         manifest_path = Path(r['repaired_input']['path']).parent/'project'/manifest_relative
+         manifest_raw = read_owned(manifest_path)
+         manifest_sha = hashlib.sha256(manifest_raw).hexdigest(); manifest = json.loads(manifest_raw)
+-        require(value['project_files'][manifest_relative] == manifest_sha and len(manifest['files']) == (2 if count == 37 else 1),
++        require(value['project_files'][manifest_relative] == manifest_sha and len(manifest['files']) == (6 if count == 38 else 2 if count == 37 else 1),
+                 'cli_runtime_chain_manifest_changed')
+         names = set(source_name) if isinstance(source_name,tuple) else {source_name}
+         require({row['path'] for row in manifest['files']} == names
+@@ -628,13 +638,20 @@
+                 'cli_runtime_chain_receipt_changed')
+         for row in manifest['files']:
+             name = row['path']
+-            require(row['before_sha256'] == before['files'][name]['sha256']
++            new_file = count == 38 and name == 'tests/agent/test_post_tool_context_fit.py'
++            require((row['before_sha256'] is None and row.get('new_file') is True and name not in before['files']
++                     if new_file else row['before_sha256'] == before['files'][name]['sha256'])
+                     and receipt['files'][name] == {k:row[k] for k in ('sha256','bytes','mode')},
+                     'cli_runtime_chain_receipt_changed')
+             raw = read_owned(snapshots.get(name,home/'hermes-agent'/name))
+             require(hashlib.sha256(raw).hexdigest() == row['sha256'] and len(raw) == row['bytes'],
+                     'cli_runtime_chain_source_changed')
+-            if count == 37:
++            if new_file:
++                absence = json.loads(read_owned(home/'preparation'/folder/'beforeimages.json',private=True))
++                require(absence.get(str(home/'hermes-agent'/name)) == {'absent':True}
++                        and not (base/'hermes-agent'/name).exists()
++                        and not (base/'hermes-agent'/name).is_symlink(), 'cli_runtime_saved_absence_changed')
++            elif count in (37,38):
+                 prior_source = base/'hermes-agent'/name
+                 raw = read_owned(prior_source,private=True)
+                 require(hashlib.sha256(raw).hexdigest() == row['before_sha256'], 'cli_runtime_saved_source_changed')
+@@ -644,6 +661,13 @@
+                 and prior['request']['repaired_input'] == r['previous_input']
+                 and prior['request']['installation_input'] == request['installation_input']
+                 and cli_historical_scope_closed(prior['clock'],'friday.installed-cli-clock.v1'), 'cli_runtime_prior_repair_changed')
++        if count == 38:
++            cli_context_previous_journey(r,home)
++            require(request.get('partial_proof') == r['partial_proof']
++                    and request.get('ordinary_readonly') == r['ordinary_readonly'],
++                    'cli_runtime_partial_proof_or_baseline_changed')
++            head, receipt = previous, before
++            continue
+         inventory = r['previous_runtime']; prefix = 'preparation/cli-runtime/'
+         require(type(inventory) is dict and len(inventory) == (4 if count == 36 else 6),
+                 'cli_runtime_prior_inventory_required')
+@@ -759,6 +783,316 @@
+ 
+ 
+ _SESSION_ARTIFACT = None
++_ORDINARY_READONLY = None
++
++
++def cli_context_previous_journey(request, home):
++    """Preserve the consumed failed V4 journey, including its absent result."""
++    from hermes_cli.friday_dashboard_owner import read_owned
++    import hashlib, re
++    home = Path(home)
++    def load(ref, expected=None):
++        require(type(ref) is dict and set(ref) == {'path','sha256'}
++                and (expected is None or ref['path'] == str(expected)), 'cli_context_history_pin_required')
++        raw = read_owned(Path(ref['path']),private=True)
++        require(hashlib.sha256(raw).hexdigest() == ref['sha256'], 'cli_context_history_pin_changed')
++        return json.loads(raw)
++    prior = load(request['previous_journey'],home/'FRIDAY-INSTALL.session-artifact-journey.intent.json')
++    require(prior['schema'] == 'friday.installed-cli-invocation.v1'
++            and prior['state'] == 'CONSUMED_NOT_COMPLETE'
++            and prior['request']['schema'] == 'friday.installed-cli-request.v4'
++            and prior['request']['repaired_input'] == request['previous_input']
++            and prior['request']['installation_input'] == request['installation_input']
++            and cli_historical_scope_closed(prior['clock'],'friday.installed-cli-clock.v1'),
++            'cli_context_closed_v4_required')
++    unit = prior['request']['unit']; prefix = 'preparation/cli-runtime/'
++    require(type(unit) is str and re.fullmatch(r'friday-rework-cli-runtime-[A-Za-z0-9-]+\.service',unit),
++            'cli_context_previous_unit_required')
++    suffixes = ('.intent.json','.json','.stdout','.stderr','.native-owner.json')
++    inventory = request['previous_runtime']
++    require(type(inventory) is dict and set(inventory) == {prefix+unit+s for s in suffixes},
++            'cli_context_failed_inventory_required')
++    observed = {}
++    for suffix in suffixes:
++        name = prefix+unit+suffix; raw = read_owned(home/name,private=True)
++        require(hashlib.sha256(raw).hexdigest() == inventory[name], 'cli_context_failed_inventory_changed')
++        observed[suffix] = {'path':str(home/name),'bytes':len(raw),'sha256':inventory[name]}
++        if suffix == '.intent.json':
++            require(json.loads(raw) == prior, 'cli_context_consumed_v4_changed')
++    result = home/(prefix+unit+'.result.json')
++    require(not result.exists() and not result.is_symlink(), 'cli_context_failed_result_must_remain_absent')
++    proof = load(request['partial_proof'])
++    require(proof['state'] == 'REAL_NATIVE_V4_PARTIAL_ARTIFACT_CONTEXT_FAIL_CUSTODY_CLOSED_NO_RETRY'
++            and proof['clock'] == prior['clock'] and proof['native_artifacts'] == observed
++            and proof['native_child_exit'] == 1 and proof['root_entry_exit'] == 2
++            and proof['reaped'] is True and proof['timeout'] is False
++            and proof['known_GNU_self_bwrap_births_gone'] is True
++            and proof['native_cgroup_gone_or_empty'] is True
++            and proof['shared_heavy_flock_returned'] is True
++            and proof['native_result_absent_due_to_child_exit1'] is True
++            and proof['retry_authorized'] is False and proof['narrow_journey_accepted'] is False
++            and proof['full_Runtime_Go'] is False,
++            'cli_context_closed_partial_proof_required')
++    binding = request['ordinary_readonly']
++    require(proof['artifact'] == {'path':binding['output'],'bytes':binding['artifact_bytes'],
++                    'sha256':binding['artifact_sha256']}
++            and prior['request']['session_artifact']['id'] == binding['id']
++            and prior['request']['session_artifact']['identity'] == binding['identity']
++            and prior['request']['session_artifact']['stable_messages_sha256'] == binding['stable_messages_sha256']
++            and prior['request']['session_artifact']['message_ids'] == binding['message_ids'],
++            'cli_context_original_session_changed')
++    return prior
++
++
++def cli_ordinary_readonly_inputs(home, binding, *, resumed=False):
++    """Lossless post-partial payload with legal mutable native lifecycle."""
++    import sqlite3, hashlib, math, re
++    home = Path(home)
++    fields = {'schema','id','database','row_sha256','messages_sha256','stable_messages_sha256',
++              'initial_lifecycle_sha256','message_ids','identity','output','max_bytes',
++              'baseline_message_ids','baseline_stable_messages_sha256','append_high_water',
++              'other_sessions_sha256','other_messages_sha256','artifact_sha256','artifact_bytes'}
++    require(type(binding) is dict and set(binding) == fields
++            and binding['schema'] == 'friday.cli-ordinary-readonly.v1'
++            and type(binding['id']) is str and re.fullmatch(r'[0-9]{8}_[0-9]{6}_[0-9a-f]{6}',binding['id'])
++            and binding['database'] == str(home/'state.db')
++            and binding['output'] == str(home/'user-artifacts/session-followup.txt')
++            and binding['max_bytes'] == 8192 and type(binding['max_bytes']) is int
++            and type(binding['artifact_bytes']) is int
++            and 0 < binding['artifact_bytes'] <= binding['max_bytes']
++            and type(binding['artifact_sha256']) is str
++            and re.fullmatch('[0-9a-f]{64}',binding['artifact_sha256'])
++            and type(binding['message_ids']) is list and len(binding['message_ids']) == 4
++            and all(type(n) is int and n > 0 for n in binding['message_ids'])
++            and binding['message_ids'] == sorted(set(binding['message_ids']))
++            and type(binding['baseline_message_ids']) is list
++            and 4 < len(binding['baseline_message_ids']) < 65
++            and all(type(n) is int and n > 0 for n in binding['baseline_message_ids'])
++            and binding['baseline_message_ids'] == sorted(set(binding['baseline_message_ids']))
++            and binding['baseline_message_ids'][:4] == binding['message_ids']
++            and type(binding['append_high_water']) is int
++            and binding['append_high_water'] >= max(binding['baseline_message_ids'])
++            and all(type(binding[k]) is str and re.fullmatch('[0-9a-f]{64}',binding[k]) for k in
++                ('row_sha256','messages_sha256','stable_messages_sha256','initial_lifecycle_sha256',
++                 'baseline_stable_messages_sha256','other_sessions_sha256','other_messages_sha256')),
++            'cli_ordinary_readonly_scope_required')
++    path = home/'state.db'; st = path.lstat()
++    require(path.resolve() == path and stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
++            and st.st_nlink == 1 and not st.st_mode & 0o077, 'cli_session_owned_database_required')
++    for suffix in ('-wal','-shm'):
++        side = path.with_name(path.name+suffix)
++        if side.exists() or side.is_symlink():
++            ss = side.lstat()
++            require(side.resolve() == side and stat.S_ISREG(ss.st_mode) and ss.st_uid == os.getuid()
++                    and ss.st_nlink == 1 and not ss.st_mode & 0o077, 'cli_session_owned_database_required')
++    fingerprint = lambda value: hashlib.sha256(json.dumps(value,sort_keys=True,
++                separators=(',',':'),ensure_ascii=False,default=lambda b:{'sqlite_blob_hex':b.hex()}).encode()).hexdigest()
++    connection = sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=0.2)
++    connection.row_factory = sqlite3.Row
++    try:
++        connection.execute('PRAGMA query_only=ON'); connection.execute('BEGIN')
++        found = connection.execute('SELECT * FROM sessions WHERE id=?',(binding['id'],)).fetchone()
++        require(found is not None, 'cli_session_missing'); row = dict(found)
++        keys = {'id','source','created_source','user_id','origin_json','profile_name','cwd','model',
++                'billing_provider','billing_base_url','parent_session_id'}
++        require(type(binding['identity']) is dict and set(binding['identity']) == keys
++                and {k:row[k] for k in keys} == binding['identity']
++                and row['source'] == row['created_source'] == 'cli' and row['profile_name'] == 'default'
++                and row['user_id'] is None and row['origin_json'] is None and row['parent_session_id'] is None
++                and row['cwd'] == str(home/'hermes-agent') and row['model'] == 'dispatcher'
++                and row['billing_provider'] == 'custom' and not row['archived'] and not row['hidden'],
++                'cli_session_foreign_identity')
++        native_time = lambda value: type(value) in (int,float) and math.isfinite(value) and value > 0
++        # Native end stamps both fields; reopen clears both. Reasons are native
++        # writer strings, not a closed enum of the current CLI's known reasons.
++        require(native_time(row['started_at'])
++                and ((row['ended_at'] is None and row['end_reason'] is None)
++                    or (native_time(row['ended_at']) and type(row['end_reason']) is str)),
++                'cli_ordinary_session_lifecycle_invalid')
++        require(resumed or (fingerprint(row) == binding['row_sha256']
++                and row['ended_at'] is not None), 'cli_ordinary_baseline_row_changed')
++        messages = [dict(r) for r in connection.execute(
++            'SELECT * FROM messages WHERE session_id=? ORDER BY id LIMIT 65',(binding['id'],))]
++        # Apply the domains before excluding flags from immutable payload pins,
++        # including newly appended rows. Message writers allow epoch zero.
++        require(all(type(m[k]) is int and m[k] in (0,1)
++                    for m in messages for k in ('active','compacted'))
++                and all(type(m['timestamp']) in (int,float) and math.isfinite(m['timestamp'])
++                    and 0 <= m['timestamp'] <= 4200000000 for m in messages),
++                'cli_ordinary_message_lifecycle_invalid')
++        count = len(binding['baseline_message_ids']); prior = messages[:count]
++        stable = lambda rows: [{k:v for k,v in m.items() if k not in {'active','compacted'}} for m in rows]
++        require(len(messages) < 65 and [m['id'] for m in prior] == binding['baseline_message_ids']
++                and fingerprint(stable(prior)) == binding['baseline_stable_messages_sha256']
++                and fingerprint(stable(prior[:4])) == binding['stable_messages_sha256']
++                and all(m['id'] > binding['append_high_water'] for m in messages[count:])
++                and (resumed or (len(messages) == count and fingerprint(messages) == binding['messages_sha256']
++                    and fingerprint([{k:m[k] for k in ('id','active','compacted')} for m in prior[:4]]) ==
++                        binding['initial_lifecycle_sha256'])), 'cli_ordinary_history_changed')
++        other_sessions = [dict(r) for r in connection.execute('SELECT * FROM sessions WHERE id<>? ORDER BY id',(binding['id'],))]
++        other_messages = [dict(r) for r in connection.execute('SELECT * FROM messages WHERE session_id<>? ORDER BY id',(binding['id'],))]
++        require(fingerprint(other_sessions) == binding['other_sessions_sha256']
++                and fingerprint(other_messages) == binding['other_messages_sha256'], 'cli_ordinary_other_session_changed')
++        high = connection.execute('SELECT COALESCE(MAX(id),0) FROM messages').fetchone()[0]
++        require(resumed or high == binding['append_high_water'], 'cli_ordinary_append_baseline_changed')
++        return row,messages
++    finally:
++        connection.close()
++
++
++def cli_ordinary_readonly_artifact(home, binding):
++    """Verify bytes through an owned parent and file descriptor, without fallback."""
++    import hashlib
++    path = Path(binding['output']); parent = Path(home)/'user-artifacts'
++    require(path == parent/'session-followup.txt' and parent.resolve() == parent,
++            'cli_ordinary_artifact_escape')
++    directory = os.open(parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
++    try:
++        pst = os.fstat(directory); named_parent = parent.lstat()
++        require(stat.S_ISDIR(pst.st_mode) and pst.st_uid == os.getuid() and not pst.st_mode & 0o077
++                and (pst.st_dev,pst.st_ino) == (named_parent.st_dev,named_parent.st_ino),
++                'cli_ordinary_parent_changed')
++        fd = os.open(path.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory)
++        try:
++            before = os.fstat(fd)
++            require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid() and before.st_nlink == 1
++                    and not before.st_mode & 0o077 and before.st_size == binding['artifact_bytes']
++                    and 0 < before.st_size <= binding['max_bytes'], 'cli_ordinary_artifact_invalid')
++            data = os.read(fd,binding['max_bytes']+1); after = os.fstat(fd)
++            named = os.stat(path.name,dir_fd=directory,follow_symlinks=False)
++            require((before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns) ==
++                    (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns)
++                    and (after.st_dev,after.st_ino) == (named.st_dev,named.st_ino)
++                    and len(data) == binding['artifact_bytes']
++                    and hashlib.sha256(data).hexdigest() == binding['artifact_sha256'],
++                    'cli_ordinary_artifact_changed')
++            data.decode('utf-8')
++            named_parent = parent.lstat()
++            require((pst.st_dev,pst.st_ino) == (named_parent.st_dev,named_parent.st_ino),
++                    'cli_ordinary_parent_changed')
++            return data
++        finally:
++            os.close(fd)
++    finally:
++        os.close(directory)
++
++
++def cli_ordinary_readonly_argv(home, binding):
++    query = ('Прочитай существующий файл '+binding['output']+
++             ' инструментом read_file. По сохранённому резюме объясни, как разделены роли Hermes, '
++             'DeepSeek Harness и Agent Zero и почему они нужны вместе. Дай краткий ответ.')
++    return ['-p','default','--cli','chat','--oneshot','-t','file','--run-budget','90',
++            '--max-turns','4','--resume',binding['id'],'--no-restore-cwd','-q',query]
++
++
++def cli_ordinary_job_id(home, binding):
++    import hashlib
++    semantic = {'schema':'friday.cli-ordinary-readonly-job.v1','session':binding['identity'],
++                'artifact':{'path':binding['output'],'sha256':binding['artifact_sha256']},
++                'query':cli_ordinary_readonly_argv(home,binding)[-1],
++                'effects':['read_file_pinned_existing_artifact','native_final_answer_and_session_append']}
++    return hashlib.sha256(json.dumps(semantic,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
++
++
++def cli_ordinary_job_consumed(home, request, clock):
++    from hermes_cli.friday_dashboard_owner import read_owned
++    job = cli_ordinary_job_id(home,request['ordinary_readonly'])
++    require(request.get('job_id') == job and 'session_artifact' not in request
++            and request['argv'] == cli_ordinary_readonly_argv(home,request['ordinary_readonly']),
++            'cli_ordinary_semantic_job_changed')
++    token = Path(home)/'preparation/cli-runtime/jobs'/(job+'.intent.json')
++    require(json.loads(read_owned(token,private=True)) == {
++            'schema':'friday.cli-ordinary-job-intent.v1','state':'CONSUMED_NO_RETRY',
++            'job_id':job,'request':request,'clock':clock}, 'cli_ordinary_consumed_job_changed')
++
++
++def cli_ordinary_readonly_current(home, binding, clock):
++    from hermes_cli.friday_dashboard_owner import read_owned
++    marker = json.loads(read_owned(Path(home)/'FRIDAY-INSTALL.json',private=True))
++    current = ordinary_cli_runtime(home,marker)
++    unit = Path('/proc/self/cgroup').read_text().strip().rsplit('/',1)[-1]
++    request = json.loads(read_owned(Path(home)/'preparation/cli-runtime'/(unit+'.intent.json'),private=True))['request']
++    require(current == clock and request.get('schema') == 'friday.installed-cli-request.v5'
++            and request.get('ordinary_readonly') == binding, 'cli_ordinary_cached_scope_changed')
++    cli_ordinary_job_consumed(home,request,clock)
++    cli_ordinary_readonly_inputs(home,binding,resumed=True)
++    cli_ordinary_readonly_artifact(home,binding)
++    import time
++    require(time.monotonic() < clock['useful_deadline_mono'], 'cli_runtime_clock_expired_or_invalid')
++
++
++def ordinary_readonly_tool(name, args):
++    if _ORDINARY_READONLY is None:
++        return False
++    cli_ordinary_readonly_current(*_ORDINARY_READONLY)
++    _,binding,_ = _ORDINARY_READONLY
++    require(name == 'read_file' and type(args) is dict and set(args) <= {'path','offset','limit'}
++            and args.get('path') == binding['output']
++            and type(args.get('offset',1)) is int and 1 <= args.get('offset',1) <= 1000000
++            and type(args.get('limit',2000)) is int and 1 <= args.get('limit',2000) <= 2000,
++            'cli_ordinary_readonly_tool_refused')
++    return True
++
++
++def ordinary_readonly_file(name, args):
++    if not ordinary_readonly_tool(name,args):
++        return None
++    home,binding,_ = _ORDINARY_READONLY
++    data = cli_ordinary_readonly_artifact(home,binding)
++    cli_ordinary_readonly_current(*_ORDINARY_READONLY)
++    lines = data.decode('utf-8').splitlines(); offset = args.get('offset',1); limit = args.get('limit',2000)
++    return json.dumps({'success':True,'content':'\n'.join(lines[offset-1:offset-1+limit]),
++                       'total_lines':len(lines),'path':binding['output'],'readonly':True})
++
++
++def cli_ordinary_native_unit_current(home, request, clock, physical):
++    """Read current manager authority, including the admitted main-process birth.
++
++    The native PID namespace may hide the host GNU PID. The manager's exact
++    InvocationID, MainPID and admitted main start timestamp remain observable;
++    no namespace-local PID is substituted for the host GNU process.
++    """
++    import subprocess, time, re
++    runtime = Path('/run/user')/str(os.getuid()); bus = runtime/'bus'
++    ds = runtime.lstat(); bs = bus.lstat()
++    require(runtime.resolve() == runtime and stat.S_ISDIR(ds.st_mode)
++            and ds.st_uid == os.getuid() and not ds.st_mode & 0o077
++            and stat.S_ISSOCK(bs.st_mode) and bs.st_uid == os.getuid() and bs.st_nlink == 1,
++            'cli_ordinary_owned_native_bus_required')
++    birth = physical.get('unit_main_start_usec')
++    require(type(birth) is int and 0 < birth < 10**20
++            and type(physical.get('gnu_stat')) is str
++            and int(physical['gnu_stat'].split(' ',1)[0]) == clock['gnu_pid']
++            and int(physical['gnu_stat'].rsplit(')',1)[1].split()[19]) == clock['gnu_starttime_ticks'],
++            'cli_ordinary_admitted_gnu_birth_required')
++    proc = Path('/proc')/str(clock['gnu_pid'])
++    if (proc/'stat').exists():
++        require(int((proc/'stat').read_text().rsplit(')',1)[1].split()[19]) == clock['gnu_starttime_ticks']
++                and (proc/'exe').resolve() == Path('/usr/bin/gnutimeout')
++                and (proc/'cmdline').read_bytes().split(b'\0')[1:4] ==
++                    [b'--signal=TERM',b'--kill-after=2s',b'180s'], 'cli_ordinary_visible_gnu_birth_changed')
++    props = ('Id','InvocationID','ActiveState','SubState','MainPID','ControlPID','ControlGroup',
++             'RuntimeMaxUSec','TimeoutStopUSec','KillMode','ExecMainStartTimestampMonotonic')
++    timeout = min(5.0,clock['useful_deadline_mono']-time.monotonic())
++    require(timeout > 0, 'cli_runtime_clock_expired_or_invalid')
++    try:
++        result = subprocess.run(['/usr/bin/systemctl','--user','show',request['unit'],
++                '--property='+','.join(props)],cwd=str(home),
++                env={'XDG_RUNTIME_DIR':str(runtime),'DBUS_SESSION_BUS_ADDRESS':'unix:path='+str(bus),
++                     'LC_ALL':'C'},stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
++                stderr=subprocess.PIPE,timeout=timeout,check=False)
++        pairs = [line.split('=',1) for line in result.stdout.decode('utf-8').splitlines()]
++        observed = dict(pairs)
++    except (OSError,ValueError,subprocess.TimeoutExpired):
++        raise CredentialDenied('cli_ordinary_native_manager_unavailable') from None
++    require(result.returncode == 0 and len(result.stdout) <= 8192
++            and time.monotonic() < clock['useful_deadline_mono']
++            and len(pairs) == len(observed) == len(props)
++            and observed == {'Id':request['unit'],'InvocationID':physical['invocation_id'],
++                'ActiveState':'active','SubState':'running','MainPID':str(clock['gnu_pid']),
++                'ControlPID':'0','ControlGroup':physical['cgroup'],'RuntimeMaxUSec':'2min 28s',
++                'TimeoutStopUSec':'30s','KillMode':'control-group',
++                'ExecMainStartTimestampMonotonic':str(birth)}, 'cli_ordinary_current_native_unit_changed')
+ 
+ 
+ def ordinary_cli_runtime(home, marker):
+@@ -795,6 +1129,13 @@
+             and type(clock['gnu_starttime_ticks']) is int and clock['gnu_starttime_ticks'] > 0
+             and clock['started_mono'] <= time.monotonic() < clock['useful_deadline_mono'],
+             'cli_runtime_clock_expired_or_invalid')
++    if request.get('schema') == 'friday.installed-cli-request.v5':
++        cli_ordinary_native_unit_current(home,request,clock,physical)
++        cli_ordinary_job_consumed(home,request,clock)
++        cli_ordinary_readonly_inputs(home,request['ordinary_readonly'],resumed=_ORDINARY_READONLY is not None)
++        cli_ordinary_readonly_artifact(home,request['ordinary_readonly'])
++        require(_ORDINARY_READONLY is None or _ORDINARY_READONLY == (Path(home),request['ordinary_readonly'],clock),
++                'cli_ordinary_cached_scope_changed')
+     base_marker = validated_cli_repair_chain(home, marker, request)
+     oldraw = read_owned(Path(request['historical_marker']['path']), private=True)
+     old = json.loads(oldraw)
+@@ -923,11 +1264,24 @@
+     require(args[:1] == ['chat'], 'cli_host_arguments_refused')
+     checked = parser.parse_args(prefix + args[1:])
+     if runtime is not None:
+-        global _SESSION_ARTIFACT
++        global _SESSION_ARTIFACT, _ORDINARY_READONLY
+         from hermes_cli.friday_dashboard_owner import read_owned
+         unit = Path('/proc/self/cgroup').read_text().strip().rsplit('/',1)[-1]
+         request = json.loads(read_owned(Path(home)/'preparation/cli-runtime'/(unit+'.intent.json'),private=True))['request']
+         artifact = request.get('schema') == 'friday.installed-cli-request.v4'
++        readonly = request.get('schema') == 'friday.installed-cli-request.v5'
++        if readonly:
++            binding = request['ordinary_readonly']
++            require(request['argv'] == cli_ordinary_readonly_argv(home,binding)
++                    and checked.resume == binding['id'] and checked.no_restore_cwd,
++                    'cli_ordinary_exact_resume_required')
++            if _ORDINARY_READONLY is None:
++                cli_ordinary_readonly_inputs(home,binding)
++                cli_ordinary_readonly_artifact(home,binding)
++                _ORDINARY_READONLY = (Path(home),binding,runtime)
++            else:
++                require(_ORDINARY_READONLY == (Path(home),binding,runtime), 'cli_ordinary_cached_scope_changed')
++                cli_ordinary_readonly_current(*_ORDINARY_READONLY)
+         if artifact:
+             require(request['argv'] == cli_session_artifact_argv(home,request['session_artifact'])
+                     and checked.resume == request['session_artifact']['id'] and checked.no_restore_cwd,
+@@ -943,7 +1297,7 @@
+                 output = Path(request['session_artifact']['output'])
+                 cli_session_artifact_path(home,request['session_artifact'],
+                         absent=not (output.exists() or output.is_symlink()))
+-        require(checked.oneshot and checked.toolsets == 'file' and (artifact or checked.resume is None)
++        require(checked.oneshot and checked.toolsets == 'file' and (artifact or readonly or checked.resume is None)
+                 and checked.run_budget == 90 and checked.max_turns == 4
+                 and time.monotonic()+checked.run_budget < runtime['useful_deadline_mono'],
+                 'cli_runtime_bounded_query_required')
+diff --git a/hermes_cli/friday_user_scope.py b/hermes_cli/friday_user_scope.py
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -343,8 +343,9 @@
+ 
+ 
+ def guard_tool(name, args, registry_scope=None):
+-    from hermes_cli.friday_credential_admission import session_artifact_tool, CredentialDenied
+-    try:
++    from hermes_cli.friday_credential_admission import session_artifact_tool, ordinary_readonly_tool, CredentialDenied
++    try:
++        ordinary_readonly_tool(name,args)
+         session_artifact_tool(name,args)
+     except CredentialDenied:
+         raise ScopeDenied() from None
+@@ -699,9 +700,11 @@
+     uses the same tool names but a descriptor-only local backend; complex native
+     file/shell operations stay explicitly unaccepted until sandbox composition.
+     """
+-    from hermes_cli.friday_credential_admission import session_artifact_file, CredentialDenied
+-    try:
+-        artifact = session_artifact_file(name,args) if current() is None else None
++    from hermes_cli.friday_credential_admission import session_artifact_file, ordinary_readonly_file, CredentialDenied
++    try:
++        artifact = ordinary_readonly_file(name,args)
++        if artifact is None:
++            artifact = session_artifact_file(name,args) if current() is None else None
+     except (CredentialDenied,OSError,ValueError):
+         raise ScopeDenied() from None
+     if artifact is not None:
+diff --git a/tests/agent/test_post_tool_context_fit.py b/tests/agent/test_post_tool_context_fit.py
+new file mode 100644
+--- /dev/null
++++ b/tests/agent/test_post_tool_context_fit.py
+@@ -0,0 +1,192 @@
++"""Finite local byte-bounded post-tool compression contracts; no model/network calls."""
++import copy
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++from agent.bounded_context import BoundedContextPolicy, bounded_preflight_tool_progress
++from agent.context_compressor import ContextCompressor, BOUNDED_SUMMARY_PREFIX
++
++POLICY = BoundedContextPolicy("custom:local", "dispatcher", "http://192.168.50.10:8001/v1",
++                              40960, 40954, 4096, 4096, 1024, 2048, 4096)
++
++def transcript():
++    return [{"role":"user","content":"Read the architecture."},
++            {"role":"assistant","content":"","tool_calls":[{"id":"read","type":"function",
++                "function":{"name":"read_file","arguments":"{}"}}]},
++            {"role":"tool","tool_call_id":"read","content":"Architecture evidence. "*200},
++            {"role":"assistant","content":"Past completed answer.","reasoning":"Past reasoning. "*200},
++            {"role":"user","content":"Save the previous answer, then confirm."},
++            {"role":"assistant","content":"","tool_calls":[{"id":"write","type":"function",
++                "function":{"name":"write_file","arguments":"{}"}}]},
++            {"role":"tool","tool_call_id":"write","content":"Written."}]
++
++class PostToolContextFitTests(unittest.TestCase):
++    def compressor(self, bounded=True):
++        c=ContextCompressor("dispatcher",config_context_length=40960,provider="custom",
++                            base_url=POLICY.base_url,api_mode="chat_completions",max_tokens=4096,quiet_mode=True)
++        c.bounded_context_policy=POLICY if bounded else None
++        return c
++    def test_window_keeps_first_current_user_and_atomic_pending_round(self):
++        rows=transcript();before=copy.deepcopy(rows);c=self.compressor()
++        self.assertEqual(c._compress_window(rows),(1,4));self.assertEqual(rows,before)
++        self.assertEqual(rows[1]["tool_calls"][0]["id"],rows[2]["tool_call_id"])
++        self.assertEqual(rows[5]["tool_calls"][0]["id"],rows[6]["tool_call_id"])
++    def test_complete_new_tool_group_rechecks_once_without_mutating_rows(self):
++        rows=transcript();before=copy.deepcopy(rows)
++        a=SimpleNamespace(_bounded_context_policy=POLICY,_current_turn_timestamp=1)
++        self.assertFalse(bounded_preflight_tool_progress(a,rows[:5]))
++        self.assertFalse(bounded_preflight_tool_progress(a,rows[:5]))
++        self.assertTrue(bounded_preflight_tool_progress(a,rows))
++        self.assertFalse(bounded_preflight_tool_progress(a,rows));self.assertEqual(rows,before)
++    def test_incomplete_or_orphaned_or_duplicate_results_do_not_recheck(self):
++        rows=transcript()
++        for bad in [rows[:-1],rows[:-1]+[dict(rows[-1],tool_call_id="foreign")],rows+[rows[-1]]]:
++            a=SimpleNamespace(_bounded_context_policy=POLICY,_current_turn_timestamp=1)
++            bounded_preflight_tool_progress(a,rows[:5]);self.assertFalse(bounded_preflight_tool_progress(a,bad))
++    def probe(self, before, after):
++        a = SimpleNamespace(_bounded_context_policy=POLICY, _current_turn_timestamp=1,
++                            attempts=2, deadline=12345)
++        self.assertFalse(bounded_preflight_tool_progress(a, copy.deepcopy(before)))
++        value = bounded_preflight_tool_progress(a, copy.deepcopy(after))
++        self.assertEqual((a.attempts, a.deadline), (2, 12345))
++        return value
++    def test_stale_prefix_changes_and_synthetic_duplicate_groups_never_rearm(self):
++        rows=transcript()
++        for prefix in [[{"role":"system","content":"request-only injection"}],
++                       [{"role":"user","content":"request-only scaffolding"}]]:
++            self.assertFalse(self.probe(rows, prefix+copy.deepcopy(rows)))
++        self.assertFalse(self.probe(rows, rows+copy.deepcopy(rows[-2:])))
++        changed=copy.deepcopy(rows[:5]);changed[0]["content"]+="edited prefix"
++        self.assertFalse(self.probe(rows[:5], changed+copy.deepcopy(rows[-2:])))
++    def test_mixed_incomplete_or_foreign_delta_before_valid_group_never_rearms(self):
++        rows=transcript()
++        pending=copy.deepcopy(rows[-2]);pending["tool_calls"][0]["id"]="unfinished"
++        for delta in [[pending, *copy.deepcopy(rows[-2:])],
++                      [{"role":"tool","tool_call_id":"foreign","content":"Unpaired"},
++                       *copy.deepcopy(rows[-2:])],
++                      [{"role":"assistant","content":"request-only text"},
++                       *copy.deepcopy(rows[-2:])]]:
++            self.assertFalse(self.probe(rows[:5], rows[:5]+delta))
++    def test_pending_multicall_completion_is_one_material_event(self):
++        rows=transcript()[:-1]
++        second=copy.deepcopy(rows[-1]["tool_calls"][0]);second["id"]="write2"
++        rows[-1]["tool_calls"].append(second)
++        a=SimpleNamespace(_bounded_context_policy=POLICY,_current_turn_timestamp=1)
++        self.assertFalse(bounded_preflight_tool_progress(a,rows))
++        rows.append({"role":"tool","tool_call_id":"write","content":"Written."})
++        self.assertFalse(bounded_preflight_tool_progress(a,rows))
++        rows.append({"role":"tool","tool_call_id":"write2","content":"Also written."})
++        self.assertTrue(bounded_preflight_tool_progress(a,rows))
++        self.assertFalse(bounded_preflight_tool_progress(a,copy.deepcopy(rows)))
++    def test_invalid_or_empty_group_never_claims_material_progress(self):
++        rows=transcript()
++        for field,value in [("name",""),("arguments","broken JSON")]:
++            bad=copy.deepcopy(rows);bad[-2]["tool_calls"][0]["function"][field]=value
++            self.assertFalse(self.probe(rows[:5],bad))
++        bad=copy.deepcopy(rows);bad[-1]["content"]="  "
++        self.assertFalse(self.probe(rows[:5],bad))
++    def test_bounded_head_preserves_all_authority_and_opening_user_after_compaction(self):
++        for roles in [[],["system"],["system","system"],
++                      ["system","developer","system","developer"]]:
++            rows=[{"role":role,"content":"Essential authority "+str(i)}
++                  for i,role in enumerate(roles)]+transcript()
++            c=self.compressor();expected=len(roles)+1
++            self.assertEqual(c._protect_head_size(rows),expected)
++            c.compression_count=1;c._previous_summary="Prior completed facts."
++            self.assertEqual(c._protect_head_size(rows),expected)
++            start,end=c._compress_window(rows)
++            self.assertEqual(start,expected);self.assertLessEqual(end,len(roles)+4)
++            with patch.object(c,"_call_summary_llm",return_value="Only previously completed facts."):
++                compressed=c.compress(copy.deepcopy(rows),current_tokens=38000)
++            self.assertEqual(compressed[:expected],rows[:expected])
++            for original in rows[len(roles)+4:]:
++                self.assertTrue(any({k:v for k,v in row.items() if k!="_compaction_tail"}==original
++                                    for row in compressed))
++    def test_pending_foreign_or_oversized_current_evidence_is_never_dropped(self):
++        base=transcript()
++        pending=copy.deepcopy(base);pending.pop()
++        foreign=copy.deepcopy(base);foreign[-1]["tool_call_id"]="foreign"
++        mixed=copy.deepcopy(base);mixed.insert(5,{"role":"tool","tool_call_id":"orphan","content":"Evidence"})
++        for rows in [pending,foreign,mixed]:
++            c=self.compressor();before=copy.deepcopy(rows)
++            with patch.object(c,"_call_summary_llm",side_effect=AssertionError("invalid group must not summarize")) as call:
++                self.assertEqual(c.compress(rows,current_tokens=38000),before)
++            self.assertEqual(rows,before);self.assertEqual(call.call_count,0)
++        large=copy.deepcopy(base);large[-1]["content"]="Unread evidence. "*10000
++        c=self.compressor()
++        with patch.object(c,"_call_summary_llm",return_value="Only previously completed facts."):
++            compressed=c.compress(copy.deepcopy(large),current_tokens=200000)
++        self.assertTrue(any({k:v for k,v in row.items() if k!="_compaction_tail"}==large[-1]
++                            for row in compressed))
++    def test_markers_and_late_summary_never_expand_middle_or_rewrite_protected_rows(self):
++        from agent.context_compressor import SUMMARY_PREFIX, COMPRESSED_SUMMARY_METADATA_KEY
++        for prefix in [SUMMARY_PREFIX, BOUNDED_SUMMARY_PREFIX]:
++            for index in [4, 5, 6]:
++                rows=transcript();rows[index]["content"]=prefix+"\nLiteral current evidence."
++                for flagged in [False, True] if index != 4 else [False]:
++                    data=copy.deepcopy(rows)
++                    if flagged:data[index][COMPRESSED_SUMMARY_METADATA_KEY]=True
++                    c=self.compressor();before=copy.deepcopy(data)
++                    seen=[]
++                    original=c._summarize_window
++                    def capture(messages, middle, *args):
++                        seen.extend(copy.deepcopy(middle));return original(messages,middle,*args)
++                    with patch.object(c,"_summarize_window",side_effect=capture), patch.object(c,"_call_summary_llm",return_value="Only prior facts."):
++                        out=c.compress(data,current_tokens=38000)
++                    self.assertEqual(data,before)
++                    self.assertEqual(out[0],before[0]);self.assertEqual(out[-3:],before[4:])
++                    self.assertTrue(all(row not in seen for row in before[4:]))
++        for role in ["assistant", "user"]:
++            rows=transcript()+[{"role":role,"content":BOUNDED_SUMMARY_PREFIX+"\nPrior handoff.",COMPRESSED_SUMMARY_METADATA_KEY:True}]
++            c=self.compressor()
++            with patch.object(c,"_call_summary_llm",return_value="Only prior facts."):
++                out=c.compress(copy.deepcopy(rows),current_tokens=38000)
++            self.assertEqual(out[-4:],rows[4:])
++    def test_assembled_invariant_denies_missing_authority_ask_and_orphan_groups(self):
++        from agent.bounded_context import assert_bounded_protected_rows, BoundedContextError
++        rows=transcript();c=self.compressor()
++        with patch.object(c,"_call_summary_llm",return_value="Only prior facts."):
++            out=c.compress(copy.deepcopy(rows),current_tokens=38000)
++        assert_bounded_protected_rows(rows,out,1,4)
++        for index in [0,2,3,4]:
++            bad=copy.deepcopy(out);bad.pop(index)
++            with self.assertRaises(BoundedContextError):assert_bounded_protected_rows(rows,bad,1,4)
++
++    def test_short_handoff_remains_recognized_and_unconfigured_policy_unchanged(self):
++        c=self.compressor();summary=c._with_selected_summary_prefix("Past facts.")
++        self.assertTrue(summary.startswith(BOUNDED_SUMMARY_PREFIX))
++        self.assertEqual(c.classify_summary_content(summary),"standalone")
++        self.assertEqual(c._strip_summary_prefix(summary),"Past facts.")
++        plain=self.compressor(False);self.assertEqual(plain._protect_head_size(transcript()),3)
++        self.assertEqual(plain._with_selected_summary_prefix("Facts."),plain._with_summary_prefix("Facts."))
++
++    def test_tool_exchange_markers_never_drive_reference_handoff(self):
++        from agent.context_compressor import (SUMMARY_PREFIX, COMPRESSED_SUMMARY_METADATA_KEY,
++            is_compaction_summary_message, reference_handoff_would_drive_next_model_call)
++        for prefix in [SUMMARY_PREFIX, BOUNDED_SUMMARY_PREFIX]:
++            for index in [5, 6]:
++                for flagged in [False, True]:
++                    for multimodal in [False, True]:
++                        rows=transcript();content=prefix+"\nLiteral tool evidence."
++                        rows[index]["content"]=[{"type":"text","text":content},
++                            {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}] if multimodal else content
++                        if flagged:rows[index][COMPRESSED_SUMMARY_METADATA_KEY]=True
++                        before=copy.deepcopy(rows)
++                        self.assertTrue(is_compaction_summary_message(rows[index]))
++                        self.assertFalse(reference_handoff_would_drive_next_model_call(rows))
++                        self.assertEqual(rows,before)
++                        carrier={"role":"assistant","content":prefix+"\nPrior facts."}
++                        self.assertFalse(reference_handoff_would_drive_next_model_call([carrier]+rows[4:]))
++    def test_legitimate_summary_carriers_still_drive_reference_handoff(self):
++        from agent.context_compressor import (SUMMARY_PREFIX, COMPRESSED_SUMMARY_METADATA_KEY,
++            reference_handoff_would_drive_next_model_call)
++        for role in ["user", "assistant"]:
++            for prefix in [SUMMARY_PREFIX, BOUNDED_SUMMARY_PREFIX]:
++                for flagged in [False, True]:
++                    row={"role":role,"content":prefix+"\nPrior facts."}
++                    if flagged:row[COMPRESSED_SUMMARY_METADATA_KEY]=True
++                    self.assertTrue(reference_handoff_would_drive_next_model_call([row]))
++                    self.assertFalse(reference_handoff_would_drive_next_model_call([row,
++                        {"role":"user","content":"Current ask."}]))
++
++if __name__ == "__main__": unittest.main()
