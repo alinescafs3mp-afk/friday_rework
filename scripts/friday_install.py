@@ -1432,8 +1432,8 @@ def installed_cli_clock():
 
 
 def installed_cli_kernel(request, clock, *, phase="installed-cli"):
-    require(phase in ("installed-cli", "repair-installed-cli", "repair-frontend-close", "repair-native-bootstrap", "repair-session-artifact", "repair-context-continuation"), "installed_cli_exact_phase_required")
-    if phase in ("repair-installed-cli", "repair-frontend-close", "repair-native-bootstrap", "repair-session-artifact", "repair-context-continuation"):
+    require(phase in ("installed-cli", "repair-installed-cli", "repair-frontend-close", "repair-native-bootstrap", "repair-session-artifact", "repair-context-continuation", "repair-native-manager"), "installed_cli_exact_phase_required")
+    if phase in ("repair-installed-cli", "repair-frontend-close", "repair-native-bootstrap", "repair-session-artifact", "repair-context-continuation", "repair-native-manager"):
         require(request.get("phase") == phase, "installed_cli_exact_phase_required")
     """Prove current GNU, native owner and kernel caps before admission writes."""
     import resource
@@ -1464,7 +1464,7 @@ def installed_cli_kernel(request, clock, *, phase="installed-cli"):
     runtime = directory(Path('/run/user')/str(os.getuid())); bus=runtime/'bus'; info=bus.lstat()
     require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink==1,
             'owned_user_bus_required')
-    ordinary = phase == 'installed-cli' and request.get('schema') == 'friday.installed-cli-request.v5'
+    ordinary = phase == 'installed-cli' and request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6')
     props='Id,InvocationID,ActiveState,SubState,MainPID,ControlPID,ControlGroup,RuntimeMaxUSec,TimeoutStopUSec,KillMode'
     if ordinary:
         props += ',ExecMainStartTimestampMonotonic'
@@ -1580,10 +1580,10 @@ def cli_session_artifact_argv(home, binding):
 
 def installed_cli(request, request_path, *, clock):
     session_artifact = request.get('schema') == 'friday.installed-cli-request.v4'
-    ordinary_readonly = request.get('schema') == 'friday.installed-cli-request.v5'
+    ordinary_readonly = request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6')
     require(type(request) is dict and set(request)==({'schema','assignment','generation','home',
         'installation_input','repaired_input','historical_marker','native_launcher','history','unit','invocation_id','argv'} | ({'ordinary_readonly','job_id','partial_proof'} if ordinary_readonly else {'session_artifact'} if session_artifact else set()))
-        and request['schema'] in ('friday.installed-cli-request.v1','friday.installed-cli-request.v2','friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5') and request['generation']==1
+        and request['schema'] in ('friday.installed-cli-request.v1','friday.installed-cli-request.v2','friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6') and request['generation']==1
         and type(request['generation']) is int
         and re.fullmatch('[A-Za-z0-9-]{1,128}',request['assignment'])
         and request['invocation_id']=='OBSERVE_NATIVE_AT_ADMISSION', 'installed_cli_exact_request_required')
@@ -1591,7 +1591,7 @@ def installed_cli(request, request_path, *, clock):
     budget=Budget(180,started=clock['started_mono'],deadline=clock['useful_deadline_mono'])
     physical=budget.call(installed_cli_kernel,request,clock)
     frontend = request['schema'] != 'friday.installed-cli-request.v1'
-    bootstrap_chain = request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5')
+    bootstrap_chain = request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6')
     original=read_json(pin(request['installation_input']));value=read_json(pin(request['repaired_input']))
     require({k:v for k,v in original.items() if k!='project_files'} ==
             {k:v for k,v in value.items() if k!='project_files'}
@@ -1606,7 +1606,8 @@ def installed_cli(request, request_path, *, clock):
                 ({'postinstall_frontend_repair'} if frontend else set()) |
                 ({'postinstall_native_bootstrap_repair'} if bootstrap_chain else set()) |
                 ({'postinstall_session_artifact_repair'} if session_artifact or ordinary_readonly else set()) |
-                ({'postinstall_context_continuation_repair'} if ordinary_readonly else set())} ==
+                ({'postinstall_context_continuation_repair'} if ordinary_readonly else set()) |
+                ({'postinstall_native_manager_repair'} if 'postinstall_native_manager_repair' in marker else set())} ==
                 {k:v for k,v in historical.items() if k!='source_receipt_sha256'}
             and marker['input_sha256']==request['installation_input']['sha256']
             and cli_historical_scope_closed(historical['original_attempt'],'friday.native-install.v1')
@@ -1619,6 +1620,10 @@ def installed_cli(request, request_path, *, clock):
     query=INSTALLED_CLI_QUERY
     expected=['-p','default','--cli','chat','--oneshot','-t','file','--run-budget','90','--max-turns','4','-q',query]
     if ordinary_readonly:
+        require((request['schema'] == 'friday.installed-cli-request.v6') ==
+                (request['ordinary_readonly'].get('schema') == 'friday.cli-ordinary-readonly.v2')
+                and (request['schema'] != 'friday.installed-cli-request.v6' or
+                     'postinstall_native_manager_repair' in marker), 'cli_ordinary_new_question_source_required')
         expected = cli_ordinary_readonly_argv(home,request['ordinary_readonly'])
         require(request['job_id'] == cli_ordinary_job_id(home,request['ordinary_readonly']),
                 'cli_ordinary_semantic_job_changed')
@@ -1638,7 +1643,7 @@ def installed_cli(request, request_path, *, clock):
             'installed_cli_native_launcher_required')
     budget.call(cli_repair_plugins,value,home,marker,{})
     full_receipt=read_json(home/'hermes-agent.source.json')
-    require(len(full_receipt['layers'])==(38 if ordinary_readonly else 37 if session_artifact else 36 if bootstrap_chain else 35 if frontend else 34) and read_json(source/'install-stamp.json')['fridaySource']==
+    require(len(full_receipt['layers'])==((39 if 'postinstall_native_manager_repair' in marker else 38) if ordinary_readonly else 37 if session_artifact else 36 if bootstrap_chain else 35 if frontend else 34) and read_json(source/'install-stamp.json')['fridaySource']==
             {'baseTree':full_receipt['base_tree'],'layers':full_receipt['layers']},'installed_cli_full_stamp_required')
     custody=Containment(value['containment'],budget,clean_environment(home))
     repair_intent=read_json(home/CLI_REPAIR_INTENT)
@@ -1649,7 +1654,7 @@ def installed_cli(request, request_path, *, clock):
         expected_previous=frontend_delta['request']['previous_input']
         if ordinary_readonly:
             repair = read_json(pin(marker['postinstall_context_continuation_repair']['intent']))
-            require(repair['request']['ordinary_readonly'] == request['ordinary_readonly']
+            require(repair['request']['ordinary_readonly'] == cli_ordinary_readonly_baseline(request['ordinary_readonly'])
                     and repair['request']['partial_proof'] == request['partial_proof'],
                     'cli_ordinary_repair_scope_changed')
             budget.call(cli_context_previous_journey,repair['request'],home)
@@ -2249,13 +2254,15 @@ def validated_cli_repair_chain(home, marker, request):
         return json.loads(raw), hashlib.sha256(raw).hexdigest()
     require(request['schema'] in ('friday.installed-cli-request.v1','friday.installed-cli-request.v2',
                                  'friday.installed-cli-request.v3','friday.installed-cli-request.v4',
-                                 'friday.installed-cli-request.v5'), 'cli_runtime_supported_request_required')
+                                 'friday.installed-cli-request.v5','friday.installed-cli-request.v6'), 'cli_runtime_supported_request_required')
     require(('postinstall_native_bootstrap_repair' in marker) ==
-            (request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5'))
-            and ('postinstall_session_artifact_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v4','friday.installed-cli-request.v5'))
-            and ('postinstall_context_continuation_repair' in marker) == (request['schema'] == 'friday.installed-cli-request.v5')
+            (request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6'))
+            and ('postinstall_session_artifact_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6'))
+            and ('postinstall_context_continuation_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6'))
             and ('postinstall_frontend_repair' in marker) == (request['schema'] != 'friday.installed-cli-request.v1'),
             'cli_runtime_supported_chain_required')
+    require(request['schema'] != 'friday.installed-cli-request.v6' or
+            'postinstall_native_manager_repair' in marker, 'cli_ordinary_new_question_source_required')
     original = load(request['installation_input'])
     current_input = load(request['repaired_input'])
     require({k:v for k,v in original.items() if k != 'project_files'} ==
@@ -2268,6 +2275,10 @@ def validated_cli_repair_chain(home, marker, request):
     head = marker
     snapshots = {}
     for field, folder, token, schema, manifest_name, source_name, count, prior_token, prior_schema in (
+        ('postinstall_native_manager_repair','native-manager-repair','FRIDAY-INSTALL.native-manager-repair.intent.json',
+         'friday.native-manager-repair-intent.v1','installed-native-manager-manifest.json',
+         'hermes_cli/friday_credential_admission.py',39,'FRIDAY-INSTALL.context-continuation-repair.intent.json',
+         'friday.context-continuation-repair-intent.v1'),
         ('postinstall_context_continuation_repair','context-continuation-repair','FRIDAY-INSTALL.context-continuation-repair.intent.json',
          'friday.context-continuation-repair-intent.v1','installed-context-continuation-manifest.json',
          ('agent/bounded_context.py','agent/context_compressor.py','agent/turn_preflight_gate.py',
@@ -2350,7 +2361,7 @@ def validated_cli_repair_chain(home, marker, request):
                 require(absence.get(str(home/'hermes-agent'/name)) == {'absent':True}
                         and not (base/'hermes-agent'/name).exists()
                         and not (base/'hermes-agent'/name).is_symlink(), 'cli_runtime_saved_absence_changed')
-            elif count in (37,38):
+            elif count in (37,38,39):
                 prior_source = base/'hermes-agent'/name
                 raw = read_owned(prior_source,private=True)
                 require(hashlib.sha256(raw).hexdigest() == row['before_sha256'], 'cli_runtime_saved_source_changed')
@@ -2360,10 +2371,20 @@ def validated_cli_repair_chain(home, marker, request):
                 and prior['request']['repaired_input'] == r['previous_input']
                 and prior['request']['installation_input'] == request['installation_input']
                 and cli_historical_scope_closed(prior['clock'],'friday.installed-cli-clock.v1'), 'cli_runtime_prior_repair_changed')
+        if count == 39:
+            cli_ordinary_previous_failed_journey(r,home)
+            require(request.get('schema') == 'friday.installed-cli-request.v6'
+                    and r['next_ordinary_readonly'].get('schema') == 'friday.cli-ordinary-readonly.v2'
+                    and request.get('ordinary_readonly') == r['next_ordinary_readonly']
+                    and cli_ordinary_readonly_baseline(r['next_ordinary_readonly']) == r['ordinary_readonly']
+                    and request.get('partial_proof') == r['partial_proof'],
+                    'cli_runtime_manager_history_scope_changed')
+            head, receipt = previous, before
+            continue
         if count == 38:
             cli_context_previous_journey(r,home)
             require(request.get('partial_proof') == r['partial_proof']
-                    and request.get('ordinary_readonly') == r['ordinary_readonly'],
+                    and cli_ordinary_readonly_baseline(request.get('ordinary_readonly')) == r['ordinary_readonly'],
                     'cli_runtime_partial_proof_or_baseline_changed')
             head, receipt = previous, before
             continue
@@ -2580,24 +2601,27 @@ def cli_bootstrap_previous_journey(request, home, *, session_artifact=False):
 
 
 
+CLI_MANAGER_MANIFEST = 'patches/hermes/installed-native-manager-manifest.json'
+CLI_MANAGER_INTENT = 'FRIDAY-INSTALL.native-manager-repair.intent.json'
+
 CLI_CONTEXT_MANIFEST = 'patches/hermes/installed-context-continuation-manifest.json'
 CLI_CONTEXT_INTENT = 'FRIDAY-INSTALL.context-continuation-repair.intent.json'
 CLI_CONTEXT_NEW_FILE = 'tests/agent/test_post_tool_context_fit.py'
 CLI_CONTEXT_NAMES = {'agent/bounded_context.py','agent/context_compressor.py','agent/turn_preflight_gate.py',
                      'hermes_cli/friday_credential_admission.py','hermes_cli/friday_user_scope.py',CLI_CONTEXT_NEW_FILE}
 
-def repair_native_bootstrap(request, request_path, *, clock, session_artifact=False, context_continuation=False):
-    phase = "repair-context-continuation" if context_continuation else "repair-session-artifact" if session_artifact else "repair-native-bootstrap"
-    token = CLI_CONTEXT_INTENT if context_continuation else CLI_SESSION_INTENT if session_artifact else CLI_BOOTSTRAP_INTENT
-    prior_token = CLI_SESSION_INTENT if context_continuation else CLI_BOOTSTRAP_INTENT if session_artifact else CLI_FRONTEND_INTENT
-    field = "postinstall_context_continuation_repair" if context_continuation else "postinstall_session_artifact_repair" if session_artifact else "postinstall_native_bootstrap_repair"
-    folder_name = "context-continuation-repair" if context_continuation else "session-artifact-repair" if session_artifact else "native-bootstrap-repair"
-    count = 38 if context_continuation else 37 if session_artifact else 36
-    schema = "friday.context-continuation-repair" if context_continuation else "friday.session-artifact-repair" if session_artifact else "friday.native-bootstrap-repair"
+def repair_native_bootstrap(request, request_path, *, clock, session_artifact=False, context_continuation=False, native_manager=False):
+    phase = "repair-native-manager" if native_manager else "repair-context-continuation" if context_continuation else "repair-session-artifact" if session_artifact else "repair-native-bootstrap"
+    token = CLI_MANAGER_INTENT if native_manager else CLI_CONTEXT_INTENT if context_continuation else CLI_SESSION_INTENT if session_artifact else CLI_BOOTSTRAP_INTENT
+    prior_token = CLI_CONTEXT_INTENT if native_manager else CLI_SESSION_INTENT if context_continuation else CLI_BOOTSTRAP_INTENT if session_artifact else CLI_FRONTEND_INTENT
+    field = "postinstall_native_manager_repair" if native_manager else "postinstall_context_continuation_repair" if context_continuation else "postinstall_session_artifact_repair" if session_artifact else "postinstall_native_bootstrap_repair"
+    folder_name = "native-manager-repair" if native_manager else "context-continuation-repair" if context_continuation else "session-artifact-repair" if session_artifact else "native-bootstrap-repair"
+    count = 39 if native_manager else 38 if context_continuation else 37 if session_artifact else 36
+    schema = "friday.native-manager-repair" if native_manager else "friday.context-continuation-repair" if context_continuation else "friday.session-artifact-repair" if session_artifact else "friday.native-bootstrap-repair"
     fields={'schema','phase','assignment','generation','home','installation_input','previous_input',
             'repaired_input','original_marker','original_receipt','original_stamp','previous_repair_intent',
             'selected_python','native_launchers','history','previous_runtime','unit','invocation_id','previous_journey'}
-    require(type(request) is dict and set(request) == fields | ({'ordinary_readonly','partial_proof'} if context_continuation else {'session_artifact'} if session_artifact else set())
+    require(type(request) is dict and set(request) == fields | ({'ordinary_readonly','next_ordinary_readonly','partial_proof','previous_ordinary_runtime','previous_ordinary_custody','previous_ordinary_unchanged'} if native_manager else {'ordinary_readonly','partial_proof'} if context_continuation else {'session_artifact'} if session_artifact else set())
             and request['schema'] == schema+'-request.v1'
             and request['phase'] == phase and type(request['generation']) is int
             and request['generation'] == 1 and re.fullmatch('[A-Za-z0-9-]{1,128}',request['assignment'])
@@ -2628,8 +2652,9 @@ def repair_native_bootstrap(request, request_path, *, clock, session_artifact=Fa
             and marker.get('source_receipt_sha256') == request['original_receipt']['sha256']
             and marker.get('postinstall_source_input') == request['previous_input']
             and field not in marker
-            and (not (session_artifact or context_continuation) or 'postinstall_native_bootstrap_repair' in marker)
-            and (not context_continuation or 'postinstall_session_artifact_repair' in marker)
+            and (not (session_artifact or context_continuation or native_manager) or 'postinstall_native_bootstrap_repair' in marker)
+            and (not (context_continuation or native_manager) or 'postinstall_session_artifact_repair' in marker)
+            and (not native_manager or 'postinstall_context_continuation_repair' in marker)
             and 'postinstall_frontend_repair' in marker
             and marker.get('runtime_ready') is False and marker.get('gateway_installed') is False
             and marker.get('native_frontends') == 'PENDING'
@@ -2638,17 +2663,24 @@ def repair_native_bootstrap(request, request_path, *, clock, session_artifact=Fa
             and cli_historical_scope_closed(marker['original_attempt'],'friday.native-install.v1')
             and cli_historical_scope_closed(marker['cli_segment']['clock'],'friday.cli-segment-clock.v1'),
             'frontend_previous_pending_history_required')
-    budget.call(validated_cli_repair_chain,home,marker,dict(request, schema=('friday.installed-cli-request.v4' if context_continuation else 'friday.installed-cli-request.v3' if session_artifact else 'friday.installed-cli-request.v2'),repaired_input=request['previous_input']))
+    budget.call(validated_cli_repair_chain,home,marker,dict(request, schema=('friday.installed-cli-request.v5' if native_manager else 'friday.installed-cli-request.v4' if context_continuation else 'friday.installed-cli-request.v3' if session_artifact else 'friday.installed-cli-request.v2'),repaired_input=request['previous_input']))
     old=read_json(paths['previous_repair_intent'])
-    require(old.get('schema') == ('friday.session-artifact-repair-intent.v1' if context_continuation else 'friday.native-bootstrap-repair-intent.v1' if session_artifact else 'friday.frontend-close-repair-intent.v1')
+    require(old.get('schema') == ('friday.context-continuation-repair-intent.v1' if native_manager else 'friday.session-artifact-repair-intent.v1' if context_continuation else 'friday.native-bootstrap-repair-intent.v1' if session_artifact else 'friday.frontend-close-repair-intent.v1')
             and old.get('state') == 'CONSUMED_NO_RETRY'
             and old['request']['repaired_input'] == request['previous_input']
             and old['request']['installation_input'] == request['installation_input']
             and old['request']['selected_python'] == request['selected_python']
             and cli_historical_scope_closed(old['clock'],'friday.installed-cli-clock.v1'), 'frontend_old_repair_consumed_required')
     budget.call(cli_repair_history,request,home)
-    budget.call(cli_context_previous_journey,request,home) if context_continuation else budget.call(cli_bootstrap_previous_journey,request,home,session_artifact=session_artifact)
-    if context_continuation:
+    budget.call(cli_ordinary_previous_failed_journey,request,home) if native_manager else budget.call(cli_context_previous_journey,request,home) if context_continuation else budget.call(cli_bootstrap_previous_journey,request,home,session_artifact=session_artifact)
+    if native_manager:
+        require(request['next_ordinary_readonly'].get('schema') == 'friday.cli-ordinary-readonly.v2'
+                and cli_ordinary_readonly_baseline(request['next_ordinary_readonly']) == request['ordinary_readonly']
+                and cli_ordinary_job_id(home,request['next_ordinary_readonly']) !=
+                    cli_ordinary_job_id(home,request['ordinary_readonly']), 'cli_ordinary_new_question_required')
+        budget.call(cli_ordinary_readonly_inputs,home,request['next_ordinary_readonly'])
+        budget.call(cli_ordinary_readonly_artifact,home,request['next_ordinary_readonly'])
+    if context_continuation or native_manager:
         budget.call(cli_ordinary_readonly_inputs,home,request['ordinary_readonly'])
         budget.call(cli_ordinary_readonly_artifact,home,request['ordinary_readonly'])
     require(len(receipt['layers']) == count-1 and stamp.get('fridaySource') ==
@@ -2670,9 +2702,9 @@ def repair_native_bootstrap(request, request_path, *, clock, session_artifact=Fa
     slim=lambda l:{k:l[k] for k in ('manifest','manifest_sha256','patch_sha256')}
     require(len(layers) == count and len({r['manifest'] for r in receipt['layers']}) == count-1
             and {l['manifest']:slim(l) for _,l in layers[:count-1]} == {r['manifest']:r for r in receipt['layers']}
-            and layers[-1][1]['manifest'] == (CLI_CONTEXT_MANIFEST if context_continuation else CLI_SESSION_MANIFEST if session_artifact else CLI_BOOTSTRAP_MANIFEST), 'frontend_single_additive_overlay_required')
+            and layers[-1][1]['manifest'] == (CLI_MANAGER_MANIFEST if native_manager else CLI_CONTEXT_MANIFEST if context_continuation else CLI_SESSION_MANIFEST if session_artifact else CLI_BOOTSTRAP_MANIFEST), 'frontend_single_additive_overlay_required')
     layer=layers[-1][1]
-    names = CLI_CONTEXT_NAMES if context_continuation else {'hermes_cli/friday_credential_admission.py','hermes_cli/friday_user_scope.py'} if session_artifact else {'hermes_cli/friday_credential_admission.py'}
+    names = {'hermes_cli/friday_credential_admission.py'} if native_manager else CLI_CONTEXT_NAMES if context_continuation else {'hermes_cli/friday_credential_admission.py','hermes_cli/friday_user_scope.py'} if session_artifact else {'hermes_cli/friday_credential_admission.py'}
     require(set(layer['files']) == names, 'frontend_exact_scope_required')
     for name,row in layer['files'].items():
         if row.get('new_file'):
@@ -2744,7 +2776,7 @@ def repair_native_bootstrap(request, request_path, *, clock, session_artifact=Fa
         require(read_json(paths['original_stamp']) == newstamp, 'frontend_full_stamp_changed')
         budget.call(cli_repair_native,custody,value,source,selected,budget)
         budget.call(cli_repair_history,request,home)
-        budget.call(cli_context_previous_journey,request,home) if context_continuation else budget.call(cli_bootstrap_previous_journey,request,home,session_artifact=session_artifact)
+        budget.call(cli_ordinary_previous_failed_journey,request,home) if native_manager else budget.call(cli_context_previous_journey,request,home) if context_continuation else budget.call(cli_bootstrap_previous_journey,request,home,session_artifact=session_artifact)
         for path in preserved.values():
             require(digest(owned_file(saved[str(path)]['path'],private=True)) == saved[str(path)]['sha256'],
                     'frontend_custody_changed')
@@ -2752,7 +2784,12 @@ def repair_native_bootstrap(request, request_path, *, clock, session_artifact=Fa
                 'frontend_previous_intent_changed')
         budget.call(installed_cli_kernel,request,clock,phase=phase)
         require(read_json(request_path) == request, 'frontend_request_changed')
-        if context_continuation:
+        if native_manager:
+            require(cli_ordinary_readonly_baseline(request['next_ordinary_readonly']) == request['ordinary_readonly'],
+                    'cli_ordinary_new_question_required')
+            budget.call(cli_ordinary_readonly_inputs,home,request['next_ordinary_readonly'])
+            budget.call(cli_ordinary_readonly_artifact,home,request['next_ordinary_readonly'])
+        if context_continuation or native_manager:
             budget.call(cli_ordinary_readonly_inputs,home,request['ordinary_readonly'])
             budget.call(cli_ordinary_readonly_artifact,home,request['ordinary_readonly'])
         if session_artifact:
@@ -2770,9 +2807,221 @@ def repair_native_bootstrap(request, request_path, *, clock, session_artifact=Fa
                  'diagnostic':retained_diagnostic(exc,'repair-native-bootstrap'),
                  'rollback':'NOT_AUTOMATIC; exact beforeimages retained; consumed token never renewed',
                  'clock':clock,'physical':physical,'Runtime_Go':False,'Resource_Go':False,'Release_Go':False}
-        try:publish(home/('FRIDAY-INSTALL.context-continuation-repair.failure.json' if context_continuation else 'FRIDAY-INSTALL.session-artifact-repair.failure.json' if session_artifact else 'FRIDAY-INSTALL.native-bootstrap-repair.failure.json'),failure)
+        try:publish(home/('FRIDAY-INSTALL.native-manager-repair.failure.json' if native_manager else 'FRIDAY-INSTALL.context-continuation-repair.failure.json' if context_continuation else 'FRIDAY-INSTALL.session-artifact-repair.failure.json' if session_artifact else 'FRIDAY-INSTALL.native-bootstrap-repair.failure.json'),failure)
         except BaseException as secondary:remember_secondary(exc,secondary)
         raise
+
+
+
+def cli_ordinary_previous_failed_journey(request, home):
+    """Pinned failed V5 grants no retry, budget renewal, or runtime authority."""
+    import hashlib, json, math, re
+    home = Path(home)
+    reader = globals().get('owned_file') or globals().get('read_owned')
+    if reader is None:
+        from hermes_cli.friday_dashboard_owner import read_owned as reader
+
+    def raw_pin(ref, expected=None, *, role, sized=False):
+        require(type(ref) is dict and set(ref) == ({'path','sha256','bytes'} if sized else {'path','sha256'})
+                and type(ref['path']) is str
+                and (expected is None or ref['path'] == str(expected))
+                and type(ref['sha256']) is str and re.fullmatch('[0-9a-f]{64}',ref['sha256']),
+                'cli_ordinary_history_pin_required')
+        raw = reader(Path(ref['path']),private=True)
+        require(hashlib.sha256(raw).hexdigest() == ref['sha256']
+                and (not sized or type(ref['bytes']) is int
+                     and 0 < ref['bytes'] <= 64*1024*1024 and len(raw) == ref['bytes']),
+                'cli_ordinary_history_pin_changed')
+        require(role in ('json','stdout','stderr')
+                and (role == 'json' or expected is not None
+                     and str(expected).endswith('.'+role)),
+                'cli_ordinary_history_role_required')
+        if role == 'json':
+            strict_json(raw)
+        return raw
+
+    def strict_json(raw):
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                require(key not in result, 'cli_ordinary_history_duplicate_json_key')
+                result[key] = value
+            return result
+        def constant(value):
+            require(False, 'cli_ordinary_history_nonfinite_json_number')
+        def finite_float(value):
+            result = float(value)
+            require(math.isfinite(result), 'cli_ordinary_history_nonfinite_json_number')
+            return result
+        return json.loads(raw,object_pairs_hook=unique,parse_constant=constant,parse_float=finite_float)
+
+    def sized_ref(ref, path, digest, length, code):
+        require(type(ref) is dict and set(ref) == {'path','sha256','bytes'}
+                and type(ref['path']) is str and type(ref['sha256']) is str
+                and type(ref['bytes']) is int and 0 < ref['bytes'] <= 64*1024*1024
+                and ref == {'path':str(path),'sha256':digest,'bytes':length}, code)
+
+    inventory = request['previous_ordinary_runtime']; prefix = 'preparation/cli-runtime/'
+    require(type(inventory) is dict and len(inventory) == 5,
+            'cli_ordinary_failed_inventory_required')
+    candidates = [name[len(prefix):-len('.intent.json')] for name in inventory
+                  if type(name) is str and name.startswith(prefix)
+                  and '/' not in name[len(prefix):] and name.endswith('.service.intent.json')]
+    require(len(candidates) == 1 and re.fullmatch(r'friday-rework-cli-runtime-[A-Za-z0-9-]+\.service',candidates[0]),
+            'cli_ordinary_previous_unit_required')
+    unit = candidates[0]; base = prefix+unit
+    suffixes = ('.intent.json','.json','.stdout','.stderr')
+    blobs = {}
+    for suffix in suffixes:
+        name = base+suffix
+        require(name in inventory, 'cli_ordinary_failed_inventory_required')
+        blobs[suffix] = raw_pin({'path':str(home/name),'sha256':inventory[name]},home/name,role=('stdout' if suffix == '.stdout' else
+                                      'stderr' if suffix == '.stderr' else 'json'))
+    prior = strict_json(blobs['.intent.json']); old = prior['request']; clock = prior['clock']
+    require(set(prior) == {'schema','state','request','clock','history','physical'}
+            and prior['schema'] == 'friday.installed-cli-invocation.v1'
+            and prior['state'] == 'CONSUMED_NOT_COMPLETE'
+            and old['schema'] == 'friday.installed-cli-request.v5'
+            and old['home'] == request['home'] == str(home)
+            and old['unit'] == unit and unit != request['unit']
+            and old['assignment'] != request['assignment']
+            and old['repaired_input'] == request['previous_input']
+            and old['installation_input'] == request['installation_input']
+            and old['history'] == prior['history'] == request['history']
+            and old['ordinary_readonly'] == request['ordinary_readonly']
+            and old['partial_proof'] == request['partial_proof']
+            and 'session_artifact' not in old
+            and cli_historical_scope_closed(clock,'friday.installed-cli-clock.v1'),
+            'cli_ordinary_closed_v5_required')
+    require(type(old['job_id']) is str and re.fullmatch('[0-9a-f]{64}',old['job_id']),
+            'cli_ordinary_previous_job_required')
+    job_name = prefix+'jobs/'+old['job_id']+'.intent.json'
+    require(set(inventory) == {base+s for s in suffixes}|{job_name},
+            'cli_ordinary_failed_inventory_required')
+    job_raw = raw_pin({'path':str(home/job_name),'sha256':inventory[job_name]},home/job_name,role='json')
+    require(strict_json(job_raw) == {'schema':'friday.cli-ordinary-job-intent.v1',
+            'state':'CONSUMED_NO_RETRY','job_id':old['job_id'],'request':old,'clock':clock},
+            'cli_ordinary_previous_job_changed')
+    cli_ordinary_job_consumed(home,old,clock)
+    for suffix in ('.native-owner.json','.result.json'):
+        path = home/(base+suffix)
+        require(not path.exists() and not path.is_symlink(), 'cli_ordinary_failed_absence_changed')
+
+    custody_raw = raw_pin(request['previous_ordinary_custody'],role='json')
+    custody = strict_json(custody_raw)
+    for field,suffix in (('native_intent','.intent.json'),('native_observation','.json'),('native_stderr','.stderr')):
+        ref = custody[field]
+        sized_ref(ref,home/(base+suffix),inventory[base+suffix],len(blobs[suffix]),
+                  'cli_ordinary_custody_artifact_changed')
+    sized_ref(custody['consumed_semantic_job'],home/job_name,inventory[job_name],len(job_raw),
+              'cli_ordinary_custody_job_changed')
+    observed = strict_json(blobs['.json'])
+    argv = observed['argv']
+    require(type(argv) is list and all(type(arg) is str for arg in argv)
+            and type(old['argv']) is list and all(type(arg) is str for arg in old['argv'])
+            and len(argv) == 16+len(old['argv'])
+            and argv[:2] == ['/usr/bin/bwrap','--json-status-fd']
+            and re.fullmatch('[1-9][0-9]{0,9}',argv[2])
+            and 3 <= int(argv[2]) <= 2147483647
+            and argv[3:16] == ['--unshare-pid','--die-with-parent','--new-session','--as-pid-1',
+                '--bind','/','/','--dev','/dev','--proc','/proc','--',
+                str(home/'hermes-agent/.hermes/bin/hermes')]
+            and argv[16:] == old['argv'], 'cli_ordinary_failed_observation_changed')
+    require(type(observed['returncode']) is type(custody['child_returncode']) is int
+            and observed['returncode'] == custody['child_returncode'] == 1
+            and type(observed['pid']) is type(observed['starttime_ticks']) is int
+            and 1 < observed['pid'] <= 2147483647 and observed['starttime_ticks'] > 0
+            and all(type(observed[k]) is int and observed[k] >= 0 for k in ('stdout_bytes','stderr_bytes'))
+            and type(observed['elapsed_seconds']) in (int,float)
+            and type(custody['child_elapsed_seconds']) in (int,float)
+            and math.isfinite(observed['elapsed_seconds']) and observed['elapsed_seconds'] > 0
+            and math.isfinite(custody['child_elapsed_seconds']) and custody['child_elapsed_seconds'] > 0
+            and observed['reaped'] is custody['child_reaped'] is True
+            and observed['timeout'] is custody['child_timeout'] is False
+            and observed['reason'] == 'command_nonzero_exit'
+            and observed['elapsed_seconds'] == custody['child_elapsed_seconds']
+            and observed['stdout_bytes'] == len(blobs['.stdout']) == 0
+            and observed['stderr_bytes'] == len(blobs['.stderr'])
+            and observed['stdout_sha256'] == hashlib.sha256(blobs['.stdout']).hexdigest()
+            and observed['stderr_sha256'] == hashlib.sha256(blobs['.stderr']).hexdigest()
+            and observed['argv'][-len(old['argv']):] == old['argv'],
+            'cli_ordinary_failed_observation_changed')
+    terminal = custody['unit']; physical = prior['physical']
+    require(type(physical['unit_main_start_usec']) is int and physical['unit_main_start_usec'] > 0
+            and type(custody['native_returncode']) is int
+            and terminal == {'ActiveState':'failed','SubState':'failed','MainPID':'0','ControlGroup':'',
+            'Result':'exit-code','ExecMainStartTimestampMonotonic':str(physical['unit_main_start_usec'])}
+            and physical['unit'] == unit
+            and custody['state'] == 'REAL_V5_NATIVE_ADMISSION_FAILED_CUSTODY_CLOSED'
+            and custody['cause'] == 'friday_credential_cli_ordinary_current_native_unit_changed'
+            and custody['original_clock'] == clock
+            and cli_historical_scope_closed(custody['original_clock'],'friday.installed-cli-clock.v1') and custody['native_returncode'] == 2
+            and custody['retry_authorized'] is False
+            and custody['Runtime_Go'] is custody['Resource_Go'] is custody['Release_Go'] is False
+            and custody['native_result_absent'] is custody['cgroup_gone_or_empty'] is custody['heavy_flock_returned'] is True
+            and type(custody['model_calls_observed']) is int and custody['model_calls_observed'] == 0,
+            'cli_ordinary_failed_custody_required')
+    births = custody['known_own_births']
+    require(type(births) is list and len(births) == 4
+            and {row['name'] for row in births} == {'self','GNU','systemd-run-client','bwrap-monitor'}
+            and all(set(row) == {'name','pid','birth_ticks','same_birth_alive'}
+                    and type(row['pid']) is int and 1 < row['pid'] <= 2147483647
+                    and type(row['birth_ticks']) is int and row['birth_ticks'] > 0
+                    and row['same_birth_alive'] is False for row in births),
+            'cli_ordinary_failed_births_required')
+    born = {row['name']:row for row in births}
+    require((born['GNU']['pid'],born['GNU']['birth_ticks']) == (clock['gnu_pid'],clock['gnu_starttime_ticks'])
+            and (born['bwrap-monitor']['pid'],born['bwrap-monitor']['birth_ticks']) ==
+                (observed['pid'],observed['starttime_ticks']), 'cli_ordinary_failed_birth_binding_changed')
+    raw_pin(custody['Root_initial_checker_negative'],role='json',sized=True)
+    # These are witness timestamps within original180, never a renewed budget.
+    witness = custody['closure_witness_mono']
+    require(type(witness) in (int,float) and math.isfinite(witness)
+            and clock['started_mono'] <= witness <= clock['deadline_mono']
+            and type(custody['original180_remaining_seconds']) in (int,float)
+            and math.isfinite(custody['original180_remaining_seconds'])
+            and custody['original180_remaining_seconds'] >= 0
+            and math.isclose(custody['original180_remaining_seconds'],clock['deadline_mono']-witness,
+                             rel_tol=0,abs_tol=0.01), 'cli_ordinary_original180_witness_changed')
+    unchanged = strict_json(raw_pin(request['previous_ordinary_unchanged'],role='json'))
+    sized_ref(unchanged['custody'],request['previous_ordinary_custody']['path'],
+              request['previous_ordinary_custody']['sha256'],len(custody_raw),
+              'cli_ordinary_unchanged_data_required')
+    require(unchanged['state'] == 'BASELINE_SQL_ARTIFACT_OLD_V4_UNCHANGED_VERIFIED'
+            and unchanged['Root_helper_argument_correction_only'] is True
+            and unchanged['artifact_unchanged'] is unchanged['baseline_SQL_payload_and_lifecycle_unchanged'] is True
+            and unchanged['old_V4_five_suffixes_consumed_result_absence_unchanged'] is True
+            and unchanged['no_runtime_retry_authorized'] is True
+            and type(unchanged['checked_monotonic']) in (int,float)
+            and math.isfinite(unchanged['checked_monotonic'])
+            and witness <= unchanged['checked_monotonic'] <= clock['deadline_mono']
+            and type(unchanged['original180_remaining_seconds']) in (int,float)
+            and math.isfinite(unchanged['original180_remaining_seconds'])
+            and unchanged['original180_remaining_seconds'] >= 0
+            and math.isclose(unchanged['original180_remaining_seconds'],
+                             clock['deadline_mono']-unchanged['checked_monotonic'],rel_tol=0,abs_tol=1e-6),
+            'cli_ordinary_unchanged_data_required')
+    # Re-read the original V4 proof and five artifacts; no reinterpretation of V4.
+    v4 = strict_json(raw_pin(old['partial_proof'],role='json'))
+    require(v4['state'] == 'REAL_NATIVE_V4_PARTIAL_ARTIFACT_CONTEXT_FAIL_CUSTODY_CLOSED_NO_RETRY'
+            and v4['retry_authorized'] is v4['narrow_journey_accepted'] is v4['full_Runtime_Go'] is False
+            and cli_historical_scope_closed(v4['clock'],'friday.installed-cli-clock.v1'),
+            'cli_ordinary_old_v4_closed_required')
+    refs = v4['native_artifacts']
+    v4_suffixes = (*suffixes,'.native-owner.json')
+    require(type(refs) is dict and set(refs) == set(v4_suffixes), 'cli_ordinary_old_v4_inventory_required')
+    v4_intent = strict_json(raw_pin(refs['.intent.json'],role='json',sized=True)); v4_unit = v4_intent['request']['unit']
+    require(re.fullmatch(r'friday-rework-cli-runtime-[A-Za-z0-9-]+\.service',v4_unit)
+            and v4_intent['state'] == 'CONSUMED_NOT_COMPLETE'
+            and v4_intent['request']['schema'] == 'friday.installed-cli-request.v4'
+            and v4_intent['clock'] == v4['clock'], 'cli_ordinary_old_v4_intent_changed')
+    for suffix in v4_suffixes:
+        raw_pin(refs[suffix],home/(prefix+v4_unit+suffix),
+                role=('stdout' if suffix == '.stdout' else
+                      'stderr' if suffix == '.stderr' else 'json'),sized=True)
+    path = home/(prefix+v4_unit+'.result.json')
+    require(not path.exists() and not path.is_symlink(), 'cli_ordinary_old_v4_result_must_remain_absent')
+    return old
 
 
 
@@ -2834,8 +3083,33 @@ def cli_context_previous_journey(request, home):
     return prior
 
 
+def cli_ordinary_readonly_baseline(binding):
+    """A next question adds caller authority without changing historical data."""
+    require(type(binding) is dict, 'cli_ordinary_question_binding_required')
+    if binding.get('schema') == 'friday.cli-ordinary-readonly.v1':
+        require('question' not in binding and 'purpose' not in binding,
+                'cli_ordinary_question_binding_required')
+        return binding
+    require(binding.get('schema') == 'friday.cli-ordinary-readonly.v2'
+            and type(binding.get('question')) is str and type(binding.get('purpose')) is str,
+            'cli_ordinary_question_binding_required')
+    question, purpose = binding['question'], binding['purpose']
+    try:
+        question_bytes, purpose_bytes = question.encode('utf-8'), purpose.encode('utf-8')
+    except UnicodeError:
+        require(False, 'cli_ordinary_question_utf8_required')
+    require(0 < len(question_bytes) <= 2048 and 0 < len(purpose_bytes) <= 128
+            and '\x00' not in question and '\x00' not in purpose,
+            'cli_ordinary_question_utf8_required')
+    require(question == 'Какой один следующий шаг реализации диспетчеризации задач от Hermes к DeepSeek Harness следует подготовить по сохранённому резюме? Назови вход, ожидаемый результат воркера и проверку локального endpoint без облачного fallback; если резюме не задаёт детали, явно обозначь предположение.' and purpose == 'next-local-worker-dispatch-implementation-step',
+            'cli_ordinary_declared_new_question_required')
+    return {**{k:v for k,v in binding.items() if k not in {'question','purpose','schema'}},
+            'schema':'friday.cli-ordinary-readonly.v1'}
+
+
 def cli_ordinary_readonly_inputs(home, binding, *, resumed=False):
     """Lossless post-partial payload with legal mutable native lifecycle."""
+    binding = cli_ordinary_readonly_baseline(binding)
     import sqlite3, hashlib, math, re
     home = Path(home)
     fields = {'schema','id','database','row_sha256','messages_sha256','stable_messages_sha256',
@@ -2968,6 +3242,12 @@ def cli_ordinary_readonly_artifact(home, binding):
 
 
 def cli_ordinary_readonly_argv(home, binding):
+    cli_ordinary_readonly_baseline(binding)
+    if binding.get('schema') == 'friday.cli-ordinary-readonly.v2':
+        query = ('Прочитай существующий файл '+binding['output']+' инструментом read_file. '
+                 +binding['question']+' Дай краткий ответ; не изменяй файлы и не вызывай другие инструменты.')
+        return ['-p','default','--cli','chat','--oneshot','-t','file','--run-budget','90',
+                '--max-turns','4','--resume',binding['id'],'--no-restore-cwd','-q',query]
     query = ('Прочитай существующий файл '+binding['output']+
              ' инструментом read_file. По сохранённому резюме объясни, как разделены роли Hermes, '
              'DeepSeek Harness и Agent Zero и почему они нужны вместе. Дай краткий ответ.')
@@ -2977,10 +3257,14 @@ def cli_ordinary_readonly_argv(home, binding):
 
 def cli_ordinary_job_id(home, binding):
     import hashlib
+    cli_ordinary_readonly_baseline(binding)
     semantic = {'schema':'friday.cli-ordinary-readonly-job.v1','session':binding['identity'],
                 'artifact':{'path':binding['output'],'sha256':binding['artifact_sha256']},
                 'query':cli_ordinary_readonly_argv(home,binding)[-1],
                 'effects':['read_file_pinned_existing_artifact','native_final_answer_and_session_append']}
+    if binding.get('schema') == 'friday.cli-ordinary-readonly.v2':
+        semantic.update(schema='friday.cli-ordinary-readonly-job.v2',
+                        question=binding['question'],purpose=binding['purpose'],binding=binding)
     return hashlib.sha256(json.dumps(semantic,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
 
 
@@ -2998,7 +3282,7 @@ def cli_ordinary_job_consumed(home, request, clock):
 def main():
     started = time.monotonic()  # before parser/input IO; never reset on dispatch
     parser = SafeParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'qualify', 'reconcile', 'resume-harness', 'resume-cli', 'continue-cli-segment', 'installed-cli', 'repair-installed-cli', 'repair-frontend-close', 'repair-native-bootstrap', 'repair-session-artifact', 'repair-context-continuation'))
+    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'qualify', 'reconcile', 'resume-harness', 'resume-cli', 'continue-cli-segment', 'installed-cli', 'repair-installed-cli', 'repair-frontend-close', 'repair-native-bootstrap', 'repair-session-artifact', 'repair-context-continuation','repair-native-manager'))
     parser.add_argument('--input', required=True, type=Path, help='Private pinned JSON, no credential values')
     parser.add_argument('--a0-plan', type=Path, help='Existing owned live native probe plan; never a readiness report')
     parser.add_argument('--a0-plan-sha256')
@@ -3006,7 +3290,7 @@ def main():
     sys.path.insert(0, str(ROOT))
     from scripts.dsh_prepare import StopUnconfirmed
     try:
-        runtime_clock = installed_cli_clock() if args.phase in ('installed-cli','repair-installed-cli','repair-frontend-close','repair-native-bootstrap','repair-session-artifact','repair-context-continuation') else None
+        runtime_clock = installed_cli_clock() if args.phase in ('installed-cli','repair-installed-cli','repair-frontend-close','repair-native-bootstrap','repair-session-artifact','repair-context-continuation','repair-native-manager') else None
         raw = owned_file(args.input, private=True)
         require((args.a0_plan is None) == (args.a0_plan_sha256 is None)
                 and (args.a0_plan is None or args.phase in ('start','qualify')),
@@ -3022,7 +3306,9 @@ def main():
                   if runtime_clock else cli_segment_clock(admission) if admission else
                   (prepared[3] if prepared else Budget(value.get('seconds'), started=started)))
         budget.check()
-        if args.phase == 'repair-context-continuation':
+        if args.phase == 'repair-native-manager':
+            result = repair_native_bootstrap(value,args.input,clock=runtime_clock,native_manager=True)
+        elif args.phase == 'repair-context-continuation':
             result = repair_native_bootstrap(value,args.input,clock=runtime_clock,context_continuation=True)
         elif args.phase == 'repair-session-artifact':
             result = repair_native_bootstrap(value,args.input,clock=runtime_clock,session_artifact=True)
