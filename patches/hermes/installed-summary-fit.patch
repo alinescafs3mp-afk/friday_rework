@@ -1,0 +1,843 @@
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -7247,6 +7247,7 @@
+         # TTFT took before this accumulator was constructed. See #99692.
+         self._host_deadline = host_deadline
+         self.content_parts: List[str] = []
++        self.refusal_parts: List[str] = []
+         self.reasoning_parts: List[str] = []
+         self.reasoning_details: List[Any] = []
+         self.tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+@@ -7328,6 +7329,12 @@
+         if piece:
+             self.content_parts.append(piece)
+             made_progress = True
++        # Structured refusal fragments must survive both sync and async aggregation.
++        # The summarizer treats this field as authoritative even with content present.
++        refusal_piece = getattr(delta, "refusal", None)
++        if isinstance(refusal_piece, str) and refusal_piece:
++            self.refusal_parts.append(refusal_piece)
++            made_progress = True
+         reasoning_piece = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
+         if reasoning_piece is None and isinstance(getattr(delta, "model_extra", None), dict):
+             reasoning_piece = delta.model_extra.get("reasoning") or delta.model_extra.get("reasoning_content")
+@@ -7351,6 +7358,7 @@
+                 for _idx, acc in sorted(self.tool_calls_acc.items())]
+         message = SimpleNamespace(
+             role="assistant", content="".join(self.content_parts), tool_calls=tool_calls,
++            refusal="".join(self.refusal_parts) or None,
+             reasoning="".join(self.reasoning_parts) or None,
+             reasoning_details=self.reasoning_details or None,
+         )
+--- a/agent/bounded_context.py
++++ b/agent/bounded_context.py
+@@ -369,6 +369,13 @@
+     else:
+         content = compressor._bound_summary_input(compressor._serialize_for_summary(turns), max_chars=limit)
+     prompt = compressor._build_summary_prompt(content, summary_budget, focus, memory, has_user_turn)
++    headroom = getattr(compressor, "_bounded_summary_json_headroom", None)
++    if type(headroom) is int:
++        prompt += ("\nFinal request fitting target: the complete summary text may add at most "
++                   f"{headroom} UTF-8 bytes after JSON string escaping (excluding the surrounding quotes). "
++                   "Preserve factual meaning, uncertainty, concrete evidence and the current task. "
++                   "Do not claim retained tool evidence is missing. A length-truncated summary is rejected; "
++                   "an oversized completed summary is also rejected without changing saved conversation rows.")
+     policy.check_request(request(prompt), compression=True)
+     return prompt
+ 
+@@ -649,9 +656,46 @@
+         raise BoundedContextError("bounded_context: compression changed protected authority/user/tool evidence")
+ 
+ 
+-def remember_bounded_protected_rows(compressor: Any, original: list, start: int, end: int) -> None:
++def remember_bounded_protected_rows(compressor: Any, original: list, start: int, end: int,
++                                    assembled: list | None = None) -> None:
+     import copy
++    carrier = None
++    if assembled is not None:
++        middle = assembled[start:len(assembled) - len(original[end:]) if original[end:] else len(assembled)]
++        if (len(middle) != 1 or middle[0].get("role") != "assistant"
++                or middle[0].get("_compressed_summary") is not True
++                or not isinstance(middle[0].get("content"), str)
++                or middle[0].get("tool_calls") or middle[0].get("reasoning_content")
++                or middle[0].get("api_content") is not None):
++            raise BoundedContextError("bounded_context: invalid protected summary carrier")
++        carrier = copy.deepcopy(middle[0])
+     compressor._bounded_protected_rows = (copy.deepcopy(original[:start]), copy.deepcopy(original[end:]))
++    compressor._bounded_protected_summary = carrier
++
++
++def _bounded_protected_wire_anchors(compressor: Any, head: list, tail: list) -> list:
++    """Project only the recorded, lossless native summary/empty-call-row merge."""
++    import copy
++    carrier = getattr(compressor, "_bounded_protected_summary", None)
++    if carrier is None:
++        return copy.deepcopy(head + tail)
++    summary = copy.deepcopy(carrier)
++    if head and head[-1].get("role") == "assistant":
++        raise BoundedContextError("bounded_context: summary would rewrite protected assistant head")
++    if not tail or tail[0].get("role") != "assistant":
++        return copy.deepcopy(head) + [summary] + copy.deepcopy(tail)
++    call_row = tail[0]
++    if (call_row.get("content") not in (None, "") or not call_row.get("tool_calls")
++            or call_row.get("api_content") not in (None, "")
++            or call_row.get("finish_reason") in {"verification_required", "verify_hook_continue"}):
++        raise BoundedContextError("bounded_context: unsafe protected summary/call merge")
++    from agent.agent_runtime_helpers import _merge_consecutive_assistants
++    merged, repairs = _merge_consecutive_assistants([summary] + copy.deepcopy(tail))
++    if (repairs != 1 or merged[0].get("content") != carrier["content"]
++            or merged[0].get("tool_calls") != call_row["tool_calls"]
++            or merged[1:] != tail[1:]):
++        raise BoundedContextError("bounded_context: protected summary/call merge is not lossless")
++    return copy.deepcopy(head) + merged
+ 
+ 
+ def assert_bounded_protected_wire(agent: Any, request: dict) -> None:
+@@ -669,7 +713,7 @@
+         return
+     from agent.turn_context import build_api_messages
+     head, tail = contract
+-    anchors = head + tail
++    anchors = _bounded_protected_wire_anchors(agent.context_compressor, head, tail)
+     current = next((i for i in range(len(anchors)-1, -1, -1)
+                     if anchors[i].get("role") == "user"), None)
+     expected, _ = build_api_messages(agent, anchors, current_turn_user_idx=current,
+@@ -740,3 +784,98 @@
+         if found is None:
+             raise BoundedContextError("bounded_context: formatter removed or rewrote protected authority/user/tool rows")
+         cursor = found + len(group)
++
++
++def remember_bounded_compaction_context(agent, messages, user_idx, ext, plugin, moa, original):
++    """Keep request-only inputs so a candidate can be priced before durable adoption."""
++    if not isinstance(getattr(agent, "_bounded_context_policy", None), BoundedContextPolicy):
++        return
++    import copy
++    incoming = messages[user_idx] if isinstance(user_idx, int) and 0 <= user_idx < len(messages) else None
++    agent._bounded_compaction_request_context = copy.deepcopy({
++        "incoming": incoming, "ext": ext, "plugin": plugin, "moa": moa, "original": original,
++    })
++
++
++def bounded_compaction_request(agent, messages, system_prompt):
++    """Build the complete Chat Completions envelope without a physical call.
++
++    Dynamic rewriting extensions cannot certify a future envelope and fail closed.
++    Both nonstreaming and the larger streaming SDK envelope must fit. The final
++    physical guard remains mandatory; this is conservative local accounting only.
++    """
++    import copy
++    from agent.turn_request_assembly import assemble_api_request
++    from agent.turn_api_request import build_api_request
++    from hermes_cli.plugins import has_middleware
++    from hermes_cli.lifecycle import has_hook
++    if has_middleware("llm_request") or has_middleware("llm_execution") or has_hook("pre_api_request"):
++        raise BoundedContextError("bounded_context: dynamic request rewriting prevents precommit fit")
++    context = getattr(agent, "_bounded_compaction_request_context", None)
++    if not isinstance(context, dict) or context.get("moa"):
++        raise BoundedContextError("bounded_context: exact request context unavailable before compaction commit")
++    incoming = context["incoming"]
++    indices = [i for i, row in enumerate(messages) if isinstance(row, dict)
++               and isinstance(incoming, dict) and row.get("role") == incoming.get("role")
++               and row.get("content") == incoming.get("content")]
++    if len(indices) != 1:
++        raise BoundedContextError("bounded_context: current user anchor is ambiguous before commit")
++    probe = copy.copy(agent)
++    for key in ("tools", "valid_tool_names", "prefill_messages", "request_overrides", "reasoning_config",
++                "_bounded_compaction_request_context", "_usage_anchor"):
++        if hasattr(agent, key):
++            setattr(probe, key, copy.deepcopy(getattr(agent, key)))
++    rows = copy.deepcopy(messages)
++    # Normal iteration preparation repairs alternation before request assembly.
++    # Mirror that exact formatter on a private copy and re-anchor the current ask.
++    from agent.agent_runtime_helpers import repair_message_sequence
++    repair_message_sequence(probe, rows)
++    indices = [i for i, row in enumerate(rows) if isinstance(row, dict)
++               and isinstance(incoming, dict) and row.get("role") == incoming.get("role")
++               and row.get("content") == incoming.get("content")]
++    if len(indices) != 1:
++        raise BoundedContextError("bounded_context: current user anchor changed during native repair")
++    probe._cached_system_prompt = system_prompt
++    assembled = assemble_api_request(
++        probe, messages=rows, current_turn_user_idx=indices[0],
++        _ext_prefetch_cache=context["ext"], _plugin_user_context=context["plugin"],
++        moa_config=None, active_system_prompt=system_prompt,
++        original_user_message=context["original"], pending_moa_prepared_request=None,
++        request_logger=__import__("logging").getLogger(__name__),
++    )
++    built = build_api_request(
++        probe, api_messages=assembled.api_messages, _moa_prepared_request=None,
++        tools_for_api=assembled.tools_for_api, system_message=system_prompt, messages=rows,
++        original_user_message=context["original"], approx_tokens=assembled.approx_tokens,
++        total_chars=assembled.total_chars, retry_count=0, api_call_count=0,
++        api_request_id="bounded-compaction-fit", api_start_time=0,
++        effective_task_id="bounded-compaction-fit", turn_id="", precommit_check=True,
++    )
++    request = built.api_kwargs
++    streaming = copy.deepcopy(request)
++    streaming["stream"] = True
++    streaming["stream_options"] = {"include_usage": True}
++    return request, streaming
++
++
++def guard_bounded_compaction(agent, messages, system_prompt):
++    policy = getattr(agent, "_bounded_context_policy", None)
++    if not isinstance(policy, BoundedContextPolicy):
++        return None
++    variants = bounded_compaction_request(agent, messages, system_prompt)
++    for request in variants:
++        guard_main_request(agent, request)
++    return max(policy.check_request(request)["estimated_input"] for request in variants)
++
++
++def bounded_summary_headroom(agent, messages, system_prompt):
++    policy = getattr(agent, "_bounded_context_policy", None)
++    variants = bounded_compaction_request(agent, messages, system_prompt)
++    # The skeleton already includes the synthetic summary row and end marker.
++    # Added summary text is charged by its JSON-escaped UTF-8 bytes, not tokens.
++    headroom = min(policy.input_budget(wire_output_tokens(request))
++                   - serialized_bytes(wire_body(request)) - policy.template_overhead_tokens
++                   for request in variants)
++    if headroom <= 0:
++        raise BoundedContextError("bounded_context: protected final request leaves no summary headroom")
++    return headroom
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -3906,13 +3906,12 @@
+         # and making the model forget the in-progress task (#11978, #11914). Treat empty content as a
+         # failure so it routes through the same main-model fallback + cooldown machinery as a transport
+         # error, rather than replacing real context with an empty summary.
++        if _is_refusal_response(response, content):
++            # The explicit refusal is authoritative even when content is empty.
++            # Keep the established fallback/cooldown/abort path before any commit.
++            raise RuntimeError(f"Context compression LLM returned refusal content {where}")
+         if not content.strip():
+             raise RuntimeError(f"Context compression LLM returned empty content {where}")
+-        if _is_refusal_response(response, content):
+-            # Treat a refusal as unusable content. This deliberately reuses the
+-            # established fallback/cooldown/abort path for an empty body, so it
+-            # can never be committed as `_previous_summary`.
+-            raise RuntimeError(f"Context compression LLM returned refusal content {where}")
+         # A finish_reason of "length" means the summarizer hit its output token cap mid-generation: the text
+         # present is PARTIAL. Persisting a partial summary as the compaction checkpoint silently truncates
+         # the conversation's memory — the cut-off text replaces the real middle turns AND is fed back into
+@@ -5684,6 +5683,10 @@
+                 display_tokens, compress_start, compress_end, len(turns_to_summarize), n_messages - scan.tail_start,
+             )
+ 
++        if bounded:
++            fit = getattr(self, "_bounded_summary_fit_callback", None)
++            self._bounded_summary_json_headroom = fit(
++                self._assemble_compressed(messages, compress_start, compress_end, scan, "")) if callable(fit) else None
+         # Phase 3: Generate structured summary (or skip the LLM when the middle is too small to matter)
+         # Choke point for staleness that arose during phases 1-2: everything below writes shared state
+         # (feasibility counters, fallback diagnostics, finalize's cursor/rearm resets), and the inner
+@@ -5716,7 +5719,7 @@
+         result = self._finalize_compressed(compressed, canonical_messages, n_messages, spare_pending_images)
+         if bounded:
+             assert_bounded_protected_rows(canonical_messages, result, compress_start, compress_end)
+-            remember_bounded_protected_rows(self, canonical_messages, compress_start, compress_end)
++            remember_bounded_protected_rows(self, canonical_messages, compress_start, compress_end, result)
+         return result
+ 
+     def _assemble_compressed(
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -180,7 +180,7 @@
+     "_last_aux_model_failure_error", "_last_aux_model_failure_model", "_last_aux_resolved_model",
+     "_summary_model_fallen_back", "summary_model",
+     "_last_compression_telemetry", "_active_compression_telemetry", "_compression_telemetry_seed",
+-    "_proactive_prune_rearm_tokens",
++    "_proactive_prune_rearm_tokens", "_bounded_protected_rows", "_bounded_protected_summary",
+ )
+ 
+ _COMPRESSOR_COOLDOWN_STATE_FIELDS = ("_summary_failure_cooldown_until", "_last_summary_error", "_cooldown_persist_failed")
+@@ -405,6 +405,11 @@
+             and (durable_cooldown_authoritative is True or not bool(snapshot.get("_cooldown_persist_failed", False)))
+         ):
+             _rollback_durable_cooldown(compressor, snapshot, durable_cooldown_authoritative, durable_cooldown_state)
++        # The first rejected attempt may introduce contracts absent at snapshot time.
++        # Restore that absence under the same owner/serial lock as existing values.
++        for name in ("_bounded_protected_rows", "_bounded_protected_summary"):
++            if name not in restored and name in getattr(compressor, "__dict__", {}):
++                delattr(compressor, name)
+         for name, value in restored.items():
+             setattr(compressor, name, value)
+ 
+@@ -3142,11 +3147,28 @@
+     # the refresh is free; when nothing changed the snapshot is byte-equal and we keep the existing list
+     # object (identity matters to provider-side tool-block caching on some backends).
+     try:
+-        _refresh_agent_tool_definitions(agent)
++        _db_for_refresh = getattr(agent, "_session_db", None)
++        _bounded_refresh = getattr(agent, "_bounded_context_policy", None) is not None
++        if _bounded_refresh:
++            agent._session_db = None
++        try:
++            _refresh_agent_tool_definitions(agent)
++        finally:
++            if _bounded_refresh:
++                agent._session_db = _db_for_refresh
+     except Exception:  # noqa: BLE001
+         logger.warning(
+             "compaction tool-definition refresh failed; keeping the session's existing tool snapshot", exc_info=True
+         )
++
++    # A saved tool pin or MCP refresh may restore broader donor definitions.
++    # Revalidate the admitted readonly scope before constructing its core prompt;
++    # the final request guard still checks the complete physical payload.
++    from hermes_cli.friday_credential_admission import ordinary_readonly_schemas
++    selected_tools = ordinary_readonly_schemas(agent.tools)
++    if selected_tools is not agent.tools:
++        agent.tools = selected_tools
++        agent.valid_tool_names = {tool["function"]["name"] for tool in selected_tools}
+ 
+     # ALWAYS rebuild the prompt here: keeping old bytes meant prompt-builder changes
+     # never reached long sessions. Equal bytes keep KV; preserve object identity.
+@@ -3689,6 +3711,13 @@
+         try:
+             # Memory extraction runs in BOTH modes: pre-compaction turns are summarized
+             # away whether or not the id rotates.
++            from agent.bounded_context import guard_bounded_compaction
++            from hermes_cli.partial_compress import rejoin_compressed_head_and_tail
++            candidate = rejoin_compressed_head_and_tail(compressed, verbatim_tail) if verbatim_tail else compressed
++            guard_bounded_compaction(agent, candidate, new_system_prompt)
++            if getattr(agent, "_bounded_context_policy", None) is not None:
++                from tools.mcp_tool_agent import persist_agent_tool_names
++                persist_agent_tool_names(agent)
+             agent.commit_memory_session(messages)
+ 
+             # Pop _compaction_tail tags before the size estimate / rotation: they must not
+@@ -3902,6 +3931,10 @@
+             agent, approx_tokens=approx_tokens, focus_topic=focus_topic, force=force, memory_context=memory_context,
+             bypass_cooldown=bypass_cooldown,
+         )
++        from agent.bounded_context import bounded_summary_headroom, BoundedContextPolicy
++        if isinstance(getattr(agent, "_bounded_context_policy", None), BoundedContextPolicy):
++            agent.context_compressor._bounded_summary_fit_callback = lambda skeleton: bounded_summary_headroom(
++                agent, skeleton, _existing_system_prompt(agent, system_message))
+         messages_before_compression = copy.deepcopy(messages)
+         _activity_heartbeat = _CompressionActivityHeartbeat(
+             agent, commit_fence=commit_fence, emit_client_status=lease.status_emitted,
+@@ -4238,7 +4271,30 @@
+             )
+         _fold_todo_snapshot(agent, compressed)
+         compressed_user_turn_outcome = _ensure_compressed_has_user_turn(messages, compressed)
++        _fit_fields = ("_cached_system_prompt", "_cached_system_prompt_static", "tools", "valid_tool_names",
++                       "_tool_snapshot_generation", "_plugin_system_prompt_sections_snapshot",
++                       "_plugin_system_prompt_sections_previous")
++        _fit_previous = {name: getattr(agent, name) for name in _fit_fields if hasattr(agent, name)}
++        _fit_old_prompt = _existing_system_prompt(agent, system_message)
+         new_system_prompt = _rebuild_system_prompt_at_boundary(agent, system_message)
++        from agent.bounded_context import guard_bounded_compaction, BoundedContextError
++        from hermes_cli.partial_compress import rejoin_compressed_head_and_tail
++        try:
++            _fit_candidate = rejoin_compressed_head_and_tail(compressed, verbatim_tail) if verbatim_tail else compressed
++            guard_bounded_compaction(agent, _fit_candidate, new_system_prompt)
++        except BoundedContextError as exc:
++            for name in _fit_fields:
++                if name in _fit_previous:
++                    setattr(agent, name, _fit_previous[name])
++                elif hasattr(agent, name):
++                    delattr(agent, name)
++            attempt.restore_compressor(agent.context_compressor)
++            _restore_messages_snapshot(messages, messages_before_compression)
++            agent._last_compaction_in_place = False
++            agent.context_compressor.record_rejected_compaction()
++            agent._emit_warning(f"Compression refused before commit: {exc}. Saved conversation rows are unchanged.")
++            _emit_aborted_attempt_telemetry(agent, attempt.started_at, "bounded_candidate_does_not_fit")
++            return messages, _fit_old_prompt
+         commit = _commit_compaction(
+             agent, messages, compressed, in_place=in_place, lease=lease, new_system_prompt=new_system_prompt,
+             system_message=system_message, compressed_user_turn_outcome=compressed_user_turn_outcome,
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1452,6 +1452,9 @@
+     _pending_verification_response_previewed: bool = False
+     # MoA guidance retained across a pre-API compression, rebased next iteration (no second fan-out).
+     pending_moa_prepared_request: Any = None
++    # Normal turns always retain reset, hooks and the final send guard.
++    # Only the explicit copied-summary precommit builder opts out of effects.
++    precommit_check: bool = False
+     # Per-iteration slots.
+     request_logger: Any = None
+     api_messages: Any = None
+--- a/agent/turn_api_request.py
++++ b/agent/turn_api_request.py
+@@ -94,7 +94,7 @@
+     agent: Any, *, api_messages: Any, _moa_prepared_request: Any, tools_for_api: Any,
+     system_message: Any, messages: Any, original_user_message: Any, approx_tokens: Any,
+     total_chars: Any, retry_count: Any, api_call_count: Any, api_request_id: Any,
+-    api_start_time: Any, effective_task_id: Any, turn_id: Any,
++    api_start_time: Any, effective_task_id: Any, turn_id: Any, precommit_check: bool = False,
+ ) -> ApiRequestBuild:
+     """Assemble the attempt's request in the original order (every mutation happens BEFORE
+     middleware/hooks/debug dumps observe the payload)."""
+@@ -102,7 +102,8 @@
+         _moa_client_consumes_prepared_request, _redecorate_prompt_cache_for_provider,
+     )
+ 
+-    agent._reset_stream_delivery_tracking()
++    if not precommit_check:
++        agent._reset_stream_delivery_tracking()
+     # Per-attempt first-chunk timestamp so a stale value never leaks into post_api_request.
+     agent._last_api_first_chunk_at = None
+     # api_messages was built for the primary; a fallback (DeepSeek / Kimi / MiMo) may
+@@ -117,7 +118,8 @@
+     )
+     # A model that rejected image content gets text only; history keeps the images.
+     strip_images_for_rejecting_model(agent, api_messages)
+-    observe_request_tools(agent, tools_for_api)
++    if not precommit_check:
++        observe_request_tools(agent, tools_for_api)
+     if tools_for_api == agent.tools:
+         api_kwargs = agent._build_api_kwargs(api_messages)
+     else:
+@@ -155,7 +157,8 @@
+         _original_api_kwargs = dict(api_kwargs)
+         _llm_middleware_trace = []
+ 
+-    _fire_pre_api_request_hook(
++    if not precommit_check:
++        _fire_pre_api_request_hook(
+         agent, api_kwargs, api_messages, _llm_middleware_trace, messages=messages,
+         original_user_message=original_user_message, approx_tokens=approx_tokens,
+         total_chars=total_chars, retry_count=retry_count, api_call_count=api_call_count,
+@@ -166,7 +169,7 @@
+     from agent.bounded_context import guard_main_request
+     guard_main_request(agent, api_kwargs)
+ 
+-    if env_var_enabled("HERMES_DUMP_REQUESTS"):
++    if not precommit_check and env_var_enabled("HERMES_DUMP_REQUESTS"):
+         agent._dump_api_request_debug(api_kwargs, reason="preflight")
+ 
+     # Private to the in-process MoA facade; added after middleware/hooks/debug dumps so
+--- a/agent/turn_request_assembly.py
++++ b/agent/turn_request_assembly.py
+@@ -120,6 +120,19 @@
+         estimate_native_anthropic_messages_tokens_rough,
+     )
+ 
++    # Projection must precede prompt rendering: restored tool pins can contain
++    # donor write schemas even though only read_file is admitted for this task.
++    from hermes_cli.friday_credential_admission import ordinary_readonly_schemas
++    selected_tools = ordinary_readonly_schemas(agent.tools)
++    if selected_tools is not agent.tools:
++        agent.tools = selected_tools
++        agent.valid_tool_names = {tool["function"]["name"] for tool in selected_tools}
++
++    from agent.bounded_context import remember_bounded_compaction_context
++    remember_bounded_compaction_context(
++        agent, messages, current_turn_user_idx, _ext_prefetch_cache,
++        _plugin_user_context, moa_config, original_user_message,
++    )
+     api_messages, effective_system = build_api_messages(
+         agent, messages, current_turn_user_idx=current_turn_user_idx,
+         ext_prefetch_cache=_ext_prefetch_cache, plugin_user_context=_plugin_user_context,
+--- a/hermes_cli/friday_credential_admission.py
++++ b/hermes_cli/friday_credential_admission.py
+@@ -4,6 +4,10 @@
+ Errors carry static codes; credentials are never copied into evidence.
+ """
+ from __future__ import annotations
++import re
++import hashlib
++import math
++from hermes_cli.friday_dashboard_owner import read_owned, read_owned as owned_file
+ from contextlib import contextmanager
+ import io
+ import json
+@@ -648,7 +652,7 @@
+ 
+ def validated_cli_repair_chain(home, marker, request):
+     """Only witnessed additive Source35/36 repairs may extend the immutable marker."""
+-    from hermes_cli.friday_dashboard_owner import read_owned
++    read_owned = owned_file
+     import hashlib, time, stat
+     home = Path(home)
+     def load(ref, expected=None):
+@@ -662,17 +666,18 @@
+         return cli_ordinary_failed_v6_json(raw), hashlib.sha256(raw).hexdigest()
+     require(request['schema'] in ('friday.installed-cli-request.v1','friday.installed-cli-request.v2',
+                                  'friday.installed-cli-request.v3','friday.installed-cli-request.v4',
+-                                 'friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8'), 'cli_runtime_supported_request_required')
++                                 'friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9'), 'cli_runtime_supported_request_required')
+     require(('postinstall_native_bootstrap_repair' in marker) ==
+-            (request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8'))
+-            and ('postinstall_session_artifact_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8'))
+-            and ('postinstall_context_continuation_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8'))
++            (request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9'))
++            and ('postinstall_session_artifact_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9'))
++            and ('postinstall_context_continuation_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9'))
+             and ('postinstall_frontend_repair' in marker) == (request['schema'] != 'friday.installed-cli-request.v1'),
+             'cli_runtime_supported_chain_required')
+-    require(request['schema'] not in ('friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8') or
++    require(request['schema'] not in ('friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9') or
+             'postinstall_native_manager_repair' in marker, 'cli_ordinary_new_question_source_required')
+-    require(('postinstall_readonly_schema_formatter_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v7','friday.installed-cli-request.v8')), 'cli_runtime_schema_formatter_chain_required')
+-    require(('postinstall_current12_readonly_fit_repair' in marker) == (request['schema'] == 'friday.installed-cli-request.v8'), 'cli_runtime_current12_chain_required')
++    require(('postinstall_readonly_schema_formatter_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9')), 'cli_runtime_schema_formatter_chain_required')
++    require(('postinstall_current12_readonly_fit_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v8','friday.installed-cli-request.v9')), 'cli_runtime_current12_chain_required')
++    require(('postinstall_summary_fit_repair' in marker) == (request['schema'] == 'friday.installed-cli-request.v9'), 'cli_runtime_summary_fit_chain_required')
+     original = load(request['installation_input'])
+     current_input = load(request['repaired_input'])
+     require({k:v for k,v in original.items() if k != 'project_files'} ==
+@@ -688,9 +693,18 @@
+         manifest41_raw = read_owned(manifest41_path)
+         require(hashlib.sha256(manifest41_raw).hexdigest() == current_input['project_files']['patches/hermes/installed-current12-readonly-fit-manifest.json'], 'cli_runtime_current12_manifest_changed')
+         names41, newfiles41 = cli_current12_manifest_scope(cli_ordinary_failed_v6_json(manifest41_raw))
++    names42, newfiles42 = set(), set()
++    if 'postinstall_summary_fit_repair' in marker:
++        manifest42_path = Path(request['repaired_input']['path']).parent/'project'/CLI_SUMMARY_FIT_MANIFEST
++        manifest42_raw = read_owned(manifest42_path)
++        require(hashlib.sha256(manifest42_raw).hexdigest() == current_input['project_files'][CLI_SUMMARY_FIT_MANIFEST], 'cli_runtime_summary_fit_manifest_changed')
++        names42, newfiles42 = cli_summary_fit_manifest_scope(cli_ordinary_failed_v6_json(manifest42_raw))
+     head = marker
+     snapshots = {}
+     for field, folder, token, schema, manifest_name, source_name, count, prior_token, prior_schema in (
++        ('postinstall_summary_fit_repair','summary-fit-repair',CLI_SUMMARY_FIT_INTENT,
++         'friday.summary-fit-repair-intent.v1','installed-summary-fit-manifest.json',
++         tuple(names42),42,CLI_CURRENT12_INTENT,'friday.current12-readonly-fit-repair-intent.v1'),
+         ('postinstall_current12_readonly_fit_repair','current12-readonly-fit-repair','FRIDAY-INSTALL.current12-readonly-fit-repair.intent.json',
+          'friday.current12-readonly-fit-repair-intent.v1','installed-current12-readonly-fit-manifest.json',
+          tuple(names41),41,'FRIDAY-INSTALL.readonly-schema-formatter-repair.intent.json','friday.readonly-schema-formatter-repair-intent.v1'),
+@@ -757,7 +771,7 @@
+         manifest_path = Path(r['repaired_input']['path']).parent/'project'/manifest_relative
+         manifest_raw = read_owned(manifest_path)
+         manifest_sha = hashlib.sha256(manifest_raw).hexdigest(); manifest = cli_ordinary_failed_v6_json(manifest_raw)
+-        require(value['project_files'][manifest_relative] == manifest_sha and len(manifest['files']) == (len(names41) if count == 41 else len(cli_readonly_schema_manifest_names()) if count == 40 else 6 if count == 38 else 2 if count == 37 else 1),
++        require(value['project_files'][manifest_relative] == manifest_sha and len(manifest['files']) == (len(names42) if count == 42 else len(names41) if count == 41 else len(cli_readonly_schema_manifest_names()) if count == 40 else 6 if count == 38 else 2 if count == 37 else 1),
+                 'cli_runtime_chain_manifest_changed')
+         names = set(source_name) if isinstance(source_name,tuple) else {source_name}
+         require({row['path'] for row in manifest['files']} == names
+@@ -770,7 +784,7 @@
+                 'cli_runtime_chain_receipt_changed')
+         for row in manifest['files']:
+             name = row['path']
+-            new_file = (count == 38 and name == 'tests/agent/test_post_tool_context_fit.py') or (count == 40 and name in cli_readonly_schema_new_files()) or (count == 41 and name in newfiles41)
++            new_file = (count == 38 and name == 'tests/agent/test_post_tool_context_fit.py') or (count == 40 and name in cli_readonly_schema_new_files()) or (count == 41 and name in newfiles41) or (count == 42 and name in newfiles42)
+             require((row['before_sha256'] is None and row.get('new_file') is True and row['mode'] == '100644' and name not in before['files']
+                      if new_file else row['before_sha256'] == before['files'][name]['sha256'])
+                     and receipt['files'][name] == {k:row[k] for k in ('sha256','bytes','mode')},
+@@ -783,7 +797,7 @@
+                 require(absence.get(str(home/'hermes-agent'/name)) == {'absent':True}
+                         and not (base/'hermes-agent'/name).exists()
+                         and not (base/'hermes-agent'/name).is_symlink(), 'cli_runtime_saved_absence_changed')
+-            elif count in (37,38,39,40,41):
++            elif count in (37,38,39,40,41,42):
+                 prior_source = base/'hermes-agent'/name
+                 raw = read_owned(prior_source,private=True)
+                 require(hashlib.sha256(raw).hexdigest() == row['before_sha256'], 'cli_runtime_saved_source_changed')
+@@ -793,6 +807,26 @@
+                 and prior['request']['repaired_input'] == r['previous_input']
+                 and prior['request']['installation_input'] == request['installation_input']
+                 and cli_historical_scope_closed(prior['clock'],'friday.installed-cli-clock.v1'), 'cli_runtime_prior_repair_changed')
++        if count == 42:
++            saved = cli_ordinary_failed_v6_json(read_owned(home/'preparation'/folder/'beforeimages.json',private=True))
++            existing = names-newfiles42
++            expected_saved = {str(home/n) for n in ('FRIDAY-INSTALL.json','hermes-agent.source.json','hermes-agent/install-stamp.json',prior_token)} | {str(home/'hermes-agent'/n) for n in names}
++            require(type(saved) is dict and set(saved) == expected_saved, 'cli_runtime_summary_fit_beforeimages_scope_changed')
++            for relative in ('FRIDAY-INSTALL.json','hermes-agent.source.json','hermes-agent/install-stamp.json',prior_token,*('hermes-agent/'+n for n in existing)):
++                row = saved[str(home/relative)]; backup = base/relative
++                require(type(row) is dict and set(row) == {'path','sha256','bytes','original_mode'}
++                        and row['path'] == str(backup) and type(row['bytes']) is type(row['original_mode']) is int
++                        and row['bytes'] >= 0 and stat.S_IMODE((home/relative).stat().st_mode) == row['original_mode'], 'cli_runtime_summary_fit_beforeimage_mode_changed')
++                raw = read_owned(backup,private=True)
++                require(hashlib.sha256(raw).hexdigest() == row['sha256'] and len(raw) == row['bytes'], 'cli_runtime_summary_fit_beforeimage_changed')
++            require(saved[str(home/prior_token)]['sha256'] == r['previous_repair_intent']['sha256'], 'cli_runtime_summary_fit_old_intent_snapshot_changed')
++            cli_ordinary_previous_failed_v8_journey(r,home)
++            require(request['schema'] == 'friday.installed-cli-request.v9'
++                    and request['ordinary_readonly'] == r['next_ordinary_readonly']
++                    and request['partial_proof'] == r['partial_proof'], 'cli_runtime_summary_fit_history_scope_changed')
++            request = dict(request,schema='friday.installed-cli-request.v8',ordinary_readonly=r['ordinary_readonly'])
++            head, receipt = previous, before
++            continue
+         if count == 41:
+             saved = cli_ordinary_failed_v6_json(read_owned(home/'preparation'/folder/'beforeimages.json',private=True))
+             existing = names-newfiles41
+@@ -1022,6 +1056,197 @@
+                     and row.get('new_file',False) is False), 'cli_current12_manifest_beforeimage_required')
+     return names,newfiles
+ 
++
++CLI_SUMMARY_FIT_MANIFEST = 'patches/hermes/installed-summary-fit-manifest.json'
++CLI_SUMMARY_FIT_INTENT = 'FRIDAY-INSTALL.summary-fit-repair.intent.json'
++CLI_CURRENT12_INTENT = 'FRIDAY-INSTALL.current12-readonly-fit-repair.intent.json'
++CLI_RUNTIME_CAPS = {'memory.max':'2147483648','memory.swap.max':'0','pids.max':'128','cpu.max':'200000 100000'}
++
++def cli_summary_fit_manifest_scope(manifest):
++    """Additive42 afterimages are supplied only after native source acceptance."""
++    required = {'agent/bounded_context.py','agent/context_compressor.py',
++                'agent/conversation_loop.py','agent/auxiliary_client.py',
++                'agent/conversation_compression.py','agent/turn_api_request.py',
++                'agent/turn_request_assembly.py','hermes_cli/friday_credential_admission.py',
++                'hermes_cli/friday_dashboard_owner.py'}
++    tests = {'tests/agent/test_summary_fit_precommit.py'}
++    rows = manifest['files']
++    if type(rows) is dict:
++        rows = [dict(row,path=name) for name,row in rows.items()]
++    require(type(rows) is list and rows and all(type(row) is dict for row in rows),
++            'cli_summary_fit_manifest_rows_required')
++    names = {row['path'] for row in rows}
++    require(len(names) == len(rows) and required <= names <= required|tests,
++            'cli_summary_fit_manifest_scope_required')
++    newfiles = names & tests
++    for row in rows:
++        require(row['mode'] == '100644' and type(row['bytes']) is int and row['bytes'] > 0
++                and type(row['sha256']) is str and re.fullmatch('[0-9a-f]{64}',row['sha256'])
++                and 'before_sha256' in row
++                and (row['before_sha256'] is None and row.get('new_file') is True if row['path'] in newfiles else
++                    type(row['before_sha256']) is str and re.fullmatch('[0-9a-f]{64}',row['before_sha256'])
++                    and row.get('new_file',False) is False), 'cli_summary_fit_manifest_beforeimage_required')
++    return names,newfiles
++
++def cli_ordinary_previous_failed_v8_journey(request, home):
++    """Consume no old job: accept only witnessed V8 partial custody and a new V9."""
++    home = Path(home)
++    reader = globals().get('owned_file') or globals().get('read_owned')
++    def load(ref, expected=None):
++        require(type(ref) is dict and set(ref) in ({'path','sha256'},{'path','sha256','bytes'})
++                and type(ref['path']) is str and (expected is None or ref['path'] == str(expected))
++                and type(ref['sha256']) is str and re.fullmatch('[0-9a-f]{64}',ref['sha256']),
++                'cli_ordinary_v8_history_pin_required')
++        raw = reader(Path(ref['path']),private=True)
++        require(len(raw) <= 64*1024*1024 and hashlib.sha256(raw).hexdigest() == ref['sha256']
++                and ('bytes' not in ref or type(ref['bytes']) is int and ref['bytes'] == len(raw)),
++                'cli_ordinary_v8_history_pin_changed')
++        return cli_ordinary_failed_v6_json(raw)
++    def same(ref, expected):
++        require(ref['path'] == expected['path'] and ref['sha256'] == expected['sha256'],
++                'cli_ordinary_v8_evidence_routing_changed')
++        return load(ref)
++    proof = load(request['previous_ordinary_qualified'])
++    same(proof['custody'],request['previous_ordinary_custody'])
++    require(request['previous_ordinary_qualified'] == request['previous_ordinary_unchanged'],
++            'cli_ordinary_v8_one_actual_proof_required')
++    saved = same(proof['complete_SQL_rows'],request['previous_ordinary_sql'])
++    custody = load(request['previous_ordinary_custody'])
++    accepted = load(request['previous_ordinary_independent'])
++    same(accepted['actual_proof'],request['previous_ordinary_qualified'])
++    review = load(accepted['review'])
++    require(accepted['schema'] == 'friday.actual-v8-partial-root-acceptance.v1'
++            and accepted['PartialRead_Go'] is accepted['Cleanup_Go'] is True
++            and accepted['GroundedFinalAnswer_Go'] is False
++            and accepted['model_call_count'] == accepted['namespace_init_exit_verified'] == 'UNKNOWN'
++            and review['schema'] == 'friday.v8-actual-partial-independent-review.v1'
++            and review['state'] == 'EXACT_ACTUAL_V8_READ_AND_CUSTODY_PARTIAL_ACCEPTED_NO_FINAL_NO_RETRY'
++            and review['PartialRead_Go'] is review['Cleanup_Go'] is True
++            and review['GroundedFinalAnswer_Go'] is review['retry_authorized'] is False
++            and all(v[k] is False for v in (proof,accepted,review) for k in ('Runtime_Go','Resource_Go','Release_Go')),
++            'cli_ordinary_v8_partial_acceptance_truth_required')
++    for role in ('request','custody','complete_SQL_rows','consumed_native_intent',
++                 'consumed_semantic_job','native_observation'):
++        same({k:review['pins'][role][k] for k in ('path','sha256','bytes')},proof[role])
++    require(proof['state'] == 'REAL_INSTALLED_V8_PARTIAL_OR_FAIL_CUSTODY_CLOSED_NO_RETRY'
++            and proof['retry_authorized'] is False and proof['native_result'] is None
++            and proof['checks']['new_final_answer'] is proof['checks']['native_result_present'] is False
++            and all(proof['checks'][k] is True for k in ('artifact_unchanged','all_foreign_rows_unchanged',
++                'complete_ordered_own_rows','immutable_prior_payload','new_exact_question','only_read_file_calls',
++                'only_read_file_tools','read_file_success','tool_calls_linked','persisted_cli_close')),
++            'cli_ordinary_v8_no_final_or_retry_required')
++    prior = load(proof['consumed_native_intent']); old = prior['request']; clock = prior['clock']
++    require(prior['schema'] == 'friday.installed-cli-invocation.v1' and prior['state'] == 'CONSUMED_NOT_COMPLETE'
++            and old['schema'] == 'friday.installed-cli-request.v8'
++            and old['home'] == request['home'] == str(home)
++            and re.fullmatch(r'friday-rework-cli-runtime-[A-Za-z0-9-]+\.service',old['unit'])
++            and old['unit'] != request['unit'] and old['assignment'] != request['assignment']
++            and old['installation_input'] == request['installation_input']
++            and old['repaired_input'] == request['previous_input']
++            and old['ordinary_readonly'] == request['ordinary_readonly']
++            and old['history'] == prior['history'] == request['history']
++            and old['partial_proof'] == request['partial_proof']
++            and cli_historical_scope_closed(clock,'friday.installed-cli-clock.v1'),
++            'cli_ordinary_v8_consumed_closed_scope_required')
++    require(load(proof['request']) == old and old['argv'] == cli_ordinary_readonly_argv(home,old['ordinary_readonly'])
++            and old['job_id'] == cli_ordinary_job_id(home,old['ordinary_readonly']),
++            'cli_ordinary_v8_consumed_semantics_changed')
++    prefix = 'preparation/cli-runtime/'; base = prefix+old['unit']
++    suffixes = ('.intent.json','.json','.stdout','.stderr','.native-owner.json')
++    job = prefix+'jobs/'+old['job_id']+'.intent.json'
++    inventory = request['previous_ordinary_runtime']
++    require(type(inventory) is dict and set(inventory) == {base+s for s in suffixes}|{job},
++            'cli_ordinary_v8_inventory_required')
++    for name,sha in inventory.items():
++        require(type(sha) is str and re.fullmatch('[0-9a-f]{64}',sha)
++                and hashlib.sha256(reader(home/name,private=True)).hexdigest() == sha,
++                'cli_ordinary_v8_inventory_changed')
++    for role,name in (('consumed_native_intent',base+'.intent.json'),('native_observation',base+'.json'),
++                      ('consumed_semantic_job',job)):
++        require(proof[role]['path'] == str(home/name) and proof[role]['sha256'] == inventory[name],
++                'cli_ordinary_v8_runtime_routing_changed')
++    require(load(proof['consumed_semantic_job']) == {'schema':'friday.cli-ordinary-job-intent.v1',
++            'state':'CONSUMED_NO_RETRY','job_id':old['job_id'],'request':old,'clock':clock}
++            and not (home/(base+'.result.json')).exists() and not (home/(base+'.result.json')).is_symlink(),
++            'cli_ordinary_v8_no_replay_required')
++    observed = load(proof['native_observation']); native = load(custody['native_return'])
++    owner = cli_ordinary_failed_v6_json(reader(home/(base+'.native-owner.json'),private=True))
++    require(type(observed['argv']) is list and len(observed['argv']) == 16+len(old['argv'])
++            and observed['argv'][:2] == ['/usr/bin/bwrap','--json-status-fd']
++            and observed['argv'][3:16] == ['--unshare-pid','--die-with-parent','--new-session','--as-pid-1',
++                '--bind','/','/','--dev','/dev','--proc','/proc','--',str(home/'hermes-agent/.hermes/bin/hermes')]
++            and observed['argv'][16:] == old['argv']
++            and owner['boot_id'] == clock['boot_id'] and owner['pid'] == 1 and type(owner['pid']) is int
++            and type(owner['starttime_ticks']) is int and owner['starttime_ticks'] >= observed['starttime_ticks']
++            and re.fullmatch(r'pid:\[[0-9]+\]',owner['pid_namespace'])
++            and all(type(observed[k+'_bytes']) is int
++                    and observed[k+'_bytes'] == len(reader(home/(base+'.'+k),private=True))
++                    and observed[k+'_sha256'] == inventory[base+'.'+k] for k in ('stdout','stderr')),
++            'cli_ordinary_v8_native_observation_changed')
++    require(observed['returncode'] == 1 and type(observed['returncode']) is int
++            and observed['reaped'] is True and observed['timeout'] is False
++            and native['returncode'] == 2 and type(native['returncode']) is int
++            and native['unit'] == old['unit'] and native['reaped'] is True and native['timed_out'] is False
++            and custody['state'] == 'VERIFIED_OWN_CUSTODY_CLOSED' and custody['clock'] == clock
++            and custody['retry_authorized'] is False and custody['cgroup_gone_or_empty'] is custody['heavy_flock_returned'] is True
++            and custody['unit'] == {'ActiveState':'failed','ControlGroup':'','MainPID':'0'}
++            and type(custody['closure_mono']) in (int,float) and math.isfinite(custody['closure_mono'])
++            and clock['started_mono'] <= custody['closure_mono'] <= clock['deadline_mono'],
++            'cli_ordinary_v8_custody_changed')
++    births = custody['own_births']
++    require(type(births) is list and len(births) == 4
++            and {b['name'] for b in births} == {'self','GNU','systemd-run-client','bwrap-monitor'}
++            and all(type(b['pid']) is type(b['birth_ticks']) is int and b['pid'] > 1
++                    and b['birth_ticks'] > 0 and b['same_birth_alive'] is False for b in births),
++            'cli_ordinary_v8_births_changed')
++    born = {b['name']:b for b in births}
++    require((born['GNU']['pid'],born['GNU']['birth_ticks']) == (clock['gnu_pid'],clock['gnu_starttime_ticks'])
++            and (born['bwrap-monitor']['pid'],born['bwrap-monitor']['birth_ticks']) == (observed['pid'],observed['starttime_ticks'])
++            and prior['physical']['caps'] == CLI_RUNTIME_CAPS and prior['physical']['unit'] == old['unit'],
++            'cli_ordinary_v8_birth_binding_changed')
++    new = request['next_ordinary_readonly']; oldbinding = old['ordinary_readonly']
++    cli_ordinary_readonly_baseline(new)
++    mutable = {'schema','question','purpose','row_sha256','messages_sha256','baseline_message_ids',
++               'baseline_stable_messages_sha256','append_high_water','initial_lifecycle_sha256'}
++    require(new['schema'] == 'friday.cli-ordinary-readonly.v5'
++            and {k:v for k,v in new.items() if k not in mutable} == {k:v for k,v in oldbinding.items() if k not in mutable}
++            and oldbinding['baseline_message_ids'] == list(range(5,17))
++            and new['baseline_message_ids'] == list(range(5,25)) and new['append_high_water'] == 24
++            and new['artifact_bytes'] == 915 and cli_ordinary_job_id(home,new) != old['job_id'],
++            'cli_ordinary_v9_genuine_new_baseline_required')
++    require(saved['complete_actual_SELECT_STAR'] is saved['no_large_payload_elision'] is True
++            and [m['id'] for m in saved['messages']] == list(range(5,25))
++            and all(type(m[k]) is int and m[k] in (0,1) for m in saved['messages'] for k in ('active','compacted'))
++            and all(type(m['timestamp']) in (int,float) and math.isfinite(m['timestamp'])
++                    and 0 <= m['timestamp'] <= 4200000000 for m in saved['messages'])
++            and saved['row']['end_reason'] == 'cli_close' and type(saved['row']['ended_at']) in (int,float)
++            and math.isfinite(saved['row']['ended_at']) and saved['row']['ended_at'] > 0
++            and {k:saved['row'][k] for k in new['identity']} == new['identity'],
++            'cli_ordinary_v8_complete_sql_required')
++    fingerprint = lambda v: hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
++    stable = lambda rows: [{k:v for k,v in m.items() if k not in {'active','compacted'}} for m in rows]
++    require(fingerprint(saved['row']) == new['row_sha256'] and fingerprint(saved['messages']) == new['messages_sha256']
++            and fingerprint(stable(saved['messages'])) == new['baseline_stable_messages_sha256']
++            and fingerprint(stable(saved['messages'][:12])) == oldbinding['baseline_stable_messages_sha256']
++            and fingerprint(stable(saved['messages'][:4])) == new['stable_messages_sha256']
++            and fingerprint([{k:m[k] for k in ('id','active','compacted')} for m in saved['messages'][:4]]) == new['initial_lifecycle_sha256']
++            and fingerprint(saved['other_sessions']) == new['other_sessions_sha256']
++            and fingerprint(saved['other_messages']) == new['other_messages_sha256']
++            and max(m['id'] for m in saved['messages']+saved['other_messages']) == 24,
++            'cli_ordinary_v8_saved_payload_changed')
++    tail = saved['messages'][-3:]
++    require([m['role'] for m in tail] == ['user','assistant','tool'] and tail[0]['content'] == old['argv'][-1]
++            and tail[1]['content'] == '' and tail[2]['tool_name'] == 'read_file', 'cli_ordinary_v8_saved_tail_changed')
++    calls = cli_ordinary_failed_v6_json(tail[1]['tool_calls'])
++    require(type(calls) is list and len(calls) == 1 and calls[0]['type'] == 'function'
++            and calls[0]['function']['name'] == 'read_file'
++            and cli_ordinary_failed_v6_json(calls[0]['function']['arguments']) == {'path':new['output']}
++            and tail[2]['tool_call_id'] == calls[0]['id'], 'cli_ordinary_v8_saved_tool_binding_changed')
++    artifact = reader(Path(new['output']),private=True); tool = cli_ordinary_failed_v6_json(tail[2]['content'])
++    require(len(artifact) == new['artifact_bytes'] and hashlib.sha256(artifact).hexdigest() == new['artifact_sha256']
++            and tool['success'] is tool['readonly'] is True and tool['path'] == new['output']
++            and tool['content'] == artifact.decode('utf-8').rstrip('\n'), 'cli_ordinary_v8_saved_artifact_changed')
++    return old
+ 
+ def cli_ordinary_previous_failed_v7_journey(request, home):
+     """A partial consumed V7 is history; only a distinct pinned V8 may follow."""
+@@ -1675,7 +1900,7 @@
+         require('question' not in binding and 'purpose' not in binding,
+                 'cli_ordinary_question_binding_required')
+         return binding
+-    require(binding.get('schema') in ('friday.cli-ordinary-readonly.v2','friday.cli-ordinary-readonly.v3','friday.cli-ordinary-readonly.v4')
++    require(binding.get('schema') in ('friday.cli-ordinary-readonly.v2','friday.cli-ordinary-readonly.v3','friday.cli-ordinary-readonly.v4','friday.cli-ordinary-readonly.v5')
+             and type(binding.get('question')) is str and type(binding.get('purpose')) is str,
+             'cli_ordinary_question_binding_required')
+     question, purpose = binding['question'], binding['purpose']
+@@ -1689,6 +1914,8 @@
+     declared = ('Какой один следующий шаг реализации диспетчеризации задач от Hermes к DeepSeek Harness следует подготовить по сохранённому резюме? Назови вход, ожидаемый результат воркера и проверку локального endpoint без облачного fallback; если резюме не задаёт детали, явно обозначь предположение.', 'next-local-worker-dispatch-implementation-step') if binding['schema'] == 'friday.cli-ordinary-readonly.v2' else ('Какие обязательные возможности Пятницы перечислены в сохранённом резюме и какие ограничения или неподтверждённые результаты там отмечены? Отдели требования от уже выполненного; не дополняй сведения догадками.', 'extract-required-capabilities-and-limits-from-saved-artifact')
+     if binding['schema'] == 'friday.cli-ordinary-readonly.v4':
+         declared = ('По сохранённому файлу составь таблицу: требование Пятницы / уже сделано / ещё не подтверждено. Включи только факты файла, укажи ограничения. Ответь по-русски.', 'build-evidence-status-table-from-saved-artifact')
++    if binding['schema'] == 'friday.cli-ordinary-readonly.v5':
++        declared = ('По сохранённому файлу назови один ещё не подтверждённый результат Пятницы и проверку, которая его подтвердит. Используй только факты файла; если проверка не задана, прямо укажи это. Ответь по-русски.', 'verify-one-unconfirmed-result-from-saved-artifact')
+     require((question,purpose) == declared, 'cli_ordinary_declared_new_question_required')
+     return {**{k:v for k,v in binding.items() if k not in {'question','purpose','schema'}},
+             'schema':'friday.cli-ordinary-readonly.v1'}
+@@ -1830,7 +2057,7 @@
+ 
+ def cli_ordinary_readonly_argv(home, binding):
+     cli_ordinary_readonly_baseline(binding)
+-    if binding.get('schema') in ('friday.cli-ordinary-readonly.v2','friday.cli-ordinary-readonly.v3','friday.cli-ordinary-readonly.v4'):
++    if binding.get('schema') in ('friday.cli-ordinary-readonly.v2','friday.cli-ordinary-readonly.v3','friday.cli-ordinary-readonly.v4','friday.cli-ordinary-readonly.v5'):
+         query = ('Прочитай существующий файл '+binding['output']+' инструментом read_file. '
+                  +binding['question']+' Дай краткий ответ; не изменяй файлы и не вызывай другие инструменты.')
+         return ['-p','default','--cli','chat','--oneshot','-t','file','--run-budget','90',
+@@ -1858,6 +2085,9 @@
+     if binding.get('schema') == 'friday.cli-ordinary-readonly.v4':
+         semantic.update(schema='friday.cli-ordinary-readonly-job.v4',
+                         question=binding['question'],purpose=binding['purpose'],binding=binding)
++    if binding.get('schema') == 'friday.cli-ordinary-readonly.v5':
++        semantic.update(schema='friday.cli-ordinary-readonly-job.v5',
++                        question=binding['question'],purpose=binding['purpose'],binding=binding)
+     return hashlib.sha256(json.dumps(semantic,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
+ 
+ 
+@@ -1879,7 +2109,7 @@
+     current = ordinary_cli_runtime(home,marker)
+     unit = Path('/proc/self/cgroup').read_text().strip().rsplit('/',1)[-1]
+     request = json.loads(read_owned(Path(home)/'preparation/cli-runtime'/(unit+'.intent.json'),private=True))['request']
+-    require(current == clock and request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8')
++    require(current == clock and request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9')
+             and request.get('ordinary_readonly') == binding, 'cli_ordinary_cached_scope_changed')
+     cli_ordinary_job_consumed(home,request,clock)
+     cli_ordinary_readonly_inputs(home,binding,resumed=True)
+@@ -1996,7 +2226,7 @@
+             and type(clock['gnu_starttime_ticks']) is int and clock['gnu_starttime_ticks'] > 0
+             and clock['started_mono'] <= time.monotonic() < clock['useful_deadline_mono'],
+             'cli_runtime_clock_expired_or_invalid')
+-    if request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8'):
++    if request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9'):
+         cli_ordinary_native_unit_current(home,request,clock,physical)
+         cli_ordinary_job_consumed(home,request,clock)
+         cli_ordinary_readonly_inputs(home,request['ordinary_readonly'],resumed=_ORDINARY_READONLY is not None)
+@@ -2136,10 +2366,10 @@
+         unit = Path('/proc/self/cgroup').read_text().strip().rsplit('/',1)[-1]
+         request = cli_ordinary_failed_v6_json(read_owned(Path(home)/'preparation/cli-runtime'/(unit+'.intent.json'),private=True))['request']
+         artifact = request.get('schema') == 'friday.installed-cli-request.v4'
+-        readonly = request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8')
++        readonly = request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9')
+         if readonly:
+             binding = request['ordinary_readonly']
+-            require(binding.get('schema') == {'friday.installed-cli-request.v5':'friday.cli-ordinary-readonly.v1','friday.installed-cli-request.v6':'friday.cli-ordinary-readonly.v2','friday.installed-cli-request.v7':'friday.cli-ordinary-readonly.v3','friday.installed-cli-request.v8':'friday.cli-ordinary-readonly.v4'}[request['schema']], 'cli_ordinary_new_question_source_required')
++            require(binding.get('schema') == {'friday.installed-cli-request.v5':'friday.cli-ordinary-readonly.v1','friday.installed-cli-request.v6':'friday.cli-ordinary-readonly.v2','friday.installed-cli-request.v7':'friday.cli-ordinary-readonly.v3','friday.installed-cli-request.v8':'friday.cli-ordinary-readonly.v4','friday.installed-cli-request.v9':'friday.cli-ordinary-readonly.v5'}[request['schema']], 'cli_ordinary_new_question_source_required')
+             require(request['argv'] == cli_ordinary_readonly_argv(home,binding)
+                     and checked.resume == binding['id'] and checked.no_restore_cwd,
+                     'cli_ordinary_exact_resume_required')
+--- a/hermes_cli/friday_dashboard_owner.py
++++ b/hermes_cli/friday_dashboard_owner.py
+@@ -32,11 +32,15 @@
+         before = os.fstat(fd)
+         require(stat.S_ISREG(before.st_mode) and before.st_uid == owner_uid()
+                 and before.st_nlink == 1 and (not private or not before.st_mode & 0o077))
++        # Charge the actual regular-file size, not the64MiB ceiling, for a tiny
++        # marker. The extra byte detects growth; metadata and length still fail
++        # closed if the owned file changes while it is being read.
++        require(0 <= before.st_size <= 64 * 1024**2)
+         with os.fdopen(fd, 'rb', closefd=False) as stream:
+-            data = stream.read(64 * 1024**2 + 1)
++            data = stream.read(before.st_size + 1)
+         after = os.fstat(fd)
+         fields = ('st_dev', 'st_ino', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_uid', 'st_nlink')
+-        require(len(data) <= 64 * 1024**2 and all(getattr(before, k) == getattr(after, k) for k in fields))
++        require(len(data) == before.st_size and all(getattr(before, k) == getattr(after, k) for k in fields))
+         return data
+     finally:
+         os.close(fd)

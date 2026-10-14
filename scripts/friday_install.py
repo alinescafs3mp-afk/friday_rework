@@ -1432,8 +1432,8 @@ def installed_cli_clock():
 
 
 def installed_cli_kernel(request, clock, *, phase="installed-cli"):
-    require(phase in ("installed-cli", "repair-installed-cli", "repair-frontend-close", "repair-native-bootstrap", "repair-session-artifact", "repair-context-continuation", "repair-native-manager", "repair-readonly-schema-formatter", "repair-current12-readonly-fit"), "installed_cli_exact_phase_required")
-    if phase in ("repair-installed-cli", "repair-frontend-close", "repair-native-bootstrap", "repair-session-artifact", "repair-context-continuation", "repair-native-manager", "repair-readonly-schema-formatter", "repair-current12-readonly-fit"):
+    require(phase in ("installed-cli", "repair-installed-cli", "repair-frontend-close", "repair-native-bootstrap", "repair-session-artifact", "repair-context-continuation", "repair-native-manager", "repair-readonly-schema-formatter", "repair-current12-readonly-fit", "repair-summary-fit"), "installed_cli_exact_phase_required")
+    if phase in ("repair-installed-cli", "repair-frontend-close", "repair-native-bootstrap", "repair-session-artifact", "repair-context-continuation", "repair-native-manager", "repair-readonly-schema-formatter", "repair-current12-readonly-fit", "repair-summary-fit"):
         require(request.get("phase") == phase, "installed_cli_exact_phase_required")
     """Prove current GNU, native owner and kernel caps before admission writes."""
     import resource
@@ -1464,7 +1464,7 @@ def installed_cli_kernel(request, clock, *, phase="installed-cli"):
     runtime = directory(Path('/run/user')/str(os.getuid())); bus=runtime/'bus'; info=bus.lstat()
     require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink==1,
             'owned_user_bus_required')
-    ordinary = phase == 'installed-cli' and request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8')
+    ordinary = phase == 'installed-cli' and request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9')
     props='Id,InvocationID,ActiveState,SubState,MainPID,ControlPID,ControlGroup,RuntimeMaxUSec,TimeoutStopUSec,KillMode'
     if ordinary:
         props += ',ExecMainStartTimestampMonotonic'
@@ -1580,10 +1580,10 @@ def cli_session_artifact_argv(home, binding):
 
 def installed_cli(request, request_path, *, clock):
     session_artifact = request.get('schema') == 'friday.installed-cli-request.v4'
-    ordinary_readonly = request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8')
+    ordinary_readonly = request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9')
     require(type(request) is dict and set(request)==({'schema','assignment','generation','home',
         'installation_input','repaired_input','historical_marker','native_launcher','history','unit','invocation_id','argv'} | ({'ordinary_readonly','job_id','partial_proof'} if ordinary_readonly else {'session_artifact'} if session_artifact else set()))
-        and request['schema'] in ('friday.installed-cli-request.v1','friday.installed-cli-request.v2','friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8') and request['generation']==1
+        and request['schema'] in ('friday.installed-cli-request.v1','friday.installed-cli-request.v2','friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9') and request['generation']==1
         and type(request['generation']) is int
         and re.fullmatch('[A-Za-z0-9-]{1,128}',request['assignment'])
         and request['invocation_id']=='OBSERVE_NATIVE_AT_ADMISSION', 'installed_cli_exact_request_required')
@@ -1591,7 +1591,7 @@ def installed_cli(request, request_path, *, clock):
     budget=Budget(180,started=clock['started_mono'],deadline=clock['useful_deadline_mono'])
     physical=budget.call(installed_cli_kernel,request,clock)
     frontend = request['schema'] != 'friday.installed-cli-request.v1'
-    bootstrap_chain = request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8')
+    bootstrap_chain = request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9')
     original=read_json(pin(request['installation_input']));value=read_json(pin(request['repaired_input']))
     require({k:v for k,v in original.items() if k!='project_files'} ==
             {k:v for k,v in value.items() if k!='project_files'}
@@ -1609,7 +1609,8 @@ def installed_cli(request, request_path, *, clock):
                 ({'postinstall_context_continuation_repair'} if ordinary_readonly else set()) |
                 ({'postinstall_native_manager_repair'} if 'postinstall_native_manager_repair' in marker else set()) |
                 ({'postinstall_readonly_schema_formatter_repair'} if 'postinstall_readonly_schema_formatter_repair' in marker else set()) |
-                ({'postinstall_current12_readonly_fit_repair'} if 'postinstall_current12_readonly_fit_repair' in marker else set())} ==
+                ({'postinstall_current12_readonly_fit_repair'} if 'postinstall_current12_readonly_fit_repair' in marker else set()) |
+                ({'postinstall_summary_fit_repair'} if 'postinstall_summary_fit_repair' in marker else set())} ==
                 {k:v for k,v in historical.items() if k!='source_receipt_sha256'}
             and marker['input_sha256']==request['installation_input']['sha256']
             and cli_historical_scope_closed(historical['original_attempt'],'friday.native-install.v1')
@@ -1622,10 +1623,11 @@ def installed_cli(request, request_path, *, clock):
     query=INSTALLED_CLI_QUERY
     expected=['-p','default','--cli','chat','--oneshot','-t','file','--run-budget','90','--max-turns','4','-q',query]
     if ordinary_readonly:
-        require(request['ordinary_readonly'].get('schema') == {'friday.installed-cli-request.v5':'friday.cli-ordinary-readonly.v1','friday.installed-cli-request.v6':'friday.cli-ordinary-readonly.v2','friday.installed-cli-request.v7':'friday.cli-ordinary-readonly.v3','friday.installed-cli-request.v8':'friday.cli-ordinary-readonly.v4'}[request['schema']]
+        require(request['ordinary_readonly'].get('schema') == {'friday.installed-cli-request.v5':'friday.cli-ordinary-readonly.v1','friday.installed-cli-request.v6':'friday.cli-ordinary-readonly.v2','friday.installed-cli-request.v7':'friday.cli-ordinary-readonly.v3','friday.installed-cli-request.v8':'friday.cli-ordinary-readonly.v4','friday.installed-cli-request.v9':'friday.cli-ordinary-readonly.v5'}[request['schema']]
                 and (request['schema'] != 'friday.installed-cli-request.v6' or 'postinstall_native_manager_repair' in marker)
                 and (request['schema'] != 'friday.installed-cli-request.v7' or 'postinstall_readonly_schema_formatter_repair' in marker)
-                and (request['schema'] != 'friday.installed-cli-request.v8' or 'postinstall_current12_readonly_fit_repair' in marker), 'cli_ordinary_new_question_source_required')
+                and (request['schema'] != 'friday.installed-cli-request.v8' or 'postinstall_current12_readonly_fit_repair' in marker)
+                and (request['schema'] != 'friday.installed-cli-request.v9' or 'postinstall_summary_fit_repair' in marker), 'cli_ordinary_new_question_source_required')
         expected = cli_ordinary_readonly_argv(home,request['ordinary_readonly'])
         require(request['job_id'] == cli_ordinary_job_id(home,request['ordinary_readonly']),
                 'cli_ordinary_semantic_job_changed')
@@ -1645,7 +1647,7 @@ def installed_cli(request, request_path, *, clock):
             'installed_cli_native_launcher_required')
     budget.call(cli_repair_plugins,value,home,marker,{})
     full_receipt=read_json(home/'hermes-agent.source.json')
-    require(len(full_receipt['layers'])==((41 if 'postinstall_current12_readonly_fit_repair' in marker else 40 if 'postinstall_readonly_schema_formatter_repair' in marker else 39 if 'postinstall_native_manager_repair' in marker else 38) if ordinary_readonly else 37 if session_artifact else 36 if bootstrap_chain else 35 if frontend else 34) and read_json(source/'install-stamp.json')['fridaySource']==
+    require(len(full_receipt['layers'])==((42 if 'postinstall_summary_fit_repair' in marker else 41 if 'postinstall_current12_readonly_fit_repair' in marker else 40 if 'postinstall_readonly_schema_formatter_repair' in marker else 39 if 'postinstall_native_manager_repair' in marker else 38) if ordinary_readonly else 37 if session_artifact else 36 if bootstrap_chain else 35 if frontend else 34) and read_json(source/'install-stamp.json')['fridaySource']==
             {'baseTree':full_receipt['base_tree'],'layers':full_receipt['layers']},'installed_cli_full_stamp_required')
     custody=Containment(value['containment'],budget,clean_environment(home))
     repair_intent=read_json(home/CLI_REPAIR_INTENT)
@@ -1655,10 +1657,10 @@ def installed_cli(request, request_path, *, clock):
         frontend_delta=read_json(pin(marker['postinstall_frontend_repair']['intent']))
         expected_previous=frontend_delta['request']['previous_input']
         if ordinary_readonly:
-            repair = read_json(pin(marker['postinstall_current12_readonly_fit_repair' if request['schema'] == 'friday.installed-cli-request.v8' else 'postinstall_readonly_schema_formatter_repair' if request['schema'] == 'friday.installed-cli-request.v7' else 'postinstall_context_continuation_repair']['intent']))
-            require((repair['request']['next_ordinary_readonly'] == request['ordinary_readonly'] if request['schema'] in ('friday.installed-cli-request.v7','friday.installed-cli-request.v8') else repair['request']['ordinary_readonly'] == cli_ordinary_readonly_baseline(request['ordinary_readonly']))
+            repair = read_json(pin(marker['postinstall_summary_fit_repair' if request['schema'] == 'friday.installed-cli-request.v9' else 'postinstall_current12_readonly_fit_repair' if request['schema'] == 'friday.installed-cli-request.v8' else 'postinstall_readonly_schema_formatter_repair' if request['schema'] == 'friday.installed-cli-request.v7' else 'postinstall_context_continuation_repair']['intent']))
+            require((repair['request']['next_ordinary_readonly'] == request['ordinary_readonly'] if request['schema'] in ('friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9') else repair['request']['ordinary_readonly'] == cli_ordinary_readonly_baseline(request['ordinary_readonly']))
                     and repair['request']['partial_proof'] == request['partial_proof'], 'cli_ordinary_repair_scope_changed')
-            if request['schema'] not in ('friday.installed-cli-request.v7','friday.installed-cli-request.v8'):
+            if request['schema'] not in ('friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9'):
                 budget.call(cli_context_previous_journey,repair['request'],home)
             jobs=home/'preparation/cli-runtime/jobs'
             if not jobs.exists():
@@ -2256,17 +2258,18 @@ def validated_cli_repair_chain(home, marker, request):
         return cli_ordinary_failed_v6_json(raw), hashlib.sha256(raw).hexdigest()
     require(request['schema'] in ('friday.installed-cli-request.v1','friday.installed-cli-request.v2',
                                  'friday.installed-cli-request.v3','friday.installed-cli-request.v4',
-                                 'friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8'), 'cli_runtime_supported_request_required')
+                                 'friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9'), 'cli_runtime_supported_request_required')
     require(('postinstall_native_bootstrap_repair' in marker) ==
-            (request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8'))
-            and ('postinstall_session_artifact_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8'))
-            and ('postinstall_context_continuation_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8'))
+            (request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9'))
+            and ('postinstall_session_artifact_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9'))
+            and ('postinstall_context_continuation_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9'))
             and ('postinstall_frontend_repair' in marker) == (request['schema'] != 'friday.installed-cli-request.v1'),
             'cli_runtime_supported_chain_required')
-    require(request['schema'] not in ('friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8') or
+    require(request['schema'] not in ('friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9') or
             'postinstall_native_manager_repair' in marker, 'cli_ordinary_new_question_source_required')
-    require(('postinstall_readonly_schema_formatter_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v7','friday.installed-cli-request.v8')), 'cli_runtime_schema_formatter_chain_required')
-    require(('postinstall_current12_readonly_fit_repair' in marker) == (request['schema'] == 'friday.installed-cli-request.v8'), 'cli_runtime_current12_chain_required')
+    require(('postinstall_readonly_schema_formatter_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9')), 'cli_runtime_schema_formatter_chain_required')
+    require(('postinstall_current12_readonly_fit_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v8','friday.installed-cli-request.v9')), 'cli_runtime_current12_chain_required')
+    require(('postinstall_summary_fit_repair' in marker) == (request['schema'] == 'friday.installed-cli-request.v9'), 'cli_runtime_summary_fit_chain_required')
     original = load(request['installation_input'])
     current_input = load(request['repaired_input'])
     require({k:v for k,v in original.items() if k != 'project_files'} ==
@@ -2282,9 +2285,18 @@ def validated_cli_repair_chain(home, marker, request):
         manifest41_raw = read_owned(manifest41_path)
         require(hashlib.sha256(manifest41_raw).hexdigest() == current_input['project_files']['patches/hermes/installed-current12-readonly-fit-manifest.json'], 'cli_runtime_current12_manifest_changed')
         names41, newfiles41 = cli_current12_manifest_scope(cli_ordinary_failed_v6_json(manifest41_raw))
+    names42, newfiles42 = set(), set()
+    if 'postinstall_summary_fit_repair' in marker:
+        manifest42_path = Path(request['repaired_input']['path']).parent/'project'/CLI_SUMMARY_FIT_MANIFEST
+        manifest42_raw = read_owned(manifest42_path)
+        require(hashlib.sha256(manifest42_raw).hexdigest() == current_input['project_files'][CLI_SUMMARY_FIT_MANIFEST], 'cli_runtime_summary_fit_manifest_changed')
+        names42, newfiles42 = cli_summary_fit_manifest_scope(cli_ordinary_failed_v6_json(manifest42_raw))
     head = marker
     snapshots = {}
     for field, folder, token, schema, manifest_name, source_name, count, prior_token, prior_schema in (
+        ('postinstall_summary_fit_repair','summary-fit-repair',CLI_SUMMARY_FIT_INTENT,
+         'friday.summary-fit-repair-intent.v1','installed-summary-fit-manifest.json',
+         tuple(names42),42,CLI_CURRENT12_INTENT,'friday.current12-readonly-fit-repair-intent.v1'),
         ('postinstall_current12_readonly_fit_repair','current12-readonly-fit-repair','FRIDAY-INSTALL.current12-readonly-fit-repair.intent.json',
          'friday.current12-readonly-fit-repair-intent.v1','installed-current12-readonly-fit-manifest.json',
          tuple(names41),41,'FRIDAY-INSTALL.readonly-schema-formatter-repair.intent.json','friday.readonly-schema-formatter-repair-intent.v1'),
@@ -2351,7 +2363,7 @@ def validated_cli_repair_chain(home, marker, request):
         manifest_path = Path(r['repaired_input']['path']).parent/'project'/manifest_relative
         manifest_raw = read_owned(manifest_path)
         manifest_sha = hashlib.sha256(manifest_raw).hexdigest(); manifest = cli_ordinary_failed_v6_json(manifest_raw)
-        require(value['project_files'][manifest_relative] == manifest_sha and len(manifest['files']) == (len(names41) if count == 41 else len(cli_readonly_schema_manifest_names()) if count == 40 else 6 if count == 38 else 2 if count == 37 else 1),
+        require(value['project_files'][manifest_relative] == manifest_sha and len(manifest['files']) == (len(names42) if count == 42 else len(names41) if count == 41 else len(cli_readonly_schema_manifest_names()) if count == 40 else 6 if count == 38 else 2 if count == 37 else 1),
                 'cli_runtime_chain_manifest_changed')
         names = set(source_name) if isinstance(source_name,tuple) else {source_name}
         require({row['path'] for row in manifest['files']} == names
@@ -2364,7 +2376,7 @@ def validated_cli_repair_chain(home, marker, request):
                 'cli_runtime_chain_receipt_changed')
         for row in manifest['files']:
             name = row['path']
-            new_file = (count == 38 and name == 'tests/agent/test_post_tool_context_fit.py') or (count == 40 and name in cli_readonly_schema_new_files()) or (count == 41 and name in newfiles41)
+            new_file = (count == 38 and name == 'tests/agent/test_post_tool_context_fit.py') or (count == 40 and name in cli_readonly_schema_new_files()) or (count == 41 and name in newfiles41) or (count == 42 and name in newfiles42)
             require((row['before_sha256'] is None and row.get('new_file') is True and row['mode'] == '100644' and name not in before['files']
                      if new_file else row['before_sha256'] == before['files'][name]['sha256'])
                     and receipt['files'][name] == {k:row[k] for k in ('sha256','bytes','mode')},
@@ -2377,7 +2389,7 @@ def validated_cli_repair_chain(home, marker, request):
                 require(absence.get(str(home/'hermes-agent'/name)) == {'absent':True}
                         and not (base/'hermes-agent'/name).exists()
                         and not (base/'hermes-agent'/name).is_symlink(), 'cli_runtime_saved_absence_changed')
-            elif count in (37,38,39,40,41):
+            elif count in (37,38,39,40,41,42):
                 prior_source = base/'hermes-agent'/name
                 raw = read_owned(prior_source,private=True)
                 require(hashlib.sha256(raw).hexdigest() == row['before_sha256'], 'cli_runtime_saved_source_changed')
@@ -2387,6 +2399,26 @@ def validated_cli_repair_chain(home, marker, request):
                 and prior['request']['repaired_input'] == r['previous_input']
                 and prior['request']['installation_input'] == request['installation_input']
                 and cli_historical_scope_closed(prior['clock'],'friday.installed-cli-clock.v1'), 'cli_runtime_prior_repair_changed')
+        if count == 42:
+            saved = cli_ordinary_failed_v6_json(read_owned(home/'preparation'/folder/'beforeimages.json',private=True))
+            existing = names-newfiles42
+            expected_saved = {str(home/n) for n in ('FRIDAY-INSTALL.json','hermes-agent.source.json','hermes-agent/install-stamp.json',prior_token)} | {str(home/'hermes-agent'/n) for n in names}
+            require(type(saved) is dict and set(saved) == expected_saved, 'cli_runtime_summary_fit_beforeimages_scope_changed')
+            for relative in ('FRIDAY-INSTALL.json','hermes-agent.source.json','hermes-agent/install-stamp.json',prior_token,*('hermes-agent/'+n for n in existing)):
+                row = saved[str(home/relative)]; backup = base/relative
+                require(type(row) is dict and set(row) == {'path','sha256','bytes','original_mode'}
+                        and row['path'] == str(backup) and type(row['bytes']) is type(row['original_mode']) is int
+                        and row['bytes'] >= 0 and stat.S_IMODE((home/relative).stat().st_mode) == row['original_mode'], 'cli_runtime_summary_fit_beforeimage_mode_changed')
+                raw = read_owned(backup,private=True)
+                require(hashlib.sha256(raw).hexdigest() == row['sha256'] and len(raw) == row['bytes'], 'cli_runtime_summary_fit_beforeimage_changed')
+            require(saved[str(home/prior_token)]['sha256'] == r['previous_repair_intent']['sha256'], 'cli_runtime_summary_fit_old_intent_snapshot_changed')
+            cli_ordinary_previous_failed_v8_journey(r,home)
+            require(request['schema'] == 'friday.installed-cli-request.v9'
+                    and request['ordinary_readonly'] == r['next_ordinary_readonly']
+                    and request['partial_proof'] == r['partial_proof'], 'cli_runtime_summary_fit_history_scope_changed')
+            request = dict(request,schema='friday.installed-cli-request.v8',ordinary_readonly=r['ordinary_readonly'])
+            head, receipt = previous, before
+            continue
         if count == 41:
             saved = cli_ordinary_failed_v6_json(read_owned(home/'preparation'/folder/'beforeimages.json',private=True))
             existing = names-newfiles41
@@ -2657,6 +2689,9 @@ def cli_bootstrap_previous_journey(request, home, *, session_artifact=False):
 
 
 
+CLI_SUMMARY_FIT_MANIFEST = 'patches/hermes/installed-summary-fit-manifest.json'
+CLI_SUMMARY_FIT_INTENT = 'FRIDAY-INSTALL.summary-fit-repair.intent.json'
+
 CLI_CURRENT12_MANIFEST = 'patches/hermes/installed-current12-readonly-fit-manifest.json'
 CLI_CURRENT12_INTENT = 'FRIDAY-INSTALL.current12-readonly-fit-repair.intent.json'
 
@@ -2672,19 +2707,19 @@ CLI_CONTEXT_NEW_FILE = 'tests/agent/test_post_tool_context_fit.py'
 CLI_CONTEXT_NAMES = {'agent/bounded_context.py','agent/context_compressor.py','agent/turn_preflight_gate.py',
                      'hermes_cli/friday_credential_admission.py','hermes_cli/friday_user_scope.py',CLI_CONTEXT_NEW_FILE}
 
-def repair_native_bootstrap(request, request_path, *, clock, session_artifact=False, context_continuation=False, native_manager=False, readonly_schema_formatter=False, current12_readonly_fit=False):
-    phase = "repair-current12-readonly-fit" if current12_readonly_fit else "repair-readonly-schema-formatter" if readonly_schema_formatter else "repair-native-manager" if native_manager else "repair-context-continuation" if context_continuation else "repair-session-artifact" if session_artifact else "repair-native-bootstrap"
-    token = CLI_CURRENT12_INTENT if current12_readonly_fit else CLI_READONLY_SCHEMA_INTENT if readonly_schema_formatter else CLI_MANAGER_INTENT if native_manager else CLI_CONTEXT_INTENT if context_continuation else CLI_SESSION_INTENT if session_artifact else CLI_BOOTSTRAP_INTENT
-    prior_token = CLI_READONLY_SCHEMA_INTENT if current12_readonly_fit else CLI_MANAGER_INTENT if readonly_schema_formatter else CLI_CONTEXT_INTENT if native_manager else CLI_SESSION_INTENT if context_continuation else CLI_BOOTSTRAP_INTENT if session_artifact else CLI_FRONTEND_INTENT
-    field = "postinstall_current12_readonly_fit_repair" if current12_readonly_fit else "postinstall_readonly_schema_formatter_repair" if readonly_schema_formatter else "postinstall_native_manager_repair" if native_manager else "postinstall_context_continuation_repair" if context_continuation else "postinstall_session_artifact_repair" if session_artifact else "postinstall_native_bootstrap_repair"
-    folder_name = "current12-readonly-fit-repair" if current12_readonly_fit else "readonly-schema-formatter-repair" if readonly_schema_formatter else "native-manager-repair" if native_manager else "context-continuation-repair" if context_continuation else "session-artifact-repair" if session_artifact else "native-bootstrap-repair"
-    count = 41 if current12_readonly_fit else 40 if readonly_schema_formatter else 39 if native_manager else 38 if context_continuation else 37 if session_artifact else 36
-    schema = "friday.current12-readonly-fit-repair" if current12_readonly_fit else "friday.readonly-schema-formatter-repair" if readonly_schema_formatter else "friday.native-manager-repair" if native_manager else "friday.context-continuation-repair" if context_continuation else "friday.session-artifact-repair" if session_artifact else "friday.native-bootstrap-repair"
-    require(sum((session_artifact,context_continuation,native_manager,readonly_schema_formatter,current12_readonly_fit)) <= 1, 'cli_repair_single_phase_required')
+def repair_native_bootstrap(request, request_path, *, clock, session_artifact=False, context_continuation=False, native_manager=False, readonly_schema_formatter=False, current12_readonly_fit=False, summary_fit=False):
+    phase = "repair-summary-fit" if summary_fit else "repair-current12-readonly-fit" if current12_readonly_fit else "repair-readonly-schema-formatter" if readonly_schema_formatter else "repair-native-manager" if native_manager else "repair-context-continuation" if context_continuation else "repair-session-artifact" if session_artifact else "repair-native-bootstrap"
+    token = CLI_SUMMARY_FIT_INTENT if summary_fit else CLI_CURRENT12_INTENT if current12_readonly_fit else CLI_READONLY_SCHEMA_INTENT if readonly_schema_formatter else CLI_MANAGER_INTENT if native_manager else CLI_CONTEXT_INTENT if context_continuation else CLI_SESSION_INTENT if session_artifact else CLI_BOOTSTRAP_INTENT
+    prior_token = CLI_CURRENT12_INTENT if summary_fit else CLI_READONLY_SCHEMA_INTENT if current12_readonly_fit else CLI_MANAGER_INTENT if readonly_schema_formatter else CLI_CONTEXT_INTENT if native_manager else CLI_SESSION_INTENT if context_continuation else CLI_BOOTSTRAP_INTENT if session_artifact else CLI_FRONTEND_INTENT
+    field = "postinstall_summary_fit_repair" if summary_fit else "postinstall_current12_readonly_fit_repair" if current12_readonly_fit else "postinstall_readonly_schema_formatter_repair" if readonly_schema_formatter else "postinstall_native_manager_repair" if native_manager else "postinstall_context_continuation_repair" if context_continuation else "postinstall_session_artifact_repair" if session_artifact else "postinstall_native_bootstrap_repair"
+    folder_name = "summary-fit-repair" if summary_fit else "current12-readonly-fit-repair" if current12_readonly_fit else "readonly-schema-formatter-repair" if readonly_schema_formatter else "native-manager-repair" if native_manager else "context-continuation-repair" if context_continuation else "session-artifact-repair" if session_artifact else "native-bootstrap-repair"
+    count = 42 if summary_fit else 41 if current12_readonly_fit else 40 if readonly_schema_formatter else 39 if native_manager else 38 if context_continuation else 37 if session_artifact else 36
+    schema = "friday.summary-fit-repair" if summary_fit else "friday.current12-readonly-fit-repair" if current12_readonly_fit else "friday.readonly-schema-formatter-repair" if readonly_schema_formatter else "friday.native-manager-repair" if native_manager else "friday.context-continuation-repair" if context_continuation else "friday.session-artifact-repair" if session_artifact else "friday.native-bootstrap-repair"
+    require(sum((session_artifact,context_continuation,native_manager,readonly_schema_formatter,current12_readonly_fit,summary_fit)) <= 1, 'cli_repair_single_phase_required')
     fields={'schema','phase','assignment','generation','home','installation_input','previous_input',
             'repaired_input','original_marker','original_receipt','original_stamp','previous_repair_intent',
             'selected_python','native_launchers','history','previous_runtime','unit','invocation_id','previous_journey'}
-    require(type(request) is dict and set(request) == fields | ({'ordinary_readonly','next_ordinary_readonly','partial_proof','previous_ordinary_runtime','previous_ordinary_custody','previous_ordinary_unchanged','previous_ordinary_qualified','previous_ordinary_sql','previous_ordinary_independent'} if (readonly_schema_formatter or current12_readonly_fit) else {'ordinary_readonly','next_ordinary_readonly','partial_proof','previous_ordinary_runtime','previous_ordinary_custody','previous_ordinary_unchanged'} if native_manager else {'ordinary_readonly','partial_proof'} if context_continuation else {'session_artifact'} if session_artifact else set())
+    require(type(request) is dict and set(request) == fields | ({'ordinary_readonly','next_ordinary_readonly','partial_proof','previous_ordinary_runtime','previous_ordinary_custody','previous_ordinary_unchanged','previous_ordinary_qualified','previous_ordinary_sql','previous_ordinary_independent'} if (readonly_schema_formatter or current12_readonly_fit or summary_fit) else {'ordinary_readonly','next_ordinary_readonly','partial_proof','previous_ordinary_runtime','previous_ordinary_custody','previous_ordinary_unchanged'} if native_manager else {'ordinary_readonly','partial_proof'} if context_continuation else {'session_artifact'} if session_artifact else set())
             and request['schema'] == schema+'-request.v1'
             and request['phase'] == phase and type(request['generation']) is int
             and request['generation'] == 1 and re.fullmatch('[A-Za-z0-9-]{1,128}',request['assignment'])
@@ -2715,11 +2750,12 @@ def repair_native_bootstrap(request, request_path, *, clock, session_artifact=Fa
             and marker.get('source_receipt_sha256') == request['original_receipt']['sha256']
             and marker.get('postinstall_source_input') == request['previous_input']
             and field not in marker
-            and (not (session_artifact or context_continuation or native_manager or readonly_schema_formatter or current12_readonly_fit) or 'postinstall_native_bootstrap_repair' in marker)
-            and (not (context_continuation or native_manager or readonly_schema_formatter or current12_readonly_fit) or 'postinstall_session_artifact_repair' in marker)
+            and (not (session_artifact or context_continuation or native_manager or readonly_schema_formatter or current12_readonly_fit or summary_fit) or 'postinstall_native_bootstrap_repair' in marker)
+            and (not (context_continuation or native_manager or readonly_schema_formatter or current12_readonly_fit or summary_fit) or 'postinstall_session_artifact_repair' in marker)
             and (not native_manager or 'postinstall_context_continuation_repair' in marker)
-            and (not (readonly_schema_formatter or current12_readonly_fit) or 'postinstall_native_manager_repair' in marker)
-            and (not current12_readonly_fit or 'postinstall_readonly_schema_formatter_repair' in marker)
+            and (not (readonly_schema_formatter or current12_readonly_fit or summary_fit) or 'postinstall_native_manager_repair' in marker)
+            and (not (current12_readonly_fit or summary_fit) or 'postinstall_readonly_schema_formatter_repair' in marker)
+            and (not summary_fit or 'postinstall_current12_readonly_fit_repair' in marker)
             and 'postinstall_frontend_repair' in marker
             and marker.get('runtime_ready') is False and marker.get('gateway_installed') is False
             and marker.get('native_frontends') == 'PENDING'
@@ -2728,17 +2764,17 @@ def repair_native_bootstrap(request, request_path, *, clock, session_artifact=Fa
             and cli_historical_scope_closed(marker['original_attempt'],'friday.native-install.v1')
             and cli_historical_scope_closed(marker['cli_segment']['clock'],'friday.cli-segment-clock.v1'),
             'frontend_previous_pending_history_required')
-    budget.call(validated_cli_repair_chain,home,marker,dict(request, schema=('friday.installed-cli-request.v7' if current12_readonly_fit else 'friday.installed-cli-request.v6' if readonly_schema_formatter else 'friday.installed-cli-request.v5' if native_manager else 'friday.installed-cli-request.v4' if context_continuation else 'friday.installed-cli-request.v3' if session_artifact else 'friday.installed-cli-request.v2'),repaired_input=request['previous_input']))
+    budget.call(validated_cli_repair_chain,home,marker,dict(request, schema=('friday.installed-cli-request.v8' if summary_fit else 'friday.installed-cli-request.v7' if current12_readonly_fit else 'friday.installed-cli-request.v6' if readonly_schema_formatter else 'friday.installed-cli-request.v5' if native_manager else 'friday.installed-cli-request.v4' if context_continuation else 'friday.installed-cli-request.v3' if session_artifact else 'friday.installed-cli-request.v2'),repaired_input=request['previous_input']))
     old=read_json(paths['previous_repair_intent'])
-    require(old.get('schema') == ('friday.readonly-schema-formatter-repair-intent.v1' if current12_readonly_fit else 'friday.native-manager-repair-intent.v1' if readonly_schema_formatter else 'friday.context-continuation-repair-intent.v1' if native_manager else 'friday.session-artifact-repair-intent.v1' if context_continuation else 'friday.native-bootstrap-repair-intent.v1' if session_artifact else 'friday.frontend-close-repair-intent.v1')
+    require(old.get('schema') == ('friday.current12-readonly-fit-repair-intent.v1' if summary_fit else 'friday.readonly-schema-formatter-repair-intent.v1' if current12_readonly_fit else 'friday.native-manager-repair-intent.v1' if readonly_schema_formatter else 'friday.context-continuation-repair-intent.v1' if native_manager else 'friday.session-artifact-repair-intent.v1' if context_continuation else 'friday.native-bootstrap-repair-intent.v1' if session_artifact else 'friday.frontend-close-repair-intent.v1')
             and old.get('state') == 'CONSUMED_NO_RETRY'
             and old['request']['repaired_input'] == request['previous_input']
             and old['request']['installation_input'] == request['installation_input']
             and old['request']['selected_python'] == request['selected_python']
             and cli_historical_scope_closed(old['clock'],'friday.installed-cli-clock.v1'), 'frontend_old_repair_consumed_required')
     budget.call(cli_repair_history,request,home)
-    budget.call(cli_ordinary_previous_failed_v7_journey,request,home) if current12_readonly_fit else budget.call(cli_ordinary_previous_failed_v6_journey,request,home) if readonly_schema_formatter else budget.call(cli_ordinary_previous_failed_journey,request,home) if native_manager else budget.call(cli_context_previous_journey,request,home) if context_continuation else budget.call(cli_bootstrap_previous_journey,request,home,session_artifact=session_artifact)
-    if readonly_schema_formatter or current12_readonly_fit:
+    budget.call(cli_ordinary_previous_failed_v8_journey,request,home) if summary_fit else budget.call(cli_ordinary_previous_failed_v7_journey,request,home) if current12_readonly_fit else budget.call(cli_ordinary_previous_failed_v6_journey,request,home) if readonly_schema_formatter else budget.call(cli_ordinary_previous_failed_journey,request,home) if native_manager else budget.call(cli_context_previous_journey,request,home) if context_continuation else budget.call(cli_bootstrap_previous_journey,request,home,session_artifact=session_artifact)
+    if readonly_schema_formatter or current12_readonly_fit or summary_fit:
         budget.call(cli_ordinary_readonly_inputs,home,request['next_ordinary_readonly'])
         budget.call(cli_ordinary_readonly_artifact,home,request['next_ordinary_readonly'])
     if native_manager:
@@ -2770,16 +2806,16 @@ def repair_native_bootstrap(request, request_path, *, clock, session_artifact=Fa
     slim=lambda l:{k:l[k] for k in ('manifest','manifest_sha256','patch_sha256')}
     require(len(layers) == count and len({r['manifest'] for r in receipt['layers']}) == count-1
             and ({slim(l)['manifest']:slim(l) for _,l in layers[:count-1]} ==
-                 {r['manifest']:r for r in receipt['layers']} if (readonly_schema_formatter or current12_readonly_fit) else
+                 {r['manifest']:r for r in receipt['layers']} if (readonly_schema_formatter or current12_readonly_fit or summary_fit) else
                  [slim(l) for _,l in layers[:count-1]] == receipt['layers'])
-            and layers[-1][1]['manifest'] == (CLI_CURRENT12_MANIFEST if current12_readonly_fit else CLI_READONLY_SCHEMA_MANIFEST if readonly_schema_formatter else CLI_MANAGER_MANIFEST if native_manager else CLI_CONTEXT_MANIFEST if context_continuation else CLI_SESSION_MANIFEST if session_artifact else CLI_BOOTSTRAP_MANIFEST), 'frontend_single_additive_overlay_required')
+            and layers[-1][1]['manifest'] == (CLI_SUMMARY_FIT_MANIFEST if summary_fit else CLI_CURRENT12_MANIFEST if current12_readonly_fit else CLI_READONLY_SCHEMA_MANIFEST if readonly_schema_formatter else CLI_MANAGER_MANIFEST if native_manager else CLI_CONTEXT_MANIFEST if context_continuation else CLI_SESSION_MANIFEST if session_artifact else CLI_BOOTSTRAP_MANIFEST), 'frontend_single_additive_overlay_required')
     layer=layers[-1][1]
-    names41,newfiles41 = cli_current12_manifest_scope(layer) if current12_readonly_fit else (set(),set())
-    names = names41 if current12_readonly_fit else cli_readonly_schema_manifest_names() if readonly_schema_formatter else {'hermes_cli/friday_credential_admission.py'} if native_manager else CLI_CONTEXT_NAMES if context_continuation else {'hermes_cli/friday_credential_admission.py','hermes_cli/friday_user_scope.py'} if session_artifact else {'hermes_cli/friday_credential_admission.py'}
+    names41,newfiles41 = cli_summary_fit_manifest_scope(layer) if summary_fit else cli_current12_manifest_scope(layer) if current12_readonly_fit else (set(),set())
+    names = names41 if current12_readonly_fit or summary_fit else cli_readonly_schema_manifest_names() if readonly_schema_formatter else {'hermes_cli/friday_credential_admission.py'} if native_manager else CLI_CONTEXT_NAMES if context_continuation else {'hermes_cli/friday_credential_admission.py','hermes_cli/friday_user_scope.py'} if session_artifact else {'hermes_cli/friday_credential_admission.py'}
     require(set(layer['files']) == names, 'frontend_exact_scope_required')
     for name,row in layer['files'].items():
         if row.get('new_file'):
-            require(((context_continuation and name == CLI_CONTEXT_NEW_FILE) or (readonly_schema_formatter and name in cli_readonly_schema_new_files()) or (current12_readonly_fit and name in newfiles41)) and name not in receipt['files'] and row['before_sha256'] is None
+            require(((context_continuation and name == CLI_CONTEXT_NEW_FILE) or (readonly_schema_formatter and name in cli_readonly_schema_new_files()) or ((current12_readonly_fit or summary_fit) and name in newfiles41)) and name not in receipt['files'] and row['before_sha256'] is None
                     and row['mode'] == '100644' and not (source/name).exists()
                     and not (source/name).is_symlink(), 'context_new_file_must_be_absent')
         else:
@@ -2795,8 +2831,8 @@ def repair_native_bootstrap(request, request_path, *, clock, session_artifact=Fa
     try:
         folder.mkdir(mode=0o700);directory(folder);saved={}
         preserved={**paths,**{name:source/name for name in names if not layer['files'][name].get('new_file')}}
-        if readonly_schema_formatter or current12_readonly_fit:
-            for name in (newfiles41 if current12_readonly_fit else cli_readonly_schema_new_files()):
+        if readonly_schema_formatter or current12_readonly_fit or summary_fit:
+            for name in (newfiles41 if current12_readonly_fit or summary_fit else cli_readonly_schema_new_files()):
                 saved[str(source/name)]={'absent':True}
         if context_continuation:
             saved[str(source/CLI_CONTEXT_NEW_FILE)]={'absent':True}
@@ -2850,7 +2886,7 @@ def repair_native_bootstrap(request, request_path, *, clock, session_artifact=Fa
         require(read_json(paths['original_stamp']) == newstamp, 'frontend_full_stamp_changed')
         budget.call(cli_repair_native,custody,value,source,selected,budget)
         budget.call(cli_repair_history,request,home)
-        budget.call(cli_ordinary_previous_failed_v7_journey,request,home) if current12_readonly_fit else budget.call(cli_ordinary_previous_failed_v6_journey,request,home) if readonly_schema_formatter else budget.call(cli_ordinary_previous_failed_journey,request,home) if native_manager else budget.call(cli_context_previous_journey,request,home) if context_continuation else budget.call(cli_bootstrap_previous_journey,request,home,session_artifact=session_artifact)
+        budget.call(cli_ordinary_previous_failed_v8_journey,request,home) if summary_fit else budget.call(cli_ordinary_previous_failed_v7_journey,request,home) if current12_readonly_fit else budget.call(cli_ordinary_previous_failed_v6_journey,request,home) if readonly_schema_formatter else budget.call(cli_ordinary_previous_failed_journey,request,home) if native_manager else budget.call(cli_context_previous_journey,request,home) if context_continuation else budget.call(cli_bootstrap_previous_journey,request,home,session_artifact=session_artifact)
         for path in preserved.values():
             require(digest(owned_file(saved[str(path)]['path'],private=True)) == saved[str(path)]['sha256'],
                     'frontend_custody_changed')
@@ -2858,7 +2894,7 @@ def repair_native_bootstrap(request, request_path, *, clock, session_artifact=Fa
                 'frontend_previous_intent_changed')
         budget.call(installed_cli_kernel,request,clock,phase=phase)
         require(read_json(request_path) == request, 'frontend_request_changed')
-        if readonly_schema_formatter or current12_readonly_fit:
+        if readonly_schema_formatter or current12_readonly_fit or summary_fit:
             budget.call(cli_ordinary_readonly_inputs,home,request['next_ordinary_readonly'])
             budget.call(cli_ordinary_readonly_artifact,home,request['next_ordinary_readonly'])
         if native_manager:
@@ -2884,7 +2920,7 @@ def repair_native_bootstrap(request, request_path, *, clock, session_artifact=Fa
                  'diagnostic':retained_diagnostic(exc,'repair-native-bootstrap'),
                  'rollback':'NOT_AUTOMATIC; exact beforeimages retained; consumed token never renewed',
                  'clock':clock,'physical':physical,'Runtime_Go':False,'Resource_Go':False,'Release_Go':False}
-        try:publish(home/('FRIDAY-INSTALL.current12-readonly-fit-repair.failure.json' if current12_readonly_fit else 'FRIDAY-INSTALL.readonly-schema-formatter-repair.failure.json' if readonly_schema_formatter else 'FRIDAY-INSTALL.native-manager-repair.failure.json' if native_manager else 'FRIDAY-INSTALL.context-continuation-repair.failure.json' if context_continuation else 'FRIDAY-INSTALL.session-artifact-repair.failure.json' if session_artifact else 'FRIDAY-INSTALL.native-bootstrap-repair.failure.json'),failure)
+        try:publish(home/('FRIDAY-INSTALL.summary-fit-repair.failure.json' if summary_fit else 'FRIDAY-INSTALL.current12-readonly-fit-repair.failure.json' if current12_readonly_fit else 'FRIDAY-INSTALL.readonly-schema-formatter-repair.failure.json' if readonly_schema_formatter else 'FRIDAY-INSTALL.native-manager-repair.failure.json' if native_manager else 'FRIDAY-INSTALL.context-continuation-repair.failure.json' if context_continuation else 'FRIDAY-INSTALL.session-artifact-repair.failure.json' if session_artifact else 'FRIDAY-INSTALL.native-bootstrap-repair.failure.json'),failure)
         except BaseException as secondary:remember_secondary(exc,secondary)
         raise
 
@@ -2943,6 +2979,194 @@ def cli_current12_manifest_scope(manifest):
                     type(row['before_sha256']) is str and re.fullmatch('[0-9a-f]{64}',row['before_sha256'])
                     and row.get('new_file',False) is False), 'cli_current12_manifest_beforeimage_required')
     return names,newfiles
+
+
+def cli_summary_fit_manifest_scope(manifest):
+    """Additive42 afterimages are supplied only after native source acceptance."""
+    required = {'agent/bounded_context.py','agent/context_compressor.py',
+                'agent/conversation_loop.py','agent/auxiliary_client.py',
+                'agent/conversation_compression.py','agent/turn_api_request.py',
+                'agent/turn_request_assembly.py','hermes_cli/friday_credential_admission.py',
+                'hermes_cli/friday_dashboard_owner.py'}
+    tests = {'tests/agent/test_summary_fit_precommit.py'}
+    rows = manifest['files']
+    if type(rows) is dict:
+        rows = [dict(row,path=name) for name,row in rows.items()]
+    require(type(rows) is list and rows and all(type(row) is dict for row in rows),
+            'cli_summary_fit_manifest_rows_required')
+    names = {row['path'] for row in rows}
+    require(len(names) == len(rows) and required <= names <= required|tests,
+            'cli_summary_fit_manifest_scope_required')
+    newfiles = names & tests
+    for row in rows:
+        require(row['mode'] == '100644' and type(row['bytes']) is int and row['bytes'] > 0
+                and type(row['sha256']) is str and re.fullmatch('[0-9a-f]{64}',row['sha256'])
+                and 'before_sha256' in row
+                and (row['before_sha256'] is None and row.get('new_file') is True if row['path'] in newfiles else
+                    type(row['before_sha256']) is str and re.fullmatch('[0-9a-f]{64}',row['before_sha256'])
+                    and row.get('new_file',False) is False), 'cli_summary_fit_manifest_beforeimage_required')
+    return names,newfiles
+
+
+def cli_ordinary_previous_failed_v8_journey(request, home):
+    """Consume no old job: accept only witnessed V8 partial custody and a new V9."""
+    home = Path(home)
+    reader = globals().get('owned_file') or globals().get('read_owned')
+    def load(ref, expected=None):
+        require(type(ref) is dict and set(ref) in ({'path','sha256'},{'path','sha256','bytes'})
+                and type(ref['path']) is str and (expected is None or ref['path'] == str(expected))
+                and type(ref['sha256']) is str and re.fullmatch('[0-9a-f]{64}',ref['sha256']),
+                'cli_ordinary_v8_history_pin_required')
+        raw = reader(Path(ref['path']),private=True)
+        require(len(raw) <= 64*1024*1024 and hashlib.sha256(raw).hexdigest() == ref['sha256']
+                and ('bytes' not in ref or type(ref['bytes']) is int and ref['bytes'] == len(raw)),
+                'cli_ordinary_v8_history_pin_changed')
+        return cli_ordinary_failed_v6_json(raw)
+    def same(ref, expected):
+        require(ref['path'] == expected['path'] and ref['sha256'] == expected['sha256'],
+                'cli_ordinary_v8_evidence_routing_changed')
+        return load(ref)
+    proof = load(request['previous_ordinary_qualified'])
+    same(proof['custody'],request['previous_ordinary_custody'])
+    require(request['previous_ordinary_qualified'] == request['previous_ordinary_unchanged'],
+            'cli_ordinary_v8_one_actual_proof_required')
+    saved = same(proof['complete_SQL_rows'],request['previous_ordinary_sql'])
+    custody = load(request['previous_ordinary_custody'])
+    accepted = load(request['previous_ordinary_independent'])
+    same(accepted['actual_proof'],request['previous_ordinary_qualified'])
+    review = load(accepted['review'])
+    require(accepted['schema'] == 'friday.actual-v8-partial-root-acceptance.v1'
+            and accepted['PartialRead_Go'] is accepted['Cleanup_Go'] is True
+            and accepted['GroundedFinalAnswer_Go'] is False
+            and accepted['model_call_count'] == accepted['namespace_init_exit_verified'] == 'UNKNOWN'
+            and review['schema'] == 'friday.v8-actual-partial-independent-review.v1'
+            and review['state'] == 'EXACT_ACTUAL_V8_READ_AND_CUSTODY_PARTIAL_ACCEPTED_NO_FINAL_NO_RETRY'
+            and review['PartialRead_Go'] is review['Cleanup_Go'] is True
+            and review['GroundedFinalAnswer_Go'] is review['retry_authorized'] is False
+            and all(v[k] is False for v in (proof,accepted,review) for k in ('Runtime_Go','Resource_Go','Release_Go')),
+            'cli_ordinary_v8_partial_acceptance_truth_required')
+    for role in ('request','custody','complete_SQL_rows','consumed_native_intent',
+                 'consumed_semantic_job','native_observation'):
+        same({k:review['pins'][role][k] for k in ('path','sha256','bytes')},proof[role])
+    require(proof['state'] == 'REAL_INSTALLED_V8_PARTIAL_OR_FAIL_CUSTODY_CLOSED_NO_RETRY'
+            and proof['retry_authorized'] is False and proof['native_result'] is None
+            and proof['checks']['new_final_answer'] is proof['checks']['native_result_present'] is False
+            and all(proof['checks'][k] is True for k in ('artifact_unchanged','all_foreign_rows_unchanged',
+                'complete_ordered_own_rows','immutable_prior_payload','new_exact_question','only_read_file_calls',
+                'only_read_file_tools','read_file_success','tool_calls_linked','persisted_cli_close')),
+            'cli_ordinary_v8_no_final_or_retry_required')
+    prior = load(proof['consumed_native_intent']); old = prior['request']; clock = prior['clock']
+    require(prior['schema'] == 'friday.installed-cli-invocation.v1' and prior['state'] == 'CONSUMED_NOT_COMPLETE'
+            and old['schema'] == 'friday.installed-cli-request.v8'
+            and old['home'] == request['home'] == str(home)
+            and re.fullmatch(r'friday-rework-cli-runtime-[A-Za-z0-9-]+\.service',old['unit'])
+            and old['unit'] != request['unit'] and old['assignment'] != request['assignment']
+            and old['installation_input'] == request['installation_input']
+            and old['repaired_input'] == request['previous_input']
+            and old['ordinary_readonly'] == request['ordinary_readonly']
+            and old['history'] == prior['history'] == request['history']
+            and old['partial_proof'] == request['partial_proof']
+            and cli_historical_scope_closed(clock,'friday.installed-cli-clock.v1'),
+            'cli_ordinary_v8_consumed_closed_scope_required')
+    require(load(proof['request']) == old and old['argv'] == cli_ordinary_readonly_argv(home,old['ordinary_readonly'])
+            and old['job_id'] == cli_ordinary_job_id(home,old['ordinary_readonly']),
+            'cli_ordinary_v8_consumed_semantics_changed')
+    prefix = 'preparation/cli-runtime/'; base = prefix+old['unit']
+    suffixes = ('.intent.json','.json','.stdout','.stderr','.native-owner.json')
+    job = prefix+'jobs/'+old['job_id']+'.intent.json'
+    inventory = request['previous_ordinary_runtime']
+    require(type(inventory) is dict and set(inventory) == {base+s for s in suffixes}|{job},
+            'cli_ordinary_v8_inventory_required')
+    for name,sha in inventory.items():
+        require(type(sha) is str and re.fullmatch('[0-9a-f]{64}',sha)
+                and hashlib.sha256(reader(home/name,private=True)).hexdigest() == sha,
+                'cli_ordinary_v8_inventory_changed')
+    for role,name in (('consumed_native_intent',base+'.intent.json'),('native_observation',base+'.json'),
+                      ('consumed_semantic_job',job)):
+        require(proof[role]['path'] == str(home/name) and proof[role]['sha256'] == inventory[name],
+                'cli_ordinary_v8_runtime_routing_changed')
+    require(load(proof['consumed_semantic_job']) == {'schema':'friday.cli-ordinary-job-intent.v1',
+            'state':'CONSUMED_NO_RETRY','job_id':old['job_id'],'request':old,'clock':clock}
+            and not (home/(base+'.result.json')).exists() and not (home/(base+'.result.json')).is_symlink(),
+            'cli_ordinary_v8_no_replay_required')
+    observed = load(proof['native_observation']); native = load(custody['native_return'])
+    owner = cli_ordinary_failed_v6_json(reader(home/(base+'.native-owner.json'),private=True))
+    require(type(observed['argv']) is list and len(observed['argv']) == 16+len(old['argv'])
+            and observed['argv'][:2] == ['/usr/bin/bwrap','--json-status-fd']
+            and observed['argv'][3:16] == ['--unshare-pid','--die-with-parent','--new-session','--as-pid-1',
+                '--bind','/','/','--dev','/dev','--proc','/proc','--',str(home/'hermes-agent/.hermes/bin/hermes')]
+            and observed['argv'][16:] == old['argv']
+            and owner['boot_id'] == clock['boot_id'] and owner['pid'] == 1 and type(owner['pid']) is int
+            and type(owner['starttime_ticks']) is int and owner['starttime_ticks'] >= observed['starttime_ticks']
+            and re.fullmatch(r'pid:\[[0-9]+\]',owner['pid_namespace'])
+            and all(type(observed[k+'_bytes']) is int
+                    and observed[k+'_bytes'] == len(reader(home/(base+'.'+k),private=True))
+                    and observed[k+'_sha256'] == inventory[base+'.'+k] for k in ('stdout','stderr')),
+            'cli_ordinary_v8_native_observation_changed')
+    require(observed['returncode'] == 1 and type(observed['returncode']) is int
+            and observed['reaped'] is True and observed['timeout'] is False
+            and native['returncode'] == 2 and type(native['returncode']) is int
+            and native['unit'] == old['unit'] and native['reaped'] is True and native['timed_out'] is False
+            and custody['state'] == 'VERIFIED_OWN_CUSTODY_CLOSED' and custody['clock'] == clock
+            and custody['retry_authorized'] is False and custody['cgroup_gone_or_empty'] is custody['heavy_flock_returned'] is True
+            and custody['unit'] == {'ActiveState':'failed','ControlGroup':'','MainPID':'0'}
+            and type(custody['closure_mono']) in (int,float) and math.isfinite(custody['closure_mono'])
+            and clock['started_mono'] <= custody['closure_mono'] <= clock['deadline_mono'],
+            'cli_ordinary_v8_custody_changed')
+    births = custody['own_births']
+    require(type(births) is list and len(births) == 4
+            and {b['name'] for b in births} == {'self','GNU','systemd-run-client','bwrap-monitor'}
+            and all(type(b['pid']) is type(b['birth_ticks']) is int and b['pid'] > 1
+                    and b['birth_ticks'] > 0 and b['same_birth_alive'] is False for b in births),
+            'cli_ordinary_v8_births_changed')
+    born = {b['name']:b for b in births}
+    require((born['GNU']['pid'],born['GNU']['birth_ticks']) == (clock['gnu_pid'],clock['gnu_starttime_ticks'])
+            and (born['bwrap-monitor']['pid'],born['bwrap-monitor']['birth_ticks']) == (observed['pid'],observed['starttime_ticks'])
+            and prior['physical']['caps'] == CLI_RUNTIME_CAPS and prior['physical']['unit'] == old['unit'],
+            'cli_ordinary_v8_birth_binding_changed')
+    new = request['next_ordinary_readonly']; oldbinding = old['ordinary_readonly']
+    cli_ordinary_readonly_baseline(new)
+    mutable = {'schema','question','purpose','row_sha256','messages_sha256','baseline_message_ids',
+               'baseline_stable_messages_sha256','append_high_water','initial_lifecycle_sha256'}
+    require(new['schema'] == 'friday.cli-ordinary-readonly.v5'
+            and {k:v for k,v in new.items() if k not in mutable} == {k:v for k,v in oldbinding.items() if k not in mutable}
+            and oldbinding['baseline_message_ids'] == list(range(5,17))
+            and new['baseline_message_ids'] == list(range(5,25)) and new['append_high_water'] == 24
+            and new['artifact_bytes'] == 915 and cli_ordinary_job_id(home,new) != old['job_id'],
+            'cli_ordinary_v9_genuine_new_baseline_required')
+    require(saved['complete_actual_SELECT_STAR'] is saved['no_large_payload_elision'] is True
+            and [m['id'] for m in saved['messages']] == list(range(5,25))
+            and all(type(m[k]) is int and m[k] in (0,1) for m in saved['messages'] for k in ('active','compacted'))
+            and all(type(m['timestamp']) in (int,float) and math.isfinite(m['timestamp'])
+                    and 0 <= m['timestamp'] <= 4200000000 for m in saved['messages'])
+            and saved['row']['end_reason'] == 'cli_close' and type(saved['row']['ended_at']) in (int,float)
+            and math.isfinite(saved['row']['ended_at']) and saved['row']['ended_at'] > 0
+            and {k:saved['row'][k] for k in new['identity']} == new['identity'],
+            'cli_ordinary_v8_complete_sql_required')
+    fingerprint = lambda v: hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
+    stable = lambda rows: [{k:v for k,v in m.items() if k not in {'active','compacted'}} for m in rows]
+    require(fingerprint(saved['row']) == new['row_sha256'] and fingerprint(saved['messages']) == new['messages_sha256']
+            and fingerprint(stable(saved['messages'])) == new['baseline_stable_messages_sha256']
+            and fingerprint(stable(saved['messages'][:12])) == oldbinding['baseline_stable_messages_sha256']
+            and fingerprint(stable(saved['messages'][:4])) == new['stable_messages_sha256']
+            and fingerprint([{k:m[k] for k in ('id','active','compacted')} for m in saved['messages'][:4]]) == new['initial_lifecycle_sha256']
+            and fingerprint(saved['other_sessions']) == new['other_sessions_sha256']
+            and fingerprint(saved['other_messages']) == new['other_messages_sha256']
+            and max(m['id'] for m in saved['messages']+saved['other_messages']) == 24,
+            'cli_ordinary_v8_saved_payload_changed')
+    tail = saved['messages'][-3:]
+    require([m['role'] for m in tail] == ['user','assistant','tool'] and tail[0]['content'] == old['argv'][-1]
+            and tail[1]['content'] == '' and tail[2]['tool_name'] == 'read_file', 'cli_ordinary_v8_saved_tail_changed')
+    calls = cli_ordinary_failed_v6_json(tail[1]['tool_calls'])
+    require(type(calls) is list and len(calls) == 1 and calls[0]['type'] == 'function'
+            and calls[0]['function']['name'] == 'read_file'
+            and cli_ordinary_failed_v6_json(calls[0]['function']['arguments']) == {'path':new['output']}
+            and tail[2]['tool_call_id'] == calls[0]['id'], 'cli_ordinary_v8_saved_tool_binding_changed')
+    artifact = reader(Path(new['output']),private=True); tool = cli_ordinary_failed_v6_json(tail[2]['content'])
+    require(len(artifact) == new['artifact_bytes'] and hashlib.sha256(artifact).hexdigest() == new['artifact_sha256']
+            and tool['success'] is tool['readonly'] is True and tool['path'] == new['output']
+            and tool['content'] == artifact.decode('utf-8').rstrip('\n'), 'cli_ordinary_v8_saved_artifact_changed')
+    return old
 
 
 def cli_ordinary_previous_failed_v7_journey(request, home):
@@ -3597,7 +3821,7 @@ def cli_ordinary_readonly_baseline(binding):
         require('question' not in binding and 'purpose' not in binding,
                 'cli_ordinary_question_binding_required')
         return binding
-    require(binding.get('schema') in ('friday.cli-ordinary-readonly.v2','friday.cli-ordinary-readonly.v3','friday.cli-ordinary-readonly.v4')
+    require(binding.get('schema') in ('friday.cli-ordinary-readonly.v2','friday.cli-ordinary-readonly.v3','friday.cli-ordinary-readonly.v4','friday.cli-ordinary-readonly.v5')
             and type(binding.get('question')) is str and type(binding.get('purpose')) is str,
             'cli_ordinary_question_binding_required')
     question, purpose = binding['question'], binding['purpose']
@@ -3611,6 +3835,8 @@ def cli_ordinary_readonly_baseline(binding):
     declared = ('Какой один следующий шаг реализации диспетчеризации задач от Hermes к DeepSeek Harness следует подготовить по сохранённому резюме? Назови вход, ожидаемый результат воркера и проверку локального endpoint без облачного fallback; если резюме не задаёт детали, явно обозначь предположение.', 'next-local-worker-dispatch-implementation-step') if binding['schema'] == 'friday.cli-ordinary-readonly.v2' else ('Какие обязательные возможности Пятницы перечислены в сохранённом резюме и какие ограничения или неподтверждённые результаты там отмечены? Отдели требования от уже выполненного; не дополняй сведения догадками.', 'extract-required-capabilities-and-limits-from-saved-artifact')
     if binding['schema'] == 'friday.cli-ordinary-readonly.v4':
         declared = ('По сохранённому файлу составь таблицу: требование Пятницы / уже сделано / ещё не подтверждено. Включи только факты файла, укажи ограничения. Ответь по-русски.', 'build-evidence-status-table-from-saved-artifact')
+    if binding['schema'] == 'friday.cli-ordinary-readonly.v5':
+        declared = ('По сохранённому файлу назови один ещё не подтверждённый результат Пятницы и проверку, которая его подтвердит. Используй только факты файла; если проверка не задана, прямо укажи это. Ответь по-русски.', 'verify-one-unconfirmed-result-from-saved-artifact')
     require((question,purpose) == declared, 'cli_ordinary_declared_new_question_required')
     return {**{k:v for k,v in binding.items() if k not in {'question','purpose','schema'}},
             'schema':'friday.cli-ordinary-readonly.v1'}
@@ -3752,7 +3978,7 @@ def cli_ordinary_readonly_artifact(home, binding):
 
 def cli_ordinary_readonly_argv(home, binding):
     cli_ordinary_readonly_baseline(binding)
-    if binding.get('schema') in ('friday.cli-ordinary-readonly.v2','friday.cli-ordinary-readonly.v3','friday.cli-ordinary-readonly.v4'):
+    if binding.get('schema') in ('friday.cli-ordinary-readonly.v2','friday.cli-ordinary-readonly.v3','friday.cli-ordinary-readonly.v4','friday.cli-ordinary-readonly.v5'):
         query = ('Прочитай существующий файл '+binding['output']+' инструментом read_file. '
                  +binding['question']+' Дай краткий ответ; не изменяй файлы и не вызывай другие инструменты.')
         return ['-p','default','--cli','chat','--oneshot','-t','file','--run-budget','90',
@@ -3780,6 +4006,9 @@ def cli_ordinary_job_id(home, binding):
     if binding.get('schema') == 'friday.cli-ordinary-readonly.v4':
         semantic.update(schema='friday.cli-ordinary-readonly-job.v4',
                         question=binding['question'],purpose=binding['purpose'],binding=binding)
+    if binding.get('schema') == 'friday.cli-ordinary-readonly.v5':
+        semantic.update(schema='friday.cli-ordinary-readonly-job.v5',
+                        question=binding['question'],purpose=binding['purpose'],binding=binding)
     return hashlib.sha256(json.dumps(semantic,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
 
 
@@ -3797,7 +4026,7 @@ def cli_ordinary_job_consumed(home, request, clock):
 def main():
     started = time.monotonic()  # before parser/input IO; never reset on dispatch
     parser = SafeParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'qualify', 'reconcile', 'resume-harness', 'resume-cli', 'continue-cli-segment', 'installed-cli', 'repair-installed-cli', 'repair-frontend-close', 'repair-native-bootstrap', 'repair-session-artifact', 'repair-context-continuation','repair-native-manager','repair-readonly-schema-formatter','repair-current12-readonly-fit'))
+    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'qualify', 'reconcile', 'resume-harness', 'resume-cli', 'continue-cli-segment', 'installed-cli', 'repair-installed-cli', 'repair-frontend-close', 'repair-native-bootstrap', 'repair-session-artifact', 'repair-context-continuation','repair-native-manager','repair-readonly-schema-formatter','repair-current12-readonly-fit','repair-summary-fit'))
     parser.add_argument('--input', required=True, type=Path, help='Private pinned JSON, no credential values')
     parser.add_argument('--a0-plan', type=Path, help='Existing owned live native probe plan; never a readiness report')
     parser.add_argument('--a0-plan-sha256')
@@ -3805,7 +4034,7 @@ def main():
     sys.path.insert(0, str(ROOT))
     from scripts.dsh_prepare import StopUnconfirmed
     try:
-        runtime_clock = installed_cli_clock() if args.phase in ('installed-cli','repair-installed-cli','repair-frontend-close','repair-native-bootstrap','repair-session-artifact','repair-context-continuation','repair-native-manager','repair-readonly-schema-formatter','repair-current12-readonly-fit') else None
+        runtime_clock = installed_cli_clock() if args.phase in ('installed-cli','repair-installed-cli','repair-frontend-close','repair-native-bootstrap','repair-session-artifact','repair-context-continuation','repair-native-manager','repair-readonly-schema-formatter','repair-current12-readonly-fit','repair-summary-fit') else None
         raw = owned_file(args.input, private=True)
         require((args.a0_plan is None) == (args.a0_plan_sha256 is None)
                 and (args.a0_plan is None or args.phase in ('start','qualify')),
@@ -3821,7 +4050,9 @@ def main():
                   if runtime_clock else cli_segment_clock(admission) if admission else
                   (prepared[3] if prepared else Budget(value.get('seconds'), started=started)))
         budget.check()
-        if args.phase == 'repair-current12-readonly-fit':
+        if args.phase == 'repair-summary-fit':
+            result = repair_native_bootstrap(value,args.input,clock=runtime_clock,summary_fit=True)
+        elif args.phase == 'repair-current12-readonly-fit':
             result = repair_native_bootstrap(value,args.input,clock=runtime_clock,current12_readonly_fit=True)
         elif args.phase == 'repair-readonly-schema-formatter':
             result = repair_native_bootstrap(value,args.input,clock=runtime_clock,readonly_schema_formatter=True)
