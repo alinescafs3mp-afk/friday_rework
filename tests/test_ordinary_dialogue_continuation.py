@@ -167,7 +167,7 @@ def test_old_cached_prompt_rebuilds_once_with_transcript_and_authority_retained(
 def test_guidance_cannot_authorize_foreign_or_revoked_agent(env,monkeypatch):
     complete(env,'1');complete(env,'2')
     with entered(env,'1'):
-        a=native_agent();assert ps.dialogue_parts(a)==[ps.DIALOGUE_GUIDANCE,ps.CONFIDENTIALITY_GUIDANCE]
+        a=native_agent();assert ps.dialogue_parts(a)==[ps.DIALOGUE_GUIDANCE, ps.CONFIDENTIALITY_GUIDANCE]
     with entered(env,'2'):
         with pytest.raises(scope.ScopeDenied):sp.build_system_prompt(a)
     with entered(env,'1'):
@@ -218,7 +218,10 @@ def test_managed_readonly_core_projection_preserves_dialogue_and_context(env,mon
     from hermes_cli import friday_credential_admission as admission
     from tools.file_tools import READ_FILE_SCHEMA
     from agent.coding_context import CODING_AGENT_GUIDANCE, _TODO_SENTENCE, _NO_TODO_SENTENCE
-    monkeypatch.chdir(home(env))
+    import agent.coding_context as cc
+    native_coding=cc.coding_system_prompt_parts
+    monkeypatch.setattr(cc,'coding_system_prompt_parts',lambda **kwargs:native_coding(**kwargs,config={'agent':{'coding_context':'on'}}))
+    monkeypatch.chdir(home(env)/'workspace')
     policy=BoundedContextPolicy('custom:friday-local','dispatcher','http://127.0.0.1:9000/v1',40960,40954,4096,4096,1024,2048,4096)
     monkeypatch.setattr(admission,'_ORDINARY_READONLY',(home(env),{},{}))
     monkeypatch.setattr(admission,'cli_ordinary_readonly_current',lambda *args:None)
@@ -231,14 +234,16 @@ def test_managed_readonly_core_projection_preserves_dialogue_and_context(env,mon
         a.tools=admission.ordinary_readonly_schemas([{'type':'function','function':custom}])
         a.context_compressor.context_length=40960
         brief=CODING_AGENT_GUIDANCE.replace(_TODO_SENTENCE,_NO_TODO_SENTENCE)
+        a._frozen_workspace_snapshot=(sp._workspace_pin_key(),'')
+        direct=cc.coding_system_prompt_parts(platform=a.platform,cwd=home(env),model=a.model,valid_tool_names=a.valid_tool_names,workspace_block='')
+        assert direct[0]
         prompt=sp.build_system_prompt(a,'UNTOUCHED_CONTEXT\n\n'+brief)
         rendered=sp.render_ordinary_readonly_prompt(a,prompt)
-        assert rendered!=prompt
+        assert rendered!=prompt, (sp._coding_parts(a), prompt[:len(prompt)-len(ps.DIALOGUE_GUIDANCE)])
         assert rendered.count(ps.DIALOGUE_GUIDANCE)==1
         assert 'UNTOUCHED_CONTEXT\n\n'+brief in rendered
         assert (home(env)/'SOUL.md').read_text().strip() in rendered
         assert 'If the same region fails twice' in rendered
-
 
 def test_managed_prompt_uses_product_help_and_confidentiality_without_backend_advertising(env,monkeypatch):
     monkeypatch.chdir(home(env))
