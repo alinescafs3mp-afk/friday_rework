@@ -182,14 +182,37 @@ class IngressTests(unittest.TestCase):
         inner = {**CALL, "turn_id": "inner-turn", "api_request_id": "inner-request", "tool_call_id": "inner-call"}
         calls = []
         def raising(_):
-            calls.append(self.admission.match(OWNER, task_id=inner["task_id"], session_id=inner["session_id"])[1])
+            # Nested native calls deliberately mask the outer correlation and
+            # cannot obtain a second admission. Error propagation must still
+            # restore the valid outer call without replaying this callback.
+            with self.assertRaisesRegex(ValueError, "missing_native"):
+                self.admission.match(OWNER, task_id=inner["task_id"], session_id=inner["session_id"])
+            calls.append("nested-refused")
             raise OSError("offline downstream failure")
         def outer(_):
             with self.assertRaises(OSError):
                 run_tool_execution_middleware("friday_work", {}, raising, **inner)
             self.assertEqual(self.admission.match(OWNER, task_id=CALL["task_id"], session_id=CALL["session_id"])[1], CALL)
         run_tool_execution_middleware("friday_work", {}, outer, **CALL)
-        self.assertEqual(calls, [inner])
+        self.assertEqual(calls, ["nested-refused"])
+        with self.assertRaisesRegex(ValueError, "missing_native"):
+            self.admission.match(OWNER, task_id=CALL["task_id"], session_id=CALL["session_id"])
+
+    def test_top_level_native_downstream_exception_is_not_replayed(self):
+        from hermes_cli.plugins import get_plugin_manager, PluginContext, PluginManifest
+        from hermes_cli.middleware import run_tool_execution_middleware
+        manager = get_plugin_manager(); manager.discover_and_load()
+        ctx = PluginContext(PluginManifest(name="top_level_downstream_scope", path=str(root)), manager)
+        registration = ctx.register_middleware("tool_execution", native_call_scope)
+        self.addCleanup(registration.dispose)
+        self.record()
+        calls = []
+        def raising(_):
+            calls.append(self.admission.match(OWNER, task_id=CALL["task_id"], session_id=CALL["session_id"])[1])
+            raise OSError("offline admitted downstream failure")
+        with self.assertRaisesRegex(OSError, "offline admitted downstream failure"):
+            run_tool_execution_middleware("friday_work", {}, raising, **CALL)
+        self.assertEqual(calls, [CALL])
         with self.assertRaisesRegex(ValueError, "missing_native"):
             self.admission.match(OWNER, task_id=CALL["task_id"], session_id=CALL["session_id"])
 
