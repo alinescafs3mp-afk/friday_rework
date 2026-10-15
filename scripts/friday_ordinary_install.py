@@ -42,6 +42,11 @@ WEB_OUTPUT_FILES = {'agent/bounded_context.py', 'tools/web_tools_truncate.py', '
 SEARCH_RECOVERY_MANIFEST = 'patches/hermes/ordinary-search-recovery-manifest.json'
 SEARCH_RECOVERY_FILES = {'tools/web_tools.py', 'tools/web_tools_truncate.py'}
 
+PROFILE_RUNTIME_MANIFEST = 'patches/hermes/ordinary-profile-runtime-manifest.json'
+PROFILE_RUNTIME_FILES = {'hermes_cli/friday_credential_admission.py', 'gateway/config.py',
+    'gateway/run_adapters.py', 'hermes_cli/friday_gateway_owner.py',
+    'hermes_cli/friday_dashboard_owner.py', 'hermes_cli/friday_product_access.py'}
+
 BROWSER_GATEWAY_MANIFEST = 'patches/hermes/ordinary-browser-gateway-manifest.json'
 BROWSER_GATEWAY_FILES = {'hermes_cli/friday_ordinary_gateway.py'}
 
@@ -521,12 +526,12 @@ def update_history(home, expected, predecessor=None):
         # This is the already committed 46->47 transaction, never an operation
         # to rerun. Its exact request and all beforeimages remain pinned.
         old = f.read_json(f.pin(predecessor))
-        if old.get('schema') in ('friday.ordinary-telegram-source-update.v2','friday.ordinary-telegram-source-update.v3','friday.ordinary-telegram-source-update.v4','friday.ordinary-telegram-source-update.v5','friday.ordinary-telegram-source-update.v6','friday.ordinary-telegram-source-update.v7','friday.ordinary-telegram-source-update.v8','friday.ordinary-telegram-source-update.v9'):
+        if old.get('schema') in ('friday.ordinary-telegram-source-update.v2','friday.ordinary-telegram-source-update.v3','friday.ordinary-telegram-source-update.v4','friday.ordinary-telegram-source-update.v5','friday.ordinary-telegram-source-update.v6','friday.ordinary-telegram-source-update.v7','friday.ordinary-telegram-source-update.v8','friday.ordinary-telegram-source-update.v9','friday.ordinary-telegram-source-update.v10'):
             # Every exact historical committed update journal survives this transition.
             actual = update_history(home, old['transaction_history'], old['predecessor_update'])
             roots = []
         f.require(old.get('schema') in ('friday.ordinary-telegram-source-update.v1',
-            'friday.ordinary-telegram-source-update.v2','friday.ordinary-telegram-source-update.v3','friday.ordinary-telegram-source-update.v4','friday.ordinary-telegram-source-update.v5','friday.ordinary-telegram-source-update.v6','friday.ordinary-telegram-source-update.v7','friday.ordinary-telegram-source-update.v8','friday.ordinary-telegram-source-update.v9'),
+            'friday.ordinary-telegram-source-update.v2','friday.ordinary-telegram-source-update.v3','friday.ordinary-telegram-source-update.v4','friday.ordinary-telegram-source-update.v5','friday.ordinary-telegram-source-update.v6','friday.ordinary-telegram-source-update.v7','friday.ordinary-telegram-source-update.v8','friday.ordinary-telegram-source-update.v9','friday.ordinary-telegram-source-update.v10'),
             'ordinary_update_exact_predecessor_required')
         f.pin(old['previous_input']); f.pin(old['current_input'])
         name = 'preparation/ordinary-source-update-'+old['previous_input']['sha256']
@@ -606,10 +611,97 @@ def check_browser_gateway(home, source, manifest, budget, *, staged):
     return module.check(home,role=False)
 
 
+def checked_worker_declaration_publication(home, request, predecessor, marker):
+    """Bridge v10 only through the exact already-consumed worker publication.
+
+    Source updates do not rerun preparation or admit a generic input mismatch.
+    The successful pinned journal binds the unchanged Native56 source, original
+    request clock, both input generations and the installed marker beforeimage.
+    """
+    import copy
+    import re
+    f = api(); proof = request['worker_declaration_publication']
+    f.require(type(proof) is dict and set(proof) == {'request','result'},
+        'ordinary_update_worker_publication_pins_required')
+    prepared = f.read_json(f.pin(proof['request']))
+    result_path = f.pin(proof['result']); result = f.read_json(result_path)
+    request_id = prepared.get('request_id')
+    f.require(prepared.get('schema') == 'friday.ordinary-worker-preparation.v1'
+        and isinstance(request_id,str) and re.fullmatch('[A-Za-z0-9_-]{1,64}',request_id)
+        and prepared.get('home') == str(home)
+        and prepared.get('current_input') == predecessor['current_input']
+        and prepared.get('preparation_input') == request['previous_input']
+        and prepared.get('source_receipt') == request['source_receipt']
+        and prepared.get('profile') == request['profile']
+        and prepared.get('native_unit') == request['native_unit'],
+        'ordinary_update_worker_publication_binding_changed')
+    tx = f.directory(home/'preparation'/('ordinary-workers-'+request_id))
+    f.require(result_path == tx/'result.json' and not os.path.lexists(tx/'failure.json'),
+        'ordinary_update_successful_worker_publication_required')
+    intent = f.read_json(tx/'intent.json')
+    f.require(result.get('state') == 'BOTH_WORKER_DECLARATIONS_PUBLISHED_QUALIFICATION_PENDING'
+        and result.get('ready') is False and result.get('runtime_enabled') is False
+        and result.get('runtime_acceptance') == 'NOT_GRANTED'
+        and result.get('original_attempt') == intent
+        and intent.get('request_id') == request_id
+        and intent.get('request_sha256') == proof['request']['sha256']
+        and intent.get('seconds') == prepared.get('seconds')
+        and intent.get('resume_allowed') is False
+        and type(intent.get('started_mono')) in (int,float)
+        and type(intent.get('deadline_mono')) in (int,float)
+        and abs(intent['deadline_mono']-intent['started_mono']-intent['seconds']) < 0.001
+        and result.get('reports') == prepared.get('reports')
+        and type(result.get('reports')) is dict
+        and set(result['reports']) == {'source','toolchain','build','smoke','inventory','a0'},
+        'ordinary_update_consumed_worker_publication_required')
+    for ref in [*result['reports'].values(),*prepared['history']]: f.pin(ref)
+    before_path = tx/('before-'+f.MARKER)
+    before = f.read_json(before_path)
+    f.require(f.digest(f.owned_file(before_path,private=True)) == prepared['marker']['sha256']
+        and prepared['marker']['path'] == str(home/f.MARKER)
+        and prepared['configuration']['path'] == str(home/'config.yaml')
+        and f.digest(f.owned_file(tx/'before-config.yaml',private=True)) == prepared['configuration']['sha256']
+        and before.get('input_sha256') == predecessor['current_input']['sha256']
+        and before.get('source_receipt_sha256') == request['source_receipt']['sha256']
+        and before.get('ordinary_gateway',{}).get('operator_entry',{}).get('input') == predecessor['current_input']
+        and marker['ordinary_gateway']['operator_entry']['input'] == request['previous_input']
+        and marker['profile_files']['config.yaml'] == result.get('configuration_sha256'),
+        'ordinary_update_worker_beforeimage_changed')
+    old = f.read_json(f.pin(prepared['current_input']))
+    new = f.read_json(f.pin(prepared['preparation_input']))
+    # The previous preparer admitted only its coherent installer package and
+    # refreshed egress evidence. No operational setting is widened here.
+    allowed = {'scripts/friday_install.py','scripts/friday_ordinary_install.py',
+        'scripts/worker_install.py','scripts/friday_worker_preparation.py',
+        'scripts/a0_prepare.py','scripts/friday_ordinary_a0_registration.py'}
+    prior = old['project_files']; fresh = new['project_files']
+    f.require(len(prior) == 178 and len(fresh) == 180
+        and set(fresh) == set(prior) | {'scripts/friday_worker_preparation.py','scripts/friday_ordinary_a0_registration.py'}
+        and all(fresh[name] == pin for name,pin in prior.items() if name not in allowed),
+        'ordinary_update_worker_source_changed')
+    left = copy.deepcopy(old); right = copy.deepcopy(new)
+    for value in (left,right):
+        value.pop('project_files')
+        value['worker_install']['dsh']['web'].pop('egress_evidence')
+    f.require(left == right and new['product']['runtime'] == {'enabled':False},
+        'ordinary_update_worker_settings_changed')
+    entry = marker['ordinary_gateway']['operator_entry']
+    f.pin(entry['script'])
+    f.require(entry['script']['sha256'] == fresh['scripts/friday_native.py'],
+        'ordinary_update_worker_operator_changed')
+    expected = copy.deepcopy(before)
+    expected['input_sha256'] = marker['input_sha256']
+    expected['profile_files']['config.yaml'] = marker['profile_files']['config.yaml']
+    for field in ('operator_entry','configuration_sha256'):
+        expected['ordinary_gateway'][field] = marker['ordinary_gateway'][field]
+    f.require(expected == marker, 'ordinary_update_worker_marker_changed')
+
+
 def update_inputs(request, budget):
     f = api()
     fields = {'schema','seconds','home','previous_input','current_input','marker','source_receipt',
         'stamp','configuration','profile','launcher','credential_files','native_unit','transaction_history'}
+    source57 = type(request) is dict and request.get('schema') == 'friday.ordinary-telegram-source-update.v11'
     source56 = type(request) is dict and request.get('schema') == 'friday.ordinary-telegram-source-update.v10'
     source55 = type(request) is dict and request.get('schema') == 'friday.ordinary-telegram-source-update.v9'
     source54 = type(request) is dict and request.get('schema') == 'friday.ordinary-telegram-source-update.v8'
@@ -619,8 +711,8 @@ def update_inputs(request, budget):
     source50 = type(request) is dict and request.get('schema') == 'friday.ordinary-telegram-source-update.v4'
     source49 = type(request) is dict and request.get('schema') == 'friday.ordinary-telegram-source-update.v3'
     source48 = type(request) is dict and request.get('schema') == 'friday.ordinary-telegram-source-update.v2'
-    f.require(type(request) is dict and set(request) == fields | ({'predecessor_update'} if source48 or source49 or source50 or source51 or source52 or source53 or source54 or source55 or source56 else set())
-        and request['schema'] in ('friday.ordinary-telegram-source-update.v1','friday.ordinary-telegram-source-update.v2','friday.ordinary-telegram-source-update.v3','friday.ordinary-telegram-source-update.v4','friday.ordinary-telegram-source-update.v5','friday.ordinary-telegram-source-update.v6','friday.ordinary-telegram-source-update.v7','friday.ordinary-telegram-source-update.v8','friday.ordinary-telegram-source-update.v9','friday.ordinary-telegram-source-update.v10')
+    f.require(type(request) is dict and set(request) == fields | ({'predecessor_update'} if source48 or source49 or source50 or source51 or source52 or source53 or source54 or source55 or source56 or source57 else set()) | ({'worker_declaration_publication'} if source57 else set())
+        and request['schema'] in ('friday.ordinary-telegram-source-update.v1','friday.ordinary-telegram-source-update.v2','friday.ordinary-telegram-source-update.v3','friday.ordinary-telegram-source-update.v4','friday.ordinary-telegram-source-update.v5','friday.ordinary-telegram-source-update.v6','friday.ordinary-telegram-source-update.v7','friday.ordinary-telegram-source-update.v8','friday.ordinary-telegram-source-update.v9','friday.ordinary-telegram-source-update.v10','friday.ordinary-telegram-source-update.v11')
         and type(request['seconds']) is int and 30 <= request['seconds'] <= 180,
         'ordinary_update_explicit_request_required')
     home = f.directory(f.canonical(request['home'])); source = f.directory(home/'hermes-agent')
@@ -647,20 +739,20 @@ def update_inputs(request, budget):
         and marker.get('source_receipt_sha256') == request['source_receipt']['sha256']
         and current['product']['runtime'] == {'enabled':False}, 'ordinary_update_committed_phase_required')
     budget.call(f.composition_checked,previous,source,receipt,donors['hermes'])
-    manifest_name = BROWSER_GATEWAY_MANIFEST if source56 else BROWSER_MANIFEST if source55 else SEARCH_RECOVERY_MANIFEST if source54 else WEB_OUTPUT_MANIFEST if source53 else WEB_CONTINUATION_MANIFEST if source52 else ADMIN_BROADCAST_MANIFEST if source51 else ADMIN_RESTART_MANIFEST if source50 else FILE_CONTINUATION_MANIFEST if source49 else PRIVATE_STATE_MANIFEST if source48 else UPDATE_MANIFEST
-    native_files = BROWSER_GATEWAY_FILES if source56 else BROWSER_FILES if source55 else SEARCH_RECOVERY_FILES if source54 else WEB_OUTPUT_FILES if source53 else WEB_CONTINUATION_FILES if source52 else ADMIN_BROADCAST_FILES if source51 else ADMIN_RESTART_FILES if source50 else FILE_CONTINUATION_FILES if source49 else PRIVATE_STATE_FILES if source48 else UPDATE_FILES
+    manifest_name = PROFILE_RUNTIME_MANIFEST if source57 else BROWSER_GATEWAY_MANIFEST if source56 else BROWSER_MANIFEST if source55 else SEARCH_RECOVERY_MANIFEST if source54 else WEB_OUTPUT_MANIFEST if source53 else WEB_CONTINUATION_MANIFEST if source52 else ADMIN_BROADCAST_MANIFEST if source51 else ADMIN_RESTART_MANIFEST if source50 else FILE_CONTINUATION_MANIFEST if source49 else PRIVATE_STATE_MANIFEST if source48 else UPDATE_MANIFEST
+    native_files = PROFILE_RUNTIME_FILES if source57 else BROWSER_GATEWAY_FILES if source56 else BROWSER_FILES if source55 else SEARCH_RECOVERY_FILES if source54 else WEB_OUTPUT_FILES if source53 else WEB_CONTINUATION_FILES if source52 else ADMIN_BROADCAST_FILES if source51 else ADMIN_RESTART_FILES if source50 else FILE_CONTINUATION_FILES if source49 else PRIVATE_STATE_FILES if source48 else UPDATE_FILES
     manifest = json.loads(f.owned_file(f.ROOT/manifest_name),object_pairs_hook=f.unique)
     old = previous['project_files']; new = current['project_files']
     patch = manifest['patch']
-    f.require(patch == ('patches/hermes/ordinary-browser-gateway.patch' if source56 else 'patches/hermes/ordinary-browser.patch' if source55 else 'patches/hermes/ordinary-search-recovery.patch' if source54 else 'patches/hermes/ordinary-web-output.patch' if source53 else 'patches/hermes/ordinary-web-continuation.patch' if source52 else 'patches/hermes/ordinary-admin-broadcast.patch' if source51 else 'patches/hermes/ordinary-admin-restart.patch' if source50 else 'patches/hermes/ordinary-file-continuation.patch' if source49 else 'patches/hermes/ordinary-private-state.patch' if source48 else 'patches/hermes/ordinary-native-repair.patch')
+    f.require(patch == ('patches/hermes/ordinary-profile-runtime.patch' if source57 else 'patches/hermes/ordinary-browser-gateway.patch' if source56 else 'patches/hermes/ordinary-browser.patch' if source55 else 'patches/hermes/ordinary-search-recovery.patch' if source54 else 'patches/hermes/ordinary-web-output.patch' if source53 else 'patches/hermes/ordinary-web-continuation.patch' if source52 else 'patches/hermes/ordinary-admin-broadcast.patch' if source51 else 'patches/hermes/ordinary-admin-restart.patch' if source50 else 'patches/hermes/ordinary-file-continuation.patch' if source49 else 'patches/hermes/ordinary-private-state.patch' if source48 else 'patches/hermes/ordinary-native-repair.patch')
         and set(new) == set(old) | {manifest_name,patch}
         and all(new[name] == pin for name,pin in old.items()
-                if name not in (({'scripts/friday_ordinary_install.py'} if source50 or source51 or source52 or source53 or source54 or source55 or source56 else {'scripts/friday_install.py','scripts/friday_ordinary_install.py'}) |
+                if name not in (({'scripts/friday_ordinary_install.py'} if source50 or source51 or source52 or source53 or source54 or source55 or source56 or source57 else {'scripts/friday_install.py','scripts/friday_ordinary_install.py'}) |
                                 ({'scripts/friday_start.py'} if source48 or source54 else set()) |
                                 (BROWSER_PLUGIN_FILES if source55 else WORKER_ATTACH_PLUGIN_FILES if source49 else set()))),
         'ordinary_update_only_reviewed_source_required')
     f.require(manifest.get('base_commit') == receipt['commit']
-        and len(receipt['layers']) == (55 if source56 else 54 if source55 else 53 if source54 else 52 if source53 else 51 if source52 else 50 if source51 else 49 if source50 else 48 if source49 else 47 if source48 else 46) and manifest_name not in {r['manifest'] for r in receipt['layers']}
+        and len(receipt['layers']) == (56 if source57 else 55 if source56 else 54 if source55 else 53 if source54 else 52 if source53 else 51 if source52 else 50 if source51 else 49 if source50 else 48 if source49 else 47 if source48 else 46) and manifest_name not in {r['manifest'] for r in receipt['layers']}
         and manifest.get('installed_prefix') == {r['manifest']:r['manifest_sha256'] for r in receipt['layers']}
         and new[manifest_name] == f.digest(f.owned_file(f.ROOT/manifest_name))
         and manifest['patch_sha256'] == new[patch] == f.digest(f.owned_file(f.ROOT/patch)),
@@ -687,13 +779,15 @@ def update_inputs(request, budget):
         'ordinary_update_final_layer_required')
     predecessor = request.get('predecessor_update')
     update_history(home,request['transaction_history'],predecessor)
-    if source48 or source49 or source50 or source51 or source52 or source53 or source54 or source55 or source56:
+    if source48 or source49 or source50 or source51 or source52 or source53 or source54 or source55 or source56 or source57:
         old_request = f.read_json(f.pin(predecessor))
-        f.require(old_request['schema'] == ('friday.ordinary-telegram-source-update.v9' if source56 else 'friday.ordinary-telegram-source-update.v8' if source55 else 'friday.ordinary-telegram-source-update.v7' if source54 else 'friday.ordinary-telegram-source-update.v6' if source53 else 'friday.ordinary-telegram-source-update.v5' if source52 else 'friday.ordinary-telegram-source-update.v4' if source51 else 'friday.ordinary-telegram-source-update.v3' if source50 else 'friday.ordinary-telegram-source-update.v2' if source49
+        f.require(old_request['schema'] == ('friday.ordinary-telegram-source-update.v10' if source57 else 'friday.ordinary-telegram-source-update.v9' if source56 else 'friday.ordinary-telegram-source-update.v8' if source55 else 'friday.ordinary-telegram-source-update.v7' if source54 else 'friday.ordinary-telegram-source-update.v6' if source53 else 'friday.ordinary-telegram-source-update.v5' if source52 else 'friday.ordinary-telegram-source-update.v4' if source51 else 'friday.ordinary-telegram-source-update.v3' if source50 else 'friday.ordinary-telegram-source-update.v2' if source49
             else 'friday.ordinary-telegram-source-update.v1'), 'ordinary_update_predecessor_version_changed')
         old_tx = home/'preparation'/('ordinary-source-update-'+old_request['previous_input']['sha256'])
         committed = f.read_json(old_tx/'committed.json')
-        f.require(old_request['home'] == str(home) and old_request['current_input'] == request['previous_input']
+        if source57:
+            budget.call(checked_worker_declaration_publication,home,request,old_request,marker)
+        f.require(old_request['home'] == str(home) and (source57 or old_request['current_input'] == request['previous_input'])
             and committed['source_receipt_sha256'] == request['source_receipt']['sha256'],
             'ordinary_update_predecessor_binding_changed')
     # Complete native identity/configuration/credential validation is reused;
@@ -705,12 +799,16 @@ def update_inputs(request, budget):
     else:
         check(home,role=False)
     f.require(all(f.digest(f.owned_file(home/name,private=True)) == pin
-        for name,pin in marker['profile_files'].items() if not ((source49 or source50 or source51 or source52 or source53 or source54 or source55 or source56) and name == 'config.yaml')),
+        for name,pin in marker['profile_files'].items() if not ((source49 or source50 or source51 or source52 or source53 or source54 or source55 or source56 or source57) and name == 'config.yaml')),
         'ordinary_update_profile_changed')
-    if source50 or source51 or source52 or source53 or source54 or source55 or source56:
+    if source50 or source51 or source52 or source53 or source54 or source55 or source56 or source57:
         before_plugins = {n:p for n,p in previous['project_files'].items() if n.startswith('plugins/friday_rework/')}
         f.require(marker.get('plugin_files') == before_plugins, 'ordinary_update_installed_plugin_marker_changed')
         checked_plugin_inventory(home, before_plugins)
+    if source57:
+        f.require(len(old) == 180 and len(new) == 182
+            and set(receipt['files']) >= PROFILE_RUNTIME_FILES,
+            'ordinary_update_exact_profile_runtime_delta_required')
     if source56:
         f.require(len(old) == 176 and len(new) == 178
             and set(receipt['files']) >= BROWSER_GATEWAY_FILES,
@@ -843,6 +941,7 @@ def update(request, request_path, budget):
             f.require(f.read_json(request_path) == request, 'ordinary_update_request_changed')
             # Recheck every explicit pin immediately before the source-only journal.
             update_inputs(request,budget)
+            source57 = request['schema'] == 'friday.ordinary-telegram-source-update.v11'
             source56 = request['schema'] == 'friday.ordinary-telegram-source-update.v10'
             source55 = request['schema'] == 'friday.ordinary-telegram-source-update.v9'
             source54 = request['schema'] == 'friday.ordinary-telegram-source-update.v8'
@@ -856,11 +955,11 @@ def update(request, request_path, budget):
                 'hermes-agent/'+row['path'] for row in manifest['files']] + plugin_changes
             absent = {'hermes-agent/'+name for name in BROWSER_NEW_FILES} if source55 else set()
             saved = ({name:update_file_state(home/name) for name in names}
-                if source55 or source56 else {name:{'data':f.owned_file(home/name),
+                if source55 or source56 or source57 else {name:{'data':f.owned_file(home/name),
                     'mode':stat.S_IMODE((home/name).stat().st_mode)} for name in names})
             f.require(all(row is None or row['mode'] in (0o600,0o644) for row in saved.values()),
                 'ordinary_update_beforeimage_mode_required')
-            if source55 or source56:
+            if source55 or source56 or source57:
                 before_pins = {f.MARKER:request['marker']['sha256'],
                     'hermes-agent.source.json':request['source_receipt']['sha256'],
                     'hermes-agent/install-stamp.json':request['stamp']['sha256']}
@@ -874,7 +973,7 @@ def update(request, request_path, budget):
             receipt = copy.deepcopy(receipt)
             for row in manifest['files']:
                 receipt['files'][row['path']] = {k:row[k] for k in ('sha256','bytes','mode')}
-            manifest_name = BROWSER_GATEWAY_MANIFEST if source56 else BROWSER_MANIFEST if source55 else SEARCH_RECOVERY_MANIFEST if source54 else WEB_OUTPUT_MANIFEST if source53 else WEB_CONTINUATION_MANIFEST if source52 else ADMIN_BROADCAST_MANIFEST if source51 else ADMIN_RESTART_MANIFEST if source50 else FILE_CONTINUATION_MANIFEST if source49 else PRIVATE_STATE_MANIFEST if request['schema'].endswith('.v2') else UPDATE_MANIFEST
+            manifest_name = PROFILE_RUNTIME_MANIFEST if source57 else BROWSER_GATEWAY_MANIFEST if source56 else BROWSER_MANIFEST if source55 else SEARCH_RECOVERY_MANIFEST if source54 else WEB_OUTPUT_MANIFEST if source53 else WEB_CONTINUATION_MANIFEST if source52 else ADMIN_BROADCAST_MANIFEST if source51 else ADMIN_RESTART_MANIFEST if source50 else FILE_CONTINUATION_MANIFEST if source49 else PRIVATE_STATE_MANIFEST if request['schema'].endswith('.v2') else UPDATE_MANIFEST
             receipt['layers'].append({'manifest':manifest_name,
                 'manifest_sha256':current['project_files'][manifest_name],'patch_sha256':manifest['patch_sha256']})
             stamp = f.read_json(source/'install-stamp.json')
@@ -912,7 +1011,7 @@ def update(request, request_path, budget):
                 from scripts.dsh_prepare import run
                 env = f.clean_environment(home); env['GIT_CEILING_DIRECTORIES'] = str(source.parent)
                 patch_root = source
-                if source55 or source56:
+                if source55 or source56 or source57:
                     # Git mutates only our private staging tree. Actual source
                     # publication records the precise created inode before rename/link.
                     patch_root = tx/'after'; patch_root.mkdir(mode=0o700)
@@ -930,8 +1029,8 @@ def update(request, request_path, budget):
                     data = f.owned_file(patch_root/row['path'])
                     f.require(f.digest(data) == row['sha256'] and len(data) == row['bytes'],
                         'ordinary_update_patch_output_changed')
-                    if source55 or source56: (patch_root/row['path']).chmod(0o600)
-                if source55 or source56:
+                    if source55 or source56 or source57: (patch_root/row['path']).chmod(0o600)
+                if source55 or source56 or source57:
                     for row in manifest['files']:
                         name = 'hermes-agent/'+row['path']; budget.check(); prove()
                         publish_update_file(home/name,f.owned_file(patch_root/row['path']),
@@ -940,14 +1039,14 @@ def update(request, request_path, budget):
                     # Same owned exact-byte private publication used by the native installer.
                     f.require(f.digest(f.owned_file(home/name,private=True)) == f.digest(saved[name]['data']),
                         'ordinary_update_worker_plugin_preimage_changed')
-                    if source55 or source56: publish_update_file(home/name,data,saved[name]['mode'],saved[name],owned,name)
+                    if source55 or source56 or source57: publish_update_file(home/name,data,saved[name]['mode'],saved[name],owned,name)
                     else: replace(home/name,data,saved[name]['mode'])
-                if source49 or source50 or source51 or source52 or source53 or source54 or source55 or source56:
+                if source49 or source50 or source51 or source52 or source53 or source54 or source55 or source56 or source57:
                     checked_plugin_inventory(home, updated['plugin_files'])
                 budget.call(f.composition_checked,current,source,receipt,donors['hermes'])
                 for name,data in publication:
                     budget.check()
-                    if source55 or source56: publish_update_file(home/name,data,saved[name]['mode'],saved[name],owned,name)
+                    if source55 or source56 or source57: publish_update_file(home/name,data,saved[name]['mode'],saved[name],owned,name)
                     else: replace(home/name,data,saved[name]['mode'])
                 # The ordinary binding and complete native source identity must
                 # agree before the update can commit. No service is launched.
@@ -956,10 +1055,13 @@ def update(request, request_path, budget):
                     check_browser_gateway(home,source,manifest,budget,staged=False)
                 else:
                     check(home,role=False)
-                if source49 or source50 or source51 or source52 or source53 or source54 or source55 or source56:
+                if source49 or source50 or source51 or source52 or source53 or source54 or source55 or source56 or source57:
                     checked_plugin_inventory(home, updated['plugin_files'])
                 update_history(home,request['transaction_history'],request.get('predecessor_update')); prove(); budget.check()
-                if source55 or source56:
+                if source57:
+                    budget.call(checked_worker_declaration_publication,home,request,
+                        f.read_json(f.pin(request['predecessor_update'])),marker)
+                if source55 or source56 or source57:
                     f.require(all(name in owned and same_update_file(home/name,owned[name]) for name in names),
                         'ordinary_update_commit_ownership_changed')
                 write(tx/'committed.json',encoded({'state':'SOURCE_UPDATED_NOT_RUNTIME_ACCEPTED',
@@ -971,7 +1073,7 @@ def update(request, request_path, budget):
             except BaseException as original:
                 try:
                     prove()
-                    if source55 or source56:
+                    if source55 or source56 or source57:
                         restore_update_files(home,saved,owned)
                     else:
                         # Unknown concurrent bytes are never overwritten by rollback.
