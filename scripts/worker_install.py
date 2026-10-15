@@ -107,9 +107,16 @@ def declared_a0(value, home):
     return a
 
 
-def prepared_product(value, home, budget):
+def prepared_product(value, home, budget, *, preparation=None):
     """Derive both exact runtimes from checked native preparation outputs."""
     spec = budget.call(settings, value)
+    if preparation is not None:
+        require(isinstance(preparation, dict) and set(preparation) ==
+                {'source', 'toolchain', 'build', 'smoke', 'inventory', 'a0'},
+                'complete_native_preparation_references_required')
+        for ref in preparation.values(): budget.call(pin, ref)
+    def report_path(name, default):
+        return Path(preparation[name]['path']) if preparation is not None else default
     lock = budget.call(read_json, value['sources_lock']['path'])
     donors = {r['id']: r for r in lock['repositories']}
     evidence = {w: [] for w in spec}
@@ -117,7 +124,7 @@ def prepared_product(value, home, budget):
     require(str(harness) == value['dsh_donor'], 'owned_harness_destination_required')
     reports = {}
     for phase in ('source', 'toolchain', 'build', 'smoke'):
-        path = home / 'preparation/harness' / ('dsh-' + phase + '.json')
+        path = report_path(phase, home / 'preparation/harness' / ('dsh-' + phase + '.json'))
         raw = budget.call(owned_file, path)
         report = json.loads(raw)
         identity = report['source']
@@ -146,7 +153,7 @@ def prepared_product(value, home, budget):
     current['source_lock_sha256'] = value['sources_lock']['sha256']
     require(all(r['source'] == current for r in reports.values()), 'harness_source_generation_changed')
     inventory = budget.call(build_inventory, harness)
-    recorded = budget.call(read_json, home / 'preparation/harness/dsh-build-inventory.json')
+    recorded = budget.call(read_json, report_path('inventory', home / 'preparation/harness/dsh-build-inventory.json'))
     require(inventory == recorded and inventory['file_count'] > 0
             and all(r.get('workspace_build_identity') == {k: inventory[k] for k in ('file_count', 'sha256')}
                     for r in (reports['build'], smoke)), 'harness_generated_build_changed')
@@ -179,7 +186,7 @@ def prepared_product(value, home, budget):
         'web': {'profile': product['web']['profile'], **spec['dsh']['web'],
                 'research_policy': {'path': str(home / 'worker-runtime-source/config/RESEARCH.md'),
                                     'sha256': value['project_files']['config/RESEARCH.md']}}}
-    a0path = home / 'preparation/a0.json'; raw = budget.call(owned_file, a0path)
+    a0path = report_path('a0', home / 'preparation/a0.json'); raw = budget.call(owned_file, a0path)
     a0 = json.loads(raw); identity = a0['source']
     require(a0.get('donor') == 'a0' and a0.get('checkout') == value['a0_donor']
             and a0.get('source_lock_sha256') == value['sources_lock']['sha256']

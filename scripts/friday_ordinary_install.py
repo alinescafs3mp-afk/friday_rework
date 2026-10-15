@@ -59,6 +59,12 @@ def api():
     return friday_install
 
 
+def prepare_workers(request, request_path, budget):
+    """Continue installation declarations without changing the receiving runtime."""
+    from scripts.friday_worker_preparation import prepare
+    return prepare(request, request_path, budget)
+
+
 def write(path, data, mode=0o600):
     fd = os.open(path, os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, mode)
     with os.fdopen(fd, 'wb') as stream:

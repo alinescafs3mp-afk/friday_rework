@@ -374,6 +374,13 @@ def test_parent_waits_for_preparer_outputs_and_retains_partial_without_replay(no
     import sys
     s=normal;value=copy.deepcopy(s.value);home=s.deploy/'fresh-normal-home'
     value['home']=str(home);value['dsh_donor']=str(home/'harness')
+    # This is a distinct fresh installation. Its explicit synthetic network
+    # declaration must name that home before the real parent validation runs.
+    policy_ref=value['worker_install']['dsh']['web']['egress_evidence']
+    policy=json.loads(Path(policy_ref['path']).read_text())
+    policy['runtime_home']=str(home)
+    value['worker_install']['dsh']['web']['egress_evidence']=doc(
+        s.deploy/'fresh-normal-home-web-policy.json',policy)
     path=s.deploy/'fresh-input.json';doc(path,value);phases=[]
     class NoNativeEffects:
         def __init__(self,pin,budget,env):self.budget=budget
