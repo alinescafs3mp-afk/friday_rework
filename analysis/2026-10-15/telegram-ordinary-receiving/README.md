@@ -1,3 +1,19 @@
+# Ordinary Telegram receiving: Native49 installed, actual restart blocker retained
+
+15October2026,06:54MSK. Native49 is SOURCE-reviewed, WIRED and INSTALLED. Normal source checks verify17671 files/49layers and the exact4 plugin continuation changes. Telegram receiving is active; no genuine model answer/follow-up, live file delivery or live worker attachment has been accepted.
+
+The shipped installer supports an exact committed48→49 update with seven Native afterimages, four private plugin afterimages and three source metadata publications. The real update completed38.918s within its original180s, including a reconciled46ms Root preflight failure before effects. All37 earlier journal/archive files, original installation clocks, configuration/credential/profile/unit bytes and prepared user state remain preserved. The operation did not grant access or execute workers.
+
+Source qualifications:46 native file controls; four independent connected Native49 worker/API/credential controls;21 updater controls with all14 rollback beforeimages, both077/002 umasks, all seven publication failures and no overwrite of unknown concurrent bytes;9 independent HOST helpers; real complete source composition. New reusable source regression tests are included. Isolated worker consumers are fixtures, not live deployments. Node UI execution remains NOT_RUN under its original512MiB AS cap. An initial public-test runner inherited repository xdist-auto and failed before tests; exact isolated focused invocation passes46 without changing caps or product topology. Failed runs and bounded group CPU exhaustion are retained privately, not labeled PASS.
+
+Current actual blocker: normal WebUI startup after a prepared ordinary user imports the guarded CLI/TUI facade without its separate principal, fails closed and exits. The earlier working Source48 WebUI predates this first binding. A bounded minimal native startup correction is being implemented and will receive independent review. No guard reset, fake local admission or alternative administrative database is authorized by this failure.
+
+The normal native CLI gateway start also reports its fixed30s caller timeout while the same Notify/watchdog invocation becomes active; no second start is issued. Source48 helper/renderer failures and all original consumed scopes remain visible. Receiving-active is not delivered-answer acceptance.
+
+Next: fix and install the normal administrative startup, finish the already requested genuine Telegram pairing and normal activation, then observe grounded local answer/contextual follow-up and the same conversation's file/web/worker paths. Owner home remains disabled generation1 with three captured scoped local keys. Latest real pairing snapshot before restart:pending0/approved0. Both intact workers, all mandatory scope/checkpoints and owner-reserved Sol are retained in [current foundation status](../../../docs/foundation-status.md).
+
+## Retained Source48 checkpoint — historical, current WebUI restart failed
+
 # Ordinary Telegram receiving: current installed result
 
 15October2026: Source48 is installed and independently accepted as source:17671 native files,48 layers. Real native receiving and the authenticated WebUI are running. Normal prepare and three scoped local credential captures succeeded; the real owner's account remains disabled pending genuine native pairing and normal activation. An interactive owner request asks for a real Telegram message. No model answer or contextual follow-up has yet been observed; Telegram LIVE/ACCEPTED and Release_Go remain false.

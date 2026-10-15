@@ -1,0 +1,744 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -1179,6 +1179,14 @@
+         # expanduser raises ValueError("embedded null byte") for a ~\x00 path.
+         return None
+     if not expanded.is_absolute():
++        return None
++    # Managed principals never inherit generic cache/recency/operator allowlists.
++    from hermes_cli.friday_user_scope import ordinary_file_source, workspace_document, ScopeDenied
++    try:
++        if ordinary_file_source() is not None:
++            workspace_document(str(expanded))
++            return str(expanded)
++    except (ScopeDenied, OSError, ValueError):
+         return None
+     # Docker agents emit MEDIA:/workspace/... — map container paths to host paths first.
+     resolved = _translate_docker_container_media_path(expanded, session_key=session_key)
+@@ -4305,6 +4313,11 @@
+         tags only, never bare local files), video → send_video, else send_document. Every failure is
+         reported. Each send feeds ``record_delivery`` so media-only turns report SUCCESS."""
+         from urllib.parse import quote as _quote
++        from gateway.run_plugin_delivery import deliver_ordinary_files
++        with self._media_delivery_scope(event.source):
++            if await deliver_ordinary_files(self, event.source,
++                    [p for p, _ in media_files] + list(local_files), record_delivery=record_delivery):
++                return
+ 
+         def _as_image(path: str) -> bool:
+             return Path(path).suffix.lower() in _IMAGE_EXTS and not force_document_attachments
+@@ -4437,6 +4450,11 @@
+         results feed ``record_delivery`` so the turn outcome reflects them."""
+         human_delay = self._get_human_delay()
+         images, media_files, local_files = extracted.images, extracted.media_files, extracted.local_files
++        if getattr(event.source, '_friday_user_scope', None) is not None:
++            from urllib.parse import unquote, urlparse
++            managed_images = [unquote(urlparse(url).path) for url, _ in images if url.startswith('file://')]
++            local_files = list(local_files) + managed_images
++            images = [(url, alt) for url, alt in images if not url.startswith('file://')]
+         if images:
+             logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
+             await self._send_image_batch(event, images, metadata, human_delay, record_delivery)
+diff --git a/gateway/run_inbound_media.py b/gateway/run_inbound_media.py
+--- a/gateway/run_inbound_media.py
++++ b/gateway/run_inbound_media.py
+@@ -3,17 +3,244 @@
+ from __future__ import annotations
+ 
+ import logging
++import hashlib
++import json
++import os
++import re
+ import shutil
++import stat
++import uuid
+ from pathlib import Path
+-
+-from gateway.platforms.event import MessageEvent
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from gateway.platforms.event import MessageEvent
+ 
+ # Log-record parity with the origin module.
+ logger = logging.getLogger("gateway.run")
+ 
++# Match the ordinary own-workspace read_file backend. A cache receipt is never
++# a capability to expose an arbitrary host file or an unbounded download.
++_READABLE_ATTACHMENT_BYTES = 1_000_000
++
++
++def _owned(info, *, directory=False):
++    from hermes_cli.friday_user_scope import ScopeDenied
++    if (info.st_uid != os.getuid() or info.st_mode & 0o077
++            or (directory and not stat.S_ISDIR(info.st_mode))
++            or (not directory and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1))):
++        raise ScopeDenied()
++
++
++def _absolute_directory(path):
++    """Pin every component; O_NOFOLLOW on just the leaf misses parent escapes."""
++    from hermes_cli.friday_user_scope import ScopeDenied
++    path = Path(path)
++    if not path.is_absolute() or any(p in {'.', '..'} for p in path.parts):
++        raise ScopeDenied()
++    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
++    try:
++        for part in path.parts[1:]:
++            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
++            os.close(fd)
++            fd = child
++        _owned(os.fstat(fd), directory=True)
++        return fd
++    except BaseException:
++        os.close(fd)
++        raise
++
++
++def _verified_bytes(directory, parts, content):
++    from hermes_cli.friday_user_scope import ScopeDenied
++    fd = os.dup(directory)
++    try:
++        for part in parts[:-1]:
++            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
++            os.close(fd)
++            fd = child
++            _owned(os.fstat(fd), directory=True)
++        item = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
++        try:
++            before = os.fstat(item)
++            _owned(before)
++            if before.st_size != content['size_bytes']:
++                raise ScopeDenied()
++            data = bytearray()
++            while len(data) <= content['size_bytes']:
++                chunk = os.read(item, min(65536, content['size_bytes'] + 1 - len(data)))
++                if not chunk:
++                    break
++                data.extend(chunk)
++            after = os.fstat(item)
++            _owned(after)
++            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
++                    after.st_size, after.st_mtime_ns, after.st_ctime_ns):
++                raise ScopeDenied()
++            if len(data) != content['size_bytes'] or hashlib.sha256(data).hexdigest() != content['sha256']:
++                raise ScopeDenied()
++            return bytes(data)
++        finally:
++            os.close(item)
++    finally:
++        os.close(fd)
++
++
++def _publish_received(directory, name, data, content):
++    """Publish complete bytes without replacing an existing user file."""
++    temporary = 'incoming_' + uuid.uuid4().hex
++    item = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
++                   0o600, dir_fd=directory)
++    try:
++        with os.fdopen(item, 'wb') as stream:
++            stream.write(data)
++            stream.flush()
++            os.fsync(stream.fileno())
++        try:
++            os.link(temporary, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
++        except FileExistsError:
++            pass
++    finally:
++        os.unlink(temporary, dir_fd=directory)
++    # Also verifies an existing deterministic name on retries; never trust an
++    # existing pathname just because its name contains a digest.
++    _verified_bytes(directory, (name,), content)
++    os.fsync(directory)
++
++
++def _rehome_user_attachments(event, cap):
++    """Admitted native Telegram bytes become ordinary files in this user's home.
++
++    Native ingress is captured before changing media paths. Both its SDK-bound
++    route/origin and the adapter's download receipt must prove the exact bytes.
++    The workspace file plus normal transcript path survive process restarts;
++    there is no new file permission, cache allowlist or session-only read grant.
++    """
++    from gateway.admitted_ingress import admitted_ingress
++    from gateway.session_identity import identity_of
++    from hermes_cli.friday_user_scope import ScopeDenied, _same_scope, _workspace_directory
++    from hermes_constants import get_routing_process_hermes_home
++    source = event.source
++    identity = identity_of(source)
++    if (not _same_scope(getattr(source, '_friday_user_scope', None), cap)
++            or identity is None or identity.transport_inferred or not identity.multiplexed
++            or identity.authorization_home != cap.authorization_home or identity.runtime_home != cap.home):
++        raise ScopeDenied()
++    # This invokes the same native provenance producer as the plugin ingress,
++    # even when no post-admission plugin hook is installed.
++    proof = admitted_ingress(event, source, '')
++    if not isinstance(proof, dict):
++        raise ScopeDenied()
++    message = proof.get('message')
++    if (proof.get('platform') != 'telegram' or cap.principal[0] != 'telegram'
++            or proof.get('transport_profile') != cap.principal[1]
++            or proof.get('runtime_profile') != cap.profile
++            or proof.get('source_profile') not in ('', cap.profile)
++            or not isinstance(message, dict)
++            or message.get('bot_id') != cap.principal[2] or message.get('user_id') != cap.principal[3]
++            or message.get('chat_id') != source.chat_id
++            or message.get('thread_id') != (source.thread_id or '')):
++        raise ScopeDenied()
++    paths = event.media_urls
++    media = message.get('media')
++    if (not isinstance(paths, list) or not 0 < len(paths) <= 64
++            or not isinstance(media, list) or len(media) != len(paths)
++            or any(not isinstance(p, str) for p in paths) or len(set(paths)) != len(paths)):
++        raise ScopeDenied()
++    cache = Path(get_routing_process_hermes_home()) / 'cache'
++    workspace = cap.home / 'workspace'
++    received = workspace / 'received'
++    staged = []
++    for raw, item in zip(paths, media):
++        if (len(raw) > 4096 or any(ord(c) < 32 for c in raw) or str(Path(raw)) != raw
++                or not Path(raw).is_absolute() or not isinstance(item, dict)
++                or item.get('local_reference') != raw):
++            raise ScopeDenied()
++        receipt = event._telegram_media_receipts.get(raw)
++        origin, content = item.get('origin'), item.get('content')
++        if (not isinstance(receipt, dict) or not isinstance(origin, dict) or not isinstance(content, dict)
++                or receipt.get('origin') != {k: v for k, v in origin.items() if k != 'thread_id'}
++                or receipt.get('content') != content or set(content) != {'size_bytes', 'sha256'}
++                or type(content['size_bytes']) is not int or not 0 <= content['size_bytes'] <= _READABLE_ATTACHMENT_BYTES
++                or not isinstance(content['sha256'], str) or re.fullmatch('[0-9a-f]{64}', content['sha256']) is None
++                or origin.get('bot_id') != message['bot_id'] or origin.get('chat_id') != message['chat_id']
++                or origin.get('thread_id') != message['thread_id']
++                or origin.get('message_id') not in {message.get('message_id'), message.get('reply_to_message_id')}
++                or not all(isinstance(origin.get(k), str) and origin[k] for k in ('file_id', 'file_unique_id'))
++                or (origin.get('declared_bytes') is not None and (
++                    type(origin['declared_bytes']) is not int or origin['declared_bytes'] != content['size_bytes']))):
++            raise ScopeDenied()
++        key = {'principal': cap.key, 'chat_id': message['chat_id'], 'thread_id': message['thread_id'],
++               'origin': origin, 'content': content}
++        digest = hashlib.sha256(json.dumps(key, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
++        suffix = Path(raw).suffix.lower()
++        if re.fullmatch(r'\.[a-z0-9]{1,12}', suffix) is None:
++            suffix = '.bin'
++        display = re.sub(r'^telegram_[0-9a-f]{64}_', '', Path(raw).name)
++        display = re.sub(r'^(?:doc|img|video|audio)_[0-9a-f]{12}_?', '', display)
++        stem = re.sub(r'[^A-Za-z0-9_.-]', '_', Path(display).stem).lstrip('.')[:80] or 'attachment'
++        destination = received / ('telegram_' + digest + '_' + stem + suffix)
++        # Only the actual launch cache or this exact already-staged attachment
++        # is readable. A receipt never opens another profile's cache/home.
++        if Path(raw) == destination:
++            root, relative = received, (destination.name,)
++        else:
++            root = cache
++            try:
++                relative = Path(raw).relative_to(cache).parts
++            except ValueError:
++                raise ScopeDenied() from None
++        if not relative or any(p in {'.', '..'} or p.startswith('.') for p in relative):
++            raise ScopeDenied()
++        root_fd = _absolute_directory(root)
++        try:
++            data = _verified_bytes(root_fd, relative, content)
++        finally:
++            os.close(root_fd)
++        staged.append((raw, destination, data, content, receipt))
++    cap.check()
++    root_fd = _workspace_directory(cap)
++    try:
++        try:
++            os.mkdir('received', mode=0o700, dir_fd=root_fd)
++        except FileExistsError:
++            pass
++        received_fd = os.open('received', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
++        try:
++            _owned(os.fstat(received_fd), directory=True)
++            for _, destination, data, content, _ in staged:
++                cap.check()
++                _publish_received(received_fd, destination.name, data, content)
++            cap.check()
++            # Do not publish a path for a directory exchanged during the copy.
++            current_fd = _absolute_directory(received)
++            try:
++                actual, pinned = os.fstat(current_fd), os.fstat(received_fd)
++                if (actual.st_dev, actual.st_ino) != (pinned.st_dev, pinned.st_ino):
++                    raise ScopeDenied()
++            finally:
++                os.close(current_fd)
++        finally:
++            os.close(received_fd)
++    finally:
++        os.close(root_fd)
++    rewritten = []
++    for raw, destination, _, _, receipt in staged:
++        rewritten.append(str(destination))
++        # Keep the origin receipt too. Remapping a verified byte copy lets the
++        # native producer prove this same event on an idempotent second call.
++        event._telegram_media_receipts[str(destination)] = {
++            'origin': dict(receipt['origin']), 'content': dict(receipt['content'])}
++        if event.text:
++            event.text = event.text.replace(raw, str(destination))
++    event.media_urls = rewritten
++
+ 
+ def rehome_inbound_media(event: MessageEvent) -> None:
+     """Move adapter-cached attachments into the ACTIVE profile's ``cache/`` and repoint the event.
++
++    An authenticated ordinary user instead receives verified, private workspace
++    copies, readable by the existing confined own-workspace file tool.
+ 
+     Adapters download and cache an attachment BEFORE the gateway routes the event to a profile, so
+     on a multiplexed gateway the file lands under the launch home while the routed turn's sandbox
+@@ -23,6 +250,14 @@
+     when the active home is the launch home, and idempotent (a moved entry is no longer under it).
+     """
+     if not event.media_urls:
++        return
++    from hermes_cli.friday_user_scope import ordinary_file_scope, ScopeDenied
++    cap = ordinary_file_scope()
++    if cap is not None:
++        try:
++            _rehome_user_attachments(event, cap)
++        except (OSError, ValueError, TypeError, KeyError, AttributeError):
++            raise ScopeDenied() from None
+         return
+     from hermes_constants import get_hermes_home, get_routing_process_hermes_home, hermes_home_key
+     active, launch = Path(get_hermes_home()), Path(get_routing_process_hermes_home())
+diff --git a/gateway/run_notifications.py b/gateway/run_notifications.py
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -363,8 +363,13 @@
+             # Capture [[as_document]] before extract_media strips it: images then go via send_document.
+             force_document_attachments = "[[as_document]]" in response
+             from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+-            media_files, cleaned = adapter.extract_media(response)
+-            media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
++            with adapter._media_delivery_scope(event.source):
++                media_files, cleaned = adapter.extract_media(response)
++                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
++            from gateway.run_plugin_delivery import deliver_ordinary_files
++            with adapter._media_delivery_scope(event.source):
++                if await deliver_ordinary_files(adapter, event.source, [p for p, _ in media_files]):
++                    return
+             # Strip image URLs (parity with the non-streaming chain); no extract_local_files here.
+             # Do NOT deduplicate explicit MEDIA tags against prior turns here (#73771). This rescan is
+             # already EXPLICIT-ONLY (see docstring): a MEDIA: directive in the final streamed reply is the
+diff --git a/gateway/run_plugin_delivery.py b/gateway/run_plugin_delivery.py
+--- a/gateway/run_plugin_delivery.py
++++ b/gateway/run_plugin_delivery.py
+@@ -107,3 +107,202 @@
+             and int(result.message_id) > 0 and proof.get("message_id") == result.message_id):
+         return {"state": "DELIVERED", **expected, "message_id": result.message_id}
+     return {"state": "UNKNOWN", "error": "document_ack_unavailable", **expected}
++
++
++_ORDINARY_DOCUMENTS = 'ordinary_documents.v1'
++
++
++def _ordinary_marker(selection):
++    from hermes_cli.friday_native_state import encoded
++    return encoded({'schema': 'friday.ordinary-document-attempt.v1', 'selection': selection})
++
++
++def _ordinary_commit(state, value, previous, *, journals):
++    from hermes_cli.friday_native_state import observe_commit_return, require_commit_return
++    witness = state.set_commit(_ORDINARY_DOCUMENTS, value, expected_value=previous,
++                               compare=True, journals=journals)
++    require_commit_return(state, observe_commit_return(state, witness))
++
++
++def _begin_ordinary_document(cap, relative, data, route, file_name):
++    """Use existing native durable CAS + immutable UNKNOWN before a send effect.
++
++    Selection is a create-only workspace path, so a changed file or a later
++    reply cannot turn an uncertain attempt into a fresh send. New revisions use
++    new filenames, as the scoped write_file contract already requires.
++    """
++    import copy
++    from hermes_cli.plugins_state import PluginState
++    from hermes_cli.friday_native_state import encoded
++    state = PluginState('friday_rework')
++    selection = hashlib.sha256(encoded([cap.key, relative])).hexdigest()
++    marker = _ordinary_marker(selection)
++    marker_name = 'friday-unknown-' + hashlib.sha256(marker).hexdigest() + '.json'
++    previous = state.get(_ORDINARY_DOCUMENTS)
++    if previous is not None and (not isinstance(previous, dict)
++            or previous.get('schema') != _ORDINARY_DOCUMENTS or not isinstance(previous.get('files'), dict)):
++        raise ValueError('ordinary_document_journal_invalid')
++    value = copy.deepcopy(previous) if previous is not None else {'schema': _ORDINARY_DOCUMENTS, 'files': {}}
++    # A lost/missing current state cannot erase its immutable uncertain history.
++    old = value['files'].get(selection)
++    if old is None and (state.data_dir / marker_name).exists():
++        raise ValueError('delivery_requires_reconciliation')
++    if old is not None:
++        if (old.get('state') != 'DELIVERED' or old.get('sha256') != hashlib.sha256(data).hexdigest()
++                or old.get('bytes') != len(data) or old.get('file_name') != file_name):
++            raise ValueError('delivery_requires_reconciliation')
++        before, after = freeze_route(old['route']), freeze_route(route)
++        if (before['source']['message_id'] == after['source']['message_id']
++                or {k:v for k,v in before.items() if k != 'source'} != {k:v for k,v in after.items() if k != 'source'}
++                or {k:v for k,v in before['source'].items() if k != 'message_id'} !=
++                   {k:v for k,v in after['source'].items() if k != 'message_id'}):
++            raise ValueError('delivery_requires_reconciliation')
++    if len(value['files']) >= 10000:
++        raise ValueError('ordinary_document_journal_full')
++    row = {'state': 'UNKNOWN', 'relative_path': relative, 'sha256': hashlib.sha256(data).hexdigest(),
++           'bytes': len(data), 'file_name': file_name, 'route': freeze_route(route), 'receipt': None}
++    value['files'][selection] = row
++    cap.check()
++    _ordinary_commit(state, value, previous, journals=(('unknown', marker), ('unknown', encoded(row))))
++    return state, selection, value
++
++
++async def deliver_ordinary_document(adapter, source, path, *, caption=None, file_name=None):
++    """Managed ordinary MEDIA uses the plugin's exact original-route byte send.
++
++    No worker, synthetic task or product activation is introduced. The native
++    source capability authorizes the own workspace, bot and original reply.
++    """
++    from types import SimpleNamespace
++    from pathlib import Path
++    from hermes_cli.friday_user_scope import current, ordinary_file_source, workspace_document
++    from gateway.session_identity import identity_of
++    from gateway.platforms.base import SendResult
++    try:
++        cap = current(required=True)
++        if ordinary_file_source() is not source or source.platform != Platform.TELEGRAM:
++            raise ValueError('original_source_required')
++        identity = identity_of(source)
++        runner = getattr(adapter, 'gateway_runner', None)
++        if (identity is None or identity.transport_inferred or identity.runtime_home != cap.home
++                or identity.runtime_profile != cap.profile or identity.transport_profile != cap.principal[1]
++                or source.user_id != cap.principal[3] or runner is None
++                or str(getattr(getattr(adapter, '_bot', None), 'id', '')) != cap.principal[2]):
++            raise ValueError('original_source_required')
++        route = freeze_route({'transport_profile': identity.transport_profile,
++                              'runtime_profile': cap.profile, 'bot_id': cap.principal[2],
++                              'source': {key: getattr(source, key) for key in
++                                  ('chat_id', 'chat_type', 'user_id', 'thread_id', 'message_id')} |
++                                        {'platform': source.platform.value}})
++        retained = getattr(source, '_friday_document_route', None)
++        if retained is None or freeze_route(retained) != route:
++            raise ValueError('native_original_route_required')
++        route = freeze_route(retained)
++        context = SimpleNamespace(_manager=SimpleNamespace(home_path=cap.home))
++        _, live_adapter = resolve_document_route(runner, context, route)
++        if live_adapter is not adapter:
++            raise ValueError('original_adapter_replaced')
++        data, relative = workspace_document(path)
++        name = file_name or Path(relative).name
++        if (not isinstance(name, str) or not name or len(name) > 255
++                or name in {'.', '..'} or any(ord(c) < 32 or c in '/\\' for c in name)):
++            raise ValueError('invalid_document_name')
++        session_id = getattr(source, '_friday_document_session_id', None)
++        if not isinstance(session_id, str) or not session_id:
++            raise ValueError('original_session_required')
++        state, selection, reserved = _begin_ordinary_document(cap, relative, data, route, name)
++    except Exception:
++        return SendResult(success=False, error='gateway_document_preflight_rejected')
++    # Cancellation or ANY commit/ack uncertainty leaves the original UNKNOWN.
++    try:
++        cap.check()
++        await _ordinary_transcript(runner, session_id, relative, 'UNKNOWN', hashlib.sha256(data).hexdigest())
++        receipt = await deliver_document(runner, context, route=route, data=data,
++                                         file_name=name, caption=caption, timeout=30)
++        cap.check()
++        if receipt.get('state') != 'DELIVERED':
++            return SendResult(success=False, error='document_delivery_UNKNOWN')
++        import copy
++        from hermes_cli.friday_native_state import encoded
++        candidate = copy.deepcopy(reserved)
++        candidate['files'][selection].update(state='DELIVERED', receipt=receipt)
++        _ordinary_commit(state, candidate, reserved,
++                         journals=(('candidate', encoded({'selection': selection, 'receipt': receipt})),))
++        await _ordinary_transcript(runner, session_id, relative, 'DELIVERED', receipt['sha256'])
++        return SendResult(success=True, message_id=receipt['message_id'], raw_response=receipt)
++    except Exception:
++        return SendResult(success=False, error='document_delivery_UNKNOWN')
++
++
++async def deliver_ordinary_files(adapter, source, paths, *, record_delivery=None):
++    """Shared managed final-MEDIA dispatcher for streaming and ordinary replies.
++
++    Unmanaged native profiles continue through their original media branches.
++    All managed local media keeps immutable bytes by using native documents.
++    """
++    from hermes_cli.friday_user_scope import ordinary_file_source
++    admitted = getattr(source, '_friday_user_scope', None)
++    if admitted is None:
++        # Detect an active managed scope whose source was swapped/cleared.
++        if ordinary_file_source() is not None:
++            from gateway.platforms.base import SendResult
++            if record_delivery: record_delivery(SendResult(success=False, error='gateway_document_route_rejected'))
++            return True
++        return False
++    for path in dict.fromkeys(paths):
++        result = await deliver_ordinary_document(adapter, source, path)
++        if record_delivery is not None: record_delivery(result)
++        if not result.success:
++            # Ordinary conversation receives the uncertainty too, including the
++            # streaming path whose textual final has already been delivered.
++            notify = getattr(adapter, 'emit_warning', None)
++            if callable(notify):
++                from gateway.platforms.base import _thread_metadata_for_source
++                try:
++                    await notify(source.chat_id,
++                        'Доставка файла не подтверждена (UNKNOWN) или отклонена до отправки. '
++                        'Не отправляю его повторно без проверки результата.',
++                        metadata=_thread_metadata_for_source(source, source.message_id))
++                except Exception:
++                    pass
++    return True
++
++
++async def _ordinary_transcript(runner, session_id, relative, state, digest):
++    """Keep file/revision and acknowledgement state in the existing conversation."""
++    import json
++    import time
++    content = '[File delivery observation: ' + json.dumps(
++        {'path': relative, 'sha256': digest, 'state': state}, ensure_ascii=False) + ']'
++    await runner.async_session_store.append_to_transcript(session_id,
++        {'role': 'assistant', 'content': content, 'timestamp': time.time()})
++
++
++def bind_ordinary_document_source(event, source):
++    """Freeze receiving SDK provenance before topic/session recovery can retarget.
++
++    Missing proof keeps plain conversation available, but cannot authorize an
++    ordinary local file effect. Called inside the already admitted native scope.
++    """
++    from gateway.admitted_ingress import admitted_ingress
++    from hermes_cli.friday_user_scope import ordinary_file_scope
++    cap = ordinary_file_scope()
++    if cap is None or source.platform != Platform.TELEGRAM:
++        return
++    proof = admitted_ingress(event, source, '')
++    if not isinstance(proof, dict):
++        return
++    message = proof.get('message', {})
++    expected = {'bot_id': cap.principal[2], 'user_id': source.user_id,
++                'chat_id': source.chat_id, 'thread_id': source.thread_id or '',
++                'message_id': source.message_id}
++    if (proof.get('platform') != cap.principal[0]
++            or proof.get('transport_profile') != cap.principal[1]
++            or proof.get('runtime_profile') != cap.profile
++            or source.user_id != cap.principal[3]
++            or any(message.get(k) != v for k, v in expected.items())):
++        return
++    source._friday_document_route = freeze_route({
++        'transport_profile': cap.principal[1], 'runtime_profile': cap.profile,
++        'bot_id': cap.principal[2], 'source': {'platform': source.platform.value,
++            **{k:getattr(source,k) for k in ('chat_id','chat_type','user_id','thread_id','message_id')}}})
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -383,6 +383,8 @@
+         """Resolve ``source`` to its session entry (topic recovery, internal-route guards, Telegram
+         topic-binding heal). Returns ``(source, session_entry, session_key)`` or ``None`` to drop
+         the event."""
++        from gateway.run_plugin_delivery import bind_ordinary_document_source
++        bind_ordinary_document_source(event, source)
+         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's last-active topic so a
+         # cross-topic Reply doesn't fragment the conversation.
+         event_metadata = getattr(event, "metadata", None) or {}
+@@ -438,6 +440,8 @@
+         if ((getattr(event, "metadata", None) or {}).get("hermes_plugin_pinned")
+             and not await self._plugin_pinned_event_current(event, source, session_id=session_entry.session_id)):
+             return
++        if getattr(source, '_friday_user_scope', None) is not None:
++            source._friday_document_session_id = session_entry.session_id
+         return source, session_entry, session_key
+ 
+     async def _hmwa_heal_telegram_topic_binding(self, source, session_entry, session_key):
+@@ -2318,10 +2322,11 @@
+         scope-aware ``TERMINAL_DOCKER_VOLUMES``; without this a secondary's ``MEDIA:/output/x.png``
+         resolves against the default profile's sandbox and mounts (#109024). No secret hydration:
+         path validation reads no credentials and this runs on the event loop."""
++        from hermes_cli.friday_user_scope import native_source_scope
+         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+-            return nullcontext()
++            return native_source_scope(source, nullcontext())
+         from gateway.run import _profile_runtime_scope
+-        return _profile_runtime_scope(self._resolve_profile_home_for_source(source), {})
++        return native_source_scope(source, _profile_runtime_scope(self._resolve_profile_home_for_source(source), {}))
+ 
+     def _reset_notice_session_info(self, source: SessionSource) -> str:
+         """Session-info block for the auto-reset notice, resolved inside the profile serving ``source``.
+diff --git a/hermes_cli/friday_user_scope.py b/hermes_cli/friday_user_scope.py
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -16,6 +16,7 @@
+ from hermes_cli.friday_product_access import principal_id, profile_name, text
+ 
+ _CURRENT = ContextVar('friday_authenticated_user_scope', default=None)
++_SOURCE = ContextVar('friday_authenticated_file_source', default=None)
+ _ENGAGED = False
+ _DELEGATION = ContextVar('friday_native_delegation', default=None)
+ MARKER = '.friday-user-scope.json'
+@@ -276,10 +277,12 @@
+         parent.check()
+     cap.check()
+     token = _CURRENT.set(cap)
++    source_token = _SOURCE.set(source)
+     try:
+         check_database(cap)
+         yield cap
+     finally:
++        _SOURCE.reset(source_token)
+         _CURRENT.reset(token)
+ 
+ 
+@@ -726,7 +729,7 @@
+     parts = path.parts
+     if not parts or any(p in ('.', '..') or p.startswith('.') for p in parts):
+         raise ScopeDenied()
+-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++    fd = _workspace_directory(cap)
+     try:
+         for component in parts[:-1]:
+             next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+@@ -752,7 +755,7 @@
+                 raise ScopeDenied()
+             content = '\n'.join(f'{n+1}: {s}' for n,s in enumerate(lines) if offset-1 <= n < offset-1+limit)[:100000]
+             return json.dumps({'success': True, 'content': content, 'total_lines': len(lines),
+-                               'path': str(path), 'scope': 'own_user_workspace'})
++                               'path': str(root / path), 'scope': 'own_user_workspace'})
+         if name != 'write_file':
+             raise ScopeDenied()
+         content = args.get('content')
+@@ -764,7 +767,7 @@
+         with os.fdopen(item, 'w', encoding='utf-8') as f:
+             f.write(content); f.flush(); os.fsync(f.fileno())
+         cap.check()
+-        return json.dumps({'success': True, 'path': str(path), 'bytes_written': len(content.encode()),
++        return json.dumps({'success': True, 'path': str(root / path), 'bytes_written': len(content.encode()),
+                            'scope': 'own_user_workspace', 'create_only': True})
+     except (OSError, ValueError):
+         raise ScopeDenied() from None
+@@ -865,3 +868,103 @@
+         if gateway.get('multiplex_profiles') is not True:
+             raise ScopeDenied()
+         return parse_profile_routes(gateway.get('profile_routes', []))
++
++
++def ordinary_file_source():
++    """Current admitted native source; unmanaged profiles retain native behavior."""
++    cap = ordinary_file_scope()
++    if cap is None:
++        return None
++    source = _SOURCE.get()
++    if source is None or not _same_scope(getattr(source, '_friday_user_scope', None), cap):
++        raise ScopeDenied()
++    return source
++
++
++def workspace_document(raw, *, max_bytes=1000000):
++    """Snapshot a private own-workspace file without following any path symlink.
++
++    Callers send these immutable bytes, never reopen the model-selected pathname.
++    Before/after descriptor and named identity checks reject concurrent mutation.
++    """
++    cap = current(required=True)
++    if not isinstance(raw, str) or not raw or '\x00' in raw:
++        raise ScopeDenied()
++    root = cap.home / 'workspace'
++    path = Path(raw)
++    if not path.is_absolute():
++        raise ScopeDenied()
++    try:
++        relative = path.relative_to(root)
++    except ValueError:
++        raise ScopeDenied() from None
++    parts = relative.parts
++    if not parts or any(c in ('.', '..') or c.startswith('.') for c in parts):
++        raise ScopeDenied()
++    parent = _workspace_directory(cap)
++    item = None
++    def identity(info):
++        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
++                info.st_ctime_ns, info.st_mode, info.st_nlink, info.st_uid)
++    try:
++        for component in parts[:-1]:
++            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
++            os.close(parent); parent = child
++            st = os.fstat(parent)
++            if st.st_uid != _owner_uid() or st.st_mode & 0o077:
++                raise ScopeDenied()
++        item = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
++        before = os.fstat(item)
++        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
++                or before.st_uid != _owner_uid() or before.st_mode & 0o077
++                or before.st_size > max_bytes):
++            raise ScopeDenied()
++        pieces, size = [], 0
++        while chunk := os.read(item, min(65536, max_bytes-size+1)):
++            pieces.append(chunk); size += len(chunk)
++            if size > max_bytes:
++                raise ScopeDenied()
++        after = os.fstat(item)
++        named = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
++        if size != before.st_size or identity(before) != identity(after) or identity(after) != identity(named):
++            raise ScopeDenied()
++        cap.check()
++        return b''.join(pieces), str(relative)
++    except (OSError, ValueError):
++        raise ScopeDenied() from None
++    finally:
++        if item is not None: os.close(item)
++        os.close(parent)
++
++
++def _workspace_directory(cap):
++    """Pin the admitted home inode before opening its workspace by descriptor."""
++    home = os.open(cap.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++    try:
++        before = os.fstat(home)
++        if (before.st_dev, before.st_ino) != cap.directory_identity:
++            raise ScopeDenied()
++        _private(cap.home, directory=True)
++        workspace = os.open('workspace', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=home)
++        info = os.fstat(workspace)
++        if not stat.S_ISDIR(info.st_mode) or info.st_uid != _owner_uid() or info.st_mode & 0o077:
++            os.close(workspace)
++            raise ScopeDenied()
++        return workspace
++    finally:
++        os.close(home)
++
++
++def ordinary_file_scope():
++    """Narrow media seam: preserve unmanaged profiles in a mixed gateway.
++
++    An active managed policy without an admitted native source still refuses;
++    another profile's earlier admission cannot grant or remove legacy authority.
++    """
++    cap = _CURRENT.get()
++    if cap is not None:
++        return cap.check()
++    from hermes_constants import get_hermes_home
++    if policy(get_hermes_home()) is not None:
++        raise ScopeDenied()
++    return None
+diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -5375,6 +5375,18 @@
+         self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
+         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
+         """Send a document/file natively as a Telegram file attachment."""
++        from hermes_cli.friday_user_scope import ordinary_file_source, ScopeDenied
++        try:
++            source = ordinary_file_source()
++        except ScopeDenied:
++            return SendResult(success=False, error="gateway_document_route_rejected")
++        if source is not None:
++            from gateway.run_plugin_delivery import deliver_ordinary_document
++            if (str(chat_id) != source.chat_id
++                    or reply_to not in (None, source.message_id)
++                    or self._metadata_thread_id(metadata) != source.thread_id):
++                return SendResult(success=False, error="gateway_document_route_rejected")
++            return await deliver_ordinary_document(self, source, file_path, caption=caption, file_name=file_name)
+         return await self._send_local_file(
+             "File", file_path, chat_id, reply_to, metadata, "document",
+             lambda f: {"document": f, "filename": file_name or os.path.basename(file_path), "caption": self._caption_1024(caption)},

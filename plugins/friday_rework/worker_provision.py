@@ -127,9 +127,15 @@ def preparation(home, profile, worker, reference, *, private_check=None):
         private_check = scope._private
     private_check(p.path)
     v = json.loads(p.read())
-    if (not isinstance(v, dict) or set(v) != {'runtime', 'inputs', 'principal_binding_sha256', 'generation', 'state', 'unobserved'}
+    fields={'runtime', 'inputs', 'principal_binding_sha256', 'generation', 'state', 'unobserved'}
+    if (not isinstance(v, dict) or set(v) not in (fields,fields|{'attachment'})
             or v['state'] != 'PREPARED_RUNTIME_UNOBSERVED'):
         raise HostUnavailable('invalid_worker_preparation')
+    if 'attachment' in v:
+        attachment=_pin(v['attachment'])
+        if attachment.path!=home / 'workers/attachment.json':
+            raise HostUnavailable('foreign_worker_attachment')
+        private_check(attachment.path); attachment.read()
     c, root = own_runtime(home, profile, worker, v['runtime'])
     for f in v['inputs']:
         q = _pin(f)

@@ -286,8 +286,12 @@ def onboarding_worker_configure(body: WorkerConfigure, profile: str, session=Dep
     return call(_admin.onboarding_worker_configure, profile, session=session, **body.model_dump())
 
 
+class WorkersPrepare(OnboardingActivate):
+    template: str | None = Field(default=None, min_length=1, max_length=64)
+
+
 @router.post('/onboarding/workers/prepare')
-def onboarding_workers_prepare(body: OnboardingActivate, profile: str, session=Depends(require_admin)):
+def onboarding_workers_prepare(body: WorkersPrepare, profile: str, session=Depends(require_admin)):
     return call(_admin.onboarding_workers_prepare, profile, session=session, **body.model_dump())
 
 

@@ -21,6 +21,7 @@ from .associations import Associations, _sync_directory
 RESOURCE = Path(__file__).parent
 SOUL_SHA256 = 'b00cf7a17bb5c0e8b9bb4df66992f9cdd854f148ccdaed3be2ffff403aaf9311'
 IDENTITY = ('platform', 'transport_profile', 'account_id', 'user_id')
+WORKER_ATTACHMENT = 'workers/attachment.json'
 
 
 def digest(path):
@@ -340,6 +341,7 @@ class Onboarding:
             if not isinstance(plans, dict): raise ValueError('invalid_onboarding_templates')
             pending = self.pending(root, profile)
             return {'config_sha256': digest(root / 'config.yaml'), 'templates': sorted(plans), 'pending': pending,
+                    'worker_templates': sorted(k for k,v in plans.items() if v.get('worker_inputs',{}).get('workers')),
                     'state': 'INSTALLATION_INPUT_MISSING' if not plans else 'EXPLICIT_NATIVE_TEMPLATES',
                     'credentials': 'NEW_PROFILE_NATIVE_SECRET_CAPTURE_ONLY'}
 
@@ -352,7 +354,7 @@ class Onboarding:
         for binding in active['bindings']:
             if binding['transport_profile'] != profile: continue
             key = principal_id(*(binding[k] for k in IDENTITY)); user = users.get(key)
-            if not user or user['enabled']: continue
+            if not user: continue
             home = get_default_hermes_root(home=root) / 'profiles' / binding['runtime_profile']
             if not (home / scope.ONBOARDING).exists():
                 result.append({'principal_id': key, 'runtime_profile': binding['runtime_profile'],
@@ -366,8 +368,9 @@ class Onboarding:
                 continue
             result.append({**{k: binding[k] for k in IDENTITY}, 'runtime_profile': binding['runtime_profile'],
                 'principal_id': key, 'template': proof['template'], 'generation': user['generation'],
-                'required_names': proof['required_secrets'], 'enabled': False,
-                'state': 'DISABLED_SETUP_PENDING', 'recoverable': True, 'config_sha256': digest(root / 'config.yaml')})
+                'required_names': proof['required_secrets'], 'enabled': user['enabled'],
+                'state': 'ADMITTED_WORKER_SETUP_AVAILABLE' if user['enabled'] else 'DISABLED_SETUP_PENDING',
+                'recoverable': True, 'config_sha256': digest(root / 'config.yaml')})
             if binding['platform'] == 'cli': result[-1]['uid'] = _cli_admission(root, binding)['uid']
             from hermes_cli.config import require_readable_config_before_write
             result[-1].update(self._worker_summary(home,binding,user['generation'],proof,
@@ -508,7 +511,23 @@ class Onboarding:
         with self.transaction(profile, expected_config_sha256, session) as (root, access, config):
             state = access.state
             home, binding, row, proof = self._prepared(root, state, platform, transport_profile, account_id, user_id, generation)
-            if row['enabled'] or (home / scope.MARKER).exists() or name not in proof['required_secrets']:
+            def staged_credential_names():
+                from .worker_provision import preparation, pin
+                attachment=self._worker_attachment(root,home,binding,generation,proof,config)
+                for kind in ('dsh','a0'):
+                    prepared,c=preparation(home,binding['runtime_profile'],kind,
+                        pin(home / 'workers' / kind / 'runtime-input.json'))
+                    if (prepared.get('attachment')!=pin(home / WORKER_ATTACHMENT)
+                            or prepared['generation']!=generation
+                            or prepared['principal_binding_sha256']!=scope._fingerprint(binding)
+                            or c!=attachment['runtimes'][kind]):
+                        raise PermissionError('worker_credential_preparation_changed')
+                return attachment['required_names']
+            if row['enabled']:
+                from agent.secret_scope import load_env_file
+                if name not in staged_credential_names() or load_env_file(home / '.env').get(name):
+                    raise PermissionError('only_missing_staged_worker_credential_capture_allowed')
+            elif (home / scope.MARKER).exists() or name not in proof['required_secrets']:
                 raise PermissionError('pending_scoped_credential_capture_required')
             if not isinstance(value, str) or not value.strip() or len(value) > 8192:
                 raise ValueError('invalid_scoped_credential')
@@ -519,6 +538,8 @@ class Onboarding:
             with config_write_transaction(home / 'config.yaml'), _env_write_lock(path):
                 self._verify_operator(profile, session)
                 self._prepared(root, state, platform, transport_profile, account_id, user_id, generation)
+                if row['enabled'] and (name not in staged_credential_names() or load_env_file(path).get(name)):
+                    raise PermissionError('only_missing_staged_worker_credential_capture_allowed')
                 with scope.authority(home):
                     # Empty local scope prevents the native lifecycle from borrowing
                     # the process's current provider credential during capture.
@@ -533,11 +554,13 @@ class Onboarding:
                     try:
                         if get_secret(name) != value: raise RuntimeError('scoped_secret_write_unconfirmed')
                     finally: reset_secret_scope(token)
-            return {'state': 'DISABLED_SETUP_PENDING', 'recorded': True, 'enabled': False,
+            return {'state': 'ADMITTED_WORKER_SETUP_PENDING' if row['enabled'] else 'DISABLED_SETUP_PENDING',
+                'recorded': True, 'enabled': row['enabled'],
                 **self._worker_summary(home,binding,generation,proof,config)}
 
     def prepare_worker(self, profile, *, session=None, expected_config_sha256, generation, platform,
-                       transport_profile, account_id, user_id, worker, runtime, a0_network=None, _declared_files=None):
+                       transport_profile, account_id, user_id, worker, runtime, a0_network=None, _declared_files=None,
+                       _attachment=None):
         """Operator-only source/config preparation for one disabled own profile.
 
         Exactly one fresh worker input tree, no adoption/retry of partial writes.
@@ -545,9 +568,17 @@ class Onboarding:
         """
         if transport_profile != profile: raise PermissionError('receiving_transport_authority_required')
         from .worker_provision import prepare_inputs, pin
-        with self.transaction(profile, expected_config_sha256, session) as (root, access, _):
+        with self.transaction(profile, expected_config_sha256, session) as (root, access, root_config):
             home, binding, row, proof = self._prepared(root, access.state, platform, transport_profile, account_id, user_id, generation)
-            if row['enabled'] or (home / scope.MARKER).exists():
+            if row['enabled']:
+                if _attachment is None:
+                    raise PermissionError('explicit_reviewed_worker_attachment_required')
+                attachment=self._worker_attachment(root,home,binding,generation,proof,root_config)
+                if _attachment!=pin(home / WORKER_ATTACHMENT) or runtime!=attachment['runtimes'].get(worker):
+                    raise PermissionError('explicit_reviewed_worker_attachment_required')
+                if a0_network!=(attachment['a0_network'] if worker=='a0' else None):
+                    raise PermissionError('worker_attachment_network_changed')
+            elif (home / scope.MARKER).exists() or _attachment is not None:
                 raise PermissionError('disabled_fresh_worker_setup_required')
             from hermes_cli.config import require_readable_config_before_write, config_write_transaction
             with scope.authority(home), config_write_transaction(home / 'config.yaml'):
@@ -575,12 +606,19 @@ class Onboarding:
                 candidate = dict(runtime=c, inputs=[pin(p) for p in files],
                     principal_binding_sha256=scope._fingerprint(binding), generation=generation,
                     state='PREPARED_RUNTIME_UNOBSERVED', unobserved=unobserved)
+                if row['enabled']: candidate['attachment']=_attachment
                 path = directory / 'runtime-input.json'
                 self._verify_operator(profile, session)
                 _new_file(path, (json.dumps(candidate, sort_keys=True, indent=2) + '\n').encode())
                 # Same existing protected scoped credential capture, no key copy.
                 # No new receipt/schema or activation marker is produced.
                 updated = dict(proof, required_secrets=list(dict.fromkeys(proof['required_secrets'] + names)))
+                if row['enabled']:
+                    # Staging must leave the admitted ordinary receipt/marker
+                    # byte-identical; worker names enter admission only at commit.
+                    return {'state':'PREPARED_RUNTIME_UNOBSERVED','enabled':True,
+                        'worker':worker,'preparation':pin(path),'runtime':c,
+                        'required_names':attachment['required_names'],'unobserved':unobserved}
                 previous_sha = digest(home / scope.ONBOARDING)
                 if json.loads((home / scope.ONBOARDING).read_text()) != proof:
                     raise PermissionError('prepared_home_changed')
@@ -599,6 +637,53 @@ class Onboarding:
                     'worker': worker, 'preparation': pin(path), 'runtime': c,
                     'required_names': updated['required_secrets'], 'unobserved': unobserved}
 
+    def _admitted_worker_home(self, root, home, binding, generation, proof):
+        """Narrow ordinary-first transition; never adopt worker state."""
+        from hermes_cli.config import require_readable_config_before_write
+        with scope.authority(root):
+            _,current,row,current_proof=self._prepared(root,self.admin._state(),
+                *(binding[k] for k in IDENTITY),generation)
+            if not row['enabled'] or current!=binding or current_proof!=proof:
+                raise PermissionError('admitted_ordinary_worker_attachment_required')
+            scope.check_onboarding_home(root,home,binding)
+            if not self._native_grant(root,binding): raise PermissionError('native_grant_revoked')
+        own=require_readable_config_before_write(home / 'config.yaml')
+        scope._private(home / scope.MARKER)
+        marker=json.loads((home / scope.MARKER).read_text())
+        if marker!={'schema':'friday.user-home.v1','principal':principal_id(*(binding[k] for k in IDENTITY)),
+                'profile':binding['runtime_profile'],'binding_sha256':scope._fingerprint(binding),
+                'onboarding_sha256':digest(home / scope.ONBOARDING)}:
+            raise PermissionError('managed_setup_marker_changed')
+        settings=own['plugins']['entries']['friday_rework']['settings']
+        if settings['runtime']!={'enabled':False} or settings.get('worker_requirements'):
+            raise PermissionError('ordinary_worker_free_home_required')
+        with scope.authority(home):
+            from hermes_cli.plugins_state import PluginState
+            if Associations(PluginState('friday_rework')).snapshot():
+                raise PermissionError('existing_worker_associations_require_reconciliation')
+        return own
+
+    def _worker_attachment(self,root,home,binding,generation,proof,root_config):
+        from .worker_provision import pin
+        self._admitted_worker_home(root,home,binding,generation,proof)
+        path=home / WORKER_ATTACHMENT
+        if not path.exists() and not path.is_symlink():
+            raise PermissionError('explicit_reviewed_worker_attachment_required')
+        scope._private(path); attachment=json.loads(path.read_text())
+        plans=root_config['plugins']['entries']['friday_rework']['settings']['onboarding']['templates']
+        template=plans[attachment['template']]
+        if (set(attachment)!={'template','template_sha256','installation_config_sha256','config_sha256',
+                'proof','marker','binding_sha256','generation','runtimes','a0_network','required_names'}
+                or attachment['template_sha256']!=scope._fingerprint(template)
+                or attachment['installation_config_sha256']!=digest(root / 'config.yaml')
+                or attachment['config_sha256']!=proof['config_sha256']
+                or attachment['proof']!=pin(home / scope.ONBOARDING)
+                or attachment['marker']!=pin(home / scope.MARKER)
+                or attachment['binding_sha256']!=scope._fingerprint(binding)
+                or attachment['generation']!=generation or set(attachment['runtimes'])!={'dsh','a0'}):
+            raise PermissionError('worker_attachment_changed_reconciliation_required')
+        return attachment
+
     def _worker_summary(self, home, binding, generation, proof, root_config):
         """Bounded protected-file inspection; no native probe or resubmission."""
         from . import user_worker_join as join
@@ -610,7 +695,26 @@ class Onboarding:
         result = {'required_workers':['dsh','a0'] if required else [], 'workers':{},
             'can_prepare_workers':False,'can_qualify_workers':False,'can_activate':not required,
             'worker_execution':'BOTH_REQUIRED_WORKERS_PENDING' if required else 'DISABLED_EXPLICIT_INSTALLATION_INPUT'}
-        if not required: return result
+        attaching=False
+        if not required:
+            root=Path(proof['authorization_home'])
+            if not (home / scope.MARKER).exists(): return result
+            result.update(can_activate=False,can_attach_workers=False,worker_attachment=True)
+            try:
+                path=home / WORKER_ATTACHMENT
+                if not path.exists() and not path.is_symlink():
+                    self._admitted_worker_home(root,home,binding,generation,proof)
+                    result['can_attach_workers']=not (home / 'workers').exists() and not (home / 'workers').is_symlink()
+                    return result
+                attachment=self._worker_attachment(root,home,binding,generation,proof,root_config)
+                from agent.secret_scope import load_env_file
+                local=load_env_file(home / '.env')
+                result.update(required_workers=['dsh','a0'],required_names=attachment['required_names'],
+                    capture_names=[n for n in attachment['required_names'] if not local.get(n)])
+                attaching=True
+            except (OSError,ValueError,PermissionError,RuntimeError,KeyError,TypeError):
+                result['worker_execution']='QUALIFICATION_OR_SETUP_REQUIRES_RECONCILIATION_NO_REPLAY'
+                return result
         present = []
         with scope.authority(home):
             runtime=require_readable_config_before_write(home / 'config.yaml')['plugins']['entries']['friday_rework']['settings']['runtime']
@@ -623,6 +727,8 @@ class Onboarding:
                         v,c=preparation(home,binding['runtime_profile'],kind,pin(directory / 'runtime-input.json'))
                         if v['generation']!=generation or v['principal_binding_sha256']!=scope._fingerprint(binding):
                             raise PermissionError('foreign_worker_preparation')
+                        if attaching and c!=attachment['runtimes'][kind]:
+                            raise PermissionError('worker_attachment_runtime_changed')
                         state='PREPARED_RUNTIME_UNOBSERVED'; present.append(kind)
                         if kind in rows:
                             check_runtime(rows[kind],Associations(PluginState('friday_rework')))
@@ -634,11 +740,11 @@ class Onboarding:
             partial = any(x['state']=='RECONCILIATION_REQUIRED' for x in result['workers'].values())
             folder=home / join.FOLDER
             attempted=folder.exists() or folder.is_symlink()
-            result['can_prepare_workers']=not present and not partial and not attempted
+            result['can_prepare_workers']=not attaching and not present and not partial and not attempted
             result['can_activate']=all(x['qualified'] for x in result['workers'].values())
             bootstrap=home / 'workers/a0/bootstrap'
             probe_attempted=bootstrap.exists() or bootstrap.is_symlink() or (home / join.PLAN).exists() or (home / join.PLAN).is_symlink()
-            result['can_qualify_workers']=len(present)==2 and not partial and not attempted and not probe_attempted
+            result['can_qualify_workers']=len(present)==2 and not partial and not attempted and not probe_attempted and not result.get('capture_names')
             if result['can_activate']:
                 result['worker_execution']='OWN_DEPLOYMENTS_QUALIFIED_LIVE_JOURNEYS_NOT_RUN'
                 try:
@@ -658,41 +764,66 @@ class Onboarding:
         if transport_profile!=profile: raise PermissionError('receiving_transport_authority_required')
         with self.transaction(profile,expected_config_sha256,session) as (root,access,config):
             home,binding,row,proof=self._prepared(root,access.state,platform,transport_profile,account_id,user_id,generation)
-            return {'state':'DISABLED_SETUP_PENDING','enabled':row['enabled'],'generation':generation,
+            summary=self._worker_summary(home,binding,generation,proof,config)
+            complete=summary['required_workers']==['dsh','a0'] and all(v['qualified'] for v in summary['workers'].values())
+            return {'state':('ADMITTED_BOTH_WORKERS_ATTACHED' if complete else 'ADMITTED_WORKER_SETUP_PENDING') if row['enabled'] else 'DISABLED_SETUP_PENDING',
+                'enabled':row['enabled'],'generation':generation,
                 'config_sha256':digest(root / 'config.yaml'),'required_names':proof['required_secrets'],
-                **self._worker_summary(home,binding,generation,proof,config)}
+                **summary}
 
     def prepare_workers(self, profile, *, session=None, expected_config_sha256, generation, platform,
-                        transport_profile, account_id, user_id):
+                        transport_profile, account_id, user_id, template=None):
         """Normal UI producer: derive both plans from the approved installation."""
         if transport_profile!=profile: raise PermissionError('receiving_transport_authority_required')
         from . import user_worker_join as join
-        from .worker_provision import prepare_inputs
+        from .worker_provision import prepare_inputs, pin
         from hermes_cli.config import require_readable_config_before_write, config_write_transaction
         values=dict(session=session,expected_config_sha256=expected_config_sha256,generation=generation,
             platform=platform,transport_profile=transport_profile,account_id=account_id,user_id=user_id)
         with self.transaction(profile,expected_config_sha256,session) as (root,access,config):
             home,binding,row,proof=self._prepared(root,access.state,platform,transport_profile,account_id,user_id,generation)
-            if row['enabled'] or (home / scope.MARKER).exists() or (home / scope.MARKER).is_symlink():
+            attaching=row['enabled']
+            if attaching:
+                self._admitted_worker_home(root,home,binding,generation,proof)
+                if not template: raise PermissionError('explicit_reviewed_worker_template_required')
+                if (home / 'workers').exists() or (home / 'workers').is_symlink():
+                    return {'state':'ADMITTED_WORKER_SETUP_REQUIRES_INSPECTION','enabled':True,
+                        **self._worker_summary(home,binding,generation,proof,config)}
+            elif (home / scope.MARKER).exists() or (home / scope.MARKER).is_symlink() or template is not None:
                 raise PermissionError('disabled_fresh_worker_setup_required')
             summary=self._worker_summary(home,binding,generation,proof,config)
-            if not summary['can_prepare_workers']:
+            if not attaching and not summary['can_prepare_workers']:
                 return {'state':'DISABLED_WORKER_SETUP_REQUIRES_INSPECTION','enabled':False,**summary}
-            inputs=config['plugins']['entries']['friday_rework']['settings']['onboarding']['templates'][proof['template']].get('worker_inputs')
+            selected=config['plugins']['entries']['friday_rework']['settings']['onboarding']['templates'][template if attaching else proof['template']]
+            validate_template(selected)
+            inputs=selected.get('worker_inputs')
             if not inputs or not inputs.get('workers'):
-                return {'state':'DISABLED_INSTALLATION_WORKER_INPUTS_MISSING','enabled':False,**summary}
+                return {'state':'INSTALLATION_WORKER_INPUTS_MISSING','enabled':row['enabled'],**summary}
             with scope.authority(home), config_write_transaction(home / 'config.yaml'):
                 own=require_readable_config_before_write(home / 'config.yaml')
                 runtimes,network,(policy_path,policy_bytes)=join.derive_inputs(home,binding['runtime_profile'],inputs,own)
                 # Check the entire coherent package before the first write.
+                names=list(proof['required_secrets'])
                 for kind,c in runtimes.items():
-                    prepare_inputs(home,binding['runtime_profile'],kind,c,own,
+                    _,_,_,worker_names,_=prepare_inputs(home,binding['runtime_profile'],kind,c,own,
                         a0_network=network if kind=='a0' else None,
                         declared_files={policy_path:policy_bytes} if kind=='dsh' else None)
+                    names.extend(worker_names)
+                attachment=None
+                if attaching:
+                    (home / 'workers').mkdir(mode=0o700)
+                    declaration=dict(template=template,template_sha256=scope._fingerprint(selected),
+                        installation_config_sha256=expected_config_sha256,config_sha256=proof['config_sha256'],
+                        proof=pin(home / scope.ONBOARDING),marker=pin(home / scope.MARKER),
+                        binding_sha256=scope._fingerprint(binding),generation=generation,
+                        runtimes=runtimes,a0_network=network,required_names=list(dict.fromkeys(names)))
+                    self._verify_operator(profile,session)
+                    _new_file(home / WORKER_ATTACHMENT,(json.dumps(declaration,sort_keys=True)+'\n').encode())
+                    attachment=pin(home / WORKER_ATTACHMENT)
         for kind in ('dsh','a0'):
             self.prepare_worker(profile,**values,worker=kind,runtime=runtimes[kind],
                 a0_network=network if kind=='a0' else None,
-                _declared_files={policy_path:policy_bytes} if kind=='dsh' else None)
+                _declared_files={policy_path:policy_bytes} if kind=='dsh' else None,_attachment=attachment)
         return self.workers_state(profile,**values)
 
     def qualify_workers(self, profile, *, session=None, expected_config_sha256, generation, platform,
@@ -712,7 +843,11 @@ class Onboarding:
         from hermes_cli.plugins_state import PluginState
         with self.transaction(profile,expected_config_sha256,session) as (root,access,config):
             home,binding,row,proof=self._prepared(root,access.state,platform,transport_profile,account_id,user_id,generation)
-            if row['enabled'] or (home / scope.MARKER).exists() or (home / scope.MARKER).is_symlink():
+            attaching=row['enabled']
+            attachment=None
+            if attaching:
+                attachment=self._worker_attachment(root,home,binding,generation,proof,config)
+            elif (home / scope.MARKER).exists() or (home / scope.MARKER).is_symlink():
                 raise PermissionError('disabled_fresh_worker_setup_required')
             scope.check_onboarding_home(root,home,binding)
             if not self._native_grant(root, binding):
@@ -720,36 +855,54 @@ class Onboarding:
             with scope.authority(home),config_write_transaction(home / 'config.yaml'):
                 own=require_readable_config_before_write(home / 'config.yaml')
                 if own['plugins']['entries']['friday_rework']['settings']['runtime']!={'enabled':False}:
-                    return {'state':'DISABLED_WORKER_SETUP_REQUIRES_INSPECTION','enabled':False,
+                    return {'state':'WORKER_SETUP_REQUIRES_INSPECTION','enabled':row['enabled'],
                         **self._worker_summary(home,binding,generation,proof,config)}
+                if attaching:
+                    from agent.secret_scope import load_env_file
+                    local=load_env_file(home / '.env')
+                    if any(not local.get(n) for n in attachment['required_names']):
+                        return {'state':'ADMITTED_WORKER_SCOPED_KEYS_PENDING','enabled':True,
+                            **self._worker_summary(home,binding,generation,proof,config)}
                 prepared={k:pin(home / 'workers' / k / 'runtime-input.json') for k in ('dsh','a0')}
                 for k,ref in prepared.items():
                     v,c=preparation(home,binding['runtime_profile'],k,ref)
                     if v['generation']!=generation or v['principal_binding_sha256']!=scope._fingerprint(binding):
                         raise PermissionError('foreign_or_revoked_worker_preparation')
+                    if attaching and (c!=attachment['runtimes'][k] or v.get('attachment')!=pin(home / WORKER_ATTACHMENT)):
+                        raise PermissionError('worker_attachment_runtime_changed')
                 def verify():
                     with scope.authority(root):
                         self._verify_operator(profile,session)
                         self._prepared(root,access.state,platform,transport_profile,account_id,user_id,generation)
+                        if digest(root / 'config.yaml')!=expected_config_sha256:
+                            raise PermissionError('onboarding_config_conflict_reload')
                         scope.check_onboarding_home(root,home,binding)
                         if not self._native_grant(root, binding): raise PermissionError('native_grant_revoked')
+                        if attaching:
+                            if self._worker_attachment(root,home,binding,generation,proof,config)!=attachment:
+                                raise PermissionError('worker_attachment_changed_reconciliation_required')
                 try: runtimes=join.qualify(home,binding,generation,prepared,verify=verify,
                     accepted_monotonic=accepted_monotonic)
                 except HostUnavailable as exc:
                     from .a0_bootstrap import PrerequisitePending
                     if isinstance(exc,PrerequisitePending):
-                        return {'state':'DISABLED_OWN_A0_NATIVE_PREREQUISITES_PENDING','enabled':False,
+                        return {'state':'ADMITTED_OWN_A0_NATIVE_PREREQUISITES_PENDING' if attaching else 'DISABLED_OWN_A0_NATIVE_PREREQUISITES_PENDING',
+                            'enabled':row['enabled'],
                             **self._worker_summary(home,binding,generation,proof,config)}
                     raise
                 for c in runtimes.values():
                     verify(); check_runtime(c,Associations(PluginState('friday_rework')))
                     join.deployment_health(c,binding=binding,generation=generation)
                 own['plugins']['entries']['friday_rework']['settings']['runtime']={'enabled':True,'workers':runtimes}
-                edit=prepare_admin_config_edit(home,own)
+                if attaching:
+                    own['plugins']['entries']['friday_rework']['settings']['worker_requirements']=['dsh','a0']
+                edit=prepare_admin_config_edit(home,own,
+                    required_secrets=attachment['required_names'] if attaching else None)
                 verify(); atomic_config_write(home / 'config.yaml',own)
                 self._verify_operator(profile,session); finish_admin_config_edit(home,edit)
                 updated=json.loads((home / scope.ONBOARDING).read_text())
-                return {'state':'CONFIGURED_NATIVE_ACTIVATION_REQUIRED','enabled':False,
+                return {'state':'ADMITTED_BOTH_WORKERS_ATTACHED' if attaching else 'CONFIGURED_NATIVE_ACTIVATION_REQUIRED',
+                    'enabled':row['enabled'],
                     'config_sha256':digest(root / 'config.yaml'),'required_names':updated['required_secrets'],
                     **self._worker_summary(home,binding,generation,updated,config)}
 
@@ -873,7 +1026,7 @@ class Onboarding:
                         'worker_execution': 'SOURCE_RUNTIME_VERIFIED_LIVE_NOT_RUN' if runtime.get('enabled') is True else 'DISABLED_EXPLICIT_INSTALLATION_INPUT'}
 
 
-def prepare_admin_config_edit(home, candidate):
+def prepare_admin_config_edit(home, candidate, *, required_secrets=None):
     """Validate a managed setup before an authorized native config edit.
 
     Old homes retain their existing contract. A managed home cannot lose its
@@ -927,6 +1080,10 @@ def prepare_admin_config_edit(home, candidate):
                 if (set(configured_runtimes(runtime))!={'dsh','a0'} or
                         candidate['plugins']['entries']['friday_rework']['settings'].get('worker_requirements')!=['dsh','a0']):
                     raise PermissionError('managed_profile_requires_both_workers')
+    if required_secrets is not None:
+        if not set(proof['required_secrets'])<=set(required_secrets):
+            raise PermissionError('managed_setup_required_credentials_cannot_drop')
+        proof=dict(proof,required_secrets=required_secrets)
     validate_template({'config': candidate, 'tools': binding['tools'],
                        'required_secrets': proof['required_secrets']})
     return {'proof': proof, 'receipt_sha256': digest(receipt), 'marker': marker,

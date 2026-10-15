@@ -26,6 +26,7 @@
     const [setup, setSetup] = R.useState({platform: "telegram", account_id: "", user_id: "", runtime_profile: "", template: "", uid: ""});
     const [prepared, setPrepared] = R.useState(null), [secretName, setSecretName] = R.useState("");
     const [secretValue, setSecretValue] = R.useState("");
+    const [workerTemplate, setWorkerTemplate] = R.useState("");
     R.useEffect(() => { let active = true;
       fetchJSON(base + "/profiles").then(p => { if (active) { setProfiles(p); setProfile(p[0] || ""); } })
         .catch(() => { if (active) setError("Administrator access or native configuration unavailable."); });
@@ -84,11 +85,13 @@
           : {...identity, generation: prepared.generation};
         if (action === "prepare" && setup.platform === "cli") body.uid = uid;
         if (action === "credentials") body = {...body, name: secretName, value: secretValue};
+        if (action === "workers/prepare" && prepared.enabled) body.template = workerTemplate;
         const result = await fetchJSON(base + "/onboarding/" + action + "?" + new URLSearchParams({profile}), {
           method: action === "credentials" ? "PUT" : "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
         if (action === "prepare") { setPrepared(result); setSecretName((result.required_names || [])[0] || "");
           setProfiles(await fetchJSON(base + "/profiles")); }
-        else setPrepared({...prepared, ...result, setup_uncertain: false});
+        else {setPrepared({...prepared, ...result, setup_uncertain: false});
+          if (result.capture_names) setSecretName(result.capture_names[0] || "");}
       } catch (_) {
         setError("Setup write unconfirmed or refused. Inspect current native state before any further action.");
         if (prepared) setPrepared({...prepared, setup_uncertain: true, can_prepare_workers: false,
@@ -173,7 +176,7 @@
       control ? h("pre", {role: "status"}, JSON.stringify(control, null, 2)) : null,
       ["users", "pairing"].includes(view) ? h("p", null, "Select the receiving account profile for user access and pairing. Execution profiles do not own these controls.") : null,
       view === "onboarding" && data ? h("div", {"aria-label": "New private Friday profile"},
-        h("p", null, "Prepare a private profile and its required workers, capture scoped keys and approve native channel access. Check both workers before activation. Incomplete or uncertain setup stays disabled."),
+        h("p", null, "Prepare a private profile or add both workers to an admitted profile. Pending worker preparation preserves ordinary conversation. New full worker profiles require both workers before activation."),
         ...["platform", "account_id", "user_id", "runtime_profile"].map(k => h("label", {key: k}, k + " ",
           h("input", {value: setup[k], disabled: busy || !!prepared, maxLength: k.includes("profile") ? 64 : 512,
             onChange: e => setSetup({...setup, [k]: e.target.value})}))),
@@ -185,27 +188,33 @@
           ...data.templates.map(t => h("option", {key: t, value: t}, t)))),
         button("Prepare disabled profile", () => onboard("prepare"), {disabled: busy || !!prepared || !setup.template}),
         !prepared ? h("ul", null, ...(data.pending || []).map(row => h("li", {key: row.principal_id},
-          row.runtime_profile + ": " + row.state + " ", row.recoverable ? button("Continue existing disabled setup", () => {
+          row.runtime_profile + ": " + row.state + " ", row.recoverable ? button(row.enabled ? "Manage workers for admitted profile" : "Continue existing disabled setup", () => {
             setSetup({platform: row.platform, account_id: row.account_id, user_id: row.user_id,
               runtime_profile: row.runtime_profile, template: row.template, uid: row.uid === undefined ? "" : String(row.uid)}); setPrepared(row);
-            setSecretName((row.required_names || [])[0] || ""); setSecretValue("");
+            setSecretName((row.capture_names || row.required_names || [])[0] || ""); setSecretValue("");setWorkerTemplate("");
           }) : null))) : null,
         prepared ? h("div", null,
           h("p", {role: "status"}, prepared.state),
           prepared.worker_execution ? h("p", {role: "status"}, workerLabel(prepared.worker_execution)) : null,
           prepared.workers ? h("ul", null, ...Object.entries(prepared.workers).map(([name, status]) =>
             h("li", {key: name}, (name === "dsh" ? "Harness" : "A0") + ": " + workerLabel(status.state)))) : null,
-          (prepared.required_workers || []).length ? h("div", null,
+          prepared.can_attach_workers ? h("label", null, "Approved worker inputs ",
+            h("select", {value:workerTemplate,disabled:busy || prepared.setup_uncertain,
+              onChange:e => setWorkerTemplate(e.target.value)},h("option",{value:""},"Select"),
+              ...(data.worker_templates || []).map(t => h("option",{key:t,value:t},t))),
+            button("Attach both workers to this profile",() => onboard("workers/prepare"),
+              {disabled:busy || prepared.setup_uncertain || !workerTemplate})) : null,
+          ((prepared.required_workers || []).length || prepared.worker_attachment) ? h("div", null,
             button("Prepare required workers", () => onboard("workers/prepare"),
               {disabled: busy || prepared.enabled || prepared.setup_uncertain || !prepared.can_prepare_workers}),
             button("Prepare and check required workers", () => onboard("workers/qualify"),
-              {disabled: busy || prepared.enabled || prepared.setup_uncertain || !prepared.can_qualify_workers}),
-            button("Inspect worker setup", () => onboard("workers/state"), {disabled: busy || prepared.enabled})) : null,
-          h("select", {value: secretName, disabled: busy || prepared.enabled, onChange: e => setSecretName(e.target.value)},
-            ...(prepared.required_names || []).map(n => h("option", {key: n, value: n}, n))),
-          h("input", {type: "password", autoComplete: "new-password", value: secretValue, disabled: busy || prepared.enabled,
+              {disabled: busy || prepared.setup_uncertain || !prepared.can_qualify_workers}),
+            button("Inspect worker setup", () => onboard("workers/state"), {disabled: busy})) : null,
+          h("select", {value: secretName, disabled: busy || (prepared.enabled && !(prepared.capture_names || []).length), onChange: e => setSecretName(e.target.value)},
+            ...(prepared.capture_names || prepared.required_names || []).map(n => h("option", {key: n, value: n}, n))),
+          h("input", {type: "password", autoComplete: "new-password", value: secretValue, disabled: busy || (prepared.enabled && !(prepared.capture_names || []).length),
             "aria-label": "New profile scoped key", onChange: e => setSecretValue(e.target.value)}),
-          button("Store scoped key", () => onboard("credentials"), {disabled: busy || prepared.enabled || prepared.setup_uncertain || !secretName || !secretValue}),
+          button("Store scoped key", () => onboard("credentials"), {disabled: busy || (prepared.enabled && !(prepared.capture_names || []).length) || prepared.setup_uncertain || !secretName || !secretValue}),
           button("Activate complete profile", () => onboard("activate"), {disabled: busy || prepared.enabled || prepared.setup_uncertain ||
             ((prepared.required_workers || []).length > 0 && !prepared.can_activate)})) : null) : null,
       view === "users" && data ? h("ul", null, ...data.users.map(renderUser)) : null,
