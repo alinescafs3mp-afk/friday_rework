@@ -3,10 +3,12 @@ from pathlib import Path
 import pytest
 from hermes_cli import friday_dashboard_owner as owner,gateway,web_server as web
 from gateway import host_rendezvous as hr
+from hermes_cli import friday_product_access as access
 
 @pytest.mark.parametrize('fault',['none','missing_owner','no_lock','source','auth','host','port'])
 def test_startup_identity_fails_closed(monkeypatch,fault):
- boot={'host':'127.0.0.1','port':9119,'source':{'receipt':'a'}}
+ boot={'host':'127.0.0.1','port':9119,'source':{'receipt':'a'},'operator':{'provider':'basic','user_id':'operator','org_id':''}}
+ monkeypatch.setattr(access,'operator_allowed',lambda identity:identity==boot['operator'])
  app=types.SimpleNamespace(state=types.SimpleNamespace(friday_dashboard_owner=boot,auth_required=True,bound_host=boot['host']))
  monkeypatch.setattr(owner,'enabled',lambda:True)
  monkeypatch.setattr(hr,'owns_host_lock',lambda role:fault!='no_lock' and role==hr.ROLE_SERVE)
@@ -22,6 +24,22 @@ def test_startup_identity_fails_closed(monkeypatch,fault):
  if fault=='none':assert owner.startup_identity(app) is boot
  else:
   with pytest.raises((ValueError,AssertionError)):owner.startup_identity(app)
+
+@pytest.mark.parametrize('outcome',['deny','error'])
+def test_startup_identity_refuses_current_operator(monkeypatch,outcome):
+ boot={'host':'127.0.0.1','port':9119,'operator':{'provider':'basic','user_id':'operator','org_id':''}}
+ app=types.SimpleNamespace(state=types.SimpleNamespace(friday_dashboard_owner=boot,auth_required=True,bound_host=boot['host']))
+ monkeypatch.setattr(owner,'enabled',lambda:True)
+ monkeypatch.setattr(hr,'owns_host_lock',lambda role:role==hr.ROLE_SERVE)
+ monkeypatch.setattr(owner,'expected',lambda **kw:boot)
+ calls=[]
+ def current_policy(identity):
+  calls.append(identity)
+  if outcome=='error':raise RuntimeError('current policy unavailable')
+  return False
+ monkeypatch.setattr(access,'operator_allowed',current_policy)
+ with pytest.raises(RuntimeError if outcome=='error' else ValueError):owner.startup_identity(app)
+ assert calls==[boot['operator']]
 
 def test_legacy_startup_identity(monkeypatch):
  monkeypatch.setattr(owner,'enabled',lambda:False)

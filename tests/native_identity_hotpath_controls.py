@@ -22,7 +22,7 @@ import tempfile, hashlib, json, ast, importlib.util, contextvars, threading, tra
 from unittest.mock import patch
 started=time.monotonic(); results=[]; findings=[]
 PINS={'friday_dashboard_owner.py':'47a3bd9a23d7207756b51c1da90b36ba6c05fca5a710882633bba591cac45c9d','friday_gateway_owner.py':'b91dca50fdb6213b9852b1cbf080b3d7f592519f5d6f3ae8ca9d4a6c76c92a88','friday_product_access.py':'612d1416d566f6df33479a41e4e87e16d8ff3caf9c9eac07320dcb6a62863711'}
-if not OLD:PINS.update({'friday_dashboard_owner.py':'23e1c85e56f32ad075b206e0d282cd5c7c9b94a563f9bdb5427894ffc747402e','friday_gateway_owner.py':'1356b30f879de3b0b55ed083c5a9dd60b3f3f1ddc2c7e332268669135b439a23'})
+if not OLD:PINS.update({'friday_dashboard_owner.py':'4a891f8ec42d3e091370faa6557929c2270970242a51323623a9ff8a6990d6ff','friday_gateway_owner.py':'1356b30f879de3b0b55ed083c5a9dd60b3f3f1ddc2c7e332268669135b439a23'})
 def sha(b):return hashlib.sha256(b).hexdigest()
 def check(name, fn):
     t=time.monotonic()
