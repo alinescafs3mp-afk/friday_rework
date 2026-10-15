@@ -15,6 +15,8 @@ import stat
 
 MANIFEST = 'patches/hermes/ordinary-telegram-manifest.json'
 TRANSACTION = 'preparation/ordinary-gateway'
+UPDATE_MANIFEST = 'patches/hermes/ordinary-native-repair-manifest.json'
+UPDATE_FILES = {'hermes_cli/friday_dashboard_owner.py', 'hermes_cli/friday_credential_admission.py'}
 
 
 def api():
@@ -77,6 +79,7 @@ def inputs(request, budget):
     original = budget.call(f.read_json, paths['installation_input'])
     f.require({k:v for k,v in original.items() if k != 'project_files'} ==
         {k:v for k,v in previous.items() if k != 'project_files'}, 'ordinary_original_installation_scope_changed')
+    f.require(request['previous_input'] != request['current_input'], 'ordinary_update_new_input_required')
     f.require({k:v for k,v in previous.items() if k != 'project_files'} ==
         {k:v for k,v in current.items() if k != 'project_files'} and current['home'] == str(home),
         'ordinary_deployment_scope_changed')
@@ -360,6 +363,260 @@ def activate(request, request_path, budget):
                 f.remember_secondary(original,restoration)
                 raise StopUnconfirmed('ordinary source restoration requires reconciliation') from original
             raise
+    finally:
+        os.close(fd)
+
+
+def update_history(home, expected):
+    """Pin the complete original activation transaction and rollback archive."""
+    f = api(); actual = {}
+    for name in (TRANSACTION, 'preparation/ordinary-gateway-archive'):
+        root = f.directory(home/name)
+        for path in root.rglob('*'):
+            f.require(not path.is_symlink(), 'ordinary_update_history_link_refused')
+            if path.is_dir():
+                f.directory(path)
+            else:
+                actual[str(path.relative_to(home))] = f.digest(f.owned_file(path,private=True))
+    f.require(type(expected) is dict and actual == expected
+        and TRANSACTION+'/committed.json' in actual, 'ordinary_update_transaction_history_changed')
+    f.require(f.read_json(home/TRANSACTION/'committed.json').get('state') ==
+        'SOURCE_ACTIVATED_NOT_RUNTIME_ACCEPTED', 'ordinary_update_committed_history_required')
+    return actual
+
+
+def update_inputs(request, budget):
+    f = api()
+    fields = {'schema','seconds','home','previous_input','current_input','marker','source_receipt',
+        'stamp','configuration','profile','launcher','credential_files','native_unit','transaction_history'}
+    f.require(type(request) is dict and set(request) == fields
+        and request['schema'] == 'friday.ordinary-telegram-source-update.v1'
+        and type(request['seconds']) is int and 30 <= request['seconds'] <= 180,
+        'ordinary_update_explicit_request_required')
+    home = f.directory(f.canonical(request['home'])); source = f.directory(home/'hermes-agent')
+    f.require(os.environ.get('HERMES_HOME') == str(home), 'ordinary_update_exact_environment_required')
+    paths = {name:budget.call(f.pin,request[name]) for name in
+        ('previous_input','current_input','marker','source_receipt','stamp','configuration','profile','launcher','native_unit')}
+    for name, path in {'marker':home/f.MARKER,'source_receipt':home/'hermes-agent.source.json',
+        'stamp':source/'install-stamp.json','configuration':home/'config.yaml',
+        'profile':home/'FRIDAY-PROFILE.json','launcher':source/'.hermes/bin/hermes'}.items():
+        f.require(paths[name] == path, 'ordinary_update_exact_installed_inputs_required')
+    previous = f.read_json(paths['previous_input']); current = f.read_json(paths['current_input'])
+    f.require(request['previous_input'] != request['current_input'], 'ordinary_update_new_input_required')
+    f.require({k:v for k,v in previous.items() if k != 'project_files'} ==
+        {k:v for k,v in current.items() if k != 'project_files'} and current['home'] == str(home),
+        'ordinary_update_operational_settings_changed')
+    _, donors = budget.call(f.spec_checked,current,cli_only=True)
+    marker = f.read_json(paths['marker']); receipt = f.read_json(paths['source_receipt'])
+    f.require(marker.get('completion_stage') == 'TELEGRAM_ORDINARY'
+        and marker.get('state') == 'INSTALLED_TEMPLATE_INCOMPLETE'
+        and marker.get('schema') == f.SCHEMA and marker.get('home') == str(home)
+        and marker.get('source') == str(source) and marker.get('runtime_ready') is False
+        and marker.get('worker_state') == 'BOTH_WORKERS_PREPARATION_PENDING'
+        and marker.get('input_sha256') == request['previous_input']['sha256']
+        and marker.get('source_receipt_sha256') == request['source_receipt']['sha256']
+        and current['product']['runtime'] == {'enabled':False}, 'ordinary_update_committed_phase_required')
+    budget.call(f.composition_checked,previous,source,receipt,donors['hermes'])
+    manifest = json.loads(f.owned_file(f.ROOT/UPDATE_MANIFEST),object_pairs_hook=f.unique)
+    old = previous['project_files']; new = current['project_files']
+    patch = manifest['patch']
+    f.require(patch == 'patches/hermes/ordinary-native-repair.patch'
+        and set(new) == set(old) | {UPDATE_MANIFEST,patch}
+        and all(new[name] == pin for name,pin in old.items()
+                if name not in ('scripts/friday_install.py','scripts/friday_ordinary_install.py')),
+        'ordinary_update_only_reviewed_source_required')
+    f.require(manifest.get('base_commit') == receipt['commit']
+        and len(receipt['layers']) == 46 and UPDATE_MANIFEST not in {r['manifest'] for r in receipt['layers']}
+        and manifest.get('installed_prefix') == {r['manifest']:r['manifest_sha256'] for r in receipt['layers']}
+        and new[UPDATE_MANIFEST] == f.digest(f.owned_file(f.ROOT/UPDATE_MANIFEST))
+        and manifest['patch_sha256'] == new[patch] == f.digest(f.owned_file(f.ROOT/patch)),
+        'ordinary_update_exact_prefix_required')
+    rows = manifest['files']
+    f.require(type(rows) is list and len(rows) == 2 and {r['path'] for r in rows} == UPDATE_FILES,
+        'ordinary_update_exact_native_files_required')
+    for row in rows:
+        f.require(row.get('new_file') is False and row.get('mode') == '100644'
+            and row['before_sha256'] == receipt['files'][row['path']]['sha256']
+            and row['before_sha256'] == f.digest(f.owned_file(source/row['path'])),
+            'ordinary_update_source_changed')
+    # Reuse the shipped preparer's Git parser before any mutation. An extra
+    # patch target must never escape this transaction's five-file rollback.
+    from scripts.hermes_prepare import overlay_layers, Budget as SourceBudget
+    layers = budget.call(overlay_layers,f.ROOT,receipt['commit'],SourceBudget(budget.deadline))
+    f.require(layers[-1][1]['manifest'] == UPDATE_MANIFEST,
+        'ordinary_update_final_layer_required')
+    update_history(home,request['transaction_history'])
+    # Complete native identity/configuration/credential validation is reused;
+    # no consumed query or historical installer phase is ever invoked.
+    f.native_packages(source)
+    from hermes_cli.friday_ordinary_gateway import check
+    check(home,role=False)
+    f.require(all(f.digest(f.owned_file(home/name,private=True)) == pin
+        for name,pin in marker['profile_files'].items()), 'ordinary_update_profile_changed')
+    credentials = request['credential_files']
+    f.require(type(credentials) is dict and set(credentials) == {'.env','auth.json'},
+        'ordinary_update_credential_pins_required')
+    for name,ref in credentials.items():
+        f.require(not os.path.lexists(home/name) if ref is None else f.pin(ref) == home/name,
+            'ordinary_update_credential_pin_changed')
+    tx = home/'preparation'/('ordinary-source-update-'+request['previous_input']['sha256'])
+    f.require(not os.path.lexists(tx), 'ordinary_update_consumed_no_retry')
+    return home, source, previous, current, marker, receipt, manifest, donors, tx
+
+
+@contextlib.contextmanager
+def stopped_consumers(home, unit_ref, budget):
+    """Prove native stop, then retain standard native custody for all three roles."""
+    f = api()
+    from gateway import host_rendezvous as hr
+    from gateway.status import get_running_pid_identity_strict
+    from hermes_cli import gateway as gw
+    f.require(gw.get_systemd_unit_path(system=False) == f.pin(unit_ref)
+        and not os.path.lexists(gw.get_systemd_unit_path(system=True)),
+        'ordinary_update_exact_native_user_unit_required')
+    runtime = f.directory(Path('/run/user')/str(os.getuid())); bus = runtime/'bus'; info = bus.lstat()
+    f.require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1,
+        'ordinary_update_owned_user_bus_required')
+    unit = gw.get_service_name()+'.service'
+    command = ['/usr/bin/env','XDG_RUNTIME_DIR='+str(runtime),
+        'DBUS_SESSION_BUS_ADDRESS=unix:path='+str(bus),'/usr/bin/systemctl','--user','show',unit,
+        '--property=Id,LoadState,ActiveState,SubState,MainPID,ControlPID']
+    from scripts.dsh_prepare import run
+    def prove():
+        output = run(command,f.ROOT,timeout=min(15,budget.check(reserve=1)),
+            env=f.clean_environment(home),deadline=budget.deadline)[0]
+        pairs = [line.split('=',1) for line in output.splitlines() if line]
+        f.require(len(pairs) == 6 and all(len(row) == 2 for row in pairs)
+            and dict(pairs) == {'Id':unit,'LoadState':'loaded','ActiveState':'inactive',
+                'SubState':'dead','MainPID':'0','ControlPID':'0'}, 'ordinary_update_native_stop_required')
+        f.require(get_running_pid_identity_strict(home/'gateway.pid') is None,
+            'ordinary_update_gateway_pid_present')
+        for role in (hr.ROLE_GATEWAY,hr.ROLE_SERVE,hr.ROLE_DESKTOP_SERVE):
+            f.require(not os.path.lexists(hr.record_path(role))
+                and hr.read_record(role,include_stale=True) is None,
+                'ordinary_update_no_native_consumer_required')
+    claimed = []
+    try:
+        prove()
+        f.directory(hr.host_state_dir())
+        for role in (hr.ROLE_GATEWAY,hr.ROLE_SERVE,hr.ROLE_DESKTOP_SERVE):
+            path = hr.lock_path(role)
+            f.require(path.parent == hr.host_state_dir() and not hr.owns_host_lock(role),
+                'ordinary_update_native_lock_scope_changed')
+            before = None
+            if os.path.lexists(path):
+                f.owned_file(path); info = path.stat(); before = (info.st_dev,info.st_ino)
+            outcome,_ = hr.claim_host_lock(role)
+            f.require(outcome is hr.HostLockOutcome.ACQUIRED,
+                'ordinary_update_native_lock_held_or_unavailable')
+            claimed.append(role)
+            # Native claim may create its ordinary empty lock; it never
+            # publishes a role record or starts a gateway/dashboard consumer.
+            f.owned_file(path); info = path.stat()
+            f.require(hr.owns_host_lock(role) and (before is None or before == (info.st_dev,info.st_ino)),
+                'ordinary_update_native_lock_identity_changed')
+        prove()
+        yield prove
+    finally:
+        for role in reversed(claimed): hr.release_host_lock(role)
+        f.require(not any(hr.owns_host_lock(role) for role in claimed),
+            'ordinary_update_native_lock_release_unconfirmed')
+
+
+
+def update(request, request_path, budget):
+    """One finite committed-phase source update; original activation stays intact."""
+    f = api(); home = f.directory(f.canonical(request['home']))
+    fd = os.open(home,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        home,source,previous,current,marker,receipt,manifest,donors,tx = update_inputs(request,budget)
+        with stopped_consumers(home,request['native_unit'],budget) as prove:
+            f.require(f.read_json(request_path) == request, 'ordinary_update_request_changed')
+            # Recheck every explicit pin immediately before the source-only journal.
+            update_inputs(request,budget)
+            names = [f.MARKER,'hermes-agent.source.json','hermes-agent/install-stamp.json'] + [
+                'hermes-agent/'+row['path'] for row in manifest['files']]
+            saved = {name:{'data':f.owned_file(home/name),
+                'mode':stat.S_IMODE((home/name).stat().st_mode)} for name in names}
+            f.require(all(row['mode'] in (0o600,0o644) for row in saved.values()),
+                'ordinary_update_beforeimage_mode_required')
+            import copy
+            receipt = copy.deepcopy(receipt)
+            for row in manifest['files']:
+                receipt['files'][row['path']] = {k:row[k] for k in ('sha256','bytes','mode')}
+            receipt['layers'].append({'manifest':UPDATE_MANIFEST,
+                'manifest_sha256':current['project_files'][UPDATE_MANIFEST],'patch_sha256':manifest['patch_sha256']})
+            stamp = f.read_json(source/'install-stamp.json')
+            stamp['fridaySource'] = {'baseTree':receipt['base_tree'],'layers':receipt['layers']}
+            receipt_data = encoded(receipt); receipt_sha = f.digest(receipt_data)
+            updated = copy.deepcopy(marker)
+            updated['input_sha256'] = request['current_input']['sha256']
+            updated['source_receipt_sha256'] = receipt_sha
+            updated['ordinary_gateway']['source_receipt_sha256'] = receipt_sha
+            updated['ordinary_gateway']['operator_entry'] = {'input':request['current_input'],
+                'script':{'path':str(f.ROOT/'scripts/friday_native.py'),
+                    'sha256':current['project_files']['scripts/friday_native.py']}}
+            publication = [('hermes-agent.source.json',receipt_data),
+                ('hermes-agent/install-stamp.json',encoded(stamp)),(f.MARKER,encoded(updated))]
+            after = {name:f.digest(data) for name,data in publication}
+            after.update({'hermes-agent/'+row['path']:row['sha256'] for row in manifest['files']})
+            tx.mkdir(mode=0o700); before = tx/'before'; before.mkdir(mode=0o700)
+            for name,row in saved.items():
+                target = before/name; target.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+                write(target,row['data'])
+            write(tx/'intent.json',encoded({'schema':'friday.ordinary-telegram-source-update-transaction.v1',
+                'state':'SOURCE_UPDATE_CONSUMED_NO_RETRY','request_sha256':f.digest(f.owned_file(request_path,private=True)),
+                'before':{name:{'sha256':f.digest(row['data']),'mode':row['mode']} for name,row in saved.items()}}))
+            sync_directory(before); sync_directory(tx); sync_directory(tx.parent)
+            try:
+                prove()
+                from scripts.dsh_prepare import run
+                env = f.clean_environment(home); env['GIT_CEILING_DIRECTORIES'] = str(source.parent)
+                for checking in (True,False):
+                    command = ['git','--no-optional-locks','apply','--whitespace=nowarn']
+                    if checking: command.append('--check')
+                    command.append(str(f.ROOT/manifest['patch']))
+                    run(command,source,timeout=min(20,budget.check(reserve=1)),env=env,deadline=budget.deadline)
+                for row in manifest['files']:
+                    data = f.owned_file(source/row['path'])
+                    f.require(f.digest(data) == row['sha256'] and len(data) == row['bytes'],
+                        'ordinary_update_patch_output_changed')
+                budget.call(f.composition_checked,current,source,receipt,donors['hermes'])
+                for name,data in publication:
+                    budget.check(); replace(home/name,data,saved[name]['mode'])
+                # The ordinary binding and complete native source identity must
+                # agree before the update can commit. No service is launched.
+                from hermes_cli.friday_ordinary_gateway import check
+                check(home,role=False)
+                update_history(home,request['transaction_history']); prove(); budget.check()
+                write(tx/'committed.json',encoded({'state':'SOURCE_UPDATED_NOT_RUNTIME_ACCEPTED',
+                    'previous_input':request['previous_input'],'current_input':request['current_input'],
+                    'source_receipt_sha256':receipt_sha,'gateway_started':False,'workers_enabled':False}))
+                sync_directory(tx)
+                return {'state':'TELEGRAM_ORDINARY_SOURCE_UPDATED','ready':False,'gateway_started':False,
+                    'workers_enabled':False,'full_release_accepted':False,'source_receipt_sha256':receipt_sha}
+            except BaseException as original:
+                try:
+                    prove()
+                    # Unknown concurrent bytes are never overwritten by rollback.
+                    f.require(all(f.digest(f.owned_file(home/name)) in
+                        {f.digest(row['data']),after[name]} for name,row in saved.items()),
+                        'ordinary_update_restore_ownership_changed')
+                    # Restore only this transaction's five exact owned files.
+                    for name,row in reversed(list(saved.items())):
+                        replace(home/name,row['data'],row['mode'])
+                    f.require(all(f.digest(f.owned_file(home/name)) == f.digest(row['data'])
+                        and stat.S_IMODE((home/name).stat().st_mode) == row['mode'] for name,row in saved.items()),
+                        'ordinary_update_restore_failed')
+                    update_history(home,request['transaction_history'])
+                    write(tx/'rolled-back.json',encoded({'state':'ROLLED_BACK_OWN_SOURCE_ONLY_NO_RETRY'}))
+                    sync_directory(tx)
+                except BaseException as restoration:
+                    from scripts.dsh_prepare import StopUnconfirmed
+                    f.remember_secondary(original,restoration)
+                    raise StopUnconfirmed('ordinary source update restoration requires reconciliation') from original
+                raise
     finally:
         os.close(fd)
 
