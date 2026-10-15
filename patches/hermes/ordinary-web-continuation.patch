@@ -1,0 +1,171 @@
+diff --git a/model_tools.py b/model_tools.py
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -276,6 +276,8 @@
+         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
+         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
+         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
++        (_web_search_limit_maximum() if "web_search" in
++         _select_tool_names(enabled_toolsets, disabled_toolsets, True) else None),
+     )
+ 
+ 
+@@ -466,7 +468,21 @@
+     return run
+ 
+ 
++def _web_search_limit_maximum() -> int:
++    from tools.web_tools import _search_limit_maximum
++    return _search_limit_maximum()
++
++
++def _rewrite_web_search(td: Dict[str, Any], available: set) -> Dict[str, Any]:
++    from copy import deepcopy
++    td = deepcopy(td)
++    limit = td["function"]["parameters"]["properties"]["limit"]
++    limit["maximum"] = _web_search_limit_maximum()
++    return td
++
++
+ _DYNAMIC_SCHEMA_REWRITERS = {
++    "web_search": _rewrite_web_search,
+     "execute_code": _rewrite_execute_code,
+     "discord": _discord_rewriter("get_dynamic_schema_core"),
+     "discord_admin": _discord_rewriter("get_dynamic_schema_admin"),
+diff --git a/tools/web_tools.py b/tools/web_tools.py
+--- a/tools/web_tools.py
++++ b/tools/web_tools.py
+@@ -347,6 +347,20 @@
+         return _finish_debug("web_search_tool", debug_call_data, f"Error searching web: {str(e)}")
+ 
+ 
++def _search_limit_maximum(provider=None) -> int:
++    """Match the selected Exa anonymous endpoint's hard result-count bound.
++
++    Other providers and keyed Exa retain the existing generic tool limit.
++    Use the provider's own tier/key decision, including a forced free tier.
++    """
++    name = provider.name if provider is not None else _get_search_backend()
++    if name == "exa":
++        from plugins.web._common import provider_env, use_keyless
++        if use_keyless("exa", provider_env("EXA_API_KEY")):
++            return 20
++    return 100
++
++
+ def _memoized_search(provider, query: str, limit: int) -> dict:
+     """TTL memo + single-flight around the paid vendor call (tools/web_result_cache.py); sits after every
+     safety/config check. With caching enabled, BUCKETED counts let near-identical limits share an entry;
+@@ -354,8 +368,18 @@
+     would make the one-shot ring fallback sticky for a whole TTL."""
+     from tools.web_result_cache import bucket_limit, cache_enabled, search_memo, slice_search_response
+ 
++    maximum = _search_limit_maximum(provider)
++    if maximum == 20 and limit > maximum:
++        # Reject before memo lookup or rescue: a stale cache must not turn an
++        # unsupported request into a success or switch its selected provider.
++        return {
++            "success": False, "state": "limit_exceeded", "provider": provider.name,
++            "requested_limit": limit, "limit_max": maximum,
++            "error": f"{provider.name} search supports at most {maximum} results in the selected mode.",
++        }
++
+     def _paid_search() -> tuple[dict, bool]:
+-        fetch_limit = bucket_limit(limit) if cache_enabled() else limit
++        fetch_limit = min(bucket_limit(limit), maximum) if cache_enabled() else limit
+         try:
+             resp = provider.search(query, fetch_limit)
+         except Exception as exc:  # noqa: BLE001 — candidate for fallback / rescue
+diff --git a/tools/web_tools_truncate.py b/tools/web_tools_truncate.py
+--- a/tools/web_tools_truncate.py
++++ b/tools/web_tools_truncate.py
+@@ -1,7 +1,7 @@
+ """Truncate-and-store pipeline for web_extract (no LLM).
+ 
+ Pages at or under the char budget are returned whole; larger pages become a head+tail window plus a
+-footer that says how much is shown, where the full text is stored (cache/web) and the exact read_file
++footer that says how much is shown, where the text is stored (own workspace or legacy cache/web) and the exact read_file
+ call that pages the omitted middle. Inline base64 images become ``[IMAGE: alt]`` placeholders. Logs under the
+ origin (tools.web_tools) logger.
+ """
+@@ -20,6 +20,8 @@
+ # Ceiling on the full-text file written to cache/web so a multi-MB page can't write unbounded bytes on
+ # every extract; the model only ever sees char_limit.
+ MAX_STORED_TEXT_CHARS = 2_000_000
++# Existing ordinary read_file byte ceiling; do not grant access to global caches.
++MAX_SCOPED_STORED_BYTES = 1_000_000
+ 
+ _CHAR_LIMIT_FLOOR, _CHAR_LIMIT_CEILING = 2000, 500_000
+ 
+@@ -57,11 +59,28 @@
+ 
+ 
+ def _store_full_text(url: str, content: str) -> Optional[str]:
+-    """Write the full page to cache/web; absolute path or None (best-effort: the truncated content is still
+-    returned). cache/web is mounted read-only into remote backends (credential_files _CACHE_DIRS) so
+-    read_file can page the complete text on any backend."""
++    """Store a bounded copy, returning its absolute path or None.
++
++    Admitted users reuse create-only private workspace I/O so scoped read_file
++    can page it. Unmanaged profiles retain their native cache/web behavior.
++    """
+     try:
+         import hashlib
++        import json
++        import uuid
++        from hermes_cli.friday_user_scope import ordinary_file_scope, scoped_file
++        cap = ordinary_file_scope()
++        if cap is not None:
++            # Reuse the admitted file tool: descriptor-pinned workspace, no ancestor
++            # symlinks, create-only private inode, and authority rechecked after I/O.
++            data = content.encode("utf-8")
++            if len(data) > MAX_SCOPED_STORED_BYTES:
++                marker = (f"\n\n[... stored copy truncated to {MAX_SCOPED_STORED_BYTES:,} UTF-8 bytes "
++                          f"of {len(data):,}; re-extract a more specific URL for the rest ...]\n")
++                content = data[:MAX_SCOPED_STORED_BYTES-len(marker.encode())].decode("utf-8", "ignore") + marker
++            path = cap.home / "workspace" / f"web-extract-{uuid.uuid4().hex}.md"
++            result = json.loads(scoped_file("write_file", {"path": str(path), "content": content}))
++            return result["path"] if result.get("success") is True else None
+         from hermes_constants import get_hermes_dir
+         from tools.web_result_cache import _host_slug
+         cache_dir = get_hermes_dir("cache/web", "web_cache")
+@@ -86,7 +105,7 @@
+ def _truncate_with_footer(content: str, url: str, char_limit: int) -> tuple[str, bool]:
+     """Return (model_text, was_truncated). Pages over ``char_limit`` become a ~75% head / ~25% tail window cut
+     on line boundaries, plus a footer saying how much is shown, where the full text is stored, and the
+-    read_file call that pages the omitted middle. Deterministic."""
++    read_file call that pages the omitted middle."""
+     if len(content) <= char_limit:
+         return content, False
+     head_budget = int(char_limit * 0.75)
+@@ -99,7 +118,14 @@
+         tail = tail[nl + 1:]
+ 
+     stored_path = _store_full_text(url, content)
++    stored_partial = False
++    scoped = False
+     if stored_path:
++        from hermes_cli.friday_user_scope import ordinary_file_scope
++        scoped = ordinary_file_scope() is not None
++        stored_partial = (len(content.encode("utf-8")) > MAX_SCOPED_STORED_BYTES if scoped
++                          else len(content) > MAX_STORED_TEXT_CHARS)
++    if stored_path and not scoped:
+         # The footer is read by the AGENT, whose read_file runs inside the active backend: render the
+         # path where docker/modal/ssh/... see the mounted cache, not the host path (#72389, #81984).
+         from tools.credential_files import to_agent_visible_cache_path
+@@ -113,10 +139,12 @@
+         # read_file is 1-indexed; +2 lands on the first line after the shown head.
+         middle_start_line = head.count("\n") + 2
+         footer_lines += [
+-            f"Full text saved to: {stored_path}",
++            f"{'Partial text' if stored_partial else 'Full text'} saved to: {stored_path}",
+             f'To read the omitted middle: read_file path="{stored_path}" '
+-            f"offset={middle_start_line} limit=200  (the file is the complete page; "
+-            f"raise/lower offset to page through it).",
++            f"offset={middle_start_line} limit=200  ("
++            + ("the stored copy is incomplete; its final marker identifies the storage limit; "
++               if stored_partial else "the file is the complete page; ")
++            + "raise/lower offset to page through it).",
+         ]
+     else:
+         footer_lines.append(
