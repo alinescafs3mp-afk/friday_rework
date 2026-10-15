@@ -24,7 +24,7 @@ from scripts import install_containment
 from test_normal_worker_install import normal, doc, pin, service, install_input
 
 REAL_NATIVE_PREPARATION = prep.native_preparation
-BUILD = {'memory_bytes': 6*1024**3, 'swap_bytes': 0, 'cpu_percent': 200, 'tasks': 128,
+BUILD = {'memory_bytes': 6*1024**3, 'swap_bytes': 0, 'cpu_percent': 200, 'tasks': 256,
          'affinity': [0, 1], 'fsize_bytes': 256*1024**2, 'core_bytes': 0, 'seconds': 900, 'cleanup_seconds': 60}
 
 
@@ -47,6 +47,7 @@ def installed(normal, monkeypatch):
     (s.home / 'hermes-agent').mkdir(mode=0o700)
     old = copy.deepcopy(s.value)
     old['project_files'].pop('scripts/friday_worker_preparation.py', None)
+    old['project_files'].pop('scripts/friday_ordinary_a0_registration.py', None)
     old_ref = doc(s.deploy / 'current-input.json', old)
     new_ref = doc(s.deploy / 'new-input.json', s.value)
     gateway = ModuleType('hermes_cli.friday_ordinary_gateway')
@@ -109,6 +110,63 @@ def installed(normal, monkeypatch):
 
 def execute(s):
     return ordinary.prepare_workers(s.request, s.request_path, Budget(300))
+
+
+def test_explicit_build_tasks256_preserves_runtime_tasks64(installed):
+    s = installed; runtime = copy.deepcopy(s.value['worker_install'])
+    assert prep.build_settings(copy.deepcopy(BUILD)) == BUILD
+    assert BUILD['tasks'] == 256 and BUILD['seconds'] - BUILD['cleanup_seconds'] == 840
+    execute(s)
+    assert s.value['worker_install'] == runtime
+    assert runtime['dsh']['resources']['memory_bytes'] == 2*1024**3
+    assert runtime['dsh']['resources']['tasks'] == 64
+
+
+@pytest.mark.parametrize('registration', [False, True])
+def test_coherent_installer_inventory_preserves_historical_pins(installed, registration):
+    s = installed
+    old = entry.read_json(Path(s.request['current_input']['path']))
+    value = copy.deepcopy(s.value)
+    installer = {'scripts/friday_install.py', 'scripts/friday_ordinary_install.py',
+                 'scripts/worker_install.py', 'scripts/friday_worker_preparation.py',
+                 'scripts/a0_prepare.py', 'scripts/friday_ordinary_a0_registration.py'}
+    # The broad fixture also collects administrative daily-analysis scripts;
+    # the actual ordinary receiver inventory excludes those and pins its root
+    # source lock. Reproduce that 178-file input without changing source bytes.
+    for candidate in (old, value):
+        candidate['project_files'] = {name: sha for name, sha in candidate['project_files'].items()
+                                      if not name.startswith('scripts/daily-analysis/')}
+        candidate['project_files']['sources.lock.json'] = entry.digest(entry.owned_file(entry.ROOT / 'sources.lock.json'))
+    assert len(old['project_files']) == 178
+    # Old installer hashes are historical data; only the exact fresh root is
+    # verified by spec_checked. Non-installer hashes must remain byte-identical.
+    for name in installer & set(old['project_files']): old['project_files'][name] = 'f'*64
+    if not registration: value['project_files'].pop('scripts/friday_ordinary_a0_registration.py')
+    assert len(value['project_files']) == (180 if registration else 179)
+    s.request['current_input'] = doc(s.deploy / 'current-input.json', old)
+    marker = entry.read_json(Path(s.request['marker']['path']))
+    marker['input_sha256'] = s.request['current_input']['sha256']
+    s.request['marker'] = doc(s.home / entry.MARKER, marker)
+    s.request['preparation_input'] = doc(s.deploy / 'new-input.json', value)
+    before = {name: (s.home / name).read_bytes() for name in ('config.yaml', entry.MARKER)}
+    prep.installed(s.request, Budget(300))
+    assert all((s.home / name).read_bytes() == data for name, data in before.items())
+    assert all(value['project_files'][name] == sha for name, sha in old['project_files'].items()
+               if name not in installer)
+
+
+@pytest.mark.parametrize('case', ['non-installer-change', 'non-installer-add', 'installer-remove', 'fresh-installer-drift'])
+def test_coherent_installer_inventory_refuses_other_source_changes(installed, case):
+    s = installed; value = copy.deepcopy(s.value)
+    if case == 'non-installer-change': value['project_files']['scripts/a0_runtime.py'] = 'f'*64
+    elif case == 'non-installer-add': value['project_files']['scripts/unreviewed.py'] = 'f'*64
+    elif case == 'installer-remove': value['project_files'].pop('scripts/a0_prepare.py')
+    else: value['project_files']['scripts/a0_prepare.py'] = 'f'*64
+    s.request['preparation_input'] = doc(s.deploy / 'new-input.json', value)
+    before = (s.home / 'config.yaml').read_bytes()
+    with pytest.raises((ValueError, AssertionError)): execute(s)
+    assert (s.home / 'config.yaml').read_bytes() == before
+    assert not list((s.home / 'preparation').glob('ordinary-workers-*')) and not s.calls
 
 
 def test_complete_publication_preserves_ordinary_runtime_users_and_failed_history(installed):
@@ -260,7 +318,7 @@ def test_remaining_dispatch_reuses_completed_phases_and_keeps_fresh_evidence(ins
     assert not s.calls and not (s.home / 'workers').exists()
 
 
-@pytest.mark.parametrize('case', ['memory', 'cpu', 'tasks', 'swap', 'affinity', 'fsize', 'core', 'root', 'parent-escape'])
+@pytest.mark.parametrize('case', ['memory', 'cpu', 'tasks128', 'tasks512', 'tasks-unbounded', 'swap', 'affinity', 'fsize', 'core', 'root', 'parent-escape'])
 def test_existing_native_resource_prerequisites_cannot_be_relaxed(installed, tmp_path, monkeypatch, case):
     s = installed; root = tmp_path / 'cgroups'; root.mkdir(mode=0o700)
     group = root / 'bounded'; group.mkdir(mode=0o700)
@@ -271,7 +329,8 @@ def test_existing_native_resource_prerequisites_cannot_be_relaxed(installed, tmp
     membership = tmp_path / 'membership'; membership.write_text('0::/bounded\n')
     prep.native_resources(r, membership=membership, root=root)
     if case == 'memory': (group / 'memory.max').write_text(str(4 * 1024**3))
-    elif case == 'tasks': (group / 'pids.max').write_text('256')
+    elif case.startswith('tasks'):
+        (group / 'pids.max').write_text({'tasks128': '128', 'tasks512': '512', 'tasks-unbounded': 'max'}[case])
     elif case == 'swap': (group / 'memory.swap.max').write_text('max')
     elif case == 'affinity': monkeypatch.setattr(prep.os, 'sched_getaffinity', lambda pid: {0})
     elif case in ('fsize', 'core'):
@@ -352,7 +411,7 @@ def test_staged_source_change_during_preparation_refuses_before_publication(inst
     assert (s.home / 'config.yaml').read_bytes() == before
 
 
-@pytest.mark.parametrize('case', ['absent', 'partial', 'extra', 'unbounded-memory', 'unbounded-clock', 'missing-cleanup', 'boolean-affinity'])
+@pytest.mark.parametrize('case', ['absent', 'partial', 'extra', 'unbounded-memory', 'unbounded-clock', 'missing-cleanup', 'boolean-affinity', 'old-tasks128', 'runtime-tasks64', 'tasks512'])
 def test_explicit_build_scope_never_changes_worker_job_resources(installed, case):
     s = installed; value = copy.deepcopy(BUILD)
     if case == 'absent': value = None
@@ -361,7 +420,8 @@ def test_explicit_build_scope_never_changes_worker_job_resources(installed, case
     elif case == 'unbounded-memory': value['memory_bytes'] = -1
     elif case == 'unbounded-clock': value['seconds'] = 86400
     elif case == 'missing-cleanup': value['cleanup_seconds'] = 0
-    else: value['affinity'] = [False, True]
+    elif case == 'boolean-affinity': value['affinity'] = [False, True]
+    else: value['tasks'] = {'old-tasks128': 128, 'runtime-tasks64': 64, 'tasks512': 512}[case]
     before = copy.deepcopy(s.value['worker_install'])
     s.request['build_resources'] = value; doc(s.request_path, s.request)
     with pytest.raises(ValueError, match='explicit_build_resources_required'): execute(s)

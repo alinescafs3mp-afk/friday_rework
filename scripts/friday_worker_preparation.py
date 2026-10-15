@@ -30,7 +30,7 @@ def build_settings(value):
               all(type(value[k]) is int for k in BUILD_FIELDS - {'affinity'}) and
               type(value['affinity']) is list and all(type(n) is int for n in value['affinity']) and
               value == {'memory_bytes': 6*1024**3, 'swap_bytes': 0, 'cpu_percent': 200,
-                        'tasks': 128, 'affinity': [0, 1], 'fsize_bytes': 256*1024**2,
+                        'tasks': 256, 'affinity': [0, 1], 'fsize_bytes': 256*1024**2,
                         'core_bytes': 0, 'seconds': 900, 'cleanup_seconds': 60},
               'ordinary_worker_explicit_build_resources_required')
     return value
@@ -80,10 +80,17 @@ def installed(request, budget):
         candidate['worker_install']['dsh']['web'].pop('egress_evidence')
     f.require(old == new and value['product']['runtime'] == {'enabled': False},
               'ordinary_worker_operational_settings_changed')
+    worker_helper = 'scripts/friday_worker_preparation.py'
+    registration_helper = 'scripts/friday_ordinary_a0_registration.py'
+    # Admit the coherent accepted installer package, including the optional A0
+    # registration entry. Every other source pin and every old inventory member
+    # stays fixed; spec_checked still verifies the complete fresh project root.
     allowed = {'scripts/friday_install.py', 'scripts/friday_ordinary_install.py',
-               'scripts/worker_install.py', 'scripts/friday_worker_preparation.py'}
+               'scripts/worker_install.py', worker_helper, 'scripts/a0_prepare.py',
+               registration_helper}
     prior = current['project_files']; fresh = value['project_files']
-    f.require(set(fresh) == set(prior) | {'scripts/friday_worker_preparation.py'}
+    f.require(set(fresh) == set(prior) | {worker_helper} |
+              ({registration_helper} if registration_helper in fresh else set())
               and all(fresh[n] == sha for n, sha in prior.items() if n not in allowed),
               'ordinary_worker_only_installer_source_change_required')
     _, donors = budget.call(f.spec_checked, value)  # Checks current policy before effects.
