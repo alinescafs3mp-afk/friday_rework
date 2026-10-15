@@ -11,7 +11,7 @@ import json
 import time
 from pathlib import Path
 
-from scripts.friday_install import canonical, directory, digest, owned_file, pin, publish, read_json, require
+from scripts.friday_install import bootstrap_pin, canonical, directory, digest, owned_file, pin, publish, read_json, require
 
 
 def settings(value, *, cli_only=False):
@@ -158,7 +158,7 @@ def prepared_product(value, home, budget, *, preparation=None):
             and all(r.get('workspace_build_identity') == {k: inventory[k] for k in ('file_count', 'sha256')}
                     for r in (reports['build'], smoke)), 'harness_generated_build_changed')
     node = {'path': tool['node_executable'], 'sha256': tool['node_sha256']}
-    budget.call(pin, node)
+    budget.call(bootstrap_pin, node)
     node_path = canonical(node['path']); toolchain = canonical(spec['dsh']['toolchain_root'])
     require(node_path == toolchain / 'bin/node' and not toolchain.is_relative_to(home)
             and not home.is_relative_to(toolchain), 'harness_toolchain_root_mismatch')

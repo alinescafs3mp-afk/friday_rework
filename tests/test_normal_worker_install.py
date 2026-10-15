@@ -84,7 +84,7 @@ def normal(service, monkeypatch):
         if r['id']=='a0': r.update(ap)
     v['sources_lock']=doc(s.deploy/'synthetic-sources.json',lock)
     cli=h/'apps/cli/lib/bin.js';write(cli,b'NEVER EXECUTED SYNTHETIC BUILD OUTPUT\n')
-    node=s.deploy/'toolchain/bin/node';write(node,b'NEVER EXECUTED SYNTHETIC NODE\n')
+    node=s.deploy/'toolchain/bin/node';write(node,b'NEVER EXECUTED SYNTHETIC NODE\n');node.chmod(0o700)
     source=dsh_prepare.verify_source(h,dsh);source['source_lock_sha256']=v['sources_lock']['sha256']
     tool={'node_executable':str(node),'node_sha256':pin(node)['sha256']}
     inv=dsh_prepare.build_inventory(h);rows={'file_count':inv['file_count'],'sha256':inv['sha256']}
@@ -135,6 +135,51 @@ def normal(service, monkeypatch):
 
 def prepared(s):
     return workers.prepared_product(s.value,s.home,s.budget)
+
+
+def test_full_prepared_product_accepts_large_protected_node_without_raising_document_cap(normal):
+    from plugins.friday_rework.user_worker_join import installation_inputs, validate_installation_inputs
+    s=normal;node=s.deploy/'toolchain/bin/node'
+    with node.open('wb') as stream:
+        stream.write(b'SYNTHETIC EXECUTABLE, NEVER RUN\n')
+        stream.truncate(67*1024**2)
+    hasher=hashlib.sha256()
+    with node.open('rb') as stream:
+        for block in iter(lambda:stream.read(1024**2),b''):hasher.update(block)
+    refs={}
+    for phase in ('source','toolchain','build','smoke'):
+        path=s.home/'preparation/harness'/('dsh-'+phase+'.json');row=entry.read_json(path)
+        row['toolchain']['node_sha256']=hasher.hexdigest();refs[phase]=doc(path,row)
+    refs['inventory']=pin(s.home/'preparation/harness/dsh-build-inventory.json')
+    refs['a0']=pin(s.home/'preparation/a0.json')
+    before=copy.deepcopy(s.value)
+    product,evidence=workers.prepared_product(s.value,s.home,s.budget,preparation=refs)
+    declarations=validate_installation_inputs(installation_inputs(product['runtime']))
+    assert set(declarations['workers'])=={'dsh','a0'}
+    assert declarations['source_scope']=={'home':str(s.home),'profile':s.value['product']['profile']}
+    assert product['runtime']['workers']['dsh']['dsh']['node']=={'path':str(node),'sha256':hasher.hexdigest()}
+    assert {k:len(v) for k,v in evidence.items()}=={'dsh':4,'a0':1}
+    assert node.stat().st_size==67*1024**2 and s.value==before
+    with pytest.raises(entry.Refused,match='input_changed_or_too_large'):entry.owned_file(node)
+    assert not (s.home/'workers').exists() and not s.calls
+
+
+@pytest.mark.parametrize('case',['wrong-hash','symlink','non-executable','writable','hardlink'])
+def test_full_prepared_product_refuses_unprotected_or_changed_node(normal,case):
+    s=normal;node=s.deploy/'toolchain/bin/node'
+    if case=='wrong-hash':
+        for phase in ('source','toolchain','build','smoke'):
+            path=s.home/'preparation/harness'/('dsh-'+phase+'.json');row=entry.read_json(path)
+            row['toolchain']['node_sha256']='0'*64;doc(path,row)
+    elif case=='symlink':
+        target=node.with_name('node-real');node.rename(target);node.symlink_to(target)
+    elif case=='non-executable':node.chmod(0o600)
+    elif case=='writable':node.chmod(0o720)
+    else:node.with_name('node-link').hardlink_to(node)
+    reason=('input_pin_changed' if case=='wrong-hash' else
+            'real_absolute_path_required' if case=='symlink' else 'owned_protected_bootstrap_executable_required')
+    with pytest.raises(entry.Refused,match=reason):prepared(s)
+    assert not (s.home/'workers').exists() and not s.calls
 
 
 @pytest.mark.parametrize('case', ['expired', 'at-expiry', 'foreign-home', 'foreign-profile',

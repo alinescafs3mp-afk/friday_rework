@@ -145,9 +145,10 @@ def reusable(value, home, reports, donors, budget):
             if phase not in reports: continue
             row = f.read_json(f.pin(reports[phase])); tool = row.get('toolchain', {})
             f.require(row.get('donor') == str(home / 'harness') and row.get('source') == identity
-                      and tool.get('node_executable') == str(node)
-                      and tool.get('node_sha256') == f.digest(f.owned_file(node)),
+                      and tool.get('node_executable') == str(node),
                       'ordinary_worker_completed_source_changed')
+            # Node is a protected executable and may exceed the document cap.
+            budget.call(f.bootstrap_pin, {'path': str(node), 'sha256': tool.get('node_sha256')})
             if phase == 'build':
                 f.require(all(row.get(k, {}).get('returncode') == 0 and
                               row[k].get('timeout') is False and row[k].get('reaped') is True

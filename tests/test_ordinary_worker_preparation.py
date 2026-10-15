@@ -31,6 +31,8 @@ BUILD = {'memory_bytes': 6*1024**3, 'swap_bytes': 0, 'cpu_percent': 200, 'tasks'
 @pytest.fixture
 def installed(normal, monkeypatch):
     s = normal
+    # Reuse validates executable metadata without executing this synthetic Node.
+    (s.deploy / 'toolchain/bin/node').chmod(0o700)
     (s.home / 'plugins/friday_rework').chmod(0o700)
     for path in (s.home / 'plugins/friday_rework').rglob('__pycache__'):
         shutil.rmtree(path)
@@ -220,6 +222,48 @@ def test_incomplete_foreign_or_changed_native_reports_refuse(installed, case):
     with pytest.raises((ValueError, RuntimeError, KeyError)): execute(s)
     assert (s.home / 'config.yaml').read_bytes() == before
     assert not (s.home / 'workers').exists() and not s.calls
+
+
+def test_completed_reports_reuse_node_larger_than_document_limit(installed):
+    s = installed; node = s.deploy / 'toolchain/bin/node'
+    with node.open('wb') as stream:
+        stream.write(b'SYNTHETIC EXECUTABLE, NEVER RUN\n')
+        stream.truncate(67 * 1024**2)
+    hasher = hashlib.sha256()
+    with node.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024**2), b''): hasher.update(block)
+    for phase in ('source', 'toolchain', 'build', 'smoke'):
+        path = Path(s.request['reports'][phase]['path']); row = entry.read_json(path)
+        row['toolchain']['node_sha256'] = hasher.hexdigest()
+        s.request['reports'][phase] = doc(path, row)
+    donors = {r['id']: r for r in entry.read_json(Path(s.value['sources_lock']['path']))['repositories']}
+    before = {Path(ref['path']): Path(ref['path']).read_bytes() for ref in s.request['reports'].values()}
+    before[s.home / 'config.yaml'] = (s.home / 'config.yaml').read_bytes()
+    prep.reusable(s.value, s.home, s.request['reports'], donors, Budget(300))
+    assert node.stat().st_size == 67 * 1024**2
+    with pytest.raises(ValueError, match='input_changed_or_too_large'): entry.owned_file(node)
+    assert all(path.read_bytes() == data for path, data in before.items())
+    assert not list((s.home / 'preparation').glob('ordinary-workers-*')) and not s.calls
+
+
+@pytest.mark.parametrize('case', ['wrong-hash', 'symlink', 'non-executable', 'writable', 'hardlink'])
+def test_completed_reports_refuse_unprotected_or_changed_node(installed, case):
+    s = installed; node = s.deploy / 'toolchain/bin/node'
+    if case == 'wrong-hash':
+        path = Path(s.request['reports']['source']['path']); row = entry.read_json(path)
+        row['toolchain']['node_sha256'] = '0' * 64
+        s.request['reports']['source'] = doc(path, row)
+    elif case == 'symlink':
+        target = node.with_name('node-real'); node.rename(target); node.symlink_to(target)
+    elif case == 'non-executable': node.chmod(0o600)
+    elif case == 'writable': node.chmod(0o720)
+    else: node.with_name('node-link').hardlink_to(node)
+    donors = {r['id']: r for r in entry.read_json(Path(s.value['sources_lock']['path']))['repositories']}
+    before = (s.home / 'config.yaml').read_bytes()
+    with pytest.raises(ValueError):
+        prep.reusable(s.value, s.home, s.request['reports'], donors, Budget(300))
+    assert (s.home / 'config.yaml').read_bytes() == before
+    assert not list((s.home / 'preparation').glob('ordinary-workers-*')) and not s.calls
 
 
 @pytest.mark.parametrize('case', ['expired', 'foreign-home', 'foreign-profile', 'changed-resources', 'changed-runtime'])
