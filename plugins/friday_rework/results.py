@@ -284,11 +284,31 @@ def output_copy_lock(row):
         os.close(fd)
 
 
+def _dsh_result_secrets(row):
+    if row["worker_kind"] != "dsh":
+        return ()
+    # Use the same trusted receiving scope as admission, and bind its values to
+    # the original launch receipt. Never use arbitrary ambient environment.
+    from .worker_web import scoped_environment
+    from .adapters.dsh import checked_output_credentials
+    try:
+        runtime = row["host"]["binding"]["runtime"]
+        dsh = runtime["dsh"]
+        names = (dsh["key_name"], "EXA_API_KEY") if dsh.get("web", {}).get("profile") == "exa-paid" else (dsh["key_name"],)
+        return checked_output_credentials(row, scoped_environment(runtime["runtime_home"], names))
+    except Exception:
+        raise AssociationError("dsh_output_credentials_unconfirmed") from None
+
+
 def _collect_outputs(store, row, paths):
     from .host_runtime import private_directory
     # Recheck the durable selection only after gaining exclusive copy ownership.
     row = store.get(row["existing_task_id"], row["owner"])
+    secrets = _dsh_result_secrets(row)
     if "result" in row:
+        import json
+        from .artifacts import _reject_secrets
+        _reject_secrets(json.dumps(row["result"], ensure_ascii=False).encode("utf-8"), secrets)
         if paths is not None and paths != row["result"]["source_paths"]:
             raise AssociationError("result_selection_already_retained")
         return row
@@ -330,7 +350,8 @@ def _collect_outputs(store, row, paths):
         item = stage_file(source_root=source, relative_path=original.reference if original else path,
                           staging_root=destination, logical_name=label,
                           media_type=original.media_type if original else "application/octet-stream",
-                          origin_reference=row["existing_task_id"], max_bytes=min(runtime["max_file_bytes"], remaining))
+                          origin_reference=row["existing_task_id"], max_bytes=min(runtime["max_file_bytes"], remaining),
+                          reject_bytes=secrets)
         if original and (item.sha256 != original.sha256 or item.size_bytes != original.size_bytes):
             raise AssociationError("a0_output_changed_during_copy")
         remaining -= item.size_bytes
@@ -395,10 +416,11 @@ def inspect_outputs(row):
     """Only stable checked bytes reach the parent; limited preview is untrusted data."""
     if "result" not in row:
         raise AssociationError("result_not_collected")
+    secrets = _dsh_result_secrets(row)
     result = []
     for value in row["result"]["artifacts"]:
         data = read_staged(staging_root=output_root(row), artifact=StagedArtifact(**value),
-                           max_bytes=row["host"]["binding"]["runtime"]["max_file_bytes"])
+                           max_bytes=row["host"]["binding"]["runtime"]["max_file_bytes"], reject_bytes=secrets)
         try:
             preview = data[:4096].decode("utf-8")
         except UnicodeError:
@@ -519,6 +541,7 @@ async def deliver_artifact(ctx, store, row, reference, *, retry=False, deadline=
     artifact = next((a for a in row.get("result", {}).get("artifacts", []) if a["reference"] == reference), None)
     if artifact is None:
         raise AssociationError("unknown_result_artifact")
+    secrets = _dsh_result_secrets(row)
     # Recheck bytes BEFORE reserving a send. A changed staging file never sends.
     if local:
         # Refuse oversize before even opening a staged payload. The ORIGINAL
@@ -527,10 +550,10 @@ async def deliver_artifact(ctx, store, row, reference, *, retry=False, deadline=
             raise AssociationError("cli_staged_document_limit")
         payload = span.sync("staged_original_read", read_staged,
                             staging_root=output_root(row), artifact=StagedArtifact(**artifact),
-                            max_bytes=min(256 * 1024, row["host"]["binding"]["runtime"]["max_file_bytes"]))
+                            max_bytes=min(256 * 1024, row["host"]["binding"]["runtime"]["max_file_bytes"]), reject_bytes=secrets)
     else:
         payload = await asyncio.to_thread(read_staged, staging_root=output_root(row), artifact=StagedArtifact(**artifact),
-                                        max_bytes=row["host"]["binding"]["runtime"]["max_file_bytes"])
+                                        max_bytes=row["host"]["binding"]["runtime"]["max_file_bytes"], reject_bytes=secrets)
     check_retained_job(row)
     attempt, row = (begin_delivery(store, row["existing_task_id"], row["owner"], reference, retry=retry) if not local else
                     span.sync("begin_durable_UNKNOWN", begin_delivery, store, row["existing_task_id"],

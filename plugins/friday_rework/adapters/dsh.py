@@ -144,6 +144,28 @@ def _identity(row):
                               "supervisor", "created_at_unix", "budget_seconds", "deadline_unix")}
 
 
+def credential_fingerprints(grant):
+    return {name: hashlib.sha256(value.encode("utf-8")).hexdigest() for name, value in grant.items()}
+
+
+def checked_output_credentials(row, grant):
+    """Original admitted keys, never an environment-wide scan or secret copy.
+
+    Rotation, missing scope, legacy jobs and lost admission evidence refuse
+    output. A fresh key cannot silently certify bytes made with an old key.
+    """
+    try:
+        control = _private(Path(row["workspace_reference"]) / ".dsh-adapter")
+        receipt = _json(control / "credential-guard.json")
+        if (set(receipt) != {"schema", "identity", "keys"} or receipt["schema"] != 1
+                or receipt["identity"] != _identity(row)
+                or receipt["keys"] != credential_fingerprints(grant)):
+            raise ValueError()
+        return tuple(value.encode("utf-8") for value in grant.values())
+    except Exception:
+        raise AdapterError("dsh_output_credentials_unconfirmed") from None
+
+
 class NativeEvents:
     """Strict finite native NDJSON reducer; exit zero alone proves nothing."""
     def __init__(self):
@@ -510,6 +532,24 @@ class DshAdapter:
         if p.stat().st_size > 16*1024**2:
             raise AdapterError("native_events_too_large")
         data = p.read_bytes()
+        try:
+            receipt = _json(control / "preparation.json")
+            row = self.config.current_association({"existing_task_id": receipt["identity"]["existing_task_id"], "owner": receipt["identity"]["owner"]})
+            secrets = checked_output_credentials(row, dict(self.config.environment()))
+        except Exception:
+            raise AdapterError("dsh_output_credentials_unconfirmed") from None
+        from ..artifacts import _reject_secrets
+        try:
+            _reject_secrets(data, secrets)
+        except RuntimeError:
+            raise AdapterError("runtime_secret_in_native_output") from None
+        stderr = _regular(control / "stderr")
+        if stderr.stat().st_size > 16*1024**2:
+            raise AdapterError("native_stderr_too_large")
+        try:
+            _reject_secrets(stderr.read_bytes(), secrets)
+        except RuntimeError:
+            raise AdapterError("runtime_secret_in_native_output") from None
         state = NativeEvents()
         lines = data.splitlines(keepends=True)
         for line in lines:
@@ -567,6 +607,8 @@ class DshAdapter:
                 or any(not isinstance(v,str) or not v or len(v)>4096
                        or any(ord(c)<32 or ord(c)==127 for c in v) for v in grant.values())):
             raise AdapterError("invalid_scoped_environment")
+        _write(control / "credential-guard.json", {"schema": 1, "identity": _identity(row),
+                                                  "keys": credential_fingerprints(grant)})
         env.update(grant)
         c = self.config
         command = [str(c.node.path), str(c.cli.path), "--profile", c.profile,
@@ -598,8 +640,12 @@ class DshAdapter:
             observed = self.supervisor.observe(self._known(row, control))
             if observed.invocation_id:
                 self._remember(row, control, observed.invocation_id)
-            _write(control/"launch.json", {"returncode": r.returncode, "stdout": r.stdout.decode(errors="replace"),
-                                           "stderr": r.stderr.decode(errors="replace")})
+            def redacted(raw):
+                for value in grant.values():
+                    raw = raw.replace(value.encode("utf-8"), b"[redacted]")
+                return raw.decode(errors="replace")
+            _write(control/"launch.json", {"returncode": r.returncode, "stdout": redacted(r.stdout),
+                                           "stderr": redacted(r.stderr)})
             if self._known(row, control)["native"] is None:
                 raise AdapterError("submission_unknown")
             self._persist_invocation(row, control)

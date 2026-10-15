@@ -217,6 +217,8 @@ class AdapterTests(unittest.TestCase):
 
     def test_observe_completion_is_not_goal_or_delivery_success(self):
         p=self.prep();c=Path(p.receipt_reference).parent
+        from friday_dsh_adapter_test.adapters.dsh import _identity, credential_fingerprints
+        _write(Path(p.receipt_reference).parent/"credential-guard.json", {"schema":1,"identity":_identity(self.row),"keys":credential_fingerprints(self.config.environment())})
         self.sup.launched=True
         _write(c/"invocation.json",{"invocation_id":INV})
         (c/"events.ndjson").write_bytes(COMPLETE)
@@ -248,6 +250,8 @@ class AdapterTests(unittest.TestCase):
 
     def test_crash_before_session_reconciles_actual_invocation_without_replay(self):
         p=self.prep();self.row["submission_observation"]="UNKNOWN"
+        from friday_dsh_adapter_test.adapters.dsh import _identity, credential_fingerprints
+        _write(Path(p.receipt_reference).parent/"credential-guard.json", {"schema":1,"identity":_identity(self.row),"keys":credential_fingerprints(self.config.environment())})
         self.sup.launched=True;self.sup.running=True
         with patch("subprocess.run") as launch:
             observed=self.adapter.observe(self.row,p)
@@ -259,6 +263,8 @@ class AdapterTests(unittest.TestCase):
 
     def test_collected_unit_recovers_terminal_invocation_after_crash(self):
         p=self.prep();c=Path(p.receipt_reference).parent;self.row["submission_observation"]="UNKNOWN"
+        from friday_dsh_adapter_test.adapters.dsh import _identity, credential_fingerprints
+        _write(Path(p.receipt_reference).parent/"credential-guard.json", {"schema":1,"identity":_identity(self.row),"keys":credential_fingerprints(self.config.environment())})
         (c/"events.ndjson").write_bytes(COMPLETE)
         _write(c/"terminal.json",{"INVOCATION_ID":INV,"SERVICE_RESULT":"success","EXIT_CODE":"exited","EXIT_STATUS":"0"})
         observed=self.adapter.observe(self.row,p)
@@ -300,6 +306,8 @@ class AdapterTests(unittest.TestCase):
 
     def test_live_partial_ndjson_remains_unknown_then_terminal_rejects(self):
         p=self.prep();c=Path(p.receipt_reference).parent;self.sup.launched=True;self.sup.running=True
+        from friday_dsh_adapter_test.adapters.dsh import _identity, credential_fingerprints
+        _write(Path(p.receipt_reference).parent/"credential-guard.json", {"schema":1,"identity":_identity(self.row),"keys":credential_fingerprints(self.config.environment())})
         (c/"events.ndjson").write_bytes(lines(OPEN).rstrip(b"\n"))
         self.assertEqual(self.adapter.observe(self.row,p).state,"unknown")
         self.sup.running=False
@@ -457,6 +465,8 @@ class AdapterTests(unittest.TestCase):
 
     def test_actual_session_retained_on_empty_crash_output(self):
         p=self.prep();self.sup.launched=True;self.sup.running=True
+        from friday_dsh_adapter_test.adapters.dsh import _identity, credential_fingerprints
+        _write(Path(p.receipt_reference).parent/"credential-guard.json", {"schema":1,"identity":_identity(self.row),"keys":credential_fingerprints(self.config.environment())})
         self.row["native"]={"invocation_id":INV,"worker_reference":SESSION}
         self.row["submission_observation"]="OBSERVED"
         self.assertEqual(self.adapter.observe(self.row,p).worker_reference,SESSION)

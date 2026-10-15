@@ -97,8 +97,29 @@ def _source(root_fd, relative):
         os.close(parent)
 
 
+def _reject_secrets(data, secrets):
+    # Exact admitted-key rejection, as in A0 native file handling. This is an
+    # egress backstop, never confidentiality against transformed/encoded data.
+    if not isinstance(secrets, tuple) or any(not isinstance(s, bytes) or not s for s in secrets):
+        raise ArtifactError("invalid_artifact_secret_guard")
+    if any(secret in data for secret in secrets):
+        raise ArtifactError("runtime_secret_in_file")
+
+
+def _checked_chunks(fd, max_bytes, secrets):
+    size, tail = 0, b""
+    overlap = max((len(s) for s in secrets), default=1) - 1
+    while data := os.read(fd, min(65536, max_bytes - size + 1)):
+        size += len(data)
+        if size > max_bytes:
+            raise ArtifactError("artifact_too_large")
+        _reject_secrets(tail + data, secrets)
+        tail = (tail + data)[-overlap:] if overlap else b""
+        yield data
+
+
 def stage_file(*, source_root, relative_path, staging_root, logical_name,
-               media_type, origin_reference, max_bytes):
+               media_type, origin_reference, max_bytes, reject_bytes=()):
     """Copy one checked source to a collision-safe stable name, with no overwrite.
 
     max_bytes is the caller's actual configured limit, never a guessed platform
@@ -109,6 +130,8 @@ def stage_file(*, source_root, relative_path, staging_root, logical_name,
     logical_name = _label(logical_name, 512)
     media_type = _label(media_type, 256)
     origin_reference = _label(origin_reference, 2048)
+    for label in (relative_path, logical_name, media_type, origin_reference):
+        _reject_secrets(label.encode("utf-8"), reject_bytes)
     suffix = Path(logical_name).suffix
     suffix = suffix if re.fullmatch(r"\.[a-zA-Z0-9]{1,12}", suffix) else ".bin"
     final = uuid.uuid4().hex + suffix
@@ -120,10 +143,16 @@ def stage_file(*, source_root, relative_path, staging_root, logical_name,
             with _source(source, relative_path) as (input_fd, before):
                 if before.st_size > max_bytes:
                     raise ArtifactError("artifact_too_large")
+                # Inspect the whole source BEFORE any copy into retained storage.
+                # Re-scan while copying, and retain the existing stable-fd check.
+                if reject_bytes:
+                    for _ in _checked_chunks(input_fd, max_bytes, reject_bytes):
+                        pass
+                    os.lseek(input_fd, 0, os.SEEK_SET)
                 output = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                  0o600, dir_fd=destination)
                 digest, size = hashlib.sha256(), 0
-                while data := os.read(input_fd, min(65536, max_bytes - size + 1)):
+                for data in _checked_chunks(input_fd, max_bytes, reject_bytes):
                     size += len(data)
                     if size > max_bytes:
                         raise ArtifactError("artifact_too_large")
@@ -153,7 +182,7 @@ def stage_file(*, source_root, relative_path, staging_root, logical_name,
                     os.unlink(temporary, dir_fd=destination)
 
 
-def read_staged(*, staging_root, artifact: StagedArtifact, max_bytes):
+def read_staged(*, staging_root, artifact: StagedArtifact, max_bytes, reject_bytes=()):
     """Read the exact checked bytes for bounded delivery, never a mutable path.
 
     Returning bytes lets a native upload use the same payload we hashed. Large
@@ -165,11 +194,13 @@ def read_staged(*, staging_root, artifact: StagedArtifact, max_bytes):
             or not 0 <= artifact.size_bytes <= max_bytes
             or not re.fullmatch(r"[0-9a-f]{64}", artifact.sha256)):
         raise ArtifactError("unverified_staged_artifact")
+    for label in (artifact.logical_name, artifact.reference, artifact.media_type, artifact.origin_reference):
+        _reject_secrets(label.encode("utf-8"), reject_bytes)
     with _root(staging_root, private=True) as root, _source(root, artifact.reference) as (fd, info):
         if info.st_size != artifact.size_bytes or stat.S_IMODE(info.st_mode) != 0o400:
             raise ArtifactError("staged_artifact_changed")
         pieces, size, digest = [], 0, hashlib.sha256()
-        while data := os.read(fd, min(65536, max_bytes - size + 1)):
+        for data in _checked_chunks(fd, max_bytes, reject_bytes):
             size += len(data)
             if size > max_bytes:
                 raise ArtifactError("artifact_too_large")
