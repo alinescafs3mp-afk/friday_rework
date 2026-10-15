@@ -108,6 +108,7 @@ DEFAULT = [
     'test_assembled_custody.py::test_authenticated_two_principals_seven_actions_and_original_clocks',
     'test_assembled_custody.py::test_actual_native_registry_discovery_direct_and_routed_handlers',
     'test_native55_owned_publication.py',
+    'test_gateway_browser_grants.py',
 ]
 selection = sys.argv[1:] or DEFAULT
 for item in selection:
@@ -119,7 +120,7 @@ arguments = ['-c', '/dev/null', '-p', 'no:cacheprovider', '--basetemp', str(TMP 
              '-q', '--tb=short', *[str(HERE / item) for item in selection]]
 exit_code = int(pytest.main(arguments))
 provenance = {}
-for name in ('hermes_cli.friday_user_scope', 'tools.browser_scoped', 'tools.browser_tool',
+for name in ('hermes_cli.friday_user_scope', 'hermes_cli.friday_ordinary_gateway', 'tools.browser_scoped', 'tools.browser_tool',
              'toolsets', 'friday_admin_controls.onboarding', 'scripts.friday_ordinary_install'):
     module = sys.modules.get(name)
     if module is not None:

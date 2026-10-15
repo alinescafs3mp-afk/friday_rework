@@ -41,3 +41,17 @@ scans. A refused `/proc` read raises PermissionError, allowing native host detec
 to use its existing failure path without reading another process. This source-only
 host-detection refusal does not qualify container-specific behavior. All observed
 refusals and selected module provenance appear in the final JSON output.
+
+Native56 adds the gateway grant consumer regression in the same directory. Run only
+this affected group for the narrow consumer correction; the earlier37-test source
+readiness remains historical evidence for its unchanged Native55 snapshot:
+
+```sh
+/path/to/project-venv/bin/python -B tests/native55/run_source_tests.py test_gateway_browser_grants.py
+```
+
+The new group is also included in the default selection. The19 cases exercise the real `dynamic_configuration` consumer with synthetic
+account/profile/route identities: complete seven-tool browser family, SAFE-only
+regression, each partial family, unsupported/duplicate tools and foreign relationships.
+This group does not invoke the full installed checker; exact read-only full-checker
+observations are reported separately in the current installed-status record.
