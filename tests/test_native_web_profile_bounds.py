@@ -22,6 +22,9 @@ def setup(monkeypatch, tmp_path):
     monkeypatch.setattr(wt, "_get_search_backend", lambda: "exa")
     monkeypatch.setattr(wt, "_load_web_config", lambda: {"backend": "exa", "keyless_rescue": False})
     monkeypatch.setattr(_common, "provider_env", lambda name: "")
+    # Exa imports this helper by value; preserve isolation after eager discovery.
+    from plugins.web.exa import provider as exa_provider
+    monkeypatch.setattr(exa_provider, "provider_env", lambda name: "")
     monkeypatch.setattr(keyless, "provider_tier", lambda name: "auto")
     monkeypatch.setattr(keyless, "keyless_enabled", lambda: True)
     monkeypatch.setattr(cache, "_web_config", lambda: {"cache_enabled": True})
