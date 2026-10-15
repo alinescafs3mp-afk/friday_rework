@@ -455,7 +455,7 @@ class Onboarding:
             with scope.authority(home), config_write_transaction(home / 'config.yaml'):
                 self._verify_operator(profile, session)
                 native_config['terminal'] = {'cwd': str(home / 'workspace')}
-                if template=='friday-local' or 'worker_inputs' in plans[template]:
+                if 'worker_inputs' in plans[template]:
                     native_config['plugins']['entries']['friday_rework']['settings']['worker_requirements']=['dsh','a0']
                 atomic_config_write(home / 'config.yaml', native_config)
             soul = (RESOURCE / 'SOUL.md').read_bytes()

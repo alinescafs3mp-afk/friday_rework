@@ -17,6 +17,29 @@ startup. The pinned composition still **refuses startup** at missing mandatory
 admission. This is source wiring, not normal-install/start acceptance or a release. Installation/download/build are
 future explicitly invoked effects; this implementation task executes none.
 
+15 October: the supported installer adds `activate-telegram`, `start-telegram`
+and `rollback-telegram`. Ordinary receiving and authenticated onboarding do not
+require worker execution; the full worker template and release gates remain.
+Activation v1 requires a fresh transaction. An explicit corrected v2 request may
+continue only after proving complete source-only rollback and retaining the
+whole failed transaction under its original request hash. It accepts a changed
+host installer, preserves original scopes/budgets, and refuses blind replay.
+Git discovery is bounded to the receiving source parent during both patch checks.
+
+The real existing installation passed this bounded source transaction after the
+host correction. Receiver start, genuine user pairing/onboarding and Telegram
+answer/follow-up acceptance remain separate. Public canonical layers45/46 have
+new composition hashes; old installed identities or runtime proofs never transfer
+automatically. Protected deployment inputs, secrets and private incremental
+transition patches are excluded from publication.
+
+The initial handoff helper currently drops user D-Bus deployment environment after
+native unit creation. Do not blindly repeat it after STOP_UNCONFIRMED. Reconcile
+source/unit identity, actual manager state and native owner first. The installed
+unit can be managed through standard user systemd operations in the operator's
+retained bus session; this operational completion is separate from fixing the
+helper's reproducible automatic setup. Never adopt or replace a foreign unit.
+
 Input fields are `home`, `bootstrap_python`, `hermes_donor`, `hermes_prepare`,
 `sources_lock`, `dsh_donor`, `a0_donor`, `product`, `project_files`, `seconds`,
 `containment`. The latter is the exact `{ "path": "/usr/bin/bwrap", "sha256":

@@ -1,0 +1,881 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -6953,6 +6953,13 @@
+         )
+     if not data.get("choices"):
+         return response
++    from agent.bounded_summary_output import active
++    if active():
++        inner_choices = data["choices"]
++        if (not isinstance(inner_choices, list) or len(inner_choices) != 1
++                or not isinstance(inner_choices[0], dict)
++                or not isinstance(inner_choices[0].get("message"), dict)):
++            raise RuntimeError("bounded_context: invalid structured summary envelope choices")
+     try:
+         return type(response).model_validate(data)
+     except (AttributeError, TypeError, ValueError):
+@@ -6964,8 +6971,9 @@
+         msg = ch.get("message") if isinstance(ch, dict) else None
+         if isinstance(msg, dict):
+             choices.append(SimpleNamespace(
+-                message=SimpleNamespace(**msg),
++                index=ch.get("index"), message=SimpleNamespace(**msg),
+                 finish_reason=ch.get("finish_reason") or "stop",
++                _bounded_actual_finish_reason=ch.get("finish_reason"),
+             ))
+     if not choices:
+         return response
+@@ -6981,6 +6989,9 @@
+ def _recover_aux_response_message(response: Any) -> Optional[Any]:
+     """Synthesize chat-completions shape from Responses-style text (``output_text``,
+     ``output`` items) that some compatible endpoints return outside ``choices``."""
++    from agent.bounded_summary_output import active
++    if active():
++        return None
+     text = _extract_aux_response_text(response)
+     if not text:
+         return None
+@@ -7165,15 +7176,6 @@
+     or when the adapter streams internally. Streaming rejections fall back to a plain call —
+     except under ``force_stream``.
+ 
+-    Behavior is byte-for-byte identical to a plain ``create(**kwargs)`` when neither trigger applies (every
+-    existing caller/task) or when the client's wire adapter streams internally. With a hook + a
+-    chunk-capable client, the request is sent with ``stream=True`` and aggregated, ticking the hook only for
+-    substantive chunks. The configured ``timeout`` acts per stream read (idle) rather than as a total
+-    budget, and outer liveness watchdogs see tokens moving. ``force_stream=True`` (stream-only providers
+-    such as Tencent Copilot — credit @kudi88, PR #60686) takes the same streamed path even without a hook.
+-    Providers that reject the streamed request fall back to the plain non-streaming call — except under
+-    ``force_stream``, where a stream-only provider rejects the plain call by definition, so the original
+-    error is surfaced to the normal recovery chains instead.
+     """
+     kwargs = bypass_chat_sdk_request_transform(kwargs, client)
+     _notify_aux_dispatch()
+@@ -7252,6 +7254,8 @@
+         self.reasoning_details: List[Any] = []
+         self.tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+         self.finish_reason = self.usage = None
++        from agent.bounded_summary_output import active
++        self._bounded_visible_output = active()
+         self.resp_id = ""
+         self.resp_model = model or ""
+ 
+@@ -7305,6 +7309,9 @@
+         return made_progress
+ 
+     def feed(self, chunk: Any) -> bool:
++        if self._bounded_visible_output:
++            from agent.bounded_summary_output import check_stream_choice
++            check_stream_choice(chunk, "".join(self.content_parts), self.finish_reason)
+         # Every frame records transport timing (TTFP); only a substantive payload ticks the
+         # forward-progress hook that keeps compression alive (and is reported as True).
+         _notify_aux_timing_response()
+@@ -7328,6 +7335,9 @@
+         piece = flatten_message_text(getattr(delta, "content", None), sep="")
+         if piece:
+             self.content_parts.append(piece)
++            if self._bounded_visible_output:
++                from agent.bounded_summary_output import check_raw_text
++                check_raw_text("".join(self.content_parts))
+             made_progress = True
+         # Structured refusal fragments must survive both sync and async aggregation.
+         # The summarizer treats this field as authoritative even with content present.
+@@ -7364,7 +7374,8 @@
+         )
+         choice = SimpleNamespace(index=0, message=message, finish_reason=self.finish_reason or "stop")
+         return SimpleNamespace(id=self.resp_id, model=self.resp_model, object="chat.completion",
+-                               choices=[choice], usage=self.usage)
++                               choices=[choice], usage=self.usage,
++                               _bounded_actual_finish_reason=self.finish_reason)
+ 
+ 
+ async def _aggregate_chat_stream_async(
+diff --git a/agent/bounded_context.py b/agent/bounded_context.py
+--- a/agent/bounded_context.py
++++ b/agent/bounded_context.py
+@@ -237,7 +237,9 @@
+     """A running compression keeps its admitted immutable policy across workers/config edits."""
+     token = _SUMMARY_POLICY.set(getattr(compressor, "bounded_context_policy", None))
+     try:
+-        yield
++        from agent.bounded_summary_output import output_scope
++        with output_scope(compressor):
++            yield
+     finally:
+         _SUMMARY_POLICY.reset(token)
+ 
+@@ -301,6 +303,8 @@
+         raise BoundedContextError("bounded_context TEST scope permits only compression auxiliary calls")
+     policy.assert_route(provider, request.get("model", ""), str(client.base_url), api_mode)
+     policy.check_request(request, compression=True)
++    from agent.bounded_summary_output import guard_format
++    guard_format(request)
+ 
+ 
+ def auxiliary_callback(client: Any, callback: Any, provider: str | None, api_mode: str | None):
+@@ -327,6 +331,8 @@
+         guard_aux_request(policy, context.get("task", ""),
+                           context.get("provider") or context.get("stream_provider") or policy.provider,
+                           context.get("api_mode") or "chat_completions", client, request)
++    from agent.bounded_summary_output import guard_format
++    guard_format(request, physical=True)
+     return client.chat.completions.create(**request)
+ 
+ 
+@@ -357,8 +363,13 @@
+     empty = compressor._build_summary_prompt("", summary_budget, focus, memory, has_user_turn)
+ 
+     def request(prompt):
+-        return {"model": policy.model, "messages": [{"role": "user", "content": prompt}],
+-                "max_tokens": allocation}
++        from agent.bounded_summary_output import response_format
++        result = {"model": policy.model, "messages": [{"role": "user", "content": prompt}],
++                  "max_tokens": allocation}
++        required = response_format(compressor)
++        if required is not None:
++            result["response_format"] = required
++        return result
+ 
+     accounting = policy.check_request(request(empty), compression=True)
+     available = accounting["input_budget"] - accounting["estimated_input"]
+@@ -383,6 +394,14 @@
+                    "Preserve factual meaning, uncertainty, concrete evidence and the current task. "
+                    "Do not claim retained tool evidence is missing. A length-truncated summary is rejected; "
+                    "an oversized completed summary is also rejected without changing saved conversation rows.")
++    from agent.bounded_summary_output import response_format
++    required = response_format(compressor)
++    if required is not None:
++        maximum = required["json_schema"]["schema"]["properties"]["summary"]["maxLength"]
++        prompt += (f"\nReturn one JSON object with exactly one string field \"summary\", at most {maximum} "
++                   "Unicode characters, including all needed summary sections. Preserve meaning and uncertainty. "
++                   "No preamble, markdown fence, alternative fields, refusal or partial text. "
++                   "This JSON envelope replaces the earlier body-only output instruction.")
+     policy.check_request(request(prompt), compression=True)
+     return prompt
+ 
+@@ -900,9 +919,19 @@
+                     "_plugin_system_prompt_sections_snapshot", "_plugin_system_prompt_sections_previous"):
+             if hasattr(agent, key):
+                 setattr(probe, key, copy.deepcopy(getattr(agent, key)))
+-        probe._session_db = None
+-        rebuilt = _rebuild_system_prompt_at_boundary(probe, None)
+-        variants += bounded_compaction_request(probe, messages, rebuilt, summary_probe=True)
++        # The boundary builder reads persisted profile/task prompt metadata. A
++        # DB-less probe omits it and underprices the final envelope. Use the real
++        # read-only handle, whose write APIs fail closed, and close our own handle.
++        from hermes_state import SessionDB
++        session_db = getattr(agent, "_session_db", None)
++        readonly_db = SessionDB(session_db.db_path, read_only=True) if session_db is not None else None
++        probe._session_db = readonly_db
++        try:
++            rebuilt = _rebuild_system_prompt_at_boundary(probe, None)
++            variants += bounded_compaction_request(probe, messages, rebuilt, summary_probe=True)
++        finally:
++            if readonly_db is not None:
++                readonly_db.close()
+     # The skeleton already includes the synthetic summary row and end marker.
+     # Added summary text is charged by its JSON-escaped UTF-8 bytes, not tokens.
+     headroom = min(policy.input_budget(wire_output_tokens(request))
+diff --git a/agent/bounded_summary_output.py b/agent/bounded_summary_output.py
+new file mode 100644
+--- /dev/null
++++ b/agent/bounded_summary_output.py
+@@ -0,0 +1,169 @@
++"""One physical, schema-bound visible summary; no truncation or unformatted retry."""
++from __future__ import annotations
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++import copy
++import json
++from typing import Any
++
++_CONTRACT = ContextVar("bounded_summary_visible_contract", default=None)
++STRATEGY = "bounded_visible_json_v1"
++
++
++def _error(reason):
++    from agent.bounded_context import BoundedContextError
++    return BoundedContextError("bounded_context: bounded visible summary " + reason)
++
++
++def escaped_bytes(text: str) -> int:
++    try:
++        return len(json.dumps(text, ensure_ascii=False, allow_nan=False).encode("utf-8")) - 2
++    except (TypeError, ValueError, UnicodeError) as exc:
++        raise _error("is not finite UTF-8 text") from exc
++
++
++def allocate(compressor: Any, mandatory: str) -> None:
++    """Six bytes bounds each Unicode scalar under the real UTF-8 JSON serializer."""
++    headroom = compressor._bounded_summary_json_headroom
++    if type(headroom) is not int or headroom < 6:
++        raise _error("has no complete-string allowance")
++    compressor._bounded_summary_visible_contract = {
++        "strategy": STRATEGY, "escaped_byte_limit": headroom,
++        "max_chars": headroom // 6,
++        "carrier_byte_limit": escaped_bytes(mandatory) + headroom,
++    }
++
++
++def response_format(compressor: Any) -> dict | None:
++    contract = getattr(compressor, "_bounded_summary_visible_contract", None)
++    if not contract or not getattr(compressor, "_bounded_summary_readonly_strategy", False):
++        return None
++    return {"type": "json_schema", "json_schema": {
++        "name": STRATEGY, "strict": True,
++        "schema": {"type": "object", "properties": {
++            "summary": {"type": "string", "minLength": 1, "maxLength": contract["max_chars"]}},
++            "required": ["summary"], "additionalProperties": False}}}
++
++
++@contextmanager
++def output_scope(compressor: Any):
++    contract = getattr(compressor, "_bounded_summary_visible_contract", None)
++    expected = response_format(compressor)
++    state = {"contract": copy.deepcopy(contract), "format": expected, "physical_calls": 0} if expected else None
++    token = _CONTRACT.set(state)
++    try:
++        yield
++    finally:
++        _CONTRACT.reset(token)
++
++
++def active() -> bool:
++    return _CONTRACT.get() is not None
++
++
++def guard_format(request: dict, *, physical: bool = False) -> None:
++    state = _CONTRACT.get()
++    if state is None:
++        return
++    from agent.bounded_context import wire_body
++    body = wire_body(request)
++    if body.get("response_format") != state["format"]:
++        raise _error("required format missing or changed; unformatted retry forbidden")
++    if physical:
++        if state["physical_calls"]:
++            raise _error("physical attempt already consumed; retry forbidden")
++        state["physical_calls"] += 1
++
++
++def _field(value, name, default=None):
++    return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
++
++
++def _unique_object(pairs):
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise _error("JSON has duplicate keys")
++        result[key] = value
++    return result
++
++
++def _reject_constant(value):
++    raise _error("JSON has nonfinite constant")
++
++
++def parse_response(compressor: Any, response: Any) -> str:
++    contract = compressor._bounded_summary_visible_contract
++    choices = _field(response, "choices")
++    if not isinstance(choices, list) or len(choices) != 1:
++        raise _error("requires exactly one explicit completed choice")
++    choice = choices[0]
++    if _field(choice, "index") != 0:
++        raise _error("choice index is missing or changed")
++    reason = _field(response, "_bounded_actual_finish_reason",
++                    _field(choice, "_bounded_actual_finish_reason", _field(choice, "finish_reason")))
++    if _field(choice, "finish_reason") != "stop" or reason != "stop":
++        raise _error("requires explicit finish_reason=stop; incomplete/length rejected")
++    message = _field(choice, "message")
++    content = _field(message, "content")
++    if (_field(message, "refusal") or _field(message, "tool_calls")
++            or not isinstance(content, str) or not content.strip()):
++        raise _error("requires visible JSON text without refusal/tool calls")
++    check_raw_text(content, contract)
++    try:
++        value = json.loads(content, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
++    except (ValueError, TypeError) as exc:
++        raise _error("invalid or incomplete JSON") from exc
++    if type(value) is not dict or set(value) != {"summary"} or type(value["summary"]) is not str:
++        raise _error("wrong JSON shape or value types")
++    summary = value["summary"]
++    if not summary.strip() or len(summary) > contract["max_chars"]:
++        raise _error("empty or schema-length-exceeding completed string")
++    from agent.context_compressor import _is_summary_refusal
++    from agent.agent_runtime_helpers import strip_think_blocks
++    if _is_summary_refusal(summary) or strip_think_blocks(None, summary) != summary:
++        raise _error("refusal or hidden-thought markup is not a complete visible summary")
++    if escaped_bytes(summary) > contract["escaped_byte_limit"]:
++        raise _error("completed string exceeds escaped-byte allowance")
++    return summary
++
++
++def check_raw_text(text: str, contract: dict | None = None) -> None:
++    if contract is None:
++        state = _CONTRACT.get()
++        if state is None:
++            return
++        contract = state["contract"]
++    # An ASCII escaped astral scalar uses 12 response bytes versus 4 wire bytes;
++    # schema maxLength <= headroom/6 bounds even that syntax. Extra whitespace
++    # is deliberately finite; oversized bodies are rejected, never clipped.
++    try:
++        size = len(text.encode("utf-8"))
++    except UnicodeError as exc:
++        raise _error("response is not UTF-8") from exc
++    if size > 2 * contract["escaped_byte_limit"] + 64:
++        raise _error("raw response exceeded finite parser allowance")
++
++
++def check_stream_choice(chunk: Any, text_so_far: str, previous_finish: Any = None) -> None:
++    if not active():
++        return
++    choices = _field(chunk, "choices")
++    if not isinstance(choices, list) or len(choices) > 1:
++        raise _error("stream choice shape changed")
++    if choices:
++        choice = choices[0]
++        delta = _field(choice, "delta")
++        if previous_finish is not None:
++            raise _error("stream choice after terminal status")
++        if _field(choice, "index") != 0 or (delta is not None and _field(delta, "content") is not None
++                                              and not isinstance(_field(delta, "content"), str)):
++            raise _error("stream content type or choice index changed")
++    check_raw_text(text_so_far)
++
++
++def check_carrier(compressor: Any, summary: str) -> None:
++    contract = getattr(compressor, "_bounded_summary_visible_contract", None)
++    if contract and escaped_bytes(summary) > contract["carrier_byte_limit"]:
++        raise _error("completed deterministic carrier exceeds reserved escaped bytes")
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -3862,6 +3862,10 @@
+             # The admitted native profile also pins this cap in extra_body.
+             # Override that same field for this call so SDK merging cannot restore 4096.
+             call_kwargs["extra_body"] = {"max_tokens": call_kwargs["max_tokens"]}
++            from agent.bounded_summary_output import response_format
++            required_format = response_format(self)
++            if required_format is not None:
++                call_kwargs["extra_body"]["response_format"] = required_format
+         # Pinned route (stall fallback) replaces task routing so the retry leaves the stalled backend.
+         self._apply_summary_route(call_kwargs, _pinned_summary_call_kwargs())
+         # Compression is atomic: protect the in-flight summary call from a mid-turn gateway interrupt.
+@@ -3900,32 +3904,20 @@
+             )
+         if self._compression_cancelled():
+             raise AuxiliaryExplicitCancellation()
++        from agent.bounded_summary_output import response_format, parse_response
++        if response_format(self) is not None:
++            return parse_response(self, response)
+         # Reasoning-field fallback (DeepSeek/Qwen/Kimi put the summary in reasoning_content); capped.
+         content = extract_content_or_reasoning(response, max_reasoning_chars=8000)
+         where = f"(provider={self.provider or 'auto'} model={self.summary_model or self.model})"
+-        # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels) return a well-formed HTTP 200
+-        # with an empty or whitespace-only ``content`` instead of an error or empty ``choices``. That
+-        # payload passes ``_validate_llm_response`` (a ``message`` exists), so it reaches here and would
+-        # otherwise be stored as a prefix-only summary with no body — silently wiping the compacted turns
+-        # and making the model forget the in-progress task (#11978, #11914). Treat empty content as a
+-        # failure so it routes through the same main-model fallback + cooldown machinery as a transport
+-        # error, rather than replacing real context with an empty summary.
++        # Empty or refused content must preserve the compacted turns.
+         if _is_refusal_response(response, content):
+             # The explicit refusal is authoritative even when content is empty.
+             # Keep the established fallback/cooldown/abort path before any commit.
+             raise RuntimeError(f"Context compression LLM returned refusal content {where}")
+         if not content.strip():
+             raise RuntimeError(f"Context compression LLM returned empty content {where}")
+-        # A finish_reason of "length" means the summarizer hit its output token cap mid-generation: the text
+-        # present is PARTIAL. Persisting a partial summary as the compaction checkpoint silently truncates
+-        # the conversation's memory — the cut-off text replaces the real middle turns AND is fed back into
+-        # every subsequent iterative update prompt, compounding the loss across compactions. Treat it as a
+-        # failure so it routes through the same main-model fallback + abort machinery as other degraded
+-        # responses instead of becoming a checkpoint. (Ported from earendil-works/pi#7048.)
+-        # A length stop means the merged rolling summary is partial — persisting it would silently drop the
+-        # tail of the merge and feed the cut-off text into every later micro-compact pass. Leave the
+-        # exchange unabsorbed instead; a later pass retries it. (Same class as _generate_summary's guard;
+-        # pi#7048.)
++        # A length stop is partial memory and must not become a checkpoint.
+         if _response_finish_reason(response) == "length":
+             raise RuntimeError(
+                 f"Context compression summary was truncated ({_TRUNCATED_SUMMARY_MARKER}): generation hit the output "
+@@ -3988,6 +3980,8 @@
+             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
+             summary = self._augment_summary_lean(summary, turns_to_summarize)
+             self._validate_summary_user_provenance(summary, has_user_turn)
++            from agent.bounded_summary_output import check_carrier
++            check_carrier(self, self._with_selected_summary_prefix(summary))
+             # A detached stale attempt must not publish its late summary onto shared compressor state:
+             # the fallback already advanced _previous_summary and owns the cooldown/error fields. The
+             # candidate itself is discarded downstream by the working-attempt check; bail here so the
+@@ -5654,7 +5648,7 @@
+             messages = copy.deepcopy(messages)
+             allocation_fields = ("_bounded_summary_json_headroom", "_bounded_summary_output_tokens",
+                                  "_bounded_summary_target_tokens",
+-                                 "_bounded_summary_readonly_strategy")
++                                 "_bounded_summary_readonly_strategy", "_bounded_summary_visible_contract")
+             allocation_before = {key: copy.deepcopy(getattr(self, key)) for key in allocation_fields
+                                  if key in getattr(self, "__dict__", {})}
+         else:
+@@ -5731,6 +5725,10 @@
+             mandatory = _reinject_pruned_skill_markers(mandatory, names)
+             mandatory = self._with_selected_summary_prefix(
+                 self._augment_summary_lean(mandatory, turns_to_summarize))
++            # Empty historical grounding strips the separator before model text.
++            # Reserve its two newlines (four escaped JSON bytes) in the probe only.
++            if self._latest_user_task_snapshot(turns_to_summarize):
++                mandatory += "\n\n"
+             self._bounded_summary_json_headroom = fit(
+                 self._assemble_compressed(messages, compress_start, compress_end, scan, mandatory)) if callable(fit) else None
+             if self._bounded_summary_readonly_strategy:
+@@ -5743,6 +5741,11 @@
+                     max(1, self._bounded_summary_json_headroom // 6))
+             else:
+                 self._bounded_summary_target_tokens = self.bounded_context_policy.compression_output_tokens
++            if self._bounded_summary_readonly_strategy:
++                from agent.bounded_summary_output import allocate
++                allocate(self, mandatory)
++            else:
++                self.__dict__.pop("_bounded_summary_visible_contract", None)
+             # Keep the already admitted configured auxiliary generation budget.
+             # Input accounting reserves this full cap even when text is shorter.
+             self._bounded_summary_output_tokens = self.bounded_context_policy.compression_output_tokens
+diff --git a/agent/turn_preflight_gate.py b/agent/turn_preflight_gate.py
+--- a/agent/turn_preflight_gate.py
++++ b/agent/turn_preflight_gate.py
+@@ -42,6 +42,60 @@
+         _provider_overflow_recovery_pending=_provider_overflow_recovery_pending,
+         _last_preflight_pressure=None,
+     )
++
++    from hermes_cli import friday_credential_admission as admission
++    if admission.claim_explicit_manual_once(agent):
++        from agent.conversation_compression import (
++            context_compression_timed_out, conversation_history_after_compression,
++            compression_skipped_due_to_lock,
++        )
++        from agent.turn_context_compaction import _refund_api_call
++        # Claim is not undone on budget exhaustion, timeout, refusal or exception.
++        if v.compression_attempts >= max_compression_attempts:
++            v.api_call_count = _refund_api_call(agent, v.api_call_count)
++            v.failed = True
++            v.final_response = 'Explicit manual compression budget exhausted.'
++            v._turn_exit_reason = 'explicit_manual_compression_budget_exhausted'
++            v.action = 'break'
++            return v
++        v.compression_attempts += 1
++        previous = v.messages
++        v.messages, v.active_system_prompt = agent._compress_context(
++            previous, system_message, approx_tokens=request_pressure_tokens,
++            task_id=effective_task_id, force=True, trigger='manual',
++        )
++        v.api_call_count = _refund_api_call(agent, v.api_call_count)
++        # The attempt budget remains charged even when a lock or no-op prevented work.
++        timed_out = context_compression_timed_out(agent)
++        cc = agent.context_compressor
++        # Post-commit session-end callbacks reset compressor diagnostics. The
++        # actual facade resets this attempt flag at entry and sets it only after
++        # a successful in-place commit; its precommit gate owns no-progress refusal.
++        failed = (timed_out or compression_skipped_due_to_lock(agent)
++                  or getattr(agent, '_last_compression_attempt_in_place', None) is not True
++                  or getattr(cc, '_last_compress_aborted', False)
++                  or getattr(cc, '_last_compress_refused_would_grow', False)
++                  or getattr(cc, '_last_summary_fallback_used', False))
++        if failed:
++            v.failed = True
++            v.final_response = 'Explicit manual compression did not commit a usable summary.'
++            v._compression_timeout_exhausted = bool(timed_out)
++            v._turn_exit_reason = ('context_compression_timeout' if timed_out
++                                   else 'explicit_manual_compression_failed')
++            v.action = 'break'
++            return v
++        v.conversation_history = conversation_history_after_compression(
++            agent, v.messages, v.conversation_history,
++        )
++        # Every prepared request still addresses the PRE-compression projection.
++        v.pending_moa_prepared_request = None
++        v._last_preflight_pressure = None
++        v._provider_overflow_recovery_pending = False
++        # Continue discards old API projection: prepare_iteration reanchors the user
++        # index, then assemble_api_request rebuilds the complete request and real main
++        # guard validates the serializable body. No budget start/deadline resets.
++        v.action = 'continue'
++        return v
+ 
+     _runtime_context_error = _ollama_context_limit_error(agent, request_pressure_tokens)
+     if _runtime_context_error:
+diff --git a/hermes_cli/friday_credential_admission.py b/hermes_cli/friday_credential_admission.py
+--- a/hermes_cli/friday_credential_admission.py
++++ b/hermes_cli/friday_credential_admission.py
+@@ -666,20 +666,21 @@
+         return cli_ordinary_failed_v6_json(raw), hashlib.sha256(raw).hexdigest()
+     require(request['schema'] in ('friday.installed-cli-request.v1','friday.installed-cli-request.v2',
+                                  'friday.installed-cli-request.v3','friday.installed-cli-request.v4',
+-                                 'friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11'), 'cli_runtime_supported_request_required')
++                                 'friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11','friday.installed-cli-request.v12'), 'cli_runtime_supported_request_required')
+     require(('postinstall_native_bootstrap_repair' in marker) ==
+-            (request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11'))
+-            and ('postinstall_session_artifact_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11'))
+-            and ('postinstall_context_continuation_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11'))
++            (request['schema'] in ('friday.installed-cli-request.v3','friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11','friday.installed-cli-request.v12'))
++            and ('postinstall_session_artifact_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v4','friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11','friday.installed-cli-request.v12'))
++            and ('postinstall_context_continuation_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11','friday.installed-cli-request.v12'))
+             and ('postinstall_frontend_repair' in marker) == (request['schema'] != 'friday.installed-cli-request.v1'),
+             'cli_runtime_supported_chain_required')
+-    require(request['schema'] not in ('friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11') or
++    require(request['schema'] not in ('friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11','friday.installed-cli-request.v12') or
+             'postinstall_native_manager_repair' in marker, 'cli_ordinary_new_question_source_required')
+-    require(('postinstall_readonly_schema_formatter_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11')), 'cli_runtime_schema_formatter_chain_required')
+-    require(('postinstall_current12_readonly_fit_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11')), 'cli_runtime_current12_chain_required')
+-    require(('postinstall_summary_fit_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11')), 'cli_runtime_summary_fit_chain_required')
+-    require(('postinstall_summary_budget_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v10','friday.installed-cli-request.v11')), 'cli_runtime_summary_budget_chain_required')
+-    require(('postinstall_summary_completion_repair' in marker) == (request['schema'] == 'friday.installed-cli-request.v11'), 'cli_runtime_summary_completion_chain_required')
++    require(('postinstall_readonly_schema_formatter_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11','friday.installed-cli-request.v12')), 'cli_runtime_schema_formatter_chain_required')
++    require(('postinstall_current12_readonly_fit_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11','friday.installed-cli-request.v12')), 'cli_runtime_current12_chain_required')
++    require(('postinstall_summary_fit_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11','friday.installed-cli-request.v12')), 'cli_runtime_summary_fit_chain_required')
++    require(('postinstall_summary_budget_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v10','friday.installed-cli-request.v11','friday.installed-cli-request.v12')), 'cli_runtime_summary_budget_chain_required')
++    require(('postinstall_summary_visible_repair' in marker) == (request['schema'] == 'friday.installed-cli-request.v12'), 'cli_runtime_summary_visible_chain_required')
++    require(('postinstall_summary_completion_repair' in marker) == (request['schema'] in ('friday.installed-cli-request.v11','friday.installed-cli-request.v12')), 'cli_runtime_summary_completion_chain_required')
+     original = load(request['installation_input'])
+     current_input = load(request['repaired_input'])
+     require({k:v for k,v in original.items() if k != 'project_files'} ==
+@@ -708,6 +709,12 @@
+         require(hashlib.sha256(manifest43_raw).hexdigest() == current_input['project_files'][CLI_SUMMARY_BUDGET_MANIFEST], 'cli_runtime_summary_budget_manifest_changed')
+         names43, _ = cli_summary_budget_manifest_scope(cli_ordinary_failed_v6_json(manifest43_raw))
+     names44 = set()
++    names45,newfiles45 = set(),set()
++    if 'postinstall_summary_visible_repair' in marker:
++        manifest45_path = Path(request['repaired_input']['path']).parent/'project'/CLI_SUMMARY_VISIBLE_MANIFEST
++        manifest45_raw = read_owned(manifest45_path)
++        require(hashlib.sha256(manifest45_raw).hexdigest() == current_input['project_files'][CLI_SUMMARY_VISIBLE_MANIFEST], 'cli_runtime_summary_visible_manifest_changed')
++        names45,newfiles45 = cli_summary_visible_manifest_scope(cli_ordinary_failed_v6_json(manifest45_raw))
+     if 'postinstall_summary_completion_repair' in marker:
+         manifest44_path = Path(request['repaired_input']['path']).parent/'project'/CLI_SUMMARY_COMPLETION_MANIFEST
+         manifest44_raw = read_owned(manifest44_path)
+@@ -716,6 +723,9 @@
+     head = marker
+     snapshots = {}
+     for field, folder, token, schema, manifest_name, source_name, count, prior_token, prior_schema in (
++        ('postinstall_summary_visible_repair','summary-visible-repair',CLI_SUMMARY_VISIBLE_INTENT,
++         'friday.summary-visible-repair-intent.v1','installed-summary-visible-manifest.json',
++         tuple(names45),45,CLI_SUMMARY_COMPLETION_INTENT,'friday.summary-completion-repair-intent.v1'),
+         ('postinstall_summary_completion_repair','summary-completion-repair',CLI_SUMMARY_COMPLETION_INTENT,
+          'friday.summary-completion-repair-intent.v1','installed-summary-completion-manifest.json',
+          tuple(names44),44,CLI_SUMMARY_BUDGET_INTENT,'friday.summary-budget-repair-intent.v1'),
+@@ -791,7 +801,7 @@
+         manifest_path = Path(r['repaired_input']['path']).parent/'project'/manifest_relative
+         manifest_raw = read_owned(manifest_path)
+         manifest_sha = hashlib.sha256(manifest_raw).hexdigest(); manifest = cli_ordinary_failed_v6_json(manifest_raw)
+-        require(value['project_files'][manifest_relative] == manifest_sha and len(manifest['files']) == (len(names44) if count == 44 else len(names43) if count == 43 else len(names42) if count == 42 else len(names41) if count == 41 else len(cli_readonly_schema_manifest_names()) if count == 40 else 6 if count == 38 else 2 if count == 37 else 1),
++        require(value['project_files'][manifest_relative] == manifest_sha and len(manifest['files']) == (len(names45) if count == 45 else len(names44) if count == 44 else len(names43) if count == 43 else len(names42) if count == 42 else len(names41) if count == 41 else len(cli_readonly_schema_manifest_names()) if count == 40 else 6 if count == 38 else 2 if count == 37 else 1),
+                 'cli_runtime_chain_manifest_changed')
+         names = set(source_name) if isinstance(source_name,tuple) else {source_name}
+         require({row['path'] for row in manifest['files']} == names
+@@ -804,7 +814,7 @@
+                 'cli_runtime_chain_receipt_changed')
+         for row in manifest['files']:
+             name = row['path']
+-            new_file = (count == 38 and name == 'tests/agent/test_post_tool_context_fit.py') or (count == 40 and name in cli_readonly_schema_new_files()) or (count == 41 and name in newfiles41) or (count == 42 and name in newfiles42)
++            new_file = (count == 45 and name in newfiles45) or (count == 38 and name == 'tests/agent/test_post_tool_context_fit.py') or (count == 40 and name in cli_readonly_schema_new_files()) or (count == 41 and name in newfiles41) or (count == 42 and name in newfiles42)
+             require((row['before_sha256'] is None and row.get('new_file') is True and row['mode'] == '100644' and name not in before['files']
+                      if new_file else row['before_sha256'] == before['files'][name]['sha256'])
+                     and receipt['files'][name] == {k:row[k] for k in ('sha256','bytes','mode')},
+@@ -817,7 +827,7 @@
+                 require(absence.get(str(home/'hermes-agent'/name)) == {'absent':True}
+                         and not (base/'hermes-agent'/name).exists()
+                         and not (base/'hermes-agent'/name).is_symlink(), 'cli_runtime_saved_absence_changed')
+-            elif count in (37,38,39,40,41,42,43,44):
++            elif count in (37,38,39,40,41,42,43,44,45):
+                 prior_source = base/'hermes-agent'/name
+                 raw = read_owned(prior_source,private=True)
+                 require(hashlib.sha256(raw).hexdigest() == row['before_sha256'], 'cli_runtime_saved_source_changed')
+@@ -827,6 +837,30 @@
+                 and prior['request']['repaired_input'] == r['previous_input']
+                 and prior['request']['installation_input'] == request['installation_input']
+                 and cli_historical_scope_closed(prior['clock'],'friday.installed-cli-clock.v1'), 'cli_runtime_prior_repair_changed')
++        if count == 45:
++            saved = cli_ordinary_failed_v6_json(read_owned(home/'preparation'/folder/'beforeimages.json',private=True))
++            expected_saved = {str(home/n) for n in ('FRIDAY-INSTALL.json','hermes-agent.source.json','hermes-agent/install-stamp.json',prior_token)} | {str(home/'hermes-agent'/n) for n in names}
++            require(type(saved) is dict and set(saved) == expected_saved, 'cli_runtime_summary_visible_beforeimages_scope_changed')
++            for relative in ('FRIDAY-INSTALL.json','hermes-agent.source.json','hermes-agent/install-stamp.json',prior_token,*('hermes-agent/'+n for n in names-newfiles45)):
++                row=saved[str(home/relative)];backup=base/relative
++                require(type(row) is dict and set(row) == {'path','sha256','bytes','original_mode'}
++                        and row['path'] == str(backup) and type(row['bytes']) is type(row['original_mode']) is int
++                        and row['bytes'] >= 0 and stat.S_IMODE((home/relative).stat().st_mode) == row['original_mode'],
++                        'cli_runtime_summary_visible_beforeimage_mode_changed')
++                raw=read_owned(backup,private=True)
++                require(len(raw) == row['bytes'] and hashlib.sha256(raw).hexdigest() == row['sha256'],
++                        'cli_runtime_summary_visible_beforeimage_changed')
++            require(saved[str(home/prior_token)]['sha256'] == r['previous_repair_intent']['sha256'], 'cli_runtime_summary_visible_old_intent_changed')
++            cli_ordinary_previous_failed_v11_journey(r,home)
++            require(request['schema'] == 'friday.installed-cli-request.v12'
++                    and request['ordinary_readonly'] == r['next_ordinary_readonly']
++                    and request['strategy_recovery'] == r['new_strategy_recovery']
++                    and request['partial_proof'] == r['partial_proof'], 'cli_runtime_summary_visible_scope_changed')
++            cli_summary_visible_recovery_contract(request['strategy_recovery'],request['ordinary_readonly'],source=home/'hermes-agent')
++            request = {k:v for k,v in request.items() if k != 'strategy_recovery'}
++            request = dict(request,schema='friday.installed-cli-request.v11',ordinary_readonly=r['ordinary_readonly'])
++            head, receipt = previous, before
++            continue
+         if count == 44:
+             saved = cli_ordinary_failed_v6_json(read_owned(home/'preparation'/folder/'beforeimages.json',private=True))
+             existing = names
+@@ -1116,6 +1150,148 @@
+                     and row.get('new_file',False) is False), 'cli_current12_manifest_beforeimage_required')
+     return names,newfiles
+ 
++
++CLI_SUMMARY_VISIBLE_MANIFEST = 'patches/hermes/installed-summary-visible-manifest.json'
++CLI_SUMMARY_VISIBLE_INTENT = 'FRIDAY-INSTALL.summary-visible-repair.intent.json'
++
++
++def cli_summary_visible_manifest_scope(manifest):
++    """Source45 preserves exact final strategy4 and adds admission plus one explicit hook."""
++    import re
++    rows = manifest['files']
++    if type(rows) is dict:
++        rows = [dict(row,path=name) for name,row in rows.items()]
++    names = {'agent/bounded_context.py','agent/context_compressor.py','agent/auxiliary_client.py',
++             'agent/bounded_summary_output.py','agent/turn_preflight_gate.py',
++             'hermes_cli/friday_credential_admission.py'}
++    newfiles = {'agent/bounded_summary_output.py'}
++    require(type(rows) is list and len(rows) == len(names) and all(type(r) is dict for r in rows)
++            and {r['path'] for r in rows} == names, 'cli_summary_visible_manifest_scope_required')
++    for row in rows:
++        new = row['path'] in newfiles
++        require(row['mode'] == '100644' and type(row['bytes']) is int and row['bytes'] > 0
++                and type(row['sha256']) is str and re.fullmatch('[0-9a-f]{64}',row['sha256'])
++                and (row['before_sha256'] is None and row.get('new_file') is True if new else
++                     type(row['before_sha256']) is str and re.fullmatch('[0-9a-f]{64}',row['before_sha256'])
++                     and row.get('new_file',False) is False), 'cli_summary_visible_afterimage_required')
++    return names,newfiles
++
++
++def cli_summary_visible_recovery_contract(recovery, binding, *, source=None):
++    """Exact source and old closed failure authorize one explicit product manual operation."""
++    import hashlib, re
++    fields = {'schema','operation','strategy','component_result','proposal','old_failure','full_SQL',
++              'raw_SQL_snapshot','session_id','message_ids','ineffective_count','recovery_deadline',
++              'job_id','strategy_afterimages'}
++    require(type(recovery) is dict and set(recovery) == fields
++            and recovery['schema'] == 'friday.visible-summary-manual-recovery.v1'
++            and recovery['operation'] == 'compress-force-once' and recovery['strategy'] == 'bounded_visible_json_v1'
++            and recovery['session_id'] == binding['id']
++            and recovery['message_ids'] == binding['baseline_message_ids'] == list(range(5,31))
++            and binding['schema'] == 'friday.cli-ordinary-readonly.v8'
++            and recovery['ineffective_count'] == 2 and type(recovery['ineffective_count']) is int
++            and recovery['recovery_deadline'] is None
++            and recovery['job_id'] == cli_ordinary_job_id(Path(binding['database']).parent,binding),
++            'cli_summary_visible_exact_manual_operation_required')
++    reader = globals().get('owned_file') or globals().get('read_owned')
++    expected = {'component_result':('734dffe347b2b11ee595590e64191672d1a765deb45da315d2b0620296452794',51213),
++                'proposal':('e5aa5e3d7b8a124a3d3d278978ae99333300a898ff2868045358c242c6a9c79b',4636),
++                'old_failure':('8af36bccd5cea921242d5ba7be9a99e684861694e6c857bcb4132e3d937bda6a',4229),
++                'full_SQL':('ed11e5c51b9ce10b7dddfbfa2089bbcf4881a2a1aa0c83d2f8cb6b78cf8e2485',91043),
++                'raw_SQL_snapshot':('937a63275a067bff7173525c8d40531fe678b866a1fb54b1e7f2927d666f048d',2004)}
++    for key,(sha,size) in expected.items():
++        ref = recovery[key]
++        require(type(ref) is dict and set(ref) == {'path','sha256','bytes'} and ref['sha256'] == sha
++                and ref['bytes'] == size and type(ref['bytes']) is int, 'cli_summary_visible_recovery_pin_required')
++        raw = reader(Path(ref['path']),private=True)
++        require(len(raw) == size and hashlib.sha256(raw).hexdigest() == sha, 'cli_summary_visible_recovery_pin_changed')
++    payload = cli_ordinary_failed_v6_json(reader(Path(recovery['full_SQL']['path']),private=True))
++    require(payload['row']['id'] == binding['id'] and payload['row']['compression_ineffective_count'] == 2
++            and payload['row']['compression_recovery_deadline'] is None
++            and [m['id'] for m in payload['messages']] == list(range(5,31)), 'cli_summary_visible_persisted_stop_changed')
++    expected_after = {'agent/context_compressor.py':('172f4ac48d4f72f59a8ff49cc5c2936450e684844cc291aaccb7abb1bad965b0',348719),
++                      'agent/bounded_context.py':('d04a60af7d259c5a9af72a25b81be3f2f21db8e2ee9854938c2a6b50dcf0a0c9',51075),
++                      'agent/auxiliary_client.py':('b129f096d3f3d2eacd7878bb3a45034961d9be6eb28368099b52227ffe346ac0',437725),
++                      'agent/bounded_summary_output.py':('70a786a2b62d365183376a1ca4d4cf141d6af7446b286cc5f222029cdb5d543b',7105)}
++    require(recovery['strategy_afterimages'] == {n:{'sha256':s,'bytes':z} for n,(s,z) in expected_after.items()},
++            'cli_summary_visible_strategy_afterimages_required')
++    if source is not None:
++        for name,(sha,size) in expected_after.items():
++            raw = reader(Path(source)/name)
++            require(len(raw) == size and hashlib.sha256(raw).hexdigest() == sha, 'cli_summary_visible_installed_strategy_changed')
++    return recovery
++
++
++def cli_ordinary_previous_failed_v11_journey(request, home):
++    """Pin the independently accepted complete stopped V11; never renew its job or clock."""
++    import hashlib, math, re
++    home = Path(home); reader = globals().get('owned_file') or globals().get('read_owned')
++    def load(ref):
++        require(type(ref) is dict and set(ref) in ({'path','sha256'},{'path','sha256','bytes'})
++                and type(ref['path']) is str and re.fullmatch('[0-9a-f]{64}',ref['sha256']), 'cli_ordinary_v11_pin_required')
++        raw = reader(Path(ref['path']),private=True)
++        require(len(raw) <= 64*1024*1024 and hashlib.sha256(raw).hexdigest() == ref['sha256']
++                and ('bytes' not in ref or ref['bytes'] == len(raw)), 'cli_ordinary_v11_pin_changed')
++        return cli_ordinary_failed_v6_json(raw)
++    require(request['previous_ordinary_independent']['sha256'] ==
++            '8af36bccd5cea921242d5ba7be9a99e684861694e6c857bcb4132e3d937bda6a', 'cli_ordinary_v11_root_acceptance_required')
++    accepted = load(request['previous_ordinary_independent'])
++    for role,key in (('actual_proof','previous_ordinary_qualified'),('custody','previous_ordinary_custody'),
++                     ('complete_SQL_rows','previous_ordinary_sql')):
++        require(request[key]['path'] == accepted[role]['path'] and request[key]['sha256'] == accepted[role]['sha256'],
++                'cli_ordinary_v11_evidence_routing_changed')
++    require(request['previous_ordinary_qualified'] == request['previous_ordinary_unchanged'], 'cli_ordinary_v11_one_proof_required')
++    require(accepted['state'] == 'ACTUAL_V11_FAILED_SCOPE_AND_PRIOR_DATA_PRESERVATION_ACCEPTED_NO_RETRY'
++            and accepted['retry_authorized'] is False and accepted['original180_custody_closed'] is True
++            and all(accepted[k] is True for k in ('FailedExecutionObservation_Go','Cleanup_Go','CompletePriorSQLPreservation_Go'))
++            and all(accepted[k] is False for k in ('ReadArtifact_Go','GroundedFinalAnswer_Go','Runtime_Go','Resource_Go','Release_Go')),
++            'cli_ordinary_v11_truth_required')
++    for key in ('independent','stable_SQL_snapshot','actual_compression_log_slice','observed_candidate40411_independent_supplement'):
++        load(accepted[key])
++    proof=load(accepted['actual_proof']); custody=load(accepted['custody']); saved=load(accepted['complete_SQL_rows'])
++    prior=load(proof['consumed_native_intent']); old=prior['request']; clock=prior['clock']
++    require(prior['schema'] == 'friday.installed-cli-invocation.v1' and prior['state'] == 'CONSUMED_NOT_COMPLETE'
++            and old['schema'] == 'friday.installed-cli-request.v11' and old['home'] == request['home'] == str(home)
++            and old['unit'] != request['unit'] and old['assignment'] != request['assignment']
++            and old['ordinary_readonly'] == request['ordinary_readonly'] and old['repaired_input'] == request['previous_input']
++            and old['installation_input'] == request['installation_input'] and old['partial_proof'] == request['partial_proof']
++            and old['history'] == request['history'] == prior['history']
++            and cli_historical_scope_closed(clock,'friday.installed-cli-clock.v1'), 'cli_ordinary_v11_old_scope_required')
++    require(load(proof['request']) == old and old['job_id'] == cli_ordinary_job_id(home,old['ordinary_readonly'])
++            and old['argv'] == cli_ordinary_readonly_argv(home,old['ordinary_readonly']), 'cli_ordinary_v11_old_semantics_changed')
++    prefix='preparation/cli-runtime/';base=prefix+old['unit'];job=prefix+'jobs/'+old['job_id']+'.intent.json'
++    inventory=request['previous_ordinary_runtime']
++    require(set(inventory) == {base+s for s in ('.intent.json','.json','.stdout','.stderr','.native-owner.json')}|{job},
++            'cli_ordinary_v11_inventory_required')
++    for name,sha in inventory.items():
++        require(hashlib.sha256(reader(home/name,private=True)).hexdigest() == sha, 'cli_ordinary_v11_inventory_changed')
++    require(load(proof['consumed_semantic_job']) == {'schema':'friday.cli-ordinary-job-intent.v1','state':'CONSUMED_NO_RETRY',
++            'job_id':old['job_id'],'request':old,'clock':clock}
++            and not (home/(base+'.result.json')).exists() and not (home/(base+'.result.json')).is_symlink()
++            and custody['clock'] == clock and custody['retry_authorized'] is False
++            and custody['cgroup_gone_or_empty'] is custody['heavy_flock_returned'] is True
++            and clock['started_mono'] <= custody['closure_mono'] <= clock['deadline_mono'], 'cli_ordinary_v11_no_replay_required')
++    new=request['next_ordinary_readonly'];cli_ordinary_readonly_baseline(new)
++    mutable={'schema','question','purpose','row_sha256','messages_sha256','baseline_message_ids',
++             'baseline_stable_messages_sha256','append_high_water','initial_lifecycle_sha256'}
++    require(new['schema'] == 'friday.cli-ordinary-readonly.v8' and new['baseline_message_ids'] == list(range(5,31))
++            and new['append_high_water'] == 30 and new['artifact_bytes'] == 915
++            and {k:v for k,v in new.items() if k not in mutable} == {k:v for k,v in old['ordinary_readonly'].items() if k not in mutable}
++            and cli_ordinary_job_id(home,new) != old['job_id'] and cli_ordinary_readonly_argv(home,new) != old['argv'],
++            'cli_ordinary_v12_genuine_question_required')
++    fingerprint=lambda v:hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
++    stable=lambda rows:[{k:v for k,v in m.items() if k not in {'active','compacted'}} for m in rows]
++    require(saved['complete_actual_SELECT_STAR'] is saved['no_large_payload_elision'] is True
++            and [m['id'] for m in saved['messages']] == list(range(5,31))
++            and len(saved['other_messages']) == 4 and len(saved['other_sessions']) == 1
++            and fingerprint(saved['row']) == new['row_sha256'] and fingerprint(saved['messages']) == new['messages_sha256']
++            and fingerprint(stable(saved['messages'])) == new['baseline_stable_messages_sha256']
++            and fingerprint(saved['other_messages']) == new['other_messages_sha256']
++            and fingerprint(saved['other_sessions']) == new['other_sessions_sha256']
++            and saved['row']['compression_ineffective_count'] == 2 and saved['row']['compression_recovery_deadline'] is None,
++            'cli_ordinary_v11_complete_persisted_stop_required')
++    cli_summary_visible_recovery_contract(request['new_strategy_recovery'],new)
++    return old
+ 
+ CLI_SUMMARY_COMPLETION_MANIFEST = 'patches/hermes/installed-summary-completion-manifest.json'
+ CLI_SUMMARY_COMPLETION_INTENT = 'FRIDAY-INSTALL.summary-completion-repair.intent.json'
+@@ -2473,7 +2649,7 @@
+         require('question' not in binding and 'purpose' not in binding,
+                 'cli_ordinary_question_binding_required')
+         return binding
+-    require(binding.get('schema') in ('friday.cli-ordinary-readonly.v2','friday.cli-ordinary-readonly.v3','friday.cli-ordinary-readonly.v4','friday.cli-ordinary-readonly.v5','friday.cli-ordinary-readonly.v6','friday.cli-ordinary-readonly.v7')
++    require(binding.get('schema') in ('friday.cli-ordinary-readonly.v2','friday.cli-ordinary-readonly.v3','friday.cli-ordinary-readonly.v4','friday.cli-ordinary-readonly.v5','friday.cli-ordinary-readonly.v6','friday.cli-ordinary-readonly.v7','friday.cli-ordinary-readonly.v8')
+             and type(binding.get('question')) is str and type(binding.get('purpose')) is str,
+             'cli_ordinary_question_binding_required')
+     question, purpose = binding['question'], binding['purpose']
+@@ -2489,7 +2665,10 @@
+         declared = ('По сохранённому файлу составь таблицу: требование Пятницы / уже сделано / ещё не подтверждено. Включи только факты файла, укажи ограничения. Ответь по-русски.', 'build-evidence-status-table-from-saved-artifact')
+     if binding['schema'] == 'friday.cli-ordinary-readonly.v5':
+         declared = ('По сохранённому файлу назови один ещё не подтверждённый результат Пятницы и проверку, которая его подтвердит. Используй только факты файла; если проверка не задана, прямо укажи это. Ответь по-русски.', 'verify-one-unconfirmed-result-from-saved-artifact')
+-    if binding['schema'] == 'friday.cli-ordinary-readonly.v7':
++    if binding['schema'] == 'friday.cli-ordinary-readonly.v8':
++        require((question,purpose) == ('По сохранённому файлу укажи репозиторий и ветку публикации Пятницы. Затем объясни, что файл подтверждает о приёмке продукта и сохранении прежней Friday. Отдели требования от подтверждённой реализации, не делай выводов вне файла и ответь кратко по-русски.','verify-saved-publication-and-product-acceptance-boundaries')
++                and question.strip() == question and purpose.strip() == purpose, 'cli_ordinary_distinct_v12_question_required')
++    elif binding['schema'] == 'friday.cli-ordinary-readonly.v7':
+         require((question,purpose) == ('По сохранённому файлу перечисли обязательные пользовательские интерфейсы Пятницы и ограничение на использование облачных моделей. Отдели требования от подтверждённой реализации; не добавляй сведений вне файла. Ответь кратко по-русски.', 'list-saved-user-interfaces-local-inference-and-implementation-boundary')
+                 and question.strip() == question and purpose.strip() == purpose
+                 and re.fullmatch('[a-z][a-z0-9-]{1,127}',purpose), 'cli_ordinary_distinct_v11_question_required')
+@@ -2639,7 +2818,7 @@
+ 
+ def cli_ordinary_readonly_argv(home, binding):
+     cli_ordinary_readonly_baseline(binding)
+-    if binding.get('schema') in ('friday.cli-ordinary-readonly.v2','friday.cli-ordinary-readonly.v3','friday.cli-ordinary-readonly.v4','friday.cli-ordinary-readonly.v5','friday.cli-ordinary-readonly.v6','friday.cli-ordinary-readonly.v7'):
++    if binding.get('schema') in ('friday.cli-ordinary-readonly.v2','friday.cli-ordinary-readonly.v3','friday.cli-ordinary-readonly.v4','friday.cli-ordinary-readonly.v5','friday.cli-ordinary-readonly.v6','friday.cli-ordinary-readonly.v7','friday.cli-ordinary-readonly.v8'):
+         query = ('Прочитай существующий файл '+binding['output']+' инструментом read_file. '
+                  +binding['question']+' Дай краткий ответ; не изменяй файлы и не вызывай другие инструменты.')
+         return ['-p','default','--cli','chat','--oneshot','-t','file','--run-budget','90',
+@@ -2676,6 +2855,10 @@
+     if binding.get('schema') == 'friday.cli-ordinary-readonly.v7':
+         semantic.update(schema='friday.cli-ordinary-readonly-job.v7',
+                         question=binding['question'],purpose=binding['purpose'],binding=binding)
++    if binding.get('schema') == 'friday.cli-ordinary-readonly.v8':
++        semantic.update(schema='friday.cli-ordinary-readonly-job.v8',
++                        question=binding['question'],purpose=binding['purpose'],binding=binding,
++                        operation='bounded-visible-json-v1-manual-compress-force-once')
+     return hashlib.sha256(json.dumps(semantic,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
+ 
+ 
+@@ -2697,7 +2880,7 @@
+     current = ordinary_cli_runtime(home,marker)
+     unit = Path('/proc/self/cgroup').read_text().strip().rsplit('/',1)[-1]
+     request = json.loads(read_owned(Path(home)/'preparation/cli-runtime'/(unit+'.intent.json'),private=True))['request']
+-    require(current == clock and request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11')
++    require(current == clock and request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11','friday.installed-cli-request.v12')
+             and request.get('ordinary_readonly') == binding, 'cli_ordinary_cached_scope_changed')
+     cli_ordinary_job_consumed(home,request,clock)
+     cli_ordinary_readonly_inputs(home,binding,resumed=True)
+@@ -2814,7 +2997,7 @@
+             and type(clock['gnu_starttime_ticks']) is int and clock['gnu_starttime_ticks'] > 0
+             and clock['started_mono'] <= time.monotonic() < clock['useful_deadline_mono'],
+             'cli_runtime_clock_expired_or_invalid')
+-    if request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11'):
++    if request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11','friday.installed-cli-request.v12'):
+         cli_ordinary_native_unit_current(home,request,clock,physical)
+         cli_ordinary_job_consumed(home,request,clock)
+         cli_ordinary_readonly_inputs(home,request['ordinary_readonly'],resumed=_ORDINARY_READONLY is not None)
+@@ -2954,10 +3137,10 @@
+         unit = Path('/proc/self/cgroup').read_text().strip().rsplit('/',1)[-1]
+         request = cli_ordinary_failed_v6_json(read_owned(Path(home)/'preparation/cli-runtime'/(unit+'.intent.json'),private=True))['request']
+         artifact = request.get('schema') == 'friday.installed-cli-request.v4'
+-        readonly = request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11')
++        readonly = request.get('schema') in ('friday.installed-cli-request.v5','friday.installed-cli-request.v6','friday.installed-cli-request.v7','friday.installed-cli-request.v8','friday.installed-cli-request.v9','friday.installed-cli-request.v10','friday.installed-cli-request.v11','friday.installed-cli-request.v12')
+         if readonly:
+             binding = request['ordinary_readonly']
+-            require(binding.get('schema') == {'friday.installed-cli-request.v5':'friday.cli-ordinary-readonly.v1','friday.installed-cli-request.v6':'friday.cli-ordinary-readonly.v2','friday.installed-cli-request.v7':'friday.cli-ordinary-readonly.v3','friday.installed-cli-request.v8':'friday.cli-ordinary-readonly.v4','friday.installed-cli-request.v9':'friday.cli-ordinary-readonly.v5','friday.installed-cli-request.v10':'friday.cli-ordinary-readonly.v6','friday.installed-cli-request.v11':'friday.cli-ordinary-readonly.v7'}[request['schema']], 'cli_ordinary_new_question_source_required')
++            require(binding.get('schema') == {'friday.installed-cli-request.v5':'friday.cli-ordinary-readonly.v1','friday.installed-cli-request.v6':'friday.cli-ordinary-readonly.v2','friday.installed-cli-request.v7':'friday.cli-ordinary-readonly.v3','friday.installed-cli-request.v8':'friday.cli-ordinary-readonly.v4','friday.installed-cli-request.v9':'friday.cli-ordinary-readonly.v5','friday.installed-cli-request.v10':'friday.cli-ordinary-readonly.v6','friday.installed-cli-request.v11':'friday.cli-ordinary-readonly.v7','friday.installed-cli-request.v12':'friday.cli-ordinary-readonly.v8'}[request['schema']], 'cli_ordinary_new_question_source_required')
+             require(request['argv'] == cli_ordinary_readonly_argv(home,binding)
+                     and checked.resume == binding['id'] and checked.no_restore_cwd,
+                     'cli_ordinary_exact_resume_required')
+@@ -3164,3 +3347,33 @@
+         return json.dumps({'success':True,'content':data.decode('utf-8'),'path':str(path)})
+     finally:
+         os.close(parent)
++
++
++def claim_explicit_manual_once(agent):
++    """Reuse the consumed v12 semantic job; claim in memory before its sole force call."""
++    if _ORDINARY_READONLY is None or _ORDINARY_READONLY[1].get('schema') != 'friday.cli-ordinary-readonly.v8':
++        return False
++    home,binding,clock = _ORDINARY_READONLY
++    cli_ordinary_readonly_current(home,binding,clock)
++    unit = Path('/proc/self/cgroup').read_text().strip().rsplit('/',1)[-1]
++    intent = cli_ordinary_failed_v6_json(read_owned(Path(home)/'preparation/cli-runtime'/(unit+'.intent.json'),private=True))
++    request = intent['request']
++    require(intent['clock'] == clock and request['schema'] == 'friday.installed-cli-request.v12'
++            and request['ordinary_readonly'] == binding and request['home'] == str(home), 'cli_summary_visible_runtime_binding_changed')
++    cli_ordinary_native_unit_current(home,request,clock,intent['physical'])
++    cli_ordinary_job_consumed(home,request,clock)
++    cli_summary_visible_recovery_contract(request['strategy_recovery'],binding,source=Path(home)/'hermes-agent')
++    require(getattr(agent,'session_id',None) == binding['id']
++            and getattr(agent,'compression_in_place',None) is True,
++            'cli_summary_visible_inplace_session_required')
++    job = request['job_id']
++    used = globals().get('_SUMMARY_VISIBLE_RECOVERY_CLAIMED_JOB')
++    require(used in (None,job), 'cli_summary_visible_recovery_job_changed')
++    if used == job:
++        return False
++    compressor = agent.context_compressor
++    require(getattr(compressor,'_session_id',None) == binding['id']
++            and getattr(compressor,'_ineffective_compression_count',None) == 2,
++            'cli_summary_visible_current_stop_required')
++    globals()['_SUMMARY_VISIBLE_RECOVERY_CLAIMED_JOB'] = job
++    return True

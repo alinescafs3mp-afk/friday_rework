@@ -354,3 +354,65 @@ def launch(value, budget, *, pins):
 def start(value, budget):
     _identity, pins = prerequisites(value, budget)
     launch(value, budget, pins=pins)
+
+
+def ordinary_start(value, budget):
+    """Ordinary receiving service only; native operator Dashboard is separate.
+
+    Full start above retains both workers and frontend qualification. This
+    scope proves current installed native bytes, local credentials and exact
+    user unit before one handoff; it never executes a worker or grants a user.
+    """
+    from gateway import host_rendezvous as hr
+    from hermes_cli import gateway as gw
+    from hermes_cli.friday_ordinary_gateway import check
+    from hermes_cli.friday_credential_admission import bootstrap, scoped, route_inputs, channel_inputs
+    from scripts.friday_install import clean_environment, require
+    from scripts.install_containment import Containment
+    from scripts.dsh_prepare import StopUnconfirmed
+    from hermes_constants import get_hermes_home
+    from pm.paths import repo_root
+    from pm.environments import project_python
+
+    home = Path(value['home']); source = home/'hermes-agent'
+    require(get_hermes_home() == home and repo_root() == source
+            and Path(sys.executable) == project_python(source), 'native_start_generation_mismatch')
+    check(home)
+    pins = snapshot(home,budget)
+    budget.call(bootstrap,home)
+    with scoped(home):
+        budget.call(route_inputs)
+        contract,_ = budget.call(channel_inputs)
+    unit,old = gateway_preflight(home,'default',budget)
+    require(budget.call(gw.get_systemd_linger_status)[0] is True, 'ordinary_existing_user_linger_required')
+    unchanged(pins,budget)
+    if old is not None:
+        gateway_observation(home,budget)
+        return {'state':'ORDINARY_NATIVE_GATEWAY_ALREADY_RUNNING','ready':False,'workers_enabled':False}
+    props = budget.call(gw._read_systemd_unit_properties,system=False)
+    require(props.get('ActiveState') in ('inactive','failed','') and str(props.get('MainPID','0')) == '0'
+            and not budget.call(gw.find_gateway_pids), 'gateway_start_requires_reconciliation')
+    launcher = source/'.hermes/bin/hermes'
+    from hermes_cli._launchers import _launcher_script,resolve_store_python
+    from scripts.friday_install import owned_file
+    python = resolve_store_python(source,publication=True)
+    require(python is not None and owned_file(launcher) == ('#!/bin/sh\nexec '+
+        shlex.join([str(python),'-I','-c',_launcher_script('hermes',source,None)])+' "$@"\n').encode()
+        and os.access(launcher,os.X_OK) and not launcher.stat().st_mode & 0o022,
+        'native_launcher_generation_changed')
+    custody = Containment(value['containment'],budget,clean_environment(home))
+    custody.probe(value['bootstrap_python']['path'],source)
+    _unit,current = gateway_preflight(home,'default',budget)
+    require(current is None,'gateway_owner_changed_before_handoff')
+    try:
+        if not unit.exists():
+            custody.run([str(launcher),'-p','default','gateway','install','--no-start-now','--no-start-on-login'],source,timeout=30)
+        unchanged(pins,budget)
+        _unit,current = gateway_preflight(home,'default',budget)
+        require(current is None,'gateway_owner_changed_before_handoff')
+        custody.run([str(launcher),'-p','default','gateway','start'],source,timeout=30)
+        gateway_observation(home,budget)
+    except BaseException as exc:
+        raise StopUnconfirmed('native ordinary gateway handoff requires reconciliation') from exc
+    return {'state':'ORDINARY_NATIVE_GATEWAY_OBSERVED','ready':False,'workers_enabled':False,
+            'runtime_acceptance':'GENUINE_TELEGRAM_INPUT_AND_CONTEXTUAL_FOLLOWUP_REQUIRED'}

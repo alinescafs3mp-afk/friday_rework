@@ -260,7 +260,7 @@ def stage_worker_runtime(value, home):
 def main():
     started = time.monotonic()
     parser = SafeParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('phase', choices=('install', 'install-cli', 'start', 'qualify'))
+    parser.add_argument('phase', choices=('install', 'install-cli', 'start', 'qualify', 'start-telegram'))
     parser.add_argument('--input', required=True, type=Path)
     parser.add_argument('--deadline', required=True, type=float, help='Inherited original monotonic deadline')
     parser.add_argument('--a0-plan',type=Path)
@@ -275,7 +275,7 @@ def main():
     require((args.a0_plan is None) == (args.a0_plan_sha256 is None)
             and (args.a0_plan is None or args.phase in ('start','qualify')),
             'qualification_plan_arguments_required')
-    home, donors = budget.call(spec_checked, value, cli_only=args.phase == 'install-cli'); budget.call(directory, home)
+    home, donors = budget.call(spec_checked, value, cli_only=args.phase in ('install-cli','start-telegram')); budget.call(directory, home)
     from scripts.friday_install import MARKER, digest, owned_file, require, partial_claim
     if args.phase == 'install':
         require(read_json(home / MARKER) == partial_claim(digest(owned_file(args.input, private=True)), budget),
@@ -296,8 +296,18 @@ def main():
     budget.call(composition_checked, value, source, receipt, donors['hermes'])
     from scripts.friday_install import native_packages
     budget.call(native_packages, source)
+    if args.phase == 'start-telegram':
+        from scripts.friday_start import ordinary_start
+        from scripts.dsh_prepare import StopUnconfirmed
+        try:
+            result = budget.call(ordinary_start,value,budget)
+        except StopUnconfirmed:
+            parser.exit(3, 'STOP_UNCONFIRMED: native ordinary gateway ownership requires reconciliation; do not retry\n')
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            parser.exit(2, 'Friday native ordinary start refused: installed admission is incomplete\n')
+        print(json.dumps(result,sort_keys=True));budget.check();return
     if args.phase in ('start','qualify'):
-        require(read_json(home/MARKER).get('completion_stage') != 'CLI_HOST_ONLY', 'cli_host_full_start_refused')
+        require(read_json(home/MARKER).get('completion_stage') not in ('CLI_HOST_ONLY','TELEGRAM_ORDINARY'), 'cli_host_full_start_refused')
         if args.a0_plan is not None or args.phase == 'qualify':
             result = budget.call(qualify,value,digest(owned_file(args.input,private=True)),
                 None if args.a0_plan is None else {'path':str(args.a0_plan),'sha256':args.a0_plan_sha256},budget)
