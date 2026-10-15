@@ -422,7 +422,7 @@ def ordinary_start(value, budget):
                     'ordinary_start_owned_user_bus_required')
             require(unit.name == gw.get_service_name()+'.service', 'ordinary_start_exact_native_unit_required')
             custody.run(['/usr/bin/env','XDG_RUNTIME_DIR='+str(runtime),
-                'DBUS_SESSION_BUS_ADDRESS=unix:path='+str(bus),'/usr/bin/systemctl','--user','start',unit.name],
+                'DBUS_SESSION_BUS_ADDRESS=unix:path='+str(bus),'SYSTEMCTL_FORCE_BUS=1','/usr/bin/systemctl','--user','start',unit.name],
                 source,timeout=90)
             gateway_observation(home,budget)
         except BaseException as exc:
