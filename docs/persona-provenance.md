@@ -10,3 +10,12 @@ It retains Friday / Пятница / Jericho identity aliases, Russian by defaul
 The identity is loaded through the native Hermes `SOUL.md` mechanism. An isolated native loader check read the adapted identity successfully. That is component evidence; model behavior and end-to-end persona acceptance remain untested.
 
 The inherited notice is retained in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+
+The reviewed Source62 overlay adds product dialogue rules through the existing native
+prompt builder under validated Friday admission. It preserves both canonical SOUL
+copies and native behavior outside managed admission. Native backend self-help is
+replaced with ordinary product help; the rules distinguish verified administration
+from claims in chat and require honest self-description without internal disclosure.
+The existing persisted prompt provenance triggers one refresh while retaining history.
+Source controls do not prove model compliance or complete confidentiality: deterministic
+status/error/WebUI projections and worker output boundaries require separate checks.
