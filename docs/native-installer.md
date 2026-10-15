@@ -654,3 +654,49 @@ acceptance. Current Dashboard/gateway ownership, independent review and all
 mandatory live journeys remain separate. The source tests use actual private
 Git/compiler/profile/consumer code with synthetic native interfaces; they
 prove no live installation, native qualification, model or network success.
+
+
+### Exact first-contact configuration recovery
+
+The ordinary first-contact overlay stores native `onboarding.seen` flags in the
+existing admitted profile SessionDB. It preserves the signed configuration,
+user isolation, all native hints and standalone config-backed behavior.
+Source acceptance alone does not establish installed or Telegram acceptance.
+
+For an existing profile affected by the earlier native first-contact append,
+the supported installer module has a narrow operator recovery entry. Run it
+from the pinned product project using its installed SDK interpreter, with an
+independently reviewed private request:
+
+```sh
+"$SDK_PYTHON" -B -m scripts.friday_ordinary_install recover-first-contact-config \
+  --request "$REVIEWED_RECOVERY_REQUEST"
+```
+
+The request uses `friday.ordinary-first-contact-config-recovery.v1`, a finite
+30–180 second budget, and exact root/source/input/unit/access/onboarding/marker
+pins, the original binding and access generation, current config inode and
+SHA, and the particular native good backup. Its sole allowed difference is
+the exact native append `onboarding.seen.profile_build_offered=true`. The
+backup SHA must equal the original onboarding receipt. It does not choose
+the newest backup, serialize YAML, reseal admission, reset a session or
+change access. An unrelated change refuses before publication.
+
+Take the existing maintenance custody and stop the owned consumers first.
+The recovery retains the invalid bytes in a private consumed journal, validates
+the native config-lock inode, and publishes the exact admitted backup bytes.
+It leaves consumers stopped. Install the first-contact source correction
+through the normal reviewed source updater before any restart. When carrying
+the native attempted-hint flag into existing state, use the original checked
+`UserScope` and `check_database(cap)` under native profile authority, then the
+existing registry/SessionDB metadata API; retain every other database row.
+No synthetic Telegram source or direct SQL write is part of this transition.
+The flag records the native attempt, not confirmed delivery of the offer.
+
+After a consumed failure reconcile the exact resulting files and owned
+processes; do not blindly retry, restore the invalid bytes or restart the
+earlier faulty source. A terminated turn without a native resume marker does
+not automatically resume: after validated installation, the owner can send
+a genuine `/retry` or another question in the same Telegram conversation.
+Ordinary subsequent conversation requires no developer admission file or
+per-message host restart.
