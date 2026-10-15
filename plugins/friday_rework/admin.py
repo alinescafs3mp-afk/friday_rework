@@ -142,6 +142,10 @@ class Administration:
         from .onboarding import Onboarding
         return Onboarding(self).prepare(profile, session=session, **values)
 
+    def onboarding_browser_configure(self, profile, *, session=None, **values):
+        from .onboarding import Onboarding
+        return Onboarding(self).configure_browser(profile, session=session, **values)
+
     def onboarding_credentials(self, profile, *, session=None, **values):
         from .onboarding import Onboarding
         return Onboarding(self).credentials(profile, session=session, **values)

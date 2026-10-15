@@ -238,6 +238,17 @@ class OnboardingActivate(OnboardingIdentity):
     generation: StrictInt = Field(ge=1)
 
 
+class OnboardingBrowserConfigure(OnboardingActivate):
+    expected_target_config_sha256: str = Field(pattern="^[0-9a-f]{64}$")
+    expected_binding_sha256: str = Field(pattern="^[0-9a-f]{64}$")
+    preset: Literal["local-headless-basic"]
+
+
+@router.post("/onboarding/browser/configure")
+def onboarding_browser_configure(body: OnboardingBrowserConfigure, profile: str, session=Depends(require_admin)):
+    return call(_admin.onboarding_browser_configure, profile, session=session, **body.model_dump())
+
+
 class OnboardingCredential(OnboardingActivate):
     name: str = Field(pattern="^[A-Z][A-Z0-9_]{0,127}$")
     value: SecretStr

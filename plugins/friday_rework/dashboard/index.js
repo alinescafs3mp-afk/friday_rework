@@ -84,6 +84,9 @@
         let body = action === "prepare" ? {...identity, runtime_profile: setup.runtime_profile, template: setup.template}
           : {...identity, generation: prepared.generation};
         if (action === "prepare" && setup.platform === "cli") body.uid = uid;
+        if (action === "browser/configure") body = {...body, preset: "local-headless-basic",
+          expected_target_config_sha256: prepared.target_config_sha256,
+          expected_binding_sha256: prepared.binding_sha256};
         if (action === "credentials") body = {...body, name: secretName, value: secretValue};
         if (action === "workers/prepare" && prepared.enabled) body.template = workerTemplate;
         const result = await fetchJSON(base + "/onboarding/" + action + "?" + new URLSearchParams({profile}), {
@@ -215,6 +218,9 @@
           h("input", {type: "password", autoComplete: "new-password", value: secretValue, disabled: busy || (prepared.enabled && !(prepared.capture_names || []).length),
             "aria-label": "New profile scoped key", onChange: e => setSecretValue(e.target.value)}),
           button("Store scoped key", () => onboard("credentials"), {disabled: busy || (prepared.enabled && !(prepared.capture_names || []).length) || prepared.setup_uncertain || !secretName || !secretValue}),
+          prepared.can_configure_browser ? button("Prepare local browser", () => onboard("browser/configure"),
+            {disabled: busy || prepared.enabled || prepared.setup_uncertain}) : null,
+          prepared.browser_execution ? h("p", {role: "status"}, "Browser execution requires network isolation setup.") : null,
           button("Activate complete profile", () => onboard("activate"), {disabled: busy || prepared.enabled || prepared.setup_uncertain ||
             ((prepared.required_workers || []).length > 0 && !prepared.can_activate)})) : null) : null,
       view === "users" && data ? h("ul", null, ...data.users.map(renderUser)) : null,

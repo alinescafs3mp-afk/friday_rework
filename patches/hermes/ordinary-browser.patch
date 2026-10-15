@@ -1,0 +1,1316 @@
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -23,6 +23,48 @@
+ SAFE = frozenset({'memory', 'session_search', 'read_file', 'write_file',
+                   'web_search', 'web_extract', 'friday_work', 'friday_result', 'delegate_task',
+                   'skills_list', 'skill_view', 'skill_manage'})
++# Explicit, narrow family. SAFE retains its existing ordinary capabilities;
++# configuration may prepare this family while execution remains fail closed.
++BROWSER_TOOLS = frozenset({'browser_navigate', 'browser_snapshot', 'browser_click',
++    'browser_type', 'browser_scroll', 'browser_back', 'browser_press'})
++BROWSER_TOOLSET = 'browser_scoped'
++BROWSER_LOCAL_CONFIG = {
++    'backend': 'off', 'cloud_provider': 'local', 'engine': 'chrome',
++    'headed': False, 'cdp_url': '', 'use_real_profile': False,
++    'record_sessions': False, 'allow_private_urls': False,
++    'auto_local_for_private_urls': False,
++    'extension_control': {'enabled': False, 'developer_mode': False},
++    'command_timeout': 30, 'inactivity_timeout': 120,
++}
++
++
++def validate_browser_config(config, tools, platform=None):
++    """Reject ambient browser selection or authority wider than the named family."""
++    granted = set(tools) & BROWSER_TOOLS
++    if not granted and 'browser' not in config:
++        return
++    if (granted != BROWSER_TOOLS or not isinstance(config.get('browser'), dict)
++            or _fingerprint(config['browser']) != _fingerprint(BROWSER_LOCAL_CONFIG)):
++        raise ScopeDenied()
++    selected = config.get('toolsets', [])
++    platforms = config.get('platform_toolsets', {})
++    if (not isinstance(selected, list) or BROWSER_TOOLSET not in selected
++            or 'browser' in selected or not isinstance(platforms, dict)):
++        raise ScopeDenied()
++    for values in platforms.values():
++        if not isinstance(values, list) or 'browser' in values:
++            raise ScopeDenied()
++    if platform is not None and BROWSER_TOOLSET not in platforms.get(platform, []):
++        raise ScopeDenied()
++
++
++def browser_admission_error(tools):
++    # Configuration is a named family, not a daemon/network grant. Actual
++    # execution requires authenticated context and verified native custody at
++    # browser_scoped.execute; missing placement/packages fail that action only.
++    return None
++
++
+ BRIDGES = frozenset({'tool_search', 'tool_describe', 'tool_call'})
+ 
+ 
+@@ -77,7 +119,7 @@
+             profile = profile_name(row['runtime_profile'])
+             if (profile == 'default' or key in keys or profile in profiles
+                     or not isinstance(row['tools'], list) or not row['tools']
+-                    or len(set(row['tools'])) != len(row['tools']) or not set(row['tools']) <= SAFE):
++                    or len(set(row['tools'])) != len(row['tools']) or not set(row['tools']) <= SAFE | BROWSER_TOOLS):
+                 raise ScopeDenied()
+             keys.add(key); profiles.add(profile)
+         return value
+@@ -377,6 +419,12 @@
+         return
+     if name not in cap.binding['tools']:
+         raise ScopeDenied()
++    if name in BROWSER_TOOLS:
++        from hermes_cli.config import require_readable_config_before_write
++        validate_browser_config(require_readable_config_before_write(cap.home / 'config.yaml'),
++                                cap.binding['tools'], cap.principal[0])
++        if browser_admission_error(cap.binding['tools']):
++            raise ScopeDenied()
+     delegated = _DELEGATION.get()
+     if delegated is not None:
+         check_delegation(delegated)
+--- /dev/null
++++ b/tools/browser_native_ipc.py
+@@ -0,0 +1,136 @@
++"""Single-dispatch transport for the pinned agent-browser 0.26.0 Rust daemon.
++
++This uses that daemon's existing Unix JSON-line protocol, not its retrying CLI
++client. The request id correlates a response; the daemon does not deduplicate it.
++Any uncertain exchange poisons this worker. Native ProcessRegistry retains the
++original deadline, cgroup custody and cleanup responsibility.
++"""
++import json
++import re
++import socket
++from urllib.parse import urlsplit
++
++
++def native_request(command, args, request_id):
++    """The seven closed mappings match v0.26.0 cli/src/commands.rs."""
++    if (type(command) is not str or type(args) is not list
++            or any(type(arg) is not str or '\x00' in arg for arg in args)
++            or type(request_id) is not str or not re.fullmatch(r'f[1-9][0-9]{0,18}', request_id)):
++        raise RuntimeError('browser_native_arguments_refused')
++    value = {'id': request_id}
++    if command == 'open' and len(args) == 1:
++        url = args[0]
++        parsed = urlsplit(url)
++        if (len(url) > 8192 or any(ord(c) < 33 for c in url)
++                or parsed.scheme not in ('http', 'https') or not parsed.hostname
++                or parsed.username is not None or parsed.password is not None
++                or parsed.port not in (None, 80, 443) or parsed.fragment
++                or '%' in parsed.netloc or '\\' in url):
++            raise RuntimeError('browser_url_refused')
++        value.update(action='navigate', url=url)
++    elif command == 'snapshot' and args in ([], ['-c']):
++        value['action'] = 'snapshot'
++        if args:
++            value['compact'] = True
++    elif command in ('click', 'fill') and len(args) == (1 if command == 'click' else 2):
++        if not re.fullmatch(r'@e[1-9][0-9]{0,8}', args[0]):
++            raise RuntimeError('browser_reference_refused')
++        value.update(action=command, selector=args[0])
++        if command == 'fill':
++            if len(args[1].encode()) > 32768 or args[1].startswith('-'):
++                raise RuntimeError('browser_text_refused')
++            value['value'] = args[1]
++    elif command == 'scroll' and len(args) == 2 and args[0] in ('up', 'down') and args[1] == '500':
++        value.update(action='scroll', direction=args[0], amount=500)
++    elif command == 'back' and not args:
++        value['action'] = 'back'
++    elif command == 'press' and len(args) == 1 and args[0] in {
++            'Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'ArrowUp', 'ArrowDown',
++            'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown', 'Space'}:
++        value.update(action='press', key=args[0])
++    else:
++        raise RuntimeError('browser_native_command_refused')
++    return value
++
++
++def daemon_environment(chromium_relative, proxy_port, idle_ms):
++    """Bypass CLI configuration parsing; supply the same native launch settings.
++
++    AGENT_BROWSER_DAEMON branches before flags/config parsing (main.rs488–499).
++    Only these variables reach the daemon: no credentials, cloud provider, CDP,
++    auto-connect, saved state, extensions or ambient launch configuration.
++    """
++    if (type(chromium_relative) is not str or not chromium_relative
++            or chromium_relative.startswith('/') or '..' in chromium_relative.split('/')
++            or '\x00' in chromium_relative or type(proxy_port) is not int
++            or not 1 <= proxy_port <= 65535 or type(idle_ms) is not int or idle_ms <= 0):
++        raise RuntimeError('browser_native_daemon_config_refused')
++    return {'HOME': '/work', 'TMPDIR': '/tmp', 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
++            'AGENT_BROWSER_DAEMON': '1', 'AGENT_BROWSER_SESSION': 'scoped',
++            'AGENT_BROWSER_SOCKET_DIR': '/work/socket',
++            'AGENT_BROWSER_ENGINE': 'chrome',
++            'AGENT_BROWSER_EXECUTABLE_PATH': '/chromium/' + chromium_relative,
++            'AGENT_BROWSER_PROFILE': '/work/profile',
++            'AGENT_BROWSER_PROXY': 'socks5://127.0.0.1:' + str(proxy_port),
++            'AGENT_BROWSER_PROXY_BYPASS': '<-loopback>',
++            'AGENT_BROWSER_ARGS': '--disable-quic,--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
++            'AGENT_BROWSER_IDLE_TIMEOUT_MS': str(idle_ms)}
++
++
++class NativeIPC:
++    """One connection and one complete JSON frame per admitted command.
++
++    sendall may finish a partial kernel write of the same frame. It never
++    reconnects or resends a complete frame. EOF/timeouts/write/parse failures,
++    wrong ids, negative responses and cancellation poison this client before
++    returning; a later invocation cannot silently replay the uncertain action.
++    """
++    def __init__(self, remaining, socket_factory=None):
++        self._remaining = remaining
++        self._socket_factory = socket_factory or socket.socket
++        self._sequence = 0
++        self._poisoned = False
++
++    def exchange(self, command, args):
++        if self._poisoned:
++            raise RuntimeError('browser_native_worker_poisoned')
++        request_id = 'f' + str(self._sequence + 1)
++        value = native_request(command, args, request_id)
++        wire = json.dumps(value, ensure_ascii=True, separators=(',', ':')).encode() + b'\n'
++        self._remaining()
++        self._sequence += 1
++        self._poisoned = True
++        sock = None
++        try:
++            sock = self._socket_factory(socket.AF_UNIX, socket.SOCK_STREAM)
++            sock.settimeout(min(30, self._remaining()))
++            sock.connect('/work/socket/scoped.sock')
++            sock.settimeout(min(5, self._remaining()))
++            sock.sendall(wire)
++            raw = bytearray()
++            while b'\n' not in raw:
++                sock.settimeout(min(30, self._remaining()))
++                piece = sock.recv(min(65536, 2_000_002 - len(raw)))
++                if not piece:
++                    raise RuntimeError('browser_native_command_unknown_effect')
++                raw.extend(piece)
++                if len(raw) > 2_000_001:
++                    raise RuntimeError('browser_native_output_too_large')
++            if not raw.endswith(b'\n') or raw.count(b'\n') != 1:
++                raise RuntimeError('browser_native_output_invalid')
++            result = json.loads(raw)
++            if (type(result) is not dict or result.get('id') != request_id
++                    or type(result.get('success')) is not bool or not result['success']):
++                raise RuntimeError('browser_native_command_unknown_effect')
++            self._remaining()
++        except BaseException:
++            # No exception text crosses the authority boundary.
++            raise RuntimeError('browser_native_command_unknown_effect') from None
++        finally:
++            if sock is not None:
++                try:
++                    sock.close()
++                except BaseException:
++                    pass
++        self._poisoned = False
++        return result
+--- /dev/null
++++ b/tools/browser_process_child.py
+@@ -0,0 +1,317 @@
++"""Trusted persistent browser transport, executed only by ProcessRegistry.
++
++Host side owns strict public TCP dials. Namespace side owns a SOCKS endpoint,
++the native Rust daemon and Chromium. The only bridge is a private Unix socket.
++"""
++import contextlib
++import hashlib
++import ipaddress
++import json
++import math
++import os
++from pathlib import Path
++import select
++import socket
++import stat
++import struct
++import subprocess
++import sys
++import tempfile
++import threading
++import time
++
++
++def read_line(stream, limit=65536):
++    raw = stream.readline(limit + 1)
++    if len(raw) > limit or not raw.endswith(b'\n'):
++        raise RuntimeError('browser_protocol_invalid')
++    return json.loads(raw)
++
++
++def exact(sock, size):
++    out = bytearray()
++    while len(out) < size:
++        data = sock.recv(size - len(out))
++        if not data:
++            raise RuntimeError('browser_proxy_eof')
++        out.extend(data)
++    return bytes(out)
++
++
++def digest(path):
++    with open(path, 'rb') as f:
++        return hashlib.file_digest(f, 'sha256').hexdigest()
++
++
++def isolated_argv(packages, bridge, helper):
++    """Empty root; system toolchain and pinned browser packages are read only.
++
++    No host home/config/profile, /run, systemd bus, /sys or direct network mount.
++    bwrap remains PID namespace init for the complete persistent worker lifetime.
++    """
++    argv = ['/usr/bin/bwrap', '--unshare-user', '--unshare-net', '--unshare-pid',
++            '--unshare-ipc', '--unshare-uts', '--die-with-parent', '--new-session',
++            '--as-pid-1', '--cap-drop', 'ALL', '--clearenv', '--ro-bind', '/usr', '/usr']
++    for alias in ('bin', 'sbin', 'lib', 'lib64'):
++        path = Path('/') / alias
++        if path.exists():
++            target = path.resolve()
++            if not target.is_relative_to('/usr'):
++                raise RuntimeError('browser_toolchain_layout_refused')
++            argv += ['--symlink', str(target), str(path)]
++    argv += ['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--tmpfs', '/work',
++             '--ro-bind', str(helper), '/browser_gate.py',
++             '--ro-bind', str(helper.with_name('browser_public_transport.py')), '/browser_transport.py',
++             '--ro-bind', str(helper.with_name('browser_native_ipc.py')), '/browser_native_ipc.py',
++             '--ro-bind', bridge, '/bridge']
++    for name, target in (('agent-browser', '/engine'), ('chromium', '/chromium')):
++        row = packages[name]
++        root = Path(row['root'])
++        relative = Path(row['relative'])
++        if (not root.is_absolute() or root.resolve() != root or relative.is_absolute()
++                or '..' in relative.parts or not relative.parts):
++            raise RuntimeError('browser_package_path_refused')
++        if digest(root / relative) != row['sha256']:
++            raise RuntimeError('browser_package_changed')
++        argv += ['--ro-bind', str(root), target]
++    argv += ['--setenv', 'HOME', '/work', '--setenv', 'TMPDIR', '/tmp',
++             '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'LANG', 'C.UTF-8',
++             '--setenv', 'PYTHONDONTWRITEBYTECODE', '1', '--chdir', '/work',
++             '--remount-ro', '/', '--', '/usr/bin/python3', '-I', '-B', '/browser_gate.py', '--namespace']
++    return argv
++
++
++def namespace_main():
++    """Long lived namespace init, not one CLI command that would orphan a daemon."""
++    os.umask(0o077)
++    sys.path.insert(0, '/')
++    from browser_transport import relay as namespace_relay
++    from browser_native_ipc import NativeIPC, daemon_environment
++    start = read_line(sys.stdin.buffer)
++    deadline = start['deadline']
++    if type(deadline) not in (int, float) or not math.isfinite(deadline) or time.monotonic() >= deadline:
++        raise RuntimeError('browser_original_deadline')
++    os.mkdir('/work/socket', 0o700)
++    os.mkdir('/work/profile', 0o700)
++    stop = threading.Event()
++    slots = threading.BoundedSemaphore(16)
++
++    def remaining():
++        left = deadline - time.monotonic() - 4
++        if stop.is_set() or left <= 0:
++            raise RuntimeError('browser_original_deadline')
++        return left
++
++    # Proxy is in the browser's isolated loopback namespace. Host network is
++    # unavailable regardless of proxy bypass, WebRTC, redirects or QUIC flags.
++    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    listener.bind(('127.0.0.1', 0)); listener.listen(16); listener.settimeout(.05)
++    port = listener.getsockname()[1]
++
++    def tunnel(client):
++        remote = None
++        try:
++            client.settimeout(min(remaining(), 5))
++            version, count = exact(client, 2)
++            if version != 5 or not 1 <= count <= 16 or 0 not in exact(client, count):
++                raise RuntimeError('browser_socks_auth_refused')
++            client.sendall(b'\x05\x00')
++            version, command, reserved, kind = exact(client, 4)
++            if version != 5 or command != 1 or reserved:
++                raise RuntimeError('browser_socks_request_refused')
++            if kind == 3:
++                size = exact(client, 1)[0]
++                if not size:
++                    raise RuntimeError('browser_socks_host_refused')
++                host = exact(client, size).decode('ascii')
++            elif kind in (1, 4):
++                host = str(ipaddress.ip_address(exact(client, 4 if kind == 1 else 16)))
++            else:
++                raise RuntimeError('browser_socks_address_refused')
++            destination_port = struct.unpack('!H', exact(client, 2))[0]
++            remote = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++            remote.settimeout(min(remaining(), 5)); remote.connect('/bridge/egress.sock')
++            remote.sendall(json.dumps({'host': host, 'port': destination_port}).encode() + b'\n')
++            if exact(remote, 1) != b'Y':
++                raise RuntimeError('browser_public_connect_refused')
++            client.sendall(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
++            # Shared bounded relay drains buffers and propagates half-closes;
++            # the host side independently checks authority on every relay tick.
++            namespace_relay(client, remote, remaining)
++        except (OSError, RuntimeError, ValueError, UnicodeError):
++            pass  # Connection refusal contains no secret-bearing exception text.
++        finally:
++            client.close()
++            if remote is not None:
++                remote.close()
++            slots.release()
++
++    def accept():
++        while not stop.is_set():
++            try:
++                remaining(); client, _ = listener.accept()
++            except socket.timeout:
++                continue
++            except (OSError, RuntimeError):
++                return
++            if not slots.acquire(False):
++                client.close(); continue
++            threading.Thread(target=tunnel, args=(client,), daemon=True).start()
++
++    threading.Thread(target=accept, daemon=True).start()
++    # Pinned native main.rs488-499 selects foreground daemon mode BEFORE CLI
++    # config parsing. Supply all launch settings through its exact environment.
++    # No ordinary command enters the native CLI's unconditional retry loop.
++    env = daemon_environment(start['chromium_relative'], port,
++                             max(1, int(remaining() * 1000)))
++    daemon = subprocess.Popen(['/engine/' + start['agent_relative']],
++                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
++                              stderr=subprocess.DEVNULL, env=env, cwd='/work', close_fds=True)
++    try:
++        # Readiness publishes no command bytes. .pid/.version precede bind in
++        # upstream daemon.rs, so wait for the private socket as well. This is
++        # bounded by the ORIGINAL deadline and never spawns a replacement.
++        socket_path = Path('/work/socket/scoped.sock')
++        startup_deadline = min(deadline - 4, time.monotonic() + 10)
++        while True:
++            remaining()
++            if daemon.poll() is not None:
++                raise RuntimeError('browser_native_daemon_start_failed')
++            try:
++                mode = socket_path.lstat().st_mode
++            except FileNotFoundError:
++                mode = None
++            if mode is not None:
++                if (not stat.S_ISSOCK(mode) or stat.S_IMODE(mode) & 0o077
++                        or Path('/work/socket/scoped.version').read_text() != '0.26.0'
++                        or Path('/work/socket/scoped.pid').read_text() != str(daemon.pid)):
++                    raise RuntimeError('browser_native_daemon_identity_refused')
++                break
++            if time.monotonic() >= startup_deadline:
++                raise RuntimeError('browser_native_daemon_start_timeout')
++            time.sleep(min(.01, remaining()))
++        native = NativeIPC(remaining)
++        print(json.dumps({'ready': True}), flush=True)
++        while True:
++            remaining()
++            request = read_line(sys.stdin.buffer)
++            command, args = request.get('command'), request.get('args')
++            if command not in {'open', 'snapshot', 'click', 'fill', 'scroll', 'back', 'press'} or type(args) is not list:
++                raise RuntimeError('browser_native_command_refused')
++            if any(type(arg) is not str or '\x00' in arg for arg in args):
++                raise RuntimeError('browser_native_arguments_refused')
++            if daemon.poll() is not None:
++                raise RuntimeError('browser_native_daemon_stopped')
++            value = native.exchange(command, args)
++            if daemon.poll() is not None:
++                raise RuntimeError('browser_native_daemon_stopped_unknown_effect')
++            print(json.dumps(value, ensure_ascii=True), flush=True)
++    finally:
++        stop.set(); listener.close()
++        if daemon.poll() is None:
++            daemon.terminate()
++        daemon.wait(timeout=max(.01, min(1, deadline - time.monotonic())))
++
++
++def host_main():
++    root = Path(__file__).resolve().parents[1]
++    sys.path.insert(0, str(root))
++    start = read_line(sys.stdin.buffer)
++    if start.get('start') is not True or start.get('home') != os.environ.get('HERMES_HOME'):
++        raise RuntimeError('browser_native_start_refused')
++    from hermes_cli import friday_user_scope as users
++    value = dict(start['authority'])
++    for key in ('authorization_home', 'home'):
++        value[key] = Path(value[key])
++    for key in ('principal', 'directory_identity'):
++        value[key] = tuple(value[key])
++    cap = users.UserScope(**value); cap.check(); users._CURRENT.set(cap)
++    from tools.browser_public_transport import public_connect, relay
++    deadline = start['deadline']
++    if type(deadline) not in (int, float) or not math.isfinite(deadline):
++        raise RuntimeError('browser_original_deadline_required')
++    stop = threading.Event()
++
++    def check():
++        cap.check()
++        left = deadline - time.monotonic() - 4
++        if stop.is_set() or left <= 0:
++            raise RuntimeError('browser_original_task_stopped')
++        return left
++
++    slots = threading.BoundedSemaphore(16)
++    with tempfile.TemporaryDirectory(prefix='hermes-browser-') as bridge:
++        os.chmod(bridge, 0o700)
++        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++        listener.bind(bridge + '/egress.sock'); os.chmod(bridge + '/egress.sock', 0o600)
++        listener.listen(16); listener.settimeout(.05)
++
++        def serve(client):
++            remote = None
++            try:
++                client.settimeout(min(check(), 5))
++                with client.makefile('rb', buffering=0) as source:
++                    request = read_line(source, 1024)
++                if type(request) is not dict or set(request) != {'host', 'port'}:
++                    raise RuntimeError('browser_egress_request_refused')
++                remote = public_connect(request['host'], request['port'], check)
++                check(); client.sendall(b'Y'); relay(client, remote, check)
++            except BaseException:
++                client.close()
++                if remote is not None:
++                    remote.close()
++            finally:
++                slots.release()
++
++        def accept():
++            while not stop.is_set():
++                try:
++                    check(); client, _ = listener.accept()
++                except socket.timeout:
++                    continue
++                except BaseException:
++                    stop.set(); return
++                if not slots.acquire(False):
++                    client.close(); continue
++                threading.Thread(target=serve, args=(client,), daemon=True).start()
++
++        threading.Thread(target=accept, daemon=True).start()
++        argv = isolated_argv(start['packages'], bridge, Path(__file__).resolve())
++        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
++                                env={'PATH': '/usr/bin:/bin'}, close_fds=True)
++        try:
++            setup = {'deadline': deadline,
++                     'chromium_relative': start['packages']['chromium']['relative'],
++                     'agent_relative': start['packages']['agent-browser']['relative']}
++            proc.stdin.write(json.dumps(setup).encode() + b'\n'); proc.stdin.flush()
++            # The namespace worker, daemon and Chrome remain together until EOF,
++            # original deadline or exact native whole-cgroup stop.
++            while True:
++                check()
++                rd, _, _ = select.select([sys.stdin.buffer, proc.stdout], [], [], min(.05, check()))
++                if proc.stdout in rd:
++                    raw = proc.stdout.readline(2_000_002)
++                    if not raw or len(raw) > 2_000_001 or not raw.endswith(b'\n'):
++                        raise RuntimeError('browser_namespace_eof_unknown_effect')
++                    check(); sys.stdout.buffer.write(raw); sys.stdout.buffer.flush()
++                if sys.stdin.buffer in rd:
++                    raw = sys.stdin.buffer.readline(65537)
++                    if not raw:
++                        return
++                    if len(raw) > 65536 or not raw.endswith(b'\n'):
++                        raise RuntimeError('browser_native_input_invalid')
++                    check(); proc.stdin.write(raw); proc.stdin.flush()
++        finally:
++            stop.set(); listener.close()
++            # PID namespace init owns its complete descendant tree; parent
++            # registry still verifies exact cgroup cessation independently.
++            if proc.poll() is None:
++                proc.terminate()
++            proc.wait(timeout=max(.01, min(1, deadline - time.monotonic())))
++
++
++if __name__ == '__main__':
++    try:
++        namespace_main() if sys.argv[1:] == ['--namespace'] else host_main()
++    except BaseException:
++        raise SystemExit(1)
+--- /dev/null
++++ b/tools/browser_public_transport.py
+@@ -0,0 +1,265 @@
++"""Public-only, numerically pinned TCP transport; no proxy or policy exceptions.
++
++``check`` owns the original deadline, stop and revocation policy. It must raise
++on cancellation and otherwise return positive finite seconds remaining. Callback
++exceptions propagate unchanged. This module never retries a connection.
++"""
++
++import ipaddress
++import itertools
++import math
++import re
++import select
++import socket
++
++
++__all__ = ["PublicTransportError", "PolicyError", "TransportError",
++           "RelayLimitError", "public_connect", "relay"]
++
++
++class PublicTransportError(RuntimeError):
++    """Transport failure with a fixed, non-secret diagnostic."""
++
++
++class PolicyError(PublicTransportError):
++    pass
++
++
++class TransportError(PublicTransportError):
++    pass
++
++
++class RelayLimitError(PublicTransportError):
++    pass
++
++
++_MAX_ANSWERS = 32
++_BUFFER_BYTES = 64 * 1024
++_RELAY_TICK = 0.05
++_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
++_NUMERIC_ALIAS = re.compile(r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*\Z")
++_V4_TRANSITION = ipaddress.ip_network("192.88.99.0/24")
++_TRANSITION = tuple(map(ipaddress.ip_network, (
++    "::/96", "::ffff:0:0/96", "::ffff:0:0:0/96",
++    "64:ff9b::/96", "64:ff9b:1::/48", "2001::/32", "2002::/16",
++    "3ffe::/16", "2001:10::/28", "2001:20::/28", "2001:30::/28",
++)))
++
++
++def _remaining(check):
++    value = check()
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        raise PolicyError("transport authorization expired")
++    try:
++        valid = math.isfinite(value) and value > 0
++    except (OverflowError, ValueError):
++        valid = False
++    if not valid:
++        raise PolicyError("transport authorization expired")
++    return float(value)
++
++
++def _public_address(text):
++    if not isinstance(text, str) or "%" in text:
++        raise PolicyError("non-public address refused")
++    try:
++        address = ipaddress.ip_address(text)
++    except ValueError:
++        raise PolicyError("invalid numeric address") from None
++    if (not address.is_global or address.is_multicast or address.is_reserved
++            or address.is_loopback or address.is_link_local or address.is_unspecified):
++        raise PolicyError("non-public address refused")
++    if address.version == 4 and address in _V4_TRANSITION:
++        raise PolicyError("transition address refused")
++    if address.version == 6:
++        if (address.is_site_local or address.ipv4_mapped is not None or address.sixtofour is not None
++                or address.teredo is not None
++                or any(address in network for network in _TRANSITION)
++                # ISATAP can embed IPv4 in otherwise public IPv6 prefixes.
++                or (int(address) >> 32) & 0xffffffff in (0x00005efe, 0x02005efe)):
++            raise PolicyError("transition address refused")
++    return address
++
++
++def _host(host):
++    if (not isinstance(host, str) or not host or len(host) > 253
++            or not host.isascii() or any(ord(c) <= 32 or ord(c) == 127 for c in host)
++            or any(c in host for c in "%/@\\?#[]")):
++        raise PolicyError("invalid destination host")
++    try:
++        address = ipaddress.ip_address(host)
++    except ValueError:
++        lowered = host.lower()
++        if (_NUMERIC_ALIAS.fullmatch(lowered) or ":" in host
++                or not all(_DNS_LABEL.fullmatch(label) for label in lowered.split("."))):
++            raise PolicyError("invalid destination host")
++        return lowered
++    if str(address) != host:
++        raise PolicyError("noncanonical numeric host")
++    _public_address(host)
++    return host
++
++
++def _sockaddr(family, sockaddr, port):
++    if (family not in (socket.AF_INET, socket.AF_INET6)
++            or not isinstance(sockaddr, tuple)
++            or len(sockaddr) != (2 if family == socket.AF_INET else 4)
++            or type(sockaddr[1]) is not int or sockaddr[1] != port):
++        raise PolicyError("invalid resolved endpoint")
++    if family == socket.AF_INET6 and (sockaddr[2] != 0 or sockaddr[3] != 0):
++        raise PolicyError("scoped endpoint refused")
++    address = _public_address(sockaddr[0])
++    if address.version != (4 if family == socket.AF_INET else 6):
++        raise PolicyError("address family mismatch")
++    # Reconstruct the destination from the approved numeric value only.
++    numeric = (str(address), port)
++    if family == socket.AF_INET6:
++        numeric += (0, 0)
++    return address, numeric
++
++
++def _close(sock):
++    if sock is not None:
++        try:
++            sock.close()
++        except Exception:
++            pass
++
++
++def public_connect(host, port, check, *, resolver=socket.getaddrinfo,
++                   socket_factory=socket.socket):
++    """Resolve once, poison mixed answers, and make exactly one numeric dial.
++
++    Only TCP ports 80/443 and canonical IP literals or ASCII DNS names are
++    accepted. DNS names are lowercased; alternate numeric encodings are refused.
++    Resolver calls are synchronous; the owner must also bound resolver lifetime
++    externally if its resolver can block beyond the original deadline.
++    """
++    if type(port) is not int or port not in (80, 443):
++        raise PolicyError("destination port refused")
++    host = _host(host)
++    _remaining(check)
++    try:
++        raw = resolver(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM,
++                       socket.IPPROTO_TCP)
++        answers = list(itertools.islice(iter(raw), _MAX_ANSWERS + 1))
++    except Exception:
++        raise TransportError("destination resolution failed") from None
++    if not answers or len(answers) > _MAX_ANSWERS:
++        raise PolicyError("resolver answer limit refused")
++    approved = []
++    for answer in answers:
++        if not isinstance(answer, tuple) or len(answer) != 5:
++            raise PolicyError("invalid resolver answer")
++        family, kind, protocol, _name, sockaddr = answer
++        if kind != socket.SOCK_STREAM or protocol != socket.IPPROTO_TCP:
++            raise PolicyError("invalid resolver transport")
++        address, numeric = _sockaddr(family, sockaddr, port)
++        approved.append((family, address, numeric))
++    family, address, numeric = approved[0]
++    sock = None
++    try:
++        try:
++            sock = socket_factory(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
++        except Exception:
++            raise TransportError("socket creation failed") from None
++        remaining = _remaining(check)
++        try:
++            sock.settimeout(min(remaining, 5.0))
++            sock.connect(numeric)
++        except Exception:
++            raise TransportError("connection failed") from None
++        _remaining(check)
++        try:
++            peer = sock.getpeername()
++        except Exception:
++            raise TransportError("peer verification failed") from None
++        peer_address, _ = _sockaddr(family, peer, port)
++        if peer_address != address:
++            raise PolicyError("connected peer mismatch")
++        return sock
++    except BaseException:
++        _close(sock)
++        raise
++
++
++def relay(left, right, check, *, max_bytes=16 * 1024 * 1024):
++    """Forward both directions with 64 KiB buffers and a total byte limit.
++
++    Own and close both sockets on every exit, including cancellation. EOF is
++    propagated as a write half-close after buffered bytes drain. The return
++    value is the aggregate number of received and successfully forwarded bytes.
++    """
++    sockets = (left, right)
++    try:
++        if left is right or type(max_bytes) is not int or max_bytes <= 0:
++            raise PolicyError("invalid relay limits")
++        _remaining(check)
++        try:
++            left.setblocking(False)
++            right.setblocking(False)
++        except Exception:
++            raise TransportError("relay setup failed") from None
++        buffers = [bytearray(), bytearray()]
++        reading = [True, True]
++        half_closed = [False, False]
++        total = 0
++        while True:
++            remaining = _remaining(check)
++            for source in (0, 1):
++                if not reading[source] and not buffers[source] and not half_closed[source]:
++                    try:
++                        sockets[1 - source].shutdown(socket.SHUT_WR)
++                    except Exception:
++                        raise TransportError("relay shutdown failed") from None
++                    half_closed[source] = True
++            if not any(reading) and not any(buffers):
++                return total
++            readers = [sockets[i] for i in (0, 1)
++                       if reading[i] and len(buffers[i]) < _BUFFER_BYTES]
++            writers = [sockets[1 - i] for i in (0, 1) if buffers[i]]
++            try:
++                ready_read, ready_write, errors = select.select(
++                    readers, writers, list(sockets), min(remaining, _RELAY_TICK))
++            except InterruptedError:
++                continue
++            except Exception:
++                raise TransportError("relay selection failed") from None
++            _remaining(check)
++            if errors:
++                raise TransportError("relay socket failed")
++            for source in (0, 1):
++                destination = sockets[1 - source]
++                if destination in ready_write and buffers[source]:
++                    _remaining(check)
++                    try:
++                        sent = destination.send(buffers[source])
++                    except (BlockingIOError, InterruptedError):
++                        continue
++                    except Exception:
++                        raise TransportError("relay write failed") from None
++                    if type(sent) is not int or not 0 < sent <= len(buffers[source]):
++                        raise TransportError("relay write failed")
++                    del buffers[source][:sent]
++            for source in (0, 1):
++                if sockets[source] in ready_read:
++                    _remaining(check)
++                    capacity = min(_BUFFER_BYTES - len(buffers[source]), max_bytes - total + 1)
++                    try:
++                        data = sockets[source].recv(capacity)
++                    except (BlockingIOError, InterruptedError):
++                        continue
++                    except Exception:
++                        raise TransportError("relay read failed") from None
++                    if not isinstance(data, bytes) or len(data) > capacity:
++                        raise TransportError("relay read failed")
++                    if not data:
++                        reading[source] = False
++                    elif len(data) > max_bytes - total:
++                        raise RelayLimitError("relay byte limit exceeded")
++                    else:
++                        buffers[source].extend(data)
++                        total += len(data)
++    finally:
++        _close(left)
++        _close(right)
+--- /dev/null
++++ b/tools/browser_scoped.py
+@@ -0,0 +1,339 @@
++"""Seven ordinary browser actions under retained native task custody.
++
++The native daemon is never started by a short lived CLI outside its namespace.
++The existing ProcessRegistry owns a persistent trusted child and all descendants.
++"""
++import dataclasses
++import hashlib
++import json
++import math
++from pathlib import Path
++import re
++import select
++import os
++import time
++import threading
++import base64
++from collections.abc import Mapping
++from urllib.parse import urlsplit, quote, quote_plus, unquote
++
++TOOLS = frozenset({'browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type',
++                   'browser_scroll', 'browser_back', 'browser_press'})
++_MAX = 2_000_000
++_OWNERS = {}
++_OWNERS_LOCK = threading.RLock()
++
++
++def action(name, args):
++    """Closed command mapping; selectors, JavaScript and arbitrary CLI flags are absent."""
++    if name not in TOOLS or type(args) is not dict:
++        raise RuntimeError('browser_action_refused')
++    allowed = {'browser_navigate': {'url'}, 'browser_snapshot': {'full', 'user_task'},
++               'browser_click': {'ref'}, 'browser_type': {'ref', 'text'},
++               'browser_scroll': {'direction'}, 'browser_back': set(), 'browser_press': {'key'}}
++    if set(args) - allowed[name]:
++        raise RuntimeError('browser_action_arguments_refused')
++    if name == 'browser_navigate':
++        url = args.get('url', '')
++        if type(url) is not str or len(url) > 8192 or any(ord(c) < 33 for c in url):
++            raise RuntimeError('browser_url_refused')
++        parsed = urlsplit(url)
++        if (parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username is not None
++                or parsed.password is not None or parsed.port not in (None, 80, 443)
++                or parsed.fragment or '%' in parsed.netloc or '\\' in url):
++            raise RuntimeError('browser_url_refused')
++        from tools.url_safety import sensitive_query_param_name
++        if sensitive_query_param_name(url):
++            raise RuntimeError('browser_credential_url_refused')
++        return 'open', [url]
++    if name == 'browser_snapshot':
++        if type(args.get('full', False)) is not bool:
++            raise RuntimeError('browser_snapshot_refused')
++        return 'snapshot', [] if args.get('full', False) else ['-c']
++    if name in ('browser_click', 'browser_type'):
++        ref = args.get('ref', '')
++        if type(ref) is not str or not re.fullmatch(r'@?e[1-9][0-9]{0,8}', ref):
++            raise RuntimeError('browser_reference_refused')
++        ref = ref if ref.startswith('@') else '@' + ref
++        if name == 'browser_click':
++            return 'click', [ref]
++        text = args.get('text', '')
++        if (type(text) is not str or len(text.encode()) > 32768 or '\x00' in text
++                or text.startswith('-')):
++            raise RuntimeError('browser_text_refused')
++        return 'fill', [ref, text]
++    if name == 'browser_scroll':
++        direction = args.get('direction', 'down')
++        if direction not in ('up', 'down'):
++            raise RuntimeError('browser_scroll_refused')
++        return 'scroll', [direction, '500']
++    if name == 'browser_back':
++        return 'back', []
++    key = args.get('key', '')
++    if key not in {'Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'ArrowUp', 'ArrowDown',
++                   'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown', 'Space'}:
++        raise RuntimeError('browser_key_refused')
++    return 'press', [key]
++
++
++def _authority(cap):
++    value = dataclasses.asdict(cap)
++    for key in ('authorization_home', 'home'):
++        value[key] = str(value[key])
++    return value
++
++
++def _packages():
++    # Read the selected PM lock/facts and verify complete package entries. No
++    # PATH fallback, downloader, Node wrapper or executable override is used.
++    from pm.install import _facts, _identity, _lockfile, _entry_verified
++    from pm import paths
++    from pm.lock import Facts
++    from pm.registry import get_package
++    from pm.store import current_target, Store
++    result = {}
++    for name, version in (('agent-browser', '0.26.0'), ('chromium', '1208+145.0.7632.6')):
++        package = get_package(name)
++        target = current_target()
++        location = None
++        lockfile = _lockfile()
++        for store_root in dict.fromkeys((paths.store_root(), paths.writable_store_root())):
++            facts = _facts() if store_root == paths.store_root() else Facts(store_root / 'facts.json')
++            fact = facts.get(name)
++            store = Store(store_root)
++            if (fact and facts.installed(name, lockfile.version(name), store_root,
++                                        _identity(lockfile, name, target))
++                    and _entry_verified(package, fact, store, target)):
++                selected = package.binary(store.entry(fact['entry']), target)
++                if selected is not None and selected.is_file() and os.access(selected, os.X_OK):
++                    location = facts, store
++                    break
++        if location is None:
++            raise RuntimeError('browser_pinned_package_required')
++        facts, store = location
++        fact = facts.get(name)
++        if fact['version'] != version:
++            raise RuntimeError('browser_package_version_not_reviewed')
++        root = store.entry(fact['entry']).resolve()
++        binary = package.binary(root, target).resolve()
++        with binary.open('rb') as stream:
++            magic = stream.read(4)
++        if not binary.is_relative_to(root) or magic != b'\x7fELF':
++            raise RuntimeError('browser_native_elf_required')
++        with binary.open('rb') as stream:
++            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
++        result[name] = {'root': str(root), 'relative': str(binary.relative_to(root)), 'sha256': digest}
++    return result
++
++
++def exchange(registry, session, call, payload):
++    """Persistent bounded stdio on the existing exact cgroup handle, no replay."""
++    raw = json.dumps(payload, ensure_ascii=True, allow_nan=False).encode() + b'\n'
++    if len(raw) > 65536:
++        raise RuntimeError('browser_input_too_large')
++    proc = session.process
++    os.set_blocking(proc.stdin.fileno(), False)
++    os.set_blocking(proc.stdout.fileno(), False)
++    offset, output = 0, bytearray()
++    while True:
++        call.check()
++        from hermes_cli.friday_user_scope import current
++        current(required=True).check()
++        remaining = min(call.deadline(), session.web_deadline) - time.monotonic() - 4
++        if remaining <= 0 or session.web_stop_requested:
++            raise RuntimeError('browser_original_task_stopped')
++        rd, wr, _ = select.select([proc.stdout], [proc.stdin] if offset < len(raw) else [], [], min(.05, remaining))
++        if wr:
++            with call.turn.lock:
++                call.check()
++                if session.web_stop_requested:
++                    raise RuntimeError('browser_original_task_stopped')
++                offset += os.write(proc.stdin.fileno(), raw[offset:])
++        if rd:
++            part = os.read(proc.stdout.fileno(), 8192)
++            if not part:
++                raise RuntimeError('browser_worker_eof_unknown_effect')
++            output.extend(part)
++            if len(output) > _MAX:
++                raise RuntimeError('browser_output_too_large')
++            if b'\n' in output:
++                if not output.endswith(b'\n') or output.count(b'\n') != 1:
++                    raise RuntimeError('browser_worker_protocol_error')
++                return json.loads(output)
++
++
++def execute(name, args, task_id=None):
++    from agent.web_call_context import current_web_call, WebCall
++    from hermes_cli import friday_user_scope as users
++    from tools.process_registry import process_registry
++    cap = users.current(required=True)
++    users.guard_tool(name, args)
++    command, arguments = action(name, args)
++    # Reject actual locally held credentials in any model-controlled field.
++    from agent.redact import redact_sensitive_text, is_secret_field_name
++    from agent.secret_scope import current_secret_scope, current_secret_scope_home
++    secrets = current_secret_scope()
++    if not isinstance(secrets, Mapping) or current_secret_scope_home() != str(cap.home):
++        raise RuntimeError('browser_profile_secret_scope_required')
++    fields = [value for value in args.values() if isinstance(value, str)]
++    for value in list(fields):
++        for _ in range(3):
++            value = unquote(value)
++            fields.append(value)
++    credential_forms = set()
++    for key, secret in secrets.items():
++        if not is_secret_field_name(key) or not isinstance(secret, str) or not secret:
++            continue
++        forms = {secret, quote(secret, safe=''), quote_plus(secret),
++                 base64.b64encode(secret.encode()).decode(),
++                 base64.urlsafe_b64encode(secret.encode()).decode()}
++        credential_forms.update(forms)
++        if any(form in value for form in forms for value in fields):
++            raise RuntimeError('browser_local_credential_refused')
++    encoded_args = json.dumps(args, ensure_ascii=True)
++    if redact_sensitive_text(encoded_args, force=True) != encoded_args:
++        raise RuntimeError('browser_local_credential_refused')
++    if command == 'open':
++        from tools.website_policy import check_website_access
++        if check_website_access(arguments[0]):
++            raise RuntimeError('browser_website_policy_refused')
++    call = current_web_call()
++    if not call.task_id or not call.session_id or task_id != call.task_id:
++        raise RuntimeError('browser_native_task_session_required')
++    pin = (cap.key, cap.profile, cap.admission_generation, call.task_id, call.session_id, call.turn_id)
++    with call.turn.lock:
++        call.check(); cap.check()
++        retained = getattr(call.turn, '_scoped_browser', None)
++        if retained is None:
++            retained = call.turn._scoped_browser = {}
++        if pin not in retained:
++            deadline = call.run_deadline if call.run_deadline is not None else call.deadline()
++            if type(deadline) not in (int, float) or not math.isfinite(deadline):
++                raise RuntimeError('browser_original_task_deadline_required')
++            owner = WebCall(call.turn, deadline, call.task_id, call.session_id,
++                            call.call_id, run_deadline=deadline)
++            owner.session_key, owner.turn_id = call.session_key, call.turn_id
++            owner.browser_lock = threading.Lock()
++            # Tombstone precedes effects. A failed launch is not retried.
++            retained[pin] = owner
++            with _OWNERS_LOCK:
++                _OWNERS[id(owner)] = (str(cap.home), call.task_id, owner)
++            try:
++                session = process_registry.spawn_browser(owner)
++                payload = {'start': True, 'home': str(cap.home), 'authority': _authority(cap),
++                           'deadline': deadline, 'packages': _packages(), 'pin': list(pin)}
++                ready = exchange(process_registry, session, call, payload)
++                if ready != {'ready': True}:
++                    raise RuntimeError('browser_namespace_not_ready')
++            except BaseException:
++                owner.stop()
++                raise
++        owner = retained[pin]
++        if owner.session is None or owner.stopped.is_set():
++            raise RuntimeError('browser_task_not_replayable')
++    try:
++        if not owner.browser_lock.acquire(timeout=max(0, call.deadline()-time.monotonic()-4)):
++            raise RuntimeError('browser_command_serialization_deadline')
++        try:
++            owner.check(); cap.check(); call.check()
++            result = exchange(process_registry, owner.session, call, {'command': command, 'args': arguments})
++            cap.check(); call.check()
++            if type(result) is not dict or type(result.get('success')) is not bool:
++                raise RuntimeError('browser_worker_protocol_error')
++            # Echoed credentials never become normal model history.
++            encoded = json.dumps(result, ensure_ascii=True)
++            for secret in sorted(credential_forms, key=len, reverse=True):
++                encoded = encoded.replace(json.dumps(secret, ensure_ascii=True)[1:-1], '[REDACTED]')
++            output = _bounded_output(redact_sensitive_text(encoded, force=True))
++            cap.check(); call.check()
++            return output
++        finally:
++            owner.browser_lock.release()
++    except BaseException:
++        owner.stop()
++        raise
++
++
++def _bounded_output(original):
++    """Bound the embedded model result; keep its exact redacted native JSON pageable.
++
++    Native transport ceilings and generic char thresholds do not reserve room
++    for fixed instructions, schemas or history. Reuse the opt-in tail allowance
++    and admitted create-only workspace I/O. No browser command is retried.
++    """
++    from agent.bounded_context import BoundedContextError, bounded_tool_result_budget, serialized_bytes
++    budget = bounded_tool_result_budget()
++    if budget is None or serialized_bytes(original) <= budget:
++        return original
++    from hermes_cli import friday_user_scope as users
++    import uuid
++    cap = users.current(required=True)
++    native = json.loads(original)
++    data = original.encode('utf-8')
++    ceiling = 1_000_000  # Existing scoped read_file/write_file ceiling.
++    incomplete = len(data) > ceiling
++    stored = original
++    if incomplete:
++        marker = ('\n[Stored copy partial at existing 1,000,000-byte limit; '
++                  'the original native result was %d UTF-8 bytes.]\n' % len(data))
++        stored = data[:ceiling-len(marker.encode())].decode('utf-8', 'ignore') + marker
++    path = cap.home / 'workspace' / ('browser-result-' + uuid.uuid4().hex + '.txt')
++    try:
++        saved = json.loads(users.scoped_file('write_file', {'path': str(path), 'content': stored}))
++        path = saved.get('path') if saved.get('success') is True else None
++    except users.ScopeDenied:
++        raise
++    except Exception:
++        path = None
++    cap.check()
++    envelope = {'success': native['success'], 'partial': True,
++                'stored_copy': ('partial' if incomplete else 'complete') if path else 'unavailable',
++                'original_utf8_bytes': len(data),
++                'read_file': {'path': path, 'offset': 1, 'char_offset': 0, 'limit': 200} if path else None,
++                'note': ('Read saved native JSON for full data, refs, origin and errors; follow '
++                         'read_file next_offset/next_char_offset. ' +
++                         ('Stored copy is incomplete at the existing storage limit.' if path and incomplete
++                          else 'Saved original is complete.' if path
++                          else 'Original could not be saved; output is incomplete.'))}
++    encode = lambda value: json.dumps(value, ensure_ascii=False, separators=(',', ':'))
++    # Preserve native status and bounded scalar metadata; the archive is authoritative.
++    for key, value in native.items():
++        if key not in envelope and key != 'data':
++            candidate = dict(envelope, **{key: value})
++            if serialized_bytes(encode(candidate)) <= budget:
++                envelope = candidate
++    snapshot = native.get('data', {}).get('snapshot') if isinstance(native.get('data'), dict) else None
++    if isinstance(snapshot, str):
++        low, high = 0, len(snapshot)
++        while low < high:
++            mid = (low + high + 1) // 2
++            candidate = dict(envelope, data={'snapshot': snapshot[:mid]})
++            if serialized_bytes(encode(candidate)) <= budget:
++                low = mid
++            else:
++                high = mid - 1
++        candidate = dict(envelope, data={'snapshot': snapshot[:low]})
++        if serialized_bytes(encode(candidate)) <= budget:
++            envelope = candidate
++    value = encode(envelope)
++    if serialized_bytes(value) > budget:
++        raise BoundedContextError('capacity: browser recovery envelope exceeds inline budget')
++    return value
++
++
++def cleanup(*, task_id=None, home=None):
++    """Only retained exact native handles; uncertainty remains in the registry."""
++    with _OWNERS_LOCK:
++        targets = [(key, owner) for key, (profile, task, owner) in _OWNERS.items()
++                   if (home is None or profile == home) and (task_id is None or task == task_id)]
++    # Latch all targets before any potentially slow native settlement.
++    for _, owner in targets:
++        owner.stopped.set()
++    receipts = []
++    for key, owner in targets:
++        receipt = owner.stop(); receipts.append(receipt)
++        if receipt['status'] == 'QUIESCENT':
++            with _OWNERS_LOCK:
++                _OWNERS.pop(key, None)
++    return {'status': 'QUIESCENT' if all(r['status'] == 'QUIESCENT' for r in receipts)
++            else 'STOP_UNCONFIRMED', 'sessions': receipts}
+--- a/tools/browser_tool.py
++++ b/tools/browser_tool.py
+@@ -1345,6 +1345,10 @@
+ def _routed_check_fn(name: str):
+     """Per-action availability gate (a named function, as the registry expects)."""
+     def check() -> bool:
++        from hermes_cli import friday_user_scope as users
++        if users.current() is not None:
++            from tools.browser_scoped import TOOLS
++            return name in TOOLS
+         return check_browser_routed_requirements(name)
+     check.__name__ = check.__qualname__ = f"check_{name}_requirements"
+     return check
+@@ -1352,11 +1356,38 @@
+ 
+ def _routed_handler(name: str, fallback):
+     def handler(args, **kw):
++        from hermes_cli import friday_user_scope as _users
++        if _users.current() is not None:
++            from tools.browser_scoped import execute
++            return execute(name, args, task_id=kw.get("task_id"))
+         return record_browser_call(lambda legacy: routed_browser_handler(
+             name, args, fallback=lambda: legacy(lambda: fallback(args, kw)),
+             task_id=kw.get("task_id"), session_id=kw.get("session_id"),
+         ), _cloud.browser_backend_name)
+     return handler
++
++
++def _ordinary_direct(function):
++    import functools
++    import inspect
++    signature = inspect.signature(function)
++    @functools.wraps(function)
++    def guarded(*args, **kwargs):
++        from hermes_cli import friday_user_scope as users
++        if users.current() is None:
++            return function(*args, **kwargs)
++        bound = signature.bind(*args, **kwargs)
++        bound.apply_defaults()
++        values = dict(bound.arguments)
++        task_id = values.pop('task_id', None)
++        from tools.browser_scoped import execute
++        return execute(function.__name__, values, task_id=task_id)
++    return guarded
++
++
++for _scoped_name in ('browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type',
++                     'browser_scroll', 'browser_back', 'browser_press'):
++    globals()[_scoped_name] = _ordinary_direct(globals()[_scoped_name])
+ 
+ 
+ for _name, _emoji, _check_fn, _defaults, *_extra in _BROWSER_TOOL_TABLE:
+--- a/tools/browser_tool_lifecycle.py
++++ b/tools/browser_tool_lifecycle.py
+@@ -23,6 +23,28 @@
+ from tools import browser_tool_real_profile as _real_profile
+ 
+ 
++def _scoped_lifecycle_only() -> bool:
++    """Installed ordinary hosts and managed admission cannot authorize shared reaping.
++
++    Unmanaged processes retain the native lifecycle. During interpreter shutdown
++    an unavailable authority module also cannot authorize scans or PID controls.
++    """
++    try:
++        from hermes_cli import friday_user_scope as users
++        if bool(users._ENGAGED) or users.current() is not None:
++            return True
++        # Startup/import can precede the first admitted user. The existing host
++        # install marker suppresses legacy effects even before _ENGAGED is set.
++        # Presence (including malformed/symlink markers) never grants authority.
++        try:
++            (Path(get_hermes_home()) / 'FRIDAY-INSTALL.json').lstat()
++        except FileNotFoundError:
++            return False
++        return True
++    except Exception:
++        return True
++
++
+ def _session_expiry_timestamp(session_info: Dict[str, Any]) -> Optional[float]:
+     """Provider-authoritative session expiry as epoch seconds; None when absent or
+     malformed (cloud providers may omit ``expires_at``; local browsers never have one)."""
+@@ -72,6 +94,11 @@
+     """atexit: close this process's sessions, then sweep orphans left by crashed
+     hermes processes — every clean exit reaps accumulated orphans, not only
+     processes that used the browser tool."""
++    if _scoped_lifecycle_only():
++        from tools.browser_scoped import cleanup
++        if cleanup()["status"] != "QUIESCENT":
++            raise RuntimeError("STOP_UNCONFIRMED")
++        return
+     try:
+         if _bt._cleanup_done:
+             return
+@@ -377,6 +404,8 @@
+     """Kill agent-browser daemons whose owning hermes process is gone (an unclean exit loses
+     ``_active_sessions`` but node + Chromium keep running). Scans the tmp dir for
+     ``agent-browser-*`` socket dirs; safe from any context."""
++    if _scoped_lifecycle_only():
++        return
+     import glob
+ 
+     # Lightpanda servers keep their own records (no socket dir); sweep them with the
+@@ -439,6 +468,8 @@
+ 
+ def _start_browser_cleanup_thread():
+     """Start the background cleanup thread if not already running."""
++    if _scoped_lifecycle_only():
++        return
+     with _bt._cleanup_lock:
+         if _bt._cleanup_thread is None or not _bt._cleanup_thread.is_alive():
+             _bt._cleanup_running = True
+@@ -621,6 +652,10 @@
+     if task_id is None:
+         task_id = "default"
+ 
++    from tools.browser_scoped import cleanup as _scoped_cleanup
++    receipt = _scoped_cleanup(task_id=task_id, home=str(get_hermes_home()))
++    if receipt["status"] != "QUIESCENT":
++        raise RuntimeError("STOP_UNCONFIRMED")
+     session_keys = [task_id]
+     sidecar_key = f"{task_id}{_bt._LOCAL_SUFFIX}"
+     with _bt._cleanup_lock:
+@@ -743,6 +778,11 @@
+ 
+ 
+ def cleanup_all_browsers() -> None:
++    from tools.browser_scoped import cleanup as _scoped_cleanup
++    if _scoped_cleanup()["status"] != "QUIESCENT":
++        raise RuntimeError("STOP_UNCONFIRMED")
++    if _scoped_lifecycle_only():
++        return
+     """Clean up all active browser sessions (shutdown) and reset cached lookups."""
+     with _bt._cleanup_lock:
+         task_ids = list(_bt._active_sessions.keys())
+--- a/tools/process_registry_web.py
++++ b/tools/process_registry_web.py
+@@ -206,7 +206,11 @@
+                                       'web_tool_call_id','web_turn_id','parent_session_id','web_stop_requested')):
+                 raise RuntimeError('web_checkpoint_required')
+ 
+-    def spawn_web(self, call):
++    def spawn_browser(self, call):
++        """Persistent scoped browser helper; original web custody, no bare PID path."""
++        return self.spawn_web(call, _browser=True)
++
++    def spawn_web(self, call, *, _browser=False):
+         from tools.process_registry import systemd_user_bus_env
+         from hermes_constants import get_hermes_home
+         import sys
+@@ -243,7 +247,7 @@
+         self._web_checkpoint(session)
+         call.check()  # Stop during intent/checkpoint must fence Popen too.
+         if session.web_stop_requested:raise RuntimeError("web_call_stopped")
+-        entry = str(Path(__file__).with_name('web_process_child.py'))
++        entry = str(Path(__file__).with_name('browser_process_child.py' if _browser else 'web_process_child.py'))
+         env = systemd_user_bus_env({'PATH':os.defpath,'HOME':str(get_hermes_home()),
+                                    'HERMES_HOME':str(get_hermes_home()),'LANG':'C.UTF-8',
+                                    'PYTHONDONTWRITEBYTECODE':'1','PYTHONUNBUFFERED':'1'})
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -110,6 +110,11 @@
+     # `disabled_toolsets: [browser]` (headless/Docker deployments) strip
+     # web_search from every session, because disabled toolsets are a strict
+     # end-of-pipeline subtraction (#17309, #64503).
++    "browser_scoped": _ts(
++        "Scoped local browser interaction (requires ordinary user admission)",
++        ["browser_navigate", "browser_snapshot", "browser_click", "browser_type",
++         "browser_scroll", "browser_back", "browser_press"],
++    ),
+     "browser": _ts(
+         "Browser automation for web interaction (navigate, click, type, scroll, "
+         "iframes, hold-click)",

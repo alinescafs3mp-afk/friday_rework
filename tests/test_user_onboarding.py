@@ -403,7 +403,14 @@ def test_read_only_recovery_uses_same_home_original_generation_and_no_adoption(e
     assert home(env).stat().st_ino==st.st_ino and cas(env)==before
     grant(env);assert Onboarding(Administration()).activate('default', session=env.operator,expected_config_sha256=before,
         generation=pending[0]['generation'],**ident())['enabled']
-    assert env.setup.templates('default')['pending']==[]
+    # Admission keeps the prepared profile visible for normal worker setup.
+    admitted = env.setup.templates('default')['pending']
+    assert len(admitted) == 1
+    assert admitted[0]['principal_id'] == initial['principal_id']
+    assert admitted[0]['generation'] == initial['generation']
+    assert admitted[0]['enabled'] and admitted[0]['recoverable']
+    assert admitted[0]['state'] == 'ADMITTED_WORKER_SETUP_AVAILABLE'
+    assert home(env).stat().st_ino == st.st_ino and cas(env) == before
 
 
 def test_pending_tampered_receipt_is_inspected_without_recovery_or_adoption(env):

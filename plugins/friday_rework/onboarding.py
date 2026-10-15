@@ -57,7 +57,7 @@ def validate_template(template):
     tools, names = template['tools'], template['required_secrets']
     if (not isinstance(config, dict) or not isinstance(tools, list) or not tools
             or any(not isinstance(k, str) for k in tools)
-            or len(set(tools)) != len(tools) or not set(tools) <= scope.SAFE
+            or len(set(tools)) != len(tools) or not set(tools) <= scope.SAFE | scope.BROWSER_TOOLS
             or not {'web_search', 'web_extract', 'friday_work', 'friday_result'} <= set(tools)
             or not isinstance(names, list) or not names
             or any(not isinstance(k, str) or not re.fullmatch('[A-Z][A-Z0-9_]{0,127}', k) for k in names)
@@ -201,6 +201,7 @@ def validate_template(template):
             or friday.get('allow_gateway_control') is not True
             or not {'web', 'friday_rework'} <= set(config.get('toolsets', []))):
         raise ValueError('useful_native_worker_result_hooks_required')
+    scope.validate_browser_config(config, tools)
     # Config is nonsecret, including recursively nested plugin/provider fields.
     # Native normal profiles carry these token *counts*, not credentials. Keep
     # the exception path-specific and numeric so arbitrary "token" fields,
@@ -370,7 +371,12 @@ class Onboarding:
                 'principal_id': key, 'template': proof['template'], 'generation': user['generation'],
                 'required_names': proof['required_secrets'], 'enabled': user['enabled'],
                 'state': 'ADMITTED_WORKER_SETUP_AVAILABLE' if user['enabled'] else 'DISABLED_SETUP_PENDING',
-                'recoverable': True, 'config_sha256': digest(root / 'config.yaml')})
+                'recoverable': True, 'config_sha256': digest(root / 'config.yaml'),
+                'target_config_sha256': proof['config_sha256'],
+                'binding_sha256': proof['binding_sha256'],
+                'browser_execution': scope.browser_admission_error(binding['tools']),
+                'can_configure_browser': not user['enabled'] and not (home / scope.MARKER).exists()
+                    and not (home / 'workers').exists() and not (set(binding['tools']) & scope.BROWSER_TOOLS)})
             if binding['platform'] == 'cli': result[-1]['uid'] = _cli_admission(root, binding)['uid']
             from hermes_cli.config import require_readable_config_before_write
             result[-1].update(self._worker_summary(home,binding,user['generation'],proof,
@@ -476,6 +482,10 @@ class Onboarding:
             return dict(state='DISABLED_INCOMPLETE', enabled=False, principal_id=key,
                         runtime_profile=runtime_profile, generation=user['generation'],
                         config_sha256=digest(root / 'config.yaml'), required_names=names,
+                        target_config_sha256=digest(home / 'config.yaml'),
+                        binding_sha256=scope._fingerprint(binding),
+                        can_configure_browser=not bool(set(tools) & scope.BROWSER_TOOLS),
+                        browser_execution=scope.browser_admission_error(tools),
                         admission='NATIVE_GRANT_AND_COMPLETE_SETUP_REQUIRED',
                         **({'uid': cli_row['uid'], 'local_authority': 'EXPLICIT_OPERATOR_MAPPING_PRODUCT_DISABLED'} if cli_row is not None else {}),
                         **self._worker_summary(home,binding,user['generation'],receipt,config))
@@ -504,6 +514,84 @@ class Onboarding:
         if platform == 'cli' and proof.get('cli_admission_sha256') != scope._fingerprint(_cli_admission(root, binding)):
             raise PermissionError('prepared_cli_admission_changed')
         return home, binding, row, proof
+
+    def configure_browser(self, profile, *, session=None, expected_config_sha256,
+                          expected_target_config_sha256, expected_binding_sha256,
+                          generation, platform, transport_profile, account_id, user_id,
+                          preset):
+        """Prepare the named local family in the original disabled home.
+
+        The existing root admission/config lock and target config lock cover all
+        writes. No identity, generation, secret, history, worker or job changes.
+        Interrupted multi-file commits retain a disabled, mismatched proof and
+        require reconciliation; they are never silently adopted or replayed.
+        """
+        if transport_profile != profile:
+            raise PermissionError('receiving_transport_authority_required')
+        if preset != 'local-headless-basic':
+            raise ValueError('explicit_browser_preset_required')
+        with self.transaction(profile, expected_config_sha256, session) as (root, access, config):
+            from hermes_cli.config import (config_write_transaction,
+                require_readable_config_before_write, atomic_config_write)
+            home, binding, row, proof = self._prepared(root, access.state,
+                platform, transport_profile, account_id, user_id, generation)
+            with config_write_transaction(home / 'config.yaml'):
+                self._verify_operator(profile, session)
+                home, binding, row, proof = self._prepared(root, access.state,
+                    platform, transport_profile, account_id, user_id, generation)
+                if row['enabled']:
+                    raise PermissionError('disabled_prepared_browser_setup_required')
+                if ((home / scope.MARKER).exists() or (home / scope.MARKER).is_symlink()
+                        or (home / 'workers').exists() or (home / 'workers').is_symlink()):
+                    raise PermissionError('browser_existing_custody_reconciliation_required')
+                if (proof['config_sha256'] != expected_target_config_sha256
+                        or proof['binding_sha256'] != expected_binding_sha256):
+                    raise ValueError('browser_config_conflict_reload')
+                with scope.authority(home):
+                    candidate = require_readable_config_before_write(home / 'config.yaml')
+                if set(binding['tools']) & scope.BROWSER_TOOLS or 'browser' in candidate:
+                    raise ValueError('browser_already_configured_reload')
+                tools = sorted(set(binding['tools']) | scope.BROWSER_TOOLS)
+                candidate['browser'] = copy.deepcopy(scope.BROWSER_LOCAL_CONFIG)
+                selected = candidate.setdefault('toolsets', [])
+                if 'browser' in selected:
+                    raise ValueError('broad_browser_toolset_refused')
+                if scope.BROWSER_TOOLSET not in selected:
+                    selected.append(scope.BROWSER_TOOLSET)
+                platforms = candidate.setdefault('platform_toolsets', {})
+                receiving = platforms.setdefault(platform, list(selected))
+                if scope.BROWSER_TOOLSET not in receiving:
+                    receiving.append(scope.BROWSER_TOOLSET)
+                scope.validate_browser_config(candidate, tools, platform)
+                validate_template({'config': candidate, 'tools': tools,
+                                   'required_secrets': proof['required_secrets']})
+                updated = dict(binding, tools=tools)
+                bindings = config['plugins']['entries']['friday_rework']['settings']['user_isolation']['bindings']
+                matches = [i for i, item in enumerate(bindings) if item == binding]
+                if len(matches) != 1:
+                    raise PermissionError('browser_binding_changed')
+                prepared = {'proof': dict(proof, binding_sha256=scope._fingerprint(updated)),
+                    'receipt_sha256': digest(home / scope.ONBOARDING),
+                    'marker': None, 'marker_sha256': None}
+                bindings[matches[0]] = updated
+                if digest(root / 'config.yaml') != expected_config_sha256:
+                    raise ValueError('onboarding_config_conflict_reload')
+                self._verify_operator(profile, session)
+                atomic_config_write(root / 'config.yaml', config)
+                self._verify_operator(profile, session)
+                with scope.authority(home):
+                    atomic_config_write(home / 'config.yaml', candidate)
+                self._verify_operator(profile, session)
+                finish_admin_config_edit(home, prepared)
+                return {'state': 'DISABLED_BROWSER_PREPARED_CUSTODY_REQUIRED',
+                    'enabled': False, 'generation': generation,
+                    'runtime_profile': binding['runtime_profile'],
+                    'config_sha256': digest(root / 'config.yaml'),
+                    'target_config_sha256': digest(home / 'config.yaml'),
+                    'binding_sha256': scope._fingerprint(updated),
+                    'browser_preset': preset, 'browser_tools': sorted(scope.BROWSER_TOOLS),
+                    'browser_execution': scope.browser_admission_error(tools),
+                    'can_configure_browser': False}
 
     def credentials(self, profile, *, session=None, expected_config_sha256, generation, platform,
                     transport_profile, account_id, user_id, name, value):
@@ -1023,6 +1111,7 @@ class Onboarding:
                          user_id=user_id, enabled=True, role='user'))
                 return {'state': 'ADMITTED_NEXT_NATIVE_REQUEST', 'enabled': True,
                         'generation': confirmed['generation'], 'runtime_profile': binding['runtime_profile'],
+                        'browser_execution': scope.browser_admission_error(binding['tools']),
                         'worker_execution': 'SOURCE_RUNTIME_VERIFIED_LIVE_NOT_RUN' if runtime.get('enabled') is True else 'DISABLED_EXPLICIT_INSTALLATION_INPUT'}
 
 
