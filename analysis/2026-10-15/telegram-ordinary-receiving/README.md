@@ -1,3 +1,19 @@
+# Ordinary Telegram receiving: current installed result
+
+15October2026: Source48 is installed and independently accepted as source:17671 native files,48 layers. Real native receiving and the authenticated WebUI are running. Normal prepare and three scoped local credential captures succeeded; the real owner's account remains disabled pending genuine native pairing and normal activation. An interactive owner request asks for a real Telegram message. No model answer or contextual follow-up has yet been observed; Telegram LIVE/ACCEPTED and Release_Go remain false.
+
+The exact two-file private-state fix repairs creation/migration of validated owned PluginState metadata0700/0600, preserving bytes/inodes, and creates new native YAML configs0600 while preserving existing modes. It closes the actual prepare503 and the subsequent isolated config0664 cause together.27 focused controls, two complete ordinary prepare positives, full canonical/private48 composition and independent source review passed. HOST tests pass110 perumask077/002; independent changed HOST controls pass68 perumask. Independent installed acceptance checks the two afterimages,48 receipt/stamp/marker/current input and retained histories; it is not runtime journey acceptance.
+
+The existing source updater now supports the exact committed47→48 transition and retains the existing native build lock under custody. Source commit73.092seconds and fresh installed qualification167.245seconds fit the SAME original180-second Root clock, including a failed52ms outer preflight and its diagnosis. This is separate from historical consumed/failed scopes and does not replay them. No manual build-lock deletion was needed for48. Earlier47 manual cleanup and all failed observations remain history.
+
+The48 handoff helper failed exit3/20.172seconds; exact primary remains unknown, despite two successful pure namespace probes. Its runtime acceptance stays false. A custom SDK renderer preflight also refused before a native start. The normal installed native CLI reached active/running Type=notify/watchdog30seconds/no restarts; its fixed30-second wait timed out, then one read-only reconciliation proved that same start active. No duplicate startup, raw-state repair or guard relaxation was used. The native unit remains unchanged. Generic helper startup/reproducibility and post-commit rollback remain open.
+
+Current next result: exact genuine Telegram pairing and normal activation, followed by a local grounded answer and same-chat contextual follow-up. The normal user is disabled generation1 with all three scoped local keys recorded. No owner-only step beyond sending a real message is currently requested. Continue independent required work while it is pending; do not block the entire goal.
+
+The complete scope and17/18–20/21–22/23October planning checkpoints remain in [foundation status](../../../docs/foundation-status.md). Both intact workers remain mandatory; ordinary conversation does not depend on them. Files, web, memory, skills, restart continuity, artifacts, stop/recovery, two-real-user administration and vanilla comparison remain unaccepted where not observed. SOURCE/WIRED/INSTALLED differ from LIVE/ACCEPTED. Sol remains owner-reserved, all inference local, old Friday OFF and Pandora untouched.
+
+## Retained Source47 checkpoint — superseded current status
+
 # Ordinary Telegram receiving: installed source and remaining runtime
 
 The next user result is a grounded local answer in a real authorized Telegram conversation, followed by a contextual follow-up. Target17October2026; presentation23October is separate from full release acceptance.

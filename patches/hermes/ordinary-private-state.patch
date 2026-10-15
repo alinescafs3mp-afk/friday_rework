@@ -1,0 +1,126 @@
+diff --git a/hermes_cli/plugins_state.py b/hermes_cli/plugins_state.py
+--- a/hermes_cli/plugins_state.py
++++ b/hermes_cli/plugins_state.py
+@@ -7,6 +7,7 @@
+ import math
+ import os
+ import re
++import stat
+ import threading
+ import time
+ from contextlib import contextmanager, nullcontext
+@@ -219,6 +220,70 @@
+                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+ 
+ 
++def _private_friday_state_directory(directory: Path, *, repair: bool) -> None:
++    """Create/tighten owned Friday metadata without replacing any state bytes.
++
++    Earlier reads created this directory and its native lock at process umask.
++    Validate descriptor ownership/type before tightening; never follow a
++    substituted directory, lock, or retained state file. An established native
++    transaction retains its existing strict drift checks instead of repairing.
++    """
++    home = directory.parent.parent
++    if not home.is_absolute() or home.resolve() != home:
++        raise PermissionError("unsafe_plugin_state_home")
++    from hermes_constants import assert_named_profile_home_live
++    assert_named_profile_home_live(home)
++    if repair:
++        home.mkdir(mode=0o700, parents=True, exist_ok=True)
++    descriptors = []
++    uid = os.getuid()
++    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
++    try:
++        current = os.open(home, flags); descriptors.append(current)
++        if os.fstat(current).st_uid != uid:
++            raise PermissionError("foreign_plugin_state_owner")
++        for name in ("plugin-data", directory.name):
++            if repair:
++                try:
++                    os.mkdir(name, 0o700, dir_fd=current)
++                except FileExistsError:
++                    pass
++            child = os.open(name, flags, dir_fd=current); descriptors.append(child)
++            info = os.fstat(child)
++            if info.st_uid != uid:
++                raise PermissionError("foreign_plugin_state_owner")
++            if stat.S_IMODE(info.st_mode) != 0o700:
++                if not repair:
++                    raise PermissionError("plugin_state_directory_changed")
++                os.fchmod(child, 0o700); os.fsync(child)
++            linked = os.stat(name, dir_fd=current, follow_symlinks=False)
++            if (linked.st_dev, linked.st_ino) != (info.st_dev, info.st_ino):
++                raise PermissionError("plugin_state_directory_changed")
++            current = child
++        for name in ("state.json", ".state.json.lock"):
++            try:
++                retained = os.stat(name, dir_fd=current, follow_symlinks=False)
++            except FileNotFoundError:
++                continue
++            if not stat.S_ISREG(retained.st_mode) or retained.st_uid != uid or retained.st_nlink != 1:
++                raise PermissionError("unsafe_native_plugin_state")
++        lock = os.open(".state.json.lock", os.O_RDWR | (os.O_CREAT if repair else 0) | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
++                       0o600, dir_fd=current); descriptors.append(lock)
++        info = os.fstat(lock)
++        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1:
++            raise PermissionError("unsafe_native_plugin_state_lock")
++        if stat.S_IMODE(info.st_mode) != 0o600:
++            if not repair:
++                raise PermissionError("plugin_state_lock_changed")
++            os.fchmod(lock, 0o600); os.fsync(lock)
++        linked = os.stat(".state.json.lock", dir_fd=current, follow_symlinks=False)
++        if (linked.st_dev, linked.st_ino) != (info.st_dev, info.st_ino):
++            raise PermissionError("plugin_state_lock_changed")
++    finally:
++        for descriptor in reversed(descriptors):
++            os.close(descriptor)
++
++
+ class PluginState:
+     """Atomic, quota-bounded JSON key/value state owned by one plugin."""
+ 
+@@ -229,8 +294,11 @@
+ 
+     @property
+     def data_dir(self) -> Path:
+-        """Profile-scoped directory matching portable plugins' PLUGIN_DATA."""
+-        return get_hermes_home() / "plugin-data" / self._data_namespace
++        """Profile-scoped PLUGIN_DATA; Friday creates/validates private metadata."""
++        directory = get_hermes_home() / "plugin-data" / self._data_namespace
++        if self._plugin_id == "friday_rework" and os.name == "posix":
++            _private_friday_state_directory(directory, repair=str(directory) not in self._native_namespaces)
++        return directory
+ 
+     @property
+     def path(self) -> Path:
+diff --git a/utils.py b/utils.py
+--- a/utils.py
++++ b/utils.py
+@@ -605,13 +605,14 @@
+     return yaml_rt, data if isinstance(data, CommentedMap) else CommentedMap(data or {})
+ 
+ 
+-def _roundtrip_dump(path: Path, yaml_rt, config, *, extra_content: "str | None" = None) -> None:
++def _roundtrip_dump(path: Path, yaml_rt, config, *, extra_content: "str | None" = None,
++                    create_mode: "int | None" = None) -> None:
+     def _write(f) -> None:
+         yaml_rt.dump(config, f)
+         if extra_content:
+             f.write(extra_content)
+ 
+-    _atomic_write(path, _write, prefix=f".{path.stem}_", mode=_preserve_file_mode(path))
++    _atomic_write(path, _write, prefix=f".{path.stem}_", mode=_mode_for_write(path, create_mode))
+ 
+ 
+ def atomic_roundtrip_yaml_update(path: Union[str, Path], key_path: str, value: Any) -> None:
+@@ -740,7 +741,8 @@
+             del dst[key]
+ 
+     _merge(existing, new_state)
+-    _roundtrip_dump(path, yaml_rt, existing, extra_content=extra_content_on_create if creating else None)
++    _roundtrip_dump(path, yaml_rt, existing,
++                    extra_content=extra_content_on_create if creating else None, create_mode=0o600)
+ 
+ 
+ def safe_json_loads(text: str, default: Any = None) -> Any:

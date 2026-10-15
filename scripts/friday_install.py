@@ -482,6 +482,13 @@ def source_checked(source, receipt, donor, *, proven_cache=None):
     generated_files = {'install-stamp.json', '.hermes-bytecode-fingerprint'}
     for p in source.rglob('*'):
         name = str(p.relative_to(source))
+        if name == '.web_ui_build.lock':
+            # Native main_web_build retains this empty advisory lock after a
+            # normal dashboard build. Validate it, preserving its inode/bytes;
+            # links, directories, payloads and world-writable modes refuse.
+            require(owned_file(p) == b'' and stat.S_IMODE(p.stat().st_mode) in
+                    (0o600, 0o644, 0o664), 'unexpected_native_web_build_lock')
+            continue
         if p.is_symlink():
             require(name.startswith(generated), 'unexpected_source_link')
         if p.is_dir():

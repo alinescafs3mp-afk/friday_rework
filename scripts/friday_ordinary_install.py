@@ -17,6 +17,8 @@ MANIFEST = 'patches/hermes/ordinary-telegram-manifest.json'
 TRANSACTION = 'preparation/ordinary-gateway'
 UPDATE_MANIFEST = 'patches/hermes/ordinary-native-repair-manifest.json'
 UPDATE_FILES = {'hermes_cli/friday_dashboard_owner.py', 'hermes_cli/friday_credential_admission.py'}
+PRIVATE_STATE_MANIFEST = 'patches/hermes/ordinary-private-state-manifest.json'
+PRIVATE_STATE_FILES = {'hermes_cli/plugins_state.py', 'utils.py'}
 
 
 def api():
@@ -34,6 +36,7 @@ def replace(path, data, mode=0o600):
     temporary = path.with_name(path.name + '.ordinary-staged')
     fd = os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,mode)
     try:
+        os.fchmod(fd,mode)  # Preserve the exact beforeimage mode under any umask.
         with os.fdopen(fd,'wb') as stream:
             stream.write(data);stream.flush();os.fsync(stream.fileno())
         os.replace(temporary,path)
@@ -367,10 +370,30 @@ def activate(request, request_path, budget):
         os.close(fd)
 
 
-def update_history(home, expected):
+def update_history(home, expected, predecessor=None):
     """Pin the complete original activation transaction and rollback archive."""
     f = api(); actual = {}
-    for name in (TRANSACTION, 'preparation/ordinary-gateway-archive'):
+    roots = [TRANSACTION, 'preparation/ordinary-gateway-archive']
+    if predecessor is not None:
+        # This is the already committed 46->47 transaction, never an operation
+        # to rerun. Its exact request and all beforeimages remain pinned.
+        old = f.read_json(f.pin(predecessor))
+        f.require(old.get('schema') == 'friday.ordinary-telegram-source-update.v1',
+            'ordinary_update_exact_predecessor_required')
+        f.pin(old['previous_input']); f.pin(old['current_input'])
+        name = 'preparation/ordinary-source-update-'+old['previous_input']['sha256']
+        tx = f.directory(home/name)
+        intent = f.read_json(tx/'intent.json'); committed = f.read_json(tx/'committed.json')
+        f.require(intent.get('schema') == 'friday.ordinary-telegram-source-update-transaction.v1'
+            and intent.get('state') == 'SOURCE_UPDATE_CONSUMED_NO_RETRY'
+            and intent.get('request_sha256') == predecessor['sha256']
+            and committed.get('state') == 'SOURCE_UPDATED_NOT_RUNTIME_ACCEPTED'
+            and committed.get('previous_input') == old['previous_input']
+            and committed.get('current_input') == old['current_input']
+            and committed.get('gateway_started') is False and committed.get('workers_enabled') is False
+            and not os.path.lexists(tx/'rolled-back.json'), 'ordinary_update_committed_predecessor_required')
+        roots.append(name)
+    for name in roots:
         root = f.directory(home/name)
         for path in root.rglob('*'):
             f.require(not path.is_symlink(), 'ordinary_update_history_link_refused')
@@ -389,8 +412,9 @@ def update_inputs(request, budget):
     f = api()
     fields = {'schema','seconds','home','previous_input','current_input','marker','source_receipt',
         'stamp','configuration','profile','launcher','credential_files','native_unit','transaction_history'}
-    f.require(type(request) is dict and set(request) == fields
-        and request['schema'] == 'friday.ordinary-telegram-source-update.v1'
+    source48 = type(request) is dict and request.get('schema') == 'friday.ordinary-telegram-source-update.v2'
+    f.require(type(request) is dict and set(request) == fields | ({'predecessor_update'} if source48 else set())
+        and request['schema'] in ('friday.ordinary-telegram-source-update.v1','friday.ordinary-telegram-source-update.v2')
         and type(request['seconds']) is int and 30 <= request['seconds'] <= 180,
         'ordinary_update_explicit_request_required')
     home = f.directory(f.canonical(request['home'])); source = f.directory(home/'hermes-agent')
@@ -417,22 +441,25 @@ def update_inputs(request, budget):
         and marker.get('source_receipt_sha256') == request['source_receipt']['sha256']
         and current['product']['runtime'] == {'enabled':False}, 'ordinary_update_committed_phase_required')
     budget.call(f.composition_checked,previous,source,receipt,donors['hermes'])
-    manifest = json.loads(f.owned_file(f.ROOT/UPDATE_MANIFEST),object_pairs_hook=f.unique)
+    manifest_name = PRIVATE_STATE_MANIFEST if source48 else UPDATE_MANIFEST
+    native_files = PRIVATE_STATE_FILES if source48 else UPDATE_FILES
+    manifest = json.loads(f.owned_file(f.ROOT/manifest_name),object_pairs_hook=f.unique)
     old = previous['project_files']; new = current['project_files']
     patch = manifest['patch']
-    f.require(patch == 'patches/hermes/ordinary-native-repair.patch'
-        and set(new) == set(old) | {UPDATE_MANIFEST,patch}
+    f.require(patch == ('patches/hermes/ordinary-private-state.patch' if source48 else 'patches/hermes/ordinary-native-repair.patch')
+        and set(new) == set(old) | {manifest_name,patch}
         and all(new[name] == pin for name,pin in old.items()
-                if name not in ('scripts/friday_install.py','scripts/friday_ordinary_install.py')),
+                if name not in ({'scripts/friday_install.py','scripts/friday_ordinary_install.py'} |
+                                ({'scripts/friday_start.py'} if source48 else set()))),
         'ordinary_update_only_reviewed_source_required')
     f.require(manifest.get('base_commit') == receipt['commit']
-        and len(receipt['layers']) == 46 and UPDATE_MANIFEST not in {r['manifest'] for r in receipt['layers']}
+        and len(receipt['layers']) == (47 if source48 else 46) and manifest_name not in {r['manifest'] for r in receipt['layers']}
         and manifest.get('installed_prefix') == {r['manifest']:r['manifest_sha256'] for r in receipt['layers']}
-        and new[UPDATE_MANIFEST] == f.digest(f.owned_file(f.ROOT/UPDATE_MANIFEST))
+        and new[manifest_name] == f.digest(f.owned_file(f.ROOT/manifest_name))
         and manifest['patch_sha256'] == new[patch] == f.digest(f.owned_file(f.ROOT/patch)),
         'ordinary_update_exact_prefix_required')
     rows = manifest['files']
-    f.require(type(rows) is list and len(rows) == 2 and {r['path'] for r in rows} == UPDATE_FILES,
+    f.require(type(rows) is list and len(rows) == 2 and {r['path'] for r in rows} == native_files,
         'ordinary_update_exact_native_files_required')
     for row in rows:
         f.require(row.get('new_file') is False and row.get('mode') == '100644'
@@ -443,9 +470,17 @@ def update_inputs(request, budget):
     # patch target must never escape this transaction's five-file rollback.
     from scripts.hermes_prepare import overlay_layers, Budget as SourceBudget
     layers = budget.call(overlay_layers,f.ROOT,receipt['commit'],SourceBudget(budget.deadline))
-    f.require(layers[-1][1]['manifest'] == UPDATE_MANIFEST,
+    f.require(layers[-1][1]['manifest'] == manifest_name,
         'ordinary_update_final_layer_required')
-    update_history(home,request['transaction_history'])
+    predecessor = request.get('predecessor_update')
+    update_history(home,request['transaction_history'],predecessor)
+    if source48:
+        old_request = f.read_json(f.pin(predecessor))
+        old_tx = home/'preparation'/('ordinary-source-update-'+old_request['previous_input']['sha256'])
+        committed = f.read_json(old_tx/'committed.json')
+        f.require(old_request['home'] == str(home) and old_request['current_input'] == request['previous_input']
+            and committed['source_receipt_sha256'] == request['source_receipt']['sha256'],
+            'ordinary_update_predecessor_binding_changed')
     # Complete native identity/configuration/credential validation is reused;
     # no consumed query or historical installer phase is ever invoked.
     f.native_packages(source)
@@ -523,6 +558,38 @@ def stopped_consumers(home, unit_ref, budget):
             'ordinary_update_native_lock_release_unconfirmed')
 
 
+@contextlib.contextmanager
+def retained_build_lock(source):
+    """Retain the exact existing native build lock; never create or replace it."""
+    f = api(); path = source/'.web_ui_build.lock'
+    if not os.path.lexists(path):
+        yield lambda: f.require(not os.path.lexists(path),'ordinary_update_web_build_lock_appeared')
+        return
+    f.require(f.owned_file(path) == b'', 'ordinary_update_native_build_lock_required')
+    fd = os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK); held = False
+    try:
+        before = os.fstat(fd)
+        def prove():
+            current = os.fstat(fd); named = path.lstat()
+            fields = ('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns')
+            f.require(stat.S_ISREG(current.st_mode) and current.st_uid == os.getuid()
+                and current.st_nlink == 1 and current.st_size == 0
+                and stat.S_IMODE(current.st_mode) in (0o600,0o644,0o664)
+                and all(getattr(before,k) == getattr(current,k) == getattr(named,k) for k in fields),
+                'ordinary_update_native_build_lock_changed')
+        prove()
+        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB); held = True
+        prove(); yield prove
+    finally:
+        try:
+            if held:
+                try: prove()
+                except BaseException as exc:
+                    from scripts.dsh_prepare import StopUnconfirmed
+                    raise StopUnconfirmed('native build lock custody requires reconciliation') from exc
+        finally: os.close(fd)
+
+
 
 def update(request, request_path, budget):
     """One finite committed-phase source update; original activation stays intact."""
@@ -531,7 +598,8 @@ def update(request, request_path, budget):
     try:
         fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
         home,source,previous,current,marker,receipt,manifest,donors,tx = update_inputs(request,budget)
-        with stopped_consumers(home,request['native_unit'],budget) as prove:
+        with stopped_consumers(home,request['native_unit'],budget) as native_prove, retained_build_lock(source) as build_prove:
+            def prove(): native_prove(); build_prove()
             f.require(f.read_json(request_path) == request, 'ordinary_update_request_changed')
             # Recheck every explicit pin immediately before the source-only journal.
             update_inputs(request,budget)
@@ -545,8 +613,9 @@ def update(request, request_path, budget):
             receipt = copy.deepcopy(receipt)
             for row in manifest['files']:
                 receipt['files'][row['path']] = {k:row[k] for k in ('sha256','bytes','mode')}
-            receipt['layers'].append({'manifest':UPDATE_MANIFEST,
-                'manifest_sha256':current['project_files'][UPDATE_MANIFEST],'patch_sha256':manifest['patch_sha256']})
+            manifest_name = PRIVATE_STATE_MANIFEST if request['schema'].endswith('.v2') else UPDATE_MANIFEST
+            receipt['layers'].append({'manifest':manifest_name,
+                'manifest_sha256':current['project_files'][manifest_name],'patch_sha256':manifest['patch_sha256']})
             stamp = f.read_json(source/'install-stamp.json')
             stamp['fridaySource'] = {'baseTree':receipt['base_tree'],'layers':receipt['layers']}
             receipt_data = encoded(receipt); receipt_sha = f.digest(receipt_data)
@@ -589,7 +658,7 @@ def update(request, request_path, budget):
                 # agree before the update can commit. No service is launched.
                 from hermes_cli.friday_ordinary_gateway import check
                 check(home,role=False)
-                update_history(home,request['transaction_history']); prove(); budget.check()
+                update_history(home,request['transaction_history'],request.get('predecessor_update')); prove(); budget.check()
                 write(tx/'committed.json',encoded({'state':'SOURCE_UPDATED_NOT_RUNTIME_ACCEPTED',
                     'previous_input':request['previous_input'],'current_input':request['current_input'],
                     'source_receipt_sha256':receipt_sha,'gateway_started':False,'workers_enabled':False}))
@@ -609,7 +678,7 @@ def update(request, request_path, budget):
                     f.require(all(f.digest(f.owned_file(home/name)) == f.digest(row['data'])
                         and stat.S_IMODE((home/name).stat().st_mode) == row['mode'] for name,row in saved.items()),
                         'ordinary_update_restore_failed')
-                    update_history(home,request['transaction_history'])
+                    update_history(home,request['transaction_history'],request.get('predecessor_update'))
                     write(tx/'rolled-back.json',encoded({'state':'ROLLED_BACK_OWN_SOURCE_ONLY_NO_RETRY'}))
                     sync_directory(tx)
                 except BaseException as restoration:
