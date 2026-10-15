@@ -1,0 +1,176 @@
+--- a/hermes_cli/friday_dashboard_owner.py
++++ b/hermes_cli/friday_dashboard_owner.py
+@@ -244,6 +244,26 @@
+     return True
+ 
+ 
++
++def startup_identity(app):
++    """Prove the claimed administrative host before choosing startup services.
++
++    This owner serves authenticated product plugin APIs, not a stdio user
++    ingress. No CLI principal is created or inherited for its background work.
++    The configured port is pinned before uvicorn has published the bound port.
++    """
++    boot = getattr(app.state, 'friday_dashboard_owner', None)
++    if boot is None:
++        require(not enabled())
++        return None
++    from gateway import host_rendezvous as hr
++    require(hr.owns_host_lock(hr.ROLE_SERVE))
++    current = expected(registered=True, auth_required=app.state.auth_required,
++                       host=app.state.bound_host, port=boot['port'])
++    require(current == boot)
++    return boot
++
++
+ def live_identity(app):
+     boot = getattr(app.state, 'friday_dashboard_owner', None)
+     if boot is None:
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -3784,7 +3784,10 @@
+     system = _systemd_scope_preamble("start", system, preflight_user=True)
+     # HERMES_HOME sync happens in refresh's systemd_unit_is_current gate; the unit is guaranteed to exist here.
+     refresh_systemd_unit_if_needed(system=system)
+-    _run_systemctl(["start", get_service_name()], system=system, check=True, timeout=30)
++    # Type=notify waits for READY after gateway initialization. A 30s client
++    # timeout can abandon a successful in-progress start before systemd's own
++    # readiness deadline; keep a bounded wait without retrying the operation.
++    _run_systemctl(["start", get_service_name()], system=system, check=True, timeout=120)
+     print(f"✓ {_service_scope_label(system).capitalize()} service started")
+ 
+ 
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -178,6 +178,8 @@
+ 
+ @asynccontextmanager
+ async def _lifespan(app: "FastAPI"):
++    from hermes_cli.friday_dashboard_owner import startup_identity
++    administrative_host = startup_identity(app) is not None
+     app.state.event_channels = {}  # dict[str, set]
+     app.state.event_lock = asyncio.Lock()
+     app.state.pty_active_session_files = {}  # dict[str, Path]
+@@ -217,31 +219,38 @@
+     # Hosted Bot rooms belong to the backend process. Recovery may need a
+     # contended state.db migration, so keep it off the pre-yield path: Group
+     # Chat must degrade on its own rather than block every Desktop feature.
+-    from tui_gateway import methods_groups as _hosted_groups
+-    import tui_gateway.server  # noqa: F401
+-
+-    try:
+-        tui_gateway.server.install_tui_message_injector()
+-    except Exception:
+-        _log.warning("TUI message injector did not install", exc_info=True)
+-
++    # Product administration has no stdio principal. Its existing authenticated
++    # plugin API shares this app, while the product boundary refuses native
++    # RPC/console/PTY/group ingress. Importing that user facade would attempt
++    # CLI admission and poison the administrative process after user prepare.
++    _hosted_groups = None
++    tui_server = None
++    hosted_room_start_thread = None
+     hosted_room_start_cancel = threading.Event()
+-
+-    def _start_hosted_rooms() -> None:
++    if not administrative_host:
++        from tui_gateway import methods_groups as _hosted_groups
++        from tui_gateway import server as tui_server
++
+         try:
+-            _hosted_groups.start_hosted_room_service()
++            tui_server.install_tui_message_injector()
+         except Exception:
+-            _log.exception("Hosted Group Chat recovery failed during backend startup")
+-        finally:
+-            if hosted_room_start_cancel.is_set():
+-                _hosted_groups.stop_hosted_room_service(timeout=1.0)
+-
+-    hosted_room_start_thread = threading.Thread(
+-        target=_start_hosted_rooms,
+-        daemon=True,
+-        name="hosted-room-startup",
+-    )
+-    hosted_room_start_thread.start()
++            _log.warning("TUI message injector did not install", exc_info=True)
++
++        def _start_hosted_rooms() -> None:
++            try:
++                _hosted_groups.start_hosted_room_service()
++            except Exception:
++                _log.exception("Hosted Group Chat recovery failed during backend startup")
++            finally:
++                if hosted_room_start_cancel.is_set():
++                    _hosted_groups.stop_hosted_room_service(timeout=1.0)
++
++        hosted_room_start_thread = threading.Thread(
++            target=_start_hosted_rooms,
++            daemon=True,
++            name="hosted-room-startup",
++        )
++        hosted_room_start_thread.start()
+ 
+     # Desktop-spawned backends fire cron jobs themselves, since the app has no
+     # gateway running the scheduler. Server `hermes dashboard` is unaffected —
+@@ -278,7 +287,10 @@
+     # Periodic authenticated self-test feeding the ``dashboard`` component on /api/status.
+     selftest_task = asyncio.create_task(_dashboard_selftest_loop())
+     # Live auto-archive timer, independent of list requests.
+-    auto_archive_task = asyncio.create_task(_auto_archive_ticker_loop())
++    # Session/skill maintenance also imports the stdio facade after its delay.
++    # Product users are maintained by their admitted gateway, never this admin.
++    auto_archive_task = (asyncio.create_task(_auto_archive_ticker_loop())
++                         if not administrative_host else None)
+ 
+     # Managed local runtime (local_runtime.enabled): bring llama-server back so a
+     # restart doesn't strand a llamacpp main model. Off-thread and best-effort;
+@@ -306,18 +318,21 @@
+     try:
+         yield
+     finally:
+-        try:
+-            tui_gateway.server.clear_tui_message_injector()
+-        except Exception:
+-            _log.debug("TUI message injector clear skipped", exc_info=True)
++        if tui_server is not None:
++            try:
++                tui_server.clear_tui_message_injector()
++            except Exception:
++                _log.debug("TUI message injector clear skipped", exc_info=True)
+         hosted_room_start_cancel.set()
+-        _hosted_groups.stop_hosted_room_service(timeout=5.0)
+-        hosted_room_start_thread.join(timeout=1.0)
++        if _hosted_groups is not None:
++            _hosted_groups.stop_hosted_room_service(timeout=5.0)
++            hosted_room_start_thread.join(timeout=1.0)
+         if cron_stop is not None:
+             cron_stop.set()
+         pty_reaper_task.cancel()
+         selftest_task.cancel()
+-        auto_archive_task.cancel()
++        if auto_archive_task is not None:
++            auto_archive_task.cancel()
+         await PTY_REGISTRY.close_all()
+         # Stop the managed llama-server with its parent (an orphan pins VRAM).
+         try:
+@@ -1677,12 +1692,13 @@
+         # in-memory transcripts to state.db before shutdown. Installed BEFORE
+         # uvicorn's capture_signals() so uvicorn re-raises into them as the
+         # "original" handlers — kills outside the serve window are covered too.
+-        try:
+-            from tui_gateway.server import install_exit_flush_signal_handlers
+-
+-            install_exit_flush_signal_handlers()
+-        except Exception as exc:
+-            _log.debug("exit-flush signal handlers not installed: %s", exc)
++        if not friday_claim:
++            try:
++                from tui_gateway.server import install_exit_flush_signal_handlers
++
++                install_exit_flush_signal_handlers()
++            except Exception as exc:
++                _log.debug("exit-flush signal handlers not installed: %s", exc)
+ 
+         # #93608: uvicorn's bind_socket() would exit 1 with a bare ERROR line,
+         # indistinguishable from "backend broken". Probe first so a conflict

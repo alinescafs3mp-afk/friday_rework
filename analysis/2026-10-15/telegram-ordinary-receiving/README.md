@@ -1,3 +1,29 @@
+# Ordinary Telegram receiving: Native51 installed; real administrative API restored
+
+15October2026,07:29MSK. SOURCE/WIRED/INSTALLED Native51. Actual normal gateway start exits0/36.500s; Notify/watchdog30/no restarts. Actual normal WebUI publishes READY. The existing signed operator cookie receives200 for auth/me, users, onboarding and pairing after restart; no repeated login or altered admission. Telegram model answer/follow-up remains LIVE=false, ACCEPTED=false.
+
+The observed Source50 API403 came from a real background free-tier announcement importing an unauthorized CLI/TUI facade and poisoning its sticky process guard. Native51 changes only free_tier_bootstrap.py: notify an already initialized consumer, without importing a facade solely for an announcement. Existing native setup.ready event/fail-soft behavior and all guards remain. Old/new full normal CLI+real backgrounds+ASGI proof gives403/200; negative auth/profile/revocation/CLI/TUI controls pass. Root independently repeated the full new path and four broadcaster controls. No external/model/worker effects in those fixtures.
+
+Supported50→51 actual update exits0/9.333s inside original180s:one native file+three metadata publications, four recoverable beforeimages,61 historical file pins,41 unchanged private plugin files, unchanged config/credentials/unit/profile/original accounting. Independent actual installed review:17671 files/51layers/168 project pins, exact prior prefix, forward/reverse patch and protected state PASS. Eleven updater controls cover both077/002 umasks, metadata-failure rollback/no-repeat and direct boundary refusals. Native50 startup fix and its20 source controls remain in this coherent publication. An isolated fixture replacement typo and a Root readonly check missing HERMES_HOME are retained as harness failures; neither changed product bytes or acceptance requirements.
+
+Normal snapshot still shows pairing pending0/approved0 and the prepared real user disabled generation1. Await the already-requested real owner message; approve/activate through the normal reviewed API, then validate actual local answer and contextual follow-up. File/artifact, web/browser, memory/skills, both workers and real shared administration remain mandatory; none is silently removed or claimed live by source acceptance. Sol remains owner-reserved. Full current scope and checkpoints: [foundation status](../../../docs/foundation-status.md).
+
+## Retained Source50 checkpoint — historical; startup and API403 closed by51
+
+# Ordinary Telegram receiving: Native50 boots; product users API still refused
+
+15October2026,07:12MSK. SOURCE/WIRED/INSTALLED Native50:17671 native files,50 layers,166 project pins. Independent installed acceptance verifies the exact three-file native delta, all17668 unchanged rows, forward/reverse patch targets, six beforeimages,50-layer prefix,53 retained history files,166 pins,41 unchanged private plugin files and protected configuration/credential/unit/profile hashes. It is not live Telegram or full release acceptance.
+
+The minimal normal administrative startup fix preserves separate user/CLI/TUI admission. A proved source/TLS/auth/operator/native-serve owner starts the administrative plugin APIs without trying to initialize an unauthorized stdio facade or deferred native-user maintenance. Existing boundary restrictions and unmanaged legacy behavior remain; no global guard reset, alternative database or new authority framework. Native gateway start has a bounded120s caller wait for actual Notify readiness, with failures still propagated and no second start.
+
+Actual update:exit0/12.157s within original180s. Actual normal gateway start:exit0/36.665s; active Notify/watchdog30/no restarts. Actual normal WebUI:READY with retained native TLS/source/ownership. Operator GET/auth/me200 using the retained cookie; GET product users403/product_scope_refused remains a direct blocker. The failed read and its private diagnostic are retained; no repeated effect was attempted. An isolated native read/mask before/after eager multiprofile succeeds, so no simple multiprofile bypass is justified. The full normal CLI/plugin/background/request producer is being diagnosed with realistic three-key onboarding; source seams did not predict this HTTP failure.
+
+Source checks:20 native tests plus old-failure/new full-startup/warm-import/auth-denial seams,15 updater controls and8 independent private-parent controls. New private beforeimage parents are0700 component by component. The old002 fixture exposed intermediate775 directories; actual49 history was already0700, so it was not modified. Tests/model-free ownership seams are offline and are not reported as an actual user journey.
+
+Source49 file and worker continuation remains installed, including original-chat immutable delivery/UNKNOWN journals, own-workspace intake/revisions and explicit normal BOTH-worker attachment to the same admitted home. No live Telegram model reply/follow-up/artifact or DSH/A0 deployment has been accepted. The next result and full mandatory scope are in [foundation status](../../../docs/foundation-status.md). Restore the normal administrative API, receive the already-requested genuine Telegram DM, approve/activate normally, and observe the actual answer/follow-up. Sol stays owner-reserved; all inference local; old Friday OFF/Pandora untouched.
+
+## Retained Source49 checkpoint — historical; startup closed by50, API403 still open
+
 # Ordinary Telegram receiving: Native49 installed, actual restart blocker retained
 
 15October2026,06:54MSK. Native49 is SOURCE-reviewed, WIRED and INSTALLED. Normal source checks verify17671 files/49layers and the exact4 plugin continuation changes. Telegram receiving is active; no genuine model answer/follow-up, live file delivery or live worker attachment has been accepted.
