@@ -1,0 +1,374 @@
+diff --git a/agent/bounded_context.py b/agent/bounded_context.py
+--- a/agent/bounded_context.py
++++ b/agent/bounded_context.py
+@@ -26,6 +26,10 @@
+ 
+ class BoundedContextError(ValueError):
+     """A bounded TEST request cannot be admitted; no physical call is permitted."""
++
++
++class BoundedSummaryHeadroomError(BoundedContextError):
++    """The complete protected skeleton cannot leave useful summary space."""
+ 
+ 
+ def _positive(value: Any, name: str) -> int:
+@@ -445,9 +449,25 @@
+ def build_bounded_summary_prompt(compressor: Any, turns: list, summary_budget: int,
+                                  focus: str | None, memory: str, has_user_turn: bool) -> str:
+     """Price mandatory content first, sample only the eligible transcript, then check all bytes."""
++    import copy
++    # Summary serialization is a request-only view too. Select the same native
++    # sidecar first, then project assistant assertions on a private copy only.
++    turns = copy.deepcopy(turns)
++    for row in turns:
++        sidecar = row.pop("api_content", None)
++        if isinstance(sidecar, str) and sidecar and row.get("role") in ("user", "assistant"):
++            row["content"] = sidecar
++    view = getattr(compressor, "_bounded_summary_input_view", None)
++    if callable(view):
++        turns = view(turns)
+     policy = compressor.bounded_context_policy
+     allocation = getattr(compressor, "_bounded_summary_output_tokens", policy.compression_output_tokens)
+     text_target = getattr(compressor, "_bounded_summary_target_tokens", allocation)
++    headroom = getattr(compressor, "_bounded_summary_json_headroom", None)
++    if type(headroom) is int:
++        # All bounded lanes need a visible-text target derived from the complete
++        # final request, not only the optional single-read-file schema lane.
++        text_target = min(text_target, max(1, headroom // 6))
+     summary_budget = min(summary_budget, max(1, text_target // 2))
+     empty = compressor._build_summary_prompt("", summary_budget, focus, memory, has_user_turn)
+ 
+@@ -831,8 +851,12 @@
+     anchors = _bounded_protected_wire_anchors(agent.context_compressor, head, tail)
+     current = next((i for i in range(len(anchors)-1, -1, -1)
+                     if anchors[i].get("role") == "user"), None)
+-    expected, _ = build_api_messages(agent, anchors, current_turn_user_idx=current,
+-        ext_prefetch_cache="", plugin_user_context="", moa_config=None, active_system_prompt="")
++    # The native formatter combines cached and ephemeral authority into ONE
++    # system row. An empty cached prompt still emits ephemeral authority, so it
++    # cannot be used as a neutral projection of the stored head/tail.
++    expected, effective_system = build_api_messages(agent, anchors, current_turn_user_idx=current,
++        ext_prefetch_cache="", plugin_user_context="", moa_config=None,
++        active_system_prompt=getattr(agent, "_cached_system_prompt", None) or "")
+     readonly_utf8_messages(agent, expected)
+     # Request assembly canonicalizes tool-call argument JSON after the native
+     # message projection. Compare that exact wire representation, rather than
+@@ -888,8 +912,17 @@
+         if not all(candidate.get(k) == wanted.get(k) for k in fields):
+             return False
+         return project_tool_calls(candidate.get("tool_calls")) == wanted.get("tool_calls")
+-    split = len(head)
+-    groups = (expected[:split], expected[split:])
++    # Check complete actual authority, including cached+ephemeral system text,
++    # rather than authorizing a matching fragment elsewhere in the request.
++    authority = lambda rows: [row for row in rows if row.get("role") in ("system", "developer")]
++    expected_authority, actual_authority = authority(expected), authority(actual)
++    if (len(expected_authority) != len(actual_authority)
++            or not all(matches(wanted, candidate)
++                       for wanted, candidate in zip(expected_authority, actual_authority))):
++        raise BoundedContextError("bounded_context: formatter changed protected system authority")
++    injected = int(bool(effective_system))
++    split = injected + len(head)
++    groups = (expected[:injected], expected[injected:split], expected[split:])
+     cursor = 0
+     for group_index, group in enumerate(groups):
+         if not group:
+@@ -1002,7 +1035,13 @@
+     variants = bounded_compaction_request(agent, messages, system_prompt)
+     for request in variants:
+         guard_main_request(agent, request)
+-    return max(policy.check_request(request)["estimated_input"] for request in variants)
++    estimated = max(policy.check_request(request)["estimated_input"] for request in variants)
++    # A bounded replacement above the unchanged soft trigger immediately asks
++    # for another expensive compaction. Allocate and validate against the same
++    # complete-request target before replacing any durable rows.
++    if estimated > policy.trigger_tokens:
++        raise BoundedContextError("bounded_context: compacted request did not clear the soft trigger")
++    return estimated
+ 
+ 
+ def bounded_summary_headroom(agent, messages, system_prompt):
+@@ -1037,9 +1076,12 @@
+                 readonly_db.close()
+     # The skeleton already includes the synthetic summary row and end marker.
+     # Added summary text is charged by its JSON-escaped UTF-8 bytes, not tokens.
+-    headroom = min(policy.input_budget(wire_output_tokens(request))
++    headroom = min(min(policy.input_budget(wire_output_tokens(request)), policy.trigger_tokens)
+                    - serialized_bytes(wire_body(request)) - policy.template_overhead_tokens
+                    for request in variants)
++    logger.info("Bounded summary allocation: complete_fixed_max=%d target=%d escaped_text_headroom=%d",
++                max(serialized_bytes(wire_body(request)) + policy.template_overhead_tokens
++                    for request in variants), policy.trigger_tokens, headroom)
+     if headroom <= 0:
+-        raise BoundedContextError("bounded_context: protected final request leaves no summary headroom")
++        raise BoundedSummaryHeadroomError("bounded_context: protected final request leaves no summary headroom below the soft trigger")
+     return headroom
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -2274,6 +2274,8 @@
+     # rows still share nested dicts with history, so clone first like the main path does.
+     api_messages = [_clone_message_for_send(m) for m in api_messages]
+     _sanitize_messages_surrogates(api_messages)
++    from hermes_cli.friday_user_scope import public_identity_request_view
++    api_messages = public_identity_request_view(agent, api_messages)
+     return api_messages
+ 
+ 
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -3928,6 +3928,7 @@
+     """Adopt a grown durable parent, gather memory context and run the summarizer.
+     A hard cancel restores the compressor snapshot + live list, records a stall backoff while the lease is
+     still held, and aborts; any other failure releases the lease and re-raises."""
++    from agent.bounded_context import BoundedSummaryHeadroomError
+     pre_msg_count = len(messages)
+     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
+     messages_before_compression = None
+@@ -3957,6 +3958,8 @@
+         )
+         from agent.bounded_context import bounded_summary_headroom, BoundedContextPolicy
+         if isinstance(getattr(agent, "_bounded_context_policy", None), BoundedContextPolicy):
++            from hermes_cli.friday_user_scope import public_identity_request_view
++            agent.context_compressor._bounded_summary_input_view = lambda rows: public_identity_request_view(agent, rows)
+             agent.context_compressor._bounded_summary_fit_callback = lambda skeleton: bounded_summary_headroom(
+                 agent, skeleton, _existing_system_prompt(agent, system_message))
+         messages_before_compression = copy.deepcopy(messages)
+@@ -3997,6 +4000,25 @@
+             STALL_INTERRUPTED_FAILURE_CLASS if _stall_backoff
+             else "commit_fence_cancelled" if _host_cancel else "explicit_interrupt",
+         )
++        return _SummaryPhase(messages=messages, abort_prompt=_existing_system_prompt(agent, system_message))
++    except BoundedSummaryHeadroomError as exc:
++        # Computed fixed authority/tools/anchors already exhaust the unchanged
++        # target. This is a transient structural no-op, before any model call,
++        # not evidence that the session should be reset or permanently disabled.
++        try:
++            attempt.restore_compressor(agent.context_compressor)
++            _restore_messages_snapshot(messages, messages_before_compression)
++            agent._last_compaction_in_place = False
++            agent.context_compressor._record_structural_no_op("bounded_summary_fixed_minimum")
++            _mark_compression_blocked_transient(agent, agent.context_compressor)
++            _emit_bounded_compaction_refusal(
++                agent, exc, rows_restored=(messages_before_compression is not None
++                                          and messages == messages_before_compression),
++            )
++            _emit_aborted_attempt_telemetry(agent, attempt.started_at, "bounded_summary_fixed_minimum")
++        finally:
++            _stop_heartbeat("context compression has no summary headroom")
++            lease.release()
+         return _SummaryPhase(messages=messages, abort_prompt=_existing_system_prompt(agent, system_message))
+     except BaseException as _compress_exc:
+         # Any failure after lock acquisition must release it or the session is permanently blocked from compression.
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -1362,4 +1362,6 @@
+         effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+     if effective_system:
+         api_messages = [{"role": "system", "content": effective_system}] + api_messages
++    from hermes_cli.friday_user_scope import public_identity_request_view
++    api_messages = public_identity_request_view(agent, api_messages)
+     return api_messages, effective_system
+diff --git a/hermes_cli/friday_prompt_scope.py b/hermes_cli/friday_prompt_scope.py
+--- a/hermes_cli/friday_prompt_scope.py
++++ b/hermes_cli/friday_prompt_scope.py
+@@ -11,7 +11,7 @@
+ 
+ FIELD = "_friday_prompt_scope"
+ # Reviewed product-source guidance, not user-configurable identity or authority.
+-DIALOGUE_REVISION = "friday.private-reply.v3"
++DIALOGUE_REVISION = "friday.public-identity.v4"
+ DIALOGUE_GUIDANCE = (
+     "## Продолжение разговора\n\n"
+     "Продолжай разговор с учётом предыдущих реплик. Приветствуй и представляйся, "
+diff --git a/hermes_cli/friday_user_scope.py b/hermes_cli/friday_user_scope.py
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -1184,10 +1184,163 @@
+     cap.check()
+ 
+ 
++# Public identity is product source, not a chat assertion or an ambient runtime field.
++PUBLIC_IDENTITY = {'name': 'Пятница (Friday)', 'kind': 'ИИ-помощник'}
++LEGACY_SELF_CLAIM_VIEW = '[Не подтверждено.]'
++
++
++def self_deployment_claim_spans(text):
++    """Bounded RU/EN assertion grammar, never a software-name blacklist.
++
++    Match a relationship to THIS assistant, or an unqualified deployment-slot
++    block. Ordinary third-person research and fenced/inline user code keep
++    their exact text. This is not an arbitrary-language semantic classifier.
++    Offsets refer to the original text so a request copy can replace only the
++    unsupported assertion; canonical history is never edited.
++    """
++    import re
++    if not isinstance(text, str):
++        return ()
++    # Code is task evidence, not the narrator asserting its deployment. An
++    # explicit own-configuration introduction outside a fence is still a claim.
++    visible = list(text)
++    fenced = False
++    for line in re.finditer(r'.*(?:\n|$)', text):
++        raw = line.group()
++        if not raw:
++            continue
++        fence = raw.lstrip().startswith(('```', '~~~'))
++        if fenced or fence:
++            for i in range(line.start(), line.end()):
++                if visible[i] != '\n': visible[i] = ' '
++        if fence: fenced = not fenced
++    prose = ''.join(visible)
++    labelled_prose = text  # Fences/inline formatting cannot authenticate deployment slots.
++    prose = re.sub(r'`[^`\n]*`', lambda m:' ' * len(m.group()), prose)
++    # These are deployment RELATIONS, not forbidden values. A newly configured
++    # model/provider or an invented router receives the same treatment.
++    subject = r'(?:\bI\b|\bI[’\x27]m\b|\bя\b|\bменя\b)'
++    slots = r'(?:backend|engine|core|kernel|runtime|model|provider|deployment|hosting|server|router|ядро|рантайм|движ(?:ок|ке|ка)|модел[ьиь]|провайдер\w*|бэкенд\w*|бекенд\w*|маршрутизатор\w*|сервер\w*|разв[её]ртывани\w*)'
++    patterns = [
++        r'\b(?:my|our|мой|моя|мо[её]|мои|наш\w*)\s+(?:(?:actual|underlying|internal|реальн\w*|внутренн\w*)\s+){0,2}' + slots + r'\s*(?:is|are|runs?|uses?|—|–|:|это|явля\w*|работа\w*|использу\w*|[A-ZА-Я0-9])',
++        r'\b(?:у\s+меня|для\s+меня|this\s+assistant[’\x27]s|this\s+assistant\s+uses)\b[^.!?;\n]{0,48}' + slots,
++        subject + r'\s+(?:(?:am|was|have\s+been)\s+)?(?:run(?:ning)?|hosted|powered|built|based|served)\s+(?:on|by|with|under)\b',
++        r'\b(?:я\s+)?(?:запущена|разв[её]рнута|основана|построена|базируюсь)\s+(?:на|под|в\s+среде)\b',
++        r'\b(?:я\s+)?работаю\s+(?:на|под|в\s+среде)\s+(?:(?:движк\w*|рантайм\w*|платформ\w*|модел\w*|сервер\w*|базе|управлением)\b|(?:Hermes|Linux|Windows|OpenAI|dispatcher|custom)\b)',
++        subject + r'[^.!?;\n]{0,40}\b(?:use|using|использую|работаю\s+через)\b[^.!?;\n]{0,40}' + slots,
++        r'\b(?:меня\s+(?:обслуживает|запускает)|мной\s+управляет)\b',
++        r'\b(?:my|мои|моя|мо[её])\s+(?:technical\s+details|configuration|технически\w*\s+параметр\w*|конфигураци\w*)\s*[:—]',
++    ]
++    claim = re.compile('|'.join('(?:'+p+')' for p in patterns), re.IGNORECASE)
++    # An explicit refusal/uncertainty is not a positive backend assertion.
++    nonassertion = re.compile(r'(?:\b(?:do\s+not|don[’\x27]t|cannot|can[’\x27]t)\s+(?:know|disclose|confirm)|\bне\s+(?:знаю|раскрываю|могу\s+(?:раскрыть|подтвердить)|подтверждаю)|\bнеизвест\w*|\bnot\s+(?:known|confirmed|disclosed|public|available)|\bunknown\b)', re.I)
++    def uncertain_value(tail, prefix=''):
++        # Uncertainty qualifies THIS slot value, never incidental later text.
++        # A concrete name stays a positive disclosure even if a different
++        # provider/model is unknown or a parenthetical disclaimer follows.
++        tail = re.sub(r'^[\s`*\"\':—–-]+', '', tail)
++        tail = re.sub(r'^(?:(?:is|are|это|является|сейчас|currently)\b[\s:—–-]*)+', '', tail, flags=re.I)
++        value = re.split(r'[,;.!?()\n]', tail, maxsplit=1)[0].strip()
++        unresolved = re.sub(slots, '', value, flags=re.I)
++        unresolved = re.sub(r'\b(?:and|or|и|или)\b', '', unresolved, flags=re.I).strip()
++        return bool(nonassertion.match(value) or (not unresolved and nonassertion.search(prefix)))
++    spans = []
++    for part in re.finditer(r'[^.!?;\n]+(?:[.!?;]|(?=\n|$))', prose):
++        value = part.group()
++        for assertion in claim.finditer(value):
++            own_slots = list(re.finditer(slots, value[assertion.start():assertion.end()], re.I))
++            target_end = (assertion.start() + own_slots[0].end()) if own_slots else assertion.end()
++            if not uncertain_value(value[target_end:], value[:target_end]):
++                spans.append((part.start(), part.end()))
++                break
++    # Actual old answers contain a labelled engine/model/provider block with
++    # no subject on each line. Two distinct deployment labels establish this
++    # typed presentation; an external-project/documentation introduction does not.
++    label = re.compile(r'(?<![\w])(?:\*\*)?(' + slots + r')(?:\*\*)?\s*[:—–]\s*\S', re.I)
++    for block in re.finditer(r'(?:[^\n]+(?:\n|$))+', labelled_prose):
++        value = block.group()
++        found = list(label.finditer(value))
++        external = re.search(r'\b(?:external\s+(?:project|example)|your\s+(?:project|example)|сторонн\w*\s+проект\w*|ваш\w*\s+проект\w*|пример\s+конфигурации|документаци\w*)\b', value, re.I)
++        # An unqualified singleton carrying a known deployed value is the
++        # same typed disclosure as the multi-slot block. External examples and
++        # unrelated model labels (e.g. linear regression) remain task content.
++        known_slot = any(re.match(r'[\s`*\"\']*(?:Hermes|Linux|dispatcher|custom|self[- ]hosted|кастомн\w*)(?:\b|$)', value[x.end()-1:], re.I) for x in found)
++        if (len({x.group(1).casefold() for x in found}) >= 2 or known_slot) and not external:
++            for m in found:
++                end = next((i for i in range(m.end(), len(value)) if value[i] in ';\n'), len(value))
++                following = next((x.start() for x in found if x.start() > m.start()), len(value))
++                end = min(end, following)
++                if not uncertain_value(value[m.end()-1:end], value[:m.start()]):
++                    spans.append((block.start()+m.start(), block.start()+end))
++    # Merge overlaps without dropping surrounding conversation or file anchors.
++    merged = []
++    for a, b in sorted(spans):
++        if merged and a <= merged[-1][1]: merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
++        else: merged.append((a, b))
++    return tuple(merged)
++
++
++def _self_claim_texts(value):
++    if isinstance(value, str):
++        yield value
++    elif isinstance(value, (list, tuple)):
++        for item in value: yield from _self_claim_texts(item)
++    elif isinstance(value, dict):
++        # Text carriers only. Tool-call arguments, names, grants and IDs are
++        # task evidence and are NOT assistant identity assertions.
++        for key in ('content', 'text', 'api_content', 'reasoning', 'reasoning_content',
++                    'reasoning_details', 'codex_reasoning_items', 'codex_message_items', 'summary', 'thinking', 'analysis'):
++            if key in value: yield from _self_claim_texts(value[key])
++
++
++def project_legacy_self_claims(rows):
++    """Pure, reversible request view AFTER api_content selection.
++
++    The caller must validate managed admission. Original rows, user/tool/system
++    authority, IDs/order, calls/results and file anchors remain untouched. Only
++    assistant prose assertion spans and matching reasoning text are projected.
++    A still-present sidecar is refused rather than projecting one representation
++    while sending a different one. The original transcript is the recovery view.
++    """
++    import copy
++    import re
++    result = copy.deepcopy(rows)
++    for row in result:
++        if not isinstance(row, dict): raise ScopeDenied()
++        if 'api_content' in row: raise ScopeDenied()
++        if row.get('role') != 'assistant': continue
++        def project(value):
++            if isinstance(value, str):
++                spans = self_deployment_claim_spans(value)
++                for start, end in reversed(spans):
++                    # Keep exact usable file/result references even when a bad
++                    # old self-description shared their sentence.
++                    anchors = re.findall(r'MEDIA:(?:"[^"\n]+"|\S+)|\[[^\]\n]+\]\([^\)\n]+\)', value[start:end])
++                    replacement = LEGACY_SELF_CLAIM_VIEW + ((' ' + ' '.join(anchors)) if anchors else '')
++                    value = value[:start] + replacement + value[end:]
++                return value
++            if isinstance(value, list): return [project(v) for v in value]
++            if isinstance(value, dict):
++                if value.get('signature') and any(self_deployment_claim_spans(t) for t in _self_claim_texts(value)):
++                    raise ScopeDenied()  # Cannot forge a new provider signature for edited thinking.
++                return {k:project(v) if k in ('text','content','reasoning','reasoning_content','summary','thinking','analysis') else v for k,v in value.items()}
++            return value
++        for key in ('content','reasoning_content','reasoning_details','codex_reasoning_items','codex_message_items'):
++            if key in row: row[key] = project(row[key])
++    return result
++
++
++def public_identity_request_view(agent, rows):
++    """Admission-bound shared main/replay/summary request presentation."""
++    if not managed_reply_stream(agent): return rows
++    _restricted_reply_values(agent)  # Existing retained principal/generation check.
++    return project_legacy_self_claims(rows)
++
++
+ def guard_generated_reply(agent, value):
+-    """Mandatory exact typed-value boundary; generic words and user research remain valid.
+-
+-    This does not claim semantic self-description, encoding or artifact confidentiality.
++    """Typed values plus bounded unsupported self-deployment assertions.
++
++    Public research/code names remain valid; arbitrary semantic/encoded secrecy is not claimed.
+     """
+     if not managed_reply_stream(agent):
+         return value, False
+@@ -1199,14 +1352,16 @@
+         if isinstance(value, str):
+             value = _public_reply_media(cap, value)
+             candidate = value
+-        denied = any(item in candidate for item in restricted)
++        typed_denied = any(item in candidate for item in restricted)
++        self_claim_denied = any(self_deployment_claim_spans(text) for text in _self_claim_texts(value))
++        denied = typed_denied or self_claim_denied
+     except Exception:
+         cap, candidate, denied = None, '', True
+     if not denied:
+         return value, False
+     agent._friday_reply_withheld = True
+     if cap is not None:
+-        try: _retain_private_reply(cap, candidate, 'restricted_deployment_value')
++        try: _retain_private_reply(cap, candidate, 'unsupported_self_deployment_claim' if self_claim_denied else 'restricted_deployment_value')
+         except Exception:
+             import logging
+             logging.getLogger('run_agent').warning('private reply withheld; private candidate storage unavailable')

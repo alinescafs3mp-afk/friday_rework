@@ -59,8 +59,17 @@ def options(cfg, home):
     return {"local_routes": routes, "toolsets": get_toolset_names(), "skills": skills,
             "required_skills": sorted(ESSENTIAL_SKILLS),
             "web_backends": ["exa-paid", "exa-keyless"],
-            "operational": ["agent.max_turns", "streaming.enabled"],
+            "operational": ["agent.max_turns", "streaming.enabled", "tools.tool_search.defer"],
             "model_slots": ["main", *[k for k, v in (cfg.get("auxiliary") or {}).items() if isinstance(v, dict)]]}
+
+
+def _memory_disclosure_defer(cfg):
+    """The native effective list plus recall and file read; no other capability is retuned."""
+    from tools.tool_search import ToolSearchConfig
+    tools = cfg.get("tools") or {}
+    if not isinstance(tools, dict):
+        raise ValueError("invalid_native_tool_search_config")
+    return ToolSearchConfig.from_raw(tools.get("tool_search")).effective_defer_tools | {"session_search", "read_file"}
 
 
 def _local_inference(cfg):
@@ -227,7 +236,10 @@ def edit(profile, home, body, verify):
                 raise ValueError("invalid_operational_setting")
             key, value = values["key"], values["value"]
             if (key == "agent.max_turns" and (type(value) is not int or not 1 <= value <= 200)
-                    or key == "streaming.enabled" and type(value) is not bool):
+                    or key == "streaming.enabled" and type(value) is not bool
+                    or key == "tools.tool_search.defer" and (
+                        type(value) is not list or any(type(name) is not str for name in value)
+                        or len(value) != len(set(value)) or set(value) != _memory_disclosure_defer(cfg))):
                 raise ValueError("invalid_operational_value")
             target = candidate
             segments = key.split(".")
