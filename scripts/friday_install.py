@@ -4908,7 +4908,7 @@ def cli_ordinary_job_consumed(home, request, clock):
 def main():
     started = time.monotonic()  # before parser/input IO; never reset on dispatch
     parser = SafeParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'qualify', 'activate-telegram', 'update-telegram', 'prepare-ordinary-workers', 'start-telegram', 'rollback-telegram', 'reconcile', 'resume-harness', 'resume-cli', 'continue-cli-segment', 'installed-cli', 'repair-installed-cli', 'repair-frontend-close', 'repair-native-bootstrap', 'repair-session-artifact', 'repair-context-continuation','repair-native-manager','repair-readonly-schema-formatter','repair-current12-readonly-fit','repair-summary-fit','repair-summary-budget','repair-summary-completion','repair-summary-visible'))
+    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'qualify', 'activate-telegram', 'update-telegram', 'prepare-ordinary-workers', 'register-ordinary-a0', 'start-telegram', 'rollback-telegram', 'reconcile', 'resume-harness', 'resume-cli', 'continue-cli-segment', 'installed-cli', 'repair-installed-cli', 'repair-frontend-close', 'repair-native-bootstrap', 'repair-session-artifact', 'repair-context-continuation','repair-native-manager','repair-readonly-schema-formatter','repair-current12-readonly-fit','repair-summary-fit','repair-summary-budget','repair-summary-completion','repair-summary-visible'))
     parser.add_argument('--input', required=True, type=Path, help='Private pinned JSON, no credential values')
     parser.add_argument('--a0-plan', type=Path, help='Existing owned live native probe plan; never a readiness report')
     parser.add_argument('--a0-plan-sha256')
@@ -4919,6 +4919,9 @@ def main():
     from scripts.dsh_prepare import StopUnconfirmed
     try:
         runtime_clock = installed_cli_clock() if args.phase in ('installed-cli','repair-installed-cli','repair-frontend-close','repair-native-bootstrap','repair-session-artifact','repair-context-continuation','repair-native-manager','repair-readonly-schema-formatter','repair-current12-readonly-fit','repair-summary-fit','repair-summary-budget','repair-summary-completion','repair-summary-visible') else None
+        if args.phase == 'register-ordinary-a0':
+            from scripts.friday_ordinary_a0_registration import registration_clock
+            runtime_clock = registration_clock()
         raw = owned_file(args.input, private=True)
         require((args.host_source_transition is None) == (args.host_source_transition_sha256 is None)
                 and (args.host_source_transition is None or args.phase == 'installed-cli'),
@@ -4945,6 +4948,9 @@ def main():
         elif args.phase == 'prepare-ordinary-workers':
             from scripts.friday_ordinary_install import prepare_workers
             result = prepare_workers(value,args.input,budget)
+        elif args.phase == 'register-ordinary-a0':
+            from scripts.friday_ordinary_a0_registration import register
+            result = register(value,args.input,clock=runtime_clock)
         elif args.phase == 'update-telegram':
             from scripts.friday_ordinary_install import update
             result = update(value,args.input,budget)

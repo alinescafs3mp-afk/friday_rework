@@ -350,12 +350,33 @@ def install_service(value, home, budget):
     directory(home)
     claim = read_json(home / MARKER)
     require(claim == partial_claim(claim['input_sha256'], budget), 'fresh_install_claim_required')
+    evidence = home / 'preparation'
+    evidence.mkdir(mode=0o700, exist_ok=True); directory(evidence)
+    def verify():
+        budget.check()
+        require(read_json(home / MARKER) == claim, 'fresh_install_claim_required')
+    return _register_service(value, home, budget, plan=plan, original_attempt=claim,
+                             evidence=evidence, verify=verify,
+                             intent_schema='friday.a0.service-install-intent.v1',
+                             receipt_schema='friday.a0.service-install-receipt.v1')
+
+
+def _register_service(value, home, budget, *, plan, original_attempt, evidence,
+                      verify, intent_schema, receipt_schema):
+    """Shared finite effects; each public admission owns a distinct identity.
+
+    The fresh-install entry retains its partial-claim contract. Installed ordinary
+    registration owns separate evidence and never changes that old claim.
+    """
+    from scripts.friday_install import require, directory, owned_file, digest, publish
+    from scripts.dsh_prepare import run, StopUnconfirmed, safe_observation
+    from scripts import a0_runtime as runtime
+    from scripts import rootless_docker_launch as launcher
     payload = service_sources(value['project_files'])
     stage = home / 'worker-runtime-source'
     for name, data in payload.items():
         require(owned_file(stage / name) == data, 'staged_a0_service_source_changed')
-    evidence = home / 'preparation'
-    evidence.mkdir(mode=0o700, exist_ok=True); directory(evidence)
+    directory(evidence)
     intent = evidence / 'a0-service.intent.json'
     require(not intent.exists() and not intent.is_symlink(), 'a0_service_attempt_requires_reconciliation')
     names = ('Id', 'LoadState', 'ActiveState', 'SubState', 'MainPID', 'ControlPID',
@@ -363,10 +384,12 @@ def install_service(value, home, budget):
              'KillMode', 'SendSIGKILL', 'DelegateSubgroup', 'MemoryMax', 'TasksMax',
              'CPUQuotaPerSecUSec', 'RuntimeMaxUSec', 'TimeoutStartUSec', 'TimeoutStopUSec')
     def command(argv, phase):
+        verify()
         out, observation = run(argv, runtime.PROJECT, timeout=min(10, budget.check(reserve=1)),
                                deadline=budget.deadline, env=runtime.ENV,
                                log=evidence / ('a0-service-' + phase))
         budget.check()
+        verify()
         return out, safe_observation(observation)
     def observe(phase):
         raw, receipt = command(['/usr/bin/systemctl', '--user', 'show', runtime.DAEMON,
@@ -404,6 +427,7 @@ def install_service(value, home, budget):
                 and digest(owned_file(plan['unit_source'])) == plan['source_files'][SERVICE_SOURCE],
                 'a0_install_published_source_changed')
     with runtime.Runtime.locked(None):
+        verify()
         quiet_paths()
         before, before_command = observe('before')
         require(before['LoadState'] == 'not-found' and not before['FragmentPath'],
@@ -411,8 +435,8 @@ def install_service(value, home, budget):
         target = launcher.ROOT / 'supervisor' / runtime.DAEMON
         for p in (runtime.LAUNCHER, target, launcher.INSTALLED_UNIT):
             require(not p.exists() and not p.is_symlink(), 'existing_a0_service_source_requires_reconciliation')
-        record = {'schema': 'friday.a0.service-install-intent.v1', 'plan': plan,
-                  'original_attempt': claim, 'before': before, 'before_command': before_command,
+        record = {'schema': intent_schema, 'plan': plan,
+                  'original_attempt': original_attempt, 'before': before, 'before_command': before_command,
                   'resume_allowed': False, 'cessation': 'NO_START_SUBMITTED'}
         publish(intent, record, budget=budget)
         try:
@@ -454,11 +478,13 @@ def install_service(value, home, budget):
                     == [120, 45, 20], 'a0_install_effective_native_limits_changed')
             quiet_paths()
             published_sources()
-            result = {**record, 'schema': 'friday.a0.service-install-receipt.v1',
+            result = {**record, 'schema': receipt_schema,
                       'state': 'REGISTERED_INACTIVE_NATIVE_START_NOT_RUN', 'after': after,
                       'link': link, 'reload': reload, 'after_command': after_command,
                       'runtime_acceptance': 'NOT_ACCEPTED'}
+            verify()
             publish(evidence / 'a0-service.receipt.json', result, budget=budget)
+            verify()
             return result
         except BaseException as exc:
             failure = {**record, 'state': 'STOP_UNCONFIRMED_REGISTRATION_REQUIRES_RECONCILIATION',
