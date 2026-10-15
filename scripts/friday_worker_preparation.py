@@ -350,7 +350,7 @@ def publish_declarations(request, home, tx, changed, updated, budget, verify):
                 owned = {}
                 try:
                     ordinary.publish_update_file(home / 'config.yaml',
-                        __import__('yaml').safe_dump(changed, allow_unicode=True, sort_keys=False).encode(),
+                        __import__('hermes_yaml').safe_dump(changed, allow_unicode=True, sort_keys=False).encode(),
                         saved['config.yaml']['mode'], saved['config.yaml'], owned, 'config.yaml')
                     updated['profile_files']['config.yaml'] = f.digest(f.owned_file(home / 'config.yaml', private=True))
                     ordinary.publish_update_file(home / f.MARKER, ordinary.encoded(updated),

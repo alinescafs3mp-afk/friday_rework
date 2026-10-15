@@ -171,6 +171,22 @@ def test_coherent_installer_inventory_refuses_other_source_changes(installed, ca
     assert not list((s.home / 'preparation').glob('ordinary-workers-*')) and not s.calls
 
 
+def test_native_publication_uses_shipped_serializer_without_pyyaml(installed, monkeypatch):
+    import builtins
+    import hermes_yaml
+    original = builtins.__import__
+    def shipped_only(name, *args, **kwargs):
+        if name == 'yaml': raise ModuleNotFoundError("PyYAML is absent in the installed native environment")
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', shipped_only)
+    result = execute(installed)
+    assert result['state'] == 'BOTH_WORKER_DECLARATIONS_PUBLISHED_QUALIFICATION_PENDING'
+    current = hermes_yaml.safe_load((installed.home / 'config.yaml').read_text())
+    assert set(prep.configuration_settings(current)['onboarding']['templates']['friday-local']['worker_inputs']['workers']) == {'dsh', 'a0'}
+    assert prep.configuration_settings(current)['runtime'] == {'enabled': False}
+    assert not installed.calls
+
+
 def test_complete_publication_preserves_ordinary_runtime_users_and_failed_history(installed):
     s = installed; result = execute(s)
     assert result['ready'] is False and result['runtime_enabled'] is False
