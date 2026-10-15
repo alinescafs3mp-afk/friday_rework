@@ -678,7 +678,7 @@ class Onboarding:
                 if worker in configured_runtimes(config['plugins']['entries']['friday_rework']['settings']['runtime']):
                     raise PermissionError('existing_worker_not_adopted')
                 c, directory, files, names, unobserved = prepare_inputs(home, binding['runtime_profile'], worker, runtime, config,
-                    a0_network=a0_network, declared_files=_declared_files)
+                    a0_network=a0_network, declared_files=_declared_files, tools=binding['tools'])
                 if directory.exists() or directory.is_symlink():
                     raise FileExistsError('existing_worker_preparation_not_adopted')
                 self._verify_operator(profile, session)
@@ -895,7 +895,7 @@ class Onboarding:
                 for kind,c in runtimes.items():
                     _,_,_,worker_names,_=prepare_inputs(home,binding['runtime_profile'],kind,c,own,
                         a0_network=network if kind=='a0' else None,
-                        declared_files={policy_path:policy_bytes} if kind=='dsh' else None)
+                        declared_files={policy_path:policy_bytes} if kind=='dsh' else None, tools=binding['tools'])
                     names.extend(worker_names)
                 attachment=None
                 if attaching:

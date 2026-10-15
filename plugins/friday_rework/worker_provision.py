@@ -40,12 +40,14 @@ def own_runtime(home, profile, worker, runtime):
     return c, root
 
 
-def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None, declared_files=None):
+def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None, declared_files=None, tools=None):
     """Return an explicit plan before any write; never read/copy readiness."""
     from .onboarding import validate_template
     from hermes_cli import friday_user_scope as scope
     # Validate the actual profile, including local routes and accepted SAFE tools.
-    validate_template({'config': config, 'tools': sorted(scope.SAFE),
+    # The protected caller supplies its already checked binding grants.
+    # Legacy non-browser callers retain their original validation contract.
+    validate_template({'config': config, 'tools': sorted(scope.SAFE) if tools is None else tools,
                        'required_secrets': [config['providers']['friday-local']['key_env'],
                            *([] if config['web']['keyless_fallback'] else ['EXA_API_KEY'])]})
     c, root = own_runtime(home, profile, worker, runtime)

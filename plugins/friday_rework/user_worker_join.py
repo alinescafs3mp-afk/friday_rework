@@ -179,7 +179,7 @@ def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=N
     def sources():
         for kind,c in runtimes.items():
             prepare_inputs(home,binding['runtime_profile'],kind,c,config,
-                a0_network=network if kind=='a0' else None)
+                a0_network=network if kind=='a0' else None, tools=binding['tools'])
     sources()
     folder = home / FOLDER
     if folder.exists() or folder.is_symlink(): raise HostUnavailable('qualification_attempt_requires_inspection')
