@@ -1,0 +1,722 @@
+diff --git a/agent/bounded_context.py b/agent/bounded_context.py
+--- a/agent/bounded_context.py
++++ b/agent/bounded_context.py
+@@ -11,11 +11,15 @@
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ from ipaddress import ip_address, ip_network
++import hashlib
++import logging
+ import json
+ from typing import Any
+ from urllib.parse import urlsplit
+ 
+ from hermes_cli.route_identity import normalize_route_base_url
++
++logger = logging.getLogger(__name__)
+ 
+ _SUMMARY_POLICY: ContextVar[BoundedContextPolicy | None] = ContextVar("bounded_summary_policy", default=None)
+ 
+@@ -282,6 +286,75 @@
+     agent.context_compressor.abort_on_summary_failure = True
+ 
+ 
++def _bounded_fingerprint(value: Any) -> dict:
++    """Private structural telemetry: hashes/lengths only, never payload text."""
++    encoded = (value.encode("utf-8") if isinstance(value, str) else
++               json.dumps(value, ensure_ascii=False, separators=(",", ":"),
++                          sort_keys=True, allow_nan=False).encode("utf-8"))
++    return {"present": value is not None, "utf8_bytes": len(encoded),
++            "sha256": hashlib.sha256(encoded).hexdigest()}
++
++
++def _bounded_row_diagnostic(row: Any) -> dict:
++    if not isinstance(row, dict):
++        return {"mapping": False}
++    role = row.get("role")
++    return {"role": role if role in {"system", "developer", "user", "assistant", "tool"} else "invalid",
++            "row": _bounded_fingerprint(row), "content": _bounded_fingerprint(row.get("content")),
++            "api_content": _bounded_fingerprint(row.get("api_content")),
++            "tool_calls": _bounded_fingerprint(row.get("tool_calls")),
++            "tool_call_id": _bounded_fingerprint(row.get("tool_call_id"))}
++
++
++def _log_bounded_protected_mismatch(agent: Any, *, stage: str, expected: list,
++                                    actual: list, group: int, candidate_start: int,
++                                    mismatch_offset: int | None, current_user_index: int | None) -> None:
++    try:
++        compressor = agent.context_compressor
++        head, tail = getattr(compressor, "_bounded_protected_rows", ([], []))
++        context = getattr(agent, "_bounded_compaction_request_context", None) or {}
++        event = {"event": "bounded_protected_mismatch", "stage": stage,
++                 "unmatched_group": group, "candidate_start": candidate_start,
++                 "mismatch_offset": mismatch_offset, "native_current_user_index": current_user_index,
++                 "expected_count": len(expected), "candidate_count": len(actual),
++                 "expected": [_bounded_row_diagnostic(row) for row in expected],
++                 "candidate": [_bounded_row_diagnostic(row) for row in actual],
++                 "head": [_bounded_row_diagnostic(row) for row in head],
++                 "tail": [_bounded_row_diagnostic(row) for row in tail],
++                 "summary": _bounded_row_diagnostic(getattr(compressor, "_bounded_protected_summary", None)),
++                 "incoming": _bounded_row_diagnostic(context.get("incoming")),
++                 "ext": _bounded_fingerprint(context.get("ext")),
++                 "plugin": _bounded_fingerprint(context.get("plugin"))}
++        logger.warning("Bounded protected-row diagnostic: %s", json.dumps(event, separators=(",", ":")))
++    except Exception:
++        # Diagnostics must never weaken the strict guard or replace its error.
++        logger.debug("Bounded protected-row diagnostic unavailable")
++
++
++def _log_bounded_request_accounting(policy: BoundedContextPolicy, request: dict, *, admitted: bool) -> None:
++    try:
++        body = wire_body(request)
++        output = wire_output_tokens(request)
++        wire = json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
++        event = {"event": "bounded_request_accounting", "admitted": admitted,
++                 "wire": _bounded_fingerprint(wire), "wire_utf8_bytes": serialized_bytes(body),
++                 "components": {key: _bounded_fingerprint(body.get(key))
++                                for key in ("messages", "tools", "model")},
++                 "other_envelope": _bounded_fingerprint({key: value for key, value in body.items()
++                                                        if key not in {"messages", "tools", "model"}}),
++                 "estimated_input": serialized_bytes(body) + policy.template_overhead_tokens,
++                 "template_reserve": policy.template_overhead_tokens,
++                 "output_reservation": output, "input_budget": policy.input_budget(output),
++                 "context_length": policy.context_length,
++                 "server_max_input_tokens": policy.server_max_input_tokens,
++                 "safety_margin_tokens": policy.safety_margin_tokens,
++                 "accounting": "utf8_json_bytes_plus_template_reserve",
++                 "serialization": "compact_utf8_json_body_at_guard", "tokenizer_verified": False}
++        logger.info("Bounded final request diagnostic: %s", json.dumps(event, separators=(",", ":")))
++    except Exception:
++        logger.debug("Bounded final request diagnostic unavailable")
++
++
+ def guard_main_request(agent: Any, request: dict, client: Any = None) -> None:
+     from hermes_cli.friday_credential_admission import ordinary_readonly_request
+     ordinary_readonly_request(request)
+@@ -292,8 +365,14 @@
+     policy.assert_route(main_provider_identity(agent, policy), agent.model, base, agent.api_mode)
+     if agent.context_compressor.context_length != policy.context_length:
+         raise BoundedContextError("bounded_context: runtime capacity changed")
+-    assert_bounded_protected_wire(agent, request)
+-    agent._bounded_context_last_accounting = policy.check_request(request)
++    try:
++        assert_bounded_protected_wire(agent, request)
++        accounting = policy.check_request(request)
++    except BoundedContextError:
++        _log_bounded_request_accounting(policy, request, admitted=False)
++        raise
++    agent._bounded_context_last_accounting = accounting
++    _log_bounded_request_accounting(policy, request, admitted=True)
+ 
+ 
+ def main_provider_identity(agent: Any, policy: BoundedContextPolicy) -> str:
+@@ -812,12 +891,26 @@
+     split = len(head)
+     groups = (expected[:split], expected[split:])
+     cursor = 0
+-    for group in groups:
++    for group_index, group in enumerate(groups):
+         if not group:
+             continue
+-        found = next((i for i in range(cursor, len(actual)-len(group)+1)
+-                      if all(matches(w, a) for w, a in zip(group, actual[i:i+len(group)]))), None)
++        found = None
++        candidate_start, best_prefix, mismatch_offset = cursor, -1, None
++        for i in range(cursor, len(actual)-len(group)+1):
++            for offset, (wanted, candidate) in enumerate(zip(group, actual[i:i+len(group)])):
++                if not matches(wanted, candidate):
++                    if offset > best_prefix:
++                        candidate_start, best_prefix, mismatch_offset = i, offset, offset
++                    break
++            else:
++                found = i
++                break
+         if found is None:
++            _log_bounded_protected_mismatch(
++                agent, stage="formatted_protected_group", expected=group, actual=actual,
++                group=group_index, candidate_start=candidate_start, mismatch_offset=mismatch_offset,
++                current_user_index=current,
++            )
+             raise BoundedContextError("bounded_context: formatter removed or rewrote protected authority/user/tool rows")
+         cursor = found + len(group)
+ 
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -1590,7 +1590,9 @@
+     # streaming is caught by the CLI post-response fallback.
+     if reasoning_text and agent.reasoning_callback and not agent.stream_delta_callback and not agent._stream_callback:
+         with contextlib.suppress(Exception):
+-            agent.reasoning_callback(reasoning_text)
++            from hermes_cli.friday_user_scope import managed_reply_stream
++            if not managed_reply_stream(agent):
++                agent.reasoning_callback(reasoning_text)
+     return _sanitize_surrogates(reasoning_text) if reasoning_text else reasoning_text
+ 
+ 
+@@ -2986,7 +2988,11 @@
+         the delta callback for tag extraction (the CLI drops non-reasoning text
+         once the stream box is closed)."""
+         if self.agent.stream_delta_callback:
+-            self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
++            from hermes_cli.friday_user_scope import managed_reply_stream
++            if managed_reply_stream(self.agent):
++                self.agent._deliver_to_stream_callbacks(text)
++            else:
++                self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
+ 
+     def _new_diag(self) -> dict:
+         diag = self.agent._stream_diag_init()
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -1486,6 +1486,25 @@
+     """Put the pre-compression deep snapshot back into the live list if it drifted."""
+     if snapshot is not None and messages != snapshot:
+         messages[:] = copy.deepcopy(snapshot)
++
++
++def _emit_bounded_compaction_refusal(agent: Any, exc: Exception, *, rows_restored: bool) -> None:
++    """Project this typed precommit outcome only, after the caller's rollback.
++
++    The exception and traceback stay in the existing private logger. Audience
++    selection is presentation only and grants no capability or retry authority.
++    """
++    logger.warning("Compression refused before commit; rows_restored=%s: %s",
++                   rows_restored, exc, exc_info=True)
++    from hermes_cli.friday_user_scope import ordinary_presentation
++    if ordinary_presentation():
++        message = ("Не удалось безопасно сократить историю. Исходная переписка сохранена."
++                   if rows_restored else
++                   "Не удалось безопасно сократить историю. Сохранность исходной переписки "
++                   "не подтверждена. Проверьте её перед повтором.")
++    else:
++        message = f"Compression refused before commit: {exc}. Saved conversation rows are unchanged."
++    agent._emit_warning(message)
+ 
+ 
+ def _restore_prune_rearm_tokens(compressor: Any, snapshot: dict) -> None:
+@@ -4297,7 +4316,10 @@
+             _restore_messages_snapshot(messages, messages_before_compression)
+             agent._last_compaction_in_place = False
+             agent.context_compressor.record_rejected_compaction()
+-            agent._emit_warning(f"Compression refused before commit: {exc}. Saved conversation rows are unchanged.")
++            _emit_bounded_compaction_refusal(
++                agent, exc, rows_restored=(messages_before_compression is not None
++                                          and messages == messages_before_compression),
++            )
+             _emit_aborted_attempt_telemetry(agent, attempt.started_at, "bounded_candidate_does_not_fit")
+             return messages, _fit_old_prompt
+         commit = _commit_compaction(
+diff --git a/agent/session_persistence.py b/agent/session_persistence.py
+--- a/agent/session_persistence.py
++++ b/agent/session_persistence.py
+@@ -282,7 +282,11 @@
+             # minted (same-batch pairing happens inside the insert).
+             if (tool_uid := tool_call_uid_from_history(messages, msg_idx, tool_uid_owners)) is not None:
+                 msg[TOOL_CALL_UID] = tool_uid
+-        batch_rows.append(_db_flush_row(agent, msg, ov_idx == msg_idx or msg is pending_cli_message))
++        row = _db_flush_row(agent, msg, ov_idx == msg_idx or msg is pending_cli_message)
++        if not is_history:
++            from hermes_cli.friday_user_scope import guard_generated_rows
++            guard_generated_rows(agent, [row], [msg])
++        batch_rows.append(row)
+         batch_msgs.append(msg)
+     return batch_rows, batch_msgs
+ 
+diff --git a/agent/stream_delivery.py b/agent/stream_delivery.py
+--- a/agent/stream_delivery.py
++++ b/agent/stream_delivery.py
+@@ -32,11 +32,27 @@
+ 
+     def _deliver_to_stream_callbacks(self, text: str) -> bool:
+         """Send ``text`` to the display + TTS delta callbacks; True if at least one accepted it."""
++        from hermes_cli.friday_user_scope import managed_reply_stream
++        if managed_reply_stream(self) and text != getattr(self, '_friday_approved_final', None):
++            pieces = getattr(self, '_friday_buffered_reply_parts', [])
++            if sum(map(len, pieces)) + len(text) <= 131072:
++                pieces.append(text)
++                self._friday_buffered_reply_parts = pieces
++            else:
++                self._friday_reply_withheld = True
++            return False
++        if managed_reply_stream(self):
++            if getattr(self, '_friday_reply_callbacks_published', False):
++                return False
++            self._friday_reply_callbacks_published = True
+         results = [self._call_quietly(cb, text) for cb in (self.stream_delta_callback, self._stream_callback)]
+         return any(results)
+ 
+     def _enqueue_stream_hook(self, event: str, *, label: str | None = None, **fields: Any) -> None:
+         """Best-effort plugin stream hook enqueue; never raises into the stream path."""
++        from hermes_cli.friday_user_scope import managed_reply_stream
++        if managed_reply_stream(self):
++            return
+         try:
+             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
+ 
+@@ -78,6 +94,7 @@
+         if ctx_scrubber is not None:
+             deliver(ctx_scrubber.flush())
+         self._current_streamed_assistant_text = ""
++        self._friday_buffered_reply_parts = []
+ 
+     @property
+     def _current_streamed_assistant_text(self) -> str:
+@@ -175,6 +192,13 @@
+ 
+     def _deliver_interim(self, visible: str, *, already_streamed: bool, record: List[str]) -> None:
+         """Hand ``visible`` to ``interim_assistant_callback`` and mark ``record`` delivered; swallows callback errors."""
++        from hermes_cli.friday_user_scope import managed_reply_stream
++        if managed_reply_stream(self):
++            if getattr(self, '_friday_generic_interim_sent', False):
++                return
++            self._friday_generic_interim_sent = True
++            visible = 'Работаю над задачей. Ход выполнения — /status, остановка — /stop.'
++            already_streamed, record = False, [visible]
+         cb = getattr(self, "interim_assistant_callback", None)
+         if cb is None:
+             return
+@@ -338,6 +362,9 @@
+ 
+         ``inline`` marks text recovered from ``<think>`` blocks in content; any other call is a native
+         provider reasoning delta and stops inline forwarding for the rest of this model response."""
++        from hermes_cli.friday_user_scope import managed_reply_stream
++        if managed_reply_stream(self):
++            return
+         if not inline:
+             self._native_reasoning_streamed = True
+         if self._stream_writer_superseded():
+diff --git a/agent/system_prompt.py b/agent/system_prompt.py
+--- a/agent/system_prompt.py
++++ b/agent/system_prompt.py
+@@ -587,7 +587,8 @@
+     if not agent.valid_tool_names:
+         return parts
+     # Steering only lands inside tool results, so only reachable with tools.
+-    parts.append(STEER_CHANNEL_NOTE)
++    from hermes_cli.friday_user_scope import ordinary_steer_note
++    parts.append(ordinary_steer_note(agent, STEER_CHANNEL_NOTE))
+     # agent.tool_use_enforcement / agent.execution_guidance: "auto" (default)
+     # matches the hardcoded model lists; true/false force; a list gives custom
+     # model-name substrings.  Execution guidance is an independent gate so
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -574,6 +574,14 @@
+ ) -> Tuple[str, str]:
+     """Stage callback/persist overrides on the agent and bind this turn's task and turn
+     ids. Returns ``(effective_task_id, turn_id)``."""
++    from hermes_cli.friday_user_scope import ordinary_presentation
++    agent._friday_private_stream = ordinary_presentation()
++    agent._friday_reply_withheld = False
++    agent._friday_approved_final = None
++    agent._friday_reply_stream_published = False
++    agent._friday_reply_callbacks_published = False
++    agent._friday_generic_interim_sent = False
++    agent._friday_buffered_reply_parts = []
+     agent._stream_callback = stream_callback  # picked up by _interruptible_api_call
+     agent._persist_user_message_idx = None
+     agent._persist_user_message_override = persist_user_message
+diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -497,6 +497,12 @@
+     rewritten (prompt-cache invariant)."""
+     if logger is None:
+         from agent.conversation_loop import logger
++    from hermes_cli.friday_user_scope import guard_generated_reply
++    _before_privacy_view = final_response
++    final_response, _private_blocked = guard_generated_reply(agent, final_response)
++    _privacy_projected = final_response != _before_privacy_view
++    if _private_blocked:
++        return final_response, True, None
+     recorded = getattr(agent, "_llm_output_transform", None)
+     if isinstance(recorded, tuple) and len(recorded) == 3 and recorded[0] == turn_id:
+         _, transformed, pre_transform = recorded
+@@ -505,7 +511,7 @@
+         return final_response, False, None
+     if platform is None:
+         platform = getattr(agent, "platform", None) or ""
+-    transformed, pre_transform = False, None
++    transformed, pre_transform = _privacy_projected, None
+     # First hook to return a string wins; None/empty leaves the text unchanged.
+     for _hook_result in _invoke_hook_safely(
+         "transform_llm_output", logger,
+@@ -518,6 +524,9 @@
+         if isinstance(_hook_result, str) and _hook_result:
+             pre_transform, final_response, transformed = final_response, _hook_result, True
+             break
++    final_response, _private_blocked = guard_generated_reply(agent, final_response)
++    if _private_blocked:
++        transformed, pre_transform = True, None
+     agent._llm_output_transform = (turn_id, transformed, pre_transform)
+     return final_response, transformed, pre_transform
+ 
+@@ -531,6 +540,14 @@
+     """Run the post-loop finalization and return the turn ``result`` dict."""
+     from agent.conversation_loop import logger
+ 
++    from hermes_cli.friday_user_scope import managed_reply_stream, guard_generated_reply, _retain_private_reply, current
++    if managed_reply_stream(agent) and not final_response:
++        pending_text = ''.join(getattr(agent, '_friday_buffered_reply_parts', []))
++        if pending_text:
++            _, held = guard_generated_reply(agent, pending_text)
++            if not held:
++                try: _retain_private_reply(current(required=True), pending_text, 'unpublished_stream_tail')
++                except Exception: logger.warning('unpublished stream tail could not be stored privately')
+     final_response, _turn_exit_reason, preserved_verification_fallback, interrupted = _resolve_budget_fallback(
+         agent, final_response=final_response, api_call_count=api_call_count,
+         interrupted=interrupted, failed=failed, messages=messages,
+@@ -684,9 +701,21 @@
+     if isinstance(final_response, str):
+         final_response = _sanitize_surrogates(final_response)
+ 
++    from hermes_cli.friday_user_scope import guard_generated_reply, managed_reply_stream
++    final_response, _private_blocked = guard_generated_reply(agent, final_response)
++    if _private_blocked:
++        failed, completed, _turn_exit_reason = True, False, 'private_reply_withheld'
++    elif managed_reply_stream(agent) and final_response and not getattr(agent, '_friday_reply_stream_published', False):
++        agent._friday_approved_final = final_response
++        deliver = getattr(agent, '_deliver_to_stream_callbacks', None)
++        if callable(deliver):
++            delivered = deliver(final_response)
++            if delivered:
++                agent._record_streamed_assistant_text(final_response)
++        agent._friday_reply_stream_published = True
+     result = {
+         "final_response": final_response,
+-        "last_reasoning": _last_turn_reasoning(messages),
++        "last_reasoning": None if managed_reply_stream(agent) else _last_turn_reasoning(messages),
+         "messages": messages,
+         "api_calls": api_call_count,
+         "completed": completed,
+@@ -695,7 +724,7 @@
+         "partial": False,  # True only when stopped due to invalid tool calls
+         "interrupted": interrupted,
+         "response_transformed": _response_transformed,
+-        "pre_transform_response": _pre_transform_response,
++        "pre_transform_response": None if managed_reply_stream(agent) else _pre_transform_response,
+         "response_previewed": getattr(agent, "_response_was_previewed", False),
+         # The final is byte-for-byte a response this turn already delivered (no footer or
+         # explanation appended since): it carries no new text for the client to paint.
+@@ -719,6 +748,8 @@
+         ).get("service_tier"),
+         "session_id": agent.session_id,
+     }
++    if _private_blocked:
++        result.update(error=final_response, failure_reason='private_reply_withheld', partial=True)
+     if agent._tool_guardrail_halt_decision is not None:
+         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+     # Persistence failures already set failed=True; also stamp `error` so the gateway
+@@ -776,6 +807,7 @@
+     if (
+         final_response
+         and not interrupted
++        and not _private_blocked
+         and not getattr(agent, "skip_background_review", False)
+         and (_should_review_memory or _should_review_skills)
+     ):
+diff --git a/agent/turn_tool_round.py b/agent/turn_tool_round.py
+--- a/agent/turn_tool_round.py
++++ b/agent/turn_tool_round.py
+@@ -177,13 +177,15 @@
+         decision = agent._tool_guardrail_halt_decision
+         _turn_exit_reason = "guardrail_halt"
+         final_response = agent._toolguard_controlled_halt_response(decision)
++        from hermes_cli.friday_user_scope import guard_generated_reply, managed_reply_stream
++        final_response, _ = guard_generated_reply(agent, final_response)
+         agent._emit_diagnostic_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
+         append_message(messages, {"role": "assistant", "content": final_response})
+         # Emit the halt so it isn't mistaken for a crash; the stream callback is still
+         # alive, so SSE/TUI clients see the explanation.
+         if final_response:
+             agent._safe_print(f"\n{final_response}\n")
+-            if agent.stream_delta_callback:
++            if agent.stream_delta_callback and not managed_reply_stream(agent):
+                 with suppress(Exception):
+                     agent.stream_delta_callback(final_response)
+                     agent.stream_delta_callback(None)
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -3344,6 +3344,11 @@
+             path = _normalize_media_tag_path(match.group("path"))
+             if path:
+                 try:
++                    from hermes_cli.friday_user_scope import ordinary_file_scope, workspace_document
++                    cap = ordinary_file_scope()
++                    if cap is not None and path.startswith('./'):
++                        workspace_document(str(cap.home / 'workspace' / path[2:]))
++                        path = str(cap.home / 'workspace' / path[2:])
+                     _add(os.path.expanduser(path))
+                 except (OSError, RuntimeError, ValueError):
+                     continue  # crafted ~\x00 path: skip it, keep the rest
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -1561,6 +1561,11 @@
+         if not _intentional_silence:
+             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
+             response = _sanitize_gateway_final_response(source.platform, response)
++            from hermes_cli.friday_user_scope import guard_gateway_reply
++            response, _private_blocked = guard_gateway_reply(source, response)
++            if _private_blocked:
++                agent_result.update(final_response=response, failed=True, completed=False,
++                                    partial=True, failure_reason='private_reply_withheld')
+ 
+         # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
+         # if the binding still points at the session this run was launched against.
+diff --git a/hermes_cli/friday_prompt_scope.py b/hermes_cli/friday_prompt_scope.py
+--- a/hermes_cli/friday_prompt_scope.py
++++ b/hermes_cli/friday_prompt_scope.py
+@@ -11,7 +11,7 @@
+ 
+ FIELD = "_friday_prompt_scope"
+ # Reviewed product-source guidance, not user-configurable identity or authority.
+-DIALOGUE_REVISION = "friday.public-dialogue.v2"
++DIALOGUE_REVISION = "friday.private-reply.v3"
+ DIALOGUE_GUIDANCE = (
+     "## Продолжение разговора\n\n"
+     "Продолжай разговор с учётом предыдущих реплик. Приветствуй и представляйся, "
+diff --git a/hermes_cli/friday_user_scope.py b/hermes_cli/friday_user_scope.py
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -1129,3 +1129,211 @@
+         value = {k:v for k,v in value.items() if k not in {'drift_backup', 'remediation'}}
+         value['error'] = 'Изменения памяти отклонены: обнаружен конфликт содержимого. Исходные данные сохранены; требуется помощь администратора.'
+     return json.dumps(value, ensure_ascii=False) if isinstance(result,str) else value
++
++
++PRIVATE_REPLY_COPY = ('Ответ скрыт: он содержит закрытые служебные сведения. '
++    'Часть действий могла выполниться; проверьте /status перед повтором.')
++
++
++def managed_reply_stream(agent):
++    """Audience selection is sticky within this turn; it never grants tool authority."""
++    value = getattr(agent, '_friday_private_stream', None)
++    if value is None:
++        value = ordinary_presentation()
++        agent._friday_private_stream = value
++    return value
++
++
++def _restricted_reply_values(agent):
++    cap = current(required=True)
++    cap.check()
++    if agent is not None:
++        check_agent(agent)
++    roots = [cap.home, cap.authorization_home]
++    # Native profile aliases are typed deployment locations, not generic software words.
++    user_home = Path.home()
++    roots.append(user_home / '.hermes' / 'profiles' / cap.profile)
++    values = {str(p) for p in roots}
++    for path in roots:
++        try: values.add('~/' + path.relative_to(user_home).as_posix())
++        except ValueError: pass
++    values.add('~/.hermes/profiles/' + cap.profile)
++    for value in (cap.profile, cap.key):
++        if not isinstance(value, str) or len(value) < 4:
++            raise ScopeDenied()
++        values.add(value)
++    if any(not isinstance(v, str) or not v or v in ('/', '~', '.') for v in values):
++        raise ScopeDenied()
++    return cap, tuple(sorted(values, key=len, reverse=True))
++
++
++def _retain_private_reply(cap, candidate, reason):
++    """Bounded latest rejected candidate in existing private state_meta, never public history."""
++    import hashlib
++    from hermes_state_registry import acquire
++    raw = candidate.encode('utf-8', errors='replace')
++    record = json.dumps({'schema':'friday.private-reply.v1', 'reason':reason,
++        'sha256':hashlib.sha256(raw).hexdigest(), 'utf8_bytes':len(raw),
++        'candidate_prefix':raw[:8192].decode('utf-8', errors='ignore'),
++        'truncated':len(raw)>8192, 'tool_effects_may_have_occurred':True}, ensure_ascii=False)
++    db = acquire(cap.home / 'state.db')
++    try:
++        db.set_meta('friday.private_reply.latest', record)
++    finally:
++        db.close()
++    cap.check()
++
++
++def guard_generated_reply(agent, value):
++    """Mandatory exact typed-value boundary; generic words and user research remain valid.
++
++    This does not claim semantic self-description, encoding or artifact confidentiality.
++    """
++    if not managed_reply_stream(agent):
++        return value, False
++    if getattr(agent, '_friday_reply_withheld', False):
++        return PRIVATE_REPLY_COPY, True
++    try:
++        cap, restricted = _restricted_reply_values(agent)
++        candidate = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
++        if isinstance(value, str):
++            value = _public_reply_media(cap, value)
++            candidate = value
++        denied = any(item in candidate for item in restricted)
++    except Exception:
++        cap, candidate, denied = None, '', True
++    if not denied:
++        return value, False
++    agent._friday_reply_withheld = True
++    if cap is not None:
++        try: _retain_private_reply(cap, candidate, 'restricted_deployment_value')
++        except Exception:
++            import logging
++            logging.getLogger('run_agent').warning('private reply withheld; private candidate storage unavailable')
++    return PRIVATE_REPLY_COPY, True
++
++
++def guard_generated_rows(agent, rows, messages):
++    """Only freshly collected assistant rows; restored/history rows are excluded by caller."""
++    if not managed_reply_stream(agent):
++        return
++    for row, message in zip(rows, messages):
++        if row.get('role') != 'assistant':
++            continue
++        if row.get('tool_calls'):
++            public_calls = _public_file_call_paths(row['tool_calls'])
++            row['tool_calls'] = message['tool_calls'] = public_calls
++            _, private_call = guard_generated_reply(agent, public_calls)
++            if private_call:
++                raise ScopeDenied()  # Halt before the public write and before tool dispatch.
++        for key in ('content', 'api_content'):
++            if isinstance(row.get(key), str):
++                public, _ = guard_generated_reply(agent, row[key])
++                row[key] = message[key] = public
++        payload = {k:row.get(k) for k in ('content','api_content','reasoning','reasoning_content','reasoning_details','codex_reasoning_items','codex_message_items')}
++        _, blocked = guard_generated_reply(agent, payload)
++        if blocked:
++            row['content'] = message['content'] = PRIVATE_REPLY_COPY
++            row['api_content'] = message['api_content'] = None
++            for key in ('reasoning','reasoning_content','reasoning_details','codex_reasoning_items','codex_message_items'):
++                if key in row: row[key] = None
++                if key in message: message[key] = None
++
++
++def ordinary_steer_note(agent, donor):
++    if not managed_reply_stream(agent):
++        return donor
++    # Exact owned prefix only. The marker and all trust/replay rules retain their bytes.
++    prefix = ('## Mid-turn user steering\nMid-turn, the user can steer you: Hermes delivers their message as a standalone user message right after '
++              'the latest tool results, wrapped exactly as:\n')
++    if not donor.startswith(prefix):
++        raise ScopeDenied()
++    return ('## Mid-turn user steering\nA direct user message can arrive after the latest tool results, wrapped exactly as:\n'
++            + donor[len(prefix):])
++
++
++def ordinary_session_schema(schema):
++    if not ordinary_presentation():
++        return schema
++    import copy
++    from tools.session_search_tool import SESSION_SEARCH_SCHEMA
++    if not isinstance(schema, dict):
++        raise ScopeDenied()
++    value = copy.deepcopy(schema)
++    if value.get('description') == SESSION_SEARCH_SCHEMA['description']:
++        prefix = 'Recall past conversations: search or read old Hermes sessions (FTS5), or '
++        value['description'] = 'Recall your past conversations: search, read, or ' + value['description'][len(prefix):]
++    profile = value.get('parameters', {}).get('properties', {}).get('profile', {})
++    if profile.get('description') == SESSION_SEARCH_SCHEMA['parameters']['properties']['profile']['description']:
++        profile['description'] = ('Optional internal follow-up routing anchor. Use only a profile anchor returned by an authorized session result; it grants no additional access.')
++    return value
++
++
++
++def _public_reply_media(cap, text):
++    """Only actual MEDIA protocol fields may project to validated relative file anchors."""
++    from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE, _mask_media_scan_text, _normalize_media_tag_path, _extensionless_media_matches
++    spans = []
++    for match in MEDIA_TAG_CLEANUP_RE.finditer(_mask_media_scan_text(text)):
++        path = _normalize_media_tag_path(match.group('path'))
++        if not path or not Path(path).is_absolute():
++            continue
++        try:
++            relative = Path(path).relative_to(cap.home / 'workspace')
++            workspace_document(str(cap.home / 'workspace' / relative))
++        except (ScopeDenied, ValueError, OSError):
++            continue
++        spans.append((match.start(), match.end(), 'MEDIA:"./' + relative.as_posix() + '"'))
++    for match, path, end in _extensionless_media_matches(_mask_media_scan_text(text)):
++        start = match.start()
++        try:
++            relative = Path(path).relative_to(cap.home / 'workspace')
++            workspace_document(str(cap.home / 'workspace' / relative))
++        except (ScopeDenied, ValueError, OSError):
++            continue
++        if not any(start < prior_end and end > prior_start for prior_start, prior_end, _ in spans):
++            spans.append((start, end, 'MEDIA:"./' + relative.as_posix() + '"'))
++    for start, end, public in sorted(spans, reverse=True):
++        text = text[:start] + public + text[end:]
++    return text
++
++
++def guard_gateway_reply(source, text):
++    if not ordinary_presentation(source):
++        return text, False
++    class ReplyBoundary: pass
++    state = ReplyBoundary()
++    try:
++        state._friday_user_scope = current(required=True)
++        state._friday_delegation = None
++    except Exception:
++        return PRIVATE_REPLY_COPY, True
++    return guard_generated_reply(state, text)
++
++
++
++def _public_file_call_paths(calls):
++    """Equivalent own-workspace path arguments retain tool names, IDs and execution authority."""
++    import copy
++    cap = current(required=True)
++    value = copy.deepcopy(calls)
++    for call in value:
++        if not isinstance(call, dict):
++            continue
++        function = call.get('function', {})
++        if function.get('name') not in ('read_file', 'write_file', 'patch', 'search_files'):
++            continue
++        try:
++            args = json.loads(function.get('arguments', '{}'))
++            raw = args.get('path')
++            if not isinstance(raw, str) or not Path(raw).is_absolute():
++                continue
++            guard_tool(function['name'], args)
++            relative = Path(raw).relative_to(cap.home / 'workspace')
++            if not relative.parts or any(part in ('.','..') or part.startswith('.') for part in relative.parts):
++                continue
++            args['path'] = relative.as_posix()
++            function['arguments'] = json.dumps(args, ensure_ascii=False)
++        except (ValueError, TypeError, ScopeDenied):
++            continue
++    return value
+diff --git a/tools/registry.py b/tools/registry.py
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -867,6 +867,9 @@
+                         name, exc)
+                 if isinstance(overrides, dict):
+                     schema_with_name.update(overrides)
++            if name == 'session_search':
++                from hermes_cli.friday_user_scope import ordinary_session_schema
++                schema_with_name = ordinary_session_schema(schema_with_name)
+             result.append({"type": "function", "function": schema_with_name})
+         return result
+ 
+@@ -952,7 +955,11 @@
+ 
+     def get_schema(self, name: str) -> Optional[dict]:
+         """Raw schema dict, bypassing check_fn filtering (token estimates, introspection)."""
+-        return self._attr(name, "schema")
++        schema = self._attr(name, "schema")
++        if name == 'session_search' and schema is not None:
++            from hermes_cli.friday_user_scope import ordinary_session_schema
++            return ordinary_session_schema(schema)
++        return schema
+ 
+     def get_toolset_for_tool(self, name: str) -> Optional[str]:
+         return self._attr(name, "toolset")
