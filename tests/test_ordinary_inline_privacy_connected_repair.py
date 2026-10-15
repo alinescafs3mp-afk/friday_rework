@@ -122,6 +122,8 @@ def test_missing_managed_scope_cannot_fall_back_to_donor(scoped,consumer):
  assert not (scoped.home/'memories/MEMORY.md').exists()
 
 def test_unmanaged_inline_memory_keeps_native_diagnostic(scoped,monkeypatch):
+ # A true standalone donor has no managed profile marker; cold missing-scope remains denied.
+ (scoped.home/s.MARKER).unlink()
  monkeypatch.setattr(s,'_ENGAGED',False);monkeypatch.setattr(s,'policy',lambda home:None);s._CURRENT.set(None)
  store=memory_tool.MemoryStore(memory_char_limit=32);store.load_from_disk()
  p=scoped.home/'memories/MEMORY.md';put(p,'NATIVE_UNDELIMITED_CONTENT_'*5);raw=p.read_bytes()

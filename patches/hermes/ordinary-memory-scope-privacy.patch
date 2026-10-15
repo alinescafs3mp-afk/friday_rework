@@ -1,0 +1,183 @@
+diff --git a/hermes_cli/friday_user_scope.py b/hermes_cli/friday_user_scope.py
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -1117,6 +1117,12 @@
+             value['session_meta'] = metadata(value['session_meta'])
+         if isinstance(value.get('results'), list):
+             value['results'] = [metadata(v) for v in value['results']]
++    elif value.get('_friday_memory_outcome') == 'unconfirmed':
++        import logging
++        logging.getLogger(__name__).warning('Managed memory unconfirmed diagnostic: %r', value)
++        value = {k:v for k,v in value.items() if k != '_friday_memory_outcome'}
++        value['error'] = 'Изменение памяти не подтверждено. Часть действий могла выполниться; проверьте содержимое памяти перед повтором. Если состояние неясно, сообщите администратору.'
++        value['effect_unknown'] = True
+     elif 'drift_backup' in value:
+         import logging
+         logging.getLogger(__name__).warning('Managed memory drift diagnostic: %r', value)
+diff --git a/hermes_cli/write_approval_commands.py b/hermes_cli/write_approval_commands.py
+--- a/hermes_cli/write_approval_commands.py
++++ b/hermes_cli/write_approval_commands.py
+@@ -4,13 +4,26 @@
+ from __future__ import annotations
+ 
+ import json
++import logging
++
++logger = logging.getLogger(__name__)
+ from typing import List, Optional
+ 
+ from tools import write_approval as wa
+ 
+ 
+ def _fmt_state(subsystem: str) -> str:
+-    on = wa.write_approval_enabled(subsystem)
++    from hermes_cli.friday_user_scope import ordinary_presentation
++    managed = subsystem == wa.MEMORY and ordinary_presentation()
++    try:
++        on = wa.write_approval_enabled(subsystem)
++    except Exception:
++        if not managed:
++            raise
++        logger.warning('Managed memory preference read unconfirmed', exc_info=True)
++        return 'Состояние подтверждения изменений памяти не установлено. Автоматическая запись не разрешена; сообщите администратору.'
++    if managed:
++        return 'Подтверждение изменений памяти: ' + ('включено.' if on else 'выключено.')
+     return f"{subsystem}.write_approval = {'on' if on else 'off'}"
+ 
+ 
+@@ -128,11 +141,17 @@
+                 return False, "memory store unavailable", {}
+             from tools.memory_tool import apply_memory_pending
+             result = apply_memory_pending(payload, memory_store)
++            from hermes_cli.friday_user_scope import ordinary_tool_metadata
++            result = ordinary_tool_metadata("memory", result)
+         else:
+             from tools.skill_manager_tool import apply_skill_pending
+             result = json.loads(apply_skill_pending(payload))
+         return bool(result.get("success")), result.get("error", ""), result
+     except Exception as e:
++        from hermes_cli.friday_user_scope import ordinary_presentation, ordinary_tool_metadata
++        if subsystem == wa.MEMORY and ordinary_presentation():
++            result = ordinary_tool_metadata('memory', {'success': False, 'error': str(e), '_friday_memory_outcome': 'unconfirmed'})
++            return False, result['error'], result
+         return False, str(e), {}
+ 
+ 
+@@ -171,12 +190,22 @@
+     enabled = _APPROVAL_VALUES.get(arg)
+     if enabled is None:
+         return f"Invalid value '{arg}'. Use: on or off."
+-    if set_mode_fn is None:
++    from hermes_cli.friday_user_scope import ordinary_presentation
++    managed = subsystem == wa.MEMORY and ordinary_presentation()
++    if set_mode_fn is None and not managed:
+         val = "true" if enabled else "false"
+         return (f"To change the {subsystem} approval gate, run:\n"
+                 f"  hermes config set {subsystem}.write_approval {val}")
+     try:
+-        set_mode_fn(enabled)
++        if managed:
++            wa.set_scoped_memory_approval(enabled)
++        else:
++            set_mode_fn(enabled)
+     except Exception as e:
++        if managed:
++            logger.warning('Managed memory preference save unconfirmed', exc_info=True)
++            return 'Сохранение настройки не подтверждено. Проверьте /memory approval перед повтором; если состояние неясно, сообщите администратору.'
+         return f"Failed to set {subsystem}.write_approval: {e}"
++    if managed:
++        return 'Подтверждение изменений памяти ' + ('включено.' if enabled else 'выключено.')
+     return f"{subsystem}.write_approval set to '{'on' if enabled else 'off'}'."
+diff --git a/tools/memory_tool.py b/tools/memory_tool.py
+--- a/tools/memory_tool.py
++++ b/tools/memory_tool.py
+@@ -230,6 +230,12 @@
+     try:
+         outcome, result = _memory_tool(action, target, content, old_text, new_text, operations, store)
+         failure_class = "none" if outcome == "success" else FAILURE_CLASS.get()
++    except Exception as e:
++        from hermes_cli.friday_user_scope import ordinary_presentation, ordinary_tool_metadata
++        if not ordinary_presentation():
++            raise
++        outcome, failure_class = 'failed', 'unconfirmed'
++        result = json.dumps(ordinary_tool_metadata('memory', {'success': False, 'error': str(e), '_friday_memory_outcome': 'unconfirmed'}), ensure_ascii=False)
+     finally:
+         FAILURE_CLASS.reset(token)
+     from hermes_cli.observability.shared_metrics_loop import record_builtin_memory_call
+diff --git a/tools/memory_tool_store.py b/tools/memory_tool_store.py
+--- a/tools/memory_tool_store.py
++++ b/tools/memory_tool_store.py
+@@ -594,7 +594,9 @@
+         hold ``_file_lock`` (via ``_mutate``): a bare write from an earlier snapshot
+         drops concurrent entries (#119668)."""
+         try:
+-            atomic_write_text(path, ENTRY_DELIMITER.join(entries), tmp_prefix=".mem_")
++            from hermes_cli.friday_user_scope import current
++            private = {"mode": 0o600} if current() is not None else {}
++            atomic_write_text(path, ENTRY_DELIMITER.join(entries), tmp_prefix=".mem_", **private)
+         except OSError as e:
+             raise RuntimeError(f"Failed to write memory file {path}: {e}")
+ 
+diff --git a/tools/write_approval.py b/tools/write_approval.py
+--- a/tools/write_approval.py
++++ b/tools/write_approval.py
+@@ -43,8 +43,59 @@
+ 
+ # --- Config resolution ---
+ 
++
++def scoped_memory_approval(*, enabled=None):
++    """Native per-user runtime preference; None is only a standalone donor.
++
++    Same state_meta/registry as onboarding flags, never the signed config.
++    Failed/invalid reads propagate so an unknown gate cannot become disabled.
++    """
++    from hermes_cli.friday_user_scope import MARKER, ScopeDenied, check_database, current, policy
++    from hermes_constants import get_default_hermes_root
++    cap = current()
++    if cap is None:
++        home = get_hermes_home()
++        if (home / MARKER).exists() or (home / MARKER).is_symlink() or policy(get_default_hermes_root(home=home)) is not None:
++            raise ScopeDenied()
++        return None
++    if enabled is not None and type(enabled) is not bool:
++        raise ValueError('memory_preference_boolean_required')
++    check_database(cap)
++    from hermes_state_registry import acquire
++    db = acquire(cap.home / 'state.db')
++    try:
++        cap.check()
++        key = 'memory.write_approval'
++        if enabled is not None:
++            db.set_meta(key, '1' if enabled else '0')
++        raw = db.get_meta(key)
++        cap.check()
++        if enabled is not None and raw != ('1' if enabled else '0'):
++            raise RuntimeError('memory_preference_commit_unconfirmed')
++        if raw is None:
++            from hermes_cli.config import load_config_readonly, cfg_get
++            return _normalize_enabled(cfg_get(load_config_readonly(), MEMORY, CONFIG_KEY, default=False))
++        if raw not in {'0', '1'}:
++            raise RuntimeError('memory_preference_state_unconfirmed')
++        return raw == '1'
++    finally:
++        db.close()
++
++
++def set_scoped_memory_approval(enabled):
++    value = scoped_memory_approval(enabled=enabled)
++    if value is None:
++        from hermes_cli.friday_user_scope import ScopeDenied
++        raise ScopeDenied()
++    return value
++
++
+ def write_approval_enabled(subsystem: str) -> bool:
+     """Read ``<subsystem>.write_approval``; any unset/invalid value means gate off."""
++    if subsystem == MEMORY:
++        scoped = scoped_memory_approval()
++        if scoped is not None:
++            return scoped
+     if subsystem == SKILLS and _fio.active() is not None:
+         from hermes_cli.config import load_config_readonly, cfg_get
+         return _normalize_enabled(cfg_get(load_config_readonly(), subsystem, CONFIG_KEY, default=False))
