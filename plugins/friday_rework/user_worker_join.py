@@ -166,7 +166,7 @@ def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=N
     """One explicit owning-host action, reusing both complete native observers."""
     from .onboarding import _new_file
     from scripts.install_containment import Budget
-    from scripts.worker_qualification import dsh_observe, a0_observe
+    from scripts.worker_qualification import dsh_observe, dsh_safety_observe, a0_observe
     from hermes_cli import friday_user_scope as scope
     from hermes_cli.config import require_readable_config_before_write
     from .worker_provision import prepare_inputs
@@ -190,16 +190,21 @@ def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=N
     claim = {'boot_id':boot, 'started_mono':budget.deadline-seconds, 'deadline_mono':budget.deadline, 'budget_seconds':seconds}
     from .a0_bootstrap import InitialProbe, own_probe, checked_custody
     # A copied live/per-job plan is not authority to adopt an existing probe.
-    probe = InitialProbe(runtimes['a0'], binding, generation, prepared, budget, verify, original_seconds=seconds)
-    credentials = {n: pin(home / n)['sha256'] if (home / n).exists() else None for n in ('.env','auth.json')}
+    if (home / PLAN).exists() or (home / PLAN).is_symlink(): checked_plan(home,binding,runtimes)
+    folder.mkdir(mode=0o700)
     try:
+        scratch = folder / 'dsh-safety'; scratch.mkdir(mode=0o700)
+        safety = budget.call(dsh_safety_observe,runtimes['dsh'],home,scratch,budget)
+        verify()
+        credentials = {n: pin(home / n)['sha256'] if (home / n).exists() else None for n in ('.env','auth.json')}
+        probe = InitialProbe(runtimes['a0'], binding, generation, prepared, budget, verify, original_seconds=seconds)
         with own_probe(probe) as plan:
             checked_plan(home, binding, runtimes)
             original = {'schema':'friday.user-worker-qualification.v1','home':str(home),
                 'profile':binding['runtime_profile'],'binding_sha256':scope._fingerprint(binding),'generation':generation,
                 'original_attempt':claim,'preparations':prepared,'credentials':credentials,'plan':plan,
                 'bootstrap_original':pin(home / 'workers/a0/bootstrap/original.json'),'binding':binding}
-            verify(); folder.mkdir(mode=0o700)
+            verify()
             _new_file(home / INTENT, (json.dumps(original,sort_keys=True)+'\n').encode())
             a0 = budget.call(a0_observe, runtimes['a0'], plan, budget, probe_owner=probe)
             verify()
@@ -208,6 +213,7 @@ def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=N
         # both observations still consume the SAME original setup deadline.
         scratch = folder / 'dsh-probe'; scratch.mkdir(mode=0o700)
         dsh = budget.call(dsh_observe, runtimes['dsh'], home, scratch, budget)
+        dsh['safety'] = safety
         verify()
         for kind, ref in prepared.items(): preparation(home,binding['runtime_profile'],kind,ref)
         budget.call(sources)

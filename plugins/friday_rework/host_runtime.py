@@ -466,9 +466,16 @@ def deployment_observations(c, proof, original_attempt, folder):
             raise HostUnavailable('worker_native_smoke_unverified')
         urls = [('https://mcp.exa.ai/' if web.profile == 'exa-keyless' else 'https://api.exa.ai/'),*policy['document_probes']]
         checked_network_observation(json.dumps(obs['network']),urls)
+        from scripts.worker_qualification import checked_dsh_safety, DSH_NATIVE_SAFETY
+        safety = obs.get('safety', {})
+        checked_dsh_safety(safety.get('report'), c, home)
+        if safety.get('specimen_sha256') != hashlib.sha256(DSH_NATIVE_SAFETY.encode()).hexdigest():
+            raise HostUnavailable('worker_native_safety_specimen_changed')
         executions = [r['observation'] for r in obs['smoke']] + [obs['network_execution']]
         prefix = hashlib.sha256(str(folder / 'dsh-probe').encode()).hexdigest()[:24]
-        for index, execution in enumerate(executions, 1):
+        checks = [(index,execution,prefix) for index,execution in enumerate(executions,1)]
+        checks.append((1,safety['execution'],hashlib.sha256(str(folder / 'dsh-safety').encode()).hexdigest()[:24]))
+        for index, execution, prefix in checks:
             envelope = execution.get('resource_envelope', {})
             if (execution.get('returncode') != 0 or execution.get('reaped') is not True
                     or execution.get('timeout') is not False

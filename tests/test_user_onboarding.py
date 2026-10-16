@@ -53,6 +53,10 @@ def env(tmp_path, monkeypatch):
     config = build_config(base_url='http://127.0.0.1:9000/v1', model='observed-local',
         key_env='LOCAL_KEY', context=32768, max_input=24576, main_output=4096,
         summary_output=2048, margin=1024, template_overhead=512, web_profile='exa-paid')
+    # The legacy receipt contract still requires an explicit scoped local provider.
+    config['model']['key_env'] = 'LOCAL_KEY'
+    config['auth'] = {'adopt_external_logins': False}
+    config['delegation'].update(base_url='http://127.0.0.1:9000/v1', key_env='LOCAL_KEY')
     config['memory'].update(memory_enabled=True, user_profile_enabled=True)
     config['plugins']['enabled'].append('friday_rework')
     config['plugins']['entries'] = {'friday_rework': {'allow_gateway_work': True, 'allow_gateway_control': True,

@@ -18,7 +18,7 @@ from test_user_onboarding import env, prepare as legacy_prepare, secrets, grant,
 from test_user_worker_provision import inputs, pin
 from test_product_profile import inputs as product_input
 from test_worker_web_admission import policy, spec_web, observation
-from test_worker_qualification import probe
+from test_worker_qualification import probe, safety_observation
 from test_admin_repair import basic_app
 from hermes_cli import friday_user_scope as scope
 from hermes_cli.config import require_readable_config_before_write
@@ -201,6 +201,10 @@ def fixture_native(e,monkeypatch,uid='1',bad=None):
         if bad=='keys':(h/'.env').write_text('')
         if bad=='expiry':budget.deadline=time.monotonic()-1
         return v
+    def safety(c,home,folder,budget):
+        budget.fixture_boot=bootstrap.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        return safety_observation(c,home,folder,budget)
+    monkeypatch.setattr(q,'dsh_safety_observe',safety)
     monkeypatch.setattr(q,'dsh_observe',dsh);monkeypatch.setattr(q,'a0_observe',a0obs)
     return calls,native
 
@@ -258,13 +262,29 @@ def test_two_users_derive_distinct_original_scoped_inputs_no_keys_or_receipts(no
     assert results[0]['workers']==results[1]['workers'] and raw(e)['owner_unrelated']=='PRESERVE_ME'
 
 
-def test_no_own_a0_producer_is_explicit_pending_no_claim_or_observer(normal_env,monkeypatch):
-    e=normal_env;pending(e)
+def test_no_own_a0_producer_preserves_safety_first_attempt_without_worker_effects(normal_env,monkeypatch):
+    e=normal_env;pending(e);calls=[]
     from scripts import worker_qualification as q
-    monkeypatch.setattr(q,'dsh_observe',lambda *a:pytest.fail('native IO before owning A0 prerequisite'))
+    from friday_admin_controls import a0_bootstrap as bootstrap
+    def safety(c,home,folder,budget):
+        calls.append('no-key-safety');budget.check()
+        return {'fixture':'not-readiness-no-native-effect'}
+    def missing_producer(*args,**kwargs):
+        calls.append('a0-readonly-prerequisite')
+        raise bootstrap.PrerequisitePending('own_a0_reviewed_native_source_unavailable')
+    monkeypatch.setattr(q,'dsh_safety_observe',safety)
+    monkeypatch.setattr(q,'dsh_observe',lambda *a:pytest.fail('later DSH smoke before A0 prerequisite'))
+    monkeypatch.setattr(bootstrap,'InitialProbe',missing_producer)
+    monkeypatch.setattr(bootstrap,'own_probe',lambda *a:pytest.fail('A0 worker/key custody effects without prerequisite'))
     r=action(e,'qualify');assert r['state']=='DISABLED_OWN_A0_NATIVE_PREREQUISITES_PENDING'
-    assert not (home(e)/join.FOLDER).exists()
-    assert action(e,'qualify')['state']==r['state']  # Inspection only, no retry/claim.
+    assert calls==['no-key-safety','a0-readonly-prerequisite']
+    folder=home(e)/join.FOLDER
+    assert folder.is_dir() and not (home(e)/join.PROOF).exists()
+    failure=json.loads((folder/'failure.json').read_text())
+    assert failure['state']=='REFUSED_OR_UNCERTAIN' and failure['retry_authorized'] is False
+    assert not (home(e)/'workers/a0/bootstrap').exists()
+    with pytest.raises(hr.HostUnavailable,match='qualification_attempt_requires_inspection'):action(e,'qualify')
+    assert calls==['no-key-safety','a0-readonly-prerequisite']
     assert not row(e)['enabled'] and not (home(e)/scope.MARKER).exists()
 
 
@@ -299,8 +319,12 @@ def test_foreign_native_probe_refuses_before_claim(normal_env,monkeypatch,bad):
         'workspace_reference':str(home(e)/'workers/a0/jobs/EXPLICIT_OFFLINE_PRIOR')}}
     if bad=='workspace':p['association_binding']['workspace_reference']=str(e.home/'foreign')
     else:p['association_binding']['owner'][{'user':'user_id','profile':'profile','bot':'bot_id'}[bad]]='foreign'
-    path.write_text(json.dumps(p))
-    with pytest.raises(hr.HostUnavailable):action(e,'qualify')
+    path.write_text(json.dumps(p));path.chmod(0o644)
+    # Privacy rejection is separate from the foreign-identity negative control.
+    with pytest.raises(scope.ScopeDenied):action(e,'qualify')
+    assert calls==[] and not (home(e)/join.FOLDER).exists()
+    path.chmod(0o600)
+    with pytest.raises(hr.HostUnavailable,match='foreign_a0_user_probe'):action(e,'qualify')
     assert calls==[] and not (home(e)/join.FOLDER).exists()
 
 

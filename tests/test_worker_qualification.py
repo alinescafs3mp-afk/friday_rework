@@ -23,6 +23,31 @@ from test_normal_worker_install import normal, materialized, doc, pin, write
 from test_worker_web_admission import policy, observation
 
 
+def safety_observation(runtime, home, folder, budget):
+    """Explicit synthetic native IO fixture; never deployment acceptance."""
+    status='NoNewPrivs: 1\nCapInh: 0000\nCapPrm: 0000\nCapEff: 0000\nCapAmb: 0000\nCapBnd: 000001ffffffffff'
+    label='friday-dsh-command-v1//&friday-dsh-native-v1 (enforce)'
+    report={'schema':'friday.dsh-native-safety.v1','status':'NATIVE_SAFETY_PASS',
+        'runtime_home':str(home),'runtime_profile':runtime['runtime_profile'],
+        'payload_root':runtime['dsh']['payload_root'],'node':runtime['dsh']['node']['path'],
+        'controls':list(q.DSH_SAFETY_CONTROLS),'shell_result':{'exitCode':0},'artifact_sha256':q.hashlib.sha256(b'R2-NATIVE-BASH-OK\n').hexdigest(),
+        'outer':{'label':'friday-dsh-native-v1 (enforce)','status':status.splitlines(),
+            'ns':{'user':'user:[2]','pid':'pid:[2]','mnt':'mnt:[2]'},'uid_map':'0 1000 1','gid_map':'0 1000 1'},
+        'host':{'namespaces':{'user':'user:[1]','pid':'pid:[1]','mnt':'mnt:[1]'},'pid':12345},
+        'nested':{'bash-label':label,'python-label':label,'node-label':label,'bash-status':status,
+            'bash-pidns':'pid:[3]','bash-userns':'user:[3]','bash-mntns':'mnt:[3]',
+            'bash-uid-map':'0 0 1','bash-gid-map':'0 0 1','bash-mountinfo':'1 2 0:1 / /proc ro - proc proc ro'},
+        'wrap':{'argv':['/usr/bin/bwrap','--unshare-pid','--proc','/proc']}}
+    d=runtime['dsh']
+    envelope={'unit':'friday-qualify-dsh-'+q.hashlib.sha256(str(folder).encode()).hexdigest()[:24]+'-1.scope',
+        **{k:d[k] for k in ('memory_bytes','cpu_percent','tasks')},
+        'boot_id':'fixture-only','deadline':budget.deadline-1}
+    # Match the existing synthetic fixture boot binding, never observe a host process.
+    if hasattr(budget,'fixture_boot'): envelope['boot_id']=budget.fixture_boot
+    return {'report':report,'execution':{'returncode':0,'reaped':True,'timeout':False,'resource_envelope':envelope},
+        'specimen_sha256':q.hashlib.sha256(q.DSH_NATIVE_SAFETY.encode()).hexdigest()}
+
+
 def probe(deployment):
     expected = a0.templates(deployment)['plugins/_model_config/presets.yaml'][0]
     return {'status':'NO_MODEL_STARTUP_PROBE_PASS','scope':'agent0/no-project/no-context',
@@ -38,6 +63,10 @@ def probe(deployment):
 @pytest.fixture
 def installed(normal,monkeypatch):
     s=normal
+    s.budget.fixture_boot = entry.partial_claim('f'*64,s.budget)['boot_id']
+    monkeypatch.setattr(q,'dsh_safety_observe',safety_observation)
+    from plugins.friday_rework.adapters import dsh as dsh_adapter
+    monkeypatch.setattr(dsh_adapter,'_apparmor_boundary',lambda config,argv:[dsh_adapter._APPARMOR_ENTRY,*argv[1:]])
     s.claim=entry.partial_claim('f'*64,s.budget)
     doc(s.home/entry.MARKER,s.claim)
     protected=s.deploy/'a0_web.py'
@@ -67,7 +96,7 @@ def installed(normal,monkeypatch):
     def dsh_io(argv,cwd,**kw):
         s.native.append(('dsh',list(argv)))
         assert argv[0]=='/usr/bin/systemd-run' and '--scope' in argv
-        assert '/usr/bin/bwrap' in argv and '--unshare-pid' in argv and '--as-pid-1' in argv
+        assert '/usr/local/libexec/friday-dsh-bwrap' in argv and '--unshare-pid' in argv and '--as-pid-1' in argv
         assert all(any(x.startswith('--property='+p+'=') for x in argv)
                    for p in ('MemoryMax','MemorySwapMax','CPUQuota','TasksMax','RuntimeMaxSec'))
         assert kw['deadline']==s.budget.deadline and kw['timeout']<=5

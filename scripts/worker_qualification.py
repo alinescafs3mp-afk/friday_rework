@@ -190,7 +190,149 @@ def a0_observe(runtime, plan_ref, budget, *, probe_owner=None):
             'native_resources':sample}
 
 
-def dsh_observe(runtime, home, folder, budget):
+DSH_NATIVE_SAFETY = r'''const fs=await import('node:fs'),assert=(await import('node:assert/strict')).default;
+const {pathToFileURL}=await import('node:url');
+const m=JSON.parse(fs.readFileSync('/job-input/manifest.json','utf8'));
+const host=JSON.parse(fs.readFileSync('/job-input/host.json','utf8'));
+assert.equal(process.execPath,m.node);
+const label=fs.readFileSync('/proc/self/attr/current','utf8').trim();
+assert.equal(label,'friday-dsh-native-v1 (enforce)','initial attachment must have no unconfined/global bwrap stack');
+const status=fs.readFileSync('/proc/self/status','utf8');
+assert.match(status,/^NoNewPrivs:\s+1$/m);
+for(const k of ['CapInh','CapPrm','CapEff','CapAmb'])assert.match(status,new RegExp('^'+k+':\\s+0+$','m'));
+const outer={label,status:status.split('\n').filter(x=>/^(Cap|NoNewPrivs|NSpid|Uid|Gid)/.test(x)),
+ uid_map:fs.readFileSync('/proc/self/uid_map','utf8'),gid_map:fs.readFileSync('/proc/self/gid_map','utf8'),
+ ns:Object.fromEntries(['user','pid','mnt'].map(k=>[k,fs.readlinkSync('/proc/self/ns/'+k)]))};
+assert(Number.isSafeInteger(host.pid) && host.pid>1);
+for(const key of ['user','pid','mnt']) {
+ assert.equal(typeof host.namespaces[key],'string');
+ assert.notEqual(outer.ns[key],host.namespaces[key]);
+}
+assert.equal(process.ppid,0,'native process must be namespace init');
+for(const key of ['FRIDAY_LLM_API_KEY','OPENAI_API_KEY','EXA_API_KEY','TELEGRAM_BOT_TOKEN','ANTHROPIC_API_KEY','FRIDAY_DSH_PARENT_SECRET']) assert.equal(process.env[key],undefined);
+for(const path of [host.secret_path,host.home+'/.env',host.home+'/auth.json']) assert.equal(fs.existsSync(path),false,path);
+assert.throws(()=>fs.readFileSync('/proc/'+host.pid+'/environ'),{code:'ENOENT'});
+assert.throws(()=>fs.readFileSync('/proc/'+host.pid+'/root'+host.secret_path),{code:'ENOENT'});
+// Zero bits are observed in this outer child user namespace. No host initial-userns membership is asserted.
+const imp=p=>import(pathToFileURL(m.harness+'/'+p).href);
+const {Context}=await imp('vendor/cordis/lib/index.js');
+const {LocalSandboxProvider}=await imp('packages/sandbox/sandbox-local/lib/index.js');
+const {default:SessionProjectionRegistry}=await imp('packages/session/session-projection/lib/index.js');
+const {SandboxPolicyService}=await imp('packages/sandbox/sandbox-policy/lib/index.js');
+const {default:LocalSubprocessRuntime}=await imp('packages/subprocess/subprocess-local/lib/index.js');
+const {SandboxBashExecutor}=await imp('packages/shell/bash-sandbox/lib/index.js');
+const ctx=new Context();let wrapped;
+try {
+ await ctx.plugin(LocalSandboxProvider,{runnerCommand:['/usr/bin/bwrap'],runnerFailureSignatures:['bwrap: ']});
+ await ctx.plugin(SessionProjectionRegistry);await ctx.plugin(SandboxPolicyService,{mode:'workspace-write',workspaceRoot:'/workspace'});
+ await ctx.plugin(LocalSubprocessRuntime);await ctx.plugin(SandboxBashExecutor,{cwd:'/workspace',timeoutMs:15000,maxTimeoutMs:15000,graceMs:200});
+ assert(ctx.shell instanceof SandboxBashExecutor);
+ const native=ctx.sandbox.confine.bind(ctx.sandbox);
+ ctx.sandbox.confine=async(...a)=>{wrapped=await native(...a);return wrapped;};
+ const command=`set -eu
+for key in FRIDAY_LLM_API_KEY OPENAI_API_KEY EXA_API_KEY TELEGRAM_BOT_TOKEN ANTHROPIC_API_KEY FRIDAY_DSH_PARENT_SECRET; do
+ if /usr/bin/printenv \"$key\" >/dev/null; then exit 74; fi
+done
+IFS= read -r label </proc/self/attr/current
+printf '%s\\n' "$label" > /workspace/bash-label
+while IFS= read -r line; do case "$line" in Cap*|NoNewPrivs*|NSpid*|Uid*|Gid*) printf '%s\\n' "$line";; esac; done </proc/self/status > /workspace/bash-status
+/usr/bin/readlink /proc/self/ns/pid > /workspace/bash-pidns
+/usr/bin/readlink /proc/self/ns/user > /workspace/bash-userns
+/usr/bin/readlink /proc/self/ns/mnt > /workspace/bash-mntns
+while IFS= read -r line; do printf '%s\\n' "$line"; done </proc/self/uid_map > /workspace/bash-uid-map
+while IFS= read -r line; do printf '%s\\n' "$line"; done </proc/self/gid_map > /workspace/bash-gid-map
+while IFS= read -r line; do printf '%s\\n' "$line"; done </proc/self/mountinfo > /workspace/bash-mountinfo
+# Fixed zero-payload attempts: success is a qualification failure; no host mounts or grants.
+for tool in /usr/bin/bwrap /usr/local/libexec/friday-dsh-bwrap; do
+ if "$tool" --unshare-user --ro-bind / / -- /usr/bin/true > /dev/null 2>/workspace/denial-\${tool##*/}; then exit 71; fi
+done
+if /usr/bin/unshare --user /usr/bin/true >/dev/null 2>/workspace/userns-denial; then exit 72; fi
+if /usr/bin/unshare --mount /usr/bin/true >/dev/null 2>/workspace/cap-denial; then exit 73; fi
+/usr/bin/python3 -I -c 'import pathlib; print(pathlib.Path("/proc/self/attr/current").read_text().strip())' > /workspace/python-label
+${m.node} -e 'console.log(require("node:fs").readFileSync("/proc/self/attr/current","utf8").trim())' > /workspace/node-label
+printf 'R2-NATIVE-BASH-OK\\n' > /workspace/artifact
+`;
+ const run=await ctx.shell.execute(ctx.shell.resolve({command,env:{PATH:'/usr/bin:/bin',HOME:'/job-home',LANG:'C.UTF-8'},timeoutMs:15000}));
+ const result=await run.result();assert.equal(result.exitCode,0,JSON.stringify(result));
+ assert.equal(wrapped.argv[0],'/usr/bin/bwrap');assert(wrapped.argv.includes('--unshare-pid'));assert(wrapped.argv.includes('--proc'));
+ const nested=Object.fromEntries(['bash-label','bash-status','bash-pidns','bash-userns','bash-mntns','bash-uid-map','bash-gid-map','bash-mountinfo','python-label','node-label'].map(k=>[k,fs.readFileSync('/workspace/'+k,'utf8').trim()]));
+ // Kernel stack component ordering is not an observation contract. Exact names,
+ // enforce suffix, cardinality and distinctness are; no extra stack is accepted.
+ const expectedComponents=['friday-dsh-command-v1','friday-dsh-native-v1'];
+ for(const k of ['bash-label','python-label','node-label']){
+  const label=nested[k],suffix=' (enforce)';assert(label.endsWith(suffix),k);
+  const components=label.slice(0,-suffix.length).split('//&');
+  assert.equal(components.length,2,k);assert.equal(new Set(components).size,2,k);
+  assert.deepEqual(components.sort(),expectedComponents,k);
+ }
+ assert.notEqual(nested['bash-pidns'],outer.ns.pid);assert.notEqual(nested['bash-mntns'],outer.ns.mnt);
+ // Native rootless bwrap implicitly creates NEWUSER on this host; argv remains intact.
+ assert.notEqual(nested['bash-userns'],outer.ns.user);
+ for(const k of ['bash-uid-map','bash-gid-map'])assert.match(nested[k],/^\d+\s+\d+\s+\d+/);
+ assert.match(nested['bash-status'],/^NoNewPrivs:\s+1$/m);
+ // CapBnd can reset across userns creation; it is recorded, never assumed zero here.
+ for(const k of ['CapInh','CapPrm','CapEff','CapAmb'])assert.match(nested['bash-status'],new RegExp('^'+k+':\\s+0+$','m'));
+ assert.match(fs.readFileSync('/workspace/bash-mountinfo','utf8'),/ \/proc .* - proc /m);
+ for(const name of ['denial-bwrap','denial-friday-dsh-bwrap','userns-denial','cap-denial'])assert.match(fs.readFileSync('/workspace/'+name,'utf8'),/Operation not permitted|Permission denied/i);
+ assert.equal(fs.readFileSync('/workspace/artifact','utf8'),'R2-NATIVE-BASH-OK\n');
+ console.log(JSON.stringify({schema:'friday.dsh-native-safety.v1',status:'NATIVE_SAFETY_PASS',runtime_home:m.runtime_home,runtime_profile:m.runtime_profile,payload_root:m.harness,node:m.node,outer,nested,host,shell_result:{exitCode:result.exitCode},wrap:{argv:wrapped.argv},artifact_sha256:(await import('node:crypto')).createHash('sha256').update(fs.readFileSync('/workspace/artifact')).digest('hex'),controls:["exact-labels", "nnp-and-current-caps", "namespace-ancestry", "fresh-proc", "parent-secret-exclusion", "strict-reexec-denials", "native-context-bash", "native-artifact"]}));
+} finally { await ctx.fiber.dispose(); }
+'''
+DSH_SAFETY_CONTROLS = ['exact-labels', 'nnp-and-current-caps', 'namespace-ancestry', 'fresh-proc', 'parent-secret-exclusion', 'strict-reexec-denials', 'native-context-bash', 'native-artifact']
+
+
+def checked_dsh_safety(report, runtime, home):
+    """Validate native evidence, never an opaque ready/success assertion."""
+    import re
+    d = runtime['dsh']
+    require(isinstance(report, dict) and report.get('schema') == 'friday.dsh-native-safety.v1'
+            and report.get('status') == 'NATIVE_SAFETY_PASS'
+            and report.get('runtime_home') == str(home)
+            and report.get('runtime_profile') == runtime['runtime_profile']
+            and report.get('payload_root') == d['payload_root'] and report.get('node') == d['node']['path']
+            and report.get('controls') == DSH_SAFETY_CONTROLS
+            and report.get('shell_result') == {'exitCode':0}
+            and report.get('artifact_sha256') == hashlib.sha256(b'R2-NATIVE-BASH-OK\n').hexdigest(),
+            'dsh_native_safety_unverified')
+    outer = report['outer']; nested = report['nested']; host = report['host']
+    require(outer['label'] == 'friday-dsh-native-v1 (enforce)', 'dsh_native_label_unverified')
+    for label in (nested[k] for k in ('bash-label','python-label','node-label')):
+        require(label.endswith(' (enforce)') and sorted(label[:-10].split('//&')) ==
+                ['friday-dsh-command-v1','friday-dsh-native-v1'], 'dsh_command_label_unverified')
+    for status in ('\n'.join(outer['status']), nested['bash-status']):
+        require(re.search(r'^NoNewPrivs:\s+1$',status,re.M) is not None, 'dsh_nnp_unverified')
+        for key in ('CapInh','CapPrm','CapEff','CapAmb'):
+            require(re.search(r'^'+key+r':\s+0+$',status,re.M) is not None, 'dsh_current_capability_present')
+        require(re.search(r'^CapBnd:\s+[0-9a-fA-F]+$',status,re.M) is not None, 'dsh_capbnd_observation_missing')
+    require(type(host.get('pid')) is int and host['pid'] > 1
+            and isinstance(host.get('namespaces'), dict)
+            and set(host['namespaces']) == {'user','pid','mnt'},
+            'dsh_host_namespace_identity_unverified')
+    for key in ('user','pid','mnt'):
+        values = (host['namespaces'][key], outer['ns'][key], nested['bash-'+key+'ns'])
+        require(all(isinstance(value, str) and re.fullmatch(key+r':\[[0-9]+\]', value)
+                    is not None for value in values), 'dsh_namespace_identity_unverified')
+        require(nested['bash-'+key+'ns'] != host['namespaces'][key],
+                'dsh_namespace_separation_unverified')
+    require(all(outer['ns'][key] != host['namespaces'][key] for key in ('user','pid','mnt'))
+            and nested['bash-pidns'] != outer['ns']['pid'] and nested['bash-userns'] != outer['ns']['user']
+            and nested['bash-mntns'] != outer['ns']['mnt'],
+            'dsh_namespace_separation_unverified')
+    for maps in (outer['uid_map'],outer['gid_map'],nested['bash-uid-map'],nested['bash-gid-map']):
+        require(re.fullmatch(r'\s*\d+\s+\d+\s+\d+\s*',maps) is not None, 'dsh_namespace_map_unverified')
+    require(re.search(r' /proc .* - proc ',nested['bash-mountinfo'],re.M) is not None,
+            'dsh_fresh_proc_unverified')
+    argv = report['wrap']['argv']
+    require(isinstance(argv,list) and argv and argv[0] == '/usr/bin/bwrap'
+            and '--unshare-pid' in argv and '--proc' in argv, 'dsh_native_bash_wrapper_unverified')
+    return report
+
+
+def dsh_safety_observe(runtime, home, folder, budget):
+    return dsh_observe(runtime, home, folder, budget, safety_only=True)
+
+
+def dsh_observe(runtime, home, folder, budget, *, safety_only=False):
     """No-model smoke and DNS/TLS inside the actual native adapter boundary."""
     from plugins.friday_rework.adapters.dsh import DshAdapter, DshHostConfig
     from plugins.friday_rework.host_runtime import _pin, _dsh_web
@@ -220,6 +362,20 @@ def dsh_observe(runtime, home, folder, budget):
         **{k:d[k] for k in ('profile','memory_bytes','cpu_percent','tasks','shutdown_seconds','tmp_bytes')})
     adapter = DshAdapter(cfg)
     adapter._pins()
+    if safety_only:
+        control = folder / 'control'; control.mkdir(mode=0o700)
+        parent_secret = os.urandom(32).hex()
+        secret = control / 'parent-secret'; secret.write_text(parent_secret); secret.chmod(0o400)
+        host = {'namespaces': {k: os.readlink('/proc/self/ns/' + k)
+                              for k in ('user','pid','mnt')},
+                'pid': os.getpid(), 'home': str(home), 'secret_path': str(secret)}
+        manifests = {'manifest.json': {'harness':str(cfg.payload_root),'node':str(cfg.node.path),
+                    'runtime_home':str(home),'runtime_profile':runtime['runtime_profile']}, 'host.json':host}
+        for name,value in manifests.items():
+            path = folder / 'inputs' / name
+            path.write_text(json.dumps(value)); path.chmod(0o400)
+        path = folder / 'inputs' / 'native-safety.mjs'
+        path.write_text(DSH_NATIVE_SAFETY); path.chmod(0o400)
     count = 0
     def observe(command):
         nonlocal count
@@ -228,9 +384,16 @@ def dsh_observe(runtime, home, folder, budget):
         r, w = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
         observation = {}; failure = None; output = ''
         try:
-            argv = adapter._boundary(folder, command)
+            limit = min(20 if safety_only else 5, budget.check(reserve=1))
+            row = {'admission_hash':hashlib.sha256(str(folder).encode()).hexdigest(),
+                   'supervisor':{'unit':'friday-qualification-construction-only.service'}}
+            # Use the exact installed adapter selector. Only its foreground
+            # boundary is run: the existing scope/PID custody remains the owner.
+            launch = adapter._launch_argv(row,folder,folder,limit,{},command)
+            from plugins.friday_rework.adapters.dsh import _APPARMOR_ENTRY
+            require(launch.count(_APPARMOR_ENTRY) == 1, 'dsh_unique_entry_required')
+            argv = launch[launch.index(_APPARMOR_ENTRY):]
             argv[1:1] = ['--json-status-fd', str(w), '--as-pid-1']
-            limit = min(5, budget.check(reserve=1))
             envelope = {'unit': 'friday-qualify-dsh-' + hashlib.sha256(str(folder).encode()).hexdigest()[:24]
                          + '-' + str(count) + '.scope',
                         'memory_bytes': cfg.memory_bytes, 'cpu_percent': cfg.cpu_percent, 'tasks': cfg.tasks,
@@ -243,7 +406,9 @@ def dsh_observe(runtime, home, folder, budget):
                     '--property=SendSIGKILL=yes', '--property=RuntimeMaxSec=' + str(limit) + 's',
                     '/usr/bin/python3', '-I', '-c', DSH_SCOPE_GUARD, json.dumps(envelope), *argv]
             try:
-                output, observation = run(argv, folder, env=adapter._environment(),
+                execution_env = adapter._environment()
+                if safety_only: execution_env = dict(execution_env,FRIDAY_DSH_PARENT_SECRET=parent_secret)
+                output, observation = run(argv, folder, env=execution_env,
                     timeout=limit, deadline=budget.deadline, pass_fds=(w,))
             except BaseException as exc:
                 failure = exc; observation = getattr(exc, 'observation', {})
@@ -259,6 +424,12 @@ def dsh_observe(runtime, home, folder, budget):
         finally:
             if w is not None: os.close(w)
             os.close(r)
+    if safety_only:
+        out, execution = observe([str(cfg.node.path), '--max-old-space-size=128', '/job-input/native-safety.mjs'])
+        report = checked_dsh_safety(json.loads(out),runtime,home)
+        adapter._pins()
+        return {'report':report,'execution':execution,
+                'specimen_sha256':hashlib.sha256(DSH_NATIVE_SAFETY.encode()).hexdigest()}
     smoke = []
     for kind, args in [('version', ['--version']), ('help', ['--help']),
                        ('headless-config', ['--profile','headless','--dump-default-config']),
@@ -307,8 +478,7 @@ def qualify(value, input_hash, plan_ref, budget):
         # No live probes before the unchanged installed ownership is checked.
         budget.call(inspect, value, input_hash)
         from plugins.friday_rework.a0_bootstrap import installation_probe, own_probe, checked_custody
-        probe_owner = None if plan_ref is not None else installation_probe(product,home,claim,budget,
-            verify=lambda:budget.call(inspect,value,input_hash))
+        probe_owner = None
         folder.mkdir(mode=0o700); directory(folder)
         files = dict(marker['profile_files'])
         files.update({p:h for p,h in marker['worker_files'].items() if p.endswith('/runtime-receipt.json')})
@@ -319,10 +489,15 @@ def qualify(value, input_hash, plan_ref, budget):
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
             with os.fdopen(fd, 'wb') as f: f.write(raw); f.flush(); os.fsync(f.fileno())
         publish(home / ORIGINAL, {'marker': marker, 'files': files}, budget=budget)
-        credentials = {name: digest(owned_file(home / name, private=True))
-            if (home / name).exists() or (home / name).is_symlink() else None for name in ('.env','auth.json')}
         custody = None
         try:
+            safety_scratch = folder / 'dsh-safety'; safety_scratch.mkdir(mode=0o700)
+            safety = budget.call(dsh_safety_observe,product['runtime']['workers']['dsh'],home,safety_scratch,budget)
+            budget.call(inspect,value,input_hash)
+            credentials = {name: digest(owned_file(home / name, private=True))
+                if (home / name).exists() or (home / name).is_symlink() else None for name in ('.env','auth.json')}
+            probe_owner = None if plan_ref is not None else installation_probe(product,home,claim,budget,
+                verify=lambda:budget.call(inspect,value,input_hash))
             if probe_owner is not None:
                 with own_probe(probe_owner) as plan_ref:
                     a0 = budget.call(a0_observe, product['runtime']['workers']['a0'], plan_ref, budget, probe_owner=probe_owner)
@@ -330,6 +505,7 @@ def qualify(value, input_hash, plan_ref, budget):
                 custody = checked_custody(home,probe_owner.binding,1,probe_owner.preparations,plan_ref)
             scratch = folder / 'dsh-probe'; scratch.mkdir(mode=0o700)
             dsh = budget.call(dsh_observe, product['runtime']['workers']['dsh'], home, scratch, budget)
+            dsh['safety'] = safety
             if probe_owner is None:
                 a0 = budget.call(a0_observe, product['runtime']['workers']['a0'], plan_ref, budget)
         except StopUnconfirmed:
@@ -338,6 +514,13 @@ def qualify(value, input_hash, plan_ref, budget):
             try:
                 publish(folder / 'failure.json', {'state': 'STOP_UNCONFIRMED',
                     'original_attempt': claim, 'plan': plan_ref, 'retry_authorized': False})
+            except (OSError, ValueError, RuntimeError):
+                pass
+            raise
+        except BaseException:
+            try:
+                publish(folder / 'failure.json', {'state':'REFUSED_OR_UNCERTAIN',
+                    'original_attempt':claim,'plan':plan_ref,'retry_authorized':False})
             except (OSError, ValueError, RuntimeError):
                 pass
             raise

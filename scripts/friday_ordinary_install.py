@@ -582,11 +582,11 @@ def update_history(home, expected, predecessor=None):
         # This is the already committed 46->47 transaction, never an operation
         # to rerun. Its exact request and all beforeimages remain pinned.
         old = f.read_json(f.pin(predecessor))
-        if old.get('schema') in ('friday.ordinary-telegram-source-update.v2','friday.ordinary-telegram-source-update.v3','friday.ordinary-telegram-source-update.v4','friday.ordinary-telegram-source-update.v5','friday.ordinary-telegram-source-update.v6','friday.ordinary-telegram-source-update.v7','friday.ordinary-telegram-source-update.v8','friday.ordinary-telegram-source-update.v9','friday.ordinary-telegram-source-update.v10','friday.ordinary-telegram-source-update.v11','friday.ordinary-telegram-source-update.v12','friday.ordinary-telegram-source-update.v13','friday.ordinary-telegram-source-update.v14','friday.ordinary-telegram-source-update.v15','friday.ordinary-telegram-source-update.v16','friday.ordinary-telegram-source-update.v17','friday.ordinary-telegram-source-update.v18','friday.ordinary-telegram-source-update.v19','friday.ordinary-telegram-source-update.v20','friday.ordinary-telegram-source-update.v21','friday.ordinary-telegram-source-update.v22','friday.ordinary-telegram-source-update.v23','friday.ordinary-telegram-source-update.v24','friday.ordinary-telegram-source-update.v25','friday.ordinary-telegram-source-update.v26','friday.ordinary-telegram-source-update.v27','friday.ordinary-telegram-source-update.v28','friday.ordinary-telegram-source-update.v29','friday.ordinary-telegram-source-update.v30','friday.ordinary-telegram-source-update.v31'):
+        if old.get('schema') in ('friday.ordinary-telegram-project-update.v1','friday.ordinary-telegram-source-update.v2','friday.ordinary-telegram-source-update.v3','friday.ordinary-telegram-source-update.v4','friday.ordinary-telegram-source-update.v5','friday.ordinary-telegram-source-update.v6','friday.ordinary-telegram-source-update.v7','friday.ordinary-telegram-source-update.v8','friday.ordinary-telegram-source-update.v9','friday.ordinary-telegram-source-update.v10','friday.ordinary-telegram-source-update.v11','friday.ordinary-telegram-source-update.v12','friday.ordinary-telegram-source-update.v13','friday.ordinary-telegram-source-update.v14','friday.ordinary-telegram-source-update.v15','friday.ordinary-telegram-source-update.v16','friday.ordinary-telegram-source-update.v17','friday.ordinary-telegram-source-update.v18','friday.ordinary-telegram-source-update.v19','friday.ordinary-telegram-source-update.v20','friday.ordinary-telegram-source-update.v21','friday.ordinary-telegram-source-update.v22','friday.ordinary-telegram-source-update.v23','friday.ordinary-telegram-source-update.v24','friday.ordinary-telegram-source-update.v25','friday.ordinary-telegram-source-update.v26','friday.ordinary-telegram-source-update.v27','friday.ordinary-telegram-source-update.v28','friday.ordinary-telegram-source-update.v29','friday.ordinary-telegram-source-update.v30','friday.ordinary-telegram-source-update.v31'):
             # Every exact historical committed update journal survives this transition.
             actual = update_history(home, old['transaction_history'], old['predecessor_update'])
             roots = []
-        f.require(old.get('schema') in ('friday.ordinary-telegram-source-update.v1',
+        f.require(old.get('schema') in ('friday.ordinary-telegram-project-update.v1','friday.ordinary-telegram-source-update.v1',
             'friday.ordinary-telegram-source-update.v2','friday.ordinary-telegram-source-update.v3','friday.ordinary-telegram-source-update.v4','friday.ordinary-telegram-source-update.v5','friday.ordinary-telegram-source-update.v6','friday.ordinary-telegram-source-update.v7','friday.ordinary-telegram-source-update.v8','friday.ordinary-telegram-source-update.v9','friday.ordinary-telegram-source-update.v10','friday.ordinary-telegram-source-update.v11','friday.ordinary-telegram-source-update.v12','friday.ordinary-telegram-source-update.v13','friday.ordinary-telegram-source-update.v14','friday.ordinary-telegram-source-update.v15','friday.ordinary-telegram-source-update.v16','friday.ordinary-telegram-source-update.v17','friday.ordinary-telegram-source-update.v18','friday.ordinary-telegram-source-update.v19','friday.ordinary-telegram-source-update.v20','friday.ordinary-telegram-source-update.v21','friday.ordinary-telegram-source-update.v22','friday.ordinary-telegram-source-update.v23','friday.ordinary-telegram-source-update.v24','friday.ordinary-telegram-source-update.v25','friday.ordinary-telegram-source-update.v26','friday.ordinary-telegram-source-update.v27','friday.ordinary-telegram-source-update.v28','friday.ordinary-telegram-source-update.v29','friday.ordinary-telegram-source-update.v30','friday.ordinary-telegram-source-update.v31'),
             'ordinary_update_exact_predecessor_required')
         f.pin(old['previous_input']); f.pin(old['current_input'])
@@ -1085,6 +1085,20 @@ def retained_build_lock(source):
 
 
 PROJECT_UPDATE_SCHEMA = 'friday.ordinary-telegram-project-update.v1'
+PROJECT_QUALIFICATION_SCHEMA = 'friday.ordinary-telegram-project-update.v2'
+PROJECT_QUALIFICATION_NATIVE_FILES = 17682
+PROJECT_QUALIFICATION_HISTORY_FILES = 417
+PROJECT_QUALIFICATION_BEFORE = {
+    'plugins/friday_rework/host_runtime.py':'89a45984ab69ca3c6fb8d339c09a123d7b76e4dda1a47099fa5a63e61b5d795c',
+    'plugins/friday_rework/user_worker_join.py':'98094b0b4063ebc419c8c5de5cc3e0fc394ad5a577c3ad361964da67da5f1894',
+    'scripts/worker_qualification.py':'fcb09bcb67e650141f057d3a32a67bc42bb9215e108c43171f3c9365fe5ac294',
+    'scripts/friday_ordinary_install.py':'a271ae1941edbabebfd7359eef955d18c773c787542f989eb7c22635313b44d5',
+}
+PROJECT_QUALIFICATION_AFTER = {
+    'plugins/friday_rework/host_runtime.py':'6435ccc10e8ea3f2b9a7fc1c639e5788f32ff18141344a6f58f0c5fcf68fd585',
+    'plugins/friday_rework/user_worker_join.py':'41b560fd9c290cd7c07cbbe518e14767fde4fafb09a616778144ad6851bb5dd1',
+    'scripts/worker_qualification.py':'3368b230ead0a1d371b8f8afb6a46298765d5832e9ef97fa3528876432ea92e1',
+}
 PROJECT_DSH = 'plugins/friday_rework/adapters/dsh.py'
 PROJECT_POLICY = 'config/apparmor/friday-dsh-native-v1'
 PROJECT_DSH_BEFORE = 'ae00308381e976dd0c7130901979f6dc1bac1d84f9e25cc49fbc7bde1408a066'
@@ -1103,7 +1117,7 @@ def project_update_inputs(request, budget):
         'stamp','configuration','profile','launcher','credential_files','native_unit',
         'transaction_history','predecessor_update'}
     f.require(type(request) is dict and set(request) == fields
-        and request['schema'] == PROJECT_UPDATE_SCHEMA
+        and request['schema'] in (PROJECT_UPDATE_SCHEMA, PROJECT_QUALIFICATION_SCHEMA)
         and type(request['seconds']) is int and 30 <= request['seconds'] <= 180,
         'ordinary_project_explicit_request_required')
     home = f.directory(f.canonical(request['home'])); source = f.directory(home/'hermes-agent')
@@ -1122,12 +1136,24 @@ def project_update_inputs(request, budget):
             {k:v for k,v in current.items() if k != 'project_files'}
         and current['home'] == str(home) and current['product']['runtime'] == {'enabled':False},
         'ordinary_update_operational_settings_changed')
-    allowed = {PROJECT_DSH,'scripts/friday_ordinary_install.py','scripts/friday_start.py','scripts/friday_native.py'}
-    f.require(len(old) == 222 and set(new) == set(old) | {PROJECT_POLICY}
-        and PROJECT_POLICY not in old and old.get(PROJECT_DSH) == PROJECT_DSH_BEFORE
-        and all(new.get(name) == sha for name,sha in PROJECT_AFTER.items())
-        and all(new[name] == sha for name,sha in old.items() if name not in allowed)
-        and old[PROJECT_DSH] != new[PROJECT_DSH], 'ordinary_project_only_reviewed_delta_required')
+    qualification = request['schema'] == PROJECT_QUALIFICATION_SCHEMA
+    if qualification:
+        allowed = set(PROJECT_QUALIFICATION_BEFORE)
+        f.require(len(old) == 223 and set(new) == set(old)
+            and all(old.get(n) == h for n,h in PROJECT_QUALIFICATION_BEFORE.items())
+            and all(new.get(n) == h and new[n] != old[n]
+                for n,h in PROJECT_QUALIFICATION_AFTER.items())
+            and new['scripts/friday_ordinary_install.py'] != old['scripts/friday_ordinary_install.py']
+            and all(new[n] == h for n,h in old.items() if n not in allowed)
+            and all(old.get(n) == h for n,h in PROJECT_AFTER.items()),
+            'ordinary_project_only_reviewed_delta_required')
+    else:
+        allowed = {PROJECT_DSH,'scripts/friday_ordinary_install.py','scripts/friday_start.py','scripts/friday_native.py'}
+        f.require(len(old) == 222 and set(new) == set(old) | {PROJECT_POLICY}
+            and PROJECT_POLICY not in old and old.get(PROJECT_DSH) == PROJECT_DSH_BEFORE
+            and all(new.get(name) == sha for name,sha in PROJECT_AFTER.items())
+            and all(new[name] == sha for name,sha in old.items() if name not in allowed)
+            and old[PROJECT_DSH] != new[PROJECT_DSH], 'ordinary_project_only_reviewed_delta_required')
     _,donors = budget.call(f.spec_checked,current,cli_only=True)
     marker = f.read_json(paths['marker']); receipt = f.read_json(paths['source_receipt'])
     f.require(marker.get('schema') == f.SCHEMA and marker.get('completion_stage') == 'TELEGRAM_ORDINARY'
@@ -1139,16 +1165,25 @@ def project_update_inputs(request, budget):
         and marker.get('source_receipt_sha256') == request['source_receipt']['sha256']
         and len(receipt['layers']) == 77 and receipt['layers'][-1]['manifest'] == DOCX_CREATION_MANIFEST,
         'ordinary_project_exact_source77_required')
+    if qualification:
+        f.require(len(receipt['files']) == PROJECT_QUALIFICATION_NATIVE_FILES
+            and len(request['transaction_history']) == PROJECT_QUALIFICATION_HISTORY_FILES,
+            'ordinary_project_exact_qualification_inventory_required')
     budget.call(f.composition_checked,previous,source,receipt,donors['hermes'])
     budget.call(f.composition_checked,current,source,receipt,donors['hermes'])
     update_history(home,request['transaction_history'],request['predecessor_update'])
     predecessor = f.read_json(paths['predecessor_update'])
-    f.require(predecessor.get('schema') == 'friday.ordinary-telegram-source-update.v31'
+    f.require(predecessor.get('schema') == (PROJECT_UPDATE_SCHEMA if qualification else
+        'friday.ordinary-telegram-source-update.v31')
         and predecessor['home'] == str(home) and predecessor['current_input'] == request['previous_input'],
         'ordinary_project_source77_predecessor_required')
     previous_tx = home/'preparation'/('ordinary-source-update-'+predecessor['previous_input']['sha256'])
     f.require(f.read_json(previous_tx/'committed.json')['source_receipt_sha256'] ==
         request['source_receipt']['sha256'], 'ordinary_update_predecessor_binding_changed')
+    if qualification:
+        f.require(f.read_json(previous_tx/'intent.json').get('project_only') is True
+            and f.read_json(previous_tx/'committed.json').get('project_only') is True,
+            'ordinary_project_exact_committed_project_predecessor_required')
     f.native_packages(source)
     from hermes_cli.friday_ordinary_gateway import check
     check(home,role=False)
@@ -1169,7 +1204,7 @@ def project_update_inputs(request, budget):
 
 
 def project_update(request, request_path, budget):
-    """Existing ordinary custody and journal, restricted to one installed plugin."""
+    """Existing ordinary custody and journal, restricted to the reviewed installed plugin delta."""
     f = api(); home = f.directory(f.canonical(request['home']))
     fd = os.open(home,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
     try:
@@ -1182,9 +1217,12 @@ def project_update(request, request_path, budget):
             f.require(request_state is not None and json.loads(request_state['data'],object_pairs_hook=f.unique) == request,
                 'ordinary_update_request_changed')
             project_update_inputs(request,budget)
-            names = [PROJECT_DSH,f.MARKER]
+            plugin_names = (sorted(n for n in PROJECT_QUALIFICATION_AFTER if n.startswith('plugins/'))
+                if request['schema'] == PROJECT_QUALIFICATION_SCHEMA else [PROJECT_DSH])
+            names = [*plugin_names,f.MARKER]
             saved = {name:update_file_state(home/name) for name in names}
-            pins = {PROJECT_DSH:previous['project_files'][PROJECT_DSH],f.MARKER:request['marker']['sha256']}
+            pins = {n:previous['project_files'][n] for n in plugin_names}
+            pins[f.MARKER] = request['marker']['sha256']
             f.require(all(row is not None and row['mode'] in (0o600,0o644)
                 and f.digest(row['data']) == pins[name] for name,row in saved.items()),
                 'ordinary_update_beforeimage_changed')
@@ -1219,12 +1257,15 @@ def project_update(request, request_path, budget):
             import copy
             updated = copy.deepcopy(marker)
             updated['input_sha256'] = request['current_input']['sha256']
-            updated['plugin_files'][PROJECT_DSH] = current['project_files'][PROJECT_DSH]
+            for name in plugin_names:
+                updated['plugin_files'][name] = current['project_files'][name]
             updated['ordinary_gateway']['operator_entry'] = {'input':request['current_input'],
                 'script':{'path':str(f.ROOT/'scripts/friday_native.py'),
                     'sha256':current['project_files']['scripts/friday_native.py']}}
-            plugin_data = f.owned_file(f.ROOT/PROJECT_DSH)
-            f.require(f.digest(plugin_data) == PROJECT_AFTER[PROJECT_DSH],
+            expected_after = (PROJECT_QUALIFICATION_AFTER
+                if request['schema'] == PROJECT_QUALIFICATION_SCHEMA else PROJECT_AFTER)
+            plugin_data = {n:f.owned_file(f.ROOT/n) for n in plugin_names}
+            f.require(all(f.digest(data) == expected_after[n] for n,data in plugin_data.items()),
                 'ordinary_update_worker_plugin_source_changed')
             unchanged()
             tx.mkdir(mode=0o700); before = tx/'before'; before.mkdir(mode=0o700)
@@ -1238,7 +1279,7 @@ def project_update(request, request_path, budget):
             owned = {}
             try:
                 unchanged()
-                for name,data in ((PROJECT_DSH,plugin_data),(f.MARKER,encoded(updated))):
+                for name,data in [*plugin_data.items(),(f.MARKER,encoded(updated))]:
                     prove(); publish_update_file(home/name,data,saved[name]['mode'],saved[name],owned,name)
                 from hermes_cli.friday_ordinary_gateway import check
                 check(home,role=False); checked_plugin_inventory(home,updated['plugin_files'])
@@ -1269,7 +1310,7 @@ def project_update(request, request_path, budget):
 
 def update(request, request_path, budget):
     """One finite committed-phase source update; original activation stays intact."""
-    if type(request) is dict and request.get('schema') == PROJECT_UPDATE_SCHEMA:
+    if type(request) is dict and request.get('schema') in (PROJECT_UPDATE_SCHEMA, PROJECT_QUALIFICATION_SCHEMA):
         return project_update(request,request_path,budget)
     f = api(); home = f.directory(f.canonical(request['home']))
     fd = os.open(home,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)

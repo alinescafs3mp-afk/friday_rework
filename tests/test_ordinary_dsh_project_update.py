@@ -57,6 +57,8 @@ def installed(tmp_path, monkeypatch):
         'scripts/friday_ordinary_install.py', 'scripts/friday_native.py',
         'scripts/friday_install.py', 'scripts/friday_start.py',
         'plugins/friday_rework/onboarding.py', 'plugins/friday_rework/unchanged.py',
+        'plugins/friday_rework/host_runtime.py', 'plugins/friday_rework/user_worker_join.py',
+        'scripts/worker_qualification.py',
         o.DOCX_CREATION_MANIFEST, 'patches/hermes/ordinary-docx-creation.patch'}
     oldproject = {n: put(root/n, before_dsh if n == o.PROJECT_DSH else
                         b'# previous '+n.encode()+b'\n')['sha256'] for n in names}
