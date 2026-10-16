@@ -59,7 +59,7 @@ def options(cfg, home):
     return {"local_routes": routes, "toolsets": get_toolset_names(), "skills": skills,
             "required_skills": sorted(ESSENTIAL_SKILLS),
             "web_backends": ["exa-paid", "exa-keyless"],
-            "operational": ["agent.max_turns", "streaming.enabled", "tools.tool_search.defer"],
+            "operational": ["agent.max_turns", "streaming.enabled", "tools.tool_search.defer", "tools.tool_search.enabled"],
             "model_slots": ["main", *[k for k, v in (cfg.get("auxiliary") or {}).items() if isinstance(v, dict)]]}
 
 
@@ -237,6 +237,7 @@ def edit(profile, home, body, verify):
             key, value = values["key"], values["value"]
             if (key == "agent.max_turns" and (type(value) is not int or not 1 <= value <= 200)
                     or key == "streaming.enabled" and type(value) is not bool
+                    or key == "tools.tool_search.enabled" and (type(value) is not str or value != "off")
                     or key == "tools.tool_search.defer" and (
                         type(value) is not list or any(type(name) is not str for name in value)
                         or len(value) != len(set(value)) or set(value) != _memory_disclosure_defer(cfg))):
