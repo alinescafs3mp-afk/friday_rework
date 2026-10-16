@@ -87,17 +87,38 @@ def validate_template(template):
     if not isinstance(auth, dict) or auth.get('adopt_external_logins') is not False:
         raise ValueError('explicit_scoped_provider_required')
     providers = config.get('providers', {})
-    if not isinstance(providers, dict) or set(providers) != {'friday-local'}:
+    if not isinstance(providers, dict) or set(providers) not in (
+            {'friday-local'}, {'friday-local', 'friday-compression'}):
         raise ValueError('explicit_scoped_provider_required')
-    entry = providers['friday-local']
-    if (not isinstance(entry, dict) or _local(entry.get('api')) != url
-            or entry.get('key_env') != key or entry.get('default_model') != selected
-            or entry.get('transport') != 'chat_completions'
-            or entry.get('discover_models') is not False or entry.get('enabled', True) is not True
-            or entry.get('name', 'friday-local') != 'friday-local'
-            or not isinstance(entry.get('models'), dict) or set(entry['models']) != {selected}
-            or not isinstance(entry['models'][selected], dict)):
-        raise ValueError('explicit_scoped_provider_required')
+    def checked_entry(name, expected_model, expected_url, expected_key):
+        entry = providers[name]
+        if (not isinstance(entry, dict) or _local(entry.get('api')) != expected_url
+                or entry.get('key_env') != expected_key or entry.get('default_model') != expected_model
+                or entry.get('transport') != 'chat_completions'
+                or entry.get('discover_models') is not False or entry.get('enabled', True) is not True
+                or entry.get('name', name) != name
+                or not isinstance(entry.get('models'), dict) or set(entry['models']) != {expected_model}
+                or not isinstance(entry['models'][expected_model], dict)):
+            raise ValueError('explicit_scoped_provider_required')
+        return entry
+    entry = checked_entry('friday-local', selected, url, key)
+    main_route = (provider, selected, url, key)
+    compression_route = None
+    if 'friday-compression' in providers:
+        comp = providers['friday-compression']
+        if not isinstance(comp, dict):
+            raise ValueError('explicit_scoped_compressor_required')
+        comp_model, comp_key = comp.get('default_model'), comp.get('key_env')
+        if (not isinstance(comp_model, str) or not comp_model or comp_model != comp_model.strip()
+                or comp_model.lower() == 'auto' or '${' in comp_model
+                or any(ord(c) < 32 or ord(c) == 127 for c in comp_model)
+                or not isinstance(comp_key, str) or comp_key not in names or comp_key == key
+                or comp_key == 'EXA_API_KEY' or comp_key in PLATFORM_TOKEN_ENV_NAMES.values()
+                or comp_key.startswith('HERMES_DASHBOARD_')):
+            raise ValueError('explicit_scoped_compressor_required')
+        comp_url = _local(comp.get('api'))
+        checked_entry('friday-compression', comp_model, comp_url, comp_key)
+        compression_route = ('custom:friday-compression', comp_model, comp_url, comp_key)
     if config.get('custom_providers', []) != []:
         raise ValueError('explicit_scoped_provider_required')
     # Native route aliases and request mergers must not replace the installation
@@ -109,20 +130,21 @@ def validate_template(template):
                     'fallback_model', 'fallback_providers'}
     user_headers = {'accept', 'accept-language', 'user-agent', 'x-request-id',
                     'x-correlation-id', 'traceparent', 'tracestate'}
-    def extensions(block):
+    def extensions(block, expected=main_route):
+        expected_provider, expected_model, expected_url, expected_key = expected
         if 'api_key' in block or 'key_cmd' in block:
             raise ValueError('inline_credentials_refused')
-        if 'key_env' in block and block['key_env'] != key:
+        if 'key_env' in block and block['key_env'] != expected_key:
             raise ValueError('explicit_scoped_provider_required')
-        if 'api_key_env' in block and block['api_key_env'] != key:
+        if 'api_key_env' in block and block['api_key_env'] != expected_key:
             raise ValueError('explicit_scoped_provider_required')
         for field in ('base_url', 'url', 'api'):
-            if field in block and _local(block[field]) != url:
+            if field in block and _local(block[field]) != expected_url:
                 raise ValueError('inference_route_override_refused')
-        for field, expected in (('model', selected), ('default_model', selected),
-                                ('provider', provider), ('api_mode', 'chat_completions'),
+        for field, value in (('model', expected_model), ('default_model', expected_model),
+                                ('provider', expected_provider), ('api_mode', 'chat_completions'),
                                 ('transport', 'chat_completions')):
-            if field in block and block[field] != expected:
+            if field in block and block[field] != value:
                 raise ValueError('inference_route_override_refused')
         for field in ('default_headers', 'extra_headers'):
             if field in block:
@@ -138,22 +160,26 @@ def validate_template(template):
             value = block['request_overrides']
             if not isinstance(value, dict) or any(not isinstance(k, str) or k.lower() in route_fields - {'extra_headers'} for k in value):
                 raise ValueError('inference_route_override_refused')
-            extensions(value)
+            extensions(value, expected)
         for field, empty in (('fallback_chain', []), ('fallback_providers', []), ('fallback_model', {})):
             if field in block and (type(block[field]) is not type(empty) or block[field] != empty):
                 raise ValueError('explicit_local_inference_required')
     extensions(model)
     extensions(entry)
     extensions(entry['models'][selected])
-    def same_route(block, reason, fallback):
-        if (not isinstance(block, dict) or block.get('provider') != provider
-                or block.get('model') != selected or not isinstance(block.get('base_url'), str)
-                or _local(block['base_url']) != url or block.get('key_env') != key
+    if compression_route is not None:
+        extensions(comp, compression_route)
+        extensions(comp['models'][comp_model], compression_route)
+    def same_route(block, reason, fallback, expected=main_route):
+        expected_provider, expected_model, expected_url, expected_key = expected
+        if (not isinstance(block, dict) or block.get('provider') != expected_provider
+                or block.get('model') != expected_model or not isinstance(block.get('base_url'), str)
+                or _local(block['base_url']) != expected_url or block.get('key_env') != expected_key
                 or block.get('api_mode') != 'chat_completions'
                 or type(block.get(fallback)) is not list or block[fallback] != []
                 or ('enabled' in block and type(block['enabled']) is not bool)):
             raise ValueError(reason)
-        extensions(block)
+        extensions(block, expected)
     auxiliary = config.get('auxiliary')
     required_aux = {name for name, value in DEFAULT_CONFIG['auxiliary'].items()
                     if isinstance(value, dict) and 'provider' in value}
@@ -162,7 +188,8 @@ def validate_template(template):
         raise ValueError('auxiliary_local_route_required')
     for name, route in auxiliary.items():
         if name != 'transient_retries':
-            same_route(route, 'auxiliary_local_route_required', 'fallback_chain')
+            expected = compression_route if name == 'compression' and compression_route is not None else main_route
+            same_route(route, 'auxiliary_local_route_required', 'fallback_chain', expected)
     delegation = config.get('delegation')
     if not isinstance(delegation, dict):
         raise ValueError('delegation_local_route_required')
@@ -188,6 +215,13 @@ def validate_template(template):
             or config.get('display', {}).get('personality')
             or config.get('agent', {}).get('system_prompt')):
         raise ValueError('explicit_private_context_and_friday_persona_required')
+    if compression_route is not None:
+        display = config.get('display', {})
+        if (not isinstance(display, dict) or display.get('show_reasoning') is not False
+                or not isinstance(display.get('platforms'), dict)
+                or not isinstance(display['platforms'].get('telegram'), dict)
+                or display['platforms']['telegram'].get('show_reasoning') is not False):
+            raise ValueError('private_protocol_reasoning_must_remain_hidden')
     if 'a0_deployment' in config:
         from .adapters.a0_profile import checked_profile
         checked_profile(config['a0_deployment'])

@@ -25,6 +25,143 @@ def template(bundle):
     return bundle['config']['plugins']['entries']['friday_rework']['settings']['onboarding']['templates']['friday-local']
 
 
+def split_inputs():
+    """Synthetic explicit bounds, not a currently admitted Spark profile."""
+    spec = inputs()
+    spec['inference'].update(base_url='http://192.168.1.195:30000/v1',
+        model='qwen38-flash-next-abliterated', key_env='FRIDAY_LLM_API_KEY',
+        context=262144, max_input=250000, main_output=8192, summary_output=4096,
+        request_options={'reasoning_echo': True, 'reasoning_effort': 'xhigh',
+            'temperature': 1.0, 'top_p': 0.95, 'presence_penalty': 0.0,
+            'extra_body': {'top_k': 20, 'min_p': 0.0, 'repetition_penalty': 1.0,
+                'chat_template_kwargs': {'enable_thinking': True, 'preserve_thinking': True}}})
+    spec['compression_inference'] = dict(base_url='http://192.168.1.78:8001/v1',
+        model='dispatcher', key_env='FRIDAY_COMPRESSION_API_KEY', context=40960,
+        max_input=40960, main_output=4096, summary_output=4096, margin=1024,
+        template_overhead=2048)
+    spec['compression_multipass'] = dict(enabled=True, max_calls=64, max_depth=16,
+        max_attempt_seconds=1800, max_call_seconds=180)
+    return spec
+
+
+def test_two_local_roles_keep_independent_limits_credentials_and_options():
+    spec = split_inputs(); before = copy.deepcopy(spec)
+    result = compose_product(spec); config = result['config']; ordinary = template(result)
+    assert spec == before
+    assert config['model']['context_length'] == 262144
+    assert config['model']['reasoning_echo'] is True
+    assert config['compression']['threshold_tokens'] > 40960
+    main = config['providers']['friday-local']; compressor = config['providers']['friday-compression']
+    assert main['api'] == spec['inference']['base_url']
+    assert compressor['api'] == spec['compression_inference']['base_url']
+    assert main['key_env'] == 'FRIDAY_LLM_API_KEY'
+    assert compressor['key_env'] == 'FRIDAY_COMPRESSION_API_KEY'
+    assert main['extra_body']['reasoning_effort'] == 'xhigh'
+    assert main['extra_body']['chat_template_kwargs']['preserve_thinking'] is True
+    assert 'extra_body' not in compressor
+    selected = config['auxiliary']['compression']
+    assert selected['provider'] == 'custom:friday-compression'
+    assert selected['model'] == 'dispatcher' and selected['context_length'] == 40960
+    assert selected['extra_body'] == {'max_tokens': 4096}
+    assert selected['multipass'] == spec['compression_multipass']
+    assert selected['fallback_chain'] == [] and config['fallback_providers'] == []
+    assert config['delegation']['base_url'] == spec['inference']['base_url']
+    assert config['auxiliary']['review']['base_url'] == spec['inference']['base_url']
+    assert config['auxiliary']['review']['extra_body']['reasoning_effort'] == 'xhigh'
+    assert result['contract']['required_scoped_names']['inference'] == [
+        'FRIDAY_LLM_API_KEY', 'FRIDAY_COMPRESSION_API_KEY']
+    assert 'FRIDAY_COMPRESSION_API_KEY' in ordinary['required_secrets']
+    assert ordinary['config']['auxiliary']['compression'] == selected
+    assert config['display']['show_reasoning'] is False
+    assert config['display']['platforms']['telegram']['show_reasoning'] is False
+    assert ordinary['config']['display'] == config['display']
+    selected['multipass']['max_calls'] = 1
+    assert ordinary['config']['auxiliary']['compression']['multipass']['max_calls'] == 64
+
+
+@pytest.mark.parametrize('path,value', [
+    ('compression_inference.key_env', 'FRIDAY_LLM_API_KEY'),
+    ('compression_inference.key_env', 'EXA_API_KEY'),
+    ('compression_inference.key_env', 'TELEGRAM_BOT_TOKEN'),
+    ('compression_inference.base_url', 'https://api.openai.com/v1'),
+    ('compression_inference.context', True),
+    ('compression_inference.main_output', 40960),
+    ('compression_multipass.enabled', False),
+    ('compression_multipass.max_calls', True),
+    ('compression_multipass.max_depth', 0),
+    ('compression_multipass.max_call_seconds', 1801),
+    ('inference.request_options.extra_body.model', 'unselected'),
+    ('inference.request_options.extra_body.max_tokens', 262144),
+    ('inference.request_options.extra_body.api_key', 'synthetic-secret'),
+    ('inference.request_options.extra_body.chat_template_kwargs.enable_thinking', 'yes'),
+    ('inference.request_options.reasoning_echo', 'yes'),
+    ('inference.request_options.temperature', float('nan')),
+])
+def test_split_or_request_options_refuse_unsafe_or_ambiguous_inputs(path, value):
+    spec = split_inputs(); node = spec; parts = path.split('.')
+    for part in parts[:-1]: node = node[part]
+    node[parts[-1]] = value
+    with pytest.raises((ValueError, KeyError, TypeError)): compose_product(spec)
+
+
+def test_split_requires_explicit_finite_multipass_and_complete_role():
+    for missing in ('compression_multipass', 'compression_inference'):
+        spec = split_inputs(); del spec[missing]
+        with pytest.raises(ValueError): compose_product(spec)
+    spec = split_inputs(); spec['compression_inference']['unapproved_option'] = True
+    with pytest.raises(ValueError): compose_product(spec)
+
+
+@pytest.mark.parametrize('field,ceiling', [
+    ('max_calls', 256), ('max_depth', 32),
+    ('max_attempt_seconds', 3600), ('max_call_seconds', 1800),
+])
+def test_split_multipass_matches_native_finite_limits(field, ceiling):
+    spec = split_inputs()
+    spec['compression_multipass']['max_attempt_seconds'] = 3600
+    spec['compression_multipass'][field] = ceiling
+    assert compose_product(spec)['config']['auxiliary']['compression']['multipass'][field] == ceiling
+    for refused in (ceiling + 1, 0, True, float('inf')):
+        spec['compression_multipass'][field] = refused
+        with pytest.raises(ValueError, match='explicit_bounded_multipass'):
+            compose_product(spec)
+
+
+@pytest.mark.parametrize('fault', ['global_true', 'telegram_true', 'global_missing',
+    'telegram_missing', 'platforms_missing', 'display_missing'])
+def test_split_template_cannot_expose_private_protocol_reasoning(fault):
+    from plugins.friday_rework.onboarding import validate_template
+    ordinary = template(compose_product(split_inputs())); config = ordinary['config']
+    display = config['display']
+    if fault == 'global_true': display['show_reasoning'] = True
+    elif fault == 'telegram_true': display['platforms']['telegram']['show_reasoning'] = True
+    elif fault == 'global_missing': del display['show_reasoning']
+    elif fault == 'telegram_missing': del display['platforms']['telegram']['show_reasoning']
+    elif fault == 'platforms_missing': del display['platforms']
+    else: del config['display']
+    with pytest.raises(ValueError, match='private_protocol_reasoning_must_remain_hidden'):
+        validate_template(ordinary)
+
+
+@pytest.mark.parametrize('fault', ['extra_provider', 'main_key', 'public_url', 'other_auxiliary',
+    'wrong_model', 'fallback', 'body_route', 'override_key', 'auth_header'])
+def test_second_role_cannot_expand_provider_or_credential_authority(fault):
+    from plugins.friday_rework.onboarding import validate_template
+    ordinary = template(compose_product(split_inputs()))
+    config = ordinary['config']; entry = config['providers']['friday-compression']
+    route = config['auxiliary']['compression']
+    if fault == 'extra_provider': config['providers']['unreviewed'] = copy.deepcopy(entry)
+    elif fault == 'main_key': entry['key_env'] = 'FRIDAY_LLM_API_KEY'
+    elif fault == 'public_url': entry['api'] = 'https://api.openai.com/v1'
+    elif fault == 'other_auxiliary': config['auxiliary']['review'] = copy.deepcopy(route)
+    elif fault == 'wrong_model': route['model'] = 'unselected-model'
+    elif fault == 'fallback': route['fallback_chain'] = [{'provider': 'auto'}]
+    elif fault == 'body_route': entry['extra_body'] = {'base_url': 'http://127.0.0.1:9001/v1'}
+    elif fault == 'override_key': entry['request_overrides'] = {'key_env': 'FRIDAY_LLM_API_KEY'}
+    else: entry['extra_headers'] = {'Authorization': 'synthetic-secret'}
+    with pytest.raises(ValueError): validate_template(ordinary)
+
+
 def test_missing_scoped_delegation_refuses_normal_template(monkeypatch):
     from hermes_cli import friday_user_scope as scope
     monkeypatch.setattr(scope, 'SAFE', scope.SAFE - {'delegate_task'})

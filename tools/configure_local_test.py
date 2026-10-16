@@ -6,9 +6,11 @@ be applied and accepted before this profile can construct an agent.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -23,6 +25,49 @@ except (ImportError, ModuleNotFoundError):  # Direct script invocation from outs
     from web_profile import hermes_web_config, research_policy
 
 ROOT = Path(__file__).resolve().parents[1]
+INFERENCE_FIELDS = frozenset({'base_url', 'model', 'key_env', 'context', 'max_input',
+    'main_output', 'summary_output', 'margin', 'template_overhead'})
+MULTIPASS_FIELDS = frozenset({'enabled', 'max_calls', 'max_depth',
+    'max_attempt_seconds', 'max_call_seconds'})
+MULTIPASS_MAXIMA = {'max_calls': 256, 'max_depth': 32,
+    'max_attempt_seconds': 3600, 'max_call_seconds': 1800}
+
+
+def validate_request_options(value):
+    """Explicit nonsecret model options; routing, credentials and caps stay owned."""
+    allowed = {'reasoning_echo', 'reasoning_effort', 'temperature', 'top_p',
+               'presence_penalty', 'extra_body'}
+    if type(value) is not dict or not set(value) <= allowed:
+        raise ValueError('explicit_supported_request_options_required')
+    result = copy.deepcopy(value)
+    if 'reasoning_echo' in result and type(result['reasoning_echo']) is not bool:
+        raise ValueError('explicit_reasoning_echo_required')
+    if 'reasoning_effort' in result and result['reasoning_effort'] not in {
+            'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'}:
+        raise ValueError('explicit_reasoning_effort_required')
+    body = result.get('extra_body', {})
+    if type(body) is not dict or not set(body) <= {
+            'top_k', 'min_p', 'repetition_penalty', 'chat_template_kwargs'}:
+        raise ValueError('supported_model_extra_body_required')
+    for k in ('temperature', 'top_p', 'presence_penalty', 'min_p', 'repetition_penalty'):
+        source = result if k in ('temperature', 'top_p', 'presence_penalty') else body
+        if k not in source:
+            continue
+        n = source[k]
+        if type(n) not in (int, float) or not math.isfinite(n):
+            raise ValueError('finite_model_sampling_required')
+        valid = (0 <= n <= 2 if k == 'temperature' else 0 < n <= 1 if k == 'top_p'
+                 else -2 <= n <= 2 if k == 'presence_penalty' else 0 <= n <= 1 if k == 'min_p'
+                 else n > 0)
+        if not valid:
+            raise ValueError('model_sampling_out_of_range')
+    if 'top_k' in body and (type(body['top_k']) is not int or body['top_k'] < -1):
+        raise ValueError('explicit_top_k_required')
+    template = body.get('chat_template_kwargs', {})
+    if (type(template) is not dict or not set(template) <= {'enable_thinking', 'preserve_thinking'}
+            or any(type(n) is not bool for n in template.values())):
+        raise ValueError('explicit_thinking_template_options_required')
+    return result
 
 
 class SafeParser(argparse.ArgumentParser):
@@ -39,7 +84,8 @@ class Once(argparse.Action):
 
 def build_config(*, base_url, model, key_env, context, max_input,
                  main_output, summary_output, margin, template_overhead,
-                 web_profile="disabled", web_extract_char_limit=None, web_extract_timeout=None):
+                 web_profile="disabled", web_extract_char_limit=None, web_extract_timeout=None,
+                 compression_inference=None, compression_multipass=None, request_options=None):
     web = hermes_web_config(web_profile, extract_char_limit=web_extract_char_limit,
                             extract_timeout=web_extract_timeout)
     values = (context, max_input, main_output, summary_output, margin, template_overhead)
@@ -116,6 +162,41 @@ def build_config(*, base_url, model, key_env, context, max_input,
         # Native additive environment prose survives personality selection.
         # Leave SOUL, display.personality and agent.system_prompt untouched.
         config["agent"]["environment_hint"] = research_policy()
+    if request_options is not None:
+        options = validate_request_options(request_options)
+        if 'reasoning_echo' in options:
+            config['model']['reasoning_echo'] = options.pop('reasoning_echo')
+        body = options.pop('extra_body', {})
+        body.update(options)
+        config['providers']['friday-local']['extra_body'] = copy.deepcopy(body)
+        for block in config['auxiliary'].values():
+            if isinstance(block, dict) and 'provider' in block:
+                block['extra_body'] = {**copy.deepcopy(body), **block.get('extra_body', {})}
+    if compression_inference is not None:
+        if (type(compression_inference) is not dict
+                or set(compression_inference) != INFERENCE_FIELDS | (set(compression_inference) & {'request_options'})):
+            raise ValueError("compression_inference_explicit_fields_required")
+        if compression_inference['key_env'] == key_env:
+            raise ValueError("separate_compression_credential_reference_required")
+        if (type(compression_multipass) is not dict
+                or set(compression_multipass) != MULTIPASS_FIELDS
+                or compression_multipass['enabled'] is not True
+                or any(type(compression_multipass[k]) is not int
+                       or not 1 <= compression_multipass[k] <= ceiling
+                       for k, ceiling in MULTIPASS_MAXIMA.items())
+                or compression_multipass['max_call_seconds'] > compression_multipass['max_attempt_seconds']):
+            raise ValueError("explicit_bounded_multipass_required_for_compression_route")
+        # Reuse exactly the same local URL, served-ID and capacity checks. The
+        # second role supplies no test-profile capabilities to the main role.
+        compressor = build_config(**compression_inference)
+        config['providers']['friday-compression'] = copy.deepcopy(compressor['providers']['friday-local'])
+        selected = copy.deepcopy(compressor['auxiliary']['compression'])
+        selected['provider'] = 'custom:friday-compression'
+        selected['multipass'] = copy.deepcopy(compression_multipass)
+        selected['max_concurrency'] = 1
+        config['auxiliary']['compression'] = selected
+    elif compression_multipass is not None:
+        raise ValueError("compression_route_required_for_multipass")
     return config
 
 

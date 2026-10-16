@@ -32,6 +32,41 @@ onboarding use the same validation as native routing.
 | `accounts` | Nonempty list of exact `platform`, `transport_profile`, `account_id`; transport must equal the receiving profile |
 | `runtime` | Explicit `{"enabled": false}` while unavailable, or the unchanged native validated worker configuration with exact receipt/source references |
 
+Optional split-route inputs are `compression_inference` (the same explicit nine
+inference fields) and `compression_multipass`. Supply both or neither. The latter
+requires `enabled: true`, positive integer `max_calls` (at most256), `max_depth`
+(at most32), `max_attempt_seconds` (at most3600) and `max_call_seconds` (at most1800,
+no greater than the whole attempt). These ceilings match the native compressor;
+they do not prescribe the live deployment's approved budgets. The existing
+single-route contract remains supported when the split is absent.
+
+The split registers exactly `custom:friday-local` for the primary model and
+`custom:friday-compression` for compression only, with separate scoped credential
+references. Other auxiliaries and delegation retain the primary route. Each
+provider has its own total context, input ceiling and output/overhead reservations;
+the smaller compression window does not set the main conversation threshold.
+The compressor is data-only and is not an automatic conversation fallback.
+Rendering this configuration requires the paired native route/credential and
+multi-pass overlays before runtime use. It grants no worker or runtime admission.
+
+Either inference object can additionally declare `request_options`: boolean
+`reasoning_echo`, a supported `reasoning_effort`, `temperature`, `top_p`,
+`presence_penalty`, and a restricted `extra_body` containing `top_k`, `min_p`,
+`repetition_penalty` and boolean `chat_template_kwargs.enable_thinking` /
+`preserve_thinking`. Route, credential and capacity overrides are refused.
+Options stay with their selected provider; the primary's thinking/sampling
+options are not copied to the separate compressor. Private protocol reasoning
+can be retained for continuation, while both global and Telegram
+`show_reasoning` remain explicitly false in validated split user templates.
+
+`context` is the total input-plus-generated-output capacity, not an input grant.
+The current bounded guard labels UTF-8 JSON byte accounting plus a template
+reserve as an estimate, with `tokenizer_verified: false`; it is not exact token
+counting or maximum-context qualification. Unknown server input limits and
+current template/tokenizer identities must be resolved before a live cutover.
+The product remains on its existing 27B route while Spark is unavailable;
+offline fixtures do not establish installed or Telegram acceptance.
+
 A profile can also supply `runtime: {"enabled": true, "workers": {"dsh":
 <existing DSH runtime>, "a0": <existing A0 runtime>}}`. Each child keeps its
 own exact deployment receipt, limits and exclusive workspace/staging/cache

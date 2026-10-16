@@ -39,6 +39,13 @@ def _exact(value, keys, label):
     return value
 
 
+def _inference(value, label):
+    _exact(value, INFERENCE | (set(value) & {'request_options'} if isinstance(value, dict) else set()), label)
+    if 'request_options' in value and type(value['request_options']) is not dict:
+        raise ValueError('explicit_supported_request_options_required')
+    return value
+
+
 def _text(value, label, *, empty=False):
     if (not isinstance(value, str) or (not empty and not value) or value != value.strip()
             or len(value) > 256 or '${' in value or any(ord(c) < 32 or ord(c) == 127 for c in value)):
@@ -95,7 +102,8 @@ def compose_product(spec):
     accepted scope; this renderer cannot expand its SAFE set or admit workers.
     """
     _exact(spec, {'profile', 'inference', 'web', 'dashboard', 'accounts', 'runtime'} |
-           ({'a0_deployment'} if isinstance(spec, dict) and 'a0_deployment' in spec else set()), 'product')
+           (set(spec) & {'a0_deployment', 'compression_inference', 'compression_multipass'}
+            if isinstance(spec, dict) else set()), 'product')
     from hermes_cli.friday_product_access import profile_name
     # Identity validation is pure; native config imports can create home state.
     profile = profile_name(spec['profile'])
@@ -103,12 +111,17 @@ def compose_product(spec):
     from hermes_cli import friday_user_scope as scope
     from plugins.friday_rework.onboarding import validate_template
 
-    inference = _exact(spec['inference'], INFERENCE, 'inference')
+    inference = _inference(spec['inference'], 'inference')
     validate_env_var_name_for_write(inference['key_env'])
     # Reuse the accepted local/capacity validator and bounded-context contract.
     # Only routing fields are shared; the deliberately narrow test capabilities
     # are not copied into the normal product configuration.
-    local = build_config(**inference)
+    compression = spec.get('compression_inference')
+    if compression is not None:
+        _inference(compression, 'compression_inference')
+        validate_env_var_name_for_write(compression['key_env'])
+    local = build_config(**inference, compression_inference=compression,
+                         compression_multipass=spec.get('compression_multipass'))
     web = _exact(spec['web'], {'profile', 'extract_char_limit', 'extract_timeout'}, 'web')
     if web['profile'] not in ('exa-paid','exa-keyless'):
         raise ValueError('mandatory_explicit_scoped_web_required')
@@ -179,9 +192,17 @@ def compose_product(spec):
             block.update(copy.deepcopy(route))
             block.setdefault('extra_body', {})['max_tokens'] = inference['summary_output']
             config['auxiliary'][name] = block
-    config['auxiliary']['compression']['context_length'] = inference['context']
+    config['auxiliary']['compression'].update(copy.deepcopy(local['auxiliary']['compression']))
+    # Primary auxiliary tasks use the primary route's own explicit options;
+    # compression keeps only its separately rendered route options and cap.
+    for name, block in config['auxiliary'].items():
+        if name != 'compression' and isinstance(block, dict) and name in local['auxiliary']:
+            block['extra_body'] = {**copy.deepcopy(local['auxiliary'][name].get('extra_body', {})),
+                                   **block.get('extra_body', {})}
     config['auxiliary']['transient_retries'] = DEFAULT_CONFIG['auxiliary']['transient_retries']
     config['compression'].update(local['compression'])
+    config['display'] = {'show_reasoning': False,
+                         'platforms': {'telegram': {'show_reasoning': False}}}
     config['delegation'].pop('api_key', None)
     config['delegation'].update({k: v for k, v in route.items() if k != 'fallback_chain'})
     config['delegation']['fallback_providers'] = []
@@ -225,14 +246,15 @@ def compose_product(spec):
     ordinary['skills'].update(create_dir=None, external_dirs=[], project_discovery=False, trusted_project_dirs=[], auto_load=[])
     web_names = ['EXA_API_KEY'] if web['profile'] == 'exa-paid' else []
     service_names = []
-    required = [inference['key_env'], *web_names]
+    inference_names = [inference['key_env'], *([compression['key_env']] if compression is not None else [])]
+    required = [*inference_names, *web_names]
     if 'a0_deployment' in spec or 'a0' in runtime or 'a0' in runtime.get('workers', {}):
         if inference['key_env'] != 'FRIDAY_LLM_API_KEY':
             raise ValueError('a0_scoped_inference_key_required')
         service_names = ['FRIDAY_EMBEDDINGS_API_KEY','SEARXNG_SECRET']
         required += service_names
-    if (len(set(required)) != len(required) or inference['key_env'] in AUTH_NAMES
-            or any(inference['key_env'] in names for names in channel_names.values())):
+    if (len(set(required)) != len(required) or any(n in AUTH_NAMES for n in inference_names)
+            or any(n in names for n in inference_names for names in channel_names.values())):
         raise ValueError('separate_scoped_credential_references_required')
     # A normal installation must carry the scoped native delegation overlay.
     # Do not render an apparently complete profile against the older denied surface.
@@ -254,7 +276,7 @@ def compose_product(spec):
     return {'config': config, 'soul': soul.decode(), 'contract': {
         'schema': 'friday.product-profile.v1', 'kind': 'normal_product', 'profile': profile,
         'state': 'TEMPLATE_INCOMPLETE', 'ready': False,
-        'required_scoped_names': {'inference_web': required, 'inference': [inference['key_env']],
+        'required_scoped_names': {'inference_web': required, 'inference': inference_names,
             'web': web_names, 'worker_service': service_names, 'dashboard': list(AUTH_NAMES), 'channels': channel_names},
         'native_dashboard': {'host': dashboard['host'], 'port': dashboard['port'],
             'public_url': config['dashboard']['public_url'], 'auth_required': True,
