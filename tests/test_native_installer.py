@@ -100,7 +100,7 @@ def test_partial_install_never_replayed_or_cleaned(install_input, tmp_path, monk
     from test_installer_lifetime import metadata, native_status
     home = Path(install_input['home']); input_path = tmp_path / 'input.json'
     input_path.write_text(json.dumps(install_input)); input_path.chmod(0o600)
-    from scripts import dsh_prepare
+    from plugins.friday_rework import runtime_process as dsh_prepare
     calls = []
     def failed(*a, **kw):
         calls.append((a, kw))
@@ -234,7 +234,7 @@ def test_matching_record_is_policy_only_not_readiness(tmp_path):
 def test_renderer_status_cannot_be_promoted_to_launch_grant(install_input, monkeypatch):
     calls = []
     monkeypatch.setattr(entry, 'inspect', lambda *a: {'state': 'READY', 'ready': True})
-    from scripts import dsh_prepare
+    from plugins.friday_rework import runtime_process as dsh_prepare
     monkeypatch.setattr(dsh_prepare, 'run', lambda *a, **kw: calls.append(a))
     with pytest.raises(ValueError, match='mandatory_a0_web_kernel_and_final_native_dashboard_owner_not_admitted'):
         entry.start(install_input, 'synthetic')
@@ -318,7 +318,7 @@ def test_whole_finite_composition_and_completed_idempotence_with_native_config(i
     install_input['product']['web']['profile']=web_profile
     p = tmp_path / 'input.json'; p.write_text(json.dumps(install_input)); p.chmod(0o600)
     home = Path(install_input['home']); calls = []
-    from scripts import dsh_prepare
+    from plugins.friday_rework import runtime_process as dsh_prepare
     from test_installer_lifetime import metadata, native_status
     e = Path(os.environ['FRIDAY_FIXTURE_EVIDENCE']); source = home / 'hermes-agent'
     def intercepted(argv, cwd, **kw):

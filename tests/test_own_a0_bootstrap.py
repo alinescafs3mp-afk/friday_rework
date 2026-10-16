@@ -21,8 +21,8 @@ from test_native_installer import install_input
 
 
 def test_initial_setup_consumes_real_existing_a0_observer_without_prequalified_job_runtime(normal_env,monkeypatch):
-    from scripts import worker_qualification as q
-    from plugins.friday_rework import host_runtime as installed_hr
+    from friday_admin_controls import runtime_observers as q
+    from friday_admin_controls import host_runtime as installed_hr
     original=q.a0_observe
     e=normal_env;pending(e);calls,path=fixture_native(e,monkeypatch)
     monkeypatch.setattr(q,'a0_observe',original)

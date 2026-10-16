@@ -11,6 +11,8 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from scripts.friday_install import _source_runtime_module
+process_runtime = _source_runtime_module('runtime_process')
 from scripts import a0_prepare as prep, a0_runtime as runtime, rootless_docker_launch as launcher
 from scripts import friday_install as entry, friday_native as native, dsh_prepare
 from scripts.install_containment import Budget
@@ -100,7 +102,7 @@ def service(install_input, tmp_path, monkeypatch):
         return out, dict(returncode=0, elapsed_seconds=.001, timeout=False, reaped=True,
             stdout_sha256=hashlib.sha256(out.encode()).hexdigest(), stderr_sha256=hashlib.sha256(b'').hexdigest(),
             stdout_bytes=len(out), stderr_bytes=0, reason='command_succeeded')
-    monkeypatch.setattr(dsh_prepare, 'run', fake_run)
+    monkeypatch.setattr(process_runtime, 'run', fake_run)
     return s
 
 

@@ -12,7 +12,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from scripts import worker_install as workers, dsh_prepare, a0_prepare, a0_runtime, friday_native as native
+from scripts import worker_install as workers, dsh_prepare as source_prepare, a0_prepare, a0_runtime, friday_native as native
+from scripts.friday_install import _source_runtime_module
+dsh_prepare = _source_runtime_module('runtime_process')
 from scripts import friday_install as entry
 from scripts.install_containment import Budget
 from test_a0_service_install import service
@@ -72,6 +74,7 @@ def normal(service, monkeypatch):
         if argv[0] == 'git': return REAL_DSH_RUN(argv, cwd, **kw)
         return fake_manager_run(argv, cwd, **kw)
     monkeypatch.setattr(dsh_prepare, 'run', dispatch)
+    monkeypatch.setattr(source_prepare, 'run', dispatch)
     v['product']['runtime']={'enabled':False}
     h=home/'harness';a=Path(v['a0_donor'])
     dsh=repository(h, {'LICENSE':b'synthetic license','THIRD_PARTY_NOTICES.md':b'synthetic notices',
@@ -85,9 +88,9 @@ def normal(service, monkeypatch):
     v['sources_lock']=doc(s.deploy/'synthetic-sources.json',lock)
     cli=h/'apps/cli/lib/bin.js';write(cli,b'NEVER EXECUTED SYNTHETIC BUILD OUTPUT\n')
     node=s.deploy/'toolchain/bin/node';write(node,b'NEVER EXECUTED SYNTHETIC NODE\n');node.chmod(0o700)
-    source=dsh_prepare.verify_source(h,dsh);source['source_lock_sha256']=v['sources_lock']['sha256']
+    source=source_prepare.verify_source(h,dsh);source['source_lock_sha256']=v['sources_lock']['sha256']
     tool={'node_executable':str(node),'node_sha256':pin(node)['sha256']}
-    inv=dsh_prepare.build_inventory(h);rows={'file_count':inv['file_count'],'sha256':inv['sha256']}
+    inv=source_prepare.build_inventory(h);rows={'file_count':inv['file_count'],'sha256':inv['sha256']}
     ok={'returncode':0,'timeout':False,'reaped':True}
     for phase in ('source','toolchain','build','smoke'):
         report={'donor':str(h),'source':source,'toolchain':tool,'runtime_task':'NOT_RUN','inference':'NOT_RUN'}

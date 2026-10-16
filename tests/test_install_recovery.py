@@ -8,7 +8,10 @@ import sys
 import time
 
 import pytest
-from scripts import friday_install as entry, install_containment as custody, dsh_prepare
+from scripts import friday_install as entry
+from scripts.friday_install import _source_runtime_module
+custody = _source_runtime_module('runtime_containment')
+dsh_prepare = _source_runtime_module('runtime_process')
 from test_native_installer import install_input
 
 
@@ -47,7 +50,8 @@ def test_probe_checks_real_device_io_before_home_admission(install_input, monkey
 
 def test_native_source_consumer_does_not_reinterpret_host_uid_but_admission_checks_it(install_input, tmp_path, monkeypatch):
     def refuse(*a): raise ValueError('protected_system_bubblewrap_required')
-    monkeypatch.setattr(custody, 'checked_binary', refuse)
+    from scripts import install_containment as installer_custody
+    monkeypatch.setattr(installer_custody, 'checked_binary', refuse)
     # This consumer performs no command or weaker launcher selection.
     home, _ = entry.spec_checked(install_input)
     assert str(home) == install_input['home']

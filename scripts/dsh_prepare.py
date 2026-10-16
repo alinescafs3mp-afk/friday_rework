@@ -15,118 +15,27 @@ import sys
 import time
 
 
-class StopUnconfirmed(RuntimeError):
-    """An owned command was signalled but its cessation was not observed."""
 
 
-SAFE_OBSERVATION_FIELDS = ('returncode', 'elapsed_seconds', 'timeout', 'stdout_sha256',
-                           'stderr_sha256', 'stdout_bytes', 'stderr_bytes', 'pid',
-                           'starttime_ticks', 'reaped', 'reason',
-                           'namespace_init_exit_verified')
 
 
-def safe_observation(observation):
-    return {key: observation[key] for key in SAFE_OBSERVATION_FIELDS if key in observation}
 
 
-class CommandFailed(RuntimeError):
-    """Reaped command failure; never carry argv, environment or raw output."""
 
-    def __init__(self, observation):
-        self.observation = safe_observation(observation)
-        super().__init__('command_timeout' if observation['timeout'] else 'command_nonzero_exit')
 
+if __name__ != '__main__':
+    from scripts.friday_install import _source_runtime_module
+    _process = _source_runtime_module('runtime_process')
+    StopUnconfirmed, SAFE_OBSERVATION_FIELDS, safe_observation, CommandFailed, clean_environment, run = (
+        getattr(_process, name) for name in ('StopUnconfirmed', 'SAFE_OBSERVATION_FIELDS',
+            'safe_observation', 'CommandFailed', 'clean_environment', 'run'))
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def clean_environment(donor):
-    # Build tools retain the user's actual home, but receive no model/Telegram keys.
-    allowed = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM",
-               "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy")
-    env = {key: os.environ[key] for key in allowed if key in os.environ}
-    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0",
-               GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
-               COREPACK_ENABLE_DOWNLOAD_PROMPT="0",
-               COREPACK_HOME=str(donor / ".git/friday-corepack"),
-               npm_config_cache=str(donor / ".git/friday-npm-cache"),
-               npm_config_child_concurrency="4", npm_config_network_concurrency="8",
-               NODE_OPTIONS="--disable-wasm-trap-handler",
-               DSH_TELEMETRY_DISABLED="1", DSH_HOME=str(donor / ".git/friday-smoke-home"))
-    return env
 
 
-def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None, pass_fds=()):
-    """Bound one group; callers needing detached-tree custody use a PID namespace."""
-    if argv[0] == "git":
-        argv = ["git", "-c", "core.hooksPath=" + os.devnull,
-                "-c", "protocol.file.allow=never", "-c", "protocol.ext.allow=never",
-                "-c", "pack.threads=4", *argv[1:]]
-    start = time.monotonic()
-    process = subprocess.Popen(argv, cwd=donor, env=env or clean_environment(donor),
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, start_new_session=True, pass_fds=pass_fds)
-    try:
-        starttime = int(Path(f'/proc/{process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
-    except (OSError, ValueError, IndexError):
-        starttime = None
-    timed_out = False
-    try:
-        out, err = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        if deadline is not None:
-            # Installer namespace cleanup consumes the same original budget.
-            # Kill namespace owner immediately; Linux closes all descendant
-            # sessions when its PID-namespace init dies (including setsid).
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise StopUnconfirmed('STOP_UNCONFIRMED: original cleanup budget exhausted')
-            try:
-                out, err = process.communicate(timeout=remaining)
-            except subprocess.TimeoutExpired as exc:
-                raise StopUnconfirmed('STOP_UNCONFIRMED: contained command not reaped') from exc
-        else:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                out, err = process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                out, err = process.communicate(timeout=5)
-    reason = ('device_null_unavailable' if
-              "fatal: could not open '/dev/null' for reading and writing: Permission denied" in err
-              else 'command_timeout' if timed_out else 'command_nonzero_exit' if process.returncode else 'command_succeeded')
-    source_reasons = {'git_source_operation_failed': 'source_git_operation_failed',
-                      'source_preparation_deadline': 'source_preparation_deadline',
-                      'source_input_or_io_failed': 'source_input_or_io_failed',
-                      'fresh_destination_required': 'source_destination_exists',
-                      'dirty_donor_refused': 'source_donor_changed',
-                      'donor_identity_changed': 'source_donor_changed',
-                      'overlay_hash_mismatch': 'source_overlay_changed'}
-    for code, stable in source_reasons.items():
-        if err.strip() == 'FRIDAY_SOURCE_REFUSED reason=' + code:
-            reason = stable
-            break
-    observation = {"argv": argv, "returncode": process.returncode,
-                   "elapsed_seconds": round(time.monotonic() - start, 3),
-                   "timeout": timed_out, "stdout_sha256": hashlib.sha256(out.encode()).hexdigest(),
-                   "stderr_sha256": hashlib.sha256(err.encode()).hexdigest(),
-                   "stdout_bytes": len(out.encode()), "stderr_bytes": len(err.encode()),
-                   "pid": process.pid, "starttime_ticks": starttime,
-                   "reaped": process.returncode is not None, "reason": reason}
-    if log:
-        log.parent.mkdir(parents=True, exist_ok=True)
-        log.with_suffix(".stdout").write_text(out)
-        log.with_suffix(".stderr").write_text(err)
-        log.with_suffix(".json").write_text(json.dumps(observation, indent=2) + "\n")
-    if timed_out or process.returncode:
-        raise CommandFailed(observation)
-    return out.strip(), observation
 
 
 def locked_source(lock):
@@ -270,6 +179,16 @@ def main():
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--build-timeout", type=int, default=900)
     args = parser.parse_args()
+    if __name__ == '__main__':
+        # Direct source execution has no project package on its import path.
+        # Run the same self-contained helper; do not alter the global path or
+        # register an alternative plugin namespace in this preparer process.
+        import runpy
+        process = runpy.run_path(str(Path(__file__).resolve().parents[1]
+                                    / 'plugins/friday_rework/runtime_process.py'))
+        for name in ('StopUnconfirmed', 'SAFE_OBSERVATION_FIELDS', 'safe_observation',
+                     'CommandFailed', 'clean_environment', 'run'):
+            globals()[name] = process[name]
     donor = args.donor.absolute()
     if donor != donor.resolve():
         raise ValueError("Refusing symlinked donor path or parent")

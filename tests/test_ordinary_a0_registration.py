@@ -10,6 +10,8 @@ from pathlib import Path
 import time
 
 import pytest
+from scripts.friday_install import _source_runtime_module
+process_runtime = _source_runtime_module('runtime_process')
 from scripts import friday_ordinary_a0_registration as registration
 from scripts import a0_prepare as prep, friday_install as entry, dsh_prepare
 from scripts import a0_runtime as runtime, rootless_docker_launch as launcher
@@ -64,7 +66,7 @@ def receiver(installed, monkeypatch):
         return out,dict(returncode=0,elapsed_seconds=.001,timeout=False,reaped=True,
             stdout_sha256=hashlib.sha256(out.encode()).hexdigest(),stderr_sha256=hashlib.sha256(b'').hexdigest(),
             stdout_bytes=len(out),stderr_bytes=0,reason='command_succeeded')
-    monkeypatch.setattr(dsh_prepare,'run',fake_run)
+    monkeypatch.setattr(process_runtime,'run',fake_run)
     s.before={str(p):p.read_bytes() for p in [s.home/entry.MARKER,s.home/'config.yaml',
               s.home/'FRIDAY-PROFILE.json',s.home/'hermes-agent.source.json',Path(s.request['history'][0]['path'])]}
     return s
@@ -297,7 +299,7 @@ def custody(tmp_path,monkeypatch):
         assert argv[:4]==['/usr/bin/systemctl','--user','show',request['unit']]
         assert kw['deadline']==clock['useful_deadline_mono'] and kw['env'] is runtime.ENV
         return '\n'.join(k+'='+v for k,v in observed.items())+'\n',{}
-    monkeypatch.setattr(dsh_prepare,'run',fake_native)
+    monkeypatch.setattr(process_runtime,'run',fake_native)
     return SimpleNamespace(request=request,clock=clock,proc=proc,root=root,boot=boot,member=member,
                            observed=observed,calls=calls)
 

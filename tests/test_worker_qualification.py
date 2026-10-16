@@ -14,9 +14,12 @@ from types import SimpleNamespace as NS
 
 import pytest
 from scripts import worker_qualification as q, worker_install as workers, friday_install as entry
-from scripts import friday_native as native, a0_runtime as a0, dsh_prepare
+from scripts import friday_native as native, a0_runtime as a0
+from scripts.friday_install import _source_runtime_module
+dsh_prepare = _source_runtime_module('runtime_process')
 from scripts.install_containment import Budget
-from plugins.friday_rework import host_runtime as hr
+import importlib
+hr = importlib.import_module(q.dsh_observe.__module__.rsplit('.', 1)[0] + '.host_runtime')
 from test_native_installer import install_input, native_home as native_scope
 from test_a0_service_install import service
 from test_normal_worker_install import normal, materialized, doc, pin, write
@@ -65,7 +68,7 @@ def installed(normal,monkeypatch):
     s=normal
     s.budget.fixture_boot = entry.partial_claim('f'*64,s.budget)['boot_id']
     monkeypatch.setattr(q,'dsh_safety_observe',safety_observation)
-    from plugins.friday_rework.adapters import dsh as dsh_adapter
+    dsh_adapter = importlib.import_module(hr.__package__ + '.adapters.dsh')
     monkeypatch.setattr(dsh_adapter,'_apparmor_boundary',lambda config,argv:[dsh_adapter._APPARMOR_ENTRY,*argv[1:]])
     s.claim=entry.partial_claim('f'*64,s.budget)
     doc(s.home/entry.MARKER,s.claim)

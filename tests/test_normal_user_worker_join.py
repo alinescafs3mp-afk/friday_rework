@@ -88,7 +88,7 @@ def pending(e,uid='1'):
 
 def fixture_native(e,monkeypatch,uid='1',bad=None):
     """Replace only external native boundaries; exact own producer stays real."""
-    from scripts import worker_qualification as q
+    from friday_admin_controls import runtime_observers as q
     from scripts import a0_runtime as a0
     h=home(e,uid);native=h/join.PLAN
     for name,filename in (('PROFILE_SOURCE','a0_profile.py'),('WEB_SOURCE','a0_web.py')):
@@ -264,7 +264,7 @@ def test_two_users_derive_distinct_original_scoped_inputs_no_keys_or_receipts(no
 
 def test_no_own_a0_producer_preserves_safety_first_attempt_without_worker_effects(normal_env,monkeypatch):
     e=normal_env;pending(e);calls=[]
-    from scripts import worker_qualification as q
+    from friday_admin_controls import runtime_observers as q
     from friday_admin_controls import a0_bootstrap as bootstrap
     def safety(c,home,folder,budget):
         calls.append('no-key-safety');budget.check()

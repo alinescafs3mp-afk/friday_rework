@@ -466,7 +466,7 @@ def deployment_observations(c, proof, original_attempt, folder):
             raise HostUnavailable('worker_native_smoke_unverified')
         urls = [('https://mcp.exa.ai/' if web.profile == 'exa-keyless' else 'https://api.exa.ai/'),*policy['document_probes']]
         checked_network_observation(json.dumps(obs['network']),urls)
-        from scripts.worker_qualification import checked_dsh_safety, DSH_NATIVE_SAFETY
+        from .runtime_observers import checked_dsh_safety, DSH_NATIVE_SAFETY
         safety = obs.get('safety', {})
         checked_dsh_safety(safety.get('report'), c, home)
         if safety.get('specimen_sha256') != hashlib.sha256(DSH_NATIVE_SAFETY.encode()).hexdigest():

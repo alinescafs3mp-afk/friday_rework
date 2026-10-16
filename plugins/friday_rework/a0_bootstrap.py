@@ -309,7 +309,7 @@ class InitialProbe:
 
     def stop(self):
         """Existing stop-only custody survives expiry, revocation and disk errors."""
-        from scripts.dsh_prepare import StopUnconfirmed
+        from .runtime_process import StopUnconfirmed
         errors = []; container = retirement = None
         if self.runtime is not None and self.start_attempted:
             try:
@@ -518,7 +518,7 @@ def installation_probe(product, home, original_attempt, budget, *, verify):
     Ambiguous multi-account installations stay pending rather than inventing
     a recipient. The bounded native phase cannot extend the installer deadline.
     """
-    from scripts.install_containment import Budget
+    from .runtime_containment import Budget
     accounts = product['accounts']
     if len(accounts) != 1:
         raise PrerequisitePending('initial_install_probe_receiving_account_ambiguous')

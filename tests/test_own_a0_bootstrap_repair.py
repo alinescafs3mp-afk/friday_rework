@@ -17,7 +17,7 @@ from scripts import worker_install, worker_qualification as qualification
 from scripts.dsh_prepare import StopUnconfirmed
 from plugins.friday_rework import a0_bootstrap as install_bootstrap, host_runtime as install_hr
 from plugins.friday_rework.adapters.a0_config import KEY_REFERENCES
-from friday_admin_controls import a0_bootstrap as bootstrap, user_worker_join as join
+from friday_admin_controls import a0_bootstrap as bootstrap, user_worker_join as join, host_runtime as hr
 
 
 def installer_transport(s, monkeypatch):
@@ -193,10 +193,11 @@ def test_delayed_container_start_waits_only_for_exact_current_original_owner(nor
 
 
 def test_real_observer_second_runtime_sample_error_remains_initial_owner_uncertainty(normal_env,monkeypatch):
-    original_observer=qualification.a0_observe
+    from friday_admin_controls import runtime_observers as observers
+    original_observer=observers.a0_observe
     e=normal_env;pending(e);calls,_=fixture_native(e,monkeypatch)
-    monkeypatch.setattr(qualification,'a0_observe',original_observer)
-    monkeypatch.setattr(install_hr,'a0_runtime_module',lambda c:e.native_fixture)
+    monkeypatch.setattr(observers,'a0_observe',original_observer)
+    monkeypatch.setattr(hr,'a0_runtime_module',lambda c:e.native_fixture)
     cls=e.native_fixture.Runtime; instances=[]; samples=[]
     ctor=cls.__init__; snapshot=cls.snapshot_container; observe=cls.observe; stop=cls.stop
     def construct(self,*args,**kw):ctor(self,*args,**kw);instances.append(self)

@@ -5,7 +5,9 @@ from pathlib import Path
 import time
 
 import pytest
-from scripts import friday_install as entry, install_containment as custody
+from scripts import friday_install as entry
+from scripts.friday_install import _source_runtime_module
+custody = _source_runtime_module('runtime_containment')
 from test_native_installer import install_input
 
 
@@ -20,7 +22,8 @@ class AdmissionClock(custody.Budget):
 
 def test_required_namespace_refuses_before_home_claim(install_input, tmp_path, monkeypatch):
     path = tmp_path / 'input.json'; entry.publish(path, install_input)
-    from scripts import dsh_prepare
+    from scripts.friday_install import _source_runtime_module
+    dsh_prepare = _source_runtime_module('runtime_process')
     def refuse(*a, **k): raise RuntimeError('required unshare PID capability absent')
     monkeypatch.setattr(dsh_prepare, 'run', refuse)
     with pytest.raises(dsh_prepare.StopUnconfirmed, match='namespace init exit not established'):
@@ -80,7 +83,8 @@ def test_late_replace_is_observation_not_success(tmp_path):
 def test_cleanup_reserve_uses_original_deadline(install_input, tmp_path, monkeypatch):
     from test_installer_lifetime import metadata, native_status
     budget = custody.Budget(30)
-    from scripts import dsh_prepare
+    from scripts.friday_install import _source_runtime_module
+    dsh_prepare = _source_runtime_module('runtime_process')
     calls = []
     def returned(*a, **kw):
         calls.append((a, kw)); native_status(kw, 0)
@@ -97,7 +101,8 @@ def test_cleanup_reserve_uses_original_deadline(install_input, tmp_path, monkeyp
 
 def test_cleanup_deadline_failure_is_stop_unconfirmed(monkeypatch, tmp_path):
     import subprocess
-    from scripts import dsh_prepare
+    from scripts.friday_install import _source_runtime_module
+    dsh_prepare = _source_runtime_module('runtime_process')
     class Process:
         pid = 98765
         def communicate(self, timeout): raise subprocess.TimeoutExpired('synthetic', timeout)
@@ -166,7 +171,8 @@ def test_cli_checks_final_success_after_serialization_and_flush(install_input, t
     def construct(seconds, *, started):
         assert started <= time.monotonic()
         received.append(started); return budget
-    monkeypatch.setattr(custody, 'Budget', construct)
+    from scripts import install_containment as installer_custody
+    monkeypatch.setattr(installer_custody, 'Budget', construct)
     def installed(*a, **kw):
         assert kw['budget'] is budget
         return {'state':'SYNTHETIC_RESULT_OBSERVATION'}
@@ -191,7 +197,8 @@ def test_cli_checks_final_success_after_serialization_and_flush(install_input, t
 
 
 def test_command_return_after_original_deadline_is_refused(install_input, tmp_path, monkeypatch):
-    from scripts import dsh_prepare
+    from scripts.friday_install import _source_runtime_module
+    dsh_prepare = _source_runtime_module('runtime_process')
     from test_installer_lifetime import metadata, native_status
     budget = AdmissionClock(30)
     runner = custody.Containment(install_input['containment'], budget, {})
@@ -209,7 +216,8 @@ def test_actual_cli_preserves_unknown_cessation_and_existing_claim(
         install_input, tmp_path, monkeypatch, capsys, stage, cause):
     from types import SimpleNamespace
     import subprocess
-    from scripts import dsh_prepare
+    from scripts.friday_install import _source_runtime_module
+    dsh_prepare = _source_runtime_module('runtime_process')
     path = tmp_path / 'input.json'; entry.publish(path, install_input)
     starts = []; killed = []; waits = []
     now = time.monotonic()
@@ -261,7 +269,8 @@ def test_untrusted_error_text_cannot_impersonate_stop_status(install_input, tmp_
 
 def test_late_final_output_keeps_attempt_provenance_and_readonly_idempotence(install_input, tmp_path, monkeypatch):
     from test_native_installer import test_whole_finite_composition_and_completed_idempotence_with_native_config as fixture
-    from scripts import dsh_prepare
+    from scripts.friday_install import _source_runtime_module
+    dsh_prepare = _source_runtime_module('runtime_process')
     original_install = entry.install; original_replace = entry.os.replace
     budget = AdmissionClock(1800); home = Path(install_input['home'])
     def install(value, path): return original_install(value, path, budget=budget)

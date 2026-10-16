@@ -3,7 +3,9 @@ import os
 import json
 import pytest
 
-from scripts import dsh_prepare, install_containment as custody
+from scripts.friday_install import _source_runtime_module
+dsh_prepare = _source_runtime_module('runtime_process')
+custody = _source_runtime_module('runtime_containment')
 
 
 def metadata(code=0, timeout=False, reaped=True):

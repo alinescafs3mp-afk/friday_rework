@@ -165,8 +165,8 @@ def checked_plan(home, binding, runtimes):
 def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=None):
     """One explicit owning-host action, reusing both complete native observers."""
     from .onboarding import _new_file
-    from scripts.install_containment import Budget
-    from scripts.worker_qualification import dsh_observe, dsh_safety_observe, a0_observe
+    from .runtime_containment import Budget
+    from .runtime_observers import dsh_observe, dsh_safety_observe, a0_observe
     from hermes_cli import friday_user_scope as scope
     from hermes_cli.config import require_readable_config_before_write
     from .worker_provision import prepare_inputs
@@ -234,7 +234,7 @@ def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=N
             c['runtime_receipt']=pin(Path(c['runtime_receipt']['path']))
         return runtimes
     except BaseException as exc:
-        from scripts.dsh_prepare import StopUnconfirmed
+        from .runtime_process import StopUnconfirmed
         failure={'state':'STOP_UNCONFIRMED' if isinstance(exc,StopUnconfirmed) else 'REFUSED_OR_UNCERTAIN',
             'original_attempt':claim,'retry_authorized':False,'a0_probe_cleanup':'OWN_INITIAL_PROBE_CUSTODY'}
         try: _new_file(folder / 'failure.json',(json.dumps(failure,sort_keys=True)+'\n').encode())

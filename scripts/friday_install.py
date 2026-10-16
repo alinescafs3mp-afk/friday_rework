@@ -29,16 +29,54 @@ FAILURE = 'FRIDAY-INSTALL.failure.json'
 INSTALLED_CLI_QUERY = ('С помощью инструмента read_file прочитай строки 30–34 файла '+str(ROOT/'README.md')+'. Назови три главных компонента архитектуры Пятницы одним предложением по-русски. Ничего не изменяй.')
 
 
+def _source_runtime_module(name):
+    """Share bounded source helpers without claiming native ``plugins``.
+
+    project_plugin still validates every private module against its exact pin.
+    """
+    if name not in ('runtime_primitives', 'runtime_process',
+                    'runtime_containment', 'runtime_observers'):
+        raise ValueError('source_runtime_helper_required')
+    alias = '_friday_install_validation_plugins'
+    if alias not in sys.modules:
+        package = importlib.util.module_from_spec(
+            importlib.machinery.ModuleSpec(alias, loader=None, is_package=True))
+        package.__path__ = [str(ROOT / 'plugins')]
+        sys.modules[alias] = package
+    if list(getattr(sys.modules[alias], '__path__', ())) != [str(ROOT / 'plugins')]:
+        raise ValueError('foreign_validator_package')
+
+    def check_paths():
+        for key, loaded in tuple(sys.modules.items()):
+            if not key.startswith(alias + '.'):
+                continue
+            relative = key[len(alias) + 1:].replace('.', '/')
+            expected = ROOT / 'plugins' / relative
+            expected = (expected / '__init__.py' if getattr(loaded, '__path__', None) is not None
+                        else expected.with_suffix('.py'))
+            if (not getattr(loaded, '__file__', None)
+                    or Path(loaded.__file__).resolve() != expected
+                    or getattr(getattr(loaded, '__spec__', None), 'origin', None) != str(expected)):
+                raise ValueError('foreign_validator_module')
+            if getattr(loaded, '__path__', None) is not None and list(loaded.__path__) != [str(expected.parent)]:
+                raise ValueError('foreign_validator_package')
+    check_paths()
+    module = importlib.import_module(alias + '.friday_rework.' + name)
+    check_paths()
+    return module
+
+
+if __name__ != '__main__':
+    _primitives = _source_runtime_module('runtime_primitives')
+    Refused, require, canonical, owned_file, unique, read_json, digest, pin = (
+        getattr(_primitives, name) for name in
+        ('Refused', 'require', 'canonical', 'owned_file', 'unique', 'read_json', 'digest', 'pin'))
+
 class SafeParser(argparse.ArgumentParser):
     def error(self, message):
         self.exit(2, 'Friday entry refused: phase=arguments reason=invalid_cli_arguments\n')
 
 
-class Refused(ValueError):
-    """A reason supplied by this source, rather than arbitrary exception text."""
-    def __init__(self, reason):
-        self.reason = reason if re.fullmatch('[a-z][a-z0-9_]{0,127}', reason) else 'invalid_input'
-        super().__init__(self.reason)
 
 
 def remember_secondary(exc, secondary):
@@ -99,9 +137,6 @@ def exit_retaining_cause(parser, code, exc, phase):
     raise transfer from exc
 
 
-def require(condition, reason):
-    if not condition:
-        raise Refused(reason)
 
 
 def safe_diagnostic(exc, phase):
@@ -135,54 +170,16 @@ def diagnostic_text(value):
     return ' '.join(parts)
 
 
-def canonical(value):
-    p = Path(value)
-    require(p.is_absolute() and str(p) == value and '..' not in p.parts
-            and p != Path('/') and p.resolve() == p, 'real_absolute_path_required')
-    return p
 
 
-def owned_file(path, *, private=False):
-    p = canonical(str(path))
-    fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        info = os.fstat(fd)
-        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
-                and info.st_nlink == 1
-                and (not private or not info.st_mode & 0o077), 'owned_regular_input_required')
-        with os.fdopen(fd, 'rb', closefd=False) as f:
-            data = f.read(64 * 1024**2 + 1)
-        after = os.fstat(fd)
-        fields = ('st_dev', 'st_ino', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_uid', 'st_nlink')
-        require(len(data) <= 64 * 1024**2 and all(getattr(info, k) == getattr(after, k) for k in fields),
-                'input_changed_or_too_large')
-        return data
-    finally:
-        os.close(fd)
 
 
-def unique(pairs):
-    out = {}
-    for key, value in pairs:
-        require(key not in out, 'duplicate_input_field')
-        out[key] = value
-    return out
 
 
-def read_json(path):
-    return json.loads(owned_file(path, private=True), object_pairs_hook=unique)
 
 
-def digest(data):
-    return hashlib.sha256(data).hexdigest()
 
 
-def pin(value):
-    require(isinstance(value, dict) and set(value) == {'path', 'sha256'}
-            and isinstance(value['sha256'], str)
-            and re.fullmatch('[0-9a-f]{64}', value['sha256']), 'exact_input_pin_required')
-    require(digest(owned_file(value['path'])) == value['sha256'], 'input_pin_changed')
-    return canonical(value['path'])
 
 
 def bootstrap_pin(value):
@@ -4916,6 +4913,11 @@ def main():
     parser.add_argument('--host-source-transition-sha256')
     args = parser.parse_args(); os.umask(0o077)
     sys.path.insert(0, str(ROOT))
+    global Refused, require, canonical, owned_file, unique, read_json, digest, pin
+    primitives = _source_runtime_module('runtime_primitives')
+    Refused, require, canonical, owned_file, unique, read_json, digest, pin = (
+        getattr(primitives, name) for name in
+        ('Refused', 'require', 'canonical', 'owned_file', 'unique', 'read_json', 'digest', 'pin'))
     from scripts.dsh_prepare import StopUnconfirmed
     try:
         runtime_clock = installed_cli_clock() if args.phase in ('installed-cli','repair-installed-cli','repair-frontend-close','repair-native-bootstrap','repair-session-artifact','repair-context-continuation','repair-native-manager','repair-readonly-schema-formatter','repair-current12-readonly-fit','repair-summary-fit','repair-summary-budget','repair-summary-completion','repair-summary-visible') else None
