@@ -327,7 +327,7 @@ def test_malformed_request_has_no_source_admission(installed,fault):
     s=installed;r=copy.deepcopy(s['request']);before=snapshot(s['home'])
     if fault=='not_dict':r=[]
     elif fault=='empty':r={}
-    elif fault=='future_schema':r['schema']='friday.ordinary-telegram-source-update.v26'
+    elif fault=='future_schema':r['schema']='friday.ordinary-telegram-source-update.v27'
     elif fault=='boolean_seconds':r['seconds']=True
     elif fault=='short_seconds':r['seconds']=29
     else:r['seconds']=181
