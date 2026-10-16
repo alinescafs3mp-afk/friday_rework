@@ -8,9 +8,11 @@ from __future__ import annotations
 import copy
 import fcntl
 import json
+import math
 import os
 import re
 import resource
+import time
 from pathlib import Path
 
 from scripts import friday_install as f
@@ -22,6 +24,433 @@ NAMES = {'source': 'dsh-source.json', 'toolchain': 'dsh-toolchain.json',
          'inventory': 'dsh-build-inventory.json', 'a0': 'a0.json'}
 BUILD_FIELDS = {'memory_bytes', 'swap_bytes', 'cpu_percent', 'tasks', 'affinity',
                 'fsize_bytes', 'core_bytes', 'seconds', 'cleanup_seconds'}
+
+KEYLESS_RECOVERY_SCHEMA = 'friday.ordinary-worker-keyless-recovery.v1'
+KEYLESS_RECOVERY_FIELDS = {'schema', 'recovery_id', 'seconds', 'home', 'profile', 'binding',
+    'generation', 'transition', 'installed_input', 'recovery_input', 'root_marker', 'source_receipt',
+    'stamp', 'root_configuration', 'root_profile', 'native_unit', 'onboarding', 'user_marker',
+    'configuration', 'access_state', 'attachment', 'preparations', 'reports', 'history',
+    'failure', 'closed_failure', 'qualification_files'}
+KEYLESS_FAILED_FILES = {'failure.json', 'dsh-safety/inputs/bootstrap.py',
+    'dsh-safety/inputs/web-network.mjs', 'dsh-safety/inputs/web-ca.pem'}
+
+
+def _keyless_request(request):
+    """This operation is a new maintenance transition, never a setup retry."""
+    f.require(type(request) is dict and set(request) == KEYLESS_RECOVERY_FIELDS
+        and request['schema'] == KEYLESS_RECOVERY_SCHEMA
+        and type(request['recovery_id']) is str
+        and re.fullmatch('[A-Za-z0-9_-]{1,64}', request['recovery_id'])
+        and type(request['seconds']) is int and 30 <= request['seconds'] <= 180
+        and type(request['generation']) is int and request['generation'] == 1
+        and request['transition'] == 'NEW_PRODUCT_MAINTENANCE_NO_RUNTIME_AUTHORITY'
+        and type(request['profile']) is str and re.fullmatch('[A-Za-z0-9_-]{1,64}', request['profile'])
+        and request['profile'] != 'default'
+        and type(request['binding']) is dict
+        and request['binding'].get('runtime_profile') == request['profile']
+        and type(request['preparations']) is dict and set(request['preparations']) == {'dsh', 'a0'}
+        and type(request['reports']) is dict and set(request['reports']) == set(NAMES)
+        and type(request['history']) is list
+        and type(request['qualification_files']) is dict
+        and set(request['qualification_files']) == KEYLESS_FAILED_FILES
+        and all(type(sha) is str and re.fullmatch('[0-9a-f]{64}', sha)
+                for sha in request['qualification_files'].values()),
+        'ordinary_keyless_explicit_recovery_request_required')
+
+
+def _keyless_failed_tree(request, profile_home, *, folder=None):
+    """Accept only the demonstrated failure before any native setup branch."""
+    folder = profile_home / 'workers/qualification' if folder is None else folder
+    f.directory(folder)
+    expected_dirs = {'dsh-safety', 'dsh-safety/home', 'dsh-safety/workspace', 'dsh-safety/inputs'}
+    files = {}; directories = {}
+    for path in [folder, *folder.rglob('*')]:
+        f.require(not path.is_symlink(), 'ordinary_keyless_failed_tree_link_refused')
+        relative = str(path.relative_to(folder))
+        if path.is_dir():
+            f.directory(path)
+            st = path.lstat()
+            directories[relative] = tuple(getattr(st, key) for key in
+                ('st_dev', 'st_ino', 'st_uid', 'st_mode'))
+        else:
+            files[relative] = ordinary.update_file_state(path)
+    f.require(set(files) == KEYLESS_FAILED_FILES and set(directories) == {'.'} | expected_dirs
+        and all(row is not None and row['mode'] == (0o600 if name == 'failure.json' else 0o400)
+            and f.digest(row['data']) == request['qualification_files'][name] for name, row in files.items()),
+        'ordinary_keyless_exact_before_native_failure_required')
+    failure = json.loads(files['failure.json']['data'], object_pairs_hook=f.unique)
+    claim = failure.get('original_attempt', {})
+    f.require(set(failure) == {'state', 'original_attempt', 'retry_authorized', 'a0_probe_cleanup'}
+        and failure['state'] == 'REFUSED_OR_UNCERTAIN' and failure['retry_authorized'] is False
+        and failure['a0_probe_cleanup'] == 'OWN_INITIAL_PROBE_CUSTODY'
+        and set(claim) == {'boot_id', 'started_mono', 'deadline_mono', 'budget_seconds'}
+        and type(claim['boot_id']) is str and bool(claim['boot_id'])
+        and type(claim['budget_seconds']) is int and claim['budget_seconds'] == 300
+        and all(type(claim[k]) in (int, float) and math.isfinite(claim[k])
+                for k in ('started_mono', 'deadline_mono'))
+        and claim['started_mono'] >= 0 and claim['deadline_mono'] - claim['started_mono'] == 300
+        and request['failure'] == {'path': str(profile_home / 'workers/qualification/failure.json'),
+            'sha256': request['qualification_files']['failure.json']},
+        'ordinary_keyless_original300_failure_required')
+    closed = f.read_json(f.pin(request['closed_failure']))
+    f.require(closed.get('state') == 'CLOSED_FAILED_FIRST_ORIGINAL300_BEFORE_NATIVE_SCOPE_NO_RETRY'
+        and closed.get('failure') == request['failure'] and closed.get('server_original_attempt') == claim
+        and closed.get('no_retry') is True and closed.get('original_attempt_marker_retained') is True
+        and closed.get('native_DSH_scope_created') is False
+        and closed.get('native_model_or_web_probe_started') is False
+        and closed.get('A0_bootstrap_or_keys_or_native_route_started') is False
+        and closed.get('workers') == 'OFF' and closed.get('worker_runtime_acceptance') is False,
+        'ordinary_keyless_closed_original300_required')
+    for kind in ('dsh', 'a0'):
+        root = profile_home / 'workers' / kind
+        for name in ('jobs', 'staging', 'cache'):
+            path = f.directory(root / name)
+            f.require(not list(path.iterdir()), 'ordinary_keyless_worker_activity_present')
+        for name in ('runtime-receipt.json', 'bootstrap', 'probe-plan.json'):
+            f.require(not os.path.lexists(root / name), 'ordinary_keyless_native_setup_already_started')
+    return {'files': files, 'directories': directories, 'original_attempt': claim}
+
+
+def _keyless_source_inputs(request, home, budget):
+    """Verify the complete installed native identity before importing native code."""
+    source = f.directory(home / 'hermes-agent')
+    original = f.read_json(f.pin(request['installed_input']))
+    value = f.read_json(f.pin(request['recovery_input']))
+    allowed = {'scripts/friday_install.py', 'scripts/friday_worker_preparation.py'}
+    old = original.get('project_files', {}); new = value.get('project_files', {})
+    f.require(request['installed_input'] != request['recovery_input']
+        and {k: v for k, v in original.items() if k != 'project_files'} ==
+            {k: v for k, v in value.items() if k != 'project_files'}
+        and original.get('home') == str(home) and value['product']['runtime'] == {'enabled': False}
+        and set(old) == set(new) and allowed <= set(old)
+        and all(new[k] == sha for k, sha in old.items() if k not in allowed)
+        and all(new[k] != old[k] for k in allowed),
+        'ordinary_keyless_only_reviewed_source_delta_required')
+    _, donors = budget.call(f.spec_checked, value, cli_only=True)
+    marker = f.read_json(f.pin(request['root_marker']))
+    receipt = f.read_json(f.pin(request['source_receipt']))
+    stamp = f.read_json(f.pin(request['stamp']))
+    f.require(marker.get('schema') == f.SCHEMA and marker.get('home') == str(home)
+        and marker.get('source') == str(source) and marker.get('completion_stage') == 'TELEGRAM_ORDINARY'
+        and marker.get('state') == 'INSTALLED_TEMPLATE_INCOMPLETE'
+        and marker.get('runtime_ready') is False
+        and marker.get('worker_state') == 'BOTH_WORKERS_PREPARATION_PENDING'
+        and marker.get('input_sha256') == request['installed_input']['sha256']
+        and marker.get('source_receipt_sha256') == request['source_receipt']['sha256']
+        and receipt.get('schema') == 'friday.hermes-source.v1'
+        and len(receipt.get('files', {})) == 17682 and len(receipt.get('layers', [])) == 77
+        and len(marker.get('plugin_files', {})) == 45 and len(request['history']) == 428
+        and stamp.get('schemaVersion') == 2 and stamp.get('distribution') == 'friday-rework'
+        and stamp.get('payload') == 'bootstrap'
+        and stamp.get('fridaySource') == {'baseTree': receipt.get('base_tree'), 'layers': receipt.get('layers')},
+        'ordinary_keyless_native77_project3_identity_required')
+    budget.call(f.composition_checked, original, source, receipt, donors['hermes'])
+    budget.call(f.composition_checked, value, source, receipt, donors['hermes'])
+    plugins = {k: v for k, v in old.items() if k.startswith('plugins/friday_rework/')}
+    f.require(marker['plugin_files'] == plugins, 'ordinary_keyless_plugin_marker_changed')
+    ordinary.checked_plugin_inventory(home, plugins)
+    for ref in request['history']:
+        path = budget.call(f.pin, ref)
+        f.require(path.is_relative_to(home / 'preparation'), 'ordinary_keyless_foreign_history')
+    for name, ref in request['reports'].items():
+        path = budget.call(f.pin, ref)
+        f.require(path.is_relative_to(home / 'preparation') and path.name == NAMES[name],
+            'ordinary_keyless_foreign_report')
+    for name, sha in marker['profile_files'].items():
+        f.require(f.digest(f.owned_file(home / name, private=True)) == sha,
+            'ordinary_keyless_root_profile_changed')
+    f.native_packages(source)
+    return value, marker, donors
+
+
+def _keyless_admission(request, home, profile_home, config, attachment):
+    """Retain the existing admitted gen1 home and its disabled runtime."""
+    from hermes_cli import friday_user_scope as user, friday_product_access as access
+    from hermes_cli.friday_ordinary_gateway import check
+    from hermes_cli.plugins_state import _plugin_data_namespace
+    from hermes_cli.config import require_readable_config_before_write
+    check(home, role=False)
+    binding = request['binding']; settings = configuration_settings(config)
+    f.require(settings['runtime'] == {'enabled': False}
+        and [b for b in settings['user_isolation']['bindings']
+            if b['runtime_profile'] == request['profile']] == [binding]
+        and f.pin(request['access_state']) == home / 'plugin-data' /
+            _plugin_data_namespace('friday_rework', '') / 'state.json',
+        'ordinary_keyless_root_binding_changed')
+    principal = tuple(binding[k] for k in ('platform', 'transport_profile', 'account_id', 'user_id'))
+    key = access.principal_id(*principal)
+    state = access.validate_access(f.read_json(f.pin(request['access_state']))[access.KEY])
+    row = state['users'].get(key)
+    f.require(row is not None and row['enabled'] is True and row['role'] == 'user'
+        and row['generation'] == request['generation']
+        and tuple(row[k] for k in ('platform', 'transport_profile', 'account_id', 'user_id')) == principal,
+        'ordinary_keyless_original_access_changed')
+    own = require_readable_config_before_write(profile_home / 'config.yaml')
+    own_settings = configuration_settings(own)
+    f.require(own_settings['runtime'] == {'enabled': False} and not own_settings.get('worker_requirements'),
+        'ordinary_keyless_user_workers_must_remain_off')
+    proof = f.read_json(f.pin(request['onboarding']))
+    f.require(proof.get('config_sha256') == request['configuration']['sha256']
+        and proof.get('binding_sha256') == user._fingerprint(binding)
+        and proof.get('authorization_home') == str(home), 'ordinary_keyless_original_proof_changed')
+    user.check_onboarding_home(home, profile_home, binding)
+    info = profile_home.stat()
+    with user.authority(profile_home):
+        user.UserScope(home, profile_home, request['profile'], principal, dict(binding),
+            (info.st_dev, info.st_ino), request['generation']).check()
+    template = settings['onboarding']['templates']['friday-local']
+    f.require(set(attachment) == {'template', 'template_sha256', 'installation_config_sha256',
+        'config_sha256', 'proof', 'marker', 'binding_sha256', 'generation', 'runtimes',
+        'a0_network', 'required_names'} and attachment['template'] == 'friday-local'
+        and attachment['template_sha256'] == user._fingerprint(template)
+        and attachment['installation_config_sha256'] == f.digest(f.owned_file(home / 'config.yaml', private=True))
+        and attachment['config_sha256'] == proof['config_sha256']
+        and attachment['proof'] == request['onboarding'] and attachment['marker'] == request['user_marker']
+        and attachment['binding_sha256'] == user._fingerprint(binding)
+        and attachment['generation'] == request['generation']
+        and set(attachment['runtimes']) == {'dsh', 'a0'}, 'ordinary_keyless_original_attachment_changed')
+    return own
+
+
+def recover_keyless(request, request_path, budget):
+    """One explicit, consumed repair; never qualify, start or enable a worker."""
+    _keyless_request(request)
+    started = time.monotonic()
+    f.require(0 < budget.deadline - started <= request['seconds'],
+        'ordinary_keyless_original_maintenance_deadline_required')
+    # Stop proof and restoration retain ten seconds of the SAME original
+    # maintenance clock. Useful work cannot consume that cleanup allowance.
+    original_budget = budget
+    from scripts.install_containment import Budget
+    budget = Budget(request['seconds'], started=original_budget.deadline - request['seconds'],
+        deadline=original_budget.deadline - 10)
+    home = f.directory(f.canonical(request['home']))
+    f.require(os.environ.get('HERMES_HOME') == str(home), 'ordinary_keyless_exact_environment_required')
+    profile_home = f.directory(home / 'profiles' / request['profile'])
+    parent = f.directory(home / 'preparation')
+    request_path = f.canonical(str(request_path))
+    request_state = ordinary.update_file_state(request_path)
+    f.owned_file(request_path, private=True)
+    f.require(f.read_json(request_path) == request, 'ordinary_keyless_request_changed')
+    paths = {'root_marker': home / f.MARKER, 'source_receipt': home / 'hermes-agent.source.json',
+        'stamp': home / 'hermes-agent/install-stamp.json', 'root_configuration': home / 'config.yaml',
+        'root_profile': home / 'FRIDAY-PROFILE.json', 'onboarding': profile_home / '.friday-onboarding.json',
+        'user_marker': profile_home / '.friday-user-scope.json', 'configuration': profile_home / 'config.yaml',
+        'attachment': profile_home / 'workers/attachment.json'}
+    refs = {k: v for k, v in request.items() if type(v) is dict and set(v) == {'path', 'sha256'}}
+    refs.update({'preparation-' + k: v for k, v in request['preparations'].items()})
+    refs.update({'report-' + k: v for k, v in request['reports'].items()})
+    refs.update({'history-' + str(i): v for i, v in enumerate(request['history'])})
+    pinned = {}
+    for name, ref in refs.items():
+        path = budget.call(f.pin, ref)
+        if name in paths: f.require(path == paths[name], 'ordinary_keyless_exact_paths_required')
+        if name in paths and name not in ('source_receipt', 'stamp'):
+            f.owned_file(path, private=True)
+        if name.startswith('preparation-'):
+            f.require(path == profile_home / 'workers' / name[12:] / 'runtime-input.json',
+                'ordinary_keyless_exact_preparation_path_required')
+        pinned[name] = ordinary.update_file_state(path)
+    f.require(len({ref['path'] for ref in request['history']}) == len(request['history']),
+        'ordinary_keyless_duplicate_history_refused')
+    fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        info = os.fstat(fd); linked = home.lstat()
+        f.require((info.st_dev, info.st_ino) == (linked.st_dev, linked.st_ino),
+            'ordinary_keyless_home_identity_changed')
+        tx = parent / ('ordinary-keyless-recovery-' + request['recovery_id'])
+        f.require(not os.path.lexists(tx), 'ordinary_keyless_recovery_consumed_no_retry')
+        # The failed experiment is a second dedup key, even with a new recovery ID.
+        for previous in parent.glob('ordinary-keyless-recovery-*'):
+            f.directory(previous)
+            intent = f.read_json(previous / 'intent.json')
+            f.require(intent.get('failure') != request['failure'], 'ordinary_keyless_failure_already_consumed')
+        value, marker, donors = _keyless_source_inputs(request, home, budget)
+        from hermes_cli.config import require_readable_config_before_write
+        config = require_readable_config_before_write(home / 'config.yaml')
+        attachment = f.read_json(paths['attachment'])
+        own = _keyless_admission(request, home, profile_home, config, attachment)
+        failed = _keyless_failed_tree(request, profile_home)
+        budget.call(reusable, value, home, request['reports'], donors, budget)
+        from plugins.friday_rework.worker_provision import preparation, prepare_inputs
+        from plugins.friday_rework.user_worker_join import validate_installation_inputs
+        from hermes_cli import friday_user_scope as user
+        declarations = configuration_settings(config)['onboarding']['templates']['friday-local']['worker_inputs']
+        validate_installation_inputs(declarations)
+        target = home / 'harness/friday-web-keyless.mjs'
+        helper_name = 'plugins/friday_rework/adapters/dsh_keyless_web.mjs'
+        helper = f.owned_file(f.ROOT / helper_name)
+        helper_pin = {'path': str(target), 'sha256': value['project_files'][helper_name]}
+        f.require(f.digest(helper) == helper_pin['sha256'] and not os.path.lexists(target)
+            and declarations['workers']['dsh']['dsh']['web']['profile'] == 'exa-keyless'
+            and declarations['workers']['dsh']['dsh']['payload_root'] == str(home / 'harness'),
+            'ordinary_keyless_exact_missing_helper_required')
+        metadata = {}
+        for kind, ref in request['preparations'].items():
+            row, runtime = preparation(profile_home, request['profile'], kind, ref)
+            f.require(runtime == attachment['runtimes'][kind]
+                and row.get('attachment') == request['attachment'] and row['generation'] == request['generation']
+                and row['principal_binding_sha256'] == user._fingerprint(request['binding']),
+                'ordinary_keyless_original_preparation_changed')
+            metadata[kind] = row
+        old_native = declarations['workers']['dsh']['dsh']['native_files']
+        f.require(old_native == attachment['runtimes']['dsh']['dsh']['native_files']
+            and all(row['path'] != str(target) for row in old_native),
+            'ordinary_keyless_original_native_inventory_changed')
+        changed = copy.deepcopy(config)
+        configuration_settings(changed)['onboarding']['templates']['friday-local'][
+            'worker_inputs']['workers']['dsh']['dsh']['native_files'].append(helper_pin)
+        new_attachment = copy.deepcopy(attachment)
+        new_attachment['runtimes']['dsh']['dsh']['native_files'].append(helper_pin)
+        new_attachment['template_sha256'] = user._fingerprint(
+            configuration_settings(changed)['onboarding']['templates']['friday-local'])
+        import hermes_yaml
+        changed_raw = hermes_yaml.safe_dump(changed, allow_unicode=True, sort_keys=False).encode()
+        new_attachment['installation_config_sha256'] = f.digest(changed_raw)
+        attachment_raw = ordinary.encoded(new_attachment)
+        attachment_pin = {'path': str(paths['attachment']), 'sha256': f.digest(attachment_raw)}
+        new_metadata = copy.deepcopy(metadata)
+        for kind, row in new_metadata.items():
+            row['attachment'] = attachment_pin
+            if kind == 'dsh': row['runtime']['dsh']['native_files'].append(helper_pin)
+        updated = copy.deepcopy(marker)
+        updated['input_sha256'] = request['recovery_input']['sha256']
+        updated['ordinary_gateway']['operator_entry'] = {'input': request['recovery_input'],
+            'script': {'path': str(f.ROOT / 'scripts/friday_native.py'),
+                'sha256': value['project_files']['scripts/friday_native.py']}}
+        from hermes_cli.friday_ordinary_gateway import normalized_configuration
+        from hermes_cli.config_effective import _effective
+        updated['ordinary_gateway']['configuration_sha256'] = normalized_configuration(_effective(changed))
+        updated['profile_files']['config.yaml'] = f.digest(changed_raw)
+        payloads = {'config.yaml': changed_raw,
+            str(paths['attachment'].relative_to(home)): attachment_raw,
+            **{str(Path(request['preparations'][kind]['path']).relative_to(home)): ordinary.encoded(row)
+                for kind, row in new_metadata.items()}, f.MARKER: ordinary.encoded(updated),
+            str(target.relative_to(home)): helper}
+        saved = {name: ordinary.update_file_state(home / name) for name in payloads}
+        f.require(saved[str(target.relative_to(home))] is None,
+            'ordinary_keyless_helper_must_be_absent')
+        retained = {path: ordinary.update_file_state(path) for base in (home, profile_home)
+            for path in (base / '.env', base / 'auth.json')}
+        def unchanged(*, published=False):
+            budget.check()
+            f.require(ordinary.same_update_file(request_path, request_state), 'ordinary_keyless_request_changed')
+            affected = set(payloads) if published else set()
+            for name, state in pinned.items():
+                path = Path(refs[name]['path'])
+                if (path.is_relative_to(home) and str(path.relative_to(home)) in affected) or (
+                        published and name == 'failure'): continue
+                f.require(ordinary.same_update_file(path, state), 'ordinary_keyless_pinned_identity_changed')
+            budget.call(f.spec_checked, value, cli_only=True)
+            ordinary.checked_plugin_inventory(home, marker['plugin_files'])
+            f.require(all(ordinary.same_update_file(path, state) for path, state in retained.items()),
+                'ordinary_keyless_credentials_changed')
+        from scripts.dsh_prepare import StopUnconfirmed
+        with ordinary.stopped_consumers(home, request['native_unit'], original_budget) as prove, \
+                ordinary.retained_build_lock(home / 'hermes-agent') as build_prove, \
+                ordinary.retained_first_contact_config_lock(home / 'config.yaml'), \
+                ordinary.retained_first_contact_config_lock(profile_home / 'config.yaml'):
+            unchanged(); prove(); build_prove()
+            f.require(_keyless_failed_tree(request, profile_home) == failed,
+                'ordinary_keyless_failed_tree_identity_changed')
+            f.require(all(ordinary.same_update_file(home / name, before) for name, before in saved.items()),
+                'ordinary_keyless_beforeimage_changed')
+            tx.mkdir(mode=0o700)
+            intent = {'schema': KEYLESS_RECOVERY_SCHEMA, 'state': 'CONSUMED_NO_RETRY',
+                'recovery_id': request['recovery_id'], 'request_sha256': f.digest(request_state['data']),
+                'failure': request['failure'], 'original_attempt': failed['original_attempt'],
+                'maintenance_clock': {'started_mono': started, 'deadline_mono': original_budget.deadline,
+                    'useful_deadline_mono': budget.deadline, 'cleanup_seconds': 10, 'seconds': request['seconds']},
+                'transition': request['transition'], 'runtime_authority': 'NOT_GRANTED',
+                'consumers_started': False, 'workers_enabled': False, 'resume_allowed': False,
+                'archive_mapping': {str(profile_home / 'workers/qualification'): str(tx / 'failed-qualification')},
+                'before': {name: None if row is None else {'sha256': f.digest(row['data']), 'mode': row['mode'],
+                    'identity': list(row['identity'])} for name, row in saved.items()}}
+            ordinary.write(tx / 'intent.json', ordinary.encoded(intent))
+            owned = {}; archived = False
+            try:
+                before_dir = tx / 'before'; before_dir.mkdir(mode=0o700)
+                for name, row in saved.items():
+                    if row is None: continue
+                    ordinary.private_parents(before_dir, name)
+                    ordinary.write(before_dir / name, row['data'], row['mode'])
+                # Keep immutable byte preimages even if a later rollback returns
+                # the original failed tree to its canonical consumed location.
+                failure_before = tx / 'failed-before'; failure_before.mkdir(mode=0o700)
+                for name, row in failed['files'].items():
+                    ordinary.private_parents(failure_before, name)
+                    ordinary.write(failure_before / name, row['data'], row['mode'])
+                ordinary.write(tx / 'before-mapping.json', ordinary.encoded({str(home / name):
+                    str(before_dir / name) for name, row in saved.items() if row is not None}))
+                ordinary.sync_directory(tx); ordinary.sync_directory(parent)
+                unchanged(); prove(); build_prove()
+                folder = profile_home / 'workers/qualification'; archive = tx / 'failed-qualification'
+                f.require(_keyless_failed_tree(request, profile_home) == failed,
+                    'ordinary_keyless_failed_tree_identity_changed')
+                f.require(not os.path.lexists(archive), 'ordinary_keyless_archive_target_occupied')
+                os.rename(folder, archive); archived = True
+                ordinary.sync_directory(folder.parent); ordinary.sync_directory(tx)
+                f.require(_keyless_failed_tree(request, profile_home, folder=archive) == failed,
+                    'ordinary_keyless_archive_identity_changed')
+                # The absent-only helper gets the same exact inode accounting as metadata.
+                order = [str(target.relative_to(home)), *[n for n in payloads if n != str(target.relative_to(home))]]
+                for name in order:
+                    budget.check(); prove(); build_prove()
+                    ordinary.publish_update_file(home / name, payloads[name],
+                        0o400 if saved[name] is None else saved[name]['mode'], saved[name], owned, name)
+                unchanged(published=True)
+                f.require(all(ordinary.same_update_file(home / name, owned[name]) for name in payloads),
+                    'ordinary_keyless_published_identity_changed')
+                _keyless_admission(request, home, profile_home, changed, new_attachment)
+                validate_installation_inputs(configuration_settings(changed)['onboarding']['templates'][
+                    'friday-local']['worker_inputs'])
+                for kind in ('dsh', 'a0'):
+                    ref = reference(Path(request['preparations'][kind]['path']))
+                    row, runtime = preparation(profile_home, request['profile'], kind, ref)
+                    f.require(row == new_metadata[kind] and runtime == new_attachment['runtimes'][kind],
+                        'ordinary_keyless_repaired_preparation_changed')
+                    budget.call(prepare_inputs, profile_home, request['profile'], kind, runtime, own,
+                        a0_network=new_attachment['a0_network'] if kind == 'a0' else None,
+                        tools=request['binding']['tools'])
+                f.require(_keyless_failed_tree(request, profile_home, folder=archive) == failed
+                    and not os.path.lexists(folder), 'ordinary_keyless_archive_identity_changed')
+                prove(); build_prove(); unchanged(published=True)
+                budget.call(f.composition_checked, value, home / 'hermes-agent',
+                    f.read_json(Path(request['source_receipt']['path'])), donors['hermes'])
+                result = {'state': 'REPAIRED_CONSUMERS_STOPPED_WORKERS_OFF_NEW_RUNTIME_NOT_AUTHORIZED',
+                    'ready': False, 'consumers_started': False, 'workers_enabled': False,
+                    'runtime_acceptance': 'NOT_GRANTED', 'new_runtime_authority': 'NOT_GRANTED',
+                    'original_attempt': failed['original_attempt'], 'old_attempt_retry_authorized': False,
+                    'archive_mapping': intent['archive_mapping'], 'recovery_id': request['recovery_id'],
+                    'request_sha256': intent['request_sha256'], 'resume_allowed': False}
+                ordinary.write(tx / 'committed.json', ordinary.encoded(result)); ordinary.sync_directory(tx)
+                return result
+            except BaseException as primary:
+                try:
+                    prove(); build_prove()
+                    ordinary.restore_update_files(home, saved, owned)
+                    if archived:
+                        f.require(not os.path.lexists(folder) and
+                            _keyless_failed_tree(request, profile_home, folder=archive) == failed,
+                            'ordinary_keyless_archive_restore_ownership_changed')
+                        os.rename(archive, folder)
+                        ordinary.sync_directory(folder.parent); ordinary.sync_directory(tx)
+                    ordinary.write(tx / 'failure.json', ordinary.encoded({'state': 'ROLLED_BACK_CONSUMED_NO_RETRY',
+                        'original_attempt': failed['original_attempt'], 'retry_authorized': False,
+                        'runtime_authority': 'NOT_GRANTED', 'diagnostic': f.retained_diagnostic(primary, 'ordinary-keyless-recovery')}))
+                    ordinary.sync_directory(tx)
+                except BaseException as secondary:
+                    f.remember_secondary(primary, secondary)
+                    raise StopUnconfirmed('ordinary keyless recovery ownership/rollback requires reconciliation') from primary
+                raise
+    except f.Refused as exc:
+        if exc.reason == 'ordinary_update_native_lock_release_unconfirmed':
+            from scripts.dsh_prepare import StopUnconfirmed
+            raise StopUnconfirmed('ordinary keyless recovery native custody release requires reconciliation') from exc
+        raise
+    finally:
+        os.close(fd)
 
 
 def build_settings(value):

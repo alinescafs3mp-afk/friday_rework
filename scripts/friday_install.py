@@ -4905,7 +4905,7 @@ def cli_ordinary_job_consumed(home, request, clock):
 def main():
     started = time.monotonic()  # before parser/input IO; never reset on dispatch
     parser = SafeParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'qualify', 'activate-telegram', 'update-telegram', 'prepare-ordinary-workers', 'register-ordinary-a0', 'start-telegram', 'rollback-telegram', 'reconcile', 'resume-harness', 'resume-cli', 'continue-cli-segment', 'installed-cli', 'repair-installed-cli', 'repair-frontend-close', 'repair-native-bootstrap', 'repair-session-artifact', 'repair-context-continuation','repair-native-manager','repair-readonly-schema-formatter','repair-current12-readonly-fit','repair-summary-fit','repair-summary-budget','repair-summary-completion','repair-summary-visible'))
+    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'qualify', 'activate-telegram', 'update-telegram', 'prepare-ordinary-workers', 'recover-ordinary-worker-keyless', 'register-ordinary-a0', 'start-telegram', 'rollback-telegram', 'reconcile', 'resume-harness', 'resume-cli', 'continue-cli-segment', 'installed-cli', 'repair-installed-cli', 'repair-frontend-close', 'repair-native-bootstrap', 'repair-session-artifact', 'repair-context-continuation','repair-native-manager','repair-readonly-schema-formatter','repair-current12-readonly-fit','repair-summary-fit','repair-summary-budget','repair-summary-completion','repair-summary-visible'))
     parser.add_argument('--input', required=True, type=Path, help='Private pinned JSON, no credential values')
     parser.add_argument('--a0-plan', type=Path, help='Existing owned live native probe plan; never a readiness report')
     parser.add_argument('--a0-plan-sha256')
@@ -4950,6 +4950,9 @@ def main():
         elif args.phase == 'prepare-ordinary-workers':
             from scripts.friday_ordinary_install import prepare_workers
             result = prepare_workers(value,args.input,budget)
+        elif args.phase == 'recover-ordinary-worker-keyless':
+            from scripts.friday_worker_preparation import recover_keyless
+            result = recover_keyless(value,args.input,budget)
         elif args.phase == 'register-ordinary-a0':
             from scripts.friday_ordinary_a0_registration import register
             result = register(value,args.input,clock=runtime_clock)
