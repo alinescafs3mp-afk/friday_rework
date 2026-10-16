@@ -114,6 +114,113 @@ def execute(s):
     return ordinary.prepare_workers(s.request, s.request_path, Budget(300))
 
 
+def configured_web_profile(s, profile):
+    old = entry.read_json(Path(s.request['current_input']['path']))
+    old['product']['web']['profile'] = s.value['product']['web']['profile'] = profile
+    s.request['current_input'] = doc(s.deploy / 'current-input.json', old)
+    s.request['preparation_input'] = doc(s.deploy / 'new-input.json', s.value)
+    marker = entry.read_json(s.home / entry.MARKER)
+    marker['input_sha256'] = s.request['current_input']['sha256']
+    s.request['marker'] = doc(s.home / entry.MARKER, marker)
+    doc(s.request_path, s.request)
+
+
+@pytest.mark.parametrize('profile', ['exa-keyless', 'exa-paid'])
+def test_exact_keyless_extra_is_staged_after_intact_checks_before_declarations(installed, monkeypatch, profile):
+    s = installed; configured_web_profile(s, profile)
+    before = {Path(ref['path']): Path(ref['path']).read_bytes() for ref in s.request['reports'].values()}
+    from scripts.dsh_prepare import build_inventory
+    inventory = build_inventory(s.home / 'harness')
+    target = s.home / 'harness/friday-web-keyless.mjs'
+    checked = []; staged = []; real_product = workers.prepared_product; real_stage = entry.stage_keyless_provider
+    def product(*args, **kwargs):
+        assert not target.exists()
+        checked.append(True)
+        return real_product(*args, **kwargs)
+    def stage(harness):
+        assert profile == 'exa-keyless' and len(checked) == 2
+        staged.append(True)
+        return real_stage(harness)
+    monkeypatch.setattr(workers, 'prepared_product', product)
+    monkeypatch.setattr(entry, 'stage_keyless_provider', stage)
+    result = execute(s)
+    declarations = prep.configuration_settings(yaml.safe_load((s.home / 'config.yaml').read_text()))[
+        'onboarding']['templates']['friday-local']['worker_inputs']
+    native = declarations['workers']['dsh']['dsh']['native_files']
+    extra = [ref for ref in native if ref['path'] == str(target)]
+    assert len(checked) == 2 and len(staged) == len(extra) == int(profile == 'exa-keyless')
+    assert len(native) == inventory['file_count'] + len(extra)
+    if extra:
+        assert extra == [pin(target)]
+        assert target.read_bytes() == entry.owned_file(entry.ROOT / 'plugins/friday_rework/adapters/dsh_keyless_web.mjs')
+        assert target.stat().st_mode & 0o777 == 0o400
+    else: assert not target.exists()
+    assert build_inventory(s.home / 'harness') == inventory
+    assert all(path.read_bytes() == data for path, data in before.items())
+    assert result['reports'] == s.request['reports'] and result['ready'] is False
+    assert result['runtime_enabled'] is False and result['runtime_acceptance'] == 'NOT_GRANTED'
+    assert prep.configuration_settings(yaml.safe_load((s.home / 'config.yaml').read_text()))['runtime'] == {'enabled': False}
+    assert not (s.home / 'workers').exists() and not s.calls
+
+
+@pytest.mark.parametrize('case', ['file', 'symlink', 'staging-failure', 'source-sha', 'staged-drift'])
+def test_keyless_stage_refuses_collision_failure_and_drift_without_publication(installed, monkeypatch, case):
+    s = installed; configured_web_profile(s, 'exa-keyless')
+    before = {name: (s.home / name).read_bytes() for name in ('config.yaml', entry.MARKER)}
+    target = s.home / 'harness/friday-web-keyless.mjs'; foreign = s.deploy / 'foreign-keyless.mjs'
+    foreign.write_bytes(b'foreign source must survive')
+    real_stage = entry.stage_keyless_provider
+    def stage(harness):
+        if case == 'file': target.write_bytes(foreign.read_bytes())
+        elif case == 'symlink': target.symlink_to(foreign)
+        elif case == 'staging-failure': raise OSError('synthetic staging failure')
+        result = real_stage(harness)
+        if case == 'source-sha': result['sha256'] = 'f' * 64
+        elif case == 'staged-drift': target.chmod(0o600); target.write_bytes(b'changed after exclusive staging')
+        return result
+    monkeypatch.setattr(entry, 'stage_keyless_provider', stage)
+    with pytest.raises((ValueError, OSError)): execute(s)
+    assert all((s.home / name).read_bytes() == data for name, data in before.items())
+    assert foreign.read_bytes() == b'foreign source must survive'
+    if case == 'file': assert target.read_bytes() == foreign.read_bytes()
+    elif case == 'symlink': assert target.is_symlink() and target.resolve() == foreign
+    elif case == 'staging-failure': assert not target.exists()
+    tx = next((s.home / 'preparation').glob('ordinary-workers-*'))
+    assert entry.read_json(tx / 'failure.json')['resume_allowed'] is False
+    with pytest.raises(ValueError, match='consumed_no_retry'): execute(s)
+    assert not (s.home / 'workers').exists() and not s.calls
+
+
+def test_second_native_validation_still_refuses_output_drift_before_keyless_stage(installed, monkeypatch):
+    s = installed; configured_web_profile(s, 'exa-keyless')
+    before = (s.home / 'config.yaml').read_bytes()
+    real_product = workers.prepared_product; calls = []
+    def product(*args, **kwargs):
+        result = real_product(*args, **kwargs); calls.append(True)
+        (s.home / 'harness/apps/cli/lib/bin.js').write_bytes(b'changed native output')
+        return result
+    monkeypatch.setattr(workers, 'prepared_product', product)
+    monkeypatch.setattr(entry, 'stage_keyless_provider', s.no_native)
+    with pytest.raises(ValueError, match='harness_generated_build_changed'): execute(s)
+    assert len(calls) == 1 and (s.home / 'config.yaml').read_bytes() == before
+    assert not (s.home / 'harness/friday-web-keyless.mjs').exists() and not s.calls
+
+
+def test_keyless_pending_host_maintenance_preserves_unstaged_reusable_donor(installed, monkeypatch):
+    s = installed; configured_web_profile(s, 'exa-keyless'); s.hosts_live = True
+    before = {name: (s.home / name).read_bytes() for name in ('config.yaml', entry.MARKER)}
+    reports = {Path(ref['path']): Path(ref['path']).read_bytes() for ref in s.request['reports'].values()}
+    monkeypatch.setattr(entry, 'stage_keyless_provider', s.no_native)
+    result = execute(s)
+    assert result['state'] == 'PENDING_NATIVE_HOST_MAINTENANCE_REQUIRED'
+    assert not (s.home / 'harness/friday-web-keyless.mjs').exists()
+    assert all((s.home / name).read_bytes() == data for name, data in before.items())
+    assert all(path.read_bytes() == data for path, data in reports.items())
+    donors = {row['id']: row for row in entry.read_json(Path(s.value['sources_lock']['path']))['repositories']}
+    prep.reusable(s.value, s.home, s.request['reports'], donors, Budget(300))
+    assert result['reports'] == s.request['reports'] and result['ready'] is False and not s.calls
+
+
 def test_explicit_build_tasks256_preserves_runtime_tasks64(installed):
     s = installed; runtime = copy.deepcopy(s.value['worker_install'])
     assert prep.build_settings(copy.deepcopy(BUILD)) == BUILD

@@ -259,6 +259,7 @@ def prepare(request, request_path, budget):
     tx = parent / ('ordinary-workers-' + request['request_id'])
     f.require(not os.path.lexists(tx), 'ordinary_worker_attempt_consumed_no_retry')
     reports = copy.deepcopy(request['reports'])
+    staged_native_files = []
     reusable(value, home, reports, donors, budget)
     def verify():
         budget.check()
@@ -271,6 +272,7 @@ def prepare(request, request_path, budget):
         budget.call(f.spec_checked, value)
         ordinary.checked_plugin_inventory(home, marker['plugin_files'])
         staged_sources(value, home, budget)
+        for ref in staged_native_files: budget.call(f.pin, ref)
     fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -287,25 +289,37 @@ def prepare(request, request_path, budget):
                                          build_resources=request['build_resources'])
             from scripts.worker_install import prepared_product
             product, evidence = budget.call(prepared_product, value, home, budget, preparation=reports)
-            from plugins.friday_rework.user_worker_join import installation_inputs, validate_installation_inputs
-            declarations = validate_installation_inputs(installation_inputs(product['runtime']))
-            f.require(set(declarations['workers']) == {'dsh', 'a0'} and
-                      declarations['source_scope'] == {'home': str(home), 'profile': value['product']['profile']},
-                      'ordinary_worker_both_declarations_required')
             verify()
-            # Recheck policy, report identities and all native bytes at publication.
+            # Finish intact donor/build checks before adding the product-only
+            # keyless source; it is not part of the native build inventory.
             budget.call(prepared_product, value, home, budget, preparation=reports)
-            changed = copy.deepcopy(config)
-            configuration_settings(changed)['onboarding']['templates']['friday-local']['worker_inputs'] = declarations
-            updated = copy.deepcopy(marker)
-            updated['input_sha256'] = request['preparation_input']['sha256']
-            updated['ordinary_gateway']['operator_entry'] = {
-                'input': request['preparation_input'], 'script': {'path': str(f.ROOT / 'scripts/friday_native.py'),
-                'sha256': value['project_files']['scripts/friday_native.py']}}
-            from hermes_cli.friday_ordinary_gateway import normalized_configuration
-            from hermes_cli.config_effective import _effective
-            updated['ordinary_gateway']['configuration_sha256'] = normalized_configuration(_effective(changed))
-            pending = publish_declarations(request, home, tx, changed, updated, budget, verify)
+            def declaration_files():
+                # Pending host maintenance must leave the donor reusable. Stage
+                # only under the same stop/config locks as declaration writes.
+                if product['web']['profile'] == 'exa-keyless':
+                    keyless = budget.call(f.stage_keyless_provider, home / 'harness')
+                    f.require(keyless['sha256'] == value['project_files'][
+                        'plugins/friday_rework/adapters/dsh_keyless_web.mjs'],
+                        'ordinary_worker_keyless_source_changed')
+                    staged_native_files.append({k: keyless[k] for k in ('path', 'sha256')})
+                    product['runtime']['workers']['dsh']['dsh']['native_files'].extend(staged_native_files)
+                from plugins.friday_rework.user_worker_join import installation_inputs, validate_installation_inputs
+                declarations = validate_installation_inputs(installation_inputs(product['runtime']))
+                f.require(set(declarations['workers']) == {'dsh', 'a0'} and
+                          declarations['source_scope'] == {'home': str(home), 'profile': value['product']['profile']},
+                          'ordinary_worker_both_declarations_required')
+                changed = copy.deepcopy(config)
+                configuration_settings(changed)['onboarding']['templates']['friday-local']['worker_inputs'] = declarations
+                updated = copy.deepcopy(marker)
+                updated['input_sha256'] = request['preparation_input']['sha256']
+                updated['ordinary_gateway']['operator_entry'] = {
+                    'input': request['preparation_input'], 'script': {'path': str(f.ROOT / 'scripts/friday_native.py'),
+                    'sha256': value['project_files']['scripts/friday_native.py']}}
+                from hermes_cli.friday_ordinary_gateway import normalized_configuration
+                from hermes_cli.config_effective import _effective
+                updated['ordinary_gateway']['configuration_sha256'] = normalized_configuration(_effective(changed))
+                return changed, updated
+            pending = publish_declarations(request, home, tx, declaration_files, budget, verify)
             from scripts.a0_prepare import service_plan
             plan = service_plan(dict(value, product=product), home)
             absent = [plan[k] for k in ('launcher', 'unit_source', 'registration') if not os.path.lexists(plan[k])]
@@ -333,7 +347,7 @@ def prepare(request, request_path, budget):
         os.close(fd)
 
 
-def publish_declarations(request, home, tx, changed, updated, budget, verify):
+def publish_declarations(request, home, tx, declaration_files, budget, verify):
     """The live boot identity is immutable. Publish only under native stop locks."""
     from hermes_cli.config import config_write_transaction
     entered = False
@@ -342,6 +356,8 @@ def publish_declarations(request, home, tx, changed, updated, budget, verify):
             entered = True
             # The config writer lock is held only for this finite publication.
             with config_write_transaction(home / 'config.yaml'):
+                verify(); prove()
+                changed, updated = declaration_files()
                 verify(); prove()
                 saved = {name: ordinary.update_file_state(home / name) for name in ('config.yaml', f.MARKER)}
                 f.require(all(f.digest(row['data']) == request['configuration' if name == 'config.yaml' else 'marker']['sha256']
