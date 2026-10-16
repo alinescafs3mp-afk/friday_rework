@@ -52,7 +52,7 @@ def locked_source(lock):
     return source
 
 
-def verify_source(donor, source):
+def verify_source(donor, source, *, keyless_helper=None):
     if donor.is_symlink() or (donor / ".git").is_symlink() or not (donor / ".git").is_dir():
         raise ValueError("An independent, non-symlink donor checkout is required")
     for name in ("index.lock", "HEAD.lock", "config.lock", "shallow.lock"):
@@ -88,7 +88,34 @@ def verify_source(donor, source):
             index[name] = (mode, blob)
     if index != expected:
         raise ValueError("Donor index differs from pinned HEAD")
-    if git("ls-files", "--others", "--exclude-standard", "-z"):
+    # Only the explicitly pinned, shipped generated helper may extend this
+    # donor. Default callers retain the original complete untracked-source guard.
+    helper_state = None
+    if keyless_helper is not None:
+        target = donor / 'friday-web-keyless.mjs'
+        if (type(keyless_helper) is not dict or set(keyless_helper) != {'path', 'sha256'}
+                or keyless_helper.get('path') != str(target) or not donor.is_absolute()
+                or donor.resolve() != donor or type(keyless_helper.get('sha256')) is not str
+                or not re.fullmatch('[0-9a-f]{64}', keyless_helper['sha256'])):
+            raise ValueError('Explicit fixed pinned keyless helper required')
+        from scripts.friday_install import owned_file
+        shipped = Path(__file__).resolve().parents[1] / 'plugins/friday_rework/adapters/dsh_keyless_web.mjs'
+        if hashlib.sha256(owned_file(shipped)).hexdigest() != keyless_helper['sha256']:
+            raise ValueError('Declared keyless helper differs from shipped source')
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as stream:
+            before = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                    or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o400):
+                raise ValueError('Owned immutable single-link keyless helper required')
+            data = stream.read(64 * 1024**2 + 1)
+            fields = ('st_dev', 'st_ino', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_uid', 'st_nlink')
+            helper_state = tuple(getattr(before, name) for name in fields)
+            if (len(data) > 64 * 1024**2 or hashlib.sha256(data).hexdigest() != keyless_helper['sha256']
+                    or helper_state != tuple(getattr(os.fstat(stream.fileno()), name) for name in fields)):
+                raise ValueError('Pinned keyless helper changed')
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z")
+    if untracked and (keyless_helper is None or untracked != 'friday-web-keyless.mjs\0'):
         raise ValueError("Unexpected untracked donor source; refusing build/startup")
     # Dotenv files are commonly ignored, but the native launcher loads them.
     for path in donor.glob(".env*"):
@@ -119,6 +146,12 @@ def verify_source(donor, source):
                     or b"\n" in data.replace(b"\r\n", b"") or canonical_blob != blob):
                 raise ValueError(f"Source blob differs from pin: {name}")
             crlf_paths.append(name)
+    if helper_state is not None:
+        current = (donor / 'friday-web-keyless.mjs').lstat()
+        if helper_state != tuple(getattr(current, name) for name in fields):
+            raise ValueError('Pinned keyless helper identity changed')
+    # Preserve the recorded base donor identity. The caller retains the separate
+    # explicit extension evidence; it is never folded into historical reports.
     return {"commit": head, "tree": tree, "tracked_clean": True,
             "tracked_blob_and_git_mode_count": len(expected), "index_matches_head": True,
             "unexpected_source_and_root_env_refused": True,
