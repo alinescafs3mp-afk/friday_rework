@@ -2380,7 +2380,10 @@ def rebind_inference(request, request_path, budget):
         inference_private_reasoning(user_cfg)
         required=list(proof['required_secrets'])
         if 'FRIDAY_COMPRESSION_API_KEY' not in required: required.append('FRIDAY_COMPRESSION_API_KEY')
-        validate_template(dict(new_template,config=user_cfg,required_secrets=required))
+        # Existing profiles may have additional, already admitted capabilities
+        # (for example the scoped browser). The native edit validator below
+        # checks the complete candidate against that profile's current binding;
+        # the base template's tools are not its authorization inventory.
         prepared=prepare_admin_config_edit(profile_home,user_cfg,required_secrets=required)
         f.require(prepared is not None and prepared['marker'] is not None,
             'ordinary_rebind_existing_admitted_onboarding_required')

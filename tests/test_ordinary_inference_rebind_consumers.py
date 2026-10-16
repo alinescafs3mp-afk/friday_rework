@@ -139,6 +139,53 @@ def reseal_changed_fixture(case,cfg,usercfg=None,proof=None):
     write(case.path,json.dumps(case.request))
 
 
+def admitted_browser_fixture(case, *, granted=True, private_urls=False):
+    """An existing native browser grant, independent of the base template."""
+    cfg=yaml.safe_load((case.home/'config.yaml').read_bytes())
+    usercfg=yaml.safe_load((case.user/'config.yaml').read_bytes())
+    binding=cfg['plugins']['entries']['friday_rework']['settings']['user_isolation']['bindings'][0]
+    if granted:
+        binding['tools']=sorted(set(binding['tools']) | users.BROWSER_TOOLS)
+    usercfg['browser']=copy.deepcopy(users.BROWSER_LOCAL_CONFIG)
+    usercfg['browser']['allow_private_urls']=private_urls
+    usercfg['toolsets'].append(users.BROWSER_TOOLSET)
+    for values in usercfg['platform_toolsets'].values():
+        if users.BROWSER_TOOLSET not in values:values.append(users.BROWSER_TOOLSET)
+    proof=json.loads((case.user/users.ONBOARDING).read_bytes())
+    proof['binding_sha256']=users._fingerprint(binding)
+    marker=json.loads((case.user/users.MARKER).read_bytes())
+    marker['binding_sha256']=proof['binding_sha256']
+    write(case.user/users.MARKER,json.dumps(marker))
+    reseal_changed_fixture(case,cfg,usercfg,proof)
+    case.before={n:(case.home/n).read_bytes() for n in case.request['before']}
+    return binding,copy.deepcopy(usercfg['browser'])
+
+
+def test_rebind_preserves_existing_browser_grant_outside_base_template(case):
+    binding,browser=admitted_browser_fixture(case)
+    root_before=yaml.safe_load((case.home/'config.yaml').read_bytes())
+    templates=root_before['plugins']['entries']['friday_rework']['settings']['onboarding']['templates']
+    assert not set(templates['friday-local']['tools']) & users.BROWSER_TOOLS
+    run(case)
+    cfg=yaml.safe_load((case.home/'config.yaml').read_bytes())
+    usercfg=yaml.safe_load((case.user/'config.yaml').read_bytes())
+    assert cfg['plugins']['entries']['friday_rework']['settings']['user_isolation']['bindings']==[binding]
+    assert usercfg['browser']==browser==users.BROWSER_LOCAL_CONFIG
+    users.validate_browser_config(usercfg,binding['tools'],platform='telegram')
+    assert usercfg['model']['default']=='synthetic-spark'
+    assert usercfg['auxiliary']['compression']['model']=='dispatcher'
+    with users.authority(case.home):
+        users.check_onboarding_home(case.home,case.user,binding)
+
+
+@pytest.mark.parametrize('granted,private_urls',[(False,False),(True,True)])
+def test_rebind_refuses_ungranted_or_widened_browser_before_publication(case,granted,private_urls):
+    admitted_browser_fixture(case,granted=granted,private_urls=private_urls)
+    with pytest.raises(users.ScopeDenied):run(case)
+    assert not case.tx.exists()
+    assert_restored(case)
+
+
 def remove_legacy_missing_privacy_flags(cfg):
     cfg.get('display',{}).pop('show_reasoning',None)
     cfg.get('display',{}).get('platforms',{}).get('telegram',{}).pop('show_reasoning',None)
