@@ -831,11 +831,11 @@ def test_closed_partial_failure_restores_original_tree_and_marker_then_deduplica
             return sync(p)
         monkeypatch.setattr(ordinary, 'sync_directory', fail)
     else:
-        write = ordinary.write
+        publish = ordinary.publish_update_file
         def fail(p, *a, **kw):
             if p == s.tx / 'committed.json': raise OSError('synthetic commit failure')
-            return write(p, *a, **kw)
-        monkeypatch.setattr(ordinary, 'write', fail)
+            return publish(p, *a, **kw)
+        monkeypatch.setattr(ordinary, 'publish_update_file', fail)
     with pytest.raises(OSError, match='synthetic'): reconcile(s)
     after = snapshot(s.home)
     assert all(after[n] == row for n, row in s.before.items())

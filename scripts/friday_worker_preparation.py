@@ -215,7 +215,7 @@ def _keyless_admission(request, home, profile_home, config, attachment):
 
 def recover_keyless(request, request_path, budget):
     """One explicit, consumed repair; never qualify, start or enable a worker."""
-    if type(request) is dict and request.get('schema') == CLOSED_RECOVERY_SCHEMA:
+    if type(request) is dict and request.get('schema') in (CLOSED_RECOVERY_SCHEMA, CLOSED_CURRENT_SCHEMA):
         return reconcile_closed(request, request_path, budget)
     _keyless_request(request)
     started = time.monotonic()
@@ -833,9 +833,315 @@ CLOSED_FAILED_FILES = {'failure.json', 'dsh-safety/control/parent-secret',
 CLOSED_RECOVERY_FIELDS = (KEYLESS_RECOVERY_FIELDS - {'schema', 'qualification_files'}) | {
     'schema', 'qualification_tree', 'native_cessation', 'original_clock',
     'diagnostic_correction', 'source_acceptance', 'maintenance_source', 'admission', 'keyless_ancestry'}
+CLOSED_CURRENT_SCHEMA = 'friday.ordinary-closed-worker-reconciliation.v2'
+# This successor admits only the reviewed Source85 product after final binding. Neither a
+# scalar count nor a caller-supplied receipt substitutes for its pinned lineage.
+CLOSED_CURRENT_UPDATE_SHA = 'f7809de47b0f654cf3a18f04cbb6411f0af3fe4f2babaec8dd44df7ab7b2d438'
+CLOSED_CURRENT_INPUT_SHA = '2c08186aa921614a2e77ffd3efbeb5a135671f1f98d8a010cdefbd7902f2eda0'
+CLOSED_DIAGNOSTIC_SOURCE_SHA = '3bc8de8bff973b2e782cd4157fba97178d0b960d4a7bf88ae978492e845bd9e8'
 
 
-def _closed_tree_state(folder, names, *, control):
+def _closed_current_source(request, home, receipt, budget):
+    """Read the complete committed update chain; never dispatch an update."""
+    f.require(CLOSED_CURRENT_UPDATE_SHA is not None and CLOSED_CURRENT_INPUT_SHA is not None,
+        'ordinary_closed_current_source85_final_binding_required')
+    reference = request['current_update']
+    f.require(reference['sha256'] == CLOSED_CURRENT_UPDATE_SHA
+        and request['installed_input']['sha256'] == CLOSED_CURRENT_INPUT_SHA,
+        'ordinary_closed_exact_current_update_required')
+    update = f.read_json(f.pin(reference))
+    f.require(update.get('schema') == 'friday.ordinary-telegram-source-update.v39'
+        and update.get('home') == str(home)
+        and update.get('current_input') == request['installed_input']
+        and update.get('configuration') == request['root_configuration']
+        and update.get('profile') == request['root_profile']
+        and update.get('native_unit') == request['native_unit'],
+        'ordinary_closed_current_update_binding_changed')
+    expected = {str(Path(row['path']).relative_to(home)): row['sha256'] for row in request['history']}
+    history = budget.call(ordinary.update_history, home, expected, reference)
+    tx = home / 'preparation' / ('ordinary-source-update-' + update['previous_input']['sha256'])
+    committed = f.read_json(tx / 'committed.json')
+    f.require(committed.get('current_input') == request['installed_input']
+        and committed.get('source_receipt_sha256') == request['source_receipt']['sha256'],
+        'ordinary_closed_current_receipt_changed')
+    # This existing validator pins current profile/proof/scope and credentials;
+    # the historical worker attachment is checked separately against beforeimages.
+    budget.call(ordinary.checked_source82_retained, home, update)
+    return history
+
+
+def _closed_current_readonly_home(home):
+    """Refuse native config initialization/backup work at this archive boundary."""
+    f.require(not any(name in os.environ for name in ('HERMES_HOME_MODE', 'HERMES_UID', 'HERMES_GID')),
+        'ordinary_closed_current_native_ownership_override_refused')
+    from hermes_cli import config
+    from hermes_cli.config_backups import list_config_backups, _LEGACY_SIBLING_GLOBS
+    for path in (home, *(home / name for name in config._HERMES_HOME_SUBDIRS)):
+        f.directory(path)
+        f.require(stat.S_IMODE(path.lstat().st_mode) == 0o700,
+            'ordinary_closed_current_native_mode_repair_refused')
+    # Native backups keep their existing group modes inside the private home.
+    for path in (home / 'backups', home / 'backups/config'):
+        info = path.lstat()
+        f.require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+            and not (info.st_mode & 0o002), 'ordinary_closed_current_backup_directory_refused')
+    soul = f.owned_file(home / 'SOUL.md', private=True).decode('utf-8-sig')
+    f.require(not config.is_legacy_template_soul(soul), 'ordinary_closed_current_soul_seed_refused')
+    path = home / 'config.yaml'; raw = f.owned_file(path, private=True)
+    f.require(not any(list(home.glob(pattern)) for pattern in _LEGACY_SIBLING_GLOBS),
+        'ordinary_closed_current_backup_sweep_refused')
+    backups = list_config_backups(path, 'good')
+    f.require(bool(backups) and f.owned_file(backups[0], private=True) == raw,
+        'ordinary_closed_current_backup_write_refused')
+
+
+def _closed_current_admission(request, home, profile_home, config, attachment, history):
+    """Check current authority and the separately retained original preparations.
+
+    Caller contract: the exact Source85 current-update request, its retained
+    current files and complete committed lineage have already passed their
+    existing validators. ``history`` is the relative-home -> SHA256 mapping
+    returned by ordinary.update_history(), including the current Source85
+    transaction. Revalidate that lineage before every subsequent call.
+
+    The return value is the ORIGINAL own configuration for prepare_inputs().
+    It is never installed, substituted for current authority, or used to grant
+    runtime readiness. Both calls before and after publication are read-only.
+    """
+    from hermes_cli import friday_user_scope as user, friday_product_access as access
+    from hermes_cli.friday_ordinary_gateway import check
+    from hermes_cli.plugins_state import _plugin_data_namespace
+    from hermes_cli.config import fast_safe_load
+
+    f.require(request['schema'] == CLOSED_CURRENT_SCHEMA
+        and type(history) is dict and type(request['generation']) is int
+        and request['generation'] == 1,
+        'ordinary_closed_current_admission_required')
+
+    def checked_bytes(reference, expected):
+        path = f.pin(reference)
+        f.require(path == expected, 'ordinary_closed_current_exact_path_required')
+        raw = f.owned_file(path, private=True)
+        f.require(f.digest(raw) == reference['sha256'],
+            'ordinary_closed_current_pinned_bytes_changed')
+        return raw
+
+    def checked_config(reference, expected):
+        raw = checked_bytes(reference, expected)
+        try:
+            parsed = fast_safe_load(raw.decode('utf-8-sig'))
+        except Exception:
+            raise f.Refused('ordinary_closed_current_config_unreadable') from None
+        f.require(type(parsed) is dict and bool(parsed),
+            'ordinary_closed_current_config_mapping_required')
+        return parsed
+
+    current_refs = {
+        'root_configuration': home / 'config.yaml',
+        'configuration': profile_home / 'config.yaml',
+        'onboarding': profile_home / '.friday-onboarding.json',
+        'user_marker': profile_home / '.friday-user-scope.json',
+        'attachment': profile_home / 'workers/attachment.json',
+        'access_state': home / 'plugin-data' /
+            _plugin_data_namespace('friday_rework', '') / 'state.json',
+    }
+    # Do not accept caller-supplied parsed data that differs from its current
+    # explicit pin. No archived configuration is passed to current authority.
+    current_root = checked_config(request['root_configuration'], current_refs['root_configuration'])
+    f.require(config == current_root, 'ordinary_closed_current_root_config_changed')
+    own = checked_config(request['configuration'], current_refs['configuration'])
+    proof = json.loads(checked_bytes(request['onboarding'], current_refs['onboarding']),
+        object_pairs_hook=f.unique)
+    checked_bytes(request['user_marker'], current_refs['user_marker'])
+    f.require(attachment == json.loads(checked_bytes(request['attachment'], current_refs['attachment']),
+        object_pairs_hook=f.unique), 'ordinary_closed_current_attachment_changed')
+
+    # Native load_config_readonly means no deepcopy; on a cold cache it may
+    # seed homes/SOUL or copy/prune/sweep backups. This operation may do none of
+    # that. Require the existing native state in which those paths are no-ops.
+    _closed_current_readonly_home(home)
+    _closed_current_readonly_home(profile_home)
+    check(home, role=False)
+    binding = request['binding']; settings = configuration_settings(current_root)
+    own_settings = configuration_settings(own)
+    f.require(settings['runtime'] == {'enabled': False}
+        and settings['user_isolation']['enabled'] is True
+        and [b for b in settings['user_isolation']['bindings']
+            if b['runtime_profile'] == request['profile']] == [binding]
+        and own_settings['runtime'] == {'enabled': False}
+        and not own_settings.get('worker_requirements'),
+        'ordinary_closed_current_workers_and_binding_changed')
+    principal = tuple(binding[k] for k in ('platform', 'transport_profile', 'account_id', 'user_id'))
+    key = access.principal_id(*principal)
+    state = access.validate_access(json.loads(checked_bytes(request['access_state'],
+        current_refs['access_state']), object_pairs_hook=f.unique)[access.KEY])
+    row = state['users'].get(key)
+    f.require(row is not None and row['enabled'] is True and row['role'] == 'user'
+        and row['generation'] == request['generation']
+        and tuple(row[k] for k in ('platform', 'transport_profile', 'account_id', 'user_id')) == principal,
+        'ordinary_closed_current_access_changed')
+    f.require(proof.get('config_sha256') == request['configuration']['sha256']
+        and proof.get('binding_sha256') == user._fingerprint(binding)
+        and proof.get('authorization_home') == str(home),
+        'ordinary_closed_current_proof_changed')
+    user.check_onboarding_home(home, profile_home, binding)
+    info = profile_home.stat()
+    with user.authority(profile_home):
+        user.UserScope(home, profile_home, request['profile'], principal, dict(binding),
+            (info.st_dev, info.st_ino), request['generation']).check()
+
+    # This fixed closed rebind is already proved by update_history. Its genuine
+    # beforeimages retain the old attachment's original root/own config and
+    # proof/scope. Do not invent new refs for the attachment or read old keys.
+    transaction = ('preparation/ordinary-inference-rebind-'
+        '2451d04ad13fb5a16949700bc32d7ee03660a9daa70e0c90bf1704209b066ef5')
+    intent_name = transaction + '/intent.json'
+    committed_name = transaction + '/committed.json'
+    f.require(history.get(intent_name) == ordinary.SOURCE80_REBIND_INTENT
+        and history.get(committed_name) == ordinary.SOURCE80_REBIND_COMMITTED,
+        'ordinary_closed_current_original_rebind_history_required')
+
+    def historical_ref(relative):
+        f.require(relative in history, 'ordinary_closed_current_history_member_required')
+        return {'path': str(home / relative), 'sha256': history[relative]}
+
+    intent_ref = historical_ref(intent_name); committed_ref = historical_ref(committed_name)
+    intent = json.loads(checked_bytes(intent_ref, home / intent_name), object_pairs_hook=f.unique)
+    committed = json.loads(checked_bytes(committed_ref, home / committed_name), object_pairs_hook=f.unique)
+    f.require(intent.get('schema') == ordinary.REBIND_SCHEMA
+        and intent.get('state') == 'CONSUMED_NO_RETRY'
+        and intent.get('request_sha256') == ordinary.SOURCE80_REBIND_REQUEST
+        and committed.get('state') == 'EXACT_INFERENCE_REBOUND_CONSUMERS_STOPPED_NOT_RUNTIME_ACCEPTED'
+        and committed.get('ready') is False
+        and all(body.get(field) is False for body in (intent, committed)
+            for field in ('consumers_started', 'workers_enabled', 'database_changed')),
+        'ordinary_closed_current_original_rebind_semantics_changed')
+    old_names = {'root': 'config.yaml', 'own': 'profiles/' + request['profile'] + '/config.yaml',
+        'proof': 'profiles/' + request['profile'] + '/.friday-onboarding.json',
+        'marker': 'profiles/' + request['profile'] + '/.friday-user-scope.json'}
+    old_refs = {}
+    for name, relative in old_names.items():
+        ref = historical_ref(transaction + '/before/' + relative)
+        f.require(intent['before'].get(relative) == {'mode': 0o600, 'sha256': ref['sha256']},
+            'ordinary_closed_current_beforeimage_binding_changed')
+        old_refs[name] = ref
+    old_root = checked_config(old_refs['root'], home / transaction / 'before/config.yaml')
+    old_own = checked_config(old_refs['own'], home / transaction / 'before' / old_names['own'])
+    old_proof = json.loads(checked_bytes(old_refs['proof'], home / transaction / 'before' /
+        old_names['proof']), object_pairs_hook=f.unique)
+    old_marker = json.loads(checked_bytes(old_refs['marker'], home / transaction / 'before' /
+        old_names['marker']), object_pairs_hook=f.unique)
+    old_settings = configuration_settings(old_root); old_own_settings = configuration_settings(old_own)
+    f.require(old_settings['runtime'] == {'enabled': False}
+        and old_settings['user_isolation']['enabled'] is True
+        and [b for b in old_settings['user_isolation']['bindings']
+            if b['runtime_profile'] == request['profile']] == [binding]
+        and old_own_settings['runtime'] == {'enabled': False}
+        and not old_own_settings.get('worker_requirements'),
+        'ordinary_closed_current_original_binding_or_workers_changed')
+    proof_fields = {'schema', 'binding_sha256', 'config_sha256', 'soul_sha256',
+        'required_secrets', 'directory_identity', 'template', 'authorization_home'}
+    f.require(set(old_proof) == proof_fields and old_proof['schema'] == 'friday.onboarding.v1'
+        and old_proof['binding_sha256'] == user._fingerprint(binding)
+        and old_proof['config_sha256'] == old_refs['own']['sha256']
+        and old_proof['authorization_home'] == str(home)
+        and old_proof['directory_identity'] == [info.st_dev, info.st_ino]
+        and old_proof['template'] == 'friday-ordinary-local'
+        and old_proof['soul_sha256'] == proof['soul_sha256']
+        and f.digest(f.owned_file(profile_home / 'SOUL.md', private=True)) == old_proof['soul_sha256']
+        and old_marker == {'schema': 'friday.user-home.v1', 'principal': key,
+            'profile': request['profile'], 'binding_sha256': user._fingerprint(binding),
+            'onboarding_sha256': old_refs['proof']['sha256']},
+        'ordinary_closed_current_original_proof_or_scope_changed')
+    template = old_settings['onboarding']['templates']['friday-local']
+    f.require(set(attachment) == {'template', 'template_sha256', 'installation_config_sha256',
+        'config_sha256', 'proof', 'marker', 'binding_sha256', 'generation', 'runtimes',
+        'a0_network', 'required_names'} and attachment['template'] == 'friday-local'
+        and attachment['template_sha256'] == user._fingerprint(template)
+        and attachment['installation_config_sha256'] == old_refs['root']['sha256']
+        and attachment['config_sha256'] == old_refs['own']['sha256']
+        and attachment['proof'] == {'path': str(current_refs['onboarding']),
+            'sha256': old_refs['proof']['sha256']}
+        and attachment['marker'] == {'path': str(current_refs['user_marker']),
+            'sha256': old_refs['marker']['sha256']}
+        and attachment['binding_sha256'] == user._fingerprint(binding)
+        and type(attachment['generation']) is int and attachment['generation'] == request['generation']
+        and set(attachment['runtimes']) == {'dsh', 'a0'}
+        and attachment['required_names'] == old_proof['required_secrets'] == template['required_secrets']
+        and type(template['tools']) is list and set(template['tools']) <= set(binding['tools']),
+        'ordinary_closed_current_original_attachment_changed')
+
+    # Repeatable verification: reject changed current pins or original archived
+    # bytes on either call. The outer caller also retains file/inode snapshots.
+    for name, expected in current_refs.items():
+        checked_bytes(request[name], expected)
+    for ref in (intent_ref, committed_ref, *old_refs.values()):
+        checked_bytes(ref, Path(ref['path']))
+    return old_own
+
+
+def _closed_current_history(request, claim, *, failure=None):
+    """Accept the exact closed420 diagnostic, retaining all old attempt clocks."""
+    if failure is None: failure = f.read_json(f.pin(request['failure']))
+    closed = f.read_json(f.pin(request['closed_failure']))
+    clock = f.read_json(f.pin(request['original_clock']))
+    result = f.read_json(f.pin(request['native_cessation']))
+    refs = closed.get('refs', {})
+    post_ref = refs.get('ROOT-POST-PRESERVATION.json')
+    f.require(refs.get('ROOT-DIAGNOSTIC-CLOCK.json') == request['original_clock']
+        and refs.get('ROOT-DIAGNOSTIC-RESULT.json') == request['native_cessation']
+        and type(post_ref) is dict, 'ordinary_closed_diagnostic_refs_changed')
+    post = f.read_json(f.pin(post_ref))
+    f.require(closed.get('schema') == 'friday.exact-current-normal-diagnostic-closure.v1'
+        and closed.get('state') == 'CONSUMED_CLOSED_FAILED_503_INTERNAL_ERROR_WORKERS_OFF_NO_RETRY'
+        and closed.get('original_server_attempt') == claim
+        and closed.get('original_physical_seconds') == 420
+        and closed.get('original_physical_deadline_preserved') is True
+        and closed.get('retry_authorized') is False and closed.get('actual_HTTP_qualification_POSTs') == 1
+        and closed.get('A0') == 'NOT_STARTED_NO_BOOTSTRAP_OR_PLAN'
+        and closed.get('worker_runtime') is False and closed.get('all_actual_owned_finite_clients_reaped') is True
+        and clock.get('operation') == result.get('operation')
+        and type(clock.get('operation')) is str and bool(clock['operation'])
+        and clock.get('boot_id') == claim['boot_id']
+        and clock.get('physical_seconds') == 420 and clock.get('server_entry_seconds') == 300
+        and clock.get('POST_count') == 1 and clock.get('retry_authorized') is False
+        and all(type(clock.get(k)) in (int, float) and math.isfinite(clock[k])
+            for k in ('started_monotonic', 'deadline_monotonic'))
+        and clock['deadline_monotonic'] - clock['started_monotonic'] == 420
+        and clock['started_monotonic'] <= claim['started_mono'] < claim['deadline_mono'] <= clock['deadline_monotonic']
+        and result.get('failure') == failure
+        and result.get('response', {}).get('status') == 503
+        and result.get('retry_authorized') is False and result.get('bootstrap_state') is None
+        and result.get('bootstrap_cleanup_confirmed') is True
+        and result.get('all_observed_native_units_terminal') is True
+        and result.get('model_calls_by_this_operation') == 0
+        and result.get('per_job_authority') == 'NOT_GRANTED'
+        and post.get('schema') == 'friday.current-diagnostic-post-preservation.v1'
+        and post.get('within_original_physical420') is True
+        and post.get('all_admission_pins_unchanged') is True
+        and post.get('all_prior_12_persistent_and_1_session_files_unchanged') is True
+        and post.get('old_claims_preserved') is True
+        and post.get('new_attempt_retry_authorized') is False and post.get('per_job_grant') is False,
+        'ordinary_closed_current_original_history_required')
+    # Project current required absences only for the unchanged fresh read-only
+    # native check. These are not fabricated historical cessation observations.
+    home = Path(request['home']); profile_home = home / 'profiles' / request['profile']
+    absences = {str(profile_home / 'workers' / n): True for n in
+        ('a0/bootstrap', 'a0/probe-plan.json', 'a0/runtime-receipt.json', 'dsh/runtime-receipt.json')}
+    absences.update({str(home.parent / 'rootless-docker/config/local-route.json'): True,
+        str(Path('/run/user') / str(os.getuid()) / 'friday-rework-docker/rootlesskit/child_pid'): True,
+        str(Path('/run/user') / str(os.getuid()) / 'friday-rework-docker/route-guard.json'): True})
+    units = result.get('native_after')
+    f.require(type(units) is dict and bool(units)
+        and all(type(row) is dict and row.get('ActiveState') == 'inactive'
+            and row.get('SubState') == 'dead' and row.get('ControlGroup') == ''
+            and row.get('InvocationID') == '' and row.get('MainPID', '0') == '0'
+            and row.get('ControlPID', '0') == '0' for row in units.values()),
+        'ordinary_closed_current_observed_native_cessation_required')
+    return {'schema': CLOSED_CURRENT_SCHEMA, 'actual_units': units, 'absences': absences}
+
+
+def _closed_tree_state(folder, names, *, control, current=False):
     """Capture complete byte/mode/inode custody; refuse any unknown member."""
     f.directory(folder)
     files = {}; directories = {}
@@ -849,7 +1155,7 @@ def _closed_tree_state(folder, names, *, control):
             directories[name] = [getattr(info, k) for k in ('st_dev', 'st_ino', 'st_uid', 'st_mode')]
         else:
             row = ordinary.update_file_state(path)
-            mode = 0o600 if name == 'failure.json' else 0o664 if name.startswith('dsh-safety/workspace/') else 0o400
+            mode = 0o600 if name == 'failure.json' else (0o600 if current else 0o664) if name.startswith('dsh-safety/workspace/') else 0o400
             f.require(row is not None and row['mode'] == mode, 'ordinary_closed_tree_mode_changed')
             files[name] = row
     f.require(set(files) == names and set(directories) == expected_dirs, 'ordinary_closed_exact_footprint_required')
@@ -858,9 +1164,10 @@ def _closed_tree_state(folder, names, *, control):
     return manifest, files
 
 
-def _closed_claim(failure):
+def _closed_claim(failure, *, current=False):
     claim = failure.get('original_attempt', {})
-    f.require(set(failure) == {'state', 'original_attempt', 'retry_authorized', 'a0_probe_cleanup'}
+    f.require(set(failure) == {'state', 'original_attempt', 'retry_authorized', 'a0_probe_cleanup'} | ({'error_kind'} if current else set())
+        and (not current or failure['error_kind'] == 'internal_error')
         and failure['state'] == 'REFUSED_OR_UNCERTAIN' and failure['retry_authorized'] is False
         and failure['a0_probe_cleanup'] == 'OWN_INITIAL_PROBE_CUSTODY'
         and set(claim) == {'boot_id', 'started_mono', 'deadline_mono', 'budget_seconds'}
@@ -872,7 +1179,7 @@ def _closed_claim(failure):
     return claim
 
 
-def _closed_native_absent(home, profile_home, cessation, budget):
+def _closed_native_absent(home, profile_home, cessation, budget, *, current=False):
     """Read-only current proof, in addition to the pinned historical cessation."""
     from scripts.dsh_prepare import run
     unit = 'friday-qualify-dsh-' + f.digest(str(profile_home / 'workers/qualification/dsh-safety').encode())[:24] + '-1.scope'
@@ -887,8 +1194,15 @@ def _closed_native_absent(home, profile_home, cessation, budget):
             'ControlGroup': '', 'InvocationID': ''}),
             ('friday-rework-docker.service', {'LoadState': 'loaded', 'ActiveState': 'inactive', 'SubState': 'dead',
             'ControlGroup': '', 'InvocationID': '', 'MainPID': '0', 'ControlPID': '0'})):
-        f.require(units[name]['returncode'] == 0 and units[name]['properties'] == expected,
-            'ordinary_closed_historical_native_cessation_required')
+        if current:
+            # The diagnostic saved properties, not a subprocess return code.
+            # Validate those actual properties without inventing a return code.
+            f.require(type(units[name]) is dict
+                and {k: units[name].get(k) for k in expected} == expected,
+                'ordinary_closed_historical_native_cessation_required')
+        else:
+            f.require(units[name]['returncode'] == 0 and units[name]['properties'] == expected,
+                'ordinary_closed_historical_native_cessation_required')
         command = ['/usr/bin/env', 'XDG_RUNTIME_DIR=' + str(runtime),
             'DBUS_SESSION_BUS_ADDRESS=unix:path=' + str(bus),
             '/usr/bin/systemctl', '--user', 'show', name, '--property=' + ','.join(expected)]
@@ -918,8 +1232,9 @@ def reconcile_closed(request, request_path, budget):
     """Archive one closed failure for later review; grant no continuation authority."""
     from scripts.install_containment import Budget
     from scripts.dsh_prepare import StopUnconfirmed
-    f.require(type(request) is dict and set(request) == CLOSED_RECOVERY_FIELDS
-        and request['schema'] == CLOSED_RECOVERY_SCHEMA
+    current = type(request) is dict and request.get('schema') == CLOSED_CURRENT_SCHEMA
+    f.require(type(request) is dict and set(request) == CLOSED_RECOVERY_FIELDS | ({'current_update'} if current else set())
+        and request['schema'] in (CLOSED_RECOVERY_SCHEMA, CLOSED_CURRENT_SCHEMA)
         and type(request['recovery_id']) is str and re.fullmatch('[A-Za-z0-9_-]{1,64}', request['recovery_id'])
         and type(request['seconds']) is int and 30 <= request['seconds'] <= 180
         and request['transition'] == 'EXPLICIT_CLOSED_ARCHIVE_NO_RUNTIME_AUTHORITY'
@@ -928,7 +1243,8 @@ def reconcile_closed(request, request_path, budget):
         and re.fullmatch('[A-Za-z0-9_-]{1,64}', request['profile'])
         and request['binding']['runtime_profile'] == request['profile']
         and set(request['preparations']) == {'dsh', 'a0'} and set(request['reports']) == set(NAMES)
-        and type(request['history']) is list and len(request['history']) == 494,
+        and type(request['history']) is list
+        and (0 < len(request['history']) <= 4096 if current else len(request['history']) == 494),
         'ordinary_closed_explicit_maintenance_request_required')
     started = time.monotonic(); original_budget = budget
     f.require(0 < budget.deadline - started <= request['seconds'], 'ordinary_closed_original_deadline_required')
@@ -953,6 +1269,9 @@ def reconcile_closed(request, request_path, budget):
     ancestry = request['keyless_ancestry']
     f.require(type(ancestry) is dict and set(ancestry) == {'intent', 'committed', 'tree'}, 'ordinary_closed_keyless_ancestry_required')
     refs.update({'ancestry-' + k: v for k, v in ancestry.items()})
+    if current:
+        closed_refs = f.read_json(f.pin(request['closed_failure'])).get('refs', {})
+        refs['diagnostic-preservation'] = closed_refs['ROOT-POST-PRESERVATION.json']
     pinned = {}
     for name, ref in refs.items():
         path = budget.call(f.pin, ref)
@@ -962,11 +1281,11 @@ def reconcile_closed(request, request_path, budget):
         if name.startswith(('history-', 'report-')):
             f.require(path.is_relative_to(parent), 'ordinary_closed_foreign_history_or_report')
         pinned[name] = ordinary.update_file_state(path)
-    f.require(set(paths) <= set(refs) and len({r['path'] for r in request['history']}) == 494,
+    f.require(set(paths) <= set(refs) and len({r['path'] for r in request['history']}) == len(request['history']),
         'ordinary_closed_complete_unique_pins_required')
     admission = f.read_json(Path(request['admission']['path']))
     authority = {k: v for k, v in request.items() if k != 'admission'}
-    f.require(admission == {'schema': CLOSED_RECOVERY_SCHEMA, 'state': 'ADMITTED_ARCHIVE_ONLY',
+    f.require(admission == {'schema': request['schema'], 'state': 'ADMITTED_ARCHIVE_ONLY',
         'request_binding_sha256': f.digest(ordinary.encoded(authority)), 'runtime_authority': 'NOT_GRANTED',
         'old_attempt_retry_authorized': False}, 'ordinary_closed_explicit_admission_required')
     original = f.read_json(Path(request['installed_input']['path']))
@@ -975,13 +1294,13 @@ def reconcile_closed(request, request_path, budget):
     checker = 'scripts/dsh_prepare.py'
     f.require({k: v for k, v in original.items() if k != 'project_files'} ==
         {k: v for k, v in value.items() if k != 'project_files'}
-        and set(old) == set(new) and {n for n in old if old[n] != new[n]} == {helper, checker}
+        and set(old) == set(new) and {n for n in old if old[n] != new[n]} == ({helper} if current else {helper, checker})
         and new[helper] == request['maintenance_source']['sha256']
         and new[checker] == f.digest(f.owned_file(Path(__file__).with_name('dsh_prepare.py'))), 'ordinary_closed_exact_maintenance_source_delta_required')
     receipt = f.read_json(paths['source_receipt']); stamp = f.read_json(paths['stamp'])
     _, donors = budget.call(f.spec_checked, value, cli_only=True)
     f.require(value['home'] == str(home) and value['product']['runtime'] == {'enabled': False}
-        and len(value['project_files']) == 231 and len(receipt['files']) == 17686 and len(receipt['layers']) == 79
+        and (len(value['project_files']), len(receipt['files']), len(receipt['layers'])) == ((241, 17693, 84) if current else (231, 17686, 79))
         and receipt['schema'] == 'friday.hermes-source.v1' and marker['schema'] == f.SCHEMA
         and marker['home'] == str(home) and marker['source'] == str(home / 'hermes-agent')
         and marker['state'] == 'INSTALLED_TEMPLATE_INCOMPLETE' and marker['runtime_ready'] is False
@@ -997,7 +1316,7 @@ def reconcile_closed(request, request_path, budget):
         'ordinary_closed_installed_diagnostic_required')
     acceptance = f.read_json(Path(request['source_acceptance']['path']))
     f.require(acceptance['state'] == 'ROOT_ACCEPTED_SOURCE_FAILURE_RECEIPT_ONLY_NOT_INSTALLED'
-        and acceptance['source_sha256'] == request['diagnostic_correction']['sha256']
+        and acceptance['source_sha256'] == (CLOSED_DIAGNOSTIC_SOURCE_SHA if current else request['diagnostic_correction']['sha256'])
         and acceptance['native_failure_cause'] == 'UNKNOWN', 'ordinary_closed_diagnostic_acceptance_required')
     for n, sha in marker['profile_files'].items():
         f.require(f.digest(f.owned_file(home / n, private=True)) == sha, 'ordinary_closed_root_profile_changed')
@@ -1005,11 +1324,15 @@ def reconcile_closed(request, request_path, budget):
     # package import, admission or stopped-consumer custody can execute.
     budget.call(f.composition_checked, original, home / 'hermes-agent', receipt, donors['hermes'])
     budget.call(f.composition_checked, value, home / 'hermes-agent', receipt, donors['hermes'])
+    history = _closed_current_source(request, home, receipt, budget) if current else None
     ordinary.checked_plugin_inventory(home, plugins)
     f.native_packages(home / 'hermes-agent')
     from hermes_cli.config import require_readable_config_before_write
     config = require_readable_config_before_write(home / 'config.yaml'); attachment = f.read_json(paths['attachment'])
-    own = _keyless_admission(request, home, profile_home, config, attachment)
+    def admission_checked():
+        return (_closed_current_admission(request, home, profile_home, config, attachment, history)
+            if current else _keyless_admission(request, home, profile_home, config, attachment))
+    own = admission_checked()
     from plugins.friday_rework.worker_provision import preparation, prepare_inputs
     from hermes_cli import friday_user_scope as user
     def checked_preparations():
@@ -1045,12 +1368,15 @@ def reconcile_closed(request, request_path, budget):
             keyless_helper=extension['reference'])
         return extension
     source_extension = checked_preparations()
-    failed, files = _closed_tree_state(folder, CLOSED_FAILED_FILES, control=True)
+    failed, files = _closed_tree_state(folder, CLOSED_FAILED_FILES, control=True, current=current)
     f.require(failed == f.read_json(Path(request['qualification_tree']['path'])), 'ordinary_closed_bound_tree_changed')
-    claim = _closed_claim(json.loads(files['failure.json']['data'], object_pairs_hook=f.unique))
+    claim = _closed_claim(json.loads(files['failure.json']['data'], object_pairs_hook=f.unique), current=current)
     closed = f.read_json(Path(request['closed_failure']['path'])); cessation = f.read_json(Path(request['native_cessation']['path']))
     clock = f.read_json(Path(request['original_clock']['path']))
-    f.require(closed['state'] == 'CONSUMED_CLOSED_FAILED_NEW_NORMAL_SETUP_AFTER_REPAIR_NO_RETRY'
+    if current:
+        cessation = _closed_current_history(request, claim)
+    else:
+        f.require(closed['state'] == 'CONSUMED_CLOSED_FAILED_NEW_NORMAL_SETUP_AFTER_REPAIR_NO_RETRY'
         and closed['original_server300'] == claim and closed['no_retry'] is True and closed['runtime_workers'] == 'OFF'
         and closed['runtime_acceptance'] is False and closed['old_original300_closed_failure_preserved'] is True
         and closed['old_physical660_not_reset'] is True and closed['original_physical660_closed_within_budget'] is True
@@ -1103,6 +1429,12 @@ def reconcile_closed(request, request_path, budget):
         budget.call(f.spec_checked, value, cli_only=True); ordinary.checked_plugin_inventory(home, plugins)
         budget.call(f.composition_checked, original, home / 'hermes-agent', receipt, donors['hermes'])
         budget.call(f.composition_checked, value, home / 'hermes-agent', receipt, donors['hermes'])
+        if current:
+            f.require(_closed_current_source(request, home, receipt, budget) == history,
+                'ordinary_closed_current_history_changed')
+            f.require(_closed_current_history(request, claim, failure=json.loads(files['failure.json']['data'])) == cessation,
+                'ordinary_closed_current_diagnostic_changed')
+            admission_checked()
         f.require(checked_preparations() == source_extension, 'ordinary_closed_source_extension_changed')
     fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -1119,11 +1451,13 @@ def reconcile_closed(request, request_path, budget):
                 ordinary.retained_first_contact_config_lock(home / 'config.yaml'), \
                 ordinary.retained_first_contact_config_lock(profile_home / 'config.yaml'):
             def check(*, archived=False):
-                unchanged(archived=archived); prove(); build_prove(); _closed_native_absent(home, profile_home, cessation, budget)
+                unchanged(archived=archived); prove(); build_prove(); _closed_native_absent(home, profile_home, cessation, budget, current=current)
             check()
-            f.require(_closed_tree_state(folder, CLOSED_FAILED_FILES, control=True)[0] == failed, 'ordinary_closed_tree_identity_changed')
+            f.require(_closed_tree_state(folder, CLOSED_FAILED_FILES, control=True, current=current)[0] == failed, 'ordinary_closed_tree_identity_changed')
             tx.mkdir(mode=0o700); moved = False; archive = tx / 'failed-qualification'
-            intent = {'schema': CLOSED_RECOVERY_SCHEMA, 'state': 'CONSUMED_NO_RETRY', 'failure': request['failure'],
+            commit_name = str((tx / 'committed.json').relative_to(home))
+            saved[commit_name] = None
+            intent = {'schema': request['schema'], 'state': 'CONSUMED_NO_RETRY', 'failure': request['failure'],
                 'request_sha256': f.digest(request_state['data']), 'original_attempt': claim,
                 'runtime_authority': 'NOT_GRANTED', 'old_attempt_retry_authorized': False,
                 'maintenance_clock': {'deadline_mono': original_budget.deadline, 'useful_deadline_mono': budget.deadline},
@@ -1139,28 +1473,35 @@ def reconcile_closed(request, request_path, budget):
                 for n, row in files.items():
                     budget.check(); ordinary.private_parents(before, n); ordinary.write(before / n, row['data'], row['mode'])
                 ordinary.sync_directory(tx); ordinary.sync_directory(parent); check()
-                f.require(_closed_tree_state(folder, CLOSED_FAILED_FILES, control=True)[0] == failed, 'ordinary_closed_tree_identity_changed')
+                f.require(_closed_tree_state(folder, CLOSED_FAILED_FILES, control=True, current=current)[0] == failed, 'ordinary_closed_tree_identity_changed')
                 f.require(not os.path.lexists(archive), 'ordinary_closed_archive_occupied')
                 os.rename(folder, archive); moved = True
                 ordinary.sync_directory(folder.parent); ordinary.sync_directory(tx)
                 ordinary.publish_update_file(paths['root_marker'], ordinary.encoded(updated),
                     saved[f.MARKER]['mode'], saved[f.MARKER], owned, f.MARKER)
                 check(archived=True)
-                _keyless_admission(request, home, profile_home, config, attachment)
-                f.require(not os.path.lexists(folder) and _closed_tree_state(archive, CLOSED_FAILED_FILES, control=True)[0] == failed,
+                admission_checked()
+                f.require(not os.path.lexists(folder) and _closed_tree_state(archive, CLOSED_FAILED_FILES, control=True, current=current)[0] == failed,
                     'ordinary_closed_archive_identity_changed')
                 result = {'state': 'ARCHIVED_CLOSED_FAILURE_WORKERS_OFF_NO_CONTINUATION_AUTHORITY',
                     'ready': False, 'runtime_authority': 'NOT_GRANTED', 'runtime_acceptance': False,
                     'consumers_started': False, 'workers_enabled': False, 'resume_allowed': False,
                     'old_attempt_retry_authorized': False, 'original_attempt': claim, 'archive_mapping': intent['archive_mapping']}
-                ordinary.write(tx / 'committed.json', ordinary.encoded(result)); ordinary.sync_directory(tx)
+                ordinary.publish_update_file(tx / 'committed.json', ordinary.encoded(result),
+                    0o600, saved[commit_name], owned, commit_name)
+                ordinary.sync_directory(tx)
                 return result
             except BaseException as primary:
                 try:
                     original_budget.check(); prove(); build_prove()
+                    # Prove the tree and every saved/owned file before withdrawing
+                    # the commit receipt or restoring any marker/archive path.
+                    if moved:
+                        f.require(not os.path.lexists(folder) and _closed_tree_state(archive, CLOSED_FAILED_FILES, control=True, current=current)[0] == failed,
+                            'ordinary_closed_restore_ownership_changed')
                     ordinary.restore_update_files(home, saved, owned)
                     if moved:
-                        f.require(not os.path.lexists(folder) and _closed_tree_state(archive, CLOSED_FAILED_FILES, control=True)[0] == failed,
+                        f.require(not os.path.lexists(folder) and _closed_tree_state(archive, CLOSED_FAILED_FILES, control=True, current=current)[0] == failed,
                             'ordinary_closed_restore_ownership_changed')
                         os.rename(archive, folder); ordinary.sync_directory(folder.parent); ordinary.sync_directory(tx)
                     ordinary.write(tx / 'failure.json', ordinary.encoded({'state': 'ROLLED_BACK_CONSUMED_NO_RETRY',
