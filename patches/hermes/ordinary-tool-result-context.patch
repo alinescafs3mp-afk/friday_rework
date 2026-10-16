@@ -1,0 +1,178 @@
+--- a/agent/web_call_context.py
++++ b/agent/web_call_context.py
+@@ -93,6 +93,13 @@
+     from tools.approval_context import get_current_session_key
+     call.session_key = get_current_session_key(default='') or call.session_id
+     call.turn_id = getattr(agent,'_current_turn_id','') or ''
++    from hermes_cli.friday_user_scope import delegation_authority
++    call.user_authority = delegation_authority()
++    stamp = (call.session_id, call.turn_id, call.run_deadline)
++    if getattr(agent, '_tool_result_call_stamp', None) != stamp:
++        agent._tool_result_calls = {}
++        agent._tool_result_call_stamp = stamp
++    agent._tool_result_calls[(task_id, call_id)] = call
+     return call
+ 
+ 
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -953,9 +953,6 @@
+         future = prepared.future
+     else:
+         authorization_gate = None
+-    if function_name in _NEVER_PARALLEL_TOOLS:
+-        return _run_agent_tool_execution_middleware(agent, **kwargs)
+-
+     from tools.daemon_pool import DaemonThreadPoolExecutor
+ 
+     if prepared is None:
+@@ -963,8 +960,14 @@
+         worker_tid: list[int] = []
+ 
+     from agent.web_call_context import make_web_call, bind_web_call
+-    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
++    # Inline interactions retain the original task clock; they have no generic worker timeout.
++    deadline = (getattr(agent, "_web_run_deadline", None) if function_name in _NEVER_PARALLEL_TOOLS
++                else time.monotonic() + timeout_s if timeout_s is not None else None)
+     web_call = make_web_call(agent, deadline, effective_task_id, tool_call_id, authorization_gate)
++
++    if function_name in _NEVER_PARALLEL_TOOLS:
++        with bind_web_call(web_call):
++            return _run_agent_tool_execution_middleware(agent, **kwargs)
+ 
+     def _run() -> _ManagedToolResult:
+         with _registered_tool_worker(agent) as tid, bind_web_call(web_call):
+@@ -1096,13 +1099,81 @@
+         )
+ 
+ 
+-def _commit_tool_result(
++@contextlib.contextmanager
++def _tool_result_environment(agent, task_id, call_id, *, undispatched=False):
++    """Retain the admitted worker caller through canonical result publication.
++
++    Stopped/expired callers may persist evidence, but cannot reacquire or execute
++    a terminal environment. No replacement deadline or ambient caller is minted.
++    """
++    from hermes_cli.friday_user_scope import current, check_agent, delegation_authority
++    cap = current()
++    if cap is None or cap.principal[0] == "cli":
++        yield get_active_env(task_id)
++        return
++    check_agent(agent)
++    from tools.approval_context import get_current_session_key
++    session_key = get_current_session_key(default="") or agent.session_id
++    call = getattr(agent, "_tool_result_calls", {}).get((task_id, call_id))
++    if call is None:
++        if undispatched:
++            yield None
++            return
++        raise RuntimeError("tool_result_original_caller_required")
++    if (call.agent is not agent or call.task_id != task_id or call.call_id != call_id
++            or call.session_id != agent.session_id or call.session_key != session_key
++            or call.turn_id != getattr(agent, "_current_turn_id", "")
++            or call.run_deadline != getattr(agent, "_web_run_deadline", None)
++            or call.user_authority != delegation_authority()):
++        raise RuntimeError("tool_result_foreign_original_caller")
++    if (call.stopped.is_set() or call.turn.stopped.is_set()
++            or getattr(agent, "_interrupt_requested", False)
++            or time.monotonic() >= call.deadline()):
++        yield None
++        return
++    from agent.web_call_context import bind_web_call
++    from tools.terminal_binding import TerminalScopeDenied
++    with bind_web_call(call):
++        try:
++            env = get_active_env(task_id)
++        except (RuntimeError, TimeoutError, TerminalScopeDenied):
++            # Stop can land between the precheck and native cache validation.
++            # Revalidate admission; only the original stop/deadline permits
++            # evidence-only publication without an environment.
++            check_agent(agent)
++            if not (call.stopped.is_set() or call.turn.stopped.is_set()
++                    or getattr(agent, "_interrupt_requested", False)
++                    or time.monotonic() >= call.deadline()):
++                raise
++            env = None
++        yield env
++
++
++def tool_execution_cwd(agent, task_id):
++    """The planner reads the admitted workspace without creating terminal custody."""
++    from hermes_cli.friday_user_scope import current, check_agent
++    cap = current()
++    if cap is not None:
++        check_agent(agent)
++        return cap.home / "workspace"
++    env = get_active_env(task_id)
++    return Path(env.cwd) if env is not None and env.cwd else None
++
++
++def _commit_tool_result(agent, messages, ref, function_result, **kwargs):
++    with _tool_result_environment(agent, ref.task_id, ref.call_id,
++                                  undispatched=kwargs.get("blocked", False)) as env:
++        return _commit_tool_result_body(agent, messages, ref, function_result, env=env, **kwargs)
++
++
++def _commit_tool_result_body(
+     agent,
+     messages: list,
+     ref: _ToolCallRef,
+     function_result,
+     *,
+     budget: BudgetConfig,
++    env,
+     tool_duration: float,
+     is_error: bool,
+     blocked: bool,
+@@ -1152,14 +1223,14 @@
+     persisted_result = function_result
+     if _is_multimodal_tool_result(persisted_result):
+         persisted_result = _persist_multimodal_text_parts(
+-            persisted_result, function_name, tool_call_id, get_active_env(effective_task_id), budget,
++            persisted_result, function_name, tool_call_id, env, budget,
+         )
+     else:
+         persisted_result = maybe_persist_tool_result(
+             content=persisted_result,
+             tool_name=function_name,
+             tool_use_id=tool_call_id,
+-            env=get_active_env(effective_task_id),
++            env=env,
+             config=budget,
+         )
+     _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
+@@ -1243,7 +1314,9 @@
+         return
+     batch = messages[-num_tools:]
+     contents_before = [message.get("content") for message in batch]
+-    enforce_turn_budget(batch, env=get_active_env(effective_task_id), config=budget)
++    call_id = batch[-1].get("tool_call_id", "") if batch else ""
++    with _tool_result_environment(agent, effective_task_id, call_id, undispatched=True) as env:
++        enforce_turn_budget(batch, env=env, config=budget)
+     record_tool_batch(agent, batch, contents_before)
+     agent._apply_pending_steer_to_tool_results(messages, num_tools)
+ 
+@@ -2016,8 +2089,7 @@
+     from types import SimpleNamespace
+ 
+     if segments is None:
+-        _active_env = get_active_env(effective_task_id)
+-        _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
++        _exec_cwd = tool_execution_cwd(agent, effective_task_id)
+         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
+ 
+     for kind, calls in segments:
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1394,8 +1394,8 @@
+                     self._execute_tool_calls_sequential(*args)
+                 else:
+                     from agent.tool_dispatch_helpers import _plan_tool_batch_segments
+-                    active_env = get_active_env(effective_task_id)
+-                    exec_cwd = Path(active_env.cwd) if active_env is not None and active_env.cwd else None
++                    from agent.tool_executor import tool_execution_cwd
++                    exec_cwd = tool_execution_cwd(self, effective_task_id)
+                     segments = _plan_tool_batch_segments(tool_calls, execution_cwd=exec_cwd)
+                     if len(segments) == 1:
+                         run = self._execute_tool_calls_concurrent if segments[0][0] == "parallel" else self._execute_tool_calls_sequential
