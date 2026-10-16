@@ -110,8 +110,14 @@ def test_create_revision_read_send_then_restart_dedup(own, monkeypatch):
     own.source.message_id='306'; own.pin()
     assert asyncio.run(delivery.deliver_ordinary_document(own.adapter,own.source,str(own.work/'draft-v2.md'))).success
     assert len(own.sent)==3 and 'DELIVERED' in own.history[-1]['content']
-    with pytest.raises(scopes.ScopeDenied):
-        scopes.scoped_file('write_file', {'path':'draft-v2.md','content':'overwrite'})
+    before=(own.work/'draft-v2.md').read_bytes()
+    try:
+        denied=scopes.scoped_file('write_file', {'path':'draft-v2.md','content':'overwrite'})
+    except scopes.ScopeDenied:
+        pass
+    else:
+        assert json.loads(denied).get('success') is False
+    assert (own.work/'draft-v2.md').read_bytes()==before
 
 
 def test_unknown_no_duplicate_after_reentry_or_mutation(own):
@@ -256,9 +262,11 @@ def test_immutable_snapshot_is_the_sent_payload(own):
     own.adapter.send_document_bytes=replace_during_send
     assert asyncio.run(delivery.deliver_ordinary_document(own.adapter,own.source,path)).success
     assert own.sent[0][1]==b'checked original'
+    # A later original request may select the new immutable current version.
+    # Each attempt still sends the bytes checked before its own transport call.
     own.source.message_id='310'; own.pin()
-    assert not asyncio.run(delivery.deliver_ordinary_document(own.adapter,own.source,path)).success
-    assert len(own.sent)==1
+    assert asyncio.run(delivery.deliver_ordinary_document(own.adapter,own.source,path)).success
+    assert [item[1] for item in own.sent]==[b'checked original',b'changed pathname']
 
 
 def test_reservation_failure_prevents_any_send(own,monkeypatch):

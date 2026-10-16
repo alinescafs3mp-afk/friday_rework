@@ -1,7 +1,7 @@
 """Real native prompt assembly, admission and cache continuation; synthetic users only.
 
 These tests prove prompt adoption and native state preservation, not model style.
-Run with the composed native source on sys.path and project tests available.
+Run with the fully composed Native62 checkout on sys.path and project tests available.
 """
 import copy
 import hashlib

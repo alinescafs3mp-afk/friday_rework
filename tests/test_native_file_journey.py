@@ -29,7 +29,7 @@ def call(a,name,args,ident,messages=None):
   te._finalize_tool_batch(a,messages,'native-file-task',1,DEFAULT_BUDGET)
  return r,out
 
-def test_actual_native_file_durable_journey_and_followup_revision_gap(env):
+def test_read_not_delivered_cannot_authorize_followup_rewrite(env):
  db=own_db(env)
  try:
   with entered(env):
@@ -46,7 +46,7 @@ def test_actual_native_file_durable_journey_and_followup_revision_gap(env):
    a._current_turn_id='native-file-followup-turn';a._web_run_deadline=time.monotonic()+60
    _,revision=call(a,'write_file',{'path':'notes.txt','content':REVISED},'file-followup-revision',m)
    denied=json.loads(revision.result)
-   assert denied=={'success':False,'error':'product_user_scope_refused'}
+   assert denied['success'] is False and denied['error']=='file_revision_requires_current_full_read'
    assert path.read_text()==TEXT
    _,after=call(a,'read_file',{'path':'notes.txt'},'file-read-after-revision',m)
    assert 'Original second point.' in json.loads(after.result)['content']
