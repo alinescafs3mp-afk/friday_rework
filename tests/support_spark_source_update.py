@@ -87,6 +87,11 @@ def installed(tmp_path,monkeypatch):
     for name in sorted(o.SPARK_REQUEST_BUDGET_FILES-o.SPARK_REQUEST_BUDGET_NEW_FILES-set(files)-earlier_additions):
         data=b'# Native79 existing '+name.encode()+b'\n';put(source/name,data,0o644)
         files[name]={'sha256':f.digest(data),'bytes':len(data),'mode':'100644'}
+    # Native files already present in the real Source81 composition; synthetic
+    # existing beforeimages allow the exact combined five-file boundary.
+    for name in sorted(o.COMBINED_INPUT_FILES-set(files)-earlier_additions):
+        data=b'# Source81 existing '+name.encode()+b'\n';put(source/name,data,0o644)
+        files[name]={'sha256':f.digest(data),'bytes':len(data),'mode':'100644'}
     put(source/'retained.txt',b'unchanged native\n',0o644)
     files['retained.txt']={'sha256':f.digest(b'unchanged native\n'),'bytes':17,'mode':'100644'}
     layers=[{'manifest':f'patches/hermes/prior-{n}.json','manifest_sha256':f.digest(str(n).encode()),

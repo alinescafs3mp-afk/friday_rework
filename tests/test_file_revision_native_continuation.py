@@ -217,10 +217,11 @@ def test_persisted_same_session_result_selects_read_revision_and_exact_delivery(
             replay = store.load_transcript(SESSION)
             observation = next(line for row in reversed(replay) if row.get('role') == 'assistant'
                 for line in reversed((row.get('content') or '').splitlines())
-                if line.startswith('[File delivery observation: ') and 'DELIVERED' in line)
-            receipt = json.loads(observation.removeprefix('[File delivery observation: ').removesuffix(']'))
+                if line.startswith('Контекст файла '))
+            receipt = db.get_messages(SESSION)[-1]['display_metadata']['friday_file_delivery_observation']
             assert receipt['state'] == 'DELIVERED' and receipt['sha256'] == hashlib.sha256(TEXT.encode()).hexdigest()
-            path = receipt['path']
+            path = json.JSONDecoder().raw_decode(observation.removeprefix('Контекст файла '))[0]
+            assert path == receipt['path']
             assert path == 'notes.txt'
             artifact = account.homes['1']/'workspace'/path
             adapter, source, sent = delivery_fixture(account, store, sent)
@@ -244,8 +245,11 @@ def test_persisted_same_session_result_selects_read_revision_and_exact_delivery(
             assert [row[1] for row in sent] == [TEXT.encode(), REVISED.encode()]
             assert next(row for row in db.get_messages(SESSION) if row.get('tool_call_id') == 'create') == first_result
             replay_after = store.load_transcript(SESSION)
-            assert 'DELIVERED' in replay_after[-1]['content']
-            assert hashlib.sha256(REVISED.encode()).hexdigest() in replay_after[-1]['content']
+            assert 'Предыдущая отправка подтверждена.' in replay_after[-1]['content']
+            receipt_after = db.get_messages(SESSION)[-1]['display_metadata']['friday_file_delivery_observation']
+            assert receipt_after['state'] == 'DELIVERED'
+            assert receipt_after['sha256'] == hashlib.sha256(REVISED.encode()).hexdigest()
+            assert receipt_after['sha256'] not in replay_after[-1]['content']
         finally:
             store.close_all_db_handles(); db.close()
 
@@ -299,7 +303,8 @@ def test_unknown_delivery_survives_database_replay_and_revised_bytes(account, mo
             first = asyncio.run(delivery.deliver_ordinary_document(adapter, source, str(artifact)))
             assert not first.success and first.error == 'document_delivery_UNKNOWN'
             replay = store.load_transcript(SESSION)
-            assert 'UNKNOWN' in replay[-1]['content'] and 'notes.txt' in replay[-1]['content']
+            assert 'Доставка не подтверждена' in replay[-1]['content'] and 'notes.txt' in replay[-1]['content']
+            assert db.get_messages(SESSION)[-1]['display_metadata']['friday_file_delivery_observation']['state'] == 'UNKNOWN'
             a = actor(db); a._last_flushed_db_idx = len(replay)
             messages = replay + [{'role': 'user', 'content': 'Revise the prior file.'}]
             run_tool(a, messages, 'read_file', {'path': 'notes.txt'}, 'read-after-unknown')

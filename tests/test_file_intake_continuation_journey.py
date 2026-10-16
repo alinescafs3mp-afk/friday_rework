@@ -70,27 +70,26 @@ def test_uploaded_txt_reopens_revises_and_delivers_without_restaging(account, mo
         store = SessionStore(account.homes['1']/'sessions', GatewayConfig())
         try:
             replay = store.load_transcript(SESSION)
-            observation = next(row for row in reversed(replay)
-                if row.get('content', '').startswith('[File delivery observation: '))
-            # Native replay coalesces adjacent assistant observations. Select
-            # the final exact JSON record, rather than assuming one per row.
-            prior = json.JSONDecoder().raw_decode(
-                observation['content'].rsplit('observation: ', 1)[1])[0]
-            assert prior['state'] == 'DELIVERED'
+            observation = next(line for row in reversed(replay)
+                for line in reversed(row.get('content', '').splitlines())
+                if line.startswith('Контекст файла '))
+            path = json.JSONDecoder().raw_decode(observation.removeprefix('Контекст файла '))[0]
+            prior = db.get_messages(SESSION)[-1]['display_metadata']['friday_file_delivery_observation']
+            assert prior['state'] == 'DELIVERED' and path == prior['path']
             messages = replay + [{'role': 'user', 'content': 'Revise point two in that file.'}]
             a = actor(db); a._last_flushed_db_idx = len(replay)
-            read = run_tool(a, messages, 'read_file', {'path': prior['path']}, 'reopened-upload-read')
+            read = run_tool(a, messages, 'read_file', {'path': path}, 'reopened-upload-read')
             assert read['success']
             with monkeypatch.context() as mp:
                 transport(a, messages, mp)
             revised = run_tool(a, messages, 'write_file', {
-                'path': prior['path'], 'content': REVISED}, 'reopened-upload-revision')
+                'path': path, 'content': REVISED}, 'reopened-upload-revision')
             assert revised['success'] and revised['verified']
             assert received.read_bytes() == REVISED.encode()
             assert (received.parent/('.friday-before-'+revised['revision_ref'])/'before').read_bytes() == TEXT.encode()
             sender, bound, sent = delivery_fixture(account, store); pin(bound, '304')
             result = asyncio.run(delivery.deliver_ordinary_document(sender, bound, str(received)))
             assert result.success and sent[-1][1] == REVISED.encode()
-            assert 'DELIVERED' in store.load_transcript(SESSION)[-1]['content']
+            assert 'Предыдущая отправка подтверждена.' in store.load_transcript(SESSION)[-1]['content']
         finally:
             store.close_all_db_handles(); db.close()
