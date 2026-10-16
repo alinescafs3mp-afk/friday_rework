@@ -1,0 +1,180 @@
+diff --git a/hermes_cli/friday_user_scope.py b/hermes_cli/friday_user_scope.py
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -788,15 +788,32 @@
+         cap.check()
+         if name == 'read_file':
+             from hermes_cli import friday_workspace_revision as revision
+-            data, version = revision.snapshot(fd, parts[-1])
+-            cap.check()
+-            lines = data.decode('utf-8').splitlines()
++            document_format = path.suffix.lower().lstrip('.') if path.suffix.lower() in {'.docx', '.pdf'} else None
++            if document_format:
++                from tools.read_extract import extract_scoped_document_bytes, ScopedExtractionError
++                data, _ = workspace_document(str(root / path), max_bytes=1000000)
++                revision.check(cap)
++                try:
++                    text = extract_scoped_document_bytes(data, document_format)
++                except ScopedExtractionError as exc:
++                    revision.check(cap)
++                    return json.dumps({'success': False, 'error': 'document_extraction_failed',
++                                       'format': document_format, 'reason': exc.code})
++                revision.check(cap)
++                lines = text.splitlines()
++            else:
++                data, version = revision.snapshot(fd, parts[-1])
++                cap.check()
++                lines = data.decode('utf-8').splitlines()
+             starts=[]; cursor=1
+             for line in lines:
+                 starts.append(cursor); cursor += len(line)+1
+             total_units=max(1,cursor-1)
+             seen=[]
+             def record_read(rendered):
++                if document_format:
++                    revision.check(cap)
++                    return  # Extracted text never grants raw binary overwrite coverage.
+                 revision.note_read(cap,task_id,path.as_posix(),version,
+                                    seen if lines else [(1,1)],total_units,rendered)
+ 
+@@ -805,6 +822,8 @@
+                 raise ScopeDenied()
+             from agent.bounded_context import bounded_tool_result_budget, serialized_bytes
+             budget = bounded_tool_result_budget()
++            if document_format and budget is None:
++                budget = 100000
+             char_offset = args.get('char_offset', 0)
+             if type(char_offset) is not int or not 0 <= char_offset <= 1000000:
+                 raise ScopeDenied()
+@@ -815,8 +834,12 @@
+                           'path': path.as_posix(), 'scope': 'own_user_workspace',
+                           'partial': offset <= len(lines), 'next_offset': offset,
+                           'next_char_offset': char_offset}
++                if document_format:
++                    result.update(extracted_document=True, format=document_format,
++                                  coverage='text_only; images_and_layout_not_covered')
+                 encode = lambda: json.dumps(result, ensure_ascii=False, separators=(',', ':'))
+                 if serialized_bytes(encode()) > budget:
++                    if document_format: revision.check(cap)
+                     return json.dumps({'success': False, 'error': 'capacity: file metadata exceeds inline budget'})
+                 for n in range(offset-1, min(len(lines), offset-1+limit)):
+                     start = char_offset if n == offset-1 else 0
+@@ -840,6 +863,7 @@
+                     if serialized_bytes(encode()) > budget or (not complete and low == 0):
+                         result.update(content=prior, partial=True, next_offset=n+1, next_char_offset=start)
+                         if not prior:
++                            if document_format: revision.check(cap)
+                             return json.dumps({'success': False, 'error': 'capacity: no text character fits'})
+                         break
+                     if low or complete:
+@@ -861,6 +885,9 @@
+             return rendered
+         if name != 'write_file':
+             raise ScopeDenied()
++        if path.suffix.lower() in {'.docx', '.pdf'}:
++            return json.dumps({'success': False, 'error': 'document_write_unsupported',
++                               'format': path.suffix.lower().lstrip('.')})
+         content = args.get('content')
+         if not isinstance(content, str) or len(content.encode()) > 1000000:
+             raise ScopeDenied()
+diff --git a/tools/read_extract.py b/tools/read_extract.py
+--- a/tools/read_extract.py
++++ b/tools/read_extract.py
+@@ -9,6 +9,7 @@
+ import functools
+ import importlib
+ import itertools
++import io
+ import json
+ import os
+ import posixpath
+@@ -20,6 +21,7 @@
+ import threading
+ import time
+ import zipfile
++import zlib
+ from pathlib import Path
+ from typing import Any, Callable, Iterator, Optional
+ from xml.etree import ElementTree as ET
+@@ -132,6 +134,47 @@
+         if ext == ".ipynb":
+             return _extract_notebook(temp_path, display_path=path)
+         return _STDLIB_EXTRACTORS[ext](temp_path)
++
++
++class ScopedExtractionError(ExtractionError):
++    """Bounded format failure for the descriptor-only ordinary document lane."""
++    def __init__(self, code: str):
++        self.code = code
++        super().__init__(code)
++
++
++def extract_scoped_document_bytes(data: bytes, format: str) -> str:
++    """Convert own immutable snapshots; never install, OCR, reopen or shell out.
++
++    DOCX reuses the native parser below. PDF uses only the already installed
++    anydoc byte API, explicitly rejecting hosted OCR. Text extraction does not
++    establish source image/layout completeness or raw write authority.
++    """
++    if not isinstance(data, bytes) or len(data) > 1000000:
++        raise ScopedExtractionError('input_limit')
++    if format == 'docx':
++        try:
++            text = _extract_docx(io.BytesIO(data), max_xml_bytes=1000000)
++        except (ExtractionError, ValueError, RuntimeError, NotImplementedError, LookupError, zlib.error):
++            raise ScopedExtractionError('malformed_or_required_part_limit') from None
++    elif format == 'pdf':
++        try:
++            module = importlib.import_module('anydoc')  # direct import, no pm loader
++        except (ImportError, OSError):
++            raise ScopedExtractionError('missing_local_converter') from None
++        try:
++            text = module.to_markdown_bytes(data, format='pdf', ocr='reject')
++        except Exception as exc:
++            needs_ocr = getattr(module, 'NeedsOcrError', None)
++            reason = 'needs_ocr' if needs_ocr is not None and isinstance(exc, needs_ocr) else 'malformed_or_unsupported'
++            raise ScopedExtractionError(reason) from None
++    else:
++        raise ScopedExtractionError('unsupported_format')
++    if not isinstance(text, str) or not text.strip():
++        raise ScopedExtractionError('no_extractable_text')
++    if len(text.encode('utf-8')) > 1000000:
++        raise ScopedExtractionError('extracted_text_limit')
++    return text
+ 
+ 
+ def _anydoc_missing_error(path: str) -> str:
+@@ -459,10 +502,19 @@
+         raise ExtractionError(f"Not a valid {kind}: {exc}" if bad_zip else str(exc)) from exc
+ 
+ 
+-def _zip_xml(zf: zipfile.ZipFile, name: str, optional: bool = False) -> Any:
++def _zip_xml(zf: zipfile.ZipFile, name: str, optional: bool = False, *, max_bytes: Optional[int] = None) -> Any:
+     """Parse a package part; ``optional`` parts yield an empty element when absent or malformed."""
+     try:
+-        return ET.fromstring(zf.read(name))
++        if max_bytes is None:
++            return ET.fromstring(zf.read(name))
++        part = zf.getinfo(name)
++        if part.file_size > max_bytes or part.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
++            raise ExtractionError('Required document XML exceeds limit or uses unsupported compression')
++        with zf.open(part) as stream:
++            data = stream.read(max_bytes + 1)
++        if len(data) > max_bytes:
++            raise ExtractionError('Required document XML exceeds limit')
++        return ET.fromstring(data)
+     except (KeyError, ET.ParseError) as exc:
+         if optional:
+             return ET.Element("missing")
+@@ -471,9 +523,9 @@
+         ) from exc
+ 
+ 
+-def _extract_docx(path: str) -> str:
++def _extract_docx(path: str, *, max_xml_bytes: Optional[int] = None) -> str:
+     with _open_zip(path, "DOCX") as zf:
+-        root = _zip_xml(zf, "word/document.xml")
++        root = _zip_xml(zf, "word/document.xml", max_bytes=max_xml_bytes)
+     w = f"{{{_NS_W}}}"
+     breaks = {f"{w}tab": "\t", f"{w}br": "\n", f"{w}cr": "\n"}
+     lines: list[str] = []
