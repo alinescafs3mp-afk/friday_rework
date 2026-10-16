@@ -95,6 +95,20 @@ class WebProfiles(unittest.TestCase):
                 self.assertTrue(rows[row]["disabled"])
         self.assertNotIn("system-prompt", rows)
 
+    def test_dsh_all_profiles_keep_exact_native_sandbox_and_inference(self):
+        baseline = DSH.build_patch(**DSH_INPUT)
+        sandbox = {'id': 'sandbox', 'config': {
+            'runnerCommand': ['/usr/bin/bwrap'], 'runnerFailureSignatures': ['bwrap: ']}}
+        for profile in ('disabled', 'exa-paid', 'exa-keyless'):
+            with self.subTest(profile=profile):
+                rows = DSH.build_patch(**DSH_INPUT, web_profile=profile)
+                self.assertEqual(rows[:3], baseline[:3])
+                self.assertEqual(rows[3], sandbox)
+                self.assertEqual([row for row in rows if row.get('id') == 'sandbox'], [sandbox])
+                disabled = [{'id': row, 'disabled': True} for row in DSH.DISABLED_ROWS
+                            if profile == 'disabled' or row != 'tool-web']
+                self.assertEqual(rows[4:], disabled + dsh_web_patch(profile))
+
     def test_native_dsh_budgets_are_separate_from_model_budgets(self):
         result = DSH.build_patch(**DSH_INPUT, web_profile="exa-paid", web_search_max_results=3,
                                 web_search_max_queries=1, web_timeout_ms=7000,

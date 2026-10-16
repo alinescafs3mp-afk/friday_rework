@@ -97,6 +97,10 @@ def build_patch(*, purpose, api, base_url, model, context_window, max_tokens,
             "summarizationProvider": "friday-local", "summarizationModel": model,
             "maxTokens": summary_max_tokens, "headroomTokens": headroom_tokens,
         }},
+        {"id": "sandbox", "config": {
+            "runnerCommand": ["/usr/bin/bwrap"],
+            "runnerFailureSignatures": ["bwrap: "],
+        }},
         *({"id": row, "disabled": True} for row in DISABLED_ROWS
           if not (web and row == "tool-web")),
         *web,

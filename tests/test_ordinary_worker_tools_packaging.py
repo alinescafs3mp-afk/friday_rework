@@ -14,6 +14,14 @@ from tools import render_dsh_local as render, web_profile as web
 ROOT=Path(__file__).resolve().parents[1]
 MANIFEST=json.loads((ROOT/'patches/hermes/ordinary-worker-tools-packaging-manifest.json').read_text())
 ROWS={r['path']:r for r in MANIFEST['files']}
+SANDBOX_MANIFEST=ROOT/'patches/hermes/ordinary-dsh-native-sandbox-profile-manifest.json'
+if SANDBOX_MANIFEST.is_file():
+    sandbox_rows=json.loads(SANDBOX_MANIFEST.read_text())['files']
+    assert len(sandbox_rows)==1
+    sandbox_row=sandbox_rows[0]
+    assert sandbox_row['path']=='tools/render_dsh_local.py'
+    assert sandbox_row['before_sha256']==ROWS['tools/render_dsh_local.py']['sha256']
+    ROWS[sandbox_row['path']]=sandbox_row
 KW=dict(purpose='temporary-local-test',api='openai-completions',base_url='http://127.0.0.1:8011/v1',model='offline-fixture',context_window=40960,max_tokens=4096,summary_max_tokens=2048,headroom_tokens=4096)
 
 
@@ -33,6 +41,11 @@ def test_exact_renderer_profiles_are_native_and_keep_inference_rows(profile):
     rows=render.build_patch(**KW,web_profile=profile)
     baseline=render.build_patch(**KW)
     assert rows[:3]==baseline[:3]
+    if SANDBOX_MANIFEST.is_file():
+        sandbox={'id':'sandbox','config':{'runnerCommand':['/usr/bin/bwrap'],
+                                         'runnerFailureSignatures':['bwrap: ']}}
+        assert rows[3]==sandbox
+        assert [r for r in rows if r.get('id')=='sandbox']==[sandbox]
     if profile=='disabled':
         assert web.dsh_web_patch(profile)==[]
         assert next(r for r in rows if r.get('id')=='tool-web')['disabled'] is True

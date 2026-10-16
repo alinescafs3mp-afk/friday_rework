@@ -56,6 +56,10 @@ class WorkerWeb(unittest.TestCase):
         self.assertIn('--property=RuntimeMaxSec=53.000000s',argv)
         self.assertIn('/etc/resolv.conf',argv)
         root=Path(self.f.row['workspace_reference']); bootstrap=root/'inputs/bootstrap.py'
+        handoff=json.loads((root/'inputs/local.patch.yml').read_bytes())
+        self.assertEqual(handoff,self.rows)
+        self.assertEqual(handoff[3],{'id':'sandbox','config':{
+            'runnerCommand':['/usr/bin/bwrap'],'runnerFailureSignatures':['bwrap: ']}})
         captured=[]
         with patch.dict('os.environ',{'EXA_API_KEY':'SYNTHETIC_EXA','LOCAL_TEST_KEY':'SYNTHETIC_LOCAL',
                                      'HTTP_PROXY':'FOREIGN','OTHER_KEY':'FOREIGN'},clear=True), \

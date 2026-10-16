@@ -30,8 +30,10 @@ class DshLocalProfile(unittest.TestCase):
         self.assertEqual(set(route), {'friday-local'})
         self.assertNotIn('apiKeyEnv', route['friday-local'])
         self.assertEqual(patch[1]['config'], dict(provider='friday-local', model='fixture-local'))
-        self.assertEqual({r['id'] for r in patch[3:]}, set(renderer.DISABLED_ROWS))
-        self.assertTrue(all(r['disabled'] is True for r in patch[3:]))
+        self.assertEqual(patch[3], {'id': 'sandbox', 'config': {
+            'runnerCommand': ['/usr/bin/bwrap'], 'runnerFailureSignatures': ['bwrap: ']}})
+        self.assertEqual(patch[4:], [{'id': row, 'disabled': True}
+                                     for row in renderer.DISABLED_ROWS])
         self.assertEqual(patch[2]['config'], dict(summarizationProvider='friday-local',
                          summarizationModel='fixture-local', maxTokens=2048, headroomTokens=4096))
 
@@ -70,8 +72,11 @@ class DshLocalProfile(unittest.TestCase):
     def test_inputs_are_independent(self):
         first = renderer.build_patch(**self.inputs)
         original = copy.deepcopy(first)
-        renderer.build_patch(**dict(self.inputs, model='second'))
+        second = renderer.build_patch(**dict(self.inputs, model='second'))
+        second[3]['config']['runnerCommand'].append('foreign-runner')
+        second[3]['config']['runnerFailureSignatures'].clear()
         self.assertEqual(first, original)
+        self.assertEqual(renderer.build_patch(**self.inputs), original)
 
     def test_native_retention_must_fit_below_pressure_including_boundary(self):
         # Native retain=floor((40960-4096)*.16)=5898, pressure=36864-headroom.
@@ -123,6 +128,9 @@ class DshLocalProfile(unittest.TestCase):
             env = dict(os.environ, FRIDAY_FIXTURE_API_KEY='SECRET_CANARY_NOT_SERIALIZED')
             ok = subprocess.run(argv, env=env, capture_output=True, timeout=10)
             self.assertEqual(ok.returncode, 0)
+            self.assertEqual(json.loads((Path(root)/'patch.yml').read_bytes())[3], {
+                'id': 'sandbox', 'config': {'runnerCommand': ['/usr/bin/bwrap'],
+                                           'runnerFailureSignatures': ['bwrap: ']}})
             combined = ok.stdout + ok.stderr + (Path(root)/'patch.yml').read_bytes()
             self.assertNotIn(b'SECRET_CANARY_NOT_SERIALIZED', combined)
             invalid = subprocess.run(argv + ['--unknown', 'SECRET_CANARY_NOT_SERIALIZED'],
