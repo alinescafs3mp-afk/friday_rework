@@ -29,6 +29,37 @@ class AdapterError(RuntimeError):
     pass
 
 
+# Root reviewed application policy is a prerequisite, never installed by this code.
+_APPARMOR_ENTRY = "/usr/local/libexec/friday-dsh-bwrap"
+_APPARMOR_FILES = (
+    ("/usr/bin/bwrap", "523da3e7399044be5163aee6f57a77a6bef7454376e28f0a0627920bae1b76b6"),
+    ("/usr/bin/python3.14", "52e0a13e60a981d8c4b6478be2ba5176f69da07948a056bf49cf6f077e30cb41"),
+    (_APPARMOR_ENTRY, "523da3e7399044be5163aee6f57a77a6bef7454376e28f0a0627920bae1b76b6"),
+    ("/etc/apparmor.d/friday-dsh-native-v1", "5a400147afe52cf1ce879112ca41f6d2ff5718032971f438f7e5461b02e4176b"),
+)
+_APPARMOR_NODE = Path("/home/jericho/.jericho/runtime/friday-toolchain22.bSt8Uu/node-v22.23.2-linux-x64/bin/node")
+
+def _apparmor_boundary(config, boundary):
+    if config.node.path != _APPARMOR_NODE or config.node.sha256 != "3517c2df0b2f8cd7f422b4b8450ef81c6889f08eb03e281d6de9079b15e6a327":
+        raise AdapterError("apparmor_native_node_changed")
+    for name, digest in _APPARMOR_FILES:
+        path = Path(name)
+        try:
+            st = path.lstat()
+            if (path.resolve() != path or not stat.S_ISREG(st.st_mode) or st.st_uid != 0
+                    or st.st_nlink != 1 or st.st_mode & 0o022
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != digest):
+                raise AdapterError("apparmor_host_input_changed")
+        except OSError as error:
+            raise AdapterError("apparmor_host_input_missing") from error
+    # The dedicated root-owned copy gets its own exec attachment; no explicit
+    # change_profile call which this host would force into an unconfined stack.
+    # Original outer arguments, native NNP, resources and custody stay unchanged.
+    if not boundary or boundary[0] != "/usr/bin/bwrap":
+        raise AdapterError("apparmor_outer_entry_changed")
+    return [_APPARMOR_ENTRY, *boundary[1:]]
+
+
 @dataclass(frozen=True)
 class PinnedFile:
     path: Path
@@ -576,7 +607,7 @@ class DshAdapter:
         boundary = self._boundary(root, command)
         if not grant:
             boundary.insert(1, "--clearenv")
-        argv += boundary
+        argv += _apparmor_boundary(c, boundary)
         return argv
 
     def submit(self, association, brief, inputs, prepared, on_native_observed):

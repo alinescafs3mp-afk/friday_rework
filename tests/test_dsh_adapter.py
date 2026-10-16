@@ -101,6 +101,14 @@ class FakeSupervisor:
 
 class AdapterTests(unittest.TestCase):
     def setUp(self):
+        # These data-only argv/supervision tests use synthetic Node paths.
+        # Root-owned host guard behavior is covered separately with isolated files.
+        def accepted_host_boundary(config, boundary):
+            self.assertEqual(boundary[0], "/usr/bin/bwrap")
+            return ["/usr/local/libexec/friday-dsh-bwrap", *boundary[1:]]
+        host_guard = patch("friday_dsh_adapter_test.adapters.dsh._apparmor_boundary",
+                           side_effect=accepted_host_boundary)
+        host_guard.start(); self.addCleanup(host_guard.stop)
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name);self.root.chmod(0o700)
         payload=self.root/"payload";payload.mkdir();(payload/"apps/cli/lib").mkdir(parents=True)
