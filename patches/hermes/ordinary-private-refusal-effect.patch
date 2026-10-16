@@ -1,0 +1,573 @@
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -325,6 +325,7 @@
+     *,
+     content: str,
+     hook_error_type: Optional[str] = None,
++    interrupted_call_id: Optional[str] = None,
+     hook_id: Optional[Callable[[Any], str]] = None,
+     flush_stage: Optional[str] = None,
+     stop_on_flush_failure: bool = True,
+@@ -333,11 +334,15 @@
+     lacks matching results (role alternation). ``content`` is formatted with ``{name}``;
+     ``hook_error_type`` also emits the terminal ``post_tool_call`` (status=cancelled) per
+     call with ``hook_id`` overriding the hook's id; ``flush_stage`` flushes after each
+-    append and returns False on the first failed flush when ``stop_on_flush_failure``."""
++    append and returns False on the first failed flush when ``stop_on_flush_failure``.
++    ``interrupted_call_id`` retains uncertainty for the already-started current call
++    without re-emitting its terminal hook; later unstarted no-hook calls stay none."""
+     for tc in tool_calls:
+         name = _tc_name(tc)
+         result = content.format(name=name)
+-        messages.append(make_tool_result_message(name, result, _pairing_tool_call_id(tc), effect_disposition="none"))
++        messages.append(make_tool_result_message(name, result, _pairing_tool_call_id(tc),
++            effect_disposition="unknown" if (hook_error_type is not None
++                or (interrupted_call_id is not None and _pairing_tool_call_id(tc) == interrupted_call_id)) else "none"))
+         if hook_error_type is not None:
+             _ToolCallRef(name, {}, effective_task_id, (hook_id or _pairing_tool_call_id)(tc), []).emit_post(
+                 agent, result,
+@@ -1676,7 +1681,9 @@
+             )
+         else:
+             ref, function_result, tool_duration, is_error, blocked = r.ref, r.result, r.duration, r.is_error, r.blocked
+-            effect_disposition = "none" if blocked else None
++            # Blocked after middleware/terminal hooks is not a proof that the
++            # whole call had no effects. Preserve unknown for that boundary.
++            effect_disposition = "unknown" if blocked else None
+             if pc.parse_error is not None:
+                 ref.emit_invalid_arguments(agent, r.result)
+         committed = _commit_tool_result(
+@@ -1882,7 +1889,7 @@
+ def _append_invalid_arguments_result(agent, messages: list, ref: _ToolCallRef, parse_error: str) -> bool:
+     """Emit + append the parse-error result for a call whose arguments were not a JSON object."""
+     ref.emit_invalid_arguments(agent, parse_error)
+-    messages.append(make_tool_result_message(ref.name, parse_error, ref.call_id))
++    messages.append(make_tool_result_message(ref.name, parse_error, ref.call_id, effect_disposition="unknown"))
+     return _flush_session_db_after_tool_progress(agent, messages, stage=f"invalid tool arguments {ref.name}")
+ 
+ 
+@@ -1920,6 +1927,7 @@
+         _append_skipped_tool_results(
+             agent, messages, remaining_calls, ref.task_id,
+             content="[Tool execution cancelled — {name} was skipped due to keyboard interrupt]",
++            interrupted_call_id=ref.call_id,
+         )
+         raise
+     except Exception as tool_error:
+@@ -1976,7 +1984,7 @@
+     committed = _commit_tool_result(
+         agent, messages, ref, function_result,
+         budget=budget, tool_duration=tool_duration, is_error=_is_error_result, blocked=managed.blocked,
+-        effect_disposition="unknown" if _execution_timed_out else None, observed=True,
++        effect_disposition="unknown" if _execution_timed_out or managed.blocked else None, observed=True,
+         error_preview=lambda res: res[:200] if isinstance(res, str) and not agent.verbose_logging else res,
+         success_log_chars=_result_len,
+         verbose_text=_multimodal_text_summary,
+--- a/agent/tool_result_classification.py
++++ b/agent/tool_result_classification.py
+@@ -21,6 +21,61 @@
+ 
+ def tool_may_have_side_effect(tool_name: str) -> bool:
+     return tool_name not in NO_EFFECT_TOOL_NAMES
++
++
++def tool_call_identity(call: Any) -> tuple[str, str]:
++    """Read pairing identity only; model arguments and disposition claims are data."""
++    if not isinstance(call, dict) or not isinstance(call.get("function"), dict):
++        return "", ""
++    call_id, name = call.get("id"), call["function"].get("name")
++    return (call_id if isinstance(call_id, str) else "",
++            name if isinstance(name, str) else "")
++
++
++def tool_effects_unknown(rows, *, no_dispatch_tool_calls=(), pending_calls=True) -> bool:
++    """Reduce native transcript metadata without reading model/tool payloads.
++
++    ``none`` is an execution-owned top-level result column, never a claim from
++    arguments/content or an assistant row. Only the native privacy pre-dispatch
++    boundary supplies ``no_dispatch_tool_calls``; those exact identities are not
++    transcript/model input. Missing, duplicate or inconsistent evidence is unsafe.
++    ``pending_calls=False`` is only for progress before a batch has finished.
++    """
++    if not isinstance(no_dispatch_tool_calls, (list, tuple)):
++        return True
++    denied = {tuple(item) for item in no_dispatch_tool_calls
++              if isinstance(item, (list, tuple)) and len(item) == 2
++              and all(isinstance(value, str) and value for value in item)}
++    calls, results = {}, set()
++    for row in rows:
++        if not isinstance(row, dict):
++            continue
++        if row.get("role") == "assistant" and row.get("tool_calls"):
++            if not isinstance(row["tool_calls"], list):
++                return True
++            for call in row["tool_calls"]:
++                call_id, name = tool_call_identity(call)
++                if not call_id or not name or call_id in calls:
++                    return True
++                calls[call_id] = name
++        elif row.get("role") == "tool":
++            call_id = row.get("tool_call_id")
++            if not isinstance(call_id, str) or call_id not in calls or call_id in results:
++                return True
++            results.add(call_id)
++            name = calls[call_id]
++            if any(row.get(key) and row[key] != name for key in ("name", "tool_name")):
++                return True
++            disposition = row.get("effect_disposition")
++            if disposition == "none":
++                continue
++            # A readonly handler name does not certify opaque native middleware,
++            # hooks or callbacks around it. Missing execution proof stays unknown.
++            return True
++    return bool(pending_calls and any(
++        call_id not in results and (call_id, name) not in denied
++        for call_id, name in calls.items()
++    ))
+ 
+ 
+ # Set by a tool that REFUSED a call the harness judged redundant (repeated identical
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -579,6 +579,8 @@
+     agent._friday_reply_withheld = False
+     agent._friday_reply_withheld_reason = None
+     agent._friday_reply_effect_unknown = False
++    agent._friday_reply_effect_messages = []
++    agent._friday_no_dispatch_tool_calls = []
+     agent._friday_approved_final = None
+     agent._friday_reply_stream_published = False
+     agent._friday_reply_callbacks_published = False
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -541,9 +541,13 @@
+     from agent.conversation_loop import logger
+     from gateway.media_repair import _current_turn_messages
+     _private_turn = _current_turn_messages(messages, len(conversation_history or []))
+-    _private_effect_unknown = any(row.get('role') == 'tool' or
+-        (row.get('role') == 'assistant' and row.get('tool_calls')) for row in _private_turn)
+-    _private_effect_unknown = _private_effect_unknown or bool(getattr(agent, '_friday_reply_effect_unknown', False))
++    from agent.tool_result_classification import tool_effects_unknown
++    _no_dispatch_calls = getattr(agent, '_friday_no_dispatch_tool_calls', ())
++    _private_effect_unknown = (tool_effects_unknown(_private_turn,
++        no_dispatch_tool_calls=_no_dispatch_calls)
++        or tool_effects_unknown(getattr(agent, '_friday_reply_effect_messages', ()),
++            no_dispatch_tool_calls=_no_dispatch_calls)
++        or bool(getattr(agent, '_friday_reply_effect_unknown', False)))
+     agent._friday_reply_effect_unknown = _private_effect_unknown
+ 
+     from hermes_cli.friday_user_scope import managed_reply_stream, guard_generated_reply, _retain_private_reply, current
+@@ -758,7 +762,8 @@
+         from hermes_cli.friday_user_scope import is_privacy_refusal
+         result.update(error=final_response, failure_reason='private_reply_withheld',
+                       partial=_private_effect_unknown, effect_unknown=_private_effect_unknown,
+-                      privacy_refusal=is_privacy_refusal(agent))
++                      privacy_refusal=is_privacy_refusal(agent),
++                      no_dispatch_tool_calls=list(_no_dispatch_calls))
+     if agent._tool_guardrail_halt_decision is not None:
+         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+     # Persistence failures already set failed=True; also stamp `error` so the gateway
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -1706,10 +1706,9 @@
+         turn_messages = _current_turn_messages(
+             agent_result.get("messages", []) or [], agent_result.get("history_offset", 0),
+         )
+-        effect_unknown = any(
+-            message.get("role") == "tool"
+-            or (message.get("role") == "assistant" and message.get("tool_calls"))
+-            for message in turn_messages
++        from agent.tool_result_classification import tool_effects_unknown
++        effect_unknown = tool_effects_unknown(turn_messages,
++            no_dispatch_tool_calls=agent_result.get("no_dispatch_tool_calls", ()),
+         ) or bool(agent_result.get("effect_unknown"))
+         from hermes_cli.friday_user_scope import ordinary_presentation, private_reply_copy
+         if (ordinary_presentation() and agent_result.get("failure_reason") == 'private_reply_withheld'
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -1978,6 +1978,7 @@
+             # Keep the reviewed refusal type and uncertainty through both return paths.
+             "privacy_refusal": result.get("privacy_refusal", False),
+             "effect_unknown": result.get("effect_unknown", False),
++            "no_dispatch_tool_calls": result.get("no_dispatch_tool_calls", []),
+             "compression_exhausted": result.get("compression_exhausted", False),
+             "compression_deferred": result.get("compression_deferred", False),
+             "tools": ctx.tools_holder[0] or [],
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -1432,9 +1432,22 @@
+     """Only freshly collected assistant rows; restored/history rows are excluded by caller."""
+     if not managed_reply_stream(agent):
+         return
+-    if any(row.get('role') == 'tool' or (row.get('role') == 'assistant' and row.get('tool_calls')) for row in rows):
+-        agent._friday_reply_effect_unknown = True
++    from agent.tool_result_classification import tool_effects_unknown, tool_call_identity
++    observed = getattr(agent, '_friday_reply_effect_messages', None)
++    if observed is None:
++        observed = agent._friday_reply_effect_messages = []
++    denied_calls = getattr(agent, '_friday_no_dispatch_tool_calls', ())
+     for row, message in zip(rows, messages):
++        if not any(prior is message for prior in observed):
++            observed.append(message)
++        # A fresh assistant declaration has not dispatched yet. Tool progress may
++        # leave other slots pending; finalization checks every missing result.
++        pending = [tool_call_identity(call) for call in (row.get('tool_calls') or ())]
++        unknown = tool_effects_unknown(observed,
++            no_dispatch_tool_calls=(*denied_calls, *pending),
++            pending_calls=row.get('role') == 'assistant')
++        agent._friday_reply_effect_unknown = bool(
++            getattr(agent, '_friday_reply_effect_unknown', False) or unknown)
+         if row.get('role') != 'assistant':
+             continue
+         if row.get('tool_calls'):
+@@ -1442,6 +1455,9 @@
+             row['tool_calls'] = message['tool_calls'] = public_calls
+             _, private_call = guard_generated_reply(agent, public_calls)
+             if private_call:
++                # Native proof for this exact batch, including the finalizer/gateway
++                # fallback. Keep the original calls and never trust model claims.
++                agent._friday_no_dispatch_tool_calls = list(denied_calls) + pending
+                 raise ScopeDenied()  # Halt before the public write and before tool dispatch.
+         for key in ('content', 'api_content'):
+             if isinstance(row.get(key), str):
+--- /dev/null
++++ b/tests/agent/test_privacy_effect_semantics.py
+@@ -0,0 +1,338 @@
++"""Pure native-AST checks: no runtime import, credentials, DB, model or transport.
++
++Run in a complete native checkout. Author validation uses an isolated source overlay.
++The capability/private-retention sink is synthetic; these are not live acceptance.
++"""
++import ast
++import builtins
++import copy
++import json
++from pathlib import Path
++from types import SimpleNamespace as NS
++import pytest
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def nodes(rel, names):
++    tree = ast.parse((ROOT / rel).read_text())
++    return [copy.deepcopy(next(n for n in ast.walk(tree)
++        if isinstance(n, ast.FunctionDef) and n.name == name)) for name in names]
++
++
++def execute(parts, namespace):
++    for part in parts:
++        part.returns = None
++        for arg in part.args.args + part.args.kwonlyargs:
++            arg.annotation = None
++    exec(compile(ast.fix_missing_locations(ast.Module(body=parts, type_ignores=[])),
++        '<native-AST>', 'exec'), namespace)
++
++
++class ScopeDenied(PermissionError):
++    pass
++
++
++class StopBeforeFinalization(Exception):
++    pass
++
++
++@pytest.fixture
++def native():
++    classification = {}
++    exec(compile((ROOT/'agent/tool_result_classification.py').read_text(),
++        'agent/tool_result_classification.py', 'exec'), classification)
++    retained = []
++    ns = dict(__builtins__={**vars(builtins)}, json=json, ScopeDenied=ScopeDenied,
++        PRIVATE_REPLY_COPY='Я не раскрываю внутренние настройки и служебные пути.',
++        PRIVATE_REPLY_FAILURE_COPY='Не удалось безопасно подготовить ответ. Если ошибка повторяется, сообщите администратору.',
++        managed_reply_stream=lambda a: True,
++        _restricted_reply_values=lambda a: (NS(), ('/SYNTHETIC_PRIVATE_DEPLOYMENT/',)),
++        _public_reply_media=lambda cap, value: value,
++        self_deployment_claim_spans=lambda text: [], _self_claim_texts=lambda value: [],
++        _retain_private_reply=lambda cap, candidate, reason, **kw: retained.append(kw),
++        _public_file_call_paths=lambda calls: calls,
++        retained=retained)
++    execute(nodes('hermes_cli/friday_user_scope.py', ['private_reply_copy',
++        'is_privacy_refusal', '_withheld_reply_copy', 'guard_generated_reply',
++        'guard_generated_rows']), ns)
++    execute(nodes('gateway/media_repair.py', ['_current_turn_messages']), ns)
++    scope = NS(ordinary_presentation=lambda *a: True,
++        private_reply_copy=ns['private_reply_copy'], managed_reply_stream=ns['managed_reply_stream'],
++        guard_generated_reply=ns['guard_generated_reply'], _retain_private_reply=ns['_retain_private_reply'],
++        current=lambda **kw: NS())
++    modules = {'agent.tool_result_classification': NS(**classification),
++        'hermes_cli.friday_user_scope': scope,
++        'gateway.media_repair': NS(_current_turn_messages=ns['_current_turn_messages']),
++        'agent.conversation_loop': NS(logger=NS(warning=lambda *a: None))}
++    def importer(name, *args, **kw):
++        assert name in modules, 'Unexpected runtime import: ' + name
++        return modules[name]
++    ns['__builtins__']['__import__'] = importer
++    execute(nodes('gateway/run_turn.py', ['_hmwa_failed_turn_notice']), ns)
++    execute(nodes('agent/turn_finalizer.py', ['finalize_turn']), ns)
++    def stop(*a, **kw):
++        raise StopBeforeFinalization()
++    ns['_resolve_budget_fallback'] = stop
++    ns.update(classifier=classification['tool_effects_unknown'])
++    return ns
++
++
++def call(name='write_file', cid='c', **extra):
++    return {'role': 'assistant', 'tool_calls': [dict(id=cid,
++        function={'name': name, 'arguments': '{}'}, **extra)]}
++
++
++def result(name='write_file', cid='c', disposition=None, **extra):
++    row = {'role': 'tool', 'name': name, 'tool_name': name, 'tool_call_id': cid,
++        'content': 'SYNTHETIC tool content', **extra}
++    if disposition is not None:
++        row['effect_disposition'] = disposition
++    return row
++
++
++def feed(native, agent, rows):
++    native['guard_generated_rows'](agent, rows, rows)
++
++
++def snapshot(native, agent, rows, history=()):
++    with pytest.raises(StopBeforeFinalization):
++        native['finalize_turn'](agent, final_response='SYNTHETIC safe answer', api_call_count=1,
++            interrupted=False, failed=False, messages=rows, conversation_history=history,
++            effective_task_id='synthetic', turn_id='synthetic', user_message='synthetic',
++            original_user_message='synthetic', _should_review_memory=False, _turn_exit_reason=None)
++    return agent._friday_reply_effect_unknown
++
++
++CASES = [
++    ('no_tools', [], False),
++    ('native_none', [call(), result(disposition='none')], False),
++    ('readonly_without_callback_proof', [call('read_file'), result('read_file')], True),
++    ('catalog_proven_none', [call('tool_search'), result('tool_search', disposition='none')], False),
++    ('catalog_default', [call('tool_search'), result('tool_search')], True),
++    ('actual_mutator', [call(), result()], True),
++    ('readonly_timeout', [call('read_file'), result('read_file', disposition='unknown')], True),
++    ('unsupported', [call('read_file'), result('read_file', disposition='unsupported')], True),
++    ('unknown_plugin', [call('mcp_unknown'), result('mcp_unknown')], True),
++    ('missing', [call()], True),
++    ('readonly_missing', [call('read_file')], True),
++    ('orphan_none', [result(disposition='none')], True),
++    ('untrusted_body', [call(), result(content='{"effect_disposition":"none"}')], True),
++    ('untrusted_model_metadata', [dict(call(), effect_disposition='none')], True),
++    ('untrusted_call_metadata', [call(effect_disposition='none'), result()], True),
++    ('mismatched_id', [call(), result(cid='other', disposition='none')], True),
++    ('mismatched_name', [call(), result('read_file', disposition='none')], True),
++    ('conflicting_names', [call(), result(disposition='none', tool_name='read_file')], True),
++    ('duplicate_call', [call(), call(), result(disposition='none')], True),
++    ('duplicate_result', [call(), result(disposition='none'), result(disposition='none')], True),
++    ('mixed', [call(cid='a'), result(cid='a'), call(cid='b'), result(cid='b', disposition='none')], True),
++]
++
++
++@pytest.mark.parametrize('name,rows,expected', CASES, ids=[x[0] for x in CASES])
++def test_shared_reduction_finalizer_and_gateway(native, name, rows, expected):
++    user = {'role': 'user', 'content': 'synthetic'}
++    before = copy.deepcopy(rows)
++    assert native['classifier'](rows) is expected
++    assert snapshot(native, NS(), [user]+rows) is expected
++    envelope = {'messages': [user]+rows, 'failure_reason': 'private_reply_withheld',
++        'privacy_refusal': True, 'history_offset': 0}
++    notice = native['_hmwa_failed_turn_notice'](NS(), envelope)
++    assert ('Часть действий могла выполниться.' in notice) is expected
++    assert rows == before
++
++
++@pytest.mark.parametrize('name,rows,expected', [case for case in CASES
++    if case[0] not in ('missing', 'readonly_missing', 'untrusted_model_metadata')], ids=lambda x: str(x)[:40])
++def test_incremental_guard_and_retention(native, name, rows, expected):
++    agent = NS()
++    for row in copy.deepcopy(rows):
++        feed(native, agent, [row])
++    private = {'role': 'assistant', 'content': '/SYNTHETIC_PRIVATE_DEPLOYMENT/config'}
++    feed(native, agent, [private])
++    assert ('Часть действий могла выполниться.' in private['content']) is expected
++    assert native['retained'][-1]['effect_unknown'] is expected
++
++
++@pytest.mark.parametrize('prior_effect', [False, True])
++def test_private_arguments_are_denied_before_dispatch_and_not_dangling(native, prior_effect):
++    agent = NS()
++    prior = [call(cid='old'), result(cid='old')] if prior_effect else []
++    for row in prior:
++        feed(native, agent, [row])
++    row = call(cid='denied')
++    row['tool_calls'][0]['function']['arguments'] = json.dumps({'path': '/SYNTHETIC_PRIVATE_DEPLOYMENT/config'})
++    dispatches = []
++    with pytest.raises(ScopeDenied):
++        feed(native, agent, [row])
++        dispatches.append('SHOULD NEVER DISPATCH')
++    assert dispatches == []
++    assert native['retained'][-1]['effect_unknown'] is prior_effect
++    assert snapshot(native, agent, prior+[row]) is prior_effect
++    envelope = {'messages': prior+[row], 'failure_reason': 'private_reply_withheld',
++        'privacy_refusal': True, 'effect_unknown': agent._friday_reply_effect_unknown,
++        'no_dispatch_tool_calls': agent._friday_no_dispatch_tool_calls}
++    notice = native['_hmwa_failed_turn_notice'](NS(), envelope)
++    assert ('Часть действий могла выполниться.' in notice) is prior_effect
++
++
++def test_none_does_not_erase_prior_uncertainty_or_hidden_compressed_evidence(native):
++    agent = NS()
++    for row in [call(cid='old'), result(cid='old'), call(cid='new'), result(cid='new', disposition='none')]:
++        feed(native, agent, [row])
++    assert snapshot(native, agent, [{'role': 'user', 'content': 'compressed'}, call(cid='new'), result(cid='new', disposition='none')])
++    assert native['classifier']([call(), result(disposition='unknown')], no_dispatch_tool_calls=[('c', 'write_file')])
++
++
++def test_gateway_compression_boundary_and_explicit_unknown(native):
++    old = [{'role': 'tool', 'content': 'old unknown'}]
++    current = [{'role': 'user', 'content': 'current'}, call('read_file'), result('read_file', disposition='none')]
++    envelope = {'messages': old+current, 'history_offset': 999,
++        'failure_reason': 'private_reply_withheld', 'privacy_refusal': True}
++    assert 'Часть действий' not in native['_hmwa_failed_turn_notice'](NS(), envelope)
++    envelope['effect_unknown'] = True
++    assert 'Часть действий' in native['_hmwa_failed_turn_notice'](NS(), envelope)
++
++
++def test_safe_answer_and_reasoning_suppression_remain(native):
++    agent = NS()
++    good = {'role': 'assistant', 'content': 'Requested safe answer', 'tool_calls': None}
++    feed(native, agent, [good])
++    assert good['content'] == 'Requested safe answer'
++    private = {'role': 'assistant', 'content': 'safe', 'reasoning_content': '/SYNTHETIC_PRIVATE_DEPLOYMENT/hidden'}
++    feed(native, agent, [private])
++    assert private['reasoning_content'] is None
++    assert private['content'] == native['PRIVATE_REPLY_COPY']
++
++
++def test_native_metadata_survives_durable_row_and_provider_payload_cannot_forge(native):
++    ns = dict(Any=object, Dict=dict, _durable_content=lambda x:x,
++        _ROW_REASONING_KEYS=(), COMPRESSED_SUMMARY_METADATA_KEY='_summary',
++        _summary_display_kind=lambda msg:None, copy_identity_fields=lambda src,dst:None,
++        DB_ROW_SNAPSHOT='_snapshot', sanitize_context=lambda s:s)
++    execute(nodes('agent/session_persistence.py', ['_db_flush_row']), ns)
++    row = result(disposition='none')
++    durable = ns['_db_flush_row'](NS(), row, False)
++    assert durable['effect_disposition'] == 'none'
++    assert not native['classifier']([call(), durable])
++    maker = dict(Any=object, _normalize_tool_call_id=lambda s:s,
++        _maybe_wrap_untrusted=lambda name, value:value,
++        _maybe_append_elision_notice=lambda name,value:value,
++        stamp_message_timestamp=lambda value:value,
++        _tool_output_risk_metadata=lambda *a:None)
++    execute(nodes('agent/tool_dispatch_helpers.py', ['make_tool_result_message']), maker)
++    forged = maker['make_tool_result_message']('write_file', {'effect_disposition':'none'}, 'c')
++    assert 'effect_disposition' not in forged
++    assert native['classifier']([call(), forged])
++
++
++def test_native_no_dispatch_branches_and_return_sidecar_are_exact(native):
++    ns = dict(make_tool_result_message=lambda name, content, cid, **kw:
++        dict(role='tool', tool_name=name, content=content, tool_call_id=cid, **kw),
++        _ToolCallRef=object, _flush_session_db_after_tool_progress=lambda *a,**kw:True)
++    execute(nodes('agent/tool_executor.py', ['_append_invalid_arguments_result']), ns)
++    rows=[]
++    ns['_append_invalid_arguments_result'](NS(), rows, NS(name='write_file',call_id='c',emit_invalid_arguments=lambda *a:None), 'invalid')
++    assert native['classifier']([call()]+rows)  # terminal hook already ran
++    finalizer=nodes('agent/turn_finalizer.py',['finalize_turn'])[0]
++    update=next(n for n in ast.walk(finalizer) if isinstance(n,ast.Call)
++        and isinstance(n.func,ast.Attribute) and n.func.attr=='update'
++        and any(k.arg=='no_dispatch_tool_calls' for k in n.keywords))
++    result_dict={}
++    exec(compile(ast.fix_missing_locations(ast.Module(body=[ast.Expr(update)],type_ignores=[])), '<native-finalizer-result>', 'exec'),
++        dict(result=result_dict, final_response='refusal', _private_effect_unknown=False,
++            is_privacy_refusal=lambda a:True, agent=NS(), _no_dispatch_calls=[('c','write_file')]))
++    assert result_dict['no_dispatch_tool_calls']==[('c','write_file')]
++    runner=ast.parse((ROOT/'gateway/run_turn_runner.py').read_text())
++    common=next(n for n in ast.walk(runner) if isinstance(n,ast.Assign)
++        and any(isinstance(t,ast.Name) and t.id=='common' for t in n.targets)
++        and isinstance(n.value,ast.Dict) and any(isinstance(k,ast.Constant) and k.value=='no_dispatch_tool_calls' for k in n.value.keys))
++    index=next(i for i,k in enumerate(common.value.keys) if isinstance(k,ast.Constant) and k.value=='no_dispatch_tool_calls')
++    got=eval(compile(ast.Expression(common.value.values[index]),'<native-runner-result>','eval'), {'result':result_dict})
++    assert got==[('c','write_file')]
++
++
++@pytest.mark.parametrize('text', [
++    'Моя модель — private-router.', 'Мой backend — Hermes.',
++    'I am powered by private-router.', 'Я работаю на Linux.',
++    'Ядро: Hermes\nМодель: private-router.',
++])
++def test_old_private_phrase_variants_still_guarded_with_real_grammar(native, text):
++    # This unmodified native semantic grammar is checked separately from the
++    # synthetic typed-value fixtures used by the effect matrix.
++    grammar = {'__builtins__': {**vars(builtins)}}
++    execute(nodes('hermes_cli/friday_user_scope.py',
++        ['self_deployment_claim_spans', '_self_claim_texts']), grammar)
++    native['self_deployment_claim_spans'] = grammar['self_deployment_claim_spans']
++    native['_self_claim_texts'] = grammar['_self_claim_texts']
++    public, blocked = native['guard_generated_reply'](NS(), text)
++    assert blocked and public == native['PRIVATE_REPLY_COPY']
++    assert native['guard_generated_reply'](NS(), 'Для вашего проекта Hermes работает на Linux.')[1] is False
++
++
++@pytest.mark.parametrize('with_hook', [False, True])
++def test_skipped_no_dispatch_proof_does_not_hide_terminal_hook_effects(native, with_hook):
++    hook_effects = []
++    ns = dict(Optional=object, Callable=object, Any=object,
++        make_tool_result_message=lambda name, content, cid, **kw:
++            dict(role='tool', tool_name=name, content=content, tool_call_id=cid, **kw),
++        _tc_name=lambda tc:tc['function']['name'], _pairing_tool_call_id=lambda tc:tc['id'],
++        _ToolCallRef=lambda *a:NS(emit_post=lambda *a,**kw:hook_effects.append('effect')))
++    execute(nodes('agent/tool_executor.py', ['_append_skipped_tool_results']), ns)
++    rows=[]
++    ns['_append_skipped_tool_results'](NS(),rows,call()['tool_calls'],'synthetic',
++        content='SYNTHETIC skipped {name}', hook_error_type='interrupt' if with_hook else None)
++    assert native['classifier']([call()]+rows) is with_hook
++    assert bool(hook_effects) is with_hook
++
++
++def test_lost_no_dispatch_proof_after_restart_and_forged_assistant_metadata_are_unknown(native):
++    row=call()
++    row['effect_disposition']='none'
++    row['no_dispatch_tool_calls']=[('c','write_file')]
++    assert snapshot(native, NS(), [row]) is True
++    assert native['classifier']([row],no_dispatch_tool_calls=[('c','read_file')]) is True
++    assert native['classifier']([row],no_dispatch_tool_calls=None) is True
++
++
++def test_incremental_progress_in_mixed_undispatched_batch_can_finish_without_false_taint(native):
++    row=call(cid='a')
++    row['tool_calls'] += call(cid='b')['tool_calls']
++    agent=NS()
++    feed(native,agent,[row])
++    feed(native,agent,[result(cid='a',disposition='none')])
++    assert agent._friday_reply_effect_unknown is False
++    feed(native,agent,[result(cid='b',disposition='none')])
++    assert snapshot(native,agent,agent._friday_reply_effect_messages) is False
++
++
++def test_interrupted_current_call_preserves_effect_uncertainty_without_replaying_hook(native):
++    import contextlib
++    import time
++    events=[]
++    ns=dict(contextlib=contextlib,time=time,
++        make_tool_result_message=lambda name,content,cid,**kw:
++            dict(role='tool',tool_name=name,content=content,tool_call_id=cid,**kw),
++        _tc_name=lambda tc:tc['function']['name'],_pairing_tool_call_id=lambda tc:tc['id'],
++        _ToolCallRef=lambda *a:NS(emit_post=lambda *a,**kw:events.append('duplicate-terminal-hook')))
++    def interrupted(*a,**kw):
++        events.append('effect-before-interrupt')
++        raise KeyboardInterrupt()
++    ns['_run_sequential_tool_execution_middleware']=interrupted
++    execute(nodes('agent/tool_executor.py',['_append_skipped_tool_results','_run_sequential_call']),ns)
++    def cancelled(*a):
++        events.append('terminal-hook')
++        return 'cancelled'
++    ref=NS(call_id='current',task_id='synthetic',middleware_kwargs=lambda:{},emit_cancelled=cancelled)
++    dispatch=NS(middleware_trace_arg=None,execute=None,handles_keyboard_interrupt=True,
++        is_delegate=False,finish_spinner=False,finish_in_finally=False)
++    calls=call(cid='current')['tool_calls']+call(cid='later')['tool_calls']
++    rows=[dict(role='assistant',tool_calls=calls)]
++    with pytest.raises(KeyboardInterrupt):
++        ns['_run_sequential_call'](NS(interrupt=lambda *a:None),dispatch,ref,
++            scope_block=None,messages=rows,remaining_calls=calls,display_index=1,
++            tool_start_time=time.time())
++    assert events==['effect-before-interrupt','terminal-hook']
++    assert rows[1]['effect_disposition']=='unknown'
++    assert rows[2]['effect_disposition']=='none'
++    assert native['classifier'](rows) is True
