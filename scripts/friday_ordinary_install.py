@@ -668,12 +668,12 @@ def update_history(home, expected, predecessor=None, keyless_recovery=None):
         # This is the already committed 46->47 transaction, never an operation
         # to rerun. Its exact request and all beforeimages remain pinned.
         old = f.read_json(f.pin(predecessor))
-        if old.get('schema') in ('friday.ordinary-telegram-project-update.v1','friday.ordinary-telegram-project-update.v2','friday.ordinary-telegram-project-update.v3','friday.ordinary-telegram-source-update.v2','friday.ordinary-telegram-source-update.v3','friday.ordinary-telegram-source-update.v4','friday.ordinary-telegram-source-update.v5','friday.ordinary-telegram-source-update.v6','friday.ordinary-telegram-source-update.v7','friday.ordinary-telegram-source-update.v8','friday.ordinary-telegram-source-update.v9','friday.ordinary-telegram-source-update.v10','friday.ordinary-telegram-source-update.v11','friday.ordinary-telegram-source-update.v12','friday.ordinary-telegram-source-update.v13','friday.ordinary-telegram-source-update.v14','friday.ordinary-telegram-source-update.v15','friday.ordinary-telegram-source-update.v16','friday.ordinary-telegram-source-update.v17','friday.ordinary-telegram-source-update.v18','friday.ordinary-telegram-source-update.v19','friday.ordinary-telegram-source-update.v20','friday.ordinary-telegram-source-update.v21','friday.ordinary-telegram-source-update.v22','friday.ordinary-telegram-source-update.v23','friday.ordinary-telegram-source-update.v24','friday.ordinary-telegram-source-update.v25','friday.ordinary-telegram-source-update.v26','friday.ordinary-telegram-source-update.v27','friday.ordinary-telegram-source-update.v28','friday.ordinary-telegram-source-update.v29','friday.ordinary-telegram-source-update.v30','friday.ordinary-telegram-source-update.v31','friday.ordinary-telegram-source-update.v32'):
+        if old.get('schema') in ('friday.ordinary-telegram-project-update.v1','friday.ordinary-telegram-project-update.v2','friday.ordinary-telegram-project-update.v3','friday.ordinary-telegram-source-update.v2','friday.ordinary-telegram-source-update.v3','friday.ordinary-telegram-source-update.v4','friday.ordinary-telegram-source-update.v5','friday.ordinary-telegram-source-update.v6','friday.ordinary-telegram-source-update.v7','friday.ordinary-telegram-source-update.v8','friday.ordinary-telegram-source-update.v9','friday.ordinary-telegram-source-update.v10','friday.ordinary-telegram-source-update.v11','friday.ordinary-telegram-source-update.v12','friday.ordinary-telegram-source-update.v13','friday.ordinary-telegram-source-update.v14','friday.ordinary-telegram-source-update.v15','friday.ordinary-telegram-source-update.v16','friday.ordinary-telegram-source-update.v17','friday.ordinary-telegram-source-update.v18','friday.ordinary-telegram-source-update.v19','friday.ordinary-telegram-source-update.v20','friday.ordinary-telegram-source-update.v21','friday.ordinary-telegram-source-update.v22','friday.ordinary-telegram-source-update.v23','friday.ordinary-telegram-source-update.v24','friday.ordinary-telegram-source-update.v25','friday.ordinary-telegram-source-update.v26','friday.ordinary-telegram-source-update.v27','friday.ordinary-telegram-source-update.v28','friday.ordinary-telegram-source-update.v29','friday.ordinary-telegram-source-update.v30','friday.ordinary-telegram-source-update.v31','friday.ordinary-telegram-source-update.v32','friday.ordinary-telegram-source-update.v33','friday.ordinary-telegram-project-update.v4'):
             # Every exact historical committed update journal survives this transition.
             actual = update_history(home, old['transaction_history'], old['predecessor_update'], old.get('keyless_recovery'))
             roots = []
         f.require(old.get('schema') in ('friday.ordinary-telegram-project-update.v1','friday.ordinary-telegram-project-update.v2','friday.ordinary-telegram-project-update.v3','friday.ordinary-telegram-source-update.v1',
-            'friday.ordinary-telegram-source-update.v2','friday.ordinary-telegram-source-update.v3','friday.ordinary-telegram-source-update.v4','friday.ordinary-telegram-source-update.v5','friday.ordinary-telegram-source-update.v6','friday.ordinary-telegram-source-update.v7','friday.ordinary-telegram-source-update.v8','friday.ordinary-telegram-source-update.v9','friday.ordinary-telegram-source-update.v10','friday.ordinary-telegram-source-update.v11','friday.ordinary-telegram-source-update.v12','friday.ordinary-telegram-source-update.v13','friday.ordinary-telegram-source-update.v14','friday.ordinary-telegram-source-update.v15','friday.ordinary-telegram-source-update.v16','friday.ordinary-telegram-source-update.v17','friday.ordinary-telegram-source-update.v18','friday.ordinary-telegram-source-update.v19','friday.ordinary-telegram-source-update.v20','friday.ordinary-telegram-source-update.v21','friday.ordinary-telegram-source-update.v22','friday.ordinary-telegram-source-update.v23','friday.ordinary-telegram-source-update.v24','friday.ordinary-telegram-source-update.v25','friday.ordinary-telegram-source-update.v26','friday.ordinary-telegram-source-update.v27','friday.ordinary-telegram-source-update.v28','friday.ordinary-telegram-source-update.v29','friday.ordinary-telegram-source-update.v30','friday.ordinary-telegram-source-update.v31','friday.ordinary-telegram-source-update.v32'),
+            'friday.ordinary-telegram-source-update.v2','friday.ordinary-telegram-source-update.v3','friday.ordinary-telegram-source-update.v4','friday.ordinary-telegram-source-update.v5','friday.ordinary-telegram-source-update.v6','friday.ordinary-telegram-source-update.v7','friday.ordinary-telegram-source-update.v8','friday.ordinary-telegram-source-update.v9','friday.ordinary-telegram-source-update.v10','friday.ordinary-telegram-source-update.v11','friday.ordinary-telegram-source-update.v12','friday.ordinary-telegram-source-update.v13','friday.ordinary-telegram-source-update.v14','friday.ordinary-telegram-source-update.v15','friday.ordinary-telegram-source-update.v16','friday.ordinary-telegram-source-update.v17','friday.ordinary-telegram-source-update.v18','friday.ordinary-telegram-source-update.v19','friday.ordinary-telegram-source-update.v20','friday.ordinary-telegram-source-update.v21','friday.ordinary-telegram-source-update.v22','friday.ordinary-telegram-source-update.v23','friday.ordinary-telegram-source-update.v24','friday.ordinary-telegram-source-update.v25','friday.ordinary-telegram-source-update.v26','friday.ordinary-telegram-source-update.v27','friday.ordinary-telegram-source-update.v28','friday.ordinary-telegram-source-update.v29','friday.ordinary-telegram-source-update.v30','friday.ordinary-telegram-source-update.v31','friday.ordinary-telegram-source-update.v32','friday.ordinary-telegram-source-update.v33','friday.ordinary-telegram-project-update.v4'),
             'ordinary_update_exact_predecessor_required')
         f.pin(old['previous_input']); f.pin(old['current_input'])
         name = 'preparation/ordinary-source-update-'+old['previous_input']['sha256']
@@ -1231,6 +1231,19 @@ PROJECT_QUALIFICATION_AFTER = {
 PROJECT_RUNTIME_SCHEMA = 'friday.ordinary-telegram-project-update.v3'
 PROJECT_RUNTIME_NATIVE_FILES = 17682
 PROJECT_RUNTIME_HISTORY_FILES = 422
+PROJECT_INFERENCE_HELPER_SCHEMA = 'friday.ordinary-telegram-project-update.v4'
+PROJECT_INFERENCE_HELPER = 'scripts/friday_ordinary_install.py'
+PROJECT_INFERENCE_HELPER_BEFORE = '660e2901317ddd1c63f936c6157e043a6d2fcd0bdb49d1aaacce4d0e5fdbaa28'
+PROJECT_INFERENCE_NATIVE_FILES = 17686
+PROJECT_INFERENCE_HISTORY_FILES = 494
+PROJECT_INFERENCE_INPUT_BEFORE = 'cbd86dd4da6febed50c38050150f66fba59bb8de71edbbc6798a66b1582d79b1'
+PROJECT_INFERENCE_PREDECESSOR_INPUT = 'b0a7f22999b881b04a8ae1059d7d21feb562e7a2b2aa0958e87a686d375e0cc4'
+PROJECT_INFERENCE_RECONCILIATION = 'preparation/ordinary-closed-reconciliation-native79-closed23-userbus-repair-20261016'
+PROJECT_INFERENCE_RECONCILIATION_PINS = {
+    PROJECT_INFERENCE_RECONCILIATION+'/intent.json':'9e3f99a9202c9e643ebadfe5178337c9b5aad16f89b73207cf466f1762195afd',
+    PROJECT_INFERENCE_RECONCILIATION+'/committed.json':'dce9f69849dbf13378583b27b8de32d862cf0174b890aed07ad221b1ce223407',
+    PROJECT_INFERENCE_RECONCILIATION+'/before/FRIDAY-INSTALL.json':'64a126decee4c29862ff1fdb118b52d92c9dcdae923a7d6ab5ed5e01442390d0',
+}
 PROJECT_RUNTIME_NEW = {
     'plugins/friday_rework/runtime_observers.py',
     'plugins/friday_rework/runtime_process.py',
@@ -1273,13 +1286,14 @@ PROJECT_AFTER = {
 
 
 def project_update_inputs(request, budget):
-    """Exact Source77 host-plugin update; no donor source layer is introduced."""
+    """Exact project-only successors; no donor source layer is introduced."""
     f = api()
     fields = {'schema','seconds','home','previous_input','current_input','marker','source_receipt',
         'stamp','configuration','profile','launcher','credential_files','native_unit',
         'transaction_history','predecessor_update'}
     f.require(type(request) is dict and set(request) == fields
-        and request['schema'] in (PROJECT_UPDATE_SCHEMA, PROJECT_QUALIFICATION_SCHEMA, PROJECT_RUNTIME_SCHEMA)
+        and request['schema'] in (PROJECT_UPDATE_SCHEMA, PROJECT_QUALIFICATION_SCHEMA,
+            PROJECT_RUNTIME_SCHEMA, PROJECT_INFERENCE_HELPER_SCHEMA)
         and type(request['seconds']) is int and 30 <= request['seconds'] <= 180,
         'ordinary_project_explicit_request_required')
     home = f.directory(f.canonical(request['home'])); source = f.directory(home/'hermes-agent')
@@ -1300,7 +1314,14 @@ def project_update_inputs(request, budget):
         'ordinary_update_operational_settings_changed')
     qualification = request['schema'] == PROJECT_QUALIFICATION_SCHEMA
     runtime = request['schema'] == PROJECT_RUNTIME_SCHEMA
-    if runtime:
+    inference_helper = request['schema'] == PROJECT_INFERENCE_HELPER_SCHEMA
+    if inference_helper:
+        f.require(len(old) == 231 and set(new) == set(old)
+            and old.get(PROJECT_INFERENCE_HELPER) == PROJECT_INFERENCE_HELPER_BEFORE
+            and {n for n in old if old[n] != new[n]} == {PROJECT_INFERENCE_HELPER}
+            and type(current['product']['runtime']['enabled']) is bool,
+            'ordinary_project_exact_inference_helper_delta_required')
+    elif runtime:
         allowed = set(PROJECT_RUNTIME_BEFORE)
         f.require(set(PROJECT_RUNTIME_AFTER) == (allowed-{'scripts/friday_ordinary_install.py'}) | PROJECT_RUNTIME_NEW
             and len(old) == 223 and set(new) == set(old) | PROJECT_RUNTIME_NEW
@@ -1338,9 +1359,14 @@ def project_update_inputs(request, budget):
         and marker.get('worker_state') == 'BOTH_WORKERS_PREPARATION_PENDING'
         and marker.get('input_sha256') == request['previous_input']['sha256']
         and marker.get('source_receipt_sha256') == request['source_receipt']['sha256']
-        and len(receipt['layers']) == 77 and receipt['layers'][-1]['manifest'] == DOCX_CREATION_MANIFEST,
-        'ordinary_project_exact_source77_required')
-    if runtime:
+        and len(receipt['layers']) == (79 if inference_helper else 77)
+        and receipt['layers'][-1]['manifest'] == (SPARK_MULTIPASS_MANIFEST if inference_helper else DOCX_CREATION_MANIFEST),
+        'ordinary_project_exact_source79_required' if inference_helper else 'ordinary_project_exact_source77_required')
+    if inference_helper:
+        f.require(len(receipt['files']) == PROJECT_INFERENCE_NATIVE_FILES
+            and len(request['transaction_history']) == PROJECT_INFERENCE_HISTORY_FILES,
+            'ordinary_project_exact_inference_inventory_required')
+    elif runtime:
         f.require(len(receipt['files']) == PROJECT_RUNTIME_NATIVE_FILES
             and len(request['transaction_history']) == PROJECT_RUNTIME_HISTORY_FILES,
             'ordinary_project_exact_runtime_inventory_required')
@@ -1352,10 +1378,21 @@ def project_update_inputs(request, budget):
     budget.call(f.composition_checked,current,source,receipt,donors['hermes'])
     update_history(home,request['transaction_history'],request['predecessor_update'])
     predecessor = f.read_json(paths['predecessor_update'])
-    f.require(predecessor.get('schema') == (PROJECT_QUALIFICATION_SCHEMA if runtime else PROJECT_UPDATE_SCHEMA if qualification else
+    if inference_helper:
+        # The accepted archive-only reconciliation already admitted two helper
+        # repairs after v33. Keep that completed transition and its old clocks;
+        # it is ancestry to retain, never another recovery operation to execute.
+        f.require(request['previous_input']['sha256'] == PROJECT_INFERENCE_INPUT_BEFORE
+            and predecessor['current_input']['sha256'] == PROJECT_INFERENCE_PREDECESSOR_INPUT,
+            'ordinary_project_exact_reconciled_input_required')
+        for name,sha in PROJECT_INFERENCE_RECONCILIATION_PINS.items():
+            f.pin({'path':str(home/name),'sha256':sha})
+    f.require(predecessor.get('schema') == ('friday.ordinary-telegram-source-update.v33' if inference_helper else
+        PROJECT_QUALIFICATION_SCHEMA if runtime else PROJECT_UPDATE_SCHEMA if qualification else
         'friday.ordinary-telegram-source-update.v31')
-        and predecessor['home'] == str(home) and predecessor['current_input'] == request['previous_input'],
-        'ordinary_project_source77_predecessor_required')
+        and predecessor['home'] == str(home)
+        and (inference_helper or predecessor['current_input'] == request['previous_input']),
+        'ordinary_project_source79_predecessor_required' if inference_helper else 'ordinary_project_source77_predecessor_required')
     previous_tx = home/'preparation'/('ordinary-source-update-'+predecessor['previous_input']['sha256'])
     f.require(f.read_json(previous_tx/'committed.json')['source_receipt_sha256'] ==
         request['source_receipt']['sha256'], 'ordinary_update_predecessor_binding_changed')
@@ -1396,7 +1433,8 @@ def project_update(request, request_path, budget):
             f.require(request_state is not None and json.loads(request_state['data'],object_pairs_hook=f.unique) == request,
                 'ordinary_update_request_changed')
             project_update_inputs(request,budget)
-            expected_after = (PROJECT_RUNTIME_AFTER if request['schema'] == PROJECT_RUNTIME_SCHEMA else
+            expected_after = ({} if request['schema'] == PROJECT_INFERENCE_HELPER_SCHEMA else
+                PROJECT_RUNTIME_AFTER if request['schema'] == PROJECT_RUNTIME_SCHEMA else
                 PROJECT_QUALIFICATION_AFTER if request['schema'] == PROJECT_QUALIFICATION_SCHEMA else PROJECT_AFTER)
             plugin_names = sorted(n for n in expected_after if n.startswith('plugins/'))
             names = [*plugin_names,f.MARKER]
@@ -1411,9 +1449,13 @@ def project_update(request, request_path, budget):
                 'source_receipt':home/'hermes-agent.source.json','stamp':source/'install-stamp.json',
                 'configuration':home/'config.yaml','profile':home/'FRIDAY-PROFILE.json',
                 'launcher':source/'.hermes/bin/hermes','native_unit':Path(request['native_unit']['path']),
-                **{name:home/name for name in ('.env','auth.json')}
+                **{name:home/name for name in ('.env','auth.json')},
+                **({name:home/name for name in PROJECT_INFERENCE_RECONCILIATION_PINS}
+                    if request['schema'] == PROJECT_INFERENCE_HELPER_SCHEMA else {}),
             }.items()}
-            f.require(all(state is not None and f.digest(state['data']) == request[name]['sha256']
+            f.require(all(state is not None and f.digest(state['data']) ==
+                (PROJECT_INFERENCE_RECONCILIATION_PINS[name] if name in PROJECT_INFERENCE_RECONCILIATION_PINS
+                 else request[name]['sha256'])
                 for name,state in retained.items() if name not in ('.env','auth.json')),
                 'ordinary_project_retained_pin_changed')
             for name in ('.env','auth.json'):
@@ -1491,7 +1533,8 @@ def project_update(request, request_path, budget):
 
 def update(request, request_path, budget):
     """One finite committed-phase source update; original activation stays intact."""
-    if type(request) is dict and request.get('schema') in (PROJECT_UPDATE_SCHEMA, PROJECT_QUALIFICATION_SCHEMA, PROJECT_RUNTIME_SCHEMA):
+    if type(request) is dict and request.get('schema') in (PROJECT_UPDATE_SCHEMA, PROJECT_QUALIFICATION_SCHEMA,
+            PROJECT_RUNTIME_SCHEMA, PROJECT_INFERENCE_HELPER_SCHEMA):
         return project_update(request,request_path,budget)
     f = api(); home = f.directory(f.canonical(request['home']))
     fd = os.open(home,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
