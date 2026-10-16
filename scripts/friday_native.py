@@ -301,8 +301,24 @@ def main():
         from scripts.dsh_prepare import StopUnconfirmed
         try:
             result = budget.call(ordinary_start,value,budget)
-        except StopUnconfirmed:
-            parser.exit(3, 'STOP_UNCONFIRMED: native ordinary gateway ownership requires reconciliation; do not retry\n')
+        except StopUnconfirmed as exc:
+            from scripts.friday_install import (InstallerExit, retained_diagnostic,
+                                                 diagnostic_text, remember_secondary)
+            transfer = InstallerExit(3, exc)
+            detail = 'phase=ordinary_handoff reason=diagnostic_unavailable'
+            try:
+                detail = diagnostic_text(retained_diagnostic(exc, 'ordinary_handoff'))
+            except BaseException as diagnostic_failure:
+                remember_secondary(exc, diagnostic_failure)
+            try:
+                parser.exit(3, 'STOP_UNCONFIRMED: native ordinary gateway ownership requires reconciliation; do not retry\n'
+                            + 'Friday native ordinary start diagnostic: ' + detail + '\n')
+                remember_secondary(exc, RuntimeError('parser_exit_returned'))
+            except BaseException as secondary:
+                if not (type(secondary) is SystemExit and type(secondary.code) is int and secondary.code == 3):
+                    remember_secondary(exc, secondary)
+            transfer.friday_custody_secondary = getattr(exc, 'friday_secondary_failures', ())
+            raise transfer from exc
         except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             parser.exit(2, 'Friday native ordinary start refused: installed admission is incomplete\n')
         print(json.dumps(result,sort_keys=True));budget.check();return

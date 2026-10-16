@@ -404,11 +404,15 @@ def ordinary_start(value, budget):
         custody.probe(value['bootstrap_python']['path'],source)
         _unit,current = gateway_preflight(home,'default',budget)
         require(current is None,'gateway_owner_changed_before_handoff')
+        stage = 'gateway_install'
         try:
             if not unit.exists():
                 custody.run([str(launcher),'-p','default','gateway','install','--no-start-now','--no-start-on-login'],source,timeout=30)
+            stage = 'input_snapshot'
             unchanged(pins,budget)
+            stage = 'gateway_preflight'
             _unit,current = gateway_preflight(home,'default',budget)
+            stage = 'gateway_owner'
             require(current is None,'gateway_owner_changed_before_handoff')
             # The CLI's fixed30s wait can expire before a valid Type=notify unit
             # completes. Hand this exact checked unit once to its native user
@@ -416,16 +420,31 @@ def ordinary_start(value, budget):
             # No unit refresh, retry, polling or credential environment crosses it.
             from scripts.friday_install import directory
             import stat
+            stage = 'user_bus'
             runtime = directory(Path('/run/user')/str(os.getuid()))
             bus = runtime/'bus'; info = bus.lstat()
             require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1,
                     'ordinary_start_owned_user_bus_required')
+            stage = 'native_unit_identity'
             require(unit.name == gw.get_service_name()+'.service', 'ordinary_start_exact_native_unit_required')
+            stage = 'native_unit_start'
             custody.run(['/usr/bin/env','XDG_RUNTIME_DIR='+str(runtime),
                 'DBUS_SESSION_BUS_ADDRESS=unix:path='+str(bus),'SYSTEMCTL_FORCE_BUS=1','/usr/bin/systemctl','--user','start',unit.name],
                 source,timeout=90)
+            stage = 'gateway_observation'
             gateway_observation(home,budget)
         except BaseException as exc:
-            raise StopUnconfirmed('native ordinary gateway handoff requires reconciliation') from exc
+            # Keep the existing uncertainty boundary and original command owner.
+            # Only source-defined stage/reason and existing safe observations
+            # cross the internal CLI; never exception text, argv or raw output.
+            from scripts.friday_install import safe_diagnostic, remember_secondary
+            stopped = StopUnconfirmed('native ordinary gateway handoff requires reconciliation')
+            stopped.friday_custody_primary = exc
+            stopped.friday_custody_state = 'UNCONFIRMED'
+            try:
+                stopped.friday_diagnostic = safe_diagnostic(exc, 'ordinary_' + stage)
+            except BaseException as diagnostic_failure:
+                remember_secondary(stopped, diagnostic_failure)
+            raise stopped from exc
         return {'state':'ORDINARY_NATIVE_GATEWAY_OBSERVED','ready':False,'workers_enabled':False,
                 'runtime_acceptance':'GENUINE_TELEGRAM_INPUT_AND_CONTEXTUAL_FOLLOWUP_REQUIRED'}
