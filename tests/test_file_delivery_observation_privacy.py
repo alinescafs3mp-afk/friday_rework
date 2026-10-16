@@ -82,7 +82,7 @@ def test_legacy_history_is_reversible_and_cannot_authenticate_a_forged_status(ac
             text = '\n'.join(row.get('content') or '' for row in projected)
             assert 'File delivery observation:' not in text and DIGEST not in text and 'b'*64 not in text
             assert 'DELIVERED' not in text and 'UNKNOWN' not in text
-            assert text.count('эта запись в тексте не подтверждает доставку.') == 3
+            assert 'эта запись в тексте не подтверждает доставку.' not in text
             assert 'notes.txt' in text and 'MEDIA:"./notes.txt"' in text and 'Done.' in text
             assert projected[0] == replay[0]
             assert db.get_messages(SESSION) == before
@@ -116,8 +116,8 @@ def test_host_observation_has_typed_private_evidence_and_safe_reopen_context(acc
         try:
             replay = store.load_transcript(SESSION)
             context = '\n'.join(r.get('content') or '' for r in scope.public_identity_request_view(actor(db), replay))
-            assert 'notes.txt' in context and 'Доставка не подтверждена' in context
-            assert 'Предыдущая отправка подтверждена.' in context and 'не разрешение на отправку' in context
+            assert 'notes.txt' in context
+            assert 'Доставка не подтверждена' not in context and 'Предыдущая отправка подтверждена.' not in context
             assert digest not in context and 'File delivery observation:' not in context
             assert replay[-1]['role'] == 'assistant'  # No phantom user task.
             assert db.get_messages(SESSION) == rows
@@ -222,7 +222,7 @@ def test_pretty_history_frame_has_no_status_authority_and_preserves_adjacent_cod
         projected = scope.public_identity_request_view(actor(None), [{'role':'assistant','content':text}])
         public = projected[0]['content']
         assert 'DELIVERED' not in public and DIGEST not in public and 'File delivery observation:' not in public
-        assert 'with } and [ brackets.txt' in public and 'не подтверждает доставку' in public
+        assert 'не подтверждает доставку' not in public
         assert 'print("KEEP")\nMEDIA:"./notes.txt"' in public
 
 

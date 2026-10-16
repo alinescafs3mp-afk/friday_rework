@@ -1,0 +1,366 @@
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -546,7 +546,9 @@
+ 
+ 
+ def _merge_consecutive_assistants(messages: List[Dict]) -> Tuple[List[Dict], int]:
+-    """Pass 0: merge consecutive assistant turns (codex interims exempt)."""
++    """Pass 0: merge assistant speech, never operational receipt records."""
++    from hermes_cli.friday_user_scope import is_file_delivery_context_row, ordinary_presentation
++    separate_file_context = ordinary_presentation()
+     repairs = 0
+     collapsed: List[Dict] = []
+     for msg in messages:
+@@ -555,6 +557,8 @@
+             prev is not None and prev.get("role") == "assistant"
+             and isinstance(msg, dict) and msg.get("role") == "assistant"
+             and not _is_codex_interim(msg) and not _is_codex_interim(prev)
++            and not (separate_file_context and
++                     (is_file_delivery_context_row(msg) or is_file_delivery_context_row(prev)))
+         ):
+             # A provisional verification candidate is superseded, not unioned.
+             if prev.get("finish_reason") in {"verification_required", "verify_hook_continue"}:
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -2241,7 +2241,7 @@
+     for msg in messages:
+         api_msg = msg.copy()
+         agent._copy_reasoning_content_for_api(msg, api_msg)
+-        for key in _SUMMARY_FOREIGN_MESSAGE_KEYS:
++        for key in _SUMMARY_FOREIGN_MESSAGE_KEYS - {'display_kind', 'display_metadata'}:
+             api_msg.pop(key, None)
+         # Mirror of the transport's role-qualified strip: ``name`` is
+         # schema-foreign on tool results only (strict providers reject with
+@@ -2302,6 +2302,10 @@
+     _sanitize_messages_surrogates(api_messages)
+     from hermes_cli.friday_user_scope import public_identity_request_view
+     api_messages = public_identity_request_view(agent, api_messages)
++    api_messages = [row for row in api_messages if not row.get('_friday_file_context_only')]
++    for row in api_messages:
++        for key in _SUMMARY_FOREIGN_MESSAGE_KEYS:
++            row.pop(key, None)
+     return api_messages
+ 
+ 
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -3618,12 +3618,27 @@
+             args = args[:self._TOOL_ARGS_HEAD] + "..."
+         return f"  {fn.get('name', '?')}({args})"
+ 
++    def _summary_request_rows(self, turns):
++        """Use the same non-authoritative request view for every summary mode."""
++        view = getattr(self, '_bounded_summary_input_view', None)
++        if not callable(view):
++            return turns
++        import copy
++        rows = copy.deepcopy(turns)
++        for row in rows:
++            sidecar = row.pop('api_content', None)
++            if isinstance(sidecar, str) and sidecar and row.get('role') in ('user', 'assistant'):
++                row['content'] = sidecar
++        return view(rows)
++
+     def _serialize_records_for_summary(self, turns: List[Dict[str, Any]]) -> List[str]:
+         """Serialize turns into a list of labeled, redacted records for the summarizer."""
+         # Lazy import: agent_runtime_helpers pulls heavy transitive imports.
+         from agent.agent_runtime_helpers import strip_think_blocks
+         parts = []
+-        for msg in turns:
++        for msg in self._summary_request_rows(turns):
++            if msg.get('_friday_file_context_only'):
++                continue
+             role = msg.get("role", "unknown")
+             content = msg.get("content")
+             if isinstance(content, list):
+@@ -3712,6 +3727,8 @@
+     ) -> str:
+         """Deterministic handoff when the LLM summarizer is unavailable: locally extractable anchors (user asks,
+         actions, files, errors) in the normal summary structure so downstream prompts recover gracefully."""
++        turns_to_summarize = [row for row in self._summary_request_rows(turns_to_summarize)
++                              if not row.get('_friday_file_context_only')]
+         anchors = self._fallback_anchors(turns_to_summarize)
+         user_asks = anchors["user_asks"]
+         completed = anchors["completed"]
+diff --git a/agent/context_compressor_multipass.py b/agent/context_compressor_multipass.py
+--- a/agent/context_compressor_multipass.py
++++ b/agent/context_compressor_multipass.py
+@@ -134,6 +134,10 @@
+         # Protocol reasoning stays in original private rows, exactly once; never
+         # reinterpret it as a visible assistant answer or summary instruction.
+         data = {key: row[key] for key in ("role", "content", "tool_calls", "tool_call_id", "name") if key in row}
++        if row.get('_friday_file_context_only'):
++            # Preserve exact source coverage without labelling a host receipt
++            # as assistant speech. No status/hash/prose is sent to the model.
++            data = {"kind": "private_operational_record", "content": ""}
+         if data.get("role") == "assistant" and isinstance(data.get("content"), str):
+             data["content"] = strip_think_blocks(None, data["content"])
+         def redact(value):
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -3959,9 +3959,13 @@
+             bypass_cooldown=bypass_cooldown,
+         )
+         from agent.bounded_context import bounded_summary_headroom, BoundedContextPolicy
+-        if isinstance(getattr(agent, "_bounded_context_policy", None), BoundedContextPolicy):
+-            from hermes_cli.friday_user_scope import public_identity_request_view
++        from hermes_cli.friday_user_scope import public_identity_request_view, managed_reply_stream
++        bounded = isinstance(getattr(agent, "_bounded_context_policy", None), BoundedContextPolicy)
++        # Operational receipts remain non-speech in every managed summary mode;
++        # retain the existing bounded callback for other routes.
++        if bounded or managed_reply_stream(agent):
+             agent.context_compressor._bounded_summary_input_view = lambda rows: public_identity_request_view(agent, rows)
++        if bounded:
+             agent.context_compressor._bounded_summary_fit_callback = lambda skeleton: bounded_summary_headroom(
+                 agent, skeleton, _existing_system_prompt(agent, system_message))
+         messages_before_compression = copy.deepcopy(messages)
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -1300,7 +1300,9 @@
+         # and only chat-completions strips underscore keys. The token estimator drops
+         # the same set, so it never prices bytes the provider never receives.
+         _api_content = api_msg.pop("api_content", None)
+-        for key in PERSISTENCE_ONLY_MESSAGE_FIELDS:
++        # Keep receipt typing until the request-only projection below. Dropping
++        # it earlier makes an operational observation indistinguishable from speech.
++        for key in PERSISTENCE_ONLY_MESSAGE_FIELDS - {'display_kind', 'display_metadata'}:
+             api_msg.pop(key, None)
+ 
+         # Inject ephemeral context (memory prefetch + pre_llm_call user hooks)
+@@ -1368,4 +1370,8 @@
+         api_messages = [{"role": "system", "content": effective_system}] + api_messages
+     from hermes_cli.friday_user_scope import public_identity_request_view
+     api_messages = public_identity_request_view(agent, api_messages)
++    api_messages = [row for row in api_messages if not row.get('_friday_file_context_only')]
++    for row in api_messages:
++        for key in PERSISTENCE_ONLY_MESSAGE_FIELDS:
++            row.pop(key, None)
+     return api_messages, effective_system
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -4684,14 +4684,31 @@
+                 if text_content or extracted.images or extracted.media_files or extracted.local_files \
+                         or _tts_paths or _tts_caption_delivered:
+                     self.pause_typing_for_chat(event.source.chat_id)
+-                if text_content and not _tts_caption_delivered:
+-                    await self._send_final_text(
+-                        event, session_key, text_content, _final_thread_metadata,
+-                        is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+-                await self._deliver_attachments(
+-                    event, extracted, _final_thread_metadata,
+-                    anything_sent=delivery_attempted or _tts_caption_delivered,
+-                    record_delivery=_record_delivery)
++                _document_caption_handled = False
++                if (self.platform == Platform.TELEGRAM and text_content
++                        and (media_files or extracted.local_files)
++                        and not is_ephemeral_response and not extracted.images
++                        and not _tts_paths and not _tts_caption_delivered):
++                    from gateway.run_plugin_delivery import deliver_ordinary_files
++                    def _record_caption_delivery(result):
++                        _record_delivery(result)
++                        stop_reply_clock(self, event.source.chat_id, result)
++                    with self._media_delivery_scope(event.source):
++                        _document_caption_handled = await deliver_ordinary_files(
++                            self, event.source,
++                            [path for path, _ in media_files] + list(extracted.local_files),
++                            caption=text_content, record_delivery=_record_caption_delivery)
++                # A handled document attempt owns the complete answer, including UNKNOWN.
++                # Only an ineligible caption falls back; never resend after a lost ACK.
++                if not _document_caption_handled:
++                    if text_content and not _tts_caption_delivered:
++                        await self._send_final_text(
++                            event, session_key, text_content, _final_thread_metadata,
++                            is_ephemeral_response, _ephemeral_ttl, _record_delivery)
++                    await self._deliver_attachments(
++                        event, extracted, _final_thread_metadata,
++                        anything_sent=delivery_attempted or _tts_caption_delivered,
++                        record_delivery=_record_delivery)
+             delivery_completed = True
+             await self._release_turn_marker(event)
+             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+diff --git a/gateway/run_plugin_delivery.py b/gateway/run_plugin_delivery.py
+--- a/gateway/run_plugin_delivery.py
++++ b/gateway/run_plugin_delivery.py
+@@ -259,6 +259,11 @@
+         _, live_adapter = resolve_document_route(runner, context, route)
+         if live_adapter is not adapter:
+             raise ValueError('original_adapter_replaced')
++        if caption is not None:
++            from hermes_cli.friday_user_scope import guard_gateway_reply
++            guarded, blocked = guard_gateway_reply(source, caption)
++            if blocked or guarded != caption or not _ordinary_caption_fits(caption):
++                raise ValueError('ordinary_caption_rejected')
+         data, relative = workspace_document(path)
+         name = file_name or Path(relative).name
+         if (not isinstance(name, str) or not name or len(name) > 255
+@@ -291,7 +296,17 @@
+         return SendResult(success=False, error='document_delivery_UNKNOWN')
+ 
+ 
+-async def deliver_ordinary_files(adapter, source, paths, *, record_delivery=None):
++def _ordinary_caption_fits(caption):
++    """Keep the complete plain-text answer within the native Telegram caption budget."""
++    if not isinstance(caption, str) or not caption:
++        return False
++    try:
++        return len(caption.encode('utf-16-le')) // 2 <= 1024
++    except UnicodeEncodeError:
++        return False
++
++
++async def deliver_ordinary_files(adapter, source, paths, *, record_delivery=None, caption=None):
+     """Shared managed final-MEDIA dispatcher for streaming and ordinary replies.
+ 
+     Unmanaged native profiles continue through their original media branches.
+@@ -306,10 +321,16 @@
+             if record_delivery: record_delivery(SendResult(success=False, error='gateway_document_route_rejected'))
+             return True
+         return False
+-    for path in dict.fromkeys(paths):
+-        result = await deliver_ordinary_document(adapter, source, path)
++    paths = list(dict.fromkeys(paths))
++    if caption is not None and (len(paths) != 1 or not _ordinary_caption_fits(caption)):
++        # No effect occurred: the caller may use its usual full-text + files path.
++        return False
++    for path in paths:
++        result = await deliver_ordinary_document(adapter, source, path, caption=caption)
+         if record_delivery is not None: record_delivery(result)
+-        if not result.success:
++        if not result.success and not (caption is not None
++                and result.error == 'gateway_document_preflight_rejected'):
++            # A caption preflight refusal authorizes no outbound warning either.
+             # Ordinary conversation receives the uncertainty too, including the
+             # streaming path whose textual final has already been delivered.
+             notify = getattr(adapter, 'emit_warning', None)
+@@ -330,17 +351,15 @@
+ 
+     These presentation fields never authorize delivery: the durable native
+     journal remains the only source for UNKNOWN/retry and route decisions.
+-    Assistant role avoids manufacturing an unanswered user turn on recovery.
+-    """
+-    import json
++    The empty hidden row is a private receipt, not an assistant utterance.
++    Request projection omits it; public user/tool/MEDIA file anchors remain.
++    Status authority stays in the journal. No unanswered user turn is manufactured
++    on recovery.
++    """
+     import time
+     observation = {'path': relative, 'sha256': digest, 'state': state}
+-    status = {'UNKNOWN': 'Доставка не подтверждена; не повторять отправку без сверки результата.',
+-              'DELIVERED': 'Предыдущая отправка подтверждена.'}[state]
+-    content = ('Контекст файла ' + json.dumps(relative, ensure_ascii=False) + ': ' + status
+-               + ' Это наблюдение, не новый запрос и не разрешение на отправку.')
+     await runner.async_session_store.append_to_transcript(session_id,
+-        {'role': 'assistant', 'content': content, 'timestamp': time.time(),
++        {'role': 'assistant', 'content': '', 'timestamp': time.time(),
+          'display_kind': 'hidden',
+          'display_metadata': {'friday_file_delivery_observation': observation}})
+ 
+diff --git a/hermes_cli/friday_user_scope.py b/hermes_cli/friday_user_scope.py
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -1371,8 +1371,9 @@
+     cannot authenticate model-generated transport evidence. Bare JSON, code
+     strings and ordinary prose are not frames. Callers exclude user/tool rows.
+     Legacy frames have no reliable provenance, even with a plausible digest or
+-    DELIVERED value: retain only an explicitly unverified file mention in the
+-    request view, never reconstruct a receipt or edit the original history.
++    DELIVERED value: omit it from assistant speech, never reconstruct a receipt
++    or edit the original history. Actual user/tool/MEDIA file references remain;
++    receipt-only filenames stay recoverable in the private canonical record.
+     """
+     import re
+     start_frame = re.compile(r'(?m)^[ \t]*(?:>[ \t]*)*(?:[-*+][ \t]+)?(?P<wrap>\*\*|__|`{1,3})?'
+@@ -1403,9 +1404,7 @@
+         end = end_frame.match(text, match.end() + consumed)
+         if end is None:
+             continue
+-        replacement = (('Упоминался файл ' + json.dumps(record['path'], ensure_ascii=False)
+-            + '; эта запись в тексте не подтверждает доставку.' + end.group('ending')) if history else '')
+-        spans.append((match.start(), end.end(), replacement))
++        spans.append((match.start(), end.end(), ''))
+     for start, end, replacement in reversed(spans):
+         text = text[:start] + replacement + text[end:]
+     return text
+@@ -1425,12 +1424,47 @@
+     return value
+ 
+ 
++def is_file_delivery_observation(row):
++    """Presentation classification only; neither metadata nor prose grants an effect."""
++    return (isinstance(row, dict) and row.get('role') == 'assistant'
++            and row.get('display_kind') == 'hidden' and not row.get('tool_calls')
++            and not row.get('tool_call_id') and isinstance(row.get('display_metadata'), dict)
++            and isinstance(row['display_metadata'].get('friday_file_delivery_observation'), dict))
++
++
++def is_file_delivery_context_row(row):
++    """A receipt-only record is not speech, including the retired text protocol.
++
++    Classification suppresses presentation only. It never authenticates a status
++    or authorizes transport, and ordinary surrounding prose/calls remain intact.
++    """
++    import re
++    if not isinstance(row, dict) or row.get('role') != 'assistant':
++        return False
++    if is_file_delivery_observation(row) or row.get('_friday_file_context_only'):
++        return True
++    if row.get('tool_calls') or any(row.get(key) for key in
++            ('reasoning', 'reasoning_content', 'reasoning_details', 'codex_reasoning_items', 'codex_message_items')):
++        return False
++    text = row.get('api_content') or row.get('content')
++    if not isinstance(text, str):
++        return False
++    projected = project_file_delivery_frames(text)
++    if projected == text:
++        return False
++    # An empty Markdown fence was only a decoration of the reserved protocol.
++    projected = re.sub(r'(?m)^[ \t]*(?:```|~~~)[a-zA-Z0-9_+-]*[ \t]*$', '', projected)
++    return not projected.strip()
++
++
+ def project_legacy_self_claims(rows):
+     """Pure, reversible request view AFTER api_content selection.
+ 
+     The caller must validate managed admission. Original rows, user/tool/system
+-    authority, IDs/order, calls/results and file anchors remain untouched. Only
+-    assistant prose assertion spans and matching reasoning text are projected.
++    IDs/order and calls/results remain untouched. Assistant assertions are
++    projected; operational records become empty private placeholders. Existing
++    user/tool/MEDIA file anchors remain exact. Receipt-only filenames remain in
++    private canonical evidence; they never rewrite protected user/tool rows.
+     A still-present sidecar is refused rather than projecting one representation
+     while sending a different one. The original transcript is the recovery view.
+     """
+@@ -1441,6 +1475,13 @@
+         if not isinstance(row, dict): raise ScopeDenied()
+         if 'api_content' in row: raise ScopeDenied()
+         if row.get('role') != 'assistant': continue
++        if is_file_delivery_context_row(row):
++            row['_friday_file_context_only'] = True
++            row['content'] = ''
++            for key in ('reasoning', 'reasoning_content', 'reasoning_details',
++                        'codex_reasoning_items', 'codex_message_items'):
++                row.pop(key, None)
++            continue
+         def project(value):
+             if isinstance(value, str):
+                 value = project_file_delivery_frames(value, history=True)
+@@ -1546,7 +1587,10 @@
+     private = {"api_content", "reasoning", "reasoning_content", "reasoning_details",
+                "codex_reasoning_items", "codex_message_items", "display_reasoning"}
+     public = {key: value for key, value in message.items() if key not in private}
+-    if message.get('role') == 'assistant' and 'content' in public:
++    if is_file_delivery_context_row(message):
++        public['content'] = ''
++        public['display_kind'] = 'hidden'
++    elif message.get('role') == 'assistant' and 'content' in public:
+         public['content'] = _public_file_delivery_text(public['content'])
+     if isinstance(public.get('display_metadata'), dict):
+         public['display_metadata'] = {key: value for key, value in public['display_metadata'].items()

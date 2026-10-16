@@ -215,12 +215,12 @@ def test_persisted_same_session_result_selects_read_revision_and_exact_delivery(
         store = SessionStore(account.homes['1']/'sessions', GatewayConfig())
         try:
             replay = store.load_transcript(SESSION)
-            observation = next(line for row in reversed(replay) if row.get('role') == 'assistant'
-                for line in reversed((row.get('content') or '').splitlines())
-                if line.startswith('Контекст файла '))
+            context = scope.public_identity_request_view(actor(db), replay)
+            reference = next(json.loads(row['content']) for row in context
+                if row.get('role') == 'tool' and row.get('tool_call_id') == 'create')
             receipt = db.get_messages(SESSION)[-1]['display_metadata']['friday_file_delivery_observation']
             assert receipt['state'] == 'DELIVERED' and receipt['sha256'] == hashlib.sha256(TEXT.encode()).hexdigest()
-            path = json.JSONDecoder().raw_decode(observation.removeprefix('Контекст файла '))[0]
+            path = reference['path']
             assert path == receipt['path']
             assert path == 'notes.txt'
             artifact = account.homes['1']/'workspace'/path
@@ -245,7 +245,7 @@ def test_persisted_same_session_result_selects_read_revision_and_exact_delivery(
             assert [row[1] for row in sent] == [TEXT.encode(), REVISED.encode()]
             assert next(row for row in db.get_messages(SESSION) if row.get('tool_call_id') == 'create') == first_result
             replay_after = store.load_transcript(SESSION)
-            assert 'Предыдущая отправка подтверждена.' in replay_after[-1]['content']
+            assert replay_after[-1]['content'] == ''
             receipt_after = db.get_messages(SESSION)[-1]['display_metadata']['friday_file_delivery_observation']
             assert receipt_after['state'] == 'DELIVERED'
             assert receipt_after['sha256'] == hashlib.sha256(REVISED.encode()).hexdigest()
@@ -303,7 +303,8 @@ def test_unknown_delivery_survives_database_replay_and_revised_bytes(account, mo
             first = asyncio.run(delivery.deliver_ordinary_document(adapter, source, str(artifact)))
             assert not first.success and first.error == 'document_delivery_UNKNOWN'
             replay = store.load_transcript(SESSION)
-            assert 'Доставка не подтверждена' in replay[-1]['content'] and 'notes.txt' in replay[-1]['content']
+            assert replay[-1]['content'] == ''
+            assert replay[-1]['display_metadata']['friday_file_delivery_observation']['path'] == 'notes.txt'
             assert db.get_messages(SESSION)[-1]['display_metadata']['friday_file_delivery_observation']['state'] == 'UNKNOWN'
             a = actor(db); a._last_flushed_db_idx = len(replay)
             messages = replay + [{'role': 'user', 'content': 'Revise the prior file.'}]
