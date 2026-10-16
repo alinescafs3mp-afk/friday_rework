@@ -20,6 +20,7 @@ import yaml
 from scripts import friday_install as f, friday_worker_preparation as recovery
 from scripts import friday_ordinary_install as ordinary, worker_install as workers
 from scripts.install_containment import Budget
+from test_closed_native_user_bus import closed_user_bus
 from test_ordinary_worker_preparation import installed, normal as base_normal, service, install_input, doc, pin, configured_web_profile
 from test_user_onboarding import env, complete, home as user_home, cas, ident, row, raw
 from scripts.a0_runtime import check_git_metadata as REAL_METADATA_CHECK
@@ -630,7 +631,7 @@ def test_fixture_is_old_helperless_user_with_no_runtime_authority(legacy):
 
 
 @pytest.fixture
-def closed_receiver(receiver, monkeypatch):
+def closed_receiver(receiver, monkeypatch, closed_user_bus):
     s = receiver
     # Produce the prior consumed repair using its unchanged production branch.
     execute(s)
@@ -671,8 +672,8 @@ def closed_receiver(receiver, monkeypatch):
         inside_original660=True, operation_id='closed-second', actual_units=units,
         absences={str(s.user / 'workers' / n): True for n in ('a0/bootstrap', 'a0/probe-plan.json', 'a0/runtime-receipt.json', 'dsh/runtime-receipt.json')})
     cessation['absences'].update({str(s.home.parent / 'rootless-docker/config/local-route.json'): True,
-        str(Path('/run/user') / str(os.getuid()) / 'friday-rework-docker/rootlesskit/child_pid'): True,
-        str(Path('/run/user') / str(os.getuid()) / 'friday-rework-docker/route-guard.json'): True})
+        str(closed_user_bus / 'friday-rework-docker/rootlesskit/child_pid'): True,
+        str(closed_user_bus / 'friday-rework-docker/route-guard.json'): True})
     request['native_cessation'] = doc(s.deploy / 'cessation.json', cessation)
     request['closed_failure'] = doc(s.deploy / 'closed-second.json', dict(
         state='CONSUMED_CLOSED_FAILED_NEW_NORMAL_SETUP_AFTER_REPAIR_NO_RETRY', original_server300=failure['original_attempt'],
@@ -726,11 +727,14 @@ def closed_receiver(receiver, monkeypatch):
     from scripts import dsh_prepare
     previous_run = dsh_prepare.run
     def native(command, *args, **kw):
-        if command[:3] != ['/usr/bin/systemctl', '--user', 'show']:
+        if command[:1] != ['/usr/bin/env']:
             assert command[0] == 'git', 'unexpected fixture command'
             return previous_run(command, *args, **kw)
         s.native_calls.append(command)
-        properties = units[command[3]]['properties']
+        assert command[:6] == ['/usr/bin/env', 'XDG_RUNTIME_DIR=' + str(closed_user_bus),
+            'DBUS_SESSION_BUS_ADDRESS=unix:path=' + str(closed_user_bus / 'bus'),
+            '/usr/bin/systemctl', '--user', 'show']
+        properties = units[command[6]]['properties']
         if s.native_live: properties = {**properties, 'ActiveState': 'active'}
         return ('\n'.join(k + '=' + v for k, v in properties.items()), {})
     monkeypatch.setattr(dsh_prepare, 'run', native)

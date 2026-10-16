@@ -12,6 +12,7 @@ import math
 import os
 import re
 import resource
+import stat
 import time
 from pathlib import Path
 
@@ -878,13 +879,19 @@ def _closed_native_absent(home, profile_home, cessation, budget):
     units = cessation['actual_units']
     f.require(unit in units and 'friday-rework-docker.service' in units,
         'ordinary_closed_exact_native_units_required')
+    runtime = f.directory(Path('/run/user') / str(os.getuid()))
+    bus = runtime / 'bus'; info = bus.lstat()
+    f.require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1,
+        'ordinary_closed_owned_user_bus_required')
     for name, expected in ((unit, {'LoadState': 'not-found', 'ActiveState': 'inactive', 'SubState': 'dead',
             'ControlGroup': '', 'InvocationID': ''}),
             ('friday-rework-docker.service', {'LoadState': 'loaded', 'ActiveState': 'inactive', 'SubState': 'dead',
             'ControlGroup': '', 'InvocationID': '', 'MainPID': '0', 'ControlPID': '0'})):
         f.require(units[name]['returncode'] == 0 and units[name]['properties'] == expected,
             'ordinary_closed_historical_native_cessation_required')
-        command = ['/usr/bin/systemctl', '--user', 'show', name, '--property=' + ','.join(expected)]
+        command = ['/usr/bin/env', 'XDG_RUNTIME_DIR=' + str(runtime),
+            'DBUS_SESSION_BUS_ADDRESS=unix:path=' + str(bus),
+            '/usr/bin/systemctl', '--user', 'show', name, '--property=' + ','.join(expected)]
         output = run(command, f.ROOT, timeout=min(15, budget.check(reserve=1)),
             env=f.clean_environment(home), deadline=budget.deadline)[0]
         pairs = [line.split('=', 1) for line in output.splitlines() if line]
