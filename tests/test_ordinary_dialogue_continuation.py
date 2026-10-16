@@ -17,7 +17,7 @@ import weakref
 
 
 @pytest.fixture
-def env(tmp_path,monkeypatch):
+def env(tmp_path,monkeypatch,request):
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from hermes_cli.friday_product_access import KEY,principal_id
     from hermes_cli.plugins_state import PluginState
@@ -33,7 +33,8 @@ def env(tmp_path,monkeypatch):
     monkeypatch.setattr(scope,'_ENGAGED',False)
     def write(p,v):p.write_text(json.dumps(v));p.chmod(0o600)
     sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
-    bindings=[dict(platform='telegram',transport_profile='default',account_id='synthetic-account',user_id=str(i),runtime_profile='fixture-user-'+str(i),tools=['memory','read_file']) for i in (1,2)]
+    native_tools=['memory','read_file'] + (['write_file'] if getattr(request,'param',None)=='write-file-boundary' else [])
+    bindings=[dict(platform='telegram',transport_profile='default',account_id='synthetic-account',user_id=str(i),runtime_profile='fixture-user-'+str(i),tools=native_tools) for i in (1,2)]
     cfg={'plugins':{'enabled':['friday_rework'],'entries':{'friday_rework':{'settings':{'product_access':{'enabled':True,'accounts':[dict(platform='telegram',transport_profile='default',account_id='synthetic-account',runtime_profiles=[b['runtime_profile'] for b in bindings])]},'user_isolation':{'enabled':True,'bindings':bindings}}}}},'gateway':{'multiplex_profiles':True,'profile_routes':[{'name':'friday-'+principal_id(*(b[k] for k in ('platform','transport_profile','account_id','user_id'))),'platform':b['platform'],'bot_profile':b['transport_profile'],'user_id':b['user_id'],'profile':b['runtime_profile'],'enabled':True} for b in bindings]}}
     write(root/'config.yaml',cfg)
     rows={principal_id(*(b[k] for k in ('platform','transport_profile','account_id','user_id'))):{k:b[k] for k in ('platform','transport_profile','account_id','user_id')}|dict(enabled=True,role='user') for b in bindings}
@@ -42,6 +43,9 @@ def env(tmp_path,monkeypatch):
     class Adapter:pass
     for b in bindings:
         h=scope.provision_new_home(root,b,{'max_iterations':8});homes[b['user_id']]=h
+        if getattr(request,'param',None)=='write-file-boundary':
+            import hermes_yaml as yaml
+            tool_cfg=yaml.safe_load((h/'config.yaml').read_text());tool_cfg['tools']={'tool_search':{'defer':['write_file']}};write(h/'config.yaml',tool_cfg)
         (h/'SOUL.md').write_text('Synthetic signed identity: Пятница. Preserve safety and tool authority.\n');(h/'SOUL.md').chmod(0o600)
         (h/'.env').write_text('SYNTHETIC_FIXTURE_KEY=offline-fixture\n');(h/'.env').chmod(0o600)
         st=h.stat();receipt=dict(schema='friday.onboarding.v1',binding_sha256=scope._fingerprint(b),config_sha256=sha(h/'config.yaml'),soul_sha256=sha(h/'SOUL.md'),required_secrets=['SYNTHETIC_FIXTURE_KEY'],directory_identity=[st.st_dev,st.st_ino],template='synthetic',authorization_home=str(root))

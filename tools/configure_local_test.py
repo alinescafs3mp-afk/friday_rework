@@ -31,6 +31,19 @@ MULTIPASS_FIELDS = frozenset({'enabled', 'max_calls', 'max_depth',
     'max_attempt_seconds', 'max_call_seconds'})
 MULTIPASS_MAXIMA = {'max_calls': 256, 'max_depth': 32,
     'max_attempt_seconds': 3600, 'max_call_seconds': 1800}
+_NO_REQUEST_BUDGET = object()
+
+
+def validate_request_budget(value):
+    """Explicit per-request limits, separate from socket and auxiliary timeouts."""
+    if type(value) is not dict or set(value) != {'first_event', 'idle', 'total'}:
+        raise ValueError('explicit_request_budget_fields_required')
+    if any(type(n) not in (int, float) or not 0 < n <= 86400 or not math.isfinite(n)
+           for n in value.values()):
+        raise ValueError('finite_positive_request_budget_required')
+    if value['first_event'] > value['total'] or value['idle'] > value['total']:
+        raise ValueError('request_phase_budget_exceeds_total')
+    return copy.deepcopy(value)
 
 
 def validate_request_options(value):
@@ -85,7 +98,8 @@ class Once(argparse.Action):
 def build_config(*, base_url, model, key_env, context, max_input,
                  main_output, summary_output, margin, template_overhead,
                  web_profile="disabled", web_extract_char_limit=None, web_extract_timeout=None,
-                 compression_inference=None, compression_multipass=None, request_options=None):
+                 compression_inference=None, compression_multipass=None, request_options=None,
+                 request_budget_seconds=_NO_REQUEST_BUDGET):
     web = hermes_web_config(web_profile, extract_char_limit=web_extract_char_limit,
                             extract_timeout=web_extract_timeout)
     values = (context, max_input, main_output, summary_output, margin, template_overhead)
@@ -162,6 +176,9 @@ def build_config(*, base_url, model, key_env, context, max_input,
         # Native additive environment prose survives personality selection.
         # Leave SOUL, display.personality and agent.system_prompt untouched.
         config["agent"]["environment_hint"] = research_policy()
+    if request_budget_seconds is not _NO_REQUEST_BUDGET:
+        config['providers']['friday-local']['request_budget_seconds'] = validate_request_budget(
+            request_budget_seconds)
     if request_options is not None:
         options = validate_request_options(request_options)
         if 'reasoning_echo' in options:
@@ -174,7 +191,8 @@ def build_config(*, base_url, model, key_env, context, max_input,
                 block['extra_body'] = {**copy.deepcopy(body), **block.get('extra_body', {})}
     if compression_inference is not None:
         if (type(compression_inference) is not dict
-                or set(compression_inference) != INFERENCE_FIELDS | (set(compression_inference) & {'request_options'})):
+                or set(compression_inference) != INFERENCE_FIELDS | (set(compression_inference) & {
+                    'request_options', 'request_budget_seconds'})):
             raise ValueError("compression_inference_explicit_fields_required")
         if compression_inference['key_env'] == key_env:
             raise ValueError("separate_compression_credential_reference_required")

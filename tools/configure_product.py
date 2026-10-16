@@ -40,7 +40,8 @@ def _exact(value, keys, label):
 
 
 def _inference(value, label):
-    _exact(value, INFERENCE | (set(value) & {'request_options'} if isinstance(value, dict) else set()), label)
+    _exact(value, INFERENCE | (set(value) & {'request_options', 'request_budget_seconds'}
+                             if isinstance(value, dict) else set()), label)
     if 'request_options' in value and type(value['request_options']) is not dict:
         raise ValueError('explicit_supported_request_options_required')
     return value

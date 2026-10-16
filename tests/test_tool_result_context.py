@@ -96,21 +96,23 @@ def test_stopped_result_is_durable_evidence_without_terminal_access(env,kind):
      with pytest.raises((RuntimeError,TimeoutError)):te.get_active_env('native-task')
  finally:db.close()
 
-def test_source73_private_reasoning_dispatch_result_then_refusal_are_durable(env):
+def test_private_reasoning_dispatch_result_then_safe_reply_are_durable(env):
  db=own_db(env)
  try:
   with entered(env):
    a=actor(db);messages=[callrow('Internal profile '+scope.current().profile)]
    assert a._flush_messages_to_session_db(messages)
-   assert a._friday_reply_withheld and messages[0]['reasoning_content'] is None
+   assert not getattr(a,'_friday_reply_withheld',False)
+   assert messages[0]['reasoning_content']=='Internal profile '+scope.current().profile
    out=dispatch(a)
    assert commit(a,messages,out.result) is not None
    messages.append({'role':'assistant','content':'A harmless followup answer.'})
    assert a._flush_messages_to_session_db(messages)
    rows=db.get_messages(a.session_id)
    assert [r['role'] for r in rows][-3:]==['assistant','tool','assistant']
-   assert rows[-1]['content']==scope.private_reply_copy(effect_unknown=True)
-   assert scope.current().profile not in json.dumps(rows)
+   assert rows[-1]['content']=='A harmless followup answer.'
+   from gateway.platforms.api_server import APIServerAdapter
+   assert scope.current().profile not in json.dumps([APIServerAdapter._message_response(row) for row in rows])
    assert a._friday_reply_effect_unknown is True
  finally:db.close()
 

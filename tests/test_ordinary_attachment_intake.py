@@ -2,6 +2,10 @@
 
 Only fresh tmp_path bytes are touched. Admission/config/database are not run:
 the retained capability is the already-admitted input to this source seam.
+
+Run with the composed native source and isolate process startup home, runtime,
+cache and temporary directories before imports. The native test runner can use
+an isolated interpreter through HERMES_PYTHON; no private pytest hook is needed.
 """
 import hashlib
 import importlib.util
@@ -56,6 +60,8 @@ def case(tmp_path, monkeypatch):
     monkeypatch.setattr(socket.socket, 'connect_ex', no_network)
     monkeypatch.setattr(socket, 'create_connection', no_network)
     launch = tmp_path / 'launch'
+    monkeypatch.setattr(Path, 'home', lambda: launch)
+    monkeypatch.setenv('HERMES_HOME', str(launch))
     cache = launch / 'cache' / 'documents'
     cache.mkdir(parents=True, mode=0o700)
     cache.parent.chmod(0o700)
@@ -72,7 +78,7 @@ def case(tmp_path, monkeypatch):
     # guard_tool paths against the actual current UserScope and binding.
     credentials = ModuleType('hermes_cli.friday_credential_admission')
     credentials.CredentialDenied = type('CredentialDenied', (ValueError,), {})
-    for name in ('ordinary_readonly_file', 'session_artifact_file', 'ordinary_readonly_tool', 'session_artifact_tool'):
+    for name in ('ordinary_readonly_file', 'session_artifact_file', 'ordinary_readonly_tool', 'session_artifact_tool', 'managed'):
         setattr(credentials, name, lambda *args, **kwargs: None)
     monkeypatch.setitem(sys.modules, credentials.__name__, credentials)
     monkeypatch.setattr(hermes_constants, 'get_routing_process_hermes_home', lambda: launch)

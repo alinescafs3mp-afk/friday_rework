@@ -1,0 +1,2520 @@
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -32,6 +32,7 @@
+ from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
+ from agent.errors import EmptyStreamError
+ from agent.chat_completion_stream_monitor import StreamingWaitMonitor
++from agent.request_budget import BudgetedStream, RequestBudget
+ from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
+ from agent.fast_mode import effective_request_overrides
+ from agent.turn_context import substitute_api_content
+@@ -628,7 +629,7 @@
+ 
+ def _configured_stale_base(agent) -> float:
+     """Per-provider ``stale_timeout_seconds`` config, else HERMES_STREAM_STALE_TIMEOUT (180s)."""
+-    cfg = get_provider_stale_timeout(agent.provider, agent.model)
++    cfg = get_provider_stale_timeout(agent.provider, agent.model, getattr(agent, "requested_provider", None))
+     return cfg if cfg is not None else _stream_env_stale_base()[0]
+ 
+ 
+@@ -693,7 +694,7 @@
+     wins over every implicit floor — the context-size tier as well as the reasoning-model
+     floor — so it can SHORTEN patience for a hung stream (#115024). Only the 180s default
+     is scaled and floored."""
+-    explicit = get_provider_stale_timeout(agent.provider, agent.model)
++    explicit = get_provider_stale_timeout(agent.provider, agent.model, getattr(agent, "requested_provider", None))
+     if explicit is not None:
+         return explicit
+     base, explicit_env = _stream_env_stale_base()
+@@ -894,6 +895,8 @@
+         self.agent = agent
+         self.api_kwargs = api_kwargs
+         self.stale_timeout = stale_timeout
++        self.request_budget = RequestBudget.for_agent(agent)
++        self.budget_error = None
+         self.call_start = call_start
+         self.client = None
+         self.done = False
+@@ -915,6 +918,11 @@
+     def _on_stale(self) -> None:
+         # Timer thread: aborts sockets only, never issues a request (keeps the no-worker
+         # property). False = request finished or an interrupt owns the outcome; stay silent.
++        if self.request_budget is not None:
++            self.budget_error = self.request_budget.expired()
++            if self.budget_error is not None:
++                self.abort("request_budget_exceeded")
++            return
+         if not self.abort("stale_call_kill"):
+             return
+         elapsed = time.time() - self.call_start
+@@ -933,6 +941,8 @@
+     def stop_watchdogs(self) -> None:
+         if self._watchdog is not None:
+             self._watchdog.cancel()
++            if self.request_budget is not None:
++                self._watchdog.join(timeout=2.0)
+         self.mark_done()
+         self._hb_stop.set()
+         self._hb.join(timeout=2.0)
+@@ -976,13 +986,17 @@
+         client = self.agent._create_request_openai_client(reason=reason, api_kwargs=self.api_kwargs)
+         with self.lock:
+             self.client = client
++            budget_error = self.request_budget.expired() if self.request_budget is not None else None
++            cancelled_before_dispatch = self.cancelled or budget_error is not None
+             stale_before_dispatch = self.stale
+-            if stale_before_dispatch:
++            if stale_before_dispatch or cancelled_before_dispatch:
+                 # Timer fired during client construction: the abort found no
+                 # socket, so dispatching now would open one AFTER the only
+                 # watchdog fired. Fail here instead. (Residual ms-scale window
+                 # before httpx opens its socket is accepted.)
+                 self._abort_client(client, "stale_call_kill", "Inline abort after late client registration failed")
++        if cancelled_before_dispatch:
++            raise budget_error or self.budget_error or InterruptedError("Request cancelled before provider dispatch")
+         if stale_before_dispatch:
+             raise TimeoutError(
+                 f"Non-streaming API call timed out before request dispatch (threshold: {int(self.stale_timeout)}s)")
+@@ -1014,13 +1028,17 @@
+     # (fail-closed), and a leaked heartbeat thread would mask real stalls forever.
+     call_start = time.time()
+     stale_timeout = _resolve_direct_stale_timeout(agent, api_kwargs)
++    policy = RequestBudget.for_agent(agent)
++    if policy is not None:
++        stale_timeout = min(policy.policy.first_event, policy.policy.total)
+     # Never override an explicit per-call timeout; otherwise pin read=stale_timeout so a
+     # no-op abort can't leave the read=None socket hanging until TCP dies (#85252).
+     from agent.chat_completion_nonstream import _inline_nonstream_hard_timeout
+     hard_timeout = _inline_nonstream_hard_timeout(stale_timeout)
+-    if hard_timeout is not None and "timeout" not in api_kwargs:
++    if hard_timeout is not None and (policy is not None or "timeout" not in api_kwargs):
+         api_kwargs = {**api_kwargs, "timeout": hard_timeout}
+     request = _InlineRequest(agent, api_kwargs, stale_timeout, call_start)
++    request.request_budget = policy
+     request.start_watchdogs()
+ 
+     # Only a clean return reports the reuse reason; errors/interrupts really
+@@ -1029,6 +1047,10 @@
+     try:
+         response = _dispatch_nonstreaming_api_request(agent, api_kwargs, make_client=request.make_client)
+     except Exception:
++        if request.request_budget is not None:
++            error = request.budget_error or request.request_budget.expired()
++            if error is not None:
++                raise error from None
+         if getattr(agent, "_interrupt_requested", False):
+             raise InterruptedError("Agent interrupted during API call") from None
+         with request.lock:
+@@ -1041,6 +1063,10 @@
+                 f"(threshold: {int(stale_timeout)}s)") from None
+         raise
+     else:
++        if request.request_budget is not None:
++            error = request.budget_error or request.request_budget.expired()
++            if error is not None:
++                raise error
+         if getattr(agent, "_interrupt_requested", False):
+             raise InterruptedError("Agent interrupted during API call")
+         # Mark ``done`` under the lock so a timer firing between response
+@@ -2843,13 +2869,15 @@
+         return None
+ 
+ 
+-class _StreamingCall(StreamingWaitMonitor):
++class _StreamingCall(StreamingWaitMonitor, BudgetedStream):
+     """One streaming request on the chat_completions / anthropic_messages wire.
+     State shared between the request worker and the poll-loop monitor (heartbeat,
+     stale kill, interrupt abort) lives on the instance, mutated from both threads."""
+ 
+     def __init__(self, agent, api_kwargs: dict, on_first_delta):
+         self.agent = agent
++        self._request_budget = None
++        self._budget_error = None
+         self.api_kwargs = api_kwargs
+         self.on_first_delta = on_first_delta
+         self.worker = None  # request thread; None in inline mode
+@@ -3003,6 +3031,7 @@
+ 
+     def _count_chunk(self, diag, chunk) -> None:
+         """Stamp liveness for a real chunk; diagnostics are best-effort."""
++        self._budget_event()
+         self.last_chunk_time["t"] = time.time()
+         self.agent._touch_activity("receiving stream response")
+         with contextlib.suppress(Exception):
+@@ -3025,7 +3054,12 @@
+         ``request_timeout_seconds`` wins over HERMES_API_TIMEOUT (1800s) and
+         HERMES_STREAM_READ_TIMEOUT (120s); connect/pool cover the handshake, not
+         inference: 30s, or capped at 60s when configured."""
+-        cfg = get_provider_request_timeout(self.agent.provider, self.agent.model)
++        if getattr(self, "_request_budget", None) is not None:
++            policy = self._request_budget.policy
++            # Socket timeouts backstop the total budget; the request-local monitor owns phase deadlines.
++            return policy.total, policy.total, min(policy.total, 60.0)
++        cfg = get_provider_request_timeout(
++            self.agent.provider, self.agent.model, getattr(self.agent, "requested_provider", None))
+         base = cfg if cfg is not None else env_float("HERMES_API_TIMEOUT", 1800.0)
+         if cfg is not None:
+             return base, cfg, min(base, 60.0)
+@@ -3081,6 +3115,7 @@
+         from agent.bounded_context import guard_main_request
+         guard_main_request(self.agent, stream_kwargs, request_client)
+         stream_kwargs = bypass_chat_sdk_request_transform(stream_kwargs, request_client)
++        self._budget_before_dispatch()
+         return request_client.chat.completions.create(**stream_kwargs)
+ 
+     def _chat_stream_created(self, raw_stream: Any) -> None:
+@@ -3520,6 +3555,7 @@
+         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
+             final_kwargs = dict(next_api_kwargs)
+             sanitize_anthropic_kwargs(final_kwargs, log_prefix=getattr(self.agent, "log_prefix", ""))
++            self._budget_before_dispatch()
+             manager = request_client.messages.stream(**final_kwargs)
+             _stream_context["manager"] = manager
+             return normalize_stream_usage(manager.__enter__())
+@@ -3684,6 +3720,11 @@
+         ``result["error"]`` set (unless our own interrupt force-closed the
+         socket). Runs inside the ``except`` so ``logger.exception`` works."""
+         import httpx as _httpx
++        if self._request_budget is not None:
++            error = self._request_budget.expired()
++            if error is not None:
++                self._budget_error = error
++                self._request_cancelled["value"] = True
+         # Our own interrupt force-close: no retry/fallback/"reconnecting" (the
+         # poll loop raises InterruptedError).
+         if self._request_cancelled["value"]:
+@@ -3860,6 +3901,8 @@
+             while _stream_attempt < _max_stream_retries + self._compat_retries:
+                 _stream_attempt += 1
+                 stream_attempt_id = self._start_stream_attempt()
++                if self._request_cancelled["value"]:
++                    return
+                 # Otherwise /stop closes the connection and the retry opens a
+                 # FRESH one, blocking up to a full read timeout per attempt.
+                 if self.agent._interrupt_requested:
+@@ -4067,6 +4110,7 @@
+     def run(self):
+         """Resolve the stale timeout, run the request (worker thread or inline),
+         drive the heartbeat/stale/interrupt monitor, then translate the outcome."""
++        self._request_budget = RequestBudget.for_agent(self.agent)
+         self._resolve_stale_timeout()
+         # Delegated children and cron turns run the request INLINE (a worker inside
+         # their nested pools wedges before the socket opens) but must still STREAM
+@@ -4087,6 +4131,12 @@
+             self.worker = threading.Thread(target=_context_thread_target(self._run_call), daemon=True)
+             self.worker.start()
+             self._monitor_loop()
++        if self._budget_error is not None:
++            raise self._budget_error
++        if self._request_budget is not None:
++            error = self._request_budget.expired()
++            if error is not None:
++                raise error
+         if self._monitor_interrupted["yes"]:
+             raise InterruptedError("Agent interrupted during streaming API call")
+         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag
+diff --git a/agent/chat_completion_nonstream.py b/agent/chat_completion_nonstream.py
+--- a/agent/chat_completion_nonstream.py
++++ b/agent/chat_completion_nonstream.py
+@@ -2,6 +2,7 @@
+ 
+ from agent import chat_completion_helpers as h
+ from agent import chat_completion_wait_notice as wn
++from agent.request_budget import RequestBudget
+ 
+ 
+ class _NonStreamRequest:
+@@ -14,6 +15,10 @@
+     def __init__(self, agent, api_kwargs: dict):
+         self.agent = agent
+         self.api_kwargs = api_kwargs
++        self.request_budget = RequestBudget.for_agent(agent)
++        if self.request_budget is not None:
++            # Non-streaming has one response event; the first-response deadline owns its read.
++            self.api_kwargs = {**api_kwargs, "timeout": self.request_budget.policy.first_event}
+         self.result = {"response": None, "error": None}
+         self.clients = h._RequestClientRegistry(agent)
+         # Request-local cancel flag: agent._interrupt_requested is cleared at turn
+@@ -62,7 +67,12 @@
+             client = self.agent._create_request_anthropic_client(reason=reason)
+         else:
+             client = self.agent._create_request_openai_client(reason=reason, api_kwargs=self.api_kwargs)
+-        return self.clients.set_client(client, kind=kind)
++        self.clients.set_client(client, kind=kind)
++        error = self.request_budget.expired() if self.request_budget is not None else None
++        if self.cancelled or error is not None:
++            self.clients.close_once("request_cancelled_before_dispatch")
++            raise error or InterruptedError("Request cancelled before provider dispatch")
++        return client
+ 
+     def _call(self):
+         watchdog_state_var = watchdog_context_token = None
+@@ -271,6 +281,7 @@
+ 
+     def run(self):
+         agent, wd = self.agent, self.wd
++        request_budget = getattr(self, "request_budget", None)
+         if wd.codex:
+             # Reset before the worker starts so a marker left over from a previous
+             # call on this agent can't be misread as the first event for this one.
+@@ -290,6 +301,20 @@
+             # Resumed events clear our notice on the next poll, not 30s later.
+             now = h.time.time()
+             elapsed = now - self.call_start
++            if request_budget is not None and request_budget.expired() is not None:
++                self.cancelled = True
++                self._abort_request("request_budget_exceeded")
++                t.join(timeout=2.0)
++                if t.is_alive():
++                    request_budget.error.mark_cleanup_pending()
++                raise request_budget.error
++            if request_budget is not None:
++                # An explicit policy owns this request; implicit stale/TTFB cutoffs must not pre-empt it.
++                if agent._interrupt_requested:
++                    self._interrupt(elapsed)
++                if poll_count % 100 == 0:
++                    agent._touch_activity("waiting under explicit provider request budget")
++                continue
+             self._emit_wait_notice(elapsed, heartbeat=poll_count % 100 == 0)
+             last_event_ts, last_progress_ts, retry_started_ts, attempt_started_ts = self._codex_watchdog_snapshot()
+             attempt_elapsed = now - attempt_started_ts
+@@ -311,6 +336,8 @@
+                 break
+             if agent._interrupt_requested:
+                 self._interrupt(elapsed)
++        if request_budget is not None and request_budget.expired() is not None:
++            raise request_budget.error
+         if self.result["error"] is not None:
+             raise self.result["error"]
+         # Success — the provider proved responsive: clear the breaker (#58962).
+diff --git a/agent/chat_completion_stream_monitor.py b/agent/chat_completion_stream_monitor.py
+--- a/agent/chat_completion_stream_monitor.py
++++ b/agent/chat_completion_stream_monitor.py
+@@ -40,6 +40,12 @@
+         """Gateway inactivity heartbeat: the start-to-first-chunk gap (thinking,
+         local prefill) can exceed the gateway timeout."""
+         if waiting_secs >= 60.0:
++            if self._request_budget is not None:
++                phase = "first_event" if self._request_budget.last_event is None else "post_event"
++                if self._mon.wait_notice.should_emit(phase, None):
++                    self.agent._emit_wait_notice(
++                        f"Waiting for provider ({waiting_secs}s without parsed events; request budget active).")
++                return
+             # No chunks for 60s+: say WHAT the wait is and WHEN recovery kicks in —
+             # once per silence, not every heartbeat (#92550).
+             stale = self._stream_stale_timeout
+@@ -66,6 +72,10 @@
+         _is_local_base = bool(self.agent.base_url) and is_local_endpoint(self.agent.base_url)
+         while not self._call_done.is_set():
+             self._call_done.wait(timeout=0.3)
++            if self._call_done.is_set():
++                break
++            if self._check_request_budget():
++                return
+             _hb_now = time.time()
+             if _is_local_base and self._poll_local_load_notice(_hb_now):
+                 continue
+@@ -80,7 +90,7 @@
+                 self._mon.last_heartbeat = _hb_now
+                 self._heartbeat(int(_hb_now - self.last_chunk_time["t"]))
+             _stale_elapsed = time.time() - self.last_chunk_time["t"]
+-            if _stale_elapsed > self._stream_stale_timeout:
++            if self._request_budget is None and _stale_elapsed > self._stream_stale_timeout:
+                 self._mon.wait_notice_started_ts = None  # Reconnect status has its own owner.
+                 self._mon.wait_notice.reset()
+                 self._kill_stale_stream(_stale_elapsed)
+diff --git a/agent/client_lifecycle.py b/agent/client_lifecycle.py
+--- a/agent/client_lifecycle.py
++++ b/agent/client_lifecycle.py
+@@ -11,6 +11,7 @@
+ 
+ from agent.lazy_forward import forward as _forward, forward_static as _forward_static, lazy_attr as _lazy_attr
+ from hermes_cli.timeouts import get_provider_request_timeout
++from agent.request_budget import main_request_timeout
+ from utils import base_url_host_matches, env_float
+ 
+ logger = logging.getLogger("run_agent")  # origin module's logger name: log records / caplog filters unchanged
+@@ -561,13 +562,13 @@
+             return ("bedrock", getattr(self, "_bedrock_region", "us-east-1") or "us-east-1")
+         return (
+             "direct", self._anthropic_api_key, getattr(self, "_anthropic_base_url", None),
+-            get_provider_request_timeout(self.provider, self.model), bool(getattr(self, "_oauth_1m_beta_disabled", False)),
++            main_request_timeout(self), bool(getattr(self, "_oauth_1m_beta_disabled", False)),
+         )
+ 
+     def _build_direct_anthropic_client(self, token: str, base_url: Any) -> Any:
+         """Native Anthropic client for ``token``/``base_url`` with the provider/model request timeout."""
+         from agent.anthropic_adapter import build_anthropic_client
+-        return build_anthropic_client(token, base_url, timeout=get_provider_request_timeout(self.provider, self.model))
++        return build_anthropic_client(token, base_url, timeout=main_request_timeout(self))
+ 
+     def _anthropic_oauth_flag(self, token: str) -> bool:
+         """OAuth flag only on native Anthropic routes; third-party Anthropic-protocol endpoints must not trip OAuth paths."""
+diff --git a/agent/history_commentary.py b/agent/history_commentary.py
+--- a/agent/history_commentary.py
++++ b/agent/history_commentary.py
+@@ -151,12 +151,14 @@
+ 
+ def project_history_commentary(messages: list[dict], *, home: Any = None) -> list[dict]:
+     """Project a batch inside the owning profile's config and redaction scope."""
+-    if not any(
+-        isinstance(message, dict) and message.get("codex_message_items")
+-        for message in messages
+-    ):
+-        return messages
+     with _owning_home(home):
++        from hermes_cli.friday_user_scope import ordinary_message_view
++        if not any(
++            isinstance(message, dict) and message.get("codex_message_items")
++            for message in messages
++        ):
++            return [ordinary_message_view(message) if isinstance(message, dict) else message
++                    for message in messages]
+         from hermes_cli.config import load_config
+ 
+         try:
+@@ -169,7 +171,7 @@
+         except Exception:
+             enabled = False  # unreadable policy must not publish raw provider items
+         return [
+-            _project_one(message, enabled=enabled)
++            ordinary_message_view(_project_one(message, enabled=enabled))
+             if isinstance(message, dict)
+             else message
+             for message in messages
+diff --git a/agent/request_budget.py b/agent/request_budget.py
+new file mode 100644
+--- /dev/null
++++ b/agent/request_budget.py
+@@ -0,0 +1,117 @@
++"""Explicit request-local deadlines, using the existing native request abort machinery."""
++
++from __future__ import annotations
++
++import contextlib
++import threading
++import time
++
++from hermes_cli.timeouts import get_provider_request_budget
++
++
++class RequestBudgetExceeded(TimeoutError):
++    """A terminal policy decision: automatic replay could duplicate provider effects."""
++
++    def __init__(self, phase: str, seconds: float):
++        self.phase = phase
++        self.seconds = seconds
++        self.cleanup_pending = False
++        super().__init__(f"Provider request budget exceeded: {phase} ({seconds:g}s); request cancelled without retry")
++
++    def mark_cleanup_pending(self):
++        if not self.cleanup_pending:
++            self.cleanup_pending = True
++            self.args = (f"{self.args[0]}; STOP_UNCONFIRMED: request worker still unwinding",)
++
++
++class RequestBudget:
++    def __init__(self, policy):
++        self.policy = policy
++        self.started = time.monotonic()
++        self.last_event = None
++        self.error = None
++        self.lock = threading.Lock()
++
++    @classmethod
++    def for_agent(cls, agent):
++        policy = get_provider_request_budget(
++            getattr(agent, "provider", ""), getattr(agent, "model", None), getattr(agent, "requested_provider", None))
++        return cls(policy) if policy is not None else None
++
++    def expired(self, *, event: bool = False):
++        """Deadline checks and chunk arrival share a lock; a late finish cannot win."""
++        with self.lock:
++            now = time.monotonic()
++            if self.error is None:
++                phase = "total" if now - self.started >= self.policy.total else None
++                if phase is None and self.last_event is None and now - self.started >= self.policy.first_event:
++                    phase = "first_event"
++                if phase is None and self.last_event is not None and now - self.last_event >= self.policy.idle:
++                    phase = "idle"
++                if phase is not None:
++                    self.error = RequestBudgetExceeded(phase, getattr(self.policy, phase))
++            if event and self.error is None:
++                self.last_event = now
++            return self.error
++
++
++class BudgetedStream:
++    """Mixin for the native streaming request; no extra watchdog thread or scheduler."""
++
++    def _budget_event(self):
++        if self._request_budget is not None:
++            error = self._request_budget.expired(event=True)
++            if error is not None:
++                self._budget_error = error
++                self._request_cancelled["value"] = True
++                raise error
++
++    def _budget_before_dispatch(self):
++        error = self._request_budget.expired() if self._request_budget is not None else None
++        if error is not None:
++            self._budget_error = error
++            self._request_cancelled["value"] = True
++        if self._request_cancelled["value"]:
++            self.clients.close_once("request_cancelled_before_dispatch")
++            raise self._budget_error or InterruptedError("Request cancelled before provider dispatch")
++
++    def _check_request_budget(self) -> bool:
++        budget = self._request_budget
++        if budget is None:
++            return False
++        error = budget.expired()
++        if error is None:
++            return False
++        self._budget_error = error
++        # Publish cancellation before shutting down: the worker must never reconnect.
++        self._request_cancelled["value"] = True
++        response = self._attempt_stream_response
++        self._cancel_current_stream_attempt("request_budget_exceeded")
++        with contextlib.suppress(Exception):
++            self.clients.close_once("request_budget_exceeded")
++        self._shutdown_stale_attempt_socket(response)
++        if self.worker is not None:
++            self.worker.join(timeout=2.0)
++            if self.worker.is_alive():
++                error.mark_cleanup_pending()
++        return True
++
++
++def main_request_timeout(agent):
++    """Request-local timeout lookup. Auxiliary clients retain their own timeout resolution."""
++    from hermes_cli.timeouts import get_provider_request_timeout
++    policy = get_provider_request_budget(agent.provider, agent.model, getattr(agent, "requested_provider", None))
++    if policy is not None:
++        return policy.total
++    return get_provider_request_timeout(agent.provider, agent.model, getattr(agent, "requested_provider", None))
++
++
++def request_budget_failure(error, messages, api_call_count):
++    return {
++        "final_response": str(error), "messages": messages, "api_calls": api_call_count,
++        "completed": False, "failed": True, "error": str(error),
++        "failure_reason": "request_budget_exceeded", "failure_retryable": False,
++        "request_budget_phase": error.phase,
++        "cleanup_pending": error.cleanup_pending,
++        "request_cleanup": "STOP_UNCONFIRMED" if error.cleanup_pending else "QUIESCENT",
++    }
+diff --git a/agent/turn_api_error.py b/agent/turn_api_error.py
+--- a/agent/turn_api_error.py
++++ b/agent/turn_api_error.py
+@@ -78,6 +78,10 @@
+         thinking_spinner = None
+     if agent.thinking_callback:
+         agent.thinking_callback("")
++
++    from agent.request_budget import RequestBudgetExceeded, request_budget_failure
++    if isinstance(api_error, RequestBudgetExceeded):
++        return _verdict("return", request_budget_failure(api_error, messages, api_call_count))
+ 
+     _recovered, active_system_prompt = recover_before_classification(
+         agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
+diff --git a/agent/turn_response_intake.py b/agent/turn_response_intake.py
+--- a/agent/turn_response_intake.py
++++ b/agent/turn_response_intake.py
+@@ -103,6 +103,9 @@
+ def _relay_thinking(agent: Any, content: str) -> None:
+     """Relay the model's text to the progress callback: subagents send the first line to
+     the parent display; any agent with a structured callback gets ``reasoning.available``."""
++    from hermes_cli.friday_user_scope import managed_reply_stream
++    if managed_reply_stream(agent):
++        return
+     _think_text = _REASONING_TAG_RE.sub('', content.strip()).strip()
+     first_line = _think_text.split('\n')[0][:80] if _think_text else ""
+     if first_line and getattr(agent, '_delegate_depth', 0) > 0:
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -417,7 +417,8 @@
+         projected = {k: v for k, v in message.items() if k not in _COMPACTION_INTERNAL_FIELDS}
+         projected["content"] = ""
+         projected["display_kind"] = "hidden"
+-    return projected
++    from hermes_cli.friday_user_scope import ordinary_message_view
++    return ordinary_message_view(projected)
+ 
+ 
+ def _auto_truncate_response_history(
+diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
+--- a/gateway/platforms/api_server_openai_routes.py
++++ b/gateway/platforms/api_server_openai_routes.py
+@@ -171,6 +171,9 @@
+     persisted (``build_assistant_message`` stores the structured reasoning under
+     ``reasoning``) rather than re-accumulating callback deltas, so it is exactly what the
+     stream would have carried and cannot double-count the post-response fallback."""
++    from hermes_cli.friday_user_scope import ordinary_presentation
++    if ordinary_presentation():
++        return ""
+     messages = result.get("messages") if isinstance(result, dict) else None
+     if not isinstance(messages, list):
+         return ""
+@@ -1223,7 +1226,12 @@
+         stored = self._current_response_store().get(response_id)
+         if stored is None:
+             return _error_response(f"Response not found: {response_id}", 404)
+-        return web.json_response(stored["response"])
++        response = stored["response"]
++        from hermes_cli.friday_user_scope import ordinary_presentation
++        if ordinary_presentation():
++            response = {**response, "output": [item for item in response.get("output", [])
++                if not _is_reasoning_input_item(item)]}
++        return web.json_response(response)
+ 
+     async def _handle_delete_response(self, request: "web.Request") -> "web.Response":
+         """DELETE /v1/responses/{response_id} — delete a stored response."""
+@@ -1304,11 +1312,13 @@
+         """Output items from ``result["messages"][start_index:]``: ``function_call`` per assistant
+         tool_call, ``function_call_output`` per tool message, then the final ``message``."""
+         from gateway.platforms.api_server import _redact_api_error_text
++        from hermes_cli.friday_user_scope import ordinary_message_view
+         items: List[Dict[str, Any]] = []
+         messages = result.get("messages", [])
+         if start_index > 0:
+             messages = messages[start_index:]
+         for msg in messages:
++            msg = ordinary_message_view(msg)
+             role = msg.get("role")
+             reasoning = msg.get("reasoning") if role == "assistant" else None
+             if isinstance(reasoning, str) and reasoning.strip():
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -3502,17 +3502,38 @@
+             callback if generation is None else (int(generation), callback))
+ 
+     @staticmethod
++    def _invoke_post_delivery_callback(callback, delivery_receipt="unknown"):
++        """Opt-in receipt argument; unrelated callbacks keep their existing contract."""
++        try:
++            accepts_receipt = "delivery_receipt" in inspect.signature(callback).parameters
++        except (TypeError, ValueError):
++            accepts_receipt = False
++        return callback(delivery_receipt=delivery_receipt) if accepts_receipt else callback()
++
++    @staticmethod
++    def _post_delivery_finalizers(callback):
++        """Carry mandatory status cleanup through nested callback chains."""
++        if getattr(callback, "_post_delivery_finalizer", False) is True:
++            return (callback,)
++        finalizers = getattr(callback, "_post_delivery_finalizers", ())
++        return finalizers if isinstance(finalizers, tuple) else ()
++
++    @staticmethod
+     def _chain_callbacks(*callbacks: Callable) -> Callable[[], Awaitable[None]]:
+         """Async wrapper running ``callbacks`` in order with per-callback exception isolation;
+         async so coroutines returned by async hooks are awaited, not dropped."""
+-        async def _chained() -> None:
++        async def _chained(*, delivery_receipt="unknown") -> None:
+             for _cb in callbacks:
+                 try:
+-                    _result = _cb()
++                    _result = BasePlatformAdapter._invoke_post_delivery_callback(_cb, delivery_receipt)
+                     if inspect.isawaitable(_result):
+                         await _result
+                 except Exception:
+                     logger.debug("Post-delivery callback failed", exc_info=True)
++        _chained._post_delivery_finalizers = tuple(
++            finalizer for callback in callbacks
++            for finalizer in BasePlatformAdapter._post_delivery_finalizers(callback)
++        )
+         return _chained
+ 
+     def pop_post_delivery_callback(
+@@ -4543,17 +4564,29 @@
+             text_content=text_content, images=images, media_files=media_files,
+             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
+ 
+-    async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
++    async def _fire_post_delivery_callback(
++        self, session_key: str, interrupt_event: asyncio.Event, *, delivery_receipt="unknown",
++    ) -> None:
+         """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
+         read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
+         would let stale runs fire a fresher run's callbacks."""
+         _post_cb = self.pop_post_delivery_callback(
+             session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None))
+         if callable(_post_cb):
+-            with contextlib.suppress(asyncio.TimeoutError, Exception):
+-                _post_result = _post_cb()
+-                if inspect.isawaitable(_post_result):
+-                    await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
++            try:
++                with contextlib.suppress(asyncio.TimeoutError, Exception):
++                    _post_result = self._invoke_post_delivery_callback(_post_cb, delivery_receipt)
++                    if inspect.isawaitable(_post_result):
++                        await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
++            finally:
++                # The slot is already consumed. An earlier callback's timeout or
++                # cancellation must not orphan the existing notification task.
++                # Status cleanup is idempotent; unrelated callbacks are not rerun.
++                for finalizer in self._post_delivery_finalizers(_post_cb):
++                    with contextlib.suppress(asyncio.TimeoutError, Exception):
++                        result = self._invoke_post_delivery_callback(finalizer, delivery_receipt)
++                        if inspect.isawaitable(result):
++                            await asyncio.wait_for(result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+ 
+     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
+         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
+@@ -4582,9 +4615,12 @@
+     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
+         """Background task that actually processes the message."""
+         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
++        delivery_completed = False
++        delivery_results = []
+ 
+         def _record_delivery(result):
+             nonlocal delivery_attempted, delivery_succeeded
++            delivery_results.append(result)
+             if result is not None:
+                 delivery_attempted = True
+                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+@@ -4596,6 +4632,7 @@
+         try:
+             await self._run_processing_hook("on_processing_start", event)
+             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
++            event._status_streamed_final_confirmed = False  # a retried event needs its own receipt
+             response = await self._message_handler(event)
+             # A muted diagnostic wake ran for the session; its reply is not presented. The
+             # policy read binds the routed profile; delivery itself stays in the launch scope.
+@@ -4655,6 +4692,7 @@
+                     event, extracted, _final_thread_metadata,
+                     anything_sent=delivery_attempted or _tts_caption_delivered,
+                     record_delivery=_record_delivery)
++            delivery_completed = True
+             await self._release_turn_marker(event)
+             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+             # Clean up the per-turn streaming-TTS flag.
+@@ -4696,7 +4734,26 @@
+             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
+             # alive.
+             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
+-            await self._fire_post_delivery_callback(session_key, interrupt_event)
++            # Callback execution also occurs on exceptions and empty responses;
++            # neither is evidence that a final answer reached the user. A partial
++            # attachment batch cannot authorize deletion merely because text landed.
++            receipt = "unknown"
++            if delivery_completed and not delivery_results and getattr(event, "_status_streamed_final_confirmed", False):
++                receipt = "confirmed"
++            if delivery_completed and delivery_results:
++                if all(
++                    getattr(item, "success", False) and getattr(item, "message_id", None)
++                    and not (isinstance(getattr(item, "raw_response", None), dict)
++                             and (item.raw_response.get("partial_overflow") or item.raw_response.get("skipped")))
++                    for item in delivery_results
++                ):
++                    receipt = "confirmed"
++                elif any(not getattr(item, "success", False) for item in delivery_results) and all(
++                    getattr(item, "success", False) or getattr(item, "error_kind", None) in {
++                    "forbidden", "not_found", "too_long", "bad_format", "rate_limited",
++                } for item in delivery_results):
++                    receipt = "failed"
++            await self._fire_post_delivery_callback(session_key, interrupt_event, delivery_receipt=receipt)
+             # Callback work or a late refresh may have recreated typing — one final bounded stop.
+             await self._stop_typing_refresh(
+                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -1970,6 +1970,11 @@
+             # /loop and /goal hooks that read the return value.
+             with suppress(Exception):
+                 event._streamed_final_response = str(response or "")
++                # already_sent carries the stream consumer's final-text receipt.
++                # Post-stream attachments/footer have their own delivery path;
++                # absent those, the empty adapter response still confirms delivery.
++                media_files, _ = adapter.extract_media(str(response or ""))
++                event._status_streamed_final_confirmed = not media_files and not _footer_line
+             return None
+ 
+         return response
+@@ -4037,6 +4042,10 @@
+     ) -> None:
+         """``finally`` half of a turn: cancel background tasks, flush stream, release the session slot."""
+         stream_consumer_holder, session_key = turn_ctx.stream_consumer_holder, turn_ctx.session_key
++        # The existing notification task owns Telegram's delivery-phase timer until
++        # the adapter's post-delivery callback receives the actual transport outcome.
++        if turn_ctx._telegram_status is not None and turn_ctx._telegram_status.awaiting_delivery:
++            _notify_task = None
+         for task in (progress_task, log_task, interrupt_monitor, _notify_task):
+             if task:
+                 task.cancel()
+@@ -4249,8 +4258,9 @@
+         no longer owns the session slot or the executor finished. ``_executor_task_holder[0]`` is
+         bound just after this task is scheduled (reads as None until then).
+ 
+-        Interval: agent.gateway_notify_interval / HERMES_AGENT_NOTIFY_INTERVAL (default 180s; 0 or
+-        long_running_notifications=off disables)."""
++        Generic native Telegram turns start immediately and edit on a one-second cadence.
++        Other surfaces retain agent.gateway_notify_interval / HERMES_AGENT_NOTIFY_INTERVAL
++        (default 180s; 0 or long_running_notifications=off disables both)."""
+         from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
+         _notify_start = time.time()
+         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
+@@ -4261,6 +4271,24 @@
+         _status_thread_metadata = turn_ctx._status_thread_metadata
+         _notify_adapter = self._delivery_adapter_for(source)
+         if not _notify_adapter:
++            return
++        if (
++            source.platform == Platform.TELEGRAM and _long_running_mode == "generic"
++            and callable(getattr(_notify_adapter, "_chat_outbound_slot_remaining", None))
++            and callable(getattr(_notify_adapter, "_send_flood_cooldown_remaining", None))
++            and callable(getattr(_notify_adapter, "register_post_delivery_callback", None))
++            and session_key
++        ):
++            from gateway.run_turn_status import TelegramTurnStatus
++            status = TelegramTurnStatus(
++                self, turn_ctx, _notify_adapter,
++                _interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
++            )
++            turn_ctx._telegram_status = status
++            _notify_adapter.register_post_delivery_callback(
++                session_key, status.after_delivery, generation=turn_ctx.run_generation,
++            )
++            await status.run()
+             return
+         _heartbeat_msg_id: Optional[str] = None
+         while True:
+@@ -4394,11 +4422,14 @@
+             else spawn(self._run_agent_notify_long_running(disp, turn_ctx, _executor_task_holder))
+         )
+ 
++        response = None
+         try:
+             # run_sync is TurnRunner.run_sync (bound method; executor call unchanged).
+             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
+             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
+             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
++            if turn_ctx._telegram_status is not None:
++                turn_ctx._telegram_status.finish(response)
+             if isinstance(response, dict):
+                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
+             self._run_agent_evict_on_fallback(turn_ctx)
+@@ -4413,6 +4444,8 @@
+                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
+                 )
+         finally:
++            if turn_ctx._telegram_status is not None:
++                turn_ctx._telegram_status.finish(response)
+             await self._run_agent_cleanup_turn_tasks(
+                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
+                 _notify_task=_notify_task, tracking_task=tracking_task, stream_task=stream_task,
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -132,6 +132,8 @@
+         if event_type == "subagent.complete":
+             self._progress_subagent_notice(preview, kwargs)
+             return
++        if ctx._telegram_status is not None and ctx._run_still_current() and not self._agent_interrupted():
++            ctx._telegram_status.activity(event_type, tool_name)
+         self._progress_live_status(event_type, tool_name, args)
+         # "log" mode: append tool.started lines to the log queue, silent in chat. Handled before
+         # the progress_queue guard because log mode runs without a chat progress queue.
+diff --git a/gateway/run_turn_status.py b/gateway/run_turn_status.py
+new file mode 100644
+--- /dev/null
++++ b/gateway/run_turn_status.py
+@@ -0,0 +1,219 @@
++"""Telegram's generic heartbeat, driven by the existing per-turn notification task.
++
++Only closed, host-owned phase labels cross this surface. Tool arguments, previews,
++scratch text and activity descriptions are deliberately never rendered.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import math
++from contextlib import suppress
++
++
++_PHASES = {
++    "working": "⏳ Обрабатываю запрос",
++    "search": "⏳ Ищу информацию",
++    "read": "⏳ Читаю файл",
++    "write": "⏳ Сохраняю файл",
++    "action": "⏳ Выполняю действие",
++    "delivery": "⏳ Отправляю результат",
++    "stopped": "⏸ Выполнение остановлено",
++    "error": "⚠ Запрос завершился с ошибкой",
++    "unknown": "⚠ Доставка результата не подтверждена",
++    "failed": "⚠ Не удалось доставить результат",
++    "delivered": "Результат доставлен",
++}
++_TOOL_PHASES = {
++    "web_search": "search", "web_extract": "search", "browse": "search",
++    "read_file": "read", "write_file": "write", "patch": "write",
++}
++
++
++class TelegramTurnStatus:
++    """One editable bubble; pacing belongs to the native Telegram adapter.
++
++    The notification task stays alive through final delivery, then its existing
++    post-delivery callback stops it. No model calls or independent timer task.
++    """
++
++    def __init__(self, runner, ctx, adapter, metadata):
++        self.runner, self.ctx, self.adapter = runner, ctx, adapter
++        self.metadata = metadata
++        self.loop = asyncio.get_running_loop()
++        self.started = self.loop.time()
++        self.wake = asyncio.Event()
++        self.task = asyncio.current_task()
++        self.phase = "working"
++        self.message_id = None
++        self.last_text = None
++        self.next_attempt = 0.0
++        self.failures = 0
++        self.disabled = self.ended = self.finished = self.awaiting_delivery = False
++        # Reuse the adapter's chat pacing and share ONLY server backoff across
++        # this surface's topics/turns. A long retry_after must not be capped.
++        self.retry_until = adapter.__dict__.setdefault("_telegram_status_retry_until", {})
++
++    def activity(self, event_type, tool_name):
++        """Worker-thread bridge; no raw text/args are queued or retained."""
++        if self.ended or self.finished or tool_name == "_thinking":
++            return
++        if event_type == "tool.started" and tool_name:
++            phase = _TOOL_PHASES.get(tool_name, "action")
++        elif event_type == "tool.completed":
++            phase = "working"
++        else:
++            return
++        self.loop.call_soon_threadsafe(self._set_phase, phase)
++
++    def _set_phase(self, phase):
++        if not self.finished and not self.ended and phase != self.phase:
++            self.phase = phase
++            self.wake.set()
++
++    def finish(self, response):
++        """Worker result is not a delivery receipt. Success waits for the adapter."""
++        if self.finished or self.ended:
++            return
++        self.finished = True
++        agent = self.ctx.agent_holder[0]
++        stopped = bool(agent is not None and getattr(agent, "is_interrupted", False))
++        if stopped or (isinstance(response, dict) and response.get("interrupted")):
++            self.phase = "stopped"
++        elif not isinstance(response, dict) or response.get("failed") or response.get("completed") is False:
++            self.phase = "error"
++        else:
++            self.phase = "delivery"
++            self.awaiting_delivery = True
++        self.wake.set()
++
++    def _remaining(self):
++        now, chat = self.loop.time(), self.ctx.source.chat_id
++        key = str(chat)
++        retry = self.retry_until.get(key, 0.0) - now
++        if retry <= 0:
++            self.retry_until.pop(key, None)
++        cooldown = self.adapter._send_flood_cooldown_remaining(chat) or 0.0
++        return max(0.0, self.next_attempt - now, retry, cooldown,
++                   self.adapter._chat_outbound_slot_remaining(chat))
++
++    def _retry_delay(self, result):
++        value = getattr(result, "retry_after", None)
++        if hasattr(value, "total_seconds"):
++            value = value.total_seconds()
++        try:
++            delay = float(value)
++        except (TypeError, ValueError):
++            return None
++        return max(1.0, delay) if math.isfinite(delay) and delay >= 0 else None
++
++    async def publish(self):
++        """An uncertain edit may retry this ID; it never becomes a new send."""
++        if self.disabled or self._remaining() > 0:
++            return
++        elapsed = max(0, int(self.loop.time() - self.started))
++        text = f"{_PHASES[self.phase]} · {elapsed // 60}:{elapsed % 60:02d}"
++        if text == self.last_text:
++            self.next_attempt = self.loop.time() + 1.0
++            return
++        self.next_attempt = self.loop.time() + 1.0
++        try:
++            if self.message_id:
++                result = await self.adapter.edit_message(self.ctx.source.chat_id, self.message_id, text)
++            else:
++                result = await self.adapter.send(self.ctx.source.chat_id, text, metadata=self.metadata)
++        except asyncio.CancelledError:
++            # A cancelled initial send can already have landed. Never send it again.
++            if not self.message_id:
++                self.disabled = True
++            raise
++        except Exception:
++            result = None
++        retry = self._retry_delay(result)
++        if retry is not None:
++            deadline = self.loop.time() + retry
++            self.retry_until[str(self.ctx.source.chat_id)] = deadline
++            self.next_attempt = deadline
++            return  # explicit refusal: even an initial send may safely retry later
++        if result is not None and getattr(result, "success", False):
++            raw = getattr(result, "raw_response", None)
++            if isinstance(raw, dict) and raw.get("skipped"):
++                return  # native slot deferral is NOT a visible edit receipt
++            if not self.message_id:
++                mid = getattr(result, "message_id", None)
++                if not mid:
++                    self.disabled = True
++                    return
++                self.message_id = str(mid)
++            self.failures, self.last_text = 0, text
++            return
++        if not self.message_id:
++            self.disabled = True  # no receipt/ID: retries could create duplicate bubbles
++            return
++        self.failures += 1
++        self.next_attempt = self.loop.time() + min(30.0, 2.0 ** min(self.failures, 5))
++        if getattr(result, "error_kind", None) in {"forbidden", "not_found"}:
++            self.disabled = True
++
++    async def run(self):
++        while not self.ended and not self.disabled:
++            self.wake.clear()
++            superseded = (not self.ctx._run_still_current()
++                          or getattr(self.runner, "_draining", False)
++                          or getattr(self.runner, "_restart_requested", False))
++            if superseded and self.awaiting_delivery:
++                # A newer generation can replace the adapter callback slot.
++                # This old notification task must not survive that replacement.
++                self.awaiting_delivery, self.phase = False, "unknown"
++            elif not self.finished and (superseded or (
++                self.ctx.agent_holder[0] is not None
++                and getattr(self.ctx.agent_holder[0], "is_interrupted", False)
++            )):
++                self.finish({"interrupted": True})
++            if self.finished and not self.awaiting_delivery:
++                await self._terminal_update()
++                return
++            await self.publish()
++            if self.disabled:
++                return
++            # Server backoff suppresses requests, not ownership/stop checks.
++            delay = max(0.01, min(1.0, self._remaining()))
++            try:
++                await asyncio.wait_for(self.wake.wait(), timeout=delay)
++            except asyncio.TimeoutError:
++                pass
++
++    async def after_delivery(self, *, delivery_receipt="unknown"):
++        """Only the real final text/artifact receipts authorize removal."""
++        if self.ended:
++            return
++        self.ended = True
++        self.awaiting_delivery = False
++        if self.task is not None and self.task is not asyncio.current_task():
++            self.task.cancel()
++            with suppress(asyncio.CancelledError):
++                await self.task
++        if self.phase in {"stopped", "error"}:
++            await self._terminal_update()
++            return
++        if delivery_receipt == "confirmed" and self.message_id:
++            with suppress(Exception):
++                if await self.adapter.delete_message(self.ctx.source.chat_id, self.message_id):
++                    return
++            self.phase = "delivered"
++        else:
++            self.phase = "failed" if delivery_receipt == "failed" else "unknown"
++        await self._terminal_update()
++
++    # Existing callback chains can time out before reaching this cleanup. The
++    # adapter invokes it in its finally as well, with the same transport receipt.
++    after_delivery._post_delivery_finalizer = True
++
++    async def _terminal_update(self):
++        # Never hold final delivery/stop on a long server penalty. The last
++        # acknowledged bubble remains visible if Telegram refuses the update.
++        remaining = self._remaining()
++        if remaining <= 1.0:
++            if remaining:
++                await asyncio.sleep(remaining)
++            await self.publish()
+diff --git a/gateway/turn_context.py b/gateway/turn_context.py
+--- a/gateway/turn_context.py
++++ b/gateway/turn_context.py
+@@ -22,6 +22,7 @@
+     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
+     _live_status_adapter: Any = None
+     _live_status_mode: str = "off"
++    _telegram_status: Any = None
+     _thinking_enabled: bool = False
+     progress_mode: str = "off"
+     progress_grouping: str = "grouped"
+diff --git a/hermes_cli/config_providers.py b/hermes_cli/config_providers.py
+--- a/hermes_cli/config_providers.py
++++ b/hermes_cli/config_providers.py
+@@ -117,7 +117,7 @@
+     "provider",
+     "name", "api", "url", "base_url", "api_key", "key_env", "api_key_env", "key_cmd",
+     "api_mode", "transport", "model", "default_model", "models", "models_discovered",
+-    "context_length", "rate_limit_delay", "request_timeout_seconds", "stale_timeout_seconds",
++    "context_length", "rate_limit_delay", "request_timeout_seconds", "stale_timeout_seconds", "request_budget_seconds",
+     "discover_models", "extra_body", "extra_headers", "capabilities", "ssl_ca_cert", "ssl_verify",
+     "catalog_provider", "session_affinity_header"}
+ 
+diff --git a/hermes_cli/friday_user_scope.py b/hermes_cli/friday_user_scope.py
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -1102,25 +1102,40 @@
+     return None
+ 
+ 
+-def ordinary_presentation(source=None):
++def ordinary_presentation(source=None, *, home=None):
+     """Conservative audience selection, never an authorization or a chat role claim.
+ 
+-    Missing/revoked managed capabilities receive the same minimal public copy.
+-    An unscoped native installation retains its diagnostics.
++    Managed child homes retain their audience before admission and in fresh
++    history-only processes. Missing/revoked managed capabilities receive the
++    same minimal public copy; unscoped operator homes retain diagnostics.
+     """
+     try:
+         if current() is not None:
+             return True
+-        if source is None:
+-            from hermes_constants import get_hermes_home
+-            return policy(get_hermes_home()) is not None
+-        if isinstance(getattr(source, '_friday_user_scope', None), UserScope):
++        from hermes_constants import get_hermes_home, get_default_hermes_root
++        if home is None:
++            if isinstance(getattr(source, '_friday_user_scope', None), UserScope):
++                return True
++            from gateway.session_identity import identity_of
++            identity = identity_of(source) if source is not None else None
++            home = identity.authorization_home if identity is not None else get_hermes_home()
++        home = Path(home)
++        # Evidence selects a restricted display only. Do not deserialize a
++        # marker/receipt or follow its claimed authorization path into authority.
++        marker = home / MARKER
++        if marker.exists() or marker.is_symlink():
+             return True
+-        from gateway.session_identity import identity_of
+-        from hermes_constants import get_hermes_home
+-        identity = identity_of(source)
+-        home = identity.authorization_home if identity is not None else get_hermes_home()
+-        return policy(home) is not None
++        if policy(home) is not None:
++            return True
++        root = get_default_hermes_root(home=home)
++        if root == home:
++            return False
++        parent_policy = policy(root)
++        # A shared root may also contain native operator profiles. Only the
++        # actual child declared in validated bindings inherits this audience.
++        return parent_policy is not None and any(
++            home == root / 'profiles' / binding['runtime_profile']
++            for binding in parent_policy['bindings'])
+     except Exception:  # A failed audience check must never enable diagnostic disclosure.
+         return True
+ 
+@@ -1428,6 +1443,48 @@
+     return _withheld_reply_copy(agent), True
+ 
+ 
++def generated_public_payload(row):
++    """Fresh public carriers only; provider scratchpad remains private replay data.
++
++    Codex message items also carry visible commentary/final output. Use the same
++    phase projection as native history; never mistake analysis or sealed reasoning
++    for public prose. Malformed visible text still receives the existing guard.
++    """
++    from agent.history_commentary import _phase_message_items
++    return {"content": [row.get("content"), *_phase_message_items(row,
++                frozenset({"commentary", "final", "final_answer", None}))],
++            "api_content": row.get("api_content")}
++
++
++def generated_public_tool_payload(calls):
++    """Scan decoded JSON argument values as well as the exact public call envelope.
++
++    Escaping is transport representation, never permission to publish a private
++    location. Invalid arguments retain the existing native parser/dispatch checks.
++    """
++    arguments = []
++    for call in calls:
++        try:
++            arguments.append(json.loads(call["function"]["arguments"]))
++        except (KeyError, TypeError, ValueError):
++            continue
++    return {"calls": calls, "arguments": arguments}
++
++
++def ordinary_message_view(message, *, home=None):
++    """Public display copy; durable provider fields remain available for model replay.
++
++    Audience selection grants no authority. Conservative managed/failed admission
++    also suppresses sidecars on administration and history presentation surfaces.
++    """
++    ordinary = ordinary_presentation() if home is None else ordinary_presentation(home=home)
++    if not ordinary:
++        return message
++    private = {"api_content", "reasoning", "reasoning_content", "reasoning_details",
++               "codex_reasoning_items", "codex_message_items", "display_reasoning"}
++    return {key: value for key, value in message.items() if key not in private}
++
++
+ def guard_generated_rows(agent, rows, messages):
+     """Only freshly collected assistant rows; restored/history rows are excluded by caller."""
+     if not managed_reply_stream(agent):
+@@ -1453,7 +1510,7 @@
+         if row.get('tool_calls'):
+             public_calls = _public_file_call_paths(row['tool_calls'])
+             row['tool_calls'] = message['tool_calls'] = public_calls
+-            _, private_call = guard_generated_reply(agent, public_calls)
++            _, private_call = guard_generated_reply(agent, generated_public_tool_payload(public_calls))
+             if private_call:
+                 # Native proof for this exact batch, including the finalizer/gateway
+                 # fallback. Keep the original calls and never trust model claims.
+@@ -1463,7 +1520,7 @@
+             if isinstance(row.get(key), str):
+                 public, _ = guard_generated_reply(agent, row[key])
+                 row[key] = message[key] = public
+-        payload = {k:row.get(k) for k in ('content','api_content','reasoning','reasoning_content','reasoning_details','codex_reasoning_items','codex_message_items')}
++        payload = generated_public_payload(row)
+         _, blocked = guard_generated_reply(agent, payload)
+         if blocked:
+             row['content'] = message['content'] = _withheld_reply_copy(agent)
+diff --git a/hermes_cli/timeouts.py b/hermes_cli/timeouts.py
+--- a/hermes_cli/timeouts.py
++++ b/hermes_cli/timeouts.py
+@@ -1,27 +1,68 @@
+ from __future__ import annotations
++
++from dataclasses import dataclass
++import math
+ 
+ 
+ def _coerce_timeout(raw: object) -> float | None:
+     try:
+         timeout = float(raw)
+-    except (TypeError, ValueError):
++    except (TypeError, ValueError, OverflowError):
+         return None
+-    return timeout if timeout > 0 else None
++    return timeout if not isinstance(raw, bool) and math.isfinite(timeout) and timeout > 0 else None
+ 
+ 
+-def _configured_timeout(provider_id: str, model: str | None, model_key: str, provider_key: str) -> float | None:
+-    """Per-model ``providers.<id>.models.<model>.<model_key>`` wins over ``providers.<id>.<provider_key>``."""
+-    if not provider_id:
+-        return None
++def _provider_config(config: dict, provider_id: str, requested_provider: str | None) -> dict:
++    """A named custom route owns its settings; never inherit another custom route's policy."""
++    from hermes_cli.config_providers import is_provider_enabled
++    from hermes_cli.providers import custom_provider_aliases
++
++    provider = (provider_id or "").strip().lower()
++    requested = (requested_provider or "").strip().lower()
++    providers = config.get("providers", {})
++    if provider != "custom" and not provider.startswith("custom:") and not requested.startswith("custom:"):
++        entry = providers.get(provider_id, {}) if isinstance(providers, dict) else {}
++        return entry if isinstance(entry, dict) else {}
++    route = (requested or provider).replace(" ", "-")
++    policy_only = None
++    if isinstance(providers, dict):
++        for key, entry in providers.items():
++            if not isinstance(entry, dict) or not is_provider_enabled(entry):
++                continue
++            aliases = custom_provider_aliases(str(entry.get("name", "") or key), str(key))
++            if route in aliases:
++                if entry.get("api") or entry.get("url") or entry.get("base_url"):
++                    return entry
++                if policy_only is None:
++                    policy_only = entry
++    legacy = config.get("custom_providers", [])
++    if isinstance(legacy, list):
++        for entry in legacy:
++            if (isinstance(entry, dict) and is_provider_enabled(entry)
++                    and route in custom_provider_aliases(entry.get("name", ""), entry.get("provider_key", ""))):
++                if entry.get("api") or entry.get("url") or entry.get("base_url"):
++                    return entry
++                if policy_only is None:
++                    policy_only = entry
++    # A caller with an explicit endpoint can still configure only its timeouts here.
++    return policy_only or {}
++
++
++def _load_provider_config(provider_id: str, requested_provider: str | None = None) -> dict:
+     try:
+         from hermes_cli.config import load_config_readonly
+         config = load_config_readonly()
+     except Exception:
++        return {}
++    return _provider_config(config, provider_id, requested_provider) if isinstance(config, dict) else {}
++
++
++def _configured_timeout(provider_id: str, model: str | None, model_key: str, provider_key: str,
++                        requested_provider: str | None = None) -> float | None:
++    """Per-model ``providers.<id>.models.<model>.<model_key>`` wins over ``providers.<id>.<provider_key>``."""
++    if not provider_id:
+         return None
+-    providers = config.get("providers", {}) if isinstance(config, dict) else {}
+-    provider_config = providers.get(provider_id, {}) if isinstance(providers, dict) else {}
+-    if not isinstance(provider_config, dict):
+-        return None
++    provider_config = _load_provider_config(provider_id, requested_provider)
+     model_config = _get_model_config(provider_config, model)
+     if model_config is not None:
+         timeout = _coerce_timeout(model_config.get(model_key))
+@@ -30,14 +71,43 @@
+     return _coerce_timeout(provider_config.get(provider_key))
+ 
+ 
+-def get_provider_request_timeout(provider_id: str, model: str | None = None) -> float | None:
++def get_provider_request_timeout(provider_id: str, model: str | None = None,
++                                 requested_provider: str | None = None) -> float | None:
+     """Return a configured provider request timeout in seconds, if any."""
+-    return _configured_timeout(provider_id, model, "timeout_seconds", "request_timeout_seconds")
++    return _configured_timeout(provider_id, model, "timeout_seconds", "request_timeout_seconds", requested_provider)
+ 
+ 
+-def get_provider_stale_timeout(provider_id: str, model: str | None = None) -> float | None:
++def get_provider_stale_timeout(provider_id: str, model: str | None = None,
++                               requested_provider: str | None = None) -> float | None:
+     """Return a configured non-stream stale timeout in seconds, if any."""
+-    return _configured_timeout(provider_id, model, "stale_timeout_seconds", "stale_timeout_seconds")
++    return _configured_timeout(provider_id, model, "stale_timeout_seconds", "stale_timeout_seconds", requested_provider)
++
++
++@dataclass(frozen=True)
++class ProviderRequestBudget:
++    first_event: float
++    idle: float
++    total: float
++
++
++def get_provider_request_budget(provider_id: str, model: str | None = None,
++                                requested_provider: str | None = None) -> ProviderRequestBudget | None:
++    """Explicit main-request policy; legacy scalar timeouts remain independent when absent."""
++    provider = _load_provider_config(provider_id, requested_provider)
++    model_config = _get_model_config(provider, model) or {}
++    if "request_budget_seconds" not in model_config and "request_budget_seconds" not in provider:
++        return None
++    raw = model_config.get("request_budget_seconds", provider.get("request_budget_seconds"))
++    fields = {"first_event", "idle", "total"}
++    if not isinstance(raw, dict) or set(raw) != fields:
++        raise ValueError("request_budget_seconds requires exactly first_event, idle and total")
++    if any(isinstance(raw[k], bool) or not isinstance(raw[k], (int, float))
++           or not 0 < raw[k] <= 86400 or not math.isfinite(raw[k]) for k in fields):
++        raise ValueError("request_budget_seconds values must be finite positive seconds <= 86400")
++    policy = ProviderRequestBudget(**{k: float(raw[k]) for k in fields})
++    if policy.first_event > policy.total or policy.idle > policy.total:
++        raise ValueError("request_budget_seconds first_event and idle must not exceed total")
++    return policy
+ 
+ 
+ def _get_model_config(provider_config: dict[str, object], model: str | None) -> dict[str, object] | None:
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -895,6 +895,7 @@
+         raise HTTPException(status_code=404, detail=_NOT_FOUND)
+ 
+     sid, session = prepared
++    profile_home = _history_profile_home(profile)
+ 
+     def _stream_export():
+         db = _open_session_db_for_profile(profile, read_only=True)
+@@ -906,8 +907,9 @@
+             last_id, first = 0, True
+             while True:
+                 messages = db.get_messages(sid, limit=500, after_id=last_id, include_inactive=True)
++                from hermes_cli.friday_user_scope import ordinary_message_view
+                 for message in messages:
+-                    yield ("" if first else ",") + _compact_json(message)
++                    yield ("" if first else ",") + _compact_json(ordinary_message_view(message, home=profile_home))
+                     first = False
+                 last_id = messages[-1].get("id") if len(messages) == 500 else None
+                 if last_id is None:  # short page, or cannot keyset without row ids
+diff --git a/run_agent.py b/run_agent.py
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -580,7 +580,8 @@
+     def _resolved_api_call_timeout(self) -> float:
+         """Per-call request timeout: per-model ``timeout_seconds`` > provider ``request_timeout_seconds`` >
+         ``HERMES_API_TIMEOUT`` > 1800s."""
+-        cfg = get_provider_request_timeout(self.provider, self.model)
++        from agent.request_budget import main_request_timeout
++        cfg = main_request_timeout(self)
+         return cfg if cfg is not None else env_float("HERMES_API_TIMEOUT", 1800.0)
+ 
+     def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
+@@ -590,7 +591,7 @@
+         Returns ``(seconds, uses_implicit_default)``; the implicit flag lets callers auto-disable the detector
+         for local endpoints only when the user configured nothing.
+         """
+-        cfg = get_provider_stale_timeout(self.provider, self.model)
++        cfg = get_provider_stale_timeout(self.provider, self.model, self.requested_provider)
+         if cfg is not None:
+             return cfg, False
+         env_timeout = os.getenv("HERMES_API_CALL_STALE_TIMEOUT")
+@@ -629,7 +630,7 @@
+     def _stale_timeout_is_explicit(self) -> bool:
+         """True when the user explicitly configured the stale timeout (config or env var); implicit values
+         (reasoning floors, the 90s default) yield to the run-budget cap, explicit ones never do."""
+-        return (get_provider_stale_timeout(self.provider, self.model) is not None
++        return (get_provider_stale_timeout(self.provider, self.model, self.requested_provider) is not None
+                 or os.getenv("HERMES_API_CALL_STALE_TIMEOUT") is not None)
+ 
+     def _codex_silent_hang_hint(self, model: Optional[str] = None) -> Optional[str]:
+diff --git a/tests/agent/test_named_request_budget.py b/tests/agent/test_named_request_budget.py
+new file mode 100644
+--- /dev/null
++++ b/tests/agent/test_named_request_budget.py
+@@ -0,0 +1,252 @@
++"""Named custom-provider budgets cancel real native HTTP streams without replay.
++
++The loopback provider never contacts a model. Its socket observes EOF before
++teardown, proving cancellation reaches the in-flight HTTP connection.
++"""
++
++import json
++import select
++import threading
++import time
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++import pytest
++
++import run_agent
++from agent import chat_completion_helpers as helpers
++from agent.request_budget import RequestBudgetExceeded
++
++
++class _BudgetWire:
++    def __init__(self, scenario):
++        self.scenario = scenario
++        self.requests = []
++        self.sent = []
++        self.peer_eof = threading.Event()
++        self.stop = threading.Event()
++        self.handlers = []
++        wire = self
++
++        class Handler(BaseHTTPRequestHandler):
++            protocol_version = "HTTP/1.1"
++
++            def log_message(self, *_args):
++                pass
++
++            def do_GET(self):
++                self.send_response(404)
++                self.send_header("Content-Length", "0")
++                self.end_headers()
++
++            def _chunk(self, delta, finish=None):
++                chunk = {
++                    "id": "budget-test", "object": "chat.completion.chunk", "created": 1, "model": "m",
++                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
++                }
++                self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
++                self.wfile.flush()
++                wire.sent.append(delta)
++
++            def _saw_eof(self, timeout):
++                ready, _, _ = select.select([self.connection], [], [], timeout)
++                if ready and self.connection.recv(1) == b"":
++                    wire.peer_eof.set()
++                    return True
++                return False
++
++            def _wait_for_eof(self):
++                while not wire.stop.is_set():
++                    if self._saw_eof(0.05):
++                        return
++
++            def do_POST(self):
++                size = int(self.headers.get("Content-Length", "0"))
++                body = json.loads(self.rfile.read(size) or b"{}")
++                if self.path != "/v1/chat/completions":
++                    # Constructor metadata discovery also probes Ollama's
++                    # POST /api/show; it must never enter the completion scenario.
++                    self.send_response(404)
++                    self.send_header("Content-Length", "0")
++                    self.end_headers()
++                    return
++                wire.handlers.append(threading.current_thread())
++                wire.requests.append((self.path, body))
++                self.close_connection = True
++                try:
++                    if wire.scenario == "before_headers":
++                        self._wait_for_eof()
++                        return
++                    self.send_response(200)
++                    self.send_header("Content-Type", "text/event-stream")
++                    self.send_header("Connection", "close")
++                    self.end_headers()
++                    self.wfile.flush()
++                    if wire.scenario == "after_headers":
++                        self._wait_for_eof()
++                        return
++                    if wire.scenario == "keepalives":
++                        while not wire.stop.is_set():
++                            self.wfile.write(b": heartbeat\n\n")
++                            self.wfile.flush()
++                            if self._saw_eof(0.15):
++                                return
++                        return
++                    self._chunk({"content": "hello"})
++                    if wire.scenario == "complete":
++                        self._chunk({}, "stop")
++                        self.wfile.write(b"data: [DONE]\n\n")
++                        self.wfile.flush()
++                        return
++                    if wire.scenario == "partial_tool":
++                        self._chunk({"tool_calls": [{
++                            "index": 0, "id": "incomplete", "type": "function",
++                            "function": {"name": "terminal", "arguments": '{"command":"'},
++                        }]})
++                    if wire.scenario in {"idle", "partial_tool"}:
++                        self._wait_for_eof()
++                        return
++                    while not wire.stop.is_set():
++                        if self._saw_eof(0.15):
++                            return
++                        self._chunk({"content": "."})
++                except (BrokenPipeError, ConnectionResetError):
++                    # A write may lose the race with FIN; still require an actual
++                    # EOF observation instead of accepting the write failure.
++                    try:
++                        self._saw_eof(1.0)
++                    except OSError:
++                        pass
++                except OSError:
++                    if not wire.stop.is_set():
++                        raise
++
++        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++        self.server.daemon_threads = True
++        self.server_thread = threading.Thread(
++            target=lambda: self.server.serve_forever(poll_interval=0.05), daemon=True)
++        self.server_thread.start()
++        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
++
++    def close(self):
++        self.stop.set()
++        self.server.shutdown()
++        self.server.server_close()
++        self.server_thread.join(timeout=3)
++        for handler in self.handlers:
++            handler.join(timeout=3)
++            assert not handler.is_alive(), "loopback request handler leaked"
++        assert not self.server_thread.is_alive(), "loopback listener leaked"
++
++
++@pytest.fixture
++def native_request(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    # These long legacy budgets and enabled retries make expiry of the named
++    # 0.8s/3s policy distinguishable from the old read/stale/retry machinery.
++    monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "30")
++    monkeypatch.setenv("HERMES_STREAM_READ_TIMEOUT", "30")
++    monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
++    Path(tmp_path, "config.yaml").write_text(
++        "providers:\n  friday-local:\n    request_timeout_seconds: 30\n"
++        "    request_budget_seconds:\n      first_event: 0.8\n      idle: 0.8\n      total: 3\n",
++        encoding="utf-8",
++    )
++    calls, monitors, wires, agents = [], [], [], []
++    original_init = helpers._StreamingCall.__init__
++    original_monitor = helpers._StreamingCall._monitor_loop
++
++    def capture_init(self, *args, **kwargs):
++        original_init(self, *args, **kwargs)
++        calls.append(self)
++
++    def capture_monitor(self):
++        monitors.append(threading.current_thread())
++        return original_monitor(self)
++
++    monkeypatch.setattr(helpers._StreamingCall, "__init__", capture_init)
++    monkeypatch.setattr(helpers._StreamingCall, "_monitor_loop", capture_monitor)
++
++    def make(scenario, platform):
++        wire = _BudgetWire(scenario)
++        wires.append(wire)
++        deltas = []
++        agent = run_agent.AIAgent(
++            api_key="test-key", base_url=wire.base_url, model="m", provider="custom",
++            requested_provider="custom:friday-local", api_mode="chat_completions", platform=platform,
++            stream_delta_callback=deltas.append, quiet_mode=True, skip_context_files=True,
++            skip_memory=True, skip_background_review=True, enabled_toolsets=[], max_iterations=1,
++        )
++        agents.append(agent)
++        agent._interrupt_requested = False
++        return agent, wire, deltas, calls
++
++    yield make
++    for call in calls:
++        if call.worker is not None:
++            call.worker.join(timeout=3)
++            assert not call.worker.is_alive(), "native request worker leaked after budget cancellation"
++        assert call._call_done.is_set(), "request returned before its worker finished"
++    for monitor in monitors:
++        if monitor is not threading.current_thread():
++            monitor.join(timeout=3)
++            assert not monitor.is_alive(), "native inline monitor leaked"
++    for wire in wires:
++        wire.close()
++    for agent in agents:
++        agent.client.close()
++
++
++def _invoke(agent):
++    return helpers.interruptible_streaming_api_call(
++        agent, {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
++
++
++@pytest.mark.parametrize("platform", ["cli", "subagent"])
++def test_timely_native_stream_completes_under_named_provider_budget(native_request, platform):
++    agent, wire, deltas, calls = native_request("complete", platform)
++    response = _invoke(agent)
++    assert response.choices[0].message.content == "hello"
++    assert "hello" in deltas
++    assert len(wire.requests) == 1
++    assert wire.requests[0][0] == "/v1/chat/completions"
++    assert calls[0]._budget_error is None
++
++
++@pytest.mark.parametrize("platform", ["cli", "subagent"])
++@pytest.mark.parametrize("scenario,phase", [
++    ("before_headers", "first_event"),
++    ("after_headers", "first_event"),
++    ("keepalives", "first_event"),
++    ("idle", "idle"),
++    ("ongoing", "total"),
++    ("partial_tool", "idle"),
++])
++def test_named_budget_cancels_native_socket_without_retry_or_partial_result(
++    native_request, platform, scenario, phase,
++):
++    agent, wire, deltas, calls = native_request(scenario, platform)
++    started = time.monotonic()
++    with pytest.raises(RequestBudgetExceeded) as caught:
++        _invoke(agent)
++    elapsed = time.monotonic() - started
++    assert caught.value.phase == phase
++    assert elapsed < 8.0, f"named {phase} budget was not enforced promptly ({elapsed:.2f}s)"
++    assert len(wire.requests) == 1, "budget expiry replayed a request despite terminal cancellation"
++    assert wire.peer_eof.wait(timeout=3), "provider did not observe socket EOF before teardown"
++    call = calls[0]
++    print(f"{platform}/{scenario}: phase={phase} elapsed={elapsed:.3f}s done={call._call_done.is_set()}")
++    assert caught.value.cleanup_pending is False
++    assert call._call_done.is_set(), "public budget failure returned before native cleanup"
++    assert call.worker is None or not call.worker.is_alive()
++    assert call._budget_error is caught.value
++    assert call.result["response"] is None, "expired stream returned a partial response/tool call"
++    assert call._request_cancelled["value"] is True
++    if scenario in {"before_headers", "after_headers", "keepalives"}:
++        assert deltas == []
++    else:
++        assert "hello" in deltas
++    if scenario == "ongoing":
++        assert len(wire.sent) >= 4, "total expiry was not tested with ongoing parsed chunks"
++    if scenario == "partial_tool":
++        assert any("tool_calls" in delta for delta in wire.sent)
+diff --git a/tests/agent/test_nonstream_request_budget.py b/tests/agent/test_nonstream_request_budget.py
+new file mode 100644
+--- /dev/null
++++ b/tests/agent/test_nonstream_request_budget.py
+@@ -0,0 +1,100 @@
++"""The same explicit route budget bounds native non-streaming worker and inline requests."""
++
++import json
++import select
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++import pytest
++
++import run_agent
++from agent import chat_completion_helpers as helpers
++from agent.request_budget import RequestBudgetExceeded
++
++
++@pytest.mark.parametrize("platform", ["cli", "subagent"])
++@pytest.mark.parametrize("silent", [False, True])
++def test_native_nonstream_request_budget_closes_socket_and_watchdogs(tmp_path, monkeypatch, platform, silent):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    (tmp_path / "config.yaml").write_text(
++        "providers:\n  friday-local:\n    request_timeout_seconds: 30\n"
++        "    request_budget_seconds: {first_event: 0.8, idle: 0.8, total: 3}\n", encoding="utf-8")
++    requests = []
++    eof, stop = threading.Event(), threading.Event()
++    handlers = []
++
++    class Handler(BaseHTTPRequestHandler):
++        protocol_version = "HTTP/1.1"
++
++        def log_message(self, *_args):
++            pass
++
++        def do_GET(self):
++            self.send_response(404)
++            self.send_header("Content-Length", "0")
++            self.end_headers()
++
++        def do_POST(self):
++            if self.path != "/v1/chat/completions":
++                self.send_response(404)
++                self.send_header("Content-Length", "0")
++                self.end_headers()
++                return
++            handlers.append(threading.current_thread())
++            requests.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)))))
++            self.close_connection = True
++            if silent:
++                while not stop.is_set():
++                    ready, _, _ = select.select([self.connection], [], [], 0.05)
++                    if ready and self.connection.recv(1) == b"":
++                        eof.set()
++                        return
++                return
++            body = json.dumps({"id": "r", "model": "m", "object": "chat.completion", "created": 1,
++                "choices": [{"index": 0, "message": {"role": "assistant", "content": "done"},
++                             "finish_reason": "stop"}]}).encode()
++            self.send_response(200)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(body)))
++            self.end_headers()
++            self.wfile.write(body)
++
++    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++    server.daemon_threads = True
++    listener = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.05), daemon=True)
++    listener.start()
++    before = set(threading.enumerate())
++    agent = None
++    try:
++        agent = run_agent.AIAgent(
++            api_key="test-key", provider="custom", requested_provider="custom:friday-local", model="m",
++            base_url=f"http://127.0.0.1:{server.server_address[1]}/v1", api_mode="chat_completions",
++            platform=platform, quiet_mode=True, skip_context_files=True, skip_memory=True,
++            skip_background_review=True, enabled_toolsets=[], max_iterations=1,
++        )
++        kwargs = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
++        if silent:
++            with pytest.raises(RequestBudgetExceeded) as caught:
++                helpers.interruptible_api_call(agent, kwargs)
++            assert caught.value.phase == "first_event"
++            assert not caught.value.cleanup_pending
++            assert eof.wait(3), "provider did not observe the native cancellation"
++        else:
++            response = helpers.interruptible_api_call(agent, kwargs)
++            assert response.choices[0].message.content == "done"
++        assert len(requests) == 1
++        assert getattr(agent, "_active_request_abort", None) is None
++        for thread in set(threading.enumerate()) - before - set(handlers):
++            if thread.name.startswith("direct-api-") or "_call" in thread.name:
++                thread.join(timeout=3)
++                assert not thread.is_alive(), "native request helper thread leaked"
++    finally:
++        stop.set()
++        server.shutdown()
++        server.server_close()
++        listener.join(3)
++        for thread in handlers:
++            thread.join(3)
++            assert not thread.is_alive()
++        if agent is not None:
++            agent.client.close()
+diff --git a/tests/agent/test_privacy_effect_semantics.py b/tests/agent/test_privacy_effect_semantics.py
+--- a/tests/agent/test_privacy_effect_semantics.py
++++ b/tests/agent/test_privacy_effect_semantics.py
+@@ -55,13 +55,15 @@
+         retained=retained)
+     execute(nodes('hermes_cli/friday_user_scope.py', ['private_reply_copy',
+         'is_privacy_refusal', '_withheld_reply_copy', 'guard_generated_reply',
+-        'guard_generated_rows']), ns)
++        'guard_generated_rows', 'generated_public_payload', 'generated_public_tool_payload']), ns)
++    execute(nodes('agent/history_commentary.py', ['_phase_message_items']), ns)
+     execute(nodes('gateway/media_repair.py', ['_current_turn_messages']), ns)
+     scope = NS(ordinary_presentation=lambda *a: True,
+         private_reply_copy=ns['private_reply_copy'], managed_reply_stream=ns['managed_reply_stream'],
+         guard_generated_reply=ns['guard_generated_reply'], _retain_private_reply=ns['_retain_private_reply'],
+         current=lambda **kw: NS())
+-    modules = {'agent.tool_result_classification': NS(**classification),
++    modules = {'agent.history_commentary': NS(_phase_message_items=ns['_phase_message_items']),
++        'agent.tool_result_classification': NS(**classification),
+         'hermes_cli.friday_user_scope': scope,
+         'gateway.media_repair': NS(_current_turn_messages=ns['_current_turn_messages']),
+         'agent.conversation_loop': NS(logger=NS(warning=lambda *a: None))}
+@@ -201,8 +203,9 @@
+     assert good['content'] == 'Requested safe answer'
+     private = {'role': 'assistant', 'content': 'safe', 'reasoning_content': '/SYNTHETIC_PRIVATE_DEPLOYMENT/hidden'}
+     feed(native, agent, [private])
+-    assert private['reasoning_content'] is None
+-    assert private['content'] == native['PRIVATE_REPLY_COPY']
++    assert private['reasoning_content'] == '/SYNTHETIC_PRIVATE_DEPLOYMENT/hidden'
++    assert not getattr(agent, '_friday_reply_withheld', False)
++    assert private['content'] == 'safe'
+ 
+ 
+ def test_native_metadata_survives_durable_row_and_provider_payload_cannot_forge(native):
+diff --git a/tests/agent/test_request_budget_terminal.py b/tests/agent/test_request_budget_terminal.py
+new file mode 100644
+--- /dev/null
++++ b/tests/agent/test_request_budget_terminal.py
+@@ -0,0 +1,88 @@
++"""Deadline failures terminate the outer turn and fence clients constructed after cancellation."""
++
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from agent.chat_completion_helpers import _InlineRequest, _StreamingCall
++from agent.chat_completion_nonstream import _NonStreamRequest
++from agent.request_budget import RequestBudget, RequestBudgetExceeded
++from agent.turn_api_error import handle_api_error
++from hermes_cli.timeouts import ProviderRequestBudget
++
++
++def _expired_budget():
++    budget = RequestBudget(ProviderRequestBudget(1, 1, 5))
++    budget.started -= 2
++    return budget
++
++
++def test_deadline_returns_terminal_failure_before_retry_rotation_or_fallback(monkeypatch):
++    recovery = Mock(side_effect=AssertionError("deadline must not enter recovery"))
++    monkeypatch.setattr("agent.turn_api_error.recover_before_classification", recovery)
++    spinner = Mock()
++    error = RequestBudgetExceeded("idle", 120)
++    verdict = handle_api_error(
++        SimpleNamespace(thinking_callback=None), api_error=error, _retry=Mock(),
++        thinking_spinner=spinner, messages=[], api_messages=[], api_kwargs={}, system_message=None,
++        active_system_prompt=None, conversation_history=[], approx_tokens=0, retry_count=0,
++        max_retries=3, compression_attempts=0, max_compression_attempts=2, api_call_count=1,
++        api_request_id="request", api_start_time=0, effective_task_id="task", turn_id="turn",
++    )
++    assert verdict.action == "return"
++    assert verdict.result["failure_reason"] == "request_budget_exceeded"
++    assert verdict.result["failure_retryable"] is False
++    assert verdict.result["failed"] is True
++    assert verdict.result["completed"] is False
++    assert verdict.result["api_calls"] == 1
++    recovery.assert_not_called()
++
++
++def test_stream_client_constructed_after_deadline_cannot_dispatch():
++    call = _StreamingCall.__new__(_StreamingCall)
++    call._request_budget = _expired_budget()
++    call._budget_error = None
++    call._request_cancelled = {"value": False}
++    call.clients = Mock()
++    with pytest.raises(RequestBudgetExceeded, match="first_event"):
++        call._budget_before_dispatch()
++    assert call._request_cancelled["value"]
++    call.clients.close_once.assert_called_once_with("request_cancelled_before_dispatch")
++
++
++def test_inline_client_registered_after_deadline_cannot_dispatch():
++    client = Mock()
++    agent = SimpleNamespace(
++        provider="custom", model="m", _create_request_openai_client=Mock(return_value=client),
++        _abort_request_openai_client=Mock(),
++    )
++    request = _InlineRequest(agent, {}, 1, 0)
++    request.request_budget = _expired_budget()
++    with pytest.raises(RequestBudgetExceeded, match="first_event"):
++        request.make_client("test")
++    agent._abort_request_openai_client.assert_called_once()
++    client.chat.completions.create.assert_not_called()
++
++
++def test_nonstream_client_registered_after_deadline_cannot_dispatch():
++    request = _NonStreamRequest.__new__(_NonStreamRequest)
++    client = Mock()
++    request.agent = SimpleNamespace(_create_request_openai_client=Mock(return_value=client))
++    request.api_kwargs = {}
++    request.clients = Mock()
++    request.request_budget = _expired_budget()
++    request.cancelled = False
++    with pytest.raises(RequestBudgetExceeded, match="first_event"):
++        request._make_client("test")
++    request.clients.close_once.assert_called_once_with("request_cancelled_before_dispatch")
++    client.chat.completions.create.assert_not_called()
++
++
++def test_late_finish_chunk_cannot_clear_expired_total_budget():
++    budget = RequestBudget(ProviderRequestBudget(2, 2, 3))
++    budget.last_event = budget.started
++    budget.started -= 4
++    error = budget.expired(event=True)
++    assert error.phase == "total"
++    assert budget.expired() is error
+diff --git a/tests/gateway/test_telegram_live_turn_status.py b/tests/gateway/test_telegram_live_turn_status.py
+new file mode 100644
+--- /dev/null
++++ b/tests/gateway/test_telegram_live_turn_status.py
+@@ -0,0 +1,567 @@
++"""One generic Telegram bubble, native heartbeat/callbacks and real delivery receipts."""
++import asyncio
++from types import SimpleNamespace
++from contextlib import suppress
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from gateway.config import Platform, PlatformConfig
++from gateway.platforms.base import BasePlatformAdapter, SendResult
++from gateway.platforms.event import MessageEvent
++from gateway.run import GatewayRunner
++from gateway.run_turn_runner import TurnRunner
++from gateway.run_turn_status import TelegramTurnStatus
++from gateway.session import SessionSource
++from gateway.turn_context import TurnContext
++
++
++class Clock:
++    def __init__(self):
++        self.now = 100.0
++        self.real_loop = asyncio.get_running_loop()
++
++    def time(self):
++        return self.now
++
++    def call_soon_threadsafe(self, callback, *args):
++        return self.real_loop.call_soon_threadsafe(callback, *args)
++
++
++class CaptureAdapter(BasePlatformAdapter):
++    """The native adapter seam, including its shared chat slot; no transport/network."""
++    def __init__(self, clock=None):
++        super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
++        self.clock = clock or asyncio.get_running_loop()
++        self.calls, self.deleted, self.slots = [], [], {}
++        self.send_results, self.edit_results = [], []
++        self.final_result = SendResult(success=True, message_id="final")
++        self.final_entered, self.final_release = asyncio.Event(), asyncio.Event()
++        self.final_release.set()
++
++    async def connect(self, *, is_reconnect=False):
++        return True
++
++    async def disconnect(self):
++        pass
++
++    async def get_chat_info(self, chat_id):
++        return {"id": chat_id}
++
++    def _send_flood_cooldown_remaining(self, chat_id):
++        return None
++
++    def _chat_outbound_slot_remaining(self, chat_id):
++        return max(0.0, self.slots.get(str(chat_id), 0) - self.clock.time())
++
++    async def send(self, chat_id, content, reply_to=None, metadata=None):
++        self.calls.append(("send", str(chat_id), content, self.clock.time(), metadata))
++        self.slots[str(chat_id)] = self.clock.time() + 1.0
++        if content == "answer":
++            self.final_entered.set()
++            await self.final_release.wait()
++            if isinstance(self.final_result, Exception):
++                raise self.final_result
++            return self.final_result
++        result = self.send_results.pop(0) if self.send_results else SendResult(success=True, message_id=f"bubble-{chat_id}")
++        if isinstance(result, Exception):
++            raise result
++        return result
++
++    async def edit_message(self, chat_id, message_id, content, **kwargs):
++        self.calls.append(("edit", str(chat_id), content, self.clock.time(), str(message_id)))
++        self.slots[str(chat_id)] = self.clock.time() + 1.0
++        result = self.edit_results.pop(0) if self.edit_results else SendResult(success=True, message_id=message_id)
++        if isinstance(result, Exception):
++            raise result
++        return result
++
++    async def delete_message(self, chat_id, message_id):
++        self.deleted.append((str(chat_id), str(message_id)))
++        return True
++
++    async def send_typing(self, chat_id, metadata=None):
++        pass
++
++    async def stop_typing(self, chat_id, metadata=None):
++        pass
++
++
++def make_turn(adapter, chat="c1", generation=1):
++    source = SessionSource(platform=Platform.TELEGRAM, chat_id=chat, chat_type="dm", thread_id="7")
++    ctx = TurnContext(source=source, session_key=f"session-{chat}", run_generation=generation,
++                      _run_still_current=lambda: True)
++    ctx.agent_holder[0] = SimpleNamespace(is_interrupted=False)
++    runner = object.__new__(GatewayRunner)
++    runner._delivery_adapter_for = lambda source: adapter
++    runner._draining = runner._restart_requested = False
++    return runner, ctx
++
++
++def status_for(adapter, clock, chat="c1"):
++    runner, ctx = make_turn(adapter, chat)
++    status = TelegramTurnStatus(runner, ctx, adapter, {"thread_id": "7", "_interim_send": True})
++    status.loop, status.started, status.task = clock, clock.time(), None
++    ctx._telegram_status = status
++    return status, TurnRunner(runner, ctx)
++
++
++@pytest.mark.asyncio
++async def test_single_initial_send_timer_phase_coalescing_and_no_private_text():
++    clock = Clock()
++    adapter = CaptureAdapter(clock)
++    status, turn = status_for(adapter, clock)
++    await status.publish()
++    assert len(adapter.calls) == 1 and "0:00" in adapter.calls[0][2]
++    assert adapter.calls[0][4]["thread_id"] == "7"
++    # Actual worker callback with tool progress OFF still updates only the closed phase.
++    await asyncio.to_thread(turn.progress_callback, "tool.started", "web_search", "/private/reasoning secret", {"token": "secret"})
++    await asyncio.sleep(0)
++    clock.now += 0.4
++    await status.publish()
++    assert len(adapter.calls) == 1  # coalesced into the chat's next allowed slot
++    await asyncio.to_thread(turn.progress_callback, "tool.started", "read_file", "secret", {"path": "/private/file"})
++    await asyncio.sleep(0)
++    clock.now += 0.6
++    await status.publish()
++    assert "Читаю файл" in adapter.calls[-1][2] and "0:01" in adapter.calls[-1][2]
++    for _ in range(5):
++        clock.now += 1
++        await status.publish()
++    assert [c[0] for c in adapter.calls] == ["send"] + ["edit"] * 6
++    assert all(c[4] == "bubble-c1" for c in adapter.calls[1:])
++    assert all("secret" not in c[2] and "/private" not in c[2] and "read_file" not in c[2] for c in adapter.calls)
++    old_phase = status.phase
++    turn.progress_callback("_thinking", "private reasoning", "raw text", {})
++    await asyncio.sleep(0)
++    assert status.phase == old_phase
++    turn.progress_callback("tool.started", "internal-worker-/sensitive/path", "secret", {})
++    await asyncio.sleep(0)
++    clock.now += 1
++    await status.publish()
++    assert "Выполняю действие" in adapter.calls[-1][2]
++    assert "internal" not in adapter.calls[-1][2]
++
++
++@pytest.mark.asyncio
++async def test_explicit_retry_after_is_shared_and_never_replaced_by_sends():
++    clock = Clock()
++    adapter = CaptureAdapter(clock)
++    first, _ = status_for(adapter, clock)
++    second, _ = status_for(adapter, clock)
++    other, _ = status_for(adapter, clock, "c2")
++    await first.publish()
++    clock.now += 1
++    adapter.edit_results = [SendResult(success=False, retry_after=600, error_kind="rate_limited")]
++    await first.publish()
++    await second.publish()
++    await other.publish()
++    assert len([c for c in adapter.calls if c[1] == "c1"]) == 2
++    assert len([c for c in adapter.calls if c[1] == "c2"]) == 1
++    clock.now += 599
++    await first.publish()
++    assert len(adapter.calls) == 3
++    clock.now += 1
++    await first.publish()
++    assert adapter.calls[-1][0] == "edit" and adapter.calls[-1][4] == "bubble-c1"
++    assert len([c for c in adapter.calls if c[0] == "send" and c[1] == "c1"]) == 1
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("outcome", [TimeoutError("uncertain"), SendResult(success=False), SendResult(success=True)])
++async def test_uncertain_initial_send_is_not_repeated(outcome):
++    clock = Clock()
++    adapter = CaptureAdapter(clock)
++    adapter.send_results = [outcome]
++    status, _ = status_for(adapter, clock)
++    await status.publish()
++    for _ in range(4):
++        clock.now += 10
++        await status.publish()
++    assert len(adapter.calls) == 1 and status.disabled
++    await status.after_delivery(delivery_receipt="unknown")
++    assert adapter.deleted == []
++
++
++@pytest.mark.asyncio
++async def test_uncertain_edit_backoff_skipped_ack_and_terminal_error_preserved():
++    clock = Clock()
++    adapter = CaptureAdapter(clock)
++    status, _ = status_for(adapter, clock)
++    await status.publish()
++    original = status.last_text
++    clock.now += 1
++    adapter.edit_results = [SendResult(success=True, message_id=status.message_id, raw_response={"skipped": True})]
++    await status.publish()
++    assert status.last_text == original
++    clock.now += 1
++    adapter.edit_results = [TimeoutError("request may have landed")]
++    await status.publish()
++    clock.now += 1
++    await status.publish()
++    assert len(adapter.calls) == 3
++    clock.now += 1
++    await status.publish()
++    assert len(adapter.calls) == 4 and adapter.calls[-1][0] == "edit"
++    status.finish({"failed": True})
++    clock.now += 1
++    await status.after_delivery(delivery_receipt="confirmed")
++    assert not adapter.deleted
++    assert "ошибкой" in adapter.calls[-1][2]
++
++
++@pytest.mark.asyncio
++async def test_actual_heartbeat_sends_promptly_and_retains_one_second_timer(monkeypatch):
++    adapter = CaptureAdapter()
++    runner, ctx = make_turn(adapter)
++    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "180")
++    disp = SimpleNamespace(_display_surface_mode=lambda *a, **k: "generic")
++    task = asyncio.create_task(runner._run_agent_notify_long_running(disp, ctx, [None]))
++    try:
++        for _ in range(100):
++            await asyncio.sleep(0)
++            if adapter.calls:
++                break
++        assert len(adapter.calls) == 1  # no 180 s / 5 s initial delay
++        # A second chat is independent while this one holds its slot.
++        runner2, ctx2 = make_turn(adapter, "c2")
++        task2 = asyncio.create_task(runner2._run_agent_notify_long_running(disp, ctx2, [None]))
++        try:
++            await asyncio.wait_for(_wait_edits(adapter, "c1", 2), 4)
++            c1 = [c for c in adapter.calls if c[1] == "c1"]
++            assert all(b[3] - a[3] >= 0.99 for a, b in zip(c1, c1[1:]))
++            assert any(c[1] == "c2" for c in adapter.calls)
++            # Generation loss stops the old bubble. Late tool events cannot wake it.
++            ctx._run_still_current = lambda: False
++            ctx._telegram_status.wake.set()
++            await asyncio.wait_for(task, 3)
++            assert ctx._telegram_status.phase == "stopped"
++        finally:
++            await ctx2._telegram_status.after_delivery(delivery_receipt="unknown")
++            with suppress(asyncio.CancelledError):
++                await task2
++    finally:
++        await ctx._telegram_status.after_delivery(delivery_receipt="unknown")
++        with suppress(asyncio.CancelledError):
++            await task
++
++
++async def _wait_edits(adapter, chat, count):
++    while len([c for c in adapter.calls if c[0] == "edit" and c[1] == chat]) < count:
++        await asyncio.sleep(0.01)
++
++
++def configure_background(adapter, handler, monkeypatch):
++    adapter._message_handler = handler
++    adapter._start_typing_refresh = MagicMock(return_value=None)
++    adapter._stop_typing_refresh = AsyncMock()
++    adapter._release_turn_marker = AsyncMock()
++    adapter._run_processing_hook = AsyncMock()
++    adapter._flush_text_debounce_now = AsyncMock()
++    adapter._finish_session_task = MagicMock()
++    adapter._record_delivery_obligation = AsyncMock(return_value=None)
++    adapter._notify_turn_error = AsyncMock(return_value=None)
++    monkeypatch.setattr("gateway.platforms.base.diagnostic_wake_muted", lambda event: False)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("outcome,attachment", [
++    (SendResult(success=True, message_id="final"), None),
++    (SendResult(success=False, error="forbidden", error_kind="forbidden"), None),
++    (TimeoutError("delivery uncertain"), None),
++    (SendResult(success=True, message_id="partial", raw_response={"partial_overflow": True}), None),
++    (SendResult(success=True, message_id="skipped", raw_response={"skipped": True}), None),
++    (SendResult(success=True), None),
++    (SendResult(success=True, message_id="final"), SendResult(success=False, error_kind="forbidden")),
++    (SendResult(success=True, message_id="final"), SendResult(success=True, message_id="document")),
++])
++async def test_actual_final_delivery_receipt_controls_cleanup(monkeypatch, outcome, attachment):
++    clock = Clock()
++    adapter = CaptureAdapter(clock)
++    adapter.final_result = outcome
++    status, _ = status_for(adapter, clock)
++    legacy_calls = []
++    adapter.register_post_delivery_callback(status.ctx.session_key, lambda: legacy_calls.append("called"), generation=1)
++    adapter.register_post_delivery_callback(status.ctx.session_key, status.after_delivery, generation=1)
++    await status.publish()
++    status.finish({"final_response": "answer"})
++    clock.now += 10
++    async def handler(event):
++        return "answer"
++    configure_background(adapter, handler, monkeypatch)
++    # The real final-ledgered send invokes this transport seam; no retry/failure-notice
++    # sends are needed to distinguish a final receipt from an uncertain exception.
++    adapter._send_with_retry = adapter.send
++    if attachment is not None:
++        async def attachments(event, extracted, metadata, **kwargs):
++            kwargs["record_delivery"](attachment)
++        adapter._deliver_attachments = attachments
++    event = MessageEvent(text="request", source=status.ctx.source)
++    guard = asyncio.Event()
++    guard._hermes_run_generation = 1
++    adapter._active_sessions[status.ctx.session_key] = guard
++    await adapter._process_message_background(event, status.ctx.session_key)
++    assert legacy_calls == ["called"]
++    success = bool(isinstance(outcome, SendResult) and outcome.success and outcome.message_id
++                   and not outcome.raw_response and (attachment is None or attachment.success))
++    assert bool(adapter.deleted) == success
++    if not success:
++        assert status.phase in {"failed", "unknown"}
++    assert status.ended and not status.awaiting_delivery
++    assert any(c[2] == "answer" for c in adapter.calls)
++
++
++@pytest.mark.asyncio
++async def test_delivery_stall_and_cancel_do_not_claim_success(monkeypatch):
++    adapter = CaptureAdapter()
++    runner, ctx = make_turn(adapter)
++    disp = SimpleNamespace(_display_surface_mode=lambda *a, **k: "generic")
++    heartbeat = asyncio.create_task(runner._run_agent_notify_long_running(disp, ctx, [None]))
++    while ctx._telegram_status is None or not adapter.calls:
++        await asyncio.sleep(0)
++    async def handler(event):
++        ctx._telegram_status.finish({"final_response": "answer"})
++        return "answer"
++    configure_background(adapter, handler, monkeypatch)
++    adapter._send_with_retry = adapter.send
++    adapter.final_release.clear()
++    event = MessageEvent(text="request", source=ctx.source)
++    guard = asyncio.Event()
++    guard._hermes_run_generation = 1
++    adapter._active_sessions[ctx.session_key] = guard
++    delivery = asyncio.create_task(adapter._process_message_background(event, ctx.session_key))
++    try:
++        await asyncio.wait_for(adapter.final_entered.wait(), 3)
++        assert not adapter.deleted and not heartbeat.done()
++        await asyncio.wait_for(_wait_edits(adapter, "c1", 1), 3)
++        assert "Отправляю результат" in adapter.calls[-1][2]
++        adapter._expected_cancelled_tasks.add(delivery)
++        delivery.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await delivery
++        assert not adapter.deleted
++        assert ctx._telegram_status.phase == "unknown"
++        with suppress(asyncio.CancelledError):
++            await heartbeat
++    finally:
++        adapter.final_release.set()
++        if not delivery.done():
++            delivery.cancel()
++        if not heartbeat.done():
++            await ctx._telegram_status.after_delivery(delivery_receipt="unknown")
++
++
++@pytest.mark.asyncio
++async def test_native_telegram_adapter_shares_send_edit_budget_and_skipped_receipt():
++    from plugins.platforms.telegram.adapter import TelegramAdapter
++    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
++    adapter._rich_send_disabled = True
++    adapter._bot = MagicMock()
++    adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=901))
++    adapter._bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=901))
++    runner, ctx = make_turn(adapter, "123")
++    status = TelegramTurnStatus(runner, ctx, adapter, {"_interim_send": True})
++    status.task = None
++    await status.publish()
++    assert status.message_id == "901"
++    await status.publish()
++    assert adapter._bot.edit_message_text.await_count == 0
++    # Another native sender/stream holds the same chat slot. This is not a
++    # successful status edit and must leave the visible snapshot unchanged.
++    status.next_attempt = 0
++    snapshot = status.last_text
++    result = await adapter.edit_message("123", "901", "other preview")
++    assert result.raw_response == {"skipped": True}
++    await status.publish()
++    assert status.last_text == snapshot and adapter._bot.edit_message_text.await_count == 0
++
++
++@pytest.mark.asyncio
++async def test_short_actual_agent_turn_keeps_status_until_delivery_receipt(monkeypatch, tmp_path):
++    import time
++    from tests.gateway.test_run_cleanup_progress import _install_fakes, _make_runner, ProgressAgent
++    class ShortAgent(ProgressAgent):
++        def run_conversation(self, message, conversation_history=None, task_id=None):
++            self.tool_progress_callback("tool.started", "read_file", "/private/contents", {"path": "/private/contents"})
++            time.sleep(0.05)  # executor worker; the gateway loop remains free
++            return {"final_response": "answer", "messages": [], "api_calls": 1}
++    adapter = CaptureAdapter()
++    runner = _make_runner(adapter)
++    runner._draining = runner._restart_requested = False
++    run = _install_fakes(monkeypatch, ShortAgent, cleanup_on=False)
++    monkeypatch.setattr(run, "_hermes_home", tmp_path)
++    monkeypatch.setattr("hermes_cli.friday_user_scope.ordinary_presentation", lambda *a, **k: True)
++    captured = {}
++    original = runner._run_agent_build_turn_context
++    def build(*args, **kwargs):
++        values = original(*args, **kwargs)
++        captured["ctx"] = values[0]
++        return values
++    runner._run_agent_build_turn_context = build
++    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", chat_type="dm")
++    result = await runner._run_agent("request", "", [], source, "short-test", session_key="short")
++    status = captured["ctx"]._telegram_status
++    try:
++        assert result["final_response"] == "answer"
++        assert status is not None and status.awaiting_delivery and not status.task.done()
++        assert len([c for c in adapter.calls if c[0] == "send"]) == 1
++        assert not adapter.deleted
++        guard = asyncio.Event()
++        await adapter._fire_post_delivery_callback("short", guard, delivery_receipt="confirmed")
++        assert adapter.deleted == [("c1", status.message_id)]
++        assert status.task.done()
++    finally:
++        if status is not None and not status.ended:
++            await status.after_delivery(delivery_receipt="unknown")
++
++
++@pytest.mark.asyncio
++async def test_pending_delivery_generation_supersession_stops_old_timer():
++    adapter = CaptureAdapter()
++    runner, ctx = make_turn(adapter)
++    disp = SimpleNamespace(_display_surface_mode=lambda *a, **k: "generic")
++    task = asyncio.create_task(runner._run_agent_notify_long_running(disp, ctx, [None]))
++    try:
++        while ctx._telegram_status is None or not adapter.calls:
++            await asyncio.sleep(0)
++        ctx._telegram_status.finish({"final_response": "answer"})
++        ctx._run_still_current = lambda: False
++        ctx._telegram_status.wake.set()
++        await asyncio.wait_for(task, 3)
++        assert ctx._telegram_status.phase == "unknown"
++        assert not ctx._telegram_status.awaiting_delivery and not adapter.deleted
++    finally:
++        await ctx._telegram_status.after_delivery(delivery_receipt="unknown")
++
++
++@pytest.mark.asyncio
++async def test_initial_explicit_refusal_retries_after_requested_wait_and_stop_is_retained():
++    clock = Clock()
++    adapter = CaptureAdapter(clock)
++    status, _ = status_for(adapter, clock)
++    adapter.send_results = [SendResult(success=False, retry_after=7, error_kind="rate_limited")]
++    await status.publish()
++    clock.now += 6
++    await status.publish()
++    assert len(adapter.calls) == 1
++    clock.now += 1
++    await status.publish()
++    assert status.message_id and len(adapter.calls) == 2
++    status.finish({"interrupted": True})
++    clock.now += 1
++    await status.after_delivery(delivery_receipt="confirmed")
++    assert not adapter.deleted and "остановлено" in adapter.calls[-1][2]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream_text,footer,confirmed", [
++    ("answer", "", True),
++    ("answer\nMEDIA:/tmp/requested-artifact.txt", "", False),
++    ("answer", "footer", False),
++])
++async def test_confirmed_stream_final_joins_empty_response_only_without_unreceipted_media(
++    monkeypatch, stream_text, footer, confirmed,
++):
++    clock = Clock()
++    adapter = CaptureAdapter(clock)
++    status, _ = status_for(adapter, clock)
++    runner, ctx = status.runner, status.ctx
++    runner._should_send_voice_reply = lambda *a, **k: False
++    runner._deliver_media_from_response = AsyncMock()
++    runner._event_thread_metadata = lambda *a: None
++    monkeypatch.setattr("gateway.run_turn.diagnostic_wake_muted", lambda event: False)
++    await status.publish()
++    status.finish({"final_response": stream_text, "already_sent": True})
++    clock.now += 10
++    adapter.register_post_delivery_callback(ctx.session_key, status.after_delivery, generation=1)
++    async def handler(event):
++        return await runner._hmwa_deliver_turn_response(
++            event, ctx.source, SimpleNamespace(session_id="s"), ctx.session_key, 1,
++            {"already_sent": True}, [], stream_text, footer, False,
++        )
++    configure_background(adapter, handler, monkeypatch)
++    event = MessageEvent(text="request", source=ctx.source)
++    guard = asyncio.Event()
++    guard._hermes_run_generation = 1
++    adapter._active_sessions[ctx.session_key] = guard
++    await adapter._process_message_background(event, ctx.session_key)
++    assert bool(adapter.deleted) is confirmed
++    if not confirmed:
++        assert status.phase == "unknown"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("earlier,receipt", [
++    ("timeout", "confirmed"), ("timeout", "unknown"),
++    ("raises", "confirmed"), ("self_cancel", "unknown"),
++    ("external_cancel", "unknown"),
++])
++async def test_prior_callback_cannot_orphan_status_or_change_receipt(monkeypatch, earlier, receipt):
++    adapter = CaptureAdapter()
++    runner, ctx = make_turn(adapter)
++    entered, never = asyncio.Event(), asyncio.Event()
++    order = []
++    async def prior():
++        order.append("prior")
++        entered.set()
++        if earlier == "raises":
++            raise RuntimeError("earlier unrelated callback failed")
++        if earlier == "self_cancel":
++            raise asyncio.CancelledError
++        await never.wait()
++    adapter.register_post_delivery_callback(ctx.session_key, prior, generation=1)
++    disp = SimpleNamespace(_display_surface_mode=lambda *a, **k: "generic")
++    heartbeat = asyncio.create_task(runner._run_agent_notify_long_running(disp, ctx, [None]))
++    fire = None
++    try:
++        while ctx._telegram_status is None or not adapter.calls:
++            await asyncio.sleep(0)
++        status = ctx._telegram_status
++        status.finish({"final_response": "answer"})
++        adapter.register_post_delivery_callback(ctx.session_key, lambda: order.append("later"), generation=1)
++        guard = asyncio.Event()
++        guard._hermes_run_generation = 1
++        monkeypatch.setattr("gateway.platforms.base._POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS", 0.05)
++        fire = asyncio.create_task(adapter._fire_post_delivery_callback(
++            ctx.session_key, guard, delivery_receipt=receipt))
++        await asyncio.wait_for(entered.wait(), 3)
++        if earlier == "external_cancel":
++            fire.cancel()
++        if earlier in {"self_cancel", "external_cancel"}:
++            with pytest.raises(asyncio.CancelledError):
++                await fire
++        else:
++            await asyncio.wait_for(fire, 3)
++        assert status.ended and not status.awaiting_delivery and heartbeat.done()
++        assert ctx.session_key not in adapter._post_delivery_callbacks
++        assert bool(adapter.deleted) is (receipt == "confirmed")
++        assert order == (["prior", "later"] if earlier == "raises" else ["prior"])
++        if receipt != "confirmed":
++            assert status.phase == "unknown"
++        # The mandatory finally must not repeat a callback already run by the chain.
++        snapshot = list(adapter.calls), list(adapter.deleted)
++        await status.after_delivery(delivery_receipt="confirmed")
++        assert snapshot == (adapter.calls, adapter.deleted)
++    finally:
++        never.set()
++        if fire is not None and not fire.done():
++            fire.cancel()
++            with suppress(asyncio.CancelledError):
++                await fire
++        if ctx._telegram_status is not None:
++            await ctx._telegram_status.after_delivery(delivery_receipt="unknown")
++        with suppress(asyncio.CancelledError):
++            await heartbeat
++
++
++@pytest.mark.asyncio
++async def test_unrelated_mock_callbacks_are_not_marked_as_finalizers():
++    adapter = CaptureAdapter()
++    first, second = MagicMock(), AsyncMock()
++    adapter.register_post_delivery_callback("mock-chain", first, generation=1)
++    adapter.register_post_delivery_callback("mock-chain", second, generation=1)
++    guard = asyncio.Event()
++    guard._hermes_run_generation = 1
++    await adapter._fire_post_delivery_callback("mock-chain", guard, delivery_receipt="confirmed")
++    first.assert_called_once_with()
++    second.assert_awaited_once_with()
+diff --git a/tests/hermes_cli/test_named_request_budget.py b/tests/hermes_cli/test_named_request_budget.py
+new file mode 100644
+--- /dev/null
++++ b/tests/hermes_cli/test_named_request_budget.py
+@@ -0,0 +1,79 @@
++"""Named route identity, opt-in budget validation, and legacy scalar compatibility."""
++
++import json
++
++import pytest
++
++from hermes_cli.timeouts import get_provider_request_budget, get_provider_request_timeout
++
++
++def _config(tmp_path, monkeypatch, value):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    (tmp_path / "config.yaml").write_text(json.dumps(value), encoding="utf-8")
++
++
++@pytest.mark.parametrize("route", ["friday-local", "custom:friday-local", "CUSTOM:Friday Local"])
++def test_named_route_budget_and_scalar_are_distinct_from_generic_custom(tmp_path, monkeypatch, route):
++    _config(tmp_path, monkeypatch, {"providers": {
++        "custom": {"request_timeout_seconds": 7},
++        "friday-local": {"request_timeout_seconds": 30,
++                         "request_budget_seconds": {"first_event": 180, "idle": 120, "total": 900}},
++        "independent-27b": {"request_timeout_seconds": 12},
++    }})
++    policy = get_provider_request_budget("custom", "m", route)
++    assert (policy.first_event, policy.idle, policy.total) == (180, 120, 900)
++    assert get_provider_request_timeout("custom", "m", route) == 30
++    assert get_provider_request_timeout("custom", "m") == 7
++    assert get_provider_request_budget("custom", "m", "custom:independent-27b") is None
++    assert get_provider_request_timeout("custom", "m", "custom:independent-27b") == 12
++    assert get_provider_request_budget("custom", "m", "custom:missing") is None
++    assert get_provider_request_timeout("custom", "m", "custom:missing") is None
++
++
++def test_legacy_alias_and_model_policy_precedence(tmp_path, monkeypatch):
++    _config(tmp_path, monkeypatch, {"custom_providers": [{
++        "name": "Legacy Local", "request_timeout_seconds": 31,
++        "request_budget_seconds": {"first_event": 180, "idle": 120, "total": 900},
++        "models": {"m": {"timeout_seconds": 33,
++                         "request_budget_seconds": {"first_event": 80, "idle": 60, "total": 300}}},
++    }]})
++    policy = get_provider_request_budget("custom", "m", "custom:legacy-local")
++    assert (policy.first_event, policy.idle, policy.total) == (80, 60, 300)
++    assert get_provider_request_timeout("custom", "m", "custom:legacy-local") == 33
++
++
++def test_canonical_auto_provider_retains_scalar_and_custom_alias_precedence(tmp_path, monkeypatch):
++    _config(tmp_path, monkeypatch, {"providers": {
++        "anthropic": {"request_timeout_seconds": 77},
++        "disabled": {"name": "Shared Route", "enabled": False, "request_timeout_seconds": 4},
++        "first": {"name": "Shared Route", "request_timeout_seconds": 21},
++        "shared-route": {"request_timeout_seconds": 22},
++    }})
++    assert get_provider_request_timeout("anthropic", "m", "auto") == 77
++    assert get_provider_request_timeout("custom", "m", "custom:shared-route") == 21
++    assert get_provider_request_timeout("custom", "m", "shared-route") == 21
++
++
++def test_saved_endpoint_alias_wins_over_a_policy_only_collision(tmp_path, monkeypatch):
++    _config(tmp_path, monkeypatch, {"providers": {
++        "policy-only": {"name": "Spark", "request_timeout_seconds": 1},
++        "selected": {"name": "Spark", "base_url": "http://127.0.0.1:1/v1", "request_timeout_seconds": 9},
++    }})
++    assert get_provider_request_timeout("custom", "m", "custom:spark") == 9
++
++
++@pytest.mark.parametrize("bad", [None, 30, {}, {"first_event": 1, "idle": 1},
++    {"first_event": True, "idle": 1, "total": 10},
++    {"first_event": "1", "idle": 1, "total": 10},
++    {"first_event": float("inf"), "idle": 1, "total": 10},
++    {"first_event": 1, "idle": float("nan"), "total": 10},
++    {"first_event": 1, "idle": 0, "total": 10},
++    {"first_event": 11, "idle": 1, "total": 10},
++    {"first_event": 1, "idle": 11, "total": 10},
++    {"first_event": 1, "idle": 1, "total": 86401},
++    {"first_event": 1, "idle": 1, "total": 10, "extra": 2}])
++def test_explicit_invalid_policy_never_falls_back_to_scalar(tmp_path, monkeypatch, bad):
++    _config(tmp_path, monkeypatch, {"providers": {"friday-local": {
++        "request_timeout_seconds": 30, "request_budget_seconds": bad}}})
++    with pytest.raises(ValueError, match="request_budget_seconds"):
++        get_provider_request_budget("custom", "m", "custom:friday-local")

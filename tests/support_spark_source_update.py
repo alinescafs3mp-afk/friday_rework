@@ -81,6 +81,12 @@ def installed(tmp_path,monkeypatch):
     for name in sorted(o.SPARK_MULTIPASS_FILES-o.SPARK_MULTIPASS_NEW_FILES):
         data=b'# Native78 existing '+name.encode()+b'\n';put(source/name,data,0o644)
         files[name]={'sha256':f.digest(data),'bytes':len(data),'mode':'100644'}
+    # Later layers may modify files introduced by the prior synthetic updates.
+    # Keep those absent here so their original addition executes exactly once.
+    earlier_additions = o.PRIVACY_EFFECT_NEW_FILES | o.SPARK_MULTIPASS_NEW_FILES
+    for name in sorted(o.SPARK_REQUEST_BUDGET_FILES-o.SPARK_REQUEST_BUDGET_NEW_FILES-set(files)-earlier_additions):
+        data=b'# Native79 existing '+name.encode()+b'\n';put(source/name,data,0o644)
+        files[name]={'sha256':f.digest(data),'bytes':len(data),'mode':'100644'}
     put(source/'retained.txt',b'unchanged native\n',0o644)
     files['retained.txt']={'sha256':f.digest(b'unchanged native\n'),'bytes':17,'mode':'100644'}
     layers=[{'manifest':f'patches/hermes/prior-{n}.json','manifest_sha256':f.digest(str(n).encode()),
