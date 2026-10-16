@@ -103,6 +103,10 @@ def test_one_layer_only_exact_owned_write_set_and_all_retained_inodes(installed)
     assert len(receipt['layers']) == 79 and receipt['layers'][:-1] == s['receipt']['layers']
     assert set(receipt['files']) == set(s['receipt']['files']) | o.SPARK_MULTIPASS_NEW_FILES
     assert len(s['previous']['project_files']) == 229 and len(s['current']['project_files']) == 231
+    assert len(o.SPARK_MULTIPASS_PROJECT_BEFORE)==5
+    assert 'scripts/friday_install.py' in o.SPARK_MULTIPASS_PROJECT_BEFORE
+    assert 'scripts/friday_install.py' in o.SPARK_MULTIPASS_PROJECT_AFTER
+    assert {n for n in s['previous']['project_files'] if s['previous']['project_files'][n] != s['current']['project_files'][n]} == set(o.SPARK_MULTIPASS_PROJECT_BEFORE)
     marker = f.read_json(s['home']/f.MARKER)
     assert len(marker['plugin_files']) == 45
     assert marker['plugin_files'] == {n:h for n,h in s['current']['project_files'].items() if n.startswith('plugins/')}
@@ -119,7 +123,7 @@ def test_one_layer_only_exact_owned_write_set_and_all_retained_inodes(installed)
 
 @pytest.mark.parametrize('fault', ['pending_manifest', 'pending_patch', 'wrong_final_manifest', 'wrong_final_patch',
     'wrong_before_input', 'extra_project', 'producer_pin', 'producer_unchanged', 'second_plugin',
-    'onboarding_pin', 'native_missing', 'native_extra', 'new_file_present', 'beforeimage', 'wrong_new_flag',
+    'onboarding_pin', 'installer_pin', 'installer_unchanged', 'native_missing', 'native_extra', 'new_file_present', 'beforeimage', 'wrong_new_flag',
     'prefix', 'history_missing', 'history_bytes', 'wrong_predecessor', 'keyless_request_extra',
     'config', 'profile', 'credential', 'runtime', 'worker_helper', 'symlink_addition'])
 def test_invalid_boundary_has_no_consumption_or_publication(installed, monkeypatch, fault):
@@ -129,12 +133,12 @@ def test_invalid_boundary_has_no_consumption_or_publication(installed, monkeypat
         monkeypatch.setattr(o, name, None if fault.startswith('pending') else '0'*64)
     elif fault == 'wrong_before_input': monkeypatch.setattr(o, 'SPARK_MULTIPASS_PREVIOUS_INPUT', '0'*64)
     elif fault == 'extra_project': s['current']['project_files']['config/extra'] = put(root/'config/extra', b'extra')['sha256']
-    elif fault in ('producer_pin', 'second_plugin', 'onboarding_pin', 'worker_helper'):
+    elif fault in ('producer_pin', 'second_plugin', 'onboarding_pin', 'worker_helper', 'installer_pin'):
         name = {'producer_pin':'tools/configure_product.py', 'second_plugin':'plugins/friday_rework/unchanged.py',
-            'onboarding_pin':'plugins/friday_rework/onboarding.py', 'worker_helper':'scripts/friday_worker_preparation.py'}[fault]
+            'onboarding_pin':'plugins/friday_rework/onboarding.py', 'worker_helper':'scripts/friday_worker_preparation.py', 'installer_pin':'scripts/friday_install.py'}[fault]
         s['current']['project_files'][name] = put(root/name, b'foreign source\n')['sha256']
-    elif fault == 'producer_unchanged':
-        name = 'tools/configure_local_test.py'; (root/name).write_bytes(b'# old source\n')
+    elif fault in ('producer_unchanged','installer_unchanged'):
+        name = 'scripts/friday_install.py' if fault == 'installer_unchanged' else 'tools/configure_local_test.py'; (root/name).write_bytes(b'# old source\n')
         s['current']['project_files'][name] = s['previous']['project_files'][name]
     elif fault == 'native_missing': s['manifest']['files'].pop()
     elif fault == 'native_extra': s['manifest']['files'].append(dict(s['manifest']['files'][0], path='foreign.py'))

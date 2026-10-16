@@ -58,8 +58,8 @@ SPARK_MULTIPASS_FILES = SPARK_MULTIPASS_NEW_FILES | {'agent/auxiliary_client.py'
     'agent/usage_anchor.py', 'agent/process_bootstrap.py', 'hermes_state_compression.py', 'hermes_cli/friday_credential_admission.py'}
 SPARK_MULTIPASS_PLUGIN_FILES = {'plugins/friday_rework/onboarding.py'}
 SPARK_MULTIPASS_NATIVE_FILES = 17683
-SPARK_MULTIPASS_PROJECT_BEFORE = {'plugins/friday_rework/onboarding.py': '63f1476661fb4e1dff0a828cd11c298d89661025416836bb115e8ab6abd529b6', 'scripts/friday_ordinary_install.py': '8d8b9cc23f2436ff9903ef29671c97d6147e10d62194cd20e300e9e39a11a1ac', 'tools/configure_local_test.py': '0bc17aa5d2f6e9aa75fad10246205421f49db23e91300fab11900c269bf9666e', 'tools/configure_product.py': '0494489e42f17558893d5372aa988d74ab8a148108836add71eb5a7f440cefdc'}
-SPARK_MULTIPASS_PROJECT_AFTER = {'plugins/friday_rework/onboarding.py': '42e262612c464e81568dbcc30266b0c67be365f1cb780fa1700a04ca59ec5c42', 'tools/configure_local_test.py': '0794011d5a06842046746b437ac7beed9eb8da1d18d8b822d701a8f91ca8c523', 'tools/configure_product.py': '8deb00592a37903938f733284562a5c852a516d386daba90277a555bdc13e56a'}
+SPARK_MULTIPASS_PROJECT_BEFORE = {'plugins/friday_rework/onboarding.py': '63f1476661fb4e1dff0a828cd11c298d89661025416836bb115e8ab6abd529b6', 'scripts/friday_ordinary_install.py': '8d8b9cc23f2436ff9903ef29671c97d6147e10d62194cd20e300e9e39a11a1ac', 'tools/configure_local_test.py': '0bc17aa5d2f6e9aa75fad10246205421f49db23e91300fab11900c269bf9666e', 'tools/configure_product.py': '0494489e42f17558893d5372aa988d74ab8a148108836add71eb5a7f440cefdc', 'scripts/friday_install.py': '8b9109adc3b690b47791ff1b9d75073b812e502ac16810361a1692059f0f67dd'}
+SPARK_MULTIPASS_PROJECT_AFTER = {'plugins/friday_rework/onboarding.py': '42e262612c464e81568dbcc30266b0c67be365f1cb780fa1700a04ca59ec5c42', 'tools/configure_local_test.py': '0794011d5a06842046746b437ac7beed9eb8da1d18d8b822d701a8f91ca8c523', 'tools/configure_product.py': '7d5ce5209e21c41442e6c44598a85accc011a5c3f6c81c772fe85d9dd2016a82', 'scripts/friday_install.py': '73521e7a4dd09b243d41c9db0869bcfc2bd85e0ecd3eac22537dbe4cbeda8901'}
 
 PRIVACY_EFFECT_MANIFEST = 'patches/hermes/ordinary-private-refusal-effect-manifest.json'
 PRIVACY_EFFECT_NEW_FILES = {'tests/agent/test_privacy_effect_semantics.py'}
@@ -2017,6 +2017,482 @@ def recover_first_contact_config(request, request_path, budget):
         os.close(fd)
 
 
+# Exact, separate CURRENT-deployment inference rebind. Source update v33 above
+# remains unchanged. This action never starts a consumer or changes an admission.
+REBIND_SCHEMA = 'friday.ordinary-existing-inference-rebind.v1'
+
+
+def inference_delta(current, original, replacement):
+    """Apply compiler-caused changes only; reject drift at every changed leaf.
+
+    Native onboarding identities and owner settings outside that delta survive.
+    A changed list is one exact CAS value, never an implicit scope merge.
+    """
+    import copy
+    f = api()
+    if original == replacement: return copy.deepcopy(current)
+    if type(original) is dict and type(replacement) is dict:
+        f.require(type(current) is dict, 'ordinary_rebind_configuration_delta_drift')
+        result = copy.deepcopy(current)
+        for key in set(original) | set(replacement):
+            if key not in original:
+                f.require(key not in current, 'ordinary_rebind_configuration_delta_drift')
+                result[key] = copy.deepcopy(replacement[key])
+            elif key not in replacement:
+                f.require(key in current and current[key] == original[key],
+                    'ordinary_rebind_configuration_delta_drift')
+                del result[key]
+            elif original[key] != replacement[key]:
+                f.require(key in current, 'ordinary_rebind_configuration_delta_drift')
+                result[key] = inference_delta(current[key],original[key],replacement[key])
+        return result
+    f.require(current == original, 'ordinary_rebind_configuration_delta_drift')
+    return copy.deepcopy(replacement)
+
+
+def inference_private_reasoning(config):
+    """Explicit requested privacy migration even when historical flags are absent."""
+    f=api()
+    for mapping,key in ((config,'display'),):
+        f.require(key not in mapping or type(mapping[key]) is dict,'ordinary_rebind_reasoning_display_shape_required')
+    display=config.setdefault('display',{})
+    display['show_reasoning']=False
+    f.require('platforms' not in display or type(display['platforms']) is dict,
+        'ordinary_rebind_reasoning_display_shape_required')
+    platforms=display.setdefault('platforms',{})
+    f.require('telegram' not in platforms or type(platforms['telegram']) is dict,
+        'ordinary_rebind_reasoning_display_shape_required')
+    platforms.setdefault('telegram',{})['show_reasoning']=False
+    return config
+
+
+def inference_env_values(raw):
+    """Parse owned dotenv without interpolation or process/global fallbacks."""
+    import io
+    from dotenv.parser import parse_stream
+    f = api(); values = {}; parts = []
+    try:
+        text = raw.decode('utf-8')
+        f.require('${' not in text, 'ordinary_rebind_dotenv_interpolation_refused')
+        for item in parse_stream(io.StringIO(text)):
+            f.require(not item.error, 'ordinary_rebind_dotenv_invalid')
+            if item.key is not None:
+                f.require(item.key not in values and isinstance(item.value,str),
+                    'ordinary_rebind_dotenv_duplicate_or_invalid')
+                values[item.key] = item.value
+            parts.append((item.key,item.original.string))
+    except (UnicodeError,TypeError):
+        raise ValueError('ordinary_rebind_dotenv_invalid') from None
+    return values,parts
+
+
+def inference_secret(value):
+    api().require(isinstance(value,str) and 0 < len(value) <= 16384 and value.isascii()
+        and value == value.strip() and '${' not in value
+        and not any(ord(c)<32 or ord(c)==127 for c in value),
+        'ordinary_rebind_credential_missing_or_invalid')
+    return value
+
+
+def inference_env_after(raw, new_primary):
+    """Retain this home's 27B key independently and preserve every other byte."""
+    f = api(); values,parts = inference_env_values(raw)
+    primary = 'FRIDAY_LLM_API_KEY'; compressor = 'FRIDAY_COMPRESSION_API_KEY'
+    old = inference_secret(values.get(primary)); inference_secret(new_primary)
+    f.require(compressor not in values or values[compressor] == old,
+        'ordinary_rebind_existing_compression_key_conflict')
+    def line(name,value):
+        # python-dotenv's supported single-quoted representation; no interpolation.
+        return name + "='" + value.replace('\\','\\\\').replace("'","\\'") + "'\n"
+    result = ''.join(line(primary,new_primary) if name == primary else original
+        for name,original in parts)
+    if compressor not in values:
+        result += ('' if not result or result.endswith('\n') else '\n') + line(compressor,old)
+    after = result.encode(); checked,_ = inference_env_values(after)
+    f.require(checked == dict(values,**{primary:new_primary,compressor:old}),
+        'ordinary_rebind_credential_roundtrip_failed')
+    return after
+
+
+def inference_primary_reference(reference):
+    """Read exactly the supplied protected selector, never search for a key."""
+    from scripts.install_credentials import references
+    f = api(); references({'FRIDAY_LLM_API_KEY':reference})
+    raw = f.owned_file(f.canonical(reference['path']),private=True)
+    f.require(len(raw)<=1024*1024, 'ordinary_rebind_credential_source_too_large')
+    try:
+        values = (json.loads(raw,object_pairs_hook=f.unique) if reference['format']=='json'
+            else inference_env_values(raw)[0])
+        f.require(type(values) is dict, 'ordinary_rebind_credential_source_invalid')
+        return inference_secret(values.get(reference['name']))
+    except (UnicodeError,TypeError,KeyError):
+        raise ValueError('ordinary_rebind_credential_source_invalid') from None
+
+
+@contextlib.contextmanager
+def inference_locks(home, profile_home, access_path, budget):
+    """Native ordering: state, root/user config, root/user dotenv; no new locks."""
+    from hermes_cli.config import _env_write_lock
+    from hermes_cli.plugins_state import PluginState
+    from plugins.friday_rework.associations import Associations
+    from hermes_cli.auth import _auth_store_lock
+    f = api(); paths = [home/'config.yaml.lock',profile_home/'config.yaml.lock',
+        home/'.env.lock',profile_home/'.env.lock',home/'auth.lock',profile_home/'auth.lock',
+        access_path.with_name('.state.json.lock')]
+    states = {}
+    for path in paths:
+        state = update_file_state(path)
+        f.require(state is not None and state['data'] == b'' and state['mode'] == 0o600,
+            'ordinary_rebind_existing_private_native_lock_required')
+        states[path] = state['identity']
+    def prove():
+        for path,identity in states.items():
+            state = update_file_state(path)
+            f.require(state is not None and state['identity'] == identity,
+                'ordinary_rebind_native_lock_identity_changed')
+    # Native admission.lock serializes supported access/onboarding writers.
+    # Holding .state.json.lock across native proof reads would self-deadlock.
+    admission=access_path.with_name('admission.lock')
+    state=update_file_state(admission)
+    f.require(state is not None and state['data']==b'v1\n' and state['mode']==0o600,
+        'ordinary_rebind_existing_native_admission_required')
+    states[admission]=state['identity']
+    state_document=f.read_json(access_path)
+    f.require('associations.v1' in state_document,'ordinary_rebind_existing_associations_required')
+    with Associations(PluginState('friday_rework'))._locked():
+        with retained_first_contact_config_lock(home/'config.yaml'):
+            with retained_first_contact_config_lock(profile_home/'config.yaml'):
+                with _auth_store_lock(target_path=home/'auth.json'), _auth_store_lock(target_path=profile_home/'auth.json'), \
+                        _env_write_lock(home/'.env'), _env_write_lock(profile_home/'.env'):
+                    prove(); yield prove; prove()
+
+
+def inference_rebind_inputs(request, budget):
+    """Exact pinned beforeimages, unchanged source inventory and historical clocks."""
+    f = api()
+    fields = {'schema','seconds','home','profile','previous_input','current_input',
+        'native_unit','before','retained','primary_credentials'}
+    f.require(type(request) is dict and set(request)==fields
+        and request['schema']==REBIND_SCHEMA and request['profile']=='dest_telegram'
+        and type(request['seconds']) is int and 30<=request['seconds']<=180,
+        'ordinary_rebind_explicit_request_required')
+    home = f.directory(f.canonical(request['home']));source=f.directory(home/'hermes-agent')
+    f.require(os.environ.get('HERMES_HOME')==str(home),'ordinary_rebind_exact_environment_required')
+    f.directory(home/'profiles');profile_home=f.directory(home/'profiles'/request['profile'])
+    f.directory(home/'preparation')
+    # Authenticate the existing native package before importing its helpers.
+    before_input=f.read_json(f.pin(request['previous_input']))
+    after_input=f.read_json(f.pin(request['current_input']))
+    budget.call(f.inspect,before_input,request['previous_input']['sha256'])
+    from hermes_cli import friday_user_scope as user
+    from hermes_cli.plugins_state import _plugin_data_namespace
+    relative = 'profiles/'+request['profile']+'/'
+    names = {'config.yaml','FRIDAY-PROFILE.json',f.MARKER,'.env',relative+'config.yaml',
+        relative+user.ONBOARDING,relative+user.MARKER,relative+'.env'}
+    f.require(type(request['before']) is dict and set(request['before'])==names,
+        'ordinary_rebind_exact_before_inventory_required')
+    for name,ref in request['before'].items():
+        f.require(f.pin(ref)==home/name,'ordinary_rebind_exact_before_path_required')
+        f.owned_file(home/name,private=True)
+        f.require(update_file_state(home/name)['mode']==0o600,
+            'ordinary_rebind_existing_private_file_required')
+    # Existing pools can override provider credentials. Preserve them and refuse
+    # until their exact provider-entry migration is independently reviewed.
+    for own in (home,profile_home):
+        f.require(not os.path.lexists(own/'auth.json'),
+            'ordinary_rebind_existing_auth_pool_migration_required')
+    credentials=request['primary_credentials']
+    f.require(type(credentials) is dict and set(credentials)=={'root','user'},
+        'ordinary_rebind_separate_home_credential_references_required')
+    from scripts.install_credentials import references
+    for reference in credentials.values(): references({'FRIDAY_LLM_API_KEY':reference})
+    f.require(request['previous_input']!=request['current_input']
+        and before_input.get('home')==after_input.get('home')==str(home)
+        and {k:v for k,v in before_input.items() if k!='product'}==
+            {k:v for k,v in after_input.items() if k!='product'},
+        'ordinary_rebind_source_inventory_or_original_budget_changed')
+    old=before_input['product'];new=after_input['product']
+    route_fields={'inference','compression_inference','compression_multipass'}
+    f.require(type(old) is dict and type(new) is dict
+        and 'compression_inference' not in old and 'compression_multipass' not in old
+        and route_fields<=set(new)
+        and all(type(p['runtime']) is dict and set(p['runtime'])=={'enabled'}
+            and p['runtime']['enabled'] is False for p in (old,new))
+        and {k:v for k,v in old.items() if k not in route_fields}==
+            {k:v for k,v in new.items() if k not in route_fields}
+        and old['inference']['key_env']==new['inference']['key_env']=='FRIDAY_LLM_API_KEY'
+        and new['compression_inference']['key_env']=='FRIDAY_COMPRESSION_API_KEY'
+        and {k:v for k,v in old['inference'].items() if k!='key_env'}==
+            {k:v for k,v in new['compression_inference'].items() if k!='key_env'},
+        'ordinary_rebind_exact_preserved_compressor_and_scope_required')
+    # Do not bypass the normal restart input validator: current versions reject
+    # split declarations until its separately reviewed integration is installed.
+    budget.call(f.spec_checked,after_input,cli_only=True)
+    marker=f.read_json(home/f.MARKER)
+    f.require(marker.get('completion_stage')=='TELEGRAM_ORDINARY'
+        and marker.get('runtime_ready') is False
+        and f.cli_historical_scope_closed(marker['original_attempt'],'friday.native-install.v1')
+        and (marker.get('cli_segment') is None or
+            f.cli_historical_scope_closed(marker['cli_segment']['clock'],'friday.cli-segment-clock.v1')),
+        'ordinary_rebind_closed_original_clocks_required')
+    access_path=home/'plugin-data'/_plugin_data_namespace('friday_rework','')/'state.json'
+    required={'hermes-agent.source.json','hermes-agent/install-stamp.json',
+        'hermes-agent/.hermes/bin/hermes','SOUL.md',relative+'SOUL.md',str(access_path.relative_to(home)),
+        str(access_path.with_name('admission.lock').relative_to(home)),
+        *marker['ordinary_gateway']['history']}
+    retained=request['retained']
+    f.require(type(retained) is dict and required<=set(retained)
+        and not set(retained)&names,'ordinary_rebind_retained_history_required')
+    for name,ref in retained.items():
+        path=Path(name)
+        f.require(not path.is_absolute() and '..' not in path.parts and '.' not in path.parts
+            and f.pin(ref)==home/path,'ordinary_rebind_exact_retained_path_required')
+    f.pin(request['native_unit'])
+    return home,source,profile_home,access_path,before_input,after_input,marker
+
+
+@contextlib.contextmanager
+def inference_retaining_cleanup(fd):
+    """Native custody teardown cannot replace the transaction's primary cause."""
+    primary=None
+    try:
+        with contextlib.ExitStack() as stack:
+            stack.callback(os.close,fd)
+            try:
+                yield stack
+            except BaseException as error:
+                primary=error
+                raise
+    except BaseException as cleanup:
+        if primary is None or cleanup is not primary:
+            from scripts.dsh_prepare import StopUnconfirmed
+            cause=primary if primary is not None else cleanup
+            if cleanup is not cause: api().remember_secondary(cause,cleanup)
+            raise StopUnconfirmed('ordinary inference rebind custody cleanup requires reconciliation') from cause
+        raise
+
+
+def rebind_inference(request, request_path, budget):
+    """One finite operator transaction; consumers remain stopped, all-or-rollback.
+
+    Only compiler-caused inference deltas and native reseals are published. The
+    journal is not a capability or a new history entry in ordinary_gateway.
+    """
+    import copy
+    f=api();request_path=f.canonical(str(request_path))
+    request_state=update_file_state(request_path);f.owned_file(request_path,private=True)
+    f.require(request_state is not None and json.loads(request_state['data'],object_pairs_hook=f.unique)==request,
+        'ordinary_rebind_request_changed')
+    # Statically reject unknown fields/pools/unsupported restart inputs before
+    # host custody or any journal/configuration/credential publication.
+    home,source,profile_home,access_path,previous,current,marker=inference_rebind_inputs(request,budget)
+    tx=home/'preparation'/('ordinary-inference-rebind-'+request['previous_input']['sha256'])
+    f.require(not os.path.lexists(tx),'ordinary_rebind_consumed_no_retry')
+    fd=os.open(home,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    with inference_retaining_cleanup(fd) as native_stack:
+        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        home_identity=(os.fstat(fd).st_dev,os.fstat(fd).st_ino)
+        directory_identities={path:(path.lstat().st_dev,path.lstat().st_ino) for path in
+            (home,home/'profiles',profile_home,source,home/'preparation',access_path.parent)}
+        def directories_unchanged():
+            for path,identity in directory_identities.items():
+                f.directory(path);info=path.lstat()
+                f.require((info.st_dev,info.st_ino)==identity,'ordinary_rebind_directory_identity_changed')
+        native_prove=native_stack.enter_context(stopped_consumers(home,request['native_unit'],budget))
+        build_prove=native_stack.enter_context(retained_build_lock(source))
+        lock_prove=native_stack.enter_context(inference_locks(home,profile_home,access_path,budget))
+        def custody():
+            native_prove();build_prove();lock_prove();directories_unchanged();budget.check()
+            info=home.lstat()
+            f.require((info.st_dev,info.st_ino)==home_identity,'ordinary_rebind_home_identity_changed')
+        again=inference_rebind_inputs(request,budget)
+        f.require(again==(home,source,profile_home,access_path,previous,current,marker),
+            'ordinary_rebind_cas_changed')
+        saved={name:update_file_state(home/name) for name in request['before']}
+        retained={name:update_file_state(home/name) for name in request['retained']}
+        f.require(all(v is not None and f.digest(v['data'])==request['before'][n]['sha256'] for n,v in saved.items())
+            and all(v is not None and f.digest(v['data'])==request['retained'][n]['sha256'] for n,v in retained.items()),
+            'ordinary_rebind_exact_snapshot_hash_changed')
+        external={request_path:request_state,Path(request['previous_input']['path']):update_file_state(Path(request['previous_input']['path'])),
+            Path(request['current_input']['path']):update_file_state(Path(request['current_input']['path'])),
+            Path(request['native_unit']['path']):update_file_state(Path(request['native_unit']['path']))}
+        f.require(all(state is not None and f.digest(state['data'])==ref['sha256'] for ref,state in
+            ((request['previous_input'],external[Path(request['previous_input']['path'])]),
+             (request['current_input'],external[Path(request['current_input']['path'])]),
+             (request['native_unit'],external[Path(request['native_unit']['path'])]))),
+            'ordinary_rebind_exact_external_hash_changed')
+        # A reference may not alias any destination or historical state.
+        for reference in request['primary_credentials'].values():
+            path=f.canonical(reference['path'])
+            f.require(path not in {home/n for n in saved} and path not in {home/n for n in retained},
+                'ordinary_rebind_credential_source_alias_refused')
+            state=update_file_state(path);f.owned_file(path,private=True)
+            external[path]=state
+        def retained_unchanged():
+            custody()
+            f.require(all(same_update_file(home/n,v) for n,v in retained.items())
+                and all(same_update_file(p,v) for p,v in external.items())
+                and all(not os.path.lexists(h/'auth.json') for h in (home,profile_home)),
+                'ordinary_rebind_retained_or_protected_reference_changed')
+        def before_unchanged():
+            retained_unchanged()
+            f.require(all(same_update_file(home/n,v) for n,v in saved.items()),
+                'ordinary_rebind_beforeimage_identity_changed')
+        from tools.configure_product import compose_product
+        from plugins.friday_rework.onboarding import prepare_admin_config_edit,finish_admin_config_edit,validate_template
+        from hermes_cli.config import atomic_config_write
+        from hermes_cli import friday_user_scope as user
+        from hermes_cli.friday_ordinary_gateway import normalized_configuration,credential_identity,check
+        from hermes_yaml import safe_load
+        old_bundle=compose_product(previous['product']);new_bundle=compose_product(current['product'])
+        original_cfg=safe_load(saved['config.yaml']['data'])
+        settings_path=lambda cfg:cfg['plugins']['entries']['friday_rework']['settings']
+        templates=settings_path(original_cfg)['onboarding']['templates']
+        f.require(type(templates) is dict and set(templates)=={'friday-local','friday-ordinary-local'},
+            'ordinary_rebind_exact_existing_templates_required')
+        ordinary_before=templates['friday-ordinary-local']
+        ordinary_settings=settings_path(ordinary_before['config'])
+        f.require('worker_inputs' not in ordinary_before
+            and type(ordinary_settings.get('runtime')) is dict
+                    and set(ordinary_settings['runtime'])=={'enabled'}
+                    and ordinary_settings['runtime']['enabled'] is False
+            and 'worker_requirements' not in ordinary_settings,
+            'ordinary_rebind_ordinary_template_independence_required')
+        root_cfg=inference_delta(original_cfg,old_bundle['config'],new_bundle['config'])
+        old_base=old_bundle['config']['plugins']['entries']['friday_rework']['settings']['onboarding']['templates']['friday-local']
+        new_base=new_bundle['config']['plugins']['entries']['friday_rework']['settings']['onboarding']['templates']['friday-local']
+        old_ordinary=copy.deepcopy(old_base);old_ordinary.pop('worker_inputs',None)
+        new_ordinary=copy.deepcopy(new_base);new_ordinary.pop('worker_inputs',None)
+        rebound_templates=settings_path(root_cfg)['onboarding']['templates']
+        rebound_templates['friday-ordinary-local']=inference_delta(ordinary_before,old_ordinary,new_ordinary)
+        inference_private_reasoning(root_cfg)
+        for selected_template in rebound_templates.values():
+            inference_private_reasoning(selected_template['config'])
+            validate_template(selected_template)
+        proof_name='profiles/'+request['profile']+'/'+user.ONBOARDING
+        user_prefix='profiles/'+request['profile']+'/'
+        proof=json.loads(saved[proof_name]['data']);template=proof['template']
+        f.require(template in templates,'ordinary_rebind_existing_template_alias_required')
+        old_template=old_base if template=='friday-local' else old_ordinary
+        new_template=rebound_templates[template]
+        user_cfg=inference_delta(safe_load(saved[user_prefix+'config.yaml']['data']),old_template['config'],
+            new_base['config'])
+        inference_private_reasoning(user_cfg)
+        required=list(proof['required_secrets'])
+        if 'FRIDAY_COMPRESSION_API_KEY' not in required: required.append('FRIDAY_COMPRESSION_API_KEY')
+        validate_template(dict(new_template,config=user_cfg,required_secrets=required))
+        prepared=prepare_admin_config_edit(profile_home,user_cfg,required_secrets=required)
+        f.require(prepared is not None and prepared['marker'] is not None,
+            'ordinary_rebind_existing_admitted_onboarding_required')
+        profile=inference_delta(json.loads(saved['FRIDAY-PROFILE.json']['data']),old_bundle['contract'],new_bundle['contract'])
+        before_unchanged();f.require(not os.path.lexists(tx),'ordinary_rebind_consumed_no_retry')
+        tx.mkdir(mode=0o700);stage=tx/'stage';stage.mkdir(mode=0o700)
+        before=tx/'before';before.mkdir(mode=0o700)
+        # Intent is consumed before any staging/publication. A failed
+        # preparation is retained, never re-executed under a new clock.
+        write(tx/'intent.json',encoded({'schema':REBIND_SCHEMA,'state':'CONSUMED_NO_RETRY',
+            'request_sha256':f.digest(request_state['data']),'seconds':request['seconds'],
+            'previous_input':request['previous_input'],'current_input':request['current_input'],
+            'before':{n:{'sha256':f.digest(v['data']),'mode':v['mode']} for n,v in saved.items()},
+            'consumers_started':False,'workers_enabled':False,'database_changed':False}),0o400)
+        sync_directory(tx);sync_directory(tx.parent)
+        owned={}
+        try:
+            for name,state in saved.items():
+                private_parents(before,name);write(before/name,state['data'])
+            for prefix,cfg in (('',root_cfg),(user_prefix,user_cfg)):
+                private_parents(stage,prefix+'config.yaml')
+                # Fresh private staging destination: complete afterimage
+                # through the native atomic writer, no omission bypass.
+                atomic_config_write(stage/prefix/'config.yaml',cfg)
+                f.require(safe_load(f.owned_file(stage/prefix/'config.yaml',private=True))==cfg,
+                    'ordinary_rebind_staged_configuration_changed')
+                original=saved[prefix+'.env']['data']
+                selected=inference_primary_reference(request['primary_credentials']['user' if prefix else 'root'])
+                write(stage/prefix/'.env',inference_env_after(original,selected));del selected
+            stage_user=stage/user_prefix
+            write(stage_user/user.ONBOARDING,saved[proof_name]['data'])
+            write(stage_user/user.MARKER,saved[user_prefix+user.MARKER]['data'])
+            finish_admin_config_edit(stage_user,prepared)
+            write(stage/'FRIDAY-PROFILE.json',encoded(profile))
+            updated=copy.deepcopy(marker)
+            updated['input_sha256']=request['current_input']['sha256']
+            updated['profile_files']['config.yaml']=f.digest(f.owned_file(stage/'config.yaml',private=True))
+            updated['profile_files']['FRIDAY-PROFILE.json']=f.digest(f.owned_file(stage/'FRIDAY-PROFILE.json',private=True))
+            phase=updated['ordinary_gateway']
+            phase['profile_sha256']=updated['profile_files']['FRIDAY-PROFILE.json']
+            # Effective native config includes defaults; raw-YAML hashing
+            # would differ from the exact ordinary check on restart.
+            from hermes_cli.config_effective import load_user_config_effective
+            phase['configuration_sha256']=normalized_configuration(load_user_config_effective(stage/'config.yaml',fail_closed=True))
+            phase['credential_files']['.env']=credential_identity(stage)[0]
+            phase['operator_entry']['input']=request['current_input']
+            write(stage/f.MARKER,encoded(updated))
+            staged={name:update_file_state(stage/name) for name in saved}
+            f.require(all(v is not None and v['mode']==0o600 for v in staged.values()),
+                'ordinary_rebind_complete_private_stage_required')
+            # Native split admission and root contract validation before
+            # replacing the first durable live file. No test receipt can
+            # substitute for these real native configuration validators.
+            from hermes_cli.friday_credential_admission import local_route,profile_policy
+            local_route(root_cfg);local_route(user_cfg);profile_policy(stage,root_cfg)
+            # Bytes were fsynced by write(); retain all nested directory entries
+            # durably before replacing the first existing deployment file.
+            for durable_root in (before,stage):
+                for directory in sorted((p for p in durable_root.rglob('*') if p.is_dir()),
+                        key=lambda p:len(p.parts),reverse=True):
+                    f.directory(directory);sync_directory(directory)
+                sync_directory(durable_root)
+            sync_directory(tx)
+            before_unchanged()
+            order=['.env',user_prefix+'.env','config.yaml',user_prefix+'config.yaml',
+                'FRIDAY-PROFILE.json',proof_name,user_prefix+user.MARKER,f.MARKER]
+            for name in order:
+                retained_unchanged();budget.check(reserve=15)
+                f.require(all(same_update_file(home/n,owned.get(n,v)) for n,v in saved.items()),
+                    'ordinary_rebind_publication_cas_changed')
+                f.require(same_update_file(stage/name,staged[name]),'ordinary_rebind_stage_identity_changed')
+                publish_update_file(home/name,staged[name]['data'],saved[name]['mode'],saved[name],owned,name)
+            retained_unchanged();check(home,role=False)
+            settings=root_cfg['plugins']['entries']['friday_rework']['settings']
+            bindings=[b for b in settings['user_isolation']['bindings'] if b['runtime_profile']==request['profile']]
+            f.require(len(bindings)==1,'ordinary_rebind_single_existing_binding_required')
+            binding=bindings[0];principal=tuple(binding[k] for k in ('platform','transport_profile','account_id','user_id'))
+            from hermes_cli.friday_product_access import current_access,principal_id
+            with user.authority(home): row=current_access()['users'][principal_id(*principal)]
+            f.require(row['enabled'] is True and row['role']=='user','ordinary_rebind_original_user_disabled')
+            info=profile_home.stat()
+            with user.authority(profile_home):
+                user.UserScope(home,profile_home,request['profile'],principal,dict(binding),
+                    (info.st_dev,info.st_ino),row['generation']).check()
+            budget.call(f.inspect,current,request['current_input']['sha256'])
+            retained_unchanged()
+            f.require(all(same_update_file(home/n,owned[n]) for n in saved),
+                'ordinary_rebind_commit_identity_changed')
+            result={'state':'EXACT_INFERENCE_REBOUND_CONSUMERS_STOPPED_NOT_RUNTIME_ACCEPTED',
+                'ready':False,'workers_enabled':False,'consumers_started':False,'database_changed':False,
+                'after':{n:f.digest(v['data']) for n,v in staged.items()}}
+            write(tx/'committed.json',encoded(result),0o400);sync_directory(tx)
+            return result
+        except BaseException as original_error:
+            try:
+                # Retain original finite custody and budget. If their
+                # proof fails, preserve the primary error and stop closed.
+                native_prove();build_prove();lock_prove();directories_unchanged()
+                restore_update_files(home,saved,owned)
+                f.require(all(same_update_file(home/n,v) for n,v in retained.items())
+                    and all(same_update_file(p,v) for p,v in external.items()),
+                    'ordinary_rebind_rollback_retained_state_changed')
+                check(home,role=False)
+                write(tx/'rolled-back.json',encoded({'state':'ROLLED_BACK_CONSUMED_NO_RETRY',
+                    'consumers_started':False,'database_changed':False}),0o400);sync_directory(tx)
+            except BaseException as restoration:
+                from scripts.dsh_prepare import StopUnconfirmed
+                f.remember_secondary(original_error,restoration)
+                raise StopUnconfirmed('ordinary inference rebind rollback requires reconciliation') from original_error
+            raise
+
+
 def recovery_main():
     """Dedicated maintenance dispatch; the ordinary installer phases stay unchanged."""
     import sys
@@ -2026,17 +2502,21 @@ def recovery_main():
     if str(root) not in sys.path: sys.path.insert(0,str(root))
     f = api(); started = time.monotonic()
     parser = f.SafeParser(description=__doc__,allow_abbrev=False)
-    parser.add_argument('phase',choices=('recover-first-contact-config',))
+    parser.add_argument('phase',choices=('recover-first-contact-config','rebind-inference'))
     parser.add_argument('--request',required=True,type=Path)
     args = parser.parse_args(); os.umask(0o077)
     try:
         request = f.read_json(args.request)
         from scripts.install_containment import Budget
         budget = Budget(request.get('seconds'),started=started)
-        result = recover_first_contact_config(request,args.request,budget)
+        result = (rebind_inference(request,args.request,budget) if args.phase=='rebind-inference'
+            else recover_first_contact_config(request,args.request,budget))
         print(json.dumps(result,sort_keys=True))
     except Exception as exc:
-        f.exit_retaining_cause(parser,2,exc,'recover-first-contact-config')
+        from scripts.dsh_prepare import StopUnconfirmed
+        if args.phase=='rebind-inference' and isinstance(exc,StopUnconfirmed):
+            f.exit_retaining_cause(parser,3,exc,args.phase)
+        f.exit_retaining_cause(parser,2,exc,args.phase)
 
 
 if __name__ == '__main__':

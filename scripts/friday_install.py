@@ -340,7 +340,7 @@ def spec_checked(value, *, cli_only=False):
             and isinstance(containment['sha256'], str)
             and re.fullmatch('[0-9a-f]{64}', containment['sha256']),
             'explicit_system_bubblewrap_pin_required')
-    require(set(product) == {'profile', 'inference', 'web', 'dashboard', 'accounts', 'runtime'} | ({'a0_deployment'} if 'a0_deployment' in product else set()),
+    require(set(product) == {'profile', 'inference', 'web', 'dashboard', 'accounts', 'runtime'} | (set(product) & {'a0_deployment','compression_inference','compression_multipass'}),
             'explicit_normal_product_required')
     if 'a0_deployment' in product:
         spec = importlib.util.spec_from_file_location('_friday_a0_profile_validator', ROOT / 'plugins/friday_rework/adapters/a0_profile.py')
@@ -348,15 +348,24 @@ def spec_checked(value, *, cli_only=False):
         spec.loader.exec_module(profile_validator)
         deployment = profile_validator.checked_profile(product['a0_deployment'])
         selected = product['inference']
+        expected_key = 'FRIDAY_LLM_API_KEY'
+        if (product.get('compression_inference') is not None
+                and type(product['runtime']) is dict and set(product['runtime'])=={'enabled'}
+                and product['runtime']['enabled'] is False):
+            # Existing legacy A0 declarations remain inactive and byte-exact.
+            # Their old27B chat is compared to the explicit preserved role.
+            selected = product['compression_inference']
+            expected_key = 'FRIDAY_COMPRESSION_API_KEY'
         chat = deployment['chat']
         require(chat['endpoint'] == selected['base_url'] and chat['model'] == selected['model']
                 and chat['context_length'] == selected['context']
                 and chat['max_output_tokens'] == selected['main_output']
-                and selected['key_env'] == 'FRIDAY_LLM_API_KEY', 'a0_product_inference_profile_mismatch')
+                and selected['key_env'] == expected_key, 'a0_product_inference_profile_mismatch')
     if 'worker_install' in value:
         from scripts.worker_install import settings
         settings(value, cli_only=cli_only)
-    build_config(**product['inference'])
+    build_config(**product['inference'], compression_inference=product.get('compression_inference'),
+                 compression_multipass=product.get('compression_multipass'))
     require(product['web'].get('profile') in ('exa-paid','exa-keyless')
             and set(product['web']) == {'profile', 'extract_char_limit', 'extract_timeout'}
             and all(product['web'][k] is not None for k in ('extract_char_limit', 'extract_timeout')),

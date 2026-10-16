@@ -67,6 +67,25 @@ current template/tokenizer identities must be resolved before a live cutover.
 The product remains on its existing 27B route while Spark is unavailable;
 offline fixtures do not establish installed or Telegram acceptance.
 
+For the existing receiving home and its `dest_telegram` profile, the ordinary
+updater's separate `rebind-inference` action applies a reviewed route change
+after the matching source update. It preserves each home's old primary key in
+its own compression slot before replacing that home's primary slot from an
+explicit protected reference. Unrelated credentials, access, conversation data,
+personality, settings and consumed worker records remain in place. Existing
+native onboarding prepares and reseals the user proof; ordinary chat needs no
+per-message migration or developer admission file. The action refuses an
+unexpected template inventory or existing credential pool rather than guessing
+how to migrate it. Its durable beforeimages and ownership checks support
+rollback; an uncertain cleanup is reported as `STOP_UNCONFIRMED`, not success
+or permission to repeat the operation.
+
+With an explicit split and exactly `runtime: {"enabled": false}`, the existing
+inactive A0 deployment may retain its validated 27B declaration when it matches
+the preserved compressor's route and capacity. This does not run A0 or grant it
+the compression credential. Enabled workers and profiles without a split retain
+the existing primary-route compatibility gate and require their own admission.
+
 A profile can also supply `runtime: {"enabled": true, "workers": {"dsh":
 <existing DSH runtime>, "a0": <existing A0 runtime>}}`. Each child keeps its
 own exact deployment receipt, limits and exclusive workspace/staging/cache

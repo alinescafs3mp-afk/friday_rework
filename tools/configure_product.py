@@ -173,10 +173,18 @@ def compose_product(spec):
         from plugins.friday_rework.adapters.a0_profile import checked_profile
         deployment = checked_profile(spec['a0_deployment'])
         chat = deployment['chat']
-        if (chat['endpoint'] != config['model']['base_url'] or chat['model'] != inference['model']
-                or chat['context_length'] != inference['context']
-                or chat['max_output_tokens'] != inference['main_output']
-                or inference['key_env'] != 'FRIDAY_LLM_API_KEY'):
+        a0_inference = inference
+        expected_key = 'FRIDAY_LLM_API_KEY'
+        if (compression is not None and type(runtime) is dict and set(runtime)=={'enabled'}
+                and runtime['enabled'] is False):
+            # Preserve inactive legacy A0 declaration, including embeddings and
+            # utility: it describes the explicitly retained27B role only.
+            a0_inference = compression
+            expected_key = 'FRIDAY_COMPRESSION_API_KEY'
+        if (chat['endpoint'] != a0_inference['base_url'] or chat['model'] != a0_inference['model']
+                or chat['context_length'] != a0_inference['context']
+                or chat['max_output_tokens'] != a0_inference['main_output']
+                or a0_inference['key_env'] != expected_key):
             raise ValueError('a0_product_inference_profile_mismatch')
         config['a0_deployment'] = deployment
     config['auth'] = {'adopt_external_logins': False}
