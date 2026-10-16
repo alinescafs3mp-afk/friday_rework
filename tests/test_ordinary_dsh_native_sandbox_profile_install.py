@@ -1,4 +1,4 @@
-"""Offline Native73 DSH supported sandbox profile source transaction, real Git patch parser and owned publication.
+"""Offline Native73 pending two-file sandbox/privacy-result maintenance transaction, real Git patch parser and owned publication.
 
 Native identity/config checks use finite synthetic source; no service, worker,
 registration, model or installed runtime is executed. Recursive consumed-history checks use pinned synthetic requests and journals;
@@ -63,10 +63,11 @@ def installed(tmp_path,monkeypatch):
     previous=copy.deepcopy(oldvalue);prevref=oldref
     rows=[];patches=[];files={}
     for name in sorted(o.DSH_SANDBOX_FILES):
-        before=b'# existing native dialogue continuation\n'
+        before=(b'# existing native privacy-result carrier\n' if name=='gateway/run_turn_runner.py'
+                else b'# existing native dialogue continuation\n')
         after=before+b'# reviewed Native73\n'
         put(source/name,before,0o644)
-        oldproject[name]=put(root/name,before)['sha256']
+        if name in oldproject:oldproject[name]=put(root/name,before)['sha256']
         files[name]={'sha256':f.digest(before),'bytes':len(before),'mode':'100644'}
         rows.append({'path':name,'before_sha256':f.digest(before),'sha256':f.digest(after),
                      'bytes':len(after),'mode':'100644','new_file':False})
@@ -158,7 +159,7 @@ def installed(tmp_path,monkeypatch):
     return locals()
 
 
-def test_source73_exact_one_file_retains_72_layers_and_consumed_state(installed,monkeypatch):
+def test_source73_exact_two_files_retains_72_layers_and_consumed_state(installed,monkeypatch):
     s=installed;before=snapshot(s['home']);receipt=copy.deepcopy(s['receipt']);marker=copy.deepcopy(s['marker'])
     # v26 must never re-enter the one-off worker declaration bridge.
     def no_bridge(*args):raise AssertionError('v26 must not replay worker publication')
@@ -183,10 +184,10 @@ def test_source73_exact_one_file_retains_72_layers_and_consumed_state(installed,
     for name,state in before.items():
         if (name.startswith(('preparation/','plugins/'))) or name in ('config.yaml','FRIDAY-PROFILE.json','hermes-agent/.hermes/bin/hermes'):
             assert after_snapshot[name]==state
-    assert {row['path'] for row in s['rows']}==o.DSH_SANDBOX_FILES=={'tools/render_dsh_local.py'}
-    assert len(s['rows'])==1 and updated['plugin_files']==marker['plugin_files']
+    assert {row['path'] for row in s['rows']}==o.DSH_SANDBOX_FILES=={'tools/render_dsh_local.py','gateway/run_turn_runner.py'}
+    assert len(s['rows'])==2 and updated['plugin_files']==marker['plugin_files']
     tx=s['home']/'preparation'/('ordinary-source-update-'+s['request']['previous_input']['sha256'])
-    assert len([p for p in tx.rglob('*') if p.is_file()])==7
+    assert len([p for p in tx.rglob('*') if p.is_file()])==9
     for row in s['rows']:
         path=s['source']/row['path'];assert f.digest(path.read_bytes())==row['sha256']
         assert stat.S_IMODE(path.stat().st_mode)==0o644
@@ -289,7 +290,7 @@ def test_real_git_parser_refuses_unlisted_patch_target_before_journal(installed)
     assert snapshot(s['home'])==before
 
 
-@pytest.mark.parametrize('publication',list(range(1,5)))
+@pytest.mark.parametrize('publication',list(range(1,6)))
 def test_failed_publication_restores_exact_owned_bytes_and_consumes_retry(installed,monkeypatch,publication):
     s=installed;before=snapshot(s['home']);original=o.publish_update_file;count=0
     def fail(*args):
@@ -363,8 +364,9 @@ def test_coherently_pinned_manifest_cannot_expand_scope(installed,fault):
     assert snapshot(s['home'])==before
 
 
-def test_changed_native_beforeimage_mode_is_refused_before_journal(installed):
-    s=installed;(s['source']/s['rows'][0]['path']).chmod(0o700);before=snapshot(s['home'])
+@pytest.mark.parametrize('native',sorted(o.DSH_SANDBOX_FILES))
+def test_changed_native_beforeimage_mode_is_refused_before_journal(installed,native):
+    s=installed;(s['source']/native).chmod(0o700);before=snapshot(s['home'])
     with pytest.raises(ValueError,match='ordinary_update_beforeimage_mode_required'):
         o.update(s['request'],s['requestpath'],Budget(180))
     assert snapshot(s['home'])==before
@@ -395,7 +397,7 @@ def test_consumed_final_validation_failures_restore_owned_set(installed,monkeypa
     s=installed;before=snapshot(s['home']);calls=0
     if point=='afterimage':
         bad=b'coherently pinned incorrect afterimage\n'
-        s['manifest']['files'][0].update(sha256=f.digest(bad),bytes=len(bad))
+        next(row for row in s['manifest']['files'] if row['path']=='tools/render_dsh_local.py').update(sha256=f.digest(bad),bytes=len(bad))
         s['current']['project_files']['tools/render_dsh_local.py']=put(s['root']/'tools/render_dsh_local.py',bad)['sha256']
         ref=doc(s['root']/o.DSH_SANDBOX_MANIFEST,s['manifest'])
         s['current']['project_files'][o.DSH_SANDBOX_MANIFEST]=ref['sha256']
@@ -482,3 +484,42 @@ def test_operational_identity_cannot_change_in_source_repair(installed,field):
     with pytest.raises(ValueError,match='ordinary_update_operational_settings_changed'):
         o.update(s['request'],s['requestpath'],Budget(180))
     assert snapshot(s['home'])==before
+
+
+def test_manifest_row_order_preserves_renderer_project_coupling(installed):
+    s=installed;s['manifest']['files'].reverse()
+    ref=doc(s['root']/o.DSH_SANDBOX_MANIFEST,s['manifest'])
+    s['current']['project_files'][o.DSH_SANDBOX_MANIFEST]=ref['sha256']
+    s['request']['current_input']=doc(Path(s['request']['current_input']['path']),s['current'])
+    doc(s['requestpath'],s['request'])
+    result=o.update(s['request'],s['requestpath'],Budget(180))
+    assert result['workers_enabled'] is result['gateway_started'] is False
+    assert len(s['current']['project_files'])==214
+    for row in s['rows']:assert f.digest((s['source']/row['path']).read_bytes())==row['sha256']
+
+
+def test_carrier_cannot_be_added_as_project_pin(installed):
+    s=installed;name='gateway/run_turn_runner.py'
+    s['current']['project_files'][name]=put(s['root']/name,b'foreign project pin\n')['sha256']
+    s['request']['current_input']=doc(Path(s['request']['current_input']['path']),s['current'])
+    doc(s['requestpath'],s['request']);before=snapshot(s['home'])
+    with pytest.raises(ValueError,match='ordinary_update_only_reviewed_source_required'):
+        o.update(s['request'],s['requestpath'],Budget(180))
+    assert snapshot(s['home'])==before
+
+
+def test_carrier_wrong_afterimage_restores_both_native_files_after_consumption(installed):
+    s=installed;before=snapshot(s['home']);bad=b'coherently pinned wrong carrier output\n'
+    next(row for row in s['manifest']['files'] if row['path']=='gateway/run_turn_runner.py').update(sha256=f.digest(bad),bytes=len(bad))
+    ref=doc(s['root']/o.DSH_SANDBOX_MANIFEST,s['manifest'])
+    s['current']['project_files'][o.DSH_SANDBOX_MANIFEST]=ref['sha256']
+    s['request']['current_input']=doc(Path(s['request']['current_input']['path']),s['current'])
+    doc(s['requestpath'],s['request'])
+    with pytest.raises(ValueError,match='ordinary_update_patch_output_changed'):
+        o.update(s['request'],s['requestpath'],Budget(180))
+    after=snapshot(s['home'])
+    for name,state in before.items():assert after[name]==state
+    tx=s['home']/'preparation'/('ordinary-source-update-'+s['request']['previous_input']['sha256'])
+    assert f.read_json(tx/'rolled-back.json')['state']=='ROLLED_BACK_OWN_SOURCE_ONLY_NO_RETRY'
+    assert not (tx/'committed.json').exists()
+    with pytest.raises(ValueError):o.update(s['request'],s['requestpath'],Budget(180))

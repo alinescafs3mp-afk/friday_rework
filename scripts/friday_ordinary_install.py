@@ -43,7 +43,7 @@ SEARCH_RECOVERY_MANIFEST = 'patches/hermes/ordinary-search-recovery-manifest.jso
 SEARCH_RECOVERY_FILES = {'tools/web_tools.py', 'tools/web_tools_truncate.py'}
 
 DSH_SANDBOX_MANIFEST = 'patches/hermes/ordinary-dsh-native-sandbox-profile-manifest.json'
-DSH_SANDBOX_FILES = {'tools/render_dsh_local.py'}
+DSH_SANDBOX_FILES = {'tools/render_dsh_local.py','gateway/run_turn_runner.py'}
 
 CURRENT_TURN_MANIFEST = 'patches/hermes/ordinary-current-turn-compaction-privacy-reply-manifest.json'
 CURRENT_TURN_FILES = set(['agent/bounded_context.py', 'agent/bounded_summary_output.py', 'agent/context_compressor.py', 'agent/turn_context.py', 'agent/turn_context_compaction.py', 'agent/turn_finalizer.py', 'gateway/run_turn.py', 'hermes_cli/friday_user_scope.py'])
@@ -807,7 +807,7 @@ def update_inputs(request, budget):
         and all(new[name] == pin for name,pin in old.items()
                 if name not in (({'scripts/friday_ordinary_install.py'} if source50 or source51 or source52 or source53 or source54 or source55 or source56 or source57 or source58 or source59 or source60 or source61 or source62 or source63 or source64 or source65 or source66 or source67 or source68 or source69 or source70 or source71 or source72 or source73 else {'scripts/friday_install.py','scripts/friday_ordinary_install.py'}) |
                                 ({'scripts/friday_start.py'} if source48 or source54 else set()) |
-                                (DSH_SANDBOX_FILES if source73 else set()) |
+                                ({'tools/render_dsh_local.py'} if source73 else set()) |
                                 (CONTEXT_SELF_PLUGIN_FILES if source71 else TOOL_METADATA_PLUGIN_FILES if source65 else WORKER_TOOLS_PLUGIN_FILES if source63 else BROWSER_PLUGIN_FILES if source55 else WORKER_ATTACH_PLUGIN_FILES if source49 else set()))),
         'ordinary_update_only_reviewed_source_required')
     f.require(manifest.get('base_commit') == receipt['commit']
@@ -869,8 +869,8 @@ def update_inputs(request, budget):
         checked_plugin_inventory(home, before_plugins)
     if source73:
         f.require(len(old) == 212 and len(new) == 214 and set(receipt['files']) >= DSH_SANDBOX_FILES
-            and old['tools/render_dsh_local.py'] == rows[0]['before_sha256']
-            and new['tools/render_dsh_local.py'] == rows[0]['sha256'],
+            and all(old[row['path']] == row['before_sha256'] and new[row['path']] == row['sha256']
+                for row in rows if row['path'] == 'tools/render_dsh_local.py'),
             'ordinary_update_exact_dsh_sandbox_delta_required')
     if source72:
         f.require(len(old) == 210 and len(new) == 212 and set(receipt['files']) >= CURRENT_TURN_FILES,

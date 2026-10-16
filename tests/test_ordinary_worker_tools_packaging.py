@@ -17,8 +17,12 @@ ROWS={r['path']:r for r in MANIFEST['files']}
 SANDBOX_MANIFEST=ROOT/'patches/hermes/ordinary-dsh-native-sandbox-profile-manifest.json'
 if SANDBOX_MANIFEST.is_file():
     sandbox_rows=json.loads(SANDBOX_MANIFEST.read_text())['files']
-    assert len(sandbox_rows)==1
-    sandbox_row=sandbox_rows[0]
+    expected_before={'tools/render_dsh_local.py':ROWS['tools/render_dsh_local.py']['sha256']}
+    if len(sandbox_rows)==2:
+        expected_before['gateway/run_turn_runner.py']='0d3c581cdb61bd2da8faedfa798f2419b7c8e59dfcc105ce5b259442db50e11e'
+    assert len(sandbox_rows)==len(expected_before)
+    assert {r['path']:r['before_sha256'] for r in sandbox_rows}==expected_before
+    sandbox_row=next(r for r in sandbox_rows if r['path']=='tools/render_dsh_local.py')
     assert sandbox_row['path']=='tools/render_dsh_local.py'
     assert sandbox_row['before_sha256']==ROWS['tools/render_dsh_local.py']['sha256']
     ROWS[sandbox_row['path']]=sandbox_row
