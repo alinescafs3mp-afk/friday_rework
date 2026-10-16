@@ -1,0 +1,294 @@
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -2248,15 +2248,9 @@
+         # "contains item with unknown key name"); it stays on user/assistant.
+         if api_msg.get("role") == "tool":
+             api_msg.pop("name", None)
+-        # api_content holds the exact bytes the main loop sent; substituting (not popping)
+-        # keeps the summary's prefix identical instead of re-prefilling the largest context.
+-        # Strict OpenAI-compatible gateways (Fireworks-backed OpenCode Go, Mistral, Moonshot/Kimi) reject
+-        # any message key outside the Chat Completions schema. The main loop drops these via
+-        # ChatCompletionsTransport.convert_messages(), but the summary path hand-builds messages and calls
+-        # chat.completions.create() directly, bypassing the transport — so mirror that sanitization here:
+-        # tool_name (SQLite FTS bookkeeping), the codex_* reasoning carriers, timestamp (preserved on
+-        # gateway user replay entries for the stale-confirmation expiry check — #47868 rejection class), and
+-        # every Hermes-internal underscore-prefixed scaffolding key.
++        # Replay api_content's exact sent bytes to keep the main/summary prefix identical.
++        # This direct SDK path bypasses ChatCompletionsTransport; mirror its cleanup
++        # of persistence/Codex/timestamp/underscore fields rejected by strict providers.
+         substitute_api_content(api_msg)
+         if needs_sanitize:
+             agent._sanitize_tool_calls_for_strict_api(api_msg, model=sanitize_model)
+@@ -2301,11 +2295,15 @@
+     api_messages = [_clone_message_for_send(m) for m in api_messages]
+     _sanitize_messages_surrogates(api_messages)
+     from hermes_cli.friday_user_scope import public_identity_request_view
++    from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload
+     api_messages = public_identity_request_view(agent, api_messages)
+     api_messages = [row for row in api_messages if not row.get('_friday_file_context_only')]
+-    for row in api_messages:
++    for idx, row in enumerate(api_messages):
+         for key in _SUMMARY_FOREIGN_MESSAGE_KEYS:
+             row.pop(key, None)
++        # Match the main request after privacy projection has emptied legacy
++        # text/reasoning carriers, without rewriting the stored recovery view.
++        fill_empty_non_final_wire_payload(row, is_final=(idx == len(api_messages) - 1))
+     return api_messages
+ 
+ 
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -1335,10 +1335,6 @@
+         # finish_reason is rejected by strict APIs (e.g. Mistral).
+         api_msg.pop("reasoning", None)
+         api_msg.pop("finish_reason", None)
+-        # Fill empty non-final user/assistant wire copies so the pre-call sanitizer
+-        # stops re-healing and flooding errors.log; durable history is untouched.
+-        # After the reasoning copy so thinking-only turns keep payload.
+-        fill_empty_non_final_wire_payload(api_msg, is_final=(idx == len(canonical_messages) - 1))
+         # _thinking_prefill survives intentionally: the drop pass below needs it.
+         # Strip length-continuation marks; some transports keep underscore keys.
+         api_msg.pop("_length_continuation_fragment", None)
+@@ -1371,7 +1367,11 @@
+     from hermes_cli.friday_user_scope import public_identity_request_view
+     api_messages = public_identity_request_view(agent, api_messages)
+     api_messages = [row for row in api_messages if not row.get('_friday_file_context_only')]
+-    for row in api_messages:
++    for idx, row in enumerate(api_messages):
+         for key in PERSISTENCE_ONLY_MESSAGE_FIELDS:
+             row.pop(key, None)
++        # Privacy projection can empty legacy text/reasoning blocks. Fill only
++        # the final wire copy, after intentionally hidden receipts are removed;
++        # canonical rows and their private recovery evidence stay unchanged.
++        fill_empty_non_final_wire_payload(row, is_final=(idx == len(api_messages) - 1))
+     return api_messages, effective_system
+--- a/agent/turn_request_assembly.py
++++ b/agent/turn_request_assembly.py
+@@ -176,13 +176,17 @@
+ 
+     evict_stale_outbound_tool_images(api_messages)
+ 
+-    # One-time repeated-heal notice goes out via the status/warning callback, NEVER
+-    # appended to messages: the cached prompt prefix stays byte-identical.
++    # Repeated wire-copy repair is an operator diagnostic, not a chat status.
++    # Logs/counters retain it on every surface; only standalone operator CLI may
++    # present it. Drain it even when hidden, without adding to conversation history.
+     try:
+         from agent.agent_runtime_helpers import consume_pending_sanitizer_heal_notice
+ 
+         _heal_notice = consume_pending_sanitizer_heal_notice()
+-        if _heal_notice:
++        from hermes_cli.friday_user_scope import ordinary_presentation
++
++        if (_heal_notice and getattr(agent, "platform", None) == "cli"
++                and not ordinary_presentation(agent)):
+             agent._emit_warning(_heal_notice)
+     except Exception:
+         logger.debug("sanitizer heal notice delivery failed", exc_info=True)
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -1443,8 +1443,11 @@
+         return False
+     if is_file_delivery_observation(row) or row.get('_friday_file_context_only'):
+         return True
+-    if row.get('tool_calls') or any(row.get(key) for key in
+-            ('reasoning', 'reasoning_content', 'reasoning_details', 'codex_reasoning_items', 'codex_message_items')):
++    # Provider-required whitespace pads are not reasoning payload. Counting a
++    # pad as speech prevents receipt removal and makes every send heal it again.
++    reasoning = (row.get(key) for key in
++        ('reasoning', 'reasoning_content', 'reasoning_details', 'codex_reasoning_items', 'codex_message_items'))
++    if row.get('tool_calls') or any(value.strip() if isinstance(value, str) else value for value in reasoning):
+         return False
+     text = row.get('api_content') or row.get('content')
+     if not isinstance(text, str):
+--- a/tools/browser_process_child.py
++++ b/tools/browser_process_child.py
+@@ -219,6 +219,17 @@
+     start = read_line(sys.stdin.buffer)
+     if start.get('start') is not True or start.get('home') != os.environ.get('HERMES_HOME'):
+         raise RuntimeError('browser_native_start_refused')
++    deadline = start['deadline']
++    if type(deadline) not in (int, float) or not math.isfinite(deadline):
++        raise RuntimeError('browser_original_deadline_required')
++    if time.monotonic() >= deadline - 4:
++        raise RuntimeError('browser_original_task_stopped')
++    # Only the host has a dependency generation; the isolated namespace stays
++    # stdlib-only. Do not run source-update completion or dependency install here.
++    from pm.environments import activate_dependencies
++    activate_dependencies(root)
++    if time.monotonic() >= deadline - 4:
++        raise RuntimeError('browser_original_task_stopped')
+     from hermes_cli import friday_user_scope as users
+     value = dict(start['authority'])
+     for key in ('authorization_home', 'home'):
+@@ -227,9 +238,6 @@
+         value[key] = tuple(value[key])
+     cap = users.UserScope(**value); cap.check(); users._CURRENT.set(cap)
+     from tools.browser_public_transport import public_connect, relay
+-    deadline = start['deadline']
+-    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+-        raise RuntimeError('browser_original_deadline_required')
+     stop = threading.Event()
+ 
+     def check():
+--- a/tools/web_process.py
++++ b/tools/web_process.py
+@@ -1,7 +1,77 @@
+ """Ordinary registered web handlers, using the caller-owned native child."""
+ import json
++import logging
+ import os
+ import time
++
++
++logger = logging.getLogger(__name__)
++
++
++def _failure(error, *, detail=None, call=None, cleanup='unknown', process_id=None):
++    # Fixed categories only: raw exceptions/provider bodies can contain credentials
++    # or host paths. The existing private process receipt retains child diagnostics.
++    logger.warning('Web operation failed: category=%s detail=%s cleanup=%s',
++                   error, detail, cleanup)
++    from hermes_cli.friday_user_scope import ordinary_presentation
++    if not ordinary_presentation():
++        result = {'error': error}
++        if error == 'STOP_UNCONFIRMED':
++            result['native_process_id'] = process_id
++        elif detail is not None:
++            result['detail'] = detail
++        return json.dumps(result)
++    message = 'Не удалось проверить сведения в интернете.'
++    if error == 'web_timeout':
++        message = 'Не удалось завершить проверку в интернете за отведённое время.'
++    elif cleanup == 'unconfirmed':
++        message = 'Проверка в интернете не завершена; её остановка пока не подтверждена.'
++    elif detail == 'web_call_stopped':
++        message = 'Проверка в интернете остановлена.'
++    return json.dumps({
++        'error': message,
++        'success': False,
++        'retry_allowed': False,
++        'cleanup': cleanup,
++        'information_verified': False,
++        'guidance': (
++            'Не повторяй веб-запрос и не обходи остановку через другой инструмент '
++            'в этом ходе. Этот сбой не подтверждает запрошенные сведения. '
++            'Кратко объясни пользователю, что сейчас не удалось их проверить. '
++            'Не выдавай сведения из памяти за актуальные или проверенные '
++            'и не сообщай о состоявшейся проверке без полученного источника. '
++            'Ранее независимо проверенные данные сохраняют свою силу; '
++            'текущая актуальность из этого результата не следует.'
++        ),
++    }, ensure_ascii=False)
++
++
++def _provider_failed(value):
++    # Only a proven wholly failed structured result. Successful bytes, including
++    # partial extraction and page text mentioning errors, pass through untouched.
++    try:
++        body = json.loads(value)
++    except (ValueError, TypeError):
++        return False
++    if not isinstance(body, dict):
++        return False
++    rows = body.get('results')
++    # Recovery descriptors and partial pages remain usable evidence, even when a
++    # capacity warning is also present. The partial flag alone proves no source.
++    if body.get('read_file'):
++        return False
++    data = body.get('data')
++    if isinstance(data, dict) and data.get('web'):
++        return False
++    if isinstance(rows, list) and any(
++            isinstance(row, dict) and (not row.get('error') or any(
++                row.get(k) for k in ('content', 'raw_content', 'text', 'read_file')))
++            for row in rows):
++        return False
++    if body.get('success') is False or body.get('error'):
++        return True
++    return (isinstance(rows, list) and bool(rows)
++            and all(isinstance(row, dict) and row.get('error') for row in rows))
+ 
+ 
+ def _scope_payload(home):
+@@ -65,7 +135,7 @@
+             receipt=call.stop()
+             call.turn.stopped.set()
+             if receipt['status']!='QUIESCENT':
+-                return json.dumps({'error':'STOP_UNCONFIRMED','native_process_id':session.id})
++                return _failure('STOP_UNCONFIRMED', call=call, cleanup='unconfirmed', process_id=session.id)
+             raise RuntimeError('web_result_settlement_failed')
+         with call.turn.lock:call.turn.calls.discard(call)
+         if not receipt.get('native_child_exit_zero'):
+@@ -77,19 +147,48 @@
+         if name=='web_search':
+             search_memo.import_query(result['search_memo'],args.get('query',''),args.get('limit',5))
+         call.check()
++        from hermes_cli.friday_user_scope import ordinary_presentation
++        if ordinary_presentation() and _provider_failed(result['value']):
++            from agent.redact import redact_sensitive_text
++            # The child already force-redacts this value. Apply the native
++            # redactor again before keeping bounded private provider diagnostics;
++            # repr escapes control characters instead of creating fake log lines.
++            private = redact_sensitive_text(result['value'], force=True)
++            logger.warning('Private web provider failure: %r%s', private[:2048],
++                           ' [truncated]' if len(private) > 2048 else '')
++            return _failure('web_provider_failed', call=call, cleanup='confirmed')
+         return result['value']
+     except Exception as exc:
++        cleanup = 'unknown'
+         if call is not None:
+-            receipt=call.stop()
+-            if receipt['status']!='QUIESCENT':
++            try:
++                receipt = call.stop()
++                cleanup = 'confirmed' if receipt['status'] == 'QUIESCENT' else 'unconfirmed'
++            except Exception:
++                # A failed cleanup observation cannot prove cessation. Keep the
++                # launch fence latched; ownership/registry records remain intact.
+                 call.turn.stopped.set()
+-                return json.dumps({'error':'STOP_UNCONFIRMED','native_process_id':getattr(call.session,'id',None)})
+-        # Native/provider bodies format their errors themselves. Parent boundary
+-        # exceptions are fixed categories, never argv/input/key/traceback dumps.
+-        return json.dumps({'error':'web_timeout' if isinstance(exc,TimeoutError) else 'web_native_boundary_refused',
+-                           'detail':str(exc) if str(exc) in ('web_caller_context_required','web_original_deadline_required',
+-                             'web_call_stopped','web_systemd_required','web_profile_scope_mismatch','web_profile_scope_required',
+-                             'web_hard_deadline_unavailable','web_hard_deadline_unverified') else type(exc).__name__})
++                return _failure('STOP_UNCONFIRMED', call=call, cleanup='unconfirmed',
++                                process_id=getattr(call.session, 'id', None))
++            if cleanup == 'unconfirmed':
++                call.turn.stopped.set()
++                return _failure('STOP_UNCONFIRMED', call=call, cleanup=cleanup,
++                                process_id=getattr(call.session, 'id', None))
++        # Native/provider bodies retain their own private diagnostics. Never copy
++        # arbitrary exception text into the model-visible failure result.
++        cause = str(exc) if str(exc) in (
++            'web_native_child_failed', 'web_result_invalid', 'web_result_incomplete',
++            'web_result_settlement_failed', 'web_cache_wait_deadline',
++            'web_caller_identity_mismatch', 'web_original_deadline') else type(exc).__name__
++        logger.warning('Private web boundary cause: %s', cause)
++        detail = str(exc) if str(exc) in (
++            'web_caller_context_required', 'web_original_deadline_required',
++            'web_call_stopped', 'web_systemd_required', 'web_profile_scope_mismatch',
++            'web_profile_scope_required', 'web_hard_deadline_unavailable',
++            'web_hard_deadline_unverified') else type(exc).__name__
++        return _failure('web_timeout' if isinstance(exc, TimeoutError)
++                        else 'web_native_boundary_refused', detail=detail,
++                        call=call, cleanup=cleanup)
+     finally:
+         if lock_held:lock.release()
+ 
+--- a/tools/web_process_child.py
++++ b/tools/web_process_child.py
+@@ -26,6 +26,11 @@
+     os.environ['PARALLEL_SEARCH_MODE']=mode
+     from agent.web_call_context import child_deadline
+     child_deadline(data['deadline'])
++    # The parent uses isolated store Python. Activate only its committed
++    # dependencies after trusted input; never run source-install sync here.
++    from pm.environments import activate_dependencies
++    activate_dependencies(Path(__file__).resolve().parents[1])
++    child_deadline(data['deadline'])  # Activation must not reset the original clock.
+     from agent.secret_scope import set_secret_scope,set_multiplex_active
+     from hermes_constants import get_hermes_home
+     set_multiplex_active(True)
