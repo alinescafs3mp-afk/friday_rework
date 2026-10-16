@@ -175,3 +175,63 @@ def test_existing_exclusive_failure_receipt_cannot_be_overwritten(fixture):
         s.join.qualify(s.home,{'runtime_profile':'fixture','tools':[]},1,{'dsh':{},'a0':{}},
             verify=lambda:None,accepted_monotonic=s.original)
     assert (s.home/s.join.FOLDER/'failure.json').read_bytes()==b'original failure evidence\n'
+
+
+@pytest.mark.parametrize('kind,label', [
+    ('host', 'host_unavailable'), ('os', 'os_error'), ('type', 'type_error'),
+    ('json', 'json_decode_error'), ('runtime', 'runtime_error'),
+    ('permission', 'permission_error'), ('missing', 'file_not_found')])
+def test_private_causal_type_and_source_site_are_fixed_not_exception_values(fixture, kind, label):
+    s=fixture
+    exc={'host':s.join.HostUnavailable(SECRET), 'os':OSError(SECRET),
+        'type':TypeError(SECRET), 'json':json.JSONDecodeError(SECRET,SECRET,0),
+        'runtime':RuntimeError(SECRET), 'permission':PermissionError(SECRET),
+        'missing':FileNotFoundError(SECRET)}[kind]
+    p,value=fail(s,exc)
+    location=value['failure_location']
+    assert location['exception_type']==label
+    assert value['qualification_stage']=='dsh_safety'
+    assert location['source_frames'] and location['trace_truncated'] is False
+    assert any(row['module']=='user_worker_join.py' for row in location['source_frames'])
+    assert all(set(row)=={'module','line'} and row['module'] in ('user_worker_join.py','runtime_containment.py')
+        and type(row['line']) is int and row['line']>0 for row in location['source_frames'])
+    assert SECRET not in p.read_text() and str(ROOT) not in p.read_text()
+
+
+def test_post_safety_failure_is_distinguished_from_dsh_and_a0_execution(fixture):
+    s=fixture;s.observers.dsh_safety_observe=lambda *a: {'safety':'fixture'}
+    checks=[]
+    exc=s.join.HostUnavailable(SECRET)
+    def verify():
+        checks.append(True)
+        if len(checks)==2:raise exc
+    with pytest.raises(s.join.HostUnavailable) as caught:
+        s.join.qualify(s.home,{'runtime_profile':'fixture','tools':[]},1,
+            {'dsh':{},'a0':{}},verify=verify,accepted_monotonic=s.original)
+    assert caught.value is exc
+    value=json.loads((s.home/s.join.FOLDER/'failure.json').read_text())
+    assert value['qualification_stage']=='post_safety_verify'
+    assert value['failure_location']['exception_type']=='host_unavailable'
+    assert value['retry_authorized'] is False and value['original_attempt']['started_mono']==s.original
+
+
+def test_unknown_class_metadata_and_untrusted_traceback_filename_are_not_saved(fixture):
+    s=fixture
+    class SensitiveType(type):
+        def __hash__(self):raise RuntimeError(SECRET)
+    class SensitiveSecret(RuntimeError,metaclass=SensitiveType):pass
+    try:
+        exec(compile('raise error',SECRET+'/private.py','exec'),{'error':SensitiveSecret(SECRET)})
+    except SensitiveSecret as exc:
+        location=s.join._failure_location(exc)
+    assert location=={'exception_type':'other','source_frames':[],'trace_truncated':False}
+    assert SECRET not in json.dumps(location) and 'SensitiveSecret' not in json.dumps(location)
+
+
+def test_deep_untrusted_traceback_has_explicit_finite_limit(fixture):
+    def deep(n):
+        if n:deep(n-1)
+        else:raise RuntimeError(SECRET)
+    try:deep(80)
+    except RuntimeError as exc:location=fixture.join._failure_location(exc)
+    assert location=={'exception_type':'runtime_error','source_frames':[],'trace_truncated':True}

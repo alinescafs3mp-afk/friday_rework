@@ -162,15 +162,54 @@ def checked_plan(home, binding, runtimes):
     return ref
 
 
+def _failure_location(exc):
+    """Private causal metadata from fixed types/sites; never values or locals."""
+    import sys
+    known = {HostUnavailable: 'host_unavailable', OSError: 'os_error',
+        PermissionError: 'permission_error', FileNotFoundError: 'file_not_found',
+        RuntimeError: 'runtime_error', TypeError: 'type_error', ValueError: 'value_error',
+        KeyError: 'key_error', IndexError: 'index_error', AssertionError: 'assertion_error',
+        TimeoutError: 'timeout_error', json.JSONDecodeError: 'json_decode_error'}
+    # Do not import new native modules while handling an existing failure.
+    for module, name, label in (
+        ('runtime_process', 'StopUnconfirmed', 'stop_unconfirmed'),
+        ('runtime_process', 'CommandFailed', 'command_failed'),
+        ('runtime_primitives', 'Refused', 'source_refused'),
+        ('adapters.dsh', 'AdapterError', 'dsh_adapter_error')):
+        loaded = sys.modules.get(__package__ + '.' + module)
+        cls = vars(loaded).get(name) if loaded is not None else None
+        if isinstance(cls, type): known[cls] = label
+    # Unknown exception names may themselves contain private input.
+    label = next((label for cls, label in known.items() if type(exc) is cls), 'other')
+    result = {'exception_type': label, 'source_frames': []}
+    root = os.path.dirname(os.path.abspath(__file__))
+    modules = ('user_worker_join.py', 'runtime_observers.py', 'runtime_process.py',
+        'runtime_primitives.py', 'runtime_containment.py', 'host_runtime.py',
+        'worker_provision.py', 'a0_bootstrap.py', 'onboarding.py',
+        'adapters/dsh.py', 'adapters/a0_native.py', 'adapters/a0_profile.py')
+    allowed = {os.path.join(root, name): name for name in modules}
+    tb = BaseException.__traceback__.__get__(exc)
+    for _ in range(64):
+        if tb is None: break
+        module = allowed.get(tb.tb_frame.f_code.co_filename)
+        if module is not None and 0 < tb.tb_lineno < 2**31:
+            result['source_frames'].append({'module': module, 'line': tb.tb_lineno})
+            result['source_frames'] = result['source_frames'][-8:]
+        tb = tb.tb_next
+    result['trace_truncated'] = tb is not None
+    return result
+
+
 def _failure_diagnostic(exc):
     """Fixed error identity and bounded metadata, never arbitrary error text."""
     import math
     from .runtime_process import StopUnconfirmed, CommandFailed, safe_observation
     from .runtime_primitives import Refused
-    if isinstance(exc, StopUnconfirmed): return {'error_kind': 'stop_unconfirmed'}
-    if isinstance(exc, Refused): return {'error_kind': 'source_refused'}
-    if not isinstance(exc, CommandFailed): return {'error_kind': 'internal_error'}
-    result = {'error_kind': 'command_failed', 'command_observation': {}}
+    result = {'failure_location': _failure_location(exc)}
+    if isinstance(exc, StopUnconfirmed): return dict(result, error_kind='stop_unconfirmed')
+    if isinstance(exc, Refused): return dict(result, error_kind='source_refused')
+    if not isinstance(exc, CommandFailed): return dict(result, error_kind='internal_error')
+    result.update(error_kind='command_failed', command_observation={})
     observation = getattr(exc, 'observation', None)
     if type(observation) is not dict: return result
     for key, value in safe_observation(observation).items():
@@ -222,13 +261,19 @@ def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=N
     # A copied live/per-job plan is not authority to adopt an existing probe.
     if (home / PLAN).exists() or (home / PLAN).is_symlink(): checked_plan(home,binding,runtimes)
     folder.mkdir(mode=0o700)
+    stage = 'dsh_safety'
     try:
         scratch = folder / 'dsh-safety'; scratch.mkdir(mode=0o700)
         safety = budget.call(dsh_safety_observe,runtimes['dsh'],home,scratch,budget)
+        stage = 'post_safety_verify'
         verify()
+        stage = 'post_safety_credentials'
         credentials = {n: pin(home / n)['sha256'] if (home / n).exists() else None for n in ('.env','auth.json')}
+        stage = 'a0_probe_prepare'
         probe = InitialProbe(runtimes['a0'], binding, generation, prepared, budget, verify, original_seconds=seconds)
+        stage = 'a0_probe_start'
         with own_probe(probe) as plan:
+            stage = 'a0_probe_plan'
             checked_plan(home, binding, runtimes)
             original = {'schema':'friday.user-worker-qualification.v1','home':str(home),
                 'profile':binding['runtime_profile'],'binding_sha256':scope._fingerprint(binding),'generation':generation,
@@ -236,14 +281,19 @@ def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=N
                 'bootstrap_original':pin(home / 'workers/a0/bootstrap/original.json'),'binding':binding}
             verify()
             _new_file(home / INTENT, (json.dumps(original,sort_keys=True)+'\n').encode())
+            stage = 'a0_observe'
             a0 = budget.call(a0_observe, runtimes['a0'], plan, budget, probe_owner=probe)
             verify()
+            stage = 'a0_probe_cleanup'
+        stage = 'a0_custody'
         custody = checked_custody(home, binding, generation, prepared, plan)
         # Native cessation precedes Harness observations/readiness publication;
         # both observations still consume the SAME original setup deadline.
+        stage = 'dsh_observe'
         scratch = folder / 'dsh-probe'; scratch.mkdir(mode=0o700)
         dsh = budget.call(dsh_observe, runtimes['dsh'], home, scratch, budget)
         dsh['safety'] = safety
+        stage = 'post_observation_verify'
         verify()
         for kind, ref in prepared.items(): preparation(home,binding['runtime_profile'],kind,ref)
         budget.call(sources)
@@ -256,8 +306,10 @@ def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=N
             'effects':'OBSERVATION_ONLY','per_job_authority':'NOT_GRANTED',
             'observed':{'boot_id':boot,'monotonic':time.monotonic(),'unix':time.time()}}
         from .host_runtime import deployment_observations
+        stage = 'deployment_proof'
         for c in runtimes.values(): budget.call(deployment_observations,c,proof,claim,folder)
         verify(); budget.call(_new_file,home / PROOF,(json.dumps(proof,sort_keys=True)+'\n').encode())
+        stage = 'readiness_receipts'
         for kind,c in runtimes.items():
             verify(); receipt=readiness_receipt(c,[prepared[kind],pin(home / PROOF)])
             budget.call(_new_file,Path(c['runtime_receipt']['path']),(json.dumps(receipt,sort_keys=True)+'\n').encode())
@@ -266,7 +318,8 @@ def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=N
     except BaseException as exc:
         from .runtime_process import StopUnconfirmed
         failure={'state':'STOP_UNCONFIRMED' if isinstance(exc,StopUnconfirmed) else 'REFUSED_OR_UNCERTAIN',
-            'original_attempt':claim,'retry_authorized':False,'a0_probe_cleanup':'OWN_INITIAL_PROBE_CUSTODY'}
+            'original_attempt':claim,'retry_authorized':False,'a0_probe_cleanup':'OWN_INITIAL_PROBE_CUSTODY',
+            'qualification_stage':stage}
         try: failure.update(_failure_diagnostic(exc))
         except Exception:
             failure['error_kind'] = 'diagnostic_unavailable'
