@@ -162,6 +162,36 @@ def checked_plan(home, binding, runtimes):
     return ref
 
 
+def _failure_diagnostic(exc):
+    """Fixed error identity and bounded metadata, never arbitrary error text."""
+    import math
+    from .runtime_process import StopUnconfirmed, CommandFailed, safe_observation
+    from .runtime_primitives import Refused
+    if isinstance(exc, StopUnconfirmed): return {'error_kind': 'stop_unconfirmed'}
+    if isinstance(exc, Refused): return {'error_kind': 'source_refused'}
+    if not isinstance(exc, CommandFailed): return {'error_kind': 'internal_error'}
+    result = {'error_kind': 'command_failed', 'command_observation': {}}
+    observation = getattr(exc, 'observation', None)
+    if type(observation) is not dict: return result
+    for key, value in safe_observation(observation).items():
+        valid = False
+        if key in ('timeout', 'reaped', 'namespace_init_exit_verified'):
+            valid = type(value) is bool
+        elif key == 'returncode':
+            valid = type(value) is int and -(2**31) <= value < 2**31
+        elif key in ('stdout_bytes', 'stderr_bytes', 'starttime_ticks'):
+            valid = type(value) is int and 0 <= value < 2**63
+        elif key == 'pid':
+            valid = type(value) is int and 0 < value < 2**31
+        elif key == 'elapsed_seconds':
+            valid = type(value) in (int, float) and 0 <= value <= 86400 and math.isfinite(value)
+        elif key in ('stdout_sha256', 'stderr_sha256'):
+            valid = type(value) is str and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
+        # Refused.reason and observation.reason can contain arbitrary identifiers.
+        if valid: result['command_observation'][key] = value
+    return result
+
+
 def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=None):
     """One explicit owning-host action, reusing both complete native observers."""
     from .onboarding import _new_file
@@ -237,6 +267,9 @@ def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=N
         from .runtime_process import StopUnconfirmed
         failure={'state':'STOP_UNCONFIRMED' if isinstance(exc,StopUnconfirmed) else 'REFUSED_OR_UNCERTAIN',
             'original_attempt':claim,'retry_authorized':False,'a0_probe_cleanup':'OWN_INITIAL_PROBE_CUSTODY'}
+        try: failure.update(_failure_diagnostic(exc))
+        except Exception:
+            failure['error_kind'] = 'diagnostic_unavailable'
         try: _new_file(folder / 'failure.json',(json.dumps(failure,sort_keys=True)+'\n').encode())
         except OSError: pass
         raise
