@@ -21,9 +21,7 @@ from scripts import friday_install as f
 from scripts import dsh_prepare  # Load trusted baseline validator before synthetic ROOT override.
 from scripts.install_containment import Budget
 
-HERE = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location('ordinary79_candidate', HERE/'scripts/friday_ordinary_install.py')
-o = importlib.util.module_from_spec(spec);spec.loader.exec_module(o)
+from scripts import friday_ordinary_install as o
 
 
 def put(path,data,mode=0o600):
@@ -55,7 +53,7 @@ def installed(tmp_path,monkeypatch):
                  'plugins/friday_rework/unchanged.py','plugins/friday_rework/adapters/dsh.py','plugins/friday_rework/artifacts.py','plugins/friday_rework/results.py'):
         oldproject[name]=put(root/name,b'# old source\n')['sha256']
     for n in range(39):
-        name=f'plugins/friday_rework/retained-{n}.py';oldproject[name]=put(root/name,b'# retained plugin\n')['sha256']
+        name=('plugins/friday_rework/runtime_containment.py','plugins/friday_rework/runtime_process.py')[n] if n < 2 else f'plugins/friday_rework/retained-{n}.py';oldproject[name]=put(root/name,b'# retained plugin\n')['sha256']
     for n in range(227-len(oldproject)):
         name=f'config/unchanged-{n}.txt';oldproject[name]=put(root/name,b'preserved\n')['sha256']
     oldvalue={'home':str(home),'project_files':oldproject,'product':{'runtime':{'enabled':False}},
