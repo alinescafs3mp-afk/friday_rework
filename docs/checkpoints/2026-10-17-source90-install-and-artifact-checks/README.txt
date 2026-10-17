@@ -21,6 +21,25 @@ Its exact cause is still under diagnosis; the source installation remains
 committed, and consumers remain stopped. A separate read-only full warm
 preflight passed, which does not establish the cause of that earlier refusal.
 
+Later read-only diagnostics narrowed a real cache-verifier defect. Standalone
+warm preflight and a helper-import context passed; adding the gateway imports
+caused the same verifier to refuse an unchanged ruamel.yaml cache. A separate
+clean compiler process matched that cache in full. Holding nested compiled
+objects changed serialization, and releasing them restored equality. These
+observations reproduce a false refusal but do not recover the hidden exception
+message from the original PM parent. The diagnostic imports attempted directory
+creation and permission changes; the audit guard blocked those attempts.
+
+Separate recovery-control source now retains safe failure stage/reason evidence
+and separates the committed Source operation from a future corrected PM operation.
+Its merged source passed independent review. On the existing SDK, 64 scope
+controls and 18 failure-observation tests passed in disposable fixtures. One
+initial test assumed the host would fail the SDK prerequisite; the actual SDK
+correctly passed it. An explicit wrong-interpreter fixture corrected that test
+without changing production source; the initial failure remains recorded.
+Recovery stays disabled until the compiler launcher is connected to both cache
+consumers and the final package is reviewed. No new PM clock or call was issued.
+
 Two original portable validation functions capture problems found during this
 work. The inventory check preserves the observed permission mode and checks the
 Git executable bit: 100644 permits a preserved 0600 file as well as 0644. It still
@@ -29,6 +48,10 @@ check compares the entire payload to exact-source compile serializations,
 including an explicit owning-reference form needed by CPython 3.14. It never
 loads untrusted marshal data or executes compiled source. Filename provenance,
 PYC headers, ownership, links and race protection remain caller obligations.
+The owning-reference variant handles one representation difference, but nested
+ownership still affects serialization. A false return is inconclusive and must
+not be reported as altered source or corrupt cached code. This prototype is not
+a complete cache verifier; a safe production compatibility fix is still pending.
 
 These helpers are an observational source proposal. They are not connected to
 installation or PM and confer no runtime admission. Eleven disposable regression

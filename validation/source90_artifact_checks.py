@@ -16,6 +16,10 @@ def source_compiled_payload_matches(source, filename, payload):
     CPython can serialize references differently depending on object ownership;
     an explicit owning container covers the native FLAG_REF form on CPython 3.14.
     This is an equality check, not a parser for untrusted marshal data.
+    A false result means these serializations did not prove equality. Nested
+    object ownership can change serialization too; false does not prove that
+    source or cached code changed. This helper does not provide complete cache
+    validation across import contexts.
     """
     if type(source) is not bytes or type(payload) is not bytes:
         raise TypeError('source_and_payload_bytes_required')
