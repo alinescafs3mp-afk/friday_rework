@@ -1,0 +1,350 @@
+diff --git a/hermes_cli/friday_user_scope.py b/hermes_cli/friday_user_scope.py
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -20,6 +20,18 @@
+ _ENGAGED = False
+ _DELEGATION = ContextVar('friday_native_delegation', default=None)
+ MARKER = '.friday-user-scope.json'
++_SCOPED_DOCUMENT_EXTENSIONS = frozenset({
++    '.docx', '.pdf', '.odt', '.rtf', '.xlsx', '.ods', '.pptx', '.odp',
++})
++# Shared native binary/document guards cover ordinary containers and media.
++# These additional Office/ODF templates and add-ins are equally opaque, even
++# when no local reader supports them. This is a text-write refusal, not a
++# declaration that their contents can be read, converted or preserved.
++_OPAQUE_OFFICE_EXTENSIONS = frozenset({
++    '.pdf', '.dot', '.dotx', '.dotm', '.xlt', '.xltx', '.xltm', '.xla',
++    '.xlam', '.xlw', '.xlm', '.potx', '.potm', '.sldx', '.sldm',
++    '.odg', '.odf', '.odb', '.odm', '.oth', '.ott', '.ots', '.otp', '.otg',
++})
+ SAFE = frozenset({'memory', 'session_search', 'read_file', 'write_file',
+                   'web_search', 'web_extract', 'friday_work', 'friday_result', 'delegate_task',
+                   'skills_list', 'skill_view', 'skill_manage'})
+@@ -809,7 +821,7 @@
+         cap.check()
+         if name == 'read_file':
+             from hermes_cli import friday_workspace_revision as revision
+-            document_format = path.suffix.lower().lstrip('.') if path.suffix.lower() in {'.docx', '.pdf'} else None
++            document_format = path.suffix.lower().lstrip('.') if path.suffix.lower() in _SCOPED_DOCUMENT_EXTENSIONS else None
+             if document_format:
+                 from tools.read_extract import extract_scoped_document_bytes, ScopedExtractionError
+                 data, _ = workspace_document(str(root / path), max_bytes=1000000)
+@@ -914,7 +926,10 @@
+                 raise ScopeDenied()
+             from hermes_cli.friday_workspace_docx import create
+             return create(cap, fd, parts[-1], path.as_posix(), args.get('content'))
+-        if path.suffix.lower() in {'.docx', '.pdf'}:
++        from tools.binary_extensions import has_binary_extension, has_opaque_document_extension
++        if (path.suffix.lower() in _OPAQUE_OFFICE_EXTENSIONS
++                or has_binary_extension(path.as_posix())
++                or has_opaque_document_extension(path.as_posix())):
+             return json.dumps({'success': False, 'error': 'document_write_unsupported',
+                                'format': path.suffix.lower().lstrip('.')})
+         content = args.get('content')
+diff --git a/tools/read_extract.py b/tools/read_extract.py
+--- a/tools/read_extract.py
++++ b/tools/read_extract.py
+@@ -143,31 +143,163 @@
+         super().__init__(code)
+ 
+ 
++def _validate_office_container(data: bytes, format: str) -> None:
++    """Validate resource/type envelopes, leaving document parsing to anydoc."""
++    expected = {'xlsx': 'xl/workbook.xml', 'pptx': 'ppt/presentation.xml',
++                'odt': 'content.xml', 'ods': 'content.xml', 'odp': 'content.xml'}
++    if format not in expected:
++        if format == 'rtf' and not data.startswith(b'{\\rtf'):
++            raise ScopedExtractionError('format_mismatch')
++        if format == 'pdf' and not data.startswith(b'%PDF-'):
++            raise ScopedExtractionError('format_mismatch')
++        return
++    try:
++        with zipfile.ZipFile(io.BytesIO(data)) as z:
++            infos = z.infolist()
++            if len(infos) > 256:
++                raise ScopedExtractionError('archive_member_limit')
++            names = set()
++            total = 0
++            for info in infos:
++                name = info.filename
++                parts = name.rstrip('/').split('/')
++                mode = info.external_attr >> 16
++                if (not name or info.orig_filename != name or name.startswith('/') or '\\' in name or ':' in name
++                        or any(p in ('', '.', '..') for p in parts) or name in names
++                        or info.flag_bits & 1 or (mode & 0o170000) not in (0, 0o100000, 0o040000)
++                        or info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)):
++                    raise ScopedExtractionError('unsafe_archive_member')
++                names.add(name)
++                total += info.file_size
++                if (info.file_size > 1000000 or total > 8000000
++                        or info.file_size > max(1, info.compress_size) * 200):
++                    raise ScopedExtractionError('archive_expansion_limit')
++                # ZipExtFile trusts advertised uncompressed size, so independently
++                # bound the raw stream before native conversion. This is archive
++                # envelope validation, not an Office document parser.
++                import struct
++                with z.open(info) as member:
++                    member.read(0)  # native ZIP local-name/header validation
++                header = data[info.header_offset:info.header_offset+30]
++                if len(header) != 30:
++                    raise ScopedExtractionError('unsafe_archive_member')
++                fields = struct.unpack('<4s5H3I2H', header)
++                start = info.header_offset + 30 + fields[-2] + fields[-1]
++                end = start + info.compress_size
++                if (fields[0] != b'PK\x03\x04' or fields[3] != info.compress_type
++                        or start < 0 or end > z.start_dir or end > len(data)):
++                    raise ScopedExtractionError('unsafe_archive_member')
++                compressed = data[start:end]
++                if info.compress_type == zipfile.ZIP_DEFLATED:
++                    inflater = zlib.decompressobj(-15)
++                    unpacked = inflater.decompress(compressed, 1000001)
++                    if (len(unpacked) > 1000000 or not inflater.eof
++                            or inflater.unused_data or inflater.unconsumed_tail):
++                        raise ScopedExtractionError('archive_expansion_limit')
++                else:
++                    unpacked = compressed
++                if (len(unpacked) != info.file_size
++                        or zlib.crc32(unpacked) & 0xffffffff != info.CRC):
++                    raise ScopedExtractionError('malformed_or_unsupported')
++            if expected[format] not in names:
++                raise ScopedExtractionError('format_mismatch')
++            if format in ('xlsx', 'pptx'):
++                if '[Content_Types].xml' not in names:
++                    raise ScopedExtractionError('format_mismatch')
++            else:
++                mime = ('application/vnd.oasis.opendocument.' +
++                        {'odt': 'text', 'ods': 'spreadsheet', 'odp': 'presentation'}[format]).encode()
++                if 'mimetype' not in names or z.read('mimetype') != mime:
++                    raise ScopedExtractionError('format_mismatch')
++    except ScopedExtractionError:
++        raise
++    except (OSError, ValueError, RuntimeError, NotImplementedError, zipfile.BadZipFile, zlib.error):
++        raise ScopedExtractionError('malformed_or_unsupported') from None
++
++
++def _scoped_anydoc_bytes(data: bytes, format: str) -> str:
++    import importlib.util
++    import signal
++    import subprocess
++    import sys
++    import tempfile
++    try:
++        spec = importlib.util.find_spec('anydoc')
++    except (ImportError, ValueError, OSError):
++        spec = None
++    if spec is None or not spec.origin or Path(spec.origin).name != '__init__.py':
++        raise ScopedExtractionError('missing_local_converter')
++    # Only the selected library package directory is passed as code provenance.
++    # Documents themselves cross the boundary solely as immutable stdin bytes.
++    package_root = str(Path(spec.origin).resolve().parent.parent)
++    worker = str(Path(__file__).resolve().with_name('scoped_office_worker.py'))
++    try:
++        with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
++            process = subprocess.Popen([sys.executable, '-I', '-B', worker, package_root],
++                                       stdin=subprocess.PIPE, stdout=output, stderr=errors,
++                                       close_fds=True, start_new_session=True,
++                                       cwd='/', env={'LANG': 'C.UTF-8', 'RAYON_NUM_THREADS': '1'})
++            try:
++                try:
++                    process.communicate(format.encode('ascii') + b'\n' + data, timeout=5)
++                except subprocess.TimeoutExpired:
++                    raise ScopedExtractionError('converter_timeout') from None
++            finally:
++                if process.poll() is None:
++                    try:
++                        os.killpg(process.pid, signal.SIGKILL)
++                    except ProcessLookupError:
++                        pass
++                    try:
++                        process.wait(timeout=2)
++                    except subprocess.TimeoutExpired:
++                        raise ScopedExtractionError('converter_cleanup_unconfirmed') from None
++                if process.stdin is not None:
++                    process.stdin.close()
++            if process.returncode != 0:
++                raise ScopedExtractionError('converter_failed')
++            output.seek(0)
++            raw = output.read(6100001)
++            if len(raw) > 6100000:
++                raise ScopedExtractionError('extracted_text_limit')
++    except OSError:
++        raise ScopedExtractionError('converter_unavailable') from None
++    try:
++        result = json.loads(raw)
++    except (ValueError, UnicodeError):
++        raise ScopedExtractionError('converter_failed') from None
++    if not isinstance(result, dict):
++        raise ScopedExtractionError('converter_failed')
++    if 'error' in result:
++        allowed = {'missing_local_converter', 'converter_containment_unavailable',
++                   'input_limit', 'unsupported_format', 'format_mismatch',
++                   'malformed_or_unsupported', 'needs_ocr', 'no_extractable_text',
++                   'extracted_text_limit', 'converter_failed'}
++        code = result['error']
++        raise ScopedExtractionError(code if isinstance(code, str) and code in allowed else 'converter_failed')
++    return result.get('text')
++
++
+ def extract_scoped_document_bytes(data: bytes, format: str) -> str:
+-    """Convert own immutable snapshots; never install, OCR, reopen or shell out.
+-
+-    DOCX reuses the native parser below. PDF uses only the already installed
+-    anydoc byte API, explicitly rejecting hosted OCR. Text extraction does not
+-    establish source image/layout completeness or raw write authority.
++    """Extract bounded immutable bytes locally; never grant raw write coverage.
++
++    DOCX retains the native body parser. PDF and the six common Office formats
++    use the maintained installed byte converter in a killable resource-limited
++    child which refuses filesystem/network/process access during conversion.
++    Missing local containment/conversion is an honest capability gap.
+     """
+     if not isinstance(data, bytes) or len(data) > 1000000:
+         raise ScopedExtractionError('input_limit')
++    if not isinstance(format, str):
++        raise ScopedExtractionError('unsupported_format')
+     if format == 'docx':
+         try:
+             text = _extract_docx(io.BytesIO(data), max_xml_bytes=1000000)
+         except (ExtractionError, ValueError, RuntimeError, NotImplementedError, LookupError, zlib.error):
+             raise ScopedExtractionError('malformed_or_required_part_limit') from None
+-    elif format == 'pdf':
+-        try:
+-            module = importlib.import_module('anydoc')  # direct import, no pm loader
+-        except (ImportError, OSError):
+-            raise ScopedExtractionError('missing_local_converter') from None
+-        try:
+-            text = module.to_markdown_bytes(data, format='pdf', ocr='reject')
+-        except Exception as exc:
+-            needs_ocr = getattr(module, 'NeedsOcrError', None)
+-            reason = 'needs_ocr' if needs_ocr is not None and isinstance(exc, needs_ocr) else 'malformed_or_unsupported'
+-            raise ScopedExtractionError(reason) from None
++    elif format in {'pdf', 'rtf', 'odt', 'ods', 'odp', 'xlsx', 'pptx'}:
++        _validate_office_container(data, format)
++        text = _scoped_anydoc_bytes(data, format)
+     else:
+         raise ScopedExtractionError('unsupported_format')
+     if not isinstance(text, str) or not text.strip():
+diff --git a/tools/scoped_office_worker.py b/tools/scoped_office_worker.py
+new file mode 100644
+--- /dev/null
++++ b/tools/scoped_office_worker.py
+@@ -0,0 +1,119 @@
++"""Private byte-only converter child; no CLI/path document conversion fallback."""
++import ctypes
++import errno
++import importlib
++import json
++import resource
++import sys
++
++
++def main():
++    # The parent supplies its selected installed package location, never a user
++    # document path. -I prevents ambient PYTHONPATH/CWD injection in this child.
++    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
++    resource.setrlimit(resource.RLIMIT_CPU, (3, 3))
++    resource.setrlimit(resource.RLIMIT_AS, (1024**3, 1024**3))
++    resource.setrlimit(resource.RLIMIT_FSIZE, (6100000, 6100000))
++    resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
++    sys.path.insert(0, sys.argv[1])
++    try:
++        module = importlib.import_module('anydoc')
++    except (ImportError, OSError):
++        return {'error': 'missing_local_converter'}
++    payload = sys.stdin.buffer.read(1000033)
++    format_raw, separator, data = payload.partition(b'\n')
++    if not separator or len(data) > 1000000:
++        return {'error': 'input_limit'}
++    format = format_raw.decode('ascii')
++    if format not in {'pdf', 'rtf', 'odt', 'ods', 'odp', 'xlsx', 'pptx'}:
++        return {'error': 'unsupported_format'}
++    try:
++        lib = ctypes.CDLL('libseccomp.so.2', use_errno=True)
++        lib.seccomp_init.argtypes = [ctypes.c_uint32]
++        lib.seccomp_init.restype = ctypes.c_void_p
++        lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
++        lib.seccomp_syscall_resolve_name.restype = ctypes.c_int
++        lib.seccomp_rule_add.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint]
++        lib.seccomp_load.argtypes = [ctypes.c_void_p]
++        lib.seccomp_release.argtypes = [ctypes.c_void_p]
++        lib.seccomp_attr_set.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint32]
++        class Compare(ctypes.Structure):
++            _fields_ = [('arg', ctypes.c_uint), ('op', ctypes.c_uint),
++                        ('a', ctypes.c_uint64), ('b', ctypes.c_uint64)]
++        lib.seccomp_rule_add_array.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
++                                              ctypes.c_int, ctypes.c_uint,
++                                              ctypes.POINTER(Compare)]
++        # Default refusal also covers new syscalls and metadata mutation.
++        ctx = lib.seccomp_init(0x50000 | errno.EPERM)  # SCMP_ACT_ERRNO
++        if not ctx:
++            raise RuntimeError()
++        try:
++            # Native libraries can initialize helper threads while importing.
++            # Require TSYNC so every existing thread receives the same filter.
++            if lib.seccomp_attr_set(ctx, 4, 1) != 0:  # SCMP_FLTATR_CTL_TSYNC
++                raise RuntimeError()
++            # Imports are complete; only anonymous memory, inherited I/O,
++            # synchronization, signals and process-local queries remain.
++            allowed = ('read', 'write', 'readv', 'writev', 'close', 'lseek',
++                       'fstat', 'newfstatat', 'statx', 'mmap', 'mmap2',
++                       'mprotect', 'munmap', 'mremap', 'madvise', 'brk',
++                       'futex', 'futex_waitv', 'rt_sigaction', 'rt_sigprocmask',
++                       'rt_sigreturn', 'sigaltstack', 'clock_gettime',
++                       'gettimeofday', 'time', 'getpid', 'getppid', 'gettid',
++                       'getrandom', 'sched_getaffinity', 'sched_yield',
++                       'rseq', 'set_robust_list', 'set_tid_address',
++                       'getrusage', 'restart_syscall', 'exit',
++                       'exit_group')
++            for name in allowed:
++                number = lib.seccomp_syscall_resolve_name(name.encode())
++                if number >= 0 and lib.seccomp_rule_add(ctx, 0x7fff0000, number, 0) != 0:
++                    raise RuntimeError()
++            # Rayon PDF extraction initializes one helper lazily. A thread
++            # shares this process and inherits the filter; process creation
++            # stays forbidden. clone3's pointer argument cannot be safely
++            # filtered, so make glibc fall back to the inspectable clone ABI.
++            clone = lib.seccomp_syscall_resolve_name(b'clone')
++            # Permit only ordinary pthread flags, excluding namespaces and
++            # tracing/parent/vfork modifiers as well as separate processes.
++            # libseccomp permits one comparison per argument. Combine the
++            # required bits and forbidden-extra-bit masks into one predicate.
++            clone_comparison = Compare(0, 7,
++                0x109ff | ((~0x013d0f00) & ((1 << 64) - 1)), 0x10900)
++            if clone < 0 or lib.seccomp_rule_add_array(ctx, 0x7fff0000, clone, 1, ctypes.byref(clone_comparison)) != 0:
++                raise RuntimeError()
++            clone3 = lib.seccomp_syscall_resolve_name(b'clone3')
++            if clone3 >= 0 and lib.seccomp_rule_add(ctx, 0x50000 | errno.ENOSYS, clone3, 0) != 0:
++                raise RuntimeError()
++            # pthread startup can query its own limits; never permit changes
++            # or another process's limits through prlimit64.
++            limits = lib.seccomp_syscall_resolve_name(b'prlimit64')
++            comparisons = (Compare * 2)(Compare(0, 4, 0, 0), Compare(2, 4, 0, 0))
++            if limits >= 0 and lib.seccomp_rule_add_array(ctx, 0x7fff0000, limits, 2, comparisons) != 0:
++                raise RuntimeError()
++            if lib.seccomp_load(ctx) != 0:
++                raise RuntimeError()
++        finally:
++            lib.seccomp_release(ctx)
++    except Exception:
++        return {'error': 'converter_containment_unavailable'}
++    try:
++        if module.format_from_bytes(data) != format:
++            return {'error': 'format_mismatch'}
++        text = module.to_markdown_bytes(data, format=format, ocr='reject')
++    except Exception as exc:
++        needs_ocr = getattr(module, 'NeedsOcrError', None)
++        code = 'needs_ocr' if needs_ocr is not None and isinstance(exc, needs_ocr) else 'malformed_or_unsupported'
++        return {'error': code}
++    if not isinstance(text, str) or not text.strip():
++        return {'error': 'no_extractable_text'}
++    if len(text.encode('utf-8')) > 1000000:
++        return {'error': 'extracted_text_limit'}
++    return {'text': text}
++
++
++if __name__ == '__main__':
++    try:
++        result = main()
++    except Exception:
++        result = {'error': 'converter_failed'}
++    sys.stdout.write(json.dumps(result, ensure_ascii=False))

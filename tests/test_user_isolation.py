@@ -24,6 +24,11 @@ from gateway.session_identity import RoutingIdentity
 from hermes_state import SessionDB
 
 
+def _assert_public_tool_refusal(result):
+    # Exact public payload: extra fields or duplicate keys must not hide private data.
+    assert result == '{"error": "Это действие недоступно."}'
+
+
 @pytest.fixture
 def users(tmp_path, monkeypatch):
     # Native startup discovers builtins before an admission fixture snapshots
@@ -194,7 +199,7 @@ def test_retained_memory_prompt_and_next_action_recheck_revocation(users, kind):
         elif kind == 'remove_policy': users.settings.pop('user_isolation'); users.save()
         else: (users.root/'config.yaml').write_text('invalid: [')
         with pytest.raises(scope.ScopeDenied): memory.format_for_system_prompt('memory')
-        assert 'product_user_scope_refused' in registry.dispatch('web_search', {'query':'research'})
+        _assert_public_tool_refusal(registry.dispatch('web_search', {'query':'research'}))
         assert not called
         users.access('1', enabled=True)
         with pytest.raises(scope.ScopeDenied): memory.format_for_system_prompt('memory')
@@ -244,7 +249,7 @@ def test_registry_dynamic_direct_and_nested_dispatch_cannot_bypass(users,name):
         'parameters':{'type':'object'}},handler=lambda args,**kw:called.append(args) or 'SECRET',override=True)
     from model_tools import handle_function_call
     with users.enter(0):
-        assert 'product_user_scope_refused' in registry.dispatch(name,{})
+        _assert_public_tool_refusal(registry.dispatch(name,{}))
         assert 'product_user_scope_refused' in handle_function_call(name,{})
         assert 'product_user_scope_refused' in handle_function_call('tool_call',{'name':name,'arguments':{}})
     assert not called
@@ -253,9 +258,10 @@ def test_registry_dynamic_direct_and_nested_dispatch_cannot_bypass(users,name):
 def test_forged_registry_scope_and_lost_thread_context_refuse(users):
     from tools.registry import registry
     with users.enter(0):
-        assert 'product_user_scope_refused' in registry.dispatch('memory',{},scope=str(users.homes[1]))
+        _assert_public_tool_refusal(registry.dispatch('memory',{},scope=str(users.homes[1])))
         empty=contextvars.Context()
-        assert 'product_user_scope_refused' in empty.run(registry.dispatch,'web_search',{})
+        # Losing the ContextVar does not turn a managed process home into an operator audience.
+        _assert_public_tool_refusal(empty.run(registry.dispatch,'web_search',{}))
         inherited=contextvars.copy_context()
         assert inherited.run(scope.current).key==scope.current().key
 
@@ -322,7 +328,16 @@ def test_web_transport_dispatch_keeps_auth_scope_and_both_users_progress(users):
     assert seen==[('telegram','default','bot-A','1'),('telegram','default','bot-A','2')]
 
 
-def test_actual_native_gateway_profile_wrapper_binds_before_memory_and_tools(users):
+@pytest.fixture
+def gateway_users(request):
+    # Match native startup: dotenv/bootstrap runs before admitting synthetic users.
+    # Keep genuine startup and the scope guards; only order this wrapper fixture.
+    import gateway.run
+    return request.getfixturevalue('users')
+
+
+def test_actual_native_gateway_profile_wrapper_binds_before_memory_and_tools(gateway_users):
+    users = gateway_users
     from gateway.run_turn import GatewayTurnMixin
     from tools.memory_tool import MemoryStore
     class Runner(GatewayTurnMixin):
@@ -339,7 +354,8 @@ def test_actual_native_gateway_profile_wrapper_binds_before_memory_and_tools(use
         with pytest.raises(scope.ScopeDenied):memory.format_for_system_prompt('memory')
 
 
-def test_actual_native_async_profile_wrapper_keeps_same_principal(users):
+def test_actual_native_async_profile_wrapper_keeps_same_principal(gateway_users):
+    users = gateway_users
     from gateway.run_turn import GatewayTurnMixin
     class Runner(GatewayTurnMixin):
         config=SimpleNamespace(multiplex_profiles=True)
@@ -434,7 +450,22 @@ def test_native_runtime_prompt_context_uses_only_own_workspace(users):
 @pytest.mark.parametrize('command',['login','exec','model','sethome','skills','config','custom-quick-shell','tools'])
 def test_native_slash_sink_refuses_unsafe_config_shell_and_unknown_plugin(users,command):
     from gateway.run_busy import GatewayBusySessionMixin
-    assert GatewayBusySessionMixin()._check_slash_access(users.sources[0],command).startswith('product_user_scope_refused')
+    refusal = 'Эта команда недоступна. Доступные команды можно посмотреть в /help.'
+    assert GatewayBusySessionMixin()._check_slash_access(users.sources[0],command) == refusal
+    # Exercise the real quick-command sink too: denial must precede shell execution.
+    from gateway.run_inbound import GatewayInboundMixin
+    called = []
+    class Runner(GatewayInboundMixin, GatewayBusySessionMixin):
+        _draining = False
+        def _hm_quick_commands(self):
+            return {command: {'type': 'exec', 'command': 'synthetic-secret-command'}}
+        async def _hm_run_exec_quick_command(self, *args):
+            called.append(args)
+            return 'SECRET-COMMAND-RESULT'
+    handled, result, resolved = asyncio.run(Runner()._hm_dispatch_quick_and_plugin_commands(
+        SimpleNamespace(), users.sources[0], command))
+    assert (handled, result, resolved) == (True, refusal, command)
+    assert called == []
     assert scope.slash_allowed(users.sources[0],'memory')
     assert scope.slash_allowed(users.sources[0],'stop')
 
