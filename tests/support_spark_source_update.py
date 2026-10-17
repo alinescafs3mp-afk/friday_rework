@@ -90,7 +90,7 @@ def installed(tmp_path,monkeypatch):
     # Native files already present in the real Source81 composition; synthetic
     # existing beforeimages allow the exact combined file boundaries, including
     # the final bound web/runtime/history targets before their update is applied.
-    later_existing = getattr(o, 'WEB_RUNTIME_HISTORY_FILES', None) or set()
+    later_existing = (getattr(o, 'WEB_RUNTIME_HISTORY_FILES', None) or set()) | (getattr(o, 'MANUAL_COMPRESSION_FILES', None) or set())
     for name in sorted((o.COMBINED_INPUT_FILES | later_existing | (o.FILE_REPLY_CONTEXT_FILES or {'agent/agent_runtime_helpers.py','agent/chat_completion_helpers.py','agent/context_compressor.py','agent/context_compressor_multipass.py','agent/turn_context.py','gateway/platforms/base.py','gateway/run_plugin_delivery.py','hermes_cli/friday_user_scope.py'}))-set(files)-earlier_additions):
         data=b'# Source81 existing '+name.encode()+b'\n';put(source/name,data,0o644)
         files[name]={'sha256':f.digest(data),'bytes':len(data),'mode':'100644'}

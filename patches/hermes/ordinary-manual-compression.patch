@@ -1,0 +1,469 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -4034,6 +4034,8 @@
+         """Tail of /stop, /new, /reset: release the command-scoped guard, then
+         spawn a fresh processing task for any follow-up queued meanwhile."""
+         await self._flush_text_debounce_now(session_key)
++        if self._active_sessions.get(session_key) is not command_guard:
++            return  # A newer stop/reset owns this guard and its pending drain.
+         pending_event = self._pending_messages.pop(session_key, None)
+         self._release_session_guard(session_key, guard=command_guard)
+         if pending_event is not None:
+@@ -4060,6 +4062,20 @@
+                 else:
+                     self._release_session_guard(session_key, guard=command_guard)
+             raise
++        # Cancelling the adapter await does not stop an executor. Keep this native
++        # command guard until a retained manual owner finishes; otherwise a queued
++        # message repeatedly bounces through the busy path before it can run.
++        runner = getattr(self, "gateway_runner", None)
++        state = runner._peek_session_state(session_key) if runner is not None else None
++        manual = getattr(state.turn.agent, "_gateway_manual_compression_task", None) if state else None
++        if isinstance(manual, asyncio.Task) and not manual.done():
++            try:
++                await asyncio.shield(manual)
++            except asyncio.CancelledError:
++                if not manual.done():
++                    raise
++            except Exception:
++                logger.debug("Manual compression settled before command drain", exc_info=True)
+         await self._drain_pending_after_session_command(session_key, command_guard)
+ 
+     async def handle_message(self, event: MessageEvent) -> None:
+diff --git a/gateway/run_agent_cache.py b/gateway/run_agent_cache.py
+--- a/gateway/run_agent_cache.py
++++ b/gateway/run_agent_cache.py
+@@ -304,6 +304,9 @@
+         if self._session_web_pending(session_key):
+             return False
+         state = self._peek_session_state(session_key)
++        manual = getattr(state.turn.agent, "_gateway_manual_compression_task", None) if state else None
++        if isinstance(manual, asyncio.Task) and not manual.done():
++            return False  # Keep ownership until the sync worker and publication really settle.
+         if state is not None:
+             if state.turn.lease is not None:
+                 try:
+@@ -332,7 +335,8 @@
+         Identity-checked + idempotent, so a live successor's token is never affected."""
+         if self._session_web_pending(session_key):
+             return
+-        self._release_running_agent_state(session_key, run_generation=run_generation)
++        if not self._release_running_agent_state(session_key, run_generation=run_generation):
++            return  # A retained manual owner or a successor must keep its cache and slot.
+         self._evict_cached_agent(session_key)
+         state = self._peek_session_state(session_key)
+         registry = getattr(self, "_turn_leases", None)
+@@ -575,6 +579,7 @@
+         _generation_at_interrupt = self._interrupt_running_turn(
+             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
+         )
++        manual = getattr(running_agent, "_gateway_manual_compression_task", None)
+         from gateway.run import _AGENT_PENDING_SENTINEL
+         # Detached delegations are independent stop targets. Signal them before
+         # observing web cessation, even when that observation remains unknown.
+@@ -588,7 +593,9 @@
+                                   or getattr(entry, "session_id", "") or ""))
+         web_receipt = await self._settle_session_web_custody(session_key)
+         prior = getattr(running_agent, '_web_stop_receipt', None)
+-        if web_receipt['status'] == 'STOP_UNCONFIRMED' or (isinstance(prior, dict) and prior.get('status') == 'STOP_UNCONFIRMED'):
++        # A retained manual owner must not suppress the independent stop targets above.
++        # Keep its slot until terminal, and preserve the actual custody observations.
++        if (isinstance(manual, asyncio.Task) and not manual.done()) or web_receipt['status'] == 'STOP_UNCONFIRMED' or (isinstance(prior, dict) and prior.get('status') == 'STOP_UNCONFIRMED'):
+             return dict(web_receipt, status='STOP_UNCONFIRMED')
+         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+             # Plugins holding a per-turn external resource (an outbound RPC blocked on a tool result
+diff --git a/gateway/run_busy.py b/gateway/run_busy.py
+--- a/gateway/run_busy.py
++++ b/gateway/run_busy.py
+@@ -587,6 +587,11 @@
+     ) -> "GatewayRunner._BusySteerOutcome":
+         """Apply interrupt->queue demotions, then attempt steer (steer mode) or redirect (interrupt mode)."""
+         from gateway.run import _AGENT_PENDING_SENTINEL
++        manual = getattr(running_agent, "_gateway_manual_compression_task", None)
++        manual_active = isinstance(manual, asyncio.Task) and not manual.done()
++        if manual_active:
++            # A temporary compressor has no conversation loop to consume steer/redirect.
++            effective_mode = "queue"
+         # Steer injects mid-run via running_agent.steer(), falling back to queue (nothing lost) when
+         # the agent isn't running yet, lacks steer(), or the payload is empty. Interrupt is demoted
+         # to queue while subagents run (interrupt() would abort them); /stop and /new still cancel all.
+@@ -595,7 +600,7 @@
+         )
+         if demoted_for_subagents:
+             effective_mode = self._demote_interrupt(session_key, "the running agent has active subagents (#30170)")
+-        demoted_for_compression = (
++        demoted_for_compression = manual_active or (
+             effective_mode == "interrupt" and await self._session_has_compression_in_flight(session_key)
+         )
+         if demoted_for_compression:
+@@ -991,6 +996,10 @@
+                 "falling back to busy-reject", policy, name,
+             )
+ 
++        if name == "compress":
++            from hermes_cli.friday_user_scope import ordinary_presentation
++            if ordinary_presentation(source):
++                return "Дождитесь завершения текущей задачи, затем повторите /compact."
+         return t("gateway.busy.slash_rejected", command=name)
+ 
+     async def _handle_pause_command(self, event: MessageEvent):
+@@ -1134,7 +1143,7 @@
+         use it so an in-flight agent can't bypass admin gating; no ``allow_admin_from`` → None)."""
+         from hermes_cli.friday_user_scope import slash_allowed
+         if not slash_allowed(source, canonical_cmd):
+-            return "Эта команда недоступна. Доступные команды: /help, /status, /stop, /new, /queue, /memory."
++            return "Эта команда недоступна. Доступные команды можно посмотреть в /help."
+         from gateway.slash_access import policy_for_runner_source
+         if not canonical_cmd:
+             return None
+diff --git a/gateway/run_shutdown.py b/gateway/run_shutdown.py
+--- a/gateway/run_shutdown.py
++++ b/gateway/run_shutdown.py
+@@ -1170,6 +1170,12 @@
+ 
+     async def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
+         for session_key, agent in active_agents.items():
++            manual = getattr(agent, "_gateway_manual_compression_task", None)
++            if isinstance(manual, asyncio.Task) and not manual.done():
++                # Its native deferred worker remains in drain/interrupt accounting.
++                # The manual owner alone publishes and cleans up after that worker;
++                # a generic transcript flush would race its compression transaction.
++                continue
+             self._flush_agent_transcript_at_shutdown(agent)
+             # Off-loop + bounded: plugin on_session_finalize hooks can do arbitrary synchronous work
+             # (e.g. a full-session trace export) — same hang class as the memory provider below.
+@@ -1262,6 +1268,10 @@
+         profile's scope from ``session_key`` when the caller has none, exactly like cache eviction."""
+         if agent is None:
+             return
++        manual = getattr(agent, "_gateway_manual_compression_task", None)
++        if (isinstance(manual, asyncio.Task) and not manual.done()
++                and asyncio.current_task() is not manual):
++            return  # Its retained owner performs cleanup after actual executor completion.
+         if context.startswith("shutdown") or context == "session expiry":
+             with suppress(Exception):
+                 agent._end_session_on_close = False
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -636,6 +636,7 @@
+                 ("reset", "начать новый разговор"),
+                 ("queue", "посмотреть очередь сообщений"),
+                 ("memory", "посмотреть сохранённую память"),
++                ("compress", f"сжать разговор, сохранив исходные сообщения; также {prefix}compact"),
+             )
+             lines = [f"{prefix}{name} — {description}" for name, description in commands
+                      if self._check_slash_access(event.source, name) is None]
+diff --git a/gateway/slash_commands_session.py b/gateway/slash_commands_session.py
+--- a/gateway/slash_commands_session.py
++++ b/gateway/slash_commands_session.py
+@@ -51,6 +51,17 @@
+     ``_last_compress_aborted`` = no usable summary, messages unchanged.  Provider exception text is
+     force-redacted at this UI boundary even when global redaction is off; an aux model recovered
+     via main is an info note so the user can fix their config."""
++    from hermes_cli.friday_user_scope import ordinary_presentation
++    if ordinary_presentation():
++        if summary.get("refused_would_grow") is True:
++            return ["Сжатие не выполнено: сводка оказалась больше исходного контекста. Сообщения сохранены."]
++        if summary.get("aborted") is True or getattr(compressor, "_last_compress_aborted", False) is True:
++            return ["Сжатие не выполнено. Сообщения сохранены."]
++        if summary.get("fallback_used") is True:
++            return ["Для продолжения использована ограниченная сводка разговора."]
++        if summary.get("noop") is True:
++            return ["Контекст разговора не изменился."]
++        return ["Контекст разговора сжат. Исходные сообщения сохранены."]
+     lines = [f"🗜️ {summary['headline']}"]
+     if focus_topic:
+         lines.append(t("gateway.compress.focus_line", topic=focus_topic))
+@@ -79,6 +90,16 @@
+                if m.get("role") in {"user", "assistant"} and m.get("content")]
+     report = summarize_compress_preview(pv_msgs, partial, keep_last, focus_topic,
+                                         estimate_request_tokens_rough(pv_msgs))
++    from hermes_cli.friday_user_scope import ordinary_presentation
++    if ordinary_presentation():
++        lines = ["Предпросмотр: изменений нет.",
++                 f"Будет обработано {report['head_count']} из {report['total']} сообщений."]
++        if report["partial"]:
++            lines.append(f"Сохраняем конец контекста без изменений (сообщений: {report['tail_count']}).")
++        lines.append("Для применения повторите команду без --preview.")
++        if agg_note:
++            lines.append(agg_note)
++        return "\n".join(lines)
+     lines = [f"🗜️ {line}" for line in report["lines"]]
+     if agg_note:
+         lines.append(agg_note)
+@@ -484,11 +505,19 @@
+         """Profile-scoping wrapper around manual /compress: multiplexed gateways resolve credentials
+         through the fail-closed per-profile secret scope, which slash dispatch (unlike ``_run_agent``)
+         does not install — unscoped, /compress would raise ``UnscopedSecretError``."""
+-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+-            return await self._handle_compress_command_inner(event)
+-        from gateway.run import _profile_runtime_scope
+-        with _profile_runtime_scope(self._resolve_profile_home_for_source(event.source)):
+-            return await self._handle_compress_command_inner(event)
++        from hermes_cli.friday_user_scope import ordinary_presentation
++        ordinary = ordinary_presentation(event.source)
++        try:
++            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
++                return await self._handle_compress_command_inner(event)
++            from gateway.run import _profile_runtime_scope
++            with _profile_runtime_scope(self._resolve_profile_home_for_source(event.source)):
++                return await self._handle_compress_command_inner(event)
++        except Exception:
++            if not ordinary:
++                raise
++            logger.exception("Manual compression could not be confirmed")
++            return "Сжатие не подтверждено. Проверьте /status перед повтором."
+ 
+     async def _compress_codex_app_server_session(self, session_key: str, session_id: str) -> str:
+         """Manual /compress for codex_app_server sessions: compacts the LIVE cached agent's
+@@ -498,52 +527,62 @@
+         See #73503.
+         """
+         from gateway.run import _AGENT_PENDING_SENTINEL
+-
++        from hermes_cli.friday_user_scope import ordinary_presentation
++
++        ordinary = ordinary_presentation()
+         agent = self._cached_agent_for(session_key, lockless_fallback=True)
+         if agent is None or agent is _AGENT_PENDING_SENTINEL or getattr(agent, "_codex_session", None) is None:
+-            return t("gateway.compress.codex_nothing")
++            return "Пока нечего сжимать." if ordinary else t("gateway.compress.codex_nothing")
+         compressor = getattr(agent, "context_compressor", None)
+         count_before = getattr(compressor, "compression_count", 0)
+         try:
+             await self._run_in_executor_with_context(
+                 lambda: agent._compress_context([], "", force=True, task_id=session_id or "default"))
+         except Exception as exc:
+-            return t("gateway.compress.failed", error=exc)
++            return ("Сжатие не подтверждено. Проверьте /status перед повтором."
++                    if ordinary else t("gateway.compress.failed", error=exc))
+         if getattr(compressor, "compression_count", 0) > count_before:
+-            return t("gateway.compress.codex_compacted")
+-        return t("gateway.compress.codex_incomplete")
++            return "Разговор сжат." if ordinary else t("gateway.compress.codex_compacted")
++        return "Сжатие не завершено. Попробуйте позже." if ordinary else t("gateway.compress.codex_incomplete")
+ 
+     async def _handle_compress_command_inner(self, event: MessageEvent) -> str:
+         """Handle /compress -- manually compress conversation context; ``/compress <focus>`` tells
+         the summariser what to preserve. Flags/positional forms are parsed by the shared core."""
+         from agent.conversation_compression_manual import MIN_MESSAGES, parse_compress_args
++        from hermes_cli.friday_user_scope import ordinary_presentation
++
++        ordinary = ordinary_presentation(event.source)
+ 
+         source = event.source
+         session_entry = await self.async_session_store.get_or_create_session(source)
+         try:
+             history = await self.async_session_store.load_transcript(session_entry.session_id)
+         except TranscriptReadError:
+-            return history_unreadable()
++            return "Не удалось прочитать историю разговора. Проверьте /status перед повтором." if ordinary else history_unreadable()
+         if not history or len(history) < MIN_MESSAGES:
+-            return t("gateway.compress.not_enough")
++            return "Пока недостаточно сообщений для сжатия." if ordinary else t("gateway.compress.not_enough")
+         request = parse_compress_args(event.get_command_args() or "")
+-        _agg_note = t("gateway.compress.aggressive_unsupported") if request.aggressive else ""
++        _agg_note = ("Этот режим сжатия недоступен. Используйте /compact." if ordinary
++                     else t("gateway.compress.aggressive_unsupported")) if request.aggressive else ""
+         if request.aggressive and not request.preview:
+             return _agg_note
+         if request.preview:
+             return _compress_preview_reply(history, request.partial, request.keep_last, request.focus_topic, _agg_note)
+         try:
+-            return await self._run_manual_compression(source, session_entry, history, request)
++            return await self._run_manual_compression(source, session_entry, history, request, event=event)
+         except Exception as e:
+             logger.warning("Manual compress failed: %s", e)
+-            return t("gateway.compress.failed", error=e)
+-
+-    async def _run_manual_compression(self, source, session_entry, history: list, request) -> str:
++            return ("Сжатие не подтверждено. Проверьте /status перед повтором."
++                    if ordinary else t("gateway.compress.failed", error=e))
++
++    async def _run_manual_compression(self, source, session_entry, history: list, request, *, event=None) -> str:
+         """Build a temporary agent, run the shared compress core, persist, and describe the outcome."""
+         from agent.conversation_compression import finalize_context_engine_compression_notification
+         from agent.conversation_compression_manual import compress_now, render_compress_result
+         from gateway.run import _platform_config_key
+-
++        from hermes_cli.friday_user_scope import ordinary_presentation
++
++        ordinary = ordinary_presentation(source)
+         session_key = self._session_key_for_source(source)
+         # Platform + stable gateway session key bind this agent (for external context engines) to
+         # the original conversation, not a default "cli" host.
+@@ -554,7 +593,7 @@
+             # has none (and finally-eviction would destroy the real context).
+             return await self._compress_codex_app_server_session(session_key, session_entry.session_id)
+         if not runtime_kwargs.get("api_key"):
+-            return t("gateway.compress.no_provider")
++            return "Сжатие сейчас недоступно. Попробуйте позже." if ordinary else t("gateway.compress.no_provider")
+         # FULL transcript (tool results included), like auto-compress: user/assistant-only starves
+         # tool-result pruning and can trip the protect-first/last early-return.
+         msgs = [m for m in history if m.get("role") in {"user", "assistant", "tool"}]
+@@ -567,27 +606,138 @@
+         # the transport applies its default effort — a 400 on non-reasoning models.
+         runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(source=source, model=model)
+ 
+-        tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
+-        try:
+-            # Not a bare run_in_executor: the profile secret scope is a contextvar the default
+-            # executor hop would drop, failing aux-client credential resolution closed.
+-            result = await self._run_in_executor_with_context(
++        # Own the same native turn slot used by /status, /stop and busy dispatch.
++        # Claim before the first await; an adapter guard alone does not own a sync worker.
++        from gateway.run import _AGENT_PENDING_SENTINEL
++        from agent.interrupt_compat import request_hard_interrupt
++        import time
++        if self._is_session_running(session_key):
++            return ("Дождитесь завершения текущей задачи, затем повторите /compact." if ordinary
++                    else t("gateway.busy.slash_rejected", command="compress"))
++        active_lease, refusal = self._claim_active_session_slot(session_key, source)
++        if refusal is not None:
++            return "Сжатие сейчас недоступно. Попробуйте позже." if ordinary else refusal
++        state = self._session_state(session_key)
++        state.turn.agent = _AGENT_PENDING_SENTINEL
++        state.turn.lease = active_lease
++        state.turn.event = event or MessageEvent(source=source, text="/compress")
++        state.turn.started_ts = time.time()
++        generation = self._begin_session_run_generation(session_key)
++        self._persist_active_agents()
++        tmp_agent = None
++        work = None
++        try:
++            tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
++            if (not self._is_session_run_current(session_key, generation)
++                    or state.turn.agent is not _AGENT_PENDING_SENTINEL):
++                # A stop/reset may have won while the agent was being constructed.
++                raise asyncio.CancelledError()
++            state.turn.agent = tmp_agent
++            work = asyncio.create_task(self._complete_manual_compression(
++                tmp_agent, source, session_entry, session_key, msgs, request))
++            tmp_agent._gateway_manual_compression_task = work
++            # Retain the task on the native owner even if the adapter cancels its await.
++            # Retrieve detached exceptions; the original waiter still receives them.
++            work.add_done_callback(lambda done: None if done.cancelled() else done.exception())
++            try:
++                return await asyncio.shield(work)
++            except asyncio.CancelledError:
++                request_hard_interrupt(tmp_agent, "manual compression cancelled")
++                raise
++        finally:
++            if work is None:
++                if tmp_agent is not None:
++                    await self._cleanup_agent_resources_off_loop(tmp_agent, context="manual compression preparation")
++                if (state.turn.agent is _AGENT_PENDING_SENTINEL
++                        and self._is_session_run_current(session_key, generation)):
++                    self._release_running_agent_state(session_key, run_generation=generation)
++
++    async def _complete_manual_compression(self, tmp_agent, source, session_entry, session_key, msgs, request):
++        """Own compression through durable publication and cleanup, independently of the adapter await."""
++        from agent.conversation_compression import finalize_context_engine_compression_notification
++        from agent.conversation_compression_manual import compress_now, render_compress_result
++        from agent.interrupt_compat import request_hard_interrupt
++        from hermes_cli.friday_user_scope import ordinary_presentation
++        ordinary = ordinary_presentation(source)
++        from contextvars import copy_context
++        # Keep the executor Future itself: a Task wrapping the native await can
++        # be cancelled by loop shutdown while its underlying thread is still live.
++        worker = None
++        try:
++            # Acquisition, synchronous submit and registration all belong to this
++            # owner. A refusal before a Future exists still must release its slot.
++            worker = asyncio.get_running_loop().run_in_executor(
++                self._get_executor(), copy_context().run,
+                 lambda: compress_now(tmp_agent, msgs, request, system_message="", skip_without_window=True,
+                                      task_id=session_entry.session_id or "default"))
++            self._track_deferred_agent_worker(worker, tmp_agent)
++            try:
++                result = await asyncio.shield(worker)
++            except asyncio.CancelledError:
++                request_hard_interrupt(tmp_agent, "manual compression cancelled")
++                # A shutdown may cancel this owner as well. Never close resources while
++                # the actual executor is still using them, including repeated cancellation.
++                while not worker.done():
++                    try:
++                        await asyncio.shield(worker)
++                    except asyncio.CancelledError:
++                        continue
++                # Observe any exception without replacing the host cancellation.
++                if not worker.cancelled():
++                    worker.exception()
++                raise
+             if result.status == "nothing_to_do":
+-                return t("gateway.compress.nothing_to_do")
++                return "Пока нечего сжимать." if ordinary else t("gateway.compress.nothing_to_do")
+             if result.status != "compressed":
++                if ordinary:
++                    if isinstance(result.lock_holder, str) and result.lock_holder.strip():
++                        return "Сжатие уже выполняется. Дождитесь завершения."
++                    return "Сжатие сейчас недоступно. Проверьте /status перед повтором."
+                 return "\n".join(render_compress_result(result))
++            # /stop invalidates the generation but retains THIS owner until it settles.
++            # A commit that won before stop still needs its native durable child adopted.
++            state = self._peek_session_state(session_key)
++            if state is None or state.turn.agent is not tmp_agent:
++                raise RuntimeError("manual compression ownership changed before publication")
+             await self._persist_manual_compression(tmp_agent, session_entry, source, result.after_messages)
+             finalize_context_engine_compression_notification(tmp_agent, committed=True)
+-            compressor = tmp_agent.context_compressor
+-            summary = result.summary
++            return "\n".join(_manual_compression_reply_lines(
++                result.summary, tmp_agent.context_compressor, request.focus_topic))
+         finally:
+-            finalize_context_engine_compression_notification(tmp_agent, committed=False)
+-            self._evict_cached_agent(session_key)  # next turn rebuilds the prompt from current files
+-            # Off-loop + bounded: teardown can block on subprocess/network/SQLite.
+-            await self._cleanup_agent_resources_off_loop(tmp_agent, context="manual compression")
+-        return "\n".join(_manual_compression_reply_lines(summary, compressor, request.focus_topic))
++            try:
++                if worker is not None:
++                    if not worker.done():
++                        # Registration can fail after submit started the thread.
++                        # Keep raw-worker custody even when the tracker did not.
++                        try:
++                            request_hard_interrupt(tmp_agent, "manual compression owner unwinding")
++                        finally:
++                            while not worker.done():
++                                try:
++                                    await asyncio.shield(worker)
++                                except asyncio.CancelledError:
++                                    continue
++                                except Exception:
++                                    # The worker's terminal exception must not mask
++                                    # an acquisition/registration/owner failure.
++                                    pass
++                    if not worker.cancelled():
++                        worker.exception()
++            finally:
++                finalize_context_engine_compression_notification(tmp_agent, committed=False)
++                try:
++                    await self._cleanup_agent_resources_off_loop(tmp_agent, context="manual compression")
++                finally:
++                    tmp_agent._gateway_manual_compression_task = None
++                    state = self._peek_session_state(session_key)
++                    if state is not None and state.turn.agent is tmp_agent:
++                        # Identity first, then current generation: stop can bump the token,
++                        # but this unwind must never evict or clear a successor's state.
++                        try:
++                            self._evict_cached_agent(session_key)
++                        finally:
++                            self._release_running_agent_state(
++                                session_key, run_generation=self._current_session_run_generation(session_key))
+ 
+     async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict):
+         """Build the throwaway AIAgent that performs a manual /compress rewrite of *session_id*."""
+diff --git a/hermes_cli/friday_user_scope.py b/hermes_cli/friday_user_scope.py
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -368,7 +368,7 @@
+         with authority(identity.runtime_home):
+             with scoped_source(source):
+                 cap.check()
+-        return command in {'help', 'status', 'stop', 'cancel', 'new', 'reset', 'queue', 'memory'}
++        return command in {'help', 'status', 'stop', 'cancel', 'new', 'reset', 'queue', 'memory', 'compress'}
+     except Exception:  # health: allow BLE001 -- Slash admission fails closed without exposing policy or plugin secrets.
+         return False
+ 

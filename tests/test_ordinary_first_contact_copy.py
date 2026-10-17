@@ -91,8 +91,8 @@ def test_actual_managed_slash_allowlist_has_no_sethome_about_version_claim(scope
  if state in {'missing','claimed_owner'}:
   del source._friday_user_scope;s._CURRENT.set(None)
   if state=='claimed_owner':source.user_name='owner developer admin'
- expected={'help','status','stop','cancel','new','reset','queue','memory'} if state=='valid' else set()
- commands=expected|{'help','status','stop','cancel','new','reset','queue','memory','sethome','about','version','commands','profile','model','cron'}
+ expected={'help','status','stop','cancel','new','reset','queue','memory','compress'} if state=='valid' else set()
+ commands=expected|{'help','status','stop','cancel','new','reset','queue','memory','compress','sethome','about','version','commands','profile','model','cron'}
  assert {c for c in commands if s.slash_allowed(source,c)}==expected
  for c in {'sethome','about','version'}:
   out=run_busy.GatewayBusySessionMixin._check_slash_access(NS(),source,c)
@@ -105,7 +105,8 @@ def test_managed_help_lists_useful_allowed_controls_without_backend_catalog(scop
  runner=NS(config=None,_catalog_options=forbidden,_telegramized_command_reply=forbidden,_typed_command_prefix_for=lambda platform:'/')
  runner._check_slash_access=lambda source,name:run_busy.GatewayBusySessionMixin._check_slash_access(runner,source,name)
  out=asyncio.run(slash_commands.GatewaySlashCommandsMixin._handle_help_command(runner,NS(source=source)))
- assert all('/'+c in out for c in ['help','status','stop','cancel','new','reset','queue','memory'])
+ assert all('/'+c in out for c in ['help','status','stop','cancel','new','reset','queue','memory','compress'])
+ assert '/compact' in out
  assert all(x not in out for x in ['Hermes','/sethome','/model','/profile','/version','/cron','/home/','developer'])
  assert 'Задачу можно написать обычным сообщением.' in out
 
@@ -140,7 +141,13 @@ def test_managed_busy_onboarding_only_existing_controls_and_donor_unchanged(scop
  out=onboarding.busy_input_hint_gateway(mode)
  assert '/help' in out and '/busy' not in out and 'First-time' not in out
  monkeypatch.setattr(s,'_ENGAGED',False);monkeypatch.setattr(s,'policy',lambda home:None);s._CURRENT.set(None)
- assert onboarding.busy_input_hint_gateway(mode)==onboarding._BUSY_INPUT_HINTS_GATEWAY.get(mode,onboarding._BUSY_INPUT_HINT_GATEWAY_DEFAULT)
+ # An unmanaged process must also leave the managed home marker behind.
+ from hermes_constants import set_hermes_home_override,reset_hermes_home_override
+ token=set_hermes_home_override(str(scoped.root))
+ try:
+  assert not s.ordinary_presentation()
+  assert onboarding.busy_input_hint_gateway(mode)==onboarding._BUSY_INPUT_HINTS_GATEWAY.get(mode,onboarding._BUSY_INPUT_HINT_GATEWAY_DEFAULT)
+ finally:reset_hermes_home_override(token)
 
 
 def test_actual_native_busy_ack_once_flag_preserves_signed_config(scoped,source,native):
