@@ -132,13 +132,29 @@
       finally { setBusy(false); }
     }
     async function saveSettings() {
+      if (!profile || busy) return;
       setBusy(true); setError(""); setControl(null);
       try {
+        if (!data || typeof data.config_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(data.config_sha256)) throw Error("Native configuration version unavailable");
         let values;
         if (edit.kind === "model") values = {slot: edit.slot, ...data.typed_options.local_routes[Number(edit.route)]};
         else if (edit.kind === "web") values = {profile: edit.web, extract_timeout: Number(edit.timeout), extract_char_limit: Number(edit.chars)};
         else if (["toolset", "skill"].includes(edit.kind)) values = {name: edit.name, enabled: edit.enabled};
-        else values = {key: edit.key, value: edit.key === "streaming.enabled" ? edit.enabled : Number(edit.value)};
+        else if (edit.kind === "operational") {
+          const spec = operationalSpec();
+          if (!spec) throw Error("Native typed setting unavailable");
+          let value;
+          if (spec.type === "boolean") {
+            if (typeof edit.enabled !== "boolean") throw Error("Boolean required");
+            value = edit.enabled;
+          } else if (spec.type === "integer") {
+            if (!/^[0-9]+$/.test(edit.value)) throw Error("Integer required");
+            value = Number(edit.value);
+            if (!Number.isSafeInteger(value) || value < spec.minimum || value > spec.maximum) throw Error("Integer out of bounds");
+          } else if (spec.type === "string") value = spec.enum[0];
+          else value = [...spec.const];
+          values = {key: edit.key, value};
+        } else throw Error("Unknown typed setting");
         setControl(await fetchJSON(base + "/settings?" + new URLSearchParams({profile}), {
           method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({kind: edit.kind, expected_sha256: data.config_sha256, values})}));
         setData(await fetchJSON(base + "/effective?" + new URLSearchParams({profile})));
@@ -158,6 +174,30 @@
       ...values.map(v => h("option", {key: v, value: v}, v)));
     const number = field => h("input", {"aria-label": field, type: "number", value: edit[field], disabled: busy, onChange: e => setEdit({...edit, [field]: e.target.value})});
     const enabled = () => h("label", null, "Enabled ", h("input", {type: "checkbox", checked: edit.enabled, onChange: e => setEdit({...edit, enabled: e.target.checked})}));
+    function operationalSpec() {
+      const options = data && data.typed_options;
+      const spec = options && options.operational_specs && options.operational_specs[edit.key];
+      if (!options || !Array.isArray(options.operational) || !options.operational.includes(edit.key) || !spec) return null;
+      if (edit.key === "agent.max_turns" && spec.type === "integer" && spec.minimum === 1 && spec.maximum === 200) return spec;
+      if (edit.key === "streaming.enabled" && spec.type === "boolean") return spec;
+      if (edit.key === "tools.tool_search.enabled" && spec.type === "string" && Array.isArray(spec.enum)
+          && spec.enum.length === 1 && spec.enum[0] === "off") return spec;
+      if (edit.key === "tools.tool_search.defer" && spec.type === "array" && Array.isArray(spec.const)
+          && spec.const.every(name => typeof name === "string" && name.length > 0 && name === name.trim())
+          && new Set(spec.const).size === spec.const.length && spec.const.includes("session_search") && spec.const.includes("read_file")) return spec;
+      return null;
+    }
+    function operationalControl() {
+      const spec = operationalSpec();
+      if (!spec) return h("p", {role: "alert"}, "Native typed setting unavailable. Reload current native state.");
+      if (spec.type === "boolean") return enabled();
+      if (spec.type === "integer") return number("value");
+      if (spec.type === "string") return h("label", null, "Native supported value ",
+        h("select", {"aria-label": "Operational string value", value: spec.enum[0], disabled: true},
+          h("option", {value: spec.enum[0]}, spec.enum[0])));
+      return h("label", null, "Native required deferred tools ", h("textarea", {
+        "aria-label": "Native required deferred tools", readOnly: true, value: spec.const.join("\n")}));
+    }
     const renderUser = row => h("li", {key: row.principal_id},
       h("span", null, `${row.platform} / ${row.transport_profile} / ${row.account_id} / ${row.user_id}: ${row.enabled ? "enabled" : "disabled"} (${row.role}) `),
       button(row.enabled ? "Disable" : "Enable", () => change(row, !row.enabled)),
@@ -259,8 +299,8 @@
             ...data.typed_options.local_routes.map((r, i) => h("option", {key: i, value: String(i)}, `${r.provider} / ${r.model} / ${r.base_url}`)))) : null,
         edit.kind === "web" ? h("div", null, select("web", data.typed_options.web_backends), number("timeout"), number("chars")) : null,
         ["toolset", "skill"].includes(edit.kind) ? h("div", null, select("name", ["", ...data.typed_options[edit.kind === "toolset" ? "toolsets" : "skills"]]), enabled()) : null,
-        edit.kind === "operational" ? h("div", null, select("key", data.typed_options.operational), edit.key === "streaming.enabled" ? enabled() : number("value")) : null,
-        button("Save operational settings", saveSettings),
+        edit.kind === "operational" ? h("div", null, select("key", Array.isArray(data.typed_options.operational) ? data.typed_options.operational : []), operationalControl()) : null,
+        button("Save operational settings", saveSettings, {disabled: busy || (edit.kind === "operational" && !operationalSpec())}),
         h("p", null, "Saved settings apply through the next native session or reload. Existing worker bindings and original deadlines remain fixed.")) : null,
       h("p", null, "Control needs the owning gateway and a valid native administrator session. Lost responses remain unknown. Channel roles do not grant Dashboard access."));
   }

@@ -60,6 +60,14 @@ def options(cfg, home):
             "required_skills": sorted(ESSENTIAL_SKILLS),
             "web_backends": ["exa-paid", "exa-keyless"],
             "operational": ["agent.max_turns", "streaming.enabled", "tools.tool_search.defer", "tools.tool_search.enabled"],
+            "operational_specs": {
+                "agent.max_turns": {"type": "integer", "minimum": 1, "maximum": 200},
+                "streaming.enabled": {"type": "boolean"},
+                "tools.tool_search.enabled": {"type": "string", "enum": ["off"]},
+                # This is the same native-derived exact set enforced at write
+                # time, not a second tool catalog or an arbitrary list editor.
+                "tools.tool_search.defer": {"type": "array", "const": sorted(_memory_disclosure_defer(cfg))},
+            },
             "model_slots": ["main", *[k for k, v in (cfg.get("auxiliary") or {}).items() if isinstance(v, dict)]]}
 
 

@@ -85,7 +85,8 @@ const context = {
     else if (path.endsWith("/onboarding/activate")) data = {state: "ADMITTED_NEXT_NATIVE_REQUEST", enabled: true};
     else if (path.endsWith("/effective")) data = {config_sha256: "c".repeat(64), typed_options: {
       model_slots: ["main"], local_routes: [{provider:"custom:friday-local",model:"observed-local",base_url:"http://127.0.0.1:9000/v1"}],
-      web_backends:["exa-paid"], toolsets:["web"], skills:[], operational:["agent.max_turns","streaming.enabled"]}};
+      web_backends:["exa-paid"], toolsets:["web"], skills:[], operational:["agent.max_turns","streaming.enabled"],
+      operational_specs:{"agent.max_turns":{type:"integer",minimum:1,maximum:200},"streaming.enabled":{type:"boolean"}}}};
     else if (path.endsWith("/settings")) data = {recorded:true};
     else if (path.endsWith("/pairing")) data = input.pending || {pending: []};
     else if (path.endsWith("/pairing/approve")) data = {recorded: true};

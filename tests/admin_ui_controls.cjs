@@ -25,7 +25,7 @@ for (const [typed, plain] of [
   ["let body: { error?: string; login_url?: string } = {};", "let body = {};"],
   ["new Promise<T>", "new Promise"],
 ]) {assert(client.includes(typed), "Pinned native client annotation changed: " + typed); client = client.replace(typed, plain);}
-const requests = [], states = [], pageStates = [], counts = [];
+const requests = [], states = [], pageStates = [], counts = [], controls = [];
 let cursor = 0, effects = [], tree, Component;
 const React = {
   createElement: (tag, props, ...children) => ({tag, props: props || {}, children}),
@@ -125,12 +125,31 @@ const click = async label => {render(); const node = find(tree, label); assert(n
     };
     locate(tree, "kind").props.onChange({target: {value: input.kind}}); render();
     for (const [field, value] of Object.entries(input.fields || {})) {
-      locate(tree, field).props.onChange({target: {value}}); render();
+      const node = field === "enabled" ? (() => {
+        const findCheckbox = n => {
+          if (!n || typeof n !== "object") return null;
+          if (n.tag === "input" && n.props.type === "checkbox") return n;
+          for (const c of n.children || []) {const hit = findCheckbox(c); if (hit) return hit;}
+          return null;
+        }; return findCheckbox(tree);
+      })() : locate(tree, field);
+      assert(node, "Missing rendered field " + field);
+      node.props.onChange({target: {value, checked: value}}); render();
     }
-    await click("Save operational settings");
+    const inspect = n => {
+      if (!n || typeof n !== "object") return;
+      if (["input", "select", "textarea"].includes(n.tag)) controls.push({tag: n.tag,
+        label: n.props["aria-label"], type: n.props.type, value: n.props.value,
+        checked: n.props.checked, readOnly: n.props.readOnly, disabled: n.props.disabled});
+      for (const c of n.children || []) inspect(c);
+    }; inspect(tree);
+    if (input.force_disabled_save) {
+      const node = find(tree, "Save operational settings"); assert(node);
+      assert(node.props.disabled); await node.props.onClick(); await tick(); render();
+    } else await click("Save operational settings");
   } else {
     await click("Load current native state");
     await click({disable: "Disable", enable: "Enable", role: "Channel admin role"}[input.action]);
   }
-  process.stdout.write(JSON.stringify({requests, page_states: pageStates, message_counts: counts}));
+  process.stdout.write(JSON.stringify({requests, page_states: pageStates, message_counts: counts, controls, rendered_text: text(tree)}));
 })().catch(e => {process.stderr.write(String(e.stack)); process.exitCode = 1;});
