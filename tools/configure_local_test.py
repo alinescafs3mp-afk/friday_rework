@@ -32,6 +32,30 @@ MULTIPASS_FIELDS = frozenset({'enabled', 'max_calls', 'max_depth',
 MULTIPASS_MAXIMA = {'max_calls': 256, 'max_depth': 32,
     'max_attempt_seconds': 3600, 'max_call_seconds': 1800}
 _NO_REQUEST_BUDGET = object()
+_NO_EXACT_RENDERER = object()
+
+
+def validate_exact_renderer(value):
+    """Validate explicit native refs; rendering is not readiness or admission.
+
+    Only the separate compression route may own this block. Native runtime
+    loading verifies pinned documents, local assets and dependencies.
+    External receipt/evidence authenticity remains separately verified. This
+    pure composer neither reads those files nor invents readiness evidence.
+    """
+    if type(value) is not dict or set(value) != {'binding', 'deployment'}:
+        raise ValueError('exact_renderer_two_pinned_references_required')
+    for ref in value.values():
+        if type(ref) is not dict or set(ref) != {'path', 'sha256'}:
+            raise ValueError('exact_renderer_explicit_reference_fields_required')
+        path, digest = ref['path'], ref['sha256']
+        if (type(path) is not str or not Path(path).is_absolute()
+                or path != path.strip() or '${' in path
+                or any(ord(c) < 32 or ord(c) == 127 for c in path)):
+            raise ValueError('exact_renderer_absolute_reference_path_required')
+        if type(digest) is not str or re.fullmatch(r'[0-9a-f]{64}', digest) is None:
+            raise ValueError('exact_renderer_explicit_sha256_required')
+    return copy.deepcopy(value)
 
 
 def validate_request_budget(value):
@@ -99,7 +123,10 @@ def build_config(*, base_url, model, key_env, context, max_input,
                  main_output, summary_output, margin, template_overhead,
                  web_profile="disabled", web_extract_char_limit=None, web_extract_timeout=None,
                  compression_inference=None, compression_multipass=None, request_options=None,
-                 request_budget_seconds=_NO_REQUEST_BUDGET):
+                 request_budget_seconds=_NO_REQUEST_BUDGET,
+                 exact_renderer=_NO_EXACT_RENDERER):
+    if exact_renderer is not _NO_EXACT_RENDERER:
+        raise ValueError("exact_renderer_is_compression_only")
     web = hermes_web_config(web_profile, extract_char_limit=web_extract_char_limit,
                             extract_timeout=web_extract_timeout)
     values = (context, max_input, main_output, summary_output, margin, template_overhead)
@@ -192,7 +219,7 @@ def build_config(*, base_url, model, key_env, context, max_input,
     if compression_inference is not None:
         if (type(compression_inference) is not dict
                 or set(compression_inference) != INFERENCE_FIELDS | (set(compression_inference) & {
-                    'request_options', 'request_budget_seconds'})):
+                    'request_options', 'request_budget_seconds', 'exact_renderer'})):
             raise ValueError("compression_inference_explicit_fields_required")
         if compression_inference['key_env'] == key_env:
             raise ValueError("separate_compression_credential_reference_required")
@@ -206,8 +233,15 @@ def build_config(*, base_url, model, key_env, context, max_input,
             raise ValueError("explicit_bounded_multipass_required_for_compression_route")
         # Reuse exactly the same local URL, served-ID and capacity checks. The
         # second role supplies no test-profile capabilities to the main role.
-        compressor = build_config(**compression_inference)
+        compressor_input = copy.deepcopy(compression_inference)
+        exact = compressor_input.pop('exact_renderer', _NO_EXACT_RENDERER)
+        if exact is not _NO_EXACT_RENDERER:
+            exact = validate_exact_renderer(exact)
+        compressor = build_config(**compressor_input)
         config['providers']['friday-compression'] = copy.deepcopy(compressor['providers']['friday-local'])
+        if exact is not _NO_EXACT_RENDERER:
+            bounded = config['providers']['friday-compression']['models'][compressor_input['model']]['bounded_context']
+            bounded['exact_renderer'] = exact
         selected = copy.deepcopy(compressor['auxiliary']['compression'])
         selected['provider'] = 'custom:friday-compression'
         selected['multipass'] = copy.deepcopy(compression_multipass)

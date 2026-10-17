@@ -17,11 +17,11 @@ import sys
 from urllib.parse import urlsplit
 
 try:
-    from tools.configure_local_test import build_config, read_owned_file
+    from tools.configure_local_test import build_config, read_owned_file, validate_exact_renderer
     from tools.web_profile import hermes_web_config, research_policy
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from configure_local_test import build_config, read_owned_file
+    from configure_local_test import build_config, read_owned_file, validate_exact_renderer
     from web_profile import hermes_web_config, research_policy
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,8 +40,13 @@ def _exact(value, keys, label):
 
 
 def _inference(value, label):
-    _exact(value, INFERENCE | (set(value) & {'request_options', 'request_budget_seconds'}
+    optional = {'request_options', 'request_budget_seconds'}
+    if label == 'compression_inference':
+        optional.add('exact_renderer')
+    _exact(value, INFERENCE | (set(value) & optional
                              if isinstance(value, dict) else set()), label)
+    if 'exact_renderer' in value:
+        validate_exact_renderer(value['exact_renderer'])
     if 'request_options' in value and type(value['request_options']) is not dict:
         raise ValueError('explicit_supported_request_options_required')
     return value
