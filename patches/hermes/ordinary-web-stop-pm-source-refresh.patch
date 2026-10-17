@@ -1,0 +1,572 @@
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -644,11 +644,12 @@
+     # tripwire slot cleared at persist.
+     from agent.web_call_context import WebTurn
+     previous_web = getattr(agent, "_web_turn", None)
+-    if previous_web is not None and previous_web.calls:
++    inherited_web = (getattr(agent, '_friday_delegation', None) or {}).get('web_turn')
++    if previous_web is not None and previous_web is not inherited_web and previous_web.calls:
+         receipt = previous_web.stop()
+         if receipt["status"] != "QUIESCENT":
+             raise RuntimeError("STOP_UNCONFIRMED")
+-    agent._web_turn = WebTurn()
++    agent._web_turn = inherited_web or WebTurn()
+     agent._current_turn_timestamp = time.time()
+ 
+     # Pre-turn connection health check: clean up dead TCP connections.
+--- a/agent/web_call_context.py
++++ b/agent/web_call_context.py
+@@ -1,6 +1,7 @@
+ """Original native call clocks and a sticky per-turn web launch/stop fence."""
+ from contextlib import contextmanager
+ from contextvars import ContextVar
++import logging
+ import math
+ import threading
+ import time
+@@ -14,6 +15,8 @@
+         self.lock = threading.RLock()
+         self.stopped = threading.Event()
+         self.calls = set()
++        # Trusted native failure metadata only; never reconstructed from tool text.
++        self.failure = None
+         self.receipt = {'status': 'QUIESCENT', 'sessions': []}
+ 
+     def stop(self):
+@@ -31,6 +34,53 @@
+         finally:
+             self.lock.release()
+ 
++    def fail(self, result):
++        """Fence this turn's web capability and settle only owned web/browser calls."""
++        if self.failure is not None:
++            return dict(self.failure)
++        # WebCall also carries clocks for safe file/memory operations. A web
++        # failure must not turn their shared clock into a whole-turn cancel.
++        self.failure = dict(result, cleanup='unknown')
++        if not self.lock.acquire(timeout=2):
++            receipt = {'status': 'STOP_UNCONFIRMED', 'reason': 'web_launch_unsettled'}
++        else:
++            try:
++                receipts = [call.stop() for call in list(self.calls) if call.uses_web]
++                receipt = {'status': 'QUIESCENT' if all(r['status'] == 'QUIESCENT' for r in receipts)
++                           else 'STOP_UNCONFIRMED', 'sessions': receipts}
++            except Exception:
++                logging.getLogger(__name__).exception('Native web cleanup observation failed')
++                receipt = {'status': 'STOP_UNCONFIRMED', 'reason': 'web_failure_cleanup_unobserved'}
++            finally:
++                self.lock.release()
++        final = dict(result)
++        if receipt['status'] != 'QUIESCENT':
++            final['cleanup'] = 'unconfirmed'
++        self.receipt = receipt
++        self.failure = final
++        return final
++
++
++def same_web_authority(call):
++    """Compare the existing retained native principal pin; never adopt a foreign call."""
++    from hermes_cli.friday_user_scope import delegation_authority, ScopeDenied
++    try:
++        return getattr(call, 'user_authority', None) == delegation_authority()
++    except ScopeDenied:
++        return False
++
++
++def web_retry_refused():
++    """Read only this authenticated caller's native fence, never external result bytes."""
++    call = _current.get()
++    if call is not None and same_web_authority(call) and call.turn.failure is not None:
++        return True
++    from hermes_cli.friday_user_scope import _DELEGATION, delegation_visible
++    delegated = _DELEGATION.get() or {}
++    turn = delegated.get('web_turn')
++    return (turn is not None and turn.failure is not None
++            and delegation_visible(delegated.get('authority')))
++
+ 
+ class WebCall:
+     def __init__(self, turn, deadline, task_id, session_id, call_id, authorization_gate=None, run_deadline=None):
+@@ -44,6 +94,7 @@
+         self.stopped = threading.Event()
+         self.session = None
+         self.registry = None
++        self.uses_web = False
+         self.receipt = {'status': 'QUIESCENT', 'session_id': None}
+         with turn.lock:
+             turn.calls.add(self)
+@@ -60,7 +111,8 @@
+ 
+     def check(self):
+         from tools.interrupt import is_interrupted
+-        if self.stopped.is_set() or self.turn.stopped.is_set() or is_interrupted():
++        if (self.stopped.is_set() or self.turn.stopped.is_set() or is_interrupted()
++                or (self.uses_web and self.turn.failure is not None)):
+             raise RuntimeError('web_call_stopped')
+         if time.monotonic() >= self.deadline():
+             raise TimeoutError('web_original_deadline')
+@@ -84,7 +136,8 @@
+     # Installed at turn start; partial callers lazily get a turn before submit.
+     turn = getattr(agent, '_web_turn', None)
+     if turn is None:
+-        turn = agent._web_turn = WebTurn()
++        delegated = getattr(agent, '_friday_delegation', None) or {}
++        turn = agent._web_turn = delegated.get('web_turn') or WebTurn()
+     if getattr(agent, '_interrupt_requested', False):
+         turn.stopped.set()
+     call = WebCall(turn, deadline, task_id, getattr(agent,'session_id','') or '', call_id,
+@@ -119,6 +172,9 @@
+     call = _current.get()
+     if call is None:
+         raise RuntimeError('web_caller_context_required')
++    if not same_web_authority(call):
++        raise RuntimeError('web_caller_identity_mismatch')
++    call.uses_web = True
+     call.check()
+     return call
+ 
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -387,13 +387,19 @@
+         _private(path)
+ 
+ 
+-def guard_tool(name, args, registry_scope=None):
++def guard_tool(name, args, registry_scope=None, *, execution=True):
+     from hermes_cli.friday_credential_admission import session_artifact_tool, ordinary_readonly_tool, CredentialDenied
+     try:
+         ordinary_readonly_tool(name,args)
+         session_artifact_tool(name,args)
+     except CredentialDenied:
+         raise ScopeDenied() from None
++    from agent.web_call_context import web_retry_refused
++    # Opaque worker launches have no machine no-web declaration. Existing
++    # result readback, safe tools, and native delegated work remain available.
++    if execution and web_retry_refused() and name in BROWSER_TOOLS | {
++            'web_search', 'web_extract', 'friday_work'}:
++        raise ScopeDenied()
+     cap = current()
+     if cap is None:
+         return
+@@ -415,7 +421,9 @@
+         for entry in entries:
+             if entry['name'] in BRIDGES:
+                 raise ScopeDenied()
+-            guard_tool(entry['name'], entry['arguments'], registry_scope)
++            # Envelope preflight proves authority only; actual per-call dispatch
++            # reads the native fence, so safe siblings are not rejected as a batch.
++            guard_tool(entry['name'], entry['arguments'], registry_scope, execution=False)
+         return
+     if name not in cap.binding['tools']:
+         raise ScopeDenied()
+@@ -566,6 +574,9 @@
+     names = set(getattr(parent, 'valid_tool_names', ()))
+     tools = frozenset((names & set(cap.binding['tools'])) - set(DELEGATE_BLOCKED_TOOLS))
+     delegated = {'parent': parent, 'authority': delegation_authority(), 'tools': tools,
++                 # A delegated task shares the parent's original web capability;
++                 # a fresh child turn must not bypass its native failure fence.
++                 'web_turn': getattr(parent, '_web_turn', None),
+                  'deadline': getattr(parent, '_web_run_deadline', None),
+                  'started_at': getattr(parent, '_run_budget_started_at', None),
+                  'iteration_budget': getattr(parent, 'iteration_budget', None), 'cancelled': False}
+--- a/tools/process_registry_web.py
++++ b/tools/process_registry_web.py
+@@ -215,6 +215,8 @@
+         from hermes_constants import get_hermes_home
+         import sys
+         from hermes_cli.friday_user_scope import delegation_authority
++        # Mark native browser owners too; their clocks share WebCall with safe tools.
++        call.uses_web = True
+         call.check()
+         if getattr(self, '_custody_recovery_blocked', False):
+             raise RuntimeError('STOP_UNCONFIRMED')
+--- a/tools/web_process.py
++++ b/tools/web_process.py
+@@ -28,7 +28,7 @@
+         message = 'Проверка в интернете не завершена; её остановка пока не подтверждена.'
+     elif detail == 'web_call_stopped':
+         message = 'Проверка в интернете остановлена.'
+-    return json.dumps({
++    result = {
+         'error': message,
+         'success': False,
+         'retry_allowed': False,
+@@ -43,7 +43,16 @@
+             'Ранее независимо проверенные данные сохраняют свою силу; '
+             'текущая актуальность из этого результата не следует.'
+         ),
+-    }, ensure_ascii=False)
++    }
++    # Only this trusted machine boundary can latch the existing native turn.
++    # The JSON/page body returned to the model never grants stop authority.
++    if call is None:
++        from agent.web_call_context import _current
++        call = _current.get()
++    from agent.web_call_context import same_web_authority
++    if call is not None and same_web_authority(call):
++        result = call.turn.fail(result)
++    return json.dumps(result, ensure_ascii=False)
+ 
+ 
+ def _provider_failed(value):
+--- a/pm/__init__.py
++++ b/pm/__init__.py
+@@ -28,8 +28,9 @@
+         "ensure", "sync_venv", "build_environment", "lock_project", "stage_manager_runtime",
+         "ensure_environment", "ensure_project_environment", "ensure_python_tool", "venv_is_current", "check_project_lock",
+         "export_requirements", "build_requirements_environment", "prune_cache", "stage_tools",
+-        "prepare_tools",
++        "prepare_tools", "refresh_source",
+     ),
++    "pm.source_refresh": ("source_identity",),
+     "pm.operations": ("environment_python", "python_tool"),
+     "pm.extras": ("available", "ensure_import", "install_hint"),
+     "pm.lock": ("Facts", "Lockfile"),
+--- a/pm/client.py
++++ b/pm/client.py
+@@ -202,6 +202,25 @@
+     return Runner(name, env_for(name, base_env=base_env))
+ 
+ 
++def refresh_source(*, expected_source: str, expected_previous_source: str,
++                   expected_environment: str, project_root: Path | None = None,
++                   pause_event=None) -> dict:
++    """Publish verified application bytes while retaining the selected dependency graph.
++
++    All three expected identities are required compare-and-swap inputs. Obtain source
++    identities with ``pm.source_identity``; this operation never accepts an asserted
++    source identity without measuring the actual source and selected workspace.
++    """
++    foreign = project_root is not None and Path(project_root).resolve() != paths.repo_root().resolve()
++    arguments = {"expected_source": expected_source, "expected_previous_source": expected_previous_source,
++                 "expected_environment": str(expected_environment)}
++    if is_runtime() and not foreign:
++        from pm.source_refresh import refresh_source as direct
++        return direct(**arguments, pause_event=pause_event)
++    return _request("refresh_source", {**arguments, "explicit": True},
++                    project_root=project_root, pause_event=pause_event)
++
++
+ def sync_venv(extras=None, *, explicit=False, plugins: PluginInput | None = None, repair=False,
+               project_root: Path | None = None, evict_incompatible_plugins: bool = False) -> None:
+     from pm.environments import running_from_selected_environment
+--- a/pm/lock.py
++++ b/pm/lock.py
+@@ -263,6 +263,7 @@
+     def record_state(
+         self, name: str, stamp: str, extras: list[str], *,
+         environment: Path | None = None, resolved_lock: Path | None = None,
++        source_identity: str | None = None, source_parent: str | None = None,
+     ) -> None:
+         """Commit a verified state package and its selected environment atomically."""
+         fact = {"stamp": stamp, "extras": extras}
+@@ -270,6 +271,10 @@
+             fact["environment"] = str(environment.resolve())
+         if resolved_lock is not None:
+             fact["resolved_lock"] = str(resolved_lock.resolve())
++        if source_identity is not None:
++            fact["source_identity"] = source_identity
++        if source_parent is not None:
++            fact["source_parent"] = source_parent
+         self._merge_and_write(name, fact)
+ 
+     def retain(self, names: set[str]) -> None:
+--- /dev/null
++++ b/pm/source_refresh.py
+@@ -0,0 +1,211 @@
++"""Explicit application publication, independent of the dependency-only stamp.
++
++A source refresh consumes three measured compare-and-swap identities. It never repairs
++an old workspace or changes the feature selection. Its fresh candidate is selected only
++when the native dependency stamp and exact resolved lock still match the prior graph.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++import re
++import shutil
++import tomllib
++
++from pm import paths
++from pm.package import InstallError
++
++
++def _metadata(root: Path) -> bytes:
++    from pm.workspace import _core_release_quarantine
++
++    document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8-sig"))
++    settings = document.get("tool", {}).get("uv", {})
++    workspace = settings.get("workspace")
++    if workspace is not None:
++        members = workspace.get("members", []) if isinstance(workspace, dict) else []
++        if (set(workspace) != {"members"} or not members
++                or any(not isinstance(member, str) or not member.startswith("plugin-sources/")
++                       or ".." in Path(member).parts for member in members)):
++            raise ValueError("source refresh cannot normalize a non-generated workspace")
++        settings.pop("workspace")
++    _core_release_quarantine(document, root / "uv.lock")
++    return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
++
++
++def source_identity(project_root: Path | None = None) -> str:
++    """Measure regular core files selected by the native workspace copier.
++
++    Dependency resolution has its own stamp. The generated workspace member table and
++    formatting do not change core identity; all remaining build metadata and shipped
++    package files (including nested dist assets) do. No asserted receipt is trusted.
++    """
++    from pm.workspace import core_input_files
++
++    root = (paths.repo_root() if project_root is None else Path(project_root)).resolve()
++    for name in ("pyproject.toml", "uv.lock"):
++        metadata = root / name
++        if not metadata.is_file() or metadata.is_symlink():
++            raise ValueError(f"core source {name} must be a regular file")
++    h = hashlib.sha256(b"hermes-core-source-v1\0")
++    for name, file in sorted(core_input_files(root).items()):
++        # Snapshotted plugin members are covered by the dependency selection, not core.
++        if name.startswith("plugin-sources/"):
++            continue
++        body = _metadata(root) if name == "pyproject.toml" else file.read_bytes()
++        h.update(name.encode()); h.update(b"\0"); h.update(hashlib.sha256(body).digest())
++    return h.hexdigest()
++
++
++def _validate_request(expected_source, expected_previous_source, expected_environment, explicit):
++    if not explicit:
++        raise ValueError("source refresh requires an explicit publication")
++    for identity in (expected_source, expected_previous_source):
++        if not isinstance(identity, str) or not re.fullmatch(r"[a-f0-9]{64}", identity):
++            raise ValueError("source identity must be a measured SHA-256")
++    if not isinstance(expected_environment, str) or not Path(expected_environment).is_absolute():
++        raise ValueError("expected environment must name the selected absolute path")
++
++
++def _selected_workspace(root, selected, fact, expected_environment):
++    from pm.environments import install_state_dir
++
++    if str(selected) != expected_environment or fact.get("environment") != str(selected):
++        raise ValueError("selected environment changed; re-read source ancestry")
++    generation = selected.parent
++    previous = generation / "workspace"
++    if (generation.parent != (install_state_dir(root) / "environments").resolve()
++            or fact.get("resolved_lock") != str(previous / "uv.lock")
++            or previous.is_symlink() or not previous.is_dir()
++            or any(not (previous / name).is_file() or (previous / name).is_symlink()
++                   for name in ("pyproject.toml", "uv.lock"))):
++        raise ValueError("selected workspace has no verified native custody")
++    extras = fact.get("extras")
++    if not isinstance(extras, list) or any(not isinstance(extra, str) for extra in extras):
++        raise ValueError("recorded extras are incomplete")
++    return previous, extras
++
++
++def refresh_source(*, expected_source: str, expected_previous_source: str,
++                   expected_environment: str, explicit: bool = True, pause_event=None) -> dict:
++    """Publish current core source with the exact selected extras and resolved graph.
++
++    Only the explicit public client calls this operation. A stale selection, missing
++    custody, changed metadata/graph, cancellation or source mutation refuses publication.
++    Legacy selections need no fabricated source fact: their workspace is measured first.
++    """
++    from pm import receipt
++    from pm.downloader import DownloadPaused
++    from pm.environments import flush_before_selecting, install_state_dir, selected_venv
++    from pm.install import _venv_install_lock, _runtime_state_matches
++    from pm.lock import Facts
++    from pm.registry import get_package
++    from hermes_cli.runtime_state import recover_publication
++
++    token = receipt.begin("source-refresh")
++    outcome = "failed"
++    candidate = None
++    committed = False
++    publication_attempted = False
++    owned_generation = None
++
++    def cancelled():
++        if pause_event is not None and pause_event.is_set():
++            raise DownloadPaused("source refresh cancelled before selection")
++
++    try:
++        _validate_request(expected_source, expected_previous_source, expected_environment, explicit)
++        cancelled()
++        with _venv_install_lock(patient=False):
++            root = paths.repo_root().resolve()
++            recover_publication(root)
++            facts = Facts(paths.runtime_facts_path(), strict=True)
++            fact = facts.get("venv")
++            if not isinstance(fact, dict) or not isinstance(fact.get("stamp"), str):
++                raise ValueError("source refresh requires a recorded dependency selection")
++            selected = selected_venv(root).resolve()
++            previous, extras = _selected_workspace(root, selected, fact, expected_environment)
++            generation = selected.parent
++            package = get_package("venv")
++            stamp = package.expected_stamp(extras)
++            if not _runtime_state_matches(fact, stamp):
++                raise ValueError("dependency selection changed; use dependency sync first")
++            previous_source = source_identity(previous)
++            if previous_source != expected_previous_source:
++                raise ValueError("previous source ancestry changed")
++            if fact.get("source_identity", previous_source) != previous_source:
++                raise ValueError("recorded source identity disagrees with selected bytes")
++            source = source_identity(root)
++            if source != expected_source:
++                raise ValueError("candidate source identity changed")
++            # Source-only publication cannot reinterpret dependency/build options.
++            if _metadata(root) != _metadata(previous):
++                raise ValueError("core build metadata changed; use a dependency update")
++            prior_lock = (previous / "uv.lock").read_bytes()
++            cancelled()
++            if source == previous_source:
++                receipt.record_venv_rebuild(False, "source already current")
++                outcome = "ok"
++                return {"state": "current", "source_identity": source, "environment": str(selected)}
++            existing_generations = set(generation.parent.iterdir())
++            result = package.apply(list(extras), explicit=True)
++            candidate = Path(result["environment"]).resolve()
++            if (candidate.parent.parent == generation.parent and candidate.name == "venv"
++                    and candidate.parent not in existing_generations):
++                owned_generation = candidate.parent
++            workspace = Path(result["resolved_lock"]).resolve().parent
++            if (candidate.parent.parent != generation.parent
++                    or workspace != candidate.parent / "workspace"
++                    or candidate == selected or candidate.parent in existing_generations):
++                raise ValueError("candidate workspace has no native custody")
++            cancelled()
++            if (package.expected_stamp(extras) != stamp
++                    or (workspace / "uv.lock").read_bytes() != prior_lock):
++                raise ValueError("dependency graph changed while refreshing source")
++            if (source_identity(root) != source or source_identity(workspace) != source
++                    or source_identity(previous) != previous_source
++                    or (previous / "uv.lock").read_bytes() != prior_lock):
++                raise ValueError("source bytes changed while preparing publication")
++            facts.reload()
++            if facts.get("venv") != fact or selected_venv(root).resolve() != selected:
++                raise ValueError("selection changed while preparing source publication")
++            flush_before_selecting()
++            cancelled()
++            # Flushing an adopted generation may take time. Recheck all publication inputs
++            # at the final boundary, including non-cooperating source/config editors.
++            facts.reload()
++            if (facts.get("venv") != fact or selected_venv(root).resolve() != selected
++                    or package.expected_stamp(extras) != stamp
++                    or source_identity(root) != source or source_identity(workspace) != source
++                    or source_identity(previous) != previous_source
++                    or (workspace / "uv.lock").read_bytes() != prior_lock
++                    or (previous / "uv.lock").read_bytes() != prior_lock):
++                raise ValueError("source or selection changed at the publication boundary")
++            cancelled()
++            # durable_write_bytes may raise after atomic replacement (e.g. fsync failure).
++            # From this point an exception is not evidence that publication did not happen.
++            publication_attempted = True
++            facts.record_state("venv", stamp, list(extras), environment=candidate,
++                               resolved_lock=workspace / "uv.lock", source_identity=source,
++                               source_parent=previous_source)
++            committed = True
++            receipt.record_venv_rebuild(True, "application source changed")
++            outcome = "ok"
++            return {"state": "rebuilt", "source_identity": source,
++                    "source_parent": previous_source, "environment": str(candidate)}
++    except BaseException as exc:
++        if publication_attempted and not committed:
++            detail = f"STOP_UNCONFIRMED: source publication may be visible; retained {owned_generation}"
++            receipt.record_step("source-publication-unconfirmed", False, detail)
++            raise InstallError("venv", detail,
++                               "reconcile selected facts and candidate before retrying; do not delete either generation") from exc
++        receipt.record_step("source-refresh", False, f"{type(exc).__name__}: {exc}")
++        raise
++    finally:
++        if owned_generation is not None and not publication_attempted:
++            # apply owns cleanup until it returns; this operation owns precommit rejection.
++            state = (install_state_dir(paths.repo_root()) / "environments").resolve()
++            if owned_generation.parent == state:
++                shutil.rmtree(owned_generation, ignore_errors=True)
++        receipt.finalize(outcome, 0 if outcome == "ok" else 1, token=token)
+--- a/pm/worker.py
++++ b/pm/worker.py
+@@ -101,7 +101,7 @@
+             arguments = request["arguments"]
+             if request["operation"] in ("sync_venv", "venv_is_current"):
+                 arguments["plugins"] = plugin_inputs.decode(arguments.get("plugins"))
+-            if request["operation"] == "ensure":
++            if request["operation"] in ("ensure", "refresh_source"):
+                 arguments["pause_event"] = pause
+             for name in ("progress", "download_progress"):
+                 if name in request["callbacks"]:
+--- a/pm/worker_operations.py
++++ b/pm/worker_operations.py
+@@ -25,6 +25,7 @@
+     "stage_only": Operation("pm.install", None, "always"),
+     "stage_tools": Operation("pm.build_operations", None, "never"),
+     "prepare_tools": Operation("pm.build_operations", None, "always"),
++    "refresh_source": Operation("pm.source_refresh", ("venv",), "policy"),
+     "sync_venv": Operation("pm.install", ("venv",), "policy"),
+     "venv_is_current": Operation("pm.install", ("venv",), "never"),
+     "build_environment": Operation("pm.operations", ("uv",), "policy"),
+--- a/pm/workspace.py
++++ b/pm/workspace.py
+@@ -62,8 +62,8 @@
+     return h.hexdigest()
+ 
+ 
+-def _copy_core_inputs(source: Path, destination: Path) -> None:
+-    """Build from a writable snapshot, never from signed/read-only source."""
++def _core_input_layout(source: Path, *, destination: Path | None = None):
++    """One authoritative directory/file selection for copying and source identity."""
+     import fnmatch
+     import tomllib
+ 
+@@ -92,18 +92,43 @@
+         return [name for name in names if name in nested_excluded or name.startswith(".")
+                 or name.endswith(".egg-info") or (Path(directory) / name).is_symlink()]
+ 
+-    for entry in source.iterdir():
+-        if (entry.is_dir() and not entry.is_symlink() and entry.name not in excluded
+-                and not entry.name.startswith(".") and entry.resolve() != destination.resolve()
+-                and any(fnmatch.fnmatchcase(entry.name, pattern) for pattern in package_roots)):
+-            target = destination / entry.name
+-            shutil.copytree(entry, target, ignore=ignore)
++    directories = [entry for entry in source.iterdir()
++                   if (entry.is_dir() and not entry.is_symlink() and entry.name not in excluded
++                       and not entry.name.startswith(".")
++                       and (destination is None or entry.resolve() != destination.resolve())
++                       and any(fnmatch.fnmatchcase(entry.name, pattern) for pattern in package_roots))]
++    result = {}
+     for name in files:
+         entry = source / name
+         if not entry.is_file() or entry.is_symlink():
+             continue
+         if not entry.resolve().is_relative_to(source.resolve()):
+             raise InstallError("venv", f"build input escapes the core project: {name}")
++        result[name] = entry
++
++    return directories, result, ignore
++
++
++def core_input_files(source: Path) -> dict[str, Path]:
++    """Exact regular core files copied by the native workspace builder."""
++    directories, result, ignore = _core_input_layout(source)
++    for entry in directories:
++        for directory, dirs, names in os.walk(entry):
++            dirs[:] = sorted(set(dirs) - set(ignore(directory, dirs)))
++            for name in sorted(set(names) - set(ignore(directory, names))):
++                file = Path(directory) / name
++                if file.is_file():
++                    result[file.relative_to(source).as_posix()] = file
++    return result
++
++
++def _copy_core_inputs(source: Path, destination: Path) -> None:
++    """Build from a writable snapshot, never from signed/read-only source."""
++    directories, files, ignore = _core_input_layout(source, destination=destination)
++    for entry in directories:
++        # Preserve namespace directories and their metadata, including empty directories.
++        shutil.copytree(entry, destination / entry.name, ignore=ignore)
++    for name, entry in files.items():
+         target = destination / name
+         target.parent.mkdir(parents=True, exist_ok=True)
+         shutil.copy2(entry, target)

@@ -1,0 +1,691 @@
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -675,6 +675,18 @@
+     connection = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=0.2)
+     try:
+         connection.execute('PRAGMA query_only=ON')
++        _check_database_rows(cap, connection)
++    except (ScopeDenied, sqlite3.Error, ValueError, TypeError, AttributeError):
++        cap.revoked = True
++        raise ScopeDenied() from None
++    finally:
++        connection.close()
++
++
++
++def _check_database_rows(cap, connection):
++    """Validate native session ownership on a caller-pinned read transaction."""
++    try:
+         rows = connection.execute('SELECT user_id, origin_json, profile_name FROM sessions LIMIT 10001').fetchall()
+         if len(rows) > 10000:
+             raise ScopeDenied()  # integrity inspection bound, never skip later rows
+@@ -689,11 +701,9 @@
+                     or account != {'schema': 'friday.account_origin.v1', 'platform': cap.principal[0],
+                                    'transport_profile': cap.principal[1], 'account_id': cap.principal[2]}):
+                 raise ScopeDenied()
+-    except (ScopeDenied, sqlite3.Error, ValueError, TypeError, AttributeError):
++    except (ScopeDenied, ValueError, TypeError, AttributeError):
+         cap.revoked = True
+         raise ScopeDenied() from None
+-    finally:
+-        connection.close()
+ 
+ 
+ def provision_new_home(authorization_home, binding, native_config, *, publish=True, verify=None):
+--- a/hermes_state_errors.py
++++ b/hermes_state_errors.py
+@@ -5,6 +5,14 @@
+ import errno
+ import re
+ import sqlite3
++
++
++class SessionSearchIndexStatusError(RuntimeError):
++    """The base rebuild-marker observation failed; it says nothing about FTS integrity."""
++
++    def __init__(self):
++        # Do not expose marker values, SQL, or database paths in the tool response.
++        super().__init__("session_search_index_status_failed")
+ 
+ # Malformed schema: ``sqlite_master`` itself is inconsistent (typically a DUPLICATE
+ # ``CREATE VIRTUAL TABLE messages_fts`` row). SQLite parses the whole schema while
+--- a/hermes_state_search.py
++++ b/hermes_state_search.py
+@@ -12,6 +12,7 @@
+ from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
+ 
+ from agent.skill_commands import describe_skill_invocation
++from hermes_state_errors import SessionSearchIndexStatusError
+ from hermes_state_common import (
+     FTS_CJK_STALE_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,
+     FTS_TRIGRAM_EXCLUDED_SOURCES, FTS_TRIGRAM_SQL,
+@@ -228,18 +229,43 @@
+ 
+     def fts_rebuild_status(self) -> Optional[Dict[str, Any]]:
+         """Deferred-rebuild progress ``{"pending", "total", "indexed", "percent"}`` or None. Reads
+-        via the pooled reader (not get_meta/self._lock) so search never blocks on the writer."""
+-        return self._rebuild_status("fts_rebuild")
++        via the pooled reader (not get_meta/self._lock) so search never blocks on the writer.
++        None only reports no pending base rebuild; it is NOT an index-integrity proof."""
++        try:
++            return self._rebuild_status("fts_rebuild", validate=True)
++        except Exception as exc:
++            raise SessionSearchIndexStatusError() from exc
+ 
+     def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
+         """CJK-index backfill progress, or None when none is pending."""
+         return self._rebuild_status("fts_cjk_rebuild")
+ 
+-    def _rebuild_status(self, prefix: str) -> Optional[Dict[str, Any]]:
++    def _rebuild_status(self, prefix: str, *, validate: bool = False) -> Optional[Dict[str, Any]]:
+         rows = self._read_all("SELECT key, value FROM state_meta WHERE key IN (?, ?)",
+                               (f"{prefix}_high_water", f"{prefix}_progress"))
+         meta = {r["key"]: r["value"] for r in rows}
+         high_water = meta.get(f"{prefix}_high_water")
++        if validate:
++            # Empty stores can legitimately be seeded at (0, 0). Missing progress
++            # with a positive high-water remains pending at zero as before. An
++            # orphan progress marker or an impossible range is not "no rebuild".
++            progress_value = meta.get(f"{prefix}_progress")
++            high_key, progress_key = f"{prefix}_high_water", f"{prefix}_progress"
++            if any(key in meta and meta[key] is None for key in (high_key, progress_key)):
++                raise ValueError("null rebuild marker")
++            if high_key not in meta:
++                if progress_key in meta:
++                    raise ValueError("orphan rebuild progress")
++                return None
++            else:
++                total = int(high_water)
++                progress = 0 if progress_value is None else int(progress_value)
++                if not 0 <= progress <= total <= (1 << 63) - 1:
++                    raise ValueError("invalid rebuild progress range")
++                if total == 0:
++                    return None
++                return {"pending": True, "total": total, "indexed": progress,
++                        "percent": 100 * progress // total}
+         if high_water is None or int(high_water) <= 0:
+             return None
+         total, progress = int(high_water), int(meta.get(f"{prefix}_progress") or 0)
+--- /dev/null
++++ b/hermes_state_search_snapshot.py
+@@ -0,0 +1,344 @@
++"""Bounded own-profile discovery from one pre-query, content-checked RAM snapshot.
++
++The original file is opened mode=ro using the existing native read budget.
++No SessionDB constructor, repair, flush, schema setup or index rebuild runs here.
++Only bounded SQLite 3.53.1 canonical base/trigram copies receive completeness
++proofs. Larger stores and CJK retain native discovery, explicitly unattested.
++"""
++from contextlib import contextmanager
++import hashlib
++import json
++import re
++import sqlite3
++import threading
++import time
++
++from hermes_state import SessionDB
++from hermes_state_common import FTS_SQL, FTS_TRIGRAM_SQL, FTS_STORAGE_VERSION
++from hermes_state_fts import FTS_CJK_TABLE_SQL, load_fts5_cjk_extension
++from hermes_cli.friday_user_scope import ScopeDenied, _check_database_rows
++
++_MAX_DATABASE_BYTES = 16 * 1024 * 1024
++_MAX_MESSAGES = 200
++_MAX_CONTENT_BYTES = 4 * 1024 * 1024
++_MAX_SECONDS = 5.0
++_MAX_VM_STEPS = 500_000
++_SLOTS = threading.BoundedSemaphore(2)
++
++
++class SnapshotUnsupported(Exception):
++    def __init__(self, code):
++        self.code = code
++        super().__init__(code)
++
++
++def _require(value, code):
++    if not value:
++        raise SnapshotUnsupported(code)
++
++
++def _canonical(value):
++    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(',', ':')).encode()
++
++
++def _sql_shape(sql):
++    return ' '.join(sql.replace('IF NOT EXISTS ', '').split()).rstrip(';')
++
++
++def _schema(conn):
++    expected = {}
++    for ddl in (FTS_SQL, FTS_TRIGRAM_SQL, FTS_CJK_TABLE_SQL):
++        for sql, name in re.findall(r'(CREATE (?:VIRTUAL TABLE|VIEW) IF NOT EXISTS (\w+)\b[^;]+);', ddl):
++            expected[name] = _sql_shape(sql)
++    rows = conn.execute("SELECT type,name,sql FROM sqlite_schema WHERE name IN "
++        "('messages','sessions','messages_fts','messages_fts_src','messages_fts_trigram',"
++        "'messages_fts_trigram_src','messages_fts_cjk','messages_fts_cjk_src') ORDER BY name").fetchall()
++    found = {r[1]: r for r in rows}
++    _require(all(name in found and found[name][0] == 'table' for name in ('messages', 'sessions')),
++             'source_tables_unsupported')
++    cjk = 'messages_fts_cjk' in found
++    _require(cjk == ('messages_fts_cjk_src' in found), 'cjk_schema_incomplete')
++    _require(all(name in found for name in ('messages_fts', 'messages_fts_src')), 'base_index_missing')
++    trigram = 'messages_fts_trigram' in found
++    _require(trigram == ('messages_fts_trigram_src' in found), 'trigram_schema_incomplete')
++    for name, row in found.items():
++        if name in expected:
++            _require(_sql_shape(row[2] or '') == expected[name], 'index_projection_unsupported')
++    return (['messages_fts'] + (['messages_fts_trigram'] if trigram else [])
++            + (['messages_fts_cjk'] if cjk else [])), hashlib.sha256(_canonical([list(r) for r in rows])).hexdigest()
++
++
++class _Budget:
++    def __init__(self):
++        self.started = time.monotonic()
++        self.deadline = self.started + _MAX_SECONDS
++        self.steps = 0
++        self.failed = None
++
++    def check(self):
++        _require(time.monotonic() <= self.deadline, 'time_budget_exceeded')
++        _require(self.failed is None, self.failed or 'query_failed')
++
++    def progress(self):
++        self.steps += 1000
++        if self.steps > _MAX_VM_STEPS or time.monotonic() > self.deadline:
++            self.failed = 'execution_budget_exceeded'
++            return 1
++        return 0
++
++    def backup(self, status, remaining, total):
++        self.check()
++        _require(status in (sqlite3.SQLITE_OK, sqlite3.SQLITE_DONE), 'backup_busy_or_failed')
++        _require(total >= 0 and total * self.page_size <= _MAX_DATABASE_BYTES, 'database_size_exceeded')
++
++
++class _CheckedCursor:
++    def __init__(self, cursor, budget):
++        self._cursor, self._budget = cursor, budget
++
++    def _call(self, fn, *args):
++        self._budget.check()
++        try:
++            result = fn(*args)
++        except Exception:
++            self._budget.failed = self._budget.failed or 'query_failed'
++            raise
++        self._budget.check()
++        return result
++
++    def fetchone(self):
++        return self._call(self._cursor.fetchone)
++
++    def fetchall(self):
++        return self._call(self._cursor.fetchall)
++
++    def fetchmany(self, *args):
++        return self._call(self._cursor.fetchmany, *args)
++
++    def __iter__(self):
++        while (row := self.fetchone()) is not None:
++            yield row
++
++
++class _CheckedConnection:
++    def __init__(self, conn, budget):
++        self._conn, self._budget = conn, budget
++
++    def execute(self, *args):
++        self._budget.check()
++        try:
++            cursor = self._conn.execute(*args)
++        except Exception:
++            self._budget.failed = self._budget.failed or 'query_failed'
++            raise
++        self._budget.check()
++        return _CheckedCursor(cursor, self._budget)
++
++
++class _SnapshotDB(SessionDB):
++    def __init__(self, conn, original, budget, indexes):
++        self._conn = _CheckedConnection(conn, budget)
++        self._lock = threading.Lock()
++        self.db_path = original.db_path
++        self.read_only = True
++        self._fts_enabled = True
++        self._fts_stale = False
++        self._trigram_available = 'messages_fts_trigram' in indexes and original._trigram_available
++        self._fts_cjk_available = 'messages_fts_cjk' in indexes and original._fts_cjk_available
++        self._budget = budget
++
++    @contextmanager
++    def _read_ctx(self):
++        self._budget.check()
++        yield self._conn
++        self._budget.check()
++
++    def _read_retrying_ioerr(self, fn):
++        return fn(self._conn)
++
++    def _session_row_dict(self, row):
++        # Native session metadata also has a tolerant JSON decoder. Preserve
++        # its ordinary output, while refusing proof after an ignored fault.
++        try:
++            raw = dict(row).get('model_config')
++            if isinstance(raw, str) and raw:
++                json.loads(raw)
++            return super()._session_row_dict(row)
++        except Exception:
++            self._budget.failed = self._budget.failed or 'discovery_data_failed'
++            raise
++
++    def _row_to_message_dict(self, row, **kwargs):
++        # Native decoders intentionally tolerate malformed persisted JSON. Such
++        # tolerance is useful for display, but cannot establish complete recall.
++        # Validate only rows actually hydrated; visibility/role filters remain
++        # native filters and never become synthetic "decode failures".
++        try:
++            raw = dict(row)
++            content = raw.get('content')
++            if isinstance(content, str) and content.startswith(self._CONTENT_JSON_PREFIX):
++                json.loads(content[len(self._CONTENT_JSON_PREFIX):])
++            if raw.get('tool_calls'):
++                json.loads(raw['tool_calls'])
++            meta = raw.get('display_metadata')
++            if meta is not None:
++                for _ in range(2):
++                    if isinstance(meta, str):
++                        meta = json.loads(meta)
++                _require(isinstance(meta, dict), 'discovery_data_failed')
++            return super()._row_to_message_dict(row, **kwargs)
++        except Exception:
++            self._budget.failed = self._budget.failed or 'discovery_data_failed'
++            raise
++
++    def flush_token_counts(self, *args, **kwargs):
++        return True  # No source writer or deferred queue exists on this snapshot.
++
++    def _enter_fts_fail_open(self, *args, **kwargs):
++        self._budget.failed = 'query_failed'
++        raise SnapshotUnsupported('query_failed')
++
++    def _execute_write(self, *args, **kwargs):
++        self._budget.failed = 'snapshot_write_refused'
++        raise SnapshotUnsupported('snapshot_write_refused')
++
++    def close(self):
++        pass  # Owning context closes the sole source or RAM connection.
++
++    def __del__(self):
++        pass
++
++
++def run_discovery_snapshot(db, cap, discover):
++    """Return native discovery, with a proof only inside the checked subset.
++
++    `discover` receives the only DB facade it may use. Existing permission admission
++    precedes this call; metadata ownership is checked again in the pinned snapshot
++    before reading content pages. Compatibility is selected before discovery,
++    never after a failed query, integrity check, ownership or resource check.
++    """
++    source = ram = None
++    permit = slot = False
++    budget = _Budget()
++    try:
++        _require(sqlite3.sqlite_version == '3.53.1', 'sqlite_version_unsupported')
++        from pathlib import Path
++        if cap is None or Path(db.db_path) != cap.home / 'state.db':
++            raise ScopeDenied()
++        cap.check()
++        budget.check()
++        _require(bool(db._fts_enabled) and not db._fts_stale, 'base_index_disabled_or_stale')
++        permit = db._read_budget.acquire(db)
++        _require(permit, 'native_read_capacity_exceeded')
++        source = db._connect_read_only(timeout=0.2)
++        source.execute('PRAGMA query_only=ON')
++        source.set_progress_handler(budget.progress, 1000)
++        source.execute('BEGIN')
++        # The first page_count read fixes the snapshot used by every later check/backup.
++        budget.page_size = source.execute('PRAGMA page_size').fetchone()[0]
++        database_bytes = source.execute('PRAGMA page_count').fetchone()[0] * budget.page_size
++        _require(database_bytes > 0, 'database_size_invalid')
++        indexes, schema_sha = _schema(source)
++        _check_database_rows(cap, source)
++        _require(source.execute('SELECT 1 FROM messages m LEFT JOIN sessions s ON s.id=m.session_id WHERE s.id IS NULL LIMIT 1').fetchone() is None,
++                 'orphan_message')
++        meta = dict(source.execute("SELECT key,value FROM state_meta WHERE key LIKE 'fts_%'"))
++        _require('fts_storage_version' not in meta or meta['fts_storage_version'] == str(FTS_STORAGE_VERSION), 'storage_version_unsupported')
++        for key in ('fts_stale', 'fts_cjk_stale', 'fts_rebuild_high_water', 'fts_rebuild_progress',
++                    'fts_cjk_rebuild_high_water', 'fts_cjk_rebuild_progress', 'fts_rebuild_deferral'):
++            _require(key not in meta, 'index_pending_stale_or_unknown')
++        # Eligibility is not a failed attestation or query. No query has run yet.
++        # Keep the bounded proof contract without imposing its size/CJK limits
++        # as new product search limits. The compatible route uses this same
++        # admitted read-only transaction, never a writer or a retry on another DB.
++        reason = None
++        if 'messages_fts_cjk' in indexes or db._fts_cjk_available:
++            reason = 'cjk_projection_not_checked'
++        elif database_bytes > _MAX_DATABASE_BYTES:
++            reason = 'database_size_exceeds_checked_subset'
++        if reason is None:
++            row_count = source.execute('SELECT count(*) FROM (SELECT id FROM messages LIMIT ?)', (_MAX_MESSAGES + 1,)).fetchone()[0]
++            if row_count > _MAX_MESSAGES:
++                reason = 'message_count_exceeds_checked_subset'
++            else:
++                # SQLite computes lengths without exporting history to Python.
++                content_bytes = source.execute("SELECT COALESCE(sum(length(CAST(COALESCE(content,'') AS BLOB))+length(CAST(COALESCE(tool_name,'') AS BLOB))+length(CAST(COALESCE(tool_calls,'') AS BLOB))),0) FROM messages").fetchone()[0]
++                if content_bytes > _MAX_CONTENT_BYTES:
++                    reason = 'content_size_exceeds_checked_subset'
++        if reason is not None:
++            if db._fts_cjk_available:
++                _require('messages_fts_cjk' in indexes and load_fts5_cjk_extension(source), 'cjk_tokenizer_unavailable')
++            compatible = _SnapshotDB(source, db, budget, indexes)
++            payload = json.loads(discover(compatible))
++            budget.check()
++            _require(payload.get('success') is True and payload.get('mode') == 'discover', 'discovery_failed')
++            _require(compatible.fts_rebuild_status() is None and not compatible._fts_stale, 'snapshot_status_changed')
++            cap.check()
++            budget.check()
++            payload['index_status'].update(query_snapshot_binding='NOT_ESTABLISHED',
++                completeness='NOT_ESTABLISHED', attestation='NOT_ESTABLISHED',
++                attestation_reason=reason, discovery_route='native_read_only_compatibility')
++            return json.dumps(payload, ensure_ascii=False)
++        slot = _SLOTS.acquire(blocking=False)
++        _require(slot, 'snapshot_capacity_exceeded')
++        ram = sqlite3.connect(':memory:', isolation_level=None)
++        ram.row_factory = sqlite3.Row
++        ram.execute('PRAGMA temp_store=MEMORY')
++        ram.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, _MAX_CONTENT_BYTES)
++        source.backup(ram, pages=64, progress=budget.backup, sleep=0)
++        source.rollback()
++        source.close(); source = None
++        db._read_budget.release(); permit = False
++        ram.set_progress_handler(budget.progress, 1000)
++        image_sha = hashlib.sha256(ram.serialize()).hexdigest()
++        for table in indexes:
++            ram.execute(f"INSERT INTO {table}({table},rank) VALUES('integrity-check',1)")
++        _require(hashlib.sha256(ram.serialize()).hexdigest() == image_sha, 'integrity_command_changed_snapshot')
++        ram.execute('PRAGMA query_only=ON')
++        snapshot = _SnapshotDB(ram, db, budget, indexes)
++        payload = json.loads(discover(snapshot))
++        budget.check()  # catches failures swallowed by native fallback/hydration helpers.
++        _require(payload.get('success') is True and payload.get('mode') == 'discover', 'discovery_failed')
++        _require(snapshot.fts_rebuild_status() is None and not snapshot._fts_stale, 'snapshot_status_changed')
++        _require(hashlib.sha256(ram.serialize()).hexdigest() == image_sha, 'query_changed_snapshot')
++        budget.check()
++        cap.check()
++        budget.check()
++        payload['index_status'] = {'read_ok': True, 'state': 'complete', 'scope': 'canonical_base_and_available_trigram_projections',
++            'observation_phase': 'same_snapshot_before_and_during_discovery',
++            'query_snapshot_binding': 'ESTABLISHED', 'completeness': 'CONTENT_COMPLETE_FOR_DECLARED_PROJECTIONS'}
++        if payload.get('count') == 0:
++            payload['message'] = 'No matching sessions returned by the native query filters and limits in the verified snapshot.'
++        proof = {'schema': 'friday.native-search-snapshot.v1', 'snapshot_sha256': image_sha,
++            'schema_sha256': schema_sha, 'sqlite_version': sqlite3.sqlite_version,
++            'indexes': indexes, 'content_integrity': 'SQLITE_FTS5_RANK1_PASS',
++            'binding': 'one_pinned_source_backup_before_query;all_discovery_reads_on_checked_copy',
++            'scope': 'validated_own_profile', 'source_access': 'mode_ro_query_only',
++            'database_bytes': database_bytes, 'message_count': row_count,
++            'result_semantics': 'native_filters_ranking_limits;not_unrestricted_absence_proof',
++            'elapsed_ms': round((time.monotonic() - budget.started) * 1000),
++            'response_sha256': hashlib.sha256(_canonical(payload)).hexdigest()}
++        payload['search_snapshot'] = proof
++        return json.dumps(payload, ensure_ascii=False)
++    except ScopeDenied:
++        return json.dumps({'success': False, 'error': 'product_user_scope_refused'})
++    except Exception as exc:  # health: allow BLE001 -- Fail closed on arbitrary hydration faults; typed refusal deliberately omits private traceback data.
++        code = exc.code if isinstance(exc, SnapshotUnsupported) else (budget.failed or ('sqlite_snapshot_failed' if isinstance(exc, sqlite3.Error) else 'snapshot_internal_failure'))
++        return json.dumps({'success': False, 'error': 'session_search_snapshot_unavailable', 'reason': code,
++            'index_status': {'read_ok': False, 'state': 'unknown', 'query_snapshot_binding': 'NOT_ESTABLISHED',
++                             'completeness': 'NOT_ESTABLISHED'}})
++    finally:
++        try:
++            try:
++                if ram is not None:
++                    ram.close()
++            finally:
++                if source is not None:
++                    source.close()
++        finally:
++            try:
++                if permit:
++                    db._read_budget.release()
++            finally:
++                if slot:
++                    _SLOTS.release()
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -848,6 +848,83 @@
+             pass
+ 
+ 
++def _friday_skill_dispatch(function_name, next_args, ids, dispatch):
++    """Bounded native scope receipt for the three existing ordinary skill tools.
++
++    No permission is issued. The exact registry call is bracketed by the native
++    guard and current capability checks. Unscoped historical calls stay unscoped.
++    """
++    from hermes_cli.friday_user_scope import current, guard_tool, ScopeDenied
++    if function_name not in {"skills_list", "skill_view", "skill_manage"}:
++        return dispatch()
++    cap = current()
++    if cap is None:
++        return dispatch()
++    # Missing correlation fails BEFORE a mutating handler, never creates a grant.
++    if any(not isinstance(value, str) or not 0 < len(value) <= 256
++           for value in (ids.session_id, ids.tool_call_id)):
++        raise ScopeDenied()
++    from hermes_cli.friday_skill_io import authority_stamp, check_stamp
++    import hashlib
++    def _digest(value):
++        return hashlib.sha256((json.dumps(value, ensure_ascii=True, sort_keys=True) + "\n").encode()).hexdigest()
++    guard_tool(function_name, next_args)
++    stamp = authority_stamp()
++    args_sha256 = _digest(next_args)
++    registry_generation = registry._generation
++    if type(registry_generation) is not int or registry_generation < 0:
++        raise ScopeDenied()
++    entry = registry.get_entry(function_name)
++    handler = getattr(entry, "handler", None)
++    def _provenance(fn, depth=0):
++        code = getattr(fn, "__code__", None)
++        if code is None or depth > 2 or len(code.co_freevars) > 4:
++            raise ScopeDenied()
++        constants = repr(code.co_consts)
++        if len(constants) > 32768:
++            raise ScopeDenied()
++        source_rel = os.path.relpath(os.path.abspath(code.co_filename), os.path.dirname(os.path.abspath(__file__)))
++        value = {"module": fn.__module__, "qualname": fn.__qualname__, "source": source_rel,
++                 "firstlineno": code.co_firstlineno,
++                 "code_sha256": _digest({"bytecode": code.co_code.hex(), "constants": constants,
++                                         "names": list(code.co_names), "freevars": list(code.co_freevars)}),
++                 "closure": []}
++        if any(not isinstance(value[k], str) or len(value[k]) > 4096 for k in ("module", "qualname", "source")):
++            raise ScopeDenied()
++        cells = fn.__closure__ or ()
++        if len(cells) != len(code.co_freevars):
++            raise ScopeDenied()
++        for name, cell in zip(code.co_freevars, cells):
++            value["closure"].append({"name": name, "callable": _provenance(cell.cell_contents, depth + 1)})
++        return value
++    provenance = _provenance(handler)
++    provenance.update(toolset=entry.toolset, registry_scope=registry.current_scope_key())
++    if any(not isinstance(provenance[k], str) or len(provenance[k]) > 4096 for k in ("toolset", "registry_scope")):
++        raise ScopeDenied()
++    # The native registry generation also catches register/restore ABA.
++    if registry._generation != registry_generation:
++        raise ScopeDenied()
++    result = dispatch()
++    if (registry._generation != registry_generation
++            or registry.get_entry(function_name) is not entry or entry.handler is not handler):
++        raise ScopeDenied()
++    guard_tool(function_name, next_args)
++    check_stamp(stamp)
++    parsed = json.loads(result) if isinstance(result, str) else result
++    if not isinstance(parsed, dict) or "_friday_scope_receipt" in parsed:
++        raise ScopeDenied()
++    parsed = dict(parsed)
++    receipt = {"schema": "friday.skill-dispatch-scope-receipt.v1",
++               "guard": "CHECKED_BEFORE_AND_AFTER_REGISTRY_DISPATCH",
++               "principal_id": stamp["principal_id"], "generation": stamp["generation"],
++               "home": stamp["home"], "directory_identity": stamp["directory_identity"],
++               "uid": os.getuid(), "session_id": ids.session_id, "tool_call_id": ids.tool_call_id,
++               "tool_name": function_name, "arguments_sha256": args_sha256,
++               "result_sha256": _digest(parsed), "handler": provenance}
++    parsed["_friday_scope_receipt"] = receipt
++    return json.dumps(parsed, ensure_ascii=False)
++
++
+ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_args: Dict[str, Any], ids: _CallIds,
+                   *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool) -> Any:
+     """Run the registry handler (through tool-execution middleware unless skipped)
+@@ -864,7 +941,8 @@
+         from tools.connectors import dispatch_connector_call, is_connector_name
+         if is_connector_name(function_name):
+             return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
+-        return registry.dispatch(function_name, next_args, **dispatch_kwargs)
++        return _friday_skill_dispatch(function_name, next_args, ids,
++                                      lambda: registry.dispatch(function_name, next_args, **dispatch_kwargs))
+ 
+     with _approval_observability(ids):
+         if skip_tool_execution_middleware:
+--- a/tools/session_search_tool.py
++++ b/tools/session_search_tool.py
+@@ -12,10 +12,12 @@
+ import logging
+ import re
+ import time
++from contextvars import ContextVar
+ from datetime import datetime, timezone
+ from typing import Any, Dict, List, Optional, Union
+ 
+ from hermes_state_common import _BOUNDARY_END_REASONS
++from hermes_state_errors import SessionSearchIndexStatusError
+ from hermes_time import safe_strftime
+ 
+ # Hidden from browsing/searching — integrations (HERMES_SESSION_SOURCE=tool), delegate
+@@ -54,6 +56,13 @@
+ # carrying its transcript forward — unlike compression continuations and live delegation
+ # children. The store's boundary set, so the two cannot drift.
+ _FRESH_RESET_END_REASONS = _BOUNDARY_END_REASONS
++_DISCOVERY_FAILURE = ContextVar('session_search_discovery_failure', default=None)
++
++
++def _note_discovery_fault():
++    budget = _DISCOVERY_FAILURE.get()
++    if budget is not None:
++        budget.failed = budget.failed or 'discovery_data_failed'
+ 
+ 
+ def _quiet(fn, default, msg, *log_args, with_exc: bool = False):
+@@ -61,6 +70,7 @@
+     try:
+         return fn()
+     except Exception as e:
++        _note_discovery_fault()
+         logging.debug(msg, *(log_args + (e,) if with_exc else log_args), exc_info=True)
+         return default
+ 
+@@ -70,6 +80,11 @@
+     calls whose failure the model must see."""
+     try:
+         return fn(), None
++    except SessionSearchIndexStatusError:
++        # search_messages also reads rebuild status (including its gap fallback).
++        # Preserve the typed failure when it occurs before response assembly.
++        logging.warning("session_search index status read failed")
++        return None, _index_status_error()
+     except Exception as e:
+         logging.error(log_msg, *log_args, e, exc_info=True)
+         return None, tool_error(f"{error_prefix}: {e}", success=False)
+@@ -314,15 +329,39 @@
+         "_lineage_root": lineage_root}
+ 
+ 
++def _index_status_observation(read_ok: bool, state: str) -> dict:
++    """A rebuild-marker observation, explicitly not a content or query-snapshot proof."""
++    return {"read_ok": read_ok, "state": state, "scope": "base_rebuild_markers",
++            "observation_phase": "after_discovery_reads" if read_ok else "not_completed",
++            "query_snapshot_binding": "NOT_ESTABLISHED", "completeness": "NOT_ESTABLISHED"}
++
++
++def _index_status_error() -> str:
++    return tool_error("session_search_index_status_failed", success=False,
++                      index_status=_index_status_observation(False, "unknown"))
++
++
+ def _discover_payload(db, query: str, detail: str, results: list, **extra) -> str:
+     """Discovery response; notes FTS backfill progress so the agent can explain thin
+     results instead of treating them as ground truth."""
+-    status = _quiet(db.fts_rebuild_status, None, "fts_rebuild_status failed")
++    try:
++        status = db.fts_rebuild_status()
++        if status is not None:
++            if (not isinstance(status, dict) or status.get("pending") is not True
++                    or any(type(status.get(k)) is not int for k in ("total", "indexed", "percent"))
++                    or status["total"] <= 0 or not 0 <= status["indexed"] <= status["total"] <= (1 << 63) - 1
++                    or status["percent"] != 100 * status["indexed"] // status["total"]):
++                raise ValueError("invalid base rebuild status")
++    except Exception:  # health: allow BLE001 -- Unknown marker-read faults must yield a typed refusal without disclosing private traceback data.
++        logging.warning("session_search index status read failed")
++        return _index_status_error()
++    observation = _index_status_observation(True, "pending" if status is not None else "no_pending")
+     rebuild = {} if status is None else {"index_rebuild": {"percent": status["percent"], "note": (
+         f"The search index is rebuilding in the background ({status['percent']}% done, "
+         f"{status['indexed']:,} of {status['total']:,} messages). Results from older messages "
+         f"may be incomplete until it finishes.")}}
+-    return _ok(mode="discover", query=query, detail=detail, results=results, count=len(results), **extra, **rebuild)
++    return _ok(mode="discover", query=query, detail=detail, results=results, count=len(results),
++               index_status=observation, **extra, **rebuild)
+ 
+ 
+ def _bookend(view: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
+@@ -336,6 +375,7 @@
+     try:
+         view = db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
+     except Exception as e:
++        _note_discovery_fault()
+         logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
+         return None
+     session_meta, full = _get_session_meta(db, lineage_root), result_detail == "full"
+@@ -354,7 +394,7 @@
+         detail=result_detail)
+ 
+ 
+-def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort: Optional[str],
++def _discover_impl(db, query: str, role_filter: Optional[List[str]], limit: int, sort: Optional[str],
+               detail: str, current_session_id: str = None, link_profile: str = None,
+               after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+               exclude_session_ids: Optional[List[str]] = None) -> str:
+@@ -382,7 +422,8 @@
+     # See #19434.
+     if not raw_results and not title_result:
+         return _discover_payload(db, query, detail, [], message=(
+-            "No matching sessions found. FTS5 ANDs all terms by default — "
++            "No matching sessions returned; index completeness is not established. "
++            "FTS5 ANDs all terms by default — "
+             "broaden with OR (`alpha OR beta`), exact-match with quoted "
+             "phrases, exclude with NOT, or prefix-match with `deploy*`."))
+     seen_sessions: Dict[str, Dict[str, Any]] = {}
+@@ -434,6 +475,21 @@
+         "session_search(session_id=..., around_message_id=match_message_id)."))
+ 
+ 
++
++def _discover(db, *args, **kwargs) -> str:
++    from hermes_cli.friday_user_scope import current
++    cap = current()
++    if cap is None:
++        return _discover_impl(db, *args, **kwargs)
++    from hermes_state_search_snapshot import run_discovery_snapshot
++    def guarded(snapshot):
++        token = _DISCOVERY_FAILURE.set(snapshot._budget)
++        try:
++            return _discover_impl(snapshot, *args, **kwargs)
++        finally:
++            _DISCOVERY_FAILURE.reset(token)
++    return run_discovery_snapshot(db, cap, guarded)
++
+ def _resolve_profile_db(profile: str):
+     """Another profile's ``state.db`` opened read-only (safe on a live DB); None = current."""
+     if profile is None or not str(profile).strip():
