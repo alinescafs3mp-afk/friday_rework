@@ -176,7 +176,8 @@ def test_exact_transition_real_installer_profile_health_and_no_job_authority(ins
     for kind in ('dsh','a0'):
         p=s.home/q.FOLDER/'original/workers'/kind/'runtime-receipt.json'
         assert entry.read_json(p)['ready'] is False
-    from plugins.friday_rework import admin,startup_health
+    admin = importlib.import_module(hr.__package__ + '.admin')
+    startup_health = importlib.import_module(hr.__package__ + '.startup_health')
     class Owner:
         def profiles(self):return ['default']
         @contextmanager

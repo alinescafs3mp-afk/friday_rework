@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
 import stat
 import time
 
@@ -72,7 +73,7 @@ def argv(binary, command, *, read_only=False):
             '--dev', '/dev', '--proc', '/proc', '--', *command]
 
 
-def namespace_exit(data, observation):
+def namespace_exit(data, observation, *, stopped_init=None):
     """Only bwrap's monitor owns this pipe; sandbox commands never inherit it."""
     try:
         if (type(data) is not bytes or len(data) > 4096
@@ -80,15 +81,86 @@ def namespace_exit(data, observation):
                 or type(observation.get('returncode')) is not int):
             return False
         rows = [json.loads(line) for line in data.splitlines() if line.strip()]
+        timeout_known = (observation.get('timeout') is False or
+                         (observation.get('timeout') is True
+                          and type(stopped_init) is tuple and len(stopped_init) == 2
+                          and all(type(n) is int and n > 0 for n in stopped_init)
+                          and rows and isinstance(rows[0], dict)
+                          and rows[0].get('child-pid') == stopped_init[0]
+                          and observation['returncode'] == 128 + signal.SIGKILL))
         return (len(data) <= 4096 and len(rows) == 2
                 and isinstance(rows[0], dict) and type(rows[0].get('child-pid')) is int
                 and rows[0]['child-pid'] > 0
                 and rows[1] == {'exit-code': observation['returncode']}
                 and type(rows[1]['exit-code']) is int
                 and observation['returncode'] >= 0
-                and observation['timeout'] is False and observation['reaped'] is True)
+                and timeout_known and observation['reaped'] is True)
     except (ValueError, KeyError, TypeError):
         return False
+
+
+class _NamespaceStop:
+    """One bounded native-status read and identity-bound init signal at timeout."""
+
+    def __init__(self, reader):
+        self.reader = reader
+        self.data = b''
+        self.stopped_init = None
+
+    def read(self):
+        if len(self.data) <= 4096:
+            try:
+                self.data += os.read(self.reader, 4097 - len(self.data))
+            except BlockingIOError:
+                pass
+        return self.data
+
+    def __call__(self, process, starttime):
+        from .runtime_process import StopUnconfirmed
+        data = self.read()
+        first, separator, _ = data.partition(b'\n')
+        if not separator or len(data) > 4096:
+            raise StopUnconfirmed('STOP_UNCONFIRMED: native init identity unavailable')
+        row = json.loads(first)
+        if (type(row) is not dict or type(row.get('child-pid')) is not int
+                or row['child-pid'] <= 1 or type(row.get('pid-namespace')) is not int
+                or type(starttime) is not int or starttime <= 0):
+            raise StopUnconfirmed('STOP_UNCONFIRMED: invalid native init identity')
+        pid = row['child-pid']
+        # Open first, validate second, then signal only the retained kernel
+        # identity. Never turn a stale numeric PID into a signal target.
+        fd = os.pidfd_open(pid)
+        failure = None
+        try:
+            monitor = Path(f'/proc/{process.pid}/stat').read_text().rsplit(')', 1)[1].split()
+            child = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+            birth = int(child[19])
+            namespace = os.readlink(f'/proc/{pid}/ns/pid')
+            owner_namespace = os.readlink(f'/proc/{process.pid}/ns/pid')
+            # fdinfo Pid becomes -1 after this exact process dies. Checking it
+            # last binds the preceding /proc samples to this still-live pidfd.
+            info = dict(line.split(':', 1) for line in
+                        Path(f'/proc/self/fdinfo/{fd}').read_text().splitlines())
+            nspids = [int(value) for value in info['NSpid'].split()]
+            if (int(monitor[19]) != starttime or int(child[1]) != process.pid
+                    or birth < starttime or int(info['Pid']) != pid
+                    or len(nspids) < 2 or nspids[0] != pid or nspids[-1] != 1
+                    or namespace != 'pid:[' + str(row['pid-namespace']) + ']'
+                    or namespace == owner_namespace):
+                raise StopUnconfirmed('STOP_UNCONFIRMED: native init identity changed')
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+            self.stopped_init = (pid, birth)
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            try:
+                os.close(fd)
+            except BaseException as close_failure:
+                if failure is None:
+                    raise
+                failure.friday_custody_secondary = (
+                    getattr(failure, 'friday_custody_secondary', ()) + (close_failure,))
 
 
 class Containment:
@@ -102,6 +174,7 @@ class Containment:
         # Reserve cleanup *inside* the original deadline; no fresh grace clock.
         limit = min(timeout, self.budget.check(reserve=1))
         reader, writer = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+        native_stop = _NamespaceStop(reader)
         failure = None; secondary = []; result = None; observation = {}; data = b''
         # A later diagnostic/pipe error must never replace the invocation cause.
         # This is a finite list: each setup/run/read/close/witness stage runs once.
@@ -117,13 +190,14 @@ class Containment:
             try:
                 logging = {'log': log} if log is not None else {}
                 result = run(args, cwd, timeout=limit, env=self.env,
-                             deadline=self.budget.deadline, pass_fds=(writer,), **logging)
+                             deadline=self.budget.deadline, pass_fds=(writer,),
+                             stop_on_timeout=native_stop, **logging)
                 observation = result[1]
             except BaseException as exc:
                 failed(exc)
-                if isinstance(exc, CommandFailed):
+                if isinstance(exc, (CommandFailed, StopUnconfirmed)):
                     try:
-                        observation = exc.observation
+                        observation = getattr(exc, 'observation', {})
                     except BaseException as observation_failure:
                         failed(observation_failure)
             closing = writer; writer = None  # never retry an ambiguous close
@@ -134,7 +208,7 @@ class Containment:
             # Exactly two small native records fit in the pipe. Never wait for
             # EOF from an uncertain monitor or use its stdout as proof.
             try:
-                data = os.read(reader, 4097)
+                data = native_stop.read()
             except BlockingIOError:
                 pass
             except BaseException as read_failure:
@@ -153,7 +227,7 @@ class Containment:
             except BaseException as close_failure:
                 failed(close_failure)
         try:
-            known = namespace_exit(data, observation) is True
+            known = namespace_exit(data, observation, stopped_init=native_stop.stopped_init) is True
         except BaseException as witness_failure:
             failed(witness_failure)
             known = False
@@ -172,13 +246,14 @@ class Containment:
                 or (failure is not None and not isinstance(failure, CommandFailed))):
             stopped = (failure if isinstance(failure, StopUnconfirmed) else
                        StopUnconfirmed('STOP_UNCONFIRMED: namespace init exit not established'))
-            stopped.friday_custody_primary = failure
+            stopped.friday_custody_primary = getattr(failure, 'friday_custody_primary', failure)
             if type(observation) is dict and observation:
                 try:
                     stopped.observation = safe_observation(observation)
                 except BaseException as observation_failure:
                     secondary.append(observation_failure)
-            stopped.friday_custody_secondary = tuple(secondary)
+            stopped.friday_custody_secondary = (getattr(failure, 'friday_custody_secondary', ())
+                                                + tuple(secondary))
             stopped.friday_custody_state = 'UNCONFIRMED'
             if stopped is failure:
                 raise stopped

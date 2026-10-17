@@ -105,6 +105,7 @@ def test_cleanup_deadline_failure_is_stop_unconfirmed(monkeypatch, tmp_path):
     dsh_prepare = _source_runtime_module('runtime_process')
     class Process:
         pid = 98765
+        returncode = None
         def communicate(self, timeout): raise subprocess.TimeoutExpired('synthetic', timeout)
     monkeypatch.setattr(dsh_prepare.subprocess, 'Popen', lambda *a, **k: Process())
     killed = []
@@ -245,7 +246,9 @@ def test_actual_cli_preserves_unknown_cessation_and_existing_claim(
     assert out.err.startswith('STOP_UNCONFIRMED:') and 'do not retry' in out.err
     assert 'PRIVATE_PROCESS_CANARY' not in out.err and 'Traceback' not in out.err
     assert len(starts) == (1 if stage == 'probe' else 2)
-    assert killed == [(98765, dsh_prepare.signal.SIGKILL)]
+    # No trusted init identity was emitted: killing the monitor group cannot
+    # establish namespace cessation, and must not be used as a fallback.
+    assert killed == []
     assert len(waits) == len(starts) + (cause == 'unreaped')
     home = Path(install_input['home'])
     if stage == 'probe': assert not home.exists()

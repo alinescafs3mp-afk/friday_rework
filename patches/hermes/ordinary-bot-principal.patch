@@ -1,0 +1,243 @@
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -243,8 +243,13 @@
+                 # posts, sender_chat): can't be paired but may be authorized via a chat allowlist.
+                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+                 return None
+-            # DMs get a pairing code or a one-time decline, groups are ignored. A bot cannot pair, and
+-            # answering one mid-cooldown is outbound traffic.
++            # Bots never receive pairing/decline replies. Only an operator-prepared
++            # ordinary principal can create a silent native pending request.
++            if getattr(source, "is_bot", False):
++                from hermes_cli.friday_bot_pairing import request_prepared_pairing
++                request_prepared_pairing(self, event)
++                return None
++            # Human DMs keep the native pairing/decline behavior.
+             pairable_dm = source.chat_type == "dm" and not getattr(source, "is_bot", False)
+             behavior = self._get_unauthorized_dm_behavior(source.platform, profile=source.profile) if pairable_dm else None
+             if behavior == "pair":
+--- a/gateway/pairing.py
++++ b/gateway/pairing.py
+@@ -341,6 +341,7 @@
+         # Merge the alternate old/new layout so upgrades cannot split approvals.
+         _migrate_split_pairing_dirs(home=profile_home, active=self._dir)
+         self._lock = threading.RLock()  # adapters run concurrently in threads sharing one store
++        self._limits_lock_holder = threading.local()
+         self._profile = profile  # for diagnostics / log lines
+         self._approved_cache: dict = {}
+ 
+@@ -478,8 +479,13 @@
+                 "hash": self._hash_code(code, salt), "salt": salt.hex(),
+                 "user_id": normalized_user_id, "user_name": user_name, "created_at": time.time(),
+             }
++            # Persist the attempt before publishing its pending request. A failed
++            # pending write consumes the existing cooldown; it cannot leave an
++            # unstamped request that reappears after expiry or revocation.
++            self._record_rate_limit(platform, user_id)
++            from utils import fsync_directory
++            fsync_directory(self._dir, strict=True)
+             self._save_json(self._pending_path(platform), pending)
+-            self._record_rate_limit(platform, user_id)
+             return code
+ 
+     def approve_code(self, platform: str, code: str) -> Optional[dict]:
+@@ -584,12 +590,25 @@
+             for alias in _user_id_aliases(platform, user_id)
+         )
+ 
++    @contextlib.contextmanager
++    def _limits_transaction(self):
++        """Retain rate stamps across native clients' concurrent read/modify/write.
++
++        This is the existing native file-lock provider, independent of config
++        locks: pairing approval may already hold its own store lock.
++        """
++        from hermes_cli.auth import _file_lock
++        path = self._rate_limit_path()
++        with _file_lock(path.with_name(path.name + ".lock"), self._limits_lock_holder,
++                        2.0, "Timed out waiting for native pairing rate-limit lock"):
++            yield self._limits()
++
+     def _record_rate_limit(self, platform: str, user_id: str) -> None:
+-        limits = self._limits()
+-        now = time.time()
+-        for alias in _user_id_aliases(platform, user_id):
+-            limits[f"{platform}:{alias}"] = now
+-        self._save_limits(limits)
++        with self._limits_transaction() as limits:
++            now = time.time()
++            for alias in _user_id_aliases(platform, user_id):
++                limits[f"{platform}:{alias}"] = now
++            self._save_limits(limits)
+ 
+     # ----- "decline" unauthorized-DM behavior (#88028) -----
+ 
+@@ -620,24 +639,24 @@
+ 
+     def _record_failed_attempt(self, platform: str) -> None:
+         """Record a failed approval attempt; triggers lockout after MAX_FAILED_ATTEMPTS."""
+-        limits = self._limits()
+-        fail_key = f"_failures:{platform}"
+-        fails = limits.get(fail_key, 0) + 1
+-        limits[fail_key] = fails
+-        if fails >= MAX_FAILED_ATTEMPTS:
+-            limits[f"_lockout:{platform}"] = time.time() + LOCKOUT_SECONDS
+-            limits[fail_key] = 0
+-            print(f"[pairing] Platform {platform} locked out for {LOCKOUT_SECONDS}s "
+-                  f"after {MAX_FAILED_ATTEMPTS} failed attempts", flush=True)
+-        self._save_limits(limits)
++        with self._limits_transaction() as limits:
++            fail_key = f"_failures:{platform}"
++            fails = limits.get(fail_key, 0) + 1
++            limits[fail_key] = fails
++            if fails >= MAX_FAILED_ATTEMPTS:
++                limits[f"_lockout:{platform}"] = time.time() + LOCKOUT_SECONDS
++                limits[fail_key] = 0
++                print(f"[pairing] Platform {platform} locked out for {LOCKOUT_SECONDS}s "
++                      f"after {MAX_FAILED_ATTEMPTS} failed attempts", flush=True)
++            self._save_limits(limits)
+ 
+     def _reset_failed_attempts(self, platform: str) -> None:
+         """Clear the failed-approval counter after a success (it tracks *consecutive* failures)."""
+-        limits = self._limits()
+-        fail_key = f"_failures:{platform}"
+-        if limits.get(fail_key):
+-            limits[fail_key] = 0
+-            self._save_limits(limits)
++        with self._limits_transaction() as limits:
++            fail_key = f"_failures:{platform}"
++            if limits.get(fail_key):
++                limits[fail_key] = 0
++                self._save_limits(limits)
+ 
+     def _all_platforms(self, suffix: str) -> list:
+         """Platforms that have a ``-<suffix>.json`` data file (``_``-prefixed files are shared state)."""
+--- /dev/null
++++ b/hermes_cli/friday_bot_pairing.py
+@@ -0,0 +1,126 @@
++"""Silent native pairing for a fresh operator-prepared ordinary Telegram bot.
++
++This creates no product/native grant, capability, session or outbound message.
++The original Telegram observation and disabled setup must both be intact.
++"""
++import json
++import time
++from pathlib import Path
++
++
++def request_prepared_pairing(runner, event):
++    """One pending request, then only the existing operator approval/activation.
++
++    The native persisted rate stamp also prevents an expired/revoked request
++    from being silently recreated. Such identities require operator inspection.
++    All failures are silent; no request text or credential is logged.
++    """
++    try:
++        return _request(runner, event)
++    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
++        return False
++
++
++def _request(runner, event):
++    from gateway.config import Platform
++    from gateway.session_identity import identity_of
++    from hermes_cli import friday_user_scope as scope
++    from hermes_cli.config import config_write_transaction, load_config_readonly
++    from hermes_cli.friday_product_access import KEY, access_policy, principal_id, validate_access
++    from hermes_cli.plugins_state import PluginState, _locked_plugin_state
++    from hermes_constants import get_default_hermes_root, get_hermes_dir
++    from plugins.platforms.telegram.telegram_ingress import message_provenance
++
++    source = event.source
++    identity = identity_of(source)
++    if (event.internal or source.platform != Platform.TELEGRAM or source.is_bot is not True
++            or source.chat_type != 'dm' or source.thread_id or identity is None
++            or not identity.multiplexed or identity.transport_inferred
++            or source.profile != identity.runtime_profile):
++        return False
++    adapter = identity.adapter()
++    if adapter is None or adapter is not runner._intake_adapter_for(source):
++        return False
++    observation = message_provenance(adapter, event)
++    if (observation is None or event.raw_message.from_user.is_bot is not True
++            or observation['user_id'] == observation['bot_id']):
++        return False
++    root = Path(identity.authorization_home)
++    home = get_default_hermes_root(home=root) / 'profiles' / identity.runtime_profile
++    if identity.runtime_home != home or home.resolve() != home or root.resolve() != root:
++        return False
++    scope._private(root, directory=True)
++    # Preparation/activation/config edits use these same native locks. State
++    # read and pending creation are held together so disable/role changes cannot
++    # race a stale product snapshot. No new lock registry or state schema.
++    with scope.authority(root), config_write_transaction(root / 'config.yaml'):
++        policy = access_policy()
++        accounts = [] if policy is None else [a for a in policy['accounts']
++            if a['platform'] == 'telegram' and a['transport_profile'] == identity.transport_profile
++            and a['account_id'] == observation['bot_id'] and identity.runtime_profile in a['runtime_profiles']]
++        if len(accounts) != 1:
++            return False
++        principal = ('telegram', identity.transport_profile, observation['bot_id'], observation['user_id'])
++        key = principal_id(*principal)
++        active = scope.policy(root)
++        bindings = [] if active is None else [b for b in active['bindings']
++            if tuple(b[k] for k in ('platform','transport_profile','account_id','user_id')) == principal]
++        if len(bindings) != 1 or bindings[0]['runtime_profile'] != identity.runtime_profile:
++            return False
++        binding = bindings[0]
++        scope._private(home, directory=True)
++        with config_write_transaction(home / 'config.yaml'):
++            marker = home / scope.MARKER
++            if marker.exists() or marker.is_symlink() or getattr(source, '_friday_user_scope', None) is not None:
++                return False
++            stat = scope._private(home, directory=True)
++            receipt_path = home / scope.ONBOARDING
++            scope._private(receipt_path)
++            receipt = json.loads(receipt_path.read_text(encoding='utf-8-sig'))
++            fields = {'schema','binding_sha256','config_sha256','soul_sha256',
++                      'required_secrets','directory_identity','template','authorization_home'}
++            if (type(receipt) is not dict or set(receipt) != fields
++                    or receipt['schema'] != 'friday.onboarding.v1'
++                    or receipt['binding_sha256'] != scope._fingerprint(binding)
++                    or receipt['authorization_home'] != str(root)
++                    or receipt['directory_identity'] != [stat.st_dev, stat.st_ino]
++                    or not isinstance(receipt['template'], str) or not receipt['template']
++                    or type(receipt['required_secrets']) is not list or not receipt['required_secrets']
++                    or any(not isinstance(n, str) or not n for n in receipt['required_secrets'])):
++                return False
++            import hashlib
++            for name, field in [('config.yaml','config_sha256'), ('SOUL.md','soul_sha256')]:
++                scope._private(home / name)
++                if hashlib.sha256((home / name).read_bytes()).hexdigest() != receipt[field]:
++                    return False
++            gateway = load_config_readonly().get('gateway', {})
++            route = dict(name='friday-' + key, platform='telegram', bot_profile=identity.transport_profile,
++                         user_id=source.user_id, profile=identity.runtime_profile, enabled=True)
++            matches = [r for r in gateway.get('profile_routes', []) if isinstance(r, dict)
++                and r.get('platform') == 'telegram' and (r.get('bot_profile') or 'default') == identity.transport_profile
++                and r.get('user_id') == source.user_id]
++            if gateway.get('multiplex_profiles') is not True or matches != [route]:
++                return False
++            store = runner._pairing_store_for(source)
++            if store is None or store._dir != get_hermes_dir('platforms/pairing','pairing',home=root):
++                return False
++            state = PluginState('friday_rework')
++            with _locked_plugin_state(state.path, lock_deadline=time.monotonic() + .25), store._lock:
++                # Native convenience readers map malformed/unreadable files to {}.
++                # A one-shot preparation must distinguish that from a fresh store.
++                for path in (store._rate_limit_path(), store._pending_path('telegram'),
++                             store._approved_path('telegram')):
++                    if path.exists() or path.is_symlink():
++                        scope._private(path)
++                        if type(json.loads(path.read_text(encoding='utf-8-sig'))) is not dict:
++                            return False
++                row = validate_access(state._read_unlocked().get(KEY, {'schema':KEY,'users':{}}))['users'].get(key)
++                if (not row or row['enabled'] is not False or row['role'] != 'user'
++                        or type(row.get('generation')) is not int or row['generation'] != 1
++                        or tuple(row[k] for k in ('platform','transport_profile','account_id','user_id')) != principal
++                        or store.is_approved('telegram',source.user_id)
++                        or 'telegram:' + source.user_id in store._limits()
++                        or any(r['user_id'] == source.user_id for r in store.list_pending('telegram'))):
++                    return False
++                # Preserve native expiry, max-pending, lockout and rate limiting.
++                return store.generate_code('telegram', source.user_id, source.user_name or '') is not None

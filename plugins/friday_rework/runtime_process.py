@@ -52,7 +52,8 @@ def clean_environment(donor):
 
 
 
-def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None, pass_fds=()):
+def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None, pass_fds=(),
+        stop_on_timeout=None):
     """Bound one group; callers needing detached-tree custody use a PID namespace."""
     if argv[0] == "git":
         argv = ["git", "-c", "core.hooksPath=" + os.devnull,
@@ -67,25 +68,65 @@ def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None, pass_fds=
     except (OSError, ValueError, IndexError):
         starttime = None
     timed_out = False
+    stop_errors = []
+    def unconfirmed(message, observation, extra=()):
+        secondary = list(stop_errors) + list(extra)
+        # A retained exception also retains this frame/Popen. Release our pipe
+        # handles now, and reap only if already exited: no renewed wait budget.
+        for name in ('stdout', 'stderr'):
+            try:
+                stream = getattr(process, name, None)
+                if stream is not None and not stream.closed:
+                    stream.close()
+            except BaseException as exc:
+                secondary.append(exc)
+        try:
+            poll = getattr(process, 'poll', None)
+            if poll is not None:
+                poll()
+                observation = dict(observation, returncode=process.returncode,
+                                   reaped=process.returncode is not None)
+        except BaseException as exc:
+            secondary.append(exc)
+        observation = dict(observation, elapsed_seconds=round(time.monotonic() - start, 3))
+        primary = CommandFailed(observation)
+        stopped = StopUnconfirmed(message)
+        stopped.observation = primary.observation
+        stopped.friday_custody_primary = primary
+        stopped.friday_custody_secondary = tuple(secondary)
+        return stopped, primary
     try:
         out, err = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
         if deadline is not None:
-            # Installer namespace cleanup consumes the same original budget.
-            # Kill namespace owner immediately; Linux closes all descendant
-            # sessions when its PID-namespace init dies (including setsid).
+            # Containment targets its exact namespace init while leaving the
+            # native monitor alive to report kernel-drained namespace exit.
+            # A process group alone provides no detached-session custody.
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+                if stop_on_timeout is not None:
+                    stop_on_timeout(process, starttime)
+                else:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            except BaseException as exc:
+                stop_errors.append(exc)
+                stop_errors.extend(getattr(exc, 'friday_custody_secondary', ()))
             remaining = deadline - time.monotonic()
+            partial = dict(returncode=process.returncode, timeout=True,
+                           pid=process.pid, starttime_ticks=starttime,
+                           reaped=process.returncode is not None, reason='command_timeout',
+                           elapsed_seconds=round(time.monotonic() - start, 3))
             if remaining <= 0:
-                raise StopUnconfirmed('STOP_UNCONFIRMED: original cleanup budget exhausted')
+                stopped, primary = unconfirmed('STOP_UNCONFIRMED: original cleanup budget exhausted', partial)
+                raise stopped from primary
             try:
                 out, err = process.communicate(timeout=remaining)
-            except subprocess.TimeoutExpired as exc:
-                raise StopUnconfirmed('STOP_UNCONFIRMED: contained command not reaped') from exc
+            except BaseException as exc:
+                stopped, primary = unconfirmed('STOP_UNCONFIRMED: contained command not reaped', partial, (exc,))
+                raise stopped from primary
         else:
             os.killpg(process.pid, signal.SIGTERM)
             try:
@@ -114,12 +155,21 @@ def run(argv, donor, *, timeout=60, log=None, env=None, deadline=None, pass_fds=
                    "stdout_bytes": len(out.encode()), "stderr_bytes": len(err.encode()),
                    "pid": process.pid, "starttime_ticks": starttime,
                    "reaped": process.returncode is not None, "reason": reason}
-    if log:
-        log.parent.mkdir(parents=True, exist_ok=True)
-        log.with_suffix(".stdout").write_text(out)
-        log.with_suffix(".stderr").write_text(err)
-        log.with_suffix(".json").write_text(json.dumps(observation, indent=2) + "\n")
+    try:
+        if log:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.with_suffix(".stdout").write_text(out)
+            log.with_suffix(".stderr").write_text(err)
+            log.with_suffix(".json").write_text(json.dumps(observation, indent=2) + "\n")
+    except BaseException as exc:
+        if timed_out or process.returncode:
+            stopped, primary = unconfirmed('STOP_UNCONFIRMED: command diagnostics failed', observation, (exc,))
+            raise stopped from primary
+        raise
     if timed_out or process.returncode:
+        if stop_errors:
+            stopped, primary = unconfirmed('STOP_UNCONFIRMED: native init stop failed', observation)
+            raise stopped from primary
         raise CommandFailed(observation)
     return out.strip(), observation
 

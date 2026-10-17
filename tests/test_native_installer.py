@@ -318,7 +318,7 @@ def test_whole_finite_composition_and_completed_idempotence_with_native_config(i
     install_input['product']['web']['profile']=web_profile
     p = tmp_path / 'input.json'; p.write_text(json.dumps(install_input)); p.chmod(0o600)
     home = Path(install_input['home']); calls = []
-    from plugins.friday_rework import runtime_process as dsh_prepare
+    dsh_prepare = entry._source_runtime_module('runtime_process')
     from test_installer_lifetime import metadata, native_status
     e = Path(os.environ['FRIDAY_FIXTURE_EVIDENCE']); source = home / 'hermes-agent'
     def intercepted(argv, cwd, **kw):
