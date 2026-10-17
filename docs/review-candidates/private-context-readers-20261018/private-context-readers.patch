@@ -1,0 +1,289 @@
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -12,6 +12,7 @@
+ import os
+ from pathlib import Path
+ import stat
++import time
+ 
+ from hermes_cli.friday_product_access import principal_id, profile_name, text
+ 
+@@ -397,6 +398,160 @@
+         raise ScopeDenied()
+     if path.exists():
+         _private(path)
++
++
++class ManagedTextReadTimeout(TimeoutError):
++    """Cooperative deadline expired while reading an owned regular file."""
++
++
++_MANAGED_TEXT_MAX_BYTES = 1000000
++
++
++def _text_identity(info):
++    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
++            info.st_ctime_ns, info.st_mode, info.st_nlink, info.st_uid)
++
++
++def _private_descriptor(fd, *, directory=False):
++    info = os.fstat(fd)
++    if (info.st_uid != _owner_uid() or info.st_mode & 0o077
++            or (directory and not stat.S_ISDIR(info.st_mode))
++            or (not directory and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1))):
++        raise ScopeDenied()
++    return info
++
++
++def _scope_home_directory(cap):
++    """Pin the existing admission's home; never acquire authority from a pathname."""
++    home = os.open(cap.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++    try:
++        info = _private_descriptor(home, directory=True)
++        if (info.st_dev, info.st_ino) != cap.directory_identity:
++            raise ScopeDenied()
++        _private(cap.home, directory=True)
++        return home
++    except BaseException:
++        os.close(home)
++        raise
++
++
++def _check_text_directories(cap, descriptors):
++    """Each opened directory must still be the private object at its name."""
++    def identity(info):
++        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink)
++    for fd, parent, name, before in reversed(descriptors):
++        after = _private_descriptor(fd, directory=True)
++        named = cap.home.lstat() if parent is None else os.stat(name, dir_fd=parent, follow_symlinks=False)
++        if identity(before) != identity(after) or identity(after) != identity(named):
++            raise ScopeDenied()
++
++
++def _owned_text_snapshot(cap, path, parts, *, encoding, timeout):
++    """Read only the validated object and revalidate its full descriptor chain.
++
++    Regular filesystem syscalls cannot be forcibly cancelled portably. The
++    deadline is checked between bounded reads; no reader thread or FD survives
++    this call. O_NONBLOCK also prevents opening a FIFO from blocking validation.
++    """
++    deadline = None if timeout is None else time.monotonic() + max(0, timeout)
++    descriptors = []
++    item = None
++    missing_leaf = False
++    def checkpoint():
++        if current(required=True) is not cap:
++            raise ScopeDenied()
++        if deadline is not None and time.monotonic() >= deadline:
++            raise ManagedTextReadTimeout()
++    try:
++        checkpoint()
++        home = _scope_home_directory(cap)
++        descriptors.append((home, None, None, os.fstat(home)))
++        for name in parts[:-1]:
++            parent = descriptors[-1][0]
++            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
++            descriptors.append((child, parent, name, os.fstat(child)))
++            _private_descriptor(child, directory=True)
++        parent = descriptors[-1][0]
++        try:
++            item = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
++        except FileNotFoundError:
++            # Absence is native behavior only after the entire allowed parent
++            # chain and retained principal have been verified.
++            _check_text_directories(cap, descriptors)
++            checkpoint()
++            missing_leaf = True
++            raise
++        before = _private_descriptor(item)
++        if before.st_size > _MANAGED_TEXT_MAX_BYTES:
++            raise ScopeDenied()
++        pieces, size = [], 0
++        while True:
++            checkpoint()
++            chunk = os.read(item, min(65536, _MANAGED_TEXT_MAX_BYTES - size + 1))
++            if not chunk:
++                break
++            pieces.append(chunk)
++            size += len(chunk)
++            if size > _MANAGED_TEXT_MAX_BYTES:
++                raise ScopeDenied()
++        after = _private_descriptor(item)
++        named = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
++        if (size != before.st_size or _text_identity(before) != _text_identity(after)
++                or _text_identity(after) != _text_identity(named)):
++            raise ScopeDenied()
++        _check_text_directories(cap, descriptors)
++        checkpoint()
++        # Path.read_text uses universal newlines, including with utf-8-sig.
++        text = b''.join(pieces).decode(encoding)
++        checkpoint()
++        return text.replace('\r\n', '\n').replace('\r', '\n')
++    except (ManagedTextReadTimeout, UnicodeError):
++        raise
++    except FileNotFoundError:
++        if missing_leaf:
++            raise
++        raise ScopeDenied() from None
++    except (OSError, ValueError):
++        raise ScopeDenied() from None
++    finally:
++        if item is not None:
++            os.close(item)
++        for fd, _, _, _ in reversed(descriptors):
++            os.close(fd)
++
++
++def read_context_text(path, *, encoding='utf-8-sig', timeout=5.0):
++    """Managed context text from the admitted SOUL or own workspace only."""
++    cap = current()
++    path = Path(path)
++    if cap is None:
++        return path.read_text(encoding=encoding)
++    check_database(cap)
++    if not path.is_absolute() or '..' in path.parts:
++        raise ScopeDenied()
++    if path == cap.home / 'SOUL.md':
++        parts = ('SOUL.md',)
++    else:
++        try:
++            relative = path.relative_to(cap.home / 'workspace')
++        except ValueError:
++            raise ScopeDenied() from None
++        if not relative.parts:
++            raise ScopeDenied()
++        parts = ('workspace', *relative.parts)
++    return _owned_text_snapshot(cap, path, parts, encoding=encoding, timeout=timeout)
++
++
++def read_memory_text(path, *, timeout=5.0):
++    """Only the two native memory targets of the current retained principal."""
++    cap = current()
++    path = Path(path)
++    if cap is None:
++        return path.read_text(encoding='utf-8-sig')
++    check_database(cap)
++    if path not in (cap.home / 'memories' / 'MEMORY.md', cap.home / 'memories' / 'USER.md'):
++        raise ScopeDenied()
++    return _owned_text_snapshot(cap, path, ('memories', path.name), encoding='utf-8-sig', timeout=timeout)
+ 
+ 
+ def guard_tool(name, args, registry_scope=None, *, execution=True):
+@@ -1107,7 +1262,7 @@
+ 
+ def _workspace_directory(cap):
+     """Pin the admitted home inode before opening its workspace by descriptor."""
+-    home = os.open(cap.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++    home = _scope_home_directory(cap)
+     try:
+         before = os.fstat(home)
+         if (before.st_dev, before.st_ino) != cap.directory_identity:
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -54,17 +54,22 @@
+ def _read_text_with_timeout(
+     path: Path, timeout: Optional[float] = None, encoding: str = "utf-8-sig"
+ ) -> Optional[str]:
+-    """``path.read_text()`` on a daemon thread so a slow file can't stall startup.
+-
+-    Returns the text, or ``None`` after *timeout* seconds (logged at WARNING;
+-    the orphaned reader thread finishes on its own). Read errors propagate to
+-    the caller exactly as a direct ``read_text`` would, so existing
+-    ``try/except`` handling at each site is unchanged.
++    """Managed text uses owned descriptors and a cooperative read deadline.
++
++    Legacy unmanaged profiles retain their native daemon-thread timeout.
++    Managed regular-filesystem syscalls cannot be forcibly interrupted; no
++    managed background reader survives this call. Read errors propagate.
+     """
+-    from hermes_cli.friday_user_scope import check_context_path
+-    check_context_path(path)
++    from hermes_cli.friday_user_scope import current, read_context_text, ManagedTextReadTimeout
++    cap = current()
+     if timeout is None:
+         timeout = _get_context_file_read_timeout()
++    if cap is not None:
++        try:
++            return read_context_text(path, encoding=encoding, timeout=timeout)
++        except ManagedTextReadTimeout:
++            logger.warning("Context file read timed out after %.1fs; skipping", timeout)
++            return None
+     result: "queue.Queue[tuple[bool, object]]" = queue.Queue(maxsize=1)
+ 
+     def _reader() -> None:
+@@ -73,7 +78,8 @@
+         except Exception as exc:  # re-raised on the caller thread
+             result.put((False, exc))
+ 
+-    threading.Thread(target=_reader, daemon=True, name=f"context-read:{path.name}").start()
++    context = contextvars.copy_context()
++    threading.Thread(target=context.run, args=(_reader,), daemon=True, name=f"context-read:{path.name}").start()
+     try:
+         ok, value = result.get(timeout=timeout)
+     except queue.Empty:
+@@ -1642,14 +1648,15 @@
+     ContextVar falls back to the launch home and reads the wrong profile's SOUL.md (#50233, same class as
+     the skills-index leak fixed in #86313).
+     """
++    from hermes_cli.friday_user_scope import ScopeDenied
+     try:
+         from hermes_cli.config import ensure_hermes_home
+         ensure_hermes_home()
++    except ScopeDenied:
++        raise
+     except Exception as e:
+         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
+     soul_path = (Path(home_override) if home_override is not None else get_hermes_home()) / "SOUL.md"
+-    if not soul_path.exists():
+-        return None
+     try:
+         content = (_read_text_with_timeout(soul_path) or "").strip()
+         if content:
+@@ -1679,6 +1686,8 @@
+                                  "identity instructions" if cap is not None else "SOUL.md",
+                                  context_length=context_length, read_path=None if cap is not None else str(soul_path),
+                                  recovery_available=cap is None)
++    except ScopeDenied:
++        raise
+     except Exception as e:
+         logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
+         return None
+@@ -1686,10 +1695,11 @@
+ 
+ def _read_context_file(path: Path) -> str:
+     """Stripped text of *path*; "" when missing, empty or unreadable (logged at debug)."""
+-    if not path.exists():
+-        return ""
++    from hermes_cli.friday_user_scope import ScopeDenied
+     try:
+         return (_read_text_with_timeout(path) or "").strip()
++    except ScopeDenied:
++        raise
+     except Exception as e:
+         logger.debug("Could not read %s: %s", path, e)
+         return ""
+--- a/tools/memory_tool_store.py
++++ b/tools/memory_tool_store.py
+@@ -564,8 +564,7 @@
+         """``(raw, read_ok)``; ``read_ok`` is False ONLY when the file EXISTS but can't be
+         read. Decoding stays STRICT (``errors="replace"`` would hand callers a lossy view
+         a save then persists); ``utf-8-sig`` strips a Notepad BOM off the first entry."""
+-        if not path.exists():
+-            return "", True
++        from hermes_cli.friday_user_scope import read_memory_text, ScopeDenied
+         try:
+             # utf-8-sig strips a leading UTF-8 BOM (Notepad-edited memory files on Windows) and is
+             # byte-identical to utf-8 otherwise. Plain utf-8 kept U+FEFF glued to the first entry,
+@@ -573,7 +572,11 @@
+             # STRICT on purpose: errors="replace" would hand read-modify-write callers a lossy view that a
+             # subsequent save persists over the real bytes — the wipe class documented above. Undecodable
+             # bytes must surface as read_ok=False.
+-            return path.read_text(encoding="utf-8-sig"), True
++            return read_memory_text(path), True
++        except ScopeDenied:
++            raise
++        except FileNotFoundError:
++            return "", True
+         except (OSError, UnicodeDecodeError):
+             return "", False
+ 
