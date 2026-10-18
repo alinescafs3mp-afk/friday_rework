@@ -15,3 +15,10 @@ were absent, and input hashes were unchanged. Kernel/backend integration and
 its whole dependent producer/consumer family still require independent review
 and fresh native qualification. No private regression oracle or raw data is
 included in this public archive.
+
+A separate current integrated-function DATA run passed 3066 negative checks,
+including 596 parent-scope field/schema/cut mutations, in 0.102 seconds. It exercised
+the actual pure producer/validator functions with synthetic fixtures, without
+a Guard constructor or kernel sampler. Original standalone 13 results were not
+transferred or added. The whole backend remains blocked on three distinct
+Source findings; native/control/runtime qualification is still outstanding.

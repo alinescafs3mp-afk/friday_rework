@@ -8,8 +8,9 @@ An additional13 corrected-boundary policy methods passed before that run.
 Counts of subtests and supplementary controls are recorded separately.
 
 Independent Source/effect review preceded the changed checker execution. The
-final composed actual-evidence review is pending. Earlier failed attempts remain
-immutable; no old spent clock or result was rewritten.
+final independent review accepted exactly these 199 synthetic offline methods;
+case IDs are distinct, with no intersections or blocking findings. Earlier failed
+attempts remain immutable; no old spent clock or result was rewritten.
 
 These are bounded HOST tests with synthetic fixtures and fake HTTP. They do not
 prove a working installed bot-to-bot loop, runtime/native authority, all formats,
