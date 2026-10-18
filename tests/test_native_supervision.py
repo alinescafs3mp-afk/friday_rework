@@ -332,23 +332,139 @@ class NativeSupervisionTests(unittest.TestCase):
 class NativeCommandTests(unittest.TestCase):
     def test_exact_argv_and_clean_environment(self):
         result = subprocess.CompletedProcess([], 0, "", "")
-        with patch.object(module.subprocess, "run", return_value=result) as run:
-            self.assertIs(NativeSupervisor._command(["show", UNIT], 3), result)
-        args, kwargs = run.call_args
+        commands = unittest.mock.Mock(spec=["run"])
+        commands.run.return_value = result
+        supervisor = NativeSupervisor(commands=commands)
+        self.assertIs(supervisor._command(["show", UNIT], 3), result)
+        args, kwargs = commands.run.call_args
         self.assertEqual(args[0], ["/usr/bin/systemctl", "--user", "--no-pager", "show", UNIT])
         self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "LC_ALL": "C",
             "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
             "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.getuid()}/bus"})
-        self.assertEqual(kwargs["timeout"], 3)
-        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(args[1], 3)
+        self.assertIsNone(kwargs["absolute"])
         self.assertNotIn("shell", kwargs)
+        commands.run.assert_called_once()
 
     def test_unavailable_or_timed_out_native_command_is_error(self):
         for error in (OSError("unavailable"), subprocess.TimeoutExpired("systemctl", 3)):
-            with self.subTest(error=type(error).__name__), patch.object(module.subprocess, "run", side_effect=error), self.assertRaisesRegex(
-                    SupervisorError, "native_control_unavailable"):
-                NativeSupervisor._command(["show", UNIT], 3)
+            commands = unittest.mock.Mock(spec=["run"])
+            commands.run.side_effect = error
+            supervisor = NativeSupervisor(commands=commands)
+            with self.subTest(error=type(error).__name__), self.assertRaisesRegex(
+                    SupervisorError, "native_control_STOP_UNCONFIRMED") as caught:
+                supervisor._command(["show", UNIT], 3)
+            self.assertIs(caught.exception.__cause__, error)
+            commands.run.assert_called_once()
 
+
+class NativeCommandCustodyTests(unittest.TestCase):
+    """Exercise the extracted seam with inert descriptors and no real child."""
+    def setUp(self):
+        from contextlib import ExitStack
+        from hermes_cli import friday_native_control
+        self.control = friday_native_control
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(self.control, "_CHILDREN", []))
+        self.child_pid = 700001
+        self.stdout_fd, self.stderr_fd, self.pidfd = 700011, 700012, 700013
+        self.process = unittest.mock.Mock(pid=self.child_pid, returncode=None)
+        self.process.stdout.fileno.return_value = self.stdout_fd
+        self.process.stderr.fileno.return_value = self.stderr_fd
+        self.birth = self.stack.enter_context(patch.object(self.control, "_birth",
+            side_effect=lambda pid: ("fixture-boot", 23 if pid == os.getpid() else 47,
+                                     "fixture-owner-stat" if pid == os.getpid() else "fixture-child-stat")))
+        self.spawn = self.stack.enter_context(patch.object(self.control.subprocess,
+            "Popen", return_value=self.process))
+        self.open_pidfd = self.stack.enter_context(patch.object(self.control.os,
+            "pidfd_open", return_value=self.pidfd))
+        self.waitpid = self.stack.enter_context(patch.object(self.control.os,
+            "waitpid", return_value=(self.child_pid, 0)))
+        self.stack.enter_context(patch.object(self.control.os, "set_blocking"))
+        self.stack.enter_context(patch.object(self.control.os, "read", return_value=b""))
+        self.close_fd = self.stack.enter_context(patch.object(self.control.os, "close"))
+        self.kill = self.stack.enter_context(patch.object(self.control.signal, "pidfd_send_signal"))
+        self.stack.enter_context(patch.object(self.control.select, "select",
+            return_value=([self.stdout_fd, self.stderr_fd], [], [])))
+        self.stack.enter_context(patch.object(self.control.time, "monotonic", return_value=10.0))
+        self.commands = self.control.CountedNativeCommands()
+
+    def test_extracted_spawn_keeps_process_options_identity_raw_reap_and_closure(self):
+        argv = ["/usr/bin/systemctl", "--user", "--no-pager", "show", UNIT]
+        environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+        result = self.commands.run(argv, 3, env=environment)
+        self.spawn.assert_called_once()
+        args, kwargs = self.spawn.call_args
+        self.assertEqual(args[0], argv)
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], subprocess.PIPE)
+        self.assertIs(kwargs["stderr"], subprocess.PIPE)
+        self.assertEqual(kwargs["env"], environment)
+        self.assertIs(kwargs["close_fds"], True)
+        self.assertNotIn("shell", kwargs)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        record = result.custody
+        self.assertIs(record, self.commands.records[0])
+        self.assertIs(record, self.control._CHILDREN[0])
+        self.assertIs(record.process, self.process)
+        self.assertEqual((record.argv, record.pid, record.boot_id, record.rawstat),
+                         (tuple(argv), self.child_pid, "fixture-boot", "fixture-child-stat"))
+        self.assertEqual(record.owner_pid, os.getpid())
+        self.assertIs(record.owner_thread, self.control.threading.current_thread())
+        self.assertEqual((record.entered_at, record.deadline), (10.0, 13.0))
+        self.assertEqual((record.raw_wait, record.state, record.closed), (0, "CLOSED", True))
+        self.assertEqual(record.eof, {"stdout", "stderr"})
+        self.assertEqual(record.stream_close_attempted, {"stdout", "stderr"})
+        self.waitpid.assert_called_once_with(self.child_pid, os.WNOHANG)
+        self.open_pidfd.assert_called_once_with(self.child_pid, 0)
+        self.process.stdout.close.assert_called_once_with()
+        self.process.stderr.close.assert_called_once_with()
+        self.close_fd.assert_called_once_with(self.pidfd)
+        self.assertIsNone(record.pidfd)
+        self.kill.assert_not_called()
+        self.assertTrue(self.commands.all_closed())
+
+    def test_owner_birth_drift_refuses_before_any_child_intent_or_spawn(self):
+        self.birth.side_effect = lambda _pid: ("changed-boot", 23, "changed-stat")
+        with self.assertRaisesRegex(RuntimeError, "native_control_owner_changed"):
+            self.commands.run(["/usr/bin/systemctl", "show", UNIT], 3)
+        self.spawn.assert_not_called()
+        self.assertEqual(self.commands.records, [])
+        self.assertEqual(self.control._CHILDREN, [])
+
+    def test_pre_pid_failure_retains_original_cause_and_unknown_custody(self):
+        primary = OSError("fixture-pre-pid-failure")
+        self.spawn.side_effect = primary
+        with self.assertRaises(self.control.ControlUnconfirmed) as caught:
+            self.commands.run(["/usr/bin/systemctl", "show", UNIT], 3)
+        record = self.commands.records[0]
+        self.assertIs(caught.exception.primary, primary)
+        self.assertIs(caught.exception.__cause__, primary)
+        self.assertIs(caught.exception.record, record)
+        self.assertIs(record, self.control._CHILDREN[0])
+        self.assertEqual(record.state, "STOP_UNCONFIRMED")
+        self.assertIsNone(record.pid)
+        self.assertIsNone(record.raw_wait)
+        self.assertFalse(record.closed)
+        self.assertFalse(self.commands.all_closed())
+        self.spawn.assert_called_once()
+        self.open_pidfd.assert_not_called()
+        self.waitpid.assert_not_called()
+        self.kill.assert_not_called()
+
+    def test_retained_unknown_child_refuses_another_spawn(self):
+        primary = OSError("fixture-pre-pid-failure")
+        self.spawn.side_effect = primary
+        with self.assertRaises(self.control.ControlUnconfirmed):
+            self.commands.run(["/usr/bin/systemctl", "show", UNIT], 3)
+        retained = self.commands.records[0]
+        with self.assertRaisesRegex(RuntimeError, "prior_native_control_STOP_UNCONFIRMED"):
+            self.commands.run(["/usr/bin/systemctl", "show", UNIT], 3)
+        self.assertEqual(len(self.commands.records), 1)
+        self.assertIs(self.commands.records[0], retained)
+        self.spawn.assert_called_once()
+        self.assertFalse(self.commands.all_closed())
 
 if __name__ == "__main__":
     unittest.main()

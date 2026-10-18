@@ -206,7 +206,9 @@ def test_failure_messages_and_metadata_do_not_include_values(operator):
 
 
 def test_two_actual_native_onboarded_user_scopes_do_not_borrow_operator(env,monkeypatch):
-    spec=inputs();spec['inference']['key_env']='LOCAL_KEY';env.template=template(compose_product(spec))
+    # Credential isolation uses the fixture's real legacy native onboarding.
+    # The normal product template separately requires qualified dsh/a0 workers.
+    spec=inputs();spec['inference']['key_env']='LOCAL_KEY'
     env.cfg['plugins']['entries']['friday_rework']['settings']['onboarding']['templates']['approved-local']=env.template
     publish(env.home/'config.yaml',env.cfg)
     complete(env,'1');complete(env,'2')
