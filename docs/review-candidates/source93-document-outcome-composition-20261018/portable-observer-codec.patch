@@ -1,0 +1,228 @@
+--- a/default_probe.py
++++ b/default_probe.py
+@@ -606,27 +606,50 @@
+             return {'path':str(path),'resolved':os.path.realpath(path),'identity':identity(before),'sha256':sha(raw),'bytes':len(raw),'header16_hex':raw[:16].hex(),'payload_sha256':sha(raw[16:]) if str(path).endswith('.pyc') else None}
+         finally:os.close(fd)
+     _CODE_DATA_CACHE={}
++    _CODE_VALUE_CACHE={}
+     _CODE_HASH_CACHE={}
+     _TELEMETRY_CHECK=None
+     def code_hash(code,data):
+         key=id(code)
+         if key not in _CODE_HASH_CACHE:_CODE_HASH_CACHE[key]=semantic_hash(data,_useful_check,separators=(', ', ': '))['sha256']
+         return _CODE_HASH_CACHE[key]
++    def _code_value(v):
++        if _TELEMETRY_CHECK is not None:_TELEMETRY_CHECK()
++        kind=type(v);key=id(v)
++        known=_CODE_VALUE_CACHE.get(key)
++        if known is not None and known[0] is v:return known[1],True
++        if isinstance(v,types.CodeType):
++            result={'code':code_data(v),'identity_diagnostic':key};immutable=True
++        elif kind is bytes:
++            result={'bytes_hex':v.hex(),'identity_diagnostic':key};immutable=True
++        elif kind in (tuple,list):
++            children=[_code_value(x) for x in v]
++            result={'type':kind.__name__,'items':[x[0] for x in children],'identity_diagnostic':key}
++            immutable=kind is tuple and all(x[1] for x in children)
++        elif kind is frozenset:
++            children=[_code_value(x) for x in v]
++            result={'frozenset_iteration_diagnostic':[x[0] for x in children],'identity_diagnostic':key}
++            immutable=all(x[1] for x in children)
++        elif v is None or kind in (str,int,float,bool):
++            result={'type':kind.__name__,'repr':repr(v),'identity_diagnostic':key,'is_interned_diagnostic':sys._is_interned(v) if kind is str and hasattr(sys,'_is_interned') else None}
++            # str interning is a time-sensitive diagnostic. Neither strings nor
++            # a container containing them are memoized across CODE snapshots.
++            immutable=kind is not str
++        else:
++            result={'type':kind.__name__,'repr':repr(v)};immutable=False
++        # Retain the original object alongside the descriptor: id reuse and Python
++        # value equality (notably signed-zero/NaN floats) cannot merge identities.
++        # Cache saturation falls back to full traversal; it adds no new refusal.
++        if immutable and len(_CODE_VALUE_CACHE)<DEFAULT_MAX_NODES:
++            _CODE_VALUE_CACHE[key]=(v,result)
++        return result,immutable
+     def code_data(c):
+         if _TELEMETRY_CHECK is not None:_TELEMETRY_CHECK()
+         known=_CODE_DATA_CACHE.get(id(c))
+         if known is not None:return known
+         if len(_CODE_DATA_CACHE)>=DEFAULT_MAX_NODES:raise ValueError('CODE_telemetry_unique_node_bound')
+         _useful_check()
+-        def value(v):
+-            if _TELEMETRY_CHECK is not None:_TELEMETRY_CHECK()
+-            if isinstance(v,types.CodeType):return {'code':code_data(v),'identity_diagnostic':id(v)}
+-            if type(v) is bytes:return {'bytes_hex':v.hex(),'identity_diagnostic':id(v)}
+-            if type(v) in (tuple,list):return {'type':type(v).__name__,'items':[value(x) for x in v],'identity_diagnostic':id(v)}
+-            if type(v) is frozenset:return {'frozenset_iteration_diagnostic':[value(x) for x in v],'identity_diagnostic':id(v)}
+-            if v is None or type(v) in (str,int,float,bool):return {'type':type(v).__name__,'repr':repr(v),'identity_diagnostic':id(v),'is_interned_diagnostic':sys._is_interned(v) if type(v) is str and hasattr(sys,'_is_interned') else None}
+-            return {'type':type(v).__name__,'repr':repr(v)}
+-        d={k:value(getattr(c,k)) for k in ('co_argcount','co_posonlyargcount','co_kwonlyargcount','co_nlocals','co_stacksize','co_flags','co_code','co_consts','co_names','co_varnames','co_filename','co_name','co_qualname','co_firstlineno','co_linetable','co_exceptiontable','co_freevars','co_cellvars')}
++        d={k:_code_value(getattr(c,k))[0] for k in ('co_argcount','co_posonlyargcount','co_kwonlyargcount','co_nlocals','co_stacksize','co_flags','co_code','co_consts','co_names','co_varnames','co_filename','co_name','co_qualname','co_firstlineno','co_linetable','co_exceptiontable','co_freevars','co_cellvars')}
+         d['code_identity_diagnostic']=id(c);d['telemetry_not_CODE_equality_or_normalization_proof']=True
+         _CODE_DATA_CACHE[id(c)]=d
+         return d
+@@ -1061,40 +1084,66 @@
+         return graph.value(root)
+ 
+     def semantic_hash(value,check=None,*,max_bytes=MAX_LOGICAL_BYTES,max_visits=MAX_LOGICAL_VISITS,separators=(',',':')):
+-        """Canonical sort_keys JSON SHA256 with <=32MiB scalar/64KiB digest scratch."""
++        """Exact canonical JSON SHA256; <=32MiB scalar/64KiB byte scratch."""
++        # Small escaped tokens share a 16KiB memo and digest writes a 48KiB buffer.
++        # Repeated values still contribute every original logical visit and byte.
++        # Containers are traversed in full; no expanded subtree is materialized.
+         check=codec_budget(check)
+         digest=hashlib.sha256();total=visits=0;deadline=time.monotonic()+60
++        buffer=bytearray();tokens={};token_bytes=0
++        comma=separators[0].encode('ascii');colon=separators[1].encode('ascii')
++        def bounded():
++            if time.monotonic()>=deadline:raise CodecError('semantic hash wall limit')
++            if check:check()
++        def flush():
++            if buffer:
++                bounded();digest.update(buffer);buffer.clear()
+         def emit(raw):
+             nonlocal total
+             total+=len(raw)
+             if total>max_bytes:raise CodecError('semantic hash byte work limit')
+-            for off in range(0,len(raw),65536):
+-                if time.monotonic()>=deadline:raise CodecError('semantic hash wall limit')
+-                if check:check()
+-                digest.update(raw[off:off+65536])
++            if len(raw)>49152:
++                flush()
++                view=memoryview(raw)
++                for off in range(0,len(raw),49152):
++                    bounded();digest.update(view[off:off+49152])
++            else:
++                if len(buffer)+len(raw)>49152:flush()
++                buffer.extend(raw)
++        def scalar(item,key_token=False):
++            nonlocal token_bytes
++            kind=type(item)
++            key=(kind,item.hex() if kind is float else item) if kind in (str,int,float,bool,type(None)) else None
++            if key is not None:
++                known=tokens.get(key)
++                if known is not None:return known
++            # Retain the large-string preallocation guard; other primitive scalars
++            # need one JSON encoding instead of _scalar_size plus a second encoding.
++            if not key_token and kind is str and len(item)>=8192 and _scalar_size(item)>MAX_RECORD_BYTES:raise CodecError('semantic scalar scratch bound')
++            raw=json.dumps(item,ensure_ascii=True,allow_nan=False,separators=(',',':')).encode('ascii')
++            if not key_token and len(raw)>MAX_RECORD_BYTES:raise CodecError('semantic scalar scratch bound')
++            if key is not None and len(tokens)<1024 and len(raw)<=4096 and token_bytes+len(raw)<=16384:
++                tokens[key]=raw;token_bytes+=len(raw)
++            return raw
+         def visit(item,depth=0):
+             nonlocal visits
+             visits+=1
+             if visits>max_visits or depth>DEFAULT_MAX_DEPTH:raise CodecError('semantic hash traversal work limit')
+-            _tick(check,visits)
++            _tick(bounded,visits)
+             if isinstance(item,Mapping):
+                 emit(b'{')
+                 for i,k in enumerate(sorted(item)):
+-                    if i:emit(separators[0].encode('ascii'))
+-                    emit(json.dumps(k,ensure_ascii=True,allow_nan=False,separators=(',',':')).encode('ascii'));emit(separators[1].encode('ascii'));visit(item[k],depth+1)
++                    if i:emit(comma)
++                    emit(scalar(k,True));emit(colon);visit(item[k],depth+1)
+                 emit(b'}')
+             elif isinstance(item,(list,GraphList)):
+                 emit(b'[')
+                 for i,x in enumerate(item):
+-                    if i:emit(separators[0].encode('ascii'))
++                    if i:emit(comma)
+                     visit(x,depth+1)
+                 emit(b']')
+-            else:
+-                if _scalar_size(item)>MAX_RECORD_BYTES:raise CodecError('semantic scalar scratch bound')
+-                raw=json.dumps(item,ensure_ascii=True,allow_nan=False,separators=(',',':')).encode('ascii')
+-                if len(raw)>MAX_RECORD_BYTES:raise CodecError('semantic scalar scratch bound')
+-                emit(raw)
+-        visit(value)
++            else:emit(scalar(item))
++        bounded();visit(value);flush();bounded()
+         return {'sha256':digest.hexdigest(),'canonical_bytes':total,'visits':visits}
+ 
+ 
+--- a/verify_observation.py
++++ b/verify_observation.py
+@@ -419,40 +419,66 @@
+     return graph.value(root)
+ 
+ def semantic_hash(value,check=None,*,max_bytes=MAX_LOGICAL_BYTES,max_visits=MAX_LOGICAL_VISITS,separators=(',',':')):
+-    """Canonical sort_keys JSON SHA256 with <=32MiB scalar/64KiB digest scratch."""
++    """Exact canonical JSON SHA256; <=32MiB scalar/64KiB byte scratch."""
++    # Small escaped tokens share a 16KiB memo and digest writes a 48KiB buffer.
++    # Repeated values still contribute every original logical visit and byte.
++    # Containers are traversed in full; no expanded subtree is materialized.
+     check=codec_budget(check)
+     digest=hashlib.sha256();total=visits=0;deadline=time.monotonic()+60
++    buffer=bytearray();tokens={};token_bytes=0
++    comma=separators[0].encode('ascii');colon=separators[1].encode('ascii')
++    def bounded():
++        if time.monotonic()>=deadline:raise CodecError('semantic hash wall limit')
++        if check:check()
++    def flush():
++        if buffer:
++            bounded();digest.update(buffer);buffer.clear()
+     def emit(raw):
+         nonlocal total
+         total+=len(raw)
+         if total>max_bytes:raise CodecError('semantic hash byte work limit')
+-        for off in range(0,len(raw),65536):
+-            if time.monotonic()>=deadline:raise CodecError('semantic hash wall limit')
+-            if check:check()
+-            digest.update(raw[off:off+65536])
++        if len(raw)>49152:
++            flush()
++            view=memoryview(raw)
++            for off in range(0,len(raw),49152):
++                bounded();digest.update(view[off:off+49152])
++        else:
++            if len(buffer)+len(raw)>49152:flush()
++            buffer.extend(raw)
++    def scalar(item,key_token=False):
++        nonlocal token_bytes
++        kind=type(item)
++        key=(kind,item.hex() if kind is float else item) if kind in (str,int,float,bool,type(None)) else None
++        if key is not None:
++            known=tokens.get(key)
++            if known is not None:return known
++        # Retain the large-string preallocation guard; other primitive scalars
++        # need one JSON encoding instead of _scalar_size plus a second encoding.
++        if not key_token and kind is str and len(item)>=8192 and _scalar_size(item)>MAX_RECORD_BYTES:raise CodecError('semantic scalar scratch bound')
++        raw=json.dumps(item,ensure_ascii=True,allow_nan=False,separators=(',',':')).encode('ascii')
++        if not key_token and len(raw)>MAX_RECORD_BYTES:raise CodecError('semantic scalar scratch bound')
++        if key is not None and len(tokens)<1024 and len(raw)<=4096 and token_bytes+len(raw)<=16384:
++            tokens[key]=raw;token_bytes+=len(raw)
++        return raw
+     def visit(item,depth=0):
+         nonlocal visits
+         visits+=1
+         if visits>max_visits or depth>DEFAULT_MAX_DEPTH:raise CodecError('semantic hash traversal work limit')
+-        _tick(check,visits)
++        _tick(bounded,visits)
+         if isinstance(item,Mapping):
+             emit(b'{')
+             for i,k in enumerate(sorted(item)):
+-                if i:emit(separators[0].encode('ascii'))
+-                emit(json.dumps(k,ensure_ascii=True,allow_nan=False,separators=(',',':')).encode('ascii'));emit(separators[1].encode('ascii'));visit(item[k],depth+1)
++                if i:emit(comma)
++                emit(scalar(k,True));emit(colon);visit(item[k],depth+1)
+             emit(b'}')
+         elif isinstance(item,(list,GraphList)):
+             emit(b'[')
+             for i,x in enumerate(item):
+-                if i:emit(separators[0].encode('ascii'))
++                if i:emit(comma)
+                 visit(x,depth+1)
+             emit(b']')
+-        else:
+-            if _scalar_size(item)>MAX_RECORD_BYTES:raise CodecError('semantic scalar scratch bound')
+-            raw=json.dumps(item,ensure_ascii=True,allow_nan=False,separators=(',',':')).encode('ascii')
+-            if len(raw)>MAX_RECORD_BYTES:raise CodecError('semantic scalar scratch bound')
+-            emit(raw)
+-    visit(value)
++        else:emit(scalar(item))
++    bounded();visit(value);flush();bounded()
+     return {'sha256':digest.hexdigest(),'canonical_bytes':total,'visits':visits}
+ 
+ 

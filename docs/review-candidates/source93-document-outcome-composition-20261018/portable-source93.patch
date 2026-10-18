@@ -1,0 +1,573 @@
+diff --git a/gateway/run_plugin_delivery.py b/gateway/run_plugin_delivery.py
+index 8a0720c5985b866235a2eed0adbb81341f32045a..d97c4a3b5f91ad6f0ea0e3ea3f557bddf583bfe8 100644
+--- a/gateway/run_plugin_delivery.py
++++ b/gateway/run_plugin_delivery.py
+@@ -124,7 +124,7 @@ def _ordinary_commit(state, value, previous, *, journals):
+     require_commit_return(state, observe_commit_return(state, witness))
+ 
+ 
+-def _ordinary_prior_attempt(state, cap, selection, relative, route):
++def _ordinary_prior_attempt(state, cap, selection, relative, route, *, outcome_request=None):
+     """Read existing bounded immutable history under its native custody lock.
+ 
+     The last mutable row alone cannot detect A -> B -> replay A. Legacy row
+@@ -157,6 +157,11 @@ def _ordinary_prior_attempt(state, cap, selection, relative, route):
+                 os.close(fd)
+             if not isinstance(row, dict):
+                 continue
++            if outcome_request is not None:
++                if (row.get('schema') == 'friday.ordinary-document-outcome.v1'
++                        and row.get('request') == outcome_request):
++                    raise ValueError('outcome_requires_reconciliation')
++                continue
+             if row.get('schema') == 'friday.ordinary-document-attempt.v1' and row.get('selection') == selection:
+                 if 'route' in row and freeze_route(row['route']) == route:
+                     raise ValueError('delivery_requires_reconciliation')
+@@ -307,6 +312,124 @@ def _ordinary_caption_fits(caption):
+         return False
+ 
+ 
++def _ordinary_outcome_authority(adapter, source, expected_route, expected_cap):
++    """Revalidate retained original authority without latest-session fallback."""
++    from types import SimpleNamespace
++    from hermes_cli.friday_user_scope import current, ordinary_file_source
++    from gateway.session_identity import identity_of
++    cap = current(required=True)
++    identity = identity_of(source)
++    runner = getattr(adapter, 'gateway_runner', None)
++    route = freeze_route(expected_route)
++    actual = freeze_route(getattr(source, '_friday_document_route', None))
++    if (cap is not expected_cap or ordinary_file_source() is not source
++            or identity is None or identity.transport_inferred or runner is None
++            or identity.runtime_home != cap.home or identity.runtime_profile != cap.profile
++            or identity.transport_profile != cap.principal[1]
++            or source.profile not in (None, '', cap.profile)
++            or source.user_id != cap.principal[3]
++            or str(getattr(getattr(adapter, '_bot', None), 'id', '')) != cap.principal[2]
++            or actual != route):
++        raise ValueError('original_outcome_authority_required')
++    current_route = freeze_route({'transport_profile': identity.transport_profile,
++        'runtime_profile': cap.profile, 'bot_id': cap.principal[2],
++        'source': {'platform': source.platform.value, **{key: getattr(source, key) for key in
++            ('chat_id', 'chat_type', 'user_id', 'thread_id', 'message_id')}}})
++    if current_route != route:
++        raise ValueError('original_outcome_route_changed')
++    context = SimpleNamespace(_manager=SimpleNamespace(home_path=cap.home))
++    _, live_adapter = resolve_document_route(runner, context, route)
++    if live_adapter is not adapter:
++        raise ValueError('original_outcome_adapter_replaced')
++    cap.check()
++    return runner
++
++
++async def _ordinary_outcome_receipt(runner, session_id, status):
++    """Use the existing hidden receipt surface; never grant document retry authority."""
++    import time
++    await runner.async_session_store.append_to_transcript(session_id,
++        {'role': 'assistant', 'content': '', 'timestamp': time.time(),
++         'display_kind': 'hidden', 'display_metadata': {
++             'friday_file_delivery_observation': {'state': 'UNKNOWN', 'outcome': status}}})
++
++
++def _reserve_ordinary_outcome(cap, route, request):
++    """Fence one status attempt in the existing native CAS and immutable journal."""
++    import copy
++    from hermes_cli.plugins_state import PluginState
++    from hermes_cli.friday_native_state import encoded
++    state = PluginState('friday_rework')
++    previous = _ordinary_prior_attempt(state, cap, None, None, route, outcome_request=request)
++    if previous is not None and (not isinstance(previous, dict)
++            or previous.get('schema') != _ORDINARY_DOCUMENTS or not isinstance(previous.get('files'), dict)):
++        raise ValueError('ordinary_document_journal_invalid')
++    value = copy.deepcopy(previous) if previous is not None else {'schema': _ORDINARY_DOCUMENTS, 'files': {}}
++    outcomes = value.setdefault('outcomes', {})
++    if not isinstance(outcomes, dict) or request in outcomes or len(outcomes) >= 10000:
++        raise ValueError('outcome_requires_reconciliation')
++    outcomes[request] = {'state': 'PENDING', 'route': freeze_route(route)}
++    marker = encoded({'schema': 'friday.ordinary-document-outcome.v1', 'request': request})
++    cap.check()
++    _ordinary_commit(state, value, previous, journals=(('unknown', marker),))
++    return state, value
++
++
++def _finish_ordinary_outcome(state, reserved, request, status):
++    import copy
++    from hermes_cli.friday_native_state import encoded
++    candidate = copy.deepcopy(reserved)
++    candidate['outcomes'][request].update(status)
++    _ordinary_commit(state, candidate, reserved, journals=(('candidate', encoded({
++        'schema': 'friday.ordinary-document-outcome-receipt.v1', 'request': request, 'outcome': status})),))
++
++
++async def _deliver_ordinary_outcome(adapter, source, route, cap, session_id, path, record_delivery):
++    """One direct response owner, with separate honest status-send observations."""
++    from gateway.platforms.base import SendResult, _thread_metadata_for_source
++    import sqlite3
++    from hermes_cli.friday_native_state import encoded
++    from pathlib import Path
++    try:
++        request = hashlib.sha256(encoded([cap.key, route, str(Path(path))])).hexdigest()
++        runner = _ordinary_outcome_authority(adapter, source, route, cap)
++        state, reserved = _reserve_ordinary_outcome(cap, route, request)
++        await _ordinary_outcome_receipt(runner, session_id, {'state': 'PENDING', 'request': request})
++        # Receipt persistence awaited: revalidate again directly before the effect.
++        _ordinary_outcome_authority(adapter, source, route, cap)
++    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
++        if record_delivery is not None:
++            record_delivery(SendResult(success=False, error='document_outcome_route_or_record_rejected'))
++        return
++    status = {'state': 'UNKNOWN', 'request': request}
++    try:
++        metadata = _thread_metadata_for_source(source, route['source']['message_id']) or {}
++        metadata['_friday_document_outcome'] = (
++            lambda: _ordinary_outcome_authority(adapter, source, route, cap), route)
++        result = await adapter.send(route['source']['chat_id'],
++            'Доставка файла не подтверждена (UNKNOWN) или отклонена до отправки. '
++            'Не отправляю его повторно без проверки результата.',
++            reply_to=route['source']['message_id'],
++            metadata=metadata)
++        if isinstance(result, SendResult):
++            if result.success is False:
++                status['state'] = 'FAILED'
++            elif result.success is True and isinstance(result.message_id, str) and result.message_id:
++                status['state'] = 'CONFIRMED'
++            if isinstance(result.message_id, str):
++                status['message_id'] = result.message_id
++    except Exception:  # health: allow BLE001 -- Arbitrary transport failures retain UNKNOWN status; never replay documents or expose private SDK error text.
++        result = SendResult(success=False, error='document_outcome_ack_unavailable')
++    if record_delivery is not None:
++        record_delivery(result)
++    try:
++        _finish_ordinary_outcome(state, reserved, request, status)
++        await _ordinary_outcome_receipt(runner, session_id, status)
++    except (OSError, RuntimeError, ValueError, sqlite3.Error):
++        # The pre-send PENDING remains truthful if the final receipt cannot persist.
++        return
++
++
+ async def deliver_ordinary_files(adapter, source, paths, *, record_delivery=None, caption=None):
+     """Shared managed final-MEDIA dispatcher for streaming and ordinary replies.
+ 
+@@ -326,25 +449,28 @@ async def deliver_ordinary_files(adapter, source, paths, *, record_delivery=None
+     if caption is not None and (len(paths) != 1 or not _ordinary_caption_fits(caption)):
+         # No effect occurred: the caller may use its usual full-text + files path.
+         return False
++    # Capture before the document await; jointly changed live/retained routes
++    # cannot acquire status authority from a newer ingress.
++    from hermes_cli.friday_user_scope import current
++    try:
++        outcome_cap = current(required=True)
++        outcome_route = freeze_route(getattr(source, '_friday_document_route', None))
++        outcome_session = getattr(source, '_friday_document_session_id', None)
++        if not isinstance(outcome_session, str) or not outcome_session:
++            raise ValueError('original_session_required')
++        _ordinary_outcome_authority(adapter, source, outcome_route, outcome_cap)
++    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
++        outcome_route = None
+     for path in paths:
+         result = await deliver_ordinary_document(adapter, source, path, caption=caption)
+         if record_delivery is not None: record_delivery(result)
+         if not result.success and not (caption is not None
+                 and result.error == 'gateway_document_preflight_rejected'):
+-            # A caption preflight refusal authorizes no outbound warning either.
+-            # Ordinary conversation receives the uncertainty too, including the
+-            # streaming path whose textual final has already been delivered.
+-            notify = getattr(adapter, 'emit_warning', None)
+-            if callable(notify):
+-                from gateway.platforms.base import _thread_metadata_for_source
+-                try:
+-                    await notify(source.chat_id,
+-                        'Доставка файла не подтверждена (UNKNOWN) или отклонена до отправки. '
+-                        'Не отправляю его повторно без проверки результата.',
+-                        metadata=_thread_metadata_for_source(source, source.message_id))
+-                except Exception:  # health: allow BLE001 -- Arbitrary adapter warning hooks must not replay document sends or reveal SDK/private exception text.
+-                    # A warning has no delivery authority; keep the document's original UNKNOWN.
+-                    continue
++            # Direct requested outcomes are normal replies, independent of the
++            # optional engine diagnostic policy. No lower layer sends this status.
++            if outcome_route is not None:
++                await _deliver_ordinary_outcome(adapter, source, outcome_route,
++                    outcome_cap, outcome_session, path, record_delivery)
+     return True
+ 
+ 
+diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
+index cff7106ff21af099770eb10205fadaf0a5d9f4f9..39667f18c8aa515d3f6caca72a3d169a6d41a00b 100644
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -3629,28 +3629,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+ 
+     async def send(
+         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+-        """Send a message to a Telegram chat."""
+-        if not self._bot:
+-            live = self._replacement_telegram_adapter()
+-            if live is not None:
+-                return await live.send(chat_id, content, reply_to, metadata)
+-            if self._is_permanent_fatal() or not await self._wait_for_reconnection():
+-                return SendResult(success=False, error="Not connected", retryable=not self._is_permanent_fatal())
+-            live = self._replacement_telegram_adapter()
+-            if not self._bot and live is not None:
+-                return await live.send(chat_id, content, reply_to, metadata)
+-            if not self._bot:
+-                return SendResult(success=False, error="Not connected", retryable=True)
+-        # getattr() — tests build adapters via object.__new__() (no __init__).
+-        if getattr(self, "_send_path_degraded", False):
+-            return SendResult(success=False, error="send_path_degraded", retryable=True)
+-        # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
+-        if not content or not content.strip():
+-            return SendResult(success=True, message_id=None)
+-        # One chat at a time (held only around the API calls, never across the reconnect wait above), so
+-        # two concurrent split replies to one chat cannot interleave their chunks (#114396).
+-        async with self._chat_send_lock(chat_id):
+-            return await self._send_text_locked(chat_id, content, reply_to, metadata)
++        """Send a message through the normal Telegram response boundary."""
++        from plugins.platforms.telegram.telegram_text_send import send
++        return await send(self, chat_id, content, reply_to, metadata)
+ 
+     async def _send_text_locked(
+         self, chat_id: str, content: str, reply_to: Optional[str], metadata: Optional[Dict[str, Any]]) -> SendResult:
+diff --git a/plugins/platforms/telegram/telegram_text_send.py b/plugins/platforms/telegram/telegram_text_send.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ccdbf27ac16e5a5bd35beff02328d0d940fed33f
+--- /dev/null
++++ b/plugins/platforms/telegram/telegram_text_send.py
+@@ -0,0 +1,83 @@
++"""Normal Telegram text entry and one retained-route direct document outcome."""
++from __future__ import annotations
++
++import asyncio
++from typing import Any, Dict, Optional
++from gateway.platforms.base import SendResult
++
++
++async def send(
++    self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
++    """Send a message to a Telegram chat."""
++    if isinstance(metadata, dict) and '_friday_document_outcome' in metadata:
++        return await _send_outcome(self, chat_id, content, reply_to, metadata)
++    if not self._bot:
++        live = self._replacement_telegram_adapter()
++        if live is not None:
++            return await live.send(chat_id, content, reply_to, metadata)
++        if self._is_permanent_fatal() or not await self._wait_for_reconnection():
++            return SendResult(success=False, error="Not connected", retryable=not self._is_permanent_fatal())
++        live = self._replacement_telegram_adapter()
++        if not self._bot and live is not None:
++            return await live.send(chat_id, content, reply_to, metadata)
++        if not self._bot:
++            return SendResult(success=False, error="Not connected", retryable=True)
++    # getattr() — tests build adapters via object.__new__() (no __init__).
++    if getattr(self, "_send_path_degraded", False):
++        return SendResult(success=False, error="send_path_degraded", retryable=True)
++    # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
++    if not content or not content.strip():
++        return SendResult(success=True, message_id=None)
++    # One chat at a time (held only around the API calls, never across the reconnect wait above), so
++    # two concurrent split replies to one chat cannot interleave their chunks (#114396).
++    async with self._chat_send_lock(chat_id):
++        return await self._send_text_locked(chat_id, content, reply_to, metadata)
++
++
++async def _send_outcome(adapter, chat_id, content, reply_to, metadata):
++    """No reconnect, retarget or retry after any ambiguous status attempt."""
++    from gateway.run_plugin_delivery import freeze_route
++    proof = metadata.get('_friday_document_outcome')
++    if not isinstance(proof, tuple) or len(proof) != 2 or not callable(proof[0]):
++        return SendResult(success=False, error='original_outcome_required')
++    validate, original = proof
++    route = freeze_route(original)
++    target = route['source']
++    if (chat_id != target['chat_id'] or reply_to != target['message_id']
++            or not isinstance(content, str) or not content):
++        return SendResult(success=False, error='original_outcome_required')
++    bot = adapter._bot
++    def check():
++        validate()
++        if (bot is None or adapter._bot is not bot or adapter.is_connected is not True
++                or getattr(adapter, '_send_path_degraded', False)
++                or str(bot.id) != route['bot_id']):
++            raise RuntimeError('original_bot_offline')
++    check()
++    async with adapter._chat_send_lock(chat_id):
++        check()
++        cooldown = adapter._send_flood_cooldown_remaining(chat_id)
++        if cooldown is not None:
++            return SendResult(success=False, error='document_outcome_rate_limited')
++        remaining = adapter._chat_outbound_slot_remaining(chat_id)
++        if remaining > 0:
++            await asyncio.sleep(remaining)
++            check()
++        adapter._hold_chat_outbound_slot(chat_id)
++        kwargs = {**adapter._notification_kwargs(metadata), 'chat_id': chat_id,
++                  'reply_to_message_id': int(target['message_id']), 'text': content, 'parse_mode': None}
++        thread_id = adapter._message_thread_id_for_send(target['thread_id'])
++        if thread_id is not None:
++            kwargs['message_thread_id'] = thread_id
++        check()
++        # The fixed short plain-text result needs no markdown or chunk fallback.
++        # One bounded SDK call; a lost ACK leaves the caller's immutable PENDING.
++        message = await asyncio.wait_for(bot.send_message(**kwargs), timeout=30)
++    message_id = getattr(message, 'message_id', None)
++    if (type(message_id) is not int or message_id <= 0
++            or str(getattr(getattr(message, 'chat', None), 'id', '')) != chat_id
++            or getattr(message, 'message_thread_id', None) != kwargs.get('message_thread_id')):
++        raise RuntimeError('document_outcome_ack_unavailable')
++    return SendResult(success=True, message_id=str(message_id), raw_response={
++        'kind': 'document_outcome', 'chat_id': chat_id, 'thread_id': target['thread_id'],
++        'reply_to': reply_to, 'message_id': str(message_id)})
+diff --git a/tests/agent/test_openai_client_custody_fixture_v2.py b/tests/agent/test_openai_client_custody_fixture_v2.py
+deleted file mode 100644
+index ee21681df6d521b5060e36b69f4c23c2dafb3bb2..0000000000000000000000000000000000000000
+--- a/tests/agent/test_openai_client_custody_fixture_v2.py
++++ /dev/null
+@@ -1,237 +0,0 @@
+-"""Versioned fixture repair: __new__ agents bind the existing requested-provider field.
+-
+-Frozen original remains unchanged; only fixture initialization differs.
+-"""
+-import sys
+-import threading
+-import types
+-from types import SimpleNamespace
+-
+-import httpx
+-import pytest
+-from openai import APIConnectionError
+-
+-sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
+-sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
+-sys.modules.setdefault("fal_client", types.SimpleNamespace())
+-
+-import run_agent
+-
+-
+-class FakeRequestClient:
+-    def __init__(self, responder):
+-        self._responder = responder
+-        self._client = SimpleNamespace(is_closed=False)
+-        self.chat = SimpleNamespace(
+-            completions=SimpleNamespace(create=self._create)
+-        )
+-        self.responses = SimpleNamespace()
+-        self.close_calls = 0
+-
+-    def _create(self, **kwargs):
+-        return self._responder(**kwargs)
+-
+-    def close(self):
+-        self.close_calls += 1
+-        self._client.is_closed = True
+-
+-
+-class FakeSharedClient(FakeRequestClient):
+-    pass
+-
+-
+-class OpenAIFactory:
+-    def __init__(self, clients):
+-        self._clients = list(clients)
+-        self.calls = []
+-
+-    def __call__(self, **kwargs):
+-        self.calls.append(dict(kwargs))
+-        if not self._clients:
+-            raise AssertionError("OpenAI factory exhausted")
+-        return self._clients.pop(0)
+-
+-
+-def _build_agent(shared_client=None):
+-    agent = run_agent.AIAgent.__new__(run_agent.AIAgent)
+-    agent.api_mode = "chat_completions"
+-    agent.provider = "openai-codex"
+-    agent.requested_provider = agent.provider
+-    agent.base_url = "https://chatgpt.com/backend-api/codex"
+-    agent.model = "gpt-5-codex"
+-    agent.log_prefix = ""
+-    agent.quiet_mode = True
+-    agent._interrupt_requested = False
+-    agent._interrupt_message = None
+-    agent._client_lock = threading.RLock()
+-    agent._client_kwargs = {"api_key": "***", "base_url": agent.base_url}
+-    agent.client = shared_client or FakeSharedClient(lambda **kwargs: {"shared": True})
+-    agent.stream_delta_callback = None
+-    agent._stream_callback = None
+-    agent.reasoning_callback = None
+-    agent.status_callback = None
+-    return agent
+-
+-
+-def _connection_error():
+-    return APIConnectionError(
+-        message="Connection error.",
+-        request=httpx.Request("POST", "https://example.com/v1/chat/completions"),
+-    )
+-
+-
+-def test_retry_after_api_connection_error_recreates_request_client(monkeypatch):
+-    first_request = FakeRequestClient(lambda **kwargs: (_ for _ in ()).throw(_connection_error()))
+-    second_request = FakeRequestClient(lambda **kwargs: {"ok": True})
+-    factory = OpenAIFactory([first_request, second_request])
+-    monkeypatch.setattr("agent.process_bootstrap.OpenAI", factory)
+-
+-    agent = _build_agent()
+-
+-    with pytest.raises(APIConnectionError):
+-        agent._interruptible_api_call({"model": agent.model, "messages": []})
+-
+-    result = agent._interruptible_api_call({"model": agent.model, "messages": []})
+-
+-    assert result == {"ok": True}
+-    assert len(factory.calls) == 2
+-    assert first_request.close_calls >= 1
+-    # The successful request's wire client is cached for reuse across
+-    # sequential calls (not closed at request end); teardown really closes it.
+-    assert second_request.close_calls == 0
+-    agent._close_cached_request_openai_client(reason="agent_close")
+-    assert second_request.close_calls == 1
+-
+-
+-def test_stale_non_stream_close_is_single_owner(monkeypatch):
+-    from agent import chat_completion_helpers
+-
+-    response_started = threading.Event()
+-    request_aborted = threading.Event()
+-
+-    def blocked_responder(**kwargs):
+-        response_started.set()
+-        assert request_aborted.wait(timeout=5), "stale watchdog never aborted request"
+-        raise _connection_error()
+-
+-    request_client = FakeRequestClient(blocked_responder)
+-    factory = OpenAIFactory([request_client])
+-    monkeypatch.setattr("agent.process_bootstrap.OpenAI", factory)
+-    monkeypatch.setattr(
+-        chat_completion_helpers,
+-        "time",
+-        SimpleNamespace(time=lambda: 1.0 if response_started.is_set() else 0.0),
+-    )
+-
+-    agent = _build_agent()
+-    agent._compute_non_stream_stale_timeout = lambda api_payload: 0.5
+-    monkeypatch.setattr(
+-        agent,
+-        "_force_close_tcp_sockets",
+-        lambda client: (request_aborted.set(), 1)[1],
+-    )
+-
+-    with pytest.raises(APIConnectionError):
+-        agent._interruptible_api_call({"model": agent.model, "messages": []})
+-
+-    assert request_client.close_calls == 1
+-
+-
+-def test_closed_shared_client_is_recreated_before_request(monkeypatch):
+-    stale_shared = FakeSharedClient(lambda **kwargs: (_ for _ in ()).throw(AssertionError("stale shared client used")))
+-    stale_shared._client.is_closed = True
+-
+-    replacement_shared = FakeSharedClient(lambda **kwargs: {"replacement": True})
+-    request_client = FakeRequestClient(lambda **kwargs: {"ok": "fresh-request-client"})
+-    factory = OpenAIFactory([replacement_shared, request_client])
+-    monkeypatch.setattr("agent.process_bootstrap.OpenAI", factory)
+-
+-    agent = _build_agent(shared_client=stale_shared)
+-    result = agent._interruptible_api_call({"model": agent.model, "messages": []})
+-
+-    assert result == {"ok": "fresh-request-client"}
+-    assert agent.client is replacement_shared
+-    assert stale_shared.close_calls >= 1
+-    assert replacement_shared.close_calls == 0
+-    assert len(factory.calls) == 2
+-
+-
+-def test_concurrent_requests_do_not_break_each_other_when_one_client_closes(monkeypatch):
+-    first_started = threading.Event()
+-    first_closed = threading.Event()
+-
+-    def first_responder(**kwargs):
+-        first_started.set()
+-        first_client.close()
+-        first_closed.set()
+-        raise _connection_error()
+-
+-    def second_responder(**kwargs):
+-        assert first_started.wait(timeout=2)
+-        assert first_closed.wait(timeout=2)
+-        return {"ok": "second"}
+-
+-    first_client = FakeRequestClient(first_responder)
+-    second_client = FakeRequestClient(second_responder)
+-    factory = OpenAIFactory([first_client, second_client])
+-    monkeypatch.setattr("agent.process_bootstrap.OpenAI", factory)
+-
+-    agent = _build_agent()
+-    results = {}
+-
+-    def run_call(name):
+-        try:
+-            results[name] = agent._interruptible_api_call({"model": agent.model, "messages": []})
+-        except Exception as exc:  # noqa: BLE001 - asserting exact type below
+-            results[name] = exc
+-
+-    thread_one = threading.Thread(target=run_call, args=("first",), daemon=True)
+-    thread_two = threading.Thread(target=run_call, args=("second",), daemon=True)
+-    thread_one.start()
+-    thread_two.start()
+-    thread_one.join(timeout=5)
+-    thread_two.join(timeout=5)
+-
+-    values = list(results.values())
+-    assert sum(isinstance(value, APIConnectionError) for value in values) == 1
+-    assert values.count({"ok": "second"}) == 1
+-    assert len(factory.calls) == 2
+-
+-
+-
+-def test_streaming_call_recreates_closed_shared_client_before_request(monkeypatch):
+-    chunks = iter([
+-        SimpleNamespace(
+-            model="gpt-5-codex",
+-            choices=[SimpleNamespace(delta=SimpleNamespace(content="Hello", tool_calls=None), finish_reason=None)],
+-        ),
+-        SimpleNamespace(
+-            model="gpt-5-codex",
+-            choices=[SimpleNamespace(delta=SimpleNamespace(content=" world", tool_calls=None), finish_reason="stop")],
+-        ),
+-    ])
+-
+-    stale_shared = FakeSharedClient(lambda **kwargs: (_ for _ in ()).throw(AssertionError("stale shared client used")))
+-    stale_shared._client.is_closed = True
+-
+-    replacement_shared = FakeSharedClient(lambda **kwargs: {"replacement": True})
+-    request_client = FakeRequestClient(lambda **kwargs: chunks)
+-    factory = OpenAIFactory([replacement_shared, request_client])
+-    monkeypatch.setattr("agent.process_bootstrap.OpenAI", factory)
+-
+-    agent = _build_agent(shared_client=stale_shared)
+-    agent.stream_delta_callback = lambda _delta: None
+-    # Force chat_completions mode so the streaming path uses
+-    # chat.completions.create(stream=True) instead of Codex responses.stream()
+-    agent.api_mode = "chat_completions"
+-    response = agent._interruptible_streaming_api_call({"model": agent.model, "messages": []})
+-
+-    assert response.choices[0].message.content == "Hello world"
+-    assert agent.client is replacement_shared
+-    assert stale_shared.close_calls >= 1
+-    # The clean stream's wire client is cached for reuse across sequential
+-    # calls (not closed at request end); teardown really closes it.
+-    assert request_client.close_calls == 0
+-    agent._close_cached_request_openai_client(reason="agent_close")
+-    assert request_client.close_calls == 1
+-    assert len(factory.calls) == 2
+diff --git a/tests/agent/test_openai_client_lifecycle.py b/tests/agent/test_openai_client_lifecycle.py
+index 1302497b3d22188d773481b46f240771e56d8206..4e75745812ab91d67bf5de902b6421020a7e064d 100644
+--- a/tests/agent/test_openai_client_lifecycle.py
++++ b/tests/agent/test_openai_client_lifecycle.py
+@@ -52,6 +52,7 @@ def _build_agent(shared_client=None):
+     agent = run_agent.AIAgent.__new__(run_agent.AIAgent)
+     agent.api_mode = "chat_completions"
+     agent.provider = "openai-codex"
++    agent.requested_provider = agent.provider
+     agent.base_url = "https://chatgpt.com/backend-api/codex"
+     agent.model = "gpt-5-codex"
+     agent.log_prefix = ""

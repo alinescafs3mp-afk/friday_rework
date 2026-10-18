@@ -109,7 +109,20 @@ def test_create_revision_read_send_then_restart_dedup(own, monkeypatch):
     assert len(own.sent)==2
     own.source.message_id='306'; own.pin()
     assert asyncio.run(delivery.deliver_ordinary_document(own.adapter,own.source,str(own.work/'draft-v2.md'))).success
-    assert len(own.sent)==3 and 'DELIVERED' in own.history[-1]['content']
+    assert len(own.sent)==3
+    receipt=own.history[-1]
+    assert receipt['content']=='' and receipt['display_kind']=='hidden'
+    observation=receipt['display_metadata']['friday_file_delivery_observation']
+    assert observation['state']=='DELIVERED'
+    assert observation['path']=='draft-v2.md'
+    assert observation['sha256']==hashlib.sha256(revised.encode()).hexdigest()
+    public=scopes.ordinary_message_view(receipt)
+    assert public['content']=='' and public['display_kind']=='hidden'
+    assert 'friday_file_delivery_observation' not in public.get('display_metadata',{})
+    from hermes_cli.plugins_state import PluginState
+    journal=PluginState('friday_rework').get(delivery._ORDINARY_DOCUMENTS)
+    assert all(row['state']=='DELIVERED' for row in journal['files'].values())
+    assert not journal.get('outcomes')
     before=(own.work/'draft-v2.md').read_bytes()
     try:
         denied=scopes.scoped_file('write_file', {'path':'draft-v2.md','content':'overwrite'})
@@ -192,15 +205,79 @@ def test_shared_streaming_and_nonstreaming_media_dispatch(own):
     assert results[0].success
 
 
-def test_uncertainty_enters_normal_transcript_and_notice(own):
+@pytest.mark.parametrize('suppressed', [False, True])
+@pytest.mark.parametrize('status_ack', ['confirmed', 'no-message-id', 'failed', 'none', 'throws'])
+def test_uncertainty_enters_normal_transcript_and_notice(own, monkeypatch, suppressed, status_ack):
+    from types import MethodType
+    from gateway import warning_notifications
+    from hermes_cli.plugins_state import PluginState
     path=private(own.work/'unknown.md')
+    digest=hashlib.sha256(Path(path).read_bytes()).hexdigest()
     notices=[]
-    async def warning(chat,text,metadata=None): notices.append((chat,text))
-    async def lost(*a,**k): raise OSError('lost ack')
-    own.adapter.send_document_bytes=lost; own.adapter.emit_warning=warning
-    asyncio.run(delivery.deliver_ordinary_files(own.adapter,own.source,[path]))
-    assert len(notices)==1 and 'UNKNOWN' in notices[0][1]
-    assert 'UNKNOWN' in own.history[-1]['content'] and 'unknown.md' in own.history[-1]['content']
+    private_error='PRIVATE lost ack '+path+' '+digest
+    async def normal_send(chat,text,*,reply_to=None,metadata=None):
+        notices.append((chat,text,reply_to,metadata))
+        if text=='diagnostic probe':
+            return SendResult(success=True,message_id='707')
+        # The normal response retains and rechecks the exact original authority.
+        check,route=metadata['_friday_document_outcome']
+        check()
+        assert route==own.source._friday_document_route
+        if status_ack=='throws': raise OSError(private_error)
+        if status_ack=='none': return None
+        return SendResult(success=status_ack!='failed',
+                          message_id='505' if status_ack=='confirmed' else None,
+                          error=private_error if status_ack=='failed' else None)
+    async def warning(*a,**kw):
+        pytest.fail('requested direct outcome must not use diagnostic warning hook')
+    async def lost(*a,**k):
+        own.sent.append(('accepted-no-ack',a[1]))
+        raise OSError(private_error)
+    own.adapter.send_document_bytes=lost
+    own.adapter.send=normal_send
+    own.adapter.emit_warning=warning
+    own.adapter.platform=Platform.TELEGRAM
+    own.adapter.warning_notifications_enabled=MethodType(BasePlatformAdapter.warning_notifications_enabled,own.adapter)
+    monkeypatch.setattr(warning_notifications,'effective_user_config',
+        lambda:{'display':{'suppress_warning_notifications':suppressed}})
+    recorded=[]
+    assert asyncio.run(delivery.deliver_ordinary_files(own.adapter,own.source,[path],record_delivery=recorded.append))
+    assert len(own.sent)==1 and own.sent[0][1]==Path(path).read_bytes()
+    assert len(notices)==1 and notices[0][0]=='202' and notices[0][2]=='303'
+    assert 'UNKNOWN' in notices[0][1]
+    for secret in (path,'unknown.md',digest,private_error,'friday_file_delivery_observation'):
+        assert secret not in notices[0][1]
+    assert len(recorded)==2 and not recorded[0].success
+    assert recorded[0].error=='document_delivery_UNKNOWN'
+    assert (recorded[1] is None)==(status_ack=='none')
+    if status_ack!='none':
+        assert recorded[1].success==(status_ack in ('confirmed','no-message-id'))
+    expected={'confirmed':'CONFIRMED','no-message-id':'UNKNOWN','failed':'FAILED','none':'UNKNOWN','throws':'UNKNOWN'}[status_ack]
+    journal=PluginState('friday_rework').get(delivery._ORDINARY_DOCUMENTS)
+    assert len(journal['files'])==1
+    assert next(iter(journal['files'].values()))['state']=='UNKNOWN'
+    assert len(journal['outcomes'])==1
+    assert next(iter(journal['outcomes'].values()))['state']==expected
+    receipts=[row['display_metadata']['friday_file_delivery_observation'] for row in own.history]
+    document_receipts=[row for row in receipts if 'outcome' not in row]
+    assert len(document_receipts)==1 and document_receipts[0]['state']=='UNKNOWN'
+    assert document_receipts[0]['path']=='unknown.md' and document_receipts[0]['sha256']==digest
+    outcomes=[row['outcome'] for row in receipts if 'outcome' in row]
+    assert outcomes[0]['state']=='PENDING' and outcomes[-1]['state']==expected
+    for row in own.history:
+        assert row['content']=='' and row['display_kind']=='hidden'
+        public=scopes.ordinary_message_view(row)
+        assert public['content']=='' and public['display_kind']=='hidden'
+        assert 'friday_file_delivery_observation' not in public.get('display_metadata',{})
+        for secret in (path,'unknown.md',digest,private_error):
+            assert secret not in json.dumps(public)
+    # Status acknowledgement never grants permission to replay the UNKNOWN file.
+    assert asyncio.run(delivery.deliver_ordinary_files(own.adapter,own.source,[path]))
+    assert len(own.sent)==1 and len(notices)==1
+    # Optional diagnostics retain their own suppression setting.
+    diagnostic=asyncio.run(BasePlatformAdapter.emit_warning(own.adapter,'202','diagnostic probe'))
+    assert len(notices)==(1 if suppressed else 2)
+    assert (diagnostic is None)==suppressed
 
 
 def test_managed_home_inode_swap_is_refused(own):
