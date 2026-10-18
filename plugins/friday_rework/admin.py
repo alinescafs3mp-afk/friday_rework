@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 import re
 import hashlib
-import hashlib
 
 from hermes_cli.friday_product_access import admin_policy, access_policy, principal_id, profile_name, settings
 from .access import ProductAccess
@@ -81,21 +80,48 @@ class Administration:
         finally:
             db.close()
 
+    @contextmanager
+    def metadata_read(self, profile, *, session=None):
+        """Carry the current verified request into one exact metadata scope."""
+        state = self._state()
+        if session is None:
+            # Existing non-request callers retain the native unscoped behavior.
+            with self.scope(profile) as root:
+                yield root, state, None
+            return
+        from .onboarding import Onboarding
+        from .operator_metadata import operator_metadata_read, preflight_operator_metadata
+        onboarding = Onboarding(self)
+        expected_root, paths = preflight_operator_metadata(onboarding, profile, session, state, read_only=True)
+        onboarding._verify_operator(profile, session)
+        with self.scope(profile) as root:
+            if root != expected_root:
+                raise PermissionError("foreign_operator_metadata_authority")
+            with operator_metadata_read(onboarding, profile, session, root, state,
+                                        expected_paths=paths) as operator:
+                yield root, state, operator
+
     @staticmethod
-    def _rows(state):
-        store = Associations(state)
+    def _rows(state, *, _operator=None):
+        store = Associations(state, _operator=_operator)
         return store.snapshot()
 
-    def users(self, profile):
-        with self.scope(profile):
-            policy = access_policy()
-            if policy is None or not any(a["transport_profile"] == profile for a in policy["accounts"]):
-                raise PermissionError("receiving_transport_authority_required")
-            accounts = [a for a in policy["accounts"] if a["transport_profile"] == profile]
-            return {"profile": profile, "authority": "RECEIVING_TRANSPORT", "accounts": accounts,
-                    "users": [{"principal_id": key, **row} for key, row in ProductAccess(self._state()).users().items()]}
+    def _users(self, profile, state, *, _operator=None):
+        policy = access_policy()
+        if policy is None or not any(a["transport_profile"] == profile for a in policy["accounts"]):
+            raise PermissionError("receiving_transport_authority_required")
+        accounts = [a for a in policy["accounts"] if a["transport_profile"] == profile]
+        return {"profile": profile, "authority": "RECEIVING_TRANSPORT", "accounts": accounts,
+                "users": [{"principal_id": key, **row} for key, row in
+                          ProductAccess(state, _operator=_operator).users().items()]}
+
+    def users(self, profile, *, session=None):
+        with self.metadata_read(profile, session=session) as (_, state, operator):
+            return self._users(profile, state, _operator=operator)
 
     def set_user(self, profile, **values):
+        from .operator_metadata import require_operator_write
+        require_operator_write()
         if values.get("transport_profile") != profile:
             raise PermissionError("receiving_transport_authority_required")
         with self.scope(profile) as root:
@@ -134,9 +160,9 @@ class Administration:
         if marker != expected:
             raise PermissionError("private_profile_setup_required")
 
-    def onboarding_templates(self, profile):
+    def onboarding_templates(self, profile, *, session=None):
         from .onboarding import Onboarding
-        return Onboarding(self).templates(profile)
+        return Onboarding(self).templates(profile, session=session)
 
     def onboarding_prepare(self, profile, *, session=None, **values):
         from .onboarding import Onboarding
@@ -174,9 +200,9 @@ class Administration:
         from .onboarding import Onboarding
         return Onboarding(self).activate(profile, session=session, **values)
 
-    def pairing(self, profile):
-        self.users(profile)  # prove this is an actual receiving transport authority
-        with self.scope(profile):
+    def pairing(self, profile, *, session=None):
+        with self.metadata_read(profile, session=session) as (_, state, operator):
+            self._users(profile, state, _operator=operator)
             from gateway.pairing import PairingStore
             store = PairingStore()
             # Pairing codes are credentials; expose only request ids to the console.
@@ -184,6 +210,8 @@ class Administration:
             return {"pending": pending, "approved": store.list_approved()}
 
     def approve(self, profile, *, platform, transport_profile, account_id, request_id):
+        from .operator_metadata import require_operator_write
+        require_operator_write()
         if transport_profile != profile:
             raise PermissionError("receiving_transport_authority_required")
         with self.scope(profile):
@@ -272,9 +300,9 @@ class Administration:
             "stop_available": True, "stop_reason": "VERIFY_CURRENT_ADMIN_AND_OWNING_GATEWAY_ON_ACTION",
             "quiescent": (row.get("host") or {}).get("quiescence") is not None}
 
-    def tasks(self, profile):
-        with self.scope(profile):
-            return [self._task_projection(row) for row in self._rows(self._state()).values()]
+    def tasks(self, profile, *, session=None):
+        with self.metadata_read(profile, session=session) as (_, state, operator):
+            return [self._task_projection(row) for row in self._rows(state, _operator=operator).values()]
 
     def conversations(self, profile, *, query="", limit=100, offset=0, filters=None):
         if not isinstance(query, str) or len(query) > 512 or not 1 <= limit <= 200 or not 0 <= offset <= 100000:
@@ -303,12 +331,12 @@ class Administration:
             # This is a bounded native page, not a claim of a global filtered count.
             return [r for r in projected if all(r["identity"].get(k) == v for k, v in filters.items())]
 
-    def conversation(self, profile, session_id, *, limit=100, offset=0):
+    def conversation(self, profile, session_id, *, limit=100, offset=0, session=None):
         if (not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", session_id)
                 or type(limit) is not int or type(offset) is not int
                 or not 1 <= limit <= 200 or not 0 <= offset <= 100000):
             raise ValueError("invalid_admin_session")
-        with self.scope(profile) as home, self._db(home) as db:
+        with self.metadata_read(profile, session=session) as (home, state, operator), self._db(home) as db:
             row = db.get_session(session_id)
             if row is None:
                 raise ValueError("native_session_not_found")
@@ -322,7 +350,7 @@ class Administration:
                     "next_offset": next_offset, "end": not has_more,
                     "state": "BOUNDED_LIMIT" if has_more and next_offset is None else ("MORE" if has_more else "END")}
             joined = []
-            for task in self._rows(self._state()).values():
+            for task in self._rows(state, _operator=operator).values():
                 owner = task["owner"]
                 if (owner["session_id"] == session_id and owner["session_key"] == identity["session_key"]
                         and identity["evidence"] != "UNKNOWN" and owner["bot_id"] == identity["account_id"]
@@ -334,14 +362,14 @@ class Administration:
                     "messages": [{k: m.get(k) for k in ("id", "role", "content", "timestamp", "tool_name")} for m in messages],
                     "tasks": joined, "page": page, "ancestor_history": "NOT_MERGED", "attachments": "USE_VERIFIED_TASK_REFERENCES_ONLY"}
 
-    def attachment(self, profile, task_id, index):
+    def attachment(self, profile, task_id, index, *, session=None):
         from .artifacts import StagedArtifact, read_staged
         from .host_record import validate_host_record
         from .results import output_root
         if type(index) is not int or not 0 <= index < 16:
             raise ValueError("invalid_admin_attachment")
-        with self.scope(profile):
-            row = self._rows(self._state()).get(task_id)
+        with self.metadata_read(profile, session=session) as (_, state, operator):
+            row = self._rows(state, _operator=operator).get(task_id)
             if row is None or (row["owner"]["profile"] or "default") != profile:
                 raise PermissionError("foreign_task_attachment")
             # This initial package exposes only existing verified staged outputs.
@@ -356,13 +384,13 @@ class Administration:
             payload = read_staged(staging_root=output_root(row), artifact=artifact, max_bytes=16 * 1024**2)
             return payload
 
-    def input_attachment(self, profile, task_id, index):
+    def input_attachment(self, profile, task_id, index, *, session=None):
         from .artifacts import StagedArtifact, read_staged
         from .host_record import validate_host_record
         if type(index) is not int or not 0 <= index < 64:
             raise ValueError("invalid_admin_attachment")
-        with self.scope(profile):
-            row = self._rows(self._state()).get(task_id)
+        with self.metadata_read(profile, session=session) as (_, state, operator):
+            row = self._rows(state, _operator=operator).get(task_id)
             if row is None or (row["owner"]["profile"] or "default") != profile:
                 raise PermissionError("foreign_task_attachment")
             validate_host_record(row)
@@ -402,6 +430,8 @@ class Administration:
                 "web_worker_journeys": "NOT_RUN"}
 
     def control(self, profile, session, task_id, action):
+        from .operator_metadata import require_operator_write
+        require_operator_write()
         from .admin_controls import authority_home, request_control
         from hermes_cli.friday_product_access import admin_policy, session_allowed
         with authority_home(self.launch_home):
@@ -417,6 +447,8 @@ class Administration:
                 raise PermissionError("verified_admin_required")
 
     def write_settings(self, profile, body, session):
+        from .operator_metadata import require_operator_write
+        require_operator_write()
         from .admin_settings import edit
         self._verify_session(profile, session)
         with self.scope(profile) as home:
@@ -424,6 +456,9 @@ class Administration:
 
     def schedules(self, profile, action=None, job_id=None, session=None):
         from .admin_settings import schedules
+        if action is not None:
+            from .operator_metadata import require_operator_write
+            require_operator_write()
         if action is not None: self._verify_session(profile, session)
         with self.scope(profile):
             return schedules(action, job_id, lambda: self._verify_session(profile, session))

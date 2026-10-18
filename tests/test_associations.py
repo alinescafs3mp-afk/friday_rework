@@ -212,7 +212,7 @@ class NativeAssociationTests(unittest.TestCase):
 
     def test_real_native_writer_and_marker_commit_before_return(self):
         with self.fixture("ordering") as (state, store, args), self.trace() as events:
-            state.data_dir.mkdir(mode=0o700, parents=True)
+            state.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             state.set("unrelated.key", {"keep": True})
             for number, method in enumerate((lambda: store.claim(**args),
                            lambda: store.begin_submission(args["task_id"], OWNER),

@@ -132,11 +132,32 @@ def test_readiness_and_preload_have_no_implicit_execution_or_secret_registration
 def test_direct_foreign_roots_and_home_overrides_refuse(env):
     make(env,'1');complete(env,'2')
     from agent.skill_utils import get_skill_search_roots
+    target=home(env,'2')/'skills/procedure/SKILL.md'
+    target.parent.mkdir(mode=0o700)
+    target.write_text(document(body='FOREIGN_SKILL_SECRET_CANARY'));target.chmod(0o600)
+    before=target.read_bytes()
+    effect=home(env,'2')/'dispatch-handler-effect'
+    calls=[]
+    entry=registry.get_entry('skill_view')
+    assert entry is not None
+    def forbidden_handler(args, **kwargs):
+        calls.append(args)
+        effect.write_text('forbidden handler reached')
+        return {'success':True,'content':target.read_text()}
     with entered(env):
         with pytest.raises(scope.ScopeDenied):get_skill_search_roots(home(env,'2')/'skills')
         with pytest.raises(scope.ScopeDenied):prompt_builder.build_skills_system_prompt(skills_dir_override=home(env,'2')/'skills')
         with pytest.raises(scope.ScopeDenied):skill_commands.build_auto_load_prompt(home_override=home(env,'2'))
-        assert dispatch('skill_view',name='../../user-2/skills/procedure').get('error') == 'product_user_scope_refused'
+        with env.monkeypatch.context() as local:
+            local.setattr(entry,'handler',forbidden_handler)
+            result=dispatch('skill_view',name='../../user-2/skills/procedure')
+        assert result == {'error':'Это действие недоступно.'}
+        assert not result.get('success')
+        public=json.dumps(result,ensure_ascii=False)
+        assert all(value not in public for value in ('product_user_scope_refused',
+            str(target),str(home(env,'2')),'../../user-2/skills/procedure',
+            'FOREIGN_SKILL_SECRET_CANARY'))
+        assert calls == [] and not effect.exists() and target.read_bytes() == before
 
 from test_user_isolation import users
 

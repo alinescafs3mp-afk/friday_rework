@@ -75,9 +75,19 @@ def env(tmp_path, monkeypatch):
     token = set_hermes_home_override(str(home))
     try:
         provider, operator = signed_operator()
-        yield SimpleNamespace(home=home, cfg=cfg, template=template, monkeypatch=monkeypatch,
-            provider=provider, operator=operator,
-            state=PluginState('friday_rework'), admin=Administration(), setup=Onboarding(Administration()))
+        from hermes_cli.dashboard_auth import registry
+        registration_scope = str(home)
+        previous = registry.snapshot_registration(provider.name, scope=registration_scope)
+        if previous is not None:
+            raise RuntimeError('onboarding_fixture_provider_namespace_occupied')
+        registry.register_provider(provider, scope=registration_scope)
+        try:
+            yield SimpleNamespace(home=home, cfg=cfg, template=template, monkeypatch=monkeypatch,
+                provider=provider, operator=operator,
+                state=PluginState('friday_rework'), admin=Administration(), setup=Onboarding(Administration()))
+        finally:
+            if not registry.restore_registration(provider.name, provider, previous, scope=registration_scope):
+                raise RuntimeError('onboarding_fixture_provider_custody_changed')
     finally: reset_hermes_home_override(token)
 
 

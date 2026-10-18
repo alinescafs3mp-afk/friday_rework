@@ -180,12 +180,20 @@ class Associations:
     taking the nonblocking flock. Another writer still receives admission_busy;
     native preparation/control never holds either metadata lock.
     """
-    def __init__(self, native_state, *, clock=time.time):
+    def __init__(self, native_state, *, clock=time.time, _operator=None):
         self.state = native_state
-        from hermes_cli.friday_cli_work import is_cli, check_store
-        from hermes_cli.friday_cli_principal import current_cli
-        self._cli_authority = current_cli(required=True) if is_cli() else None
-        check_store(self._cli_authority, self.state)
+        self._operator = _operator
+        if _operator is not None:
+            from .operator_metadata import _OperatorMetadata
+            if type(_operator) is not _OperatorMetadata:
+                raise AssociationError('operator_metadata_authority_required')
+            _operator.check(self.state)
+            self._cli_authority = None
+        else:
+            from hermes_cli.friday_cli_work import is_cli, check_store
+            from hermes_cli.friday_cli_principal import current_cli
+            self._cli_authority = current_cli(required=True) if is_cli() else None
+            check_store(self._cli_authority, self.state)
         self._cli_state = self.state
         self._cli_directory = Path(self.state.data_dir)
         self._cli_namespace = self.state._data_namespace if self._cli_authority is not None else None
@@ -195,6 +203,9 @@ class Associations:
         self._native_expected = ContextVar("association_native_expected", default=None)
 
     def _check_local_state(self):
+        if self._operator is not None:
+            self._operator.check(self.state)
+            return
         from hermes_cli.friday_cli_work import check_store
         check_store(self._cli_authority, self.state)
         if self._cli_authority is not None and (self.state is not self._cli_state
@@ -224,19 +235,29 @@ class Associations:
     def state_get(self, key, default=None):
         self._check_local_state()
         with self.lock_budget():
-            value = self.state.get(key, default, lock_budget=self._lock_allowance.get())
+            if self._operator is not None:
+                value = self._operator.get(self.state, key, default, self._lock_allowance.get())
+            else:
+                value = self.state.get(key, default, lock_budget=self._lock_allowance.get())
             self._check_local_state()
             return value
 
     def state_set(self, key, value):
         self._check_local_state()
+        if self._operator is not None:
+            self._operator.require_write()
         with self.lock_budget():
-            self.state.set(key, value, lock_budget=self._lock_allowance.get())
+            if self._operator is not None:
+                self._operator.set(self.state, key, value, self._lock_allowance.get())
+            else:
+                self.state.set(key, value, lock_budget=self._lock_allowance.get())
         self._check_local_state()
 
     @contextmanager
     def _locked(self):
         self._check_local_state()
+        if self._operator is not None:
+            self._operator.require_write()
         # Unload and coroutine cancellation use the same owned store through
         # different executor threads. Their contention is not a foreign writer.
         with self.lock_budget():
@@ -246,15 +267,31 @@ class Associations:
                     raise TimeoutError("association_lock_deadline")
             prior_native_expected = self._native_expected.set(None)
             try:
+                self._check_local_state()
                 with self._locked_file() as data:
                     yield data
             finally:
                 self._native_expected.reset(prior_native_expected)
                 self._thread_lock.release()
 
+    @staticmethod
+    def _check_native_paths(directory):
+        # Native PluginState opens these paths itself. They must be inside
+        # this private, worker-inaccessible directory, never symlink aliases.
+        for name in ("state.json", ".state.json.lock"):
+            path = directory / name
+            if path.is_symlink():
+                raise AssociationError("unsafe_native_state")
+            if path.exists():
+                fs = path.stat()
+                if not stat.S_ISREG(fs.st_mode) or fs.st_uid != os.getuid() or fs.st_nlink != 1:
+                    raise AssociationError("unsafe_native_state")
+
     @contextmanager
     def _locked_file(self):
         self._check_local_state()
+        if self._operator is not None:
+            self._operator.require_write()
         directory = Path(self.state.data_dir)
         if not directory.is_absolute() or directory.resolve() != directory:
             raise AssociationError("unsafe_state_directory")
@@ -274,16 +311,8 @@ class Associations:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise AssociationError("admission_busy") from exc
-            # Native PluginState opens these paths itself. They must be inside
-            # this private, worker-inaccessible directory, never symlink aliases.
-            for name in ("state.json", ".state.json.lock"):
-                path = directory / name
-                if path.is_symlink():
-                    raise AssociationError("unsafe_native_state")
-                if path.exists():
-                    fs = path.stat()
-                    if not stat.S_ISREG(fs.st_mode) or fs.st_uid != os.getuid() or fs.st_nlink != 1:
-                        raise AssociationError("unsafe_native_state")
+            self._check_local_state()
+            self._check_native_paths(directory)
             marker = os.pread(fd, 4, 0)
             if marker not in (b"", b"v1\n"):
                 raise AssociationError("invalid_admission_marker")
@@ -300,11 +329,15 @@ class Associations:
             if not marker:
                 if os.pwrite(fd, b"v1\n", 0) != 3:
                     raise OSError("short_admission_marker_write")
+            if self._operator is not None:
+                self._check_local_state()
             os.fsync(fd)
             # mkdir(parents=True) can create multiple directory entries. Sync
             # bottom-up on every open, including recovery after a failed first
             # initialization, before returning access or an external grant.
             for parent in (directory, *directory.parents):
+                if self._operator is not None:
+                    self._check_local_state()
                 _sync_directory(parent)
             try:
                 yield data
@@ -329,6 +362,13 @@ class Associations:
             span.check("native_store_save_before", cleanup=True)
         _validate_store(data)
         self._check_local_state()
+        if self._operator is not None:
+            with self.lock_budget():
+                returned = self._operator.set(self.state, KEY, data, self._lock_allowance.get(),
+                    expected_value=self._native_expected.get(), compare=True)
+            self._native_expected.set(copy.deepcopy(data))
+            self._check_local_state()
+            return returned
         if self._cli_authority is not None:
             from hermes_cli.friday_native_state import observe_commit_return
             cutoff = span.end if span is not None else None
@@ -432,8 +472,78 @@ class Associations:
 
     def snapshot(self):
         """Checked profile snapshot; callers still enforce ownership per control."""
+        if self._operator is not None and self._operator.read_only:
+            return self._readonly_snapshot()
         with self._locked() as data:
             return {k: self.consumer_copy(v) for k, v in data["jobs"].items()}
+
+    def _readonly_snapshot(self):
+        """Keep lost-store/marker checks without initializing association data."""
+        with self.lock_budget():
+            return self._readonly_snapshot_file()
+
+    def _readonly_snapshot_file(self):
+        self._check_local_state()
+        directory = Path(self.state.data_dir)
+        fd = None
+        primary_error = None
+        path = directory / "admission.lock"
+        try:
+            try:
+                identity = self._check_readonly_admission(path)
+            except FileNotFoundError:
+                marker = b""
+            else:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+                self._check_readonly_admission(path, fd, identity)
+                with self._lock_allowance.get().acquiring():
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    except BlockingIOError as exc:
+                        raise AssociationError("admission_busy") from exc
+                self._check_local_state()
+                self._check_readonly_admission(path, fd, identity)
+                marker = os.pread(fd, 4, 0)
+            if marker not in (b"", b"v1\n"):
+                raise AssociationError("invalid_admission_marker")
+            missing = object()
+            data = self.state_get(KEY, missing)
+            if data is missing:
+                if marker:
+                    raise AssociationError("association_store_lost")
+                data = {"schema_version": 1, "jobs": {}}
+            _validate_store(data)
+            result = {k: self.consumer_copy(v) for k, v in data["jobs"].items()}
+            self._check_local_state()
+            if fd is not None:
+                self._check_readonly_admission(path, fd, identity)
+            return result
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except BaseException as cleanup:
+                    if primary_error is not None:
+                        raise BaseExceptionGroup("association_primary_and_admission_close_UNKNOWN",
+                                                 [primary_error, cleanup])
+                    raise
+
+    @staticmethod
+    def _check_readonly_admission(path, fd=None, expected=None):
+        named = os.stat(path, follow_symlinks=False)
+        observations = (named,) if fd is None else (named, os.fstat(fd))
+        identity = (named.st_dev, named.st_ino)
+        for info in observations:
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                    or (info.st_dev, info.st_ino) != identity):
+                raise AssociationError("unsafe_admission_lock")
+        if expected is not None and identity != expected:
+            raise AssociationError("unsafe_admission_lock")
+        return identity
 
     def attach_a0_capability(self, task_id, owner, pin, validate):
         """Once-only trusted producer attachment in the existing durable row.

@@ -333,6 +333,8 @@ class Onboarding:
         # engaged process with no current user still permits its dashboard.
         if scope._CURRENT.get() is not None:
             raise PermissionError('operator_source_scope_required')
+        from .operator_metadata import verify_active_operator
+        verify_active_operator(self, profile, session)
         self.admin._verify_session(profile, session)
 
     @staticmethod
@@ -351,6 +353,11 @@ class Onboarding:
         Supported onboarding/user writers share this admission lock; external
         operator edits still require the explicit file CAS on the next action.
         """
+        if scope._CURRENT.get() is not None:
+            raise PermissionError('operator_source_scope_required')
+        from .operator_metadata import operator_metadata, preflight_operator_metadata
+        state = self.admin._state()
+        expected_root, expected_paths = preflight_operator_metadata(self, profile, session, state)
         self._verify_operator(profile, session)
         from hermes_cli import config as native
         with self.admin.scope(profile) as root:
@@ -359,33 +366,39 @@ class Onboarding:
             if root != get_routing_process_hermes_home():
                 raise PermissionError('primary_multiplex_route_authority_required')
             ProductAccess.require_transport(profile)
-            state = self.admin._state(); access = ProductAccess(state); store = access.store
-            with store._locked(), native.config_write_transaction(root / 'config.yaml'):
-                self._verify_operator(profile, session)
-                path = root / 'config.yaml'
-                if digest(path) != expected_config_sha256:
-                    raise ValueError('onboarding_config_conflict_reload')
-                raw = native.require_readable_config_before_write(path)
-                yield root, access, raw
+            if root != expected_root:
+                raise PermissionError('foreign_operator_metadata_authority')
+            with operator_metadata(self, profile, session, root, state,
+                                   expected_paths=expected_paths) as operator:
+                access = ProductAccess(state, _operator=operator); store = access.store
+                with store._locked(), native.config_write_transaction(root / 'config.yaml'):
+                    operator.check(state)
+                    path = root / 'config.yaml'
+                    if digest(path) != expected_config_sha256:
+                        raise ValueError('onboarding_config_conflict_reload')
+                    raw = native.require_readable_config_before_write(path)
+                    yield root, access, raw
 
-    def templates(self, profile):
-        with self.admin.scope(profile) as root:
-            self.admin.users(profile)
+    def templates(self, profile, *, session=None):
+        with self.admin.metadata_read(profile, session=session) as (root, state, operator):
+            self.admin._users(profile, state, _operator=operator)
             from hermes_cli.friday_product_access import settings
             plans = settings().get('onboarding', {}).get('templates', {})
             if not isinstance(plans, dict): raise ValueError('invalid_onboarding_templates')
-            pending = self.pending(root, profile)
+            pending = self.pending(root, profile, state=state, _operator=operator)
             return {'config_sha256': digest(root / 'config.yaml'), 'templates': sorted(plans), 'pending': pending,
                     'worker_templates': sorted(k for k,v in plans.items() if v.get('worker_inputs',{}).get('workers')),
                     'state': 'INSTALLATION_INPUT_MISSING' if not plans else 'EXPLICIT_NATIVE_TEMPLATES',
                     'credentials': 'NEW_PROFILE_NATIVE_SECRET_CAPTURE_ONLY'}
 
-    def pending(self, root, profile):
+    def pending(self, root, profile, *, state=None, _operator=None):
         """Read existing bindings/PluginState/preparation proofs, never a new DB."""
         active = scope.policy(root)
         if active is None: return []
         from hermes_constants import get_default_hermes_root
-        state = self.admin._state(); users = current_access(state)['users']; result = []
+        state = self.admin._state() if state is None else state
+        access = ProductAccess(state, _operator=_operator)
+        users = access._document()['users']; result = []
         for binding in active['bindings']:
             if binding['transport_profile'] != profile: continue
             key = principal_id(*(binding[k] for k in IDENTITY)); user = users.get(key)
@@ -396,7 +409,8 @@ class Onboarding:
                                'state': 'PARTIAL_OR_EXISTING_PROFILE_NO_ADOPTION', 'recoverable': False})
                 continue
             try:
-                _, _, _, proof = self._prepared(root, state, *(binding[k] for k in IDENTITY), user['generation'])
+                _, _, _, proof = self._prepared(root, state, *(binding[k] for k in IDENTITY),
+                                                user['generation'], _access=access)
             except (PermissionError, ValueError, OSError, KeyError):
                 result.append({'principal_id': key, 'runtime_profile': binding['runtime_profile'],
                                'state': 'SETUP_CHANGED_RECONCILIATION_REQUIRED', 'recoverable': False})
@@ -524,10 +538,11 @@ class Onboarding:
                         **({'uid': cli_row['uid'], 'local_authority': 'EXPLICIT_OPERATOR_MAPPING_PRODUCT_DISABLED'} if cli_row is not None else {}),
                         **self._worker_summary(home,binding,user['generation'],receipt,config))
 
-    def _prepared(self, root, state, platform, transport_profile, account_id, user_id, generation):
+    def _prepared(self, root, state, platform, transport_profile, account_id, user_id, generation, *, _access=None):
         from hermes_cli.friday_product_access import settings
         key = principal_id(platform, transport_profile, account_id, user_id)
-        row = current_access(state)['users'].get(key)
+        document = current_access(state) if _access is None else _access._document()
+        row = document['users'].get(key)
         if not row or row['generation'] != generation or row['role'] != 'user':
             raise ValueError('onboarding_access_generation_conflict')
         bindings = settings()['user_isolation']['bindings']

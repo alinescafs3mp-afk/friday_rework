@@ -7,9 +7,15 @@ from hermes_cli.friday_product_access import (
 
 
 class ProductAccess:
-    def __init__(self, state):
+    def __init__(self, state, *, _operator=None):
         self.state = state
-        self.store = Associations(state)
+        self.store = Associations(state, _operator=_operator)
+
+    def _document(self):
+        if self.store._operator is not None:
+            self.store._operator.check(self.state)
+            return validate_access(self.store.state_get(KEY, {"schema": KEY, "users": {}}))
+        return current_access(self.state)
 
     @staticmethod
     def require_transport(transport_profile):
@@ -19,12 +25,14 @@ class ProductAccess:
             raise PermissionError("receiving_transport_authority_required")
 
     def users(self):
-        rows = current_access(self.state)["users"]
+        rows = self._document()["users"]
         for row in rows.values():
             self.require_transport(row["transport_profile"])
         return copy.deepcopy(rows)
 
     def set_user(self, *, platform, transport_profile, account_id, user_id, enabled, role):
+        if self.store._operator is not None:
+            self.store._operator.require_write()
         self.require_transport(transport_profile)
         policy = access_policy()
         if policy is None or not any(
@@ -41,13 +49,17 @@ class ProductAccess:
 
     def _write_user_locked(self, key, row):
         """Compound administrative setup already holds this exact store lock."""
+        if self.store._operator is not None:
+            self.store._operator.require_write()
         validate_access({"schema": KEY, "users": {key: row}})
-        document = current_access(self.state)
+        document = self._document()
         document["users"][key] = row
         validate_access(document)
         self.store.state_set(KEY, document)
+        if self.store._operator is not None:
+            self.store._check_local_state()
         _sync_directory(self.state.data_dir)
-        confirmed = current_access(self.state)["users"].get(key)
+        confirmed = self._document()["users"].get(key)
         if not confirmed or any(confirmed.get(k) != v for k, v in row.items()):
             raise RuntimeError("product_access_write_unconfirmed")
         return {"principal_id": key, **confirmed}

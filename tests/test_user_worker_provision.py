@@ -78,12 +78,13 @@ def worker_prepare(env,uid='1',worker='dsh',runtime=None,network=None,**changes)
 
 def reviewed(env,prepared):
     """Synthetic external evidence producer, intentionally NOT product code."""
+    import tools.web_profile as profile_helper
     c=prepared['runtime'];d=c['dsh'];p=Path(c['runtime_receipt']['path']);e=p.parent/'synthetic-independent-evidence.json'
     e.write_text('{"fixture_only":true,"runtime_acceptance":"NOT_RUN"}');e.chmod(0o600)
     r=dict(schema='friday-rework.dsh-runtime.v1',ready=True,runtime_sha256=digest({k:v for k,v in c.items() if k!='runtime_receipt'}),
         adapter_sha256=sha(ROOT/'plugins/friday_rework/adapters/dsh.py'),evidence=[pin(e)],web_source_pins={
             'plugins/friday_rework/worker_web.py':sha(ROOT/'plugins/friday_rework/worker_web.py'),
-            'tools/web_profile.py':sha(ROOT/'tools/web_profile.py'),'config/RESEARCH.md':d['web']['research_policy']['sha256']})
+            'tools/web_profile.py':sha(Path(profile_helper.__file__)),'config/RESEARCH.md':d['web']['research_policy']['sha256']})
     p.write_text(json.dumps(r));p.chmod(0o600)
     return pin(p)
 

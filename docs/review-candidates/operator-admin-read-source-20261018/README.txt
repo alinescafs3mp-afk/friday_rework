@@ -1,0 +1,7 @@
+Operator admin metadata reads —18 October2026
+
+The exact thirteen source units are integrated in main, following238unique Source PASS plus85passed subtests, zero blocking/advisory findings for all13changed units, and independent Source review. The signed native request Session now reaches seven metadata-read consumers after ordinary engagement. Readonly authority cannot initialize or repair metadata or enter write paths. The earlier178/1original result remains historical; the qualified public refusal test adds real handler and file no-effect checks.
+
+These are HOST3.14.4 synthetic-home/in-process ASGI observations against exact Source93. The installed runtime is unchanged. Populated conversation/download positives, whole dashboard/native/full functional/live/modern-worker acceptance remain open. The expected full catalog is now261files after3new test modules; full collection and execution remain NOT_RUN.
+
+Two independent reviews found concrete preparation gaps before further execution: final CODE verifier consumers require complete v2-reference support, and the generic functional supervisor requires lifetime/recovery/durability fixes. Both are active private repairs. A successful bounded semantic transport HOST component run is preserved; it does not establish the final verifier or native graph. Private acceptance checklists, raw homes, credentials and oracles are excluded from this public cut.

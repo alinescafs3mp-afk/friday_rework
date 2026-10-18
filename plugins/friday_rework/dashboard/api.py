@@ -125,8 +125,8 @@ def profiles():
 
 
 @router.get("/users")
-def users(profile: str):
-    return call(_admin.users, profile)
+def users(profile: str, session=Depends(require_admin)):
+    return call(_admin.users, profile, session=session)
 
 
 @router.put("/users")
@@ -135,8 +135,8 @@ def change_user(body: UserChange, profile: str):
 
 
 @router.get("/pairing")
-def pairing(profile: str):
-    return call(_admin.pairing, profile)
+def pairing(profile: str, session=Depends(require_admin)):
+    return call(_admin.pairing, profile, session=session)
 
 
 @router.post("/pairing/approve")
@@ -153,13 +153,14 @@ def conversations(profile: str, query: str = Query("", max_length=512), limit: i
 
 
 @router.get("/conversations/{session_id}")
-def conversation(session_id: str, profile: str, limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0, le=100000)):
-    return call(_admin.conversation, profile, session_id, limit=limit, offset=offset)
+def conversation(session_id: str, profile: str, limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0, le=100000),
+                 session=Depends(require_admin)):
+    return call(_admin.conversation, profile, session_id, limit=limit, offset=offset, session=session)
 
 
 @router.get("/tasks")
-def tasks(profile: str):
-    return call(_admin.tasks, profile)
+def tasks(profile: str, session=Depends(require_admin)):
+    return call(_admin.tasks, profile, session=session)
 
 
 @router.post("/tasks/{task_id}/control")
@@ -183,9 +184,9 @@ def schedule_control(job_id: str, body: ScheduleChange, profile: str, session=De
 
 
 @router.get("/attachments/{task_id}/{index}")
-def attachment(task_id: str, index: int, profile: str):
+def attachment(task_id: str, index: int, profile: str, session=Depends(require_admin)):
     try:
-        payload = _admin.attachment(profile, task_id, index)
+        payload = _admin.attachment(profile, task_id, index, session=session)
     except PermissionError:
         raise HTTPException(403, "product_scope_refused") from None
     except Exception:
@@ -201,9 +202,9 @@ def effective(profile: str):
 
 
 @router.get("/inputs/{task_id}/{index}")
-def input_attachment(task_id: str, index: int, profile: str):
+def input_attachment(task_id: str, index: int, profile: str, session=Depends(require_admin)):
     try:
-        payload = _admin.input_attachment(profile, task_id, index)
+        payload = _admin.input_attachment(profile, task_id, index, session=session)
     except PermissionError:
         raise HTTPException(403, "product_scope_refused") from None
     except Exception:
@@ -255,8 +256,8 @@ class OnboardingCredential(OnboardingActivate):
 
 
 @router.get("/onboarding")
-def onboarding_templates(profile: str):
-    return call(_admin.onboarding_templates, profile)
+def onboarding_templates(profile: str, session=Depends(require_admin)):
+    return call(_admin.onboarding_templates, profile, session=session)
 
 
 @router.post("/onboarding/prepare")
