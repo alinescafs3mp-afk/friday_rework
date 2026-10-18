@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import select
 import stat
 import time
 
@@ -102,8 +103,9 @@ def namespace_exit(data, observation, *, stopped_init=None):
 class _NamespaceStop:
     """One bounded native-status read and identity-bound init signal at timeout."""
 
-    def __init__(self, reader):
+    def __init__(self, reader, *, deadline=None):
         self.reader = reader
+        self.deadline = deadline
         self.data = b''
         self.stopped_init = None
 
@@ -118,6 +120,16 @@ class _NamespaceStop:
     def __call__(self, process, starttime):
         from .runtime_process import StopUnconfirmed
         data = self.read()
+        # Exceptional custody may begin before bwrap emits its first record.
+        # Wait only on this native fd, within the unchanged installation deadline.
+        while b'\n' not in data and len(data) <= 4096 and self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0 or not select.select([self.reader], [], [], remaining)[0]:
+                raise StopUnconfirmed('STOP_UNCONFIRMED: native init identity unavailable')
+            before = len(data)
+            data = self.read()
+            if len(data) == before:  # EOF cannot become a trustworthy identity.
+                raise StopUnconfirmed('STOP_UNCONFIRMED: native init identity unavailable')
         first, separator, _ = data.partition(b'\n')
         if not separator or len(data) > 4096:
             raise StopUnconfirmed('STOP_UNCONFIRMED: native init identity unavailable')
@@ -174,7 +186,7 @@ class Containment:
         # Reserve cleanup *inside* the original deadline; no fresh grace clock.
         limit = min(timeout, self.budget.check(reserve=1))
         reader, writer = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
-        native_stop = _NamespaceStop(reader)
+        native_stop = _NamespaceStop(reader, deadline=self.budget.deadline)
         failure = None; secondary = []; result = None; observation = {}; data = b''
         # A later diagnostic/pipe error must never replace the invocation cause.
         # This is a finite list: each setup/run/read/close/witness stage runs once.

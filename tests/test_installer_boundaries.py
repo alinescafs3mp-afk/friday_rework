@@ -112,7 +112,8 @@ def test_cleanup_deadline_failure_is_stop_unconfirmed(monkeypatch, tmp_path):
     monkeypatch.setattr(dsh_prepare.os, 'killpg', lambda *a: killed.append(a))
     with pytest.raises(RuntimeError, match='STOP_UNCONFIRMED'):
         dsh_prepare.run(['/not-executed'], tmp_path, timeout=.1, deadline=time.monotonic()+1)
-    assert killed == [(98765, dsh_prepare.signal.SIGKILL)]
+    # An absent leader identity cannot authorize a numeric PID/PGID signal.
+    assert killed == []
 
 
 def test_actual_original_30s_final_verification_refuses_success(install_input, tmp_path, monkeypatch):
