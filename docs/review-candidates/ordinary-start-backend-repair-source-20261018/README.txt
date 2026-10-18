@@ -20,8 +20,12 @@ The complete layered source and supported stopped-install transition still need
 current candidate binding; this inert archive is not used by the installer.
 
 Independent Source review found no remaining findings. Source parsing and exact
-patch reconstruction passed. Runtime tests were not run when this archive was
-prepared; Source approval is not installed, live or release acceptance. The
+patch reconstruction passed. The archive was initially prepared before runtime tests. A later coherent
+development SDK pass completed 152 tests and 8 subtests; see
+SDK-COMPONENT-RESULT.json and the additional test-fixture compatibility patch.
+The complete shipped source composer also produced the attached 17,760-file,
+94-layer receipt with exact file/mode/layer verification. Production PM,
+installed behavior, live and release acceptance remain unverified. The
 failed service was stopped with owned process cleanup verified. No tester
 messages or new model requests were issued in that failed attempt.
 
