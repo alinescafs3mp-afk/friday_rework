@@ -231,14 +231,20 @@ def test_matching_record_is_policy_only_not_readiness(tmp_path):
     assert out == {'state': 'TEMPLATE_INCOMPLETE', 'ready': False, 'credentials_checked': False}
 
 
-def test_renderer_status_cannot_be_promoted_to_launch_grant(install_input, monkeypatch):
+def test_renderer_status_cannot_be_promoted_to_launch_grant(install_input, tmp_path, monkeypatch):
+    path, install_calls, installed = install_synthetic_template(install_input, tmp_path, monkeypatch)
+    input_hash = entry.digest(entry.owned_file(path, private=True))
+    assert installed['runtime_ready'] is False
+    assert entry.inspect(install_input, input_hash)['ready'] is False
+    before = list(install_calls)
     calls = []
     monkeypatch.setattr(entry, 'inspect', lambda *a: {'state': 'READY', 'ready': True})
-    from plugins.friday_rework import runtime_process as dsh_prepare
+    dsh_prepare = entry._source_runtime_module('runtime_process')
     monkeypatch.setattr(dsh_prepare, 'run', lambda *a, **kw: calls.append(a))
     with pytest.raises(ValueError, match='mandatory_a0_web_kernel_and_final_native_dashboard_owner_not_admitted'):
-        entry.start(install_input, 'synthetic')
+        entry.start(install_input, input_hash)
     assert not calls
+    assert install_calls == before
 
 
 def test_a0_fixed_runtime_not_retried_and_portable_gap_explicit(install_input):
@@ -312,10 +318,12 @@ def test_composition_is_bound_to_reviewed_lock_and_exact_overlays(install_input,
         entry.composition_checked(install_input, Path(install_input['home']), receipt, {})
 
 
-@pytest.mark.parametrize('web_profile',['exa-paid','exa-keyless'])
-def test_whole_finite_composition_and_completed_idempotence_with_native_config(install_input, tmp_path, monkeypatch,web_profile):
-    """Commands are intercepted; native config/files are real. No PM acceptance."""
-    install_input['product']['web']['profile']=web_profile
+def install_synthetic_template(install_input, tmp_path, monkeypatch):
+    """Use the real installer/validators; intercept only donor commands.
+
+    The real installer owns the claim and completed marker. No manually minted
+    install marker can turn a rendered status into normal-start authority.
+    """
     p = tmp_path / 'input.json'; p.write_text(json.dumps(install_input)); p.chmod(0o600)
     home = Path(install_input['home']); calls = []
     dsh_prepare = entry._source_runtime_module('runtime_process')
@@ -357,6 +365,15 @@ def test_whole_finite_composition_and_completed_idempotence_with_native_config(i
         return '', metadata()
     monkeypatch.setattr(dsh_prepare, 'run', intercepted)
     result = entry.install(install_input, p)
+    return p, calls, result
+
+
+@pytest.mark.parametrize('web_profile',['exa-paid','exa-keyless'])
+def test_whole_finite_composition_and_completed_idempotence_with_native_config(install_input, tmp_path, monkeypatch,web_profile):
+    """Commands are intercepted; native config/files are real. No PM acceptance."""
+    install_input['product']['web']['profile']=web_profile
+    p, calls, result = install_synthetic_template(install_input, tmp_path, monkeypatch)
+    home = Path(install_input['home'])
     assert result['state'] == 'INSTALLED_TEMPLATE_INCOMPLETE' and result['runtime_ready'] is False
     assert result['gateway_installed'] is False
     assert len(calls) == 10  # composer, tools, dependencies, selected-Python, completion, Harness4, A0

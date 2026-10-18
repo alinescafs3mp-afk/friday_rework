@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -398,13 +399,22 @@ def test_dashboard_foreign_or_unproven_attachment_precedes_all_service_effects(l
     assert f.calls == []
 
 
-def test_rendered_ready_or_disabled_workers_never_reexec(install_input, monkeypatch):
+def test_rendered_ready_or_disabled_workers_never_reexec(install_input, tmp_path, monkeypatch):
+    from test_native_installer import install_synthetic_template
+
+    # Let the actual installer create/validate the owned home and completion
+    # marker before injecting a misleading rendered READY status.
+    path, install_calls, installed = install_synthetic_template(install_input, tmp_path, monkeypatch)
+    input_hash = entry.digest(entry.owned_file(path, private=True))
+    assert installed["runtime_ready"] is False
+    assert entry.inspect(install_input, input_hash)["ready"] is False
+    before = list(install_calls)
     monkeypatch.setattr(entry, "inspect", lambda *a: {"state": "READY", "ready": True})
     calls = []
     monkeypatch.setattr(os, "execve", lambda *a: calls.append(a))
     with pytest.raises(ValueError, match="mandatory_a0_web_kernel"):
-        entry.start(install_input, "synthetic")
-    assert calls == []
+        entry.start(install_input, input_hash)
+    assert calls == [] and install_calls == before
 
 
 @pytest.mark.parametrize(
@@ -594,19 +604,39 @@ def test_real_original_runtime_receipt_check_is_not_a_start_grant(tmp_path, monk
     if mutation == "foreign-home":
         runtime["runtime_home"] = str(tmp_path / "foreign")
     token = set_hermes_home_override(str(home))
-    state = PluginState("friday_rework")
-    state.data_dir.mkdir(parents=True, mode=0o700)
-    retained = state.data_dir / "state.json"
-    retained.write_text('{"owner_pause":true,"cancelled_generation":4,"original_budget":60}')
-    retained.chmod(0o600)
-    before = retained.read_bytes()
     try:
+        state = PluginState("friday_rework")
+        assert not (home / "plugin-data").exists()
+        # The native property creates and validates owned private metadata.
+        # A second mkdir would fail before the real receipt checker is reached.
+        data_dir = state.data_dir
+        native_lock = data_dir / ".state.json.lock"
+        for directory in (data_dir.parent, data_dir):
+            info = directory.lstat()
+            assert stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700
+            assert info.st_uid == os.getuid()
+        info = native_lock.lstat()
+        assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o600
+        assert info.st_uid == os.getuid() and info.st_nlink == 1
+        retained = data_dir / "state.json"
+        retained.write_text('{"owner_pause":true,"cancelled_generation":4,"original_budget":60}')
+        retained.chmod(0o600)
+
+        def retained_state():
+            return {str(p.relative_to(data_dir)): (p.lstat().st_dev, p.lstat().st_ino,
+                    p.lstat().st_mode, p.lstat().st_uid, p.lstat().st_nlink, p.read_bytes())
+                    for p in data_dir.iterdir()}
+
+        before = retained_state()
         if mutation == "none":
             assert host_runtime.check_runtime(runtime, Associations(state)) == runtime
         else:
-            with pytest.raises((ValueError, RuntimeError, OSError)):
+            reason = {"receipt-not-ready": "runtime_not_verified", "source": "runtime_not_verified",
+                      "runtime": "runtime_not_verified", "receipt-byte": "host_input_changed",
+                      "foreign-home": "foreign_runtime_home"}[mutation]
+            with pytest.raises((ValueError, RuntimeError, OSError), match=reason):
                 host_runtime.check_runtime(runtime, Associations(state))
-        assert retained.read_bytes() == before
+        assert retained_state() == before
     finally:
         reset_hermes_home_override(token)
 

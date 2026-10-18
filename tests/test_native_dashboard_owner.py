@@ -57,9 +57,9 @@ def installation(tmp_path_factory):
 def owner(installation, monkeypatch):
     home, source, config, verified = installation
     from hermes_cli import friday_dashboard_owner as boundary
+    from hermes_cli import plugins as native_plugins
     from hermes_cli.config import atomic_config_replace
-    from hermes_cli.dashboard_auth import clear_providers, register_provider
-    from plugins.dashboard_auth import basic
+    from hermes_cli.dashboard_auth import get_provider
     from gateway import host_rendezvous as hr, status
     monkeypatch.setattr(boundary, 'SOURCE', source)
     monkeypatch.setenv('HERMES_HOME', str(home))
@@ -71,17 +71,35 @@ def owner(installation, monkeypatch):
     (home / 'host-locks').mkdir(mode=0o700, exist_ok=True)
     with native_home(home):
         atomic_config_replace(home / 'config.yaml', copy.deepcopy(config))
-        clear_providers(); provider = basic.BasicAuthProvider(**basic._settings()); register_provider(provider)
-        from hermes_cli import web_server as ws
-        monkeypatch.setattr(ws.app.state, 'auth_required', True, raising=False)
-        monkeypatch.setattr(ws.app.state, 'bound_host', '127.0.0.1', raising=False)
-        monkeypatch.setattr(ws.app.state, 'bound_port', 9119, raising=False)
-        monkeypatch.setattr(ws.app.state, 'host_role', 'serve', raising=False)
-        monkeypatch.setattr(ws.app.state, 'serves_spa', True, raising=False)
-        monkeypatch.setattr(ws.app.state, 'friday_dashboard_owner', None, raising=False)
-        yield SimpleNamespace(home=home, source=source, boundary=boundary, hr=hr,
-                              provider=provider, ws=ws, config=copy.deepcopy(config))
-        hr.clear_record('serve'); hr.release_host_lock('serve'); clear_providers()
+        native_plugins._reset_plugin_managers_for_tests()
+        try:
+            # Load the declared bundled Source through its native parser/loader.
+            # A bare import creates a different Basic class and no LoadedPlugin.
+            manifests = [m for m in native_plugins.scan_directory(
+                source / 'plugins/dashboard_auth', 'bundled', prefix='dashboard_auth')
+                if m.key == 'dashboard_auth/basic']
+            assert len(manifests) == 1
+            native_plugins.get_plugin_manager()._load_plugin(manifests[0])
+            basic = boundary.registered_basic()
+            provider = get_provider('basic')
+            assert type(provider) is basic.BasicAuthProvider
+            from hermes_cli import web_server as ws
+            monkeypatch.setattr(ws.app.state, 'auth_required', True, raising=False)
+            monkeypatch.setattr(ws.app.state, 'bound_host', '127.0.0.1', raising=False)
+            monkeypatch.setattr(ws.app.state, 'bound_port', 9119, raising=False)
+            monkeypatch.setattr(ws.app.state, 'host_role', 'serve', raising=False)
+            monkeypatch.setattr(ws.app.state, 'serves_spa', True, raising=False)
+            monkeypatch.setattr(ws.app.state, 'friday_dashboard_owner', None, raising=False)
+            yield SimpleNamespace(home=home, source=source, boundary=boundary, hr=hr,
+                                  provider=provider, ws=ws, config=copy.deepcopy(config))
+        finally:
+            try:
+                hr.clear_record('serve')
+            finally:
+                try:
+                    hr.release_host_lock('serve')
+                finally:
+                    native_plugins._reset_plugin_managers_for_tests()
 
 
 @pytest.fixture
@@ -229,7 +247,7 @@ def test_ambient_auth_override_not_scoped_to_home_refused(record_owner, suffix, 
 
 def test_protected_native_plaintext_secret_capture_is_supported(record_owner, monkeypatch):
     owner = record_owner
-    from plugins.dashboard_auth import basic
+    basic = owner.boundary.registered_basic()
     from hermes_cli.dashboard_auth import clear_providers, register_provider
     path = owner.home / '.env'; path.write_text('HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=FIXTURE_NEW_PASSWORD\n'); path.chmod(0o600)
     monkeypatch.setenv('HERMES_DASHBOARD_BASIC_AUTH_PASSWORD', 'FIXTURE_NEW_PASSWORD')
