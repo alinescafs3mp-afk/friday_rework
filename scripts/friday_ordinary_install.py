@@ -2418,7 +2418,15 @@ def project_dashboard_history(home, request):
         f.require(not path.is_absolute() and path.parts and not {'.','..'} & set(path.parts)
             and n not in {'source_receipt','stamp','configuration','profile','launcher','native_unit'}
             and f.pin(ref) == home/path,'ordinary_project_exact_retained_path_required')
-    facts = f.read_json(home/facts_name); environment = f.canonical(facts['environment'])
+    facts = f.read_json(home/facts_name)
+    # Read the one native PM selection; an absent/broken record grants no
+    # permission to select a fallback or a different retained generation.
+    f.require(type(facts) is dict and type(facts.get('schema')) is int and facts['schema'] == 1
+        and type(facts.get('packages')) is dict
+        and type(facts['packages'].get('venv')) is dict
+        and type(facts['packages']['venv'].get('environment')) is str,
+        'ordinary_project_native_pm_environment_required')
+    environment = f.canonical(facts['packages']['venv']['environment'])
     f.require(environment.is_relative_to(home/state/'environments')
         and str(environment.relative_to(home))+'/pyvenv.cfg' in retained
         and all(n in retained and retained[n]['sha256'] == h for n,h in required.items())
@@ -3953,15 +3961,34 @@ def recovery_main():
     """Dedicated maintenance dispatch; the ordinary installer phases stay unchanged."""
     import sys
     import time
+    if 'rebind-worker-declarations' in sys.argv[1:] and not sys.dont_write_bytecode:
+        # Refuse before importing a product module that could populate an
+        # installed __pycache__ outside the five-file transaction.
+        print(json.dumps({'state': 'NOT_STARTED', 'ready': False,
+            'error': 'worker_declaration_native_no_bytecode_required'}), file=sys.stderr)
+        raise SystemExit(2)
     # Direct module/script invocation resolves the existing product package.
     root = Path(__file__).resolve().parents[1]
     if str(root) not in sys.path: sys.path.insert(0,str(root))
     f = api(); started = time.monotonic()
     parser = f.SafeParser(description=__doc__,allow_abbrev=False)
-    parser.add_argument('phase',choices=('recover-first-contact-config','rebind-inference'))
+    parser.add_argument('phase',choices=('recover-first-contact-config','rebind-inference',
+        'rebind-worker-declarations'))
     parser.add_argument('--request',required=True,type=Path)
+    parser.add_argument('--request-sha256')
     args = parser.parse_args(); os.umask(0o077)
     try:
+        if args.phase == 'rebind-worker-declarations':
+            # The new maintenance phase owns an externally pinned original
+            # clock; it must never inherit this dispatcher's fresh start.
+            from plugins.friday_rework.worker_declarations import _read_reference
+            from plugins.friday_rework.worker_declaration_writer import apply_declarations
+            request = _read_reference({'path': str(args.request), 'sha256': args.request_sha256})
+            result = apply_declarations(request, request_path=args.request,
+                request_sha256=args.request_sha256)
+            print(json.dumps(result, sort_keys=True))
+            return
+        f.require(args.request_sha256 is None, 'ordinary_legacy_request_pin_option_refused')
         request = f.read_json(args.request)
         from scripts.install_containment import Budget
         budget = Budget(request.get('seconds'),started=started)
@@ -3970,7 +3997,7 @@ def recovery_main():
         print(json.dumps(result,sort_keys=True))
     except Exception as exc:
         from scripts.dsh_prepare import StopUnconfirmed
-        if args.phase=='rebind-inference' and isinstance(exc,StopUnconfirmed):
+        if args.phase in ('rebind-inference','rebind-worker-declarations') and isinstance(exc,StopUnconfirmed):
             f.exit_retaining_cause(parser,3,exc,args.phase)
         f.exit_retaining_cause(parser,2,exc,args.phase)
 

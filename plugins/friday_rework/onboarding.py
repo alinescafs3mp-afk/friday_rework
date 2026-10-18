@@ -963,6 +963,106 @@ class Onboarding:
                 _declared_files={policy_path:policy_bytes} if kind=='dsh' else None,_attachment=attachment)
         return self.workers_state(profile,**values)
 
+    def archive_workers(self, profile, *, session=None, expected_config_sha256, generation, platform,
+                        transport_profile, account_id, user_id, request):
+        """Archive one exact stale stopped setup; prepare/qualify remain explicit.
+
+        The signed operator transaction owns current authority throughout. Old
+        attachment/configuration bytes are provenance, never live authority.
+        The permanent archive claim consumes the old tree and original attempt
+        even when publication or rollback is interrupted. No runtime is enabled.
+        """
+        import time
+        accepted = time.monotonic()
+        if transport_profile != profile:
+            raise PermissionError('receiving_transport_authority_required')
+        from . import worker_archive
+        from .runtime_containment import Budget
+        from hermes_cli.config import config_write_transaction
+        # Fixed maintenance interval, including cleanup; never a new worker
+        # qualification budget and never a client-supplied replacement clock.
+        budget = Budget(180, started=accepted)
+        if (type(request) is not dict or set(request) != {'path', 'sha256'}
+                or type(request['path']) is not str or len(request['path']) > 4096):
+            raise ValueError('explicit_worker_archive_request_required')
+        with self.transaction(profile, expected_config_sha256, session) as (root, access, config):
+            home, binding, row, proof = self._prepared(root, access.state, platform,
+                transport_profile, account_id, user_id, generation)
+            self._admitted_worker_home(root, home, binding, generation, proof)
+            # Private references are read only after native operator/session,
+            # current principal, generation, ordinary-home and grant admission.
+            budget.check()
+            request_state = worker_archive.read_request(request)
+            raw = request_state['data']
+            document = worker_archive.decode_request(raw)
+            if (type(document) is not dict or document.get('home') != str(home)
+                    or document.get('profile') != binding['runtime_profile']
+                    or document.get('binding_sha256') != scope._fingerprint(binding)
+                    or type(document.get('generation')) is not int
+                    or document['generation'] != generation):
+                raise PermissionError('foreign_worker_archive_request')
+            paths = {'root_configuration': root / 'config.yaml',
+                'configuration': home / 'config.yaml', 'onboarding': home / scope.ONBOARDING,
+                'user_marker': home / scope.MARKER}
+            current = document.get('current')
+            if type(current) is not dict or set(current) != set(paths):
+                raise ValueError('current_worker_archive_pins_required')
+            for name, path in paths.items():
+                if (current[name] != {'path': str(path), 'sha256': digest(path)}
+                        or (name == 'root_configuration'
+                            and current[name]['sha256'] != expected_config_sha256)):
+                    raise PermissionError('current_worker_archive_pin_changed')
+            # Keep the existing per-profile native writer lock through rename,
+            # receipt publication and guarded rollback. Parent current pins do
+            # not require workers/ to exist after the engine moves that tree.
+            with config_write_transaction(home / 'config.yaml'):
+                declaration_summary = None
+                if 'declaration_source' in document:
+                    from .worker_declarations import validate_declaration_source
+                    own = self._admitted_worker_home(root, home, binding, generation, proof)
+                    declaration_summary = validate_declaration_source(document['declaration_source'],
+                        config, own, root_home=root, profile_home=home)
+                    if (declaration_summary['binding_sha256'] != scope._fingerprint(binding)
+                            or declaration_summary['generation'] != generation
+                            or declaration_summary['stale_attachment_sha256'] !=
+                                document['tree']['files']['attachment.json']['sha256']):
+                        raise PermissionError('foreign_worker_declaration_source')
+                # Companion data is validated under the same current authority;
+                # it never changes the archiver schema or authorizes config writes.
+                archive_document = {k: v for k, v in document.items() if k != 'declaration_source'}
+
+                def verify():
+                    budget.check()
+                    with scope.authority(root):
+                        self._verify_operator(profile, session)
+                        now_home, now_binding, now_row, now_proof = self._prepared(root,
+                            access.state, platform, transport_profile, account_id, user_id, generation)
+                        if (now_home != home or now_binding != binding or now_row != row
+                                or now_proof != proof):
+                            raise PermissionError('worker_archive_authority_changed')
+                        own = self._admitted_worker_home(root, home, binding, generation, proof)
+                        for name, path in paths.items():
+                            if current[name] != {'path': str(path), 'sha256': digest(path)}:
+                                raise PermissionError('current_worker_archive_pin_changed')
+                        if worker_archive.read_request(request) != request_state:
+                            raise PermissionError('worker_archive_request_changed')
+                        if declaration_summary is not None:
+                            if validate_declaration_source(document['declaration_source'], config, own,
+                                    root_home=root, profile_home=home) != declaration_summary:
+                                raise PermissionError('worker_declaration_source_changed')
+                verify()
+                # No callback or native-stop evidence is accepted from JSON.
+                # Engine owns fixed native guards and irreversible dedup claims.
+                result = worker_archive.archive(home, binding, generation, archive_document,
+                    verify=verify, budget=budget)
+                if declaration_summary is not None:
+                    # Source validation is separate from native migration. No
+                    # candidate configuration or private identity is returned.
+                    result = dict(result, declaration_source={k: declaration_summary[k] for k in
+                        ('status', 'bundle_sha256', 'candidate_root_sha256',
+                         'candidate_profile_sha256', 'native_apply_implemented')})
+                return result
+
     def qualify_workers(self, profile, *, session=None, expected_config_sha256, generation, platform,
                         transport_profile, account_id, user_id):
         """Protected initial A0 owner, bounded observations and BOTH-worker attach.

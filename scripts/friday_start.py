@@ -223,18 +223,25 @@ def gateway_observation(home, budget):
         "native_gateway_start_not_observed",
     )
     generation = budget.call(expected_gateway, home)
-    live = budget.call(identify_gateway, home, timeout=min(5.0, budget.check()))
-    require(
-        isinstance(live, dict)
-        and live.get("protocol") == CONTROL_PROTOCOL_VERSION
-        and live.get("kind") == "hermes-gateway"
-        and live.get("pid") == record.pid
-        and live.get("start_time") == record.start_time
-        and live.get("hermes_home") == str(home)
-        and live.get("code_sha") == source["commit"]
-        and live.get("friday_owner") == generation,
-        "native_gateway_generation_unproved",
-    )
+    diagnostic = {}
+    live = budget.call(identify_gateway, home, timeout=min(5.0, budget.check()), diagnostic=diagnostic)
+    identity = live if isinstance(live, dict) else {}
+    fields = {
+        "response": isinstance(live, dict),
+        "protocol": identity.get("protocol") == CONTROL_PROTOCOL_VERSION,
+        "kind": identity.get("kind") == "hermes-gateway",
+        "pid": type(identity.get("pid")) is int and identity.get("pid") == record.pid,
+        "start_time": type(identity.get("start_time")) is int and identity.get("start_time") == record.start_time,
+        "hermes_home": identity.get("hermes_home") == str(home),
+        "code_sha": identity.get("code_sha") == source["commit"],
+        "friday_owner": identity.get("friday_owner") == generation,
+    }
+    if not all(fields.values()):
+        from scripts.friday_install import Refused
+        exc = Refused("native_gateway_generation_unproved")
+        exc.friday_identity_observation = {**diagnostic,
+            "mismatch": [name for name, matched in fields.items() if not matched]}
+        raise exc
     # Generation validation and the native identify exchange can outlive an
     # incarnation. Reconcile the retained native owner after that exchange.
     observed = budget.call(hr.read_record, hr.ROLE_GATEWAY, include_stale=True)

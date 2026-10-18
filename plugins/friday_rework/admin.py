@@ -188,6 +188,10 @@ class Administration:
         from .onboarding import Onboarding
         return Onboarding(self).prepare_workers(profile, session=session, **values)
 
+    def onboarding_workers_archive(self, profile, *, session=None, **values):
+        from .onboarding import Onboarding
+        return Onboarding(self).archive_workers(profile, session=session, **values)
+
     def onboarding_workers_qualify(self, profile, *, session=None, **values):
         from .onboarding import Onboarding
         return Onboarding(self).qualify_workers(profile, session=session, **values)

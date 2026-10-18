@@ -53,7 +53,10 @@ def dashboard(installed,monkeypatch):
  intent={'schema':o.REBIND_RENDERER_SCHEMA,'state':'CONSUMED_NO_RETRY','request_sha256':rendererref['sha256'],'seconds':180,'previous_input':oldref,'current_input':latestref,'before':{n:{'sha256':ref['sha256'],'mode':0o600} for n,ref in before.items()},'consumers_started':False,'workers_enabled':False,'database_changed':False}
  doc(rtx/'intent.json',intent);doc(rtx/'committed.json',{'state':'EXACT_COMPRESSOR_RENDERER_REBOUND_CONSUMERS_STOPPED_NOT_RUNTIME_ACCEPTED','ready':False,'workers_enabled':False,'consumers_started':False,'database_changed':False,'after':after})
  state='installs/'+f.digest(str(source).encode())[:16];environment=home/state/'environments/generation-fixture'
- factsref=doc(home/state/'facts.json',{'environment':str(environment),'source':'Source90','selection':'retained'})
+ facts={'schema':1,'packages':{'venv':{'environment':str(environment),'extras':[],
+  'resolved_lock':str(home/state/'resolved.lock'),'source_identity':'synthetic-Source90',
+  'source_parent':str(source.parent),'stamp':'synthetic-retained-generation'}}}
+ factsref=doc(home/state/'facts.json',facts)
  pyvenvref=put(environment/'pyvenv.cfg',b'fixture interpreter never executed\n')
  retained={**renderer_retained,**{n:{'path':str(home/n),'sha256':h} for n,h in after.items() if n!=f.MARKER},state+'/facts.json':factsref,str(environment.relative_to(home))+'/pyvenv.cfg':pyvenvref}
  # Retain representative current private DB/WAL/session/artifacts without opening DBs.
@@ -119,7 +122,7 @@ def test_refuses_drift_without_publication(dashboard,monkeypatch,fault):
   d=copy.deepcopy(s['source_request']);d['schema']='friday.ordinary-telegram-source-update.v43';r['predecessor_update']=doc(Path(r['predecessor_update']['path']),d)
  elif fault=='facts':put(h/s['state']/'facts.json',b'changed')
  elif fault=='selectedgeneration':
-  ref=doc(h/s['state']/'facts.json',{'environment':str(h/s['state']/'environments/foreign')});r['retained'][s['state']+'/facts.json']=ref
+  facts=f.read_json(h/s['state']/'facts.json');facts['packages']['venv']['environment']=str(h/s['state']/'environments/foreign');r['retained'][s['state']+'/facts.json']=doc(h/s['state']/'facts.json',facts)
  elif fault=='omitfacts':r['retained'].pop(s['state']+'/facts.json')
  elif fault=='omitgeneration':r['retained'].pop(str(s['environment'].relative_to(h))+'/pyvenv.cfg')
  elif fault=='omit_user_scope':r['retained'].pop('profiles/dest_telegram/.friday-user-scope.json')
@@ -129,6 +132,40 @@ def test_refuses_drift_without_publication(dashboard,monkeypatch,fault):
  repin(s);before=snapshot(h)
  with pytest.raises((ValueError,KeyError,AssertionError)):o.update(r,s['requestpath'],Budget(180))
  assert snapshot(h)==before
+
+
+@pytest.mark.parametrize('fault',['root_malformed','schema','schema_boolean','top_level_only',
+ 'packages_missing','packages_malformed','venv_missing','venv_malformed',
+ 'environment_missing','environment_type','foreign_install','foreign_generation'])
+def test_native_pm_facts_selection_refuses_malformed_missing_or_foreign(dashboard,fault):
+ s=dashboard;home=s['home'];r=s['request'];name=s['state']+'/facts.json'
+ facts=f.read_json(home/name)
+ if fault=='root_malformed':facts=[]
+ elif fault=='schema':facts['schema']=2
+ elif fault=='schema_boolean':facts['schema']=True
+ elif fault=='top_level_only':facts={'schema':1,'packages':{},'environment':str(s['environment'])}
+ elif fault=='packages_missing':facts.pop('packages')
+ elif fault=='packages_malformed':facts['packages']=[]
+ elif fault=='venv_missing':facts['packages'].pop('venv')
+ elif fault=='venv_malformed':facts['packages']['venv']=[]
+ elif fault=='environment_missing':facts['packages']['venv'].pop('environment')
+ elif fault=='environment_type':facts['packages']['venv']['environment']=None
+ else:
+  # A different extant generation is not authority to switch environments:
+  # an outside-install generation stays refused even with an exact retained pin.
+  selected=(home/'installs/foreign-install/environments/generation/venv' if fault=='foreign_install'
+   else home/s['state']/'environments/foreign-generation/venv')
+  config=put(selected/'pyvenv.cfg',b'synthetic unselected interpreter never executed\n')
+  facts['packages']['venv']['environment']=str(selected)
+  if fault=='foreign_install':r['retained'][str(selected.relative_to(home))+'/pyvenv.cfg']=config
+ r['retained'][name]=doc(home/name,facts)
+ repin(s);before=snapshot(home)
+ reason=('latest_retained_scope_changed' if fault in ('foreign_install','foreign_generation')
+  else 'native_pm_environment_required')
+ with pytest.raises(ValueError,match=reason):o.update(r,s['requestpath'],Budget(180))
+ assert snapshot(home)==before
+ tx=home/'preparation'/('ordinary-source-update-'+r['previous_input']['sha256'])
+ assert not(tx/'intent.json').exists()
 
 @pytest.mark.parametrize('publication',[1,2,3,4])
 def test_injected_failure_owned_rollback_and_once_intent(dashboard,monkeypatch,publication):

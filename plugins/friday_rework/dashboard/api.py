@@ -307,6 +307,21 @@ def onboarding_workers_prepare(body: WorkersPrepare, profile: str, session=Depen
     return call(_admin.onboarding_workers_prepare, profile, session=session, **body.model_dump())
 
 
+class WorkerArchiveReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str = Field(min_length=1, max_length=4096)
+    sha256: str = Field(pattern="^[0-9a-f]{64}$")
+
+
+class WorkersArchive(OnboardingActivate):
+    request: WorkerArchiveReference
+
+
+@router.post('/onboarding/workers/archive')
+def onboarding_workers_archive(body: WorkersArchive, profile: str, session=Depends(require_admin)):
+    return call(_admin.onboarding_workers_archive, profile, session=session, **body.model_dump())
+
+
 @router.post('/onboarding/workers/qualify')
 def onboarding_workers_qualify(body: OnboardingActivate, profile: str, session=Depends(require_admin)):
     return call(_admin.onboarding_workers_qualify, profile, session=session, **body.model_dump())

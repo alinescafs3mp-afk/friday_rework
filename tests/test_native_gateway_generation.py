@@ -34,7 +34,7 @@ def test_live_identity_must_match_admitted_process_and_generation(native_home, m
     else:
         response['protocol'] += 1
     calls = []
-    def identify(home, *, timeout):
+    def identify(home, *, timeout, diagnostic=None):
         calls.append((home, timeout))
         return response
     monkeypatch.setattr(control_socket, 'identify_gateway', identify)

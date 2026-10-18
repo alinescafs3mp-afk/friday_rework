@@ -179,18 +179,18 @@ def compose_product(spec):
         from plugins.friday_rework.adapters.a0_profile import checked_profile
         deployment = checked_profile(spec['a0_deployment'])
         chat = deployment['chat']
-        a0_inference = inference
-        expected_key = 'FRIDAY_LLM_API_KEY'
-        if (compression is not None and type(runtime) is dict and set(runtime)=={'enabled'}
-                and runtime['enabled'] is False):
-            # Preserve inactive legacy A0 declaration, including embeddings and
-            # utility: it describes the explicitly retained27B role only.
-            a0_inference = compression
-            expected_key = 'FRIDAY_COMPRESSION_API_KEY'
-        if (chat['endpoint'] != a0_inference['base_url'] or chat['model'] != a0_inference['model']
-                or chat['context_length'] != a0_inference['context']
-                or chat['max_output_tokens'] != a0_inference['main_output']
-                or a0_inference['key_env'] != expected_key):
+        # A declaration may follow the current primary as one complete route.
+        # An inactive retained deployment may instead describe the explicit
+        # compressor role. Never mix fields from the two route identities.
+        candidates = [(inference, 'FRIDAY_LLM_API_KEY')]
+        if (compression is not None and type(runtime) is dict
+                and set(runtime) == {'enabled'} and runtime['enabled'] is False):
+            candidates.append((compression, 'FRIDAY_COMPRESSION_API_KEY'))
+        actual = (chat['endpoint'], chat['model'], chat['context_length'],
+                  chat['max_output_tokens'])
+        if not any(actual == (route['base_url'], route['model'], route['context'],
+                route['main_output']) and route['key_env'] == key
+                for route, key in candidates):
             raise ValueError('a0_product_inference_profile_mismatch')
         config['a0_deployment'] = deployment
     config['auth'] = {'adopt_external_logins': False}

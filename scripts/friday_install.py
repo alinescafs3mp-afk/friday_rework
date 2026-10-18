@@ -152,6 +152,20 @@ def safe_diagnostic(exc, phase):
         result['cessation'] = 'REAPED' if exc.observation['reaped'] else 'UNCONFIRMED'
     elif isinstance(exc, Refused):
         result['reason'] = exc.reason
+        identity = getattr(exc, 'friday_identity_observation', None)
+        if exc.reason == 'native_gateway_generation_unproved' and type(identity) is dict:
+            allowed = {'transport': {'unix', 'windows'},
+                'outcome': {'ok', 'no_response', 'socket_unavailable', 'timeout', 'transport_error',
+                    'malformed_response', 'invalid_response', 'native_error', 'invalid_result'},
+                'refusal': {'source_or_owner_unproved', 'credential_refused', 'unspecified'}}
+            safe = {k: v for k, v in identity.items()
+                    if k in allowed and type(v) is str and v in allowed[k]}
+            fields = {'response', 'protocol', 'kind', 'pid', 'start_time',
+                      'hermes_home', 'code_sha', 'friday_owner'}
+            mismatch = identity.get('mismatch')
+            if type(mismatch) is list and all(type(k) is str and k in fields for k in mismatch):
+                safe['mismatch'] = mismatch
+            result['identity'] = safe
     elif isinstance(exc, OSError):
         result.update(reason='native_io_failed', errno=exc.errno)
     elif isinstance(exc, (KeyError, TypeError)):
@@ -163,6 +177,10 @@ def safe_diagnostic(exc, phase):
 
 def diagnostic_text(value):
     parts = [f"phase={value['phase']}", f"reason={value['reason']}"]
+    if 'identity' in value:
+        identity = value['identity']
+        parts.append("identify=" + identity.get('outcome', 'unobserved'))
+        parts.append("mismatch=" + ','.join(identity.get('mismatch', [])))
     if 'returncode' in value:
         parts.extend([f"child_exit={value['returncode']}",
                       f"timeout={str(value['timeout']).lower()}",
@@ -347,20 +365,16 @@ def spec_checked(value, *, cli_only=False):
         profile_validator = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(profile_validator)
         deployment = profile_validator.checked_profile(product['a0_deployment'])
-        selected = product['inference']
-        expected_key = 'FRIDAY_LLM_API_KEY'
+        candidates = [(product['inference'], 'FRIDAY_LLM_API_KEY')]
         if (product.get('compression_inference') is not None
-                and type(product['runtime']) is dict and set(product['runtime'])=={'enabled'}
+                and type(product['runtime']) is dict and set(product['runtime']) == {'enabled'}
                 and product['runtime']['enabled'] is False):
-            # Existing legacy A0 declarations remain inactive and byte-exact.
-            # Their old27B chat is compared to the explicit preserved role.
-            selected = product['compression_inference']
-            expected_key = 'FRIDAY_COMPRESSION_API_KEY'
+            candidates.append((product['compression_inference'], 'FRIDAY_COMPRESSION_API_KEY'))
         chat = deployment['chat']
-        require(chat['endpoint'] == selected['base_url'] and chat['model'] == selected['model']
-                and chat['context_length'] == selected['context']
-                and chat['max_output_tokens'] == selected['main_output']
-                and selected['key_env'] == expected_key, 'a0_product_inference_profile_mismatch')
+        actual = (chat['endpoint'], chat['model'], chat['context_length'], chat['max_output_tokens'])
+        require(any(actual == (route['base_url'], route['model'], route['context'], route['main_output'])
+                and route['key_env'] == key for route, key in candidates),
+                'a0_product_inference_profile_mismatch')
     if 'worker_install' in value:
         from scripts.worker_install import settings
         settings(value, cli_only=cli_only)

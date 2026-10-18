@@ -31,7 +31,8 @@ GUARD = STATE / 'route-guard.json'
 NFT = Path('/usr/sbin/nft')
 NSENTER = Path('/usr/bin/nsenter')
 BRIDGE = 'br-frwa0local'
-ENDPOINTS = [{'ip': '192.168.1.78', 'port': 8001, 'transport': 'tcp'},
+ENDPOINTS = [{'ip': '192.168.1.195', 'port': 30000, 'transport': 'tcp'},
+             {'ip': '192.168.1.78', 'port': 8001, 'transport': 'tcp'},
              {'ip': '192.168.1.78', 'port': 8002, 'transport': 'tcp'}]
 NS_GET_USERNS = 0xb701
 
@@ -146,13 +147,17 @@ def policy(web=None):
                      ' { type filter hook ' + chain + ' priority -10; policy drop; }')
     rules = {
         'input': ['meta nfproto ipv6 counter drop',
+                  'meta nfproto ipv4 meta l4proto tcp iifname "tap0" ip saddr 192.168.1.195 tcp sport 30000 ct state established counter accept',
                   'meta nfproto ipv4 meta l4proto tcp iifname "tap0" ip saddr 192.168.1.78 tcp sport { 8001, 8002 } ct state established counter accept',
                   'counter drop'],
         'forward': ['meta nfproto ipv6 counter drop',
+                    'meta nfproto ipv4 meta l4proto tcp iifname "br-frwa0local" oifname "tap0" ip daddr 192.168.1.195 tcp dport 30000 ct state { new, established } counter accept',
                     'meta nfproto ipv4 meta l4proto tcp iifname "br-frwa0local" oifname "tap0" ip daddr 192.168.1.78 tcp dport { 8001, 8002 } ct state { new, established } counter accept',
+                    'meta nfproto ipv4 meta l4proto tcp iifname "tap0" oifname "br-frwa0local" ip saddr 192.168.1.195 tcp sport 30000 ct state established counter accept',
                     'meta nfproto ipv4 meta l4proto tcp iifname "tap0" oifname "br-frwa0local" ip saddr 192.168.1.78 tcp sport { 8001, 8002 } ct state established counter accept',
                     'counter drop'],
         'output': ['meta nfproto ipv6 counter drop',
+                   'meta nfproto ipv4 meta l4proto tcp oifname "tap0" ip daddr 192.168.1.195 tcp dport 30000 ct state { new, established } counter accept',
                    'meta nfproto ipv4 meta l4proto tcp oifname "tap0" ip daddr 192.168.1.78 tcp dport { 8001, 8002 } ct state { new, established } counter accept',
                    'counter drop']}
     for chain, rs in rules.items():
@@ -177,22 +182,23 @@ def expected_rules(web=None):
         return {'match': {'op': '==', 'left': left, 'right': right}}
     def meta(k, v): return match({'meta': {'key': k}}, v)
     def payload(protocol, field, v): return match({'payload': {'protocol': protocol, 'field': field}}, v)
-    def allow(incoming, bridge=False):
+    def allow(incoming, bridge=False, spark=False):
         out = [meta('nfproto', 'ipv4'), meta('l4proto', 'tcp')]
         if incoming: out += [meta('iifname', 'tap0')]
         if bridge: out += [meta('oifname' if incoming else 'iifname', BRIDGE)]
         if not incoming: out += [meta('oifname', 'tap0')]
-        out += [payload('ip', 'saddr' if incoming else 'daddr', '192.168.1.78'),
-                payload('tcp', 'sport' if incoming else 'dport', {'set': [8001, 8002]}),
+        out += [payload('ip', 'saddr' if incoming else 'daddr', '192.168.1.195' if spark else '192.168.1.78'),
+                payload('tcp', 'sport' if incoming else 'dport', 30000 if spark else {'set': [8001, 8002]}),
                 {'match': {'op': 'in', 'left': {'ct': {'key': 'state'}},
                            'right': ['established'] if incoming else ['new', 'established']}},
                 {'counter': None}, {'accept': None}]
         return out
     deny6 = [meta('nfproto', 'ipv6'), {'counter': None}, {'drop': None}]
     deny = [{'counter': None}, {'drop': None}]
-    rows = {'input': [deny6, allow(True), deny],
-            'forward': [deny6, allow(False, True), allow(True, True), deny],
-            'output': [deny6, allow(False), deny]}
+    rows = {'input': [deny6, allow(True, spark=True), allow(True), deny],
+            'forward': [deny6, allow(False, True, spark=True), allow(False, True),
+                        allow(True, True, spark=True), allow(True, True), deny],
+            'output': [deny6, allow(False, spark=True), allow(False), deny]}
     if web is not None:
         checked_web(web)
         for chain in rows: rows[chain][-1:-1] = web_rule_expr(chain, web)
