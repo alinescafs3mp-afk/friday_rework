@@ -1,0 +1,7 @@
+Functional fixture source paths and diagnostic qualification — 18 October 2026
+
+The inert two-file patch replaces stale ancestor-derived DSH/A0 fixture paths with explicit reviewed input roots. Independent static review confirms all 26/23 assertion ASTs and all decorators remain unchanged. The patch is not applied to the project tests and those changed tests have not run. The current wrapper must first admit both exact fixture environment keys; real process/socket profiles and final immutable input bindings remain open.
+
+The exact separate repaired private runner completed all 25 synthetic lifecycle/custody/fault scenarios in one finite run, including parent death, independent wall expiry, durability failures, damaged recovery inputs and timeout/reap races. Independent final review accepted only these synthetic observations and exact custody. Its Source audit/seccomp suffix and original resource caps are unchanged. This does not execute the real product test driver. A separate native-verifier HOST successor completed 10 positive groups and 121 negative controls while keeping native Root policy and runtime authority explicitly pending. Historical failures are preserved in the observations.
+
+This archive separates source preparation, accepted synthetic runner observations and pending final independent acceptance of the verifier HOST successor. It contains no private control programs, acceptance checklist/oracles, raw fixture homes, handoffs or credentials. Whole project/native/installed/live/release acceptance remains open.
