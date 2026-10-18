@@ -1,0 +1,7 @@
+Reviewed Source91 Office and compressor quality repairs
+
+These two exact, independently reviewed Source components are published for analysis outside the canonical patch inventory. They are not installed or wired into product execution. Apply them only to the complete Source91 input named in SOURCE-STATUS.json, after the normal supported composition and final gate process.
+
+The Office component separates scoped file, revision-recovery, child-cleanup, read-guard, ledger-rollback and dependency handling while retaining privacy, rollback and process custody. Its 24 afterimages address 46 assigned diagnostics. The compressor component keeps exact renderer identity and strict asset handling while teaching the temporary-path checker to distinguish validated tokenizer vocabulary keys from operational JSON fields. Its canonical test uses the existing project-relative immutable asset and fails when that asset is absent or corrupt.
+
+Focused tests and pinned native-policy quality checks passed for these exact components. Independent review accepted the Source bytes. Historical harness and baseline failures remain visible in SOURCE-STATUS.json; overlapping controls are not summed into a coverage total. The earlier complete Source91 quality gate remains failed. Other repair slices, final whole composition, required full gates, installation, runtime and live acceptance remain separate unfinished work.
