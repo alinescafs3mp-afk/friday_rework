@@ -1,0 +1,547 @@
+--- a/gateway/control_socket.py
++++ b/gateway/control_socket.py
+@@ -137,7 +137,13 @@
+         self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
+             "identify": build_identify_payload, "status": build_status_payload, **(verb_handlers or {})}
+         from hermes_cli.friday_gateway_owner import bind_identify
+-        self._handlers["identify"] = bind_identify(self._home, self._handlers["identify"])
++        try:
++            self._handlers["identify"] = bind_identify(self._home, self._handlers["identify"])
++        except Exception:
++            # Startup may otherwise swallow this at DEBUG and leave no socket.
++            # A fixed code distinguishes pre-bind identity failure without data.
++            logger.warning("native_gateway_identify_binding_failed")
++            raise
+ 
+     async def start(self) -> bool:
+         """Bind and start serving. Returns True on success, False otherwise."""
+@@ -273,7 +279,8 @@
+ 
+ 
+ def query_gateway_control(home: Path, verb: str, *, params: Optional[dict[str, Any]] = None,
+-                          timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
++                          timeout: float = _DEFAULT_CLIENT_TIMEOUT,
++                          diagnostic: Optional[dict[str, str]] = None) -> Optional[dict[str, Any]]:
+     """Ask the gateway serving ``home`` a control verb; returns its ``result`` payload. Any failure (no/stale
+     socket, timeout, malformed answer, ``ok: false``) returns None so callers fall back to the scan layer.
+     ``params`` carries verb arguments (e.g. ``{"old": ..., "new": ...}``). Never raises."""
+@@ -282,12 +289,46 @@
+         payload["params"] = params
+     request = json.dumps(payload).encode("utf-8") + b"\n"
+     query = _query_windows_pipe if _IS_WINDOWS else _query_unix_socket
++    if diagnostic is not None:
++        diagnostic.clear()
++        diagnostic.update(transport="windows" if _IS_WINDOWS else "unix", outcome="no_response")
+     try:
+-        raw = query(Path(home), request, timeout)
++        raw = (query(Path(home), request, timeout) if diagnostic is None or _IS_WINDOWS
++               else query(Path(home), request, timeout, diagnostic=diagnostic))
+         response = json.loads(raw.decode("utf-8")) if raw else None
++    except (ValueError, UnicodeError):
++        if diagnostic is not None:
++            diagnostic["outcome"] = "malformed_response"
++        return None
+     except Exception:
++        if diagnostic is not None:
++            diagnostic["outcome"] = "transport_error"
+         return None
+-    result = response.get("result") if isinstance(response, dict) and response.get("ok") is True else None
++    if raw and diagnostic is not None:
++        diagnostic["outcome"] = "invalid_response"
++    return _control_response_result(response, diagnostic)
++
++
++def _control_response_result(response, diagnostic):
++    """Separate fixed outcome classification from the unchanged native payload."""
++    if not isinstance(response, dict):
++        return None
++    if response.get("ok") is not True:
++        if diagnostic is not None:
++            if response.get("ok") is not False:
++                diagnostic["outcome"] = "invalid_response"
++                return None
++            diagnostic["outcome"] = "native_error"
++            # Never copy server text, paths, configuration or identity material.
++            error = response.get("error")
++            diagnostic["refusal"] = (
++                "source_or_owner_unproved" if error == "ValueError: friday_dashboard_owner_unproved"
++                else "credential_refused" if isinstance(error, str)
++                and error.startswith("CredentialDenied: friday_credential_") else "unspecified")
++        return None
++    result = response.get("result")
++    if diagnostic is not None:
++        diagnostic["outcome"] = "ok" if isinstance(result, dict) else "invalid_result"
+     return result if isinstance(result, dict) else None
+ 
+ 
+@@ -304,16 +345,25 @@
+     return b"".join(chunks).partition(b"\n")[0] or None
+ 
+ 
+-def _query_unix_socket(home: Path, request: bytes, timeout: float) -> Optional[bytes]:
++def _query_unix_socket(home: Path, request: bytes, timeout: float, *,
++                       diagnostic: Optional[dict[str, str]] = None) -> Optional[bytes]:
+     path = resolve_client_socket_path(home)
+     if path is None:
++        if diagnostic is not None:
++            diagnostic["outcome"] = "socket_unavailable"
+         return None
+-    # OSError covers ConnectionRefusedError / FileNotFoundError on connect and socket.timeout on read.
+-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock, contextlib.suppress(OSError):
+-        sock.settimeout(timeout)
+-        sock.connect(str(path))
+-        sock.sendall(request)
+-        return _read_response_line(lambda: sock.recv(65536), time.monotonic() + timeout)
++    try:
++        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
++            sock.settimeout(timeout)
++            sock.connect(str(path))
++            sock.sendall(request)
++            return _read_response_line(lambda: sock.recv(65536), time.monotonic() + timeout)
++    except TimeoutError:
++        if diagnostic is not None:
++            diagnostic["outcome"] = "timeout"
++    except OSError:
++        if diagnostic is not None:
++            diagnostic["outcome"] = "transport_error"
+     return None
+ 
+ 
+@@ -349,9 +399,12 @@
+             handle.close()
+ 
+ 
+-def identify_gateway(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
++def identify_gateway(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT,
++                     diagnostic: Optional[dict[str, str]] = None) -> Optional[dict[str, Any]]:
+     """Convenience wrapper: ``identify`` the gateway serving ``home``."""
+-    return query_gateway_control(home, "identify", timeout=timeout)
++    if diagnostic is None:
++        return query_gateway_control(home, "identify", timeout=timeout)
++    return query_gateway_control(home, "identify", timeout=timeout, diagnostic=diagnostic)
+ 
+ 
+ def pause_gateway_for_update(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -821,10 +821,11 @@
+     @staticmethod
+     def _start_hosted_room_worker_sync():
+         """Start the local Group Chat worker without importing the dashboard."""
+-        import tui_gateway.server  # noqa: F401
+         from tui_gateway import methods_groups
+         service = methods_groups.get_hosted_room_service()
+         if service is None:
++            from tui_gateway.backend import hosted_room_backend
++            hosted_room_backend()
+             service = methods_groups.start_hosted_room_service()
+         if service is None:
+             raise RuntimeError("Group Chat worker has no bound session backend")
+--- /dev/null
++++ b/tests/gateway/test_control_socket_diagnostic.py
+@@ -0,0 +1,74 @@
++"""Fixed native identify diagnostics never reflect server payloads."""
++import json
++
++import pytest
++
++from gateway import control_socket as cs
++
++
++@pytest.mark.parametrize("response,outcome,refusal", [
++    ({"ok": True, "result": {"pid": 1}}, "ok", None),
++    ({"ok": False, "error": "ValueError: friday_dashboard_owner_unproved"},
++     "native_error", "source_or_owner_unproved"),
++    ({"ok": False, "error": "CredentialDenied: friday_credential_route_override_refused"},
++     "native_error", "credential_refused"),
++    ({"ok": False, "error": "SECRET /private/path"}, "native_error", "unspecified"),
++    ({"ok": True, "result": "SECRET"}, "invalid_result", None),
++    ([], "invalid_response", None),
++    (None, "invalid_response", None),
++    ({"error": "SECRET"}, "invalid_response", None),
++])
++def test_static_response_classification(monkeypatch, tmp_path, response, outcome, refusal):
++    monkeypatch.setattr(cs, "_IS_WINDOWS", False)
++    monkeypatch.setattr(cs, "_query_unix_socket", lambda *a, **kw: json.dumps(response).encode())
++    diagnostic = {"old": "SECRET"}
++    result = cs.identify_gateway(tmp_path, timeout=5, diagnostic=diagnostic)
++    assert diagnostic == {"transport": "unix", "outcome": outcome,
++                          **({"refusal": refusal} if refusal else {})}
++    assert result == (response["result"] if outcome == "ok" else None)
++
++
++def test_absent_socket_and_malformed_response_remain_refusals(monkeypatch, tmp_path):
++    monkeypatch.setattr(cs, "_IS_WINDOWS", False)
++    monkeypatch.setattr(cs, "resolve_client_socket_path", lambda home: None)
++    diagnostic = {}
++    assert cs.identify_gateway(tmp_path, diagnostic=diagnostic) is None
++    assert diagnostic == {"transport": "unix", "outcome": "socket_unavailable"}
++    monkeypatch.setattr(cs, "_query_unix_socket", lambda *a, **kw: b"SECRET not JSON")
++    assert cs.identify_gateway(tmp_path, diagnostic=diagnostic) is None
++    assert diagnostic == {"transport": "unix", "outcome": "malformed_response"}
++
++
++def test_transport_timeout_is_distinct_without_changed_timeout(monkeypatch, tmp_path):
++    monkeypatch.setattr(cs, "_IS_WINDOWS", False)
++    monkeypatch.setattr(cs, "resolve_client_socket_path", lambda home: tmp_path / "gateway.sock")
++    timeouts = []
++
++    class Socket:
++        def __enter__(self):
++            return self
++        def __exit__(self, *args):
++            pass
++        def settimeout(self, seconds):
++            timeouts.append(seconds)
++        def connect(self, path):
++            raise TimeoutError("SECRET")
++
++    monkeypatch.setattr(cs.socket, "socket", lambda *a: Socket())
++    diagnostic = {}
++    assert cs.identify_gateway(tmp_path, timeout=5, diagnostic=diagnostic) is None
++    assert timeouts == [5]
++    assert diagnostic == {"transport": "unix", "outcome": "timeout"}
++
++
++def test_binding_failure_has_static_startup_diagnostic(monkeypatch, tmp_path, caplog):
++    from hermes_cli import friday_gateway_owner as proof
++
++    def refused(*args):
++        raise ValueError("SECRET /private/path")
++
++    monkeypatch.setattr(proof, "bind_identify", refused)
++    with pytest.raises(ValueError):
++        cs.GatewayControlServer(tmp_path)
++    assert [r.getMessage() for r in caplog.records] == ["native_gateway_identify_binding_failed"]
++    assert "SECRET" not in caplog.text
+--- /dev/null
++++ b/tests/tui_gateway/test_native_backend_import.py
+@@ -0,0 +1,173 @@
++"""Native daemon initialization grants no CLI/session authority."""
++from __future__ import annotations
++
++import contextvars
++import os
++from pathlib import Path
++import subprocess
++import sys
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++
++@pytest.fixture
++def native_owner(monkeypatch, tmp_path):
++    from gateway import host_rendezvous as hr, status
++    import hermes_constants as homes
++    from hermes_cli import friday_gateway_owner as proof, friday_user_scope as users
++    from hermes_cli.friday_cli_principal import _LOCAL
++    from tui_gateway import backend
++
++    record = SimpleNamespace(role=hr.ROLE_GATEWAY, pid=os.getpid(),
++                             start_time=123, home=str(tmp_path))
++    state = {"record": record, "lock": True, "alive": True, "token": True,
++             "birth": 123, "home": tmp_path, "proofs": 0}
++    monkeypatch.setattr(hr, "read_record", lambda *a, **kw: state["record"])
++    monkeypatch.setattr(hr, "owns_host_lock", lambda *a: state["lock"])
++    monkeypatch.setattr(hr, "liveness_is_proven", lambda *a: state["alive"])
++    monkeypatch.setattr(hr, "record_token_is_consistent", lambda *a: state["token"])
++    monkeypatch.setattr(status, "get_process_start_time", lambda *a: state["birth"])
++    monkeypatch.setattr(homes, "get_process_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr(homes, "get_hermes_home", lambda: state["home"])
++
++    def expected(home):
++        assert home == tmp_path
++        state["proofs"] += 1
++        if state.get("bad_source"):
++            raise ValueError("friday_dashboard_owner_unproved")
++        return {"home": str(home)}
++
++    monkeypatch.setattr(proof, "expected", expected)
++    u = users._CURRENT.set(None)
++    c = _LOCAL.set(None)
++    try:
++        yield backend, state, users, _LOCAL
++    finally:
++        users._CURRENT.reset(u)
++        _LOCAL.reset(c)
++
++
++def test_actual_native_owner_checks_source_without_minting_user(native_owner):
++    backend, state, users, local = native_owner
++    assert backend._gateway_owner() is state["record"]
++    assert state["proofs"] == 1
++    assert users._CURRENT.get() is None and local.get() is None
++
++
++@pytest.mark.parametrize("fault", ["missing", "foreign_pid", "foreign_home", "wrong_role",
++    "lock", "alive", "token", "birth", "scoped_home", "user", "cli", "foreign_cli", "revoked_cli", "bad_source"])
++def test_daemon_import_refuses_other_incarnations_and_principals(native_owner, fault):
++    backend, state, users, local = native_owner
++    token = None
++    if fault == "missing":
++        state["record"] = None
++    elif fault in {"foreign_pid", "foreign_home", "wrong_role"}:
++        name, value = {"foreign_pid": ("pid", os.getpid() + 1),
++                       "foreign_home": ("home", "/foreign"),
++                       "wrong_role": ("role", "serve")}[fault]
++        setattr(state["record"], name, value)
++    elif fault in {"lock", "alive", "token"}:
++        state[fault] = False
++    elif fault == "birth":
++        state["birth"] += 1
++    elif fault == "scoped_home":
++        state["home"] = Path("/foreign")
++    elif fault in {"user", "cli", "foreign_cli", "revoked_cli"}:
++        capability = SimpleNamespace(principal=("cli", "foreign", "foreign", "foreign"),
++                                     revoked=fault == "revoked_cli")
++        token = (users._CURRENT if fault == "user" else local).set(capability)
++    else:
++        state["bad_source"] = True
++    try:
++        with pytest.raises((users.ScopeDenied, ValueError)):
++            backend._gateway_owner()
++    finally:
++        if token is not None:
++            (users._CURRENT if fault == "user" else local).reset(token)
++
++
++def test_import_lease_cannot_cross_threads_replay_or_leak(native_owner, monkeypatch):
++    backend, state, users, _local = native_owner
++    monkeypatch.setattr("hermes_cli.friday_dashboard_owner.enabled", lambda: True)
++    contexts = []
++
++    def load(name):
++        assert name == "tui_gateway.server"
++        ctx = contextvars.copy_context()
++        contexts.append(ctx)
++        errors = []
++
++        def copied_thread():
++            try:
++                ctx.run(backend.native_backend_import)
++            except users.ScopeDenied:
++                errors.append("refused")
++
++        thread = threading.Thread(target=copied_thread)
++        thread.start()
++        thread.join(timeout=1)
++        assert not thread.is_alive() and errors == ["refused"]
++        assert backend.native_backend_import() is True
++        with pytest.raises(users.ScopeDenied):
++            backend.native_backend_import()
++        return SimpleNamespace(_entry_gateway_backend=True)
++
++    monkeypatch.setattr(backend.importlib, "import_module", load)
++    assert backend.hosted_room_backend()._entry_gateway_backend is True
++    assert backend._IMPORT.get() is None
++    with pytest.raises(users.ScopeDenied):
++        contexts[0].run(backend.native_backend_import)
++    assert backend.native_backend_import() is False
++
++
++def test_backend_failure_resets_lease_and_cached_cli_is_not_reclassified(native_owner, monkeypatch):
++    backend, _state, users, _local = native_owner
++    monkeypatch.setattr("hermes_cli.friday_dashboard_owner.enabled", lambda: True)
++    monkeypatch.setattr(backend.importlib, "import_module", lambda name: SimpleNamespace())
++    with pytest.raises(users.ScopeDenied):
++        backend.hosted_room_backend()
++    assert backend._IMPORT.get() is None
++
++
++def test_real_embedded_backend_retains_cached_unbound_tui_refusal(tmp_path):
++    """Real module initialization, isolated from this pytest process's server cache."""
++    source = Path(__file__).resolve().parents[2]
++    script = r'''
++import sys
++sys.path.insert(0, sys.argv[1])
++from hermes_cli import env_loader, banner, friday_dashboard_owner, friday_user_scope as users
++from tui_gateway import backend, authz
++from types import SimpleNamespace
++def forbidden(*args, **kwargs):
++    raise AssertionError("interactive initialization effect")
++env_loader.load_hermes_dotenv = forbidden
++banner.prefetch_update_check = forbidden
++friday_dashboard_owner.enabled = lambda: True
++owner = SimpleNamespace()
++backend._gateway_owner = lambda: owner
++users._ENGAGED = True
++stdout, hook = sys.stdout, sys.excepthook
++server = backend.hosted_room_backend()
++assert server._entry_gateway_backend and server._entry_cli_cap is None
++assert sys.stdout is stdout and sys.excepthook is hook
++assert type(server._stdio_transport) is server._DropTransport
++assert users._CURRENT.get() is None
++from tui_gateway import server as cached
++assert cached is server
++for check in (authz.current, authz.check_profile, lambda: authz.check_profile("foreign"),
++              lambda: authz.check_session({}), lambda: authz.check_transport(server._stdio_transport),
++              lambda: authz.check_rpc(server._stdio_transport, "session.create", {}, {})):
++    try:
++        check()
++    except users.ScopeDenied:
++        pass
++    else:
++        raise AssertionError("cached backend granted unbound TUI authority")
++'''
++    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_")}
++    env.update(HERMES_HOME=str(tmp_path), HERMES_TEST_ISOLATION="1")
++    completed = subprocess.run([sys.executable, "-I", "-c", script, str(source)],
++                               env=env, capture_output=True, timeout=30)
++    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")[-2000:]
+--- /dev/null
++++ b/tui_gateway/backend.py
+@@ -0,0 +1,80 @@
++"""Embedded native session backend for the already owning messaging daemon.
++
++The lease permits module initialization only. It never admits a product user,
++changes the CLI principal or relaxes a session/RPC/profile check.
++"""
++from __future__ import annotations
++
++from contextvars import ContextVar
++import importlib
++import os
++from threading import get_ident
++
++_IMPORT = ContextVar("hermes_native_backend_import", default=None)
++
++
++def _deny():
++    from hermes_cli.friday_user_scope import ScopeDenied
++    raise ScopeDenied()
++
++
++def _gateway_owner():
++    from gateway import host_rendezvous as hr
++    from gateway.status import get_process_start_time
++    from hermes_constants import get_hermes_home, get_process_hermes_home
++    from hermes_cli import friday_user_scope as users
++    from hermes_cli.friday_cli_principal import _LOCAL
++    from hermes_cli.friday_gateway_owner import expected
++
++    # A model/tool/CLI context in the same OS process is not its daemon owner.
++    if users._CURRENT.get() is not None or _LOCAL.get() is not None:
++        _deny()
++    home = get_process_hermes_home()
++    record = hr.read_record(hr.ROLE_GATEWAY, include_stale=True)
++    if (get_hermes_home() != home or record is None
++            or not hr.owns_host_lock(hr.ROLE_GATEWAY)
++            or record.role != hr.ROLE_GATEWAY or record.pid != os.getpid()
++            or record.home != str(home) or type(record.start_time) is not int
++            or record.start_time != get_process_start_time(os.getpid())
++            or not hr.liveness_is_proven(record)
++            or not hr.record_token_is_consistent(record)):
++        _deny()
++    # Full source/configuration and the actual native run role remain required.
++    expected(home)
++    if hr.read_record(hr.ROLE_GATEWAY, include_stale=True) != record:
++        _deny()
++    return record
++
++
++def native_backend_import() -> bool:
++    """Consume one exact daemon import lease; otherwise retain the CLI guard."""
++    lease = _IMPORT.get()
++    if lease is None:
++        return False
++    if (not lease["active"] or lease["used"] or lease["pid"] != os.getpid()
++            or lease["thread"] != get_ident() or _gateway_owner() != lease["owner"]):
++        _deny()
++    lease["used"] = True
++    return True
++
++
++def hosted_room_backend():
++    """Reuse native handlers, under the current daemon's actual owned incarnation."""
++    from hermes_cli.friday_dashboard_owner import enabled
++    if not enabled():
++        return importlib.import_module("tui_gateway.server")
++    record = _gateway_owner()
++    lease = {"active": True, "used": False, "pid": os.getpid(),
++             "thread": get_ident(), "owner": record}
++    token = _IMPORT.set(lease)
++    try:
++        server = importlib.import_module("tui_gateway.server")
++        # A cached interactive backend cannot be reclassified as a daemon.
++        if not getattr(server, "_entry_gateway_backend", False):
++            _deny()
++        if _gateway_owner() != record:
++            _deny()
++        return server
++    finally:
++        lease["active"] = False
++        _IMPORT.reset(token)
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -24,8 +24,11 @@
+     check_session as _friday_check_session, check_transport as _friday_check_transport,
+     session_fields as _friday_session_fields, origin_json as _friday_origin_json)
+ 
+-# A direct facade import must also fail before native profile/model readers.
+-_entry_cli_cap = _friday_check_profile()
++# Direct interactive imports retain their guard. Only the actual native owner
++# can initialize this same implementation as an embedded session backend.
++from tui_gateway.backend import native_backend_import as _native_backend_import
++_entry_gateway_backend = _native_backend_import()
++_entry_cli_cap = None if _entry_gateway_backend else _friday_check_profile()
+ 
+ # Several of these look unused here but are resolved BARE by split-module bodies rebound onto this
+ # namespace (method_ctx.bind_module) — deleting one breaks a handler at call time, not import time.
+@@ -57,8 +60,9 @@
+ logger = logging.getLogger(__name__)
+ 
+ _hermes_home = _HERMES_HOME_AT_IMPORT = get_hermes_home()
+-load_hermes_dotenv(hermes_home=_hermes_home,
+-                   project_env=None if _entry_cli_cap is not None else Path(__file__).parent.parent / ".env")
++if not _entry_gateway_backend:
++    load_hermes_dotenv(hermes_home=_hermes_home,
++                       project_env=None if _entry_cli_cap is not None else Path(__file__).parent.parent / ".env")
+ 
+ 
+ # ── Panic logger: crashes otherwise leave no forensics (stdout is the JSON-RPC pipe, stderr doesn't
+@@ -86,14 +90,15 @@
+     sys.__excepthook__(exc_type, exc_value, exc_tb)  # chain so the process still terminates normally
+ 
+ 
+-sys.excepthook = _panic_hook
+-threading.excepthook = lambda args: _record_crash(
+-    "thread exception", args.exc_type, args.exc_value, args.exc_traceback, thread_name=args.thread.name)
+-
+-with contextlib.suppress(Exception):
+-    from hermes_cli.banner import prefetch_update_check
+-
+-    prefetch_update_check()
++if not _entry_gateway_backend:
++    sys.excepthook = _panic_hook
++    threading.excepthook = lambda args: _record_crash(
++        "thread exception", args.exc_type, args.exc_value, args.exc_traceback, thread_name=args.thread.name)
++
++    with contextlib.suppress(Exception):
++        from hermes_cli.banner import prefetch_update_check
++
++        prefetch_update_check()
+ 
+ from tui_gateway.render import make_stream_renderer, render_diff, render_message  # noqa: F401
+ 
+@@ -213,7 +218,8 @@
+ # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr so stray print() from
+ # libraries/tools becomes harmless gateway.stderr instead of corrupting the JSON protocol.
+ _real_stdout = sys.stdout
+-sys.stdout = sys.stderr
++if not _entry_gateway_backend:
++    sys.stdout = sys.stderr
+ 
+ 
+ class _DropTransport:
+@@ -228,7 +234,8 @@
+ 
+ # Module-level stdio transport — fallback sink when no transport is bound via contextvar or session.
+ # Stream resolved through a lambda so test monkey-patches of `_real_stdout` still land.
+-_stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
++_stdio_transport = (_DropTransport() if _entry_gateway_backend
++                    else StdioTransport(lambda: _real_stdout, _stdout_lock))
+ 
+ # Detached websocket sessions use a drop sink instead of stdio: Desktop embeds the gateway in-process
+ # and captures stdout into logs, so stale frames must not fall through while a session awaits resume/reap.
