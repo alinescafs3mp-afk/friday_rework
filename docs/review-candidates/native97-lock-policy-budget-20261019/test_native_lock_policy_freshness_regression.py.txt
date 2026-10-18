@@ -1,0 +1,215 @@
+"""Additional Source regressions; original supplemental12/task350/focused222 unchanged.
+
+Actual native transactions, provider/session/policy validation and real flock are
+retained. The deterministic clock distinguishes validator work from lock waits;
+it does not substitute a validator, authorize an installed home or prove timing.
+"""
+import builtins
+import copy
+import json
+import os
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from hermes_cli import config_effective as effective
+from hermes_cli import friday_native_state as transactions
+from hermes_cli import plugins_state as states
+from hermes_cli import friday_user_scope as users
+from friday_admin_controls import operator_metadata as metadata
+from test_user_onboarding import env, prepare, raw, save
+from test_binding_refusal_readonly_regression import inventory, document
+
+
+def current_settings(path):
+    return effective.read_user_config_effective_readonly(path)['plugins']['entries']['friday_rework']['settings']
+
+
+def test_same_raw_bytes_parse_once_but_environment_managed_layer_and_results_stay_fresh(tmp_path, monkeypatch):
+    root = tmp_path / 'root'; root.mkdir(mode=0o700)
+    managed = tmp_path / 'managed'; managed.mkdir(mode=0o700)
+    path = root / 'config.yaml'
+    monkeypatch.setenv('HERMES_MANAGED_DIR', str(managed))
+    monkeypatch.setenv('FRW_LOCK_POLICY_SYNTHETIC', 'first')
+    document(path, {'plugins': {'entries': {'friday_rework': {'settings': {
+        'fresh_env': '${FRW_LOCK_POLICY_SYNTHETIC}', 'nested': {'keep': str(tmp_path)}}}}}})
+    document(managed / 'config.yaml', {'plugins': {'entries': {'friday_rework': {
+        'settings': {'managed': 'first'}}}}})
+    parse = effective.fast_safe_load
+    calls = []
+    def observed(source):
+        calls.append(1)
+        return parse(source)
+    monkeypatch.setattr(effective, 'fast_safe_load', observed)
+    first = current_settings(path)
+    first['nested']['keep'] = 'caller mutation'
+    monkeypatch.setenv('FRW_LOCK_POLICY_SYNTHETIC', 'second')
+    document(managed / 'config.yaml', {'plugins': {'entries': {'friday_rework': {
+        'settings': {'managed': 'second'}}}}})
+    before = inventory(root), inventory(managed)
+    second = current_settings(path)
+    assert second == {'fresh_env': 'second', 'nested': {'keep': str(tmp_path)}, 'managed': 'second'}
+    assert len(calls) == 1
+    assert (inventory(root), inventory(managed)) == before
+
+
+def test_current_bytes_override_same_path_size_and_restored_mtime(tmp_path, monkeypatch):
+    monkeypatch.delenv('HERMES_MANAGED_DIR', raising=False)
+    path = tmp_path / 'config.yaml'
+    document(path, {'plugins': {'entries': {'friday_rework': {'settings': {'value': 'first'}}}}})
+    before = path.stat()
+    assert current_settings(path)['value'] == 'first'
+    source = path.read_bytes().replace(b'first', b'other')
+    assert len(source) == before.st_size
+    path.write_bytes(source)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert current_settings(path)['value'] == 'other'
+
+
+def test_cached_raw_mapping_never_bypasses_current_open_failure(tmp_path, monkeypatch):
+    monkeypatch.delenv('HERMES_MANAGED_DIR', raising=False)
+    path = tmp_path / 'config.yaml'
+    document(path, {'plugins': {'entries': {'friday_rework': {'settings': {'fresh': str(tmp_path)}}}}})
+    assert current_settings(path)['fresh'] == str(tmp_path)
+    original = builtins.open
+    def denied(selected, *args, **kwargs):
+        if selected == path:
+            raise PermissionError('synthetic current read revoked')
+        return original(selected, *args, **kwargs)
+    monkeypatch.setattr(builtins, 'open', denied)
+    with pytest.raises(PermissionError):
+        effective.read_user_config_effective_readonly(path)
+
+
+def test_cache_hit_still_requires_current_root_operator_policy(env):
+    prepare(env)
+    # Warm the raw cache through the same real operator path.
+    env.setup.templates('default', session=env.operator)
+    changed = raw(env)
+    changed['plugins']['entries']['friday_rework']['settings']['admin']['operators'][0]['user_id'] = 'revoked-owner'
+    save(env, changed)
+    before = inventory(env.home)
+    with pytest.raises((ValueError, PermissionError, RuntimeError)):
+        env.setup.templates('default', session=env.operator)
+    assert inventory(env.home) == before
+
+
+
+def test_cached_raw_never_survives_file_removal_or_changes_strict_empty_contract(tmp_path, monkeypatch):
+    monkeypatch.delenv('HERMES_MANAGED_DIR', raising=False)
+    path = tmp_path / 'config.yaml'
+    document(path, {'plugins': {'entries': {'friday_rework': {'settings': {'fresh': str(tmp_path)}}}}})
+    assert current_settings(path)['fresh'] == str(tmp_path)
+    path.unlink()
+    with pytest.raises(FileNotFoundError):
+        effective.read_user_config_effective_readonly(path)
+    assert effective.read_user_config_effective_readonly(path, allow_empty=True) == {}
+    assert not path.exists()
+
+
+def test_larger_policy_files_are_current_and_do_not_enter_bounded_retained_cache(tmp_path, monkeypatch):
+    monkeypatch.delenv('HERMES_MANAGED_DIR', raising=False)
+    path = tmp_path / 'config.yaml'
+    document(path, {'padding': 'x' * (1024 * 1024 + 1),
+        'plugins': {'entries': {'friday_rework': {'settings': {'fresh': str(tmp_path)}}}}})
+    parse = effective.fast_safe_load
+    calls = []
+    def observed(source):
+        calls.append(1)
+        return parse(source)
+    monkeypatch.setattr(effective, 'fast_safe_load', observed)
+    for _ in range(2):
+        assert current_settings(path)['fresh'] == str(tmp_path)
+    assert len(calls) == 2
+
+
+def controlled_clock(monkeypatch):
+    now = [100.0]
+    clock = SimpleNamespace(monotonic=lambda: now[0], time=time.time,
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(states, 'time', clock)
+    monkeypatch.setattr(transactions, 'time', clock)
+    monkeypatch.setattr(metadata, 'time', clock)
+    return now
+
+
+@pytest.mark.parametrize('read_only', [False, True])
+def test_real_operator_validation_work_preserves_shared_lock_allowance(env, monkeypatch, read_only):
+    prepare(env)
+    now = controlled_clock(monkeypatch)
+    original = metadata._OperatorMetadata.check
+    def checked(authority, state):
+        original(authority, state)  # Real provider, policy, identity and custody checks.
+        now[0] += 10.0             # Deterministic expensive validator work.
+    monkeypatch.setattr(metadata._OperatorMetadata, 'check', checked)
+    factory = metadata.operator_metadata_read if read_only else metadata.operator_metadata
+    before = inventory(env.home)
+    with factory(env.setup, 'default', env.operator, env.home, env.state) as authority:
+        allowance = states.LockAcquisitionBudget(.25)  # Actual Associations default, never increased.
+        for _ in range(2):
+            assert authority.get(env.state, 'associations.v1', None, allowance) == {
+                'schema_version': 1, 'jobs': {}}
+    assert inventory(env.home) == before
+
+
+@pytest.mark.parametrize('read_only', [False, True])
+def test_real_flock_contention_exhausts_same_allowance_and_cannot_revive(env, monkeypatch, read_only):
+    import fcntl
+    prepare(env)
+    controlled_clock(monkeypatch)
+    factory = metadata.operator_metadata_read if read_only else metadata.operator_metadata
+    before = inventory(env.home)
+    with factory(env.setup, 'default', env.operator, env.home, env.state) as authority:
+        allowance = states.LockAcquisitionBudget(.025)
+        lock = env.state.data_dir / '.state.json.lock'
+        with lock.open('rb') as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with pytest.raises((transactions.NativeCommitUncertain, TimeoutError)) as failure:
+                authority.get(env.state, 'associations.v1', None, allowance)
+            primary = getattr(failure.value, 'primary', failure.value)
+            assert isinstance(primary, TimeoutError)
+            fcntl.flock(held, fcntl.LOCK_UN)
+        with pytest.raises(TimeoutError):
+            authority.get(env.state, 'associations.v1', None, allowance)
+    assert inventory(env.home) == before
+
+
+def test_slow_native_validation_still_enforces_original_cutoff(env, monkeypatch):
+    prepare(env)
+    now = controlled_clock(monkeypatch)
+    original = transactions.RetainedStateTransaction.check
+    def checked(transaction):
+        original(transaction)
+        now[0] += 10.0
+    monkeypatch.setattr(transactions.RetainedStateTransaction, 'check', checked)
+    before = inventory(env.home)
+    with pytest.raises(transactions.NativeCommitUncertain) as failure:
+        transactions.get_native(env.state, 'associations.v1', cutoff=105.0,
+            lock_budget=states.LockAcquisitionBudget(.25))
+    assert isinstance(failure.value.primary, TimeoutError)
+    assert inventory(env.home) == before
+
+
+def test_slow_native_validation_cannot_pass_an_expired_absolute_lock_deadline(env, monkeypatch):
+    import fcntl
+    prepare(env)
+    now = controlled_clock(monkeypatch)
+    flock_attempts = []
+    real_flock = fcntl.flock
+    def observed_flock(fd, operation):
+        if operation & fcntl.LOCK_EX:
+            flock_attempts.append((fd, operation))
+        return real_flock(fd, operation)
+    monkeypatch.setattr(fcntl, 'flock', observed_flock)
+    original = transactions.RetainedStateTransaction.check
+    def checked(transaction):
+        original(transaction)
+        now[0] += 10.0
+    monkeypatch.setattr(transactions.RetainedStateTransaction, 'check', checked)
+    before = inventory(env.home)
+    with pytest.raises(transactions.NativeCommitUncertain) as failure:
+        transactions.get_native(env.state, 'associations.v1', lock_deadline=105.0)
+    assert isinstance(failure.value.primary, TimeoutError)
+    assert inventory(env.home) == before
+    assert flock_attempts == []  # Expiry must refuse BEFORE even an uncontended flock.
