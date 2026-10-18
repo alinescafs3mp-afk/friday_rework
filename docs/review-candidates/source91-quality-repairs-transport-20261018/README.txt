@@ -1,0 +1,7 @@
+Reviewed Source91 transport and process-custody quality repair
+
+This exact Source component is published for analysis outside the canonical patch inventory. It is not installed or connected to product execution. The patch targets the complete Source91 input named in SOURCE-STATUS.json, preserving the original donor comparison for the eventual coherent gate.
+
+The repair covers 17 original files and six topical helpers, with all 136 assigned diagnostic dispositions retained privately. It keeps fixed privacy and uncertain-cleanup boundaries, makes extraction respect original resource custody, and fixes nested STOP_UNCONFIRMED propagation, retained connection/GC lifetimes and instrumented urllib Request storage access. Specific exception reasons remain visible in the source and public decision list; no global baseline or native-policy threshold is changed.
+
+The final exact Source snapshot passed 177 core cases and the original 14 wire cases with retained own child/socket cleanup. Independent review accepted the Source and its final descriptor delta. Earlier harness and product failures are retained and were not relabelled. Focused ratchet health0/0 does not erase the inherited strict-without-baseline54/3 debt. The prior complete Source91 gate remains failed until all final components are composed and the required full gate is run again. No installed/native/live or release result is claimed.
