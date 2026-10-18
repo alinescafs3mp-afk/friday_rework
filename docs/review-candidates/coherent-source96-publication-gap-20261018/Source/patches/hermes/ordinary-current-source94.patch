@@ -1,0 +1,1200 @@
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -316,8 +316,11 @@
+     start_background_bootstrap()
+ 
+     try:
++        if tui_server is not None:
++            tui_server._start_idle_reaper()
+         yield
+     finally:
++        idle_reaper_stopped = tui_server is None or tui_server._stop_idle_reaper()
+         if tui_server is not None:
+             try:
+                 tui_server.clear_tui_message_injector()
+@@ -344,6 +347,8 @@
+         if desktop_owned:
+             _terminate_desktop_managed_gateway()
+         eager_reconcile_thread.join()
++        if not idle_reaper_stopped:
++            raise RuntimeError("idle reaper did not stop within the shutdown join budget")
+ 
+ 
+ def _app_state_default(app: "FastAPI", name: str, factory):
+--- /dev/null
++++ b/tests/hermes_cli/test_web_idle_reaper_lifecycle.py
+@@ -0,0 +1,84 @@
++"""FastAPI owns the native idle reaper only while a user backend serves.
++
++Peripheral native jobs are replaced with finite unit collaborators. The actual
++app lifespan and native idle-reaper thread/start/stop/join remain real. Prepared
++source only; execution belongs to Root on the final composed Source.
++"""
++from __future__ import annotations
++
++import asyncio
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++
++def _prepare_native_lifespan(monkeypatch, administrative):
++    from gateway import code_skew
++    from hermes_cli import config, free_tier_bootstrap, friday_dashboard_owner, web_server
++    from hermes_cli.local_runtime import bootstrap
++    from tui_gateway import methods_groups, server
++
++    async def idle_job(*args):
++        await asyncio.Event().wait()
++
++    async def close_all():
++        return None
++
++    monkeypatch.setattr(friday_dashboard_owner, "startup_identity",
++                        lambda app: object() if administrative else None)
++    monkeypatch.setattr(web_server, "_eager_reconcile_own_session_db", lambda: None)
++    monkeypatch.setattr(web_server, "_warm_gateway_module", lambda: None)
++    monkeypatch.setattr(code_skew, "record_boot_fingerprint", lambda: None)
++    monkeypatch.setattr(server, "install_tui_message_injector", lambda: None)
++    monkeypatch.setattr(server, "clear_tui_message_injector", lambda: None)
++    monkeypatch.setattr(methods_groups, "start_hosted_room_service", lambda: None)
++    monkeypatch.setattr(methods_groups, "stop_hosted_room_service", lambda **kw: True)
++    monkeypatch.setattr(web_server, "is_desktop_owned_backend", lambda: False)
++    monkeypatch.setattr(web_server, "run_reaper", idle_job)
++    monkeypatch.setattr(web_server, "_dashboard_selftest_loop", idle_job)
++    monkeypatch.setattr(web_server, "_auto_archive_ticker_loop", idle_job)
++    monkeypatch.setattr(web_server, "PTY_REGISTRY", SimpleNamespace(close_all=close_all))
++    monkeypatch.setattr(config, "load_config", lambda: {})
++    monkeypatch.setattr(bootstrap, "ensure_local_runtime", lambda config: None)
++    monkeypatch.setattr(bootstrap, "shutdown_local_runtime", lambda: None)
++    monkeypatch.setattr(free_tier_bootstrap, "start_background_bootstrap", lambda: None)
++    return web_server, server
++
++
++@pytest.mark.parametrize("administrative,body_error", [(False, False), (False, True), (True, False)])
++def test_native_app_lifespan_owns_reaper_and_cleans_exception(monkeypatch, administrative, body_error):
++    web_server, server = _prepare_native_lifespan(monkeypatch, administrative)
++    assert server._idle_reaper_thread is None
++    baseline = {id(thread) for thread in threading.enumerate()}
++    seen = []
++
++    async def serve():
++        async with web_server._lifespan(SimpleNamespace(state=SimpleNamespace())):
++            thread = server._idle_reaper_thread
++            if administrative:
++                assert thread is None
++                assert not any(t.name == "hermes-idle-reaper" for t in threading.enumerate())
++            else:
++                assert thread is not None and thread.is_alive()
++                assert sum(t.name == "hermes-idle-reaper" for t in threading.enumerate()) == 1
++                seen.append(thread)
++            if body_error:
++                raise LookupError("finite serving-body error")
++
++    try:
++        if body_error:
++            with pytest.raises(LookupError, match="finite serving-body error"):
++                asyncio.run(serve())
++        else:
++            asyncio.run(serve())
++        assert server._idle_reaper_thread is None
++        assert all(not thread.is_alive() for thread in seen)
++    finally:
++        assert server._stop_idle_reaper()
++        # Existing lifecycle's finite eager/local/hosted startup workers also
++        # remain owned by this test; join rather than ignore any final return.
++        owned = [thread for thread in threading.enumerate() if id(thread) not in baseline]
++        for thread in owned:
++            thread.join(timeout=2.0)
++        assert all(not thread.is_alive() for thread in owned)
+--- a/tests/tui_gateway/test_backend_heartbeat.py
++++ b/tests/tui_gateway/test_backend_heartbeat.py
+@@ -102,19 +102,32 @@
+         def _start():
+             started["n"] += 1
+ 
++        # The test owns heartbeat-start wiring, not principal bootstrap or
++        # orphan maintenance. Real main/reaper start/stop remain unpatched.
++        from hermes_cli.observability import shared_metrics_process
++        from agent import ssl_verify
++
++        monkeypatch.setattr(server, "install_tui_message_injector", lambda: None)
++        monkeypatch.setattr(shared_metrics_process, "begin_process", lambda *args: None)
++        monkeypatch.setattr(ssl_verify, "install_truststore", lambda: True)
++        monkeypatch.setattr(server, "_stdio_is_rpc_channel", False, raising=False)
++        monkeypatch.setattr(entry, "_prepare_stdio_entry", lambda: None)
++        monkeypatch.setattr(entry, "server", server, raising=False)
++        monkeypatch.setattr(server, "_schedule_startup_orphan_sweep", lambda: None)
+         monkeypatch.setattr(server, "_start_backend_heartbeat_refresher", _start)
+         monkeypatch.setattr(entry, "_install_sidecar_publisher", lambda: None)
+         monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: None)
+-        monkeypatch.setattr(entry, "resolve_skin", lambda: "default")
++        monkeypatch.setattr(entry, "resolve_skin", lambda: "default", raising=False)
+         monkeypatch.setattr(entry.server, "_ensure_skin_watcher", lambda: None)
+         monkeypatch.setattr(entry, "_log_exit", lambda reason: None)
+         monkeypatch.setattr(entry, "handle_spurious_eof", lambda *a: False)
+-        monkeypatch.setattr(entry, "write_json", lambda _payload: True)
++        monkeypatch.setattr(entry, "write_json", lambda _payload: True, raising=False)
+         monkeypatch.setattr(entry.sys, "stdin", io.StringIO(""))
+ 
+         monkeypatch.setattr(model_switch_providers, "prewarm_picker_cache_async", lambda: None)
+ 
+         entry.main()
++        assert server._idle_reaper_thread is None
+         assert started["n"] == 1
+ 
+     def test_handle_ws_starts_heartbeat_refresher(self, monkeypatch):
+--- a/tests/tui_gateway/test_entry_inline_handler_error.py
++++ b/tests/tui_gateway/test_entry_inline_handler_error.py
+@@ -22,14 +22,30 @@
+         {"jsonrpc": "2.0", "id": "next", "method": "ping"},
+     ))
+ 
++    from tui_gateway import server
++    from hermes_cli import model_switch_providers
++
++    # This unit owns inline dispatch, not principal bootstrap. The real main
++    # and serving-owned reaper stay intact across the lazy preparation seam.
++    from hermes_cli.observability import shared_metrics_process
++    from agent import ssl_verify
++
++    monkeypatch.setattr(server, "install_tui_message_injector", lambda: None)
++    monkeypatch.setattr(shared_metrics_process, "begin_process", lambda *args: None)
++    monkeypatch.setattr(ssl_verify, "install_truststore", lambda: True)
++    monkeypatch.setattr(server, "_stdio_is_rpc_channel", False, raising=False)
++    monkeypatch.setattr(entry, "_prepare_stdio_entry", lambda: None)
++    monkeypatch.setattr(entry, "server", server, raising=False)
++    monkeypatch.setattr(entry, "_err", server._err, raising=False)
++    monkeypatch.setattr(model_switch_providers, "prewarm_picker_cache_async", lambda: None)
+     monkeypatch.setattr(entry, "_install_sidecar_publisher", lambda: None)
+     monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: None)
+-    monkeypatch.setattr(entry, "resolve_skin", lambda: "default")
++    monkeypatch.setattr(entry, "resolve_skin", lambda: "default", raising=False)
+     monkeypatch.setattr(entry.server, "_start_backend_heartbeat_refresher", lambda: None)
+     monkeypatch.setattr(entry.server, "_schedule_startup_orphan_sweep", lambda: None)
+     monkeypatch.setattr(entry.server, "_ensure_skin_watcher", lambda: None)
+     monkeypatch.setattr(entry, "handle_spurious_eof", lambda *_args: False)
+-    monkeypatch.setattr(entry, "write_json", lambda payload: replies.append(payload) or True)
++    monkeypatch.setattr(entry, "write_json", lambda payload: replies.append(payload) or True, raising=False)
+     monkeypatch.setattr(entry, "_append_crash_log", lambda header, dump=None: breadcrumbs.append(header))
+     monkeypatch.setattr(entry.sys, "stdin", io.StringIO(stdin_text))
+ 
+@@ -38,9 +54,10 @@
+             raise NameError("clipboard backend is unavailable")
+         return {"jsonrpc": "2.0", "id": req["id"], "result": {"ok": True}}
+ 
+-    monkeypatch.setattr(entry, "dispatch", dispatch)
++    monkeypatch.setattr(entry, "dispatch", dispatch, raising=False)
+ 
+     entry.main()
++    assert server._idle_reaper_thread is None
+ 
+     assert replies[1]["id"] == "broken"
+     assert replies[1]["error"]["code"] == -32000
+--- a/tests/tui_gateway/test_entry_picker_prewarm.py
++++ b/tests/tui_gateway/test_entry_picker_prewarm.py
+@@ -36,10 +36,24 @@
+     ``events`` receives ``("write", <event type>)`` for every write_json call
+     and ``("prewarm",)`` when the spy fires, in call order.
+     """
++    from tui_gateway import server
++
++    # Isolate picker wiring at the explicit lazy-bootstrap unit boundary;
++    # keep native main and real reaper ownership, exclude unrelated workers.
++    from hermes_cli.observability import shared_metrics_process
++    from agent import ssl_verify
++
++    monkeypatch.setattr(server, "install_tui_message_injector", lambda: None)
++    monkeypatch.setattr(shared_metrics_process, "begin_process", lambda *args: None)
++    monkeypatch.setattr(ssl_verify, "install_truststore", lambda: True)
++    monkeypatch.setattr(entry, "_prepare_stdio_entry", lambda: None)
++    monkeypatch.setattr(entry, "server", server, raising=False)
++    monkeypatch.setattr(server, "_start_backend_heartbeat_refresher", lambda: None)
++    monkeypatch.setattr(server, "_schedule_startup_orphan_sweep", lambda: None)
+     monkeypatch.setattr(entry, "_install_sidecar_publisher", lambda: None)
+     monkeypatch.setattr(entry.server, "_stdio_is_rpc_channel", False, raising=False)  # main() flips it; restore after
+     monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: None)
+-    monkeypatch.setattr(entry, "resolve_skin", lambda: "default")
++    monkeypatch.setattr(entry, "resolve_skin", lambda: "default", raising=False)
+     monkeypatch.setattr(entry.server, "_ensure_skin_watcher", lambda: None)
+     monkeypatch.setattr(entry, "_log_exit", lambda reason: None)
+     # Genuine EOF, no fd-0 forensics in the test process.
+@@ -50,7 +64,7 @@
+         events.append(("write", params.get("type") or payload.get("method")))
+         return True
+ 
+-    monkeypatch.setattr(entry, "write_json", _write_json)
++    monkeypatch.setattr(entry, "write_json", _write_json, raising=False)
+ 
+     # entry.main() imports the helper lazily from hermes_cli.model_switch,
+     # so the spy must live on that module, not on entry.
+@@ -65,6 +79,7 @@
+     monkeypatch.setattr(entry.sys, "stdin", io.StringIO(""))
+ 
+     entry.main()
++    assert server._idle_reaper_thread is None
+ 
+ 
+ 
+--- /dev/null
++++ b/tests/tui_gateway/test_idle_reaper_lifecycle.py
+@@ -0,0 +1,726 @@
++"""Native idle-reaper ownership, cancellation and serving-boundary regression tests.
++
++These sources have only been prepared, not executed. Root must run through the
++canonical isolated native test runner on its composed final source.
++"""
++from __future__ import annotations
++
++import threading
++import time
++
++import pytest
++
++
++@pytest.fixture
++def gateway():
++    from tui_gateway import server
++
++    # A fresh per-file native runner import must never start the reaper.
++    assert server._idle_reaper_thread is None
++    assert not any(t.name == "hermes-idle-reaper" for t in threading.enumerate())
++    yield server
++    assert server._stop_idle_reaper(), "owned native reaper failed to settle"
++
++
++def test_real_wait_wakes_and_restart_owns_a_new_thread(gateway):
++    assert gateway._REAPER_SCAN_S == 300.0
++    gateway._start_idle_reaper()
++    first = gateway._idle_reaper_thread
++    assert first is not None and first.is_alive()
++    assert first.daemon
++    gateway._start_idle_reaper()
++    assert gateway._idle_reaper_thread is first
++    assert sum(t.name == "hermes-idle-reaper" for t in threading.enumerate()) == 1
++    began = time.monotonic()
++    assert gateway._stop_idle_reaper()
++    assert time.monotonic() - began < 2.0
++    assert not first.is_alive()
++    assert gateway._idle_reaper_thread is None
++    assert gateway._stop_idle_reaper()
++    gateway._start_idle_reaper()
++    second = gateway._idle_reaper_thread
++    assert second is not first and second.is_alive()
++    assert gateway._stop_idle_reaper()
++    assert not second.is_alive()
++
++
++def test_loop_retains_300_second_cadence_and_retries_scan_errors(gateway, monkeypatch):
++    intervals = []
++    scanned = []
++
++    class UnitWait:
++        def wait(self, interval):
++            intervals.append(interval)
++            return len(intervals) == 3
++
++        def is_set(self):
++            return False
++
++    def scan():
++        scanned.append("scan")
++        if len(scanned) == 1:
++            raise RuntimeError("one failed native scan")
++
++    monkeypatch.setattr(gateway, "_reap_idle_sessions", scan)
++    gateway._idle_reaper_loop(UnitWait())
++    assert intervals == [300.0, 300.0, 300.0]
++    assert scanned == ["scan", "scan"]
++
++
++def test_stop_between_wait_and_scan_does_not_begin_another_scan(gateway, monkeypatch):
++    scanned = []
++
++    class UnitWait:
++        def wait(self, interval):
++            assert interval == 300.0
++            return False
++
++        def is_set(self):
++            return True
++
++    monkeypatch.setattr(gateway, "_reap_idle_sessions", lambda: scanned.append(True))
++    gateway._idle_reaper_loop(UnitWait())
++    assert scanned == []
++
++
++def test_concurrent_starts_and_stops_preserve_one_owner(gateway):
++    barrier = threading.Barrier(9)
++    errors = []
++
++    def start():
++        try:
++            barrier.wait(timeout=2.0)
++            gateway._start_idle_reaper()
++        except BaseException as exc:
++            errors.append(exc)
++
++    starters = [threading.Thread(target=start) for _ in range(8)]
++    for thread in starters:
++        thread.start()
++    try:
++        barrier.wait(timeout=2.0)
++    finally:
++        for thread in starters:
++            thread.join(timeout=2.0)
++    assert not errors
++    assert all(not thread.is_alive() for thread in starters)
++    first = gateway._idle_reaper_thread
++    assert first is not None and first.is_alive()
++    assert sum(t.name == "hermes-idle-reaper" for t in threading.enumerate()) == 1
++    stopped = []
++    stoppers = [threading.Thread(target=lambda: stopped.append(gateway._stop_idle_reaper()))
++                for _ in range(8)]
++    for thread in stoppers:
++        thread.start()
++    for thread in stoppers:
++        thread.join(timeout=2.0)
++    assert all(not thread.is_alive() for thread in stoppers)
++    # The stop API conservatively refuses lock contention. Every helper must
++    # return, then one bounded serialized cleanup confirms the captured owner.
++    assert len(stopped) == 8 and all(isinstance(value, bool) for value in stopped)
++    assert gateway._stop_idle_reaper()
++    assert not first.is_alive()
++    assert gateway._idle_reaper_thread is None
++
++
++def test_active_scan_timeout_keeps_ownership_and_refuses_overlap(gateway, monkeypatch):
++    entered, release = threading.Event(), threading.Event()
++    original_loop = gateway._idle_reaper_loop
++
++    def finite_busy_scan(stop_event):
++        entered.set()
++        assert release.wait(2.0), "test-owned scan was not released"
++
++    # Unit seam only: force a finite in-flight callback without shortening the
++    # real native 300-second interval or changing threading globally.
++    monkeypatch.setattr(gateway, "_idle_reaper_loop", finite_busy_scan)
++    gateway._start_idle_reaper()
++    first = gateway._idle_reaper_thread
++    try:
++        assert entered.wait(2.0)
++        assert gateway._stop_idle_reaper(timeout=0.0) is False
++        assert gateway._idle_reaper_thread is first
++        assert gateway._idle_reaper_stop.is_set()
++        with pytest.raises(RuntimeError, match="still stopping"):
++            gateway._start_idle_reaper()
++        assert sum(t.name == "hermes-idle-reaper" for t in threading.enumerate()) == 1
++    finally:
++        release.set()
++        first.join(timeout=2.0)
++    assert not first.is_alive()
++    assert gateway._stop_idle_reaper()
++    monkeypatch.setattr(gateway, "_idle_reaper_loop", original_loop)
++    gateway._start_idle_reaper()
++    assert gateway._idle_reaper_thread is not first
++
++
++def test_self_stop_requests_exit_without_self_join(gateway, monkeypatch):
++    done, start_returned = threading.Event(), threading.Event()
++    outcome = []
++
++    def self_stop(stop_event):
++        assert start_returned.wait(2.0), "completed-start boundary not released"
++        outcome.append(gateway._stop_idle_reaper())
++        outcome.append(stop_event.is_set())
++        done.set()
++
++    monkeypatch.setattr(gateway, "_idle_reaper_loop", self_stop)
++    gateway._start_idle_reaper()
++    thread = gateway._idle_reaper_thread
++    try:
++        start_returned.set()
++        assert done.wait(2.0)
++    finally:
++        start_returned.set()
++        thread.join(timeout=2.0)
++    assert outcome == [False, True]
++    assert not thread.is_alive()
++    assert gateway._stop_idle_reaper()
++
++
++def test_native_stdio_boundary_starts_and_stops_on_eof_and_error(gateway, monkeypatch):
++    from tui_gateway import entry
++
++    monkeypatch.setattr(entry, "_prepare_stdio_entry", lambda: None)
++    monkeypatch.setattr(entry, "server", gateway, raising=False)
++    seen = []
++
++    def serving():
++        thread = gateway._idle_reaper_thread
++        assert thread is not None and thread.is_alive()
++        seen.append(thread)
++
++    monkeypatch.setattr(entry, "_serve_stdio", serving)
++    entry.main()
++    assert len(seen) == 1 and not seen[0].is_alive()
++    assert gateway._idle_reaper_thread is None
++
++    def broken_serving():
++        serving()
++        raise LookupError("finite startup/read-loop error")
++
++    monkeypatch.setattr(entry, "_serve_stdio", broken_serving)
++    with pytest.raises(LookupError, match="finite startup/read-loop error"):
++        entry.main()
++    assert len(seen) == 2 and not seen[1].is_alive()
++    assert gateway._idle_reaper_thread is None
++
++
++def test_shutdown_fallback_wakes_before_flush_and_joins_after(gateway, monkeypatch):
++    observed = []
++    gateway._start_idle_reaper()
++    thread = gateway._idle_reaper_thread
++    stop = gateway._idle_reaper_stop
++    monkeypatch.setattr(gateway, "_sessions", {})
++
++    def flush():
++        assert not stop.is_set()
++        observed.append("flush")
++
++    monkeypatch.setattr(gateway, "_flush_sessions_before_exit", flush)
++    monkeypatch.setattr(gateway, "_release_gateway_wake_owner", lambda: observed.append("wake"))
++    monkeypatch.setattr(gateway, "_stop_turns_before_exit", lambda: observed.append("turns"))
++    gateway._shutdown_sessions()
++    assert observed == ["flush", "wake", "turns"]
++    assert not thread.is_alive()
++    assert gateway._idle_reaper_thread is None
++
++
++def test_old_stop_cannot_clear_a_concurrently_restarted_owner(gateway, monkeypatch):
++    gateway._start_idle_reaper()
++    first = gateway._idle_reaper_thread
++    native_join = first.join
++    joined, release = threading.Event(), threading.Event()
++    results = []
++
++    def hold_after_join(timeout=None):
++        native_join(timeout=timeout)
++        joined.set()
++        assert release.wait(2.0), "test-owned old-stop barrier was not released"
++
++    # The instance seam schedules the precise old-join/new-start race without
++    # patching the global threading implementation or suppressing ownership.
++    monkeypatch.setattr(first, "join", hold_after_join)
++    stopper = threading.Thread(target=lambda: results.append(gateway._stop_idle_reaper()))
++    stopper.start()
++    try:
++        assert joined.wait(2.0)
++        assert not first.is_alive()
++        gateway._start_idle_reaper()
++        second = gateway._idle_reaper_thread
++        assert second is not first and second.is_alive()
++    finally:
++        release.set()
++        stopper.join(timeout=2.0)
++    assert not stopper.is_alive()
++    assert results == [True]
++    assert gateway._idle_reaper_thread is second
++    assert second.is_alive()
++
++
++def test_start_failure_releases_unstarted_owner_for_a_clean_retry(gateway, monkeypatch):
++    from agent import memory_provider
++
++    def rejected_factory(*args, **kwargs):
++        raise RuntimeError("finite native thread-construction refusal")
++
++    with monkeypatch.context() as local:
++        local.setattr(memory_provider, "spawn_context_thread", rejected_factory)
++        with pytest.raises(RuntimeError, match="finite native thread-construction refusal"):
++            gateway._start_idle_reaper()
++    assert gateway._idle_reaper_thread is None
++    assert gateway._idle_reaper_stop is None
++    gateway._start_idle_reaper()
++    assert gateway._idle_reaper_thread.is_alive()
++
++
++def test_loop_calls_native_idle_policy_and_preserves_busy_exemptions(gateway, monkeypatch):
++    now = time.time()
++    old = now - gateway._SESSION_TTL_S - 10.0
++    ready = threading.Event()
++    ready.set()
++
++    def record(**changes):
++        data = {"created_at": old, "last_active": old, "running": False,
++                "transport": gateway._detached_ws_transport, "agent_ready": ready}
++        data.update(changes)
++        return data
++
++    sessions = {"idle": record(), "running": record(running=True),
++                "pending": record(), "delegating": record(),
++                "building": record(agent_ready=threading.Event()),
++                "connected": record(transport=object()),
++                "fresh": record(created_at=now, last_active=now)}
++    observed = []
++    monkeypatch.setattr(gateway, "_sessions", sessions)
++    monkeypatch.setattr(gateway, "_session_pending_kind", lambda sid: "approval" if sid == "pending" else None)
++    monkeypatch.setattr(gateway, "_session_has_active_delegations", lambda sid, session: sid == "delegating")
++    monkeypatch.setattr(gateway, "_flush_dirty_sessions", lambda: observed.append("flush"))
++    monkeypatch.setattr(gateway, "_repair_missing_ws_orphan_reaps", lambda: observed.append("orphans"))
++    monkeypatch.setattr(gateway, "_enforce_session_cap", lambda: observed.append("cap"))
++    monkeypatch.setattr(gateway, "_reclaim_orphaned_leases", lambda: observed.append("leases"))
++    monkeypatch.setattr(gateway, "_sessions_quiescent", lambda: False)
++
++    def close(sid, *, end_reason, predicate):
++        assert end_reason == "idle_timeout"
++        assert predicate(sessions[sid])
++        sessions.pop(sid)
++        observed.append(sid)
++
++    monkeypatch.setattr(gateway, "_close_session_by_id", close)
++
++    class OneUnitTick:
++        waits = 0
++
++        def wait(self, interval):
++            assert interval == 300.0
++            self.waits += 1
++            return self.waits > 1
++
++        def is_set(self):
++            return False
++
++    gateway._idle_reaper_loop(OneUnitTick())
++    assert observed == ["flush", "idle", "orphans", "cap", "leases"]
++    assert set(sessions) == {"running", "pending", "delegating", "building", "connected", "fresh"}
++
++
++def test_native_thread_factory_retains_the_serving_context(gateway, monkeypatch):
++    import contextvars
++
++    marker = contextvars.ContextVar("idle-reaper-unit-context", default="empty")
++    recorded = []
++    entered = threading.Event()
++    original_loop = gateway._idle_reaper_loop
++
++    def observe(stop_event):
++        recorded.append(marker.get())
++        entered.set()
++        original_loop(stop_event)
++
++    monkeypatch.setattr(gateway, "_idle_reaper_loop", observe)
++    token = marker.set("serving-context")
++    try:
++        gateway._start_idle_reaper()
++    finally:
++        marker.reset(token)
++    assert entered.wait(2.0)
++    assert gateway._stop_idle_reaper()
++    assert recorded == ["serving-context"]
++
++
++def test_start_exception_after_real_thread_creation_retains_ownership(gateway, monkeypatch):
++    from agent import memory_provider
++
++    native_spawn = memory_provider.spawn_context_thread
++    entered, release = threading.Event(), threading.Event()
++    captured = []
++
++    def finite_scan(stop_event):
++        entered.set()
++        assert release.wait(2.0), "test-owned interrupted-start scan was not released"
++
++    def start_then_raise(target, **kwargs):
++        thread = native_spawn(target, **kwargs)
++        native_start = thread.start
++
++        def interrupted():
++            native_start()
++            assert entered.wait(2.0)
++            raise RuntimeError("finite failure after native thread creation")
++
++        monkeypatch.setattr(thread, "start", interrupted)
++        captured.append(thread)
++        return thread
++
++    monkeypatch.setattr(gateway, "_idle_reaper_loop", finite_scan)
++    monkeypatch.setattr(memory_provider, "spawn_context_thread", start_then_raise)
++    try:
++        with pytest.raises(RuntimeError, match="finite failure after native thread creation"):
++            gateway._start_idle_reaper()
++        assert gateway._idle_reaper_thread is captured[0]
++        assert gateway._idle_reaper_stop.is_set()
++        assert gateway._stop_idle_reaper(timeout=0.0) is False
++    finally:
++        release.set()
++        for thread in captured:
++            thread.join(timeout=2.0)
++    assert all(not thread.is_alive() for thread in captured)
++    assert gateway._stop_idle_reaper()
++
++
++def test_signal_reentry_preserves_flush_while_reaper_lock_is_held(gateway, monkeypatch):
++    observed = []
++    monkeypatch.setattr(gateway, "_sessions", {})
++    monkeypatch.setattr(gateway, "_flush_sessions_before_exit", lambda: observed.append("flush"))
++    monkeypatch.setattr(gateway, "_release_gateway_wake_owner", lambda: None)
++    monkeypatch.setattr(gateway, "_stop_turns_before_exit", lambda: None)
++    with gateway._idle_reaper_lock:
++        gateway._shutdown_sessions(reaper_timeout=0.0)
++    assert observed == ["flush"]
++
++
++def test_pending_native_start_is_not_falsely_cleared(gateway, monkeypatch):
++    from agent import memory_provider
++
++    class PendingStart:
++        done = False
++
++        def start(self):
++            raise KeyboardInterrupt("native created, _started not set")
++
++        def is_alive(self):
++            return False
++
++        def join(self, timeout=None):
++            if not self.done:
++                raise RuntimeError("cannot join thread before it is started")
++
++    pending = PendingStart()
++    monkeypatch.setattr(memory_provider, "spawn_context_thread", lambda *a, **kw: pending)
++    try:
++        with pytest.raises(KeyboardInterrupt):
++            gateway._start_idle_reaper()
++        assert gateway._idle_reaper_thread is pending
++        assert gateway._stop_idle_reaper(timeout=0.0) is False
++        with pytest.raises(RuntimeError, match="unconfirmed"):
++            gateway._start_idle_reaper()
++        assert gateway._idle_reaper_thread is pending
++    finally:
++        pending.done = True
++    assert gateway._stop_idle_reaper()
++
++
++def test_compute_host_owns_native_reaper_until_eof_cleanup(gateway, monkeypatch):
++    import io
++    from types import SimpleNamespace
++    from tui_gateway import compute_host
++
++    seen = []
++
++    class FiniteHost:
++        _transport = object()
++        _boot_id = "unit-host"
++        _closed = threading.Event()
++
++        def emit(self, frame):
++            return None
++
++        def shutdown(self, **kwargs):
++            seen.append(gateway._idle_reaper_thread)
++            self._closed.set()
++
++    host = FiniteHost()
++    monkeypatch.setenv("HERMES_COMPUTE_HOST_CHILD", "unit-prior-value")
++    monkeypatch.setattr(compute_host, "ComputeHost", lambda **kwargs: host)
++    monkeypatch.setattr(compute_host, "_build_sha", lambda: "unit-build")
++    monkeypatch.setattr(compute_host, "signal", SimpleNamespace(SIGTERM=15, SIGINT=2, signal=lambda *a: None))
++    monkeypatch.setattr(gateway, "register_live_transport", lambda transport: None)
++    monkeypatch.setattr(gateway, "unregister_live_transport", lambda transport: None)
++    compute_host.run_host(stdin=io.BytesIO(b""), stdout=io.StringIO())
++    assert len(seen) == 1 and seen[0] is not None
++    assert not seen[0].is_alive()
++    assert gateway._idle_reaper_thread is None
++
++
++def test_exact_native_pre_started_interval_retains_pending_owner(gateway, monkeypatch):
++    from agent import memory_provider
++
++    native_spawn = memory_provider.spawn_context_thread
++    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
++    captured = []
++
++    def pending_native(target, **kwargs):
++        thread = native_spawn(target, **kwargs)
++        native_inner = thread._bootstrap_inner
++
++        def delayed_inner():
++            entered.set()
++            try:
++                release.wait(2.0)
++            finally:
++                native_inner()
++                finished.set()
++
++        def interrupted_started_wait(timeout=None):
++            assert entered.wait(2.0)
++            raise KeyboardInterrupt("native bootstrap exists before _started")
++
++        # Exact Thread/Event instance seams, never global threading replacement.
++        monkeypatch.setattr(thread, "_bootstrap_inner", delayed_inner)
++        monkeypatch.setattr(thread._started, "wait", interrupted_started_wait)
++        captured.append(thread)
++        return thread
++
++    monkeypatch.setattr(memory_provider, "spawn_context_thread", pending_native)
++    try:
++        with pytest.raises(KeyboardInterrupt):
++            gateway._start_idle_reaper()
++        thread = captured[0]
++        assert entered.is_set() and not thread._started.is_set()
++        assert not thread.is_alive()
++        assert gateway._idle_reaper_thread is thread
++        assert gateway._stop_idle_reaper(timeout=0.0) is False
++        with pytest.raises(RuntimeError, match="unconfirmed"):
++            gateway._start_idle_reaper()
++    finally:
++        release.set()
++        assert finished.wait(2.0)
++        for thread in captured:
++            thread.join(timeout=2.0)
++    assert all(not thread.is_alive() for thread in captured)
++    assert gateway._stop_idle_reaper()
++
++
++@pytest.mark.platforms("posix")
++def test_own_sigterm_reentry_flushes_with_native_reaper_lock_held(gateway, monkeypatch):
++    import os
++    import signal
++    from types import SimpleNamespace
++    from tui_gateway import entry
++
++    class NoHardExitTimer:
++        def __init__(self, *args, **kwargs):
++            self.daemon = True
++
++        def start(self):
++            return None
++
++    observed = []
++    monkeypatch.setattr(entry, "threading", SimpleNamespace(Timer=NoHardExitTimer))
++    monkeypatch.setattr(entry, "_append_crash_log", lambda *args: None)
++    monkeypatch.setattr(gateway, "_sessions", {})
++    monkeypatch.setattr(gateway, "_flush_sessions_before_exit", lambda: observed.append("flush"))
++    monkeypatch.setattr(gateway, "_release_gateway_wake_owner", lambda: None)
++    monkeypatch.setattr(gateway, "_stop_turns_before_exit", lambda: None)
++    prior = signal.signal(signal.SIGTERM, entry._log_signal)
++    try:
++        with gateway._idle_reaper_lock:
++            with pytest.raises(SystemExit):
++                os.kill(os.getpid(), signal.SIGTERM)
++    finally:
++        signal.signal(signal.SIGTERM, prior)
++    assert observed == ["flush"]
++
++
++@pytest.mark.parametrize("input_error", [False, True])
++def test_real_compute_host_eof_and_reader_error_settle_reaper(gateway, monkeypatch, input_error):
++    import io
++    import signal
++    from tui_gateway import compute_host
++    from tools.environments import base
++
++    class FiniteInput:
++        def __iter__(self):
++            if input_error:
++                raise OSError("finite control input failure")
++            return iter(())
++
++    # Only peripheral process-kill/build discovery are replaced; the actual host,
++    # executor, reader, reaper, close and transport lifecycle all remain real.
++    monkeypatch.setenv("HERMES_COMPUTE_HOST_HEARTBEAT_SECS", "0")
++    monkeypatch.setenv("HERMES_COMPUTE_HOST_CHILD", "unit-prior-value")
++    monkeypatch.setattr(compute_host, "_build_sha", lambda: "unit-build")
++    monkeypatch.setattr(base, "kill_live_foreground_processes", lambda: None)
++    captured = []
++    native_host = compute_host.ComputeHost
++
++    def make_host(**kwargs):
++        host = native_host(**kwargs)
++        captured.append(host)
++        return host
++
++    monkeypatch.setattr(compute_host, "ComputeHost", make_host)
++    # Surface reader failures synchronously to run_host's actual main loop,
++    # without accepting an unhandled-thread warning as a test oracle.
++    native_hook = threading.excepthook
++    failures = []
++
++    def record_failure(args):
++        if args.thread.name == "compute-host-control-reader":
++            failures.append(args.exc_value)
++        else:
++            native_hook(args)
++
++    monkeypatch.setattr(threading, "excepthook", record_failure)
++    prior = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
++    baseline = {id(t) for t in threading.enumerate()}
++    try:
++        compute_host.run_host(stdin=FiniteInput(), stdout=io.StringIO())
++    finally:
++        for sig, handler in prior.items():
++            signal.signal(sig, handler)
++        owned = [t for t in threading.enumerate() if id(t) not in baseline]
++        for thread in owned:
++            thread.join(timeout=2.0)
++        assert all(not t.is_alive() for t in owned)
++    assert captured[0]._closed.is_set()
++    assert gateway._idle_reaper_thread is None
++    assert len(failures) == int(input_error)
++    if input_error:
++        assert isinstance(failures[0], OSError)
++
++
++def test_real_compute_host_close_stops_reaper_before_hard_exit(gateway, monkeypatch):
++    import io
++    from tui_gateway import compute_host
++    from tools.environments import base
++
++    monkeypatch.setattr(base, "kill_live_foreground_processes", lambda: None)
++    host = compute_host.ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
++    gateway._start_idle_reaper()
++    owner = gateway._idle_reaper_thread
++    try:
++        # This is the real handler immediately preceding run_host's os._exit.
++        host.handle_frame({"type": "shutdown", "request_id": "finite-close"})
++        assert host._closed.is_set()
++        assert not owner.is_alive()
++        assert gateway._idle_reaper_thread is None
++    finally:
++        host.close()
++        assert gateway._stop_idle_reaper()
++
++
++def test_real_compute_host_shutdown_finalization_error_still_cancels_reaper(gateway, monkeypatch):
++    import io
++    from tui_gateway import compute_host
++    from tools.environments import base
++
++    monkeypatch.setattr(base, "kill_live_foreground_processes", lambda: None)
++    host = compute_host.ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
++    gateway._start_idle_reaper()
++    owner = gateway._idle_reaper_thread
++
++    def fail_flush(**kwargs):
++        raise OSError("finite transcript failure")
++
++    monkeypatch.setattr(host, "flush_all_sessions", fail_flush)
++    try:
++        with pytest.raises(OSError, match="finite transcript failure"):
++            host.shutdown(reason="test-error", wait=0.0)
++        assert not owner.is_alive()
++        assert gateway._idle_reaper_thread is None
++    finally:
++        host.close()
++        assert gateway._stop_idle_reaper()
++
++
++def test_stop_lock_contention_reports_unconfirmed_without_dropping_owner(gateway):
++    gateway._start_idle_reaper()
++    thread = gateway._idle_reaper_thread
++    stop = gateway._idle_reaper_stop
++    try:
++        with gateway._idle_reaper_lock:
++            assert gateway._stop_idle_reaper(timeout=0.0) is False
++            assert gateway._idle_reaper_thread is thread
++            assert not stop.is_set()
++            assert thread.is_alive()
++    finally:
++        assert gateway._stop_idle_reaper()
++    assert not thread.is_alive()
++    assert gateway._idle_reaper_thread is None
++
++
++@pytest.mark.parametrize("close_host", [False, True])
++def test_ordinary_stop_waits_for_brief_native_mutex_contention(gateway, monkeypatch, close_host):
++    import io
++    from tui_gateway import compute_host
++    from tools.environments import base
++
++    monkeypatch.setattr(base, "kill_live_foreground_processes", lambda: None)
++    host = compute_host.ComputeHost(stdout=io.StringIO(), heartbeat_secs=0) if close_host else None
++    gateway._start_idle_reaper()
++    owner = gateway._idle_reaper_thread
++    native_lock = gateway._idle_reaper_lock
++    attempts = [threading.Event() for _ in range(2 if close_host else 1)]
++    results, failures = [], []
++
++    class ObservedNativeLock:
++        def acquire(self, blocking=True, timeout=-1):
++            index = int(threading.current_thread().name.rsplit("-", 1)[1])
++            if not blocking:
++                # The legacy immediate-refusal branch must actually observe
++                # the held native mutex before the parent releases it.
++                acquired = native_lock.acquire(False)
++                attempts[index].set()
++                return acquired
++            attempts[index].set()
++            return native_lock.acquire(blocking, timeout)
++
++        def release(self):
++            native_lock.release()
++
++    def close(index):
++        try:
++            results.append(host.close() if close_host else gateway._stop_idle_reaper())
++        except BaseException as exc:
++            failures.append(exc)
++
++    # Only this exact mutex's observation seam changes. Both close paths, the
++    # real lock, real native owner and every thread/join remain authentic.
++    workers = [threading.Thread(target=close, args=(i,), name=f"finite-close-{i}")
++               for i in range(len(attempts))]
++    try:
++        with native_lock:
++            monkeypatch.setattr(gateway, "_idle_reaper_lock", ObservedNativeLock())
++            for worker in workers:
++                worker.start()
++            assert all(event.wait(2.0) for event in attempts)
++        for worker in workers:
++            worker.join(timeout=2.0)
++        assert all(not worker.is_alive() for worker in workers)
++        assert not failures
++        assert results == ([None, None] if close_host else [True])
++        assert not owner.is_alive()
++        assert gateway._idle_reaper_thread is None
++    finally:
++        # Restore the actual mutex before serialized fallback cleanup; never
++        # treat a proxy or a surviving test helper as proof of native cleanup.
++        monkeypatch.setattr(gateway, "_idle_reaper_lock", native_lock)
++        for worker in workers:
++            if worker.ident is not None:
++                worker.join(timeout=2.0)
++        if host is not None:
++            host.close()
++        assert gateway._stop_idle_reaper()
++        assert all(not worker.is_alive() for worker in workers)
+--- a/tui_gateway/compute_host.py
++++ b/tui_gateway/compute_host.py
+@@ -107,6 +107,11 @@
+         with contextlib.suppress(Exception):
+             from tools.environments.base import kill_live_foreground_processes
+             kill_live_foreground_processes()
++        # Explicit shutdown and the orphan guard hard-exit next, bypassing atexit.
++        # Settle this process's real maintenance owner on every close path.
++        from tui_gateway import server
++        if not server._stop_idle_reaper():
++            raise RuntimeError("idle reaper did not stop within the shutdown join budget")
+ 
+     def shutdown(self, *, reason: str = "shutdown", wait: float = 10.0) -> None:
+         """Drain in-flight turns, then finalize every session.
+@@ -128,8 +133,10 @@
+             time.sleep(min(0.05, remaining))
+         with self._turn_futures_lock:
+             live_sids = {sid for f, sid in self._turn_futures.items() if sid and not f.done()}
+-        self.flush_all_sessions(reason=reason, skip_sids=live_sids)
+-        self.close()
++        try:
++            self.flush_all_sessions(reason=reason, skip_sids=live_sids)
++        finally:
++            self.close()
+ 
+     def flush_all_sessions(
+         self, *, reason: str = "shutdown", skip_sids: Collection[str] | None = None) -> None:
+@@ -586,14 +593,19 @@
+             if host._closed.is_set():
+                 break
+     reader = threading.Thread(target=_reader, name="compute-host-control-reader", daemon=True)
+-    reader.start()
+     try:
++        server._start_idle_reaper()
++        reader.start()
+         while not host._closed.wait(0.2):
+             if not reader.is_alive():
+                 break
+     finally:
+-        server.unregister_live_transport(host._transport)
+-        host.shutdown(reason="stdin_closed", wait=2.0)
++        try:
++            server.unregister_live_transport(host._transport)
++            host.shutdown(reason="stdin_closed", wait=2.0)
++        finally:
++            if not server._stop_idle_reaper():
++                raise RuntimeError("idle reaper did not stop within the shutdown join budget")
+ 
+ 
+ def main(argv: list[str] | None = None) -> int:
+--- a/tui_gateway/entry.py
++++ b/tui_gateway/entry.py
+@@ -139,7 +139,7 @@
+     # the GIL/_stdout_lock; finalize explicitly so unpersisted messages reach state.db first.
+     with suppress(Exception):
+         from tui_gateway.server import _shutdown_sessions
+-        _shutdown_sessions()
++        _shutdown_sessions(reaper_timeout=0.0)
+     # Unwind the main thread so atexit + finalisers run; the daemon timer is the safety net.
+     sys.exit(0)
+ 
+@@ -286,6 +286,15 @@
+ 
+ def main():
+     _prepare_stdio_entry()
++    try:
++        server._start_idle_reaper()
++        _serve_stdio()
++    finally:
++        if not server._stop_idle_reaper():
++            raise RuntimeError("idle reaper did not stop within the shutdown join budget")
++
++
++def _serve_stdio():
+     # stdout is this process's JSON-RPC client channel: peer-less global broadcasts belong on it.
+     server._stdio_is_rpc_channel = True
+     try:
+--- /dev/null
++++ b/tui_gateway/idle_reaper_lifecycle.py
+@@ -0,0 +1,101 @@
++"""Serving-owned idle reaper; helpers bind to the facade's session state.
++
++Importing this module starts no work. Native stdio, Web and compute-host owners
++explicitly start the ContextVar-preserving thread and confirm bounded cleanup.
++"""
++from __future__ import annotations
++
++import contextlib
++import threading
++
++from .method_ctx import bind_module
++
++
++def _shutdown_sessions(*, reaper_timeout: float = 1.0) -> None:
++    # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
++    for step in (_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit):
++        with contextlib.suppress(Exception):
++            step()
++    with _sessions_lock:
++        sids = list(_sessions)
++    try:
++        for sid in sids:
++            _close_session_by_id(sid, end_reason="tui_shutdown")
++    finally:
++        if not _stop_idle_reaper(timeout=reaper_timeout):
++            logger.error("idle reaper did not stop within the shutdown join budget")
++
++def _idle_reaper_loop(stop_event: threading.Event) -> None:
++    # Keep the native scan cadence; an exit request wakes the wait immediately.
++    while not stop_event.wait(_REAPER_SCAN_S):
++        if stop_event.is_set():
++            return
++        with contextlib.suppress(Exception):
++            _reap_idle_sessions()
++
++def _start_idle_reaper() -> None:
++    """Start one process-wide reaper from the serving lifecycle, never on import."""
++    global _idle_reaper_thread, _idle_reaper_stop, _idle_reaper_start_complete
++    with _idle_reaper_lock:
++        if _idle_reaper_thread is not None and not _idle_reaper_start_complete:
++            raise RuntimeError("idle reaper start outcome is unconfirmed")
++        if _idle_reaper_thread is not None and _idle_reaper_thread.is_alive():
++            if _idle_reaper_stop.is_set():
++                raise RuntimeError("idle reaper is still stopping")
++            return
++        stop_event = threading.Event()
++        from agent.memory_provider import spawn_context_thread
++        thread = spawn_context_thread(
++            _idle_reaper_loop, name="hermes-idle-reaper", args=(stop_event,))
++        _idle_reaper_stop = stop_event
++        _idle_reaper_thread = thread
++        _idle_reaper_start_complete = False
++        try:
++            thread.start()
++            _idle_reaper_start_complete = True
++        except BaseException:
++            # A start interrupted after creating the OS thread must not leave
++            # that thread sleeping forever or discard a live owner's handle.
++            stop_event.set()
++            # False is_alive cannot distinguish an unstarted refusal from an
++            # OS thread not yet past _started. Keep the sole uncertain owner.
++            raise
++
++def _stop_idle_reaper(timeout: float = 1.0) -> bool:
++    """Bounded cleanup, including signal reentry and uncertain native starts."""
++    global _idle_reaper_thread, _idle_reaper_stop, _idle_reaper_start_complete
++    # Ordinary concurrent closes may briefly share this mutex. Account for
++    # both mutex phases and the join under one budget; the signal caller uses
++    # zero after its durable flush so reentry cannot wait on its own lock.
++    deadline = time.monotonic() + max(0.0, timeout)
++    if not _idle_reaper_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
++        return False
++    try:
++        thread = _idle_reaper_thread
++        if thread is None:
++            return True
++        _idle_reaper_stop.set()
++    finally:
++        _idle_reaper_lock.release()
++    if thread is threading.current_thread():
++        return False
++    try:
++        thread.join(timeout=max(0.0, deadline - time.monotonic()))
++    except RuntimeError:
++        return False  # Pending _started outcome is unconfirmed, not completed.
++    if thread.is_alive():
++        return False
++    if not _idle_reaper_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
++        return False
++    try:
++        if _idle_reaper_thread is thread:
++            _idle_reaper_thread = _idle_reaper_stop = None
++            _idle_reaper_start_complete = False
++    finally:
++        _idle_reaper_lock.release()
++    return True
++
++
++def register(server) -> None:
++    """Publish helpers against the existing facade globals and patch seams."""
++    bind_module(globals(), server)
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -395,15 +395,6 @@
+     return is_truthy_value(_display_cfg().get("interim_assistant_messages", True))
+ 
+ 
+-def _shutdown_sessions() -> None:
+-    # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
+-    for step in (_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit):
+-        with contextlib.suppress(Exception):
+-            step()
+-    with _sessions_lock:
+-        sids = list(_sessions)
+-    for sid in sids:
+-        _close_session_by_id(sid, end_reason="tui_shutdown")
+ 
+ 
+ # Session reaping / flushing knobs (session_reaper.py). TTL is the last-resort net for disconnect paths that
+@@ -417,18 +408,22 @@
+ _INCREMENTAL_FLUSH_INTERVAL_S = max(0.0, env_float("HERMES_TUI_SESSION_FLUSH_INTERVAL_S", _REAPER_SCAN_S))
+ 
+ 
+-def _start_idle_reaper() -> None:
+-    def _loop():
+-        while True:
+-            time.sleep(_REAPER_SCAN_S)
+-            with contextlib.suppress(Exception):
+-                _reap_idle_sessions()
+-    from agent.memory_provider import spawn_context_thread
+-    spawn_context_thread(_loop, name="hermes-idle-reaper").start()
+-
++_idle_reaper_lock = threading.Lock()
++_idle_reaper_thread: threading.Thread | None = None
++_idle_reaper_stop: threading.Event | None = None
++_idle_reaper_start_complete = False
++
++
++
++
++
++
++
++
++from tui_gateway import idle_reaper_lifecycle as _idle_reaper_lifecycle
++_idle_reaper_lifecycle.register(sys.modules[__name__])
+ 
+ atexit.register(_shutdown_sessions)
+-_start_idle_reaper()
+ 
+ 
+ # ── Plumbing ──────────────────────────────────────────────────────────
