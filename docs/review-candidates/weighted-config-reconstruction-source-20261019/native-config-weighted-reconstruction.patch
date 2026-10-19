@@ -1,0 +1,270 @@
+--- a/hermes_cli/config_effective.py
++++ b/hermes_cli/config_effective.py
+@@ -15,7 +15,10 @@
+ from __future__ import annotations
+ 
+ import copy
+-from functools import lru_cache
++import marshal
++from collections import OrderedDict, namedtuple
++from functools import wraps
++from threading import RLock
+ from pathlib import Path
+ from typing import Any, Dict, Optional, Tuple
+ 
+@@ -44,9 +47,14 @@
+ 
+     def expand(value):
+         if isinstance(value, str):
+-            return _config._expand_env_vars(value)
++            # Literal built-in strings cannot match the ${...} expansion regex.
++            # Subclasses retain the original regex conversion behavior.
++            return (value if type(value) is str and "${" not in value
++                    else _config._expand_env_vars(value))
+         if isinstance(value, dict):
+-            return {copy.deepcopy(key, memo): expand(child)
++            # deepcopy returns exact str keys unchanged; retain its behavior for
++            # tuples and other opaque keys, sharing the same isolation memo.
++            return {(key if type(key) is str else copy.deepcopy(key, memo)): expand(child)
+                     for key, child in value.items()}
+         if isinstance(value, list):
+             return [expand(child) for child in value]
+@@ -55,8 +63,11 @@
+     return expand(raw)
+ 
+ 
+-def _effective(raw: Dict[str, Any], *, isolate_raw: bool = False) -> Dict[str, Any]:
+-    expanded = (_clone_expand_readonly_raw(raw) if isolate_raw
++def _effective(raw: Dict[str, Any], *, isolate_raw: bool = False,
++               reconstruction=None) -> Dict[str, Any]:
++    expanded = (_reconstruct_expand_readonly_raw(reconstruction)
++                if isolate_raw and reconstruction is not None
++                else _clone_expand_readonly_raw(raw) if isolate_raw
+                 else _config._expand_env_vars(raw))
+     merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {})
+     return _config._normalize_root_model_keys(merged if isinstance(merged, dict) else {})
+@@ -136,10 +147,13 @@
+ 
+ 
+ 
+-# Bound retained source bytes to at most four MiB (plus parsed mappings). Larger
+-# files keep the same uncached reader. Never retain an effective/env-expanded
+-# result: every caller receives its own raw mapping before the normal pipeline.
+-_READONLY_RAW_CACHE_MAX_BYTES = 1024 * 1024
++# Weighted raw LRU: at most four MiB TOTAL source bytes and four entries, plus
++# their parsed raw mappings and separately bounded reconstruction plans. A single
++# document up to four MiB may now be retained; this changes the previous one-MiB
++# per-entry admission but does not increase its four-MiB total raw-byte bound.
++# Larger sources remain uncached. Never retain an env-expanded/effective result.
++_READONLY_RAW_CACHE_MAX_BYTES = 4 * 1024 * 1024
++_READONLY_RAW_CACHE_MAX_ENTRIES = 4
+ 
+ 
+ def _parse_readonly_user_raw(source: bytes, *, preserve_bom: bool = False):
+@@ -148,16 +162,183 @@
+     return fast_safe_load(source.decode("utf-8" if preserve_bom else "utf-8-sig"))
+ 
+ 
+-@lru_cache(maxsize=4)
++# The optional internal encoding contains only already-parsed UNEXPANDED raw
++# builtins. Per retained entry: at most one MiB of encoding, 4,096 expansion
++# paths, and 65,536 path components. The four-entry raw LRU bounds all of these
++# independently of its changed, weighted source-byte admission.
++_READONLY_RECONSTRUCTION_MAX_BYTES = 1024 * 1024
++_READONLY_RECONSTRUCTION_MAX_NODES = 65536
++_READONLY_RECONSTRUCTION_MAX_DEPTH = 64
++_READONLY_RECONSTRUCTION_MAX_PATHS = 4096
++_READONLY_RECONSTRUCTION_MAX_PATH_PARTS = 65536
++
++
++def _compile_readonly_raw_reconstruction(raw):
++    """Bounded encoding of plain raw trees; opaque/subclass/cyclic graphs fall back.
++
++    Version 2 deliberately has no mutable-container references: repeated YAML
++    dict/list aliases reconstruct independently, as the existing expander does.
++    No tuples, sets, dates, bytes, subclasses, or non-string keys enter this
++    path: their original deepcopy/alias behavior stays with the fallback.
++    Count repeated occurrences, not only unique objects, to bound alias growth.
++    """
++    if type(raw) is not dict:
++        return None
++    paths = []
++    active = set()
++    nodes = estimated_bytes = path_parts = 0
++
++    def visit(value, path):
++        nonlocal nodes, estimated_bytes, path_parts
++        nodes += 1
++        estimated_bytes += 16
++        if (nodes > _READONLY_RECONSTRUCTION_MAX_NODES
++                or len(path) > _READONLY_RECONSTRUCTION_MAX_DEPTH
++                or estimated_bytes > _READONLY_RECONSTRUCTION_MAX_BYTES):
++            return False
++        kind = type(value)
++        if kind is str:
++            estimated_bytes += 4 * len(value)
++            if "${" in value:
++                paths.append(path)
++                path_parts += len(path)
++                if (len(paths) > _READONLY_RECONSTRUCTION_MAX_PATHS
++                        or path_parts > _READONLY_RECONSTRUCTION_MAX_PATH_PARTS):
++                    return False
++        elif kind is int:
++            estimated_bytes += 2 * ((value.bit_length() + 7) // 8)
++        elif kind is float:
++            if value != value:  # deepcopy preserves NaN identity; marshal would not.
++                return False
++        elif value is None or kind is bool:
++            pass
++        elif kind is dict or kind is list:
++            identity = id(value)
++            if identity in active:
++                return False
++            active.add(identity)
++            try:
++                if kind is dict:
++                    for key, child in value.items():
++                        if type(key) is not str:
++                            return False
++                        nodes += 1
++                        estimated_bytes += 16 + 4 * len(key)
++                        if not visit(child, path + (key,)):
++                            return False
++                else:
++                    for index, child in enumerate(value):
++                        if not visit(child, path + (index,)):
++                            return False
++            finally:
++                active.remove(identity)
++        else:
++            return False
++        return estimated_bytes <= _READONLY_RECONSTRUCTION_MAX_BYTES
++
++    if not visit(raw, ()):
++        return None
++    # This is our own bounded encoding of validated parser output. External
++    # YAML bytes never reach marshal.loads, and parsing/errors remain original.
++    try:
++        encoded = marshal.dumps(raw, 2)
++    except (ValueError, OverflowError, RecursionError):
++        return None
++    if len(encoded) > _READONLY_RECONSTRUCTION_MAX_BYTES:
++        return None
++    return encoded, tuple(paths)
++
++
++def _reconstruct_expand_readonly_raw(reconstruction):
++    """Fresh containers, followed by live expansion at every raw reference path."""
++    encoded, paths = reconstruction
++    expanded = marshal.loads(encoded)
++    for path in paths:
++        parent = expanded
++        for part in path[:-1]:
++            parent = parent[part]
++        key = path[-1]
++        parent[key] = _config._expand_env_vars(parent[key])
++    return expanded
++
++
++def _weighted_readonly_raw_cache(parse):
++    """Internal byte-keyed LRU; source bytes/count bounded, no authorization state.
++
++    Parse failures are not retained. The lock protects cache accounting only;
++    parsing/plan construction remains outside it, like functools.lru_cache.
++    Concurrent misses may parse twice, but only one value per exact key is kept.
++    """
++    entries = OrderedDict()
++    lock = RLock()
++    retained_bytes = hits = misses = 0
++    cache_info_type = namedtuple("CacheInfo", "hits misses maxsize currsize")
++
++    @wraps(parse)
++    def cached(source: bytes, *, preserve_bom: bool = False):
++        nonlocal retained_bytes, hits, misses
++        key = source, preserve_bom
++        with lock:
++            try:
++                value = entries.pop(key)
++            except KeyError:
++                misses += 1
++            else:
++                entries[key] = value
++                hits += 1
++                return value
++        value = parse(source, preserve_bom=preserve_bom)
++        if len(source) <= _READONLY_RAW_CACHE_MAX_BYTES:
++            with lock:
++                # Another thread may have populated the same key while parsing.
++                if key not in entries:
++                    while entries and (
++                            len(entries) >= _READONLY_RAW_CACHE_MAX_ENTRIES
++                            or retained_bytes + len(source) > _READONLY_RAW_CACHE_MAX_BYTES):
++                        old_key, _ = entries.popitem(last=False)
++                        retained_bytes -= len(old_key[0])
++                    entries[key] = value
++                    retained_bytes += len(source)
++        return value
++
++    def cache_clear():
++        nonlocal retained_bytes, hits, misses
++        with lock:
++            entries.clear()
++            retained_bytes = hits = misses = 0
++
++    def cache_info():
++        with lock:
++            return cache_info_type(hits, misses, _READONLY_RAW_CACHE_MAX_ENTRIES, len(entries))
++
++    def cache_raw_bytes():
++        with lock:
++            return retained_bytes
++
++    cached.cache_clear = cache_clear
++    cached.cache_info = cache_info
++    cached.cache_parameters = lambda: {"maxsize": _READONLY_RAW_CACHE_MAX_ENTRIES, "typed": False}
++    cached.cache_raw_bytes = cache_raw_bytes
++    return cached
++
++
++@_weighted_readonly_raw_cache
+ def _cached_readonly_user_raw(source: bytes, *, preserve_bom: bool = False):
+-    return _parse_readonly_user_raw(source, preserve_bom=preserve_bom)
++    raw = _parse_readonly_user_raw(source, preserve_bom=preserve_bom)
++    return raw, _compile_readonly_raw_reconstruction(raw)
++
++
++def _readonly_user_raw_entry(source: bytes, *, preserve_bom: bool = False):
++    if len(source) > _READONLY_RAW_CACHE_MAX_BYTES:
++        # Large, unretained documents keep the exact original parse/clone path.
++        return _parse_readonly_user_raw(source, preserve_bom=preserve_bom), None
++    # Keep the common no-BOM case on one cache key for both native readers.
++    return (_cached_readonly_user_raw(source, preserve_bom=True) if preserve_bom
++            else _cached_readonly_user_raw(source))
+ 
+ 
+ def _readonly_user_raw(source: bytes, *, preserve_bom: bool = False):
+-    parse = (_cached_readonly_user_raw if len(source) <= _READONLY_RAW_CACHE_MAX_BYTES
+-             else _parse_readonly_user_raw)
+-    # Keep the common no-BOM case on one cache key for both native readers.
+-    return parse(source, preserve_bom=True) if preserve_bom else parse(source)
++    return _readonly_user_raw_entry(source, preserve_bom=preserve_bom)[0]
+ 
+ 
+ def _clone_user_config_source_text(document: str):
+@@ -186,13 +367,13 @@
+         # Path/mtime signatures cannot authorize a policy read or prove bytes.
+         with open(config_path, "rb") as stream:
+             source = stream.read()
+-        raw = _readonly_user_raw(source)
++        raw, reconstruction = _readonly_user_raw_entry(source)
+     except FileNotFoundError:
+         if not allow_empty:
+             raise
+-        raw = {}
++        raw, reconstruction = {}, None
+     if raw is None and allow_empty:
+         raw = {}
+     if not isinstance(raw, dict):
+         raise ValueError("effective_config_mapping_required")
+-    return _effective(raw, isolate_raw=True)
++    return _effective(raw, isolate_raw=True, reconstruction=reconstruction)
