@@ -1,0 +1,187 @@
+--- a/current_fourbody_parity.py
++++ b/current_fourbody_parity.py
+@@ -14,6 +14,7 @@
+ import os
+ from pathlib import Path
+ import resource
++import signal
+ import stat
+ import sys
+ import time
+@@ -40,6 +41,15 @@
+ 
+ class Refusal(Exception):
+     """Only constant error codes cross the privacy boundary."""
++
++class SlowProviderCall(Refusal):
++    """One consumed uncertain request: owner decision required, never resend."""
++
++class TransportStopUnconfirmed(Refusal):
++    """Transport or native cleanup must not be relabelled as an ordinary slow call."""
++
++def provider_slow_alarm(_signum, _frame):
++    raise SlowProviderCall('OWNER_SLOW_DECISION_REQUIRED_NO_RESEND')
+ 
+ def need(value, code):
+     if not value:
+@@ -381,23 +391,69 @@
+     url = urlsplit(b['admission']['endpoint'])
+     need(url.scheme in ('http','https') and url.path == '/v1/chat/completions' and not url.query and not url.fragment and url.username is None, 'ENDPOINT_SHAPE')
+     ipaddress.ip_address(url.hostname)
+-    timeout = min(b['admission']['caps']['request_timeout_seconds'], clock(b, 2))
++    # This is a smaller per-call ceiling inside the ORIGINAL admission clocks.
++    # The absolute one-shot alarm covers aggregate connect/send/header/body wait;
++    # the socket timeout alone would restart on each blocking operation.
++    timeout = min(b['admission']['caps']['request_timeout_seconds'], 10.0, clock(b, 2))
+     connection = (http.client.HTTPSConnection if url.scheme == 'https' else http.client.HTTPConnection)(url.hostname, url.port, timeout=timeout)
+-    try:
++    response = None; handler_set = False; cleanup_failed = False
++    try:
++        need(signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0), 'PREEXISTING_NETWORK_TIMER_REFUSED')
++        old_handler = signal.signal(signal.SIGALRM, provider_slow_alarm)
++        handler_set = True
++        # Armed only for the actual network call, once; never renewed per stage.
++        signal.setitimer(signal.ITIMER_REAL, timeout)
+         # http.client never retries or follows redirects; proxies are not used.
+         connection.request('POST', url.path, body=body_bytes, headers={'Authorization': 'Bearer ' + secret, 'Content-Type':'application/json'})
+         response = connection.getresponse()
+         need(response.status == 200, 'PROVIDER_STATUS_REFUSED')
+         raw = response.read(b['admission']['caps']['response_bytes'] + 1)
+         need(len(raw) <= b['admission']['caps']['response_bytes'], 'PROVIDER_RESPONSE_OVERSIZE')
+-        obj = decode(raw)
+-        usage = obj['usage']
+-        prompt, completion = usage['prompt_tokens'], usage['completion_tokens']
+-        need(type(prompt) is int and prompt > 0 and type(completion) is int and 0 <= completion <= 1, 'PROVIDER_USAGE_INVALID')
+-        need(type(obj['choices']) is list and len(obj['choices']) == 1, 'PROVIDER_CHOICES_INVALID')
+-        return prompt, completion
+-    finally:
+-        connection.close()
++    except TimeoutError:
++        raise SlowProviderCall('OWNER_SLOW_DECISION_REQUIRED_NO_RESEND') from None
++    finally:
++        # Every owned cleanup is attempted once, even if an earlier one failed.
++        # No cleanup exception text, response content or credential is emitted.
++        if handler_set:
++            try: signal.setitimer(signal.ITIMER_REAL, 0)
++            except BaseException: cleanup_failed = True
++            try: signal.signal(signal.SIGALRM, old_handler)
++            except BaseException: cleanup_failed = True
++        if response is not None:
++            try: response.close()
++            except BaseException: cleanup_failed = True
++        try: connection.close()
++        except BaseException: cleanup_failed = True
++        if cleanup_failed:
++            raise TransportStopUnconfirmed('STOP_UNCONFIRMED') from None
++    # Network alarm is already disarmed and both transport owners are closed.
++    obj = decode(raw)
++    usage = obj['usage']
++    prompt, completion = usage['prompt_tokens'], usage['completion_tokens']
++    need(type(prompt) is int and prompt > 0 and type(completion) is int and 0 <= completion <= 1, 'PROVIDER_USAGE_INVALID')
++    need(type(obj['choices']) is list and len(obj['choices']) == 1, 'PROVIDER_CHOICES_INVALID')
++    return prompt, completion
++
++def inner_outcome(stdout, observation):
++    # A safe slow result is usable only AFTER exact native namespace exit proof.
++    if not (type(observation) is dict and observation.get('namespace_init_exit_verified') is True and observation.get('returncode') == 0 and observation.get('reaped') is True and observation.get('timeout') is False):
++        raise TransportStopUnconfirmed('STOP_UNCONFIRMED')
++    result = decode(stdout)
++    need(type(result) is dict and result.get('schema') == 'current-fourbody-inner.v1' and type(result.get('cases')) is list, 'INNER_RESULT_INVALID')
++    rows = result['cases']
++    if set(result) == {'schema','cases'}:
++        need(len(rows) == 4, 'INNER_RESULT_INVALID')
++        return 'PASS', rows
++    need(set(result) == {'schema','status','safe_event','cases'} and result['status'] == 'OWNER_SLOW_DECISION_REQUIRED_NO_RESEND' and result['safe_event'] == 'SLOW_PROVIDER_CALL' and 1 <= len(rows) <= 4, 'INNER_SLOW_RESULT_INVALID')
++    for index, row in enumerate(rows):
++        name, digest_body, size = CASES[index]
++        need(type(row) is dict and set(row) == {'case','request_sha256','request_bytes','max_tokens','tools_absent','local_prompt_tokens','provider_prompt_tokens','provider_completion_tokens','matched','request_attempts'}, 'INNER_SLOW_CASE_INVALID')
++        need(row['case'] == name and row['request_sha256'] == digest_body and row['request_bytes'] == size and row['max_tokens'] == 1 and row['tools_absent'] is True and type(row['local_prompt_tokens']) is int and row['local_prompt_tokens'] > 0 and type(row['request_attempts']) is int and row['request_attempts'] == 1, 'INNER_SLOW_CASE_INVALID')
++        if index == len(rows) - 1:
++            need(row['provider_prompt_tokens'] is None and row['provider_completion_tokens'] is None and row['matched'] is None, 'INNER_SLOW_UNCERTAINTY_REQUIRED')
++        else:
++            need(type(row['provider_prompt_tokens']) is int and row['provider_prompt_tokens'] == row['local_prompt_tokens'] and type(row['provider_completion_tokens']) is int and 0 <= row['provider_completion_tokens'] <= 1 and row['matched'] is True, 'INNER_SLOW_PRIOR_PARITY_REQUIRED')
++    return 'OWNER_SLOW_DECISION_REQUIRED_NO_RESEND', rows
+ 
+ def inner(path, digest):
+     need(os.getpid() == 1, 'NATIVE_NAMESPACE_PID1_REQUIRED')
+@@ -422,7 +478,18 @@
+         local = count_result['count']
+         # Deliberately discard deployment_verified and all reversible/local data.
+         need(type(local) is int and local > 0, 'LOCAL_COUNT_INVALID')
+-        remote, completion = provider(raw, b, secret)
++        try:
++            remote, completion = provider(raw, b, secret)
++        except SlowProviderCall:
++            # The uncertain send consumes this body and halts all remaining sends.
++            # Exit 0 carries only safe structured outcome through fixed helpers;
++            # outer still requires physical helper exit before reporting slow.
++            rows.append({'case':name,'request_sha256':digest_body,'request_bytes':size,'max_tokens':1,'tools_absent':True,'local_prompt_tokens':local,'provider_prompt_tokens':None,'provider_completion_tokens':None,'matched':None,'request_attempts':1})
++            secret = None
++            # No parity is claimed; do not delay the owner decision by replaying
++            # the full closure postcheck. Preflight and PASS postcheck remain.
++            print(json.dumps({'schema':'current-fourbody-inner.v1','status':'OWNER_SLOW_DECISION_REQUIRED_NO_RESEND','safe_event':'SLOW_PROVIDER_CALL','cases':rows}, separators=(',',':')))
++            return
+         row = {'case':name,'request_sha256':digest_body,'request_bytes':size,'max_tokens':1,'tools_absent':True,'local_prompt_tokens':local,'provider_prompt_tokens':remote,'provider_completion_tokens':completion,'matched':local==remote,'request_attempts':1}
+         rows.append(row)
+         need(local == remote, 'EXACT_BODY_PARITY_MISMATCH')
+@@ -458,7 +525,7 @@
+     containment = sys.modules[package.__name__+'.runtime_containment']
+     lock = b['admission']['lock']
+     fd = os.open(LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+-    released = False; observation = None; status = 'REFUSED_NO_RETRY'; rows = []
++    released = False; observation = None; status = 'REFUSED_NO_RETRY'; rows = []; boundary_started = False
+     try:
+         st = os.fstat(fd)
+         need((st.st_dev,st.st_ino,stat.S_IMODE(st.st_mode),st.st_nlink,st.st_size)==(lock['dev'],lock['ino'],lock['mode'],1,0),'LOCK_IDENTITY_CHANGED')
+@@ -468,21 +535,29 @@
+         env = {'PATH':'/usr/bin:/bin','HOME':str(output),'LANG':'C.UTF-8','PYTHONDONTWRITEBYTECODE':'1','TOKENIZERS_PARALLELISM':'false','HF_HUB_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1'}
+         binary = next(x for x in b['binary_refs'] if x['path']=='/usr/bin/bwrap')
+         boundary = containment.Containment({'path':binary['path'],'sha256':binary['sha256']},budget,env)
++        boundary_started = True
+         stdout, observation = boundary.run(['/usr/bin/python3.14','-I','-B','-S',str(Path(__file__).resolve()),'--inner',path,digest],output,timeout=clock(b,2),read_only=True)
+-        inner_result = decode(stdout)
+-        need(inner_result['schema']=='current-fourbody-inner.v1' and len(inner_result['cases'])==4,'INNER_RESULT_INVALID')
+-        rows = inner_result['cases']
+-        need(observation.get('namespace_init_exit_verified') is True and observation.get('returncode')==0, 'STOP_UNCONFIRMED')
+-        status = 'PASS'
+-    except BaseException:
+-        # Do not serialize exception strings, tracebacks, stdout or response bodies.
+-        status = 'REFUSED_OR_STOP_UNCONFIRMED_NO_RETRY'
+-    finally:
+-        os.close(fd); released = True
++        status, rows = inner_outcome(stdout, observation)
++    except BaseException as exc:
++        # Fixed helper exceptions carry only their safe physical observation.
++        # Never serialize exception strings, tracebacks, stdout or response bodies.
++        process = sys.modules[package.__name__+'.runtime_process']
++        if isinstance(exc, (process.CommandFailed, process.StopUnconfirmed)):
++            observation = getattr(exc, 'observation', None)
++        confirmed = type(observation) is dict and observation.get('namespace_init_exit_verified') is True and observation.get('reaped') is True
++        status = ('STOP_UNCONFIRMED' if isinstance(exc, (TransportStopUnconfirmed, process.StopUnconfirmed)) or (boundary_started and not confirmed) else 'REFUSED_OR_STOP_UNCONFIRMED_NO_RETRY')
++    finally:
++        try:
++            os.close(fd); released = True
++        except BaseException:
++            status = 'STOP_UNCONFIRMED'
+     identity=b['identity']
+-    receipt={'schema':'current-fourbody-parity.v1','status':status,'actual_execution':True,'root_binding_sha256':b['root_binding_sha256'],'runner_sha256':b['runner_sha256'],**{k:identity[k] for k in ('actual_installation_ref','actual_source_ref','assurance_ref','process_identity','serving_identity','model_asset_id','normalizer_sha256')},'counter_sha256':COUNTER_SHA,'assets':b['assets'],'dependencies':b['dependencies'],'dependency_sources':b['dependency_sources'],'plan_sha256':PLAN_SHA,'cases':rows,'bounded':{'calls':len(rows) if status=='PASS' else None,'max_calls':4,'helpers':2,'helper_reaped':bool(observation and observation.get('namespace_init_exit_verified') is True),'lock_released':released,'original_caps_preserved':True,'unchanged_retry':False},'assurance_level':'SOURCE/DISK/STARTUP','local_trust_remote_code':False,'selected_startup_trust_remote_code':True,'actual_currentNative100':b['actual_currentNative100'],'scope':'FOUR_BODY_PARITY_ONLY'}
++    receipt={'schema':'current-fourbody-parity.v1','status':status,'actual_execution':True,'root_binding_sha256':b['root_binding_sha256'],'runner_sha256':b['runner_sha256'],**{k:identity[k] for k in ('actual_installation_ref','actual_source_ref','assurance_ref','process_identity','serving_identity','model_asset_id','normalizer_sha256')},'counter_sha256':COUNTER_SHA,'assets':b['assets'],'dependencies':b['dependencies'],'dependency_sources':b['dependency_sources'],'plan_sha256':PLAN_SHA,'cases':rows,'bounded':{'calls':len(rows) if status in ('PASS','OWNER_SLOW_DECISION_REQUIRED_NO_RESEND') else None,'max_calls':4,'helpers':2,'helper_reaped':bool(observation and observation.get('namespace_init_exit_verified') is True and observation.get('reaped') is True),'lock_released':released,'original_caps_preserved':True,'unchanged_retry':False},'assurance_level':'SOURCE/DISK/STARTUP','local_trust_remote_code':False,'selected_startup_trust_remote_code':True,'actual_currentNative100':b['actual_currentNative100'],'scope':'FOUR_BODY_PARITY_ONLY'}
+     exclusive_json(output/'RECEIPT.json',receipt)
+-    print(json.dumps({'schema':receipt['schema'],'status':status,'receipt_sha256':sha(regular(output/'RECEIPT.json'))}))
++    safe_output = {'schema':receipt['schema'],'status':status,'receipt_sha256':sha(regular(output/'RECEIPT.json'))}
++    if status == 'OWNER_SLOW_DECISION_REQUIRED_NO_RESEND':
++        safe_output.update(safe_event='SLOW_PROVIDER_CALL', owner_decision_required=True, no_resend=True)
++    print(json.dumps(safe_output))
+     return 0 if status=='PASS' else 2
+ 
+ if __name__ == '__main__':
+@@ -493,6 +568,9 @@
+         raise SystemExit(outer(sys.argv[1],sys.argv[2]))
+     except SystemExit:
+         raise
++    except TransportStopUnconfirmed:
++        print('{"status":"STOP_UNCONFIRMED","private_details_redacted":true}')
++        raise SystemExit(3)
+     except BaseException:
+         print('{"status":"REFUSED_NO_RETRY","private_details_redacted":true}')
+         raise SystemExit(2)
