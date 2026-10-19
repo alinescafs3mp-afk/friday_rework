@@ -650,11 +650,34 @@ def test_staging_cli_internal_failures_are_constant_redacted_and_make_no_current
         '--request', request_ref['path'], '--request-sha256', request_ref['sha256'],
         '--output', str(s.output)])
     before = file_snapshot(s.root)
-    assert native.main() == 2
-    captured = capsys.readouterr()
-    public = json.loads(captured.out)
-    assert public == {'state': 'FAILED_CLOSED_RECONCILE_EXACT_JOURNAL', 'ready': False,
-        'error': 'worker_declaration_request_failed_closed', 'native_migration': 'NO_ACCEPTANCE_CLAIM'}
-    assert not captured.err and len(captured.out) < 256
-    assert str(s.root) not in captured.out and 'SYNTHETIC_PRIVATE_CLI_CANARY' not in captured.out
-    assert file_snapshot(s.root) == before and not s.output.exists()
+    public_json_loads = json.loads
+
+    def refused(error_code):
+        assert native.main() == 2
+        captured = capsys.readouterr()
+        public = public_json_loads(captured.out)
+        assert public == {'state': 'FAILED_CLOSED_RECONCILE_EXACT_JOURNAL', 'ready': False,
+            'error': error_code, 'native_migration': 'NO_ACCEPTANCE_CLAIM'}
+        assert not captured.err and len(captured.out) < 256
+        assert str(s.root) not in captured.out and 'SYNTHETIC_PRIVATE_CLI_CANARY' not in captured.out
+        assert file_snapshot(s.root) == before and not s.output.exists()
+
+    if failure == 'nested-json-recursion':
+        # The selected CPython C decoder accepts these real 20000-level bytes.
+        # Their non-object shape must still be refused without current writes.
+        refused('worker_declaration_stage_request_required')
+        decoder_calls = []
+
+        def recursive_decoder(raw, **kwargs):
+            decoder_calls.append(raw)
+            raise RecursionError('SYNTHETIC_PRIVATE_CLI_CANARY:' + str(s.root))
+
+        # A deterministic unit negative control at the real pinned-file decoder
+        # call; do not change global recursion limits or the ordinary decoder.
+        with monkeypatch.context() as decoder_patch:
+            decoder_patch.setattr(declaration.json, 'loads', recursive_decoder)
+            refused('worker_declaration_request_failed_closed')
+        assert decoder_calls == [request_path.read_bytes()]
+        assert declaration.json.loads is public_json_loads
+    else:
+        refused('worker_declaration_request_failed_closed')
