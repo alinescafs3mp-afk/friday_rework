@@ -1,0 +1,452 @@
+--- a/hermes_cli/config_effective.py
++++ b/hermes_cli/config_effective.py
+@@ -31,8 +31,33 @@
+ _EFFECTIVE_CACHE: Dict[str, Tuple[Any, ...]] = {}
+ 
+ 
+-def _effective(raw: Dict[str, Any]) -> Dict[str, Any]:
+-    expanded = _config._expand_env_vars(raw)
++def _clone_expand_readonly_raw(raw):
++    """Copy/expand the user layer without first cloning every dict/list twice.
++
++    Expansion already constructs fresh dicts/lists and breaks their YAML aliases,
++    just as ``_expand_env_vars(deepcopy(raw))`` does. Keys and opaque leaves still
++    need deepcopy: safe YAML includes mutable sets and tuples from !!pairs or
++    sequence keys. One memo preserves aliases inside those retained objects and
++    keeps them isolated from the byte-keyed raw cache and every other caller.
++    """
++    memo = {}
++
++    def expand(value):
++        if isinstance(value, str):
++            return _config._expand_env_vars(value)
++        if isinstance(value, dict):
++            return {copy.deepcopy(key, memo): expand(child)
++                    for key, child in value.items()}
++        if isinstance(value, list):
++            return [expand(child) for child in value]
++        return copy.deepcopy(value, memo)
++
++    return expand(raw)
++
++
++def _effective(raw: Dict[str, Any], *, isolate_raw: bool = False) -> Dict[str, Any]:
++    expanded = (_clone_expand_readonly_raw(raw) if isolate_raw
++                else _config._expand_env_vars(raw))
+     merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {})
+     return _config._normalize_root_model_keys(merged if isinstance(merged, dict) else {})
+ 
+@@ -117,16 +142,33 @@
+ _READONLY_RAW_CACHE_MAX_BYTES = 1024 * 1024
+ 
+ 
+-def _parse_readonly_user_raw(source: bytes):
+-    raw = fast_safe_load(source.decode("utf-8-sig"))
+-    if raw is not None and not isinstance(raw, dict):
+-        raise ValueError("effective_config_mapping_required")
+-    return raw
++def _parse_readonly_user_raw(source: bytes, *, preserve_bom: bool = False):
++    # Write guards pass the exact text their existing UTF-8-sig stream read.
++    # Do not strip a second BOM after re-encoding such a text document.
++    return fast_safe_load(source.decode("utf-8" if preserve_bom else "utf-8-sig"))
+ 
+ 
+ @lru_cache(maxsize=4)
+-def _cached_readonly_user_raw(source: bytes):
+-    return _parse_readonly_user_raw(source)
++def _cached_readonly_user_raw(source: bytes, *, preserve_bom: bool = False):
++    return _parse_readonly_user_raw(source, preserve_bom=preserve_bom)
++
++
++def _readonly_user_raw(source: bytes, *, preserve_bom: bool = False):
++    parse = (_cached_readonly_user_raw if len(source) <= _READONLY_RAW_CACHE_MAX_BYTES
++             else _parse_readonly_user_raw)
++    # Keep the common no-BOM case on one cache key for both native readers.
++    return parse(source, preserve_bom=True) if preserve_bom else parse(source)
++
++
++def _clone_user_config_source_text(document: str):
++    """An isolated raw parse of already-current text, without policy or recovery.
++
++    The caller still opens/reads its current file; only parsing identical text
++    can reuse the existing bounded raw cache. Root-type/empty/error handling
++    belongs to each caller, and no expanded or authorized result is retained.
++    """
++    source = document.encode("utf-8")
++    return copy.deepcopy(_readonly_user_raw(source, preserve_bom=source.startswith(b"\xef\xbb\xbf")))
+ 
+ 
+ def read_user_config_effective_readonly(
+@@ -144,9 +186,7 @@
+         # Path/mtime signatures cannot authorize a policy read or prove bytes.
+         with open(config_path, "rb") as stream:
+             source = stream.read()
+-        parse = (_cached_readonly_user_raw if len(source) <= _READONLY_RAW_CACHE_MAX_BYTES
+-                 else _parse_readonly_user_raw)
+-        raw = copy.deepcopy(parse(source))
++        raw = _readonly_user_raw(source)
+     except FileNotFoundError:
+         if not allow_empty:
+             raise
+@@ -155,4 +195,4 @@
+         raw = {}
+     if not isinstance(raw, dict):
+         raise ValueError("effective_config_mapping_required")
+-    return _effective(raw)
++    return _effective(raw, isolate_raw=True)
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -2030,7 +2030,8 @@
+ 
+     try:
+         with open(config_path, encoding="utf-8-sig") as f:
+-            loaded = fast_safe_load(f)
++            from hermes_cli.config_effective import _clone_user_config_source_text
++            loaded = _clone_user_config_source_text(f.read())
+     except OSError as exc:
+         raise _refuse_overwrite(config_path, "cannot be read", exc, _FIX_PERMS) from exc
+     except Exception as exc:
+--- /dev/null
++++ b/tests/hermes_cli/test_readonly_yaml_causal_remedy.py
+@@ -0,0 +1,341 @@
++"""SOURCE controls: unexecuted; Root must qualify the final frozen candidate.
++
++Exercises real safe YAML, current temporary files and the legacy semantic
++reference. Does not authorize installed-home writes or performance acceptance.
++"""
++import builtins
++import copy
++from datetime import date, datetime
++import os
++from pathlib import Path
++
++import pytest
++
++import hermes_yaml as yaml
++from hermes_cli import config as cfg
++from hermes_cli import config_effective as effective
++from hermes_cli import managed_scope
++
++
++@pytest.fixture(autouse=True)
++def isolated_raw_cache(monkeypatch):
++    effective._cached_readonly_user_raw.cache_clear()
++    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: None)
++    yield
++    effective._cached_readonly_user_raw.cache_clear()
++
++
++def legacy_effective(raw):
++    # Exact old order, independently spelled out; do not use the new helper.
++    expanded = cfg._expand_env_vars(copy.deepcopy(raw))
++    merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {})
++    return cfg._normalize_root_model_keys(merged if isinstance(merged, dict) else {})
++
++
++DOCUMENTS = [
++    "values: [null, true, false, 42, 1.5, .inf, on, OFF]\n",
++    "value: ${REMEDY_ENV}\nmodel: {name: local/model, api_base: https://example.invalid}\nprovider: local\n",
++    "blob: !!binary aGVsbG8=\nday: 2026-10-19\nstamp: 2026-10-19T01:00:00Z\n",
++    "shared: &s !!set {red: null, blue: null}\nsame: *s\n",
++    "shared: &s ['${REMEDY_ENV}', {v: hello}]\nsame: *s\n",
++    "base: &b {x: 2, env: '${REMEDY_ENV}'}\nmerged: {<<: *b, x: 3}\n",
++    "pairs: !!pairs [{key: {env: '${REMEDY_ENV}'}}]\n",
++    "ordered: !!omap [{z: 1}, {a: '${REMEDY_ENV}'}]\n",
++    "? [one, two]\n: {value: '${REMEDY_ENV}'}\n",
++]
++
++
++@pytest.mark.parametrize("document", DOCUMENTS)
++def test_real_yaml_values_and_types_match_legacy(document, monkeypatch):
++    monkeypatch.setenv("REMEDY_ENV", "expanded-current")
++    raw = yaml.safe_load(document)
++    assert effective._effective(raw, isolate_raw=True) == legacy_effective(raw)
++    result = effective._effective(raw, isolate_raw=True)
++    if "blob" in result:
++        assert type(result["blob"]) is bytes and result["blob"] == b"hello"
++        assert type(result["day"]) is date and isinstance(result["stamp"], datetime)
++    if "pairs" in result:
++        assert isinstance(result["pairs"][0], tuple)
++        assert result["pairs"][0][1]["env"] == "${REMEDY_ENV}"
++    if "ordered" in result:
++        assert list(result["ordered"]) == ["z", "a"]
++    if ("one", "two") in result:
++        assert result[("one", "two")]["value"] == "expanded-current"
++
++
++def test_alias_mutation_isolation_including_opaque_pairs_and_sets(monkeypatch):
++    monkeypatch.setenv("REMEDY_ENV", "expanded-current")
++    raw = yaml.safe_load("""
++shared: &shared !!set {red: null}
++set_alias: *shared
++items: &items [one]
++items_alias: *items
++pairs: &pairs !!pairs [{x: {flag: original}}]
++pairs_alias: *pairs
++""")
++    first = effective._effective(raw, isolate_raw=True)
++    second = effective._effective(raw, isolate_raw=True)
++    assert first["shared"] is first["set_alias"]
++    assert first["items"] is not first["items_alias"]
++    assert first["pairs"] is not first["pairs_alias"]
++    assert first["pairs"][0] is first["pairs_alias"][0]
++    first["shared"].add("changed")
++    first["items"].append("changed")
++    first["pairs"][0][1]["flag"] = "changed"
++    assert second == legacy_effective(raw)
++    assert raw["shared"] == {"red"}
++    assert raw["pairs"][0][1]["flag"] == "original"
++
++
++def test_naive_no_clone_is_a_meaningful_negative_control():
++    raw = yaml.safe_load("value: !!set {original: null}\n")
++    unsafe = cfg._expand_env_vars(raw)
++    unsafe["value"].add("leaked")
++    assert "leaked" in raw["value"]
++    clean = yaml.safe_load("value: !!set {original: null}\n")
++    safe = effective._effective(clean, isolate_raw=True)
++    safe["value"].add("private")
++    assert clean["value"] == {"original"}
++
++
++def test_fresh_files_same_stat_signature_and_current_env(tmp_path, monkeypatch):
++    path = tmp_path / "config.yaml"
++    path.write_text("value: first\nenv: ${REMEDY_ENV}\n")
++    monkeypatch.setenv("REMEDY_ENV", "one")
++    first_stat = path.stat()
++    first = effective.read_user_config_effective_readonly(path)
++    path.write_text("value: other\nenv: ${REMEDY_ENV}\n")
++    os.utime(path, ns=(first_stat.st_atime_ns, first_stat.st_mtime_ns))
++    monkeypatch.setenv("REMEDY_ENV", "two")
++    second = effective.read_user_config_effective_readonly(path)
++    assert path.stat().st_size == first_stat.st_size
++    assert first == {"value": "first", "env": "one"}
++    assert second == {"value": "other", "env": "two"}
++
++
++def test_managed_overlay_and_model_normalization_remain_current(tmp_path, monkeypatch):
++    path = tmp_path / "config.yaml"
++    path.write_text("model: {name: own/model}\nprovider: custom\nlabel: user\n")
++    managed = tmp_path / "managed"
++    managed.mkdir()
++    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: managed)
++    managed_scope.invalidate_managed_cache()
++    (managed / "config.yaml").write_text("label: ${REMEDY_ENV}\n")
++    monkeypatch.setenv("REMEDY_ENV", "one")
++    first = effective.read_user_config_effective_readonly(path)
++    monkeypatch.setenv("REMEDY_ENV", "two")
++    second = effective.read_user_config_effective_readonly(path)
++    assert first["label"] == "one" and second["label"] == "two"
++    assert second["model"] == {"default": "own/model", "provider": "custom"}
++    assert "gateway" not in second
++    managed_scope.invalidate_managed_cache()
++
++
++def test_both_callers_read_every_time_and_refuse_after_warm(tmp_path, monkeypatch):
++    path = tmp_path / "config.yaml"
++    path.write_text("value: current\n")
++    real_open = builtins.open
++    reads = []
++    deny = False
++
++    def observed_open(file, *args, **kwargs):
++        if isinstance(file, (str, os.PathLike)) and Path(file) == path:
++            reads.append((args, kwargs))
++            if deny:
++                raise PermissionError("synthetic-current-read-refused")
++        return real_open(file, *args, **kwargs)
++
++    monkeypatch.setattr(builtins, "open", observed_open)
++    assert effective.read_user_config_effective_readonly(path) == {"value": "current"}
++    assert cfg.require_readable_config_before_write(path) == {"value": "current"}
++    assert effective.read_user_config_effective_readonly(path) == {"value": "current"}
++    assert cfg.require_readable_config_before_write(path) == {"value": "current"}
++    assert len(reads) == 4
++    assert effective._cached_readonly_user_raw.cache_info().misses == 1
++    deny = True
++    with pytest.raises(PermissionError):
++        effective.read_user_config_effective_readonly(path)
++    with pytest.raises(RuntimeError, match="cannot be read"):
++        cfg.require_readable_config_before_write(path)
++    assert len(reads) == 6
++
++
++def test_write_guard_raw_result_isolation_and_no_expansion(tmp_path, monkeypatch):
++    path = tmp_path / "config.yaml"
++    path.write_text("env: ${REMEDY_ENV}\nset: !!set {original: null}\n")
++    monkeypatch.setenv("REMEDY_ENV", "expanded")
++    first = cfg.require_readable_config_before_write(path)
++    first["set"].add("private")
++    second = cfg.require_readable_config_before_write(path)
++    assert second == {"env": "${REMEDY_ENV}", "set": {"original"}}
++    assert effective.read_user_config_effective_readonly(path)["env"] == "expanded"
++
++
++@pytest.mark.parametrize("body", ["[]", "42", "true", "a: [unterminated", "a: 1\na: 2\n"])
++def test_invalid_current_file_refuses_after_warm(tmp_path, body):
++    path = tmp_path / "config.yaml"
++    path.write_text("value: good\n")
++    cfg.require_readable_config_before_write(path)
++    effective.read_user_config_effective_readonly(path)
++    path.write_text(body)
++    with pytest.raises((ValueError, yaml.YAMLError)):
++        effective.read_user_config_effective_readonly(path)
++    with pytest.raises(RuntimeError) as failure:
++        cfg.require_readable_config_before_write(path)
++    if body in ("[]", "42", "true"):
++        assert "must start with settings names" in str(failure.value)
++        assert isinstance(failure.value.__cause__, TypeError)
++    else:
++        assert "has a formatting error" in str(failure.value)
++        assert isinstance(failure.value.__cause__, yaml.YAMLError)
++    assert path.read_text() == body
++
++
++def test_missing_empty_and_deleted_file_keep_each_caller_contract(tmp_path):
++    path = tmp_path / "config.yaml"
++    assert cfg.require_readable_config_before_write(path) == {}
++    assert effective.read_user_config_effective_readonly(path, allow_empty=True) == {}
++    with pytest.raises(FileNotFoundError):
++        effective.read_user_config_effective_readonly(path)
++    path.write_text("")
++    assert cfg.require_readable_config_before_write(path) == {}
++    assert effective.read_user_config_effective_readonly(path, allow_empty=True) == {}
++    with pytest.raises(ValueError, match="effective_config_mapping_required"):
++        effective.read_user_config_effective_readonly(path)
++    path.write_text("value: good\n")
++    effective.read_user_config_effective_readonly(path)
++    path.unlink()
++    with pytest.raises(FileNotFoundError):
++        effective.read_user_config_effective_readonly(path)
++
++
++@pytest.mark.parametrize("prefix", [b"", b"\xef\xbb\xbf", b"\xef\xbb\xbf\xef\xbb\xbf"])
++@pytest.mark.parametrize("newline", [b"\n", b"\r\n", b"\r"])
++def test_text_guard_matches_exact_legacy_stream_bom_and_newline(tmp_path, prefix, newline):
++    path = tmp_path / "config.yaml"
++    path.write_bytes(prefix + newline.join([b"value: hello", b"items: [one, two]", b""]))
++    with open(path, encoding="utf-8-sig") as stream:
++        expected = yaml.safe_load(stream)
++    first = cfg.require_readable_config_before_write(path)
++    second = cfg.require_readable_config_before_write(path)
++    assert first == second == expected
++
++
++def test_large_current_source_bypasses_retained_cache_and_mutation_isolated(tmp_path):
++    path = tmp_path / "config.yaml"
++    path.write_text("#" + "x" * effective._READONLY_RAW_CACHE_MAX_BYTES + "\nvalue: [original]\n")
++    before = effective._cached_readonly_user_raw.cache_info()
++    first = cfg.require_readable_config_before_write(path)
++    first["value"].append("private")
++    assert cfg.require_readable_config_before_write(path) == {"value": ["original"]}
++    assert effective.read_user_config_effective_readonly(path) == {"value": ["original"]}
++    assert effective._cached_readonly_user_raw.cache_info() == before
++
++
++def test_recursive_container_alias_keeps_legacy_refusal():
++    raw = yaml.safe_load("loop: &loop [*loop]\n")
++    with pytest.raises(RecursionError):
++        legacy_effective(raw)
++    with pytest.raises(RecursionError):
++        effective._effective(raw, isolate_raw=True)
++
++
++def test_invalid_encoding_refuses_after_valid_warm_read(tmp_path):
++    path = tmp_path / "config.yaml"
++    path.write_bytes(b"value: good\n")
++    cfg.require_readable_config_before_write(path)
++    effective.read_user_config_effective_readonly(path)
++    path.write_bytes(b"value: \xff\n")
++    with pytest.raises(UnicodeDecodeError):
++        effective.read_user_config_effective_readonly(path)
++    with pytest.raises(RuntimeError, match="formatting error"):
++        cfg.require_readable_config_before_write(path)
++    assert path.read_bytes() == b"value: \xff\n"
++
++
++def test_existing_four_entry_bound_is_not_enlarged(tmp_path):
++    for index in range(5):
++        path = tmp_path / (str(index) + ".yaml")
++        path.write_text("value: [" + str(index) + "]\n")
++        assert effective.read_user_config_effective_readonly(path) == {"value": [index]}
++    info = effective._cached_readonly_user_raw.cache_info()
++    assert info.currsize == info.maxsize == 4
++
++
++def test_product_settings_reflect_current_file_after_cache_warm(tmp_path, monkeypatch):
++    from hermes_cli import friday_product_access as access
++    path = tmp_path / "config.yaml"
++    monkeypatch.setattr(cfg, "get_config_path", lambda: path)
++    path.write_text("plugins: {entries: {friday_rework: {settings: {product_access: {enabled: false}}}}}\n")
++    assert access.access_policy() is None
++    path.write_text("plugins: {entries: {friday_rework: {settings: {product_access: {enabled: true}}}}}\n")
++    with pytest.raises(ValueError, match="invalid_product_access_policy"):
++        access.access_policy()
++
++
++
++def test_unchanged_file_env_only_rotation_and_public_mutation_isolation(tmp_path, monkeypatch):
++    path = tmp_path / "config.yaml"
++    path.write_text("env: ${REMEDY_ENV}\nset: &set !!set {red: null}\nalias: *set\nlist: [original]\n")
++    original = path.read_bytes()
++    monkeypatch.setenv("REMEDY_ENV", "one")
++    first = effective.read_user_config_effective_readonly(path)
++    assert first["set"] is first["alias"]
++    first["set"].add("private")
++    first["list"].append("private")
++    monkeypatch.setenv("REMEDY_ENV", "two")
++    second = effective.read_user_config_effective_readonly(path)
++    write_guard = cfg.require_readable_config_before_write(path)
++    assert path.read_bytes() == original
++    assert second == {"env": "two", "set": {"red"}, "alias": {"red"}, "list": ["original"]}
++    assert write_guard["env"] == "${REMEDY_ENV}" and write_guard["set"] == {"red"}
++
++
++def test_both_readers_ignore_frozen_complete_stat_signature(tmp_path, monkeypatch):
++    path = tmp_path / "config.yaml"
++    path.write_text("value: first\n")
++    frozen = path.stat()
++    original_stat = Path.stat
++
++    def same_target_stat(target, *args, **kwargs):
++        return frozen if target == path else original_stat(target, *args, **kwargs)
++
++    monkeypatch.setattr(Path, "stat", same_target_stat)
++    assert cfg.require_readable_config_before_write(path) == {"value": "first"}
++    assert effective.read_user_config_effective_readonly(path) == {"value": "first"}
++    path.write_text("value: other\n")
++    assert cfg.require_readable_config_before_write(path) == {"value": "other"}
++    assert effective.read_user_config_effective_readonly(path) == {"value": "other"}
++
++
++def test_alias_across_opaque_pairs_and_expanded_branch_keeps_legacy_graph(monkeypatch):
++    monkeypatch.setenv("REMEDY_ENV", "expanded")
++    raw = yaml.safe_load("""
++node: &node {env: '${REMEDY_ENV}', tags: !!set {red: null}}
++pairs: !!pairs [{node: *node}]
++""")
++    expected = legacy_effective(raw)
++    actual = effective._effective(raw, isolate_raw=True)
++    for result in (expected, actual):
++        assert result["node"]["env"] == "expanded"
++        assert result["pairs"][0][1]["env"] == "${REMEDY_ENV}"
++        assert result["node"] is not result["pairs"][0][1]
++        assert result["node"]["tags"] is result["pairs"][0][1]["tags"]
++    actual["pairs"][0][1]["tags"].add("private")
++    assert expected["node"]["tags"] == raw["node"]["tags"] == {"red"}
++
++
++def test_recursive_alias_hidden_in_opaque_pair_preserves_finite_legacy_graph():
++    raw = yaml.safe_load("""&root
++flag: original
++pairs: !!pairs [{root: *root}]
++""")
++    expected = legacy_effective(raw)
++    actual = effective._effective(raw, isolate_raw=True)
++    for result in (expected, actual):
++        retained_root = result["pairs"][0][1]
++        assert retained_root is not result
++        assert retained_root["pairs"][0] is result["pairs"][0]
++        assert retained_root["flag"] == "original"
++    actual["pairs"][0][1]["flag"] = "private"
++    assert expected["pairs"][0][1]["flag"] == raw["flag"] == "original"
