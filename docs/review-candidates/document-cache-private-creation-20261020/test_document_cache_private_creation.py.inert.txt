@@ -1,0 +1,109 @@
+"""Document cache privacy and failclosed creation under gateway umasks."""
+import builtins
+import hashlib
+import os
+from pathlib import Path
+import stat
+from types import SimpleNamespace
+
+import pytest
+import gateway.platforms.base as base
+from gateway import run_inbound_media as consumer
+
+pytestmark = pytest.mark.skipif(os.name != "posix", reason="POSIX cache ownership contract")
+DATA = (b"Synthetic isolated private document fixture.\n" * 23)[:934]
+
+@pytest.fixture
+def cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(base, 'get_document_cache_dir', lambda: tmp_path)
+    monkeypatch.setattr(base, 'get_inbound_media_max_bytes', lambda: 1_000_000)
+    return tmp_path
+
+@pytest.mark.parametrize('mask', [0o000, 0o002, 0o022, 0o077])
+def test_private_at_creation_before_first_write(cache, monkeypatch, mask):
+    real_open = os.open
+    seen = []
+    def record_open(path, flags, mode=0o777, **kwargs):
+        fd = real_open(path, flags, mode, **kwargs)
+        info = os.fstat(fd)
+        seen.append((stat.S_IMODE(info.st_mode), info.st_size))
+        return fd
+    monkeypatch.setattr(base.os, 'open', record_open)
+    previous = os.umask(mask)
+    try:
+        path = Path(base.cache_document_from_bytes(DATA, 'report.txt'))
+    finally:
+        os.umask(previous)
+    assert seen == [(0o600, 0)]
+    assert path.read_bytes() == DATA
+
+@pytest.mark.parametrize('kind', ['file', 'symlink'])
+def test_collision_never_truncates_or_follows(cache, monkeypatch, kind):
+    monkeypatch.setattr(base.uuid, 'uuid4', lambda: SimpleNamespace(hex='a' * 32))
+    target = cache / 'existing.txt'
+    target.write_bytes(b'unchanged-target')
+    occupied = cache / ('doc_' + 'a' * 12 + '_report.txt')
+    if kind == 'file':
+        occupied.write_bytes(b'unchanged-collision')
+    else:
+        occupied.symlink_to(target)
+    with pytest.raises(FileExistsError):
+        base.cache_document_from_bytes(DATA, 'report.txt')
+    assert target.read_bytes() == b'unchanged-target'
+    assert occupied.read_bytes() == (b'unchanged-collision' if kind == 'file' else b'unchanged-target')
+
+@pytest.mark.parametrize('name, suffix', [('folder/report.txt', '_report.txt'), ('\x00', '_document'), ('', '_document'), ('..', '_document')])
+def test_name_compatibility(cache, name, suffix):
+    path = Path(base.cache_document_from_bytes(DATA, name))
+    assert path.parent == cache and path.name.endswith(suffix)
+    assert path.read_bytes() == DATA
+
+def test_size_guard_before_creation(cache, monkeypatch):
+    monkeypatch.setattr(base, 'get_inbound_media_max_bytes', lambda: len(DATA) - 1)
+    with pytest.raises(ValueError, match='too large'):
+        base.cache_document_from_bytes(DATA, 'too-big.txt')
+    assert list(cache.iterdir()) == []
+
+def test_open_failure_has_no_plain_write_fallback(cache, monkeypatch):
+    def refused(*args, **kwargs):
+        raise PermissionError('synthetic exclusive-create rejection')
+    monkeypatch.setattr(base.os, 'open', refused)
+    with pytest.raises(PermissionError, match='exclusive-create rejection'):
+        base.cache_document_from_bytes(DATA, 'report.txt')
+    assert list(cache.iterdir()) == []
+
+def test_partial_failure_propagates_closes_and_stays_private(cache, monkeypatch):
+    # Prior behavior permits a partial failed cache entry; this fix preserves that
+    # behavior while making the entry private, closed, and never returned.
+    real_open = builtins.open
+    observed = {}
+    class FailingWrite:
+        def __init__(self, handle):
+            self.handle = handle
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
+        def write(self, data):
+            self.handle.write(data[:7])
+            raise OSError('synthetic short-write failure')
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+    def failing_open(*args, **kwargs):
+        handle = real_open(*args, **kwargs)
+        observed['handle'] = handle
+        return FailingWrite(handle)
+    monkeypatch.setattr(base, 'open', failing_open, raising=False)
+    with pytest.raises(OSError, match='short-write failure'):
+        base.cache_document_from_bytes(DATA, 'partial.txt')
+    assert observed['handle'].closed
+    [path] = list(cache.iterdir())
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert path.read_bytes() == DATA[:7]
+
+@pytest.mark.asyncio
+async def test_async_real_document_dispatch(cache):
+    result = await base.cache_media_bytes_async(DATA, filename='report.txt', mime_type='text/plain')
+    assert result.kind == 'document' and result.media_type == 'text/plain'
+    assert result.content == {'size_bytes': len(DATA), 'sha256': hashlib.sha256(DATA).hexdigest()}
+    assert Path(result.path).read_bytes() == DATA
+    consumer._owned(Path(result.path).stat())
