@@ -1,0 +1,189 @@
+"""Shared YAML 1.1 policy for config, manifests, and frontmatter.
+
+Ruamel's native schema includes bare y/n booleans and rejects duplicate keys.
+Every operation owns its parser/emitter; instances must not be shared by threads.
+"""
+
+from io import StringIO
+from typing import Any, IO, overload
+
+from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError as YAMLError
+from ruamel.yaml.resolver import VersionedResolver
+
+
+class _Yaml11Resolver(VersionedResolver):
+    # Quote strings like "off" without adding a %YAML directive to every config/snippet.
+    @property
+    def processing_version(self) -> tuple[int, int]:
+        return (1, 1)
+
+
+def _composed_c_safe_load(document: str | bytes, yaml) -> Any:
+    """Optional installed libyaml syntax parser with the native ruamel schema.
+
+    PyYAML supplies only syntax/nodes, never value construction or its schema.
+    Each document owns both parsers and the native resolver/constructor. Native
+    ruamel remains the fallback when libyaml rejects valid pure-parser syntax.
+    No parsed document, HOME, authority, expanded value or mutable result is cached.
+    """
+    try:
+        from yaml import CBaseLoader
+        from yaml.error import YAMLError as CParserError
+        from yaml import nodes as c_nodes
+    except ImportError:
+        return yaml.load(document)
+    from ruamel.yaml import nodes as r_nodes
+    from ruamel.yaml.tag import Tag
+
+    if (b"%" in document if isinstance(document, bytes) else "%" in document):
+        return yaml.load(document)
+    resolver = yaml.resolver
+    kinds = {c_nodes.ScalarNode: r_nodes.ScalarNode,
+             c_nodes.SequenceNode: r_nodes.SequenceNode,
+             c_nodes.MappingNode: r_nodes.MappingNode}
+
+    class SyntaxLoader(CBaseLoader):
+        def resolve(self, kind, value, implicit):
+            # Called only for implicit/nonspecific tags; an explicit !!str is
+            # already tagged by CParser and must never be inferred again.
+            tag = resolver.resolve(kinds[kind], value, implicit)
+            # This is exactly Tag.trval for a suffix with no URI escapes;
+            # CParser needs only that string, not a second URI decode.
+            if tag.handle is None and "%" not in tag.suffix:
+                return tag.suffix
+            return str(tag)
+
+    parser = SyntaxLoader(document)
+    try:
+        try:
+            root = parser.get_single_node()
+        except CParserError:
+            return yaml.load(document)
+        if root is None:
+            return None
+        seen = {}
+
+        class UnacceleratedDepth(Exception):
+            pass
+
+        def native_node(node, depth=0):
+            # This bounds optimization only: deeper documents use the exact
+            # original parser, including its existing nesting/error limits.
+            if depth > 32:
+                raise UnacceleratedDepth
+
+            if node in seen:
+                return seen[node]
+            tag = Tag(suffix=node.tag)
+            if "%" not in node.tag:
+                # Native Tag.trval is exactly its suffix when no URI escape is
+                # present. Fill the same per-node lazy property directly; this
+                # avoids re-decoding an already resolved tag on every scalar.
+                # No tag, node, document or HOME is shared across operations.
+                tag._trval = node.tag
+            args = (tag, node.value if isinstance(node, c_nodes.ScalarNode) else [],
+                    node.start_mark, node.end_mark)
+            if isinstance(node, c_nodes.ScalarNode):
+                result = r_nodes.ScalarNode(*args, style=node.style)
+            elif isinstance(node, c_nodes.SequenceNode):
+                result = r_nodes.SequenceNode(*args, flow_style=node.flow_style)
+            else:
+                result = r_nodes.MappingNode(*args, flow_style=node.flow_style)
+            seen[node] = result  # retain aliases, including recursive graphs
+            if isinstance(node, c_nodes.SequenceNode):
+                result.value.extend(native_node(child, depth + 1) for child in node.value)
+            elif isinstance(node, c_nodes.MappingNode):
+                result.value.extend((native_node(key, depth + 1), native_node(value, depth + 1))
+                                    for key, value in node.value)
+            return result
+
+        try:
+            root = native_node(root)
+        except (RecursionError, UnacceleratedDepth):
+            # Preserve the original parser's own nesting/error behavior.
+            return yaml.load(document)
+        return yaml.constructor.construct_document(root)
+    finally:
+        parser.dispose()
+
+
+def _load(document: str | bytes, *, pure: bool) -> Any:
+    yaml = YAML(typ="safe", pure=pure)
+    yaml.version = (1, 1)
+    if not pure and yaml.Parser.__name__ != "CParser":
+        return _composed_c_safe_load(document, yaml)
+    return yaml.load(document)
+
+
+def safe_load(stream: str | bytes | IO[str] | IO[bytes]) -> Any:
+    """Read standard YAML data; existing configs use YAML 1.1 booleans.
+
+    The pure parser defines what parses: Windows ARM64 has no C extension, and libyaml rejects
+    documents the pure parser accepts (``[{url: http://h}]``), so a C rejection is re-read pure.
+    """
+    document = stream if isinstance(stream, (str, bytes)) else stream.read()
+    try:
+        return _load(document, pure=False)
+    except YAMLError:
+        return _load(document, pure=True)
+
+
+@overload
+def safe_dump(
+    data: Any, stream: None = None, *, default_flow_style: bool = False,
+    sort_keys: bool = True, allow_unicode: bool = True, width: int = 80,
+) -> str: ...
+
+
+@overload
+def safe_dump(
+    data: Any, stream: IO[str], *, default_flow_style: bool = False,
+    sort_keys: bool = True, allow_unicode: bool = True, width: int = 80,
+) -> None: ...
+
+
+def safe_dump(
+    data: Any,
+    stream: IO[str] | None = None,
+    *,
+    default_flow_style: bool = False,
+    sort_keys: bool = True,
+    allow_unicode: bool = True,
+    width: int = 80,
+) -> str | None:
+    """Write standard YAML data with readable Unicode and indented block lists."""
+    # The C emitter ignores sequence offsets and escapes astral Unicode.
+    yaml = YAML(typ="safe", pure=True)
+    yaml.Resolver = _Yaml11Resolver
+    yaml.default_flow_style = default_flow_style
+    yaml.allow_unicode = allow_unicode
+    yaml.width = width
+    yaml.sort_base_mapping_type_on_output = sort_keys
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    if stream is not None:
+        yaml.dump(data, stream)
+        return None
+    output = StringIO()
+    yaml.dump(data, output)
+    return output.getvalue()
+
+
+# ruamel's emitter can change a double-quoted value when it folds a long line right after an
+# escaped backslash (``D:\\Cent…`` → ``D:\\`` + bare newline): the fold reloads as a literal space
+# and a no-op save mutates the stored value (#119844). Config writes must be value-preserving, so
+# every round-trip emitter in the tree keeps scalars on one line instead of folding (``None``
+# does NOT disable folding on 0.18.x; only a large width does).
+ROUNDTRIP_YAML_WIDTH = 2**31 - 1
+
+
+def roundtrip_yaml() -> YAML:
+    """Create a fresh comment/quote-preserving editor for user-authored YAML."""
+    yaml = YAML(typ="rt")
+    yaml.width = ROUNDTRIP_YAML_WIDTH
+    yaml.Resolver = _Yaml11Resolver
+    yaml.preserve_quotes = True
+    yaml.allow_unicode = True
+    yaml.default_flow_style = False
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    return yaml
