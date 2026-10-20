@@ -1,0 +1,306 @@
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -303,7 +303,16 @@
+         )
+         return result
+ 
+-    def emit_invalid_arguments(self, agent, result: str) -> None:
++    def emit_invalid_arguments(self, agent, result: str, *, private_cause: Optional[str] = None) -> None:
++        if private_cause is not None:
++            # Private diagnostic keeps the exact typed machine cause (e.g. a scope
++            # refusal), distinct from a JSON parse failure; `result` stays the
++            # public payload.
++            self.emit_post(
++                agent, result, trace=[],
++                status="error", error_type=private_cause, error_message=private_cause,
++            )
++            return
+         self.emit_post(
+             agent, result, trace=[],
+             status="error", error_type="invalid_tool_arguments", error_message="Tool arguments must be a valid JSON object",
+@@ -447,6 +456,7 @@
+     middleware_trace: list
+     parse_error: Optional[str]
+     scope_block: Optional[str]
++    private_cause: Optional[str] = None
+ 
+     def ref(self, task_id: str) -> _ToolCallRef:
+         return _ToolCallRef(self.name, self.args, task_id, _pairing_tool_call_id(self.tool_call), self.middleware_trace)
+@@ -457,12 +467,17 @@
+     args, parse_error = _parse_tool_arguments(tool_call.function.arguments)
+     scope_block = None
+     if parse_error is None:
+-        from hermes_cli.friday_user_scope import guard_tool, check_agent, ScopeDenied
++        from hermes_cli.friday_user_scope import guard_tool, check_agent, ScopeDenied, ordinary_tool_error_json
+         try:
+             check_agent(agent)
+             guard_tool(name, args)
+         except ScopeDenied:
+-            return _ParsedCall(tool_call, name, args, [], "product_user_scope_refused", None)
++            # Public payload is projected at the ordinary boundary; the exact typed
++            # scope refusal is carried privately so diagnostics never confuse it
++            # with invalid JSON arguments.
++            return _ParsedCall(tool_call, name, args, [],
++                               ordinary_tool_error_json("product_user_scope_refused") or "product_user_scope_refused",
++                               None, private_cause="product_user_scope_refused")
+     if parse_error is None:
+         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
+     return _ParsedCall(tool_call, name, args, [], parse_error, scope_block)
+@@ -1564,7 +1579,7 @@
+             # whole call had no effects. Preserve unknown for that boundary.
+             effect_disposition = "unknown" if blocked else None
+             if pc.parse_error is not None:
+-                ref.emit_invalid_arguments(agent, r.result)
++                ref.emit_invalid_arguments(agent, r.result, private_cause=pc.private_cause)
+         committed = _commit_tool_result(
+             agent, messages, ref, function_result,
+             budget=budget, tool_duration=tool_duration, is_error=is_error, blocked=blocked,
+@@ -1688,12 +1703,13 @@
+     function_name, function_args, effective_task_id, tool_call_id, middleware_trace = (
+         ref.name, ref.args, ref.task_id, ref.call_id, ref.trace,
+     )
+-    from hermes_cli.friday_user_scope import guard_tool, check_agent, ScopeDenied
++    from hermes_cli.friday_user_scope import guard_tool, check_agent, ScopeDenied, ordinary_tool_error_json
+     try:
+         check_agent(agent)
+         guard_tool(function_name, function_args)
+     except ScopeDenied:
+-        return _SequentialDispatch(lambda next_args: json.dumps({"error": "product_user_scope_refused"}))
++        return _SequentialDispatch(lambda next_args: ordinary_tool_error_json("product_user_scope_refused")
++                                   or json.dumps({"error": "product_user_scope_refused"}))
+     if function_name != "delegate_task" and function_name in INLINE_TOOL_EXECUTORS:
+         # Agent-level tools that need live AIAgent state; table shared with invoke_tool.
+         inline_executor = INLINE_TOOL_EXECUTORS[function_name]
+@@ -1725,7 +1741,7 @@
+             check_agent(agent)
+             guard_tool(function_name, next_args)
+         except ScopeDenied:
+-            return json.dumps({"error": "product_user_scope_refused"})
++            return ordinary_tool_error_json("product_user_scope_refused") or json.dumps({"error": "product_user_scope_refused"})
+         import model_tools
+ 
+         with model_tools.suppress_post_tool_call_hook():
+@@ -1765,9 +1781,9 @@
+     return _append_skipped_tool_results(agent, messages, remaining, effective_task_id, **skip_kwargs)
+ 
+ 
+-def _append_invalid_arguments_result(agent, messages: list, ref: _ToolCallRef, parse_error: str) -> bool:
++def _append_invalid_arguments_result(agent, messages: list, ref: _ToolCallRef, parse_error: str, *, private_cause: Optional[str] = None) -> bool:
+     """Emit + append the parse-error result for a call whose arguments were not a JSON object."""
+-    ref.emit_invalid_arguments(agent, parse_error)
++    ref.emit_invalid_arguments(agent, parse_error, private_cause=private_cause)
+     messages.append(make_tool_result_message(ref.name, parse_error, ref.call_id, effect_disposition="unknown"))
+     return _flush_session_db_after_tool_progress(agent, messages, stage=f"invalid tool arguments {ref.name}")
+ 
+@@ -1912,7 +1928,7 @@
+         if pc.parse_error is not None:
+             from hermes_cli.friday_cli_caller import publish_original, CallerUnconfirmed
+             with publish_original(agent, ref.call_id) as span:
+-                if not _append_invalid_arguments_result(agent, messages, ref, pc.parse_error):
++                if not _append_invalid_arguments_result(agent, messages, ref, pc.parse_error, private_cause=pc.private_cause):
+                     if span is not None:
+                         raise CallerUnconfirmed("invalid_arguments_canonical_flush_FAILED")
+                     return False
+--- a/agent/turn_explainers.py
++++ b/agent/turn_explainers.py
+@@ -217,6 +217,24 @@
+         """
+         if not failed:
+             return ""
++        from hermes_cli.friday_user_scope import (
++            ordinary_presentation, ordinary_failure_preview,
++            PUBLIC_FILE_MUTATION_HEADER, PUBLIC_FILE_MUTATION_FAILED, PUBLIC_FILE_MUTATION_MORE,
++        )
++        if ordinary_presentation():
++            # Dedicated ordinary-user footer: safe filenames only, no tool
++            # identifiers, no execution instructions, no host path prefixes.
++            # The private raw verifier record is untouched; counts stay truthful.
++            lines = [PUBLIC_FILE_MUTATION_HEADER.format(count=len(failed))]
++            shown = list(failed.items())[:10]
++            for path, info in shown:
++                preview = (info.get("error_preview") or "").strip()
++                name = os.path.basename(str(path).rstrip("/")) or str(path)
++                lines.append(f"• {name}: {ordinary_failure_preview(preview, failed_copy=PUBLIC_FILE_MUTATION_FAILED)}")
++            remaining = len(failed) - len(shown)
++            if remaining > 0:
++                lines.append(PUBLIC_FILE_MUTATION_MORE.format(count=remaining))
++            return "\n".join(lines)
+         lines = [t("explainer.file_mutation.header", count=len(failed))]
+         shown = list(failed.items())[:10]
+         for path, info in shown:
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -1230,6 +1230,102 @@
+     return 'Ответ не получен. Часть действий могла выполниться; проверьте результат перед повтором. Если ошибка повторяется, сообщите администратору.'
+ 
+ 
++# Exact existing registry.dispatch public wording, kept as the single source.
++PUBLIC_TOOL_REFUSAL_COPY = 'Это действие недоступно.'
++PUBLIC_TOOL_FAILURE_COPY = 'Не удалось выполнить действие. Возможен частичный результат; проверьте его перед повтором.'
++PUBLIC_WEB_FAILURE_COPY = 'Не удалось проверить сведения в интернете.'
++PUBLIC_WEB_STOPPED_COPY = 'Проверка в интернете остановлена.'
++PUBLIC_FILE_EXISTS_COPY = 'Файл уже существует; изменение не выполнено.'
++# Dedicated ordinary file-mutation footer copy: no tool identifiers, no execution
++# instructions, no host path prefixes. Counts stay truthful.
++PUBLIC_FILE_MUTATION_HEADER = 'Не все изменения файлов выполнены: {count}.'
++PUBLIC_FILE_MUTATION_FAILED = 'изменение не выполнено'
++PUBLIC_FILE_MUTATION_MORE = 'И ещё: {count}.'
++
++
++def ordinary_tool_error_json(code):
++    """Public JSON for an exact known machine refusal at the ordinary tool boundary.
++
++    Machine codes stay in private receipts and unmanaged diagnostics. Access
++    refusal is never translated as absence, and an uncertain operation is never
++    reported completed. Returns None outside ordinary presentation so callers
++    keep their existing raw result.
++    """
++    if code == 'product_user_scope_refused' and ordinary_presentation():
++        return json.dumps({'error': PUBLIC_TOOL_REFUSAL_COPY, 'success': False}, ensure_ascii=False)
++    return None
++
++
++def ordinary_exception_error_text(cause):
++    """Public status for an exact known boundary cause; arbitrary exception text stays private.
++
++    Only the exact 'web_call_stopped' fence keeps its specific truthful status;
++    every other cause falls back to the generic partial-result wording. Returns
++    None outside ordinary presentation so callers keep their existing copy.
++    """
++    if not ordinary_presentation():
++        return None
++    if cause == 'web_call_stopped':
++        return PUBLIC_WEB_STOPPED_COPY
++    return PUBLIC_TOOL_FAILURE_COPY
++
++
++def ordinary_web_error_text(cause):
++    """Public text for a returned web/provider failure cause at the ordinary boundary.
++
++    The exact 'web_call_stopped' fence (bare or provider-prefixed, e.g.
++    'Exa search failed: web_call_stopped') keeps its specific truthful stopped
++    status; every other provider cause falls back to the generic web failure
++    wording. Returns None outside ordinary presentation or for an empty cause.
++    """
++    if not ordinary_presentation() or not cause:
++        return None
++    if cause == 'web_call_stopped' or cause.endswith(': web_call_stopped'):
++        return PUBLIC_WEB_STOPPED_COPY
++    return PUBLIC_WEB_FAILURE_COPY
++
++
++def ordinary_public_web_failure(payload):
++    """Project a returned provider failure envelope at the ordinary public boundary.
++
++    Returns ``(public_payload, raw_cause)``. Only the public ``error`` text is
++    replaced; success/state/data and any recovered partial content stay
++    byte-identical. ``raw_cause`` is the exact original error string for the
++    existing private debug/receipt path (None when nothing was projected). The
++    payload passes through unchanged outside ordinary presentation or when it is
++    not a failure dict.
++    """
++    if not ordinary_presentation() or not isinstance(payload, dict):
++        return payload, None
++    if payload.get('success') is not False:
++        return payload, None
++    cause = payload.get('error')
++    if not isinstance(cause, str) or not cause:
++        return payload, None
++    public = dict(payload)
++    public['error'] = ordinary_web_error_text(cause)
++    return public, cause
++
++
++_PUBLIC_PREVIEW_CODES = {
++    'document_already_exists': PUBLIC_FILE_EXISTS_COPY,
++    'product_user_scope_refused': PUBLIC_TOOL_REFUSAL_COPY,
++    'web_call_stopped': PUBLIC_WEB_STOPPED_COPY,
++}
++
++
++def ordinary_failure_preview(preview, *, failed_copy):
++    """Bounded public preview for the managed file-mutation verifier footer.
++
++    Exact known machine codes keep their truthful public status; anything else
++    (provider bodies, host paths, credentials) stays in private receipts and the
++    entry falls back to the generic failed marker. Filenames stay visible.
++    """
++    if preview in _PUBLIC_PREVIEW_CODES:
++        return _PUBLIC_PREVIEW_CODES[preview]
++    return failed_copy
++
++
+ def ordinary_tool_metadata(name, result):
+     """Project only native typed metadata; never rewrite user text or tool artifacts.
+ 
+--- a/tools/web_tools.py
++++ b/tools/web_tools.py
+@@ -330,7 +330,8 @@
+             if provider is None and backend and selection_exists("web"):
+                 error_text = debug_call_data["error"] = _strict_selection_error("search", backend)
+                 _finish_debug("web_search_tool", debug_call_data)
+-                return json.dumps({"success": False, "error": error_text}, indent=2, ensure_ascii=False)
++                from hermes_cli.friday_user_scope import ordinary_web_error_text
++                return json.dumps({"success": False, "error": ordinary_web_error_text(error_text) or error_text}, indent=2, ensure_ascii=False)
+             # Never-configured install: legacy availability-walked autodetect.
+             provider = get_active_search_provider()
+ 
+@@ -341,6 +342,12 @@
+             logger.info("Web search via %s: '%s' (limit: %d)", provider.name, query, limit)
+             response_data = _memoized_search(provider, query, limit)
+ 
++        from hermes_cli.friday_user_scope import ordinary_public_web_failure
++        response_data, private_cause = ordinary_public_web_failure(response_data)
++        if private_cause is not None:
++            # Typed provider cause retained on the existing private debug path
++            # BEFORE the public envelope is serialized; public error is projected.
++            debug_call_data["private_cause"] = private_cause
+         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+         result_json = _bounded_search_response(response_data, result_json) or result_json
+@@ -348,7 +355,13 @@
+         _finish_debug("web_search_tool", debug_call_data)
+         return result_json
+     except Exception as e:
+-        return _finish_debug("web_search_tool", debug_call_data, f"Error searching web: {str(e)}")
++        from hermes_cli.friday_user_scope import ordinary_exception_error_text
++        raw = f"Error searching web: {str(e)}"
++        public = ordinary_exception_error_text(str(e))
++        if public is None:
++            return _finish_debug("web_search_tool", debug_call_data, raw)
++        _finish_debug("web_search_tool", debug_call_data, raw)
++        return tool_error(public)
+ 
+ 
+ def _search_limit_maximum(provider=None) -> int:
+@@ -456,6 +469,15 @@
+             if error_json is not None:
+                 return error_json
+             results = await _extract_safe_urls(provider, safe_urls, format)
++            from hermes_cli.friday_user_scope import ordinary_presentation, ordinary_web_error_text
++            if ordinary_presentation():
++                # Project provider per-URL failure text only; generated boundary
++                # messages (SSRF/invalid) and recovered content stay untouched.
++                for entry in results:
++                    cause = entry.get("error") if isinstance(entry, dict) else None
++                    if isinstance(cause, str) and cause:
++                        debug_call_data.setdefault("private_causes", []).append(cause)
++                        entry["error"] = ordinary_web_error_text(cause)
+         # Reconstruct input order across invalid, blocked, and provider entries (providers preserve
+         # the order of the safe URL list they receive).
+         if invalid_urls or ssrf_blocked:
+@@ -480,7 +502,13 @@
+         _finish_debug("web_extract_tool", debug_call_data)
+         return cleaned_result
+     except Exception as e:
+-        return _finish_debug("web_extract_tool", debug_call_data, f"Error extracting content: {str(e)}")
++        from hermes_cli.friday_user_scope import ordinary_exception_error_text
++        raw = f"Error extracting content: {str(e)}"
++        public = ordinary_exception_error_text(str(e))
++        if public is None:
++            return _finish_debug("web_extract_tool", debug_call_data, raw)
++        _finish_debug("web_extract_tool", debug_call_data, raw)
++        return tool_error(public)
+ 
+ 
+ def _provider_is_ready(provider) -> bool:
