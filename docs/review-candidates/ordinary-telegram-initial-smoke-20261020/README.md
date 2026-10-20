@@ -10,6 +10,8 @@ Source90 explicitly admits its bounded ordinary Telegram phase while full runtim
 
 The earlier zero-executed-scenarios baseline remains an immutable historical result. Subsequent catalogue execution is a separate shard. The receiver's terminal state remains `EVIDENCE_READY` and its automatic `delivery_acceptance` remains `NOT_ESTABLISHED`; operator and independent corroboration are separate evidence, not mutations of that tool state. Each of the three requests was sent once under the original run deadline. Initial pre-send and diagnostic-helper failures are retained privately.
 
+[Subsequent observation delta](OBSERVATIONS.json) records three independently reviewed live shards with eleven additional requests. It separates the observed preference, dialogue and contextual-summary behavior from the web failure, the document observer's plan gap, public diagnostic vocabulary, and withdrawn offline credit for testing the wrong product. These aggregate observations add no full-baseline, office-binary, restart or release acceptance.
+
 Not established here: complete catalogue/format coverage, human-client UX, cross-user isolation testing, ordinary restart recovery, office-format fixes, exact-token rendering, multipass, DSH/A0 workers, full qualification or release acceptance. Kimi's document fixes and Source100 preparations remain uninstalled candidates. Their source checks are not transferred into this installed observation.
 
 This publication contains aggregate outcomes only. Bot/account/session identifiers, operational paths, credentials, user inputs, private expected answers, acceptance definitions, raw messages, database rows, logs and handoffs are excluded. It contains no runnable implementation or deployment instructions.
