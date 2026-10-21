@@ -1,0 +1,614 @@
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -1108,8 +1108,9 @@
+ def _tool_result_environment(agent, task_id, call_id, *, undispatched=False):
+     """Retain the admitted worker caller through canonical result publication.
+ 
+-    Stopped/expired callers may persist evidence, but cannot reacquire or execute
+-    a terminal environment. No replacement deadline or ambient caller is minted.
++    Stopped, expired or trusted-failed callers may persist evidence, but cannot
++    reacquire or execute a terminal environment. No replacement deadline or
++    ambient caller is minted; returned tool text never supplies the failure latch.
+     """
+     from hermes_cli.friday_user_scope import current, check_agent, delegation_authority
+     cap = current()
+@@ -1118,22 +1119,34 @@
+         return
+     check_agent(agent)
+     from tools.approval_context import get_current_session_key
+-    session_key = get_current_session_key(default="") or agent.session_id
+     call = getattr(agent, "_tool_result_calls", {}).get((task_id, call_id))
+     if call is None:
+         if undispatched:
+             yield None
+             return
+         raise RuntimeError("tool_result_original_caller_required")
+-    if (call.agent is not agent or call.task_id != task_id or call.call_id != call_id
+-            or call.session_id != agent.session_id or call.session_key != session_key
+-            or call.turn_id != getattr(agent, "_current_turn_id", "")
+-            or call.run_deadline != getattr(agent, "_web_run_deadline", None)
+-            or call.user_authority != delegation_authority()):
+-        raise RuntimeError("tool_result_foreign_original_caller")
+-    if (call.stopped.is_set() or call.turn.stopped.is_set()
+-            or getattr(agent, "_interrupt_requested", False)
+-            or time.monotonic() >= call.deadline()):
++
++    def check_original_caller():
++        # Cache validation can race a turn transition, identity change or
++        # revocation. A failure latch never substitutes for these original pins.
++        check_agent(agent)
++        session_key = get_current_session_key(default="") or agent.session_id
++        if (getattr(agent, "_tool_result_calls", {}).get((task_id, call_id)) is not call
++                or call.agent is not agent or call.task_id != task_id or call.call_id != call_id
++                or call.session_id != agent.session_id or call.session_key != session_key
++                or call.turn_id != getattr(agent, "_current_turn_id", "")
++                or call.run_deadline != getattr(agent, "_web_run_deadline", None)
++                or call.user_authority != delegation_authority()):
++            raise RuntimeError("tool_result_foreign_original_caller")
++
++    def evidence_only():
++        return (call.stopped.is_set() or call.turn.stopped.is_set()
++                or getattr(agent, "_interrupt_requested", False)
++                or time.monotonic() >= call.deadline()
++                or call.turn.failure is not None)
++
++    check_original_caller()
++    if evidence_only():
+         yield None
+         return
+     from agent.web_call_context import bind_web_call
+@@ -1142,15 +1155,18 @@
+         try:
+             env = get_active_env(task_id)
+         except (RuntimeError, TimeoutError, TerminalScopeDenied):
+-            # Stop can land between the precheck and native cache validation.
+-            # Revalidate admission; only the original stop/deadline permits
+-            # evidence-only publication without an environment.
+-            check_agent(agent)
+-            if not (call.stopped.is_set() or call.turn.stopped.is_set()
+-                    or getattr(agent, "_interrupt_requested", False)
+-                    or time.monotonic() >= call.deadline()):
++            # Only the same authenticated caller's native stop/deadline/failure
++            # permits evidence publication after a cache lookup race.
++            check_original_caller()
++            if not evidence_only():
+                 raise
+             env = None
++        else:
++            # A successful native cache check may finish just as the retained
++            # turn fails. Publication still receives no executable environment.
++            check_original_caller()
++            if evidence_only():
++                env = None
+         yield env
+ 
+ 
+--- a/agent/turn_explainers.py
++++ b/agent/turn_explainers.py
+@@ -5,6 +5,7 @@
+ """
+ import os
+ import re
++import unicodedata
+ from contextlib import suppress
+ from typing import Any, Dict, Optional
+ 
+@@ -106,6 +107,35 @@
+         return enabled
+     except Exception:
+         return True
++
++
++# Generic Russian marker for labels that carry no safe displayable residue.
++_GENERIC_FILE_LABEL = "файл"
++_SAFE_LABEL_MAX = 80
++
++
++def _safe_display_label(path) -> str:
++    """Bounded safe basename for the managed public file-mutation footer.
++
++    Both slash styles are treated as separators so Windows-style host paths
++    cannot leak through on a POSIX host; the label is cut at the first
++    control, format, or Unicode line/paragraph boundary character (ASCII
++    newlines, U+2028/U+2029, bidi/zero-width marks) so an injected
++    presentation directive can never reach the caption. An empty or
++    unusable residue never falls back to the raw path — the generic
++    Russian marker is used instead. Ordinary Unicode and space-containing
++    filenames are preserved verbatim.
++    """
++    tail = str(path or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
++    safe = []
++    for ch in tail:
++        if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp"):
++            break
++        safe.append(ch)
++    cleaned = "".join(safe).strip()
++    if len(cleaned) > _SAFE_LABEL_MAX:
++        cleaned = cleaned[:_SAFE_LABEL_MAX].rstrip()
++    return cleaned or _GENERIC_FILE_LABEL
+ 
+ 
+ class TurnExplainersMixin:
+@@ -217,6 +247,24 @@
+         """
+         if not failed:
+             return ""
++        from hermes_cli.friday_user_scope import (
++            ordinary_presentation, ordinary_failure_preview,
++            PUBLIC_FILE_MUTATION_HEADER, PUBLIC_FILE_MUTATION_FAILED, PUBLIC_FILE_MUTATION_MORE,
++        )
++        if ordinary_presentation():
++            # Dedicated ordinary-user footer: safe filenames only, no tool
++            # identifiers, no execution instructions, no host path prefixes.
++            # The private raw verifier record is untouched; counts stay truthful.
++            lines = [PUBLIC_FILE_MUTATION_HEADER.format(count=len(failed))]
++            shown = list(failed.items())[:10]
++            for path, info in shown:
++                preview = (info.get("error_preview") or "").strip()
++                name = _safe_display_label(path)
++                lines.append(f"• {name}: {ordinary_failure_preview(preview, failed_copy=PUBLIC_FILE_MUTATION_FAILED)}")
++            remaining = len(failed) - len(shown)
++            if remaining > 0:
++                lines.append(PUBLIC_FILE_MUTATION_MORE.format(count=remaining))
++            return "\n".join(lines)
+         lines = [t("explainer.file_mutation.header", count=len(failed))]
+         shown = list(failed.items())[:10]
+         for path, info in shown:
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -1546,7 +1546,10 @@
+     # Final safety check: ensure path stays inside cache dir
+     if not filepath.resolve().is_relative_to(cache_dir.resolve()):
+         raise ValueError(f"Path traversal rejected: {filename!r}")
+-    filepath.write_bytes(data)
++    # Create private even under a permissive gateway umask. Exclusive creation
++    # also refuses colliding files/symlinks without changing their contents.
++    with open(filepath, "xb", opener=lambda path, flags: os.open(path, flags, 0o600)) as handle:
++        handle.write(data)
+     return str(filepath)
+ 
+ 
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -1170,6 +1170,36 @@
+ 
+ def empty_response_copy():
+     return 'Ответ не получен. Часть действий могла выполниться; проверьте результат перед повтором. Если ошибка повторяется, сообщите администратору.'
++# Exact existing registry.dispatch public wording, kept as the single source.
++PUBLIC_TOOL_REFUSAL_COPY = 'Это действие недоступно.'
++PUBLIC_WEB_STOPPED_COPY = 'Проверка в интернете остановлена.'
++PUBLIC_FILE_EXISTS_COPY = 'Файл уже существует; изменение не выполнено.'
++# Dedicated ordinary file-mutation footer copy: no tool identifiers, no execution
++# instructions, no host path prefixes. Counts stay truthful.
++PUBLIC_FILE_MUTATION_HEADER = 'Не все изменения файлов выполнены: {count}.'
++PUBLIC_FILE_MUTATION_FAILED = 'изменение не выполнено'
++PUBLIC_FILE_MUTATION_MORE = 'И ещё: {count}.'
++
++
++_PUBLIC_PREVIEW_CODES = {
++    'document_already_exists': PUBLIC_FILE_EXISTS_COPY,
++    'product_user_scope_refused': PUBLIC_TOOL_REFUSAL_COPY,
++    'web_call_stopped': PUBLIC_WEB_STOPPED_COPY,
++}
++
++
++def ordinary_failure_preview(preview, *, failed_copy):
++    """Bounded public preview for the managed file-mutation verifier footer.
++
++    Exact known machine codes keep their truthful public status; anything else
++    (provider bodies, host paths, credentials) stays in private receipts and the
++    entry falls back to the generic failed marker. Filenames stay visible.
++    """
++    if preview in _PUBLIC_PREVIEW_CODES:
++        return _PUBLIC_PREVIEW_CODES[preview]
++    return failed_copy
++
++
+ 
+ 
+ def ordinary_tool_metadata(name, result):
+--- a/plugins/web/keyless_mcp.py
++++ b/plugins/web/keyless_mcp.py
+@@ -187,7 +187,7 @@
+     return response.content.decode(declared or "utf-8", errors="replace")
+ 
+ 
+-def mcp_call(url: str, tool: str, arguments: Dict[str, Any], timeout: int = _TIMEOUT_SECONDS) -> str:
++def mcp_call(url: str, tool: str, arguments: Dict[str, Any], timeout: int = _TIMEOUT_SECONDS, *, _text_handler=None) -> str:
+     """POST a JSON-RPC ``tools/call`` and return the text payload. Raises
+     :class:`KeylessMCPError` on transport failures, non-2xx, JSON-RPC and tool errors."""
+     import requests
+@@ -242,39 +242,8 @@
+             session.trust_env = False
+             with session.post(url, json=payload, headers=headers, stream=True,
+                               allow_redirects=False, timeout=(min(5,timeout),timeout)) as response:
+-                if response.status_code != 200: raise KeylessMCPError("keyless provider unavailable")
+-                if response.headers.get('Content-Encoding','identity') != 'identity':
+-                    raise KeylessMCPError('keyless encoding refused')
+-                if int(response.headers.get('Content-Length', '0')) > 1000000:
+-                    raise KeylessMCPError("keyless response bound")
+-                # The pinned requests/urllib3 native socket is re-bounded to the
+-                # remaining whole call time before every bounded read. Refuse
+-                # an unsupported transport instead of reading without a bound.
+-                sock = response.raw._fp.fp.raw._sock
+-                parts = []; size = 0
+-                while True:
+-                    left = deadline - time.monotonic()
+-                    if left <= 0: raise KeylessMCPError("keyless timeout")
+-                    sock.settimeout(left)
+-                    part = response.raw.read1(65536)
+-                    if not part: break
+-                    size += len(part)
+-                    if size > 1000000: raise KeylessMCPError("keyless response bound")
+-                    parts.append(part)
+-                body = b''.join(parts).decode('utf-8')
+-                candidates = [body.strip()] if body.lstrip().startswith('{') else [line[5:].strip() for line in re.split(r'\r\n|\r|\n',body) if line.startswith('data:')]
+-                if len(candidates) != 1: raise KeylessMCPError("keyless envelope refused")
+-                v = json.loads(candidates[0]); result = v.get('result') or {}
+-                if (set(v) != {'jsonrpc','id','result'} or v['jsonrpc'] != '2.0' or type(v['id']) is not int or v['id'] != 1
+-                        or set(result) - {'content','isError'} or result.get('isError')
+-                        or not isinstance(result.get('content'),list) or len(result['content']) != 1
+-                        or result['content'][0].get('type') != 'text'
+-                        or set(result['content'][0]) - {'type','text','_meta'}):
+-                    raise KeylessMCPError("keyless result refused")
+-                text = result['content'][0]['text']
+-                if not isinstance(text,str) or len(text) > 15000:
+-                    raise KeylessMCPError("keyless text bound")
+-                return text
++                from plugins.web.keyless_mcp_bounded import read_response
++                return read_response(response, deadline, KeylessMCPError, text_handler=_text_handler)
+     except KeylessMCPError:
+         raise
+     except Exception:
+@@ -346,17 +315,75 @@
+     return results
+ 
+ 
++def _exa_provider_text(text: str, deadline: float) -> Optional[dict]:
++    """Retain oversized admitted wire text through existing private file I/O."""
++    import time
++    if len(text) <= 15000:
++        return None
++    from hermes_cli.friday_user_scope import ordinary_file_scope
++    from tools.web_tools_truncate import _store_full_text, MAX_SCOPED_STORED_BYTES
++    if (time.monotonic() >= deadline or ordinary_file_scope() is None
++            or len(text.encode("utf-8")) > MAX_SCOPED_STORED_BYTES):
++        raise KeylessMCPError("keyless text bound")
++    path = _store_full_text("https://exa-provider.invalid/" + uuid.uuid4().hex, text)
++    if not path or time.monotonic() >= deadline or ordinary_file_scope() is None:
++        raise KeylessMCPError("keyless text bound")
++    return {"stored_copy": "complete", "original_chars": len(text),
++            "original_bytes": len(text.encode("utf-8")),
++            "read_file": {"path": path, "offset": 1, "char_offset": 0, "limit": 200}}
++
++
+ def exa_search_keyless(query: str, limit: int = 5) -> Dict[str, Any]:
+-    return _search("exa", lambda: _parse_exa_search_text(mcp_call(EXA_MCP_URL, "web_search_exa", {"query": query, "numResults": max(1, int(limit))}), limit))
++    def _format(text, deadline):
++        from tools.web_tools_truncate import _bounded_search_response
++        # Parse every source block before the normal requested-result selection;
++        # the retained raw provider text also preserves unparsed source fields.
++        rows = _parse_exa_search_text(text, 0)
++        if len(text) > 15000 and not rows:
++            raise KeylessMCPError("keyless text bound")
++        response = search_ok(rows[:limit] if limit else rows)
++        recovery = _exa_provider_text(text, deadline)
++        if recovery is not None:
++            response.update(provider_text=recovery, provider_result_count=len(rows),
++                            result_count=len(response["data"]["web"]),
++                            partial=len(response["data"]["web"]) < len(rows))
++        original = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
++        return _bounded_search_response(response, original, inline_budget=15000,
++                                        require_recovery=True) or original
++    try:
++        return json.loads(mcp_call(EXA_MCP_URL, "web_search_exa",
++                                  {"query": query, "numResults": max(1, int(limit))},
++                                  _text_handler=_format))
++    except KeylessMCPError as exc:
++        return search_fail(_fail_msg("exa", "search", exc))
+ 
+ 
+ def exa_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
+-    """Called per-URL; the tool returns one combined text payload."""
++    """Called per-URL; bound and retain text before transport publication."""
+     def _fetch(url: str) -> Dict[str, Any]:
+-        text = mcp_call(EXA_MCP_URL, "web_fetch_exa", {"urls": [url]})
+-        # Title: first markdown H1 or ``Title:`` line, whichever comes first.
+-        titles = (_after(s, "# " if s.startswith("# ") else "Title:") for s in map(str.strip, text.splitlines()) if s.startswith(("# ", "Title:")))
+-        return _page(url, next(titles, ""), text)
++        def _format(text, deadline):
++            from tools.web_tools_truncate import _bounded_extract_response
++            titles = (_after(s, "# " if s.startswith("# ") else "Title:")
++                      for s in map(str.strip, text.splitlines()) if s.startswith(("# ", "Title:")))
++            page = _page(url, next(titles, ""), text)
++            recovery = _exa_provider_text(text, deadline)
++            if recovery is not None:
++                page["provider_text"] = recovery
++            original = json.dumps({"results": [page]}, ensure_ascii=False, separators=(",", ":"))
++            from agent.bounded_context import serialized_bytes
++            if len(original) <= 15000 and serialized_bytes(original) <= 15000:
++                return original
++            return _bounded_extract_response([page], inline_budget=15000, require_recovery=True)
++        value = mcp_call(EXA_MCP_URL, "web_fetch_exa", {"urls": [url]}, _text_handler=_format)
++        bounded = json.loads(value)
++        if bounded.get("results"):
++            return bounded["results"][0]
++        if bounded.get("read_file") and bounded.get("stored_copy") == "complete":
++            # Existing manifest fallback retains oversized titles/metadata and
++            # each source descriptor. Preserve the per-URL extraction contract.
++            return {"url": url, "title": "", "content": "Read the retained result manifest for source text and metadata.",
++                    "partial": True, "stored_copy": "complete", "read_file": bounded["read_file"]}
++        raise KeylessMCPError("keyless text bound")
+ 
+     return _per_url(urls, _fetch, "exa", catch=KeylessMCPError, hint=True)
+ 
+--- /dev/null
++++ b/plugins/web/keyless_mcp_bounded.py
+@@ -0,0 +1,84 @@
++"""Bounded Exa argument and native response phases for keyless MCP."""
++
++import json
++import re
++import time
++
++
++def validate_arguments(tool, arguments, KeylessMCPError):
++    if tool not in ("web_search_exa", "web_fetch_exa"):
++        raise KeylessMCPError("keyless tool refused")
++    if not isinstance(arguments, dict): raise KeylessMCPError("keyless arguments refused")
++    if tool == 'web_search_exa':
++        if (set(arguments) != {'query','numResults'} or not isinstance(arguments['query'], str)
++                or not 1 <= len(arguments['query']) <= 4096
++                or type(arguments['numResults']) is not int or not 1 <= arguments['numResults'] <= 20):
++            raise KeylessMCPError("keyless search bounds refused")
++    else:
++        from urllib.parse import urlsplit
++        import ipaddress
++        urls = arguments.get('urls')
++        if set(arguments) != {'urls'} or not isinstance(urls,list) or len(urls) != 1:
++            raise KeylessMCPError("keyless fetch bounds refused")
++        url_value = urls[0]
++        if not isinstance(url_value,str) or len(url_value)>2048: raise KeylessMCPError("keyless URL refused")
++        u = urlsplit(url_value)
++        try: ipaddress.ip_address(u.hostname or '')
++        except ValueError: pass
++        else: raise KeylessMCPError("keyless IP URL refused")
++        if (u.scheme != 'https' or u.username or u.password or u.port or u.fragment
++                or not u.hostname or '.' not in u.hostname or u.hostname.endswith(('.local','.internal'))
++                or any(ord(c)<=32 for c in url_value) or '\\' in url_value):
++            raise KeylessMCPError("keyless URL refused")
++
++
++def read_response(response, deadline, KeylessMCPError, *, text_handler=None):
++    if response.status_code != 200: raise KeylessMCPError("keyless provider unavailable")
++    if response.headers.get('Content-Encoding','identity') != 'identity':
++        raise KeylessMCPError('keyless encoding refused')
++    if int(response.headers.get('Content-Length', '0')) > 1000000:
++        raise KeylessMCPError("keyless response bound")
++    # The pinned requests/urllib3 native socket is re-bounded to the
++    # remaining whole call time before every bounded read. Refuse
++    # an unsupported transport instead of reading without a bound.
++    sock = response.raw._fp.fp.raw._sock
++    parts = []; size = 0
++    while True:
++        left = deadline - time.monotonic()
++        if left <= 0: raise KeylessMCPError("keyless timeout")
++        sock.settimeout(left)
++        part = response.raw.read1(65536)
++        if not part: break
++        size += len(part)
++        if size > 1000000: raise KeylessMCPError("keyless response bound")
++        parts.append(part)
++    body = b''.join(parts).decode('utf-8')
++    candidates = [body.strip()] if body.lstrip().startswith('{') else [line[5:].strip() for line in re.split(r'\r\n|\r|\n',body) if line.startswith('data:')]
++    if len(candidates) != 1: raise KeylessMCPError("keyless envelope refused")
++    v = json.loads(candidates[0]); result = v.get('result') or {}
++    if (set(v) != {'jsonrpc','id','result'} or v['jsonrpc'] != '2.0' or type(v['id']) is not int or v['id'] != 1
++            or set(result) - {'content','isError'} or result.get('isError')
++            or not isinstance(result.get('content'),list) or len(result['content']) != 1
++            or result['content'][0].get('type') != 'text'
++            or set(result['content'][0]) - {'type','text','_meta'}):
++        raise KeylessMCPError("keyless result refused")
++    text = result['content'][0]['text']
++    if not isinstance(text, str):
++        raise KeylessMCPError("keyless text bound")
++    # The only oversized lane composes the native parser and private pageable
++    # result before returning bytes to the provider/model pipeline. No raw large
++    # string is released to an ordinary caller of this transport.
++    if time.monotonic() >= deadline:
++        raise KeylessMCPError("keyless timeout")
++    if text_handler is not None:
++        try:
++            text = text_handler(text, deadline)
++        except Exception:
++            # Preserve the original fixed refusal if parsing/private recovery
++            # cannot complete; never refetch or leak a foreign exception body.
++            raise KeylessMCPError("keyless text bound") from None
++    if time.monotonic() >= deadline:
++        raise KeylessMCPError("keyless timeout")
++    if not isinstance(text, str) or len(text) > 15000:
++        raise KeylessMCPError("keyless text bound")
++    return text
+--- a/tools/web_tools_extract.py
++++ b/tools/web_tools_extract.py
+@@ -230,7 +230,11 @@
+         source = meta.get("sourceURL") if isinstance(meta, dict) else None
+         url = next((u for u in (fetched.get("url"), source) if u in requested), None)
+         _content = fetched.get("raw_content", "") or fetched.get("content", "")
+-        if url and _content and not fetched.get("error"):
++        # Provider-stage previews carry pageable originals. The text-only cache
++        # cannot retain their recovery descriptors; caching a preview would later
++        # misrepresent it as the complete fetched page.
++        if (url and _content and not fetched.get("error")
++                and not fetched.get("partial") and not fetched.get("provider_text")):
+             extract_cache_put(url, _content, fetched.get("title", ""), format=format, provider=provider.name)
+     return results
+ 
+--- a/tools/web_tools_truncate.py
++++ b/tools/web_tools_truncate.py
+@@ -102,7 +102,7 @@
+         return None
+ 
+ 
+-def _truncate_with_footer(content: str, url: str, char_limit: int) -> tuple[str, bool]:
++def _truncate_with_footer(content: str, url: str, char_limit: int, *, recovery: Optional[dict] = None) -> tuple[str, bool]:
+     """Return (model_text, was_truncated). Pages over ``char_limit`` become a ~75% head / ~25% tail window cut
+     on line boundaries, plus a footer saying how much is shown, where the full text is stored, and the
+     read_file call that pages the omitted middle."""
+@@ -117,14 +117,18 @@
+     if 0 <= (nl := tail.find("\n")) < tail_budget * 0.5:
+         tail = tail[nl + 1:]
+ 
+-    stored_path = _store_full_text(url, content)
+-    stored_partial = False
++    # A provider-stage bounded preview already has a complete source descriptor.
++    # Further caller-specific previewing must keep that source, not save a
++    # preview and call the preview a complete page.
++    stored_path = recovery["read_file"]["path"] if recovery else _store_full_text(url, content)
++    stored_partial = recovery.get("stored_copy") == "partial" if recovery else False
+     scoped = False
+     if stored_path:
+         from hermes_cli.friday_user_scope import ordinary_file_scope
+         scoped = ordinary_file_scope() is not None
+-        stored_partial = (len(content.encode("utf-8")) > MAX_SCOPED_STORED_BYTES if scoped
+-                          else len(content) > MAX_STORED_TEXT_CHARS)
++        if not recovery:
++            stored_partial = (len(content.encode("utf-8")) > MAX_SCOPED_STORED_BYTES if scoped
++                              else len(content) > MAX_STORED_TEXT_CHARS)
+     if stored_path and not scoped:
+         # The footer is read by the AGENT, whose read_file runs inside the active backend: render the
+         # path where docker/modal/ssh/... see the mounted cache, not the host path (#72389, #81984).
+@@ -133,11 +137,13 @@
+     footer_lines = [
+         "", "─" * 8 + " [TRUNCATED] " + "─" * 8,
+         f"Showing {len(head):,} chars (head) + {len(tail):,} chars (tail) "
+-        f"of {len(content):,} total clean characters.",
++        + (f"of {len(content):,} inline preview characters; retained source has "
++         f"{recovery['original_chars']:,} characters." if recovery else
++         f"of {len(content):,} total clean characters."),
+     ]
+     if stored_path:
+         # read_file is 1-indexed; +2 lands on the first line after the shown head.
+-        middle_start_line = max(1, head.count("\n") + 1)
++        middle_start_line = 1 if recovery else max(1, head.count("\n") + 1)
+         footer_lines += [
+             f"{'Partial text' if stored_partial else 'Full text'} saved to: {stored_path}",
+             f'To read the omitted middle: read_file path="{stored_path}" '
+@@ -197,7 +203,8 @@
+             logger.info("%s (binary payload: %s, %d chars dropped)", url, binary_kind, len(raw_content))
+             continue
+         clean = convert_base64_images_to_links(raw_content)
+-        model_text, truncated = _truncate_with_footer(clean, url, char_limit)
++        model_text, truncated = _truncate_with_footer(clean, url, char_limit, recovery=(result.get("provider_text") or
++            (result if result.get("partial") and result.get("read_file") and "original_chars" in result else None)))
+         result["content"] = model_text
+         if truncated:
+             debug_call_data["pages_truncated"] += 1
+@@ -209,7 +216,7 @@
+             logger.info("%s (%d chars, whole)", url, len(clean))
+ 
+ 
+-def _bounded_search_response(response: dict, original: str) -> Optional[str]:
++def _bounded_search_response(response: dict, original: str, *, inline_budget: Optional[int] = None, require_recovery: bool = False) -> Optional[str]:
+     """Keep small/native responses exact; bound oversized search JSON with recovery.
+ 
+     The saved original includes every result, rank, citation and provider/error
+@@ -220,6 +227,10 @@
+     import uuid
+     from agent.bounded_context import bounded_tool_result_budget, serialized_bytes
+     budget = bounded_tool_result_budget()
++    if inline_budget is None and (response.get("provider_text") or (response.get("partial") and response.get("read_file"))):
++        inline_budget = 15000
++    if inline_budget is not None:
++        budget = min(budget, inline_budget) if budget is not None else inline_budget
+     if budget is None or serialized_bytes(original) <= budget:
+         return None
+     # Unique storage identity also prevents the unmanaged cache fallback from
+@@ -229,6 +240,8 @@
+     scoped = ordinary_file_scope() is not None
+     incomplete = (len(original.encode("utf-8")) > MAX_SCOPED_STORED_BYTES if scoped
+                   else len(original) > MAX_STORED_TEXT_CHARS)
++    if require_recovery and (not scoped or not path or incomplete):
++        raise ValueError("complete private web recovery required")
+     data = response.get("data")
+     web = data.get("web", []) if isinstance(data, dict) else []
+     count = len(web) if isinstance(web, list) else 0
+@@ -267,13 +280,15 @@
+     value = encode(envelope)
+     if serialized_bytes(value) > budget:
+         # Extremely long workspace paths cannot escape the aggregate ceiling.
++        if require_recovery:
++            raise ValueError("web recovery envelope exceeds inline budget")
+         value = encode({"success": False, "data": {"web": []}, "result_count": count,
+                         "partial": True, "stored_copy": "unavailable",
+                         "error": "capacity: recovery envelope exceeds inline budget"})
+     return value
+ 
+ 
+-def _bounded_extract_response(results: List[dict], originals: Optional[List[dict]] = None) -> Optional[str]:
++def _bounded_extract_response(results: List[dict], originals: Optional[List[dict]] = None, *, inline_budget: Optional[int] = None, require_recovery: bool = False) -> Optional[str]:
+     """Bound the whole embedded result in the opt-in byte-accounted lane.
+ 
+     Store original clean pages before reducing any inline evidence. A final
+@@ -283,6 +298,10 @@
+     import json
+     from agent.bounded_context import bounded_tool_result_budget, serialized_bytes
+     budget = bounded_tool_result_budget()
++    if inline_budget is None and any(r.get("provider_text") or (r.get("partial") and r.get("read_file")) for r in results):
++        inline_budget = 15000
++    if inline_budget is not None:
++        budget = min(budget, inline_budget) if budget is not None else inline_budget
+     if budget is None:
+         return None
+     encode = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+@@ -293,22 +312,38 @@
+     for result, source in zip(results, originals if originals is not None else results):
+         content = source.get("raw_content", "") or source.get("content", "")
+         clean = convert_base64_images_to_links(content)
+-        path = _store_full_text(result.get("url", ""), clean) if clean and not result.get("error") else None
+-        partial = bool(path and len(clean.encode("utf-8")) > MAX_SCOPED_STORED_BYTES)
++        recovery = source.get("provider_text") or (source if source.get("partial") and source.get("read_file") else None)
++        path = (recovery["read_file"]["path"] if recovery else
++                _store_full_text(result.get("url", ""), clean) if clean and not result.get("error") else None)
++        partial = (recovery.get("stored_copy") == "partial" if recovery else
++                   bool(path and len(clean.encode("utf-8")) > MAX_SCOPED_STORED_BYTES))
++        if require_recovery:
++            from hermes_cli.friday_user_scope import ordinary_file_scope
++            if not path or partial or ordinary_file_scope() is None:
++                raise ValueError("complete private web recovery required")
+         rows.append({"url": result.get("url", ""), "title": result.get("title", ""),
+                      "content": "", "error": result.get("error"), "partial": True,
++                     "original_chars": recovery.get("original_chars", len(clean)) if recovery else len(clean),
++                     **({"provider_text": result["provider_text"]} if result.get("provider_text") else {}),
+                      **({"blocked_by_policy": result["blocked_by_policy"]} if "blocked_by_policy" in result else {}),
+                      "stored_copy": "partial" if partial else "complete" if path else "unavailable",
+                      "read_file": {"path": path, "offset": 1, "limit": 200} if path else None})
+-    base = {"results": rows, "partial": True, "note": "Inline preview; read_file pages retained source text."}
++    base = {"results": rows, "result_count": len(results), "inline_result_count": len(rows), "partial": True, "note": "Inline preview; read_file pages retained source text."}
+     if serialized_bytes(encode(base)) > budget:
+         manifest_text = encode(base)
+         manifest = _store_full_text("https://web-extract.invalid/results", manifest_text)
+-        response = {"results": [], "partial": True, "error": "capacity: result metadata exceeds inline budget",
++        if require_recovery:
++            from hermes_cli.friday_user_scope import ordinary_file_scope
++            if (not manifest or len(manifest_text.encode("utf-8")) > MAX_SCOPED_STORED_BYTES
++                    or ordinary_file_scope() is None):
++                raise ValueError("complete private web recovery required")
++        response = {"results": [], "result_count": len(results), "inline_result_count": 0, "partial": True, "error": "capacity: result metadata exceeds inline budget",
+                     "stored_copy": ("partial" if len(manifest_text.encode()) > MAX_SCOPED_STORED_BYTES else "complete") if manifest else "unavailable",
+                     "read_file": {"path": manifest, "offset": 1, "limit": 200} if manifest else None}
+         value = encode(response)
+         if serialized_bytes(value) > budget:
++            if require_recovery:
++                raise ValueError("web recovery envelope exceeds inline budget")
+             return encode({"results": [], "partial": True, "error": "capacity: no recoverable result envelope fits"})
+         return value
+     # Fair aggregate allocation, priced after both JSON serializations. URLs,
+@@ -334,6 +369,7 @@
+             "url": r.get("url", ""), "title": r.get("title", ""), "content": r.get("content", ""),
+             "error": r.get("error"),
+             **({"blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
++            **({key: r[key] for key in ("provider_text", "partial", "stored_copy", "read_file", "original_chars") if key in r}),
+         }
+         for r in results
+     ]
