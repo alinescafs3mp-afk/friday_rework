@@ -1,205 +1,95 @@
-Последний исходный срез 18.10.2026: интегрированы подписанные административные чтения после подключения пользователя —238 Source PASS, отдельно85subtests,13изменённых единиц прошли quality и независимое review. Установленный runtime не менялся; полный прогон ожидаемых261тестовых файлов и живая приёмка ещё впереди. [Код, доказательства и открытые ограничения](docs/review-candidates/operator-admin-read-source-20261018/README.txt).
+# Friday
 
-18.10.2026. [Reviewed operator transaction and full functional-input catalog](docs/review-candidates/operator-transaction-source-and-functional-readiness-20261018/README.txt): private second-user transaction Source has178 PASS/1 retained public-oracle FAIL; authenticated metadata reads remain under repair. All258 existing test files are accounted for statically, including nested tests and30 aliases; full functional execution is pending. Native R8 closed safely after the original16M transport-work refusal and supplies no full witness. These patches are uninstalled; Source93 quality and its33 focused cases remain the completed checks below.
+**A personal AI assistant built to run on hardware its owner controls.**
 
-18.10.2026,11:49MSK. [Source93 coherent document-outcome candidate](docs/review-candidates/source93-document-outcome-composition-20261018/README.txt): all11 native source-quality checks PASS, plus28 document and5 canonical SDK fixture tests. Lost document acknowledgements now use a normal generic UNKNOWN response with exact-route revalidation and no ambiguous retry. This is reviewed, uninstalled Source; installed native qualification, the genuine second-user onboarding fix, complete functional and live Telegram/Jarvis/UI journeys and release remain unfinished. The previous diagnostic R7 codec-budget failure and reviewed two-file Source optimization are preserved in the same package.
+Friday (Пятница) is our effort to build an assistant that can keep track of ongoing work, remember useful preferences, work with files, and help with coding and engineering tasks. We want it to be useful over time, with local model inference and a familiar way to talk to it through Telegram.
 
-<!-- Earlier installed/source checkpoints below are historical; their acceptance does not transfer to Source93. -->
+There are four of us: **two system administrators and two software developers**. This repository contains the Friday integration, patches, deployment tools, and development records. The project is in active development.
 
-15.10.2026,10:11MSK. Native56 corrects the ordinary gateway consumer that rejected the normally configured seven browser grants. Independent source review PASS; supported55→56 update observed exit0/9.38s with17675 native files,56 ordered layers and178 private project pins. Exactly one existing native gateway file changes; configuration, disabled generation1 user, credentials,41 plugin files and115 history pins are preserved. The installed read-only full checker PASS and the normal shipped gateway helper exited0/58.09s. Genuine browser execution, Telegram answer/follow-up and release remain unaccepted. The new portable gateway regression passed19 cases through the existing bounded runner; the unchanged Native55 matrix was not repeated. Normal WebUI READY and all four retained-session APIs returned HTTP200. At14:47MSK after the model-capacity interruption, the same gateway remained active with zero restarts; pairing pending0/approved0 and the prepared user disabledgeneration1. The first genuine Telegram answer and contextual follow-up remain the next user-visible result.
+## What we are building
 
-<!-- Retained Native55 checkpoint and earlier history; current Native56 status above. -->
+The intended system brings together:
 
-15.10.2026,09:58MSK. Current runtime blocker after supported browser configuration: the disabled generation1 profile was configured normally without restart, but the shipped ordinary gateway checker rejects the new browser grants with binding_scope_mismatch because its consumer still allows only SAFE. No user was enabled and no live browser/Telegram action occurred. Native55 installation/start and source controls above remain scoped historical observations; the configured browser path is NOT accepted. Next is the narrow gateway-consumer correction through a new supported source update, preserving consumed55, configuration and original budgets.
+- **Conversation and continuity:** Telegram conversations, persistent history, user preferences, and memory.
+- **Practical file work:** creating, revising, and returning useful documents and other artifacts.
+- **Coding and engineering:** specialized workers that can carry out tasks and return results to the same conversation.
+- **Research:** access to current web sources when a task needs them.
+- **Administration:** a web interface for users, access, conversations, tasks, and configuration.
 
-# Friday_rework
+Production model calls are designed to use explicitly configured local endpoints, with no automatic cloud inference fallback. Web research is a separate capability: running the models locally should still allow the assistant to look up information when authorized.
 
-15.10.2026,09:48MSK — [Native55 ordinary browser source and installed status](analysis/2026-10-15/telegram-ordinary-receiving/README.md):17675 files/55layers/176 private project pins; supported update, normal gateway/WebUI startup and four authenticated API responses HTTP200 observed. The named seven scoped browser tools, recoverable bounded JSON, disabled-user browser preset and exact updater transaction are independently accepted at source. Genuine browser execution and Telegram answer/follow-up remain NOT_YET_OBSERVED; runtime journeys and release remain unaccepted. The [full current scope](docs/foundation-status.md), original budgets, failed observations and all mandatory workers/gates remain intact.
+## What has already worked
 
-12.10.2026 CURRENT COMPLETED SOURCE CUT: [current completed Source delta](analysis/2026-10-12/current-complete-source-delta/README.md) preserves C83 accepted original Source26/schema27, C92 PARTIAL final31/schema32 with five missing causes, and C58 Source26/Fixture/Driver/current209+original106 definitions with final REQUEST_CHANGES3. All derivatives are inert and unconnected; actual physical collection/native/full30/ELF/runtime/release remain unfinished. The [daily report](analysis/2026-10-12/DAILY-REPORT.md) and [period ledger](analysis/2026-10-12/DAILY-PERIOD-LEDGER.json) cover all18 existing period commits546b..3f20 plus this prepared completed-source delta; changing successor outputs and daily completion are not credited.
+We have moved beyond a design document. Earlier installed development builds have demonstrated the following in controlled bot-to-bot Telegram tests:
 
-12.10.2026 SOURCE SNAPSHOT: [complete kernel26 / CLI22 final Source refusals](analysis/2026-10-12/kernel26-cli22-final-source-refusals/README.md) preserves the complete refused C55/C68 source snapshots and their controls, selected actual dependencies and exact GNU9.7 Source/license/provenance. C55 is REQUEST_CHANGES3; C68 is REQUEST_CHANGES5; GNU is ACCEPT dependency Source evidence ONLY. All current controls remain DEFINITIONS_NOT_RUN; runtime and release are UNACCEPTED. This archive is inert and unconnected, with final findings at concrete sites and exact public byte/SHA rows. Earlier author/ACTIVE/PASS entries below are historical snapshots and supply no current acceptance.
+| Area | Observed result |
+| --- | --- |
+| Conversation | Replies and contextual follow-ups, with the exchanges preserved in native conversation history. |
+| Preferences | Saving, updating, and recalling a preference within the tested user's existing conversation. |
+| File delivery | TXT and DOCX files received through Telegram, downloaded, and checked against the workspace artifacts. |
+| Document revision | A requested date change delivered in a new DOCX copy, with the original preserved and the other document parts unchanged. |
 
-The remaining entries document historical checkpoints before this archive; their local status applies to those recorded bytes only.
+These are specific, bounded observations from earlier builds. They do not establish every document format, memory across fresh sessions, or the reliability of the latest build. The revision test also exposed a technical warning in the document caption that still needs correction.
 
-12.10.2026: [complete inert kernel26 and partial CLI20 Source](analysis/2026-10-12/kernel26-cli20-connected-inert-source/README.md) preserves all 26 kernel modules/fixtures, all 20 CLI modules, eight captured dependencies and seven CLI fixture programs. Five authored kernel repairs, original32/C45 definitions, early-owned stop and the final auxiliary custody, RLIM_INFINITY and private-parent findings are recorded; final independent wholeSource26 Safety is REQUEST_CHANGES with three blockers and Source UNACCEPTED. CLI strict physical whole30 remains BLOCKED by synchronous metadata/input/renderer and late durable promotion. Author 78/242 AST/metadata checks supply no runtime credit. Original late receipt/directory deviations, unknown resources and previous failures remain; moving C53 is excluded. Complete text has exact private-path/host-metadata normalization lineage and public byte/SHA manifest. kernel120/full32/physical-fit, native/install/normal3600 and release remain unaccepted.
+The [Telegram and document observations](docs/review-candidates/ordinary-telegram-initial-smoke-20261020/README.md) record both the successful results and their limits.
 
-12.10.2026: [closed partial full310, alias exec-identity cause and latest Source14](analysis/2026-10-12/canonical-full310-partial286-and-alias-source/README.md) preserves actual 286 PASS / 1 FAIL, with alias22 at 21/1 and supplemental23 incomplete; full310 is NOT_ACCEPTED. The two fault-mutated path keys collided and mislabelled selector code as RPC; Root8 confirms that cause only in read-only compile/equality scope. Six complete latest-A changed harnesses, six actual-F harnesses and eight exact unchanged public Source references remain inert. Latest-A independent review is pending and its full310 is NOT_RUN. Root pure54 is a separate memory extraction; the supplied standalone helper is NOT_RUNNABLE because support is missing. Kernel/native/install/genuine/current receipt/normal3600/full19/all7 and release acceptance remain pending. Privacy repair replaces live sessions with a symbolic integer and records every tool/session/path transformation with exact original-to-public lineage; publication review remains pending. Later actual310 PASS/final review is outside this immutable cutoff and supplies no acceptance here.
+## Current development status
 
-12.10.2026: [C39 genuine native-entry implementation and independent REFUSE](analysis/2026-10-12/native-genuine-entry-commit-c39-refusal-source/README.md) preserves the complete changed host/caller/updater Source, exact unchanged dependency references, 63 NOT_RUN runtime specifications and 724-module/41-resource capture schema. Three blocking findings remain: cached application code, first-birth/host hard reservation and relative stock deadline. Static AST/fault/regression coverage grants no native, receipt, kernel120, normal3600 or release acceptance. Changing C40/C41 successors are outside this cut.
+**Status snapshot: 22 October 2026, Moscow time.**
 
-The [canonical Source297 first actual gate archive](analysis/2026-10-12/canonical-source297-first-actual-gate/README.md) preserves the independently accepted exact private Source and first physical failure: all41 input controls passed, then uutils guard-negative returned137 and failed the required adopted-caller direct-wait assertion. Four known actors were freshly closed; original233+supplemental23 were NOT_RUN and full297 is NOT_ACCEPTED. A distinct minimal GNU binary diagnostic observed wrapper/caller -9 direct waits and fresh4 closure, with no Source297/runtime credit. All14 Source dependencies are preserved as inert text or unchanged frozen public references. Changing GNU Source repair is outside the cutoff; runtime/native/kernel120/normal3600/canonical installation/release remain pending.
+Friday is a development project, and a complete release has not yet been validated. The latest recorded startup attempt failed to establish readiness. A reviewed startup change is awaiting installation after an updater compatibility issue; its effect on startup readiness has not yet been verified. See the [startup and installation status](docs/review-candidates/startup-two-flush-await-bounds-source95-20261022/STATUS.json) for the exact snapshot.
 
+Current work includes startup and update reliability, incoming documents, grounded web research, complete worker workflows, and broader validation of memory, skills, administration, and user isolation. Earlier successful exchanges remain useful evidence; each new installed build still needs its own checks.
 
-The new [zombie/adopted actual21 Source archive](analysis/2026-10-12/zombie-adopted-observation-actual21-source/README.md) records independently reviewed final f3f3/22f private Source and fresh Root actual21: all 21 expected outcomes passed, seven real finite stock-flock actors returned 0, and 82 known Source births were freshly absent. It preserves physical flock/pidfd/wait/fstat observations, four raw early R-to-Z PermissionError notes and the late metadata ledger seal without reset. All 68 Source/adapters are inert path-sanitized text whose derivative hashes carry no original execution credit. The earlier 04:27 archive stays frozen. Installed runtime, native19/all7, kernel120/normal3600 and release remain NOT_ACCEPTED.
+## How the system fits together
 
-12.10.2026, Source-срез с cutoff 04:27 МСК: [наблюдаемость retained FD и canonical alias sender](analysis/2026-10-12/retained-fd-observability-canonical-alias-source/README.md). Опубликованы 18 инертных исходников и точные границы доказательств: 14 фактических приватных Source-cases PASS, два adopted-cases неполные. Физическое ожидание flock подтверждено; zombie-наблюдение помешало проверке wait-EIO. d35 принят статически; полный gate-пакет C34 получил REFUSE. Состав, приватность, буквальные преобразования и ссылки 24 публичных файлов независимо проверены. Изменённые публичные байты не получают приватный execution credit. После выбранного cutoff Сол подготовил исправление и пять дополнительных отрицательных контролей — их независимая приёмка и все 21 фактическая проверка впереди. Полные d35-gates, установленный runtime, native19, семь journeys и релиз остаются непринятыми; ежедневный checkpoint12Oct21MSK сохраняется.
+Friday builds on existing projects. Our work is in their integration, local deployment, access boundaries, task handling, document delivery, and the assistant's behavior.
 
-12.10.2026, предыдущий Source-срез: [captured-import547, stock owner70c и девять реальных Root-fixtures](analysis/2026-10-12/captured-import547-owner70c-actual9/README.md). Реальный отказ f213 при captured import сохранён. Исправленный547 независимо принят в области captured imports: проверены прежние 25 controls, пять неизменных зависимостей и два readonly-конструктора без replay. Полный70c/final14 имеет статическую приёмку; динамически приняты только девять приватных fixtures с фактическими direct return и закрытием 29 известных births. Остальные семь retained-FD/adopted наблюдений NOT_GRANTED_NOT_RUN. Истёкший C32 отказал до helper/worker/GO; отдельный actual Root запуск сохранил свой исходный лимит и прежний учёт. Установленный owner, native19, все семь installed journeys и релиз NOT_ACCEPTED. Прежние C26 34+81 и15+81, canonical20604/genuine compatibility receipt и stops сохранены; новый sender требует штатной полной проверки. Следующий Source-пакет наблюдаемости вне текущего cutoff; суточный checkpoint12Oct21MSK остаётся обязательным.
+| Component | Role in the intended system |
+| --- | --- |
+| [Hermes](https://github.com/NousResearch/hermes-agent) | Main assistant runtime, conversations, memory, ordinary tools, Telegram, and the administrative dashboard. |
+| [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) | Dedicated coding worker. |
+| [Agent Zero](https://github.com/agent0ai/agent-zero) | Dedicated engineering worker with its own environment and interfaces. |
+| Friday integration | The plugin, adapters, patches, local configuration, user and task associations, and result delivery that connect the system. |
 
-12.10.2026: [G8 выполнен и независимо принят как безопасная native-диагностика](analysis/2026-10-12/g8-and-admission-checkpoint/README.md). Все шесть сценариев прошли, завершение известных процессов, уборка и освобождение FD9 подтверждены; повтор не разрешён. Это не допуск продуктового kernel120 или normal3600. Последующие Source-исправления описаны выше; installed runtime и все семь journeys остаются NOT_ACCEPTED.
+The [architecture notes](docs/integration-boundary.md) describe these boundaries. [sources.lock.json](sources.lock.json) records the initial selected upstream revisions; individual development records describe later changes and their validation.
 
-11.10.2026, 21:33 МСК: [суточная публикация завершена](analysis/2026-10-11/DAILY-PUBLICATION-RECEIPT.json), точный удалённый коммит `546b4058cef42b0ae348ea25444cbab47e6e2f8e` проверен. Независимо принят состав, приватность и достоверность статусов [полного среза](analysis/2026-10-11/daily-complete-period-21msk/README.md): 52 предшествующих коммита / 765 изменённых путей, затем 12 файлов завершающей публикации. Поля PENDING в замороженных подготовленных материалах остаются историей; последующий результат записан отдельной квитанцией.
+## Hardware and support
 
-11.10.2026, предшествующий срез: [Финальные семантические и LF/ASCII исходники](analysis/2026-10-11/final-semantic-lf-ascii-source/README.md) приняты только в своих узких SOURCE-областях. [C20 с разрывом ресурсной границы](analysis/2026-10-11/C20-known-birth-gap-source/README.md) опубликован как непринятый материал вместе с [независимыми замечаниями](analysis/2026-10-11/daily-C20-independent-review-findings.json). Установленный runtime, все семь пользовательских journeys и релиз остаются NOT_ACCEPTED; G8 требует ранее описанного физического терминала владельца, kernel120 не допущен, normal3600 не запускался.
+Our current development hardware is **one PC with an NVIDIA RTX 5090 and one NVIDIA DGX Spark**.
 
-Separate Hermes-based Friday implementation. Integration is under validation; no product acceptance or deployment is claimed.
+That lets us develop and test parts of Friday. We want additional inference capacity to evaluate larger local models, longer context, and practical workloads shared by the assistant and its workers. Our current setup limits the scale we can test, even as software integration and reliability work continue.
 
-Composition: pinned Hermes host, intact DeepSeek Harness coding worker, intact dedicated Agent Zero engineering worker, and verified Friday personality/Telegram deltas. Production inference uses explicitly configured existing local endpoints, with no automatic cloud fallback. Autonomous web retrieval, web access during both worker paths, and a working administrative WebUI are mandatory release capabilities; authorized web connectivity is separate from model routing.
+Our long-term target is an **eight-GPU NVIDIA H200 NVL inference server**. The full configuration we have in mind is now estimated at **over US$900,000 locally**, well beyond what we can fund ourselves. We can make progress toward that target in smaller steps.
 
-The legacy Friday checkout, runtime, data and Telegram consumer stay preserved. Publication target: `alinescafs3mp-afk/friday_rework`, branch `main`. Secrets, private handoffs, donor checkouts, live runtime state and raw private evidence are excluded from source control. Sanitized, inert source snapshots and selected result extracts are published separately for analysis with their validation status.
+If you would like to help, contributions toward hardware, equipment offers, or introductions to someone who might support the project would be welcome. We can share the current results, the proposed configuration, and what we want to test next. You can [get in touch through a repository issue](https://github.com/alinescafs3mp-afk/friday_rework/issues).
 
-[Daily-use setup and strict load-plan validation](analysis/2026-10-10/soak-setup/README.md) are independently accepted as source only; the original rejection and corrected evidence are retained. At that historical cut, G7 had failed and G8 was prepared but not executed. Installed runtime journeys remain unaccepted; the completed G8 diagnostic is recorded above.
+## Exploring the repository
 
-See `docs/foundation-status.md` for verified progress and current gaps. See `sources.lock.json` for the selected upstream identities and `docs/integration-boundary.md` for the implementation boundary. The existing owner task register remains authoritative; this repository adds no dispatcher or second backlog.
+| Location | What you will find |
+| --- | --- |
+| [plugins/friday_rework](plugins/friday_rework/) | Friday's plugin, adapters, administration, access, and task/result handling. |
+| [patches](patches/) | Changes to the selected upstream components. |
+| [scripts](scripts/), [tools](tools/), [deploy](deploy/) | Preparation, configuration, installation, and deployment tooling. |
+| [config](config/) | Assistant personality, research guidance, and runtime policy configuration. |
+| [tests](tests/), [validation](validation/) | Component checks, validation tools, and acceptance definitions. |
+| [docs](docs/), [analysis](analysis/) | Architecture, implementation notes, dated observations, and development history. |
 
-See `docs/mandatory-web-admin.md` and `validation/acceptance-web-admin.json` for the owner's cumulative web/admin requirements and complete user journeys. These capabilities are not yet accepted.
+For technical work, start with:
 
-[Donor capabilities and integration status](docs/donor-capabilities.md) distinguish planned, implemented, connected and verified functionality, including the mandatory web and administration journeys.
+- [Local model and product configuration](docs/product-profile.md)
+- [Installation design and current prerequisites](docs/native-installer.md)
+- [Web research and administration requirements](docs/mandatory-web-admin.md)
+- [Detailed development status](docs/foundation-status.md)
 
-[Work log and intermediate analysis — 9 October](analysis/2026-10-09/incremental-01/README.md) record completed work, failed attempts, remaining gaps and next steps. This was the first partial publication; its observations remain historical.
+Deployment currently depends on the selected upstream revisions, reviewed patches, and operator-specific configuration. Read the installation prerequisites before attempting to run the stack.
 
-[Expanded source, outcomes and process analysis](analysis/2026-10-09/incremental-02/README.md) adds 349 historical result summaries, 40 design/control plans, source snapshots and explicit remaining coverage gaps. It is an intermediate publication, not the completed daily checkpoint or a release.
+The detailed logs include unsuccessful attempts and checks that have not run. A passing component test is evidence for that component, rather than a claim that the entire assistant is ready. Each dated record should be read within its stated scope.
 
-[Additional outcomes and provenance](analysis/2026-10-09/incremental-03/README.md) closes the selected 171-row metadata omission table, including previously omitted failures, successful runs and exact Linux header provenance. These observations precede the reconciled daily cut.
+The [README before this rewrite](https://github.com/alinescafs3mp-afk/friday_rework/blob/0ad7e023536dd544397011519f8173bb706e88bd/README.md) preserves the earlier checkpoint index.
 
-[Recent fixes and integration decisions](analysis/2026-10-09/incremental-04/README.md) adds callback and TypeScript source repairs, independent findings and 36 selected process records. Runtime qualification remained pending at that cut.
+## Credits and licenses
 
-[Cache identity, process ownership and review decisions](analysis/2026-10-09/incremental-05/README.md) adds later source corrections, their independent findings and the remaining execution gaps. This is the fifth intermediate publication. Installed journeys remain unaccepted.
+Friday depends on the work of the Hermes, DeepSeek Harness, and Agent Zero communities, as well as earlier Friday development.
 
-[Daily work and coverage — 9 October](analysis/2026-10-09/daily/README.md) joins the five intermediate publications with the later Astra/Sol material, describes coverage boundaries and lists the next runtime acceptance work. Read its explicit cutoff and residual gaps; publication does not establish product readiness.
-
-[Caller bootstrap failures and contract corrections](analysis/2026-10-09/incremental-06/README.md) adds the next completed source-analysis block after the verified daily commit `00c3b825260792b834e7f2aecf19eaabaa02935d`, including explicit late upstream-service carryover. F4/F5 remain unclosed; active successors and runtime acceptance are outside this cut.
-
-Промежуточный [срез исходников F4 native/F5 bootstrap от 09.10.2026](analysis/2026-10-09/incremental-07/README.md) сохраняет полный изменённый код и три открытых source findings R1/R2/J1. Обе реализации не приняты; final build/F6 NOT_RUN, продуктовая приёмка не меняется.
-
-09.10.2026: [incremental-08](analysis/2026-10-09/incremental-08/README.md) сохраняет объединённый исходник с независимо закрытыми J1/R1/R2 и первые две DSO-сборки PASS без загрузки. Полные изменённые тела и внутренние pin-map delta опубликованы для анализа; ABI/F6 и установленный продукт (7 journeys / 4 web) остаются UNACCEPTED.
-
-[Первый primitive runtime: отказ и source repair](analysis/2026-10-09/incremental-09/README.md): фактический `EPROTO71` до target exec закрыт в исходные 180 с; восемь controls не приняты. Подтверждён uninitialized affinity tail, опубликованы пять полных исходников и реальная сборка исправленного C. Новая библиотека в срезе NOT_LOADED; sole cause и успешный runtime-повтор не доказаны. Full F6/GNU/all11/7 journeys/4 web UNACCEPTED.
-
-10.10.2026: [последующий реальный запуск G2](analysis/2026-10-10/native-validation-g2.json) прошёл восемь native-проверок и независимое ревью точных результатов. Процессы завершены, блокировка освобождена. Это узкая приёмка native-проверок; полная приёмка Friday остаётся открытой.
-
-[Первый GNU runtime](analysis/2026-10-10/gnu-runtime-first/README.md): исправлены и независимо проверены два несоответствия source bindings и caller lock; опубликованы восемь полных исходников. Реальная попытка завершилась с GNU exit125 до запуска target. Завершение процессов и освобождение блокировки подтверждены, попытка потреблена. Срез сохраняет отказ, ограничения CPU-наблюдений и следующий шаг диагностики; успешный GNU или продуктовый результат не заявлен.
-
-10.10.2026: опубликованы [десять полных исходников и найденные причины отказов](analysis/2026-10-10/next-runtime-corrections/README.md). Последующий [исправленный GNU-запуск](analysis/2026-10-10/gnu-corrected-runtime.json) выполнил девять проверок и завершился с exit0; процессы закрыты, блокировка освобождена внутри исходного лимита. Независимая приёмка результата ещё идёт. Отдельный native fault repair собран, не загружен; полный продукт остаётся UNACCEPTED.
-
-10.10.2026: [custody-поправки и два реальных наблюдения](analysis/2026-10-10/birth-custody-and-cpu-observation/README.md) показывают пять полных исходников, независимо проверенную поправку контроля child, выполненное прерывание после его создания и отдельный CPU-сценарий с отказом. Процессы завершены, блокировки освобождены в исходных пределах. Узкая независимая приёмка прерывания подтверждена; CPU FAIL сохранён. [Предыдущий срез](analysis/2026-10-10/native-fault-arm-and-upstream/README.md) и [узкая приёмка сигнала после arm](analysis/2026-10-10/native-fault-arm-and-upstream/runtime-acceptance.json) остаются историческими. Установленный продукт ещё UNACCEPTED.
-
-10.10.2026: [объединённая CPU/custody-поправка и новая сборка](analysis/2026-10-10/cpu-witness-integration/README.md) прошли независимую проверку исходников и согласование. Квалификационная библиотека реально собрана, не загружена; проверка фактического ELF и live-приёмка новых байтов остаются открытыми. Исходный CPU FAIL сохранён.
-
-### Later actual Source310: 310 PASS / 0 FAIL, independent Source-only ACCEPT
-
-[Later actual results](analysis/2026-10-12/canonical-full310-accepted-source-results/README.md) preserve 233 + 41 + 23 + 13 ordered cases on exact Source14, original budgets/resources, direct waits, FD restoration and fresh82, with early helpers/aggregate usage UNKNOWN. Source-only final ACCEPT preserves the initial read-only binding refusal, two malformed-grant-only KeyError rows, reviewer boundary correction and late external bookkeeping. [The frozen predecessor](analysis/2026-10-12/canonical-full310-partial286-and-alias-source/README.md) is published at 804d046651919ba6c6e3442ba62b10b3cd757987 and retains its cutoff/status. Kernel120 is ungranted; genuine/installed runtime/full19, normal3600, all7 and release remain NOT_ACCEPTED. No live/native journey passed. Independent publication review pending.
-
-## 2026-10-12: kernel/fixture/Root source and refused reviews
-
-[Inert C44, memory harness and C45 archive](analysis/2026-10-12/kernel-fixture-and-root-adapter-source-refusals/README.md): current C44 280, complete harness12 and C45 76 logical payloads with exact public pins and shared-copy ledger. C44 REFUSE5 and harness MH-R1 remain. C45 facility/fit refusal is Source reasoning; independent review was pending at the cutoff. Root timing deviations are explicit. Source/tests were not executed; runtime/release acceptance is not granted.
-
-## 2026-10-12: coherent FD and bounded memory source
-
-[Corrected Source23, FD adapter, Root wrapper and C46 actual128](analysis/2026-10-12/coherent-fd-and-memory-source/README.md): inert complete source, refusals and exact lineage. At this cutoff, merged23 final static review and C46 final actual review are ACTIVE; H991/FD8 are NOT_RUN. Corrected C46 static memory safety is independently accepted and128 actual memory controls PASS. Source310 is unchanged. Kernel/native/genuine/installed/full19/normal3600/all7/release remain unaccepted; independent final publication review required.
-
-
-## 2026-10-12: corrected7988 and full bounded memory observations
-
-[Exact inert Source and evidence archive](analysis/2026-10-12/root-wrapper-and-full-memory-evidence/README.md): corrected7988 C49 Source/staticSafety; full actual H991/FD8 memory run (original120INCLUDING30, known2 fresh Root closed); independent C48 actual128 memory-only acceptance. At this immutable cutoff the H991 actual independent review remains ACTIVE/NOT ACCEPTED. C50 is excluded; kernel/native/genuine installed/full19/normal3600/all7/release remain NOT ACCEPTED. Source bodies and JSON observations grant no runtime authority.
-
-Subsequent exact acceptance: [full H991/FD8 memory result independently accepted](analysis/2026-10-12/root-wrapper-and-full-memory-evidence/INDEPENDENT-MEMORY-ACCEPTANCE.json), with all original69 groups plus reserved2, 128 births/991 operations/18 segments, FD8 and both close variants. This update provides memory-only acceptance; kernel/native/genuine/installed/full release acceptance remains pending.
-
-
-## 2026-10-12: partial connected C51 Source and original-clock refusal
-
-[Inert Source25 plus static causal evidence](analysis/2026-10-12/kernel-connected-source-c51-partial/README.md): partial connected Source preserves the four serial same-original19..21 versus guardian-retention>50 contradiction and refuses full32 before GO. The author's173 checks are AST/metadata only; 16 new tests are NOT_RUN, scope_complete=false and independent whole-Source safety review is ACTIVE at this capture. Root received45 exact private payloads and paired administrative closure occurred before original1800 final, after its useful cutoff; raw tool terminal and aggregate resources remain UNKNOWN. H991/FD8 memory acceptance grants no C51/runtime authority. No kernel120/full32/native/genuine/installed/full19/normal3600/all7/release acceptance is claimed. Moving C52 and unfinished review outputs are excluded. All25 bodies are normalized inert .py.txt with separate original/public pins; independent publication review remains required.
-
-Preparation discloses an earlier uutils metadata-timeout wrapper deviation; later exact GNU static validation does not retrospectively establish contract compliance. Root assessment and independent publication/privacy review remain required.
-
-Independent final Source25 review is now REQUEST_CHANGES: failure custody, Root output-FD identity before close, original clock-to-phase producer, typed negative dispatch/order, and affected C45 regressions. A separate exact public GNU-executable reader is also required. Earlier exact owned Root stop may preserve the existing bounds; actual four-cycle fit remains UNPROVEN. Source correction is in progress; no kernel/runtime/release acceptance. Preparation used earlier uutils metadata wrappers, then GNU revalidation; historical resource nonconformance and late Root intake are retained.
-
-
-Актуализация независимого ревью Source26: REQUEST_CHANGES, три блокера — auxiliary custody до эффектов, RLIM_INFINITY и private owner/parent перед path effects. Полный результат: [публичные замечания](analysis/2026-10-12/kernel26-cli20-connected-inert-source/SOURCE26-FINAL-SAFETY-FINDINGS.json). Source и runtime не приняты. Исходные сценарии/бюджеты сохранены; исправление ведётся отдельным кандидатом. Ранние FS128MiB helper-отклонения сохранены; финальная сверка полных26/all67 выполнена при FS64MiB и не отменяет историю.
-
-This inert directory preserves the exact refused kernel C55 and CLI C68 source snapshots. Subsequent completed independent Source reviews captured here refused newer kernel C75 on two pre-prefix checks and newer CLI C56 on three caller/certificate checks. Exact earlier C55/C68 bodies remain this directory's snapshot; later changes and runtime acceptance are separate. [Findings and scope](analysis/2026-10-12/kernel26-cli22-final-source-refusals/Evidence/HISTORY-AND-LIMITS.md).
-
-
-## 2026-10-13 — genuine CLI source and native closure frontier
-
-The frozen [analysis snapshot](analysis/2026-10-13/cli-source-and-native-closure-frontier/README.md) after `ffc2bf78e787d6ff5da4464e9dfd3197e922773a` contains all eleven repaired genuine CLI producer modules, all thirty partial original-caller modules, thirteen prior independent findings with author repair status, twenty-eight native control requirements, and the ordered original106 + new44 declarations with every required positive/adverse variant retained. Source is inert text with exact original/public pins and lossless reconstruction indexes.
-
-At capture, changed Source11 independent review is **PENDING**; Source30 is **PARTIAL**. Native provider `claim_original_caller` plus eleven methods, atomic receipt/store closure, outside-owner hard stop/reap and universal past FD ownership remain **UNBOUND**. Original150 has **0 complete current whole paths / NOT_RUN**; the earlier **FAIL 30.113563198945485 seconds** remains recorded. Kernel/native/live, ordinary installed journeys and release are **NOT_ACCEPTED**. This analysis publication grants no integration or execution; later reviewer/native-core results require a later delta.
-
-
-## 2026-10-13 — complete inert source96 delta and exact refusal frontier
-
-The [source96 analysis snapshot](docs/checkpoints/2026-10-13-source96-delta/README.md) preserves all native41 (40 Python + one unqualified C), general13 Python, and kernel42 (41 Python + schema) payloads as inert text/fragments with exact reconstruction pins. Native41 previous review is REQUEST_CHANGES3; current S1–S3 corrected whole41 is UNREVIEWED. The original Root R7 cause claim is INVALID_INFERRED: original ACTIVITY schemas agreed; client-only widening introduced S1, then was reverted. General13 remains REQUEST_CHANGES3. Kernel42 remains PARTIAL: C58 red3 unchanged and genuine C59_28 producer missing. R04 genuine original DB/VFS audit remains UNBOUND. Original150 has zero completed current whole paths; FAIL30.113563198945485 remains. Native/Resource/Go/full150/kernel/admission/runtime/release are NOT_GRANTED_NOT_RUN. Private bindings are finite reversible placeholders with separate original/public hashes and no acceptance transfer; independent publication privacy/content review is PENDING. Daily 13 October 21:00 Moscow baseline remains `ffc2bf78e787d6ff5da4464e9dfd3197e922773a`.
-
-
-Publication review note: the preparation/PENDING/not-published labels in this frozen archive describe its capture before independent Root publication review. Root has now checked exact source reconstruction, private-binding removal and the content of this snapshot for publication. This accepts publication content only; Source, native, Resource, Go, runtime and release acceptance remain absent. The actual publication outcome is recorded after the ordinary main commit and remote verification.
-
-
-## 2026-10-13 — source16 current genuine capture and native Source-only acceptance
-
-The [source16 delta](docs/checkpoints/2026-10-13-source16-native-accepted-delta/README.md) preserves all current genuine13 db36 bodies, including retained R01/R02 Source repairs and the proposed two-file R03 dispatch-frame change. Previous whole review was REQUEST_CHANGES1; fresh whole review is ACTIVE / PENDING_UNACCEPTED. R04 original DB/VFS/sidecar audit is incomplete. Separate native41 3c500 is ACCEPT_SAFE_SOURCE_ONLY_WITH_EXACT_GAPS: three current corrected bodies plus 38 unchanged source96 references; all G1–G9 remain UNBOUND. Kernel nonR2 review is REQUEST_CHANGES14 (12 P1 / 2 P2); separate connected correction is ACTIVE and moving bytes are excluded. Original150+28 requirements are unchanged, current whole paths remain zero/all NOT_RUN and old FAIL30.113563198945485 remains. Source/privacy acceptance grants no native, Resource, Go, runtime or release acceptance. Ordinary publication review is PENDING; the daily 13 October 21:00 Moscow baseline remains unchanged. Earlier README text and capture statuses are preserved as history.
-
-
-Publication review note: Root independently verified every public byte, all sixteen exact source reconstructions and the thirty-eight prior native references for this analysis snapshot. This accepts publication content and privacy. Preparation/PENDING/not-published labels describe the frozen capture before this review; actual publication is recorded after the ordinary commit and remote verification. The genuine db36 candidate remains unaccepted, with callback invocation and proxy creator custody concerns under independent review. Native acceptance is Source-only with all G1–G9 gaps. Runtime, Resource, Go, full150 and release acceptance remain absent.
-
-
-## 2026-10-13 — final kernel42 connected author correction, unaccepted
-
-The [inert kernel14 connected delta](docs/checkpoints/2026-10-13-kernel14-connected-delta/README.md) preserves all ten changed complete payloads plus thirty-two exact unchanged source96 references. All F01–F14 fixes remain author claims / PROPOSED_UNACCEPTED; independent final nonR2 Source review is ACTIVE at capture. R2 genuine C59_28 remains missing and C58 red3 unchanged; stopped HF is not retried or substituted. The first author direct GNU birth and whole clock/caps proof gap remain UNKNOWN_NOT_ZERO. Original declarations and all mandatory gates remain unchanged and NOT_RUN, physical final2sfit unbound, and all seven installed journeys unaccepted. Exact administrative intake/closure supplies no Safety, Source, kernel, native, runtime, Resource, Go or release acceptance. Publication content/privacy review is REQUIRED_PENDING; earlier README bytes and historical capture statuses are retained. Daily 13 October 21:00 Moscow baseline remains unchanged.
-
-
-Final review update: the completed independent nonR2 Source review requested three changes. N01 (P1): retained Root STOP cannot reach the complete raw-terminal capture boundary within the original clock. N02 (P1): late STOP custody comparison rejects a legitimately acquired original guardian pidfd. N03 (P2): duplicate-operation capture lacks an exact fcntl(F_DUPFD_CLOEXEC) route. These are Source counterexamples, not measured runtime observations. The captured ACTIVE/PENDING labels above describe preparation history before the final review. Root verified all public bytes, all42 forward/inverse source reconstructions and all32 prior references for content/privacy publication only. Runtime, physical2sfit, full mandatory gates and release remain unaccepted; R2 remains incomplete and stopped HF is not retried. The connected three-cause Source correction is being prepared separately and is not included in this frozen publication. Actual publication is recorded after the ordinary commit and remote verification.
-
-
-## 13 October current Source and focused-control delta
-
-[Current code and findings](docs/checkpoints/2026-10-13-current-source-and-focused-controls-delta/README.md): genuine13 R01–R03 and focused K02/K04 accepted at Source with gaps; current kernel correction pending independent review. Runtime and release remain unaccepted.
-
-
-Review capture note: during the still active current kernel Source review, an additional connected N03 counterexample was reported: the duplicate-operation marker also covers a required late batch-finalization fault reached after original age90.001, while that marker uses the original useful cutoff90. The required raw duplicate/fault-after coverage can therefore be refused before the control operation. This is an interim static counterexample; the reviewer is still completing the exact final report. The kernel candidate is unaccepted. Genuine13 and focused G9 are accepted at Source only with the listed runtime gaps. This is a frozen analysis capture and not final runtime acceptance.
-
-
-Completed review update: the exact final independent kernel Source review now requests one change, N04. Required C55_UNKNOWN_BATCH_TERMINAL_FD batch finalization occurs after original age90.001, while the new duplicate-operation marker requires age<90 and aborts capture before real dup/fault18. The earlier ACTIVE/PENDING and interim labels above are frozen capture history, superseded by this completed Source finding. The connected correction is separate and not included. Genuine13 R01–R03 and focused G9 are accepted at Source with explicit gaps. Full runtime/native/interpreter/Resource/owner/delegation/Go/allgates/sevenjourneys and release remain unaccepted. All30 frozen public files passed independent exact content/privacy review; this note and final review metadata add only the verified final verdict. Actual publication is recorded after ordinary commit and remote verification.
-
-
-## 2026-10-13 — constructor205 static source capture
-
-[Complete inert constructor205 source and curated provenance](docs/checkpoints/2026-10-13-constructor205-static-source-capture/README.md) records the selected 205 bodies and exact source/derivative hashes. The independent constructor205 review was ACTIVE at capture; this composition remains UNACCEPTED, nonrunnable and nonloaded. Source13/Native41 and all original gates retain their separate unchanged status. No runtime, SourceSafety, full547, Resource, Go, R04 or release credit is granted.
-
-The capture also records the [interim named-body inventory gap](docs/checkpoints/2026-10-13-constructor205-static-source-capture/KNOWN-EVIDENCE-GAPS.json): 79 conditional definitions omitted from the original 7940-row index; complete Source205 bodies are preserved, with no final review/admission claim.
-
-
-Completed review update: the exact independent Source review of the original205-file bundle requested one metadata correction, RC205-01. All205 full Source files,109 constructors and58074 static calls were verified. The captured7940-row named-body inventory omits79 conditional definitions, including both invoke_tool._execute bodies; complete traversal yields8019. The frozen PENDING/interim labels above are capture history, superseded by this completed finding for the original manifest. A separate8019 metadata correction preserves every Source byte and all7940 original rows; that correction is outside this capture. All415 frozen public files passed independent exact content/privacy review, including full205 reconstructions and two reversible private-binding substitutions. The verified final verdict and this note add no Source or runtime admission. Loaded-source/native/interpreter/SQLite/VFS/R04/Resource/Go/fullgates/sevenjourneys and release remain unaccepted; the payloads remain inert analysis materials.
-
-
-## Constructor205 corrected named-body metadata — 2026-10-13
-
-The separate [corrected 8,019 metadata checkpoint](docs/checkpoints/2026-10-13-constructor205-corrected8019/README.md) records the exact independent disposition ACCEPT_EXACT_CORRECTED_SOURCE_INDEX_WITH_GAPS. RC205-01 is closed for the corrected static named-body index: all 8,019 rows are present, original 7,940 rows are exact and unchanged, and 79 conditional/nested definitions include both invoke_tool._execute branches. The original incomplete7940 capture and its at-capture pending state remain preserved as history.
-
-Already published 205 full Source inputs (8,499,448 original bytes), 109 constructors, 58,074 static calls and other original indices are unchanged; this checkpoint adds inert metadata, controls and saved algorithm only. Original body/module hashes retain original-byte meaning and do not identify public derivatives. Accepted scope is static Source input/index presence and completeness with gaps. Loaded calls/classes/MRO/globals/import resolution, complete 547/Native67 SourceSafety, SQLite C/VFS, R04 DB/WAL/SHM ownership, runtime and ResourceGo remain UNKNOWN/UNBOUND or NOT_RUN and unaccepted. MATCH17/26 and STOP16/19/34/no repin remain. All original 150 + 28, full 32,all mandatory gates and seven installed journeys remain NOT_RUN; wholepaths 0 and oldFAIL30.113563198945485 remain.
-
-
-### 2026-10-13: final N04 Source42 capture
-
-Inert complete [Source42 capture](docs/checkpoints/2026-10-13-kernel-n04-source-accepted/README.md): final snapshot `a1e3a3930b33c8593e8ea1cf4cbb2034e56bb8d36c49fe64f2b27f4514e8ca30`, 42 files/41 Python modules/1,037,971 original bytes/941 complete bodies (938 retained + 3 added), three complete changed modules and 39 exact previous references. Independent final Source verdict `ACCEPT_SAFE_SOURCE_ONLY_WITH_EXACT_GAPS_NONR2` closes N04 for this static nonR2 source snapshot. The previous REQUEST_N04 capture remains historical. Actual native binding, whole Safety, kernel120, Resource, Go, physical2sfit and release remain unbound/not accepted; full547/native67/original32/150+28/all gates/seven journeys are not run. R2 missingC59_28/redC58_3 and old FAIL `30.113563198945485` remain unchanged.
-
-
-### Current Source239 collection and frozen caller19 analysis checkpoint — 2026-10-13
-
-The [complete Source239 collection and separate caller19 appendix](docs/checkpoints/2026-10-13-coherent239-frozen-caller19/CHECKPOINT-NOTE.txt) preserve full source body references, 8,537 named definitions, 5,885 imports, 151 constructors, the ten selected revision differences and nine old caller pin conflicts. Twenty-two additional full bodies are inert byte-exact payloads. The [independent static review status](docs/checkpoints/2026-10-13-coherent239-frozen-caller19/CURRENT-STATIC-REVIEW-STATUS.json) accepts this exact static collection with qualification gaps and supersedes preparation-time pending-review statements. Runtime, native authority, Resource Go, whole gates, R04 and the seven installed journeys remain unbound or unrun. This checkpoint does not connect these analysis payloads to the product.
-
-
-### Dashboard request contract Source repair — 13 October 2026
-
-The [complete three-file correction](docs/checkpoints/2026-10-13-dashboard3-source-repair/README.md) preserves97,384bytes of API/onboarding/WebUI Source and its exact diff/map. Static Source component and the new127-file inert data input component are accepted with explicitly retained historical closure failures; wholeinstallation/runtime remain unaccepted. The API constant422/schema and explicit CLI UID flow are corrected in this inert analysis material. The separate native correction delivered0materializedSourcefiles before its original useful cutoff. Kernel/native authority, resources, all gates and seven installed journeys remain unqualified/NOT_RUN. Older uutils/GNU and evidence-closure variances remain recorded. This publication carries analysis material; it performs no product integration or runtime admission.
-
-Analysis checkpoint: [immutable native negative7 baseline and incomplete kernel Source audit](docs/checkpoints/2026-10-13-native-negative7-kernel-source/README.md). Native11 baseline149998B: NOT_ACCEPTED_7_SOURCE_DEFECTS; complete7-cause/29-adjudication review. Kernel: INCOMPLETE_LATE602.933_USEFUL540_TOTAL600,43 sites/25 events/41 preparation obligations/24 missing client definitions, upstreamv7 Source not exact Ubuntu7.0.0-34.34. Coverage0, SourceSafety NO_GO, ResourceGo NO_GO, live NOT_RUN; no qualification/release acceptance. Corrected Source proposal11/167071B completed13Oct13:37MSK; first independent final Source review pending, corrected code excluded; full547/native67/full150+28/full32/all7 journeys and required gates remain unbound.
-
-### 2026-10-13: final native seven Source repair
-
-[The inert Source checkpoint](docs/checkpoints/2026-10-13-native-seven-source-repair/README.md) contains eleven complete final bodies (167071 bytes), eight exact diffs, forty-one dependency identities and the independent current S1–S7/all29/four-consumer/ABI/62-control evidence. All seven components were accepted for static Source structure only. Native SourceSafety/ResourceGo remain NO_GO, actual kernel coverage and client provider definitions are zero, and live execution is NOT_RUN. The candidate is not integrated or release accepted; original failures, timing variances and remaining full gate scopes are retained.
-
-Preparation retains an explicit resource variance: initial helper file-size rlimit128MiB instead of required64MiB. Saved files were separately bounded; full preparation resource conformance is incomplete. See [the variance](docs/checkpoints/2026-10-13-native-seven-source-repair/PREPARATION-RESOURCE-VARIANCE.json) and [final complete manifest](docs/checkpoints/2026-10-13-native-seven-source-repair/FINAL-PUBLIC-MANIFEST.json).
-
-2026-10-13: docs/checkpoints/2026-10-13-native-epoch-disposal-source preserves corrected11/186296-byte disposal Source and complete static evidence. A new independent final artifact accepts only this corrected static component; the original retired-guard blocker and failed600 finalization remain recorded. SourceSafety/ResourceGo NO_GO, runtime/live NOT_RUN, author effects/resources INCOMPLETE, release NOT_ACCEPTED. Inert source proposal; final independent publication content/privacy review required.
+Third-party components retain their own license terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the relevant upstream repositories. The third-party notices do not assign a single license to this entire integration repository.
