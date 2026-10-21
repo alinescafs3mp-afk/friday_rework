@@ -1,0 +1,1161 @@
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5946,7 +5946,10 @@
+         if recovered:
+             logger.info("Recovered %d pending message(s) from shutdown flush", recovered)
+ 
+-    _best_effort(_recover_pending)
++    # Startup may have returned through its graceful-abort path after stop()
++    # closed the session stores. Leave pending spools for a future live boot.
++    if runner._running and not runner._startup_should_abort():
++        _best_effort(_recover_pending)
+     if runner.should_exit_cleanly:
+         _shutdown_gateway_health_export(runner)
+         if runner.exit_reason:
+@@ -5955,8 +5958,8 @@
+         if runner.exit_code is not None:
+             raise SystemExit(runner.exit_code)
+         return True
+-    if not runner._running:
+-        # Startup aborted by restart/shutdown before running mode; preserve that path without starting cron.
++    if not runner._running or runner._startup_should_abort():
++        # Startup aborted by restart/shutdown; never start cron or announce READY while stopping.
+         try:
+             await runner.wait_for_shutdown()
+             try:
+--- a/gateway/run_adapters.py
++++ b/gateway/run_adapters.py
+@@ -90,12 +90,15 @@
+             await awaitable
+             return True
+         task = asyncio.ensure_future(awaitable)
++        custody = getattr(self, "_startup_cleanup_tasks", None)
++        if custody is not None:
++            self._track_task_in(custody, task)
+         if not await self._wait_or_detach(task, timeout):
+             return False
+         await task
+         return True
+ 
+-    async def _safe_adapter_disconnect(self, adapter, platform) -> None:
++    async def _safe_adapter_disconnect(self, adapter, platform) -> bool:
+         """Call adapter.disconnect() defensively (bounded, never raises, tolerates partial-init state):
+         after a failed connect() partial resources (ClientSession, poll tasks, subprocesses) leak."""
+         timeout = self._adapter_disconnect_timeout_secs()
+@@ -106,6 +109,9 @@
+                     "Timed out after %.1fs while disconnecting %s adapter; continuing shutdown",
+                     timeout, label,
+                 )
++                return False
++            return True
++        return False
+ 
+     async def _bounded_adapter_teardown(self, adapter, platform, *, profile: Optional[str] = None) -> None:
+         """Tear down one adapter on the shutdown path with bounded awaits (never raises). Unbounded,
+@@ -203,6 +209,10 @@
+         if timeout <= 0:
+             return await adapter.connect(is_reconnect=is_reconnect)
+         task = asyncio.ensure_future(adapter.connect(is_reconnect=is_reconnect))
++        custody = getattr(self, "_startup_unconfirmed_adapters", {})
++        if initial and id(adapter) in custody:
++            self._track_task_in(self._startup_cleanup_tasks, task)
++            self._startup_connect_tasks.setdefault(id(adapter), set()).add(task)
+         if await self._wait_or_detach(task, timeout):
+             return bool(await task)
+         raise TimeoutError(f"{platform.value} connect timed out after {timeout:g}s")
+--- a/gateway/run_shutdown.py
++++ b/gateway/run_shutdown.py
+@@ -2019,7 +2019,10 @@
+                 await self._bounded_adapter_teardown(adapter, platform, profile=_prof)
+             _amap.clear()
+         _profile_adapters.clear()
+-        logger.info("Shutdown phase: all adapters disconnected at +%.2fs", ctx.elapsed())
++        if getattr(self, "_startup_unconfirmed_adapters", None) or getattr(self, "_startup_cleanup_tasks", None):
++            logger.info("Shutdown phase: registered adapters torn down; startup cleanup remains owned at +%.2fs", ctx.elapsed())
++        else:
++            logger.info("Shutdown phase: all adapters disconnected at +%.2fs", ctx.elapsed())
+ 
+     async def _stop_release_runtime_state(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
+         """Cancel background tasks, flush pending messages, clear per-session state, final tool kill."""
+@@ -2152,11 +2155,91 @@
+         _step("Shared SessionDB close error", _close_shared)
+         logger.info("Shutdown phase: SessionDB close done at +%.2fs", ctx.elapsed())
+ 
++    def _stop_startup_cleanup_owners(self) -> set:
++        """Snapshot all retained startup owners, including separately tracked connect/teardown."""
++        owners = set(getattr(self, "_startup_cleanup_tasks", ()) or ())
++        owners.update((getattr(self, "_startup_adapter_teardowns", {}) or {}).values())
++        for connect_tasks in (getattr(self, "_startup_connect_tasks", {}) or {}).values():
++            owners.update(connect_tasks)
++        return owners
++
++    async def _stop_settle_startup_cleanup(self, ctx) -> bool:
++        """Join retained startup work within the remaining existing drain budget."""
++        tasks = getattr(self, "_startup_cleanup_tasks", None)
++        raw = getattr(self, "_startup_unconfirmed_adapters", None)
++        if not self._stop_startup_cleanup_owners() and not raw:
++            return not getattr(self, "_startup_cleanup_failure", None)
++        if tasks is None:
++            tasks = self._startup_cleanup_tasks = set()
++        deadline = asyncio.get_running_loop().time() + max(
++            0.0, effective_stop_drain_timeout(self) - ctx.elapsed(),
++        )
++        # Background cancellation in the preceding phase may enqueue an unsent-claim cleanup.
++        await asyncio.sleep(0)
++        while True:
++            owners = self._stop_startup_cleanup_owners()
++            if asyncio.current_task() in owners:
++                # A stop owner cannot confirm its own completion by awaiting itself.
++                return False
++            pending = {t for t in owners if not t.done()}
++            if not pending:
++                # No connect/aggregate owner remains. Only never-attempted raw adapters may be taken.
++                for platform, adapter in list((raw or {}).values()):
++                    if id(adapter) not in getattr(self, "_startup_adapter_teardowns", {}):
++                        task = asyncio.create_task(self._startup_teardown_adapter(adapter, platform))
++                        self._track_task_in(tasks, task)
++                owners = self._stop_startup_cleanup_owners()
++                pending = {t for t in owners if not t.done()}
++            if not pending:
++                break
++            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
++            if remaining <= 0:
++                return False
++            _done, pending_at_deadline = await asyncio.wait(pending, timeout=remaining)
++            if pending_at_deadline:
++                return False
++            # Re-read ownership: settlement may create bounded children or suffix cleanup.
++        return (
++            not raw and not getattr(self, "_startup_cleanup_failure", None)
++            and not any(t.cancelled() or t.exception() is not None for t in owners)
++        )
++
+     async def _stop_persist_exit_state(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
+         """PID/lock release, clean-shutdown marker, restart markers, terminal runtime status."""
+         from gateway.run import _hermes_home, _planned_restart_notification_path, _shutdown_gateway_health_export
+         from utils import atomic_json_write
+         from gateway.status import remove_pid_file, release_gateway_runtime_lock
++        try:
++            startup_settled = await self._stop_settle_startup_cleanup(ctx)
++        except BaseException:
++            # An interrupted join is not confirmation of cleanup. Preserve the original error
++            # (including cancellation), ownership and the already-armed hard backstop.
++            self._startup_shutdown_unconfirmed = True
++            self._exit_with_failure = True
++            self._exit_reason = self._exit_reason or "Startup cleanup join interrupted; ownership retained"
++            self._draining = True
++            self._shutdown_event.set()
++            raise
++        if not startup_settled:
++            reason = "Startup cleanup remains unconfirmed; PID/lock ownership retained"
++            self._exit_with_failure = True
++            self._exit_reason = reason
++            self._startup_shutdown_unconfirmed = True
++            self._draining = True
++            self._shutdown_event.set()
++            logger.error(reason)
++            self._update_runtime_status("startup_failed", reason)
++            try:
++                from gateway.status import flush_runtime_status_async
++                flush_timeout = 2.0
++                budget = getattr(self, "_launchd_exit_timeout_s", None)
++                if getattr(self, "_stop_requested_by_signal", False) and isinstance(budget, (int, float)) and budget > 0:
++                    flush_timeout = max(0.0, min(flush_timeout, budget - ctx.elapsed()))
++                await flush_runtime_status_async(timeout=flush_timeout)
++            except Exception:
++                logger.debug("Failed to flush uncertain shutdown status", exc_info=True)
++            _shutdown_gateway_health_export(self)
++            return
+         remove_pid_file()
+         release_gateway_runtime_lock()
+         # Clean-shutdown marker skips crash-turn recovery next boot; a timed-out drain left
+@@ -2268,7 +2351,25 @@
+             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)
+             await GatewayRunner._stop_persist_exit_state(self, ctx)
+         finally:
+-            _watchdog_done.set()
++            # A failure before the join can also leave raw/connect/cleanup owners live. Inspect
++            # every retained owner, including completed failures whose callbacks may not yet run.
++            startup_tasks = self._stop_startup_cleanup_owners()
++            startup_uncertain = (
++                getattr(self, "_startup_shutdown_unconfirmed", False)
++                or bool(getattr(self, "_startup_unconfirmed_adapters", None))
++                or bool(getattr(self, "_startup_cleanup_failure", None))
++                or any(not task.done() or task.cancelled() or task.exception() is not None
++                       for task in startup_tasks)
++            )
++            if startup_uncertain:
++                self._startup_shutdown_unconfirmed = True
++                self._exit_with_failure = True
++                self._exit_reason = self._exit_reason or "Startup cleanup remains unconfirmed; ownership retained"
++                self._draining = True
++                self._shutdown_event.set()
++            else:
++                # Keep the original deadline/exit policy; only confirmed cleanup disarms it.
++                _watchdog_done.set()
+ 
+     async def stop(
+         self, *, restart: bool = False, detached_restart: bool = False, service_restart: bool = False
+@@ -2285,10 +2386,13 @@
+             self._restart_detached = detached_restart
+             self._restart_via_service = service_restart
+         if self._stop_task is not None:
+-            await self._stop_task
++            if self._stop_task is asyncio.current_task():
++                # Direct self-await failed finitely before shielding; do not turn it into a cycle.
++                raise RuntimeError("Authoritative stop task cannot await itself")
++            await asyncio.shield(self._stop_task)
+             return
+         self._stop_task = asyncio.create_task(GatewayRunner._stop_impl(self))
+-        await self._stop_task
++        await asyncio.shield(self._stop_task)
+ 
+     async def wait_for_shutdown(self) -> None:
+         """Wait for shutdown signal."""
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -117,6 +117,8 @@
+         drained = 0
+         queue = getattr(self, "_startup_restore_queue", None) or []
+         while queue:
++            if self._startup_should_abort():
++                return drained
+             event = queue.pop(0)
+             try:
+                 source = getattr(event, "source", None)
+@@ -257,8 +259,12 @@
+                 for task in done:
+                     report(task)
+             self._startup_restore_tasks = []
++            if self._startup_should_abort():
++                return
+             # Warm the turn machinery BEFORE the queue drains: inbound turns must not build skeleton prompts.
+             await self._await_startup_warmup()
++            if self._startup_should_abort():
++                return
+             drained = await self._drain_startup_restore_queue()
+         finally:
+             # The inbound gate must open no matter what raised above it (bounded wait, warm-up,
+@@ -281,6 +287,44 @@
+                 logger.log(level, message, exc_info=(type(exc), exc, exc.__traceback__))
+         return _report
+ 
++    async def _run_owned_startup_cleanup(self, awaitable, message: str):
++        """Retain cleanup independently of caller/background cancellation until it settles.
++
++        This is only cleanup custody, not a background send or a replacement stop task.
++        Individual adapter operations retain their existing configured deadlines.
++        """
++        tasks = getattr(self, "_startup_cleanup_tasks", None)
++        if tasks is None:
++            tasks = self._startup_cleanup_tasks = set()
++        task = self._track_task_in(tasks, asyncio.create_task(awaitable))
++        task.add_done_callback(self._late_failure_callback(message))
++        def _remember_failure(done):
++            if done.cancelled() or done.exception() is not None:
++                self._startup_cleanup_failure = message
++        task.add_done_callback(_remember_failure)
++        return await asyncio.shield(task)
++
++    async def _release_unsent_boot_claims(self, claimed: list) -> None:
++        """Release only rows the caller has established were never dispatched."""
++        async def _release():
++            first_error = None
++            for row in claimed:
++                if row.get("adopted"):
++                    continue
++                try:
++                    await self._release_runtime_claim_quiet(
++                        row["obligation_id"], "boot claim release failed for %s",
++                        row.get("last_error") or "startup_stopped",
++                    )
++                except BaseException as error:
++                    logger.error("Unsent obligation %s cleanup interrupted; release unconfirmed", row["obligation_id"], exc_info=True)
++                    if first_error is None:
++                        first_error = error
++            if first_error is not None:
++                raise first_error
++        if claimed:
++            await self._run_owned_startup_cleanup(_release(), "startup unsent claim cleanup failed")
++
+     async def _await_startup_boot_sends(self, *, planned_restart_notification_pending: bool) -> None:
+         """Run boot-path sends without letting them pin the inbound restore gate (one Telegram
+         flood-control sleep must not freeze inbound on every platform): same bounded wait as the
+@@ -292,25 +336,48 @@
+         *before* ``_finish_startup_restore`` released the gate. See #91969.
+         """
+         from gateway.run import _startup_restore_drain_timeout_secs
++        if self._startup_should_abort():
++            return
+         claimed = await self._claim_pending_obligations()
+ 
+         async def _boot_sends() -> None:
+-            await self._send_restart_notification()
+-            if planned_restart_notification_pending:
+-                await self._replay_pending_planned_restart_notification()
+-            await self._redeliver_claimed_obligations(claimed)
+-
+-        boot_task = asyncio.create_task(_boot_sends())
++            redelivery_started = False
++            try:
++                if self._startup_should_abort():
++                    return
++                await self._send_restart_notification()
++                if self._startup_should_abort():
++                    return
++                if planned_restart_notification_pending:
++                    await self._replay_pending_planned_restart_notification()
++                    if self._startup_should_abort():
++                        return
++                redelivery_started = True
++                await self._redeliver_claimed_obligations(claimed)
++            finally:
++                if not redelivery_started:
++                    await self._release_unsent_boot_claims(claimed)
++
++        if not hasattr(self, "_startup_cleanup_tasks"):
++            self._startup_cleanup_tasks = set()
++        boot_task = self._retain_background_task(self._track_task_in(
++            self._startup_cleanup_tasks, asyncio.create_task(_boot_sends()),
++        ))
++        boot_task.add_done_callback(self._late_failure_callback("boot-path send failed"))
+         timeout = _startup_restore_drain_timeout_secs()
+         if timeout <= 0:
+             await boot_task  # unbounded: a failing send surfaces here (unlike the gate path)
+             return
+-        await self._wait_bounded_or_release(
+-            {boot_task}, timeout,
+-            "Boot-path sends still running after %.0fs; releasing inbound gate so other platforms are not "
+-            "frozen. Restart notification / obligation redelivery continue in the background.",
+-            "background boot-path send failed after gate release: see traceback", track=True,
+-        )
++        try:
++            await self._wait_bounded_or_release(
++                {boot_task}, timeout,
++                "Boot-path sends still running after %.0fs; releasing inbound gate so other platforms are not "
++                "frozen. Restart notification / obligation redelivery continue in the background.",
++                "background boot-path send failed after gate release: see traceback", track=True,
++            )
++        except asyncio.CancelledError:
++            boot_task.cancel()
++            raise
+ 
+     async def _clear_resume_pending_for_claimed_obligations(
+         self, claimed: list, *, require_success: bool = False
+@@ -377,7 +444,7 @@
+         return claimed
+ 
+     @staticmethod
+-    async def _release_runtime_claim_quiet(obligation_id, log_fmt: str, error: str = "send_path_degraded") -> None:
++    async def _release_runtime_claim_quiet(obligation_id, log_fmt: str, error: str = "send_path_degraded") -> bool:
+         """Release an unsent runtime delivery-ledger claim; log-only on failure. ``error`` is what the row
+         goes back to ``failed`` with: the claim's own pre-claim error when the caller knows it, so a
+         flood-refused row keeps its ``flood_control:<seconds>`` and stays on the flood timer's list (the
+@@ -385,9 +452,13 @@
+         ``send_path_degraded``."""
+         from gateway.delivery_ledger import release_runtime_claim
+         try:
+-            await asyncio.to_thread(release_runtime_claim, obligation_id, error)
++            released = await asyncio.to_thread(release_runtime_claim, obligation_id, error)
+         except Exception:
+-            logger.debug(log_fmt, obligation_id, exc_info=True)
++            logger.warning(log_fmt, obligation_id, exc_info=True)
++            return False
++        if not released:
++            logger.warning("Unsent obligation %s claim release unconfirmed: exact owner/state predicate refused", obligation_id)
++        return bool(released)
+ 
+     def _schedule_flood_redelivery(self, platform, *, profile: Optional[str] = None) -> None:
+         """Wake one deadline-driven ledger worker per bot identity, never sleep in a send."""
+@@ -452,37 +523,52 @@
+             from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
+         except Exception:
+             logger.debug("delivery ledger import failed", exc_info=True)
++            await self._release_unsent_boot_claims(claimed)
+             return 0
+         redelivered = 0
+-        for row in claimed:
+-            if row.get("adopted"):
+-                # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
+-                # the timer armed below sends it once the platform's deadline has passed.
+-                continue
+-            adapter = await self._obligation_adapter(row)
+-            if adapter is None:
+-                continue
+-            content = row["content"]
+-            if row.get("needs_marker"):
+-                content = row.get("marker", RECOVERED_MARKER) + content
+-            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+-            try:
+-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+-            except Exception as send_err:
+-                logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
+-                result = None
+-            with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
+-                if result is not None and getattr(result, "success", False):
+-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
+-                    redelivered += 1
+-                    logger.info(
+-                        "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
+-                        row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
+-                    )
+-                else:
+-                    await asyncio.to_thread(
+-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
+-                    )
++        untouched = 0
++        try:
++            for index, row in enumerate(claimed):
++                untouched = index
++                if row.get("adopted"):
++                    # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
++                    # the timer armed below sends it once the platform's deadline has passed.
++                    continue
++                if self._startup_should_abort():
++                    return redelivered
++                adapter = await self._obligation_adapter(row)
++                if self._startup_should_abort():
++                    return redelivered
++                if adapter is None:
++                    untouched = index + 1
++                    continue
++                content = row["content"]
++                if row.get("needs_marker"):
++                    content = row.get("marker", RECOVERED_MARKER) + content
++                metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
++                # From this point the current send is uncertain even if cancellation interrupts it.
++                untouched = index + 1
++                try:
++                    result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
++                except Exception as send_err:
++                    logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
++                    result = None
++                with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
++                    if result is not None and getattr(result, "success", False):
++                        await asyncio.to_thread(mark_delivered, row["obligation_id"])
++                        redelivered += 1
++                        logger.info(
++                            "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
++                            row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
++                        )
++                    else:
++                        await asyncio.to_thread(
++                            mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
++                        )
++        finally:
++            await self._release_unsent_boot_claims(claimed[untouched:])
++        if self._startup_should_abort():
++            return redelivered
+         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
+         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
+         with _log_suppressed(logging.DEBUG, "arming flood redelivery timers failed", exc_info=True):
+@@ -651,11 +737,61 @@
+     def _startup_should_abort(self) -> bool:
+         return self._restart_requested or self._draining or self._shutdown_event.is_set()
+ 
+-    async def _startup_teardown_adapter(self, adapter, platform) -> None:
+-        """Cancel an adapter's background tasks (best-effort) then disconnect it."""
+-        with _log_suppressed(logging.DEBUG, "✗ %s background-task cancel error: %s", platform.value):
+-            await adapter.cancel_background_tasks()
+-        await self._safe_adapter_disconnect(adapter, platform)
++    def _startup_take_adapter_custody(self, adapter, platform):
++        """Own raw resources before a connect/cleanup can first suspend."""
++        if not hasattr(self, "_startup_cleanup_tasks"):
++            self._startup_cleanup_tasks = set()
++        if not hasattr(self, "_startup_unconfirmed_adapters"):
++            self._startup_unconfirmed_adapters = {}
++        if not hasattr(self, "_startup_adapter_teardowns"):
++            self._startup_adapter_teardowns = {}
++        if not hasattr(self, "_startup_connect_tasks"):
++            self._startup_connect_tasks = {}
++        self._startup_unconfirmed_adapters[id(adapter)] = (platform, adapter)
++        return self._startup_unconfirmed_adapters
++
++    def _startup_cleanup_uncertain(self, platform) -> None:
++        reason = "Startup adapter %s cleanup unconfirmed" % platform.value
++        logger.error("%s; retaining ownership and refusing successful shutdown", reason)
++        self._exit_with_failure = True
++        self._exit_reason = reason
++        self._shutdown_event.set()
++
++    async def _startup_teardown_adapter(self, adapter, platform, *, cancel_background=True) -> bool:
++        """One retained teardown per raw adapter; failure never authorizes a blind retry."""
++        custody = self._startup_take_adapter_custody(adapter, platform)
++        key = id(adapter)
++        task = self._startup_adapter_teardowns.get(key)
++        if task is None:
++            async def _teardown():
++                confirmed = False
++                try:
++                    # A detached connect may still allocate resources. Never race it with disconnect.
++                    if any(not t.done() for t in self._startup_connect_tasks.get(key, ())):
++                        return False
++                    cancelled = not cancel_background
++                    if cancel_background:
++                        with _log_suppressed(logging.DEBUG, "✗ %s background-task cancel error: %s", platform.value):
++                            cancelled = await self._await_adapter_cleanup_with_timeout(
++                                adapter.cancel_background_tasks(), self._adapter_disconnect_timeout_secs(),
++                            )
++                    disconnected = await self._safe_adapter_disconnect(adapter, platform)
++                    confirmed = cancelled and disconnected
++                    return confirmed
++                finally:
++                    if confirmed:
++                        custody.pop(key, None)
++                        self._startup_connect_tasks.pop(key, None)
++                    else:
++                        self._startup_cleanup_uncertain(platform)
++            task = self._track_task_in(self._startup_cleanup_tasks, asyncio.create_task(_teardown()))
++            self._startup_adapter_teardowns[key] = task
++            task.add_done_callback(self._late_failure_callback("startup adapter teardown failed"))
++        result = await asyncio.shield(task)
++        if result:
++            custody.pop(key, None)
++        return result
++
+ 
+     def _startup_retry_entry(self, platform, adapter, platform_config, *, queued: bool = True) -> dict:
+         """``_failed_platforms`` entry for a platform that failed at startup (first retry in 30s)."""
+@@ -671,13 +807,17 @@
+             await self._startup_teardown_adapter(adapter, platform)
+         stop_task = self._stop_task
+         current_task = asyncio.current_task()
++        if current_task in getattr(self, "_startup_cleanup_tasks", ()):
++            # stop joins retained startup owners; they must never await stop themselves.
++            return True
+         if stop_task is not None and stop_task is not current_task:
+-            await stop_task
+-        elif not self._shutdown_event.is_set():
+-            await self.stop(
++            await asyncio.shield(stop_task)
++        elif stop_task is None and not self._shutdown_event.is_set():
++            # The stop coroutine owns _stop_task; caller cancellation must not cancel cleanup.
++            await asyncio.shield(self.stop(
+                 restart=self._restart_requested, detached_restart=self._restart_detached,
+                 service_restart=self._restart_via_service,
+-            )
++            ))
+         return True
+ 
+     def _start_loop_liveness_guards(self, loop: asyncio.AbstractEventLoop) -> None:
+@@ -899,6 +1039,8 @@
+ 
+     async def _start_log_startup_environment(self) -> None:
+         """Bind the gateway loop, disarm the startup watchdog, and log the startup environment."""
++        if self._startup_should_abort():
++            return
+         try:
+             self._gateway_loop = asyncio.get_running_loop()
+         except RuntimeError:
+@@ -935,20 +1077,24 @@
+             _profile = get_active_profile_name()  # launch profile, pre-identity (boot log)
+             if _profile and _profile != "default":
+                 logger.info("Active profile: %s", _profile)
+-        try:
+-            from gateway.status import write_runtime_status
+-            persisted = await asyncio.to_thread(
+-                write_runtime_status,
++        if self._startup_should_abort():
++            return
++        try:
++            from gateway.status import publish_runtime_status, flush_runtime_status_async
++            # Enqueue before yielding, so a later stop snapshot always follows this one.
++            # reload_existing preserves the initial disk merge under the existing status lock.
++            publish_runtime_status(
+                 gateway_state="starting",
+                 exit_reason=None,
+                 clear_profile_platforms=True,
+                 reload_existing=True,
+-                wait_timeout=2.0,
+-            )
+-            if not persisted:
++            )
++            if not await flush_runtime_status_async(timeout=2.0):
+                 logger.warning("Timed out persisting initial gateway runtime status")
+         except Exception:
+             logger.debug("Initial gateway runtime-status write failed", exc_info=True)
++        if self._startup_should_abort():
++            return
+         with _log_suppressed(logging.DEBUG, "gateway health OTLP export startup failed", exc_info=True):
+             from hermes_cli.config import load_config
+             from agent.monitoring.gateway_health_export import start_gateway_health_export
+@@ -1174,6 +1320,8 @@
+                     "Recovered %d interrupted turn(s) from previous run (%d to resume, %d reply(ies) "
+                     "owed delivery)", resumed + ledgered, resumed, ledgered,
+                 )
++        if self._startup_should_abort():
++            return
+         # Stuck-loop detection: a session active across 3+ consecutive restarts is auto-suspended.
+         with _log_suppressed(logging.DEBUG, "Stuck-loop detection failed: %s"):
+             # Auto-suspend it so the user gets a clean slate on the next message. See #7536.
+@@ -1234,16 +1382,21 @@
+                 continue
+             # Under multiplexing the default profile needs the same whole-handler runtime scope as a
+             # secondary (authorization and prompt rendering run before the agent-turn scope).
++            self._startup_take_adapter_custody(adapter, platform)
+             self._wire_adapter_handlers(adapter)
+             _pending_connects.append((platform, platform_config, adapter))
+         return False, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
+ 
+     async def _start_connect_pending(self, _pending_connects: list) -> Optional[list]:
+-        """Connect the pre-filtered adapters concurrently. Returns the raw per-platform results, or
+-        None when a restart/shutdown aborted startup mid-connect (adapters already torn down)."""
++        """Retain the complete raw batch through connect, caller cancellation and teardown."""
++        if not _pending_connects:
++            return []
++        for p, _cfg, adapter in _pending_connects:
++            self._startup_take_adapter_custody(adapter, p)
++        caller_cancelled = False
++
+         async def _connect_one_startup(p, p_cfg, adp):
+-            """Connect a single platform; never let one block the others (#83791)."""
+-            if await self._abort_startup_if_shutdown_requested(adp, p):
++            if self._startup_should_abort():
+                 return (p, adp, p_cfg, "aborted", None)
+             logger.info("Connecting to %s...", p.value)
+             self._update_platform_runtime_status(
+@@ -1251,37 +1404,44 @@
+             )
+             try:
+                 ok = await self._connect_initial_adapter_with_timeout(adp, p)
+-            except Exception as _exc:  # noqa: BLE001 - surfaced below as a retryable error
+-                return (p, adp, p_cfg, "exception", _exc)
++            except Exception as exc:
++                return (p, adp, p_cfg, "exception", exc)
+             return (p, adp, p_cfg, "ok" if ok else "failed", None)
+ 
+-        if not _pending_connects:
+-            return []
+-        # Abort-aware concurrent wait: a restart/shutdown mid-connect cancels pending connects, tears down
+-        # completed ones, and aborts startup.
+-        _task_map = {
+-            asyncio.ensure_future(_connect_one_startup(p, c, a)): (p, c, a) for (p, c, a) in _pending_connects
+-        }
+-        _pending_tasks = set(_task_map)
+-        while _pending_tasks:
+-            _done, _pending_tasks = await asyncio.wait(_pending_tasks, timeout=0.05)
+-            if _pending_tasks and self._startup_should_abort():
+-                break
+-        else:
+-            return [_t.exception() or _t.result() for _t in _task_map]
+-        # Settle in-flight connects FIRST so a completed adapter's disconnect cannot unblock a sibling.
+-        for _t in _pending_tasks:
+-            _t.cancel()
+-        await asyncio.gather(*_pending_tasks, return_exceptions=True)
+-        # Then tear down adapters whose connect succeeded — never registered, so stop() won't reach them.
+-        _connected_ok = [
+-            _t for _t in _task_map
+-            if _t not in _pending_tasks and not _t.cancelled() and _t.exception() is None and _t.result()[3] == "ok"
+-        ]
+-        for _t in [*_pending_tasks, *_connected_ok]:
+-            await self._startup_teardown_adapter(_task_map[_t][2], _task_map[_t][0])
+-        await self._abort_startup_if_shutdown_requested()
+-        return None
++        async def _connect_and_collect():
++            task_map = {}
++            try:
++                for p, cfg, adapter in _pending_connects:
++                    task = self._track_task_in(self._startup_cleanup_tasks,
++                        asyncio.create_task(_connect_one_startup(p, cfg, adapter)))
++                    self._startup_connect_tasks.setdefault(id(adapter), set()).add(task)
++                    task_map[task] = (p, cfg, adapter)
++                pending = set(task_map)
++                while pending:
++                    done, pending = await asyncio.wait(pending, timeout=0.05)
++                    if caller_cancelled or self._startup_should_abort():
++                        return None
++                return [t.exception() or t.result() for t in task_map]
++            finally:
++                if caller_cancelled or self._startup_should_abort():
++                    pending = {t for t in task_map if not t.done()}
++                    for task in pending:
++                        task.cancel()
++                    if pending:
++                        timeout = self._adapter_disconnect_timeout_secs()
++                        # Preserve configured nonpositive opt-out; stop's remaining drain still bounds its join.
++                        await asyncio.wait(pending, timeout=timeout if timeout > 0 else None)
++                    for p, _cfg, adapter in _pending_connects:
++                        await self._startup_teardown_adapter(adapter, p)
++        try:
++            return await self._run_owned_startup_cleanup(
++                _connect_and_collect(), "startup raw connect owner failed",
++            )
++        except asyncio.CancelledError:
++            caller_cancelled = True
++            self._shutdown_event.set()
++            raise
++
+ 
+     def _startup_queue_transient_failure(
+         self, platform, adapter, platform_config, message: str, startup_retryable_errors: list
+@@ -1298,59 +1458,107 @@
+     ) -> int:
+         """Apply connect outcomes to shared state single-threaded (exactly as the original serial
+         loop did); returns the connected adapter count."""
+-        connected_count = 0
+-        for _item in _raw:
+-            if isinstance(_item, Exception):
+-                # Unexpected escape from _connect_one_startup (shouldn't happen); log and skip.
+-                logger.error("Unexpected startup connect error: %s", _item)
+-                continue
+-            platform, adapter, platform_config, outcome, exc = _item
+-            if outcome == "aborted":
+-                continue
+-            if outcome == "exception":
+-                logger.error("\u2717 %s error: %s", platform.value, exc)
+-                # An adapter that raised mid-connect may still hold a ClientSession/subprocess; treat
+-                # unexpected exceptions as transient and queue for retry.
+-                await self._safe_adapter_disconnect(adapter, platform)
+-                self._startup_queue_transient_failure(
+-                    platform, adapter, platform_config, str(exc), startup_retryable_errors
+-                )
+-                continue
+-            if outcome == "ok":
+-                self._publish_primary_adapter(platform, adapter)
+-                connected_count += 1
+-                # connect() may return True on a degraded (unconfirmed) receive path; don't stamp "connected".
+-                _degraded = adapter.send_path_degraded
+-                self._update_platform_runtime_status(
+-                    platform.value, platform_state="retrying" if _degraded else "connected", error_code=None,
+-                    error_message=adapter.DEGRADED_STATUS_MESSAGE if _degraded else None,
+-                )
+-                logger.info("\u2713 %s connected%s", platform.value, " (degraded)" if _degraded else "")
+-                continue
+-            # outcome == "failed"
+-            logger.warning("\u2717 %s failed to connect", platform.value)
+-            # A failed connect() may have allocated ClientSessions / poll tasks / subprocesses.
+-            await self._safe_adapter_disconnect(adapter, platform)
+-            if not adapter.has_fatal_error:
+-                # No fatal error info means likely a transient issue -- queue for retry
+-                self._startup_queue_transient_failure(
+-                    platform, adapter, platform_config, "failed to connect", startup_retryable_errors
+-                )
+-                continue
+-            # A live foreign token holder is an ownership conflict, not a blip: retryable only for
+-            # MID-RUN reconnects; at startup route it non-retryable so the gateway exits 78, not deaf.
+-            _retryable = adapter.fatal_error_retryable and not is_global_startup_conflict(adapter.fatal_error_code)
+-            self._update_platform_runtime_status(
+-                platform.value, platform_state="retrying" if _retryable else "fatal",
+-                error_code=adapter.fatal_error_code, error_message=adapter.fatal_error_message,
+-            )
+-            target = startup_retryable_errors if _retryable else startup_nonretryable_errors
+-            target.append(f"{platform.value}: {adapter.fatal_error_message}")
+-            if _retryable:
+-                self._failed_platforms[platform] = self._startup_retry_entry(
+-                    platform, adapter, platform_config, queued=False
+-                )
+-        return connected_count
++        caller_cancelled = False
++        custody = getattr(self, "_startup_unconfirmed_adapters", None)
++        if custody is None:
++            custody = self._startup_unconfirmed_adapters = {}
++
++        for item in _raw:
++            if not isinstance(item, Exception) and item[3] != "aborted":
++                self._startup_take_adapter_custody(item[1], item[0])
++
++        async def _disconnect(adapter, platform):
++            await self._startup_teardown_adapter(adapter, platform, cancel_background=False)
++
++        async def _aggregate():
++            next_raw = 0
++            try:
++                connected_count = 0
++                for index, _item in enumerate(_raw):
++                    if caller_cancelled or self._startup_should_abort():
++                        return connected_count
++                    next_raw = index + 1
++                    if isinstance(_item, Exception):
++                        # Unexpected escape from _connect_one_startup (shouldn't happen); log and skip.
++                        logger.error("Unexpected startup connect error: %s", _item)
++                        continue
++                    platform, adapter, platform_config, outcome, exc = _item
++                    if outcome == "aborted":
++                        continue
++                    if outcome == "exception":
++                        logger.error("\u2717 %s error: %s", platform.value, exc)
++                        # An adapter that raised mid-connect may still hold a ClientSession/subprocess; treat
++                        # unexpected exceptions as transient and queue for retry.
++                        await _disconnect(adapter, platform)
++                        if caller_cancelled or self._startup_should_abort():
++                            continue
++                        self._startup_queue_transient_failure(
++                            platform, adapter, platform_config, str(exc), startup_retryable_errors
++                        )
++                        continue
++                    if outcome == "ok":
++                        self._publish_primary_adapter(platform, adapter)
++                        custody.pop(id(adapter), None)
++                        self._startup_connect_tasks.pop(id(adapter), None)
++                        connected_count += 1
++                        # connect() may return True on a degraded (unconfirmed) receive path; don't stamp "connected".
++                        _degraded = adapter.send_path_degraded
++                        self._update_platform_runtime_status(
++                            platform.value, platform_state="retrying" if _degraded else "connected", error_code=None,
++                            error_message=adapter.DEGRADED_STATUS_MESSAGE if _degraded else None,
++                        )
++                        logger.info("\u2713 %s connected%s", platform.value, " (degraded)" if _degraded else "")
++                        continue
++                    # outcome == "failed"
++                    logger.warning("\u2717 %s failed to connect", platform.value)
++                    # A failed connect() may have allocated ClientSessions / poll tasks / subprocesses.
++                    await _disconnect(adapter, platform)
++                    if caller_cancelled or self._startup_should_abort():
++                        continue
++                    if not adapter.has_fatal_error:
++                        # No fatal error info means likely a transient issue -- queue for retry
++                        self._startup_queue_transient_failure(
++                            platform, adapter, platform_config, "failed to connect", startup_retryable_errors
++                        )
++                        continue
++                    # A live foreign token holder is an ownership conflict, not a blip: retryable only for
++                    # MID-RUN reconnects; at startup route it non-retryable so the gateway exits 78, not deaf.
++                    _retryable = adapter.fatal_error_retryable and not is_global_startup_conflict(adapter.fatal_error_code)
++                    self._update_platform_runtime_status(
++                        platform.value, platform_state="retrying" if _retryable else "fatal",
++                        error_code=adapter.fatal_error_code, error_message=adapter.fatal_error_message,
++                    )
++                    target = startup_retryable_errors if _retryable else startup_nonretryable_errors
++                    target.append(f"{platform.value}: {adapter.fatal_error_message}")
++                    if _retryable:
++                        self._failed_platforms[platform] = self._startup_retry_entry(
++                            platform, adapter, platform_config, queued=False
++                        )
++                return connected_count
++            finally:
++                first_error = None
++                for pending in _raw[next_raw:]:
++                    if isinstance(pending, Exception) or pending[3] == "aborted":
++                        continue
++                    platform, adapter = pending[:2]
++                    custody[id(adapter)] = (platform, adapter)
++                    try:
++                        if await self._startup_teardown_adapter(adapter, platform):
++                            custody.pop(id(adapter), None)
++                        else:
++                            logger.error("Startup adapter %s teardown unconfirmed; retaining raw-adapter custody", platform.value)
++                    except BaseException as error:
++                        logger.error("Startup adapter %s teardown failed; retaining raw-adapter custody", platform.value, exc_info=True)
++                        if first_error is None:
++                            first_error = error
++                if first_error is not None:
++                    raise first_error
++
++        try:
++            return await self._run_owned_startup_cleanup(_aggregate(), "startup raw-adapter cleanup failed")
++        except asyncio.CancelledError:
++            caller_cancelled = True
++            raise
+ 
+     def _startup_fail_fatal_config(self, reason: str) -> None:
+         """Record a fatal-config startup failure (exit 78) and request a clean exit."""
+@@ -1472,6 +1680,8 @@
+ 
+     async def _start_post_connect_services(self, connected_count: int) -> None:
+         """Room worker, heartbeat, gateway:startup hook, channel directory, /update notice."""
++        if self._startup_should_abort():
++            return
+         from gateway.run import _hermes_home
+         try:
+             await self._ensure_hosted_room_worker()
+@@ -1480,15 +1690,21 @@
+                 "Group Chat worker failed to start; mutating Group Chat commands "
+                 "will fail closed until supervision recovers it", exc_info=True,
+             )
++        if self._startup_should_abort():
++            return
+         self._spawn_supervised(self._hosted_room_worker_watcher, "hosted_room_worker")
+         self._start_loop_heartbeat_task()
+         from gateway.run_heartbeat_restore import restore_heartbeat_watches
+         self._start_heartbeat_poller()  # Keep retrying even when the first scan is empty.
+         await restore_heartbeat_watches(self)
++        if self._startup_should_abort():
++            return
+         hook_count = len(self.hooks.loaded_hooks)
+         if hook_count:
+             logger.info("%s hook(s) loaded", hook_count)
+         await self.hooks.emit("gateway:startup", {"platforms": [p.value for p in self.adapters]})
++        if self._startup_should_abort():
++            return
+         if connected_count > 0:
+             logger.info("Gateway running with %s platform(s)", connected_count)
+         # Initial channel directory for send_message name resolution
+@@ -1497,8 +1713,12 @@
+             directory = await build_channel_directory(self.adapters)
+             ch_count = sum(len(chs) for chs in directory.get("platforms", {}).values())
+             logger.info("Channel directory built: %d target(s)", ch_count)
++        if self._startup_should_abort():
++            return
+         # Restarting after a /update still in progress: keep watching so we notify when it finishes.
+         notified = await self._send_update_notification()
++        if self._startup_should_abort():
++            return
+         if not notified and any(
+             (_hermes_home / name).exists()
+             for name in (".update_pending.json", ".update_pending.claimed.json")
+@@ -1507,11 +1727,17 @@
+ 
+     async def _start_finish_wiring(self, connected_count: int) -> None:
+         """Post-connect wiring: services, boot notifications, startup restore, recovered watchers."""
++        if self._startup_should_abort():
++            return
+         from gateway.run import _planned_restart_notification_pending, _restart_notification_pending
+         await self._start_post_connect_services(connected_count)
++        if self._startup_should_abort():
++            return
+         # Let fresh adapters settle before lifecycle sends (helps Discord thread deliveries).
+         if connected_count > 0:
+             await asyncio.sleep(1.0)
++        if self._startup_should_abort():
++            return
+         # Before _send_restart_notification() unlinks the marker: did we boot from a chat /restart?
+         # One-shot signal for _is_stale_restart_redelivery.
+         if _restart_notification_pending():
+@@ -1523,27 +1749,41 @@
+         await self._await_startup_boot_sends(
+             planned_restart_notification_pending=_planned_restart_notification_pending(),
+         )
++        if self._startup_should_abort():
++            return
+         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
+         # auto-resume stays visible on the next user message.
+         self._schedule_resume_pending_sessions()
+         await self._finish_startup_restore()
++        if self._startup_should_abort():
++            return
+         # Surface state.db init failures to messaging platforms before the user loses data.
+         # See #88235.
+         await self._send_session_db_warning_notifications()
++        if self._startup_should_abort():
++            return
+         # Resume recovered process watchers. Detach the batch atomically (fresh list, not clear(): a
+         # concurrent append during the yield must not be lost); yield every 100 to keep the loop live.
+         with _log_suppressed(logging.ERROR, "Recovered watcher setup error: %s"):
+             from tools.process_registry import process_registry
+             watchers = process_registry.pending_watchers
+             process_registry.pending_watchers = []
+-            for i, watcher in enumerate(watchers):
+-                self._spawn_supervised(
+-                    lambda w=watcher: self._run_process_watcher(w),
+-                    f"process_watcher:{watcher.get('session_id')}", restart=False,
+-                )
+-                logger.info("Resumed watcher for recovered process %s", watcher.get("session_id"))
+-                if i % 100 == 99:
+-                    await asyncio.sleep(0)
++            consumed = 0
++            try:
++                for watcher in watchers:
++                    if self._startup_should_abort():
++                        return
++                    self._spawn_supervised(
++                        lambda w=watcher: self._run_process_watcher(w),
++                        f"process_watcher:{watcher.get('session_id')}", restart=False,
++                    )
++                    consumed += 1
++                    logger.info("Resumed watcher for recovered process %s", watcher.get("session_id"))
++                    if consumed % 100 == 0:
++                        await asyncio.sleep(0)
++            finally:
++                # Keep unconsumed recovery work, including on cancellation, ahead of fresh appends.
++                process_registry.pending_watchers[0:0] = watchers[consumed:]
+ 
+     # Long-lived supervised watchers spawned at the end of start(), in order; supervised name = method
+     # name minus the leading underscore.
+@@ -1606,6 +1846,10 @@
+             await self._start_flush_runtime_status()
+ 
+     async def _start_impl(self) -> bool:
++        # MCP discovery can yield while shutdown completes. Do not re-arm guards or
++        # publish starting state after a stop that is already latched.
++        if await self._abort_startup_if_shutdown_requested():
++            return True
+         logger.info("Starting Hermes Gateway...")
+         self._start_install_faulthandler()
+         await self._start_log_startup_environment()
+@@ -1614,12 +1858,16 @@
+         if self._start_check_access_policy():
+             return True
+         await self._start_recover_previous_run()
++        if await self._abort_startup_if_shutdown_requested():
++            return True
+         # The gateway is a boot owner of the Nous free tier, beside `cmd_chat` and `hermes serve`: every
+         # demand-time site (provider resolution, /login, the connector token) is a read that needs the
+         # identity to already exist. Blocking here, before any adapter connects, is what keeps a fast
+         # first DM from arriving with nothing to resolve. With the launch gate unset this is a local
+         # inventory and no network.
+         await self._run_free_tier_bootstrap()
++        if await self._abort_startup_if_shutdown_requested():
++            return True
+         # Serialize startup restore against inbound: adapters receive as soon as they connect, so inbound
+         # queues until every synthetic resume turn has finished.
+         self._startup_restore_in_progress = True
+@@ -1651,6 +1899,8 @@
+         )
+         if _aborted:
+             return True
++        if await self._abort_startup_if_shutdown_requested():
++            return True
+         if self._start_handle_no_connections(
+             connected_count, enabled_platform_count, startup_retryable_errors, startup_nonretryable_errors
+         ):
+@@ -1666,6 +1916,8 @@
+         # line next to "Gateway running with N platform(s)".
+         self._update_runtime_status(self._serving_state())
+         await self._start_finish_wiring(connected_count)
++        if await self._abort_startup_if_shutdown_requested():
++            return True
+         self._start_spawn_background_watchers()
+         from hermes_cli.observability.shared_metrics_startup import record_process_ready
+         record_process_ready("gateway_boot", background=True)
+--- a/gateway/status.py
++++ b/gateway/status.py
+@@ -1320,14 +1320,15 @@
+     return writer.wait(generation, timeout=wait_timeout)
+ 
+ 
+-def publish_runtime_status(**fields: Any) -> int:
++def publish_runtime_status(*, reload_existing: bool = False, **fields: Any) -> int:
+     """Merge and enqueue status without waiting for filesystem persistence.
+ 
++    ``reload_existing`` preserves the startup disk merge under the existing lock.
+     Keyword ``fields`` are those of ``_prepare_runtime_status_update``.
+     """
+     with _runtime_status_state_lock:
+         path, payload, previous_payload = _prepare_runtime_status_update(
+-            load_existing=False, **fields)
++            load_existing=reload_existing, reload_existing=reload_existing, **fields)
+         generation = _get_runtime_status_writer().submit(path, payload)
+     _emit_runtime_status_transition(previous_payload, payload)
+     return generation
+--- a/hermes_cli/friday_dashboard_owner.py
++++ b/hermes_cli/friday_dashboard_owner.py
+@@ -9,7 +9,11 @@
+ import hashlib
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+-from threading import get_ident
++from threading import get_ident, get_native_id, local
++from functools import wraps
++from itertools import count
++import logging
++from time import monotonic_ns
+ import hmac
+ import io
+ import json
+@@ -77,6 +81,64 @@
+         _SOURCE_CHECKS.reset(token)
+ 
+ 
++def _source_guard_diagnostics(check):
++    """Best-effort metadata only; preserve proof failures and interrupt ownership."""
++    sequence = count(1)
++    emitting = local()
++    logger = logging.getLogger(__name__)
++
++    def record(message):
++        try:
++            # A logging handler may itself enter the guard. That proof still runs,
++            # but its diagnostic is unobserved rather than recursively logging.
++            if getattr(emitting, 'active', False) or len(message) > 512:
++                return
++            emitting.active = True
++            try:
++                logger.warning(message)
++            finally:
++                emitting.active = False
++        except Exception:
++            pass
++
++    @wraps(check)
++    def observed(*args, **kwargs):
++        span = None
++        try:
++            # Reserve an ordinal even when a handler reenters: later sequence
++            # gaps remain evidence of unobserved entries, never zero calls.
++            seq = next(sequence)
++            if not getattr(emitting, 'active', False):
++                pid, tid = os.getpid(), get_native_id()
++                entered = monotonic_ns()
++                record(f'FRW_SOURCE_GUARD_V1 event=begin pid={pid} tid={tid} seq={seq} enter_ns={entered}')
++                span = (pid, tid, seq, entered, monotonic_ns())
++        except Exception:
++            pass
++        ok = False
++        try:
++            result = check(*args, **kwargs)
++            ok = True
++            return result
++        finally:
++            try:
++                if span is not None:
++                    ended = monotonic_ns()
++                    pid, tid, seq, entered, body_begin = span
++                    status = 'ok' if ok else 'fail'
++                    record(f'FRW_SOURCE_GUARD_V1 event=end pid={pid} tid={tid} seq={seq} enter_ns={entered} body_begin_ns={body_begin} end_ns={ended} status={status}')
++            except Exception:
++                pass
++            except BaseException:
++                # A pending proof exception keeps its exact object/type. With no
++                # proof failure, do not swallow SystemExit/KeyboardInterrupt.
++                if ok:
++                    raise
++
++    return observed
++
++
++@_source_guard_diagnostics
+ def _verify_source_files(source, files, receipt):
+     for name, row in files.items():
+         p = Path(name)
+--- a/hermes_cli/friday_ordinary_gateway.py
++++ b/hermes_cli/friday_ordinary_gateway.py
+@@ -288,6 +288,16 @@
+     from hermes_cli import gateway as gw
+     from gateway import host_rendezvous as hr
+     from hermes_cli.friday_dashboard_owner import read_owned
++    from hermes_cli.friday_credential_admission import configuration
++    # Unit generation runs during bootstrap, before channel secret scope exists.
++    # Revalidate the deployment and bind this read before using its nonsecret
++    # watchdog setting; full gateway config would re-enter restart admission.
++    phase = check(home, role=False)
++    cfg = configuration(home)
++    require(normalized_configuration(cfg) == phase['configuration_sha256'], 'configuration_changed')
++    configuration_contract(cfg, phase['baseline'])
++    expected = gw.generate_systemd_unit(
++        system=False, watchdog_seconds=cfg['gateway'].get('systemd_watchdog_seconds'))
+     unit = gw.get_systemd_unit_path(system=False)
+     dropins = unit.parent / (unit.name + '.d')
+     require(gw.supports_systemd_services() and unit.exists()
+@@ -298,7 +308,7 @@
+     actual = read_owned(unit).decode('utf-8-sig')
+     norm = lambda text: gw._normalize_service_definition(gw._strip_optional_systemd_directives(text))
+     require(not unit.stat().st_mode & 0o022 and gw._hermes_home_pinned_by_unit(unit) == str(home)
+-            and norm(actual) == norm(gw.generate_systemd_unit(system=False)), 'restart_foreign_unit_refused')
++            and norm(actual) == norm(expected), 'restart_foreign_unit_refused')
+     record = hr.read_record(hr.ROLE_GATEWAY,include_stale=True)
+     require(record is not None and record.home == str(home) and 'default' in record.profiles
+             and record.protocol_version == 1 and record.start_time is not None
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -3250,7 +3250,8 @@
+         reset_hermes_home_override(token)
+ 
+ 
+-def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
++def generate_systemd_unit(system: bool = False, run_as_user: str | None = None,
++                          *, watchdog_seconds: int | None = None) -> str:
+     from hermes_cli._launchers import installation_command
+ 
+     python_path = get_python_path()
+@@ -3304,7 +3305,10 @@
+         env_lines = _ld_library_path_line(system=False)
+         wanted_by = "default.target"
+ 
+-    watchdog_seconds = _systemd_watchdog_seconds(hermes_home)
++    # An admission caller may already hold validated deployment configuration
++    # before a channel secret scope exists. Keep rendering independent of it.
++    watchdog_seconds = (_systemd_watchdog_seconds(hermes_home) if watchdog_seconds is None
++                        else coerce_systemd_watchdog_seconds(watchdog_seconds))
+     systemd_type, systemd_watchdog_directives = "simple", ""
+     if watchdog_seconds > 0:
+         systemd_type, systemd_watchdog_directives = "notify", f"NotifyAccess=main\nWatchdogSec={watchdog_seconds}s\n"
