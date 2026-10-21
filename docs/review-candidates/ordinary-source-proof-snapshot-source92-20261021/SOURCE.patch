@@ -1,0 +1,145 @@
+--- a/hermes_cli/friday_dashboard_owner.py
++++ b/hermes_cli/friday_dashboard_owner.py
+@@ -7,6 +7,7 @@
+ from __future__ import annotations
+ 
+ import hashlib
++from copy import deepcopy
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ from threading import get_ident, get_native_id, local
+@@ -62,6 +63,10 @@
+ # returning any proof. Context isolation prevents sharing a pending validation
+ # between requests; calls outside this computation retain immediate verification.
+ _SOURCE_CHECKS = ContextVar("friday_identity_source_checks", default=None)
++# Context-bound tokens probe ownership without ever resetting the authoritative
++# proof scope. A caught interrupt during probe rotation cannot expose an outer
++# pending proof. A stale/used token simply requires an immediate full check.
++_SOURCE_CONTEXT = ContextVar("friday_identity_source_context", default=None)
+ 
+ 
+ @contextmanager
+@@ -69,16 +74,37 @@
+     # Every public identity entry owns a new proof, even in a copied context.
+     # Only explicit private delegation within that synchronous entry shares it.
+     pending = {}
+-    scope = {'thread': get_ident(), 'pending': pending, 'active': True}
+-    token = _SOURCE_CHECKS.set(scope)
++    scope = {'thread': get_ident(), 'pid': os.getpid(), 'pending': pending, 'active': True}
++    previous = _SOURCE_CHECKS.get()
+     try:
++        _SOURCE_CHECKS.set(scope)
++        scope['token'] = _SOURCE_CONTEXT.set(None)
+         yield
+-        for source, files, receipt in pending.values():
++        for source, files, receipt, _parsed in pending.values():
+             _verify_source_files(source, files, receipt)
+     finally:
+         scope['active'] = False
+         pending.clear()
+-        _SOURCE_CHECKS.reset(token)
++        # Restore the outer entry even if probe creation/rotation was interrupted.
++        # The inert context probe never changes this authoritative proof scope.
++        _SOURCE_CHECKS.set(previous)
++
++
++def _current_source_check():
++    """A copied Context must not borrow its parent's unfinished proof."""
++    active = _SOURCE_CHECKS.get()
++    if (active is None or not active['active'] or active['thread'] != get_ident()
++            or active['pid'] != os.getpid()):
++        return None
++    # Tokens belong to the exact Context, not just a thread/task identifier.
++    # Only the inert probe is reset. The authoritative scope remains current
++    # even when the caller catches an interrupt between reset and set.
++    try:
++        _SOURCE_CONTEXT.reset(active['token'])
++    except (ValueError, RuntimeError):
++        return None
++    active['token'] = _SOURCE_CONTEXT.set(None)
++    return active
+ 
+ 
+ def _source_guard_diagnostics(check):
+@@ -139,13 +165,16 @@
+ 
+ 
+ @_source_guard_diagnostics
+-def _verify_source_files(source, files, receipt):
++def _verify_source_files(source, files, receipt, *, _digests=None):
+     for name, row in files.items():
+         p = Path(name)
+         require(not p.is_absolute() and '..' not in p.parts and name == str(p))
+         data = read_owned(source / name)
+-        require(sha(data) == row['sha256'] and len(data) == row['bytes']
++        actual = sha(data)
++        require(actual == row['sha256'] and len(data) == row['bytes']
+                 and bool((source / name).stat().st_mode & 0o111) == (row['mode'] == '100755'))
++        if _digests is not None:
++            _digests[str(source / name)] = actual
+     require(not (source / '.env').exists() and not (source / '.env').is_symlink())
+     generated = ('.hermes/', 'node_modules/', 'ui-tui/node_modules/', 'web/node_modules/',
+                  'ui-tui/dist/', 'hermes_cli/web_dist/')
+@@ -157,24 +186,43 @@
+ 
+ def source_identity(home, *, source=None):
+     """Actual complete composed source and truthful native install stamp."""
++    return _source_identity(home, source=source)
++
++
++def _source_snapshot_identity(home, *, source):
++    """One complete immediate proof also supplies this call's named-byte digests.
++
++    The collector never escapes an unfinished proof and is never cached. Callers
++    compare it in memory only, after reading their remaining private inputs.
++    """
++    digests = {}
++    identity = _source_identity(home, source=source, _digests=digests)
++    return identity, digests
++
++
++def _source_identity(home, *, source=None, _digests=None):
+     source = SOURCE if source is None else Path(source)
+     require(source == Path(home) / 'hermes-agent' and source.resolve() == source
+             and not (source / '.git').exists())
+     raw = read_owned(source.parent / 'hermes-agent.source.json', private=True)
+-    receipt = json.loads(raw)
++    active = _current_source_check() if _digests is None else None
++    pending = active['pending'] if active is not None else None
++    previous = pending.get(str(source)) if pending is not None else None
++    # Each call still reads the current owned receipt bytes. Reuse only parsing
++    # of exactly equal bytes within this unfinished synchronous computation.
++    require(previous is None or previous[2] == raw)
++    receipt = previous[3] if previous is not None else json.loads(raw)
+     require(receipt.get('schema') == 'friday.hermes-source.v1'
+             and receipt.get('status') == 'SOURCE_COMPOSED_NOT_RUNTIME_ACCEPTED')
+     files = receipt.get('files'); require(isinstance(files, dict) and len(files) > 1000)
+     require('hermes_cli/friday_dashboard_owner.py' in files)
+-    active = _SOURCE_CHECKS.get()
+-    pending = (active['pending'] if active is not None and active['active']
+-               and active['thread'] == get_ident() else None)
+     if pending is None:
+-        _verify_source_files(source, files, raw)
++        if _digests is None:
++            _verify_source_files(source, files, raw)
++        else:
++            _verify_source_files(source, files, raw, _digests=_digests)
+     else:
+-        previous = pending.get(str(source))
+-        require(previous is None or previous[2] == raw)
+-        pending[str(source)] = (source, files, raw)
++        pending[str(source)] = (source, files, raw, receipt)
+     stamp = json.loads(read_owned(source / 'install-stamp.json', private=True))
+     require(stamp.get('fridaySource') == {'baseTree': receipt['base_tree'], 'layers': receipt['layers']}
+             and stamp.get('commit') == receipt['commit'] and stamp.get('dirty') is True)
+@@ -192,8 +240,8 @@
+                 and sha(read_owned(Path(home) / name, private=True)) == expected)
+     target = Path(home) / 'plugins/friday_rework'
+     require({str(p.relative_to(home)) for p in target.rglob('*') if not p.is_dir()} == set(plugins))
+-    return {'root': str(source), 'receipt': sha(raw), 'commit': receipt['commit'],
+-            'baseTree': receipt['base_tree'], 'plugin': sha(json.dumps(plugins, sort_keys=True).encode())}
++    return {'root': str(source), 'receipt': sha(raw), 'commit': deepcopy(receipt['commit']),
++            'baseTree': deepcopy(receipt['base_tree']), 'plugin': sha(json.dumps(plugins, sort_keys=True).encode())}
+ 
+ 
+ def declared(home, *, source=None):
