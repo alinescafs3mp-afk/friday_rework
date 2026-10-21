@@ -1,0 +1,11 @@
+# Startup runtime-status flush bounds: conditional Source95
+
+The two startup status flush calls already allow persistence failure and timeout. Their inner two-second timeout begins when an executor thread runs, leaving executor queue delay unbounded. This candidate wraps both existing awaits in `asyncio.wait_for(..., timeout=2.0)` and preserves publication, warning/error handling, external cancellation and the successful-startup order before systemd READY.
+
+Independent review verified all 263 project files and 17,710 native files, the complete 94-layer parent prefix and the exact two-hunk change. Only `gateway/run_startup.py` changes; the project adds the patch and manifest. Authorization, isolation, source verification, process custody and recovery code remain byte-identical.
+
+Twenty independent focused checks used the real status writer and async flush definitions with an owned executor and temporary persistence. The old async wait remained pending for 2.250 seconds with the executor occupied; both changed await sites timed out with their existing warnings in about 2.002 seconds. Checks covered normal success, failure, external cancellation, coalesced updates and persistence of the later stopped snapshot. All owned threads were released and joined. Temporary persistence used an injected writer function; the production atomic-write primitive was outside this check. The new bound is cooperative and depends on event-loop progress.
+
+This is source acceptance only. Source94 remains installed. Its corrected ordinary startup used the full 90-second service-command allowance, reached Telegram polling connection, and still timed out before observed READY. Its exact owned cleanup succeeded. Neither the historical failure's main coroutine nor executor saturation was observed; this candidate is not a proven explanation or resolution of that failure. Jarvis remains unsent and B00 core execution remains zero. Final consumer bindings, actual installation acceptance and supported startup with a genuine authorized reply, persistence and contextual follow-up remain outstanding.
+
+The separate accepted web, incoming-document and public-caption package is retained for later deployment; it is not a prerequisite for this recovery candidate.
