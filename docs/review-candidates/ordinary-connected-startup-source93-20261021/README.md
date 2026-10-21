@@ -1,0 +1,11 @@
+# Connected ordinary startup source snapshot
+
+This package preserves the connected startup repair proposed after the actual installed Source92 native90 timeout. It contains the exact native two-file patch and its paired project `friday_start.py`. They form one source candidate for the existing deployment path; this package performs no installation.
+
+The parent resolves a fresh protected watchdog value for unit rendering through the existing explicit argument. The child uses a protected mode probe and retains the real scoped configuration load, both receiving channel gates and final drift checks. The existing complete ordinary check validates source, configuration, credentials, profile and invocation before resolver or secret hydration. Foreign homes and nonordinary stages keep their prior dispatch.
+
+The corrected probe fingerprints concrete safe YAML types without JSON-only conversion. Independent tests with the actual selected Python and unmodified ruamel completed 98 checks with zero failures, including the original date/set reproductions and failures before secret-scope effects. Controlled dependency boundaries remain explicit; those tests do not establish genuine managed runtime admission. Earlier failures are retained. Cyclic aliases and preexisting ordinary configuration restrictions are outside this repair.
+
+The existing full composer exported 93 layers, 259 project files and 17,710 native files, with only two native files changed and 17,708 unchanged. The exact final deployment tuple review and actual current admission are still pending. Source92 remains installed with its failed activation safely stopped. Source93 startup has not run; Jarvis remains UNSENT. No runtime, full baseline or release acceptance is claimed.
+
+`STATUS.json` records separate evidence and remaining direct dependencies. `MANIFEST.json` pins only included public files. Private fixtures, test oracles, reproductions, credentials, runtime identities, receipts, inputs, handoffs and internal evidence paths are excluded.
