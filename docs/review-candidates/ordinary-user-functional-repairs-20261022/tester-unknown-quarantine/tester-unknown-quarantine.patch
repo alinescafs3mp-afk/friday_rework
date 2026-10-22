@@ -1,0 +1,237 @@
+--- bot_tester.py.before
++++ bot_tester.py.candidate
+@@ -385,7 +385,7 @@
+                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+             except BlockingIOError:
+                 raise Refused('Another tester consumer is active') from None
+-            yield
++            yield fd
+         finally:
+             os.close(fd)
+ 
+@@ -828,6 +828,189 @@
+             if isinstance(exc, RateLimited):
+                 # Shared existing dispatch guards must honor a NEW server429 too.
+                 # This safety record changes no stopped run, cursor or observer stop.
++                self.cooldown(exc)
++                terminal['retry_after_seconds'] = exc.seconds
++            self.store.put(action / 'TERMINAL.json', terminal)
++            raise
++
++    def unknown_reconciliation_context(self, plan, consumer_fd=None, credential_fd=None):
++        # This is quarantine of one bounded receive batch, NEVER a new product query.
++        # Local operator pins are not evidence of product delivery or runtime adoption.
++        fields = {'schema', 'operator', 'action_id', 'run_id', 'run_sha256',
++                  'scenario_sha256', 'task_sha256', 'cursor_sha256', 'state_identity',
++                  'consumer_identity', 'credential_identity', 'current_tuple',
++                  'tester_id', 'peer_id', 'max_updates', 'clock'}
++        if (not isinstance(plan, dict) or set(plan) != fields
++                or plan['schema'] != 'friday.tester.reconcile-unknown.v1'
++                or plan['operator'] != 'Root'
++                or plan['tester_id'] != TESTER or type(plan['tester_id']) is not int
++                or plan['peer_id'] != PEER or type(plan['peer_id']) is not int):
++            raise Refused('Unknown reconciliation requires its exact named operator plan')
++        for key in ('action_id', 'run_id'):
++            self.store.run_path(plan[key])
++        for key in ('run_sha256', 'scenario_sha256', 'task_sha256', 'cursor_sha256'):
++            if not isinstance(plan[key], str) or not re.fullmatch('[a-f0-9]{64}', plan[key]):
++                raise Refused('Unknown reconciliation requires exact unchanged evidence hashes')
++        context = plan['current_tuple']
++        if (not isinstance(context, dict) or set(context) != {'source', 'installed', 'layers', 'project', 'native', 'service_owner'}
++                or any(type(context[k]) is not int or context[k] < 0
++                       for k in ('source', 'installed', 'layers', 'project', 'native'))
++                or context['native'] != 0 or context['service_owner'] != 'Root'):
++            raise Refused('Root must explicitly bind the current product tuple; native must remain zero')
++        # Validate the same finite fresh clock schema as existing read-only recovery.
++        clock = plan['clock']
++        if (not isinstance(clock, dict) or set(clock) != {'boot_id', 'origin_monotonic', 'deadline_monotonic'}
++                or not isinstance(clock['boot_id'], str)
++                or not re.fullmatch('[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', clock['boot_id'])
++                or any(type(clock[k]) not in (int, float) or not math.isfinite(clock[k])
++                       for k in ('origin_monotonic', 'deadline_monotonic'))
++                or not 0 <= clock['origin_monotonic'] < clock['deadline_monotonic'] <= clock['origin_monotonic'] + 120):
++            raise Refused('Bind one fresh reconciliation clock of at most 120 seconds')
++        self.recovery_guard(plan)
++        root_stat = no_symlinks(self.store.root).stat()
++        if (plan['state_identity'] != {'path': str(self.store.root), 'device': root_stat.st_dev,
++                                      'inode': root_stat.st_ino, 'uid': root_stat.st_uid}
++                or stat.S_IMODE(root_stat.st_mode) != 0o700 or root_stat.st_uid != os.getuid()):
++            raise Refused('Reconciliation state root identity changed')
++        for name, key, fd in [('consumer.lock', 'consumer_identity', consumer_fd),
++                              ('tester-token', 'credential_identity', credential_fd)]:
++            path = no_symlinks(self.store.root / name)
++            current = path.stat()
++            if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
++                    or current.st_uid != os.getuid() or stat.S_IMODE(current.st_mode) != 0o600
++                    or plan[key] != input_stat(current)):
++                raise Refused('Reconciliation lock or credential inode pin changed')
++            if fd is not None:
++                if input_stat(os.fstat(fd)) != plan[key]:
++                    raise Refused('Reconciliation descriptor differs from the pinned named inode')
++                try:
++                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                except BlockingIOError:
++                    raise Refused('Another tester consumer is active') from None
++        run_raw = safe_read(self.store.run_path(plan['run_id']))
++        if digest(run_raw) != plan['run_sha256']:
++            raise Refused('Unknown predecessor bytes changed')
++        run = self.load(plan['run_id'])
++        if safe_read(self.store.run_path(plan['run_id'])) != run_raw:
++            raise Refused('Unknown predecessor changed during validation')
++        steps = run['scenario']['steps']
++        if (run.get('status') != 'UNKNOWN_SEND' or run.get('send_state') != 'unknown'
++                or run['step'] != 0 or len(steps) != 1 or 'input' not in steps[0]
++                or not reply_capture(steps[0]['observe']) or run.get('send_attempts') != 1
++                or type(run.get('send_attempts')) is not int or run.get('sent_ids') != []
++                or any(k in run for k in ('sent_api_ack_reference', 'sent_window_reference',
++                                         'sent_message_id', 'sent_date', 'capture_until', 'receive_head'))
++                or run.get('seen') != [] or run.get('message_ids') != []
++                or run.get('observations') != [] or run.get('update_count') != 0
++                or run['scenario_sha256'] != plan['scenario_sha256']):
++            raise Refused('Only a fresh unchanged document unknown without ACK can be quarantined')
++        dispatched = run.get('send_dispatch_at')
++        if (type(dispatched) not in (int, float) or not math.isfinite(dispatched)
++                or run.get('send_timeout_seconds') != REPLY_ACK_RESERVE
++                or dispatched + REPLY_ACK_RESERVE + steps[0]['observe']['window_seconds']
++                   + REPLY_WINDOW_RESERVE > run['deadline'] or self.clock() < run['deadline']):
++            raise Refused('The complete original scenario deadline must close before reconciliation')
++        task = run.get('sent_task_reference')
++        metadata = self.read_reference(task, 'send-task-' + run['id'] + '-0-1.json')
++        upload = steps[0]['input']
++        values = dict(method='sendDocument', chat_id=USERNAME, input_sha256=upload['sha256'],
++                      input_bytes=upload['stat']['size_bytes'], input_stat=upload['stat'],
++                      filename=upload['filename'], mime_type=upload['mime_type'], caption=upload['caption'],
++                      scenario_sha256=run['scenario_sha256'])
++        if (task['sha256'] != plan['task_sha256'] or metadata != run.get('request_metadata')
++                or set(metadata) != set(values) | {'body_bytes', 'body_sha256', 'content_type'}
++                or any(type(metadata.get(k)) is not type(v) or metadata[k] != v for k, v in values.items())
++                or type(metadata['body_bytes']) is not int
++                or not upload['stat']['size_bytes'] <= metadata['body_bytes'] <= upload['stat']['size_bytes'] + MAX_MULTIPART_OVERHEAD
++                or not isinstance(metadata['body_sha256'], str) or not re.fullmatch('[a-f0-9]{64}', metadata['body_sha256'])
++                or not isinstance(metadata['content_type'], str)
++                or not re.fullmatch('multipart/form-data; boundary=frw-[a-f0-9]{64}', metadata['content_type'])):
++            raise Refused('Unknown predecessor outbound task/scenario pins disagree')
++        cursor_raw = safe_read(self.store.root / 'cursor.json')
++        if digest(cursor_raw) != plan['cursor_sha256']:
++            raise Refused('Reconciliation cursor commitment changed')
++        cursor = json.loads(cursor_raw, object_pairs_hook=unique_object)
++        self.cursor_offsets(cursor)  # Existing global receive-chain integrity, never replaced.
++        if (type(run.get('capture_start_offset')) is not int
++                or not 0 <= run['capture_start_offset'] <= cursor['offset']):
++            raise Refused('Reconciliation cursor cannot predate the original send cursor')
++        if type(plan['max_updates']) is not int or not 1 <= plan['max_updates'] <= min(20, run['scenario']['max_updates']):
++            raise Refused('Reconciliation requires one bounded receive batch')
++        for path in self.store.runs.glob('*.json'):
++            if path == self.store.run_path(run['id']):
++                continue
++            old = self.store.get(path)
++            if old.get('status') not in ('EVIDENCE_READY', 'STOPPED', 'FAILED') or old.get('send_state') in ('intent', 'unknown'):
++                raise Refused('Other unfinished work blocks unknown reconciliation')
++        # Exclude editable action/run names and fresh clocks from the once-only key.
++        # Renaming the grant or a copied run cannot reopen the same physical dispatch.
++        key = digest(encoded(dict(tester_id=TESTER, peer_id=PEER, task_sha256=task['sha256'],
++                                  scenario_sha256=run['scenario_sha256'], dispatched_at=dispatched,
++                                  step=0, send_attempts=1)))
++        return run, cursor, key
++
++    def reconcile_unknown(self, plan, plan_sha256, consumer_fd, credential_fd):
++        if (not isinstance(plan_sha256, str) or not re.fullmatch('[a-f0-9]{64}', plan_sha256)
++                or digest(encoded(plan)) != plan_sha256):
++            raise Refused('Reconciliation operator plan hash mismatch')
++        if consumer_fd is None or credential_fd is None:
++            raise Refused('Reconciliation requires both existing pinned exclusive locks')
++        run, cursor, key = self.unknown_reconciliation_context(plan, consumer_fd, credential_fd)
++        parent = secure_dir(self.store.root / 'reconciliations')
++        action = parent / key
++        action.mkdir(mode=0o700)  # Intent/crash/failed authentication consumes this dispatch once.
++        for directory in (self.store.root, parent):
++            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++            try:
++                os.fsync(fd)
++            finally:
++                os.close(fd)
++        common = dict(action_id=plan['action_id'], predecessor_run_id=run['id'],
++                      original_send_outcome='UNKNOWN', original_operation_replayed=False,
++                      original_run_mutated=False, cursor_mutated=False, outbound_sent=False,
++                      acceptance='NOT_ESTABLISHED', product_runtime_binding_verified=False,
++                      response_binding='UNBOUND', original_observation_window='NOT_COMMITTED_NO_ACK')
++        self.store.put(action / 'INTENT.json', dict(plan=plan, plan_sha256=plan_sha256,
++                       status='ADMITTED_ONCE_NO_RETRY', at=stamp(), **common))
++        phase = 'preflight'
++        try:
++            preflight(self.api, timeout=self.recovery_guard(plan), guard=lambda: self.recovery_guard(plan))
++            self.unknown_reconciliation_context(plan, consumer_fd, credential_fd)
++            # This offset acknowledges no newly received update: no cursor change or
++            # second getUpdates is permitted. Shared pending updates remain available.
++            params = dict(offset=cursor['offset'], timeout=0, limit=plan['max_updates'], allowed_updates=['message'])
++            self.store.put(action / 'DISPATCH.json', dict(method='getUpdates', params=params,
++                           at=stamp(), no_new_update_acknowledged=True))
++            self.api._last_response = None
++            phase = 'receive'
++            updates = self.api.call('getUpdates', params, timeout=self.recovery_guard(plan))
++            raw = getattr(self.api, '_last_response', None)
++            if not isinstance(raw, bytes) or not 1 <= len(raw) <= MAX_JSON:
++                raise Refused('Reconciliation lacks exact bounded HTTP response custody')
++            self.store.write(action / 'response.private.json', raw)
++            wire = json.loads(raw, object_pairs_hook=unique_object)
++            if (not isinstance(wire, dict) or wire.get('ok') is not True or wire.get('result') != updates
++                    or not isinstance(updates, list) or len(updates) > plan['max_updates']
++                    or any(not isinstance(u, dict) or type(u.get('update_id')) is not int
++                           or u['update_id'] < cursor['offset'] for u in updates)
++                    or len({u['update_id'] for u in updates}) != len(updates)):
++                raise Refused('Reconciliation response is ambiguous or exceeds the bounded batch')
++            self.recovery_guard(plan)
++            self.unknown_reconciliation_context(plan, consumer_fd, credential_fd)
++            result = dict(status='RECEIVE_BATCH_QUARANTINED_UNGRADED', update_count=len(updates),
++                          saturated=len(updates) == plan['max_updates'], complete_history=False,
++                          nonreceipt_proves_unsent=False, no_retry=True,
++                          response_sha256=digest(raw), response_bytes=len(raw),
++                          artifact_acceptance='NOT_ESTABLISHED', **common)
++            self.store.put(action / 'TERMINAL.json', result)
++            return result
++        except BaseException as exc:
++            partial = getattr(exc, 'bounded_body', None)
++            if phase == 'receive' and isinstance(partial, bytes) and len(partial) <= MAX_JSON:
++                self.store.write(action / 'partial.private.bin', partial)
++            terminal = dict(status='FAILED_OR_UNKNOWN_NO_RETRY', complete_history=False,
++                            artifact_acceptance='NOT_ESTABLISHED', no_retry=True, **common)
++            if isinstance(exc, RateLimited):
+                 self.cooldown(exc)
+                 terminal['retry_after_seconds'] = exc.seconds
+             self.store.put(action / 'TERMINAL.json', terminal)
+@@ -2592,6 +2775,9 @@
+     recover = sub.add_parser('recover-document', help='Read ONE committed captured document; never resume or send')
+     recover.add_argument('--plan', required=True)
+     recover.add_argument('--plan-sha256', required=True)
++    reconcile = sub.add_parser('reconcile-unknown', help='Quarantine ONE receive batch; no send, download, cursor advance or grade')
++    reconcile.add_argument('--plan', required=True)
++    reconcile.add_argument('--plan-sha256', required=True)
+     args = parser.parse_args(argv)
+     os.umask(0o077)
+     try:
+@@ -2608,7 +2794,7 @@
+             result = {'status': 'OBSERVER_STOP_REQUESTED', 'product_cancelled': False,
+                       'note': 'Existing operator product cancellation path is separate'}
+         else:
+-            with store.lock():
++            with store.lock() as consumer_fd:
+                 if args.command == 'setup':
+                     result = setup(store)
+                 elif args.command == 'reset-stop':
+@@ -2635,6 +2821,16 @@
+                 elif args.command == 'reject-evidence':
+                     rejection = json.loads(safe_read(args.rejection), object_pairs_hook=unique_object)
+                     result = Runner(store, None).reject_evidence(args.run_id, rejection)
++                elif args.command == 'reconcile-unknown':
++                    plan_raw = safe_read(args.plan)
++                    plan = json.loads(plan_raw, object_pairs_hook=unique_object)
++                    if digest(plan_raw) != args.plan_sha256 or plan_raw != encoded(plan):
++                        raise Refused('Reconciliation plan requires pinned canonical JSON bytes')
++                    Runner(store, None).unknown_reconciliation_context(plan)
++                    with store.lock(store.root / 'tester-token', create=False) as credential_fd:
++                        token = safe_read(store.root / 'tester-token', 256).decode('ascii').strip()
++                        result = Runner(store, BotAPI(token)).reconcile_unknown(
++                            plan, args.plan_sha256, consumer_fd, credential_fd)
+                 elif args.command == 'recover-document':
+                     plan_raw = safe_read(args.plan)
+                     plan = json.loads(plan_raw, object_pairs_hook=unique_object)
