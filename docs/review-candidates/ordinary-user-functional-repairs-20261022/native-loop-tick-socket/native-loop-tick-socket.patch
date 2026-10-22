@@ -1,0 +1,439 @@
+--- a/gateway/shutdown_watchdog.py
++++ b/gateway/shutdown_watchdog.py
+@@ -15,6 +15,8 @@
+ import json
+ import logging
+ import os
++import socket
++import stat
+ import sys
+ import threading
+ import time
+@@ -188,17 +190,52 @@
+     return _home(home).joinpath(*_HEARTBEAT_RELATIVE)
+ 
+ 
++def _validate_tick_socket_directory(directory: Path, *, private: bool) -> None:
++    """Refuse symlinks/foreign owners; the new shared-temp namespace must be private."""
++    info = directory.lstat()
++    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
++            or (private and stat.S_IMODE(info.st_mode) & 0o077)):
++        raise PermissionError(f"Unsafe loop tick socket directory: {directory}")
++
++
++def _tick_socket_identity(path: Path) -> tuple[int, int]:
++    info = path.lstat()
++    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
++        raise PermissionError(f"Unsafe loop tick socket node: {path}")
++    return info.st_dev, info.st_ino
++
++
+ def get_loop_tick_socket_path(home: Optional[Path] = None, pid: Optional[int] = None) -> Path:
+-    """``<HERMES_HOME>/state/gateway.loop-tick.<pid>.sock`` — PID-suffixed so a stale node from a
+-    dead process is never mistaken for this gateway's witness. Served by the loop itself
+-    (``_tick_socket_handler``), so an answer proves the loop dispatches; the heartbeat cannot.
+-
+-    Served by the gateway loop itself (see ``_tick_socket_handler``): an answer is direct proof that the
+-    loop is dispatching, which is exactly the property the heartbeat file lost when its write moved off-loop
+-    (#90502).
++    """Shared, read-only producer/probe address, with a private short-home fallback.
++
++    Keep existing short addresses. Long homes use a deterministic per-user/per-home directory
++    under /tmp, independent of the producer's and CLI's TMPDIR. The PID suffix prevents a dead
++    gateway's node being mistaken for another gateway's loop witness.
+     """
++    from gateway.control_socket import _fits_sun_path, _home_hash
++
+     pid = int(pid if pid is not None else os.getpid())
+-    return _home(home) / "state" / f"gateway.loop-tick.{pid}.sock"
++    if pid <= 0:
++        raise ValueError("Loop tick socket PID must be positive")
++    home = _home(home)
++    direct = home / "state" / f"gateway.loop-tick.{pid}.sock"
++    if os.name != "posix":
++        return direct  # native Windows uses the existing TCP witness
++    # Existing state directories keep their modes; only the shared-temp fallback requires 0700.
++    private = not _fits_sun_path(direct)
++    path = (Path("/tmp") / f"hermes-loop-tick-{os.getuid()}-{_home_hash(home)}" / direct.name
++            if private else direct)  # no-tmp: ok — bounded AF_UNIX rendezvous, never scratch data
++    if not _fits_sun_path(path):
++        raise ValueError("Loop tick socket path exceeds the AF_UNIX byte limit")
++    try:
++        _validate_tick_socket_directory(path.parent, private=private)
++    except FileNotFoundError:
++        pass
++    try:
++        _tick_socket_identity(path)
++    except FileNotFoundError:
++        pass
++    return path
+ 
+ 
+ def get_shutdown_watchdog_dump_path(home: Optional[Path] = None) -> Path:
+@@ -327,17 +364,44 @@
+             writer.close()
+ 
+ 
++def _unlink_owned_tick_socket(path: Path, identity: tuple[int, int]) -> None:
++    """Only remove the socket inode we inspected/bound, never a replacement node."""
++    with contextlib.suppress(OSError):
++        if _tick_socket_identity(path) == identity:
++            path.unlink()
++
++
++def _remove_abandoned_tick_socket(path: Path) -> None:
++    """PID reuse may leave our exact node behind; preserve any connectable listener."""
++    try:
++        identity = _tick_socket_identity(path)
++    except FileNotFoundError:
++        return
++    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
++        probe.settimeout(0.1)
++        try:
++            probe.connect(str(path))
++        except ConnectionRefusedError:
++            _unlink_owned_tick_socket(path, identity)
++        # Other errors, including timeout/permission errors, do not prove abandonment.
++
++
+ def _sweep_stale_tick_sockets(own_path: Path) -> None:
+-    """Unlink loop-tick socket nodes left by dead PIDs (POSIX only; never raises).
+-    create_unix_server removes a leftover node at OUR path (os._exit / SIGKILL skip the
+-    finally-unlink) but not SIBLING nodes from other dead PIDs. os.kill(pid, 0) is a liveness
+-    probe only on POSIX (Windows would TerminateProcess)."""
+-    try:
+-        for stale in (p for p in own_path.parent.glob("gateway.loop-tick.*.sock") if p != own_path):
++    """Sweep only owned socket nodes naming a strictly positive, proven-dead PID."""
++    try:
++        for stale in own_path.parent.glob("gateway.loop-tick.*.sock"):
++            if stale == own_path:
++                continue
++            pid_text = stale.name[len("gateway.loop-tick."):-len(".sock")]
++            if not pid_text.isascii() or not pid_text.isdecimal() or int(pid_text) <= 0:
++                continue
+             try:
+-                os.kill(int(stale.name.split(".")[-2]), 0)  # windows-footgun: ok — POSIX-only
+-            except (ValueError, IndexError, OSError):
+-                stale.unlink(missing_ok=True)
++                identity = _tick_socket_identity(stale)
++                os.kill(int(pid_text), 0)  # windows-footgun: ok — called only by the POSIX arm
++            except ProcessLookupError:
++                _unlink_owned_tick_socket(stale, identity)
++            except OSError:
++                continue  # EPERM and unknown errors are not proof of death
+     except Exception:
+         logger.debug("stale loop-tick socket sweep failed", exc_info=True)
+ 
+@@ -360,27 +424,46 @@
+     # (ungated it raised AttributeError on native Windows), so non-POSIX binds TCP loopback and
+     # publishes ``loop_tick_tcp_port``.
+     tick_server = tick_socket_path = tick_tcp_port = None
+-    try:
+-        if os.name == "posix":
+-            tick_socket_path = get_loop_tick_socket_path(home)
+-            tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
+-            _sweep_stale_tick_sockets(tick_socket_path)
+-            tick_server = await asyncio.start_unix_server(_tick_socket_handler,
+-                                                          path=str(tick_socket_path))
+-        else:
+-            tick_server = await asyncio.start_server(_tick_socket_handler, host="127.0.0.1", port=0)
+-            for _s in tick_server.sockets or []:
+-                with contextlib.suppress(Exception):
+-                    if isinstance(_sname := _s.getsockname(), tuple) and len(_sname) >= 2:
+-                        tick_tcp_port = int(_sname[1])
+-                        break
+-    except Exception:
+-        tick_server = tick_tcp_port = None
+-        logger.warning("Loop tick socket unavailable — liveness probes will have no "
+-                       "loop-scheduling witness and will not escalate on a stale heartbeat",
+-                       exc_info=True)
+-    extra = {"loop_tick_socket": tick_server is not None, "loop_tick_tcp_port": tick_tcp_port}
+-    try:
++    tick_socket = tick_socket_identity = None
++    try:
++        try:
++            if os.name == "posix":
++                tick_socket_path = get_loop_tick_socket_path(home)
++                tick_socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++                _validate_tick_socket_directory(
++                    tick_socket_path.parent, private=tick_socket_path.parent != _home(home) / "state")
++                _sweep_stale_tick_sockets(tick_socket_path)
++                _remove_abandoned_tick_socket(tick_socket_path)
++                tick_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++                # Bind ourselves: asyncio's path= form silently unlinks an existing live socket.
++                old_umask = os.umask(0o177)
++                try:
++                    tick_socket.bind(str(tick_socket_path))
++                finally:
++                    os.umask(old_umask)
++                tick_socket_identity = _tick_socket_identity(tick_socket_path)
++                os.chmod(tick_socket_path, 0o600)
++                tick_socket.setblocking(False)
++                tick_server = await asyncio.start_unix_server(_tick_socket_handler, sock=tick_socket)
++                tick_socket = None  # the server owns it now
++            else:
++                tick_server = await asyncio.start_server(_tick_socket_handler, host="127.0.0.1", port=0)
++                for _s in tick_server.sockets or []:
++                    with contextlib.suppress(Exception):
++                        if isinstance(_sname := _s.getsockname(), tuple) and len(_sname) >= 2:
++                            tick_tcp_port = int(_sname[1])
++                            break
++        except Exception:
++            tick_server = tick_tcp_port = None
++            if tick_socket is not None:
++                tick_socket.close()
++                tick_socket = None
++            if tick_socket_path is not None and tick_socket_identity is not None:
++                _unlink_owned_tick_socket(tick_socket_path, tick_socket_identity)
++            logger.warning("Loop tick socket unavailable — liveness probes will have no "
++                           "loop-scheduling witness and will not escalate on a stale heartbeat",
++                           exc_info=True)
++        extra = {"loop_tick_socket": tick_server is not None, "loop_tick_tcp_port": tick_tcp_port}
+         while True:  # first write is immediate so monitors see a fresh file at once
+             try:
+                 await asyncio.to_thread(write_loop_heartbeat, start_time=start_time, home=home,
+@@ -393,10 +476,11 @@
+             if should_continue is not None and not should_continue():
+                 return
+     finally:
++        if tick_socket is not None:
++            tick_socket.close()
+         if tick_server is not None:
+             tick_server.close()
+             with contextlib.suppress(Exception):
+                 await tick_server.wait_closed()
+-            if tick_socket_path is not None:
+-                with contextlib.suppress(Exception):
+-                    tick_socket_path.unlink(missing_ok=True)
++        if tick_socket_path is not None and tick_socket_identity is not None:
++            _unlink_owned_tick_socket(tick_socket_path, tick_socket_identity)
+--- /dev/null
++++ b/tests/gateway/test_loop_tick_socket_paths.py
+@@ -0,0 +1,227 @@
++"""Real Unix listener/probe coverage for long-home loop tick rendezvous and custody."""
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import json
++import os
++import shutil
++import socket
++import stat
++import tempfile
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++import gateway.shutdown_watchdog as wd
++import hermes_cli.gateway as cli
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++@pytest.fixture
++def socket_homes():
++    root = Path(tempfile.mkdtemp(prefix="tick-fix-", dir="/tmp"))
++    homes = [root / ("a" * 90), root / ("д" * 60)]
++    parents = set()
++    for home in homes:
++        home.mkdir()
++        parents.add(wd.get_loop_tick_socket_path(home).parent)
++    try:
++        yield root, homes
++    finally:
++        for directory in parents:
++            if directory.is_symlink():
++                directory.unlink()
++            elif directory.exists():
++                shutil.rmtree(directory)
++        shutil.rmtree(root)
++
++
++def bind_node(path, *, listening=False):
++    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
++    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++    server.bind(str(path))
++    path.chmod(0o600)
++    if listening:
++        server.listen(8)
++    return server
++
++
++async def wait_payload(home):
++    for _ in range(100):
++        try:
++            return json.loads(wd.get_loop_heartbeat_path(home).read_text())
++        except (OSError, json.JSONDecodeError):
++            await asyncio.sleep(0.02)
++    pytest.fail("producer did not publish heartbeat")
++
++
++@pytest.mark.parametrize("index", [0, 1], ids=["ascii", "multibyte"])
++@pytest.mark.asyncio
++async def test_long_home_real_producer_and_product_probe(socket_homes, index):
++    _, homes = socket_homes
++    home = homes[index]
++    direct = home / "state" / f"gateway.loop-tick.{os.getpid()}.sock"
++    direct.parent.mkdir()
++    # The original producer's actual bind fails for this fixture, including multibyte homes.
++    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as old:
++        with pytest.raises(OSError, match="path too long"):
++            old.bind(str(direct))
++    path = wd.get_loop_tick_socket_path(home)
++    assert len(os.fsencode(path)) <= 100 < 108
++    assert not path.parent.exists()  # resolving a probe address never creates it
++    task = asyncio.create_task(wd.loop_heartbeat_forever(home=home))
++    try:
++        payload = await wait_payload(home)
++        assert payload["loop_tick_socket"] is True
++        assert payload["loop_tick_tcp_port"] is None
++        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
++        assert stat.S_IMODE(path.stat().st_mode) == 0o600
++        assert await asyncio.to_thread(cli._probe_loop_tick_socket, os.getpid(), home, 1) is True
++        assert cli._probe_loop_tick_socket(os.getpid() + 1, home, 0.01) is None
++        assert cli._probe_loop_tick_socket(os.getpid(), homes[1 - index], 0.01) is None
++    finally:
++        task.cancel()
++        with contextlib.suppress(asyncio.CancelledError):
++            await task
++    assert not path.exists()
++    assert path.parent.is_dir()  # another PID may still own a socket in this namespace
++
++
++def test_path_identity_compatibility_and_environment_independence(socket_homes, monkeypatch):
++    root, homes = socket_homes
++    short = root / "s"
++    assert wd.get_loop_tick_socket_path(short, 123) == short / "state/gateway.loop-tick.123.sock"
++    path = wd.get_loop_tick_socket_path(homes[0], 123)
++    monkeypatch.setenv("TMPDIR", str(root / "unrelated"))
++    assert wd.get_loop_tick_socket_path(homes[0], 123) == path
++    assert wd.get_loop_tick_socket_path(homes[0], 124) != path
++    assert wd.get_loop_tick_socket_path(homes[1], 123) != path
++    for pid in (0, -1):
++        with pytest.raises(ValueError):
++            wd.get_loop_tick_socket_path(homes[0], pid)
++
++
++@pytest.mark.parametrize("unsafe", ["symlink", "writable", "foreign"])
++@pytest.mark.asyncio
++async def test_unsafe_namespace_refused_by_producer_and_probe(socket_homes, monkeypatch, unsafe):
++    root, homes = socket_homes
++    home = homes[0]
++    path = wd.get_loop_tick_socket_path(home)
++    if unsafe == "symlink":
++        target = root / "foreign-target"
++        target.mkdir(mode=0o700)
++        path.parent.symlink_to(target, target_is_directory=True)
++    else:
++        path.parent.mkdir(mode=0o700)
++        if unsafe == "writable":
++            path.parent.chmod(0o777)
++        else:
++            original = Path.lstat
++            def foreign_lstat(p, *args, **kwargs):
++                info = original(p, *args, **kwargs)
++                return (SimpleNamespace(st_mode=info.st_mode, st_uid=info.st_uid + 1)
++                        if p == path.parent else info)
++            monkeypatch.setattr(Path, "lstat", foreign_lstat)
++    assert cli._probe_loop_tick_socket(os.getpid(), home, 0.01) is None
++    task = asyncio.create_task(wd.loop_heartbeat_forever(home=home, should_continue=lambda: False))
++    await task
++    assert (await wait_payload(home))["loop_tick_socket"] is False
++    assert not path.exists()
++    assert path.parent.lstat()  # refusal did not unlink or chmod the namespace
++
++
++def test_stale_sweep_preserves_live_foreign_symlink_and_non_socket(socket_homes, monkeypatch):
++    _, homes = socket_homes
++    own = wd.get_loop_tick_socket_path(homes[0])
++    own.parent.mkdir(mode=0o700)
++    live = own.with_name(f"gateway.loop-tick.{os.getpid()}.sock")
++    dead = own.with_name("gateway.loop-tick.123456789.sock")
++    denied = own.with_name("gateway.loop-tick.123456788.sock")
++    foreign = own.with_name("gateway.loop-tick.123456787.sock")
++    regular = own.with_name("gateway.loop-tick.123456786.sock")
++    link = own.with_name("gateway.loop-tick.123456785.sock")
++    malformed = own.with_name("gateway.loop-tick.-1.sock")
++    for path in (live, dead, denied, foreign, malformed):
++        bind_node(path).close()
++    regular.write_text("keep")
++    link.symlink_to(dead)
++    original_lstat = Path.lstat
++    def foreign_lstat(p, *args, **kwargs):
++        info = original_lstat(p, *args, **kwargs)
++        return (SimpleNamespace(st_mode=info.st_mode, st_uid=info.st_uid + 1)
++                if p == foreign else info)
++    monkeypatch.setattr(Path, "lstat", foreign_lstat)
++    calls = []
++    def kill(pid, sig):
++        calls.append((pid, sig))
++        if pid == 123456789:
++            raise ProcessLookupError()
++        if pid == 123456788:
++            raise PermissionError()
++    monkeypatch.setattr(wd.os, "kill", kill)
++    wd._sweep_stale_tick_sockets(own.with_name("gateway.loop-tick.123456784.sock"))
++    assert not dead.exists()
++    assert all(p.lstat() for p in (live, denied, foreign, regular, link, malformed))
++    assert set(calls) == {(os.getpid(), 0), (123456789, 0), (123456788, 0)}
++
++
++@pytest.mark.asyncio
++async def test_live_existing_node_and_replacement_survive_cleanup(socket_homes):
++    _, homes = socket_homes
++    home = homes[0]
++    path = wd.get_loop_tick_socket_path(home)
++    listener = bind_node(path, listening=True)
++    before = path.lstat().st_ino
++    try:
++        await wd.loop_heartbeat_forever(home=home, should_continue=lambda: False)
++        assert path.lstat().st_ino == before
++        assert (await wait_payload(home))["loop_tick_socket"] is False
++    finally:
++        listener.close()
++        path.unlink()
++        wd.get_loop_heartbeat_path(home).unlink()
++    task = asyncio.create_task(wd.loop_heartbeat_forever(home=home))
++    await wait_payload(home)
++    retained = path.with_suffix(".retained")
++    path.rename(retained)
++    replacement = bind_node(path, listening=True)
++    before = path.lstat().st_ino
++    try:
++        task.cancel()
++        with contextlib.suppress(asyncio.CancelledError):
++            await task
++        assert path.lstat().st_ino == before
++    finally:
++        replacement.close()
++
++
++@pytest.mark.asyncio
++async def test_cancel_during_server_handoff_closes_bound_fd(socket_homes, monkeypatch):
++    _, homes = socket_homes
++    path = wd.get_loop_tick_socket_path(homes[0])
++    bound = []
++    async def cancelled(*args, sock=None, **kwargs):
++        assert sock.fileno() >= 0 and path.is_socket()
++        bound.append(sock)
++        raise asyncio.CancelledError()
++    monkeypatch.setattr(wd.asyncio, "start_unix_server", cancelled)
++    with pytest.raises(asyncio.CancelledError):
++        await wd.loop_heartbeat_forever(home=homes[0])
++    assert bound and bound[0].fileno() == -1
++    assert not path.exists()
++
++
++def test_unsafe_leaf_is_never_probe_evidence(socket_homes):
++    root, homes = socket_homes
++    path = wd.get_loop_tick_socket_path(homes[0])
++    path.parent.mkdir(mode=0o700)
++    target = root / "elsewhere.sock"
++    with bind_node(target):
++        path.symlink_to(target)
++        assert cli._probe_loop_tick_socket(os.getpid(), homes[0], 0.01) is None
++        with pytest.raises(PermissionError):
++            wd.get_loop_tick_socket_path(homes[0])
++        assert path.is_symlink() and target.is_socket()
