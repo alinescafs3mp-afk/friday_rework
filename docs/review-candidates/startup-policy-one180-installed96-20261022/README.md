@@ -1,6 +1,6 @@
-# Temporary ONE180 startup policy — source review candidate
+# Temporary ONE180 startup policy — source and actual outcome
 
-This inert review package proposes an explicitly selected 180-second startup experiment on the Source96 baseline. The ordinary absent-policy path remains 90 seconds. The owner authorized one test, not a permanent default. The setting itself does not enforce one-shot custody or grant launch authority.
+This review package records an explicitly selected 180-second startup experiment on the Source96 baseline. The ordinary absent-policy path remains 90 seconds. The owner authorized one test, not a permanent default. The setting itself does not enforce one-shot custody or grant launch authority.
 
 `native.patch` changes only the unit renderer and managed credential bootstrap. The exact string `HERMES_FRIDAY_STARTUP_TEST_SECONDS=180` adds `TimeoutStartSec=180s` and the matching unit environment. Absent policy preserves the original renderer; all other values are rejected. Managed profile dotenv may not persist or override this key. Type, notify behavior, watchdog30, stop70 and restart policy are preserved.
 
@@ -10,7 +10,11 @@ This inert review package proposes an explicitly selected 180-second startup exp
 
 The four-file candidate has 31 previously passing author scenarios and four additional independent Sol controls, with source-only acceptance and zero open high/medium findings for those four paths. Existing composition checks verified the 17,710-file native and 267-file project trees. This publication preparation reuses those results and performs static packaging checks; it does not rerun them. Source95 flush fixes and Source96 observations remain intact. S115 owner optimization is excluded and is not a gate. Historical Source96 FAIL3 remains separate from this candidate. No deeper startup cause is established as solved.
 
-As of this package, actual installation, startup, loaded-unit verification and genuine Telegram/persistence/followup are all **NOT_RUN**. Source review is not runtime acceptance. Any actual attempt still needs the existing exact request, stopped-unit install, original budgets, once-intent custody, loaded180/type/watchdog/stop/restart/fragment/drop-in/Exec checks, and owned stop/cleanup. Reversal regenerates the admitted unit with the knob absent under stopped custody, reloads it, and verifies baseline unit identity and loaded90.
+`external-updater.patch` is a three-hunk delta between external adapter snapshots, separate from the main product files. The Source92 feature discriminator now validates the declared exact project changes, publishes their plugin subset through the existing custody and rollback path, and refreshes the marker plugin map. The previously executed 33 entry-validation fixtures and 20 real isolated transaction fixtures were source-accepted by independent review with zero open high/medium findings. Those results are reused here; no private harness or operational binding is published.
+
+Actual installation completed through the supported source CLI (exit 0; process reaped; 43.507 seconds), followed by independent installed-state verification (exit 0; process reaped; 38.795 seconds). The loaded unit used startup180, Type=notify, watchdog30 and stop70. The service emitted READY with result=true and status=ok at 92.134598 seconds after process birth (polling elapsed 85.210 seconds). Ordinary handoff then refused with `native_gateway_generation_unproved` (**FAIL3**), and the exact owned stop was confirmed. A genuine Telegram message was **NOT_SENT**; persistence/followup remained **NOT_RUN**. The cause of the generation check failure remains unproved, and runtime acceptance remains false.
+
+The supported installer restored the exact prior standard90 unit bytes (exit 0; process reaped; 35.161 seconds), with watchdog30 configuration unchanged. The READY observation does not establish a fully usable service or release acceptance. Historical failures and the existing 31+4 source evidence remain preserved.
 
 ## Portable focused tests
 
@@ -22,4 +26,4 @@ Prepare copies of the exact baseline and candidate files outside a live installa
 python3 focused_tests.py --inputs harness-inputs.example.json --output-dir /tmp/one180-focused-output
 ```
 
-The example input files are intentionally not bundled. The Linux harness retains its original two-CPU affinity, 1GiB address-space, CPU240 and file64MiB limits. Its JSON result records fixture execution only. No unchanged full suite, actual installed renderer, live startup or Telegram result is implied.
+The example input files are intentionally not bundled. The Linux harness retains its original two-CPU affinity, 1GiB address-space, CPU240 and file64MiB limits. Its JSON result records fixture execution only. The portable harness alone establishes no installed renderer, live startup or Telegram result; the actual observations above are separate.
