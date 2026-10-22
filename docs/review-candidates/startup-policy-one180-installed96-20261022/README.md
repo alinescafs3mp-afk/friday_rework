@@ -1,6 +1,6 @@
-# Temporary ONE180 startup policy — source and actual outcome
+# Ordinary 180-second cold-start policy — source and actual outcome
 
-This review package records an explicitly selected 180-second startup experiment on the Source96 baseline. The ordinary absent-policy path remains 90 seconds. The owner authorized one test, not a permanent default. The setting itself does not enforce one-shot custody or grant launch authority.
+This package records the first 180-second startup experiment on the Source96 baseline and its subsequent adoption by the owner on 22 October as the standard finite cold-start window for this deployment. Future automatic restoration to90 is superseded. The closed first attempt and its failure remain unchanged. The existing explicit policy mechanism is reused; the setting itself does not grant launch authority.
 
 `native.patch` changes only the unit renderer and managed credential bootstrap. The exact string `HERMES_FRIDAY_STARTUP_TEST_SECONDS=180` adds `TimeoutStartSec=180s` and the matching unit environment. Absent policy preserves the original renderer; all other values are rejected. Managed profile dotenv may not persist or override this key. Type, notify behavior, watchdog30, stop70 and restart policy are preserved.
 
@@ -15,6 +15,16 @@ The four-file candidate has 31 previously passing author scenarios and four addi
 Actual installation completed through the supported source CLI (exit 0; process reaped; 43.507 seconds), followed by independent installed-state verification (exit 0; process reaped; 38.795 seconds). The loaded unit used startup180, Type=notify, watchdog30 and stop70. The service emitted READY with result=true and status=ok at 92.134598 seconds after process birth (polling elapsed 85.210 seconds). Ordinary handoff then refused with `native_gateway_generation_unproved` (**FAIL3**), and the exact owned stop was confirmed. A genuine Telegram message was **NOT_SENT**; persistence/followup remained **NOT_RUN**. The cause of the generation check failure remains unproved, and runtime acceptance remains false.
 
 The supported installer restored the exact prior standard90 unit bytes (exit 0; process reaped; 35.161 seconds), with watchdog30 configuration unchanged. The READY observation does not establish a fully usable service or release acceptance. Historical failures and the existing 31+4 source evidence remain preserved.
+
+## Standard configuration and startup path
+
+The supported deployment recipe builds `clean_environment(home)` and then sets `HERMES_FRIDAY_STARTUP_TEST_SECONDS` to the exact string `180` on **each final entry**. The historical environment-key name is retained for compatibility. Configure or refresh the stopped, reconciled service through the existing installed launcher with `-p default gateway install --no-start-now --no-start-on-login`; no handwritten unit or drop-in is used. Verify the exact generated unit and effective loaded startup180, Type=notify, NotifyAccess=main, configured watchdog30, stop70 and restart settings before startup. An inactive runtime watchdog property can be `infinity`; verify runtime30 and watchdog operation during the actual start.
+
+Start through the existing selected native Python and pinned `scripts/friday_native.py start-telegram --input <current-input> --deadline <inherited-monotonic-deadline>`, again with sanitized environment plus exact180. After the accepted generation-handoff repair is deployed, this path selects command210, proof60 and identify20. Preserve the enclosing operation deadline and the existing owned-stop70 and cleanup reserves. Owned cleanup stops the service when required; it does not regenerate90. A new attempt must use its own unconsumed operation and current identity checks; the closed first attempt is never replayed.
+
+This is an explicit deployment policy, not a global change to the native getter's absent-value default. Plain Hermes start/install may regenerate90, and the unmodified outer ordinary-install start wrapper strips the flag when it sanitizes its final environment. Those invocations are outside this recipe. Ambient export around that wrapper is insufficient. Every supported configure/refresh/final-start invocation must retain exact180 after sanitization.
+
+The next result remains successful generation verification followed by a genuine authorized Jarvis reply, persisted exchange and separate contextual follow-up. Cold-start optimization, workers and the full release matrix do not block that result. Adoption of180 alone does not change runtime or release acceptance.
 
 ## Portable focused tests
 
