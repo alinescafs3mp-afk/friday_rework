@@ -1,0 +1,294 @@
+--- a/gateway/slash_commands_session.py
++++ b/gateway/slash_commands_session.py
+@@ -627,7 +627,7 @@
+         tmp_agent = None
+         work = None
+         try:
+-            tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
++            tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs, source=source)
+             if (not self._is_session_run_current(session_key, generation)
+                     or state.turn.agent is not _AGENT_PENDING_SENTINEL):
+                 # A stop/reset may have won while the agent was being constructed.
+@@ -668,8 +668,7 @@
+             # owner. A refusal before a Future exists still must release its slot.
+             worker = asyncio.get_running_loop().run_in_executor(
+                 self._get_executor(), copy_context().run,
+-                lambda: compress_now(tmp_agent, msgs, request, system_message="", skip_without_window=True,
+-                                     task_id=session_entry.session_id or "default"))
++                lambda: self._compress_manual_snapshot(tmp_agent, msgs, request, session_entry.session_id))
+             self._track_deferred_agent_worker(worker, tmp_agent)
+             try:
+                 result = await asyncio.shield(worker)
+@@ -739,7 +738,31 @@
+                             self._release_running_agent_state(
+                                 session_key, run_generation=self._current_session_run_generation(session_key))
+ 
+-    async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict):
++    def _compress_manual_snapshot(self, agent, msgs, request, session_id):
++        """Bind a between-turn envelope, then fence it under the native compression lease."""
++        from agent.bounded_context import BoundedContextPolicy, prepare_bounded_manual_compaction
++        from agent.conversation_compression import _strip_marker_for_comparison
++        from agent.conversation_compression_manual import compress_now
++        import copy
++        snapshot = copy.deepcopy(msgs)
++        bounded = isinstance(getattr(agent, "_bounded_context_policy", None), BoundedContextPolicy)
++
++        def snapshot_is_current():
++            gateway_check = getattr(agent, "_bounded_manual_gateway_snapshot", None)
++            if bounded and (not callable(gateway_check) or not gateway_check()):
++                return False
++            current = self.session_store.load_transcript(session_id)
++            current = [m for m in current if m.get("role") in {"user", "assistant", "tool"}]
++            return (agent.session_id == session_id
++                    and _strip_marker_for_comparison(current) == _strip_marker_for_comparison(snapshot))
++
++        if bounded:
++            prepare_bounded_manual_compaction(agent, snapshot, snapshot_is_current=snapshot_is_current)
++        return compress_now(agent, msgs, request, system_message="", skip_without_window=True,
++                            task_id=session_id or "default",
++                            **({"snapshot_is_current": snapshot_is_current} if bounded else {}))
++
++    async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict, *, source=None):
+         """Build the throwaway AIAgent that performs a manual /compress rewrite of *session_id*."""
+         from run_agent import AIAgent
+         from gateway.run import _GATEWAY_HYGIENE_PLATFORM, _seed_hygiene_system_prompt
+@@ -764,16 +787,63 @@
+         _checkpoint_required = _is_truthy(
+             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"),
+             default=False)
++        from agent.bounded_context import configured_policy
++        enabled, disabled = ["memory"], None
++        gateway_snapshot = None
++        if configured_policy() is not None:
++            from agent.bounded_context import BoundedContextError
++            from gateway.run import _load_gateway_config, _platform_config_key
++            if source is None:
++                raise BoundedContextError("bounded_context: manual source identity unavailable")
++            import copy
++            from types import SimpleNamespace
++            from gateway.run_turn_runner import TurnRunner
++            from gateway.session_prompt_pin import sanitize_prompt_pin
++            config = _load_gateway_config()
++            session_key = self._session_key_for_source(source)
++            pin = sanitize_prompt_pin(self.session_store.get_prompt_pin(
++                session_key, expected_session_id=session_id))
++            if (pin is None or pin["redact_pii"] != bool((config.get("privacy") or {}).get("redact_pii", False))
++                    or pin["parent_chat_id"] != getattr(source, "parent_chat_id", None)
++                    or not hasattr(self, "_prefill_messages")):
++                raise BoundedContextError("bounded_context: exact manual gateway prompt inputs unavailable")
++            context = SimpleNamespace(source=source, context_prompt=pin["context_prompt"],
++                                      channel_prompt=pin["channel_prompt"])
++            combined = TurnRunner(self, context)._combined_ephemeral_prompt()
++            prefills = copy.deepcopy(self._prefill_messages)
++
++            def gateway_snapshot():
++                return (self.session_store.get_prompt_pin(session_key, expected_session_id=session_id) == pin
++                        and _load_gateway_config() == config
++                        and self._prefill_messages == prefills
++                        and TurnRunner(self, context)._combined_ephemeral_prompt() == combined)
++
++            enabled, disabled = self._resolve_turn_toolsets(
++                config, source, _platform_config_key(source.platform))
++            runtime_kwargs = {**runtime_kwargs, **{k: getattr(source, k, None) for k in (
++                "user_id", "user_id_alt", "user_name", "chat_id", "chat_name", "chat_type", "thread_id")},
++                "service_tier": self._resolve_session_service_tier(source=source),
++                "ephemeral_system_prompt": combined or None, "prefill_messages": prefills or None}
+         tmp_agent = AIAgent(**runtime_kwargs, model=model, max_iterations=4, quiet_mode=True,
+-                            skip_memory=not _checkpoint_required, enabled_toolsets=["memory"],
++                            skip_memory=not _checkpoint_required, enabled_toolsets=enabled,
++                            disabled_toolsets=disabled,
+                             session_id=session_id,
+                             session_db=getattr(self._session_db, "_db", self._session_db))
++        if gateway_snapshot is not None:
++            tmp_agent._bounded_manual_gateway_snapshot = gateway_snapshot
+         _seed_hygiene_system_prompt(tmp_agent, session_row)
+         # Real platform during construction (context engines bind correctly); the stamp afterwards
+         # only marks this agent as no real surface. Since #104414 Platform is not a restore-identity
+         # field, so it no longer forces the next live turn to rebuild; the seed's retain flag is what
+         # keeps the reduced-toolset build out of the session row (#122822).
+-        tmp_agent.platform = _GATEWAY_HYGIENE_PLATFORM
++        if gateway_snapshot is None:
++            tmp_agent.platform = _GATEWAY_HYGIENE_PLATFORM
++        else:
++            # NULL persisted prompts need the authoritative live surface builder,
++            # not hygiene's reduced-surface prompt. Keep the complete native tool
++            # construction snapshot for the legitimate no/legacy-pin branch.
++            import copy
++            tmp_agent._bounded_manual_native_tools = copy.deepcopy(tmp_agent.tools)
+         tmp_agent._print_fn = lambda *a, **kw: None
+         # close() must not end the rotated session the gateway entry now points at.
+         tmp_agent._end_session_on_close = False
+--- a/agent/bounded_context.py
++++ b/agent/bounded_context.py
+@@ -1070,6 +1070,16 @@
+     expected, effective_system = build_api_messages(agent, anchors, current_turn_user_idx=current,
+         ext_prefetch_cache="", plugin_user_context="", moa_config=None,
+         active_system_prompt=getattr(agent, "_cached_system_prompt", None) or "")
++    # Native assembly inserts current prefills immediately after the system row.
++    # They are authority too: compare their exact wire projection, rather than
++    # rejecting valid prefills or ignoring an extra system/developer instruction.
++    import copy
++    prefills = copy.deepcopy(getattr(agent, "prefill_messages", None) or [])
++    offset = int(bool(expected and expected[0].get("role") == "system"))
++    for idx, row in enumerate(prefills):
++        if isinstance(row.get("content"), str):
++            row["content"] = row["content"].strip()
++        expected.insert(offset + idx, row)
+     readonly_utf8_messages(agent, expected)
+     # Request assembly canonicalizes tool-call argument JSON after the native
+     # message projection. Compare that exact wire representation, rather than
+@@ -1133,7 +1143,7 @@
+             or not all(matches(wanted, candidate)
+                        for wanted, candidate in zip(expected_authority, actual_authority))):
+         raise BoundedContextError("bounded_context: formatter changed protected system authority")
+-    injected = int(bool(effective_system))
++    injected = int(bool(effective_system)) + len(prefills)
+     split = injected + len(head)
+     groups = (expected[:injected], expected[injected:split], expected[split:])
+     cursor = 0
+@@ -1161,6 +1171,130 @@
+         cursor = found + len(group)
+ 
+ 
++def _manual_compaction_session(row):
++    # Activity heartbeats legitimately update last_activity_at/description.
++    # Only request authority/identity belongs in this fence; native lease/history
++    # fencing separately protects the immutable original transcript.
++    keys = ("id", "source", "model", "system_prompt", "tool_names", "ended_at", "end_reason")
++    config = json.loads((row or {}).get("model_config") or "{}")
++    return {**{k: (row or {}).get(k) for k in keys},
++            "prompt_scope": config.get("_friday_prompt_scope"),
++            "profile_name": (row or {}).get("profile_name")}
++
++
++def _manual_compaction_state(agent):
++    # Compare private values directly: no prompt, schema, user text or credentials in logs.
++    import copy
++    fields = ("session_id", "model", "provider", "base_url", "api_mode", "max_tokens",
++              "reasoning_config", "request_overrides", "tools", "valid_tool_names",
++              "prefill_messages", "ephemeral_system_prompt", "_cached_system_prompt",
++              "_cached_system_prompt_static", "_current_turn_timestamp", "service_tier",
++              "_plugin_system_prompt_sections_snapshot", "_plugin_system_prompt_sections_previous")
++    return copy.deepcopy({key: getattr(agent, key, None) for key in fields})
++
++
++def prepare_bounded_manual_compaction(agent, messages, *, snapshot_is_current):
++    """Prepare the exact between-turn gateway envelope; never synthesize a new ask.
++
++    Historical api_content already contains its old ephemeral injections. There is
++    no new turn/prefetch/pre_llm_call here. This proves THIS manual envelope only;
++    a future user turn must still pass the unchanged final physical guard.
++    """
++    if not isinstance(getattr(agent, "_bounded_context_policy", None), BoundedContextPolicy):
++        return
++    import copy
++    import time
++    from agent.turn_context_compaction import _reset_retry_state_after_compaction
++    from agent.conversation_compression import _is_real_user_message
++    from agent.conversation_loop import _stored_prompt_matches_runtime
++    from agent.system_prompt import restore_plugin_prompt_sections, reconstruct_static_prefix
++    from tools.mcp_tool_agent import restore_agent_tool_prefix
++    from hermes_cli import friday_prompt_scope
++    from hermes_cli.friday_credential_admission import ordinary_readonly_schemas
++    db = getattr(agent, "_session_db", None)
++    friday_prompt_scope.check_store(agent)
++    row = db.get_session(agent.session_id) if db is not None else None
++    prompt = row.get("system_prompt") if isinstance(row, dict) else None
++    if (not isinstance(row, dict) or row.get("ended_at") is not None
++            or not snapshot_is_current()):
++        raise BoundedContextError("bounded_context: manual session snapshot unavailable or stale")
++    raw_pin = row.get("tool_names")
++    import re
++    missing = prompt is None
++    legacy = raw_pin is None or (isinstance(raw_pin, str) and re.fullmatch(r"[0-9a-fA-F]{64}", raw_pin) is not None)
++    if missing and legacy:
++        # No historical prompt/schema bytes can be restored. Build CURRENT
++        # authority with the SAME native full per-source constructor/core builder,
++        # never by treating NULL/hash as an empty or fabricated persisted pin.
++        native_tools = getattr(agent, "_bounded_manual_native_tools", None)
++        if not isinstance(native_tools, list) or not native_tools or agent.tools != native_tools:
++            raise BoundedContextError("bounded_context: current native manual tool snapshot unavailable")
++        agent.tools = ordinary_readonly_schemas(copy.deepcopy(native_tools))
++        agent.valid_tool_names = {t["function"]["name"] for t in agent.tools}
++        from hermes_cli.config import load_config_readonly
++        from tools.memory_tool import get_builtin_memory_config
++        from agent.agent_init import _init_memory, is_core_memory_provider
++        config = load_config_readonly()
++        if not is_core_memory_provider(get_builtin_memory_config(config).get("provider", "")):
++            raise BoundedContextError("bounded_context: current external memory prompt cannot be built without provider effects")
++        _init_memory(agent, config, False, agent.platform)
++        # A private native read-only handle preserves prompt-store grounding and
++        # task/title/profile metadata without permitting any precommit pin write.
++        from hermes_state import SessionDB
++        readonly_db = SessionDB(db.db_path, read_only=True)
++        agent._session_db = readonly_db
++        try:
++            prompt = agent._build_system_prompt("")
++        finally:
++            agent._session_db = db
++            readonly_db.close()
++        if not isinstance(prompt, str) or not prompt.strip() or not _stored_prompt_matches_runtime(agent, prompt):
++            raise BoundedContextError("bounded_context: current native manual prompt build failed")
++        if not snapshot_is_current() or _manual_compaction_session(db.get_session(agent.session_id)) != _manual_compaction_session(row):
++            raise BoundedContextError("bounded_context: manual session changed during native prompt build")
++    else:
++        if (not isinstance(prompt, str) or not prompt.strip()
++                or not friday_prompt_scope.matches(agent, prompt, row)
++                or not _stored_prompt_matches_runtime(agent, prompt)):
++            raise BoundedContextError("bounded_context: manual session snapshot unavailable or stale")
++        try:
++            pin = json.loads(raw_pin or "null")
++            pinned = pin["tools"]
++            if not isinstance(pin, dict) or not isinstance(pinned, list) or not pinned:
++                raise ValueError()
++            if any(not isinstance(t, dict) or not t.get("function", {}).get("name") for t in pinned):
++                raise ValueError()
++            expected = ordinary_readonly_schemas(copy.deepcopy(pinned))
++            agent._session_db = None
++            try:
++                restore_agent_tool_prefix(agent, pin)
++            finally:
++                agent._session_db = db
++            agent.tools = ordinary_readonly_schemas(agent.tools)
++            agent.valid_tool_names = {t["function"]["name"] for t in agent.tools}
++            if agent.tools != expected:
++                raise ValueError()
++        except (KeyError, TypeError, ValueError) as exc:
++            raise BoundedContextError("bounded_context: exact manual tool pin unavailable") from exc
++    agent._cached_system_prompt = prompt
++    agent._retain_seeded_system_prompt = True
++    restore_plugin_prompt_sections(agent, prompt)
++    reconstruct_static_prefix(agent, system_message="", log_label="manual compression")
++    _reset_retry_state_after_compaction(agent)
++    agent._current_turn_timestamp = time.time()
++    indices = [i for i, m in enumerate(messages) if _is_real_user_message(m)]
++    if not indices:
++        raise BoundedContextError("bounded_context: manual current user anchor unavailable")
++    idx = indices[-1]
++    remember_bounded_compaction_context(agent, messages, idx, "", "", None, messages[idx].get("content"))
++    # A callback is deliberately outside the deep-copied request-input mapping.
++    agent._bounded_manual_compaction_snapshot = snapshot_is_current
++    agent._bounded_manual_compaction_session = _manual_compaction_session(row)
++    agent._bounded_manual_compaction_state = _manual_compaction_state(agent)
++    # No physical request is dispatched here. Full original history may be over
++    # budget; the existing headroom/commit builders price the final envelope.
++
++
+ def remember_bounded_compaction_context(agent, messages, user_idx, ext, plugin, moa, original):
+     """Keep request-only inputs so a candidate can be priced before durable adoption."""
+     if not isinstance(getattr(agent, "_bounded_context_policy", None), BoundedContextPolicy):
+@@ -1186,6 +1320,14 @@
+     from hermes_cli.lifecycle import has_hook
+     if has_middleware("llm_request") or has_middleware("llm_execution") or has_hook("pre_api_request"):
+         raise BoundedContextError("bounded_context: dynamic request rewriting prevents precommit fit")
++    manual_state = getattr(agent, "_bounded_manual_compaction_state", None)
++    if manual_state is not None:
++        db = getattr(agent, "_session_db", None)
++        check = getattr(agent, "_bounded_manual_compaction_snapshot", None)
++        if (not callable(check) or not check() or db is None
++                or _manual_compaction_session(db.get_session(agent.session_id)) != agent._bounded_manual_compaction_session
++                or _manual_compaction_state(agent) != manual_state):
++            raise BoundedContextError("bounded_context: manual request context changed before commit")
+     context = getattr(agent, "_bounded_compaction_request_context", None)
+     if not isinstance(context, dict) or context.get("moa"):
+         raise BoundedContextError("bounded_context: exact request context unavailable before compaction commit")
