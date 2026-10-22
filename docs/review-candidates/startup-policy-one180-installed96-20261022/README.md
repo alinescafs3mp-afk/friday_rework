@@ -26,6 +26,10 @@ This is an explicit deployment policy, not a global change to the native getter'
 
 The next result remains successful generation verification followed by a genuine authorized Jarvis reply, persisted exchange and separate contextual follow-up. Cold-start optimization, workers and the full release matrix do not block that result. Adoption of180 alone does not change runtime or release acceptance.
 
+`generation-handoff.patch` is the subsequent narrow project repair against the exact `friday_start.py` identity in validation.json. Explicit180 now uses identify20 within the existing proof60; other callers retain5. The same eight generation comparisons retain their order and gain fixed first-failing reasons without exposing payloads. Post-exchange incarnation and owner checks remain. Twenty-four selected-source controls and six isolated actual-query-body controls passed, with independent source review reporting zero high/medium findings; those unchanged results are reused here. The original live failure's exact cause remains unproved.
+
+The repair was installed through the existing project-only update route (exit0, reaped,64.047s), changing the installation marker's pinned operator entry while retaining native source and plugins. Independent installed-state verification and the new live startup are pending at this publication. No new READY, generation success, Telegram reply, persistence or contextual follow-up is claimed.
+
 ## Portable focused tests
 
 `focused_tests.py` retains the author's 31 tests and finite fixtures. Only input/output path handling is adapted. It extracts selected source functions with AST and supplies explicit collaborators; it does not import product modules or launch services. The portable copy was parsed but **not executed** during this packaging task.
