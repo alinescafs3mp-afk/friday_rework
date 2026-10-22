@@ -1,0 +1,240 @@
+--- a/skills/productivity/docx/scripts/docx_common.py
++++ b/skills/productivity/docx/scripts/docx_common.py
+@@ -5,36 +5,89 @@
+ 
+ from docx.oxml import OxmlElement
+ from docx.oxml.ns import qn
++from docx.text.run import Run
++
++
++class _AliasDedup:
++    """Identity dedup over underlying XML nodes for ONE traversal invocation.
++
++    Merged table cells (horizontal ``gridSpan``, vertical ``vMerge`` and
++    rectangular merges) expose the same ``w:tc`` subtree once per grid slot,
++    and linked header/footer parts expose the same part element once per
++    linking section, so the same underlying ``w:p`` node can be reached many
++    times in one traversal.  Keys are ``id()`` of the lxml proxy objects;
++    lxml returns the same proxy for the same underlying node while a
++    reference to it is alive, and this class holds a strong reference to
++    every recorded node for the whole traversal, so no proxy identity can be
++    garbage-collected and recycled for a different node.  Identity, never
++    text or XML serialization, decides duplication: distinct nodes with
++    identical content stay distinct.
++    """
++
++    def __init__(self):
++        self._ids = set()
++        self._keepalive = []
++
++    def node_is_new(self, element) -> bool:
++        if id(element) in self._ids:
++            return False
++        self._ids.add(id(element))
++        self._keepalive.append(element)
++        return True
++
++    def paragraph_is_new(self, para) -> bool:
++        return self.node_is_new(para._p)
++
++    def cell_is_new(self, cell) -> bool:
++        return self.node_is_new(cell._tc)
+ 
+ 
+ def iter_all_paragraphs(doc, include_headers_footers: bool = True):
+-    """Yield every paragraph in body, tables (recursively), headers, footers."""
+-    yield from _iter_container(doc)
++    """Yield every paragraph in body, tables (recursively), headers, footers.
++
++    Each underlying ``w:p`` XML node is yielded exactly once per invocation,
++    in the original first-encounter order (paragraphs first, then tables,
++    per container; body first, then each section's header/footer parts).
++    Merged-cell aliases and shared/linked header/footer parts no longer
++    rescan or re-yield a node already yielded.  ``include_headers_footers``
++    keeps its original meaning.
++    """
++    dedup = _AliasDedup()
++    yield from _iter_container(doc, dedup)
+     if include_headers_footers:
++        seen_parts = _AliasDedup()
+         for section in doc.sections:
+             for part in (
+                 section.header, section.footer,
+                 section.first_page_header, section.first_page_footer,
+                 section.even_page_header, section.even_page_footer,
+             ):
+-                if part is not None:
+-                    yield from _iter_container(part)
+-
+-
+-def _iter_container(container):
++                if part is not None and seen_parts.node_is_new(part._element):
++                    yield from _iter_container(part, dedup)
++
++
++def _iter_container(container, dedup=None):
++    if dedup is None:
++        dedup = _AliasDedup()
+     for para in container.paragraphs:
+-        yield para
++        if dedup.paragraph_is_new(para):
++            yield para
+     for table in container.tables:
+-        yield from _iter_table(table)
+-
+-
+-def _iter_table(table):
++        yield from _iter_table(table, dedup)
++
++
++def _iter_table(table, dedup=None):
++    if dedup is None:
++        dedup = _AliasDedup()
+     for row in table.rows:
+         for cell in row.cells:
++            if not dedup.cell_is_new(cell):
++                continue  # merged-cell alias of an already visited w:tc
+             for para in cell.paragraphs:
+-                yield para
++                if dedup.paragraph_is_new(para):
++                    yield para
+             for nested in cell.tables:
+-                yield from _iter_table(nested)
++                yield from _iter_table(nested, dedup)
+ 
+ 
+ def iter_part_roots(doc):
+@@ -60,9 +113,11 @@
+     ``w:hyperlink`` or other wrapper elements are excluded, so concatenating
+     every run text would invent adjacency that does not exist in the real
+     paragraph text.  Every non-``w:r`` child (``w:hyperlink``, bookmarks,
+-    ``w:sdt``, ``w:pPr``, ...) is a hard barrier: matches never cross it, the
+-    barrier XML stays byte-exact, and hyperlink-internal or cross-container
+-    text remains explicitly unsupported instead of being silently corrupted.
++    ``w:sdt``, ``w:pPr``, ...) is a hard barrier: matches never cross it and the
++    barrier XML stays byte-exact.  Hyperlink-internal text is matched
++    separately, wholly inside each direct ``w:hyperlink`` container (see
++    ``replace_in_paragraph``); text inside other wrappers stays explicitly
++    unsupported instead of being silently corrupted.
+     """
+     segments = []
+     current = []
+@@ -166,47 +221,46 @@
+         offset = end
+ 
+ 
+-def replace_in_paragraph(para, old: str, new: str) -> int:
+-    """Replace `old` with `new` in a paragraph, preserving run formatting.
+-
+-    Matches are the non-overlapping occurrences of `old` in the paragraph's
+-    ORIGINAL text, scanned left to right within each maximal segment of
+-    consecutive direct runs; non-run XML children of the paragraph
+-    (hyperlinks, bookmarks, ...) are barriers that matches never cross.  Each
+-    match is processed exactly once and inserted replacement text is never
+-    rescanned, so the function terminates even when `new` contains `old` or
+-    `old == new`.
+-
+-    Formatting policy: ordinary matches inherit the first positively
+-    overlapped run's formatting.  If a match crosses an opaque XML boundary
+-    (fields, drawings, etc., including in empty runs), preserving its global
+-    anchor takes priority: replacement characters occupy their original
+-    character slots across runs, clamped to replacement length, and expansion
+-    remainder belongs to the last matched character.  Original run styles
+-    therefore apply on each side of that boundary.  Equal opaque-spanning
+-    replacements keep XML unchanged; shorter replacements can collapse
+-    boundaries without moving, deleting or reversing their XML nodes.  rPr
+-    is formatting, not an opaque boundary for this policy.  Returns number
+-    of replacements made.  No field recalculation or Office rendering is
+-    claimed.
+-
+-    Implementation: original run offsets are mapped once per segment, matches
+-    are found on the original segment text, edits are collected per original
+-    run only for positive-overlap ranges (empty or boundary-touching runs
+-    receive no edit and no assignment, so their XML -- e.g. a field marker in
+-    an empty run -- stays byte-identical).  One forward reconstruction per
+-    affected run changes only positively overlapped text-bearing children;
+-    Run.text is never assigned on the real run.  Work is proportional to
+-    input + output + XML children + runs + matches; runs are not rescanned
+-    per match and no per-match full-string rebuilding occurs.
+-    """
+-    if not old:
+-        return 0
+-    runs = para.runs
++def _hyperlink_run_groups(para):
++    """Yield ``(runs, segments)`` for each direct ``w:hyperlink`` child.
++
++    Only hyperlinks that are DIRECT children of the paragraph element are
++    eligible; hyperlinks nested inside other wrappers (``w:sdt``,
++    ``w:smartTag``, ...) stay explicitly unsupported and are never entered.
++    Within one hyperlink only its direct ``w:r`` children participate,
++    grouped into maximal consecutive-run segments exactly like paragraph
++    direct runs; every non-``w:r`` child is a hard barrier.  Each hyperlink
++    is its own group, so matches are invented neither across two hyperlinks
++    nor between direct runs and hyperlink runs.  Hyperlink attributes,
++    relationship ids/targets and run ``rPr`` are never modified: only
++    text-bearing children of positively overlapped runs change.
++    """
++    for child in para._p.iterchildren():
++        if child.tag != qn('w:hyperlink'):
++            continue
++        runs = []
++        segments = []
++        current = []
++        for element in child.iterchildren():
++            if element.tag == qn('w:r'):
++                current.append(len(runs))
++                runs.append(Run(element, para))
++            elif current:
++                segments.append(current)
++                current = []
++        if current:
++            segments.append(current)
++        if segments:
++            yield runs, segments
++
++
++def _replace_in_run_segments(runs, segments, old, new):
++    """Original matching/edit logic shared by direct runs and each eligible
++    hyperlink container.  Callers guarantee a non-empty ``old``."""
+     texts = [r.text for r in runs]
+     edits = [[] for _ in runs]
+     total = 0
+-    for segment in _direct_run_segments(para):
++    for segment in segments:
+         seg_texts = [texts[i] for i in segment]
+         offsets = []  # original start offset of each run in the segment text
+         pos = 0
+@@ -278,3 +332,33 @@
+             continue
+         _replace_run_text_preserving_xml(runs[i], run_edits)
+     return total
++
++
++def replace_in_paragraph(para, old: str, new: str) -> int:
++    """Replace `old` with `new` in a paragraph, preserving run formatting.
++
++    Eligible text lives in two kinds of containers that never share a match:
++    maximal segments of consecutive direct ``w:r`` children of the paragraph
++    (original behaviour, unchanged), and -- new in this candidate -- each
++    DIRECT ``w:hyperlink`` child of the paragraph, matched wholly inside its
++    own direct ``w:r`` children under the identical non-overlapping
++    original-text policy.  Hyperlink attributes, relationship ids/targets,
++    ``rPr`` and all opaque nodes are preserved; matches never cross a
++    container boundary in either direction, never enter hyperlinks nested in
++    other wrappers (``w:sdt``, ``w:smartTag``, ...), and never rescan
++    inserted replacement text, so the function terminates even when ``new``
++    contains ``old`` or ``old == new``.
++
++    Formatting policy inside each container is exactly the pre-existing one:
++    ordinary matches inherit the first positively overlapped run's
++    formatting; matches crossing an opaque XML boundary keep global
++    character anchors.  Returns number of replacements made.  No field
++    recalculation or Office rendering is claimed.
++    """
++    if not old:
++        return 0
++    total = _replace_in_run_segments(para.runs, _direct_run_segments(para),
++                                     old, new)
++    for hl_runs, hl_segments in _hyperlink_run_groups(para):
++        total += _replace_in_run_segments(hl_runs, hl_segments, old, new)
++    return total
