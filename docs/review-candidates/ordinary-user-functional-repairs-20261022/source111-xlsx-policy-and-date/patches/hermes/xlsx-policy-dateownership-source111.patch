@@ -1,0 +1,516 @@
+--- a/agent/bounded_context.py
++++ b/agent/bounded_context.py
+@@ -1278,6 +1278,16 @@
+             raise BoundedContextError("bounded_context: exact manual tool pin unavailable") from exc
+     agent._cached_system_prompt = prompt
+     agent._retain_seeded_system_prompt = True
++    # Persisted-prompt branch: carry the composition-origin date-ownership sidecar
++    # with the seeded bytes so the in-place commit keeps the live session's
++    # renderer-owned date span (the rebuild branch above already set it via the
++    # build).  Validated like a live restore; unusable records fail closed to
++    # None and the next persist honestly drops the stale sidecar.
++    if missing and legacy:
++        pass
++    else:
++        from agent.system_prompt import seed_date_ownership_from_session
++        agent._date_ownership = seed_date_ownership_from_session(agent, row, prompt)
+     restore_plugin_prompt_sections(agent, prompt)
+     reconstruct_static_prefix(agent, system_message="", log_label="manual compression")
+     _reset_retry_state_after_compaction(agent)
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -3385,11 +3385,20 @@
+         _profile_for_child = None
+     old_title = agent._session_db.get_session_title(agent.session_id)
+     new_session_id = mint_session_id()
++    # The rebuilt prompt's owned date span is byte-identical in the published child;
++    # rebind the composition sidecar to the child id (the lineage root does not move)
++    # so a later restore can still validate it.  No record: nothing is minted.
++    _child_model_config = agent._session_init_model_config
++    _child_date_ownership = getattr(agent, "_date_ownership", None)
++    if isinstance(_child_date_ownership, dict):
++        from agent.system_prompt import DATE_OWNERSHIP_FIELD
++        _child_model_config = dict(_child_model_config or {})
++        _child_model_config[DATE_OWNERSHIP_FIELD] = {**_child_date_ownership, "session_id": new_session_id}
+     from agent.context_compressor import _DB_PERSISTED_MARKER
+     agent._session_db.publish_compression_child(
+         parent_session_id=old_session_id, child_session_id=new_session_id,
+         source=_compression_child_source(agent, old_session_id), model=agent.model,
+-        model_config=agent._session_init_model_config, system_prompt=new_system_prompt, messages=compressed,
++        model_config=_child_model_config, system_prompt=new_system_prompt, messages=compressed,
+         cwd=getattr(agent, "working_directory", None), profile_name=_profile_for_child,
+         compression_lock_holder=lease.holder, require_compression_lease=lease.holder is not None,
+         require_lease_refresh=lease.holder is not None, lease_ttl_seconds=lease.ttl,
+@@ -3819,7 +3828,9 @@
+                 # re-baseline transcript handling.
+                 compacted_in_place = True
+                 # In-place still updates the current row's prompt; rotation published it atomically above.
+-                agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
++                # The rebuilt prompt's composition-origin date sidecar rides the same transaction.
++                agent._session_db.update_system_prompt(agent.session_id, new_system_prompt,
++                                                       date_ownership=getattr(agent, "_date_ownership", None))
+                 agent._last_flushed_db_idx = 0
+             else:
+                 # Bind old_session_id first: it is the rollback key in the handler below.
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -688,12 +688,15 @@
+ def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool = False) -> None:
+     """Persist ``agent._cached_system_prompt`` to the session row; failures log at WARNING
+     (with ``failure_message``) because the gateway path (fresh AIAgent per turn) reads
+-    this row every turn, so a silent failure breaks prefix-cache reuse."""
++    this row every turn, so a silent failure breaks prefix-cache reuse.  The renderer's
++    composition-origin date-ownership sidecar (``agent._date_ownership``, set by the last
++    build/refresh) rides the same transaction; None drops any stale sidecar."""
+     if not agent._session_db:
+         return
+     _friday_prompt_scope.check_store(agent)
+     try:
+-        agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
++        agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt,
++                                               date_ownership=getattr(agent, "_date_ownership", None))
+         if persist_tools:
+             from tools.mcp_tool_agent import persist_agent_tool_names
+             persist_agent_tool_names(agent)
+@@ -808,8 +811,32 @@
+             )
+             return
+         # Continuing session — reuse the exact system prompt from the
+-        # previous turn so the Anthropic cache prefix matches.
+-        agent._cached_system_prompt = stored_prompt
++        # previous turn so the Anthropic cache prefix matches.  The one allowed
++        # movement is the renderer-owned date block: when the persisted
++        # composition sidecar validates (session, lineage, prompt hash, span,
++        # owned bytes), a day rollover re-renders exactly that span and persists
++        # once; a same-day restore writes nothing.  Quoted date text elsewhere
++        # in the prompt is never owned and never touched.
++        from agent.system_prompt import (
++            date_ownership_from_session_row, reconstruct_static_prefix, refresh_owned_date_block,
++            restore_plugin_prompt_sections,
++        )
++        refreshed, ownership, date_changed = refresh_owned_date_block(
++            agent, stored_prompt, date_ownership_from_session_row(session_row))
++        agent._date_ownership = ownership
++        if date_changed:
++            record_cache_break(agent, "day_rollover")
++            stored_prompt = agent._cached_system_prompt = refreshed
++            # Persist so the NEXT turn restores the refreshed bytes verbatim; on a
++            # write failure the stored sidecar still holds the old owned day, so
++            # the refresh honestly re-fires next turn.
++            _persist_system_prompt(
++                agent,
++                "Session DB update_system_prompt failed for owned date refresh (session=%s): %s. "
++                "The refresh will re-fire next turn.",
++            )
++        else:
++            agent._cached_system_prompt = stored_prompt
+         # The reused bytes may describe the surface this conversation STARTED on; correct that
+         # at the tail of the request instead of rebuilding the prompt in front of it (#104414).
+         announced_switch = stage_surface_switch_note(agent, stored_prompt, conversation_history)
+@@ -830,7 +857,6 @@
+         # prefix is not persisted either; rebuild it for the early cache breakpoint or
+         # fresh-per-turn gateway agents fall back to the single-breakpoint layout
+         # (reconstruct_static_prefix gates on _use_prompt_caching, fails open to legacy).
+-        from agent.system_prompt import reconstruct_static_prefix, restore_plugin_prompt_sections
+         restore_plugin_prompt_sections(agent, stored_prompt)
+         reconstruct_static_prefix(agent, system_message=system_message)
+         return
+--- a/agent/system_prompt.py
++++ b/agent/system_prompt.py
+@@ -14,6 +14,7 @@
+ from hermes_cli.friday_prompt_scope import (dialogue_parts as _friday_dialogue_parts, ordinary_prompt_cap as _ordinary_prompt_cap, ordinary_identity as _ordinary_identity, ordinary_workspace_parts as _ordinary_workspace_parts, ORDINARY_CAPABILITY_GUIDANCE)
+ from hermes_cli.friday_prompt_scope import product_help_guidance as _friday_product_help
+ 
++import hashlib
+ import json
+ import logging
+ import os
+@@ -505,16 +506,35 @@
+     return bits
+ 
+ 
+-def _timestamp_line(agent: Any) -> str:
+-    """Date-only so the prompt is byte-stable for the day; zone + offset so
+-    tools needn't guess EST vs EDT. Long-lived sessions get an "as of" line on
+-    rebuild days (the cache prefix is already invalidated at that boundary)."""
++DATE_OWNERSHIP_FIELD = "_friday_date_ownership"
++DATE_OWNERSHIP_SCHEMA = "friday.date-ownership.v1"
++
++
++def _conversation_root_id_quiet(agent: Any) -> Optional[str]:
++    """Lineage-root session id when the session DB answers, else None.
++    Ownership emitted without a lineage proof fails closed at restore."""
++    db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
++    if db is None or not isinstance(session_id, str) or not session_id:
++        return None
++    try:
++        root = db.get_conversation_root(session_id)
++    except Exception:
++        return None
++    return root if isinstance(root, str) and root else None
++
++
++def _render_timestamp_owned(agent: Any) -> Tuple[str, Optional[Dict[str, Any]]]:
++    """Render the volatile timestamp part; the second element is the renderer-owned
++    date block (``Conversation started:`` plus the rebuild-day band) captured AT
++    EMISSION, or None when nothing date-owned was emitted (timeless Bot Chat).
++    Composition callers carry this identity into persistence so a later restore
++    refreshes exactly that span — completed prompt text is never re-scanned."""
+     from hermes_time import get_timezone as _hermes_tz, now as _hermes_now, safe_strftime
+     now = _hermes_now()
+     _bits = _zone_bits(now, _hermes_tz())
+     _zone_suffix = f" ({', '.join(_bits)})" if _bits else ""
+     _start = _session_start_like(agent, now)
+-    timestamp_line = f"Conversation started: {safe_strftime(_start, '%A, %B %d, %Y')}{_zone_suffix}"
++    date_block = f"Conversation started: {safe_strftime(_start, '%A, %B %d, %Y')}{_zone_suffix}"
+     # Second line (maintainer design, salvaging #96224's anchor): long-lived sessions — Bot Mode
+     # forever-chats, messenger channels people never close — span many days and many compactions. A lone
+     # birth date leads the model to believe it is still living in that old day. The prompt is rebuilt at
+@@ -523,15 +543,121 @@
+     # line costs no extra cache churn. Same-day sessions skip the second line entirely — nothing to correct,
+     # and the single-line shape stays byte-identical for the day (prefix-cache safe).
+     if now.strftime("%Y%m%d") != _start.strftime("%Y%m%d"):
+-        timestamp_line += (f"\nToday's date (as of the last context rebuild): {safe_strftime(now, '%A, %B %d, %Y')} "
+-                           "— trust this over the start date for what day it is now; query tools for exact time.")
++        date_block += (f"\nToday's date (as of the last context rebuild): {safe_strftime(now, '%A, %B %d, %Y')} "
++                       "— trust this over the start date for what day it is now; query tools for exact time.")
+     if getattr(agent, "_bot_chat_timeless_prompt", False):
+         timestamp_line = f"Timezone: {', '.join(_bits)}" if _bits else ""
++        owned = None
++    else:
++        timestamp_line = date_block
++        owned = {"block": date_block, "start_day": _start.strftime("%Y%m%d"),
++                 "owned_day": now.strftime("%Y%m%d"),
++                 "session_id": getattr(agent, "session_id", None),
++                 "root_id": _conversation_root_id_quiet(agent)}
+     if _ordinary_prompt_cap(agent) is not None:
+-        return timestamp_line
++        return timestamp_line, owned
+     trailer = (("Session ID", agent.session_id if agent.pass_session_id else None), ("Model", agent.model),
+                ("Provider", agent.provider), ("Platform", agent.platform))
+-    return timestamp_line + "".join(f"\n{label}: {value}" for label, value in trailer if value)
++    return timestamp_line + "".join(f"\n{label}: {value}" for label, value in trailer if value), owned
++
++
++def _timestamp_line(agent: Any) -> str:
++    """Date-only so the prompt is byte-stable for the day; zone + offset so
++    tools needn't guess EST vs EDT. Long-lived sessions get an "as of" line on
++    rebuild days (the cache prefix is already invalidated at that boundary)."""
++    return _render_timestamp_owned(agent)[0]
++
++
++def valid_date_ownership(session_id: Any, prompt: Any, ownership: Any) -> Optional[Dict[str, Any]]:
++    """Structural validation for persistence: the sidecar must be bound to THIS
++    session and THESE exact bytes (span in bounds, both content hashes matching).
++    Anything else returns None — persistence never mints ownership from text."""
++    if not isinstance(ownership, dict) or ownership.get("schema") != DATE_OWNERSHIP_SCHEMA:
++        return None
++    if not isinstance(prompt, str) or not prompt or ownership.get("session_id") != session_id:
++        return None
++    span = ownership.get("span")
++    if not (isinstance(span, (list, tuple)) and len(span) == 2
++            and all(isinstance(i, int) and not isinstance(i, bool) for i in span)):
++        return None
++    start, end = span
++    if not (0 <= start < end <= len(prompt)):
++        return None
++    if hashlib.sha256(prompt.encode("utf-8")).hexdigest() != ownership.get("prompt_sha256"):
++        return None
++    if hashlib.sha256(prompt[start:end].encode("utf-8")).hexdigest() != ownership.get("owned_sha256"):
++        return None
++    if not all(isinstance(ownership.get(k), str) and ownership[k] for k in ("start_day", "owned_day")):
++        return None
++    root = ownership.get("root_id")
++    return {"schema": DATE_OWNERSHIP_SCHEMA, "session_id": session_id,
++            "root_id": root if isinstance(root, str) and root else None,
++            "start_day": ownership["start_day"], "owned_day": ownership["owned_day"],
++            "span": [start, end], "owned_sha256": ownership["owned_sha256"],
++            "prompt_sha256": ownership["prompt_sha256"]}
++
++
++def date_ownership_from_session_row(session_row: Any) -> Optional[Dict[str, Any]]:
++    """The persisted ownership sidecar from a session row's model_config; None
++    when absent or malformed (callers then fail closed, leaving bytes unchanged)."""
++    if not isinstance(session_row, dict):
++        return None
++    raw = session_row.get("model_config")
++    try:
++        config = json.loads(raw) if isinstance(raw, str) and raw else (raw if isinstance(raw, dict) else {})
++    except ValueError:
++        return None
++    record = config.get(DATE_OWNERSHIP_FIELD) if isinstance(config, dict) else None
++    return record if isinstance(record, dict) and record.get("schema") == DATE_OWNERSHIP_SCHEMA else None
++
++
++def _usable_ownership(agent: Any, prompt: str, ownership: Any) -> bool:
++    """Restore-side validation: valid persistence shape PLUS the recorded lineage
++    root must still be the session's current root. No DB answer, no refresh."""
++    if valid_date_ownership(getattr(agent, "session_id", None), prompt, ownership) is None:
++        return False
++    recorded = ownership.get("root_id")
++    return isinstance(recorded, str) and bool(recorded) and _conversation_root_id_quiet(agent) == recorded
++
++
++def refresh_owned_date_block(agent: Any, prompt: str, ownership: Optional[Dict[str, Any]]) -> Tuple[str, Optional[Dict[str, Any]], bool]:
++    """Refresh ONLY the renderer-owned date block of a continuing session's
++    persisted prompt.  The owned span comes from composition (the persisted
++    sidecar), never from locating date-looking text.  Returns
++    ``(prompt, ownership, changed)``; any validation failure returns the input
++    unchanged with ownership None so a later persist drops the unusable sidecar."""
++    if not _usable_ownership(agent, prompt, ownership):
++        return prompt, None, False
++    from hermes_time import now as _hermes_now
++    today = _hermes_now().strftime("%Y%m%d")
++    if today == ownership["owned_day"]:
++        return prompt, ownership, False
++    _text, owned = _render_timestamp_owned(agent)
++    if owned is None or owned["start_day"] != ownership["start_day"] or owned["root_id"] != ownership["root_id"]:
++        return prompt, None, False
++    start, end = ownership["span"]
++    block = owned["block"]
++    refreshed = prompt[:start] + block + prompt[end:]
++    advanced = {**ownership, "owned_day": today, "span": [start, start + len(block)],
++                "owned_sha256": hashlib.sha256(block.encode("utf-8")).hexdigest(),
++                "prompt_sha256": hashlib.sha256(refreshed.encode("utf-8")).hexdigest()}
++    return refreshed, advanced, True
++
++
++def seed_date_ownership_from_session(agent: Any, session_row: Any, prompt: str) -> Optional[Dict[str, Any]]:
++    """The validated composition-origin sidecar for a detached/manual agent seeded
++    with the persisted prompt bytes (gateway hygiene, /compress, bounded manual).
++    The carrier is COPIED from the session row, never reconstructed from text, and
++    must validate exactly as a live restore would: bound to this session, these
++    exact bytes, and the session's current lineage root.  Any failure returns
++    None — fail closed, so the next persist honestly drops a stale sidecar instead
++    of retaining unproven ownership."""
++    if not isinstance(prompt, str) or not prompt:
++        return None
++    record = date_ownership_from_session_row(session_row)
++    if record is None or not _usable_ownership(agent, prompt, record):
++        return None
++    return valid_date_ownership(getattr(agent, "session_id", None), prompt, record)
+ 
+ 
+ def _memory_parts(agent: Any) -> List[str]:
+@@ -816,14 +942,25 @@
+     # The profile line names this home's path, so it rides in the volatile tier: the stable
+     # prefix then stays byte-identical across every profile (and home) on the host.
+     volatile_parts.append(_active_profile_line(agent))
+-    volatile_parts.append(_timestamp_line(agent))
++    _pre_timestamp_parts = list(volatile_parts)
++    timestamp_text, owned_date = _render_timestamp_owned(agent)
++    volatile_parts.append(timestamp_text)
+     # Keep the renderer-owned runtime anchor after all user/plugin prose so quoted
+     # host examples cannot shadow it during persisted-prompt validation.
+     if environment_hints:
+         # Embedder hints are prose too; reserve the delimiter for the renderer.
+         environment_hints = environment_hints.replace(_pb.RUNTIME_ENVIRONMENT_HEADING, "> " + _pb.RUNTIME_ENVIRONMENT_HEADING)
+         volatile_parts.append(f"{_pb.RUNTIME_ENVIRONMENT_HEADING}\n\n{environment_hints}\n\n{_pb.RUNTIME_ENVIRONMENT_END}")
+-    return {"stable": _join_tier(stable_parts), "context": _join_tier(context_parts), "volatile": _join_tier(volatile_parts)}
++    volatile_text = _join_tier(volatile_parts)
++    # Composition-origin capture: the owned date block's span inside the volatile
++    # tier is pure join arithmetic over the parts just assembled — no text search.
++    if owned_date is not None and timestamp_text.strip():
++        pre = _join_tier(_pre_timestamp_parts)
++        start = len(pre) + 2 if pre else 0
++        agent._date_ownership_emission = {**owned_date, "volatile_span": (start, start + len(owned_date["block"]))}
++    else:
++        agent._date_ownership_emission = None
++    return {"stable": _join_tier(stable_parts), "context": _join_tier(context_parts), "volatile": volatile_text}
+ 
+ 
+ # These exact fragments only operate unavailable write/search/terminal tools.
+@@ -873,16 +1010,46 @@
+     return prefix + "\n\n" + rendered + "\n\n" + prompt[len(frame):]
+ 
+ 
++def _ownership_from_emission(agent: Any, parts: Dict[str, str], prompt: str) -> Optional[Dict[str, Any]]:
++    """Finalize the emission record against the FULL joined prompt: absolute span
++    plus content hashes.  The span is composition arithmetic carried through the
++    tier joins; the slice equality checks only verify that join semantics did not
++    drift (fail closed), never locate date-looking text."""
++    emission = getattr(agent, "_date_ownership_emission", None)
++    if not isinstance(emission, dict):
++        return None
++    session_id = emission.get("session_id")
++    volatile = parts["volatile"]
++    if not isinstance(session_id, str) or not session_id or not volatile:
++        return None
++    start, end = emission["volatile_span"]
++    if volatile[start:end] != emission["block"]:
++        return None
++    offset = sum(len(tier) + 2 for tier in (parts["stable"], parts["context"]) if tier)
++    span = [offset + start, offset + end]
++    if prompt[span[0]:span[1]] != emission["block"]:
++        return None
++    return {"schema": DATE_OWNERSHIP_SCHEMA, "session_id": session_id, "root_id": emission.get("root_id"),
++            "start_day": emission["start_day"], "owned_day": emission["owned_day"], "span": span,
++            "owned_sha256": hashlib.sha256(emission["block"].encode("utf-8")).hexdigest(),
++            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest()}
++
++
+ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
+     """Assemble the full prompt; cached on ``agent._cached_system_prompt`` and
+     only rebuilt after compression.  Tiers are ordered stable -> context ->
+-    volatile so implicit longest-prefix caches keep the unchanged scaffold."""
++    volatile so implicit longest-prefix caches keep the unchanged scaffold.
++    Also publishes the composition-origin date-ownership record on
++    ``agent._date_ownership`` for the next persistence write (None when the
++    render emitted nothing date-owned)."""
+     parts = build_system_prompt_parts(agent, system_message=system_message)
+     agent._cached_system_prompt_static = parts["stable"]
+     # Surface context-file truncation warnings in chat, not only in logs.
+     for warning in drain_truncation_warnings():
+         agent._emit_diagnostic_status(warning)
+-    return "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
++    prompt = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
++    agent._date_ownership = _ownership_from_emission(agent, parts, prompt)
++    return prompt
+ 
+ 
+ def invalidate_system_prompt(agent: Any) -> None:
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -511,6 +511,13 @@
+     agent._cached_system_prompt = stored_prompt
+     # Compaction otherwise rebuilds the prompt at the commit boundary from this agent's reduced toolset.
+     agent._retain_seeded_system_prompt = True
++    # Carry the persisted composition-origin date-ownership sidecar alongside the
++    # exact seeded bytes, so a detached in-place commit keeps the live session's
++    # renderer-owned date span instead of json_removing it (the next fresh restore
++    # then still refreshes the date on day rollover).  Validated like a live
++    # restore; anything unusable seeds None, which drops a stale sidecar honestly.
++    from agent.system_prompt import seed_date_ownership_from_session
++    agent._date_ownership = seed_date_ownership_from_session(agent, session_row, stored_prompt)
+     return bool(stored_prompt)
+ 
+ 
+--- a/hermes_cli/friday_prompt_scope.py
++++ b/hermes_cli/friday_prompt_scope.py
+@@ -11,7 +11,7 @@
+ 
+ FIELD = "_friday_prompt_scope"
+ # Reviewed product-source guidance, not user-configurable identity or authority.
+-DIALOGUE_REVISION = "friday.public-identity.v7"
++DIALOGUE_REVISION = "friday.public-identity.v8"
+ DIALOGUE_GUIDANCE = (
+     "## Продолжение разговора\n\n"
+     "Продолжай разговор с учётом предыдущих реплик. Приветствуй и представляйся, "
+@@ -222,12 +222,19 @@
+     if function['name'] == 'read_file':
+         function['description'] = (
+             'Read an own-workspace UTF-8 text file with numbered lines. Use offset, limit and the '
+-            'returned next_offset/next_char_offset for continuation. PDF and DOCX extract text '
++            'returned next_offset/next_char_offset for continuation. PDF, DOCX and XLSX extract text '
+             'only; images and layout are not covered. Other binary formats are unsupported. '
+             'Before replacing an existing text file, read its complete current content in this task.')
+     else:
+         function['description'] = (
+-            'Create a UTF-8 text file in your own workspace (up to 1000000 bytes). '
++            'Create text, DOCX, or an XLSX numeric-cell copy. '
++            'For an XLSX edit, call with format=xlsx, path set to a NEW .xlsx name, and content '
++            'a JSON string with source (the existing own-workspace .xlsx path), sheet, cell, '
++            'expected (current numeric value), value (new numeric value). Example content: '
++            '{"source":"orders.xlsx","sheet":"Orders","cell":"C3","expected":6,"value":7}. '
++            'Other archive parts and formulas are preserved; formula caches are not recalculated. '
++            'Never rebuild a workbook from extracted text or substitute CSV, XML, or .xls for XLSX. '
++            'For normal UTF-8 text, omit format (up to 1000000 bytes). '
+             'Existing parent directories are required. To replace existing text, first read '
+             'the complete current file in this task, merge the requested changes, then write; '
+             'stale or incomplete reads refuse without overwriting. Explicit format=docx creates '
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -919,8 +919,15 @@
+             from hermes_cli.friday_workspace_docx import create
+             return create(cap, fd, parts[-1], path.as_posix(), args.get('content'))
+         if path.suffix.lower() in {'.docx', '.pdf', '.xlsx', '.xls'}:
+-            return json.dumps({'success': False, 'error': 'document_write_unsupported',
+-                               'format': path.suffix.lower().lstrip('.')})
++            refusal = {'success': False, 'error': 'document_write_unsupported',
++                       'format': path.suffix.lower().lstrip('.')}
++            if path.suffix.lower() == '.xlsx':
++                refusal['hint'] = (
++                    'To edit an existing own-workspace XLSX, use write_file with format=xlsx, '
++                    'path set to a NEW .xlsx name, and content a JSON string with source, '
++                    'sheet, cell, expected (current numeric value), value (new numeric value). '
++                    'Do not write extracted text, CSV or XML under an XLSX filename.')
++            return json.dumps(refusal)
+         content = args.get('content')
+         if not isinstance(content, str) or len(content.encode()) > 1000000:
+             raise ScopeDenied()
+--- a/hermes_state_sessions.py
++++ b/hermes_state_sessions.py
+@@ -698,10 +698,18 @@
+             (model_config_json, model, session_id),
+         )
+ 
+-    def update_system_prompt(self, session_id: str, system_prompt: Optional[str]) -> None:
+-        """Store the full assembled system prompt snapshot."""
++    def update_system_prompt(self, session_id: str, system_prompt: Optional[str], *, date_ownership: Any = None) -> None:
++        """Store the full assembled system prompt snapshot.
++
++        ``date_ownership`` is the renderer's composition-origin sidecar (see
++        ``agent.system_prompt``): stored in the SAME transaction only when
++        explicitly supplied and structurally valid for these exact bytes.  A
++        write without it — or with an invalid one — drops any stale sidecar, so
++        a raw write of arbitrary text can neither mint nor retain ownership."""
+         from hermes_cli.friday_prompt_scope import FIELD, for_persistence, matches_provenance
++        from agent.system_prompt import DATE_OWNERSHIP_FIELD, valid_date_ownership
+         provenance = for_persistence(self, session_id, system_prompt)
++        ownership = valid_date_ownership(session_id, system_prompt, date_ownership)
+         def _do(conn):
+             if provenance is not None:
+                 previous = conn.execute(
+@@ -731,6 +739,21 @@
+                     "UPDATE sessions SET model_config = json_set(COALESCE(model_config, '{}'), "
+                     "'$._friday_prompt_scope', json(?)) WHERE id = ?",
+                     (json.dumps(provenance, sort_keys=True), session_id),
++                )
++            if ownership is not None:
++                # Composition-origin date ownership rides the same transaction as
++                # the prompt bytes it describes.
++                conn.execute(
++                    "UPDATE sessions SET model_config = json_set(COALESCE(model_config, '{}'), "
++                    "'$." + DATE_OWNERSHIP_FIELD + "', json(?)) WHERE id = ?",
++                    (json.dumps(ownership, sort_keys=True), session_id),
++                )
++            else:
++                # Unowned/custom/null replacement must not retain a stale sidecar.
++                conn.execute(
++                    "UPDATE sessions SET model_config = json_remove(model_config, '$." + DATE_OWNERSHIP_FIELD + "') "
++                    "WHERE id = ? AND json_type(model_config, '$." + DATE_OWNERSHIP_FIELD + "') IS NOT NULL",
++                    (session_id,),
+                 )
+             self._delete_unreferenced_system_prompts(conn)
+         self._execute_write(_do)
+--- a/tools/mcp_tool_agent.py
++++ b/tools/mcp_tool_agent.py
+@@ -154,7 +154,15 @@
+     from hermes_cli import __version__
+     from hermes_cli.build_info import get_code_identity
+     identity = get_code_identity()
+-    return identity.get("sha") or identity.get("version") or __version__
++    version = identity.get("sha") or identity.get("version") or __version__
++    # Ordinary descriptions are product policy layered onto the donor build.
++    # A new policy must invalidate its persisted tools[] pin even when that
++    # donor build identity is unchanged; unmanaged sessions keep native pins.
++    from hermes_cli.friday_user_scope import current
++    if current() is not None:
++        from hermes_cli.friday_prompt_scope import DIALOGUE_REVISION
++        return version + ":" + DIALOGUE_REVISION
++    return version
+ 
+ 
+ def persist_agent_tool_names(agent) -> None:
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -1827,7 +1827,8 @@
+     try:
+         with _session_profile_runtime_scope(session):
+             prompt = agent._cached_system_prompt = agent._build_system_prompt(None)
+-        db.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt)
++        db.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt,
++                                date_ownership=getattr(agent, "_date_ownership", None))
+     except Exception:
+         logger.warning("failed to persist live session system prompt for session %s", session_key, exc_info=True)
+     finally:
