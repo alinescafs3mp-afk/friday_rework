@@ -19,8 +19,8 @@ made by this work. Private oracles, raw logs and credentials are not published.
 
 22 October 2026: typed local deadline diagnostic source candidate
 
-The generic typed-local-deadline.patch is source accepted, NOT INSTALLED: the
-current live-test owner retains the pinned canonical tester. Only the two actual
+At its source checkpoint the generic typed-local-deadline.patch was accepted,
+NOT INSTALLED, while the live-test owner retained the prior pinned tester. Only the two actual
 owned alarm/body expiry sites gain fixed local cause labels. Generic I/O, even
 near cutoff, retains UNKNOWN; broad TRANSPORT_OUTCOME_UNKNOWN and STOPPED remain.
 Monotonic client-budget and sampled cutoff fields are diagnostic only. There is
@@ -33,3 +33,21 @@ was corrected without a candidate change; original diagnostic gaps are retained.
 Independent patch/AST review found0 HIGH/0 MEDIUM and compiled the candidate;
 it did not repeat the33-control suite. Historical warm STOPPED/UNKNOWN remains
 unchanged. No installed/live cure, coverage, full baseline or release is claimed.
+
+Subsequent installed tester and first live B00 shard, 22 October
+
+After that owner completed and released the observer, the accepted diagnostic
+source was installed atomically under the existing canonical consumer lock, with
+a verified beforeimage for rollback. Two offline CLI plan validations passed;
+the selected completed run records and cursor stayed byte-identical. No network,
+token read, product, model or service change occurred during installation.
+Future live diagnostic behavior remains unaccepted; historical UNKNOWN is kept.
+
+The first real B00 TXT/core shard used two genuine inputs: the explicit
+number-only conversation case passed and persisted; TXT ingress returned a
+generic product failure before a document exchange was persisted. Its dependent
+quote, absent-fact and document-memory cases remain NOT_RUN. Root independently
+verified reply custody and scoped persistence. The uploaded synthetic TXT was
+observed with mode0664; the receiver requires private owner-only bytes. The
+accepted but uninstalled incoming-document repair creates exclusive0600 files.
+This is partial evidence, not a full170-case/120-format baseline or release.
