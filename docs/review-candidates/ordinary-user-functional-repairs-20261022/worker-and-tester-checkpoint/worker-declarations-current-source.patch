@@ -1,0 +1,1166 @@
+--- /dev/null
++++ b/scripts/friday_worker_declarations.py
+@@ -0,0 +1,616 @@
++"""Exact worker declaration maintenance; never worker/runtime admission.
++
++This entry never invokes historical recovery/rebind commands. Staging does
++not consume an attempt, change a deployment marker, or qualify a worker.
++"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import stat
++import copy
++import contextlib
++import fcntl
++import sys
++import time
++import importlib
++
++# Do not create a namespace `plugins` before native_packages authenticates and
++# extends the regular Hermes package. Use the existing pure validation alias.
++from scripts import friday_install as _installer
++_installer._source_runtime_module('runtime_primitives')
++_declarations = importlib.import_module(
++    '_friday_install_validation_plugins.friday_rework.worker_declarations')
++for _name in ('DeclarationError', 'NATIVE_GAPS', '_absolute', '_read_reference', '_same',
++        'load_declaration_source', 'plan_declaration_delta', 'require', 'validate_declaration_source'):
++    globals()[_name] = getattr(_declarations, _name)
++
++
++def _encoded(value):
++    return (json.dumps(value, ensure_ascii=False, sort_keys=True,
++        indent=2, allow_nan=False) + '\n').encode()
++
++
++APPLY_SCHEMA = 'friday.worker-declarations.apply.v1'
++LAUNCHER_BEFORE = '27d86999105a33ac2e41872dfd9cb9b2c203b65388ecc3642406909383f001f0'
++LAUNCHER_AFTER = 'b6825c510a7b50be20419fc0f57fee042dc9beef6d10a58b10fef1592da2fd77'
++PROJECT_BEFORE = {
++    'scripts/friday_install.py': '73521e7a4dd09b243d41c9db0869bcfc2bd85e0ecd3eac22537dbe4cbeda8901',
++    'tools/configure_product.py': 'ff737472e587c42238b2e6ead282afcf4cad4198751d3acc3382016b096349f4',
++    'scripts/rootless_docker_launch.py': LAUNCHER_BEFORE,
++}
++PLANNER = 'plugins/friday_rework/worker_declarations.py'
++PLANNER_SHA256 = '29ad1098f0d47ee6ac8af33389d39736a1ab141248482bc5885f83a7bfb7ed34'
++PROJECT_NEW = frozenset({PLANNER, 'scripts/friday_worker_declarations.py'})
++SOURCE99_RECEIPT = '838e02726072ec8ad71a1a8682f90a99ba657a083504cfcc91a6878ad6aebf47'
++SPARK_POLICY_SHA256 = '4a48202e2704f46968df864c4c3c23b6b5dc941dc11dabf04c5de5d9b1595a4d'
++
++
++def project_delta(previous, current):
++    """One project-only Source99 successor, not an inspector input override."""
++    old, new = previous.get('project_files'), current.get('project_files')
++    require(type(old) is dict and type(new) is dict and set(new) == set(old) | PROJECT_NEW
++        and not set(old) & PROJECT_NEW
++        and all(old.get(n) == h and new.get(n) != h for n, h in PROJECT_BEFORE.items())
++        and all(new[n] == h for n, h in old.items() if n not in PROJECT_BEFORE)
++        and new.get(PLANNER) == PLANNER_SHA256
++        and new.get('scripts/rootless_docker_launch.py') == LAUNCHER_AFTER,
++        'worker_declaration_exact_project_source_delta_required')
++
++
++def input_delta(previous, current, deployment, worker_inputs):
++    """No source update, resource change, runtime enable or inferred defaults."""
++    require(type(previous) is dict and type(current) is dict,
++        'worker_declaration_install_inputs_required')
++    project_delta(previous, current)
++    expected = copy.deepcopy(previous)
++    expected['project_files'] = copy.deepcopy(current['project_files'])
++    require('a0_deployment' in previous.get('product', {})
++        and previous['product'].get('runtime') == {'enabled': False},
++        'worker_declaration_disabled_install_input_required')
++    expected['product']['a0_deployment'] = copy.deepcopy(deployment)
++    old_a0 = previous.get('worker_install', {}).get('a0', {})
++    require({'policy', 'network'} <= set(old_a0),
++        'worker_declaration_existing_network_required')
++    expected['worker_install']['a0']['policy'] = copy.deepcopy(worker_inputs['a0_network']['policy'])
++    expected['worker_install']['a0']['network'] = copy.deepcopy(worker_inputs['a0_network'])
++    require(_same(expected, current) and not _same(previous, current),
++        'worker_declaration_unrelated_install_input_delta')
++
++
++def _admission(home, profile_home, identity):
++    """Use native current access/proof; no JSON flag confers operator scope."""
++    from hermes_cli import friday_user_scope as user
++    from hermes_cli.friday_product_access import current_access, principal_id
++    require(user._CURRENT.get() is None, 'worker_declaration_operator_scope_required')
++    binding = identity['binding']
++    principal = tuple(binding[k] for k in ('platform', 'transport_profile', 'account_id', 'user_id'))
++    with user.authority(home):
++        row = current_access()['users'].get(principal_id(*principal))
++    require(type(row) is dict and row.get('role') == 'user' and row.get('enabled') is True
++        and type(row.get('generation')) is int and row['generation'] == identity['generation'],
++        'worker_declaration_current_access_required')
++    user.check_onboarding_home(home, profile_home, binding)
++    info = profile_home.stat()
++    with user.authority(profile_home):
++        user.UserScope(home, profile_home, profile_home.name, principal, dict(binding),
++            (info.st_dev, info.st_ino), row['generation']).check()
++
++
++@contextlib.contextmanager
++def _launcher_custody(budget):
++    """Existing A0 native lock and stopped daemon; no Docker or service effects."""
++    from scripts import a0_runtime as runtime, rootless_docker_launch as launcher
++    from scripts.dsh_prepare import run
++    from scripts import friday_install as f
++    # Retain the existing runtime lock inode; Runtime.locked may not create it.
++    from scripts import friday_ordinary_install as ordinary
++    lock = runtime.RUNTIME / 'runtime.lock'
++    before = ordinary.update_file_state(lock)
++    require(before is not None and before['mode'] == 0o600,
++        'worker_declaration_existing_a0_lock_required')
++    def prove():
++        require(ordinary.same_update_file(lock, before), 'worker_declaration_a0_lock_changed')
++        launcher.checked_unit_registration()
++        raw, _ = run(['/usr/bin/systemctl', '--user', 'show', runtime.DAEMON,
++            '--property=Id,LoadState,ActiveState,SubState,MainPID,ControlPID,ControlGroup,Job'],
++            f.ROOT, timeout=min(10, budget.check(reserve=1)), deadline=budget.deadline,
++            env=runtime.ENV)
++        pairs = [line.split('=', 1) for line in raw.splitlines() if line]
++        require(len(pairs) == 8 and all(len(p) == 2 for p in pairs)
++            and dict(pairs) == {'Id': runtime.DAEMON, 'LoadState': 'loaded',
++                'ActiveState': 'inactive', 'SubState': 'dead', 'MainPID': '0',
++                'ControlPID': '0', 'ControlGroup': '', 'Job': ''},
++            'worker_declaration_a0_stopped_required')
++        for path in (launcher.REQUEST, launcher.GUARD, launcher.STATE / 'rootlesskit'):
++            require(not os.path.lexists(path), 'worker_declaration_retained_route_or_namespace')
++        if os.path.lexists(launcher.STATE):
++            launcher.owned_directory(launcher.STATE)
++            require(not any(launcher.STATE.iterdir()), 'worker_declaration_retained_route_or_namespace')
++    with runtime.Runtime.locked(None):
++        prove()
++        yield prove
++        prove()
++
++
++def apply_inputs(request, budget):
++    """Authenticate current installed input before importing native authority."""
++    from scripts import friday_install as f, friday_ordinary_install as ordinary
++    fields = {'schema', 'seconds', 'home', 'profile', 'previous_input', 'current_input',
++        'native_unit', 'source', 'before', 'retained', 'launcher_before'}
++    require(type(request) is dict and set(request) == fields and request['schema'] == APPLY_SCHEMA
++        and type(request['seconds']) is int and 30 <= request['seconds'] <= 180,
++        'worker_declaration_exact_apply_request_required')
++    home = f.directory(_absolute(request['home']))
++    require(os.environ.get('HERMES_HOME') == str(home), 'worker_declaration_exact_home_required')
++    previous = _read_reference(request['previous_input'])
++    current = _read_reference(request['current_input'])
++    require(previous.get('home') == current.get('home') == str(home),
++        'worker_declaration_install_home_changed')
++    project_delta(previous, current)
++    # Existing source-update seam: validate the actual new project inventory,
++    # unchanged donor composition, old installed plugin set and native marker.
++    # f.inspect(previous) deliberately cannot validate a new helper checkout.
++    _, donors = budget.call(f.spec_checked, current, cli_only=True)
++    source = f.directory(home / 'hermes-agent')
++    marker = f.read_json(home / f.MARKER)
++    receipt_path = home / 'hermes-agent.source.json'
++    receipt = f.read_json(receipt_path)
++    old_entry = marker.get('ordinary_gateway', {}).get('operator_entry', {})
++    old_script = old_entry.get('script', {})
++    old_script_path = _absolute(old_script.get('path'))
++    require(marker.get('schema') == f.SCHEMA and marker.get('home') == str(home)
++        and marker.get('source') == str(source)
++        and marker.get('state') == 'INSTALLED_TEMPLATE_INCOMPLETE'
++        and marker.get('worker_state') == 'BOTH_WORKERS_PREPARATION_PENDING'
++        and marker.get('input_sha256') == request['previous_input']['sha256']
++        and marker.get('source_receipt_sha256') == f.digest(f.owned_file(receipt_path)) == SOURCE99_RECEIPT
++        and set(old_entry) == {'input', 'script'} and old_entry['input'] == request['previous_input']
++        and old_script_path.name == 'friday_native.py' and old_script_path.parent.name == 'scripts'
++        and old_script.get('sha256') == previous['project_files'].get('scripts/friday_native.py')
++        and set(marker.get('profile_files', {})) == {'config.yaml', 'SOUL.md', 'FRIDAY-PROFILE.json'}
++        and receipt.get('schema') == 'friday.hermes-source.v1',
++        'worker_declaration_installed_source_lineage_changed')
++    f.pin(old_script)
++    budget.call(f.composition_checked, current, source, receipt, donors['hermes'])
++    old_plugins = {n: h for n, h in previous['project_files'].items()
++        if n.startswith('plugins/friday_rework/')}
++    require(marker.get('plugin_files') == old_plugins, 'worker_declaration_installed_plugin_marker_changed')
++    ordinary.checked_plugin_inventory(home, old_plugins)
++    require(all(f.digest(f.owned_file(home / n, private=True)) == h
++        for n, h in marker['profile_files'].items() if n != 'config.yaml'),
++        'worker_declaration_installed_profile_changed')
++    f.native_packages(source)
++    from hermes_cli.friday_ordinary_gateway import check
++    check(home, role=False)
++    from hermes_constants import get_hermes_home
++    from pm.paths import repo_root
++    from pm.environments import project_python
++    require(get_hermes_home() == home and repo_root() == home / 'hermes-agent'
++        and Path(sys.executable) == project_python(home / 'hermes-agent'),
++        'worker_declaration_native_pm_owner_required')
++    bundle, worker_inputs, identity = load_declaration_source(request['source'])
++    profile_home = f.directory(_absolute(identity['profile']))
++    require(profile_home.parent.parent == home and profile_home.name == request['profile'],
++        'worker_declaration_profile_changed')
++    refs = identity['source_refs']
++    from hermes_cli.plugins_state import _plugin_data_namespace
++    access_path = home / 'plugin-data' / _plugin_data_namespace('friday_rework', '') / 'state.json'
++    require(_absolute(refs['access_state']['path']) == access_path,
++        'worker_declaration_access_namespace_changed')
++    from hermes_cli import friday_user_scope as user
++    prefix = 'profiles/' + request['profile'] + '/'
++    names = {'config.yaml', prefix + 'config.yaml', prefix + user.ONBOARDING,
++        prefix + user.MARKER, f.MARKER, PLANNER,
++        'worker-runtime-source/scripts/rootless_docker_launch.py'}
++    require(type(request['before']) is dict and set(request['before']) == names,
++        'worker_declaration_exact_before_inventory_required')
++    for name, ref in request['before'].items():
++        if name == PLANNER:
++            require(ref is None and not os.path.lexists(home / name),
++                'worker_declaration_existing_planner_refused')
++            continue
++        require(_absolute(ref['path']) == home / name,
++            'worker_declaration_before_path_changed')
++        _read_reference(ref, json_document=False) if not name.startswith('worker-runtime-source/') else f.pin(ref)
++    require(_same(request['before']['config.yaml'], refs['root_configuration'])
++        and _same(request['before'][prefix + 'config.yaml'], refs['configuration'])
++        and _same(request['before'][prefix + user.ONBOARDING], refs['onboarding'])
++        and _same(request['before'][prefix + user.MARKER], refs['user_marker']),
++        'worker_declaration_identity_before_join_changed')
++    from hermes_cli.config import fast_safe_load
++    root_config = fast_safe_load(_read_reference(refs['root_configuration'], json_document=False).decode('utf-8-sig'))
++    profile_config = fast_safe_load(_read_reference(refs['configuration'], json_document=False).decode('utf-8-sig'))
++    validate_declaration_source(request['source'], root_config, profile_config,
++        root_home=home, profile_home=profile_home)
++    plan = plan_declaration_delta(root_config, profile_config, worker_inputs, identity, bundle)
++    # A network policy is executable input, not authority supplied by the bundle.
++    require(worker_inputs['a0_network']['policy']['sha256'] == SPARK_POLICY_SHA256,
++        'worker_declaration_reviewed_network_policy_required')
++    f.pin(worker_inputs['a0_network']['policy'])
++    old_template = root_config['plugins']['entries']['friday_rework']['settings']['onboarding']['templates']['friday-local']['worker_inputs']
++    require(_same(previous['product']['a0_deployment'], root_config['a0_deployment'])
++        and _same(previous['worker_install']['a0']['network'], old_template['a0_network'])
++        and _same(previous['worker_install']['a0']['policy'], old_template['a0_network']['policy'])
++        and _same(old_template['workers']['a0']['a0']['launcher'], request['launcher_before']),
++        'worker_declaration_existing_input_lineage_changed')
++    input_delta(previous, current, plan['root_config']['a0_deployment'], worker_inputs)
++    budget.call(f.spec_checked, current, cli_only=True)
++    marker = f.read_json(home / f.MARKER)
++    require(marker.get('completion_stage') == 'TELEGRAM_ORDINARY' and marker.get('runtime_ready') is False
++        and f.cli_historical_scope_closed(marker['original_attempt'], 'friday.native-install.v1')
++        and (marker.get('cli_segment') is None or f.cli_historical_scope_closed(
++            marker['cli_segment']['clock'], 'friday.cli-segment-clock.v1')),
++        'worker_declaration_closed_original_clocks_required')
++    from scripts import a0_runtime, rootless_docker_launch as launcher
++    profile_validator = f.project_plugin('adapters.a0_profile', current)
++    require(profile_validator.network_endpoints(plan['root_config']['a0_deployment']) == launcher.ENDPOINTS,
++        'worker_declaration_reviewed_launcher_endpoints_required')
++    launcher_path = _absolute(request['launcher_before']['path'])
++    require(launcher_path == a0_runtime.LAUNCHER == launcher.ROOT / 'launch.py'
++        and request['launcher_before']['sha256'] == LAUNCHER_BEFORE
++        and request['before']['worker-runtime-source/scripts/rootless_docker_launch.py']['sha256'] == LAUNCHER_BEFORE
++        and current['project_files']['scripts/rootless_docker_launch.py'] == LAUNCHER_AFTER
++        and worker_inputs['workers']['a0']['a0']['launcher'] == {'path': str(launcher_path), 'sha256': LAUNCHER_AFTER}
++        and launcher.ROOT.parent == home.parent,
++        'worker_declaration_exact_launcher_lineage_required')
++    f.pin(request['launcher_before'])
++    require(f.digest(f.owned_file(f.ROOT / 'scripts/rootless_docker_launch.py')) == LAUNCHER_AFTER,
++        'worker_declaration_reviewed_launcher_changed')
++    required = {'FRIDAY-PROFILE.json', 'hermes-agent.source.json', 'hermes-agent/install-stamp.json',
++        'SOUL.md', prefix + 'SOUL.md', '.env', prefix + '.env', str(access_path.relative_to(home)),
++        str(access_path.with_name('admission.lock').relative_to(home)),
++        *marker['ordinary_gateway']['history'], *old_plugins}
++    retained = request['retained']
++    require(type(retained) is dict and required <= set(retained) and not set(retained) & names,
++        'worker_declaration_retained_history_required')
++    for name, ref in retained.items():
++        require(type(name) is str and name == str(Path(name)) and not Path(name).is_absolute()
++            and '..' not in Path(name).parts and name != '.' and _absolute(ref['path']) == home / name,
++            'worker_declaration_retained_path_changed')
++        f.pin(ref)
++    for own in (home, profile_home):
++        if os.path.lexists(own / 'auth.json'):
++            require(str((own / 'auth.json').relative_to(home)) in retained,
++                'worker_declaration_auth_inventory_required')
++    # Stale preparations/attachment are historical bytes, never renewed here.
++    # Every existing worker file must be pinned; unknown state refuses. A later
++    # supported archive/prepare/qualify must handle them under its own authority.
++    for worker_root in (home / 'workers', profile_home / 'workers'):
++        if not os.path.lexists(worker_root):
++            continue
++        f.directory(worker_root)
++        for path in worker_root.rglob('*'):
++            if path.is_dir() and not path.is_symlink():
++                f.directory(path)
++            else:
++                name = str(path.relative_to(home))
++                require(name in retained, 'worker_declaration_unpinned_worker_history')
++                f.pin(retained[name])
++    if os.path.lexists(profile_home / 'workers/attachment.json'):
++        require(retained.get(prefix + 'workers/attachment.json') == refs['stale_attachment'],
++            'worker_declaration_stale_attachment_changed')
++    _admission(home, profile_home, identity)
++    return home, profile_home, access_path, previous, current, marker, plan, identity
++
++
++def apply_declarations(request, budget=None, *, request_path=None):
++    """Existing stopped-owner transaction, exact CAS, reseal, rollback/no retry."""
++    require(budget is not None and request_path is not None,
++        'worker_declaration_native_entry_and_budget_required')
++    from scripts import friday_install as f, friday_ordinary_install as ordinary
++    from scripts.dsh_prepare import StopUnconfirmed
++    request_path = _absolute(str(request_path))
++    raw = _read_reference({'path': str(request_path), 'sha256': f.digest(f.owned_file(request_path, private=True))},
++        json_document=False)
++    require(_same(json.loads(raw, object_pairs_hook=f.unique), request), 'worker_declaration_request_changed')
++    values = apply_inputs(request, budget)
++    home, profile_home, access_path, previous, current, marker, plan, identity = values
++    tx = home / 'preparation' / ('worker-declarations-' + request['previous_input']['sha256'])
++    require(not os.path.lexists(tx), 'worker_declaration_consumed_no_retry')
++    owned = {}
++    fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++    with ordinary.inference_retaining_cleanup(fd) as stack:
++        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        native = stack.enter_context(ordinary.stopped_consumers(home, request['native_unit'], budget))
++        build = stack.enter_context(ordinary.retained_build_lock(home / 'hermes-agent'))
++        pm = stack.enter_context(ordinary.retained_pm_lock(home, home / 'hermes-agent'))
++        locks = stack.enter_context(ordinary.inference_locks(home, profile_home, access_path, budget))
++        daemon = stack.enter_context(_launcher_custody(budget))
++        require(apply_inputs(request, budget) == values, 'worker_declaration_locked_cas_changed')
++        boundary = home.parent
++        saved = {str((home / n).relative_to(boundary)): ordinary.update_file_state(home / n)
++            for n in request['before']}
++        launch_name = str(_absolute(request['launcher_before']['path']).relative_to(boundary))
++        saved[launch_name] = ordinary.update_file_state(boundary / launch_name)
++        before_refs = {home.name + '/' + n: r for n, r in request['before'].items()}
++        before_refs[launch_name] = request['launcher_before']
++        require(all((s is None and n == home.name + '/' + PLANNER and before_refs[n] is None)
++            or (s is not None and s['mode'] in ((0o400, 0o600, 0o644)
++            if n == launch_name or n.endswith('/worker-runtime-source/scripts/rootless_docker_launch.py') else (0o600,))
++            and before_refs[n] is not None and f.digest(s['data']) == before_refs[n]['sha256'])
++            for n, s in saved.items()), 'worker_declaration_private_before_modes_or_hash_changed')
++        _, worker_inputs, _ = load_declaration_source(request['source'])
++        all_refs = [request['previous_input'], request['current_input'], request['native_unit'],
++            worker_inputs['a0_network']['policy'],
++            {'path': str(f.ROOT / 'scripts/rootless_docker_launch.py'), 'sha256': LAUNCHER_AFTER},
++            marker['ordinary_gateway']['operator_entry']['script'],
++            *request['source'].values(), *identity['source_refs'].values(),
++            *request['retained'].values()]
++        # A stale attachment may already have been natively archived; absence
++        # is not converted into permission to recreate it.
++        all_refs = [ref for ref in all_refs if ref != identity['source_refs']['stale_attachment']
++            or os.path.lexists(ref['path'])]
++        external = {Path(ref['path']): ordinary.update_file_state(Path(ref['path'])) for ref in all_refs}
++        require(all(external[Path(ref['path'])] is not None
++            and f.digest(external[Path(ref['path'])]['data']) == ref['sha256'] for ref in all_refs),
++            'worker_declaration_external_snapshot_changed')
++        external[request_path] = ordinary.update_file_state(request_path)
++        require(external[request_path] is not None and external[request_path]['data'] == raw,
++            'worker_declaration_request_snapshot_changed')
++        changed_paths = {boundary / n for n in saved}
++        external = {p: s for p, s in external.items() if p not in changed_paths}
++        require(all(s is not None for s in external.values()), 'worker_declaration_retained_state_missing')
++        auth_before = {own / 'auth.json': ordinary.update_file_state(own / 'auth.json')
++            for own in (home, profile_home)}
++        dirs = ordinary.SourceUpdateDirectories(boundary, list(saved), [])
++        stack.callback(dirs.close)
++        def worker_inventory():
++            result = {}
++            for root in (home / 'workers', profile_home / 'workers'):
++                if not os.path.lexists(root):
++                    result[str(root)] = None
++                    continue
++                for path in (root, *root.rglob('*')):
++                    st = path.lstat()
++                    if stat.S_ISDIR(st.st_mode):
++                        f.directory(path)
++                        result[str(path)] = (st.st_dev, st.st_ino, st.st_uid, st.st_mode)
++                    else:
++                        require(str(path.relative_to(home)) in request['retained'],
++                            'worker_declaration_unpinned_worker_history')
++                        result[str(path)] = ordinary.update_file_state(path)
++            return result
++        workers_before = worker_inventory()
++        def custody():
++            native(); build(); pm(); locks(); daemon(); dirs.prove(); budget.check()
++        def retained():
++            custody()
++            require(all(ordinary.same_update_file(p, s) for p, s in external.items()),
++                'worker_declaration_retained_identity_changed')
++            require(worker_inventory() == workers_before, 'worker_declaration_worker_history_changed')
++            require(all(ordinary.same_update_file(p, s) for p, s in auth_before.items()),
++                'worker_declaration_auth_identity_changed')
++            plugins = dict(marker['plugin_files'])
++            planner_name = home.name + '/' + PLANNER
++            if os.path.lexists(home / PLANNER):
++                require(planner_name in owned and ordinary.same_update_file(home / PLANNER, owned[planner_name]),
++                    'worker_declaration_unowned_planner_appeared')
++                plugins[PLANNER] = PLANNER_SHA256
++            ordinary.checked_plugin_inventory(home, plugins)
++        def unchanged(owned):
++            retained()
++            require(all(ordinary.same_update_file(boundary / n, owned.get(n, s), dirs.parent_fd(n))
++                for n, s in saved.items()), 'worker_declaration_publication_cas_changed')
++        from plugins.friday_rework.onboarding import prepare_admin_config_edit, finish_admin_config_edit, validate_template
++        from hermes_cli import friday_user_scope as user
++        from hermes_cli.config import atomic_config_write
++        from hermes_cli.friday_ordinary_gateway import normalized_configuration, check
++        from hermes_cli.config_effective import load_user_config_effective
++        from hermes_cli.friday_credential_admission import local_route, profile_policy
++        root_cfg, own_cfg = plan['root_config'], plan['profile_config']
++        for template in root_cfg['plugins']['entries']['friday_rework']['settings']['onboarding']['templates'].values():
++            validate_template(template)
++        prepared = prepare_admin_config_edit(profile_home, own_cfg)
++        require(prepared is not None and prepared['marker'] is not None,
++            'worker_declaration_admitted_reseal_required')
++        unchanged({})
++        require(not os.path.lexists(tx), 'worker_declaration_consumed_no_retry')
++        tx.mkdir(mode=0o700)
++        ordinary.write(tx / 'intent.json', _encoded({'schema': APPLY_SCHEMA,
++            'state': 'CONSUMED_NO_RETRY', 'request_sha256': f.digest(raw),
++            'deadline_monotonic': budget.deadline, 'seconds': request['seconds'],
++            'previous_input': request['previous_input'], 'current_input': request['current_input'],
++            'before': {n: None if s is None else {'sha256': f.digest(s['data']), 'mode': s['mode']} for n, s in saved.items()},
++            'runtime_acceptance': 'NOT_GRANTED', 'workers_enabled': False}), 0o400)
++        ordinary.sync_directory(tx); ordinary.sync_directory(tx.parent)
++        try:
++            before = tx / 'before'; stage_home = tx / 'stage'
++            before.mkdir(mode=0o700); stage_home.mkdir(mode=0o700)
++            prefix = 'profiles/' + request['profile'] + '/'
++            for n, s in saved.items():
++                if s is None:
++                    continue
++                ordinary.private_parents(before, n); ordinary.write(before / n, s['data'], s['mode'])
++            for relative, cfg in (('config.yaml', root_cfg), (prefix + 'config.yaml', own_cfg)):
++                ordinary.private_parents(stage_home, relative)
++                atomic_config_write(stage_home / relative, cfg)
++            stage_profile = stage_home / prefix
++            for name in (user.ONBOARDING, user.MARKER):
++                ordinary.write(stage_profile / name, saved[home.name + '/' + prefix + name]['data'])
++            finish_admin_config_edit(stage_profile, prepared)
++            # Native normalized configuration, never a raw-YAML/manual marker stamp.
++            updated = copy.deepcopy(marker)
++            updated['plugin_files'][PLANNER] = current['project_files'][PLANNER]
++            updated['input_sha256'] = request['current_input']['sha256']
++            updated['profile_files']['config.yaml'] = f.digest(f.owned_file(stage_home / 'config.yaml', private=True))
++            phase = updated['ordinary_gateway']
++            phase['configuration_sha256'] = normalized_configuration(load_user_config_effective(
++                stage_home / 'config.yaml', fail_closed=True))
++            phase['operator_entry'] = {'input': request['current_input'],
++                'script': {'path': str(f.ROOT / 'scripts/friday_native.py'),
++                    'sha256': current['project_files']['scripts/friday_native.py']}}
++            ordinary.write(stage_home / f.MARKER, _encoded(updated))
++            # Stage unchanged contract for the existing native policy validator.
++            ordinary.write(stage_home / 'FRIDAY-PROFILE.json', f.owned_file(home / 'FRIDAY-PROFILE.json', private=True))
++            local_route(root_cfg); local_route(own_cfg); profile_policy(stage_home, root_cfg)
++            payloads = {home.name + '/' + n: f.owned_file(stage_home / n, private=True)
++                for n in request['before'] if not n.startswith('worker-runtime-source/') and n != PLANNER}
++            payloads[home.name + '/' + PLANNER] = f.owned_file(f.ROOT / PLANNER)
++            require(f.digest(payloads[home.name + '/' + PLANNER]) == PLANNER_SHA256,
++                'worker_declaration_planner_source_changed')
++            launcher_raw = f.owned_file(f.ROOT / 'scripts/rootless_docker_launch.py')
++            require(f.digest(launcher_raw) == LAUNCHER_AFTER, 'worker_declaration_launcher_changed')
++            payloads[launch_name] = launcher_raw
++            payloads[home.name + '/worker-runtime-source/scripts/rootless_docker_launch.py'] = launcher_raw
++            for directory in sorted((p for p in tx.rglob('*') if p.is_dir()),
++                    key=lambda p: len(p.parts), reverse=True): ordinary.sync_directory(directory)
++            ordinary.sync_directory(tx)
++            # Marker last: every intermediate state remains fail closed.
++            order = [n for n in payloads if n != home.name + '/' + f.MARKER] + [home.name + '/' + f.MARKER]
++            for n in order:
++                unchanged(owned); budget.check(reserve=15)
++                ordinary.publish_update_file(boundary / n, payloads[n], saved[n]['mode'] if saved[n] else 0o600, saved[n],
++                    owned, n, parent_fd=dirs.parent_fd(n))
++            unchanged(owned)
++            check(home, role=False)
++            _admission(home, profile_home, identity)
++            budget.call(f.inspect, current, request['current_input']['sha256'])
++            unchanged(owned)
++            result = {'schema': 'friday.worker-declarations.result.v1',
++                'state': 'DECLARATIONS_REBOUND_WORKERS_OFF_QUALIFICATION_NOT_RUN',
++                'ready': False, 'workers_enabled': False, 'consumers_started': False,
++                'runtime_acceptance': 'NOT_GRANTED', 'previous_input': request['previous_input'],
++                'current_input': request['current_input'], 'source_receipt_sha256': marker['source_receipt_sha256'],
++                'semantic_changes': plan['semantic_changes'],
++                'after': {n: {'sha256': f.digest(data), 'mode': saved[n]['mode'] if saved[n] else 0o600} for n, data in payloads.items()},
++                'historical_worker_preparations': 'RETAINED_NOT_RENEWED_NOT_RUNTIME_AUTHORITY'}
++            ordinary.write(tx / 'committed.json', _encoded(result), 0o400)
++            ordinary.sync_directory(tx)
++            return result
++        except BaseException as original:
++            try:
++                custody()
++                require(not os.path.lexists(tx / 'committed.json'), 'worker_declaration_commit_outcome_ambiguous')
++                ordinary.restore_update_files(boundary, saved, owned, dirs)
++                retained()
++                check(home, role=False)
++                ordinary.write(tx / 'rolled-back.json', _encoded({'state': 'ROLLED_BACK_CONSUMED_NO_RETRY',
++                    'workers_enabled': False, 'consumers_started': False}), 0o400)
++                ordinary.sync_directory(tx)
++            except BaseException as restoration:
++                f.remember_secondary(original, restoration)
++                raise StopUnconfirmed('worker declaration rollback requires reconciliation') from original
++            raise
++
++
++def stage(request, *, output):
++    """Produce private proposed JSON configs after exact current-byte CAS.
++
++    Native config parsing is reused, not reimplemented. Output is not an
++    installation request and no apply path consumes these candidate files.
++    """
++    require(type(request) is dict and set(request) == {'schema', 'source',
++        'root_configuration', 'profile_configuration'} and request['schema'] ==
++        'friday.worker-declarations.stage.v1', 'worker_declaration_stage_request_required')
++    bundle, inputs, identity = load_declaration_source(request['source'])
++    require(_same(request['root_configuration'], bundle.get('root_before'))
++        and _same(request['profile_configuration'], bundle.get('profile_before')),
++        'worker_declaration_stage_raw_cas_changed')
++    root_raw = _read_reference(request['root_configuration'], json_document=False)
++    own_raw = _read_reference(request['profile_configuration'], json_document=False)
++    # Reuse the actual native YAML parser on the authenticated bytes. Reopening
++    # mutable config paths through a loader would introduce a second read race.
++    # This neither writes config nor creates a native operator session.
++    from hermes_cli.config import fast_safe_load
++    root = fast_safe_load(root_raw.decode('utf-8-sig'))
++    own = fast_safe_load(own_raw.decode('utf-8-sig'))
++    profile_home = Path(identity['profile'])
++    joined = validate_declaration_source(request['source'], root, own,
++        root_home=profile_home.parent.parent, profile_home=profile_home)
++    plan = plan_declaration_delta(root, own, inputs, identity, bundle)
++    require(_read_reference(request['root_configuration'], json_document=False) == root_raw
++        and _read_reference(request['profile_configuration'], json_document=False) == own_raw,
++        'worker_declaration_stage_source_changed')
++    target = _absolute(str(output))
++    # A new direct child of an existing private owned directory only. Refuse
++    # an installed home or one of its ancestors/descendants as output.
++    home = profile_home.parent.parent
++    require(target != home and home not in target.parents and target not in home.parents,
++        'worker_declaration_stage_external_output_required')
++    parent = target.parent
++    info = parent.lstat()
++    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
++        and stat.S_IMODE(info.st_mode) == 0o700 and parent.resolve() == parent,
++        'worker_declaration_private_stage_parent_required')
++    files = {'root-config.proposed.json': _encoded(plan['root_config']),
++        'profile-config.proposed.json': _encoded(plan['profile_config']),
++        'declaration-source-join.json': _encoded(joined),
++        'request.json': _encoded(request)}
++    summary = {'schema': 'friday.worker-declaration-stage.v1',
++        'state': 'STAGED_ONLY_NATIVE_MIGRATION_UNIMPLEMENTED', 'ready': False,
++        'native_migration': 'UNIMPLEMENTED', 'workers_enabled': False,
++        'source': request['source'], 'missing_native_prerequisites': list(NATIVE_GAPS),
++        'files': {name: {'sha256': hashlib.sha256(data).hexdigest(),
++            'bytes': len(data), 'mode': '0o600'} for name, data in files.items()}}
++    files['stage.json'] = _encoded(summary)
++    parent_fd = os.open(parent, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY)
++    stage_fd = None
++    try:
++        require(os.fstat(parent_fd).st_ino == info.st_ino
++            and os.fstat(parent_fd).st_dev == info.st_dev,
++            'worker_declaration_stage_parent_changed')
++        # Exclusive claim, independent of wall time. Never overwrite/replay.
++        os.mkdir(target.name, 0o700, dir_fd=parent_fd)
++        stage_fd = os.open(target.name, os.O_RDONLY | os.O_CLOEXEC
++            | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=parent_fd)
++        for name, data in files.items():
++            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
++                | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600, dir_fd=stage_fd)
++            try:
++                view = memoryview(data)
++                while view:
++                    count = os.write(fd, view)
++                    require(count > 0, 'worker_declaration_stage_write_failed')
++                    view = view[count:]
++                os.fchmod(fd, 0o600)
++                os.fsync(fd)
++            finally:
++                os.close(fd)
++        os.fsync(stage_fd)
++        os.fsync(parent_fd)
++    except FileExistsError:
++        raise DeclarationError('worker_declaration_stage_consumed_no_overwrite') from None
++    finally:
++        if stage_fd is not None:
++            os.close(stage_fd)
++        os.close(parent_fd)
++    return summary
++
++
++def main():
++    started = time.monotonic()
++    class SafeParser(argparse.ArgumentParser):
++        def error(self, message):
++            raise DeclarationError('worker_declaration_cli_arguments_invalid')
++    parser = SafeParser(description=__doc__)
++    parser.add_argument('action', choices=('stage', 'apply'))
++    parser.add_argument('--request', required=True)
++    parser.add_argument('--request-sha256', required=True)
++    parser.add_argument('--output')
++    try:
++        args = parser.parse_args()
++        request = _read_reference({'path': args.request, 'sha256': args.request_sha256})
++        if args.action == 'apply':
++            require(args.output is None, 'worker_declaration_apply_output_forbidden')
++            from scripts.install_containment import Budget
++            result = apply_declarations(request, Budget(request.get('seconds'), started=started), request_path=args.request)
++        else:
++            require(args.output is not None, 'worker_declaration_stage_output_required')
++            result = stage(request, output=args.output)
++        print(json.dumps({key: result[key] for key in ('state', 'ready', 'workers_enabled')}, sort_keys=True))
++        return 0
++    except Exception as error:
++        # Full private input/path details never become a public traceback.
++        print(json.dumps({'state': 'REFUSED_OR_UNCERTAIN_CHECK_PRIVATE_JOURNAL', 'ready': False,
++            'error': error.code if isinstance(error, DeclarationError)
++                else 'worker_declaration_request_failed_closed',
++            'native_migration': 'NOT_GRANTED'}, sort_keys=True))
++        return 2
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+--- /dev/null
++++ b/plugins/friday_rework/worker_declarations.py
+@@ -0,0 +1,439 @@
++"""Typed worker declaration proposals; no admission or deployment authority.
++
++The caller must authenticate the source references and own the native operator
++transaction.  These functions deliberately do not edit config, reseal a home,
++archive a worker, run a probe, or treat a declaration as an observation.
++"""
++from __future__ import annotations
++
++import copy
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++import stat
++
++
++ROOT_A0 = ('a0_deployment',)
++SETTINGS = ('plugins', 'entries', 'friday_rework', 'settings')
++TEMPLATE = SETTINGS + ('onboarding', 'templates', 'friday-local')
++TEMPLATE_A0 = TEMPLATE + ('config', 'a0_deployment')
++TEMPLATE_INPUTS = TEMPLATE + ('worker_inputs',)
++IDENTITY_FIELDS = ('platform', 'transport_profile', 'account_id', 'user_id')
++CHANGE_PATHS = frozenset({('root_config', ROOT_A0),
++    ('profile_config', ROOT_A0), ('root_config', TEMPLATE_A0),
++    ('root_config', TEMPLATE_INPUTS)})
++WORKER_INPUT_CHANGE_PATHS = (
++    ('workers', 'a0', 'a0', 'deployment'),
++    ('workers', 'a0', 'a0', 'launcher', 'sha256'),
++    ('workers', 'a0', 'a0', 'policy'),
++    ('a0_network', 'policy'),
++    ('a0_network', 'endpoints'),
++)
++NATIVE_GAPS = (
++    'reviewed_current_root_input_and_source_build_pm_inventory_required',
++    'native_stopped_consumer_and_operator_admission_handoff_unimplemented',
++    'native_config_marker_lineage_and_profile_reseal_writer_unimplemented',
++    'reviewed_launcher_promotion_and_all_input_pin_propagation_required',
++)
++MAX_SOURCE_BYTES = 32 * 1024 * 1024
++
++
++class DeclarationError(ValueError):
++    """Bounded public code; never interpolate a path or private document."""
++    def __init__(self, code):
++        self.code = code
++        super().__init__(code)
++
++
++def require(condition, code):
++    if not condition:
++        raise DeclarationError(code)
++
++
++def fingerprint(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True,
++        separators=(',', ':'), allow_nan=False).encode()).hexdigest()
++
++
++def _typed(value):
++    """Canonical JSON equality distinguishes bool/int and absent/null."""
++    return json.dumps(value, sort_keys=True, separators=(',', ':'),
++        ensure_ascii=False, allow_nan=False)
++
++
++def _same(left, right):
++    return _typed(left) == _typed(right)
++
++
++def _at(value, path):
++    for part in path:
++        require(type(value) is dict and part in value,
++            'worker_declaration_path_missing')
++        value = value[part]
++    return value
++
++
++def _replace(value, path, replacement):
++    parent = _at(value, path[:-1])
++    require(type(parent) is dict and path[-1] in parent,
++        'worker_declaration_path_missing')
++    parent[path[-1]] = copy.deepcopy(replacement)
++
++
++def _absolute(value):
++    require(type(value) is str and value.startswith('/')
++        and not any(ord(char) < 32 for char in value),
++        'worker_declaration_absolute_path_required')
++    path = Path(value)
++    require(str(path) == value and '..' not in path.parts,
++        'worker_declaration_canonical_path_required')
++    return path
++
++
++def _reference(value):
++    require(type(value) is dict and set(value) == {'path', 'sha256'},
++        'worker_declaration_exact_reference_required')
++    path = _absolute(value['path'])
++    sha = value['sha256']
++    require(type(sha) is str and len(sha) == 64
++        and all(c in '0123456789abcdef' for c in sha) and sha != '0' * 64,
++        'worker_declaration_exact_digest_required')
++    return path
++
++
++def _no_duplicates(pairs):
++    result = {}
++    for key, value in pairs:
++        require(key not in result, 'worker_declaration_duplicate_json_key')
++        result[key] = value
++    return result
++
++
++def _read_reference(ref, *, json_document=True):
++    """Read a pinned owned private regular file, retaining exact fd identity.
++
++    Open each directory without following links. Native mutation locks remain
++    the caller's responsibility; an unchanged hash alone grants no authority.
++    """
++    path = _reference(ref)
++    # Reject a FIFO/device at fstat instead of blocking in open beforehand.
++    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
++    parent_fd = os.open('/', flags | os.O_DIRECTORY)
++    fd = None
++    try:
++        for part in path.parts[1:-1]:
++            child = os.open(part, flags | os.O_DIRECTORY, dir_fd=parent_fd)
++            os.close(parent_fd)
++            parent_fd = child
++        fd = os.open(path.name, flags, dir_fd=parent_fd)
++        before = os.fstat(fd)
++        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
++            and before.st_nlink == 1 and stat.S_IMODE(before.st_mode) == 0o600
++            and before.st_size <= MAX_SOURCE_BYTES,
++            'worker_declaration_private_source_required')
++        chunks = []
++        size = 0
++        while True:
++            chunk = os.read(fd, min(1024 * 1024, MAX_SOURCE_BYTES + 1 - size))
++            if not chunk:
++                break
++            chunks.append(chunk)
++            size += len(chunk)
++            require(size <= MAX_SOURCE_BYTES, 'worker_declaration_source_too_large')
++        after = os.fstat(fd)
++        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
++        identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns,
++            s.st_ctime_ns, s.st_mode, s.st_uid, s.st_nlink)
++        require(identity(before) == identity(after) == identity(current),
++            'worker_declaration_source_changed')
++        raw = b''.join(chunks)
++        require(hashlib.sha256(raw).hexdigest() == ref['sha256'],
++            'worker_declaration_source_digest_changed')
++        if not json_document:
++            return raw
++        return json.loads(raw, object_pairs_hook=_no_duplicates,
++            parse_constant=lambda _: (_ for _ in ()).throw(
++                DeclarationError('worker_declaration_nonfinite_json')))
++    finally:
++        if fd is not None:
++            os.close(fd)
++        os.close(parent_fd)
++
++
++def _identity_join(root_config, profile_config, identity, bundle):
++    require(type(identity) is dict and identity.get('schema') ==
++        'frw.current-dest-worker-identity.v1', 'worker_declaration_identity_schema')
++    binding = identity.get('binding')
++    require(type(binding) is dict and all(type(binding.get(k)) is str
++        and binding[k] and len(binding[k].encode()) <= 512
++        and binding[k].strip() == binding[k]
++        and not any(ord(char) < 32 for char in binding[k]) for k in IDENTITY_FIELDS)
++        and all(type(binding.get(k)) is str and re.fullmatch(
++            r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', binding[k])
++            for k in ('runtime_profile', 'transport_profile')),
++        'worker_declaration_identity_invalid')
++    principal = hashlib.sha256(json.dumps([binding[k] for k in IDENTITY_FIELDS],
++        ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
++    require(identity.get('principal') == principal
++        and identity.get('binding_sha256') == fingerprint(binding),
++        'worker_declaration_identity_fingerprint_changed')
++    require(type(identity.get('generation')) is int and identity['generation'] > 0
++        and identity.get('enabled') is True,
++        'worker_declaration_current_generation_required')
++    require(identity.get('profile_template') == 'friday-ordinary-local'
++        and identity.get('worker_attach_template') == 'friday-local',
++        'worker_declaration_template_identity_changed')
++    profile_home = _absolute(identity.get('profile'))
++    require(profile_home.name == binding['runtime_profile']
++        and profile_home.parent.name == 'profiles',
++        'worker_declaration_profile_identity_changed')
++    home = profile_home.parent.parent
++    rows = _at(root_config, SETTINGS + ('user_isolation', 'bindings'))
++    require(type(rows) is list, 'worker_declaration_bindings_required')
++    matches = [row for row in rows if type(row) is dict
++        and row.get('runtime_profile') == binding['runtime_profile']]
++    require(len(matches) == 1 and _same(matches[0], binding),
++        'worker_declaration_current_binding_changed')
++    for document in (root_config, profile_config):
++        settings = _at(document, SETTINGS)
++        require(type(settings) is dict and _same(settings.get('runtime'), {'enabled': False})
++            and 'worker_requirements' not in settings,
++            'worker_declaration_ordinary_profile_required')
++    refs = identity.get('source_refs')
++    require(type(refs) is dict and set(refs) == {'access_state', 'configuration',
++        'onboarding', 'root_configuration', 'stale_attachment', 'user_marker'},
++        'worker_declaration_identity_sources_required')
++    paths = {name: _reference(ref) for name, ref in refs.items()}
++    expected = {'configuration': profile_home / 'config.yaml',
++        'root_configuration': home / 'config.yaml',
++        'onboarding': profile_home / '.friday-onboarding.json',
++        'user_marker': profile_home / '.friday-user-scope.json',
++        'stale_attachment': profile_home / 'workers' / 'attachment.json'}
++    require(all(paths[name] == path for name, path in expected.items())
++        and paths['access_state'].name == 'state.json'
++        and paths['access_state'].parent.parent == home / 'plugin-data',
++        'worker_declaration_identity_source_path_changed')
++    require(_same(refs['root_configuration'], bundle.get('root_before'))
++        and _same(refs['configuration'], bundle.get('profile_before')),
++        'worker_declaration_current_raw_cas_changed')
++    return home, profile_home
++
++
++def _deployment_join(root_config, profile_config, deployment):
++    """Join A0 chat to both current native main declarations, keeping auxiliaries.
++
++    An authenticated proposal still cannot choose a different model/capacity
++    merely because its four container subtrees were explicitly named.
++    """
++    chat_fields = {'endpoint', 'model', 'context_length', 'max_output_tokens'}
++    require(type(deployment) is dict and type(deployment.get('chat')) is dict,
++        'worker_declaration_deployment_required')
++    after_chat = deployment['chat']
++    for document in (root_config, profile_config):
++        model = _at(document, ('model',))
++        require(type(model) is dict and type(model.get('default')) is str
++            and type(model.get('base_url')) is str,
++            'worker_declaration_current_main_metadata_required')
++        capacity = _at(document, ('providers', 'friday-local', 'models', model['default']))
++        require(type(capacity) is dict and type(capacity.get('context_length')) is int
++            and capacity['context_length'] > 0
++            and type(capacity.get('bounded_context')) is dict
++            and type(capacity['bounded_context'].get('main_max_output_tokens')) is int
++            and 0 < capacity['bounded_context']['main_max_output_tokens'] <=
++                capacity['context_length'],
++            'worker_declaration_current_main_capacity_required')
++        expected = {'endpoint': model['base_url'], 'model': model['default'],
++            'context_length': capacity['context_length'],
++            'max_output_tokens': capacity['bounded_context']['main_max_output_tokens']}
++        require(all(field in after_chat and _same(after_chat[field], value)
++            for field, value in expected.items()),
++            'worker_declaration_current_main_join_changed')
++    for before in (_at(root_config, ROOT_A0), _at(profile_config, ROOT_A0),
++            _at(root_config, TEMPLATE_A0)):
++        require(type(before) is dict and type(before.get('chat')) is dict
++            and all(field in before and field in deployment
++                and _same(before[field], deployment[field]) for field in ('utility', 'embedding')),
++            'worker_declaration_auxiliary_deployment_changed')
++        # Preserve timeout and all unrequested chat/deployment metadata. The
++        # declared descriptive name and the four current-main leaves may move.
++        require('timeout' in before['chat'] and 'timeout' in after_chat
++            and _same(before['chat']['timeout'], after_chat['timeout'])
++            and _same({k: v for k, v in before['chat'].items() if k not in chat_fields},
++                {k: v for k, v in after_chat.items() if k not in chat_fields})
++            and _same({k: v for k, v in before.items() if k not in ('name', 'chat')},
++                {k: v for k, v in deployment.items() if k not in ('name', 'chat')}),
++            'worker_declaration_deployment_metadata_changed')
++
++
++def _worker_inputs_join(root_config, worker_inputs, deployment):
++    """Retain every resource budget/native pin outside five reviewed leaves."""
++    before = _at(root_config, TEMPLATE_INPUTS)
++    require(type(before) is dict, 'worker_declaration_current_worker_inputs_required')
++    _reference(_at(before, ('workers', 'a0', 'a0', 'launcher')))
++    policy = _at(worker_inputs, ('workers', 'a0', 'a0', 'policy'))
++    network_policy = _at(worker_inputs, ('a0_network', 'policy'))
++    _reference(policy)
++    _reference(network_policy)
++    require(_same(policy, network_policy), 'worker_declaration_network_policy_join_changed')
++    endpoints = []
++    for role in ('chat', 'utility', 'embedding'):
++        value = deployment[role].get('endpoint')
++        require(type(value) is str and value,
++            'worker_declaration_deployment_endpoint_required')
++        if value not in endpoints:
++            endpoints.append(value)
++    require(_same(_at(worker_inputs, ('a0_network', 'endpoints')), endpoints),
++        'worker_declaration_network_endpoints_join_changed')
++    restored = copy.deepcopy(worker_inputs)
++    for path in WORKER_INPUT_CHANGE_PATHS:
++        # Both sides must actually contain each admitted leaf. No implicit
++        # defaults or guessed native declarations may enter the proposal.
++        _at(restored, path)
++        _replace(restored, path, _at(before, path))
++    require(_same(before, restored), 'worker_declaration_unrelated_worker_input_delta')
++
++
++def plan_declaration_delta(root_config, profile_config, worker_inputs, identity, bundle):
++    """Return exactly four typed CAS replacements on current document copies.
++
++    This pure function checks a static identity join, not native pairing,
++    current_access, a signed operator session, or current source installation.
++    Authenticate all input pins in the owning native transaction before use.
++    """
++    require(type(root_config) is dict and type(profile_config) is dict
++        and type(worker_inputs) is dict and type(bundle) is dict,
++        'worker_declaration_documents_required')
++    require(bundle.get('schema') == 'frw.current-both-spark-declaration-change-data.v1'
++        and bundle.get('state') ==
++            'PROPOSED_NOT_APPLIED_NOT_AN_EXECUTABLE_MIGRATION_REQUEST',
++        'worker_declaration_bundle_schema')
++    _reference(bundle.get('identity_reference'))
++    home, profile_home = _identity_join(root_config, profile_config, identity, bundle)
++    require(worker_inputs.get('required') == ['dsh', 'a0']
++        and type(worker_inputs.get('workers')) is dict
++        and set(worker_inputs['workers']) == {'dsh', 'a0'}
++        and _same(worker_inputs.get('source_scope'), {'home': str(home),
++            'profile': identity['binding']['transport_profile']}),
++        'worker_declaration_worker_input_scope_changed')
++    try:
++        deployment = worker_inputs['workers']['a0']['a0']['deployment']
++        launcher = worker_inputs['workers']['a0']['a0']['launcher']
++    except (KeyError, TypeError):
++        raise DeclarationError('worker_declaration_a0_inputs_required') from None
++    _reference(launcher)
++    require(type(deployment) is dict and type(deployment.get('chat')) is dict
++        and type(deployment.get('utility')) is dict
++        and type(deployment.get('embedding')) is dict,
++        'worker_declaration_deployment_required')
++    _deployment_join(root_config, profile_config, deployment)
++    _worker_inputs_join(root_config, worker_inputs, deployment)
++    changes = bundle.get('changes')
++    require(type(changes) is list and len(changes) == 4,
++        'worker_declaration_exact_four_changes_required')
++    indexed = {}
++    for row in changes:
++        require(type(row) is dict and type(row.get('document')) is str
++            and type(row.get('path')) is list
++            and all(type(part) is str for part in row['path']),
++            'worker_declaration_change_shape_invalid')
++        key = (row['document'], tuple(row['path']))
++        require(key in CHANGE_PATHS and key not in indexed,
++            'worker_declaration_change_path_forbidden')
++        indexed[key] = row
++    require(set(indexed) == CHANGE_PATHS, 'worker_declaration_exact_four_changes_required')
++    documents = {'root_config': copy.deepcopy(root_config),
++        'profile_config': copy.deepcopy(profile_config)}
++    semantic = []
++    for document, path in sorted(CHANGE_PATHS):
++        row = indexed[(document, path)]
++        before = _at(documents[document], path)
++        if path == TEMPLATE_INPUTS:
++            require(set(row) == {'document', 'path', 'before_sha256', 'after_reference'}
++                and row['before_sha256'] == fingerprint(before),
++                'worker_declaration_worker_inputs_cas_changed')
++            _reference(row['after_reference'])
++            after = worker_inputs
++        else:
++            require(set(row) == {'document', 'path', 'before', 'after'}
++                and _same(before, row['before']), 'worker_declaration_beforeimage_changed')
++            require(_same(row['after'], deployment),
++                'worker_declaration_deployment_join_changed')
++            after = row['after']
++        require(not _same(before, after), 'worker_declaration_noop_not_four_changes')
++        _replace(documents[document], path, after)
++        semantic.append({'document': document, 'path': list(path),
++            'before_sha256': fingerprint(before), 'after_sha256': fingerprint(after)})
++    # Prove the complement, including dynamic identity collections and all
++    # browser/web/compressor/model settings, with type-sensitive equality.
++    for name, original in (('root_config', root_config), ('profile_config', profile_config)):
++        restored = copy.deepcopy(documents[name])
++        for document, path in CHANGE_PATHS:
++            if document == name:
++                _replace(restored, path, _at(original, path))
++        require(_same(original, restored), 'worker_declaration_unrelated_delta')
++    return {'schema': 'friday.worker-declaration-delta.v1',
++        'state': 'SOURCE_DECLARATION_DELTA_ONLY_NOT_NATIVE_AUTHORITY',
++        'ready': False, 'native_authority': False, 'native_apply_implemented': False,
++        'workers_enabled': False,
++        'root_config': documents['root_config'], 'profile_config': documents['profile_config'],
++        'semantic_changes': semantic, 'principal': identity['principal'],
++        'generation': identity['generation'], 'profile': str(profile_home),
++        'launcher': {'reference': copy.deepcopy(launcher),
++            'state': 'FUTURE_INSTALL_AND_PIN_PROPAGATION_REQUIRED', 'installed': False},
++        'missing_native_prerequisites': list(NATIVE_GAPS)}
++
++
++def load_declaration_source(companion):
++    """Read exact private JSON pins; no public request supplies callbacks."""
++    require(type(companion) is dict and set(companion) == {'bundle', 'worker_inputs', 'identity'},
++        'worker_declaration_exact_source_companion_required')
++    bundle = _read_reference(companion['bundle'])
++    identity = _read_reference(companion['identity'])
++    inputs = _read_reference(companion['worker_inputs'])
++    require(_same(bundle.get('identity_reference'), companion['identity']),
++        'worker_declaration_identity_reference_changed')
++    rows = bundle.get('changes')
++    require(type(rows) is list, 'worker_declaration_change_shape_invalid')
++    refs = [row.get('after_reference') for row in rows if type(row) is dict
++        and row.get('document') == 'root_config' and row.get('path') == list(TEMPLATE_INPUTS)]
++    require(len(refs) == 1 and _same(refs[0], companion['worker_inputs']),
++        'worker_declaration_inputs_reference_changed')
++    return bundle, inputs, identity
++
++
++def validate_declaration_source(companion, root_config, profile_config, *, root_home, profile_home):
++    """Authenticated Onboarding companion preflight; return redacted proof only.
++
++    The caller owns the signed session, native current_access/generation/proof
++    checks and config/admission locks. This function grants none of them. The
++    stale attachment is a historical member: its returned digest must match
++    the archive engine's exact before-tree inventory. The engine retains that
++    custody across rename; this function never guesses a replacement path.
++    """
++    bundle, inputs, identity = load_declaration_source(companion)
++    plan = plan_declaration_delta(root_config, profile_config, inputs, identity, bundle)
++    require(Path(root_home) == Path(identity['profile']).parent.parent
++        and Path(profile_home) == Path(identity['profile']),
++        'worker_declaration_native_home_changed')
++    for name, ref in identity['source_refs'].items():
++        if name != 'stale_attachment':
++            _read_reference(ref, json_document=False)
++    return {'schema': 'friday.worker-declaration-source-join.v1',
++        'state': plan['state'], 'status': 'SOURCE_JOIN_ONLY_NATIVE_APPLY_UNIMPLEMENTED',
++        'ready': False, 'native_authority': False, 'native_apply_implemented': False,
++        'binding_sha256': identity['binding_sha256'],
++        'generation': identity['generation'], 'principal': identity['principal'],
++        'stale_attachment_sha256': identity['source_refs']['stale_attachment']['sha256'],
++        'bundle_sha256': companion['bundle']['sha256'],
++        # Semantic JSON fingerprints, never native YAML/raw configuration pins.
++        'candidate_root_sha256': fingerprint(plan['root_config']),
++        'candidate_profile_sha256': fingerprint(plan['profile_config']),
++        'candidate_digest_kind': 'semantic-canonical-json-not-native-yaml-raw',
++        'source': copy.deepcopy(companion),
++        'semantic_changes': copy.deepcopy(plan['semantic_changes']),
++        'delta_sha256': fingerprint(plan['semantic_changes']),
++        'launcher_state': plan['launcher']['state'],
++        'native_migration': 'UNIMPLEMENTED',
++        'missing_native_prerequisites': list(NATIVE_GAPS)}
+--- a/scripts/rootless_docker_launch.py
++++ b/scripts/rootless_docker_launch.py
+@@ -31,7 +31,8 @@
+ NFT = Path('/usr/sbin/nft')
+ NSENTER = Path('/usr/bin/nsenter')
+ BRIDGE = 'br-frwa0local'
+-ENDPOINTS = [{'ip': '192.168.1.78', 'port': 8001, 'transport': 'tcp'},
++ENDPOINTS = [{'ip': '192.168.1.195', 'port': 30000, 'transport': 'tcp'},
++             {'ip': '192.168.1.78', 'port': 8001, 'transport': 'tcp'},
+              {'ip': '192.168.1.78', 'port': 8002, 'transport': 'tcp'}]
+ NS_GET_USERNS = 0xb701
+ 
+@@ -146,13 +147,17 @@
+                      ' { type filter hook ' + chain + ' priority -10; policy drop; }')
+     rules = {
+         'input': ['meta nfproto ipv6 counter drop',
++                  'meta nfproto ipv4 meta l4proto tcp iifname "tap0" ip saddr 192.168.1.195 tcp sport 30000 ct state established counter accept',
+                   'meta nfproto ipv4 meta l4proto tcp iifname "tap0" ip saddr 192.168.1.78 tcp sport { 8001, 8002 } ct state established counter accept',
+                   'counter drop'],
+         'forward': ['meta nfproto ipv6 counter drop',
++                    'meta nfproto ipv4 meta l4proto tcp iifname "br-frwa0local" oifname "tap0" ip daddr 192.168.1.195 tcp dport 30000 ct state { new, established } counter accept',
+                     'meta nfproto ipv4 meta l4proto tcp iifname "br-frwa0local" oifname "tap0" ip daddr 192.168.1.78 tcp dport { 8001, 8002 } ct state { new, established } counter accept',
++                    'meta nfproto ipv4 meta l4proto tcp iifname "tap0" oifname "br-frwa0local" ip saddr 192.168.1.195 tcp sport 30000 ct state established counter accept',
+                     'meta nfproto ipv4 meta l4proto tcp iifname "tap0" oifname "br-frwa0local" ip saddr 192.168.1.78 tcp sport { 8001, 8002 } ct state established counter accept',
+                     'counter drop'],
+         'output': ['meta nfproto ipv6 counter drop',
++                   'meta nfproto ipv4 meta l4proto tcp oifname "tap0" ip daddr 192.168.1.195 tcp dport 30000 ct state { new, established } counter accept',
+                    'meta nfproto ipv4 meta l4proto tcp oifname "tap0" ip daddr 192.168.1.78 tcp dport { 8001, 8002 } ct state { new, established } counter accept',
+                    'counter drop']}
+     for chain, rs in rules.items():
+@@ -177,22 +182,23 @@
+         return {'match': {'op': '==', 'left': left, 'right': right}}
+     def meta(k, v): return match({'meta': {'key': k}}, v)
+     def payload(protocol, field, v): return match({'payload': {'protocol': protocol, 'field': field}}, v)
+-    def allow(incoming, bridge=False):
++    def allow(incoming, bridge=False, spark=False):
+         out = [meta('nfproto', 'ipv4'), meta('l4proto', 'tcp')]
+         if incoming: out += [meta('iifname', 'tap0')]
+         if bridge: out += [meta('oifname' if incoming else 'iifname', BRIDGE)]
+         if not incoming: out += [meta('oifname', 'tap0')]
+-        out += [payload('ip', 'saddr' if incoming else 'daddr', '192.168.1.78'),
+-                payload('tcp', 'sport' if incoming else 'dport', {'set': [8001, 8002]}),
++        out += [payload('ip', 'saddr' if incoming else 'daddr', '192.168.1.195' if spark else '192.168.1.78'),
++                payload('tcp', 'sport' if incoming else 'dport', 30000 if spark else {'set': [8001, 8002]}),
+                 {'match': {'op': 'in', 'left': {'ct': {'key': 'state'}},
+                            'right': ['established'] if incoming else ['new', 'established']}},
+                 {'counter': None}, {'accept': None}]
+         return out
+     deny6 = [meta('nfproto', 'ipv6'), {'counter': None}, {'drop': None}]
+     deny = [{'counter': None}, {'drop': None}]
+-    rows = {'input': [deny6, allow(True), deny],
+-            'forward': [deny6, allow(False, True), allow(True, True), deny],
+-            'output': [deny6, allow(False), deny]}
++    rows = {'input': [deny6, allow(True, spark=True), allow(True), deny],
++            'forward': [deny6, allow(False, True, spark=True), allow(False, True),
++                        allow(True, True, spark=True), allow(True, True), deny],
++            'output': [deny6, allow(False, spark=True), allow(False), deny]}
+     if web is not None:
+         checked_web(web)
+         for chain in rows: rows[chain][-1:-1] = web_rule_expr(chain, web)
+--- a/scripts/friday_install.py
++++ b/scripts/friday_install.py
+@@ -349,7 +349,9 @@
+         deployment = profile_validator.checked_profile(product['a0_deployment'])
+         selected = product['inference']
+         expected_key = 'FRIDAY_LLM_API_KEY'
+-        if (product.get('compression_inference') is not None
++        if (not all(deployment['chat'][a] == selected[b] for a,b in
++                (('endpoint','base_url'),('model','model'),('context_length','context'),('max_output_tokens','main_output')))
++                and product.get('compression_inference') is not None
+                 and type(product['runtime']) is dict and set(product['runtime'])=={'enabled'}
+                 and product['runtime']['enabled'] is False):
+             # Existing legacy A0 declarations remain inactive and byte-exact.
+@@ -4914,7 +4916,7 @@
+ def main():
+     started = time.monotonic()  # before parser/input IO; never reset on dispatch
+     parser = SafeParser(description=__doc__, allow_abbrev=False)
+-    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'qualify', 'activate-telegram', 'update-telegram', 'prepare-ordinary-workers', 'recover-ordinary-worker-keyless', 'register-ordinary-a0', 'start-telegram', 'rollback-telegram', 'reconcile', 'resume-harness', 'resume-cli', 'continue-cli-segment', 'installed-cli', 'repair-installed-cli', 'repair-frontend-close', 'repair-native-bootstrap', 'repair-session-artifact', 'repair-context-continuation','repair-native-manager','repair-readonly-schema-formatter','repair-current12-readonly-fit','repair-summary-fit','repair-summary-budget','repair-summary-completion','repair-summary-visible'))
++    parser.add_argument('phase', choices=('plan', 'install', 'check', 'dashboard-check', 'start', 'qualify', 'activate-telegram', 'update-telegram', 'prepare-ordinary-workers', 'apply-worker-declarations', 'recover-ordinary-worker-keyless', 'register-ordinary-a0', 'start-telegram', 'rollback-telegram', 'reconcile', 'resume-harness', 'resume-cli', 'continue-cli-segment', 'installed-cli', 'repair-installed-cli', 'repair-frontend-close', 'repair-native-bootstrap', 'repair-session-artifact', 'repair-context-continuation','repair-native-manager','repair-readonly-schema-formatter','repair-current12-readonly-fit','repair-summary-fit','repair-summary-budget','repair-summary-completion','repair-summary-visible'))
+     parser.add_argument('--input', required=True, type=Path, help='Private pinned JSON, no credential values')
+     parser.add_argument('--a0-plan', type=Path, help='Existing owned live native probe plan; never a readiness report')
+     parser.add_argument('--a0-plan-sha256')
+@@ -4956,6 +4958,9 @@
+         if args.phase == 'activate-telegram':
+             from scripts.friday_ordinary_install import activate
+             result = activate(value,args.input,budget)
++        elif args.phase == 'apply-worker-declarations':
++            from scripts.friday_worker_declarations import apply_declarations
++            result = apply_declarations(value, budget, request_path=args.input)
+         elif args.phase == 'prepare-ordinary-workers':
+             from scripts.friday_ordinary_install import prepare_workers
+             result = prepare_workers(value,args.input,budget)
+--- a/tools/configure_product.py
++++ b/tools/configure_product.py
+@@ -181,7 +181,9 @@
+         chat = deployment['chat']
+         a0_inference = inference
+         expected_key = 'FRIDAY_LLM_API_KEY'
+-        if (compression is not None and type(runtime) is dict and set(runtime)=={'enabled'}
++        if (not all(chat[a] == inference[b] for a,b in
++                (('endpoint','base_url'),('model','model'),('context_length','context'),('max_output_tokens','main_output')))
++                and compression is not None and type(runtime) is dict and set(runtime)=={'enabled'}
+                 and runtime['enabled'] is False):
+             # Preserve inactive legacy A0 declaration, including embeddings and
+             # utility: it describes the explicitly retained27B role only.

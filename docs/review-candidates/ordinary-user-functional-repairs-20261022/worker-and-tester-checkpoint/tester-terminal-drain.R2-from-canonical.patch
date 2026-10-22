@@ -1,0 +1,223 @@
+--- bot_tester.BASE.py
++++ bot_tester.R2.py
+@@ -1537,7 +1537,7 @@
+             raise Refused('Raw/arrival pairs differ from required global capture inventory')
+         return committed_offsets
+ 
+-    def receive_inventory(self, run, cursor=None):
++    def receive_inventory(self, run, cursor=None, terminal=False):
+         if (not isinstance(run.get('seen'), list) or any(type(uid) is not int for uid in run['seen'])
+                 or not isinstance(run.get('observations'), list)
+                 or any(not isinstance(o, dict) for o in run['observations'])
+@@ -1580,8 +1580,56 @@
+         if actual_names != expected_names:
+             raise Refused('Unpaired capture/process witness outside committed receipt inventory')
+         captures = {}; processed = {}; processing = set(); offset = run['capture_start_offset']; message_ids = []
++        drain = {}; terminal_updates = None; terminal_processed = None
+         for record in reversed(records):
+             kind = record.get('kind'); uid = record.get('update_id')
++            if drain.get('complete'):
++                raise Refused('No capture operation may follow terminal completion')
++            if kind == 'terminal_intent':
++                started = record.get('started_at'); timeout = record.get('timeout_seconds')
++                count = record.get('update_count')
++                if (drain or processing or set(captures) != set(processed)
++                        or record['offset'] != offset
++                        or type(started) not in (int, float) or not math.isfinite(started)
++                        or not run['capture_until'] <= started < run['deadline'] - REPLY_WINDOW_RESERVE
++                        or type(timeout) not in (int, float) or not math.isfinite(timeout)
++                        or not 0 < timeout <= min(10, run['deadline'] - started - REPLY_WINDOW_RESERVE)
++                        or type(count) is not int or not len(processed) <= count <= run['scenario']['max_updates']
++                        or type(record.get('limit')) is not int
++                        or record['limit'] != min(20, run['scenario']['max_updates'] - count + 1)):
++                    raise Refused('Invalid or repeated terminal drain intent')
++                drain = {'intent': record}; terminal_processed = len(processed)
++                continue
++            if kind == 'terminal_response':
++                intent = drain.get('intent'); received = record.get('received_at')
++                if (intent is None or 'response' in drain or record['offset'] != offset
++                        or type(received) not in (int, float) or not math.isfinite(received)
++                        or not intent['started_at'] <= received <= intent['started_at'] + intent['timeout_seconds']
++                        or received >= run['deadline'] - REPLY_WINDOW_RESERVE):
++                    raise Refused('Invalid terminal response boundary')
++                name = 'terminal-response-' + self.receive_key(run) + '.json'
++                wire = self.read_reference(record.get('wire'), name)
++                terminal_updates = wire.get('result') if isinstance(wire, dict) and wire.get('ok') is True else None
++                if (not isinstance(terminal_updates, list) or len(terminal_updates) > intent['limit']
++                        or any(not isinstance(u, dict) or type(u.get('update_id')) is not int
++                               or u['update_id'] < offset for u in terminal_updates)
++                        or len({u['update_id'] for u in terminal_updates}) != len(terminal_updates)):
++                    raise Refused('Invalid terminal response update inventory')
++                drain['response'] = record
++                continue
++            if kind == 'terminal_complete':
++                intent = drain.get('intent'); completed = record.get('completed_at')
++                if (terminal_updates is None or len(terminal_updates) >= intent['limit']
++                        or processing or record['offset'] != offset
++                        or set(captures) != set(processed)
++                        or len(processed) - terminal_processed != len(terminal_updates)
++                        or run['update_count'] != intent['update_count'] + len(terminal_updates)
++                        or type(completed) not in (int, float) or not math.isfinite(completed)
++                        or not drain['response']['received_at'] <= completed < run['deadline']
++                        or any(u['update_id'] not in processed for u in terminal_updates)):
++                    raise Refused('Unproven or saturated terminal drain cannot complete')
++                drain['complete'] = record
++                continue
+             if kind == 'seed':
+                 legacy_heads = record.get('legacy_heads', {})
+                 if (not isinstance(legacy_heads, dict)
+@@ -1595,6 +1643,9 @@
+             if type(uid) is not int or uid < run['capture_start_offset']:
+                 raise Refused('Capture receipt update identity invalid')
+             if kind == 'capture':
++                if drain and (terminal_updates is None
++                              or not any(u.get('update_id') == uid for u in terminal_updates)):
++                    raise Refused('Capture does not belong to the single terminal response')
+                 if uid in captures or uid < offset or record['offset'] != uid + 1:
+                     raise Refused('Capture receipt offset/identity sequence invalid')
+                 raw = safe_read(self.store.captures / (str(uid) + '.json'))
+@@ -1612,6 +1663,9 @@
+                         or arrival.get('update_id') != uid or arrival.get('raw_update') != record['raw_update']
+                         or type(arrival.get('arrived_at')) not in (int, float) or not math.isfinite(arrival['arrived_at'])):
+                     raise Refused('Capture arrival identity/time/run/window changed')
++                if drain and (update not in terminal_updates
++                              or arrival['arrived_at'] < drain['response']['received_at']):
++                    raise Refused('Terminal raw update or host arrival changed')
+                 captures[uid] = arrival; offset = uid + 1
+             elif kind == 'processing':
+                 if uid not in captures or uid in processing or uid in processed or record['offset'] != offset:
+@@ -1643,7 +1697,7 @@
+         for uid, record in processed.items():
+             if [o for o in run.get('observations', []) if o.get('update_id') == uid] != record['observations']:
+                 raise Refused('Committed processed observations missing or changed')
+-        return captures, processed
++        return (captures, processed, drain) if terminal else (captures, processed)
+ 
+     def capture_reply(self, run, update):
+         captures, processed = self.receive_inventory(run)
+@@ -2081,11 +2135,76 @@
+             run.update(artifact_acceptance='RECEIVED_UNGRADED', acceptance='NOT_ESTABLISHED')
+         self.finish_process(run, uid)
+ 
++    def terminal_drain(self, run):
++        # One finite read after the unchanged cutoff. Durable intent consumes the
++        # opportunity even if dispatch/transport/process custody later becomes unknown.
++        captures, processed, drain = self.receive_inventory(run, terminal=True)
++        if drain:
++            if drain.get('complete'):
++                return
++            raise Refused('Terminal drain already consumed or incomplete; never retry')
++        self.reply_window(run)
++        self.guard(run)
++        started = self.clock()
++        timeout = min(10, run['deadline'] - started - REPLY_WINDOW_RESERVE)
++        if started < run['capture_until'] or timeout <= 0:
++            raise Refused('No original budget for terminal drain')
++        if (type(run.get('update_count')) is not int
++                or not len(processed) <= run['update_count'] <= run['scenario']['max_updates']):
++            raise Refused('Invalid original update budget for terminal drain')
++        cursor = self.store.get(self.store.root / 'cursor.json')
++        limit = min(20, run['scenario']['max_updates'] - run['update_count'] + 1)
++        self.commit_receive(run, dict(kind='terminal_intent', offset=cursor['offset'],
++                            started_at=started, timeout_seconds=timeout,
++                            update_count=run['update_count'], limit=limit))
++        # Recheck stop/cooldown and subtract durable-intent overhead from HTTP budget.
++        remaining = min(self.guard(run), started + timeout - self.clock())
++        if remaining <= 0:
++            raise Refused('Terminal intent budget expired before dispatch')
++        updates = self.api.call('getUpdates', {'offset': cursor['offset'], 'timeout': 0,
++                                'limit': limit, 'allowed_updates': ['message']}, timeout=remaining)
++        received = self.clock()
++        raw = getattr(self.api, '_last_response', None)
++        if not isinstance(raw, bytes) or not 1 <= len(raw) <= MAX_JSON:
++            raise Refused('Terminal response lacks exact bounded HTTP custody')
++        try:
++            wire = json.loads(raw, object_pairs_hook=unique_object)
++        except (ValueError, UnicodeError):
++            raise Refused('Terminal response is not unambiguous JSON') from None
++        if (not isinstance(wire, dict) or wire.get('ok') is not True or wire.get('result') != updates
++                or not isinstance(updates, list) or len(updates) > limit
++                or any(not isinstance(u, dict) or type(u.get('update_id')) is not int
++                       or u['update_id'] < cursor['offset'] for u in updates)
++                or len({u['update_id'] for u in updates}) != len(updates)):
++            raise Refused('Invalid terminal response batch')
++        name = 'terminal-response-' + self.receive_key(run) + '.json'
++        path = self.store.root / name
++        if path.exists():
++            raise Refused('Terminal response already exists; preserve first evidence')
++        self.store.write(path, raw)
++        self.commit_receive(run, dict(kind='terminal_response', offset=cursor['offset'],
++                            received_at=received,
++                            wire={'basename': name, 'bytes': len(raw), 'sha256': digest(raw)}))
++        if len(updates) >= limit:
++            # Keep the exact batch receipt without consuming update budget/cursor.
++            raise Refused('Terminal batch saturated; remaining updates unproven')
++        for update in sorted(updates, key=lambda u: u['update_id']):
++            self.guard(run)
++            self.capture(update)
++            self.process(run, update)  # Host arrivals after cutoff remain late/excluded.
++        self.guard(run)
++        self.commit_receive(run, dict(kind='terminal_complete',
++                            offset=self.store.get(self.store.root / 'cursor.json')['offset'],
++                            completed_at=self.clock()))
++        self.receive_inventory(run, terminal=True)
++
+     def ready(self, run):
+         expected = run['scenario']['steps'][run['step']]['observe']
+         if reply_capture(expected):
+-            # Readiness is the completed precommitted window, never first reply or quiet.
+-            return type(run.get('capture_until')) in (int, float) and self.clock() >= run['capture_until']
++            # Neither wall-clock passage nor mutable flags prove terminal coverage.
++            return (type(run.get('capture_until')) in (int, float)
++                    and self.clock() >= run['capture_until']
++                    and bool(self.receive_inventory(run, terminal=True)[2].get('complete')))
+         return ((not any(k in expected for k in ('text_equals', 'text_contains')) or any(o['kind'] == 'text' for o in run['observations']))
+                 and sum(o['kind'] == 'document' for o in run['observations']) == len(expected.get('documents', [])))
+ 
+@@ -2112,9 +2231,9 @@
+         try:
+             if not self.preflight_valid:
+                 if reply:
+-                    # Post-send preflight is bounded by the remaining fixed window; once the
+-                    # window is complete there is no network after cutoff, only offline
+-                    # replay of retained raw updates and terminal readiness.
++                    # Post-send preflight is bounded by the remaining fixed window;
++                    # after cutoff only the single committed terminal read may follow.
++                    # Preflight does not reset or extend the original observation window.
+                     try:
+                         remaining_window = self.reply_timeout(run)
+                     except ReplyWindowClosed:
+@@ -2141,6 +2260,9 @@
+             while True:
+                 phase = 'observe_guard'
+                 self.guard(run)
++                phase = 'terminal_drain'
++                if reply and self.clock() >= self.reply_window(run):
++                    self.terminal_drain(run)
+                 phase = 'readiness'
+                 if self.ready(run):
+                     if reply:
+@@ -2162,7 +2284,11 @@
+                 cursor = self.store.get(self.store.root / 'cursor.json', {'offset': 0})
+                 phase = 'poll_budget'
+                 try:
+-                    timeout = self.reply_timeout(run) if reply else self.guard(run)
++                    if reply and self.clock() >= self.reply_window(run):
++                        raise ReplyWindowClosed('Dispatch crossed fixed cutoff')
++                    # getUpdates may return across cutoff; the original host-arrival
++                    # eligibility still applies. Its HTTP deadline uses overall budget.
++                    timeout = self.guard(run)
+                 except ReplyWindowClosed:
+                     # No HTTP call started. Re-enter the normal guard/readiness and
+                     # custody path; do not catch any API or document failure here.
+@@ -2179,6 +2305,10 @@
+                     # only: it never changes dispatch budgets, readiness, or cause.
+                     poll_diagnostic['stop_poll_capture_cutoff_monotonic'] = (
+                         poll_started + (run['capture_until'] - self.clock()))
++                # guard() performs durable reads and may cross the fixed cutoff.
++                # Sample again at dispatch; only terminal intent permits a later read.
++                if reply and self.reply_window(run) <= self.clock():
++                    continue
+                 updates = self.api.call('getUpdates', {'offset': cursor['offset'], 'timeout': 1,
+                     'limit': min(20, run['scenario']['max_updates'] - run['update_count'] + 1),
+                     'allowed_updates': ['message']},
