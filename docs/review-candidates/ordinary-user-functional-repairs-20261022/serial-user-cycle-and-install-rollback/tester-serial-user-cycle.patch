@@ -1,0 +1,352 @@
+--- a/bot_tester.py
++++ b/bot_tester.py
+@@ -1057,13 +1057,109 @@
+             self.store.put(action / 'TERMINAL.json', terminal)
+             raise
+ 
++    def serial_predecessor(self, plan, check_custody=True):
++        # One exact closed admitted operation, not a replay of global history.
++        pin = plan['predecessor']
++        if (not isinstance(pin, dict) or set(pin) != {'run_id', 'run_sha256', 'admission_reference',
++                'cursor_sha256', 'semantic_review_reference'}
++                or not isinstance(pin['run_id'], str)
++                or not isinstance(pin['run_sha256'], str) or not re.fullmatch('[a-f0-9]{64}', pin['run_sha256'])):
++            raise Refused('Exact closed predecessor commitment required')
++        raw = safe_read(self.store.run_path(pin['run_id']))
++        if digest(raw) != pin['run_sha256']:
++            raise Refused('Closed admitted predecessor changed')
++        run = json.loads(raw, object_pairs_hook=unique_object)
++        value = self.read_reference(pin['admission_reference'])
++        if not isinstance(run, dict) or not isinstance(value, dict) or not isinstance(value.get('plan'), dict):
++            raise Refused('Closed predecessor and admission must be JSON objects')
++        previous_plan = value['plan']
++        if (run.get('id') != pin['run_id'] or run.get('status') != 'EVIDENCE_READY'
++                or run.get('send_state') != 'sent' or run.get('send_attempts') != 1
++                or run.get('capture_window_complete') is not True
++                or type(run.get('capture_until')) not in (int, float) or self.clock() < run['capture_until']
++                or run.get('continuation_reference') != pin['admission_reference']
++                or previous_plan.get('new_run_id') != run['id']
++                or previous_plan.get('new_scenario') != run.get('scenario')
++                or previous_plan.get('quarantine_key') != plan['quarantine_key']
++                or any(previous_plan.get(k) != plan[k] for k in ('intent_sha256', 'terminal_sha256', 'response_sha256'))
++                or value.get('schema') != 'friday.tester.closed-unknown-admission.v1'
++                or value.get('plan_sha256') != digest(encoded(previous_plan))
++                or not isinstance(pin['cursor_sha256'], str) or not re.fullmatch('[a-f0-9]{64}', pin['cursor_sha256'])):
++            raise Refused('Successor requires the exact full-window closed admitted ACK/capture')
++        key = digest(encoded(dict(admission=pin['admission_reference'], task=run.get('sent_task_reference'),
++                                  ack=run.get('sent_api_ack_reference'), window=run.get('sent_window_reference'))))
++        admission_path = self.store.root / ('continue-' + key + '.json')
++        if admission_path.exists():
++            admission = self.store.get(admission_path)
++            if (not isinstance(admission, dict) or admission.get('plan') != plan
++                    or admission.get('plan_sha256') != digest(encoded(plan))):
++                raise Refused('Physical predecessor already has a different successor admission')
++            cursor = admission.get('predecessor_cursor')
++            if digest(encoded(cursor)) != pin['cursor_sha256']:
++                raise Refused('Successor historical cursor custody changed')
++        else:
++            cursor_raw = safe_read(self.store.root / 'cursor.json')
++            if digest(cursor_raw) != pin['cursor_sha256']:
++                raise Refused('Fresh successor cursor commitment changed')
++            cursor = json.loads(cursor_raw, object_pairs_hook=unique_object)
++        # Validate this closed local receive chain against its immutable admission
++        # cursor. The CURRENT chain is separately checked before any new effects;
++        # a current processing intent must not invalidate this historical closure.
++        if check_custody and not getattr(self, '_serial_custody', False):
++            saved_reply = getattr(self, 'reply_run', None)
++            self._serial_custody = True
++            try:
++                self.verify_reply_custody(run, cursor=cursor)
++                captures, processed, drain = self.receive_inventory(run, cursor, terminal=True)
++                if not isinstance(drain.get('complete'), dict):
++                    raise Refused('Closed predecessor lacks complete terminal receive custody')
++            finally:
++                self._serial_custody = False
++                self.reply_run = saved_reply
++        return run, previous_plan, key
++
++    def continuation_key(self, plan):
++        return (self.serial_predecessor(plan, False)[2] if 'predecessor' in plan
++                else plan['quarantine_key'])
++
++    def reply_semantic_review(self, run, reference):
++        # Root's external assertion is pinned, never produced/graded by this receiver.
++        if (not isinstance(reference, dict) or set(reference) != {'path', 'bytes', 'sha256'}
++                or not isinstance(reference['path'], str) or not reference['path'].startswith('/')
++                or type(reference['bytes']) is not int or not 1 <= reference['bytes'] <= 65536
++                or not isinstance(reference['sha256'], str) or not re.fullmatch('[a-f0-9]{64}', reference['sha256'])):
++            raise Refused('Contextual effect requires a private external Root semantic receipt')
++        raw = safe_read(reference['path'], 65536)
++        if len(raw) != reference['bytes'] or digest(raw) != reference['sha256']:
++            raise Refused('External Root semantic receipt custody changed')
++        report = json.loads(raw, object_pairs_hook=unique_object)
++        artifacts = [o for o in run['observations'] if o.get('kind') == 'document']
++        if len(artifacts) != 1 or artifacts[0].get('complete_artifact') is not True:
++            raise Refused('Contextual followup requires one actual complete preceding artifact')
++        expected = dict(self.capture_binding(run), schema='frw.bot-tester.reply-semantic-review.v1',
++                        run_record_sha256=digest(safe_read(self.store.run_path(run['id']))),
++                        artifacts=[{k: artifacts[0][k] for k in ('sha256', 'bytes', 'message_id', 'update_id')}])
++        if (not isinstance(report, dict) or set(report) != set(expected) | {'verdict', 'operator_checked', 'reviewer', 'checks', 'diagnostic_reference'}
++                or any(encoded(report.get(k)) != encoded(v) for k, v in expected.items())
++                or report.get('verdict') != 'ACCEPTED_FOR_CONTEXTUAL_FOLLOWUP'
++                or report.get('operator_checked') is not True or report.get('reviewer') != 'Root'
++                or not isinstance(report.get('checks'), list) or not 1 <= len(report['checks']) <= 64
++                or any(not isinstance(c, str) or not 1 <= len(c) <= 4000 or not c.strip() for c in report['checks'])
++                or not isinstance(report.get('diagnostic_reference'), str)
++                or not 1 <= len(report['diagnostic_reference']) <= 4000 or not report['diagnostic_reference'].strip()):
++            raise Refused('External Root semantic receipt must bind the actual preceding task/artifact')
++        return artifacts[0]
++
+     def continuation_material(self, plan, check_current=False, consumer_fd=None, credential_fd=None):
+         # A separate explicit new effect. Never reclassifies or resumes the unknown.
+         fields = {'schema', 'operator', 'action_id', 'new_run_id', 'new_scenario',
+                   'new_task', 'quarantine_key', 'intent_sha256', 'terminal_sha256',
+                   'response_sha256', 'clock', 'current_tuple', 'ack_timeout_seconds', 'acknowledgement'}
++        serial = isinstance(plan, dict) and plan.get('schema') == 'friday.tester.continue-closed-unknown.v2'
++        if serial:
++            fields = fields | {'predecessor'}
+         if (not isinstance(plan, dict) or set(plan) != fields
+-                or plan['schema'] != 'friday.tester.continue-closed-unknown.v1'
++                or plan['schema'] != ('friday.tester.continue-closed-unknown.v2' if serial else 'friday.tester.continue-closed-unknown.v1')
+                 or plan['operator'] != 'Root'
+                 or type(plan['ack_timeout_seconds']) is not int or not 10 <= plan['ack_timeout_seconds'] <= 30
+                 or plan['acknowledgement'] != 'OLD_OUTCOME_UNKNOWN_NO_REPLAY_NEW_DISTINCT_EFFECT_AUTHORIZED'):
+@@ -1116,40 +1212,83 @@
+                        for u in updates)
+                 or [u['update_id'] for u in updates] != sorted({u['update_id'] for u in updates})):
+             raise Refused('Quarantine IDs, order or finite capture bounds invalid')
++        comparison = old
++        if serial:
++            comparison, previous_plan, successor_key = self.serial_predecessor(plan)
++            # The original batch was already imported before the predecessor polled.
++            # Never import or acknowledge historical quarantine again.
++            updates = []
++            prior = dict(prior, cursor_sha256=plan['predecessor']['cursor_sha256'])
+         scenario = validate_scenario(plan['new_scenario'])
+         spec = plan['new_task']
+-        sf = {'kind', 'nonce', 'sheet', 'cell', 'from_value', 'to_value', 'output_filename'}
+-        if (not isinstance(spec, dict) or set(spec) != sf or spec['kind'] != 'distinct-xlsx-copy'
+-                or not isinstance(spec['nonce'], str) or not re.fullmatch('[a-f0-9]{32}', spec['nonce'])
+-                or not isinstance(spec['sheet'], str) or not re.fullmatch('[A-Za-z][A-Za-z0-9_ -]{0,30}', spec['sheet'])
+-                or not isinstance(spec['cell'], str) or not re.fullmatch('[A-Z]{1,2}[1-9][0-9]{0,3}', spec['cell'])
+-                or any(type(spec[k]) is not int or not -1000000 <= spec[k] <= 1000000 for k in ('from_value', 'to_value'))
+-                or spec['from_value'] == spec['to_value']
+-                or len(scenario['steps']) != 1 or set(scenario['steps'][0]) != {'input', 'observe'}
+-                or not reply_capture(scenario['steps'][0]['observe'])):
+-            raise Refused('Only one exact distinct XLSX copy task is admitted')
+-        step = scenario['steps'][0]; upload = step['input']; previous = old['scenario']['steps'][0]['input']
+-        validate_capture(dict(mode='bounded_capture', max_bytes=MAX_FILE,
+-            filename_equals=spec['output_filename'], mime_type_equals=UPLOAD_TYPES['xlsx'], caption_equals=spec['nonce']))
+-        caption = ('Новая независимая задача ' + spec['nonce'] + '. Работай только с приложенным новым файлом '
+-                   + upload['filename'] + '. На листе ' + spec['sheet'] + ' в ячейке ' + spec['cell'] + ' замени значение '
+-                   + str(spec['from_value']) + ' на ' + str(spec['to_value']) + '; сохрани новую копию '
+-                   + spec['output_filename'] + '. В подписи к ответному файлу укажи ровно: '
+-                   + spec['nonce'] + '. Старые файлы и задания не повторять.')
+-        if (upload['mime_type'] != UPLOAD_TYPES['xlsx'] or not upload['filename'].endswith('.xlsx')
+-                or not spec['output_filename'].endswith('.xlsx')
+-                or upload['sha256'] == previous['sha256'] or upload['path'] == previous['path']
+-                or Path(upload['path']).name == Path(previous['path']).name
+-                or (upload['stat']['device'], upload['stat']['inode']) == (previous['stat']['device'], previous['stat']['inode'])
+-                or len({upload['filename'], spec['output_filename'], previous['filename']}) != 3
+-                or upload['caption'] != caption or plan['new_run_id'] == old['id']
+-                or digest(encoded(scenario)) == old['scenario_sha256']
+-                or any(token in caption for token in (previous['filename'], previous['sha256'], old['id']))
+-                or not 1 <= step['observe']['max_documents'] <= 2
+-                or scenario['max_updates'] < len(updates) + step['observe']['max_messages'] + 1
+-                or scenario['deadline_seconds'] > 300 or step['observe']['window_seconds'] > 180
+-                or plan['ack_timeout_seconds'] + step['observe']['window_seconds'] + REPLY_WINDOW_RESERVE > scenario['deadline_seconds']):
+-            raise Refused('New fixture, filename, effect, scenario and capacity must be distinct and finite')
++        followup = isinstance(spec, dict) and spec.get('kind') == 'contextual-text-followup'
++        if followup:
++            if (not serial or set(spec) != {'kind', 'nonce', 'question'}
++                    or not isinstance(spec['nonce'], str) or not re.fullmatch('[a-f0-9]{32}', spec['nonce'])
++                    or not isinstance(spec['question'], str) or not 1 <= len(spec['question']) <= 2000
++                    or len(scenario['steps']) != 1 or set(scenario['steps'][0]) != {'request', 'observe'}
++                    or not reply_capture(scenario['steps'][0]['observe'])):
++                raise Refused('One exact separately authorized contextual text effect required')
++            artifact = self.reply_semantic_review(comparison, plan['predecessor']['semantic_review_reference'])
++            request = ('Контекст: файл ' + artifact['advertised_document']['file_name'] + ', SHA-256 '
++                       + artifact['sha256'] + '. Вопрос по результату предыдущей задачи: ' + spec['question']
++                       + ' Ответь текстом, начни ответ с ' + spec['nonce'] + '.')
++            step = scenario['steps'][0]
++            if (step['request'] != request or step['observe']['max_documents'] != 0
++                    or scenario['deadline_seconds'] > 300 or step['observe']['window_seconds'] > 180
++                    or plan['ack_timeout_seconds'] + step['observe']['window_seconds'] + REPLY_WINDOW_RESERVE > scenario['deadline_seconds']):
++                raise Refused('Exact contextual request and finite text capture required')
++        else:
++            if serial and previous_plan['new_task']['kind'] == 'contextual-text-followup':
++                # A completed contextual question does not reserve the whole tester.
++                # Its exact pinned artifact-producing predecessor is one direct hop.
++                comparison, previous_plan, _ = self.serial_predecessor(previous_plan, False)
++            sf = {'kind', 'nonce', 'sheet', 'cell', 'from_value', 'to_value', 'output_filename'}
++            if (not isinstance(spec, dict) or set(spec) != sf or spec['kind'] != 'distinct-xlsx-copy'
++                    or not isinstance(spec['nonce'], str) or not re.fullmatch('[a-f0-9]{32}', spec['nonce'])
++                    or not isinstance(spec['sheet'], str) or not re.fullmatch('[A-Za-z][A-Za-z0-9_ -]{0,30}', spec['sheet'])
++                    or not isinstance(spec['cell'], str) or not re.fullmatch('[A-Z]{1,2}[1-9][0-9]{0,3}', spec['cell'])
++                    or any(type(spec[k]) is not int or not -1000000 <= spec[k] <= 1000000 for k in ('from_value', 'to_value'))
++                    or spec['from_value'] == spec['to_value']
++                    or len(scenario['steps']) != 1 or set(scenario['steps'][0]) != {'input', 'observe'}
++                    or not reply_capture(scenario['steps'][0]['observe'])):
++                raise Refused('Only one exact distinct XLSX copy task is admitted')
++            step = scenario['steps'][0]; upload = step['input']; previous = comparison['scenario']['steps'][0].get('input')
++            if previous is None:
++                raise Refused('Distinct document successor requires a preceding document task')
++            validate_capture(dict(mode='bounded_capture', max_bytes=MAX_FILE,
++                filename_equals=spec['output_filename'], mime_type_equals=UPLOAD_TYPES['xlsx'], caption_equals=spec['nonce']))
++            caption = ('Новая независимая задача ' + spec['nonce'] + '. Работай только с приложенным новым файлом '
++                       + upload['filename'] + '. На листе ' + spec['sheet'] + ' в ячейке ' + spec['cell'] + ' замени значение '
++                       + str(spec['from_value']) + ' на ' + str(spec['to_value']) + '; сохрани новую копию '
++                       + spec['output_filename'] + '. В подписи к ответному файлу укажи ровно: '
++                       + spec['nonce'] + '. Старые файлы и задания не повторять.')
++            if (upload['mime_type'] != UPLOAD_TYPES['xlsx'] or not upload['filename'].endswith('.xlsx')
++                    or not spec['output_filename'].endswith('.xlsx')
++                    or upload['sha256'] == previous['sha256'] or upload['path'] == previous['path']
++                    or Path(upload['path']).name == Path(previous['path']).name
++                    or (upload['stat']['device'], upload['stat']['inode']) == (previous['stat']['device'], previous['stat']['inode'])
++                    or len({upload['filename'], spec['output_filename'], previous['filename']}) != 3
++                    or upload['caption'] != caption or plan['new_run_id'] == comparison['id']
++                    or digest(encoded(scenario)) == comparison['scenario_sha256']
++                    or any(token in caption for token in (previous['filename'], previous['sha256'], comparison['id']))
++                    or not 1 <= step['observe']['max_documents'] <= 2
++                    or scenario['max_updates'] < len(updates) + step['observe']['max_messages'] + 1
++                    or scenario['deadline_seconds'] > 300 or step['observe']['window_seconds'] > 180
++                    or plan['ack_timeout_seconds'] + step['observe']['window_seconds'] + REPLY_WINDOW_RESERVE > scenario['deadline_seconds']):
++                raise Refused('New fixture, filename, effect, scenario and capacity must be distinct and finite')
++
++            if serial:
++                original = old['scenario']['steps'][0]['input']
++                if (upload['sha256'] == original['sha256'] or upload['path'] == original['path']
++                        or Path(upload['path']).name == Path(original['path']).name
++                        or (upload['stat']['device'], upload['stat']['inode']) == (original['stat']['device'], original['stat']['inode'])
++                        or original['filename'] in (upload['filename'], spec['output_filename'])
++                        or spec['nonce'] == previous_plan['new_task']['nonce']
++                        or previous_plan['new_task'].get('output_filename') in (upload['filename'], spec['output_filename'])
++                        or tuple(spec[k] for k in ('sheet', 'cell', 'from_value', 'to_value')) == tuple(previous_plan['new_task'].get(k) for k in ('sheet', 'cell', 'from_value', 'to_value'))
++                        or plan['predecessor']['semantic_review_reference'] is not None):
++                    raise Refused('Successive input, physical file, nonce, names and edit must be distinct')
+         if check_current:
+             if any(spec['nonce'] in encoded(self.store.get(path)).decode('ascii')
+                    for path in self.store.runs.glob('*.json')):
+@@ -1196,17 +1335,22 @@
+             raise Refused('Pinned canonical continuation plan and both locks required')
+         old, updates, prior = self.continuation_material(plan, True, consumer_fd, credential_fd)
+         self.recovery_guard(plan)
+-        # Fixed old-dispatch key, never reopened by new IDs/nonces/clock/scenario.
++        # Original dispatch or immediate admitted attempt: one successor per physical
++        # commitment, never reopened by new IDs/nonces/clock/scenario.
+         parent = secure_dir(self.store.root / 'continuations')
+-        (parent / plan['quarantine_key']).mkdir(mode=0o700)
++        key = self.continuation_key(plan)
++        (parent / key).mkdir(mode=0o700)
+         for directory in (self.store.root, parent):
+             fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+             try: os.fsync(fd)
+             finally: os.close(fd)
+-        name = 'continue-' + plan['quarantine_key'] + '.json'
+-        data = encoded(dict(schema='friday.tester.closed-unknown-admission.v1', plan=plan,
+-                            plan_sha256=plan_sha256, original_outcome='UNKNOWN', original_replayed=False,
+-                            status='ONE_NEW_EFFECT_ADMITTED_NO_RETRY', response_binding='UNBOUND'))
++        name = 'continue-' + key + '.json'
++        value = dict(schema='friday.tester.closed-unknown-admission.v1', plan=plan,
++                     plan_sha256=plan_sha256, original_outcome='UNKNOWN', original_replayed=False,
++                     status='ONE_NEW_EFFECT_ADMITTED_NO_RETRY', response_binding='UNBOUND')
++        if 'predecessor' in plan:
++            value['predecessor_cursor'] = self.store.get(self.store.root / 'cursor.json')
++        data = encoded(value)
+         if (self.store.root / name).exists():
+             raise Refused('Continuation admission already exists')
+         self.store.write(self.store.root / name, data)
+@@ -1233,6 +1377,13 @@
+         if admitted is None or not isinstance(message, dict):
+             return False
+         spec = admitted[0]['new_task']; doc = message.get('document')
++        if spec['kind'] == 'contextual-text-followup':
++            thread = message.get('reply_to_message', {})
++            text = message.get('text')
++            return (isinstance(thread, dict) and (not thread or (type(thread.get('message_id')) is int
++                    and thread['message_id'] == run['sent_message_id']))
++                    and isinstance(text, str) and text.startswith(spec['nonce'])
++                    and 'document' not in message)
+         thread = message.get('reply_to_message', {})
+         # An explicit OTHER thread is never overridden by a nonce. Missing thread
+         # may retain the exact nonce/name/MIME artifact, still UNBOUND/UNGRADED.
+@@ -1421,7 +1572,7 @@
+                 or run.get('capture_until') != commitment['capture_until']):
+             raise Refused('Bounded reply window commitment does not bind the exact run/clock/ack')
+ 
+-    def verify_reply_custody(self, run):
++    def verify_reply_custody(self, run, cursor=None):
+         # Unconditional recovery/terminal custody derived from the committed scenario:
+         # outbound task+ACK, window commitment, raw updates/cursor, every text receipt,
+         # and complete or incomplete document bytes with their receipts and raw joins.
+@@ -1439,7 +1590,7 @@
+                 or len(set(run['message_ids'])) != len(run['message_ids'])):
+             raise Refused('Bounded reply raw update/cursor join invalid')
+         self.reply_run = run
+-        captures, processed = self.receive_inventory(run)
++        captures, processed = self.receive_inventory(run, cursor)
+         if set(run['seen']) != set(processed):
+             raise Refused('Processed update inventory differs from independent receipt custody')
+         for uid, record in processed.items():
+@@ -1588,7 +1739,7 @@
+         if admitted is not None and (run.get('send_attempts') != 0 or run.get('send_state') != 'none'):
+             raise Refused('Continuation permits one send attempt, never retry')
+         if admitted is not None:
+-            claim = self.store.root / 'continuations' / admitted[0]['quarantine_key'] / 'SEND-ATTEMPT.json'
++            claim = self.store.root / 'continuations' / self.continuation_key(admitted[0]) / 'SEND-ATTEMPT.json'
+             fd = os.open(no_symlinks(claim), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+             with os.fdopen(fd, 'wb') as f:
+                 f.write(encoded(dict(run_id=run['id'], at=stamp(), no_retry=True)))
+@@ -1705,7 +1856,9 @@
+                 or type(result.get('date')) is not int or result['date'] < 0
+                 or (admitted is not None and (not isinstance(result.get('from'), dict)
+                     or result['from'].get('id') != TESTER or type(result['from'].get('id')) is not int
+-                    or result['from'].get('is_bot') is not True or result.get('caption') != upload['caption']))
++                    or result['from'].get('is_bot') is not True
++                    or (upload is not None and result.get('caption') != upload['caption'])
++                    or (upload is None and result.get('text') != step['request'])))
+                 or (upload is not None and (not valid_document_ack(result)
+                     or result.get('caption', '') != upload['caption']
+                     or ('file_size' in result['document']
+@@ -2178,7 +2331,9 @@
+             raise Refused('Cursor rewound behind committed capture inventory')
+         # Directory enumeration only detects extras. Required files always come from
+         # the independent commitment above, including the crash-before-process case.
+-        if cursor['offset'] == offset:
++        # Explicit historical cursors validate their own committed inventory. The
++        # live global cursor checker separately joins every current owner/raw pair.
++        if global_check and cursor['offset'] == offset:
+             for path in self.store.captures.glob('*.json'):
+                 stem = path.name.split('.')[0]
+                 if stem.isdigit() and int(stem) >= run['capture_start_offset'] and int(stem) not in captures:
+@@ -2286,7 +2441,8 @@
+                 or type(acknowledgement['from'].get('id')) is not int
+                 or acknowledgement['from']['id'] != TESTER
+                 or acknowledgement['from'].get('is_bot') is not True
+-                or acknowledgement.get('caption') != run['scenario']['steps'][0]['input']['caption']):
++                or ('input' in run['scenario']['steps'][0] and acknowledgement.get('caption') != run['scenario']['steps'][0]['input']['caption'])
++                or ('request' in run['scenario']['steps'][0] and acknowledgement.get('text') != run['scenario']['steps'][0]['request'])):
+             raise Refused('Continuation acknowledgement sender or exact task caption changed')
+         step = run['scenario']['steps'][run['step']]
+         metadata = run['request_metadata']
+@@ -2368,6 +2524,9 @@
+                        message_id=message['message_id'], update_id=uid, date=message['date'],
+                        raw_update={'basename': str(uid) + '.json', 'bytes': len(raw), 'sha256': digest(raw)},
+                        text_acceptance='RECEIVED_UNGRADED', acceptance='NOT_ESTABLISHED')
++        if 'continuation_reference' in run:
++            receipt['response_binding'] = 'NEW_NONCE_CONTRACT_UNBOUND_UNGRADED'
++            receipt['continuation'] = run['continuation_reference']
+         name = run['id'] + '-' + str(message['message_id']) + '-' + receipt['text_sha256'] + '.text-receipt.json'
+         target = self.store.downloads / name
+         data = encoded(receipt)
+@@ -2573,6 +2732,10 @@
+                     or message['date'] > until):
+                 # Outside the committed window (late arrival/replay or future-dated):
+                 # raw update retained as evidence, never counted as answer or downloaded.
++                self.finish_process(run, uid)
++                return
++        if admitted is not None and admitted[0]['new_task']['kind'] == 'contextual-text-followup':
++            if not nonce_document:
+                 self.finish_process(run, uid)
+                 return
+         if admitted is not None and 'document' in message:
