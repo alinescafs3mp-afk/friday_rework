@@ -1,0 +1,645 @@
+--- a/bot_tester.py
++++ b/bot_tester.py
+@@ -54,12 +54,45 @@
+ 
+ 
+ class Uncertain(Refused):
+-    def __init__(self, *args, cause_code='TRANSPORT_OUTCOME_UNKNOWN'):
++    def __init__(self, *args, cause_code='TRANSPORT_OUTCOME_UNKNOWN', phase_code='SEND_API_CALL'):
+         super().__init__(*args)
+         # Only owned local deadline sites opt in; timing never establishes cause.
+         self.cause_code = (cause_code if cause_code in (
+-            'LOCAL_HTTP_ALARM_DEADLINE', 'LOCAL_HTTP_BODY_DEADLINE')
++            'LOCAL_HTTP_ALARM_DEADLINE', 'LOCAL_HTTP_BODY_DEADLINE',
++            'TRANSPORT_TIMEOUT', 'TRANSPORT_URL_FAILURE', 'TRANSPORT_OS_FAILURE')
+             else 'TRANSPORT_OUTCOME_UNKNOWN')
++        self.phase_code = phase_code if phase_code in (
++            'HTTP_WHOLE_CALL', 'HTTP_REQUEST_OR_HEADERS', 'HTTP_RESPONSE_BODY',
++            'HTTP_RESPONSE_STATUS', 'HTTP_RESPONSE_ENVELOPE', 'SEND_API_CALL') else 'SEND_API_CALL'
++
++
++def send_failure_diagnostic(exc, phase='SEND_API_CALL'):
++    # Fixed diagnostic vocabulary only. Never serialize exception text/reason/URL.
++    phases = {'HTTP_WHOLE_CALL', 'HTTP_REQUEST_OR_HEADERS', 'HTTP_RESPONSE_BODY',
++              'HTTP_RESPONSE_STATUS', 'HTTP_RESPONSE_ENVELOPE', 'SEND_API_CALL'}
++    causes = {'LOCAL_HTTP_ALARM_DEADLINE', 'LOCAL_HTTP_BODY_DEADLINE',
++              'HTTP_STATUS_3XX', 'HTTP_STATUS_4XX', 'HTTP_STATUS_5XX', 'HTTP_STATUS_OTHER',
++              'TRANSPORT_TIMEOUT', 'TRANSPORT_URL_FAILURE', 'TRANSPORT_OS_FAILURE',
++              'TRANSPORT_OUTCOME_UNKNOWN'}
++    phase = phase if type(phase) is str and phase in phases else 'SEND_API_CALL'
++    if isinstance(exc, urllib.error.HTTPError):
++        status = exc.code
++        category = status // 100 if type(status) is int else None
++        return ('HTTP_STATUS_' + str(category) + 'XX' if category in (3, 4, 5)
++                else 'HTTP_STATUS_OTHER'), 'HTTP_RESPONSE_STATUS'
++    if isinstance(exc, TimeoutError):
++        return 'TRANSPORT_TIMEOUT', phase
++    if isinstance(exc, urllib.error.URLError):
++        return ('TRANSPORT_TIMEOUT' if isinstance(exc.reason, TimeoutError)
++                else 'TRANSPORT_URL_FAILURE'), phase
++    if isinstance(exc, OSError):
++        return 'TRANSPORT_OS_FAILURE', phase
++    if isinstance(exc, Refused):
++        code = getattr(exc, 'cause_code', None)
++        supplied_phase = getattr(exc, 'phase_code', None)
++        return (code if type(code) is str and code in causes else 'TRANSPORT_OUTCOME_UNKNOWN',
++                supplied_phase if type(supplied_phase) is str and supplied_phase in phases else phase)
++    return 'TRANSPORT_OUTCOME_UNKNOWN', phase
+ 
+ 
+ class RateLimited(Refused):
+@@ -79,7 +112,7 @@
+         raise Refused('Existing process alarm prevents safe network deadline ownership')
+     def expired(signum, frame):
+         raise Uncertain('Whole HTTP deadline expired; preserve uncertain send',
+-                        cause_code='LOCAL_HTTP_ALARM_DEADLINE')
++                        cause_code='LOCAL_HTTP_ALARM_DEADLINE', phase_code='HTTP_WHOLE_CALL')
+     signal.signal(signal.SIGALRM, expired)
+     signal.setitimer(signal.ITIMER_REAL, seconds)
+     try:
+@@ -423,7 +456,7 @@
+                     while True:
+                         if time.monotonic() >= expires:
+                             raise Uncertain('Network deadline expired; outcome unknown',
+-                                            cause_code='LOCAL_HTTP_BODY_DEADLINE')
++                                            cause_code='LOCAL_HTTP_BODY_DEADLINE', phase_code='HTTP_RESPONSE_BODY')
+                         # read1 performs at most one buffered/socket read, so a drip-fed
+                         # response cannot extend the deadline by filling a large read.
+                         chunk = response.read1(min(65536, limit + 1 - size))
+@@ -448,7 +481,9 @@
+                     if isinstance(exc, urllib.error.HTTPError):
+                         raise
+                     # Mid-read resets/timeouts keep the capped received prefix as evidence.
+-                    uncertain = Uncertain('Transport outcome unknown; never blindly resend')
++                    code, phase = send_failure_diagnostic(exc, 'HTTP_RESPONSE_BODY')
++                    uncertain = Uncertain('Transport outcome unknown; never blindly resend',
++                                          cause_code=code, phase_code=phase)
+                     if size:
+                         uncertain.bounded_body = b''.join(chunks)[:limit]
+                         uncertain.received_at_least = size
+@@ -463,13 +498,17 @@
+                         raise RateLimited(retry) from None
+                 except (ValueError, TypeError):
+                     pass
+-                raise Refused('Telegram HTTP rejection; response intentionally withheld') from None
++                refused = Refused('Telegram HTTP rejection; response intentionally withheld')
++                refused.cause_code, refused.phase_code = send_failure_diagnostic(exc)
++                raise refused from None
+             finally:
+                 # Python 3.14 warns on implicit HTTPError cleanup using repr(msg).
+                 # The reason is server-controlled and may contain a credential.
+                 exc.close()
+-        except (urllib.error.URLError, TimeoutError, OSError):
+-            raise Uncertain('Transport outcome unknown; never blindly resend') from None
++        except (urllib.error.URLError, TimeoutError, OSError) as exc:
++            code, phase = send_failure_diagnostic(exc, 'HTTP_REQUEST_OR_HEADERS')
++            raise Uncertain('Transport outcome unknown; never blindly resend',
++                            cause_code=code, phase_code=phase) from None
+         if len(data) > limit:
+             raise Refused('Response size bound exceeded')
+         return data
+@@ -833,7 +872,7 @@
+             self.store.put(action / 'TERMINAL.json', terminal)
+             raise
+ 
+-    def unknown_reconciliation_context(self, plan, consumer_fd=None, credential_fd=None):
++    def unknown_reconciliation_context(self, plan, consumer_fd=None, credential_fd=None, *, continuation_validation=False):
+         # This is quarantine of one bounded receive batch, NEVER a new product query.
+         # Local operator pins are not evidence of product delivery or runtime adoption.
+         fields = {'schema', 'operator', 'action_id', 'run_id', 'run_sha256',
+@@ -857,14 +896,16 @@
+                        for k in ('source', 'installed', 'layers', 'project', 'native'))
+                 or context['native'] != 0 or context['service_owner'] != 'Root'):
+             raise Refused('Root must explicitly bind the current product tuple; native must remain zero')
+-        # Validate the same finite fresh clock schema as existing read-only recovery.
++        # The public v1 reconciliation always remains <=120s. The separately
++        # acknowledged NEW-effect admission reuses only these local evidence checks.
++        clock_limit = 300 if continuation_validation else 120
+         clock = plan['clock']
+         if (not isinstance(clock, dict) or set(clock) != {'boot_id', 'origin_monotonic', 'deadline_monotonic'}
+                 or not isinstance(clock['boot_id'], str)
+                 or not re.fullmatch('[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', clock['boot_id'])
+                 or any(type(clock[k]) not in (int, float) or not math.isfinite(clock[k])
+                        for k in ('origin_monotonic', 'deadline_monotonic'))
+-                or not 0 <= clock['origin_monotonic'] < clock['deadline_monotonic'] <= clock['origin_monotonic'] + 120):
++                or not 0 <= clock['origin_monotonic'] < clock['deadline_monotonic'] <= clock['origin_monotonic'] + clock_limit):
+             raise Refused('Bind one fresh reconciliation clock of at most 120 seconds')
+         self.recovery_guard(plan)
+         root_stat = no_symlinks(self.store.root).stat()
+@@ -1016,6 +1057,212 @@
+             self.store.put(action / 'TERMINAL.json', terminal)
+             raise
+ 
++    def continuation_material(self, plan, check_current=False, consumer_fd=None, credential_fd=None):
++        # A separate explicit new effect. Never reclassifies or resumes the unknown.
++        fields = {'schema', 'operator', 'action_id', 'new_run_id', 'new_scenario',
++                  'new_task', 'quarantine_key', 'intent_sha256', 'terminal_sha256',
++                  'response_sha256', 'clock', 'current_tuple', 'ack_timeout_seconds', 'acknowledgement'}
++        if (not isinstance(plan, dict) or set(plan) != fields
++                or plan['schema'] != 'friday.tester.continue-closed-unknown.v1'
++                or plan['operator'] != 'Root'
++                or type(plan['ack_timeout_seconds']) is not int or not 10 <= plan['ack_timeout_seconds'] <= 30
++                or plan['acknowledgement'] != 'OLD_OUTCOME_UNKNOWN_NO_REPLAY_NEW_DISTINCT_EFFECT_AUTHORIZED'):
++            raise Refused('Exact Root closed-ambiguity acknowledgement required')
++        for k in ('action_id', 'new_run_id'):
++            self.store.run_path(plan[k])
++        for k in ('quarantine_key', 'intent_sha256', 'terminal_sha256', 'response_sha256'):
++            if not isinstance(plan[k], str) or not re.fullmatch('[a-f0-9]{64}', plan[k]):
++                raise Refused('Exact quarantine commitments required')
++        action = self.store.root / 'reconciliations' / plan['quarantine_key']
++        values = []
++        for name, key in [('INTENT.json', 'intent_sha256'), ('TERMINAL.json', 'terminal_sha256'),
++                          ('response.private.json', 'response_sha256')]:
++            raw = safe_read(action / name)
++            if digest(raw) != plan[key]:
++                raise Refused('Quarantine custody changed')
++            values.append(json.loads(raw, object_pairs_hook=unique_object))
++        intent, terminal, wire = values
++        prior = intent.get('plan')
++        if (not isinstance(prior, dict) or digest(encoded(prior)) != intent.get('plan_sha256')
++                or intent.get('status') != 'ADMITTED_ONCE_NO_RETRY'
++                or terminal.get('status') != 'RECEIVE_BATCH_QUARANTINED_UNGRADED'
++                or terminal.get('saturated') is not False or terminal.get('response_binding') != 'UNBOUND'
++                or terminal.get('original_send_outcome') != 'UNKNOWN'
++                or terminal.get('response_sha256') != plan['response_sha256']
++                or terminal.get('acceptance') != 'NOT_ESTABLISHED'):
++            raise Refused('Only a complete unsaturated ungraded quarantine batch can hand off')
++        # Validate historical evidence with its original immutable clock, but only the
++        # separate fresh clock governs NEW effects. No historical plan is rewritten.
++        old_raw = safe_read(self.store.run_path(prior['run_id']))
++        old = json.loads(old_raw, object_pairs_hook=unique_object)
++        if (digest(old_raw) != prior['run_sha256'] or old.get('status') != 'UNKNOWN_SEND'
++                or old.get('send_state') != 'unknown' or self.clock() < old['deadline']
++                or old.get('scenario_sha256') != prior['scenario_sha256']
++                or old.get('send_attempts') != 1 or old.get('sent_ids') != []):
++            raise Refused('Closed unknown predecessor changed')
++        task = self.read_reference(old.get('sent_task_reference'))
++        key = digest(encoded(dict(tester_id=TESTER, peer_id=PEER,
++                    task_sha256=old['sent_task_reference']['sha256'], scenario_sha256=old['scenario_sha256'],
++                    dispatched_at=old['send_dispatch_at'], step=0, send_attempts=1)))
++        if (key != plan['quarantine_key'] or task != old.get('request_metadata')
++                or old['sent_task_reference']['sha256'] != prior['task_sha256']):
++            raise Refused('Original physical dispatch commitment changed')
++        updates = wire.get('result') if isinstance(wire, dict) and wire.get('ok') is True else None
++        cursor_raw = safe_read(self.store.root / 'cursor.json')
++        if (not isinstance(updates, list) or len(updates) >= prior['max_updates']
++                or terminal.get('update_count') != len(updates)
++                or any(not isinstance(u, dict) or type(u.get('update_id')) is not int
++                       or u['update_id'] < old['capture_start_offset'] or len(encoded(u)) > 256 * 1024
++                       for u in updates)
++                or [u['update_id'] for u in updates] != sorted({u['update_id'] for u in updates})):
++            raise Refused('Quarantine IDs, order or finite capture bounds invalid')
++        scenario = validate_scenario(plan['new_scenario'])
++        spec = plan['new_task']
++        sf = {'kind', 'nonce', 'sheet', 'cell', 'from_value', 'to_value', 'output_filename'}
++        if (not isinstance(spec, dict) or set(spec) != sf or spec['kind'] != 'distinct-xlsx-copy'
++                or not isinstance(spec['nonce'], str) or not re.fullmatch('[a-f0-9]{32}', spec['nonce'])
++                or not isinstance(spec['sheet'], str) or not re.fullmatch('[A-Za-z][A-Za-z0-9_ -]{0,30}', spec['sheet'])
++                or not isinstance(spec['cell'], str) or not re.fullmatch('[A-Z]{1,2}[1-9][0-9]{0,3}', spec['cell'])
++                or any(type(spec[k]) is not int or not -1000000 <= spec[k] <= 1000000 for k in ('from_value', 'to_value'))
++                or spec['from_value'] == spec['to_value']
++                or len(scenario['steps']) != 1 or set(scenario['steps'][0]) != {'input', 'observe'}
++                or not reply_capture(scenario['steps'][0]['observe'])):
++            raise Refused('Only one exact distinct XLSX copy task is admitted')
++        step = scenario['steps'][0]; upload = step['input']; previous = old['scenario']['steps'][0]['input']
++        validate_capture(dict(mode='bounded_capture', max_bytes=MAX_FILE,
++            filename_equals=spec['output_filename'], mime_type_equals=UPLOAD_TYPES['xlsx'], caption_equals=spec['nonce']))
++        caption = ('Новая независимая задача ' + spec['nonce'] + '. Работай только с приложенным новым файлом '
++                   + upload['filename'] + '. На листе ' + spec['sheet'] + ' в ячейке ' + spec['cell'] + ' замени значение '
++                   + str(spec['from_value']) + ' на ' + str(spec['to_value']) + '; сохрани новую копию '
++                   + spec['output_filename'] + '. В подписи к ответному файлу укажи ровно: '
++                   + spec['nonce'] + '. Старые файлы и задания не повторять.')
++        if (upload['mime_type'] != UPLOAD_TYPES['xlsx'] or not upload['filename'].endswith('.xlsx')
++                or not spec['output_filename'].endswith('.xlsx')
++                or upload['sha256'] == previous['sha256'] or upload['path'] == previous['path']
++                or Path(upload['path']).name == Path(previous['path']).name
++                or (upload['stat']['device'], upload['stat']['inode']) == (previous['stat']['device'], previous['stat']['inode'])
++                or len({upload['filename'], spec['output_filename'], previous['filename']}) != 3
++                or upload['caption'] != caption or plan['new_run_id'] == old['id']
++                or digest(encoded(scenario)) == old['scenario_sha256']
++                or any(token in caption for token in (previous['filename'], previous['sha256'], old['id']))
++                or not 1 <= step['observe']['max_documents'] <= 2
++                or scenario['max_updates'] < len(updates) + step['observe']['max_messages'] + 1
++                or scenario['deadline_seconds'] > 300 or step['observe']['window_seconds'] > 180
++                or plan['ack_timeout_seconds'] + step['observe']['window_seconds'] + REPLY_WINDOW_RESERVE > scenario['deadline_seconds']):
++            raise Refused('New fixture, filename, effect, scenario and capacity must be distinct and finite')
++        if check_current:
++            if any(spec['nonce'] in encoded(self.store.get(path)).decode('ascii')
++                   for path in self.store.runs.glob('*.json')):
++                raise Refused('Continuation nonce must be absent from all prior run history')
++            # Reuse exact existing inode/credential/closed-send/receive authority checks.
++            # This is validation of a new plan, not mutation/reuse of historical authority.
++            current = dict(prior, clock=plan['clock'], current_tuple=plan['current_tuple'])
++            run, cursor, checked_key = self.unknown_reconciliation_context(current, consumer_fd, credential_fd, continuation_validation=True)
++            if (checked_key != key or digest(cursor_raw) != prior['cursor_sha256']
++                    or any(u['update_id'] < cursor['offset'] for u in updates)):
++                raise Refused('Initial protected cursor or original dispatch changed')
++        return old, updates, prior
++
++    def continuation_receipt(self, run):
++        # The independently retained admission obliges this run even if its mutable
++        # field is removed. The immutable send-window/receive chain also binds it.
++        matches = []
++        for path in self.store.root.glob('continue-*.json'):
++            value = self.store.get(path)
++            if value.get('plan', {}).get('new_run_id') == run['id']:
++                raw = safe_read(path)
++                matches.append((value, dict(basename=path.name, bytes=len(raw), sha256=digest(raw))))
++        if not matches and 'continuation_reference' not in run:
++            return None
++        if len(matches) != 1 or run.get('continuation_reference') != matches[0][1]:
++            raise Refused('Mandatory continuation admission missing or changed')
++        value, ref = matches[0]; plan = value['plan']
++        if (value.get('plan_sha256') != digest(encoded(plan))
++                or run['scenario'] != plan['new_scenario'] or run['step'] != 0
++                or run['id'] != plan['new_run_id']):
++            raise Refused('Continuation task commitment changed')
++        old, updates, prior = self.continuation_material(plan)
++        root = no_symlinks(self.store.root).stat()
++        if (prior['state_identity'] != dict(path=str(self.store.root), device=root.st_dev, inode=root.st_ino, uid=root.st_uid)
++                or root.st_uid != os.getuid() or stat.S_IMODE(root.st_mode) != 0o700):
++            raise Refused('Continuation state root changed')
++        for name, field in [('consumer.lock', 'consumer_identity'), ('tester-token', 'credential_identity')]:
++            if input_stat(no_symlinks(self.store.root / name).stat()) != prior[field]:
++                raise Refused('Continuation consumer or credential identity changed')
++        return plan, updates, ref
++
++    def continue_unknown(self, plan, plan_sha256, consumer_fd, credential_fd):
++        if digest(encoded(plan)) != plan_sha256 or consumer_fd is None or credential_fd is None:
++            raise Refused('Pinned canonical continuation plan and both locks required')
++        old, updates, prior = self.continuation_material(plan, True, consumer_fd, credential_fd)
++        self.recovery_guard(plan)
++        # Fixed old-dispatch key, never reopened by new IDs/nonces/clock/scenario.
++        parent = secure_dir(self.store.root / 'continuations')
++        (parent / plan['quarantine_key']).mkdir(mode=0o700)
++        for directory in (self.store.root, parent):
++            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++            try: os.fsync(fd)
++            finally: os.close(fd)
++        name = 'continue-' + plan['quarantine_key'] + '.json'
++        data = encoded(dict(schema='friday.tester.closed-unknown-admission.v1', plan=plan,
++                            plan_sha256=plan_sha256, original_outcome='UNKNOWN', original_replayed=False,
++                            status='ONE_NEW_EFFECT_ADMITTED_NO_RETRY', response_binding='UNBOUND'))
++        if (self.store.root / name).exists():
++            raise Refused('Continuation admission already exists')
++        self.store.write(self.store.root / name, data)
++        ref = dict(basename=name, bytes=len(data), sha256=digest(data))
++        run = self.new(plan['new_run_id'], plan['new_scenario'], continuation=ref)
++        self.send(run)
++        self.observe(run)
++        return dict(run_id=run['id'], status=run['status'], original_outcome='UNKNOWN',
++                    acceptance='NOT_ESTABLISHED', artifact_acceptance=run.get('artifact_acceptance', 'NOT_ESTABLISHED'))
++
++    def send_ack_budget(self, run):
++        admitted = self.continuation_receipt(run)
++        if admitted is None:
++            if 'new_ack_timeout_seconds' in run:
++                raise Refused('Legacy or old run cannot override its original ACK bound')
++            return REPLY_ACK_RESERVE
++        value = admitted[0]['ack_timeout_seconds']
++        if run.get('new_ack_timeout_seconds') != value or type(run.get('new_ack_timeout_seconds')) is not int:
++            raise Refused('New operation ACK bound differs from its immutable admission')
++        return value
++
++    def continuation_document_match(self, run, message):
++        admitted = self.continuation_receipt(run)
++        if admitted is None or not isinstance(message, dict):
++            return False
++        spec = admitted[0]['new_task']; doc = message.get('document')
++        thread = message.get('reply_to_message', {})
++        # An explicit OTHER thread is never overridden by a nonce. Missing thread
++        # may retain the exact nonce/name/MIME artifact, still UNBOUND/UNGRADED.
++        return (isinstance(doc, dict) and isinstance(thread, dict)
++                and (not thread or (type(thread.get('message_id')) is int
++                     and thread['message_id'] == run['sent_message_id']))
++                and doc.get('file_name') == spec['output_filename']
++                and doc.get('mime_type') == UPLOAD_TYPES['xlsx']
++                and message.get('caption') == spec['nonce'])
++
++    def import_quarantine(self, run):
++        admitted = self.continuation_receipt(run)
++        if admitted is None:
++            return
++        plan, updates, ref = admitted
++        # A real fresh ACK/window/seed exists. Import arrival means HOST IMPORT time,
++        # never historical network arrival. All imported records are UNBOUND.
++        self.verify_capture_context(run)
++        for update in updates:
++            captures, processed = self.receive_inventory(run)
++            uid = update['update_id']
++            if uid not in processed:
++                self.capture_reply(run, update)
++                self.process(run, update)
++            elif safe_read(self.store.captures / (str(uid) + '.json')) != encoded(update):
++                raise Refused('Quarantine capture changed')
++        captures, processed = self.receive_inventory(run)
++        if any(u['update_id'] not in processed for u in updates):
++            raise Refused('Quarantine handoff incomplete; no receive ACK permitted')
++
+     def save(self, run):
+         data = encoded(run)
+         if len(data) > MAX_JSON:
+@@ -1076,12 +1323,21 @@
+         expected = run['scenario']['steps'][run['step']]['observe']
+         return (type(dispatched) in (int, float) and math.isfinite(dispatched)
+                 and type(sent) in (int, float) and math.isfinite(sent)
+-                and run.get('send_timeout_seconds') == REPLY_ACK_RESERVE
+-                and dispatched <= sent <= dispatched + REPLY_ACK_RESERVE
+-                and dispatched + REPLY_ACK_RESERVE + expected['window_seconds']
++                and run.get('send_timeout_seconds') == self.send_ack_budget(run)
++                and dispatched <= sent <= dispatched + self.send_ack_budget(run)
++                and dispatched + self.send_ack_budget(run) + expected['window_seconds']
+                     + REPLY_WINDOW_RESERVE <= run['deadline'])
+ 
+     def guard(self, run):
++        continuation = self.continuation_receipt(run)
++        monotonic_budget = 10
++        if continuation is not None:
++            monotonic_budget = self.recovery_guard(continuation[0])
++            if run.get('send_state') in ('none', 'intent'):
++                old, updates, prior = self.continuation_material(continuation[0])
++                if digest(safe_read(self.store.root / 'cursor.json')) != prior['cursor_sha256']:
++                    raise Refused('Continuation receive cursor drifted before new outbound effect')
++                self.cursor_offsets(self.store.get(self.store.root / 'cursor.json'))
+         if (self.store.root / 'observer-stop.json').exists():
+             raise Refused('Observer stopped; product cancellation is separate')
+         if self.clock() >= run['deadline']:
+@@ -1089,7 +1345,9 @@
+         cooldown = self.store.get(self.store.root / 'cooldown.json', {})
+         if self.clock() < cooldown.get('until', 0):
+             raise Refused('retry_after cooldown active; no network request allowed')
+-        return min(10, run['deadline'] - self.clock())
++        if continuation is not None:
++            monotonic_budget = self.recovery_guard(continuation[0])  # Sample after durable validation reads.
++        return min(10, monotonic_budget, run['deadline'] - self.clock())
+ 
+     def cooldown(self, exc):
+         self.store.put(self.store.root / 'cooldown.json', {'until': self.clock() + exc.seconds, 'seconds': exc.seconds})
+@@ -1154,10 +1412,11 @@
+                 or commitment['sent_at'] + expected['window_seconds']
+                    + REPLY_WINDOW_RESERVE > commitment['deadline']
+                 or commitment.get('send_dispatch_at') != run.get('send_dispatch_at')
+-                or commitment.get('send_timeout_seconds') != REPLY_ACK_RESERVE
++                or commitment.get('send_timeout_seconds') != self.send_ack_budget(run)
+                 or not self.valid_send_budget(run)
+                 or commitment.get('ack') != run.get('sent_api_ack_reference')
+                 or commitment.get('task') != run.get('sent_task_reference')
++                or commitment.get('continuation') != run.get('continuation_reference')
+                 or run.get('sent_at') != commitment['sent_at']
+                 or run.get('capture_until') != commitment['capture_until']):
+             raise Refused('Bounded reply window commitment does not bind the exact run/clock/ack')
+@@ -1244,7 +1503,8 @@
+                     or message.get('chat', {}).get('id') != PEER
+                     or message.get('from', {}).get('id') != PEER
+                     or message.get('from', {}).get('is_bot') is not True
+-                    or message.get('reply_to_message', {}).get('message_id') != run['sent_message_id']):
++                    or (message.get('reply_to_message', {}).get('message_id') != run['sent_message_id']
++                        and not self.continuation_document_match(run, message))):
+                 raise Refused('Reply raw update custody/binding mismatch')
+             if observation.get('kind') == 'reply_text':
+                 raw_reference = observation.get('raw_update', {})
+@@ -1282,14 +1542,23 @@
+                            if k not in ('receipt_path', 'receipt_sha256', 'receipt_bytes')}):
+                 raise Refused('Reply evidence receipt custody changed')
+ 
+-    def new(self, name, scenario):
++    def new(self, name, scenario, continuation=None):
+         validate_scenario(scenario)
+         self.cursor_offsets(self.store.get(self.store.root / 'cursor.json', {'offset': 0}))
+         path = self.store.run_path(name)
+         if path.exists():
+             raise Refused('Run ID already used; inspect or resume, never replay')
++        admitted = None
++        if continuation is not None:
++            value = self.read_reference(continuation)
++            admitted = value['plan']
++            self.continuation_material(admitted, True)
++            if name != admitted['new_run_id'] or scenario != admitted['new_scenario']:
++                raise Refused('Admission binds a different new task')
+         for old in self.store.runs.glob('*.json'):
+             previous = self.store.get(old)
++            if admitted is not None and previous['id'] == self.store.get(self.store.root / 'reconciliations' / admitted['quarantine_key'] / 'INTENT.json')['plan']['run_id']:
++                continue
+             if previous['status'] not in ('EVIDENCE_READY', 'STOPPED', 'FAILED'):
+                 raise Refused('Unfinished prior run blocks new work')
+             if previous.get('send_state') in ('intent', 'unknown'):
+@@ -1302,10 +1571,33 @@
+                'seen': [], 'message_ids': [], 'observations': [], 'update_count': 0,
+                'last_text': None, 'repeat_count': 0, 'send_attempts': 0,
+                'capture_start_offset': self.store.get(self.store.root / 'cursor.json', {'offset': 0})['offset']}
++        if continuation is not None:
++            run['continuation_reference'] = continuation
++            run['new_ack_timeout_seconds'] = admitted['ack_timeout_seconds']
++            run['deadline'] = min(run['deadline'], self.clock() + admitted['clock']['deadline_monotonic'] - time.monotonic())
+         self.save(run)
+         return run
+ 
+     def send(self, run):
++        admitted = self.continuation_receipt(run)
++        ack_budget = self.send_ack_budget(run)
++        def monotonic_window_fits():
++            return (admitted is None or time.monotonic() + ack_budget
++                    + run['scenario']['steps'][run['step']]['observe']['window_seconds']
++                    + REPLY_WINDOW_RESERVE <= admitted[0]['clock']['deadline_monotonic'])
++        if admitted is not None and (run.get('send_attempts') != 0 or run.get('send_state') != 'none'):
++            raise Refused('Continuation permits one send attempt, never retry')
++        if admitted is not None:
++            claim = self.store.root / 'continuations' / admitted[0]['quarantine_key'] / 'SEND-ATTEMPT.json'
++            fd = os.open(no_symlinks(claim), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
++            with os.fdopen(fd, 'wb') as f:
++                f.write(encoded(dict(run_id=run['id'], at=stamp(), no_retry=True)))
++                f.flush(); os.fsync(f.fileno())
++            fd = os.open(claim.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++            try: os.fsync(fd)
++            finally: os.close(fd)
++        if admitted is None and any(self.store.get(p).get('send_state') in ('intent', 'unknown') for p in self.store.runs.glob('*.json') if p != self.store.run_path(run['id'])):
++            raise Refused('Unresolved predecessor requires exact new-task admission')
+         self.cursor_offsets(self.store.get(self.store.root / 'cursor.json', {'offset': 0}))
+         if run['send_state'] in ('intent', 'unknown', 'sent', 'refused_pre_request'):
+             raise Refused('Existing or uncertain send must never be reissued')
+@@ -1320,7 +1612,7 @@
+         reply = reply_capture(step['observe'])
+         self.reply_run = None
+         self.legacy_run = None if reply else run
+-        if reply and self.clock() + REPLY_ACK_RESERVE + step['observe']['window_seconds'] + REPLY_WINDOW_RESERVE > run['deadline']:
++        if reply and (self.clock() + ack_budget + step['observe']['window_seconds'] + REPLY_WINDOW_RESERVE > run['deadline'] or not monotonic_window_fits()):
+             raise Refused('Bounded reply window does not fit the remaining original deadline; nothing sent')
+         upload = step.get('input')
+         body = content_type = None
+@@ -1365,7 +1657,7 @@
+         self.save(run)  # Crash from this point is ambiguous, never a replay grant.
+         try:
+             remaining = self.guard(run)
+-            if reply and self.clock() + REPLY_ACK_RESERVE + step['observe']['window_seconds'] + REPLY_WINDOW_RESERVE > run['deadline']:
++            if reply and (self.clock() + ack_budget + step['observe']['window_seconds'] + REPLY_WINDOW_RESERVE > run['deadline'] or not monotonic_window_fits()):
+                 # Preflight/custody may have consumed the mandatory window+reserve.
+                 raise Refused('Bounded reply window no longer fits the original deadline; nothing sent')
+         except Refused:
+@@ -1373,15 +1665,15 @@
+             self.save(run)
+             raise
+         if reply:
+-            run.update(send_dispatch_at=self.clock(), send_timeout_seconds=REPLY_ACK_RESERVE)
++            run.update(send_dispatch_at=self.clock(), send_timeout_seconds=ack_budget)
+             self.save(run)
+-            if self.clock() + REPLY_ACK_RESERVE + step['observe']['window_seconds'] + REPLY_WINDOW_RESERVE > run['deadline']:
++            if (self.clock() + ack_budget + step['observe']['window_seconds'] + REPLY_WINDOW_RESERVE > run['deadline'] or not monotonic_window_fits()):
+                 run.update(send_state='refused_pre_request', status='PRE_REQUEST_REFUSED')
+                 self.save(run)
+                 raise Refused('ACK, full receive window and cleanup no longer fit; nothing sent')
+             # The real BotAPI enforces this whole-call bound including DNS/TLS/body.
+             run['send_dispatch_at'] = self.clock()
+-            remaining = REPLY_ACK_RESERVE
++            remaining = ack_budget
+         try:
+             if upload is not None:
+                 result = self.api.send_document(body, content_type, timeout=remaining)
+@@ -1392,13 +1684,15 @@
+             run.update(send_state='not_sent_rate_limited', status='RATE_LIMITED')
+             self.save(run)
+             raise
+-        except Exception:
+-            run.update(send_state='unknown', status='UNKNOWN_SEND')
++        except Exception as exc:
++            code, phase = send_failure_diagnostic(exc)
++            run.update(send_state='unknown', status='UNKNOWN_SEND',
++                       send_failure_cause=code, send_failure_phase=phase)
+             self.save(run)
+             raise Refused('Send outcome unknown; preserve evidence and reconcile, do not resend') from None
+         ack_received_at = self.clock()
+         self.keep_ack(run, result)  # Preserve bounded exact acknowledgement before validation.
+-        if reply and not run['send_dispatch_at'] <= ack_received_at <= run['send_dispatch_at'] + REPLY_ACK_RESERVE:
++        if reply and not run['send_dispatch_at'] <= ack_received_at <= run['send_dispatch_at'] + ack_budget:
+             run.update(send_state='unknown', status='ACK_DEADLINE_VIOLATION')
+             self.save(run)
+             raise Refused('Send exceeded the admitted whole-call ACK budget; never resend')
+@@ -1409,6 +1703,9 @@
+                 or result['chat'].get('type') != 'private'
+                 or type(result.get('message_id')) is not int or result['message_id'] <= 0
+                 or type(result.get('date')) is not int or result['date'] < 0
++                or (admitted is not None and (not isinstance(result.get('from'), dict)
++                    or result['from'].get('id') != TESTER or type(result['from'].get('id')) is not int
++                    or result['from'].get('is_bot') is not True or result.get('caption') != upload['caption']))
+                 or (upload is not None and (not valid_document_ack(result)
+                     or result.get('caption', '') != upload['caption']
+                     or ('file_size' in result['document']
+@@ -1443,6 +1740,8 @@
+                           'window_seconds': step['observe']['window_seconds'],
+                           'ack': run['sent_api_ack_reference'],
+                           'task': run.get('sent_task_reference')}
++            if admitted is not None:
++                commitment['continuation'] = run['continuation_reference']
+             commitment_raw = encoded(commitment)
+             commitment_name = 'send-window-' + run['id'] + '-' + str(run['step']) + '-' + str(run['send_attempts']) + '.json'
+             commitment_path = self.store.root / commitment_name
+@@ -1510,10 +1809,13 @@
+         return run['id'] + '-' + str(run['step']) + '-' + str(run['send_attempts'])
+ 
+     def receive_context(self, run):
+-        return dict(self.capture_binding(run), tester_id=TESTER, peer_id=PEER,
++        context = dict(self.capture_binding(run), tester_id=TESTER, peer_id=PEER,
+                     window=run['sent_window_reference'], deadline=run['deadline'],
+                     capture_start_offset=run['capture_start_offset'],
+                     prior_tracking=run['reply_capture_prior_tracking'])
++        if 'continuation_reference' in run:
++            context['continuation'] = run['continuation_reference']
++        return context
+ 
+     def read_reference(self, reference, expected_name=None):
+         if (not isinstance(reference, dict) or set(reference) != {'basename', 'bytes', 'sha256'}
+@@ -1979,6 +2281,13 @@
+                 raise Refused('Capture outbound acknowledgement message/context mismatch')
+         except (ValueError, TypeError, KeyError, AttributeError):
+             raise Refused('Capture outbound acknowledgement invalid') from None
++        admitted = self.continuation_receipt(run)
++        if admitted is not None and (not isinstance(acknowledgement.get('from'), dict)
++                or type(acknowledgement['from'].get('id')) is not int
++                or acknowledgement['from']['id'] != TESTER
++                or acknowledgement['from'].get('is_bot') is not True
++                or acknowledgement.get('caption') != run['scenario']['steps'][0]['input']['caption']):
++            raise Refused('Continuation acknowledgement sender or exact task caption changed')
+         step = run['scenario']['steps'][run['step']]
+         metadata = run['request_metadata']
+         task_ref = run.get('sent_task_reference', {})
+@@ -2039,6 +2348,9 @@
+                        caption=message.get('caption', ''), declared_selectors=expectation,
+                        complete_artifact=complete and len(data) == message['document'].get('file_size') == info.get('file_size'),
+                        artifact_acceptance='RECEIVED_UNGRADED', acceptance='NOT_ESTABLISHED')
++        if 'continuation_reference' in run:
++            receipt['response_binding'] = 'NEW_NONCE_CONTRACT_UNBOUND_UNGRADED'
++            receipt['continuation'] = run['continuation_reference']
+         receipt_path = target.with_suffix('.receipt.json')
+         if receipt_path.exists() and safe_read(receipt_path) != encoded(receipt):
+             raise Refused('Conflicting retained artifact receipt; first evidence preserved')
+@@ -2223,6 +2535,10 @@
+         run['update_count'] += 1
+         if run['update_count'] > run['scenario']['max_updates']:
+             raise Refused('Update bound exceeded')
++        admitted = self.continuation_receipt(run)
++        if admitted is not None and any(u['update_id'] == uid for u in admitted[1]):
++            self.finish_process(run, uid)  # Immutable initial quarantine: UNBOUND, no semantic/download.
++            return
+         message = update.get('message')
+         if not isinstance(message, dict):
+             self.finish_process(run, uid)
+@@ -2242,7 +2558,8 @@
+         if type(mid) is not int or mid in run['message_ids']:
+             self.finish_process(run, uid)
+             return
+-        if (message.get('reply_to_message', {}).get('message_id') != run['sent_message_id']
++        nonce_document = self.continuation_document_match(run, message)
++        if ((message.get('reply_to_message', {}).get('message_id') != run['sent_message_id'] and not nonce_document)
+                 or type(message.get('date')) is not int or message['date'] < run['sent_date']):
+             self.finish_process(run, uid)
+             return
+@@ -2258,9 +2575,15 @@
+                 # raw update retained as evidence, never counted as answer or downloaded.
+                 self.finish_process(run, uid)
+                 return
++        if admitted is not None and 'document' in message:
++            task = admitted[0]['new_task']; doc = message['document']
++            if (not isinstance(doc, dict) or doc.get('file_name') != task['output_filename']
++                    or doc.get('mime_type') != UPLOAD_TYPES['xlsx'] or message.get('caption') != task['nonce']):
++                self.finish_process(run, uid)  # Captured UNBOUND; not the exact new artifact contract.
++                return
+         if capture_step:
+             if (type(chat.get('id')) is not int or type(sender.get('id')) is not int or mid <= 0
+-                    or type(message.get('reply_to_message', {}).get('message_id')) is not int
++                    or (type(message.get('reply_to_message', {}).get('message_id')) is not int and not nonce_document)
+                     or type(uid) is not int or uid < 0
+                     or message['date'] > self.clock() + 30):
+                 raise Refused('Capture requires exact authenticated numeric context and bounded date')
+@@ -2417,6 +2740,7 @@
+             # Unconditional custody revalidation on recovery, derived from the committed
+             # scenario: outbound task/ACK, window commitment, raw updates, all receipts.
+             self.verify_reply_custody(run)
++        self.import_quarantine(run)
+         phase = 'preflight_budget'
+         poll_diagnostic = None
+         try:
+@@ -2778,6 +3102,9 @@
+     reconcile = sub.add_parser('reconcile-unknown', help='Quarantine ONE receive batch; no send, download, cursor advance or grade')
+     reconcile.add_argument('--plan', required=True)
+     reconcile.add_argument('--plan-sha256', required=True)
++    continuation = sub.add_parser('continue-unknown', help='One explicitly admitted DISTINCT XLSX task after closed quarantined ambiguity')
++    continuation.add_argument('--plan', required=True)
++    continuation.add_argument('--plan-sha256', required=True)
+     args = parser.parse_args(argv)
+     os.umask(0o077)
+     try:
+@@ -2821,6 +3148,15 @@
+                 elif args.command == 'reject-evidence':
+                     rejection = json.loads(safe_read(args.rejection), object_pairs_hook=unique_object)
+                     result = Runner(store, None).reject_evidence(args.run_id, rejection)
++                elif args.command == 'continue-unknown':
++                    raw = safe_read(args.plan)
++                    plan = json.loads(raw, object_pairs_hook=unique_object)
++                    if raw != encoded(plan) or digest(raw) != args.plan_sha256:
++                        raise Refused('Continuation plan requires pinned canonical JSON')
++                    Runner(store, None).continuation_material(plan, True, consumer_fd)
++                    with store.lock(store.root / 'tester-token', create=False) as credential_fd:
++                        token = safe_read(store.root / 'tester-token', 256).decode('ascii').strip()
++                        result = Runner(store, BotAPI(token)).continue_unknown(plan, args.plan_sha256, consumer_fd, credential_fd)
+                 elif args.command == 'reconcile-unknown':
+                     plan_raw = safe_read(args.plan)
+                     plan = json.loads(plan_raw, object_pairs_hook=unique_object)
