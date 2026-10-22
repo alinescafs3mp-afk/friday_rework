@@ -1,0 +1,136 @@
+--- a/tools/read_extract.py
++++ b/tools/read_extract.py
+@@ -146,9 +146,10 @@
+ def extract_scoped_document_bytes(data: bytes, format: str) -> str:
+     """Convert own immutable snapshots; never install, OCR, reopen or shell out.
+ 
+-    DOCX reuses the native parser below. PDF uses only the already installed
+-    anydoc byte API, explicitly rejecting hosted OCR. Text extraction does not
+-    establish source image/layout completeness or raw write authority.
++    DOCX/XLSX reuse the native parsers below with bounded ZIP/XML parts. PDF
++    uses only the already installed anydoc byte API, explicitly rejecting
++    hosted OCR. Text extraction does not establish source image/layout
++    completeness or raw write authority.
+     """
+     if not isinstance(data, bytes) or len(data) > 1000000:
+         raise ScopedExtractionError('input_limit')
+@@ -157,6 +158,11 @@
+             text = _extract_docx(io.BytesIO(data), max_xml_bytes=1000000)
+         except (ExtractionError, ValueError, RuntimeError, NotImplementedError, LookupError, zlib.error):
+             raise ScopedExtractionError('malformed_or_required_part_limit') from None
++    elif format == 'xlsx':
++        try:
++            text = _extract_xlsx(io.BytesIO(data), max_xml_bytes=1000000, max_total_xml_bytes=1000000)
++        except (ExtractionError, ValueError, RuntimeError, NotImplementedError, LookupError, zlib.error):
++            raise ScopedExtractionError('malformed_or_required_part_limit') from None
+     elif format == 'pdf':
+         try:
+             module = importlib.import_module('anydoc')  # direct import, no pm loader
+@@ -502,11 +508,15 @@
+         raise ExtractionError(f"Not a valid {kind}: {exc}" if bad_zip else str(exc)) from exc
+ 
+ 
+-def _zip_xml(zf: zipfile.ZipFile, name: str, optional: bool = False, *, max_bytes: Optional[int] = None) -> Any:
++def _zip_xml(zf: zipfile.ZipFile, name: str, optional: bool = False, *, max_bytes: Optional[int] = None,
++             _charge: Optional[Callable[[int], None]] = None) -> Any:
+     """Parse a package part; ``optional`` parts yield an empty element when absent or malformed."""
+     try:
+         if max_bytes is None:
+-            return ET.fromstring(zf.read(name))
++            data = zf.read(name)
++            if _charge is not None:
++                _charge(len(data))
++            return ET.fromstring(data)
+         part = zf.getinfo(name)
+         if part.file_size > max_bytes or part.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+             raise ExtractionError('Required document XML exceeds limit or uses unsupported compression')
+@@ -514,6 +524,8 @@
+             data = stream.read(max_bytes + 1)
+         if len(data) > max_bytes:
+             raise ExtractionError('Required document XML exceeds limit')
++        if _charge is not None:
++            _charge(len(data))
+         return ET.fromstring(data)
+     except (KeyError, ET.ParseError) as exc:
+         if optional:
+@@ -523,6 +535,21 @@
+         ) from exc
+ 
+ 
++def _zip_part_bytes(zf: zipfile.ZipFile, name: str, max_bytes: int,
++                    *, _charge: Optional[Callable[[int], None]] = None) -> bytes:
++    """Bounded raw part bytes for parsers that map their own errors (e.g. sheet XML)."""
++    part = zf.getinfo(name)
++    if part.file_size > max_bytes or part.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
++        raise ExtractionError('Required document XML exceeds limit or uses unsupported compression')
++    with zf.open(part) as stream:
++        data = stream.read(max_bytes + 1)
++    if len(data) > max_bytes:
++        raise ExtractionError('Required document XML exceeds limit')
++    if _charge is not None:
++        _charge(len(data))
++    return data
++
++
+ def _extract_docx(path: str, *, max_xml_bytes: Optional[int] = None) -> str:
+     with _open_zip(path, "DOCX") as zf:
+         root = _zip_xml(zf, "word/document.xml", max_bytes=max_xml_bytes)
+@@ -546,23 +573,41 @@
+         for child in item if child.tag in {f"{s}t", f"{s}r"})
+ 
+ 
+-def _extract_xlsx(path: str) -> str:
++def _extract_xlsx(path: str, *, max_xml_bytes: Optional[int] = None,
++                  max_total_xml_bytes: Optional[int] = None) -> str:
+     s, r, pr = f"{{{_NS_S}}}", f"{{{_NS_REL}}}", f"{{{_NS_PKG_REL}}}"
+     with _open_zip(path, "XLSX") as zf:
+         names = set(zf.namelist())
+-        sst = _zip_xml(zf, "xl/sharedStrings.xml", optional=True)
++        # Aggregate bound (bounded lanes only): actual uncompressed bytes of every required
++        # part read are charged, so repeated sheet references and many individually small
++        # parts cannot multiply work past max_total_xml_bytes. Abort fires before the part
++        # that would cross the budget is parsed; at most one extra per-part-bounded read
++        # is charged past the budget. Generic callers (max_xml_bytes=None) never charge.
++        spent = 0
++
++        def _charge(n_bytes: int) -> None:
++            nonlocal spent
++            spent += n_bytes
++            if max_total_xml_bytes is not None and spent > max_total_xml_bytes:
++                raise ExtractionError('Required document XML aggregate exceeds limit')
++
++        charge = _charge if max_xml_bytes is not None else None
++        sst = _zip_xml(zf, "xl/sharedStrings.xml", optional=True, max_bytes=max_xml_bytes, _charge=charge)
+         shared = [_xlsx_string_text(item, s) for item in sst.iter(f"{s}si")]
+-        rels_root = _zip_xml(zf, "xl/_rels/workbook.xml.rels", optional=True)
++        rels_root = _zip_xml(zf, "xl/_rels/workbook.xml.rels", optional=True, max_bytes=max_xml_bytes, _charge=charge)
+         rels = {rel.get("Id", ""): rel.get("Target", "")
+-                for rel in rels_root.iter(f"{pr}Relationship") if rel.get("Id")}
++                for rel in rels_root.iter(f"{pr}Relationship")
++                if rel.get("Id") and (max_xml_bytes is None or rel.get("TargetMode") != "External")}
+         out: list[str] = []
+-        for sheet in _zip_xml(zf, "xl/workbook.xml").iter(f"{s}sheet"):
++        for sheet in _zip_xml(zf, "xl/workbook.xml", max_bytes=max_xml_bytes, _charge=charge).iter(f"{s}sheet"):
+             target = rels.get(sheet.get(f"{r}id", ""), "").lstrip("/")
+             part = posixpath.normpath(target if target.startswith("xl/") else f"xl/{target}")
+             if sheet.get("state", "visible") in {"hidden", "veryHidden"} or part not in names:
+                 continue
+             with contextlib.suppress(ET.ParseError):
+-                rows = _sheet_rows(zf.read(part), shared)
++                rows = _sheet_rows(
++                    _zip_part_bytes(zf, part, max_xml_bytes, _charge=charge) if max_xml_bytes is not None
++                    else zf.read(part), shared)
+                 out += [f"# ── Sheet: {sheet.get('name', 'Sheet')} ──",
+                         *(["\t".join(row) for row in rows] or ["(empty)"]), ""]
+     return _joined(out, "XLSX has no visible sheets with content")
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -809,7 +809,7 @@
+         cap.check()
+         if name == 'read_file':
+             from hermes_cli import friday_workspace_revision as revision
+-            document_format = path.suffix.lower().lstrip('.') if path.suffix.lower() in {'.docx', '.pdf'} else None
++            document_format = path.suffix.lower().lstrip('.') if path.suffix.lower() in {'.docx', '.pdf', '.xlsx'} else None
+             if document_format:
+                 from tools.read_extract import extract_scoped_document_bytes, ScopedExtractionError
+                 data, _ = workspace_document(str(root / path), max_bytes=1000000)
