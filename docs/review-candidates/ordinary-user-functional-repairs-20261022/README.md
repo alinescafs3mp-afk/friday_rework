@@ -1,4 +1,23 @@
+Current power-recovery and document delta: [latest actual state](actual-jarvis-source109/postpower-and-document-delta.json). Before the outage, fresh PDF intake and a returned DOCX date-only edit passed scoped physical checks; XLSX editing failed and selects the next connected repair. The installed Source109 files remain, but the current gateway is stopped after a new boot and Spark is still in its existing boot recovery. Earlier READY and web/context successes below are historical accepted results, not current-boot readiness. Full release scope remains open.
+
 # Ordinary user repairs: installed partial result
+
+### Publication update: actual Source109, fresh TXT and applied tester
+
+Source109 is installed with17,711 native files,291 project files and109 layers. A fresh finite1,800-second enclosing operation started the already installed artifact without reinstalling it. Genuine notify READY took92.255021 seconds; native generation passed with the unchanged180-second startup,70-second stop and30-second watchdog limits and zero restarts. The preceding R39 refusal remains a closed enclosing-budget failure before service start: mandatory preflight left less than the required271 seconds. It was not a180-second service timeout.
+
+A genuine IANA web request retrieved the official page through supported `tool_call`, returned grounded requested facts and a source link, and persisted the own-session exchange. This is a **partial result**: an initial direct-tool route failed before recovery, and the answer falsely said it was checked on20October during the22October run. Both defects remain. Independent cached review accepted this scoped partial with explicit Root-attested custody/live-provenance limits; it did not cover the later contextual followup. That separate followup passed Root checks in15.528 seconds without new tools.
+
+Before Source109 installation, one genuine fresh TXT on Source108 passed intake, exact-byte/private-mode checks, an actual owned-file read, summary and synthetic contact exclusion. Its separate context followup used no new read. Response times were28.103 and9.231 seconds. Kimi independently passed25 cached checks; lower-level full90-second/terminal custody remains Root-attested. Initial Root message-namespace, missing-scenario and unrequested-word assertions remain recorded as preparation failures.
+
+The canonical tester now has the accepted S147600-second capture-window ceiling and B48 single-file final-input support. The [exact cumulative patch and source identities](actual-jarvis-source109/tester-manifest.json) retain26 S147 focused,19 B48 author and14 independent functional checks with zero HIGH/MEDIUM. A wrong hunk-count metadata assertion remains recorded. Outgoing TXT/PDF/DOCX/XLSX are limited to1MiB; received documents retain8MiB. Capture remains intentionally nongrading with the existing custody, finite budget, terminal drain and no-resend rules.
+
+The [actual scoped status](actual-jarvis-source109/status.json) separates source, installation, startup and user results. Historical dated source-only snapshots below remain intact. The separate pending fresh-document operation is NOT_RUN at this snapshot. Full170/120, catalog840, general memory/skill autoload, complete file/web coverage, workers, DSH/A0, administration and release remain open. Private fixtures, oracles, transcripts, runtime IDs, host paths and raw evidence are excluded.
+
+### Historical publication snapshots
+
+The following sections retain their original installation and acceptance times. Current installation identity is only `STATUS.json#/publication_installation_identity`.
+
 
 ### Publication update: installed Source108 and genuine Telegram results
 
