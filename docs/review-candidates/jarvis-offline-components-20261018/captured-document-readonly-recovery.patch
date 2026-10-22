@@ -1,0 +1,258 @@
+--- bot_tester.py
++++ bot_tester.py
+@@ -601,6 +601,229 @@
+     def __init__(self, store, api, clock=time.time, sleep=time.sleep):
+         self.store, self.api, self.clock, self.sleep = store, api, clock, sleep
+         self.preflight_valid = False
++
++    def recovery_guard(self, plan):
++        # This is a NEW finite read operation, never a reset of the old run clock.
++        clock = plan['clock']
++        boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
++        now = time.monotonic()
++        if boot != clock['boot_id'] or not clock['origin_monotonic'] <= now < clock['deadline_monotonic']:
++            raise Refused('Recovery original boot/deadline invalid or expired')
++        if (self.store.root / 'observer-stop.json').exists():
++            raise Refused('Observer stop retained; recovery cannot reset it')
++        cooldown = self.store.get(self.store.root / 'cooldown.json', {})
++        if self.clock() < cooldown.get('until', 0):
++            raise Refused('retry_after cooldown active; no recovery dispatch')
++        remaining = clock['deadline_monotonic'] - time.monotonic()
++        if remaining <= 0:
++            raise Refused('Recovery original deadline expired')
++        return min(10, remaining)
++
++    def recovery_context(self, plan):
++        # Exact pinned legacy run is the task-metadata commitment for legacy runs
++        # which never created sent_task_reference. Do not manufacture that receipt.
++        fields = {'schema', 'action_id', 'run_id', 'run_sha256', 'scenario_sha256',
++                  'update_id', 'raw_sha256', 'sent_message_id', 'message_id',
++                  'tester_id', 'peer_id', 'document', 'clock'}
++        if not isinstance(plan, dict) or set(plan) != fields or plan['schema'] != 'friday.tester.recover-document.v1':
++            raise Refused('Recovery requires its exact closed operator plan')
++        for key in ('action_id', 'run_id'):
++            self.store.run_path(plan[key])  # Existing bounded local basename validator.
++        for key in ('run_sha256', 'scenario_sha256', 'raw_sha256'):
++            if not isinstance(plan[key], str) or not re.fullmatch('[a-f0-9]{64}', plan[key]):
++                raise Refused('Recovery requires exact evidence hashes')
++        for key in ('update_id', 'sent_message_id', 'message_id', 'tester_id', 'peer_id'):
++            if type(plan[key]) is not int or plan[key] <= 0:
++                raise Refused('Recovery numeric identity invalid')
++        if plan['tester_id'] != TESTER or plan['peer_id'] != PEER:
++            raise Refused('Recovery authenticated identities must remain pinned')
++        clock = plan['clock']
++        if (not isinstance(clock, dict) or set(clock) != {'boot_id', 'origin_monotonic', 'deadline_monotonic'}
++                or not isinstance(clock['boot_id'], str)
++                or not re.fullmatch('[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', clock['boot_id'])
++                or any(type(clock[k]) not in (int, float) or not math.isfinite(clock[k]) for k in ('origin_monotonic', 'deadline_monotonic'))
++                or not 0 <= clock['origin_monotonic'] < clock['deadline_monotonic'] <= clock['origin_monotonic'] + 120):
++            raise Refused('Bind one fresh original recovery clock of at most 120 seconds')
++        spec = validate_capture(plan['document'])
++        self.recovery_guard(plan)
++        run_raw = safe_read(self.store.run_path(plan['run_id']))
++        if digest(run_raw) != plan['run_sha256']:
++            raise Refused('Pinned stopped run bytes changed')
++        run = self.load(plan['run_id'])  # Read-only existing scenario/step validation.
++        if (safe_read(self.store.run_path(plan['run_id'])) != run_raw
++                or run.get('status') != 'STOPPED' or run.get('send_state') != 'sent'
++                or run['scenario_sha256'] != plan['scenario_sha256']
++                or run.get('sent_message_id') != plan['sent_message_id']
++                or type(run.get('send_attempts')) is not int or run['send_attempts'] < 1
++                or type(run.get('sent_date')) is not int
++                or not isinstance(run.get('sent_ids'), list)
++                or any(type(mid) is not int or mid <= 0 for mid in run['sent_ids'])
++                or len(run['sent_ids']) != run['step'] + 1
++                or run['sent_ids'][-1] != run['sent_message_id']
++                or len(set(run['sent_ids'])) != len(run['sent_ids'])):
++            raise Refused('Recovery requires unchanged terminal confirmed outbound context')
++        captures = {}
++        self.legacy_receive_inventory(run, run.get('legacy_receive_head'), captures)
++        uid = plan['update_id']
++        if (uid not in captures or type(run.get('capture_start_offset')) is not int
++                or uid < run['capture_start_offset']
++                or not isinstance(run.get('seen'), list)
++                or any(type(i) is not int for i in run['seen'])
++                or set(run['seen']) != set(captures) or len(run['seen']) != len(captures)
++                or plan['message_id'] not in run.get('message_ids', [])):
++            raise Refused('Recovery raw update is not committed to the exact stopped run')
++        raw = safe_read(self.store.captures / (str(uid) + '.json'))
++        if digest(raw) != plan['raw_sha256']:
++            raise Refused('Pinned captured update bytes changed')
++        update = json.loads(raw, object_pairs_hook=unique_object)
++        if not isinstance(update, dict) or type(update.get('update_id')) is not int or update['update_id'] != uid:
++            raise Refused('Captured update ID mismatch')
++        message = update.get('message')
++        if not isinstance(message, dict):
++            raise Refused('Recovery requires a regular captured message')
++        def identity(value, sender):
++            return (isinstance(value, dict) and type(value.get('id')) is int
++                    and value['id'] == sender)
++        if (not identity(message.get('chat'), PEER) or message['chat'].get('type') != 'private'
++                or not identity(message.get('from'), PEER) or message['from'].get('is_bot') is not True
++                or type(message.get('message_id')) is not int or message['message_id'] != plan['message_id']
++                or type(message.get('date')) is not int
++                or not run['sent_date'] <= message['date'] <= captures[uid]['arrived_at']
++                or not run['sent_date'] <= captures[uid]['arrived_at'] <= run['deadline']):
++            raise Refused('Captured response peer/message/date binding invalid')
++        reference = run.get('sent_api_ack_reference')
++        if not isinstance(reference, dict) or set(reference) != {'basename', 'bytes', 'sha256', 'representation'}:
++            raise Refused('Recovery outbound acknowledgement reference missing')
++        name = 'send-ack-' + run['id'] + '-' + str(run['step']) + '-' + str(run['send_attempts']) + '.json'
++        ack = self.read_reference({k: v for k, v in reference.items() if k != 'representation'}, name)
++        if reference['representation'] == 'botapi-wire-envelope-json':
++            if not isinstance(ack, dict) or ack.get('ok') is not True:
++                raise Refused('Recovery outbound wire acknowledgement invalid')
++            ack = ack.get('result')
++        elif reference['representation'] != 'decoded-message-json':
++            raise Refused('Recovery acknowledgement representation invalid')
++        reply = message.get('reply_to_message')
++        if (not isinstance(ack, dict) or reply != ack
++                or not identity(ack.get('chat'), PEER) or ack['chat'].get('type') != 'private'
++                or not identity(ack.get('from'), TESTER) or ack['from'].get('is_bot') is not True
++                or type(ack.get('message_id')) is not int or ack['message_id'] != plan['sent_message_id']
++                or type(ack.get('date')) is not int or ack['date'] != run['sent_date']):
++            raise Refused('Captured reply does not join the exact tester outbound acknowledgement')
++        step = run['scenario']['steps'][run['step']]
++        metadata = run.get('request_metadata')
++        if not isinstance(metadata, dict) or metadata.get('scenario_sha256') != plan['scenario_sha256']:
++            raise Refused('Recovery outbound task metadata missing')
++        if 'sent_task_reference' in run:
++            self.verify_capture_context(run)
++        elif 'input' in step:
++            upload = step['input']
++            values = dict(method='sendDocument', chat_id=USERNAME, input_sha256=upload['sha256'],
++                          input_bytes=upload['stat']['size_bytes'], input_stat=upload['stat'],
++                          filename=upload['filename'], mime_type=upload['mime_type'], caption=upload['caption'],
++                          scenario_sha256=run['scenario_sha256'])
++            if (set(metadata) != set(values) | {'body_bytes', 'body_sha256', 'content_type'}
++                    or any(type(metadata.get(k)) is not type(v) or metadata[k] != v for k, v in values.items())
++                    or type(metadata['body_bytes']) is not int
++                    or not upload['stat']['size_bytes'] <= metadata['body_bytes'] <= upload['stat']['size_bytes'] + MAX_MULTIPART_OVERHEAD
++                    or not isinstance(metadata['body_sha256'], str) or not re.fullmatch('[a-f0-9]{64}', metadata['body_sha256'])
++                    or not isinstance(metadata['content_type'], str)
++                    or not re.fullmatch('multipart/form-data; boundary=frw-[a-f0-9]{64}', metadata['content_type'])
++                    or not valid_document_ack(ack) or ack.get('caption', '') != upload['caption']
++                    or ack['document'].get('file_size') != upload['stat']['size_bytes']):
++                raise Refused('Legacy upload acknowledgement/task/scenario join invalid')
++        elif 'request' in step:
++            params = dict(chat_id=USERNAME, text=step['request'])
++            if (metadata.get('method') != 'sendMessage' or metadata.get('params') != params
++                    or metadata.get('body_sha256') != digest(encoded(params))
++                    or metadata.get('body_bytes') != len(encoded(params)) or ack.get('text') != step['request']):
++                raise Refused('Legacy text acknowledgement/task/scenario join invalid')
++        else:
++            raise Refused('Unsupported committed outbound task')
++        doc = message.get('document')
++        if (not valid_document_ack(message) or type(doc.get('file_size')) is not int
++                or not 1 <= doc['file_size'] <= spec['max_bytes']
++                or len(doc['file_id']) > 512 or len(doc['file_unique_id']) > 512
++                or doc.get('file_name') != spec['filename_equals']
++                or doc.get('mime_type') != spec['mime_type_equals']
++                or message.get('caption', '') != spec['caption_equals']):
++            raise Refused('Captured document metadata differs from explicit finite selectors')
++        return run, message
++
++    def recover_document(self, plan, plan_sha256):
++        # Caller holds the existing consumer and credential inode locks. No consumer
++        # starts here: no getUpdates, send, cursor write, run save, or retry path.
++        if (not isinstance(plan_sha256, str) or not re.fullmatch('[a-f0-9]{64}', plan_sha256)
++                or digest(encoded(plan)) != plan_sha256):
++            raise Refused('Recovery operator plan hash mismatch')
++        run, message = self.recovery_context(plan)
++        parent = secure_dir(self.store.root / 'recoveries')
++        action = parent / plan['action_id']
++        action.mkdir(mode=0o700)  # Existing action, even uncertain/empty, MUST NOT rerun.
++        # Persist both new directory entries before any network dispatch. Store.put
++        # below then persists the intent bytes and its entry inside the action.
++        for directory in (self.store.root, parent):
++            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++            try:
++                os.fsync(fd)
++            finally:
++                os.close(fd)
++        self.store.put(action / 'INTENT.json', dict(plan=plan, plan_sha256=plan_sha256,
++                       status='ADMITTED_ONCE_NO_RETRY', at=stamp(), acceptance='NOT_ESTABLISHED'))
++        phase = 'preflight'
++        try:
++            preflight(self.api, timeout=self.recovery_guard(plan), guard=lambda: self.recovery_guard(plan))
++            # Fresh read-only revalidation after authentication, immediately before getFile.
++            run, message = self.recovery_context(plan)
++            doc = message['document']
++            info = self.api.call('getFile', {'file_id': doc['file_id']}, timeout=self.recovery_guard(plan))
++            if (not isinstance(info, dict) or info.get('file_id') != doc['file_id']
++                    or info.get('file_unique_id') != doc['file_unique_id']
++                    or type(info.get('file_size')) is not int or info['file_size'] != doc['file_size']):
++                raise Refused('getFile identity/size differs from committed captured document')
++            phase = 'download'
++            data = self.api.download(info.get('file_path'), plan['document']['max_bytes'], timeout=self.recovery_guard(plan))
++            if not isinstance(data, bytes) or len(data) > plan['document']['max_bytes']:
++                raise Refused('Recovery download violated its finite byte bound')
++            # Retain bounded bytes before refusing a truncated response. Never grade it.
++            self.store.write(action / 'document.bin', data)
++            complete = len(data) == doc['file_size'] == info['file_size']
++            receipt = dict(schema='friday.tester.recovered-document.v1', action_id=plan['action_id'],
++                           plan_sha256=plan_sha256, run_sha256=plan['run_sha256'],
++                           raw_sha256=plan['raw_sha256'], **self.capture_binding(run),
++                           update_id=plan['update_id'], message_id=plan['message_id'],
++                           document=doc, get_file=info, path=str(action / 'document.bin'),
++                           sha256=digest(data), bytes=len(data), complete_artifact=complete,
++                           artifact_acceptance='RECEIVED_UNGRADED' if complete else 'INCOMPLETE_UNGRADED',
++                           acceptance='NOT_ESTABLISHED', old_run_mutated=False, cursor_mutated=False,
++                           get_updates_called=False, outbound_sent=False)
++            self.store.put(action / 'receipt.json', receipt)
++            self.recovery_guard(plan)
++            self.recovery_context(plan)
++            if not complete:
++                raise Refused('Recovery document truncated; bounded evidence retained')
++            result = dict(status='DOCUMENT_RECOVERED_UNGRADED', action_id=plan['action_id'],
++                          receipt_path=str(action / 'receipt.json'), receipt_sha256=digest(encoded(receipt)),
++                          artifact_path=receipt['path'], artifact_sha256=receipt['sha256'],
++                          artifact_bytes=len(data), acceptance='NOT_ESTABLISHED',
++                          old_run_mutated=False, cursor_mutated=False, no_retry=True)
++            self.store.put(action / 'TERMINAL.json', result)
++            return result
++        except BaseException as exc:
++            # No exception text, URL or credential is copied into evidence. A first
++            # intent always survives failure/interrupt; the same action cannot retry.
++            partial = getattr(exc, 'bounded_body', None)
++            if phase == 'download' and isinstance(partial, bytes) and len(partial) <= plan['document']['max_bytes']:
++                self.store.write(action / 'partial.bin', partial)
++            terminal = dict(status='FAILED_OR_UNKNOWN_NO_RETRY', action_id=plan['action_id'],
++                            acceptance='NOT_ESTABLISHED', complete_artifact=False,
++                            old_run_mutated=False, cursor_mutated=False)
++            if isinstance(exc, RateLimited):
++                # Shared existing dispatch guards must honor a NEW server429 too.
++                # This safety record changes no stopped run, cursor or observer stop.
++                self.cooldown(exc)
++                terminal['retry_after_seconds'] = exc.seconds
++            self.store.put(action / 'TERMINAL.json', terminal)
++            raise
+ 
+     def save(self, run):
+         data = encoded(run)
+@@ -2228,6 +2451,9 @@
+             command.add_argument('--corroboration', required=True)
+         if name == 'reject-evidence':
+             command.add_argument('--rejection', required=True)
++    recover = sub.add_parser('recover-document', help='Read ONE committed captured document; never resume or send')
++    recover.add_argument('--plan', required=True)
++    recover.add_argument('--plan-sha256', required=True)
+     args = parser.parse_args(argv)
+     os.umask(0o077)
+     try:
+@@ -2271,6 +2497,15 @@
+                 elif args.command == 'reject-evidence':
+                     rejection = json.loads(safe_read(args.rejection), object_pairs_hook=unique_object)
+                     result = Runner(store, None).reject_evidence(args.run_id, rejection)
++                elif args.command == 'recover-document':
++                    plan_raw = safe_read(args.plan)
++                    plan = json.loads(plan_raw, object_pairs_hook=unique_object)
++                    if digest(plan_raw) != args.plan_sha256 or plan_raw != encoded(plan):
++                        raise Refused('Recovery plan requires pinned canonical JSON bytes')
++                    Runner(store, None).recovery_context(plan)  # Refuse stale/unbound data before token read.
++                    with store.lock(store.root / 'tester-token', create=False):
++                        token = safe_read(store.root / 'tester-token', 256).decode('ascii').strip()
++                        result = Runner(store, BotAPI(token)).recover_document(plan, args.plan_sha256)
+                 else:
+                     # Also lock credential inode: canonical token cannot have two readers/consumers.
+                     with store.lock(store.root / 'tester-token', create=False):

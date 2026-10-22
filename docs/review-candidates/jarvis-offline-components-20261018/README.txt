@@ -51,3 +51,15 @@ verified reply custody and scoped persistence. The uploaded synthetic TXT was
 observed with mode0664; the receiver requires private owner-only bytes. The
 accepted but uninstalled incoming-document repair creates exclusive0600 files.
 This is partial evidence, not a full170-case/120-format baseline or release.
+
+22 October: captured-document read-only recovery
+
+The existing canonical tester now has the reviewed recover-document command,
+installed atomically at exclusive idle. Its 60 focused inert controls passed
+and were independently executed; unaffected historical controls were reused.
+One new finite action retrieved an already committed correlated document via
+the existing authenticated preflight/getFile/download client. No product request
+was repeated, no getUpdates consumer started, and the stopped run and cursor
+stayed byte-identical. The owned process was reaped. The Source98 snapshot records
+the separate actual summary-content verification. The original observer-format
+refusal and full-window gap remain; no full baseline or release is claimed.
