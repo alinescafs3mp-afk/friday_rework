@@ -2,6 +2,8 @@
 
 These are accepted source changes over the published Source114 chain. The installed version at this checkpoint remains Source114/project303. Installation, runtime behavior and feature acceptance of this bundle are pending.
 
+The subsequent [Source116 installation and permanent-service checkpoint](../native116-install-runtime/README.md) records the actual combined installation and startup. Source acceptance here remains distinct from those later facts and from user semantic acceptance.
+
 Source115 adds the scoped native route for a hosted shared room with two to six distinct local profiles. Every member must explicitly opt in and approve its own membership. The route is model-only and uses shared room context; private tools, history, memory and context stay outside it. Revoke/restart and source policy boundaries have 51 scoped controls and independent review. This is source acceptance, not a live group-chat result.
 
 Source116 fixes the actual origin-metadata regression found after the Source114 official reset. The reset already created the new row from its validated admitted source, but published a route that inherited the prior conversation's source. A subsequent ordinary metadata refresh wrote that stale origin back. The one-file fix publishes the same validated creation origin in the new route. Resume and unmanaged inheritance, parent lineage, authority checks and refusal paths stay in the existing lifecycle.
