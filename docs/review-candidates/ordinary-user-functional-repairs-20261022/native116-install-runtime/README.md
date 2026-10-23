@@ -16,6 +16,8 @@ Three preparation or verification issues are retained as failures rather than hi
 
 At this checkpoint the installed service is healthy. The corrected reset/route-origin behavior still needs the distinct Source116 native reset and post-reset memory user runs. Their acceptance is not inferred from installation or startup. Shared-room live acceptance, worker runtime/qualification, the full matrix and overall release acceptance remain open.
 
+The subsequent [actual post-reset memory checkpoint](../native116-postreset-memory/README.md) records the scoped key-only recall and preserved origin, while retaining the preceding reset confirmation's incomplete receive observation. The [worker preparation successor](../worker-preparation-successor-source/README.md) is a separate accepted source change and remains uninstalled.
+
 - [Machine-readable facts and limits](facts.json)
 - [Exact Source115/116 patches, manifests and source evidence](../native115-116-source-bundle/README.md)
 - [Preserved Source114 reset/memory failure](../native114-runtime-reset-memory/README.md)
