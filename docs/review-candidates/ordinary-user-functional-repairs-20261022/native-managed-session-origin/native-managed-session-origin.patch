@@ -1,0 +1,272 @@
+--- a/gateway/session.py
++++ b/gateway/session.py
+@@ -1009,7 +1009,9 @@
+                 # Honour an explicit suspension/reset decision instead of silently reopening via recovery.
+                 if reset_reason:
+                     decision.schedule_reset(reset_reason, entry, entry.last_prompt_tokens > 0)
+-                self._entries.pop(session_key, None)
++                if not reset_reason:
++                    self._entries.pop(session_key, None)
++                # Keep the predecessor reachable until replacement creation succeeds.
+                 decision.needs_recover = True
+             else:
+                 # Internal/system events preserve the user-activity clock.
+@@ -1046,19 +1048,22 @@
+             auto_reset_reason=decision.reset_reason, reset_had_activity=decision.reset_had_activity,
+             prev_session_id=decision.prev_session_id, transport_profile=transport_profile_of(source),
+         )
++        create_kwargs = self._session_create_kwargs(
++            session_id=session_id, session_key=session_key, origin=source,
++            source_value=source.platform.value, display_name=source.chat_name,
++            parent_session_id=decision.prev_session_id,
++        )
+         with self._lock:
+             current = self._entries.get(session_key)
+-            if current is None or (force_new and current is observed):
++            if (current is None or (force_new and current is observed)
++                    or (decision.reset_reason and current is observed)):
++                self._prepare_managed_session_row(session_key, create_kwargs)
+                 self._entries[session_key] = current = candidate
+         decision.entry = current
+         decision.needs_save = True
+         if current is not candidate:
+             return None
+-        return self._session_create_kwargs(
+-            session_id=session_id, session_key=session_key, origin=source,
+-            source_value=source.platform.value, display_name=source.chat_name,
+-            parent_session_id=decision.prev_session_id,
+-        )
++        return create_kwargs
+ 
+     def update_session(
+         self, session_key: str, last_prompt_tokens: int = None, touch_activity: bool = True,
+@@ -1120,27 +1125,47 @@
+             entry = self._entry_locked(session_key)
+             return dict(entry.model_override) if entry and entry.model_override else None
+ 
+-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
+-        """Force reset a session, creating a new session ID."""
++    def reset_session(
++        self, session_key: str, display_name: Optional[str] = None, *,
++        source: Optional[SessionSource] = None,
++    ) -> Optional[SessionEntry]:
++        """Force reset; managed creation requires the current admitted source.
++
++        A restored old_entry.origin intentionally has no live identity/capability.
++        Never use it to mint a new managed row or retrofit existing history.
++        """
++        from hermes_cli.friday_user_scope import current, ScopeDenied
++        cap = current()
+         with self._lock:
+             old_entry = self._entry_locked(session_key)
+             if old_entry is None:
+                 return None
++            origin = source if cap is not None else old_entry.origin
++            if cap is not None:
++                old = old_entry.origin
++                if (source is None or old is None
++                        or self._generate_session_key(source) != session_key
++                        or old_entry.transport_profile != cap.principal[1]
++                        or old.profile not in (None, '', cap.profile)
++                        or any(getattr(old, name) != getattr(source, name)
++                               for name in ('platform', 'user_id', 'chat_id', 'chat_type', 'thread_id'))):
++                    raise ScopeDenied()
+             now = _now()
+             session_id = _new_session_id(now)
++            name = display_name if display_name is not None else old_entry.display_name
++            db_create_kwargs = self._session_create_kwargs(
++                session_id=session_id, session_key=session_key, origin=origin,
++                source_value=old_entry.platform.value if old_entry.platform else "unknown",
++                display_name=name, parent_session_id=old_entry.session_id,
++            )
++            self._prepare_managed_session_row(session_key, db_create_kwargs)
+             new_entry = self._replace_route_locked(
+                 session_key, old_entry, session_id, now,
+-                display_name=display_name if display_name is not None else old_entry.display_name,
+-                is_fresh_reset=True,
+-            )
+-            db_create_kwargs = self._session_create_kwargs(
+-                session_id=session_id, session_key=session_key, origin=old_entry.origin,
+-                source_value=old_entry.platform.value if old_entry.platform else "unknown",
+-                display_name=old_entry.display_name, parent_session_id=old_entry.session_id,
++                display_name=name, is_fresh_reset=True,
+             )
+         self._finish_route_transition(
+             session_key, end_session_id=old_entry.session_id, end_reason="session_reset",
+-            create_kwargs=db_create_kwargs, origin=old_entry.origin,
++            create_kwargs=db_create_kwargs, origin=origin,
+             display_name=new_entry.display_name, during=" during reset",
+         )
+         return new_entry
+--- a/gateway/session_recovery.py
++++ b/gateway/session_recovery.py
+@@ -299,7 +299,9 @@
+             row=recovered, session_key=session_key, source=source, now=now)
+         return entry, migrated_legacy
+ 
+-    def _promote_session_reset(self, session_key: str, session_id: str, reason: str, *, log) -> None:
++    def _promote_session_reset(
++        self, session_key: str, session_id: str, reason: str, *, log, successor_session_id=None,
++    ) -> None:
+         """End *session_id* with *reason* via ``promote_to_session_reset`` (``end_session`` on old
+         SessionDBs). Promote, not plain end: a row already ended with a recoverable accidental
+         reason (agent_close / ws_orphan_reap) must be upgraded to the explicit boundary, or
+@@ -308,7 +310,10 @@
+             db = self._db_for_key(session_key)
+             promote = getattr(db, "promote_to_session_reset", None)
+             if callable(promote):
+-                promote(session_id, reason)
++                if successor_session_id is None:
++                    promote(session_id, reason)
++                else:
++                    promote(session_id, reason, successor_session_id=successor_session_id)
+             else:
+                 db.end_session(session_id, reason)
+             # Stop the departed conversation's schedule in its owning profile, even when
+@@ -398,13 +403,17 @@
+         explicit reset boundary (with the specific reason so state.db is auditable, e.g.
+         ``suspended`` vs plain ``session_reset``), then INSERT the new row + routing
+         peer. Both best-effort: failures are warned and self-healed by the next peer refresh."""
++        from hermes_cli.friday_user_scope import current
++        # Only managed rows were preinserted; preserve the unmanaged DB contract.
++        successor_session_id = (create_kwargs["session_id"]
++                                if create_kwargs and current() is not None else None)
+         if end_session_id:
+             from hermes_cli.observability.relay_shared_metrics import close_session_run
+ 
+             close_session_run(end_session_id)
+         if self._db_for_key(session_key) and end_session_id:
+             self._promote_session_reset(
+-                session_key, end_session_id, end_reason,
++                session_key, end_session_id, end_reason, successor_session_id=successor_session_id,
+                 log=lambda e: logger.warning(
+                     "Failed to end predecessor session row %s for %s%s: %s — the old row remains "
+                     "open and may win restart recovery until the next successful peer refresh",
+@@ -427,6 +436,21 @@
+         (parent/_reset_from) land atomically in the INSERT so a crash right after cannot strand the
+         row unroutable."""
+         from gateway.session_identity import identity_of, transport_profile_of
++        from hermes_cli.friday_user_scope import current, scoped_source, ScopeDenied
++        cap = current()
++        if cap is not None:
++            # A retained routing source is metadata, never an admission capability.
++            # Validate the live source and the entire owning store before any INSERT.
++            with scoped_source(origin):
++                raw_origin = _origin_json(origin, new=True)
++            expected = {"schema": "friday.account_origin.v1", "platform": cap.principal[0],
++                        "transport_profile": cap.principal[1], "account_id": cap.principal[2]}
++            if (source_value != cap.principal[0] or not raw_origin
++                    or json.loads(raw_origin).get("friday_account_origin") != expected
++                    or SessionRecoveryMixin._profile_from_session_key(session_key) != cap.profile):
++                raise ScopeDenied()
++        else:
++            raw_origin = _origin_json(origin, new=True)
+         pinned = identity_of(origin)
+         return {
+             "session_id": session_id,
+@@ -436,13 +460,30 @@
+             "chat_id": origin.chat_id if origin else None,
+             "chat_type": origin.chat_type if origin else None,
+             "thread_id": origin.thread_id if origin else None,
+-            "profile_name": origin.profile if origin else None,
++            "profile_name": cap.profile if cap is not None else (origin.profile if origin else None),
+             "transport_profile": pinned.transport_profile if pinned is not None else transport_profile_of(origin),
+-            "origin_json": _origin_json(origin, new=True),
++            "origin_json": raw_origin,
+             "display_name": display_name,
+             "parent_session_id": parent_session_id,
+             "model_config": {"_reset_from": parent_session_id} if parent_session_id else None,
+         }
++
++    def _prepare_managed_session_row(self, session_key, create_kwargs) -> None:
++        """Managed rows must be durable with full ownership BEFORE publishing a route.
++
++        Unmanaged stores retain their existing best-effort recovery behavior.
++        """
++        from pathlib import Path
++        from hermes_cli.friday_user_scope import current, check_database, ScopeDenied
++        cap = current()
++        if cap is None:
++            return
++        check_database(cap)
++        db = self._db_for_key(session_key)
++        if db is None or Path(db.db_path) != cap.home / "state.db":
++            raise ScopeDenied()
++        cap.check()
++        db.create_session(**create_kwargs)
+ 
+     def _create_session_row(self, session_key, db_create_kwargs, origin, display_name, *, log) -> None:
+         """INSERT a session row and record its routing peer; ``log(exc)`` on failure. A failed
+--- a/gateway/slash_commands_session.py
++++ b/gateway/slash_commands_session.py
+@@ -208,7 +208,7 @@
+                                   parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
+         _reset_process_scoped_tool_state()
+ 
+-        new_entry = await self.async_session_store.reset_session(session_key)
++        new_entry = await self.async_session_store.reset_session(session_key, source=source)
+         _old_sid = old_entry.session_id if old_entry else None
+         await self._fire_session_reset_hooks(source, session_key, _old_sid,
+                                              new_entry.session_id if new_entry else None)
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -1792,7 +1792,7 @@
+             )
+         elif agent_result.get("compression_exhausted") and session_entry and session_key:
+             logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
+-            new_entry = await self.async_session_store.reset_session(session_key)
++            new_entry = await self.async_session_store.reset_session(session_key, source=source)
+             self._evict_cached_agent(session_key)
+             # Conversation boundary: the funnel clears every conversation-scoped per-session dict.
+             self._clear_conversation_scope(session_key, reason="compression_exhausted_reset")
+--- a/hermes_state_sessions.py
++++ b/hermes_state_sessions.py
+@@ -547,7 +547,9 @@
+             self._unarchive_auto_archived_lineage(conn, session_id)
+         self._execute_write(_do)
+ 
+-    def promote_to_session_reset(self, session_id: str, reason: str = "session_reset") -> bool:
++    def promote_to_session_reset(
++        self, session_id: str, reason: str = "session_reset", *, successor_session_id: Optional[str] = None,
++    ) -> bool:
+         """Durably mark an intentional reset boundary on live rows or rows with a *recoverable* accidental
+         end_reason (explicit boundaries are preserved): an ``agent_close`` row left recoverable would be
+         resurrected by stale-route recovery. Keep in sync with find_latest_gateway_session_for_peer.
+@@ -559,14 +561,31 @@
+         if not session_id:
+             return False
+         now = time.time()
+-        # /new and policy auto-resets promote rather than end_session, so the
+-        # generation advances here too — same transaction, only when written.
+-        try:
+-            return bool(self._execute_write(lambda conn: self._end_and_bump(
++        def _do(conn):
++            boundary = now
++            if successor_session_id is not None:
++                # A managed gateway prepares the successor before route publication.
++                # Use its native birth time, never a caller-guessed historical clock.
++                row = conn.execute(
++                    "SELECT s.started_at FROM sessions s JOIN sessions p ON p.id = ? "
++                    "WHERE s.id = ? AND s.parent_session_id = p.id "
++                    "AND json_extract(s.model_config, '$._reset_from') = p.id "
++                    "AND s.session_key = p.session_key AND s.source = p.source "
++                    "AND s.user_id = p.user_id AND s.profile_name = p.profile_name "
++                    "AND s.transport_profile = p.transport_profile",
++                    (session_id, successor_session_id),
++                ).fetchone()
++                if row is None or not isinstance(row[0], (int, float)) or not 0 <= row[0] <= now:
++                    return False
++                boundary = row[0]
++            return self._end_and_bump(
+                 conn, "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ? AND (ended_at IS NULL "
+                 f"OR end_reason IN ({_RECOVERABLE_END_REASONS_SQL}))",
+-                (now, reason, session_id), session_id, reason,
+-            )))
++                (boundary, reason, session_id), session_id, reason,
++            )
++        # Explicit boundaries remain immutable; generation changes in the same write.
++        try:
++            return bool(self._execute_write(_do))
+         except Exception:
+             return False
+ 
