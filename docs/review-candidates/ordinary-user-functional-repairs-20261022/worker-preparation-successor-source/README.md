@@ -12,6 +12,10 @@ The source package has 26 author controls on the actual changed functions, nine 
 
 The remaining connected path uses existing operations: genuine declaration maintenance, a project-only Source92 update, protected preparation in the receiving profile, separate qualification, and real user jobs for both DSH and A0. Future mutable state, authorization, clocks and results must come from those actual operations. No new installer or framework is required. Original inactive registrations, failed/uncertain effects, data, recovery paths, resource limits and local-only inference remain protected.
 
+The subsequent project-only installation source package reproduced an inherited history-verification defect: removing every maintenance-history key also removed identical original-registration rows needed by the recursive source predecessor. Its reviewed external updater now takes that predecessor base from the genuine maintenance receipt's authenticated `source_update_ancestry.history`. Physical reads, recursive verification, collision rejection and exact final history union remain strict. The original refusal is preserved; the reviewer authored the one-expression fix and another participant checked its delta. The [exact external-updater patch](project-only-history-overlap.external.patch) applies to the frozen installed updater baseline. It is separate from the target project's unchanged updater and is not applied automatically to a later main version.
+
+The [installer source facts](project-only-install-source.json) identify the accepted existing caller/verifier chain. Actual declaration maintenance, complete fresh histories, native grants, current CAS/generation, stopped custody and the original Root operation clock remain unbound. No installation, worker qualification or user-job success is claimed. No old installation, stop or uncertain effect was repeated.
+
 - [Actual Source116 installation and permanent service](../native116-install-runtime/README.md)
 - [Machine-readable source facts and acceptance limits](facts.json)
 

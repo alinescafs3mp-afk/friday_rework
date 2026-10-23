@@ -18,6 +18,8 @@ At this checkpoint the installed service is healthy. The corrected reset/route-o
 
 The subsequent [actual post-reset memory checkpoint](../native116-postreset-memory/README.md) records the scoped key-only recall and preserved origin, while retaining the preceding reset confirmation's incomplete receive observation. The [worker preparation successor](../worker-preparation-successor-source/README.md) is a separate accepted source change and remains uninstalled.
 
+The subsequent [native administrative startup and login-entry checkpoint](../native116-admin-start-login/README.md) proves the separate Dashboard owner/TLS, public login rendering and unauthenticated refusal. Actual password login and two-identity shared-history acceptance remain open.
+
 - [Machine-readable facts and limits](facts.json)
 - [Exact Source115/116 patches, manifests and source evidence](../native115-116-source-bundle/README.md)
 - [Preserved Source114 reset/memory failure](../native114-runtime-reset-memory/README.md)
