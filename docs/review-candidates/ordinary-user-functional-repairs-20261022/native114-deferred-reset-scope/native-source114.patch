@@ -1,0 +1,277 @@
+diff --git a/gateway/run_busy.py b/gateway/run_busy.py
+--- a/gateway/run_busy.py
++++ b/gateway/run_busy.py
+@@ -1321,23 +1321,31 @@
+         ``approvals.destructive_slash_confirm`` is off; otherwise via ``_request_slash_confirm``:
+         ``once`` runs it, ``always`` persists the opt-out then runs it, ``cancel`` skips it.
+         """
++        from gateway.slash_confirm_scope import capture_destructive_authority
++        retained = capture_destructive_authority(self, event, command)
+         confirm_required = True
+-        try:
+-            approvals = self._read_user_config().get("approvals")
+-            if isinstance(approvals, dict):
+-                confirm_required = bool(approvals.get("destructive_slash_confirm", True))
+-        except Exception:
+-            pass
++        with retained.scope() if retained is not None else contextlib.nullcontext():
++            try:
++                approvals = self._read_user_config().get("approvals")
++                if isinstance(approvals, dict):
++                    confirm_required = bool(approvals.get("destructive_slash_confirm", True))
++            except Exception:
++                pass
+         if not confirm_required:
+-            return await execute()
++            with retained.scope() if retained is not None else contextlib.nullcontext():
++                return await execute()
+ 
+         session_key = self._session_key_for_source(event.source)
+ 
+         async def _on_confirm(choice: str):
++            if choice not in {"once", "always", "cancel"}:
++                from hermes_cli.friday_user_scope import ScopeDenied
++                raise ScopeDenied()
+             # Via the class, not ``self``: tests drive this gate on a bare SimpleNamespace runner.
+-            return await GatewayBusySessionMixin._run_confirmed_destructive_slash(
+-                choice, command, execute, session_key
+-            )
++            with retained.scope(deferred=True) if retained is not None else contextlib.nullcontext():
++                return await GatewayBusySessionMixin._run_confirmed_destructive_slash(
++                    choice, command, execute, session_key
++                )
+ 
+         _p = self._typed_command_prefix_for(event.source.platform)
+         prompt_message = t("gateway.confirm.destructive_prompt", command=command, detail=detail, prefix=_p)
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -498,7 +498,7 @@
+         )
+         if _confirm_choice is not None:
+             _resolved = await _slash_confirm_mod.resolve(
+-                _quick_key, _pending_confirm.get("confirm_id"), _confirm_choice,
++                _quick_key, _pending_confirm.get("confirm_id"), _confirm_choice, source=event.source,
+             )
+             return _resolved or ""
+         # Stale pending + unrelated command: the user moved on, so drop the pending state rather
+diff --git a/gateway/slash_commands_session.py b/gateway/slash_commands_session.py
+--- a/gateway/slash_commands_session.py
++++ b/gateway/slash_commands_session.py
+@@ -178,9 +178,13 @@
+     @native_control("new")
+     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+         """Handle /new or /reset command."""
++        from hermes_cli.friday_user_scope import current
++        current()  # Refuse missing/revoked product context before any reset effect.
+         source = event.source
+         session_key = self._session_key_for_source(source)
+         receipt = await self._settle_session_web_custody(session_key)
++        from gateway.slash_confirm_scope import revalidate_destructive_authority
++        revalidate_destructive_authority()  # Custody may yield while the pending run changes.
+         if receipt['status'] == 'STOP_UNCONFIRMED':
+             from hermes_cli.friday_user_scope import pending_stop_copy
+             return EphemeralReply(pending_stop_copy(source, reset=True))
+diff --git a/gateway/slash_confirm_scope.py b/gateway/slash_confirm_scope.py
+new file mode 100644
+--- /dev/null
++++ b/gateway/slash_confirm_scope.py
+@@ -0,0 +1,122 @@
++"""Retain admitted destructive-command authority across the confirmation gap."""
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass
++import time
++
++from gateway.session_identity import identity_of
++from hermes_cli.friday_user_scope import ScopeDenied, current, policy, _same_scope
++
++
++_active_authority = ContextVar("destructive_confirmation_authority", default=None)
++
++
++def revalidate_destructive_authority():
++    """Recheck after native custody yields, before invalidating or closing a run."""
++    current()
++    active = _active_authority.get()
++    if active is not None:
++        retained, fresh, capability = active
++        retained.check_target()
++        if fresh is not None:
++            retained.check_confirmation(fresh, capability)
++
++
++def _source_key(source):
++    return tuple(getattr(source, name, None) for name in (
++        'platform', 'user_id', 'chat_id', 'chat_type', 'thread_id', 'scope_id', 'profile',
++        'user_id_alt', 'chat_id_alt', 'is_bot', 'role_authorized', 'delivered_via_upstream_relay'))
++
++
++def _session_id(runner, key):
++    entry = runner.session_store._entries.get(key)
++    return getattr(entry, 'session_id', None)
++
++
++@dataclass(frozen=True)
++class DestructiveAuthority:
++    runner: object
++    event: object
++    command: str
++    source: object
++    capability: object
++    identity: object
++    source_key: tuple
++    request: tuple
++    session_key: str
++    session_id: str
++    run_generation: int
++    created: float
++
++    def check_target(self):
++        from tools.slash_confirm import DEFAULT_TIMEOUT_SECONDS
++        if (self.event.source is not self.source
++                or _source_key(self.source) != self.source_key
++                or identity_of(self.source) is not self.identity
++                or getattr(self.source, '_friday_user_scope', None) is not self.capability
++                or (self.event.text, self.event.message_id) != self.request
++                or self.runner._session_key_for_source(self.source) != self.session_key
++                or _session_id(self.runner, self.session_key) != self.session_id
++                or self.runner._current_session_run_generation(self.session_key) != self.run_generation
++                or time.monotonic() - self.created > DEFAULT_TIMEOUT_SECONDS):
++            raise ScopeDenied()
++        with self.runner._profile_scope_for_source(self.source):
++            if (current(required=True) is not self.capability
++                    or not self.runner._is_user_authorized_for_source(self.source)
++                    or self.runner._check_slash_access(self.source, self.command) is not None):
++                raise ScopeDenied()
++
++    def check_confirmation(self, fresh, expected_capability=None):
++        if (fresh is None or _source_key(fresh) != self.source_key
++                or identity_of(fresh) != self.identity
++                or (expected_capability is not None
++                    and getattr(fresh, '_friday_user_scope', None) is not expected_capability)
++                or not self.runner._is_user_authorized_for_source(fresh)):
++            raise ScopeDenied()
++        with self.runner._profile_scope_for_source(fresh):
++            cap = current(required=True)
++            if (not _same_scope(cap, self.capability)
++                    or self.runner._session_key_for_source(fresh) != self.session_key
++                    or self.runner._check_slash_access(fresh, self.command) is not None):
++                raise ScopeDenied()
++            return cap
++
++    @contextmanager
++    def scope(self, *, deferred=False):
++        """Revalidate before config writes, custody, agent close or session reset."""
++        from tools.slash_confirm import confirmation_source
++        self.check_target()
++        fresh = confirmation_source() if deferred else None
++        fresh_cap = self.check_confirmation(fresh) if deferred else None
++        # Both _CURRENT and _SOURCE are restored by the native scope. asyncio's
++        # to_thread copies this context, including the genuine capability.
++        with self.runner._profile_scope_for_source(self.source):
++            token = _active_authority.set((self, fresh, fresh_cap))
++            try:
++                yield
++            finally:
++                _active_authority.reset(token)
++
++
++def capture_destructive_authority(runner, event, command):
++    """Capture only an already admitted in-memory source, never serialized origin."""
++    source = event.source
++    identity = identity_of(source)
++    from hermes_constants import get_hermes_home
++    home = identity.authorization_home if identity is not None else get_hermes_home()
++    if policy(home) is None:
++        if getattr(source, '_friday_user_scope', None) is not None:
++            raise ScopeDenied()
++        return None
++    cap = getattr(source, '_friday_user_scope', None)
++    if cap is None or identity is None:
++        raise ScopeDenied()
++    with runner._profile_scope_for_source(source):
++        if (current(required=True) is not cap
++                or not runner._is_user_authorized_for_source(source)
++                or runner._check_slash_access(source, command) is not None):
++            raise ScopeDenied()
++        key = runner._session_key_for_source(source)
++        return DestructiveAuthority(runner, event, command, source, cap, identity,
++            _source_key(source), (event.text, event.message_id), key, _session_id(runner, key),
++            runner._current_session_run_generation(key), time.monotonic())
+diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -4794,7 +4794,18 @@
+         # The runner stored a handler keyed by session_key; run it and send any returned text as a follow-up.
+         try:
+             from tools import slash_confirm as _slash_confirm_mod
+-            result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice)
++            # Use the same native source builder and thread normalization as
++            # ingress; the callback message belongs to the bot, but its actor
++            # is query.from_user, authenticated by the native callback gate.
++            chat_type = self._chat_type_str(query.message.chat)
++            chat_type = "group" if chat_type in {"group", "supergroup"} else ("channel" if chat_type == "channel" else "dm")
++            source = self.build_source(
++                chat_id=str(query.message.chat_id), chat_type=chat_type,
++                user_id=str(query.from_user.id),
++                is_bot=bool(getattr(query.from_user, "is_bot", False)),
++                thread_id=self._effective_message_thread_id(query.message))
++            self._canonicalize(source)
++            result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice, source=source)
+             if result_text and query.message:
+                 # Inherit the prompt's topic: forums use message_thread_id; private DM-topic lanes need
+                 # both the topic id and the prompt reply anchor.
+diff --git a/tools/slash_confirm.py b/tools/slash_confirm.py
+--- a/tools/slash_confirm.py
++++ b/tools/slash_confirm.py
+@@ -11,6 +11,7 @@
+ from __future__ import annotations
+ 
+ import logging
++from contextvars import ContextVar
+ import threading
+ import time
+ from typing import Any, Awaitable, Callable, Dict, Optional
+@@ -20,6 +21,12 @@
+ # session_key -> {"confirm_id", "command", "handler", "created_at"}
+ _pending: Dict[str, Dict[str, Any]] = {}
+ _lock = threading.RLock()
++_confirmation_source = ContextVar("slash_confirmation_source", default=None)
++
++
++def confirmation_source():
++    """Live source supplied by the authenticated confirmation producer, never a saved row."""
++    return _confirmation_source.get()
+ 
+ # Older pending confirms are discarded when the session's next message arrives (buttons live
+ # as long as the adapter keeps callback_data).
+@@ -62,12 +69,14 @@
+ 
+ 
+ async def resolve(session_key: str, confirm_id: str, choice: str,
+-                  timeout: float = DEFAULT_TIMEOUT_SECONDS) -> Optional[str]:
++                  timeout: float = DEFAULT_TIMEOUT_SECONDS, *, source=None) -> Optional[str]:
+     """Run the pending handler with ``choice`` ("once" / "always" / "cancel").
+ 
+     Returns the handler's output string, or None if the confirm was stale, already resolved,
+     or the confirm_id doesn't match (superseded prompt).
+     """
++    if choice not in {"once", "always", "cancel"}:
++        return None
+     with _lock:
+         entry = _pending.get(session_key)
+         if not entry or entry.get("confirm_id") != confirm_id:
+@@ -81,9 +90,12 @@
+ 
+     if not handler:
+         return None
++    token = _confirmation_source.set(source)
+     try:
+         result = await handler(choice)
+     except Exception as exc:
+         logger.error("Slash-confirm handler for /%s raised: %s", command, exc, exc_info=True)
+         return f"❌ Error handling confirmation: {exc}"
++    finally:
++        _confirmation_source.reset(token)
+     return result if isinstance(result, str) else None
