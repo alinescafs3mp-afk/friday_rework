@@ -1,0 +1,472 @@
+--- a/hermes_cli/dashboard_auth/refresh_singleflight.py
++++ b/hermes_cli/dashboard_auth/refresh_singleflight.py
+@@ -56,6 +56,7 @@
+     # that changed network between two requests of one burst must still hit the cache.
+     digest = hashlib.sha256(token.encode()).digest()
+     key = (id(provider), digest)
++    cacheable = getattr(provider, "refresh_session_cacheable", True)
+     with _guard:
+         _prune(time.monotonic())
+         flight = _flights.setdefault(key, _Flight())
+@@ -64,7 +65,7 @@
+         with flight.lock:
+             with _guard:
+                 cached = _cache.get(key)
+-                if cached is not None and cached[0] > time.monotonic():
++                if cacheable and cached is not None and cached[0] > time.monotonic():
+                     return cached[2]
+             try:
+                 session = provider.refresh_session(refresh_token=token)
+@@ -73,7 +74,8 @@
+             # ProviderError and unexpected execution failures are deliberately not cached.
+             with _guard:
+                 now = time.monotonic()
+-                _cache[key] = (now + (_SUCCESS_TTL if session is not None else _FAILURE_TTL), provider, session)
++                if cacheable:
++                    _cache[key] = (now + (_SUCCESS_TTL if session is not None else _FAILURE_TTL), provider, session)
+                 _prune(now)
+             return session
+     finally:
+--- a/hermes_cli/dashboard_auth/routes.py
++++ b/hermes_cli/dashboard_auth/routes.py
+@@ -449,12 +449,21 @@
+ @router.post("/auth/logout", name="auth_logout")
+ async def auth_logout(request: Request):
+     _at, rt = read_session_cookies(request)
+-    # Best-effort revoke on every provider; failures logged, never raised.
+-    for provider in list_providers() if rt else ():
++    # Durable local providers must acknowledge persistence before logout can succeed.
++    # Other providers retain their existing best-effort network revocation contract.
++    durable_failed = False
++    for provider in list_providers() if rt or _at else ():
+         try:
+-            provider.revoke_session(refresh_token=rt)
++            if getattr(provider, "supports_durable_revocation", False):
++                await run_in_threadpool(provider.revoke_session, refresh_token=rt, access_token=_at or "")
++            elif rt:
++                provider.revoke_session(refresh_token=rt)
+         except Exception as e:  # noqa: BLE001 — best-effort
+             _log.warning("dashboard-auth: revoke on %r failed: %s", provider.name, e)
++            durable_failed |= bool(getattr(provider, "supports_durable_revocation", False))
++    if durable_failed:
++        # Keep cookies for an explicit retry; do not audit/redirect as a completed logout.
++        raise _http(503, "Session revocation could not be persisted; retry logout.")
+     sess = getattr(request.state, "session", None)
+     _audit(request, AuditEvent.LOGOUT, provider=(sess.provider if sess else "unknown"),
+            user_id=(sess.user_id if sess else ""))
+--- a/plugins/dashboard_auth/basic/__init__.py
++++ b/plugins/dashboard_auth/basic/__init__.py
+@@ -1,8 +1,8 @@
+ """BasicAuthProvider — username/password dashboard auth (no OAuth IDP).
+ 
+ Login is a credential form (``supports_password`` + ``complete_password_login``); cookies,
+-verify, refresh, ws-tickets and logout are the shared framework. Sessions are stateless
+-HMAC-signed tokens (no IDP, no database); passwords use stdlib scrypt and login always hashes
++verify, refresh, ws-tickets and logout are the shared framework. Sessions are HMAC-signed
++tokens backed by a private durable session-family ledger; passwords use stdlib scrypt and login always hashes
+ even for an unknown username (no username-enumeration timing oracle). Config: ``dashboard.
+ basic_auth.{username,password_hash|password,secret,session_ttl_seconds}`` or the
+ ``HERMES_DASHBOARD_BASIC_AUTH_*`` env vars (env wins when non-empty; see ``_settings``).
+@@ -19,8 +19,10 @@
+ import secrets
+ import time
+ from typing import Optional
++from pathlib import Path
+ 
+ from hermes_cli.dashboard_auth import DashboardAuthProvider, InvalidCredentialsError, RefreshExpiredError, Session
++from ._sessions import SessionStore
+ from plugins.dashboard_auth._shared import (
+     NonInteractiveMixin, SkipRegistration, load_config_section, register_provider, resolve_env_or_cfg)
+ 
+@@ -90,10 +92,12 @@
+     return base64.urlsafe_b64encode(raw + sig).decode()
+ 
+ 
+-def _unsign(token: str, secret: bytes, kind: str) -> Optional[dict]:
++def _unsign(token: str, secret: bytes, kind: str, *, allow_expired: bool = False) -> Optional[dict]:
+     """Return the payload if the signature is valid, ``kind`` matches and it
+     is unexpired; ``None`` otherwise (including on any decode error)."""
+     try:
++        if not isinstance(token, str) or len(token) > 16384:
++            return None
+         blob = base64.urlsafe_b64decode(token.encode())
+         if len(blob) <= _SIG_LEN:
+             return None
+@@ -102,27 +106,41 @@
+         if not hmac.compare_digest(sig, expected):
+             return None
+         payload = json.loads(raw)
++        if (not isinstance(payload, dict) or not isinstance(payload.get("sub"), str)
++                or not payload["sub"] or type(payload.get("exp")) is not int
++                or payload["exp"] <= 0 or payload.get("kind") != kind):
++            return None
++        if not allow_expired and payload["exp"] <= int(time.time()):
++            return None
++        if "sid" in payload and (not isinstance(payload["sid"], str) or len(payload["sid"]) != 32
++                                 or any(ch not in "0123456789abcdef" for ch in payload["sid"])):
++            return None
++        if "legacy" in payload and (not isinstance(payload["legacy"], str) or len(payload["legacy"]) != 64
++                                    or any(ch not in "0123456789abcdef" for ch in payload["legacy"])):
++            return None
+     except Exception:
+         return None
+-    if payload.get("kind") != kind or payload.get("exp", 0) <= int(time.time()):
+-        return None
+     return payload
+ 
+ 
+ # ---- Provider ----
+ 
+ class BasicAuthProvider(NonInteractiveMixin, DashboardAuthProvider):
+-    """Username/password provider with stateless HMAC-signed sessions."""
++    """Username/password provider with durable, individually revocable session families."""
+ 
+     name = "basic"
+     display_name = "Username & Password"
+     supports_password = True
++    # A cached successful rotation must never bypass a later durable revocation.
++    refresh_session_cacheable = False
++    supports_durable_revocation = True
+     _NOT_INTERACTIVE = "BasicAuthProvider is password-only; use complete_password_login."
+     _NO_START_LOGIN = (
+         "BasicAuthProvider is password-only; there is no OAuth redirect flow. "
+         "The login page POSTs to /auth/password-login instead.")
+ 
+-    def __init__(self, *, username: str, password_hash: str, secret: bytes, ttl_seconds: int = _DEFAULT_TTL_SECONDS) -> None:
++    def __init__(self, *, username: str, password_hash: str, secret: bytes,
++                 ttl_seconds: int = _DEFAULT_TTL_SECONDS, session_store_dir: str | Path | None = None) -> None:
+         if not username:
+             raise ValueError("username must be non-empty")
+         if not password_hash:
+@@ -133,6 +151,12 @@
+         self._password_hash = password_hash
+         self._secret = secret
+         self._ttl = max(60, int(ttl_seconds))
++        if session_store_dir is None:
++            from hermes_constants import get_hermes_home
++            # A changed (including random per-process) signing key gets its own namespace;
++            # never reset a ledger authenticated under a different key.
++            session_store_dir = get_hermes_home() / ("dashboard-basic-sessions-" + hashlib.sha256(secret).hexdigest()[:16])
++        self._sessions = SessionStore(session_store_dir, secret)
+ 
+     # ---- password login ----------------------------------------------------
+ 
+@@ -152,7 +176,10 @@
+         payload = _unsign(access_token, self._secret, "access")
+         if payload is None:
+             return None
+-        return self._session(str(payload.get("sub", "")), int(payload["exp"]), access_token, "")
++        with self._sessions.transaction() as state:
++            if not self._accepted(state, payload, access_token):
++                return None
++            return self._session(payload["sub"], payload["exp"], access_token, "")
+ 
+     def refresh_session(self, *, refresh_token: str) -> Session:
+         if not refresh_token:
+@@ -160,21 +187,84 @@
+         payload = _unsign(refresh_token, self._secret, "refresh")
+         if payload is None:
+             raise RefreshExpiredError("refresh token expired or invalid")
+-        return self._mint_session(str(payload.get("sub", self._username)))
+-
+-    def revoke_session(self, *, refresh_token: str) -> None:
+-        # Stateless tokens — nothing to revoke server-side; the session expires within its TTL. Must not raise.
+-        return None
++        with self._sessions.transaction() as state:
++            if not self._accepted(state, payload, refresh_token):
++                raise RefreshExpiredError("refresh session revoked or invalid")
++            sid = payload.get("sid")
++            legacy = payload.get("legacy", "")
++            if not sid:
++                # Legacy stateless RTs migrate on use without a blanket logout. A stable
++                # origin digest keeps every descendant revocable by the original RT.
++                legacy = hashlib.sha256(refresh_token.encode()).hexdigest()
++                sid = hmac.new(self._secret, ("legacy-family:" + legacy).encode(), hashlib.sha256).hexdigest()[:32]
++            return self._mint_locked(state, payload["sub"], sid, legacy)
++
++    def revoke_session(self, *, refresh_token: str, access_token: str = "") -> None:
++        payload = _unsign(refresh_token, self._secret, "refresh", allow_expired=True)
++        access = _unsign(access_token, self._secret, "access", allow_expired=True)
++
++        def owned(candidate):
++            return (candidate is not None and candidate["sub"] == self._username
++                    and ("sid" not in candidate or candidate.get("store") == self._sessions.store_id))
++
++        from_refresh = owned(payload)
++        if not from_refresh:
++            payload = access if owned(access) else None
++        if payload is None:
++            return
++        with self._sessions.transaction() as state:
++            if "sid" in payload:
++                if payload.get("store") != state["store_id"]:
++                    return
++                state["sessions"].pop(payload["sid"], None)
++            legacy = payload.get("legacy")
++            if "sid" not in payload and from_refresh:
++                legacy = hashlib.sha256(refresh_token.encode()).hexdigest()
++                sid = hmac.new(self._secret, ("legacy-family:" + legacy).encode(), hashlib.sha256).hexdigest()[:32]
++                state["sessions"].pop(sid, None)
++            if legacy:
++                state["revoked"]["legacy:" + legacy] = max(payload["exp"], int(time.time()) + _REFRESH_TTL_SECONDS)
++            # Only revoke the exact access credential observed by the existing logout
++            # route. Sid-less legacy tokens cannot safely be grouped by guessed TTLs.
++            matching_family = (access is not None and ("sid" not in access
++                               or (access.get("sid") == payload.get("sid")
++                                   and access.get("store") == payload.get("store"))))
++            if matching_family and access["sub"] == payload["sub"]:
++                state["revoked"]["access:" + hashlib.sha256(access_token.encode()).hexdigest()] = access["exp"]
++            self._sessions.publish(state)
+ 
+     # ---- internals ---------------------------------------------------------
+ 
+     def _mint_session(self, user_id: str) -> Session:
++        with self._sessions.transaction() as state:
++            return self._mint_locked(state, user_id, secrets.token_hex(16), "")
++
++    def _accepted(self, state: dict, payload: dict, token: str) -> bool:
++        if payload["sub"] != self._username:
++            return False
++        now = int(time.time())
++        revoked = state["revoked"]
++        if revoked.get("access:" + hashlib.sha256(token.encode()).hexdigest(), 0) > now:
++            return False
++        if "sid" not in payload:
++            return revoked.get("legacy:" + hashlib.sha256(token.encode()).hexdigest(), 0) <= now
++        return (payload.get("store") == state["store_id"]
++                and state["sessions"].get(payload["sid"], 0) > now
++                and revoked.get("legacy:" + payload.get("legacy", ""), 0) <= now)
++
++    def _mint_locked(self, state: dict, user_id: str, sid: str, legacy: str) -> Session:
+         now = int(time.time())
+         exp = now + self._ttl
++        refresh_exp = now + _REFRESH_TTL_SECONDS
++        state["sessions"][sid] = max(exp, refresh_exp, state["sessions"].get(sid, 0))
++        self._sessions.publish(state)
++        family = {"sid": sid, "store": state["store_id"]}
++        if legacy:
++            family["legacy"] = legacy
+         return self._session(
+             user_id, exp,
+-            _sign({"sub": user_id, "kind": "access", "exp": exp}, self._secret),
+-            _sign({"sub": user_id, "kind": "refresh", "exp": now + _REFRESH_TTL_SECONDS}, self._secret))
++            _sign({"sub": user_id, "kind": "access", "exp": exp, **family}, self._secret),
++            _sign({"sub": user_id, "kind": "refresh", "exp": refresh_exp, **family}, self._secret))
+ 
+     def _session(self, user_id: str, exp: int, access_token: str, refresh_token: str) -> Session:
+         return Session(
+--- /dev/null
++++ b/plugins/dashboard_auth/basic/_sessions.py
+@@ -0,0 +1,212 @@
++"""Private, bounded Basic session tombstones; no tokens or passwords at rest.
++
++The directory is an authority boundary. Never repair/reset missing or invalid state
++automatically: restore a verified complete backup, or deliberately provision a new
++directory (new store id invalidates previously issued sid-bearing credentials).
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++import fcntl
++import hashlib
++import hmac
++import json
++import os
++from pathlib import Path
++import secrets
++import stat
++import time
++
++from hermes_cli.dashboard_auth import ProviderError
++
++_MAX_BYTES = 8 * 1024 * 1024
++_MAX_RECORDS = 100000
++
++
++class SessionStore:
++    def __init__(self, path: str | Path, secret: bytes):
++        self.path = Path(os.path.abspath(os.fspath(path)))
++        self.anchor = self.path.with_name(self.path.name + ".anchor")
++        self.key = hmac.new(secret, b"dashboard-basic-session-store-v1", hashlib.sha256).digest()
++        # Do not silently follow a redirected custody path, including ancestors.
++        for part in reversed((self.path, *self.path.parents)):
++            try:
++                if stat.S_ISLNK(part.lstat().st_mode):
++                    raise ProviderError("Basic session store path contains a symlink")
++            except FileNotFoundError:
++                pass
++        try:
++            os.mkdir(self.path, 0o700)
++            created = True
++        except FileExistsError:
++            created = False
++        except OSError as exc:
++            raise ProviderError("Basic session store directory unavailable") from exc
++        self.identity = None
++        self.lock_identity = None
++        self.store_id = None
++        try:
++            with self._directory() as directory:
++                if created:
++                    lock = os.open("lock", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
++                                   0o600, dir_fd=directory)
++                    os.fsync(lock)
++                    os.close(lock)
++                    os.fsync(directory)
++                with self._locked(directory):
++                    if created:
++                        state = {"version": 1, "store_id": secrets.token_hex(16), "sessions": {}, "revoked": {}}
++                        # Sibling anchor survives loss of the ledger directory. Never
++                        # recreate it for an existing store, nor overwrite an old anchor.
++                        self._create_anchor(state["store_id"])
++                        self._write(directory, state)
++                    else:
++                        state = self._read(directory)
++                    self.store_id = state["store_id"]
++                    self._check_anchor()
++        except (OSError, ValueError, TypeError, KeyError) as exc:
++            raise ProviderError("Basic session store unavailable; restore verified state") from exc
++
++    @contextmanager
++    def _directory(self):
++        descriptor = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++        try:
++            info = os.fstat(descriptor)
++            if info.st_uid != os.geteuid() or info.st_mode & 0o077:
++                raise ProviderError("Basic session store must be private and owned by the process user")
++            identity = (info.st_dev, info.st_ino)
++            if self.identity is not None and identity != self.identity:
++                raise ProviderError("Basic session store directory was replaced")
++            self.identity = identity
++            yield descriptor
++        finally:
++            os.close(descriptor)
++
++    @staticmethod
++    def _private_file(descriptor):
++        info = os.fstat(descriptor)
++        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
++                or info.st_mode & 0o077 or info.st_nlink != 1):
++            raise ProviderError("Basic session store file custody is invalid")
++        return info
++
++    @contextmanager
++    def _locked(self, directory):
++        descriptor = os.open("lock", os.O_RDWR | os.O_NOFOLLOW, dir_fd=directory)
++        try:
++            info = self._private_file(descriptor)
++            identity = (info.st_dev, info.st_ino)
++            if self.lock_identity is not None and identity != self.lock_identity:
++                raise ProviderError("Basic session store lock was replaced")
++            self.lock_identity = identity
++            deadline = time.monotonic() + 1.0
++            while True:
++                try:
++                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                    break
++                except BlockingIOError:
++                    if time.monotonic() >= deadline:
++                        raise ProviderError("Basic session store lock timed out")
++                    time.sleep(0.01)
++            named = os.stat("lock", dir_fd=directory, follow_symlinks=False)
++            if (named.st_dev, named.st_ino) != identity:
++                raise ProviderError("Basic session store lock changed while acquiring it")
++            yield
++        finally:
++            os.close(descriptor)
++
++    @staticmethod
++    def _raw(state):
++        return json.dumps(state, sort_keys=True, separators=(",", ":")).encode()
++
++    def _create_anchor(self, store_id):
++        raw = self._raw({"store_id": store_id, "mac": hmac.new(self.key, store_id.encode(), hashlib.sha256).hexdigest()})
++        descriptor = os.open(self.anchor, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
++        with os.fdopen(descriptor, "wb") as stream:
++            stream.write(raw)
++            stream.flush()
++            os.fsync(stream.fileno())
++        parent = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++        try:
++            os.fsync(parent)
++        finally:
++            os.close(parent)
++
++    def _check_anchor(self):
++        descriptor = os.open(self.anchor, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
++        with os.fdopen(descriptor, "rb") as stream:
++            self._private_file(stream.fileno())
++            raw = stream.read(1025)
++        if len(raw) > 1024:
++            raise ValueError("invalid session store anchor")
++        anchor = json.loads(raw)
++        if (anchor["store_id"] != self.store_id
++                or not hmac.compare_digest(anchor["mac"], hmac.new(self.key, self.store_id.encode(), hashlib.sha256).hexdigest())):
++            raise ValueError("session store anchor mismatch")
++
++    def _read(self, directory):
++        descriptor = os.open("state.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
++        with os.fdopen(descriptor, "rb") as stream:
++            self._private_file(stream.fileno())
++            raw = stream.read(_MAX_BYTES + 1)
++        if len(raw) > _MAX_BYTES:
++            raise ValueError("session state exceeds bound")
++        envelope = json.loads(raw)
++        state = envelope["state"]
++        expected = hmac.new(self.key, self._raw(state), hashlib.sha256).hexdigest()
++        if not hmac.compare_digest(envelope["mac"], expected):
++            raise ValueError("session state integrity failure")
++        if (set(state) != {"version", "store_id", "sessions", "revoked"}
++                or type(state["version"]) is not int or state["version"] != 1
++                or not isinstance(state["store_id"], str) or len(state["store_id"]) != 32
++                or any(ch not in "0123456789abcdef" for ch in state["store_id"])
++                or not isinstance(state["revoked"], dict) or not isinstance(state["sessions"], dict)
++                or len(state["revoked"]) + len(state["sessions"]) > _MAX_RECORDS):
++            raise ValueError("invalid session state")
++        if self.store_id is not None and state["store_id"] != self.store_id:
++            raise ValueError("session state was replaced")
++        for key, expiry in (*state["revoked"].items(), *state["sessions"].items()):
++            if (not isinstance(key, str) or len(key) > 80
++                    or type(expiry) is not int or expiry <= 0):
++                raise ValueError("invalid session tombstone")
++        return state
++
++    def _write(self, directory, state):
++        envelope = {"state": state, "mac": hmac.new(self.key, self._raw(state), hashlib.sha256).hexdigest()}
++        raw = self._raw(envelope)
++        if len(raw) > _MAX_BYTES or len(state["revoked"]) + len(state["sessions"]) > _MAX_RECORDS:
++            raise ProviderError("Basic session revocation store is full")
++        temporary = ".state-" + secrets.token_hex(16)
++        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
++                             0o600, dir_fd=directory)
++        try:
++            with os.fdopen(descriptor, "wb") as stream:
++                stream.write(raw)
++                stream.flush()
++                os.fsync(stream.fileno())
++            os.replace(temporary, "state.json", src_dir_fd=directory, dst_dir_fd=directory)
++            os.fsync(directory)
++        finally:
++            try:
++                os.unlink(temporary, dir_fd=directory)
++            except FileNotFoundError:
++                pass
++
++    @contextmanager
++    def transaction(self):
++        try:
++            with self._directory() as directory, self._locked(directory):
++                self._check_anchor()
++                state = self._read(directory)
++                yield state
++        except (OSError, ValueError, TypeError, KeyError) as exc:
++            raise ProviderError("Basic session store unavailable; restore verified state") from exc
++
++    def publish(self, state):
++        now = int(time.time())
++        state = dict(state,
++                     revoked={key: expiry for key, expiry in state["revoked"].items() if expiry > now},
++                     sessions={key: expiry for key, expiry in state["sessions"].items() if expiry > now})
++        # Called within transaction; reopen only the same checked directory, retaining flock.
++        with self._directory() as directory:
++            self._write(directory, state)
