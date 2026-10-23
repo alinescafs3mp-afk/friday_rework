@@ -1,0 +1,9 @@
+# Native history compatibility — 2026-10-23
+
+The installed Native116/Source6/project307 source update is independently verified. The separate embedding migration is applied and Root verified. Services remain stopped at this checkpoint; startup and user acceptance remain separate. Native117 DOCX and registered worker source309 are reviewed source candidates and have not been installed.
+
+This patch targets the existing private normal4 invocation package, not a new installer. It aligns historical request hashing with the existing producer serializer and reuses identical archived YAML parses with the same parser, independent copies, at most16 records,4MiB per record and8MiB total raw input. Every archive pin, source read, clock, grant and live custody check remains. Native-owned PID lock files retain their normal locking and exact before/after inode and empty-byte checks separately from immutable data.
+
+R121 refused during preflight; R122 refused during locked preflight. Persistent configurations, retained data, launcher and unit hashes were unchanged, and the deterministic native semantic transaction was absent. Their original clocks, failures and no-retry intents remain preserved. The corrected R123 operation committed in150.108seconds under its original180-second native window. Root verified all9 published files,1956 immutable retained records,6 restored native PID locks and1342 unchanged history records. Later closure bookkeeping reached188.353seconds; that overrun remains explicit and did not extend the native effect clock. Detailed outcomes are recorded in OBSERVATIONS.json.
+
+The independent source reviews found no open HIGH/MEDIUM issues. Process failures remain explicit: two earlier static reviews exceeded their own time windows; S194 exceeded its fixture-process allocation and used two host fixture processes outside the selected interpreter. Source acceptance does not erase those failures or supply operational authority.
