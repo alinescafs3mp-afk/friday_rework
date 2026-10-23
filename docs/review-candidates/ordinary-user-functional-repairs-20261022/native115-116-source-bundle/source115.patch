@@ -1,0 +1,1076 @@
+--- /dev/null
++++ b/gateway/hosted_room_consent.py
+@@ -0,0 +1,368 @@
++"""Process-local explicit native member admission for one shared room task.
++
++Durable room rows describe coordination only. No value from those rows can recreate
++the original authenticated UserScope retained here. Restart deliberately empties
++this registry; historical shared room messages remain in the existing room store.
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++from dataclasses import dataclass, field
++import math
++import threading
++import time
++import uuid
++
++
++class RoomConsentDenied(PermissionError):
++    def __init__(self):
++        super().__init__("room_member_readmission_required")
++
++
++def _text(value):
++    if not isinstance(value, str) or not value or len(value) > 256:
++        raise RoomConsentDenied()
++    return value
++
++
++def _room_key(room):
++    try:
++        if room.get("disbanded_at") is not None:
++            raise RoomConsentDenied()
++        epoch = room["authority_epoch"]
++        if type(epoch) is not int or epoch < 1:
++            raise RoomConsentDenied()
++        return (_text(room["room_id"]), _text(room["authority_gateway_id"]), epoch)
++    except (KeyError, TypeError, ValueError):
++        raise RoomConsentDenied() from None
++
++
++def _roster(room):
++    try:
++        members = room["members"]
++        if not isinstance(members, list) or not 2 <= len(members) <= 6:
++            raise RoomConsentDenied()
++        rows = []
++        for member in members:
++            target = member.get("target") or {"kind": "local", "profile": member["profile"]}
++            if target != {"kind": "local", "profile": member["profile"]}:
++                raise RoomConsentDenied()  # peer topology remains on its existing path
++            rows.append((_text(member["member_id"]), _text(member["profile"])))
++        if len(set(x[0] for x in rows)) != len(rows) or len(set(x[1] for x in rows)) != len(rows):
++            raise RoomConsentDenied()
++        return tuple(rows)
++    except (KeyError, TypeError, ValueError):
++        raise RoomConsentDenied() from None
++
++
++@dataclass
++class _Member:
++    source: object
++    capability: object
++    principal: tuple
++    admission_generation: int
++    identity: object
++    session_id: str | None = None
++
++
++@dataclass
++class _Consent:
++    key: tuple
++    roster: tuple
++    requester: _Member
++    task_id: str
++    thread_id: str
++    text: str
++    expires_at: float
++    cancel_generation: int
++    consent_id: str
++    members: dict = field(default_factory=dict)
++    source_event_seq: int | None = None
++    started: bool = False
++    revoked: bool = False
++    turns: dict = field(default_factory=dict)
++
++
++class RoomConsentRegistry:
++    """One service-owned authority registry; all grants die with the process."""
++
++    def __init__(self, *, clock=time.time):
++        self.clock, self._lock, self._rooms = clock, threading.RLock(), {}
++        self._used_tasks = set()
++        self._cleanup_entries = {}
++
++    @staticmethod
++    def _admitted(source):
++        from gateway.session_identity import identity_of
++        from hermes_cli.friday_user_scope import UserScope, authority, scoped_source
++        cap = getattr(source, "_friday_user_scope", None)
++        identity = identity_of(source)
++        # Live native provenance is required. Restored SessionSource/JSON objects
++        # may coordinate messages but cannot supply a fresh member opt-in.
++        if (not isinstance(cap, UserScope) or identity is None
++                or identity.adapter() is None or identity.transport_inferred
++                or not identity.multiplexed):
++            raise RoomConsentDenied()
++        with authority(cap.home), scoped_source(source) as current:
++            if current is not cap:
++                raise RoomConsentDenied()
++            cap.check()
++        return _Member(source, cap, tuple(cap.principal), cap.admission_generation, identity)
++
++    def _check_member(self, member):
++        from gateway.session_identity import identity_of
++        from hermes_cli.friday_user_scope import authority
++        cap, source = member.capability, member.source
++        identity = identity_of(source)
++        if (getattr(source, "_friday_user_scope", None) is not cap
++                or identity is not member.identity or identity.adapter() is None
++                or tuple(cap.principal) != member.principal
++                or cap.admission_generation != member.admission_generation
++                or source.platform.value != cap.principal[0] or source.user_id != cap.principal[3]
++                or source.profile not in (None, "", cap.profile)
++                or identity.runtime_profile != cap.profile or identity.runtime_home != cap.home
++                or identity.authorization_home != cap.authorization_home
++                or identity.transport_profile != cap.principal[1]):
++            raise RoomConsentDenied()
++        # Rechecking another retained member must never replace the ambient
++        # principal. Only member_scope enters that member's original context.
++        with authority(cap.home):
++            cap.check()
++        return cap
++
++    def _entry(self, room, *, historical=False):
++        entry = self._rooms.get(_room_key(room)[0])
++        if (entry is None or entry.key != _room_key(room) or entry.roster != _roster(room)
++                or not historical and (entry.revoked or self.clock() >= entry.expires_at)):
++            raise RoomConsentDenied()
++        return entry
++
++    def _get(self, room, *, all_members=False):
++        entry = self._entry(room)
++        self._check_member(entry.requester)
++        if all_members and set(entry.members) != {m for m, _p in entry.roster}:
++            raise RoomConsentDenied()
++        for member in entry.members.values():
++            self._check_member(member)
++        return entry
++
++    def open(self, room, source, *, task_id, thread_id, text, expires_at, cancel_generation=0):
++        requester, key, roster = self._admitted(source), _room_key(room), _roster(room)
++        if requester.capability.profile not in {p for _m, p in roster}:
++            raise RoomConsentDenied()
++        if (not isinstance(text, str) or not text.strip() or len(text.encode()) > 65536
++                or type(expires_at) not in (float, int) or not math.isfinite(expires_at)
++                or not self.clock() < expires_at <= self.clock() + 3600
++                or type(cancel_generation) is not int or cancel_generation != 0):
++            raise RoomConsentDenied()
++        with self._lock:
++            previous = self._rooms.get(key[0])
++            if ((key[0], task_id) in self._used_tasks
++                    or previous is not None and not previous.revoked):
++                raise RoomConsentDenied()  # stop the old task before replacing its authority
++            self._rooms[key[0]] = _Consent(key, roster, requester, _text(task_id),
++                _text(thread_id), text, float(expires_at), cancel_generation, uuid.uuid4().hex)
++            self._used_tasks.add((key[0], task_id))
++        return self.describe(room, source, invitation=True)
++
++    def describe(self, room, source, *, invitation=False):
++        member = self._admitted(source)
++        with self._lock:
++            entry = self._get(room)
++            if member.capability.profile not in {p for _m, p in entry.roster}:
++                raise RoomConsentDenied()
++            if not invitation:
++                self._read_access(entry, member)
++            return {"room_id": entry.key[0], "gateway_id": entry.key[1],
++                "authority_epoch": entry.key[2], "requester": list(entry.requester.principal),
++                "task_id": entry.task_id, "thread_id": entry.thread_id,
++                "consent_id": entry.consent_id,
++                "shared_task": entry.text, "expires_at": entry.expires_at,
++                "cancel_generation": entry.cancel_generation,
++                "members": [{"member_id": m, "profile": p, "accepted": m in entry.members}
++                            for m, p in entry.roster],
++                "shared": "Only room messages and this shared task's outputs. Private history, memory, config and credentials remain private.",
++                "approval": "Each affected member approves its own exact current effect."}
++
++    def accept(self, room, source, task_id, consent_id):
++        member = self._admitted(source)
++        with self._lock:
++            entry = self._get(room)
++            matches = [m for m, p in entry.roster if p == member.capability.profile]
++            if (entry.started or task_id != entry.task_id or consent_id != entry.consent_id
++                    or len(matches) != 1):
++                raise RoomConsentDenied()
++            old = entry.members.get(matches[0])
++            if old is not None and old.principal != member.principal:
++                raise RoomConsentDenied()
++            entry.members[matches[0]] = member
++        return self.describe(room, source)
++
++    def _read_access(self, entry, member):
++        if (member.principal != entry.requester.principal and not any(
++                m.principal == member.principal for m in entry.members.values())):
++            raise RoomConsentDenied()
++
++    def requester(self, room, source):
++        member = self._admitted(source)
++        with self._lock:
++            entry = self._entry(room, historical=True)
++            if member.principal != entry.requester.principal:
++                raise RoomConsentDenied()
++            return entry
++
++    def own_member(self, room, source, member_id):
++        incoming = self._admitted(source)
++        with self._lock:
++            entry = self._get(room, all_members=True)
++            member = entry.members.get(member_id)
++            if member is None or incoming.principal != member.principal:
++                raise RoomConsentDenied()
++            return member
++
++    def validate_start(self, room, source, task_id):
++        """Reject wrong/replayed starts before the producer performs cleanup."""
++        with self._lock:
++            entry = self.requester(room, source)
++            self._get(room, all_members=True)
++            if entry.started or task_id != entry.task_id:
++                raise RoomConsentDenied()
++            return entry
++
++    def start(self, room, source, task_id):
++        with self._lock:
++            entry = self.validate_start(room, source, task_id)
++            entry.started = True  # never repeat send after an uncertain result
++            return {"text": entry.text, "thread_id": entry.thread_id}
++
++    def bind_event(self, room, *, event_id, source_event_seq):
++        with self._lock:
++            entry = self._get(room, all_members=True)
++            if (not entry.started or entry.task_id != event_id or entry.source_event_seq is not None
++                    or type(source_event_seq) is not int or source_event_seq < 1):
++                raise RoomConsentDenied()
++            entry.source_event_seq = source_event_seq
++
++    def revoke(self, room, source):
++        member = self._admitted(source)
++        with self._lock:
++            entry = self._entry(room, historical=True)
++            owned = [m for m, p in entry.roster if p == member.capability.profile
++                     and m in entry.members and entry.members[m].principal == member.principal]
++            if len(owned) != 1:
++                raise RoomConsentDenied()
++            entry.revoked = True
++            return owned[0]
++
++    def stop(self, room, source):
++        with self._lock:
++            entry = self.requester(room, source)
++            if entry.revoked:
++                return
++            entry.revoked = True
++            entry.cancel_generation += 1
++
++    def require_all(self, room):
++        with self._lock:
++            return self._get(room, all_members=True)
++
++    @contextmanager
++    def member_scope(self, room, member_id, profile, *, task=None, session_id=None, operation="execute"):
++        """Bind one exact room/task/turn/session attempt to its ORIGINAL member.
++
++        A retry after a consumed/cancelled generation requires a fresh invitation;
++        this first version never transfers an old opt-in to a different attempt.
++        """
++        from hermes_cli.friday_user_scope import authority, scoped_source
++        if operation == "interrupt":
++            raise RoomConsentDenied()  # cleanup has its separate, authority-free scope
++        with self._lock:
++            entry = self._get(room, all_members=True)
++            if (member_id, profile) not in entry.roster:
++                raise RoomConsentDenied()
++            member = entry.members[member_id]
++            if not entry.started or entry.source_event_seq is None:
++                raise RoomConsentDenied()
++            if task is not None:
++                identity, payload = task["identity"], task["payload"]
++                if (identity.room_id != entry.key[0] or identity.thread_id != entry.thread_id
++                        or payload.get("source_event_seq") != entry.source_event_seq
++                        or payload.get("target_profile") != profile
++                        or payload.get("target_member_id", profile) != member_id
++                        or task.get("cancel_generation") != entry.cancel_generation
++                        or type(task.get("execution_generation")) is not int
++                        or task.get("execution_generation") not in (0, 1)):
++                    raise RoomConsentDenied()
++                # Stable deterministic turn identity, independently checked against
++                # room policy and the durable running generation by the backend.
++                proof = (identity.thread_id, identity.turn_id, member_id, profile,
++                         int(task.get("execution_generation") or 1), entry.cancel_generation)
++                previous = entry.turns.get(identity.task_id)
++                if previous is None:
++                    entry.turns[identity.task_id] = proof
++                    self._cleanup_entries[(entry.key[0], identity.task_id)] = entry
++                elif previous != proof:
++                    raise RoomConsentDenied()
++            if session_id is not None:
++                session_id = _text(session_id)
++                if member.session_id not in (None, session_id):
++                    raise RoomConsentDenied()
++                member.session_id = session_id
++            cap = self._check_member(member)
++        with authority(cap.home), scoped_source(member.source) as current:
++            if current is not cap:
++                raise RoomConsentDenied()
++            yield cap
++
++    @contextmanager
++    def interruption_scope(self, room, member_id, profile, *, task, session_id):
++        """Cleanup ONLY for an already bound original task/turn/session handle.
++
++        Does not enter UserScope, runtime-home or credential context, check a
++        database, mint a grant, or yield a capability. The caller may only stop
++        its exact existing active record; loss of product admission cannot
++        prevent that cleanup. Every fresh effect uses member_scope instead.
++        """
++        from gateway.session_identity import identity_of
++        with self._lock:
++            key = _room_key(room)
++            entry = self._cleanup_entries.get((key[0], task["identity"].task_id))
++            if entry is None or entry.key != key or entry.roster != _roster(room):
++                raise RoomConsentDenied()
++            member = entry.members.get(member_id)
++            if (member is None or (member_id, profile) not in entry.roster
++                    or not entry.started or member.session_id != session_id):
++                raise RoomConsentDenied()
++            cap = member.capability
++            identity, payload = task["identity"], task["payload"]
++            original = member.identity
++            proof = entry.turns.get(identity.task_id)
++            expected = (identity.thread_id, identity.turn_id, member_id, profile,
++                        task.get("execution_generation"))
++            if (getattr(member.source, "_friday_user_scope", None) is not cap
++                    or identity_of(member.source) is not original
++                    or cap.principal != member.principal or cap.profile != profile
++                    or cap.home != original.runtime_home
++                    or cap.authorization_home != original.authorization_home
++                    or cap.admission_generation != member.admission_generation
++                    or identity.room_id != entry.key[0] or identity.thread_id != entry.thread_id
++                    or payload.get("source_event_seq") != entry.source_event_seq
++                    or payload.get("target_profile") != profile
++                    or payload.get("target_member_id", profile) != member_id
++                    or task.get("cancel_generation") not in (0, 1)
++                    or proof is None or proof[:5] != expected
++                    or task.get("status") not in ("running", "stopping", "indeterminate")):
++                raise RoomConsentDenied()
++        yield
++
++    def shared_events(self, room, source, events):
++        member = self._admitted(source)
++        with self._lock:
++            entry = self._entry(room, historical=True)
++            self._read_access(entry, member)
++            # Only explicit shared transcript events. Never call session.history
++            # or a member's private store to serve this room view.
++            return [{k: event[k] for k in ("seq", "event_id", "kind", "actor", "payload") if k in event}
++                    for event in events if event.get("room_id") == entry.key[0]
++                    and event.get("kind") in {"message.user", "message.member", "turn.settled",
++                        "turn.failed", "turn.cancelled", "turn.deferred", "room.activity"}]
+--- /dev/null
++++ b/gateway/hosted_room_native.py
+@@ -0,0 +1,130 @@
++"""Admitted native /room ingress for the existing hosted room worker."""
++from __future__ import annotations
++
++import json
++import shlex
++import threading
++import uuid
++
++from gateway.hosted_room_consent import RoomConsentDenied
++
++_SERVICE_LOCK = threading.RLock()
++_REFUSED = "Group Chat requires current personal admission and explicit member consent."
++_HELP = (
++    "/room invite <JSON: room_id, name, members, task_id, thread_id, text, expires_at>\n"
++    "/room inspect ROOM\n/room join ROOM TASK CONSENT_ID\n/room start ROOM TASK\n"
++    "/room log ROOM\n/room stop ROOM\n/room revoke ROOM\n"
++    "/room pending ROOM MEMBER\n"
++    "/room approve ROOM MEMBER TASK GENERATION REQUEST once|deny"
++)
++
++
++def get_native_room_service(runner):
++    """One existing service/worker per native gateway; no dashboard/CLI authority."""
++    from tui_gateway.hosted_room_service import HostedRoomService
++    with _SERVICE_LOCK:
++        service = getattr(runner, "_native_hosted_room_service", None)
++        if service is None:
++            service = HostedRoomService(None)
++            runner._native_hosted_room_service = service
++        service.start()
++        return service
++
++
++def stop_native_room_service(runner, *, timeout=5.0):
++    with _SERVICE_LOCK:
++        service = getattr(runner, "_native_hosted_room_service", None)
++    return True if service is None else service.stop(timeout=timeout)
++
++
++async def dispatch_native_room(runner, event, source, *, is_internal=False):
++    """Called only after GatewayInboundMixin._hm_admit_event and its pause gate.
++
++    The original SessionSource already owns the UserScope minted by the real
++    native/product authorization intersection. JSON carries only coordination.
++    """
++    text = getattr(event, "text", "")
++    if not isinstance(text, str) or text.split(maxsplit=1)[0:1] != ["/room"]:
++        return False, None
++    if is_internal or getattr(event, "internal", False):
++        return True, _REFUSED
++    from hermes_cli.friday_user_scope import slash_allowed
++    if not slash_allowed(source, "room"):
++        return True, _REFUSED
++    denied = runner._check_slash_access(source, "room")
++    if denied:
++        return True, denied
++    try:
++        # Recheck the actual native admission before retaining authority. A
++        # mutable source/capability attached after admission is not a grant.
++        if not runner._is_user_authorized_for_source(source):
++            raise RoomConsentDenied()
++        from gateway.hosted_room_consent import RoomConsentRegistry
++        RoomConsentRegistry._admitted(source)
++        service = get_native_room_service(runner)
++        registry = service.consent
++        pieces = text.split(maxsplit=2)
++        if len(pieces) < 2 or pieces[1] == "help":
++            return True, _HELP
++        command = pieces[1]
++        raw = pieces[2] if len(pieces) == 3 else ""
++        if command == "invite":
++            value = json.loads(raw)
++            if not isinstance(value, dict) or set(value) != {
++                    "room_id", "name", "members", "task_id", "thread_id", "text", "expires_at"}:
++                raise RoomConsentDenied()
++            # Validate genuine source BEFORE any coordination writes.
++            registry._admitted(source)
++            room = service.create_room(room_id=value["room_id"], name=value["name"], members=value["members"])
++            # Reusing a durable event id never authorizes replay of its effects.
++            if any(e.get("event_id") == value["task_id"] for e in service._events(value["room_id"])):
++                raise RoomConsentDenied()
++            result = registry.open(room, source, task_id=value["task_id"], thread_id=value["thread_id"],
++                text=value["text"], expires_at=value["expires_at"])
++        else:
++            args = shlex.split(raw)
++            if not args:
++                return True, _HELP
++            room = service._room(args[0])
++            if command == "inspect" and len(args) == 1:
++                result = registry.describe(room, source, invitation=True)
++            elif command == "join" and len(args) == 3:
++                result = registry.accept(room, source, args[1], args[2])
++            elif command == "start" and len(args) == 2:
++                registry.validate_start(room, source, args[1])
++                if next(iter(service._list_tasks(args[0],
++                        ("queued", "running", "stopping", "indeterminate", "deferred"))), None) is not None:
++                    # Fresh admission never retries a consumed or unknown old
++                    # effect. The existing exact cancellation path must prove
++                    # acknowledged cleanup before admitting this NEW event.
++                    service.stop_room(args[0], cancel_id=f"readmission:{uuid.uuid4().hex}",
++                                      require_acknowledged=True)
++                payload = registry.start(room, source, args[1])
++                result = service.send(room_id=args[0], event_id=args[1], payload=payload,
++                                      native_consent_event=True)
++            elif command == "log" and len(args) == 1:
++                result = registry.shared_events(room, source, service._events(args[0]))
++            elif command == "stop" and len(args) == 1:
++                registry.stop(room, source)
++                result = {"stopped": service.stop_room(args[0], cancel_id=f"native:{uuid.uuid4().hex}")}
++            elif command == "revoke" and len(args) == 1:
++                member_id = registry.revoke(room, source)
++                # Losing any required frozen member invalidates this shared task;
++                # use the existing cancellation path to stop pending room turns.
++                result = {"revoked_member": member_id,
++                    "stopped": service.stop_room(args[0], cancel_id=f"member-revoke:{uuid.uuid4().hex}")}
++            elif command == "pending" and len(args) == 2:
++                registry.own_member(room, source, args[1])
++                result = service.native_rpc.pending(room_id=args[0], member_id=args[1], source=source)
++            elif command == "approve" and len(args) == 6:
++                registry.own_member(room, source, args[1])
++                result = service.approve_room_task(args[0], member_id=args[1], task_id=args[2],
++                    execution_generation=int(args[3]), request_id=args[4], choice=args[5],
++                    native_source=source)
++            else:
++                return True, _HELP
++        return True, json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
++    except (RoomConsentDenied, PermissionError, RuntimeError, OSError):
++        return True, _REFUSED
++    except (ValueError, TypeError, KeyError):
++        return True, _HELP
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -1308,6 +1308,12 @@
+         if _paused_notice is not None:
+             return _paused_notice
+ 
++        from gateway.hosted_room_native import dispatch_native_room
++        _room_handled, _room_reply = await dispatch_native_room(
++            self, event, source, is_internal=is_internal)
++        if _room_handled:
++            return _room_reply
++
+         # Controls retain native pause policy and require no new agent/session.
+         from gateway.run_plugin_commands import dispatch_control
+         _control_handled, _control_reply = await dispatch_control(self, event, source)
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -958,16 +958,25 @@
+             return "" if silent_ok else _unexpected_silence_reply()
+         return _strip_media_directives(_sanitize_gateway_final_response(origin.platform, last["content"])).strip() or None
+ 
+-    @staticmethod
+-    def _start_hosted_room_worker_sync():
++    def _start_hosted_room_worker_sync(self):
+         """Start the local Group Chat worker without importing the dashboard."""
+-        import tui_gateway.server  # noqa: F401
+-        from tui_gateway import methods_groups
+-        service = methods_groups.get_hosted_room_service()
+-        if service is None:
+-            service = methods_groups.start_hosted_room_service()
+-        if service is None:
+-            raise RuntimeError("Group Chat worker has no bound session backend")
++        from hermes_cli.friday_user_scope import policy
++        from hermes_constants import get_hermes_home
++        if policy(get_hermes_home()) is not None:
++            from gateway.hosted_room_native import get_native_room_service
++            service = get_native_room_service(self)
++            self._hosted_room_worker_route = "native"
++        else:
++            # Unmanaged local and peer rooms keep their existing session
++            # backend and topology. This branch supplies no product grant.
++            import tui_gateway.server  # noqa: F401
++            from tui_gateway import methods_groups
++            service = methods_groups.get_hosted_room_service()
++            if service is None:
++                service = methods_groups.start_hosted_room_service()
++            if service is None:
++                raise RuntimeError("Group Chat worker has no bound session backend")
++            self._hosted_room_worker_route = "legacy"
+         status = service.runtime.status()
+         if not status.get("running") or status.get("stopping"):
+             raise RuntimeError("Group Chat worker did not start")
+@@ -984,6 +993,9 @@
+ 
+     async def _stop_hosted_room_worker(self, timeout: float = 5.0) -> bool:
+         """Pause room execution durably without interrupting accepted turns."""
++        if getattr(self, "_hosted_room_worker_route", None) == "native":
++            from gateway.hosted_room_native import stop_native_room_service
++            return await asyncio.to_thread(stop_native_room_service, self, timeout=timeout)
+         from tui_gateway import methods_groups
+         return await asyncio.to_thread(methods_groups.stop_hosted_room_service, timeout=timeout)
+ 
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -368,7 +368,7 @@
+         with authority(identity.runtime_home):
+             with scoped_source(source):
+                 cap.check()
+-        return command in {'help', 'status', 'stop', 'cancel', 'new', 'reset', 'queue', 'memory', 'compress'}
++        return command in {'help', 'status', 'stop', 'cancel', 'new', 'reset', 'queue', 'memory', 'compress', 'room'}
+     except Exception:  # health: allow BLE001 -- Slash admission fails closed without exposing policy or plugin secrets.
+         return False
+ 
+@@ -495,6 +495,11 @@
+             raise ScopeDenied()
+         retained.check()
+     if cap is not None:
++        room_guard = getattr(agent, '_friday_room_guard', None)
++        if room_guard is not None:
++            if not callable(room_guard):
++                raise ScopeDenied()
++            room_guard()
+         delegated = getattr(agent, '_friday_delegation', None)
+         if delegated is not None:
+             hard = getattr(agent, '_hard_interrupt_requested', None)
+--- /dev/null
++++ b/tui_gateway/hosted_room_native_rpc.py
+@@ -0,0 +1,397 @@
++"""Exact-member native room backend over the existing session store and agent.
++
++The CLI facade is deliberately not imported. This backend obtains every member's
++original admitted source from the process-local explicit consent registry. JSON
++origin fields are comparisons only; they never recreate a capability.
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++from dataclasses import dataclass, field
++import json
++import threading
++import time
++import uuid
++
++from gateway import hosted_room_driver as state
++from gateway import hosted_rooms
++from gateway.hosted_room_consent import RoomConsentRegistry, RoomConsentDenied
++
++
++@dataclass
++class _Session:
++    binding: object
++    identity: object
++    member_id: str
++    profile: str
++    capability: object
++    session_id: str
++    origin: dict
++    agent: object = None
++    active: bool = False
++    execution_generation: int = 0
++    consumed: set = field(default_factory=set)
++    receipts: list = field(default_factory=list)
++    lock: object = field(default_factory=threading.RLock)
++
++
++class NativeHostedRoomRPC:
++    """Real session backend retained by the existing HostedRoomService."""
++
++    def __init__(self, service, registry):
++        if type(registry) is not RoomConsentRegistry:
++            raise RoomConsentDenied()
++        self.service, self.registry = service, registry
++        self._sessions, self._lock = {}, threading.RLock()
++
++    def join(self, *, timeout=5.0):
++        """Bounded shutdown proof for native turn threads owned by this service."""
++        deadline = time.monotonic() + max(0.0, timeout)
++        with self._lock:
++            threads = [getattr(record, "thread", None) for record in self._sessions.values()]
++        for thread in threads:
++            if thread is not None and thread is not threading.current_thread():
++                thread.join(max(0.0, deadline - time.monotonic()))
++        return all(thread is None or not thread.is_alive() for thread in threads)
++
++    def for_task(self, binding, task):
++        return _TaskRPC(self, binding, task["identity"])
++
++    def approve(self, *, session_id, request_id, choice, source=None):
++        # No requester/host proxy approval: the original affected member alone
++        # can resolve its exact existing native pending request.
++        cap = getattr(source, "_friday_user_scope", None)
++        with self._lock:
++            record = self._sessions.get(session_id)
++        from hermes_cli.friday_user_scope import _same_scope
++        if record is None or not _same_scope(cap, record.capability):
++            raise RoomConsentDenied()
++        return _TaskRPC(self, record.binding, record.identity).approve(
++            profile=record.profile, session_id=session_id, request_id=request_id,
++            choice=choice, source=source)
++
++    def pending(self, *, room_id, member_id, source):
++        """Read an exact effect only on its affected member's admitted ingress."""
++        room = hosted_rooms.room_state(self.service.db_path, room_id=room_id)
++        self.registry.own_member(room, source, member_id)
++        from hermes_cli.friday_user_scope import _same_scope
++        cap = getattr(source, "_friday_user_scope", None)
++        with self._lock:
++            records = [r for r in self._sessions.values() if r.binding.room_id == room_id
++                       and r.member_id == member_id and _same_scope(cap, r.capability)]
++        result = []
++        for record in records:
++            rpc = _TaskRPC(self, record.binding, record.identity)
++            with rpc._scope(record.profile, "bot_room", record.session_id):
++                from tools.approval import get_pending_gateway_approval
++                pending = get_pending_gateway_approval(record.session_id)
++                if record.active and pending:
++                    result.append({**dict(pending), "task_id": record.identity.task_id,
++                        "execution_generation": record.execution_generation})
++        return {"pending": result}
++
++
++def _origin(binding, task, member_id, cap):
++    return {"schema": "friday.native-room-session.v1", "platform": cap.principal[0],
++        "friday_account_origin": {"schema": "friday.account_origin.v1",
++            "platform": cap.principal[0], "transport_profile": cap.principal[1],
++            "account_id": cap.principal[2]}, "room_id": binding.room_id,
++        "gateway_id": binding.gateway_id, "authority_epoch": binding.authority_epoch,
++        "thread_id": task["identity"].thread_id,
++        "source_event_seq": task["payload"]["source_event_seq"],
++        "member_id": member_id, "profile": cap.profile, "principal": list(cap.principal),
++        "admission_generation": cap.admission_generation}
++
++
++class _TaskRPC:
++    def __init__(self, owner, binding, identity):
++        self.owner, self.binding, self.identity = owner, binding, identity
++
++    def _task(self, *, effect=False, interrupt=False):
++        task = state.get_task(self.owner.service.db_path, self.identity)
++        room = hosted_rooms.room_state(self.owner.service.db_path, room_id=self.binding.room_id)
++        from gateway.hosted_room_discussion import reconstruct_task_plan
++        reconstruct_task_plan(room, self.owner.service._events(self.binding.room_id), task,
++                              local_profiles=(tuple(m["profile"] for m in room["members"])
++                                  if interrupt else self.owner.service.local_profiles()))
++        if ((room["authority_gateway_id"], room["authority_epoch"]) !=
++                (self.binding.gateway_id, self.binding.authority_epoch)
++                or task["identity"] != self.identity
++                or task.get("cancel_generation") not in ((0, 1) if interrupt else (0,))
++                or task.get("execution_generation") != 1
++                or (effect and task.get("status") != "running")):
++            raise RoomConsentDenied()
++        return room, task
++
++    @contextmanager
++    def _scope(self, profile, source, session_id=None, *, operation="read"):
++        if source != "bot_room":
++            raise RoomConsentDenied()
++        room, task = self._task(effect=operation in {"create", "submit", "approve", "effect"}, interrupt=operation == "interrupt")
++        member_id = str(task["payload"].get("target_member_id") or task["payload"]["target_profile"])
++        with self.owner.registry.member_scope(room, member_id, profile, task=task,
++                session_id=session_id, operation=operation) as cap:
++            # Resolve secrets/config/database only after genuine admission and
++            # exact task fences. This existing gateway scope is per home and
++            # never mutates process environment or borrows the CLI capability.
++            from agent.secret_scope import (build_profile_secret_scope, set_secret_scope,
++                reset_secret_scope, set_multiplex_context, reset_multiplex_context)
++            from tools.terminal_scope import install_and_reset_profile_terminal_scope
++            secret_token = set_secret_scope(build_profile_secret_scope(cap.home), profile_home=str(cap.home))
++            multiplex_token = set_multiplex_context(True)
++            try:
++              with install_and_reset_profile_terminal_scope(cap.home):
++                cap.check()
++                from hermes_cli.friday_user_scope import check_database
++                check_database(cap)
++                if session_id is not None:
++                    with self.owner._lock:
++                        record = self.owner._sessions.get(session_id)
++                    if (record is None or record.capability is not cap
++                            or record.origin != _origin(self.binding, task, member_id, cap)):
++                        raise RoomConsentDenied()
++                yield cap, task, member_id
++            finally:
++                reset_multiplex_context(multiplex_token)
++                reset_secret_scope(secret_token)
++
++    @contextmanager
++    def _database(self, cap):
++        from hermes_state import SessionDB
++        db = SessionDB(cap.home / "state.db")
++        try:
++            yield db
++        finally:
++            db.close()
++
++    def _session_result(self, record):
++        return {"session_id": record.session_id, "stored_session_id": record.session_id}
++
++    def _stopping_record(self, profile, source, session_id=None):
++        """Coordinator-only cleanup observation, with no profile store readers."""
++        current = state.get_task(self.owner.service.db_path, self.identity)
++        if current.get("status") != "stopping":
++            return None
++        if source != "bot_room" or current["payload"].get("target_profile") != profile:
++            raise RoomConsentDenied()
++        room, task = self._task(interrupt=True)
++        with self.owner._lock:
++            record = next((r for r in self.owner._sessions.values()
++                if r.identity == self.identity and r.profile == profile
++                and (session_id is None or r.session_id == session_id)), None)
++        if record is None:
++            raise RoomConsentDenied()
++        with self.owner.registry.interruption_scope(room, record.member_id, profile,
++                task=task, session_id=record.session_id):
++            return record
++
++    def resolve_exact(self, *, profile, title, source):
++        if title != f"Group: {self.binding.room_id}":
++            raise RoomConsentDenied()
++        if (record := self._stopping_record(profile, source)) is not None:
++            return self._session_result(record)
++        with self._scope(profile, source) as (cap, task, member):
++            if title != f"Group: {self.binding.room_id}":
++                raise RoomConsentDenied()
++            origin = _origin(self.binding, task, member, cap)
++            # Only an in-memory binding minted under this genuine admission can
++            # be resumed. Restart is pending re-admission; durable descriptors
++            # cannot stand in for authority or bind private historical sessions.
++            with self.owner._lock:
++                record = next((r for r in self.owner._sessions.values()
++                    if r.capability is cap and r.origin == origin), None)
++            return None if record is None else self._session_result(record)
++
++    def create(self, *, profile, title, source):
++        with self._scope(profile, source, operation="create") as (cap, task, member):
++            if title != f"Group: {self.binding.room_id}":
++                raise RoomConsentDenied()
++            origin = _origin(self.binding, task, member, cap)
++            with self.owner._lock:
++                record = next((r for r in self.owner._sessions.values()
++                    if r.capability is cap and r.origin == origin), None)
++                if record is not None:
++                    return self._session_result(record)
++                session_id = "native-room-" + uuid.uuid4().hex
++                with self.owner.registry.member_scope(
++                        hosted_rooms.room_state(self.owner.service.db_path, room_id=self.binding.room_id),
++                        member, profile, task=task, session_id=session_id, operation="create"):
++                    with self._database(cap) as db:
++                        db.create_session(session_id, "bot_room", user_id=cap.principal[3],
++                            session_key=session_id, chat_id=self.binding.room_id,
++                            chat_type="group", thread_id=self.identity.thread_id,
++                            cwd=str(cap.home / "workspace"), profile_name=cap.profile,
++                            transport_profile=cap.principal[1], origin_json=json.dumps(origin))
++                        db.set_session_title(session_id, f"{title} [{session_id}]")
++                        db.set_session_hidden(session_id, True)
++                record = _Session(self.binding, self.identity, member, profile, cap, session_id, origin)
++                self.owner._sessions[session_id] = record
++                return self._session_result(record)
++
++    def resume(self, *, profile, session_id, source):
++        if (record := self._stopping_record(profile, source, session_id)) is not None:
++            return self._session_result(record)
++        with self._scope(profile, source, session_id) as (cap, _task, _member):
++            record = self.owner._sessions[session_id]
++            with self._database(cap) as db:
++                row = db.get_session(session_id)
++                if (row is None or row.get("source") != "bot_room"
++                        or row.get("user_id") != cap.principal[3]
++                        or row.get("profile_name") != cap.profile
++                        or json.loads(row.get("origin_json") or "null") != record.origin):
++                    raise RoomConsentDenied()
++            return self._session_result(record)
++
++    def _build_agent(self, cap, session_id, db):
++        from hermes_cli.config_effective import load_user_config_effective
++        from hermes_cli.runtime_provider import resolve_runtime_with_fallback
++        from run_agent import AIAgent
++        config = load_user_config_effective(cap.home / "config.yaml")
++        runtime, fallback = resolve_runtime_with_fallback(config)
++        model_config = config.get("model", {})
++        if isinstance(model_config, str):
++            model_config = {"default": model_config}
++        model = (fallback or {}).get("model") or model_config.get("default")
++        runtime = {key: runtime.get(key) for key in (
++            "api_key", "base_url", "provider", "requested_provider", "api_mode",
++            "credential_pool", "request_overrides")}
++        max_iterations = config.get("agent", {}).get("max_turns", 500)
++        return AIAgent(model=model, **runtime, max_iterations=max_iterations,
++            quiet_mode=True, verbose_logging=False, session_id=session_id,
++            session_db=db, platform=cap.principal[0], user_id=cap.principal[3],
++            # A shared room is a fresh shared prompt. This minimal native
++            # surface does not expose any private profile tool or context.
++            cwd=str(cap.home / "workspace"), enabled_toolsets=[],
++            skip_memory=True, skip_context_files=True, load_soul_identity=False,
++            skip_background_review=True, prefill_messages=None,
++            reasoning_config=config.get("reasoning"), service_tier=config.get("service_tier"))
++
++    def submit(self, *, profile, session_id, prompt, source, task, execution_generation,
++               on_terminal, member_id):
++        with self._scope(profile, source, session_id, operation="submit") as (cap, current, member):
++            if (task != self.identity or member_id != member
++                    or execution_generation != current["execution_generation"]
++                    or prompt != current["payload"]["prompt"]):
++                raise RoomConsentDenied()
++            record = self.owner._sessions[session_id]
++            key = (task.task_id, execution_generation, current["cancel_generation"])
++            with record.lock:
++                if key in record.consumed or record.active:
++                    raise RoomConsentDenied()
++                record.consumed.add(key)  # an uncertain effect is never repeated
++                record.active, record.identity = True, task
++                record.execution_generation = execution_generation
++            def run():
++                from tools.approval import register_gateway_notify, unregister_gateway_notify
++                register_gateway_notify(session_id, lambda _request: None)
++                agent = None
++                try:
++                    with self._scope(profile, source, session_id, operation="effect"):
++                        with self._database(cap) as db:
++                            agent = self._build_agent(cap, session_id, db)
++                            with record.lock:
++                                record.agent = agent
++                            def guard():
++                                with self._scope(profile, source, session_id, operation="effect"):
++                                    pass
++                            agent._friday_room_guard = guard
++                            guard()
++                            result = agent.run_conversation(user_message=prompt, task_id=task.task_id)
++                            # Export only the explicit shared output, never the
++                            # member model/tool/private session transcript.
++                            text = str((result or {}).get("final_response") or "")
++                            status = "failed" if (result or {}).get("error") else "settled"
++                            receipt = {"status": status, "text": text,
++                                "message_id": f"reply:{task.task_id}:{execution_generation}",
++                                "task_id": task.task_id, "execution_generation": execution_generation}
++                            guard()
++                            with record.lock:
++                                record.receipts.append({"role": "assistant", "content": text, **receipt})
++                            on_terminal(receipt)
++                except Exception:
++                    # Never expose an exception which can contain provider or
++                    # profile secrets to other room principals.
++                    current_task = state.get_task(self.owner.service.db_path, self.identity)
++                    if current_task["status"] == "running":
++                        on_terminal({"status": "failed", "text": "Shared member turn failed.",
++                            "task_id": task.task_id, "execution_generation": execution_generation})
++                finally:
++                    unregister_gateway_notify(session_id)
++                    with record.lock:
++                        record.active, record.agent = False, None
++                    cleanup = getattr(agent, "close", None)
++                    if callable(cleanup):
++                        cleanup()
++            # Existing context-propagating thread primitive, one finite native
++            # turn; room scheduling and cancellation remain in the old runtime.
++            from agent.memory_provider import spawn_context_thread
++            record.thread = spawn_context_thread(run, name=f"native-room-{task.task_id}")
++            try:
++                record.thread.start()
++            except Exception:
++                with record.lock:
++                    record.active = False
++                # No thread started; consumption remains sticky and the driver
++                # records an ambiguous failed admission rather than retrying.
++                raise
++            return {"accepted": True, "task_id": task.task_id}
++
++    def history(self, *, profile, session_id, source):
++        if self._stopping_record(profile, source, session_id) is not None:
++            return ()  # cleanup never reads a profile transcript or approvals
++        with self._scope(profile, source, session_id):
++            return tuple(dict(r) for r in self.owner._sessions[session_id].receipts
++                         if r["task_id"] == self.identity.task_id)
++
++    def info(self, *, profile, session_id, source):
++        if (record := self._stopping_record(profile, source, session_id)) is not None:
++            return {"active": record.active, "task_id": record.identity.task_id,
++                    "execution_generation": record.execution_generation}
++        with self._scope(profile, source, session_id):
++            record = self.owner._sessions[session_id]
++            from tools.approval import get_pending_gateway_approval
++            result = {"active": record.active, "task_id": record.identity.task_id}
++            pending = get_pending_gateway_approval(session_id)
++            if pending and record.active:
++                result.update(status="waiting_for_approval", pending_approval={
++                    "request_id": pending["request_id"], "task_id": record.identity.task_id,
++                    "execution_generation": record.execution_generation})
++            return result
++
++    def approve(self, *, profile, session_id, request_id, choice, source):
++        with self._scope(profile, "bot_room", session_id, operation="approve") as (cap, task, _member):
++            from hermes_cli.friday_user_scope import current, scoped_source, _same_scope
++            with scoped_source(source):
++                if not _same_scope(current(required=True), cap) or choice not in {"once", "deny"}:
++                    raise RoomConsentDenied()
++                from tools.approval import get_pending_gateway_approval, resolve_gateway_approval
++                pending = get_pending_gateway_approval(session_id)
++                record = self.owner._sessions[session_id]
++                if (not record.active or record.identity != self.identity
++                        or record.execution_generation != task["execution_generation"]
++                        or not pending or pending.get("request_id") != request_id):
++                    raise RoomConsentDenied()
++                if resolve_gateway_approval(session_id, choice, request_id=request_id) != 1:
++                    raise RoomConsentDenied()
++                return {"resolved": True, "request_id": request_id}
++
++    def interrupt(self, *, profile, session_id, source, expected_task_id):
++        if source != "bot_room" or expected_task_id != self.identity.task_id:
++            raise RoomConsentDenied()
++        room, task = self._task(interrupt=True)
++        with self.owner._lock:
++            record = self.owner._sessions.get(session_id)
++        if (record is None or record.identity != self.identity or record.profile != profile
++                or record.execution_generation != task["execution_generation"]):
++            raise RoomConsentDenied()
++        with self.owner.registry.interruption_scope(room, record.member_id, profile,
++                task=task, session_id=session_id):
++            with record.lock:
++                if record.agent is not None and record.active:
++                    record.agent.interrupt(hard_cancel=True)
++                    return {"status": "interrupted"}
++                if record.active:
++                    # The finite worker rechecks task fences before constructing
++                    # or invoking the agent; no unguarded future effect remains.
++                    return {"status": "interrupted"}
++            return {"status": "cancelled"}
+--- a/tui_gateway/hosted_room_service.py
++++ b/tui_gateway/hosted_room_service.py
+@@ -74,6 +74,10 @@
+         self._pending_actions: dict[tuple[str, str], dict[str, Any]] = {}
+         self.policy_checkpoint = HostedRoomPolicyCheckpoint(self.db_path)
+         self.rpc = HostedRoomServerRPC(server)
++        from gateway.hosted_room_consent import RoomConsentRegistry
++        from tui_gateway.hosted_room_native_rpc import NativeHostedRoomRPC
++        self.consent = RoomConsentRegistry()
++        self.native_rpc = NativeHostedRoomRPC(self, self.consent)
+         self._link_load_error = None
+         self._peer_route_status: dict[tuple[str, str], str] = {}
+         self.peer_routes: dict[tuple[str, str], PeerMemberRoute] = {}
+@@ -163,7 +167,9 @@
+         self.runtime.start()
+ 
+     def stop(self, *, timeout: float = 5.0) -> bool:
+-        return self.runtime.stop(timeout=timeout)
++        deadline = time.monotonic() + max(0.0, timeout)
++        stopped = self.runtime.stop(timeout=timeout)
++        return self.native_rpc.join(timeout=max(0.0, deadline - time.monotonic())) and stopped
+ 
+     def wakeup(self) -> None:
+         self.runtime.wakeup()
+@@ -238,6 +244,9 @@
+         if route is None:
+             if self._member_is_peer(binding.room_id, member_id):
+                 raise RuntimeError("peer room route is unavailable")
++            from hermes_cli.friday_user_scope import policy
++            if self.server is None or policy(self.root) is not None:
++                return self.native_rpc.for_task(binding, task)
+             return self.rpc
+         client = self.peer_clients.get(key)
+         if client is None:
+@@ -418,6 +427,9 @@
+                 self.db_path, room_id=binding.room_id, clock=self.runtime.clock)
+             if next(iter(self._list_tasks(binding.room_id, _LIVE_STATUSES)), None) is not None:
+                 return
++            from hermes_cli.friday_user_scope import policy
++            if self.server is None or policy(self.root) is not None:
++                self.consent.require_all(room)
+             decision = discussion.plan_next_task(
+                 room, list(snapshot.events), local_profiles=self.local_profiles(),
+                 initial_watermarks=snapshot.watermarks)
+@@ -451,13 +463,15 @@
+         self.runtime.wakeup()
+         return room
+ 
+-    def send(self, *, room_id: str, event_id: str, payload: Any) -> dict[str, Any]:
++    def send(self, *, room_id: str, event_id: str, payload: Any, native_consent_event: bool = False) -> dict[str, Any]:
+         normalized = discussion.validate_user_payload(payload)
+         gateway_id, epoch = self._owned_authority(room_id)
+         event = hosted_rooms.append_event(
+             self.db_path, room_id=room_id, event_id=event_id, kind="message.user",
+             actor={"kind": "user", "id": "desktop"}, payload=normalized,
+             authority_gateway_id=gateway_id, authority_epoch=epoch)
++        if native_consent_event:
++            self.consent.bind_event(self._room(room_id), event_id=event_id, source_event_seq=int(event["seq"]))
+         binding = next((b for b in self.bindings() if b.room_id == room_id), None)
+         if binding is None:
+             raise hosted_rooms.RoomNotFoundError("hosted room not found")
+@@ -497,7 +511,7 @@
+ 
+     def approve_room_task(
+         self, room_id: str, *, member_id: str, task_id: str, execution_generation: int,
+-        choice: str, request_id: str | None = None) -> Mapping[str, Any]:
++        choice: str, request_id: str | None = None, native_source=None) -> Mapping[str, Any]:
+         """Resolve one exact local or peer approval and wake room observation."""
+         key = (room_id, member_id)
+         route, client = self.peer_routes.get(key), self.peer_clients.get(key)
+@@ -523,8 +537,14 @@
+             session_id = str(action.get("session_id") or "")
+             if not session_id:
+                 raise RuntimeError("local room approval identity is unavailable")
+-            result = self.rpc.approve(
+-                session_id=session_id, request_id=requested_approval_id, choice=choice)
++            from hermes_cli.friday_user_scope import policy
++            if self.server is None or policy(self.root) is not None:
++                self.consent.own_member(self._room(room_id), native_source, member_id)
++                result = self.native_rpc.approve(session_id=session_id,
++                    request_id=requested_approval_id, choice=choice, source=native_source)
++            else:
++                result = self.rpc.approve(
++                    session_id=session_id, request_id=requested_approval_id, choice=choice)
+         if result is None:
+             raise RuntimeError("room approval target is unavailable")
+         with self._policy_lock:
