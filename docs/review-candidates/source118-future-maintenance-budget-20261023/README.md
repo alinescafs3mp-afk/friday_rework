@@ -1,0 +1,9 @@
+# Future source-maintenance budget - reviewed source delta
+
+The observed C3 installer spends 61.28 seconds on one complete current authenticated-history traversal. Three required traversals already exceed 180 seconds before the rest of installation. No installation with a 180 second budget was admitted or retried on this evidence.
+
+This targeted change lets the existing generic worker_source_maintenance route carry an explicitly planned future budget of up to 600 seconds. The default remains 180. Other phases retain their previous limits. A fresh operation, request-core hash and original clock must bind the chosen duration. Cold bootstrap, both full preflights, staging, all postchecks, publication/commit and rollback keep one original native deadline; a clipped or refreshed deadline is rejected before once-dispatch. Historical operations and effects remain closed.
+
+The patch includes seven reviewed implementation files under logical paths: canonical registration; the existing private invocation carrier and its registration sibling; producer; capture/dispatch callers; and helper. This is a delta for the existing targeted integration recipe, not universal support for 600 seconds through the installed CLI. The canonical ordinary installer stays unchanged. Both private and canonical registration consumers need the phase-aware history check so future worker provenance accepts the authenticated maintenance record.
+
+Eighteen effective-function controls and 386 independent source/predicate/producer/Budget controls passed. They use isolated synthetic fixtures, not a physical installation. No unchanged suites were repeated. Exact C4 project/input/frozen/helper/verifier composition and fresh Root admission are required before effects. Source117 remains installed; this patch is not runtime or user acceptance and does not prove that the entire operation fits in 600 seconds. No new service, worker, API, framework or controller is introduced.
