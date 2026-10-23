@@ -18,3 +18,5 @@ Service startup and user scenarios are separate later lifecycles and are **not a
 - [Facts, evidence hashes and limits](facts.json)
 
 The native patch applies over the accepted Source113 chain at the manifest's upstream base commit; existing upstream provenance and license obligations remain. Operator deltas replace private absolute locations with placeholders and are analysis material, not an installable authority. Private user data, transcripts and memory oracle are excluded.
+
+Later actual service, official reset and scoped memory observations, including the remaining origin-metadata failure, are recorded in [the runtime checkpoint](../native114-runtime-reset-memory/README.md).

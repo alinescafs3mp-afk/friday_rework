@@ -1,0 +1,17 @@
+# Source114: actual service and official conversation reset
+
+The installed Source114/project303 completed a normal native service start in 78.33 seconds within the existing 180-second startup window. Systemd notification, process identity and the owned event-loop tick were checked. The healthy permanent service remains under Root/systemd ownership independently of each finite user test.
+
+A real official `/new` command and its own confirmation then completed once each through the Telegram native path. Both replies had their complete 180-second captures and terminal receive drains. The actual primary route rotated to a newly created empty conversation; its parent links to the prior conversation, whose 3 physical messages and counter were retained. The same service instance stayed healthy. The original Source113 deferred-scope failure remains recorded; the Source114 result came from a distinct task after the repair.
+
+Startup had legitimately reopened the old ended conversation, so a proposed separate recovery echo was unnecessary and was not sent. A local tick-check initially compared an access timestamp that its own socket probe could change; the failed observation was retained, and a read-only check of the actual identity fields passed without a service restart. Legacy missing dispatch timestamps remain neutral metadata: 25 of 26 such old runs had already been sent. Their immutable histories were retained.
+
+One subsequent query in the actual new conversation recalled the exact saved value. Its complete 180-second capture and terminal drain closed after a single send. The exact request was joined to the single new native user row, and Root compared the captured reply and native assistant answer with the local saved oracle after capture. The scoped memory semantics passed. The recall request contains only a saved key and a new task nonce. The expected value stays in a local Root-only oracle and is never placed in that request or the public packet.
+
+This checkpoint establishes scoped behavior on the named installed version. It does not establish all localization paths, all adapters, general memory requirements or full product readiness. The confirmation card was English and its normal completion reply was Russian. The provider's exact prompt payload was not retained, so its complete contents are not proven.
+
+Private conversations, the memory key/value and oracle, account identifiers, credentials and operational bindings are excluded. Evidence hashes in facts.json identify the retained local receipts without exposing their contents.
+
+The first recall preparation was refused before admission because it omitted two required predecessor fields. No request was sent in that attempt. Its failed record and original clock were kept; the corrected preparation passed the actual consumer in read-only mode before a separate named admission.
+
+The recall caller nevertheless exited2: its after-capture check caught persisted origin message metadata regressing from the fresh reset source to the old routing cache. SID, parent, principal, account and profile stayed unchanged, and the actual new user message had a distinct newer native receiving ID. The failed caller observation remains preserved. This checkpoint therefore accepts observed memory recall only; durable-origin integrity and the complete reset/recall workflow remain unaccepted. A minimal source repair is being prepared separately; it is not installed. No query was resent or old effect clock reopened.
