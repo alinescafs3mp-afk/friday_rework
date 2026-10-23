@@ -1,0 +1,487 @@
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -1792,7 +1792,7 @@
+             )
+         elif agent_result.get("compression_exhausted") and session_entry and session_key:
+             logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
+-            new_entry = await self.async_session_store.reset_session(session_key)
++            new_entry = await self.async_session_store.reset_session(session_key, source=source)
+             self._evict_cached_agent(session_key)
+             # Conversation boundary: the funnel clears every conversation-scoped per-session dict.
+             self._clear_conversation_scope(session_key, reason="compression_exhausted_reset")
+diff --git a/gateway/session.py b/gateway/session.py
+--- a/gateway/session.py
++++ b/gateway/session.py
+@@ -1009,7 +1009,9 @@
+                 # Honour an explicit suspension/reset decision instead of silently reopening via recovery.
+                 if reset_reason:
+                     decision.schedule_reset(reset_reason, entry, entry.last_prompt_tokens > 0)
+-                self._entries.pop(session_key, None)
++                if not reset_reason:
++                    self._entries.pop(session_key, None)
++                # Keep the predecessor reachable until replacement creation succeeds.
+                 decision.needs_recover = True
+             else:
+                 # Internal/system events preserve the user-activity clock.
+@@ -1046,19 +1048,22 @@
+             auto_reset_reason=decision.reset_reason, reset_had_activity=decision.reset_had_activity,
+             prev_session_id=decision.prev_session_id, transport_profile=transport_profile_of(source),
+         )
++        create_kwargs = self._session_create_kwargs(
++            session_id=session_id, session_key=session_key, origin=source,
++            source_value=source.platform.value, display_name=source.chat_name,
++            parent_session_id=decision.prev_session_id,
++        )
+         with self._lock:
+             current = self._entries.get(session_key)
+-            if current is None or (force_new and current is observed):
++            if (current is None or (force_new and current is observed)
++                    or (decision.reset_reason and current is observed)):
++                self._prepare_managed_session_row(session_key, create_kwargs)
+                 self._entries[session_key] = current = candidate
+         decision.entry = current
+         decision.needs_save = True
+         if current is not candidate:
+             return None
+-        return self._session_create_kwargs(
+-            session_id=session_id, session_key=session_key, origin=source,
+-            source_value=source.platform.value, display_name=source.chat_name,
+-            parent_session_id=decision.prev_session_id,
+-        )
++        return create_kwargs
+ 
+     def update_session(
+         self, session_key: str, last_prompt_tokens: int = None, touch_activity: bool = True,
+@@ -1120,27 +1125,47 @@
+             entry = self._entry_locked(session_key)
+             return dict(entry.model_override) if entry and entry.model_override else None
+ 
+-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
+-        """Force reset a session, creating a new session ID."""
++    def reset_session(
++        self, session_key: str, display_name: Optional[str] = None, *,
++        source: Optional[SessionSource] = None,
++    ) -> Optional[SessionEntry]:
++        """Force reset; managed creation requires the current admitted source.
++
++        A restored old_entry.origin intentionally has no live identity/capability.
++        Never use it to mint a new managed row or retrofit existing history.
++        """
++        from hermes_cli.friday_user_scope import current, ScopeDenied
++        cap = current()
+         with self._lock:
+             old_entry = self._entry_locked(session_key)
+             if old_entry is None:
+                 return None
++            origin = source if cap is not None else old_entry.origin
++            if cap is not None:
++                old = old_entry.origin
++                if (source is None or old is None
++                        or self._generate_session_key(source) != session_key
++                        or old_entry.transport_profile != cap.principal[1]
++                        or old.profile not in (None, '', cap.profile)
++                        or any(getattr(old, name) != getattr(source, name)
++                               for name in ('platform', 'user_id', 'chat_id', 'chat_type', 'thread_id'))):
++                    raise ScopeDenied()
+             now = _now()
+             session_id = _new_session_id(now)
++            name = display_name if display_name is not None else old_entry.display_name
++            db_create_kwargs = self._session_create_kwargs(
++                session_id=session_id, session_key=session_key, origin=origin,
++                source_value=old_entry.platform.value if old_entry.platform else "unknown",
++                display_name=name, parent_session_id=old_entry.session_id,
++            )
++            self._prepare_managed_session_row(session_key, db_create_kwargs)
+             new_entry = self._replace_route_locked(
+                 session_key, old_entry, session_id, now,
+-                display_name=display_name if display_name is not None else old_entry.display_name,
+-                is_fresh_reset=True,
+-            )
+-            db_create_kwargs = self._session_create_kwargs(
+-                session_id=session_id, session_key=session_key, origin=old_entry.origin,
+-                source_value=old_entry.platform.value if old_entry.platform else "unknown",
+-                display_name=old_entry.display_name, parent_session_id=old_entry.session_id,
++                display_name=name, is_fresh_reset=True,
+             )
+         self._finish_route_transition(
+             session_key, end_session_id=old_entry.session_id, end_reason="session_reset",
+-            create_kwargs=db_create_kwargs, origin=old_entry.origin,
++            create_kwargs=db_create_kwargs, origin=origin,
+             display_name=new_entry.display_name, during=" during reset",
+         )
+         return new_entry
+diff --git a/gateway/session_recovery.py b/gateway/session_recovery.py
+--- a/gateway/session_recovery.py
++++ b/gateway/session_recovery.py
+@@ -299,7 +299,9 @@
+             row=recovered, session_key=session_key, source=source, now=now)
+         return entry, migrated_legacy
+ 
+-    def _promote_session_reset(self, session_key: str, session_id: str, reason: str, *, log) -> None:
++    def _promote_session_reset(
++        self, session_key: str, session_id: str, reason: str, *, log, successor_session_id=None,
++    ) -> None:
+         """End *session_id* with *reason* via ``promote_to_session_reset`` (``end_session`` on old
+         SessionDBs). Promote, not plain end: a row already ended with a recoverable accidental
+         reason (agent_close / ws_orphan_reap) must be upgraded to the explicit boundary, or
+@@ -308,7 +310,10 @@
+             db = self._db_for_key(session_key)
+             promote = getattr(db, "promote_to_session_reset", None)
+             if callable(promote):
+-                promote(session_id, reason)
++                if successor_session_id is None:
++                    promote(session_id, reason)
++                else:
++                    promote(session_id, reason, successor_session_id=successor_session_id)
+             else:
+                 db.end_session(session_id, reason)
+             # Stop the departed conversation's schedule in its owning profile, even when
+@@ -398,13 +403,17 @@
+         explicit reset boundary (with the specific reason so state.db is auditable, e.g.
+         ``suspended`` vs plain ``session_reset``), then INSERT the new row + routing
+         peer. Both best-effort: failures are warned and self-healed by the next peer refresh."""
++        from hermes_cli.friday_user_scope import current
++        # Only managed rows were preinserted; preserve the unmanaged DB contract.
++        successor_session_id = (create_kwargs["session_id"]
++                                if create_kwargs and current() is not None else None)
+         if end_session_id:
+             from hermes_cli.observability.relay_shared_metrics import close_session_run
+ 
+             close_session_run(end_session_id)
+         if self._db_for_key(session_key) and end_session_id:
+             self._promote_session_reset(
+-                session_key, end_session_id, end_reason,
++                session_key, end_session_id, end_reason, successor_session_id=successor_session_id,
+                 log=lambda e: logger.warning(
+                     "Failed to end predecessor session row %s for %s%s: %s — the old row remains "
+                     "open and may win restart recovery until the next successful peer refresh",
+@@ -427,6 +436,21 @@
+         (parent/_reset_from) land atomically in the INSERT so a crash right after cannot strand the
+         row unroutable."""
+         from gateway.session_identity import identity_of, transport_profile_of
++        from hermes_cli.friday_user_scope import current, scoped_source, ScopeDenied
++        cap = current()
++        if cap is not None:
++            # A retained routing source is metadata, never an admission capability.
++            # Validate the live source and the entire owning store before any INSERT.
++            with scoped_source(origin):
++                raw_origin = _origin_json(origin, new=True)
++            expected = {"schema": "friday.account_origin.v1", "platform": cap.principal[0],
++                        "transport_profile": cap.principal[1], "account_id": cap.principal[2]}
++            if (source_value != cap.principal[0] or not raw_origin
++                    or json.loads(raw_origin).get("friday_account_origin") != expected
++                    or SessionRecoveryMixin._profile_from_session_key(session_key) != cap.profile):
++                raise ScopeDenied()
++        else:
++            raw_origin = _origin_json(origin, new=True)
+         pinned = identity_of(origin)
+         return {
+             "session_id": session_id,
+@@ -436,13 +460,30 @@
+             "chat_id": origin.chat_id if origin else None,
+             "chat_type": origin.chat_type if origin else None,
+             "thread_id": origin.thread_id if origin else None,
+-            "profile_name": origin.profile if origin else None,
++            "profile_name": cap.profile if cap is not None else (origin.profile if origin else None),
+             "transport_profile": pinned.transport_profile if pinned is not None else transport_profile_of(origin),
+-            "origin_json": _origin_json(origin, new=True),
++            "origin_json": raw_origin,
+             "display_name": display_name,
+             "parent_session_id": parent_session_id,
+             "model_config": {"_reset_from": parent_session_id} if parent_session_id else None,
+         }
++
++    def _prepare_managed_session_row(self, session_key, create_kwargs) -> None:
++        """Managed rows must be durable with full ownership BEFORE publishing a route.
++
++        Unmanaged stores retain their existing best-effort recovery behavior.
++        """
++        from pathlib import Path
++        from hermes_cli.friday_user_scope import current, check_database, ScopeDenied
++        cap = current()
++        if cap is None:
++            return
++        check_database(cap)
++        db = self._db_for_key(session_key)
++        if db is None or Path(db.db_path) != cap.home / "state.db":
++            raise ScopeDenied()
++        cap.check()
++        db.create_session(**create_kwargs)
+ 
+     def _create_session_row(self, session_key, db_create_kwargs, origin, display_name, *, log) -> None:
+         """INSERT a session row and record its routing peer; ``log(exc)`` on failure. A failed
+diff --git a/gateway/shutdown_watchdog.py b/gateway/shutdown_watchdog.py
+--- a/gateway/shutdown_watchdog.py
++++ b/gateway/shutdown_watchdog.py
+@@ -15,6 +15,8 @@
+ import json
+ import logging
+ import os
++import socket
++import stat
+ import sys
+ import threading
+ import time
+@@ -188,17 +190,52 @@
+     return _home(home).joinpath(*_HEARTBEAT_RELATIVE)
+ 
+ 
++def _validate_tick_socket_directory(directory: Path, *, private: bool) -> None:
++    """Refuse symlinks/foreign owners; the new shared-temp namespace must be private."""
++    info = directory.lstat()
++    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
++            or (private and stat.S_IMODE(info.st_mode) & 0o077)):
++        raise PermissionError(f"Unsafe loop tick socket directory: {directory}")
++
++
++def _tick_socket_identity(path: Path) -> tuple[int, int]:
++    info = path.lstat()
++    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
++        raise PermissionError(f"Unsafe loop tick socket node: {path}")
++    return info.st_dev, info.st_ino
++
++
+ def get_loop_tick_socket_path(home: Optional[Path] = None, pid: Optional[int] = None) -> Path:
+-    """``<HERMES_HOME>/state/gateway.loop-tick.<pid>.sock`` — PID-suffixed so a stale node from a
+-    dead process is never mistaken for this gateway's witness. Served by the loop itself
+-    (``_tick_socket_handler``), so an answer proves the loop dispatches; the heartbeat cannot.
+-
+-    Served by the gateway loop itself (see ``_tick_socket_handler``): an answer is direct proof that the
+-    loop is dispatching, which is exactly the property the heartbeat file lost when its write moved off-loop
+-    (#90502).
++    """Shared, read-only producer/probe address, with a private short-home fallback.
++
++    Keep existing short addresses. Long homes use a deterministic per-user/per-home directory
++    under /tmp, independent of the producer's and CLI's TMPDIR. The PID suffix prevents a dead
++    gateway's node being mistaken for another gateway's loop witness.
+     """
++    from gateway.control_socket import _fits_sun_path, _home_hash
++
+     pid = int(pid if pid is not None else os.getpid())
+-    return _home(home) / "state" / f"gateway.loop-tick.{pid}.sock"
++    if pid <= 0:
++        raise ValueError("Loop tick socket PID must be positive")
++    home = _home(home)
++    direct = home / "state" / f"gateway.loop-tick.{pid}.sock"
++    if os.name != "posix":
++        return direct  # native Windows uses the existing TCP witness
++    # Existing state directories keep their modes; only the shared-temp fallback requires 0700.
++    private = not _fits_sun_path(direct)
++    path = (Path("/tmp") / f"hermes-loop-tick-{os.getuid()}-{_home_hash(home)}" / direct.name
++            if private else direct)  # no-tmp: ok — bounded AF_UNIX rendezvous, never scratch data
++    if not _fits_sun_path(path):
++        raise ValueError("Loop tick socket path exceeds the AF_UNIX byte limit")
++    try:
++        _validate_tick_socket_directory(path.parent, private=private)
++    except FileNotFoundError:
++        pass
++    try:
++        _tick_socket_identity(path)
++    except FileNotFoundError:
++        pass
++    return path
+ 
+ 
+ def get_shutdown_watchdog_dump_path(home: Optional[Path] = None) -> Path:
+@@ -327,17 +364,44 @@
+             writer.close()
+ 
+ 
++def _unlink_owned_tick_socket(path: Path, identity: tuple[int, int]) -> None:
++    """Only remove the socket inode we inspected/bound, never a replacement node."""
++    with contextlib.suppress(OSError):
++        if _tick_socket_identity(path) == identity:
++            path.unlink()
++
++
++def _remove_abandoned_tick_socket(path: Path) -> None:
++    """PID reuse may leave our exact node behind; preserve any connectable listener."""
++    try:
++        identity = _tick_socket_identity(path)
++    except FileNotFoundError:
++        return
++    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
++        probe.settimeout(0.1)
++        try:
++            probe.connect(str(path))
++        except ConnectionRefusedError:
++            _unlink_owned_tick_socket(path, identity)
++        # Other errors, including timeout/permission errors, do not prove abandonment.
++
++
+ def _sweep_stale_tick_sockets(own_path: Path) -> None:
+-    """Unlink loop-tick socket nodes left by dead PIDs (POSIX only; never raises).
+-    create_unix_server removes a leftover node at OUR path (os._exit / SIGKILL skip the
+-    finally-unlink) but not SIBLING nodes from other dead PIDs. os.kill(pid, 0) is a liveness
+-    probe only on POSIX (Windows would TerminateProcess)."""
+-    try:
+-        for stale in (p for p in own_path.parent.glob("gateway.loop-tick.*.sock") if p != own_path):
++    """Sweep only owned socket nodes naming a strictly positive, proven-dead PID."""
++    try:
++        for stale in own_path.parent.glob("gateway.loop-tick.*.sock"):
++            if stale == own_path:
++                continue
++            pid_text = stale.name[len("gateway.loop-tick."):-len(".sock")]
++            if not pid_text.isascii() or not pid_text.isdecimal() or int(pid_text) <= 0:
++                continue
+             try:
+-                os.kill(int(stale.name.split(".")[-2]), 0)  # windows-footgun: ok — POSIX-only
+-            except (ValueError, IndexError, OSError):
+-                stale.unlink(missing_ok=True)
++                identity = _tick_socket_identity(stale)
++                os.kill(int(pid_text), 0)  # windows-footgun: ok — called only by the POSIX arm
++            except ProcessLookupError:
++                _unlink_owned_tick_socket(stale, identity)
++            except OSError:
++                continue  # EPERM and unknown errors are not proof of death
+     except Exception:
+         logger.debug("stale loop-tick socket sweep failed", exc_info=True)
+ 
+@@ -360,27 +424,46 @@
+     # (ungated it raised AttributeError on native Windows), so non-POSIX binds TCP loopback and
+     # publishes ``loop_tick_tcp_port``.
+     tick_server = tick_socket_path = tick_tcp_port = None
+-    try:
+-        if os.name == "posix":
+-            tick_socket_path = get_loop_tick_socket_path(home)
+-            tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
+-            _sweep_stale_tick_sockets(tick_socket_path)
+-            tick_server = await asyncio.start_unix_server(_tick_socket_handler,
+-                                                          path=str(tick_socket_path))
+-        else:
+-            tick_server = await asyncio.start_server(_tick_socket_handler, host="127.0.0.1", port=0)
+-            for _s in tick_server.sockets or []:
+-                with contextlib.suppress(Exception):
+-                    if isinstance(_sname := _s.getsockname(), tuple) and len(_sname) >= 2:
+-                        tick_tcp_port = int(_sname[1])
+-                        break
+-    except Exception:
+-        tick_server = tick_tcp_port = None
+-        logger.warning("Loop tick socket unavailable — liveness probes will have no "
+-                       "loop-scheduling witness and will not escalate on a stale heartbeat",
+-                       exc_info=True)
+-    extra = {"loop_tick_socket": tick_server is not None, "loop_tick_tcp_port": tick_tcp_port}
+-    try:
++    tick_socket = tick_socket_identity = None
++    try:
++        try:
++            if os.name == "posix":
++                tick_socket_path = get_loop_tick_socket_path(home)
++                tick_socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++                _validate_tick_socket_directory(
++                    tick_socket_path.parent, private=tick_socket_path.parent != _home(home) / "state")
++                _sweep_stale_tick_sockets(tick_socket_path)
++                _remove_abandoned_tick_socket(tick_socket_path)
++                tick_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++                # Bind ourselves: asyncio's path= form silently unlinks an existing live socket.
++                old_umask = os.umask(0o177)
++                try:
++                    tick_socket.bind(str(tick_socket_path))
++                finally:
++                    os.umask(old_umask)
++                tick_socket_identity = _tick_socket_identity(tick_socket_path)
++                os.chmod(tick_socket_path, 0o600)
++                tick_socket.setblocking(False)
++                tick_server = await asyncio.start_unix_server(_tick_socket_handler, sock=tick_socket)
++                tick_socket = None  # the server owns it now
++            else:
++                tick_server = await asyncio.start_server(_tick_socket_handler, host="127.0.0.1", port=0)
++                for _s in tick_server.sockets or []:
++                    with contextlib.suppress(Exception):
++                        if isinstance(_sname := _s.getsockname(), tuple) and len(_sname) >= 2:
++                            tick_tcp_port = int(_sname[1])
++                            break
++        except Exception:
++            tick_server = tick_tcp_port = None
++            if tick_socket is not None:
++                tick_socket.close()
++                tick_socket = None
++            if tick_socket_path is not None and tick_socket_identity is not None:
++                _unlink_owned_tick_socket(tick_socket_path, tick_socket_identity)
++            logger.warning("Loop tick socket unavailable — liveness probes will have no "
++                           "loop-scheduling witness and will not escalate on a stale heartbeat",
++                           exc_info=True)
++        extra = {"loop_tick_socket": tick_server is not None, "loop_tick_tcp_port": tick_tcp_port}
+         while True:  # first write is immediate so monitors see a fresh file at once
+             try:
+                 await asyncio.to_thread(write_loop_heartbeat, start_time=start_time, home=home,
+@@ -393,10 +476,11 @@
+             if should_continue is not None and not should_continue():
+                 return
+     finally:
++        if tick_socket is not None:
++            tick_socket.close()
+         if tick_server is not None:
+             tick_server.close()
+             with contextlib.suppress(Exception):
+                 await tick_server.wait_closed()
+-            if tick_socket_path is not None:
+-                with contextlib.suppress(Exception):
+-                    tick_socket_path.unlink(missing_ok=True)
++        if tick_socket_path is not None and tick_socket_identity is not None:
++            _unlink_owned_tick_socket(tick_socket_path, tick_socket_identity)
+diff --git a/gateway/slash_commands_session.py b/gateway/slash_commands_session.py
+--- a/gateway/slash_commands_session.py
++++ b/gateway/slash_commands_session.py
+@@ -208,7 +208,7 @@
+                                   parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
+         _reset_process_scoped_tool_state()
+ 
+-        new_entry = await self.async_session_store.reset_session(session_key)
++        new_entry = await self.async_session_store.reset_session(session_key, source=source)
+         _old_sid = old_entry.session_id if old_entry else None
+         await self._fire_session_reset_hooks(source, session_key, _old_sid,
+                                              new_entry.session_id if new_entry else None)
+diff --git a/hermes_state_sessions.py b/hermes_state_sessions.py
+--- a/hermes_state_sessions.py
++++ b/hermes_state_sessions.py
+@@ -547,7 +547,9 @@
+             self._unarchive_auto_archived_lineage(conn, session_id)
+         self._execute_write(_do)
+ 
+-    def promote_to_session_reset(self, session_id: str, reason: str = "session_reset") -> bool:
++    def promote_to_session_reset(
++        self, session_id: str, reason: str = "session_reset", *, successor_session_id: Optional[str] = None,
++    ) -> bool:
+         """Durably mark an intentional reset boundary on live rows or rows with a *recoverable* accidental
+         end_reason (explicit boundaries are preserved): an ``agent_close`` row left recoverable would be
+         resurrected by stale-route recovery. Keep in sync with find_latest_gateway_session_for_peer.
+@@ -559,14 +561,31 @@
+         if not session_id:
+             return False
+         now = time.time()
+-        # /new and policy auto-resets promote rather than end_session, so the
+-        # generation advances here too — same transaction, only when written.
+-        try:
+-            return bool(self._execute_write(lambda conn: self._end_and_bump(
++        def _do(conn):
++            boundary = now
++            if successor_session_id is not None:
++                # A managed gateway prepares the successor before route publication.
++                # Use its native birth time, never a caller-guessed historical clock.
++                row = conn.execute(
++                    "SELECT s.started_at FROM sessions s JOIN sessions p ON p.id = ? "
++                    "WHERE s.id = ? AND s.parent_session_id = p.id "
++                    "AND json_extract(s.model_config, '$._reset_from') = p.id "
++                    "AND s.session_key = p.session_key AND s.source = p.source "
++                    "AND s.user_id = p.user_id AND s.profile_name = p.profile_name "
++                    "AND s.transport_profile = p.transport_profile",
++                    (session_id, successor_session_id),
++                ).fetchone()
++                if row is None or not isinstance(row[0], (int, float)) or not 0 <= row[0] <= now:
++                    return False
++                boundary = row[0]
++            return self._end_and_bump(
+                 conn, "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ? AND (ended_at IS NULL "
+                 f"OR end_reason IN ({_RECOVERABLE_END_REASONS_SQL}))",
+-                (now, reason, session_id), session_id, reason,
+-            )))
++                (boundary, reason, session_id), session_id, reason,
++            )
++        # Explicit boundaries remain immutable; generation changes in the same write.
++        try:
++            return bool(self._execute_write(_do))
+         except Exception:
+             return False
+ 
