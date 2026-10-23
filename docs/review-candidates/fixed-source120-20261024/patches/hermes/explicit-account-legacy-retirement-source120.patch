@@ -1,0 +1,186 @@
+--- a/hermes_cli/dashboard_auth/routes.py
++++ b/hermes_cli/dashboard_auth/routes.py
+@@ -21,7 +21,7 @@
+ import threading
+ import time
+ from collections import defaultdict, deque
+-from typing import Any, Deque, Dict
++from typing import Any, Deque, Dict, Literal
+ from urllib.parse import quote, unquote, urlencode, urlparse, urlunparse
+ 
+ from fastapi import APIRouter, HTTPException, Request
+@@ -483,6 +483,52 @@
+     return sess
+ 
+ 
++class _LegacyRetirementBody(BaseModel):
++    scope: Literal["all-legacy-dashboard-signins"]
++    password: str = Field(min_length=1, max_length=4096)
++
++    class Config:
++        extra = "forbid"
++
++
++@router.post("/api/auth/legacy-retirement", name="auth_legacy_retirement")
++async def api_auth_legacy_retirement(request: Request, body: _LegacyRetirementBody):
++    """Explicit self-account legacy-only retirement, with fresh password proof.
++
++    The verified provider/account is the only target. A modern session can repeat
++    this idempotently; a legacy caller loses admission after a successful action.
++    """
++    sess = _require_session(request)
++    # A custom intent header cannot be sent by a cross-origin HTML form. Also
++    # refuse cross-origin fetches even if a deployment enables credentialed CORS.
++    if (request.headers.get("x-hermes-legacy-retirement") != "1"
++            or request.headers.get("sec-fetch-site", "") == "cross-site"):
++        raise _http(403, "Explicit same-origin retirement intent required")
++    origin = request.headers.get("origin")
++    public = _prefix_mod.resolve_public_url()
++    target = urlparse(public or str(request.url))
++    if origin is not None and origin != f"{target.scheme}://{target.netloc}":
++        raise _http(403, "Cross-origin retirement refused")
++    p = get_provider(sess.provider)
++    if (sess.provider != "basic" or p is None or p.name != "basic"
++            or not getattr(p, "supports_self_legacy_retirement", False)
++            or not callable(getattr(p, "retire_legacy_signins", None))):
++        raise _http(403, "Legacy retirement requires a Basic account")
++    if _password_rate_limited(_client_ip(request)):
++        raise _http(429, "Too many reauthentication attempts. Try again shortly.")
++    try:
++        already = await run_in_threadpool(
++            p.retire_legacy_signins, access_token=sess.access_token, password=body.password)
++    except InvalidCredentialsError:
++        raise _http(401, "Invalid account reauthentication")
++    except ProviderError:
++        # Publication may have committed before acknowledgement failed. Do not
++        # claim it did not happen or clear/replace the caller's credentials.
++        raise _http(503, "Legacy retirement not confirmed; durable outcome may already be committed")
++    return JSONResponse({"ok": True, "scope": body.scope, "provider": sess.provider,
++                         "user_id": sess.user_id, "already_retired": already}, headers=_NO_STORE)
++
++
+ @router.get("/api/auth/me", name="auth_me")
+ async def api_auth_me(request: Request):
+     """Return the verified session as JSON. Auth-required (gate enforces)."""
+--- a/hermes_cli/friday_product_access.py
++++ b/hermes_cli/friday_product_access.py
+@@ -206,7 +206,7 @@
+             return True
+         return (path.startswith("/api/plugins/friday_rework/")
+                 or (request.method == "GET" and path in {"/api/auth/me", "/api/plugins", "/api/dashboard/plugins", "/api/host/identity", "/api/status", "/api/health", "/api/model/info", "/api/config/defaults", "/api/config/schema", "/api/dashboard/themes"})
+-                or (request.method == "POST" and path == "/api/auth/ws-ticket"))
++                or (request.method == "POST" and path in {"/api/auth/ws-ticket", "/api/auth/legacy-retirement"}))
+     except Exception:  # health: allow BLE001 -- Deny the HTTP route when policy, profile or request evaluation fails.
+         return False
+ 
+--- a/plugins/dashboard_auth/basic/__init__.py
++++ b/plugins/dashboard_auth/basic/__init__.py
+@@ -139,6 +139,7 @@
+     # A cached successful rotation must never bypass a later durable revocation.
+     refresh_session_cacheable = False
+     supports_durable_revocation = True
++    supports_self_legacy_retirement = True
+     _NOT_INTERACTIVE = "BasicAuthProvider is password-only; use complete_password_login."
+     _NO_START_LOGIN = (
+         "BasicAuthProvider is password-only; there is no OAuth redirect flow. "
+@@ -238,6 +239,32 @@
+                 state["revoked"]["access:" + hashlib.sha256(access_token.encode()).hexdigest()] = access["exp"]
+             self._sessions.publish(state)
+ 
++    def retire_legacy_signins(self, *, access_token: str, password: str) -> bool:
++        """Permanently end ALL legacy sign-ins of this verified Basic account.
++
++        Returns whether it was already retired. A failed acknowledgement can follow
++        a committed write; callers must not claim failure means no durable effect.
++        Modern nonlegacy sessions and other subjects remain active.
++        """
++        payload = _unsign(access_token, self._secret, "access")
++        owned = payload is not None and payload["sub"] == self._username
++        password_ok = _verify_password(password, self._password_hash if owned else _DUMMY_HASH)
++        if not (owned and password_ok):
++            raise InvalidCredentialsError("invalid account reauthentication")
++        with self._sessions.transaction() as state:
++            # Recheck under the same lock that serializes refresh and retirement.
++            if not self._accepted(state, payload, access_token):
++                raise InvalidCredentialsError("invalid account reauthentication")
++            subject = hashlib.sha256(payload["sub"].encode("utf-8")).hexdigest()
++            if subject in state["retired_subjects"]:
++                # A previous acknowledgement may have failed after replace but
++                # before directory fsync. Reaffirm durability before success.
++                self._sessions.publish(state)
++                return True
++            state["retired_subjects"].append(subject)
++            self._sessions.publish(state)
++            return False
++
+     # ---- internals ---------------------------------------------------------
+ 
+     def _mint_session(self, user_id: str) -> Session:
+@@ -246,6 +273,9 @@
+ 
+     def _accepted(self, state: dict, payload: dict, token: str) -> bool:
+         if payload["sub"] != self._username:
++            return False
++        subject = hashlib.sha256(payload["sub"].encode("utf-8")).hexdigest()
++        if subject in state["retired_subjects"] and ("sid" not in payload or "legacy" in payload):
+             return False
+         now = int(time.time())
+         revoked = state["revoked"]
+--- a/plugins/dashboard_auth/basic/_sessions.py
++++ b/plugins/dashboard_auth/basic/_sessions.py
+@@ -55,7 +55,7 @@
+                     os.fsync(directory)
+                 with self._locked(directory):
+                     if created:
+-                        state = {"version": 1, "store_id": secrets.token_hex(16), "sessions": {}, "revoked": {}}
++                        state = {"version": 2, "store_id": secrets.token_hex(16), "sessions": {}, "revoked": {}, "retired_subjects": []}
+                         # Sibling anchor survives loss of the ledger directory. Never
+                         # recreate it for an existing store, nor overwrite an old anchor.
+                         self._create_anchor(state["store_id"])
+@@ -152,12 +152,19 @@
+         if len(raw) > _MAX_BYTES:
+             raise ValueError("session state exceeds bound")
+         envelope = json.loads(raw)
++        if not isinstance(envelope, dict) or set(envelope) != {"state", "mac"}:
++            raise ValueError("invalid session envelope")
+         state = envelope["state"]
+         expected = hmac.new(self.key, self._raw(state), hashlib.sha256).hexdigest()
+         if not hmac.compare_digest(envelope["mac"], expected):
+             raise ValueError("session state integrity failure")
+-        if (set(state) != {"version", "store_id", "sessions", "revoked"}
+-                or type(state["version"]) is not int or state["version"] != 1
++        if not isinstance(state, dict) or type(state.get("version")) is not int:
++            raise ValueError("invalid session state version")
++        version = state["version"]
++        fields = {"version", "store_id", "sessions", "revoked"}
++        if version == 2:
++            fields.add("retired_subjects")
++        if (version not in (1, 2) or set(state) != fields
+                 or not isinstance(state["store_id"], str) or len(state["store_id"]) != 32
+                 or any(ch not in "0123456789abcdef" for ch in state["store_id"])
+                 or not isinstance(state["revoked"], dict) or not isinstance(state["sessions"], dict)
+@@ -169,12 +176,23 @@
+             if (not isinstance(key, str) or len(key) > 80
+                     or type(expiry) is not int or expiry <= 0):
+                 raise ValueError("invalid session tombstone")
++        # Authenticate and validate the entire old schema before normalizing it.
++        # Migration is published by the next existing write; store/anchor stay fixed.
++        if version == 1:
++            state = dict(state, version=2, retired_subjects=[])
++        retired = state["retired_subjects"]
++        if (not isinstance(retired, list) or len(retired) > _MAX_RECORDS
++                or any(not isinstance(key, str) or len(key) != 64
++                       or any(ch not in "0123456789abcdef" for ch in key) for key in retired)
++                or len(set(retired)) != len(retired)
++                or len(retired) + len(state["revoked"]) + len(state["sessions"]) > _MAX_RECORDS):
++            raise ValueError("invalid retired subjects")
+         return state
+ 
+     def _write(self, directory, state):
+         envelope = {"state": state, "mac": hmac.new(self.key, self._raw(state), hashlib.sha256).hexdigest()}
+         raw = self._raw(envelope)
+-        if len(raw) > _MAX_BYTES or len(state["revoked"]) + len(state["sessions"]) > _MAX_RECORDS:
++        if len(raw) > _MAX_BYTES or len(state["revoked"]) + len(state["sessions"]) + len(state["retired_subjects"]) > _MAX_RECORDS:
+             raise ProviderError("Basic session revocation store is full")
+         temporary = ".state-" + secrets.token_hex(16)
+         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
