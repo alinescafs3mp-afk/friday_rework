@@ -1,0 +1,487 @@
+--- a/gateway/pairing.py
++++ b/gateway/pairing.py
+@@ -13,6 +13,7 @@
+ import logging
+ import os
+ import secrets
++import stat
+ import threading
+ import time
+ from pathlib import Path
+@@ -289,6 +290,75 @@
+     atomic_json_write(path, data, mode=0o600)
+ 
+ 
++def _approved_json_storage_readonly(path: Path, home: Path) -> dict:
++    """Read one existing owned approval file; never hide corruption or unsafe custody."""
++    if not home.is_absolute() or home.resolve() != home or not path.is_relative_to(home):
++        raise PermissionError('unsafe_pairing_home')
++    def unsafe_directory(info, *, private_root):
++        # A held, owner-only root makes same-owner/group native 0775 children
++        # unreachable to other users. Never extend this exception to an exposed
++        # root, foreign group, world-writable child, or special permission bits.
++        mode = stat.S_IMODE(info.st_mode)
++        return (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
++                or info.st_gid != os.getgid()
++                or (mode != 0o700 if private_root else bool(mode & 0o7002)))
++
++    descriptors = []
++    directories = []
++    try:
++        directory = home
++        for part in (None, *path.parent.relative_to(home).parts):
++            if part is not None:
++                directory = directory / part
++            try:
++                fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
++            except FileNotFoundError:
++                if part is None:
++                    raise
++                return {}
++            descriptors.append(fd)
++            directories.append(directory)
++            info = os.fstat(fd)
++            if unsafe_directory(info, private_root=part is None):
++                raise PermissionError('unsafe_pairing_directory')
++            linked = directory.stat(follow_symlinks=False)
++            if (linked.st_dev, linked.st_ino) != (info.st_dev, info.st_ino):
++                raise PermissionError('pairing_directory_changed')
++        try:
++            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
++                         dir_fd=descriptors[-1])
++        except FileNotFoundError:
++            return {}
++        descriptors.append(fd)
++        before = os.fstat(fd)
++        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
++                or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600):
++            raise PermissionError('unsafe_pairing_approval_file')
++        with os.fdopen(os.dup(fd), 'r', encoding='utf-8-sig') as stream:
++            data = json.load(stream)
++        if not isinstance(data, dict):
++            raise ValueError('invalid_pairing_approval_file')
++        after = os.fstat(fd)
++        linked = os.stat(path.name, dir_fd=descriptors[-2], follow_symlinks=False)
++        if (not stat.S_ISREG(linked.st_mode) or linked.st_uid != os.getuid()
++                or linked.st_nlink != 1 or stat.S_IMODE(linked.st_mode) != 0o600
++                or (before.st_dev, *file_signature(before)) != (after.st_dev, *file_signature(after))
++                or (linked.st_dev, *file_signature(linked)) != (after.st_dev, *file_signature(after))):
++            raise PermissionError('pairing_approval_file_changed')
++        for directory_path, directory_fd in zip(directories, descriptors[:-1]):
++            info = os.fstat(directory_fd)
++            linked = directory_path.stat(follow_symlinks=False)
++            if (unsafe_directory(info, private_root=directory_path == home)
++                    or (linked.st_dev, linked.st_ino) != (info.st_dev, info.st_ino)):
++                raise PermissionError('pairing_directory_changed')
++        if home.resolve() != home or path.parent.resolve() != path.parent:
++            raise PermissionError('pairing_directory_changed')
++        return data
++    finally:
++        for fd in reversed(descriptors):
++            os.close(fd)
++
++
+ def _migrate_split_pairing_dirs(*, home: Optional[Path] = None, active: Optional[Path] = None) -> None:
+     """Merge split legacy (``pairing``) / new (``platforms/pairing``) data into the active dir.
+ 
+@@ -406,6 +476,29 @@
+         """Check if a user is approved (paired) on a platform."""
+         with self._lock:
+             return bool(_matching_ids(platform, self._load_approved(platform), user_id))
++
++    @staticmethod
++    def is_approved_storage_readonly(platform: str, user_id: str, *, profile: Optional[str] = None) -> bool:
++        """Check native approvals, merging split layouts in memory with active entries winning."""
++        if (not isinstance(platform, str) or not 0 < len(platform) <= 128
++                or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in platform)):
++            raise ValueError('invalid_pairing_platform')
++        home = get_hermes_home()
++        if profile:
++            root = get_default_hermes_root()
++            home = root if profile == 'default' else root / 'profiles' / profile
++        from hermes_constants import assert_named_profile_home_live
++        assert_named_profile_home_live(home)
++        active = get_hermes_dir('platforms/pairing', 'pairing', home=home) if profile else _default_pairing_dir()
++        old = home / 'pairing'
++        modern = home / 'platforms' / 'pairing'
++        if active not in (old, modern):
++            raise PermissionError('unsafe_pairing_directory')
++        alternate = modern if active == old else old
++        filename = f'{platform}-approved.json'
++        approved = _approved_json_storage_readonly(alternate / filename, home)
++        approved.update(_approved_json_storage_readonly(active / filename, home))
++        return bool(_matching_ids(platform, approved, user_id))
+ 
+     def list_approved(self, platform: str = None) -> list:
+         """List approved users, optionally filtered by platform."""
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -177,6 +177,8 @@
+ # the config writer seam, which produces a fresh inode, so stat() sees a new signature and the next load
+ # repopulates automatically — no explicit invalidation hook. See #58514.
+ _LOAD_CONFIG_CACHE: Dict[str, Tuple[int, ...]] = {}
++# Disk-read-only policy loads must not warm the initializer/recovery cache.
++_STORAGE_READONLY_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, ...]] = {}
+ # path -> (mtime_ns, size, ino, ctime_ns, raw yaml dict) for read_raw_config() (no defaults merged in).
+ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, ...]] = {}
+ 
+@@ -2109,6 +2111,15 @@
+     return _load_config_impl(want_deepcopy=False)
+ 
+ 
++def load_config_storage_readonly() -> Dict[str, Any]:
++    """Read expanded config without home initialization or backup persistence.
++
++    The returned cached mapping is shared: callers must not mutate it. Current
++    storage/parse failures propagate and are never cached as recovery defaults.
++    """
++    return _load_config_impl(want_deepcopy=False, storage_readonly=True)
++
++
+ def _ensure_dict(parent: Dict[str, Any], key: str) -> Dict[str, Any]:
+     """Return ``parent[key]`` as a dict, replacing a missing or non-dict value with ``{}``."""
+     child = parent.get(key)
+@@ -2304,13 +2315,13 @@
+     return _deep_merge(expanded, _expand_env_vars(managed_normalized)), managed_config
+ 
+ 
+-def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[Dict[str, Any]]:
++def _load_config_cache_hit(path_key: str, cache_sig: Any, *, cache=None) -> Optional[Dict[str, Any]]:
+     """Lookup: the cached expanded config for ``path_key`` if its signature equals
+     ``cache_sig`` AND every ``${VAR}`` it was expanded against still has the same value, else
+     ``None``. Signatures matching is not enough: a load before load_hermes_dotenv() would otherwise
+     pin unexpanded literals (e.g. auxiliary.<task>.api_key) for the process lifetime (#58514).
+     Shared by the lock-free fast path and the locked re-check of ``_load_config_impl``."""
+-    cached = _LOAD_CONFIG_CACHE.get(path_key)
++    cached = (_LOAD_CONFIG_CACHE if cache is None else cache).get(path_key)
+     if cached is None or cache_sig is None or cached[:8] != cache_sig:
+         return None
+     hit = cached[8]
+@@ -2329,7 +2340,15 @@
+     return None
+ 
+ 
+-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
++def _load_config_impl(*, want_deepcopy: bool, storage_readonly: bool = False) -> Dict[str, Any]:
++    cache = _STORAGE_READONLY_LOAD_CONFIG_CACHE if storage_readonly else _LOAD_CONFIG_CACHE
++    if storage_readonly:
++        # Validate even on cache hits: a tombstone or lost mount revokes a read.
++        from hermes_constants import assert_named_profile_home_live
++        from hermes_cli.config_home import validate_home_readonly
++        home = get_hermes_home()
++        assert_named_profile_home_live(home)
++        validate_home_readonly(home)
+     # Lock-free fast path for cache hits — same publication contract as `_read_raw_config_impl`
+     # above (whole-tuple replace, `_CONFIG_LOCK` only serializes rebuilds and writers). A hit costs
+     # ~0.024ms; behind a lock held by `save_config()` the same read measured 10010ms, and on a
+@@ -2337,9 +2356,9 @@
+     try:
+         config_path = get_config_path()
+         path_key = str(config_path)
+-        if path_key in _LOAD_CONFIG_CACHE:
++        if path_key in cache:
+             _, fast_sig = _load_config_cache_sig(config_path)
+-            hit = _load_config_cache_hit(path_key, fast_sig)
++            hit = _load_config_cache_hit(path_key, fast_sig, cache=cache)
+             if hit is not None:
+                 return copy.deepcopy(hit) if want_deepcopy else hit
+     except Exception:
+@@ -2348,13 +2367,14 @@
+         pass
+ 
+     with _CONFIG_LOCK:
+-        ensure_hermes_home()
++        if not storage_readonly:
++            ensure_hermes_home()
+         config_path = get_config_path()
+         path_key = str(config_path)
+ 
+         user_sig, cache_sig = _load_config_cache_sig(config_path)
+ 
+-        hit = _load_config_cache_hit(path_key, cache_sig)
++        hit = _load_config_cache_hit(path_key, cache_sig, cache=cache)
+         if hit is not None:
+             return copy.deepcopy(hit) if want_deepcopy else hit
+ 
+@@ -2363,7 +2383,10 @@
+         if user_sig is not None:
+             try:
+                 with open(config_path, encoding="utf-8-sig") as f:
+-                    user_config = fast_safe_load(f) or {}
++                    parsed_config = fast_safe_load(f)
++                if storage_readonly and parsed_config is not None and not isinstance(parsed_config, dict):
++                    raise TypeError("top-level configuration must be a mapping")
++                user_config = parsed_config or {}
+                 _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
+ 
+                 if "max_turns" in user_config:
+@@ -2377,9 +2400,12 @@
+                 # A copy of the file that just parsed is what a FRESH process falls back to when the
+                 # next edit breaks the YAML (see _last_known_good_fallback). backup_config() skips
+                 # byte-identical repeats and keeps a bounded count, so steady-state loads cost one stat.
+-                from hermes_cli.config_backups import backup_config
+-                backup_config(config_path, "good")
++                if not storage_readonly:
++                    from hermes_cli.config_backups import backup_config
++                    backup_config(config_path, "good")
+             except Exception as e:
++                if storage_readonly:
++                    raise
+                 lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
+                 if lkg_copy is not None:
+                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
+@@ -2388,12 +2414,13 @@
+                 fallback = FailedConfigRead(
+                     _merge_managed_overlay(_expand_env_vars(_canonicalize_config(config)))[0], error=e)
+                 if cache_sig is not None:
+-                    _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, fallback, {})
++                    cache[path_key] = (*cache_sig, fallback, {})
+                 return copy.deepcopy(fallback) if want_deepcopy else fallback
+ 
+         normalized = _canonicalize_config(config)
+         expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
+-        _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
++        if not storage_readonly:
++            _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
+         if cache_sig is not None:
+             # The cache stores its own deepcopy so load_config() callers can mutate freely while
+             # load_config_readonly() callers all see the same stable object. The env snapshot
+@@ -2402,12 +2429,12 @@
+             env_snapshot = _env_ref_snapshot(normalized)
+             if managed_config:
+                 _env_ref_snapshot(managed_config, env_snapshot)
+-            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
++            cache[path_key] = (*cache_sig, cached_copy, env_snapshot)
+             # Readonly path returns the same object later calls will see (identity invariant).
+             if not want_deepcopy:
+                 return cached_copy
+         else:
+-            _LOAD_CONFIG_CACHE.pop(path_key, None)
++            cache.pop(path_key, None)
+         # First-load result is a fresh dict (not aliased to the cache); safe to return directly.
+         return expanded
+ 
+--- a/hermes_cli/config_home.py
++++ b/hermes_cli/config_home.py
+@@ -52,6 +52,11 @@
+         ) from exc
+ 
+ 
++def validate_home_readonly(home: Path) -> None:
++    """Validate existing home/link storage without creation, repair or mode changes."""
++    _ensure_directory(home, create=False, secure=False, home=home)
++
++
+ def initialize_home(home: Path, subdirs: tuple[str, ...], ensured: set[str]) -> None:
+     from hermes_cli.config import _ensure_default_soul_md, is_managed
+ 
+--- a/hermes_cli/friday_cli_work.py
++++ b/hermes_cli/friday_cli_work.py
+@@ -266,11 +266,12 @@
+     return ingress_for(turn),copy.deepcopy(lease['ids'])
+ 
+ 
+-def check_store(cap,state):
++def check_store(cap,state,*,storage_readonly=False):
+     if cap is None:
+         if is_cli(): raise users.ScopeDenied()
+         return
+-    if current_cli(required=True) is not cap or Path(state.data_dir) != cap.home/'plugin-data'/state._data_namespace or state._plugin_id != 'friday_rework':
++    directory = state.directory_storage_readonly if storage_readonly else state.data_dir
++    if current_cli(required=True) is not cap or Path(directory) != cap.home/'plugin-data'/state._data_namespace or state._plugin_id != 'friday_rework':
+         raise users.ScopeDenied()
+ 
+ 
+--- a/hermes_cli/friday_product_access.py
++++ b/hermes_cli/friday_product_access.py
+@@ -27,7 +27,7 @@
+ 
+ 
+ def settings():
+-    from hermes_cli.config import get_config_path, load_config_readonly, require_readable_config_before_write
++    from hermes_cli.config import get_config_path, load_config_storage_readonly, require_readable_config_before_write
+     from utils import load_yaml_file_readonly
+     # Preserve fail-closed current-file validation without reparsing the entire
+     # worker inventory on every policy read. The native read-only YAML cache
+@@ -40,7 +40,7 @@
+     else:
+         if raw is not None and not isinstance(raw, dict):
+             require_readable_config_before_write(path)
+-    value = (load_config_readonly().get("plugins") or {}).get("entries", {}).get("friday_rework", {})
++    value = (load_config_storage_readonly().get("plugins") or {}).get("entries", {}).get("friday_rework", {})
+     return value.get("settings", {})
+ 
+ 
+@@ -117,7 +117,7 @@
+     if state is None:
+         from hermes_cli.plugins_state import PluginState
+         state = PluginState("friday_rework")
+-    return validate_access(state.get(KEY, {"schema": KEY, "users": {}}, lock_deadline=time.monotonic() + 2))
++    return validate_access(state.get_storage_readonly(KEY, {"schema": KEY, "users": {}}, lock_deadline=time.monotonic() + 2))
+ 
+ 
+ def gateway_allowed(source, *, transport_profile, runtime_profile):
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -981,7 +981,7 @@
+     values = load_env_file(home / '.env')
+     if any(not values.get(k) for k in names):
+         raise ScopeDenied()
+-    from hermes_cli.config import load_config_readonly
++    from hermes_cli.config import load_config_storage_readonly
+     if binding['platform'] == 'cli':
+         # Local ingress has no messaging route or pairing grant. Reuse the
+         # exact frozen OS-UID map and generic product account policy instead.
+@@ -993,7 +993,7 @@
+                 principal_id('cli', r['transport_profile'], r['account_id'], r['user_id']) == key]
+         with authority(root):
+             accounts = access_policy()['accounts']
+-            gateway = load_config_readonly().get('gateway', {})
++            gateway = load_config_storage_readonly().get('gateway', {})
+         matches = [a for a in accounts if
+                    (a['platform'], a['transport_profile'], a['account_id']) ==
+                    (binding['platform'], binding['transport_profile'], binding['account_id'])
+@@ -1004,7 +1004,7 @@
+             raise ScopeDenied()
+         return
+     with authority(root):
+-        gateway = load_config_readonly().get('gateway', {})
++        gateway = load_config_storage_readonly().get('gateway', {})
+     route = {'name': 'friday-' + principal_id(*(binding[k] for k in
+              ('platform', 'transport_profile', 'account_id', 'user_id'))),
+              'platform': binding['platform'], 'bot_profile': binding['transport_profile'],
+--- a/hermes_cli/plugins_discovery.py
++++ b/hermes_cli/plugins_discovery.py
+@@ -112,8 +112,8 @@
+ def _get_disabled_plugins() -> set:
+     """Read ``plugins.disabled`` — a deny-list that wins over ``plugins.enabled``."""
+     try:
+-        from hermes_cli.config import load_config
+-        disabled = cfg_get(load_config(), "plugins", "disabled", default=[])
++        from hermes_cli.config import load_config_storage_readonly
++        disabled = cfg_get(load_config_storage_readonly(), "plugins", "disabled", default=[])
+         return set(disabled) if isinstance(disabled, list) else set()
+     except Exception:
+         return set()
+@@ -124,8 +124,8 @@
+     enabled yet"; the first ``migrate_config`` run grandfathers installed user plugins); ``set()`` = explicitly
+     empty; else the allow-list."""
+     try:
+-        from hermes_cli.config import load_config
+-        enabled = cfg_get(load_config(), "plugins", "enabled")
++        from hermes_cli.config import load_config_storage_readonly
++        enabled = cfg_get(load_config_storage_readonly(), "plugins", "enabled")
+         return set(enabled) if isinstance(enabled, list) else None
+     except Exception:
+         return None
+--- a/hermes_cli/plugins_state.py
++++ b/hermes_cli/plugins_state.py
+@@ -267,7 +267,7 @@
+                 continue
+             if not stat.S_ISREG(retained.st_mode) or retained.st_uid != uid or retained.st_nlink != 1:
+                 raise PermissionError("unsafe_native_plugin_state")
+-        lock = os.open(".state.json.lock", os.O_RDWR | (os.O_CREAT if repair else 0) | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
++        lock = os.open(".state.json.lock", (os.O_RDWR | os.O_CREAT if repair else os.O_RDONLY) | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                        0o600, dir_fd=current); descriptors.append(lock)
+         info = os.fstat(lock)
+         if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1:
+@@ -299,6 +299,99 @@
+         if self._plugin_id == "friday_rework" and os.name == "posix":
+             _private_friday_state_directory(directory, repair=str(directory) not in self._native_namespaces)
+         return directory
++
++    @property
++    def directory_storage_readonly(self) -> Path:
++        """Existing Friday metadata only; never initialize or repair storage."""
++        if self._plugin_id != "friday_rework" or os.name != "posix":
++            raise RuntimeError("storage_readonly_requires_native_Friday_POSIX_state")
++        directory = get_hermes_home() / "plugin-data" / self._data_namespace
++        _private_friday_state_directory(directory, repair=False)
++        return directory
++
++    def get_storage_readonly(self, key: str, default: Any = None, *,
++                             lock_deadline: float | None = None,
++                             lock_budget: LockAcquisitionBudget | None = None) -> Any:
++        """Read existing state under its native lock without filesystem writes.
++
++        Missing storage, unsafe custody or concurrent namespace changes are
++        errors. A missing key in a validated document retains normal get semantics.
++        The writer's thread lock and exclusive flock serialize atomic replacement.
++        """
++        self._validate_key(key)
++        if lock_deadline is not None and (isinstance(lock_deadline, bool)
++                or not isinstance(lock_deadline, (float, int)) or not math.isfinite(lock_deadline)):
++            raise ValueError("lock_deadline must be a finite monotonic timestamp")
++        if lock_budget is not None and (not isinstance(lock_budget, LockAcquisitionBudget)
++                                        or lock_deadline is not None):
++            raise ValueError("lock_budget requires LockAcquisitionBudget without lock_deadline")
++        if lock_deadline is None and lock_budget is None:
++            lock_deadline = time.monotonic() + 2
++        directory = self.directory_storage_readonly
++        path = directory / "state.json"
++        lock_path = directory / ".state.json.lock"
++        with _thread_state_lock(_PLUGIN_STATE_LOCKS_GUARD, lock_deadline, lock_budget):
++            thread_lock = _PLUGIN_STATE_LOCKS.setdefault(str(lock_path), threading.RLock())
++        with _thread_state_lock(thread_lock, lock_deadline, lock_budget):
++            dirfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
++            try:
++                di = os.fstat(dirfd)
++                def private(info, *, directory=False):
++                    kind = stat.S_ISDIR if directory else stat.S_ISREG
++                    if (not kind(info.st_mode) or info.st_uid != os.getuid()
++                            or stat.S_IMODE(info.st_mode) != (0o700 if directory else 0o600)
++                            or not directory and info.st_nlink != 1):
++                        raise PermissionError("unsafe_storage_readonly_state")
++                def identity(info):
++                    return info.st_dev, info.st_ino
++                private(di, directory=True)
++                lockfd = os.open(".state.json.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
++                                 dir_fd=dirfd)
++                try:
++                    li = os.fstat(lockfd); private(li)
++                    with os.fdopen(lockfd, "rb", closefd=False) as handle:
++                        with _acquisition_scope(lock_deadline, lock_budget) as acquisition_deadline:
++                            _acquire_state_file(handle, acquisition_deadline)
++                        try:
++                            def check():
++                                if self.directory_storage_readonly != directory:
++                                    raise PermissionError("storage_readonly_namespace_changed")
++                                current = os.stat(directory, follow_symlinks=False); private(current, directory=True)
++                                if identity(current) != identity(di):
++                                    raise PermissionError("storage_readonly_directory_changed")
++                                current = os.stat(".state.json.lock", dir_fd=dirfd, follow_symlinks=False); private(current)
++                                if identity(current) != identity(li):
++                                    raise PermissionError("storage_readonly_lock_changed")
++                            check()
++                            statefd = os.open("state.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
++                                              dir_fd=dirfd)
++                            try:
++                                before = os.fstat(statefd); private(before)
++                                if not 0 <= before.st_size <= self.quota_bytes:
++                                    raise ValueError("storage_readonly_state_quota")
++                                with os.fdopen(statefd, "rb", closefd=False) as stream:
++                                    raw = stream.read(self.quota_bytes + 1)
++                                if len(raw) > self.quota_bytes:
++                                    raise ValueError("storage_readonly_state_quota")
++                                data = json.loads(raw.decode("utf-8-sig"))
++                                after = os.fstat(statefd); private(after)
++                                linked = os.stat("state.json", dir_fd=dirfd, follow_symlinks=False); private(linked)
++                                signature = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
++                                if signature(before) != signature(after) or signature(after) != signature(linked):
++                                    raise PermissionError("storage_readonly_state_changed")
++                                if not isinstance(data, dict):
++                                    raise ValueError("storage_readonly_state_root_not_object")
++                                check()
++                                return data.get(key, default)
++                            finally:
++                                os.close(statefd)
++                        finally:
++                            import fcntl
++                            fcntl.flock(lockfd, fcntl.LOCK_UN)
++                finally:
++                    os.close(lockfd)
++            finally:
++                os.close(dirfd)
+ 
+     @property
+     def path(self) -> Path:
