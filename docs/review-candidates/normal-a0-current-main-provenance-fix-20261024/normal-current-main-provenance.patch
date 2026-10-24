@@ -1,0 +1,470 @@
+--- a/plugins/friday_rework/dashboard/api.py
++++ b/plugins/friday_rework/dashboard/api.py
+@@ -94,7 +94,15 @@
+         raise HTTPException(403, "product_scope_refused") from None
+     except (ValueError, KeyError, IndexError):
+         raise HTTPException(400, "invalid_or_unproved_product_reference") from None
+-    except Exception:
++    except Exception as exc:
++        # Fixed private category/relative frames only; never error text/locals.
++        # An observation failure must preserve the original opaque HTTP result.
++        try:
++            import logging
++            from _friday_dashboard_projection.user_worker_join import _failure_location
++            logging.getLogger(__name__).error("product_native_failure_location %s", _failure_location(exc))
++        except Exception:
++            pass
+         raise HTTPException(503, "native_state_unavailable_or_write_unconfirmed") from None
+ 
+ 
+--- a/plugins/friday_rework/onboarding.py
++++ b/plugins/friday_rework/onboarding.py
+@@ -500,6 +500,28 @@
+     return tx
+ 
+ 
++def current_main_config(config, required_secrets):
++    """Pure exact current-main selection shared by producer and provenance join."""
++    from .adapters.a0_config import KEY_REFERENCES
++    from .adapters.a0_profile import checked_profile
++    candidate = copy.deepcopy(config)
++    deployment = checked_profile(candidate.get('a0_deployment'))
++    main = candidate['model']; provider = candidate['providers']['friday-local']
++    if (main.get('provider') != 'custom:friday-local'
++            or main.get('key_env') != KEY_REFERENCES['API_KEY_OPENAI']
++            or provider.get('key_env') != KEY_REFERENCES['API_KEY_OPENAI']
++            or not set(KEY_REFERENCES.values()) <= set(required_secrets)):
++        raise PermissionError('a0_scoped_profile_key_mismatch')
++    capacity = provider['models'][main['default']]
++    for role in ('chat', 'utility'):
++        deployment[role].update(endpoint=main['base_url'], model=main['default'],
++            context_length=capacity['context_length'],
++            max_output_tokens=capacity['bounded_context']['main_max_output_tokens'])
++    if deployment['name'] == 'legacy-local-test': deployment['name'] = 'current-main'
++    candidate['a0_deployment'] = checked_profile(deployment)
++    return candidate
++
++
+ class Onboarding:
+     def __init__(self, administration):
+         self.admin = administration
+@@ -741,8 +763,6 @@
+         if selection != 'current-main':
+             raise ValueError('explicit_current_main_selection_required')
+         from hermes_cli.config import config_write_transaction, atomic_config_write
+-        from .adapters.a0_config import KEY_REFERENCES
+-        from .adapters.a0_profile import checked_profile
+         with self.transaction(profile, expected_config_sha256, session) as (root, access, config):
+             home, binding, row, proof = self._prepared(root, access.state,
+                 platform, transport_profile, account_id, user_id, generation)
+@@ -759,23 +779,7 @@
+                     self._admitted_worker_home(root, home, binding, generation, proof)
+                 verify()
+                 candidate = self._admitted_worker_home(root, home, binding, generation, proof)
+-                deployment = checked_profile(candidate.get('a0_deployment'))
+-                main = candidate['model']
+-                provider = candidate['providers']['friday-local']
+-                if (main.get('provider') != 'custom:friday-local'
+-                        or main.get('key_env') != KEY_REFERENCES['API_KEY_OPENAI']
+-                        or provider.get('key_env') != KEY_REFERENCES['API_KEY_OPENAI']
+-                        or not set(KEY_REFERENCES.values()) <= set(proof['required_secrets'])):
+-                    raise PermissionError('a0_scoped_profile_key_mismatch')
+-                capacity = provider['models'][main['default']]
+-                for role in ('chat', 'utility'):
+-                    deployment[role].update(endpoint=main['base_url'], model=main['default'],
+-                        context_length=capacity['context_length'],
+-                        max_output_tokens=capacity['bounded_context']['main_max_output_tokens'])
+-                # The historical named preset has immutable bytes; selecting a
+-                # different declared model gives this own deployment a new name.
+-                if deployment['name'] == 'legacy-local-test': deployment['name'] = 'current-main'
+-                candidate['a0_deployment'] = checked_profile(deployment)
++                candidate = current_main_config(candidate, proof['required_secrets'])
+                 with scope.authority(home):
+                     prepared = prepare_admin_config_edit(home, candidate)
+                 if prepared is None:
+@@ -952,12 +956,14 @@
+                 if digest(home / 'config.yaml') != proof['config_sha256']:
+                     raise PermissionError('prepared_home_changed')
+                 config = require_readable_config_before_write(home / 'config.yaml')
++                current_main = (self._current_main_source_target(root, home, binding, generation, proof)
++                    if row['enabled'] and worker == 'a0' else None)
+                 from .host_runtime import configured_runtimes
+                 if worker in configured_runtimes(config['plugins']['entries']['friday_rework']['settings']['runtime']):
+                     raise PermissionError('existing_worker_not_adopted')
+                 c, directory, files, names, unobserved = prepare_inputs(home, binding['runtime_profile'], worker, runtime, config,
+                     a0_network=a0_network, declared_files=_declared_files, tools=binding['tools'],
+-                    _history_walk=_history_walk)
++                    _history_walk=_history_walk, _current_main=current_main)
+                 if directory.exists() or directory.is_symlink():
+                     raise FileExistsError('existing_worker_preparation_not_adopted')
+                 self._verify_operator(profile, session)
+@@ -1029,6 +1035,20 @@
+             if Associations(PluginState('friday_rework')).snapshot():
+                 raise PermissionError('existing_worker_associations_require_reconciliation')
+         return own
++
++    def _current_main_source_target(self, root, home, binding, generation, proof):
++        """Fresh native admission first; this handoff grants source custody only."""
++        own = self._admitted_worker_home(root, home, binding, generation, proof)
++        try:
++            selected = current_main_config(own, proof['required_secrets'])
++        except (KeyError, ValueError, PermissionError):
++            # Ineligible legacy profiles retain the strict source path. Native
++            # authority failures above are never caught or converted to a grant.
++            return None
++        if json.dumps(selected, sort_keys=True) != json.dumps(own, sort_keys=True):
++            return None
++        return {'home': str(home), 'profile': binding['runtime_profile'],
++            'binding_sha256': proof['binding_sha256']}
+ 
+     def _worker_attachment(self,root,home,binding,generation,proof,root_config):
+         from .worker_provision import pin
+@@ -1180,6 +1200,8 @@
+                 return {'state':'INSTALLATION_WORKER_INPUTS_MISSING','enabled':row['enabled'],**summary}
+             with scope.authority(home), config_write_transaction(home / 'config.yaml'):
+                 own=require_readable_config_before_write(home / 'config.yaml')
++                current_main = (self._current_main_source_target(root, home, binding, generation, proof)
++                    if attaching else None)
+                 runtimes,network,declared_files=join.derive_inputs(home,binding['runtime_profile'],inputs,own,web_policy=web_policy)
+                 # Check the entire coherent package before the first write.
+                 names=list(proof['required_secrets'])
+@@ -1189,7 +1211,7 @@
+                     plan=prepare_inputs(home,binding['runtime_profile'],kind,c,own,
+                         a0_network=network if kind=='a0' else None,
+                         declared_files=declared_files[kind], tools=binding['tools'],
+-                        _history_walk=history_walk)
++                        _history_walk=history_walk, _current_main=current_main)
+                     plans[kind] = plan
+                     names.extend(plan[3])
+                 attachment=None
+@@ -1199,7 +1221,7 @@
+                         proof=pin(home / scope.ONBOARDING),marker=pin(home / scope.MARKER),
+                         binding_sha256=scope._fingerprint(binding),generation=generation,
+                         runtimes=runtimes,a0_network=network,required_names=list(dict.fromkeys(names)))
+-                    checked = checked_installed_a0_source_successor(runtimes['a0'], _history_walk=history_walk)
++                    checked = checked_installed_a0_source_successor(runtimes['a0'], _history_walk=history_walk, _current_main=current_main)
+                     successor = None if checked is None else _worker_successor_location(root,home,binding,generation,checked)[0]
+                     if (home / 'workers').exists() or (home / 'workers').is_symlink() or (successor is not None and (successor.exists() or successor.is_symlink())):
+                         if checked is None:
+@@ -1210,7 +1232,7 @@
+                             self._admitted_worker_home(root,home,binding,generation,proof)
+                             if digest(root / 'config.yaml') != expected_config_sha256:
+                                 raise PermissionError('onboarding_config_conflict_reload')
+-                            if checked_installed_a0_source_successor(runtimes['a0'], _history_walk=history_walk) != checked:
++                            if checked_installed_a0_source_successor(runtimes['a0'], _history_walk=history_walk, _current_main=current_main) != checked:
+                                 raise PermissionError('worker_successor_maintenance_changed')
+                         _replace_inactive_worker_inputs(root,home,binding,generation,checked,declaration,plans,
+                             budget=budget,verify=verify)
+@@ -1294,8 +1316,9 @@
+                         if attaching:
+                             if self._worker_attachment(root,home,binding,generation,proof,config)!=attachment:
+                                 raise PermissionError('worker_attachment_changed_reconciliation_required')
++                source_target = (lambda: self._current_main_source_target(root, home, binding, generation, proof)) if attaching else None
+                 try: runtimes=join.qualify(home,binding,generation,prepared,verify=verify,
+-                    accepted_monotonic=accepted_monotonic)
++                    accepted_monotonic=accepted_monotonic, _source_target=source_target)
+                 except HostUnavailable as exc:
+                     from .a0_bootstrap import PrerequisitePending
+                     if isinstance(exc,PrerequisitePending):
+--- a/plugins/friday_rework/user_worker_join.py
++++ b/plugins/friday_rework/user_worker_join.py
+@@ -274,7 +274,7 @@
+     return result
+ 
+ 
+-def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=None):
++def qualify(home, binding, generation, prepared, *, verify, accepted_monotonic=None, _source_target=None):
+     """One explicit owning-host action, reusing both complete native observers."""
+     from .onboarding import _new_file
+     from .runtime_containment import Budget
+@@ -289,9 +289,14 @@
+     a=runtimes['a0']['a0']
+     network={'name':'friday-onboarding','endpoints':endpoint_urls(a['deployment']),'policy':a['policy']}
+     def sources():
++        current_main = None
++        if _source_target is not None:
++            verify()
++            current_main = _source_target()
+         for kind,c in runtimes.items():
+             prepare_inputs(home,binding['runtime_profile'],kind,c,config,
+-                a0_network=network if kind=='a0' else None, tools=binding['tools'])
++                a0_network=network if kind=='a0' else None, tools=binding['tools'],
++                _current_main=current_main)
+     sources()
+     folder = home / FOLDER
+     if folder.exists() or folder.is_symlink(): raise HostUnavailable('qualification_attempt_requires_inspection')
+--- a/plugins/friday_rework/worker_provision.py
++++ b/plugins/friday_rework/worker_provision.py
+@@ -216,7 +216,7 @@
+     return DeclaredPolicy(reference.path, reference.sha256)
+ 
+ 
+-def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None, declared_files=None, tools=None, _history_walk=None):
++def prepare_inputs(home, profile, worker, runtime, config, *, a0_network=None, declared_files=None, tools=None, _history_walk=None, _current_main=None):
+     """Return an explicit plan before any write; never read/copy readiness."""
+     from .onboarding import validate_template
+     from hermes_cli import friday_user_scope as scope
+@@ -271,7 +271,10 @@
+         web.checked_patch(data)
+         names = [d['key_name'], *([] if d['web']['profile'] == 'exa-keyless' else ['EXA_API_KEY'])]
+     else:
+-        checked_installed_a0_source_successor(c, _history_walk=_history_walk)
++        if _current_main is not None and (_current_main.get('home') != str(home)
++                or _current_main.get('profile') != profile):
++            raise HostUnavailable('foreign_current_main_source_target')
++        checked_installed_a0_source_successor(c, _history_walk=_history_walk, _current_main=_current_main)
+         if not isinstance(a0_network, dict) or set(a0_network) != {'name', 'endpoints', 'policy'}:
+             raise HostUnavailable('explicit_a0_local_network_inputs_required')
+         from .adapters.a0_config import LocalNetwork, local_profile, KEY_REFERENCES
+@@ -343,7 +346,7 @@
+     return v, c
+ 
+ 
+-def checked_installed_a0_source_successor(runtime, *, _history_walk=None):
++def checked_installed_a0_source_successor(runtime, *, _history_walk=None, _current_main=None):
+     """Consume maintenance and authenticated ordinary descendants before setup.
+ 
+     The ordinary marker remains pending. This check grants neither readiness
+@@ -370,8 +373,8 @@
+     registration = source_module('scripts.friday_ordinary_a0_registration')
+     checked_source_maintenance_successor = registration.checked_source_maintenance_successor
+     _checked_source_maintenance_successor = registration._checked_source_maintenance_successor
+-    checked = (checked_source_maintenance_successor(installed_home, reference) if _history_walk is None
+-        else _checked_source_maintenance_successor(installed_home, reference, _walk=_history_walk))
++    checked = (checked_source_maintenance_successor(installed_home, reference, _current_main=_current_main) if _history_walk is None
++        else _checked_source_maintenance_successor(installed_home, reference, _walk=_history_walk, _current_main=_current_main))
+     plan = checked['receipt']['new_plan']; declaration = runtime['a0']
+     expected = {'runtime': {'path': str(source), 'sha256': plan['source_files']['scripts/a0_runtime.py']},
+         'launcher': checked['receipt']['launcher'],
+--- a/scripts/friday_ordinary_a0_registration.py
++++ b/scripts/friday_ordinary_a0_registration.py
+@@ -1276,7 +1276,122 @@
+     f.require(False, 'ordinary_a0_descendant_resource_limit')
+ 
+ 
+-def _checked_source_maintenance_current(home, reference, checked, *, current_input=None, pending_service_project=None, _budget=None):
++def _checked_current_main_publication(home, checked, target, *, _budget=None):
++    """Reconcile only one freshly admitted target's exact supported native reseal.
++
++    Returns exact pins from the validated read bytes, never refreshed history.
++    Immutable history is never rewritten. The caller supplies current native
++    admission separately; this pure/file join grants no worker or user authority.
++    """
++    check_budget = (lambda: None) if _budget is None else _budget.check
++    check_budget()
++    f.require(type(target) is dict and set(target) == {'home', 'profile', 'binding_sha256'}
++        and type(target['profile']) is str and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,95}', target['profile'])
++        and target['profile'] not in ('.', '..')
++        and target['home'] == str(home / 'profiles' / target['profile'])
++        and type(target['binding_sha256']) is str and re.fullmatch('[0-9a-f]{64}', target['binding_sha256']),
++        'ordinary_a0_current_main_target_required')
++    f.require(f.directory(f.canonical(target['home'])) == home / 'profiles' / target['profile'],
++        'ordinary_a0_current_main_target_changed')
++    prefix = 'profiles/' + target['profile'] + '/'
++    names = {prefix + n for n in ('config.yaml', '.friday-onboarding.json', '.friday-user-scope.json')}
++    after = checked['committed']['after']
++    f.require(names <= set(after), 'ordinary_a0_current_main_historical_target_required')
++    stage = Path(checked['transaction']) / 'stage'
++    previous = {}; current = {}
++    for name in names:
++        check_budget()
++        previous[name] = f.owned_file(stage / name, private=True)
++        f.require(f.digest(previous[name]) == after[name], 'ordinary_a0_current_main_history_changed')
++        current[name] = f.owned_file(home / name, private=True)
++    from hermes_cli.config import fast_safe_load
++    from scripts.friday_ordinary_install import _historical_yaml_parse
++    from _friday_install_validation_plugins.friday_rework.onboarding import current_main_config
++    config_name = prefix + 'config.yaml'; proof_name = prefix + '.friday-onboarding.json'
++    marker_name = prefix + '.friday-user-scope.json'
++    old_config = _historical_yaml_parse(previous[config_name].decode('utf-8-sig'), fast_safe_load)
++    config = fast_safe_load(current[config_name].decode('utf-8-sig'))
++    old_proof = json.loads(previous[proof_name], object_pairs_hook=f.unique)
++    old_marker = json.loads(previous[marker_name], object_pairs_hook=f.unique)
++    f.require(old_proof.get('binding_sha256') == target['binding_sha256']
++        and old_proof.get('config_sha256') == f.digest(previous[config_name])
++        and old_marker.get('profile') == target['profile']
++        and old_marker.get('binding_sha256') == target['binding_sha256']
++        and old_marker.get('onboarding_sha256') == f.digest(previous[proof_name]),
++        'ordinary_a0_current_main_historical_binding_changed')
++    selected = current_main_config(old_config, old_proof['required_secrets'])
++    f.require(json.dumps(config, sort_keys=True, allow_nan=False) == json.dumps(selected, sort_keys=True, allow_nan=False),
++        'ordinary_a0_current_main_config_changed')
++    expected_proof = dict(old_proof, config_sha256=f.digest(current[config_name]))
++    proof_raw = (json.dumps(expected_proof, sort_keys=True) + '\n').encode()
++    expected_marker = dict(old_marker, onboarding_sha256=f.digest(proof_raw))
++    f.require(current[proof_name] == proof_raw
++        and current[marker_name] == (json.dumps(expected_marker, sort_keys=True) + '\n').encode(),
++        'ordinary_a0_current_main_reseal_changed')
++    check_budget()
++    return {name: f.digest(current[name]) for name in names}
++
++
++def _current_main_source_target_for_update(home, checked):
++    """Fresh native join for the existing bound private OS-operator updater.
++
++    Its caller authenticates the complete installed source before this helper.
++    Only the exact historical secondary receiving identity is eligible;
++    request hashes, old clocks and a new document cannot supply user authority.
++    """
++    changed = set()
++    for name, sha in checked['committed']['after'].items():
++        parts = Path(name).parts
++        if len(parts) == 3 and parts[0] == 'profiles' and parts[2] in (
++                'config.yaml', '.friday-onboarding.json', '.friday-user-scope.json'):
++            if f.digest(f.owned_file(home / name, private=True)) != sha:
++                changed.add(name)
++    if not changed: return None
++    profiles = {Path(name).parts[1] for name in changed}
++    f.require(len(profiles) == 1, 'ordinary_a0_current_main_single_target_required')
++    profile = next(iter(profiles))
++    from _friday_install_validation_plugins.friday_rework.worker_declarations import load_declaration_source
++    bundle, _, _ = load_declaration_source(checked['receipt']['source'])
++    identity = bundle.get('secondary_profile')
++    f.require(type(identity) is dict and type(identity.get('binding')) is dict
++        and identity['binding'].get('runtime_profile') == profile
++        and type(identity.get('generation')) is int and identity['generation'] > 0,
++        'ordinary_a0_current_main_historical_target_identity_required')
++    own = f.directory(f.canonical(str(home / 'profiles' / profile)))
++    f.require(own == home / 'profiles' / profile, 'ordinary_a0_current_main_target_changed')
++    # This does not execute an entry/registration or grant a worker capability.
++    f.native_packages(home / 'hermes-agent')
++    from hermes_cli import friday_user_scope as user
++    from hermes_cli.friday_product_access import settings, current_access, principal_id
++    from hermes_cli.plugins_state import PluginState
++    from _friday_install_validation_plugins.friday_rework.onboarding import Onboarding, IDENTITY
++    from _friday_install_validation_plugins.friday_rework.access import ProductAccess
++    from types import SimpleNamespace
++    f.require(user._CURRENT.get() is None, 'ordinary_a0_current_main_operator_scope_required')
++    with user.authority(home):
++        bindings = settings()['user_isolation']['bindings']
++        matches = [b for b in bindings if b['runtime_profile'] == profile]
++        f.require(len(matches) == 1, 'ordinary_a0_current_main_native_binding_required')
++        binding = matches[0]
++        f.require(json.dumps(binding, sort_keys=True) == json.dumps(identity['binding'], sort_keys=True),
++            'ordinary_a0_current_main_historical_target_binding_changed')
++        ProductAccess.require_transport(binding['transport_profile'])
++        state = PluginState('friday_rework')
++        row = current_access(state)['users'].get(principal_id(*(binding[k] for k in IDENTITY)))
++        f.require(type(row) is dict and row.get('enabled') is True and row.get('role') == 'user'
++            and type(row.get('generation')) is int and row['generation'] == identity['generation'],
++            'ordinary_a0_current_main_native_admission_required')
++        setup = Onboarding(SimpleNamespace(_state=lambda: state))
++        verified, current, _, proof = setup._prepared(home, state,
++            *(binding[k] for k in IDENTITY), row['generation'])
++        f.require(verified == own and current == binding, 'ordinary_a0_current_main_native_home_changed')
++        target = setup._current_main_source_target(home, own, binding, row['generation'], proof)
++    f.require(target is not None, 'ordinary_a0_current_main_selection_required')
++    _checked_current_main_publication(home, checked, target)
++    return target
++
++
++def _checked_source_maintenance_current(home, reference, checked, *, current_input=None, pending_service_project=None, _budget=None, _current_main=None):
+     """Verify current source provenance only; fresh native admission is separate."""
+     check_budget = (lambda: None) if _budget is None else _budget.check
+     check_budget()
+@@ -1285,6 +1400,8 @@
+     receipt = checked['receipt']; home = f.directory(f.canonical(str(home)))
+     marker = f.read_json(home / f.MARKER)
+     direct = marker == f.read_json(Path(checked['transaction']) / 'stage' / f.MARKER)
++    target_pins = ({} if _current_main is None else
++        _checked_current_main_publication(home, checked, _current_main, _budget=_budget))
+     if direct:
+         effective_input = receipt['current_input']
+         f.require(f.digest(f.owned_file(home / f.MARKER, private=True)) == checked['committed']['after'][f.MARKER]
+@@ -1292,7 +1409,7 @@
+             'ordinary_a0_successor_current_marker_changed')
+         for name, sha in checked['committed']['after'].items():
+             check_budget()
+-            f.require(f.digest(f.owned_file(home / name, private=True)) == sha,
++            f.require(f.digest(f.owned_file(home / name, private=True)) == target_pins.get(name, sha),
+                 'ordinary_a0_successor_current_publication_changed')
+     else:
+         # Select only the exact reviewed old-plan -> current-source tuple. The
+@@ -1316,7 +1433,7 @@
+         for name, sha in checked['committed']['after'].items():
+             check_budget()
+             if name not in publication:
+-                f.require(f.digest(f.owned_file(home / name, private=True)) == sha,
++                f.require(f.digest(f.owned_file(home / name, private=True)) == target_pins.get(name, sha),
+                     'ordinary_a0_successor_current_publication_changed')
+         for name, pin in publication.items():
+             check_budget()
+@@ -1387,22 +1504,22 @@
+ 
+ 
+ def _checked_source_maintenance_successor(home, reference, *, current_input=None,
+-        pending_service_project=None, _walk):
++        pending_service_project=None, _walk, _current_main=None):
+     """Reuse immutable facts only; current custody is freshly checked each time."""
+     checked = _checked_source_maintenance_history(home, reference, _walk=_walk)
+     _walk._check_budget()
+     current = _checked_source_maintenance_current(home, reference, checked,
+         current_input=current_input, pending_service_project=pending_service_project,
+-        _budget=_walk._budget)
++        _budget=_walk._budget, _current_main=_current_main)
+     _walk._check_budget()
+     return current
+ 
+ 
+-def checked_source_maintenance_successor(home, reference, *, current_input=None, pending_service_project=None):
++def checked_source_maintenance_successor(home, reference, *, current_input=None, pending_service_project=None, _current_main=None):
+     """Authenticate full immutable ancestry, then freshly check current custody."""
+     from scripts.friday_ordinary_install import _HistoryWalk
+     return _checked_source_maintenance_successor(home, reference, current_input=current_input,
+-        pending_service_project=pending_service_project, _walk=_HistoryWalk())
++        pending_service_project=pending_service_project, _walk=_HistoryWalk(), _current_main=_current_main)
+ 
+ 
+ 
+--- a/scripts/friday_ordinary_install.py
++++ b/scripts/friday_ordinary_install.py
+@@ -2064,11 +2064,12 @@
+     import copy
+     f = api(); proof = request['worker_source_maintenance']
+     checked = checked_worker_source_maintenance_history(home, proof)
+-    from scripts.friday_ordinary_a0_registration import _checked_source_maintenance_current
++    from scripts.friday_ordinary_a0_registration import _checked_source_maintenance_current, _current_main_source_target_for_update
+     from _friday_install_validation_plugins.friday_rework.worker_declarations import pending_service_project
+     pending = pending_service_project(f.read_json(f.pin(request['previous_input'])),f.read_json(f.pin(request['current_input'])))
+     live = _checked_source_maintenance_current(home, proof['receipt'], checked,
+-        current_input=request['previous_input'],pending_service_project=pending)
++        current_input=request['previous_input'],pending_service_project=pending,
++        _current_main=_current_main_source_target_for_update(home, checked))
+     f.require(live['receipt'] == checked['receipt'],
+         'ordinary_update_worker_source_maintenance_current_lineage_changed')
+     maintenance = checked['request']; receipt = checked['receipt']; tx = Path(checked['transaction'])
+@@ -10668,10 +10669,17 @@
+     profiles=request['retained_profile_files']
+     f.require(type(profiles) is dict and set(profiles)==WEB_INPUT_PROFILE_FILES,
+         'ordinary_update_current_profile_pins_required')
+-    after=(checked_worker_source_maintenance_history(home,request['worker_source_maintenance'])['committed']['after']
+-        if 'worker_source_maintenance' in request else {})
++    checked = (checked_worker_source_maintenance_history(home, request['worker_source_maintenance'])
++        if 'worker_source_maintenance' in request else None)
++    after = {} if checked is None else checked['committed']['after']
++    target_pins = {}
++    if checked is not None:
++        from scripts.friday_ordinary_a0_registration import _current_main_source_target_for_update, _checked_current_main_publication
++        target = _current_main_source_target_for_update(home, checked)
++        if target is not None:
++            target_pins = _checked_current_main_publication(home, checked, target, _budget=budget)
+     for name,ref in profiles.items():
+-        f.require(f.pin(ref)==home/name and (name not in after or ref['sha256']==after[name]),
++        f.require(f.pin(ref)==home/name and (name not in after or ref['sha256']==target_pins.get(name,after[name])),
+             'ordinary_update_worker_current_profile_changed')
+     for name in ('previous_input','current_input','configuration','profile','launcher','native_unit'):
+         f.pin(request[name])
+@@ -10690,10 +10698,11 @@
+         return _WORKER_MAINTENANCE_IMMEDIATE_BRIDGE(home,request,predecessor,marker)
+     f=api();proof=request['worker_source_maintenance']
+     checked=checked_worker_source_maintenance_history(home,proof)
+-    from scripts.friday_ordinary_a0_registration import _checked_source_maintenance_current
++    from scripts.friday_ordinary_a0_registration import _checked_source_maintenance_current, _current_main_source_target_for_update
+     from _friday_install_validation_plugins.friday_rework.worker_declarations import pending_service_project
+     pending=pending_service_project(f.read_json(f.pin(request['previous_input'])),f.read_json(f.pin(request['current_input'])))
+-    live=_checked_source_maintenance_current(home,proof['receipt'],checked,current_input=request['previous_input'],pending_service_project=pending)
++    live=_checked_source_maintenance_current(home,proof['receipt'],checked,current_input=request['previous_input'],pending_service_project=pending,
++        _current_main=_current_main_source_target_for_update(home, checked))
+     f.require(live['receipt']==checked['receipt']
+         and marker.get('a0_service_source_successor')==proof['receipt']
+         and marker.get('ordinary_source_update_request')==request['predecessor_update']
