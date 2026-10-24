@@ -1,0 +1,160 @@
+--- a/plugins/friday_rework/associations.py
++++ b/plugins/friday_rework/associations.py
+@@ -180,25 +180,31 @@
+     taking the nonblocking flock. Another writer still receives admission_busy;
+     native preparation/control never holds either metadata lock.
+     """
+-    def __init__(self, native_state, *, clock=time.time):
++    def __init__(self, native_state, *, clock=time.time, storage_readonly=False):
+         self.state = native_state
++        if type(storage_readonly) is not bool:
++            raise ValueError('invalid_association_storage_mode')
++        self._storage_readonly = storage_readonly
+         from hermes_cli.friday_cli_work import is_cli, check_store
+         from hermes_cli.friday_cli_principal import current_cli
+         self._cli_authority = current_cli(required=True) if is_cli() else None
+-        check_store(self._cli_authority, self.state)
++        check_store(self._cli_authority, self.state, storage_readonly=self._storage_readonly)
+         self._cli_state = self.state
+-        self._cli_directory = Path(self.state.data_dir)
+-        self._cli_namespace = self.state._data_namespace if self._cli_authority is not None else None
++        self._cli_directory = self._state_directory()
++        self._cli_namespace = self.state._data_namespace if self._cli_authority is not None or self._storage_readonly else None
+         self.clock = clock
+         self._thread_lock = threading.RLock()
+         self._lock_allowance = ContextVar("association_lock_allowance", default=None)
+         self._native_expected = ContextVar("association_native_expected", default=None)
+ 
++    def _state_directory(self):
++        return Path(self.state.directory_storage_readonly if self._storage_readonly else self.state.data_dir)
++
+     def _check_local_state(self):
+         from hermes_cli.friday_cli_work import check_store
+-        check_store(self._cli_authority, self.state)
+-        if self._cli_authority is not None and (self.state is not self._cli_state
+-                or Path(self.state.data_dir) != self._cli_directory
++        check_store(self._cli_authority, self.state, storage_readonly=self._storage_readonly)
++        if (self._cli_authority is not None or self._storage_readonly) and (self.state is not self._cli_state
++                or self._state_directory() != self._cli_directory
+                 or self.state._data_namespace != self._cli_namespace):
+             raise AssociationError('foreign_cli_state')
+ 
+@@ -224,11 +230,14 @@
+     def state_get(self, key, default=None):
+         self._check_local_state()
+         with self.lock_budget():
+-            value = self.state.get(key, default, lock_budget=self._lock_allowance.get())
++            read = self.state.get_storage_readonly if self._storage_readonly else self.state.get
++            value = read(key, default, lock_budget=self._lock_allowance.get())
+             self._check_local_state()
+             return value
+ 
+     def state_set(self, key, value):
++        if self._storage_readonly:
++            raise AssociationError('association_storage_readonly')
+         self._check_local_state()
+         with self.lock_budget():
+             self.state.set(key, value, lock_budget=self._lock_allowance.get())
+@@ -254,6 +263,8 @@
+ 
+     @contextmanager
+     def _locked_file(self):
++        if self._storage_readonly:
++            raise AssociationError('association_storage_readonly')
+         self._check_local_state()
+         directory = Path(self.state.data_dir)
+         if not directory.is_absolute() or directory.resolve() != directory:
+@@ -323,6 +334,8 @@
+                 raise
+ 
+     def _save(self, data, *, journals=()):
++        if self._storage_readonly:
++            raise AssociationError('association_storage_readonly')
+         from hermes_cli.friday_cli_caller import current as current_original_caller
+         span = current_original_caller()
+         if span is not None:
+@@ -435,6 +448,64 @@
+         with self._locked() as data:
+             return {k: self.consumer_copy(v) for k, v in data["jobs"].items()}
+ 
++    def snapshot_storage_readonly(self):
++        """Read an established association store without creating or repairing it."""
++        if not self._storage_readonly:
++            raise AssociationError('association_storage_readonly_required')
++        self._check_local_state()
++        with self.lock_budget():
++            with self._lock_allowance.get().acquiring() as deadline:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0 or not self._thread_lock.acquire(timeout=remaining):
++                    raise TimeoutError('association_lock_deadline')
++            try:
++                directory = self._state_directory()
++                if directory != self._cli_directory:
++                    raise AssociationError('association_state_directory_changed')
++                ds = directory.stat(follow_symlinks=False)
++                if (not stat.S_ISDIR(ds.st_mode) or ds.st_uid != os.getuid()
++                        or stat.S_IMODE(ds.st_mode) != 0o700):
++                    raise AssociationError('state_directory_not_private')
++                fd = os.open(directory / 'admission.lock',
++                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
++                try:
++                    before = os.fstat(fd)
++                    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
++                            or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600):
++                        raise AssociationError('unsafe_admission_lock')
++                    try:
++                        with self._lock_allowance.get().acquiring():
++                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                    except BlockingIOError as exc:
++                        raise AssociationError('admission_busy') from exc
++                    if os.pread(fd, 4, 0) != b'v1\n':
++                        raise AssociationError('invalid_admission_marker')
++                    missing = object()
++                    data = self.state.get_storage_readonly(KEY, missing,
++                        lock_budget=self._lock_allowance.get())
++                    if data is missing:
++                        raise AssociationError('association_store_lost')
++                    _validate_store(data)
++                    self._check_local_state()
++                    current_directory = self._state_directory()
++                    current_ds = current_directory.stat(follow_symlinks=False)
++                    if (current_directory != directory or not stat.S_ISDIR(current_ds.st_mode)
++                            or current_ds.st_uid != os.getuid() or stat.S_IMODE(current_ds.st_mode) != 0o700
++                            or (current_ds.st_dev, current_ds.st_ino) != (ds.st_dev, ds.st_ino)):
++                        raise AssociationError('association_state_directory_changed')
++                    linked = os.stat(directory / 'admission.lock', follow_symlinks=False)
++                    signature = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
++                    if (not stat.S_ISREG(linked.st_mode) or linked.st_uid != os.getuid()
++                            or linked.st_nlink != 1 or stat.S_IMODE(linked.st_mode) != 0o600
++                            or signature(linked) != signature(before)
++                            or os.pread(fd, 4, 0) != b'v1\n'):
++                        raise AssociationError('admission_lock_changed')
++                    return {k: self.consumer_copy(v) for k, v in data['jobs'].items()}
++                finally:
++                    os.close(fd)
++            finally:
++                self._thread_lock.release()
++
+     def attach_a0_capability(self, task_id, owner, pin, validate):
+         """Once-only trusted producer attachment in the existing durable row.
+ 
+--- a/plugins/friday_rework/onboarding.py
++++ b/plugins/friday_rework/onboarding.py
+@@ -541,7 +541,7 @@
+             _cli_admission(root, binding)
+             return True  # Explicit operator map; product enable remains separate.
+         from gateway.pairing import PairingStore
+-        return PairingStore().is_approved(binding['platform'], binding['user_id'])
++        return PairingStore.is_approved_storage_readonly(binding['platform'], binding['user_id'])
+ 
+     @contextmanager
+     def transaction(self, profile, expected_config_sha256, session=None):
+@@ -1032,7 +1032,7 @@
+             raise PermissionError('ordinary_worker_free_home_required')
+         with scope.authority(home):
+             from hermes_cli.plugins_state import PluginState
+-            if Associations(PluginState('friday_rework')).snapshot():
++            if Associations(PluginState('friday_rework'), storage_readonly=True).snapshot_storage_readonly():
+                 raise PermissionError('existing_worker_associations_require_reconciliation')
+         return own
+ 
