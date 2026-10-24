@@ -1,0 +1,1315 @@
+diff --git a/plugins/friday_rework/associations.py b/plugins/friday_rework/associations.py
+--- a/plugins/friday_rework/associations.py
++++ b/plugins/friday_rework/associations.py
+@@ -180,25 +180,37 @@
+     taking the nonblocking flock. Another writer still receives admission_busy;
+     native preparation/control never holds either metadata lock.
+     """
+-    def __init__(self, native_state, *, clock=time.time):
++    def __init__(self, native_state, *, clock=time.time, storage_readonly=False):
+         self.state = native_state
++        if type(storage_readonly) is not bool:
++            raise ValueError('invalid_association_storage_mode')
++        self._storage_readonly = storage_readonly
+         from hermes_cli.friday_cli_work import is_cli, check_store
+         from hermes_cli.friday_cli_principal import current_cli
+         self._cli_authority = current_cli(required=True) if is_cli() else None
+-        check_store(self._cli_authority, self.state)
++        if self._storage_readonly:
++            check_store(self._cli_authority, self.state, storage_readonly=True)
++        else:
++            check_store(self._cli_authority, self.state)
+         self._cli_state = self.state
+-        self._cli_directory = Path(self.state.data_dir)
+-        self._cli_namespace = self.state._data_namespace if self._cli_authority is not None else None
++        self._cli_directory = self._state_directory()
++        self._cli_namespace = self.state._data_namespace if self._cli_authority is not None or self._storage_readonly else None
+         self.clock = clock
+         self._thread_lock = threading.RLock()
+         self._lock_allowance = ContextVar("association_lock_allowance", default=None)
+         self._native_expected = ContextVar("association_native_expected", default=None)
+ 
++    def _state_directory(self):
++        return Path(self.state.directory_storage_readonly if self._storage_readonly else self.state.data_dir)
++
+     def _check_local_state(self):
+         from hermes_cli.friday_cli_work import check_store
+-        check_store(self._cli_authority, self.state)
+-        if self._cli_authority is not None and (self.state is not self._cli_state
+-                or Path(self.state.data_dir) != self._cli_directory
++        if self._storage_readonly:
++            check_store(self._cli_authority, self.state, storage_readonly=True)
++        else:
++            check_store(self._cli_authority, self.state)
++        if (self._cli_authority is not None or self._storage_readonly) and (self.state is not self._cli_state
++                or self._state_directory() != self._cli_directory
+                 or self.state._data_namespace != self._cli_namespace):
+             raise AssociationError('foreign_cli_state')
+ 
+@@ -224,11 +236,14 @@
+     def state_get(self, key, default=None):
+         self._check_local_state()
+         with self.lock_budget():
+-            value = self.state.get(key, default, lock_budget=self._lock_allowance.get())
++            read = self.state.get_storage_readonly if self._storage_readonly else self.state.get
++            value = read(key, default, lock_budget=self._lock_allowance.get())
+             self._check_local_state()
+             return value
+ 
+     def state_set(self, key, value):
++        if self._storage_readonly:
++            raise AssociationError('association_storage_readonly')
+         self._check_local_state()
+         with self.lock_budget():
+             self.state.set(key, value, lock_budget=self._lock_allowance.get())
+@@ -254,6 +269,8 @@
+ 
+     @contextmanager
+     def _locked_file(self):
++        if self._storage_readonly:
++            raise AssociationError('association_storage_readonly')
+         self._check_local_state()
+         directory = Path(self.state.data_dir)
+         if not directory.is_absolute() or directory.resolve() != directory:
+@@ -323,6 +340,8 @@
+                 raise
+ 
+     def _save(self, data, *, journals=()):
++        if self._storage_readonly:
++            raise AssociationError('association_storage_readonly')
+         from hermes_cli.friday_cli_caller import current as current_original_caller
+         span = current_original_caller()
+         if span is not None:
+@@ -435,6 +454,64 @@
+         with self._locked() as data:
+             return {k: self.consumer_copy(v) for k, v in data["jobs"].items()}
+ 
++    def snapshot_storage_readonly(self):
++        """Read an established association store without creating or repairing it."""
++        if not self._storage_readonly:
++            raise AssociationError('association_storage_readonly_required')
++        self._check_local_state()
++        with self.lock_budget():
++            with self._lock_allowance.get().acquiring() as deadline:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0 or not self._thread_lock.acquire(timeout=remaining):
++                    raise TimeoutError('association_lock_deadline')
++            try:
++                directory = self._state_directory()
++                if directory != self._cli_directory:
++                    raise AssociationError('association_state_directory_changed')
++                ds = directory.stat(follow_symlinks=False)
++                if (not stat.S_ISDIR(ds.st_mode) or ds.st_uid != os.getuid()
++                        or stat.S_IMODE(ds.st_mode) != 0o700):
++                    raise AssociationError('state_directory_not_private')
++                fd = os.open(directory / 'admission.lock',
++                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
++                try:
++                    before = os.fstat(fd)
++                    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
++                            or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600):
++                        raise AssociationError('unsafe_admission_lock')
++                    try:
++                        with self._lock_allowance.get().acquiring():
++                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                    except BlockingIOError as exc:
++                        raise AssociationError('admission_busy') from exc
++                    if os.pread(fd, 4, 0) != b'v1\n':
++                        raise AssociationError('invalid_admission_marker')
++                    missing = object()
++                    data = self.state.get_storage_readonly(KEY, missing,
++                        lock_budget=self._lock_allowance.get())
++                    if data is missing:
++                        raise AssociationError('association_store_lost')
++                    _validate_store(data)
++                    self._check_local_state()
++                    current_directory = self._state_directory()
++                    current_ds = current_directory.stat(follow_symlinks=False)
++                    if (current_directory != directory or not stat.S_ISDIR(current_ds.st_mode)
++                            or current_ds.st_uid != os.getuid() or stat.S_IMODE(current_ds.st_mode) != 0o700
++                            or (current_ds.st_dev, current_ds.st_ino) != (ds.st_dev, ds.st_ino)):
++                        raise AssociationError('association_state_directory_changed')
++                    linked = os.stat(directory / 'admission.lock', follow_symlinks=False)
++                    signature = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
++                    if (not stat.S_ISREG(linked.st_mode) or linked.st_uid != os.getuid()
++                            or linked.st_nlink != 1 or stat.S_IMODE(linked.st_mode) != 0o600
++                            or signature(linked) != signature(before)
++                            or os.pread(fd, 4, 0) != b'v1\n'):
++                        raise AssociationError('admission_lock_changed')
++                    return {k: self.consumer_copy(v) for k, v in data['jobs'].items()}
++                finally:
++                    os.close(fd)
++            finally:
++                self._thread_lock.release()
++
+     def attach_a0_capability(self, task_id, owner, pin, validate):
+         """Once-only trusted producer attachment in the existing durable row.
+ 
+diff --git a/plugins/friday_rework/onboarding.py b/plugins/friday_rework/onboarding.py
+--- a/plugins/friday_rework/onboarding.py
++++ b/plugins/friday_rework/onboarding.py
+@@ -523,7 +523,10 @@
+ 
+ 
+ class Onboarding:
+-    def __init__(self, administration):
++    def __init__(self, administration, *, storage_readonly=True):
++        if type(storage_readonly) is not bool:
++            raise ValueError('invalid_onboarding_storage_mode')
++        self._storage_readonly = storage_readonly
+         self.admin = administration
+ 
+     def _verify_operator(self, profile, session):
+@@ -536,11 +539,17 @@
+         self.admin._verify_session(profile, session)
+ 
+     @staticmethod
+-    def _native_grant(root, binding):
++    def _native_grant(root, binding, *, storage_readonly=True):
++        if type(storage_readonly) is not bool:
++            raise ValueError('invalid_onboarding_storage_mode')
+         if binding['platform'] == 'cli':
+             _cli_admission(root, binding)
+             return True  # Explicit operator map; product enable remains separate.
+         from gateway.pairing import PairingStore
++        if storage_readonly:
++            return PairingStore.is_approved_storage_readonly(binding['platform'], binding['user_id'])
++        # Explicit mutation-authorized source-update phase uses the genuine
++        # currently imported native API; publishing files does not reload it.
+         return PairingStore().is_approved(binding['platform'], binding['user_id'])
+ 
+     @contextmanager
+@@ -1019,7 +1028,7 @@
+             if not row['enabled'] or current!=binding or current_proof!=proof:
+                 raise PermissionError('admitted_ordinary_worker_attachment_required')
+             scope.check_onboarding_home(root,home,binding)
+-            if not self._native_grant(root,binding): raise PermissionError('native_grant_revoked')
++            if not self._native_grant(root,binding, storage_readonly=self._storage_readonly): raise PermissionError('native_grant_revoked')
+         own=require_readable_config_before_write(home / 'config.yaml')
+         scope._private(home / scope.MARKER)
+         marker=json.loads((home / scope.MARKER).read_text())
+@@ -1032,7 +1041,12 @@
+             raise PermissionError('ordinary_worker_free_home_required')
+         with scope.authority(home):
+             from hermes_cli.plugins_state import PluginState
+-            if Associations(PluginState('friday_rework')).snapshot():
++            state = PluginState('friday_rework')
++            if self._storage_readonly:
++                associations = Associations(state, storage_readonly=True).snapshot_storage_readonly()
++            else:
++                associations = Associations(state).snapshot()
++            if associations:
+                 raise PermissionError('existing_worker_associations_require_reconciliation')
+         return own
+ 
+@@ -1137,7 +1151,7 @@
+                 try:
+                     with scope.authority(Path(proof['authorization_home'])):
+                         scope.check_onboarding_home(Path(proof['authorization_home']),home,binding)
+-                        if not self._native_grant(Path(proof['authorization_home']), binding):
++                        if not self._native_grant(Path(proof['authorization_home']), binding, storage_readonly=self._storage_readonly):
+                             raise PermissionError('native_grant_missing')
+                 except (OSError,ValueError,PermissionError):
+                     result['can_activate']=False
+@@ -1285,7 +1299,7 @@
+             elif (home / scope.MARKER).exists() or (home / scope.MARKER).is_symlink():
+                 raise PermissionError('disabled_fresh_worker_setup_required')
+             scope.check_onboarding_home(root,home,binding)
+-            if not self._native_grant(root, binding):
++            if not self._native_grant(root, binding, storage_readonly=self._storage_readonly):
+                 return {'state':'DISABLED_NATIVE_GRANT_MISSING','enabled':False}
+             with scope.authority(home),config_write_transaction(home / 'config.yaml'):
+                 own=require_readable_config_before_write(home / 'config.yaml')
+@@ -1312,7 +1326,7 @@
+                         if digest(root / 'config.yaml')!=expected_config_sha256:
+                             raise PermissionError('onboarding_config_conflict_reload')
+                         scope.check_onboarding_home(root,home,binding)
+-                        if not self._native_grant(root, binding): raise PermissionError('native_grant_revoked')
++                        if not self._native_grant(root, binding, storage_readonly=self._storage_readonly): raise PermissionError('native_grant_revoked')
+                         if attaching:
+                             if self._worker_attachment(root,home,binding,generation,proof,config)!=attachment:
+                                 raise PermissionError('worker_attachment_changed_reconciliation_required')
+@@ -1374,7 +1388,7 @@
+             if worker == 'a0' and not normal:
+                 return {'state': 'DISABLED_A0_RECONCILIATION_REQUIRED', 'enabled': False}
+             scope.check_onboarding_home(root, home, binding)
+-            if not self._native_grant(root, binding):
++            if not self._native_grant(root, binding, storage_readonly=self._storage_readonly):
+                 return {'state': 'DISABLED_NATIVE_GRANT_MISSING', 'enabled': False}
+             with scope.authority(home), config_write_transaction(home / 'config.yaml'):
+                 self._verify_operator(profile, session)
+@@ -1421,7 +1435,7 @@
+                 if any(not load_env_file(path).get(k) for k in proof['required_secrets']):
+                     return {'state': 'DISABLED_SCOPED_KEYS_MISSING', 'enabled': False}
+                 scope.check_onboarding_home(root, home, binding)
+-                if not self._native_grant(root, binding):
++                if not self._native_grant(root, binding, storage_readonly=self._storage_readonly):
+                     return {'state': 'DISABLED_NATIVE_GRANT_MISSING', 'enabled': False}
+                 from hermes_cli.config import load_config_readonly
+                 with scope.authority(home):
+diff --git a/plugins/friday_rework/runtime_process.py b/plugins/friday_rework/runtime_process.py
+--- a/plugins/friday_rework/runtime_process.py
++++ b/plugins/friday_rework/runtime_process.py
+@@ -60,16 +60,32 @@
+                 "-c", "protocol.file.allow=never", "-c", "protocol.ext.allow=never",
+                 "-c", "pack.threads=4", *argv[1:]]
+     start = time.monotonic()
+-    process = subprocess.Popen(argv, cwd=donor, env=env or clean_environment(donor),
+-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+-                               text=True, start_new_session=True, pass_fds=pass_fds)
++    # A scoped updater alarm may fire during Popen or the first custody read.
++    # Defer that delivery until the returned child is inside the cleanup try.
++    # Unlike a blocked mask, this does not change the child's inherited mask.
++    import threading
++    previous_alarm = signal.getsignal(signal.SIGALRM)
++    deferred_alarm = []
++    def defer_alarm(signum, frame):
++        if not deferred_alarm:
++            deferred_alarm.append((signum,frame))
++    defer = (threading.current_thread() is threading.main_thread()
++        and callable(previous_alarm)
++        and getattr(previous_alarm,'_friday_ordinary_update_deadline',False) is True)
++    if defer: signal.signal(signal.SIGALRM,defer_alarm)
+     try:
+-        starttime = int(Path(f'/proc/{process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
+-    except (OSError, ValueError, IndexError):
+-        starttime = None
++        process = subprocess.Popen(argv, cwd=donor, env=env or clean_environment(donor),
++                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                                   text=True, start_new_session=True, pass_fds=pass_fds)
++    except BaseException:
++        if defer: signal.signal(signal.SIGALRM,previous_alarm)
++        raise
++    starttime = None
+     timed_out = False
+     stop_errors = []
++    custody_failure = None
+     def unconfirmed(message, observation, extra=()):
++        nonlocal custody_failure
+         secondary = list(stop_errors) + list(extra)
+         # A retained exception also retains this frame/Popen. Release our pipe
+         # handles now, and reap only if already exited: no renewed wait budget.
+@@ -94,46 +110,112 @@
+         stopped.observation = primary.observation
+         stopped.friday_custody_primary = primary
+         stopped.friday_custody_secondary = tuple(secondary)
++        custody_failure = stopped
+         return stopped, primary
+     try:
+-        out, err = process.communicate(timeout=timeout)
+-    except subprocess.TimeoutExpired:
+-        timed_out = True
+-        if deadline is not None:
+-            # Containment targets its exact namespace init while leaving the
+-            # native monitor alive to report kernel-drained namespace exit.
+-            # A process group alone provides no detached-session custody.
+-            try:
+-                if stop_on_timeout is not None:
+-                    stop_on_timeout(process, starttime)
+-                else:
++        if defer:
++            signal.signal(signal.SIGALRM,previous_alarm)
++            if deferred_alarm:
++                previous_alarm(*deferred_alarm[0])
++        try:
++            starttime = int(Path(f'/proc/{process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
++        except (OSError, ValueError, IndexError):
++            starttime = None
++        try:
++            out, err = process.communicate(timeout=timeout)
++        except subprocess.TimeoutExpired:
++            timed_out = True
++            if deadline is not None:
++                # Containment targets its exact namespace init while leaving the
++                # native monitor alive to report kernel-drained namespace exit.
++                # A process group alone provides no detached-session custody.
++                try:
++                    if stop_on_timeout is not None:
++                        stop_on_timeout(process, starttime)
++                    else:
++                        try:
++                            os.killpg(process.pid, signal.SIGKILL)
++                        except ProcessLookupError:
++                            pass
++                except BaseException as exc:
++                    stop_errors.append(exc)
++                    stop_errors.extend(getattr(exc, 'friday_custody_secondary', ()))
++                remaining = deadline - time.monotonic()
++                partial = dict(returncode=process.returncode, timeout=True,
++                               pid=process.pid, starttime_ticks=starttime,
++                               reaped=process.returncode is not None, reason='command_timeout',
++                               elapsed_seconds=round(time.monotonic() - start, 3))
++                if remaining <= 0:
++                    stopped, primary = unconfirmed('STOP_UNCONFIRMED: original cleanup budget exhausted', partial)
++                    raise stopped from primary
++                try:
++                    out, err = process.communicate(timeout=remaining)
++                except BaseException as exc:
++                    stopped, primary = unconfirmed('STOP_UNCONFIRMED: contained command not reaped', partial, (exc,))
++                    raise stopped from primary
++            else:
++                os.killpg(process.pid, signal.SIGTERM)
++                try:
++                    out, err = process.communicate(timeout=5)
++                except subprocess.TimeoutExpired:
++                    os.killpg(process.pid, signal.SIGKILL)
++                    out, err = process.communicate(timeout=5)
++    except BaseException as interrupted:
++        # Cancellation/deadline exceptions have the same owned stop/reap
++        # obligation as timeout. Never introduce a new wait budget here.
++        if interrupted is custody_failure:
++            raise
++        partial = dict(returncode=process.returncode,timeout=timed_out,
++            pid=process.pid,starttime_ticks=starttime,reaped=process.returncode is not None,
++            reason='command_interrupted',elapsed_seconds=round(time.monotonic()-start,3))
++        try:
++            if stop_on_timeout is None:
++                # A second scoped wakeup may expire during cleanup. Defer it
++                # only across the nonblocking exact owned-group stop attempt;
++                # no child inherits this mask, and no wait runs under it.
++                stop_mask = signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGALRM})
++                probe_failure = None
++                try:
+                     try:
+-                        os.killpg(process.pid, signal.SIGKILL)
+-                    except ProcessLookupError:
+-                        pass
+-            except BaseException as exc:
+-                stop_errors.append(exc)
+-                stop_errors.extend(getattr(exc, 'friday_custody_secondary', ()))
+-            remaining = deadline - time.monotonic()
+-            partial = dict(returncode=process.returncode, timeout=True,
+-                           pid=process.pid, starttime_ticks=starttime,
+-                           reaped=process.returncode is not None, reason='command_timeout',
+-                           elapsed_seconds=round(time.monotonic() - start, 3))
++                        running = process.poll() is None
++                    except BaseException as exc:
++                        probe_failure = exc
++                        running = process.returncode is None
++                    if running:
++                        try: os.killpg(process.pid,signal.SIGKILL)
++                        except ProcessLookupError: pass
++                finally:
++                    signal.pthread_sigmask(signal.SIG_SETMASK,stop_mask)
++                if probe_failure is not None:
++                    raise probe_failure
++            elif process.poll() is None:
++                # A namespace callback retains its existing custody authority.
++                # Interruption/failure never substitutes a group kill for it.
++                try:
++                    stop_on_timeout(process,starttime)
++                except Exception as exc:
++                    stop_errors.append(exc)
++                    stop_errors.extend(getattr(exc,'friday_custody_secondary',()))
++            remaining = (start + timeout if deadline is None else deadline) - time.monotonic()
+             if remaining <= 0:
+-                stopped, primary = unconfirmed('STOP_UNCONFIRMED: original cleanup budget exhausted', partial)
+-                raise stopped from primary
+-            try:
+-                out, err = process.communicate(timeout=remaining)
+-            except BaseException as exc:
+-                stopped, primary = unconfirmed('STOP_UNCONFIRMED: contained command not reaped', partial, (exc,))
+-                raise stopped from primary
+-        else:
+-            os.killpg(process.pid, signal.SIGTERM)
+-            try:
+-                out, err = process.communicate(timeout=5)
+-            except subprocess.TimeoutExpired:
+-                os.killpg(process.pid, signal.SIGKILL)
+-                out, err = process.communicate(timeout=5)
++                stopped, primary = unconfirmed('STOP_UNCONFIRMED: original interruption cleanup budget exhausted',
++                    partial,(interrupted,))
++                raise stopped from interrupted
++            process.communicate(timeout=remaining)
++            if stop_errors:
++                partial.update(returncode=process.returncode,reaped=process.returncode is not None)
++                stopped, primary = unconfirmed('STOP_UNCONFIRMED: interrupted native stop failed',
++                    partial,(interrupted,))
++                raise stopped from interrupted
++        except BaseException as cleanup:
++            if cleanup is custody_failure:
++                raise
++            stopped, primary = unconfirmed('STOP_UNCONFIRMED: interrupted command cleanup incomplete',
++                partial,(interrupted,cleanup))
++            raise stopped from interrupted
++        raise
++    finally:
++        if defer: signal.signal(signal.SIGALRM,previous_alarm)
+     reason = ('device_null_unavailable' if
+               "fatal: could not open '/dev/null' for reading and writing: Permission denied" in err
+               else 'command_timeout' if timed_out else 'command_nonzero_exit' if process.returncode else 'command_succeeded')
+diff --git a/scripts/friday_install.py b/scripts/friday_install.py
+--- a/scripts/friday_install.py
++++ b/scripts/friday_install.py
+@@ -7,6 +7,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import contextvars
+ import hashlib
+ import ipaddress
+ import importlib.util
+@@ -64,6 +65,27 @@
+     module = importlib.import_module(alias + '.friday_rework.' + name)
+     check_paths()
+     return module
++
++
++# An observer exists only while an ordinary invocation authenticates immutable
++# history. The context is reset on every exit; no graph fact is stored here.
++_ORDINARY_HISTORY_OBSERVER = contextvars.ContextVar('ordinary_history_observer', default=None)
++
++
++def _history_read_boundary(reader, *, pin_reader=False):
++    def checked(value, *args, **kwargs):
++        observer = _ORDINARY_HISTORY_OBSERVER.get()
++        if observer is None:
++            return reader(value, *args, **kwargs)
++        path = value.get('path') if pin_reader and type(value) is dict else value
++        before = observer.before_read(path)
++        result = reader(value, *args, **kwargs)
++        raw = observer.read_leaf(path) if pin_reader else result
++        observer.record_read(path, raw, before)
++        if pin_reader:
++            require(digest(raw) == value['sha256'], 'ordinary_history_pin_changed')
++        return result
++    return checked
+ 
+ 
+ # Cache only JSON decoding, never ownership, bytes, pins or validation results.
+@@ -123,6 +145,8 @@
+     Refused, require, canonical, owned_file, unique, read_json, digest, pin = (
+         getattr(_primitives, name) for name in
+         ('Refused', 'require', 'canonical', 'owned_file', 'unique', 'read_json', 'digest', 'pin'))
++    owned_file = _history_read_boundary(owned_file)
++    pin = _history_read_boundary(pin, pin_reader=True)
+     read_json = _read_json_cached
+ 
+ class SafeParser(argparse.ArgumentParser):
+@@ -274,8 +298,11 @@
+ 
+ def directory(path):
+     p = canonical(str(path)); info = p.stat()
++    observer = _ORDINARY_HISTORY_OBSERVER.get()
++    before = observer.directory_state(p) if observer is not None else None
+     require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+             and stat.S_IMODE(info.st_mode) == 0o700, 'owned_private_directory_required')
++    if observer is not None: observer.record_directory(p, before)
+     return p
+ 
+ 
+@@ -4983,6 +5010,8 @@
+     Refused, require, canonical, owned_file, unique, read_json, digest, pin = (
+         getattr(primitives, name) for name in
+         ('Refused', 'require', 'canonical', 'owned_file', 'unique', 'read_json', 'digest', 'pin'))
++    owned_file = _history_read_boundary(owned_file)
++    pin = _history_read_boundary(pin, pin_reader=True)
+     read_json = _read_json_cached
+     from scripts.dsh_prepare import StopUnconfirmed
+     try:
+diff --git a/scripts/friday_ordinary_install.py b/scripts/friday_ordinary_install.py
+--- a/scripts/friday_ordinary_install.py
++++ b/scripts/friday_ordinary_install.py
+@@ -621,27 +621,29 @@
+             os.unlink(stage,dir_fd=parent_fd)
+ 
+ 
+-def restore_update_files(home, saved, owned, directories=None):
++def restore_update_files(home, saved, owned, directories=None, *, _deadline=None):
+     f = api()
+     def parent_fd(name): return directories.parent_fd(name) if directories is not None else None
+     # Prove the entire affected set before changing any path. Same bytes on a
+     # foreign inode or with a changed mode do not confer restoration ownership.
+     for name,before in saved.items():
++        if _deadline is not None: _deadline.check()
+         state = update_file_state(home/name,parent_fd(name))
+         f.require(state == before or (name in owned and state == owned[name]),
+             'ordinary_update_restore_ownership_changed')
+     restored = {}
+     for name,before in reversed(list(saved.items())):
+-        if directories is not None: directories.prove()
+-        path = home/name; state = update_file_state(path,parent_fd(name))
+-        if state == before: continue
+-        f.require(name in owned and state == owned[name],'ordinary_update_restore_ownership_changed')
+-        if before is None:
+-            os.unlink(path if parent_fd(name) is None else path.name,dir_fd=parent_fd(name))
+-            if parent_fd(name) is None: sync_directory(path.parent)
+-            else: os.fsync(parent_fd(name))
+-        else:
+-            publish_update_file(path,before['data'],before['mode'],owned[name],restored,name,**({'parent_fd':parent_fd(name)} if directories is not None else {}))
++        with _deadline.atomic() if _deadline is not None else contextlib.nullcontext():
++            if directories is not None: directories.prove()
++            path = home/name; state = update_file_state(path,parent_fd(name))
++            if state == before: continue
++            f.require(name in owned and state == owned[name],'ordinary_update_restore_ownership_changed')
++            if before is None:
++                os.unlink(path if parent_fd(name) is None else path.name,dir_fd=parent_fd(name))
++                if parent_fd(name) is None: sync_directory(path.parent)
++                else: os.fsync(parent_fd(name))
++            else:
++                publish_update_file(path,before['data'],before['mode'],owned[name],restored,name,**({'parent_fd':parent_fd(name)} if directories is not None else {}))
+     for name,before in saved.items():
+         current = update_file_state(home/name,parent_fd(name))
+         f.require(current == restored.get(name,before),
+@@ -2054,7 +2056,7 @@
+     return _checked_worker_source_maintenance_join(home, proof, checked)
+ 
+ 
+-def checked_worker_source_maintenance_bridge(home, request, predecessor, marker):
++def checked_worker_source_maintenance_bridge(home, request, predecessor, marker, *, _walk=None):
+     """Only the exact authenticated declaration input step may bridge ancestry.
+ 
+     The ordinary updater still validates its own complete source delta, current
+@@ -2063,7 +2065,7 @@
+     """
+     import copy
+     f = api(); proof = request['worker_source_maintenance']
+-    checked = checked_worker_source_maintenance_history(home, proof)
++    checked = checked_worker_source_maintenance_history(home, proof, _walk=_walk)
+     from scripts.friday_ordinary_a0_registration import _checked_source_maintenance_current, _current_main_source_target_for_update
+     from _friday_install_validation_plugins.friday_rework.worker_declarations import pending_service_project
+     pending = pending_service_project(f.read_json(f.pin(request['previous_input'])),f.read_json(f.pin(request['current_input'])))
+@@ -2370,7 +2372,7 @@
+     return source88_retained_inventory(home,budget)[0]
+ 
+ 
+-def checked_source88_retained(home,request,budget):
++def checked_source88_retained(home,request,budget, *, _walk=None):
+     """Fresh opaque byte/mode pins; old pre-bot data never serves as current."""
+     f=api();refs=request['retained_data_files']
+     names,directories=source88_retained_inventory(home,budget)
+@@ -2438,9 +2440,10 @@
+     return {'files':rows,'bundle_layers':[(EXACT_RESPONSE_MANIFEST,manifest)]}
+ 
+ 
+-def update_inputs(request, budget):
++def update_inputs(request, budget, *, _walk=None):
++    _walk = _HistoryWalk(budget=budget) if _walk is None else _walk
+     if type(request) is dict and request.get('schema') == SOURCE92_FEATURE_SCHEMA:
+-        return source92_feature_update_inputs(request, budget)
++        return source92_feature_update_inputs(request, budget, _walk=_walk)
+     f = api()
+     fields = {'schema','seconds','home','previous_input','current_input','marker','source_receipt',
+         'stamp','configuration','profile','launcher','credential_files','native_unit','transaction_history'}
+@@ -2621,7 +2624,7 @@
+         f.require(layers[-1][1]['manifest'] == manifest_name,
+             'ordinary_update_final_layer_required')
+     predecessor = request.get('predecessor_update')
+-    update_history(home,request['transaction_history'],predecessor,request.get('keyless_recovery'),request.get('inference_rebind'),request.get('worker_archive'),request.get('worker_source_maintenance'))
++    update_history(home,request['transaction_history'],predecessor,request.get('keyless_recovery'),request.get('inference_rebind'),request.get('worker_archive'),request.get('worker_source_maintenance'), _walk=_walk)
+     if source48 or source49 or source50 or source51 or source52 or source53 or source54 or source55 or source56 or source57 or source58 or source59 or source60 or source61 or source62 or source63 or source64 or source65 or source66 or source67 or source68 or source69 or source70 or source71 or source72 or source73 or source74 or source75 or source76 or source77 or source78 or source79 or source80 or source81 or source82 or source83 or source84 or source85 or source86 or source87 or source88 or exact_response:
+         old_request = f.read_json(f.pin(predecessor))
+         f.require(old_request['schema'] == (BUNDLE_SCHEMA if exact_response else 'friday.ordinary-telegram-source-update.v40' if source87 or source88 else 'friday.ordinary-telegram-source-update.v39' if source86 else 'friday.ordinary-telegram-source-update.v38' if source85 else 'friday.ordinary-telegram-source-update.v37' if source84 else 'friday.ordinary-telegram-source-update.v35' if source83 or source82 else 'friday.ordinary-telegram-source-update.v34' if source81 else PROJECT_INFERENCE_HELPER_SCHEMA if source80 else 'friday.ordinary-telegram-source-update.v32' if source79 else PROJECT_RUNTIME_SCHEMA if source78 else 'friday.ordinary-telegram-source-update.v30' if source77 else 'friday.ordinary-telegram-source-update.v29' if source76 else 'friday.ordinary-telegram-source-update.v28' if source75 else 'friday.ordinary-telegram-source-update.v27' if source74 else 'friday.ordinary-telegram-source-update.v26' if source73 else 'friday.ordinary-telegram-source-update.v25' if source72 else 'friday.ordinary-telegram-source-update.v24' if source71 else 'friday.ordinary-telegram-source-update.v23' if source70 else 'friday.ordinary-telegram-source-update.v22' if source69 else 'friday.ordinary-telegram-source-update.v21' if source68 else 'friday.ordinary-telegram-source-update.v20' if source67 else 'friday.ordinary-telegram-source-update.v19' if source66 else 'friday.ordinary-telegram-source-update.v18' if source65 else 'friday.ordinary-telegram-source-update.v17' if source64 else 'friday.ordinary-telegram-source-update.v16' if source63 else 'friday.ordinary-telegram-source-update.v15' if source62 else 'friday.ordinary-telegram-source-update.v14' if source61 else 'friday.ordinary-telegram-source-update.v13' if source60 else 'friday.ordinary-telegram-source-update.v12' if source59 else 'friday.ordinary-telegram-source-update.v11' if source58 else 'friday.ordinary-telegram-source-update.v10' if source57 else 'friday.ordinary-telegram-source-update.v9' if source56 else 'friday.ordinary-telegram-source-update.v8' if source55 else 'friday.ordinary-telegram-source-update.v7' if source54 else 'friday.ordinary-telegram-source-update.v6' if source53 else 'friday.ordinary-telegram-source-update.v5' if source52 else 'friday.ordinary-telegram-source-update.v4' if source51 else 'friday.ordinary-telegram-source-update.v3' if source50 else 'friday.ordinary-telegram-source-update.v2' if source49
+@@ -2663,7 +2666,7 @@
+             and len(before_plugins) == 45
+             and not f.read_json(old_tx/'intent.json').get('project_only',False)
+             and not committed.get('project_only',False), 'ordinary_update_exact_response_ancestry_required')
+-        checked_source88_retained(home,request,budget)
++        checked_source88_retained(home,request,budget, _walk=_walk)
+     if source88:
+         f.require(request['previous_input']['sha256'] == BUNDLE_PREVIOUS_INPUT
+             and request['predecessor_update']['sha256'] == BUNDLE_PREDECESSOR_REQUEST
+@@ -3434,7 +3437,129 @@
+         os.close(fd)
+ 
+ 
++class _OrdinaryUpdateDeadlineExpired(BaseException):
++    """A scoped wakeup must not be swallowed as an ordinary IO/parse error."""
++
++@contextlib.contextmanager
++def _ordinary_update_deadline(budget):
++    """Reserve cleanup inside the unchanged original ordinary operation clock.
++
++    The existing Budget remains authoritative, including its exact public clock
++    fields. A scoped wakeup interrupts synchronous validation before that clock
++    expires. No timer or signal handler survives this one invocation.
++    """
++    import math
++    import signal
++    import threading
++    import time
++    from types import SimpleNamespace
++
++    if threading.current_thread() is not threading.main_thread():
++        raise ValueError('ordinary_update_main_thread_deadline_required')
++    hard = budget.deadline
++    if type(hard) not in (int,float) or not math.isfinite(hard):
++        raise ValueError('ordinary_update_original_deadline_required')
++    # Native seconds180 retains thirty seconds for owned restoration. Shorter
++    # historical operations retain the same fraction, without renewing a clock.
++    reserve = min(30.0, budget.seconds / 6.0)
++    useful = hard - reserve
++    cleanup_end = hard - min(1.0, reserve / 10.0)
++    phase = 'useful'
++    wakeup_stage = 'useful'
++    previous_handler = signal.getsignal(signal.SIGALRM)
++    previous_timer = signal.getitimer(signal.ITIMER_REAL)
++    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGALRM})
++    installed = False
++
++    def check():
++        budget.check()
++        if time.monotonic() >= (useful if phase == 'useful' else cleanup_end):
++            raise _OrdinaryUpdateDeadlineExpired('ordinary_update_'+phase+'_deadline_exhausted')
++
++    def expired(signum, frame):
++        nonlocal wakeup_stage
++        expired_phase = wakeup_stage
++        if wakeup_stage == 'useful':
++            # Even a command that cannot be reaped must yield UNKNOWN before
++            # the native hard stop. This is the same absolute cleanup end,
++            # never another cleanup allowance or a renewed operation clock.
++            wakeup_stage = 'cleanup'
++            remaining = cleanup_end-time.monotonic()
++            if remaining > 0:
++                signal.setitimer(signal.ITIMER_REAL,remaining)
++        raise _OrdinaryUpdateDeadlineExpired('ordinary_update_'+expired_phase+'_deadline_exhausted')
++
++    expired._friday_ordinary_update_deadline = True
++
++    def cancel_pending():
++        signal.setitimer(signal.ITIMER_REAL,0)
++        if signal.SIGALRM in signal.sigpending():
++            signal.sigwait({signal.SIGALRM})
++
++    def stop():
++        mask = signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGALRM})
++        try:
++            cancel_pending()
++        finally:
++            signal.pthread_sigmask(signal.SIG_SETMASK,mask)
++
++    def cleanup():
++        nonlocal phase, wakeup_stage
++        mask = signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGALRM})
++        try:
++            cancel_pending()
++            phase = 'cleanup'
++            wakeup_stage = 'cleanup'
++            check()
++            signal.setitimer(signal.ITIMER_REAL,cleanup_end-time.monotonic())
++        finally:
++            signal.pthread_sigmask(signal.SIG_SETMASK,mask)
++
++    @contextlib.contextmanager
++    def atomic():
++        # Ownership must be recorded before a wakeup can transfer control. The
++        # block covers one existing finite filesystem operation, never graph
++        # validation or an external process wait.
++        mask = signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGALRM})
++        try:
++            yield
++        finally:
++            signal.pthread_sigmask(signal.SIG_SETMASK,mask)
++        check()
++
++    try:
++        if (signal.SIGALRM in previous_mask or signal.SIGALRM in signal.sigpending()
++                or previous_timer != (0.0,0.0)):
++            raise ValueError('ordinary_update_existing_alarm_refused')
++        check()
++        signal.signal(signal.SIGALRM,expired)
++        installed = True
++        signal.setitimer(signal.ITIMER_REAL,useful-time.monotonic())
++        signal.pthread_sigmask(signal.SIG_SETMASK,previous_mask)
++        yield SimpleNamespace(check=check,cleanup=cleanup,atomic=atomic,stop=stop)
++    finally:
++        signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGALRM})
++        if installed:
++            cancel_pending()
++            signal.signal(signal.SIGALRM,previous_handler)
++            signal.setitimer(signal.ITIMER_REAL,*previous_timer)
++        signal.pthread_sigmask(signal.SIG_SETMASK,previous_mask)
++
+ def update(request, request_path, budget):
++    """Use the existing update/rollback transaction within its original clock."""
++    if type(request) is dict and request.get('schema') in (PROJECT_UPDATE_SCHEMA,
++            PROJECT_QUALIFICATION_SCHEMA,PROJECT_RUNTIME_SCHEMA,PROJECT_INFERENCE_HELPER_SCHEMA,
++            PROJECT_DASHBOARD_SCHEMA,PROJECT_HANDOFF_SCHEMA):
++        return _ordinary_update(request,request_path,budget)
++    try:
++        with _ordinary_update_deadline(budget) as deadline:
++            return _ordinary_update(request,request_path,budget,_deadline=deadline)
++    except _OrdinaryUpdateDeadlineExpired as expired:
++        # The private wakeup bypasses ordinary IO/parse catches inside the
++        # operation. Normalize only after its owned rollback and scope unwind.
++        raise ValueError(str(expired)) from expired
++
++def _ordinary_update(request, request_path, budget, *, _deadline=None):
+     """One finite committed-phase source update; original activation stays intact."""
+     recovery_source90 = type(request) is dict and request.get('schema') == SOURCE90_RECOVERY_SCHEMA
+     narrow_source90 = type(request) is dict and request.get('schema') in (SOURCE90_GUARD_SCHEMA,SOURCE90_RECOVERY_SCHEMA,SOURCE91_PROOF_SCHEMA,SOURCE92_FEATURE_SCHEMA)
+@@ -3448,20 +3573,23 @@
+             PROJECT_RUNTIME_SCHEMA, PROJECT_INFERENCE_HELPER_SCHEMA, PROJECT_DASHBOARD_SCHEMA, PROJECT_HANDOFF_SCHEMA):
+         return project_update(request,request_path,budget)
+     f = api(); home = f.directory(f.canonical(request['home']))
++    history_walk = _HistoryWalk(budget=budget)
+     directories = None
+     fd = os.open(home,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+     try:
+         fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+-        home,source,previous,current,marker,receipt,manifest,donors,tx = update_inputs(request,budget)
++        home,source,previous,current,marker,receipt,manifest,donors,tx = update_inputs(request,budget, _walk=history_walk)
+         exact_response = request['schema'] in (EXACT_RESPONSE_SCHEMA,SOURCE90_GUARD_SCHEMA,SOURCE90_RECOVERY_SCHEMA,SOURCE91_PROOF_SCHEMA,SOURCE92_FEATURE_SCHEMA)
+         source88 = request['schema'] == BUNDLE_SCHEMA
+         source87 = request['schema'] == 'friday.ordinary-telegram-source-update.v41'
+         with stopped_consumers(home,request['native_unit'],budget, allow_settled_failed=narrow_source90) as native_prove, retained_build_lock(source) as build_prove, \
+                 (retained_pm_lock(home,source) if source87 or source88 or exact_response else contextlib.nullcontext(lambda:None)) as pm_prove:
+-            def prove(): native_prove(); build_prove(); pm_prove()
++            def prove():
++                if _deadline is not None: _deadline.check()
++                native_prove(); build_prove(); pm_prove()
+             f.require(f.read_json(request_path) == request, 'ordinary_update_request_changed')
+             # Recheck every explicit pin immediately before the source-only journal.
+-            update_inputs(request,budget)
++            update_inputs(request,budget, _walk=history_walk)
+             source87 = request['schema'] == 'friday.ordinary-telegram-source-update.v41'
+             source86 = request['schema'] == 'friday.ordinary-telegram-source-update.v40'
+             source85 = request['schema'] == 'friday.ordinary-telegram-source-update.v39'
+@@ -3516,11 +3644,12 @@
+                     {'hermes-agent/'+name for name in (narrow_binding['native_new_directories'] if narrow_source90 else set() if exact_response else BUNDLE_NEW_DIRECTORIES if source88 else PROTECTED_COMPRESSOR_NEW_DIRECTORIES)})
+             def parent_fd(name): return directories.parent_fd(name) if directories is not None else None
+             def publish(path,data,mode,before,owned,name):
+-                if directories is not None:
+-                    directories.prove()
+-                    result = publish_update_file(path,data,mode,before,owned,name,parent_fd=parent_fd(name))
+-                    directories.prove(); return result
+-                return publish_update_file(path,data,mode,before,owned,name)
++                with _deadline.atomic() if _deadline is not None else contextlib.nullcontext():
++                    if directories is not None:
++                        directories.prove()
++                        result = publish_update_file(path,data,mode,before,owned,name,parent_fd=parent_fd(name))
++                        directories.prove(); return result
++                    return publish_update_file(path,data,mode,before,owned,name)
+ 
+             saved = ({name:(None if (source87 or source88 or exact_response) and name in absent else update_file_state(home/name,parent_fd(name))) for name in names}
+                 if source55 or source56 or source57 or source58 or source59 or source60 or source61 or source62 or source63 or source64 or source65 or source66 or source67 or source68 or source69 or source70 or source71 or source72 or source73 or source74 or source75 or source76 or source77 or source78 or source79 or source80 or source81 or source82 or source83 or source84 or source85 or source86 or source87 or source88 or exact_response else {name:{'data':f.owned_file(home/name),
+@@ -3610,16 +3739,18 @@
+             try:
+                 prove()
+                 if source87 or source88 or exact_response:
+-                    directories.create(tx/'directories')
++                    with _deadline.atomic() if _deadline is not None else contextlib.nullcontext():
++                        directories.create(tx/'directories')
+                     write(tx/'created-directories.json',encoded({name:directories.identities[name]
+                         for name in directories.created}))
+                     sync_directory(tx)
+                 if source63:
+                     # Exact absent parent belongs to this additive layer only.
+                     # Never adopt an existing directory or follow a symlink.
+-                    (source/'config').mkdir(mode=0o700)
+-                    info = (source/'config').lstat()
+-                    created_directory = tuple(getattr(info,k) for k in ('st_dev','st_ino','st_uid','st_mode'))
++                    with _deadline.atomic() if _deadline is not None else contextlib.nullcontext():
++                        (source/'config').mkdir(mode=0o700)
++                        info = (source/'config').lstat()
++                        created_directory = tuple(getattr(info,k) for k in ('st_dev','st_ino','st_uid','st_mode'))
+                     directory_custody(); sync_directory(source)
+                 from scripts.dsh_prepare import run
+                 env = f.clean_environment(home); env['GIT_CEILING_DIRECTORIES'] = str(source.parent)
+@@ -3644,6 +3775,7 @@
+                     f.require(f.digest(data) == row['sha256'] and len(data) == row['bytes'],
+                         'ordinary_update_patch_output_changed')
+                     if source55 or source56 or source57 or source58 or source59 or source60 or source61 or source62 or source63 or source64 or source65 or source66 or source67 or source68 or source69 or source70 or source71 or source72 or source73 or source74 or source75 or source76 or source77 or source78 or source79 or source80 or source81 or source82 or source83 or source84 or source85 or source86 or source87 or source88 or exact_response: (patch_root/row['path']).chmod(0o600)
++                history_walk.prove()
+                 if source55 or source56 or source57 or source58 or source59 or source60 or source61 or source62 or source63 or source64 or source65 or source66 or source67 or source68 or source69 or source70 or source71 or source72 or source73 or source74 or source75 or source76 or source77 or source78 or source79 or source80 or source81 or source82 or source83 or source84 or source85 or source86 or source87 or source88 or exact_response:
+                     for row in manifest['files']:
+                         name = 'hermes-agent/'+row['path']; budget.check(); prove(); directory_custody()
+@@ -3674,9 +3806,9 @@
+                     check(home,role=False)
+                 if source49 or source50 or source51 or source52 or source53 or source54 or source55 or source56 or source57 or source58 or source59 or source60 or source61 or source62 or source63 or source64 or source65 or source66 or source67 or source68 or source69 or source70 or source71 or source72 or source73 or source74 or source75 or source76 or source77 or source78 or source79 or source80 or source81 or source82 or source83 or source84 or source85 or source86 or source87 or source88 or exact_response:
+                     checked_plugin_inventory(home, updated['plugin_files'])
+-                update_history(home,request['transaction_history'],request.get('predecessor_update'),request.get('keyless_recovery'),request.get('inference_rebind'),request.get('worker_archive'),request.get('worker_source_maintenance')); prove(); budget.check()
++                update_history(home,request['transaction_history'],request.get('predecessor_update'),request.get('keyless_recovery'),request.get('inference_rebind'),request.get('worker_archive'),request.get('worker_source_maintenance'), _walk=history_walk); prove(); budget.check()
+                 if source82 or source83 or source84 or source85 or source86 or source87 or source88 or exact_response:
+-                    checked_source88_retained(home,request,budget) if exact_response else checked_source82_retained(home,request)
++                    checked_source88_retained(home,request,budget, _walk=history_walk) if exact_response else checked_source82_retained(home,request)
+                     budget.call(f.spec_checked,current,cli_only=True)
+                 if source81:
+                     checked_source81_retained(home,request,after=True)
+@@ -3707,28 +3839,36 @@
+                 if narrow_source90:
+                     for key in ('target_frozen','current_input','target_source_receipt','manifest','patch','source_review','root_operation'):
+                         budget.call(f.pin,narrow_binding[key])
++                history_walk.prove()
+                 committed_data = encoded({'state':'SOURCE_UPDATED_NOT_RUNTIME_ACCEPTED',
+                     'previous_input':request['previous_input'],'current_input':request['current_input'],
+                     'source_receipt_sha256':receipt_sha,'gateway_started':False,'workers_enabled':False,
+                     **({'after':{name:{'sha256':sha,'mode':owned[name]['mode']} for name,sha in after.items()}}
+                        if source92_descendant else {})})
+                 budget.check()
++                if _deadline is not None: _deadline.check()
+                 # Once commit publication is attempted, a partial/visible/durable
+                 # receipt may exist. Never roll source back beneath that record.
+                 commit_publication_started = True
+                 write(tx/'committed.json',committed_data)
+                 sync_directory(tx); budget.check()
++                if _deadline is not None:
++                    _deadline.check(); _deadline.stop()
+                 return {'state':'TELEGRAM_ORDINARY_SOURCE_UPDATED','ready':False,'gateway_started':False,
+                     'workers_enabled':False,'full_release_accepted':False,'source_receipt_sha256':receipt_sha}
+             except BaseException as original:
+                 if commit_publication_started:
++                    if _deadline is not None: _deadline.stop()
+                     from scripts.dsh_prepare import StopUnconfirmed
+                     raise StopUnconfirmed('ordinary source update commit publication requires reconciliation') from original
+                 try:
++                    if _deadline is not None: _deadline.cleanup()
+                     prove(); directory_custody()
+                     if source55 or source56 or source57 or source58 or source59 or source60 or source61 or source62 or source63 or source64 or source65 or source66 or source67 or source68 or source69 or source70 or source71 or source72 or source73 or source74 or source75 or source76 or source77 or source78 or source79 or source80 or source81 or source82 or source83 or source84 or source85 or source86 or source87 or source88 or exact_response:
+-                        restore_update_files(home,saved,owned,directories)
+-                        if directories is not None: directories.remove_created()
++                        restore_update_files(home,saved,owned,directories,_deadline=_deadline)
++                        if directories is not None:
++                            with _deadline.atomic() if _deadline is not None else contextlib.nullcontext():
++                                directories.remove_created()
+                         if created_directory is not None:
+                             directory_custody()
+                             (source/'config').rmdir(); sync_directory(source)
+@@ -3743,12 +3883,14 @@
+                         f.require(all(f.digest(f.owned_file(home/name)) == f.digest(row['data'])
+                             and stat.S_IMODE((home/name).stat().st_mode) == row['mode'] for name,row in saved.items()),
+                             'ordinary_update_restore_failed')
+-                    update_history(home,request['transaction_history'],request.get('predecessor_update'),request.get('keyless_recovery'),request.get('inference_rebind'),request.get('worker_archive'),request.get('worker_source_maintenance'))
++                    update_history(home,request['transaction_history'],request.get('predecessor_update'),request.get('keyless_recovery'),request.get('inference_rebind'),request.get('worker_archive'),request.get('worker_source_maintenance'), _walk=history_walk)
+                     if source88:
+                         checked_plugin_inventory(home,marker['plugin_files'])
+                     write(tx/'rolled-back.json',encoded({'state':'ROLLED_BACK_OWN_SOURCE_ONLY_NO_RETRY'}))
+                     sync_directory(tx)
++                    if _deadline is not None: _deadline.stop()
+                 except BaseException as restoration:
++                    if _deadline is not None: _deadline.stop()
+                     from scripts.dsh_prepare import StopUnconfirmed
+                     f.remember_secondary(original,restoration)
+                     raise StopUnconfirmed('ordinary source update restoration requires reconciliation') from original
+@@ -6774,8 +6916,9 @@
+         'source92_feature_handoff_exact_committed_edge_changed')
+     return tx,intent,committed
+ 
+-def source92_feature_update_inputs(request,budget):
++def source92_feature_update_inputs(request,budget, *, _walk=None):
+     """Admission only; publication/recovery use the existing update transaction."""
++    _walk = _HistoryWalk(budget=budget) if _walk is None else _walk
+     p=source92_feature_pins_checked();f=api()
+     fields={'schema','seconds','home','previous_input','current_input','marker','source_receipt',
+         'stamp','configuration','profile','launcher','credential_files','native_unit','transaction_history',
+@@ -6875,7 +7018,7 @@
+     with SourceUpdateDirectories(home,['hermes-agent/'+r['path'] for r in SOURCE92_FEATURE_NATIVE_ROWS],
+             {'hermes-agent/'+n for n in p['native_new_directories']}) as directories:
+         directories.prove()
+-    update_history(home,request['transaction_history'],request['predecessor_update'])
++    update_history(home,request['transaction_history'],request['predecessor_update'], _walk=_walk)
+     predecessor=f.read_json(budget.call(f.pin,p['predecessor_update']))
+     old_tx=home/'preparation'/('ordinary-source-update-'+predecessor['previous_input']['sha256'])
+     committed=f.read_json(old_tx/'committed.json')
+@@ -6897,7 +7040,7 @@
+         if n!='config.yaml'),'ordinary_update_profile_changed')
+     plugins={n:v for n,v in previous['project_files'].items() if n.startswith('plugins/friday_rework/')}
+     f.require(marker.get('plugin_files')==plugins,'ordinary_update_installed_plugin_marker_changed')
+-    checked_plugin_inventory(home,plugins);checked_source88_retained(home,request,budget)
++    checked_plugin_inventory(home,plugins);checked_source88_retained(home,request,budget, _walk=_walk)
+     credentials=request['credential_files']
+     f.require(type(credentials) is dict and set(credentials)=={'.env','auth.json'},'ordinary_update_credential_pins_required')
+     for name,ref in credentials.items():
+@@ -8929,6 +9072,9 @@
+     """Walk every parent without following links; descriptors pin the walk."""
+     p=_r44_pathlib.Path(path)
+     _r44_need(p.is_absolute() and '..' not in p.parts and str(p)==str(path), 'canonical_path_required')
++    observer=api()._ORDINARY_HISTORY_OBSERVER.get()
++    tracked=observer is not None and observer.history_directory(p)
++    observed_before=observer.directory_state(p) if tracked else None
+     fd=_r44_os.open('/',_r44_os.O_RDONLY|_r44_os.O_DIRECTORY)
+     try:
+         for part in p.parts[1:]:
+@@ -8937,12 +9083,17 @@
+             st=_r44_os.fstat(fd)
+             _r44_need(_r44_stat.S_ISDIR(st.st_mode) and st.st_uid in (0,_r44_os.getuid())
+                 and not st.st_mode & 0o022, 'unsafe_parent')
++        if tracked:
++            _r44_need(observer._identity(_r44_os.fstat(fd))==observed_before[0], 'history_directory_identity_changed')
++            observer.record_directory(p,observed_before)
+         return fd
+     except BaseException:
+         _r44_os.close(fd);raise
+ 
+ def _r44_read(path, expected=None, metadata=None, maximum=16*1024*1024):
+     p=_r44_pathlib.Path(path);parent=_r44_dirfd(str(p.parent))
++    observer=api()._ORDINARY_HISTORY_OBSERVER.get()
++    observed_before=observer.before_read(p) if observer is not None else None
+     fd=None
+     try:
+         fd=_r44_os.open(p.name,_r44_os.O_RDONLY|_r44_os.O_NOFOLLOW|_r44_os.O_NONBLOCK,dir_fd=parent)
+@@ -8970,6 +9121,7 @@
+                 (b.st_dev,b.st_ino,b.st_uid,b.st_gid,b.st_mode),'canonical_parent_changed')
+         finally: _r44_os.close(checkparent)
+         if expected is not None: _r44_need(_r44_sha(data)==expected,'file_hash_changed')
++        if observer is not None: observer.record_read(p,data,observed_before)
+         return data
+     finally:
+         if fd is not None: _r44_os.close(fd)
+@@ -9981,10 +10133,11 @@
+     return expected
+ 
+ 
+-def source92_feature_update_inputs(request,budget):
++def source92_feature_update_inputs(request,budget, *, _walk=None):
++    _walk = _HistoryWalk(budget=budget) if _walk is None else _walk
+     p=source92_feature_pins_checked()
+     if not ({'worker_source_maintenance', 'worker_source_first_promotion', 'ordinary_source_first_promotion'} & set(p)):
+-        return _SOURCE92_EXACT_UPDATE_INPUTS(request,budget)
++        return _SOURCE92_EXACT_UPDATE_INPUTS(request,budget, _walk=_walk)
+     phase=source92_worker_phase(p);f=api()
+     fields={'schema','seconds','home','previous_input','current_input','marker','source_receipt',
+         'stamp','configuration','profile','launcher','credential_files','native_unit','transaction_history',
+@@ -10048,13 +10201,13 @@
+         directories.prove()
+     predecessor=f.read_json(budget.call(f.pin,p['predecessor_update']))
+     if phase == 'worker_source_first_promotion':
+-        checked_worker_first_source_promotion(home,request,predecessor,marker)
++        checked_worker_first_source_promotion(home,request,predecessor,marker, _walk=_walk)
+     elif phase == 'ordinary_source_first_promotion':
+-        checked_ordinary_first_source_promotion(home,request,predecessor,marker)
++        checked_ordinary_first_source_promotion(home,request,predecessor,marker, _walk=_walk)
+     else:
+-        checked_worker_source_maintenance_bridge(home,request,predecessor,marker)
++        checked_worker_source_maintenance_bridge(home,request,predecessor,marker, _walk=_walk)
+     update_history(home,request['transaction_history'],request['predecessor_update'],
+-        worker_source_maintenance=request.get('worker_source_maintenance'))
++        worker_source_maintenance=request.get('worker_source_maintenance'), _walk=_walk)
+     f.native_packages(source)
+     __import__('sys').modules['scripts'].__path__=[str(f.ROOT/'scripts')]
+     from hermes_cli.friday_ordinary_gateway import check
+@@ -10063,7 +10216,7 @@
+         if n!='config.yaml'), 'ordinary_update_profile_changed')
+     plugins={n:v for n,v in previous['project_files'].items() if n.startswith('plugins/friday_rework/')}
+     f.require(marker.get('plugin_files')==plugins,'ordinary_update_installed_plugin_marker_changed')
+-    checked_plugin_inventory(home,plugins);checked_source88_retained(home,request,budget)
++    checked_plugin_inventory(home,plugins);checked_source88_retained(home,request,budget, _walk=_walk)
+     credentials=request['credential_files']
+     f.require(type(credentials) is dict and set(credentials)=={'.env','auth.json'},'ordinary_update_credential_pins_required')
+     for name,ref in credentials.items():
+@@ -10165,10 +10318,10 @@
+     return proof
+ 
+ 
+-def checked_ordinary_first_source_promotion(home,request,predecessor,marker):
++def checked_ordinary_first_source_promotion(home,request,predecessor,marker, *, _walk=None):
+     """Authenticate the complete source graph for standalone/current callers."""
+     proof=_checked_ordinary_first_source_promotion_join(home,request,predecessor,marker)
+-    ancestry=update_history(home,request['transaction_history'],request['predecessor_update'])
++    ancestry=update_history(home,request['transaction_history'],request['predecessor_update'], _walk=_walk)
+     return {'source_update_ancestry':proof['source_update_ancestry'],'history':ancestry}
+ 
+ 
+@@ -10411,7 +10564,7 @@
+     return proof
+ 
+ 
+-def checked_worker_first_source_promotion(home,request,predecessor,marker):
++def checked_worker_first_source_promotion(home,request,predecessor,marker, *, _walk=None):
+     """Authenticate current110/ordinary111 -> first worker project before maintenance exists.
+ 
+     Historical registration remains consumed and inactive. This classifier grants
+@@ -10440,7 +10593,7 @@
+             'ordinary_source92_worker_first_history_pin_collision')
+         retained[name]=ref
+     ancestry=checked_registered_inactive_source_ancestry(home,historical,request['previous_input'],
+-        marker,retained,proof['source_update_ancestry'])
++        marker,retained,proof['source_update_ancestry'], _walk=_walk)
+     return {'historical':historical,'ancestry':ancestry}
+ 
+ 
+@@ -10651,7 +10804,7 @@
+ 
+ _SOURCE88_RETAINED_EXACT = checked_source88_retained
+ 
+-def checked_source88_retained(home,request,budget):
++def checked_source88_retained(home,request,budget, *, _walk=None):
+     if request.get('schema')!=SOURCE92_FEATURE_SCHEMA or not ({'worker_source_maintenance', 'worker_source_first_promotion', 'ordinary_source_first_promotion'} & set(request)):
+         return _SOURCE88_RETAINED_EXACT(home,request,budget)
+     f=api();refs=request['retained_data_files'];names,directories=source88_retained_inventory(home,budget)
+@@ -10669,7 +10822,7 @@
+     profiles=request['retained_profile_files']
+     f.require(type(profiles) is dict and set(profiles)==WEB_INPUT_PROFILE_FILES,
+         'ordinary_update_current_profile_pins_required')
+-    checked = (checked_worker_source_maintenance_history(home, request['worker_source_maintenance'])
++    checked = (checked_worker_source_maintenance_history(home, request['worker_source_maintenance'], _walk=_walk)
+         if 'worker_source_maintenance' in request else None)
+     after = {} if checked is None else checked['committed']['after']
+     target_pins = {}
+@@ -10692,12 +10845,12 @@
+ 
+ _WORKER_MAINTENANCE_IMMEDIATE_BRIDGE = checked_worker_source_maintenance_bridge
+ 
+-def checked_worker_source_maintenance_bridge(home,request,predecessor,marker):
++def checked_worker_source_maintenance_bridge(home,request,predecessor,marker, *, _walk=None):
+     if (marker.get('ordinary_source_update_request') is None
+             or predecessor.get('current_input') != request.get('previous_input')):
+-        return _WORKER_MAINTENANCE_IMMEDIATE_BRIDGE(home,request,predecessor,marker)
++        return _WORKER_MAINTENANCE_IMMEDIATE_BRIDGE(home,request,predecessor,marker, _walk=_walk)
+     f=api();proof=request['worker_source_maintenance']
+-    checked=checked_worker_source_maintenance_history(home,proof)
++    checked=checked_worker_source_maintenance_history(home,proof, _walk=_walk)
+     from scripts.friday_ordinary_a0_registration import _checked_source_maintenance_current, _current_main_source_target_for_update
+     from _friday_install_validation_plugins.friday_rework.worker_declarations import pending_service_project
+     pending=pending_service_project(f.read_json(f.pin(request['previous_input'])),f.read_json(f.pin(request['current_input'])))
+@@ -10741,6 +10894,23 @@
+     module.__file__=pin['path']
+     exec(compile(raw,pin['path'],'exec'),module.__dict__)
+     module.api=api
++    module._r44_read=api()._history_read_boundary(module._r44_read)
++    original_dirfd=module._r44_dirfd
++    def observed_dirfd(path):
++        observer=api()._ORDINARY_HISTORY_OBSERVER.get()
++        tracked=observer is not None and observer.history_directory(Path(path))
++        before=observer.directory_state(path) if tracked else None
++        fd=original_dirfd(path)
++        try:
++            if tracked:
++                if observer._identity(os.fstat(fd))!=before[0]:
++                    raise ValueError('ordinary_history_directory_identity_changed')
++                observer.record_directory(path,before)
++            return fd
++        except BaseException:
++            os.close(fd)
++            raise
++    module._r44_dirfd=observed_dirfd
+     for name in ('update','main','recovery_main','source92_feature_main',
+             'source111_r49_update','source111_r49_update_inputs',
+             'source111_r49_authority_checked'):
+@@ -10790,17 +10960,22 @@
+ 
+ 
+ class _HistoryWalk:
+-    """Completed exact graph facts owned by one bounded source-check invocation.
+-
+-    No instance is retained by a module, receipt or caller-visible result.
+-    Evidence is physically checked on the first completed visit; a reused fact
+-    is not a new physical observation. Public checkers always make a new walk; an ordinary prepare owns its
+-    private walk only until that original prepare returns or raises.
++    """Exact completed graph facts retained only by one finite invocation.
++
++    A successful fact owns the bytes and identities observed by its checker,
++    including external pinned reads and immutable directory membership. Every
++    reuse re-authenticates that custody; publication authenticates it again.
+     """
++    _identity_fields = ('st_dev','st_ino','st_uid','st_gid','st_mode','st_nlink',
++        'st_size','st_mtime_ns','st_ctime_ns')
++    _parent_fields = ('st_dev','st_ino','st_uid','st_gid','st_mode')
++
+     def __init__(self, *, budget=None):
+         self._budget = budget
+         self._completed = {}
+         self._active = set()
++        self._frames = []
++        self._home = None
+         self._hits = 0
+         self._misses = 0
+ 
+@@ -10822,6 +10997,121 @@
+         if self._budget is not None:
+             self._budget.check()
+ 
++    @classmethod
++    def _identity(cls, info, fields=None):
++        return tuple(getattr(info, key) for key in (cls._identity_fields if fields is None else fields))
++
++    def before_read(self, path):
++        self._check_budget()
++        path = Path(path)
++        if not path.is_absolute() or '..' in path.parts or '.' in path.parts:
++            raise ValueError('ordinary_history_canonical_leaf_required')
++        parents = []
++        for parent in path.parents:
++            info = parent.lstat()
++            if not stat.S_ISDIR(info.st_mode):
++                raise ValueError('ordinary_history_parent_changed')
++            parents.append((str(parent), self._identity(info, self._parent_fields)))
++        info = path.lstat()
++        if not (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
++                and info.st_nlink == 1 and not info.st_mode & 0o022):
++            raise ValueError('ordinary_history_owned_leaf_required')
++        return self._identity(info), tuple(parents)
++
++    def read_leaf(self, path):
++        before = self.before_read(path)
++        fd = os.open(path, os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
++        try:
++            if self._identity(os.fstat(fd)) != before[0]:
++                raise ValueError('ordinary_history_leaf_identity_changed')
++            with os.fdopen(fd, 'rb', closefd=False) as stream:
++                data = stream.read(64*1024**2+1)
++            if (len(data) > 64*1024**2 or len(data) != before[0][6]
++                    or self._identity(os.fstat(fd)) != before[0]
++                    or self.before_read(path) != before):
++                raise ValueError('ordinary_history_leaf_changed')
++            return data
++        finally:
++            os.close(fd)
++
++    def _merge(self, section, path, value):
++        for frame in self._frames:
++            old = frame[section].get(path)
++            if old is not None and old != value:
++                raise ValueError('ordinary_history_observation_changed')
++            frame[section][path] = value
++
++    def record_read(self, path, raw, before):
++        if type(raw) is not bytes or self.before_read(path) != before:
++            raise ValueError('ordinary_history_read_changed')
++        proof = (before, __import__('hashlib').sha256(raw).hexdigest())
++        self._merge('files', str(path), proof)
++
++    def history_directory(self, path):
++        path = Path(path)
++        return (self._home is not None and path != self._home/'preparation'
++            and (self._home/'preparation') in path.parents)
++
++    def directory_state(self, path):
++        self._check_budget()
++        path = Path(path); info = path.lstat()
++        if not stat.S_ISDIR(info.st_mode):
++            raise ValueError('ordinary_history_directory_changed')
++        # These two shared containers legitimately gain this invocation's new
++        # transaction. Their identities remain fixed; old graph roots do not.
++        mutable = self._home is not None and path in (self._home, self._home/'preparation')
++        identity = self._identity(info, self._parent_fields if mutable else None)
++        names = None if mutable else tuple(sorted(item.name for item in path.iterdir()))
++        if self._identity(path.lstat(), self._parent_fields if mutable else None) != identity:
++            raise ValueError('ordinary_history_directory_changed')
++        return identity, names
++
++    def record_directory(self, path, before):
++        if self.directory_state(path) != before:
++            raise ValueError('ordinary_history_directory_changed')
++        self._merge('directories', str(path), before)
++
++    def _prove(self, proof):
++        for path, (before, sha) in proof['files'].items():
++            self._check_budget()
++            if (self.before_read(path) != before
++                    or __import__('hashlib').sha256(self.read_leaf(path)).hexdigest() != sha):
++                raise ValueError('ordinary_history_reused_leaf_changed')
++        for path, before in proof['directories'].items():
++            if self.directory_state(path) != before:
++                raise ValueError('ordinary_history_reused_directory_changed')
++
++    def prove(self):
++        """Fresh exact graph custody immediately before publication/commit."""
++        self._check_budget()
++        if self._active:
++            raise ValueError('ordinary_history_incomplete_scope')
++        proof = {'files': {}, 'directories': {}}
++        for _, completed in self._completed.values():
++            for section in proof:
++                for path, value in completed[section].items():
++                    if path in proof[section] and proof[section][path] != value:
++                        raise ValueError('ordinary_history_observation_changed')
++                    proof[section][path] = value
++        self._prove(proof)
++
++    def _seed(self, kind, arguments):
++        if not self._frames or len(self._frames) != 1:
++            return
++        if kind in ('update_history', 'legacy_update_history'):
++            expected = arguments[1]
++            if type(expected) is not dict:
++                return
++            for name, sha in expected.items():
++                rel = Path(name)
++                if rel.is_absolute() or '..' in rel.parts or not rel.parts:
++                    raise ValueError('ordinary_history_relative_leaf_required')
++                path = self._home/rel; before = self.before_read(path)
++                raw = self.read_leaf(path)
++                if __import__('hashlib').sha256(raw).hexdigest() != sha:
++                    raise ValueError('ordinary_history_expected_leaf_changed')
++                self.record_read(path, raw, before)
++
+     def _checked(self, kind, arguments, checker):
+         self._check_budget()
+         key = self._key(kind, arguments)
+@@ -10830,18 +11120,48 @@
+             self._check_budget()
+             return checked
+         if key in self._active:
++            self._completed.clear()
+             raise ValueError('ordinary_preflight_history_cycle')
++        if self._home is None:
++            self._home = Path(arguments[0])
++        elif self._home != Path(arguments[0]):
++            raise ValueError('ordinary_history_scope_home_changed')
+         if key in self._completed:
+-            self._hits += 1
+-            return copy.deepcopy(self._completed[key])
++            try:
++                checked, proof = self._completed[key]
++                self._prove(proof)
++                for section in proof:
++                    for path, value in proof[section].items():
++                        self._merge(section, path, value)
++                self._check_budget()
++                self._hits += 1
++                return copy.deepcopy(checked)
++            except BaseException:
++                self._completed.clear()
++                raise
+         self._misses += 1
+         self._active.add(key)
++        frame = {'files': {}, 'directories': {}}
++        self._frames.append(frame)
++        observer = api()._ORDINARY_HISTORY_OBSERVER
++        token = observer.set(self)
+         try:
++            self._seed(kind, arguments)
+             checked = checker()
+             self._check_budget()
+-            self._completed[key] = copy.deepcopy(checked)
++            # Nested acquisitions are joined to this outer proof; only its
++            # boundary seals the full union, avoiding another recursive walk.
++            if len(self._frames) == 1: self._prove(frame)
++            self._completed[key] = (copy.deepcopy(checked), frame)
+             return copy.deepcopy(checked)
++        except BaseException:
++            # A failed enclosing walk never leaves its successful children as
++            # reusable partial evidence, including cycle/budget/read failures.
++            self._completed.clear()
++            raise
+         finally:
++            observer.reset(token)
++            self._frames.pop()
+             self._active.remove(key)
+ 
+ 
+@@ -10874,19 +11194,21 @@
+ 
+ 
+ def update_history(home, expected, predecessor=None, keyless_recovery=None,
+-        inference_rebind=None, worker_archive=None, worker_source_maintenance=None):
+-    """Fully authenticate the complete graph in a fresh standalone walk."""
++        inference_rebind=None, worker_archive=None, worker_source_maintenance=None, *, _walk=None):
++    """Authenticate freshly unless the current update explicitly owns this walk."""
+     return _checked_update_history(home, expected, predecessor, keyless_recovery,
+-        inference_rebind, worker_archive, worker_source_maintenance, _walk=_HistoryWalk())
+-
+-
+-def checked_worker_source_maintenance_history(home, proof):
+-    return _checked_worker_source_maintenance_history(home, proof, _walk=_HistoryWalk())
+-
+-
+-def checked_registered_inactive_source_ancestry(home, historical, previous_input, marker, retained, proof):
++        inference_rebind, worker_archive, worker_source_maintenance,
++        _walk=_HistoryWalk() if _walk is None else _walk)
++
++
++def checked_worker_source_maintenance_history(home, proof, *, _walk=None):
++    return _checked_worker_source_maintenance_history(home, proof,
++        _walk=_HistoryWalk() if _walk is None else _walk)
++
++
++def checked_registered_inactive_source_ancestry(home, historical, previous_input, marker, retained, proof, *, _walk=None):
+     return _checked_registered_inactive_source_ancestry(home, historical, previous_input,
+-        marker, retained, proof, _walk=_HistoryWalk())
++        marker, retained, proof, _walk=_HistoryWalk() if _walk is None else _walk)
+ 
+ 
+ 
