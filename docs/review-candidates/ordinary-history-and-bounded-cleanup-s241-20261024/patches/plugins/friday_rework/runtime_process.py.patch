@@ -1,0 +1,190 @@
+--- a/plugins/friday_rework/runtime_process.py
++++ b/plugins/friday_rework/runtime_process.py
+@@ -60,16 +60,32 @@
+                 "-c", "protocol.file.allow=never", "-c", "protocol.ext.allow=never",
+                 "-c", "pack.threads=4", *argv[1:]]
+     start = time.monotonic()
+-    process = subprocess.Popen(argv, cwd=donor, env=env or clean_environment(donor),
+-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+-                               text=True, start_new_session=True, pass_fds=pass_fds)
++    # A scoped updater alarm may fire during Popen or the first custody read.
++    # Defer that delivery until the returned child is inside the cleanup try.
++    # Unlike a blocked mask, this does not change the child's inherited mask.
++    import threading
++    previous_alarm = signal.getsignal(signal.SIGALRM)
++    deferred_alarm = []
++    def defer_alarm(signum, frame):
++        if not deferred_alarm:
++            deferred_alarm.append((signum,frame))
++    defer = (threading.current_thread() is threading.main_thread()
++        and callable(previous_alarm)
++        and getattr(previous_alarm,'_friday_ordinary_update_deadline',False) is True)
++    if defer: signal.signal(signal.SIGALRM,defer_alarm)
+     try:
+-        starttime = int(Path(f'/proc/{process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
+-    except (OSError, ValueError, IndexError):
+-        starttime = None
++        process = subprocess.Popen(argv, cwd=donor, env=env or clean_environment(donor),
++                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                                   text=True, start_new_session=True, pass_fds=pass_fds)
++    except BaseException:
++        if defer: signal.signal(signal.SIGALRM,previous_alarm)
++        raise
++    starttime = None
+     timed_out = False
+     stop_errors = []
++    custody_failure = None
+     def unconfirmed(message, observation, extra=()):
++        nonlocal custody_failure
+         secondary = list(stop_errors) + list(extra)
+         # A retained exception also retains this frame/Popen. Release our pipe
+         # handles now, and reap only if already exited: no renewed wait budget.
+@@ -94,46 +110,112 @@
+         stopped.observation = primary.observation
+         stopped.friday_custody_primary = primary
+         stopped.friday_custody_secondary = tuple(secondary)
++        custody_failure = stopped
+         return stopped, primary
+     try:
+-        out, err = process.communicate(timeout=timeout)
+-    except subprocess.TimeoutExpired:
+-        timed_out = True
+-        if deadline is not None:
+-            # Containment targets its exact namespace init while leaving the
+-            # native monitor alive to report kernel-drained namespace exit.
+-            # A process group alone provides no detached-session custody.
+-            try:
+-                if stop_on_timeout is not None:
+-                    stop_on_timeout(process, starttime)
+-                else:
++        if defer:
++            signal.signal(signal.SIGALRM,previous_alarm)
++            if deferred_alarm:
++                previous_alarm(*deferred_alarm[0])
++        try:
++            starttime = int(Path(f'/proc/{process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
++        except (OSError, ValueError, IndexError):
++            starttime = None
++        try:
++            out, err = process.communicate(timeout=timeout)
++        except subprocess.TimeoutExpired:
++            timed_out = True
++            if deadline is not None:
++                # Containment targets its exact namespace init while leaving the
++                # native monitor alive to report kernel-drained namespace exit.
++                # A process group alone provides no detached-session custody.
++                try:
++                    if stop_on_timeout is not None:
++                        stop_on_timeout(process, starttime)
++                    else:
++                        try:
++                            os.killpg(process.pid, signal.SIGKILL)
++                        except ProcessLookupError:
++                            pass
++                except BaseException as exc:
++                    stop_errors.append(exc)
++                    stop_errors.extend(getattr(exc, 'friday_custody_secondary', ()))
++                remaining = deadline - time.monotonic()
++                partial = dict(returncode=process.returncode, timeout=True,
++                               pid=process.pid, starttime_ticks=starttime,
++                               reaped=process.returncode is not None, reason='command_timeout',
++                               elapsed_seconds=round(time.monotonic() - start, 3))
++                if remaining <= 0:
++                    stopped, primary = unconfirmed('STOP_UNCONFIRMED: original cleanup budget exhausted', partial)
++                    raise stopped from primary
++                try:
++                    out, err = process.communicate(timeout=remaining)
++                except BaseException as exc:
++                    stopped, primary = unconfirmed('STOP_UNCONFIRMED: contained command not reaped', partial, (exc,))
++                    raise stopped from primary
++            else:
++                os.killpg(process.pid, signal.SIGTERM)
++                try:
++                    out, err = process.communicate(timeout=5)
++                except subprocess.TimeoutExpired:
++                    os.killpg(process.pid, signal.SIGKILL)
++                    out, err = process.communicate(timeout=5)
++    except BaseException as interrupted:
++        # Cancellation/deadline exceptions have the same owned stop/reap
++        # obligation as timeout. Never introduce a new wait budget here.
++        if interrupted is custody_failure:
++            raise
++        partial = dict(returncode=process.returncode,timeout=timed_out,
++            pid=process.pid,starttime_ticks=starttime,reaped=process.returncode is not None,
++            reason='command_interrupted',elapsed_seconds=round(time.monotonic()-start,3))
++        try:
++            if stop_on_timeout is None:
++                # A second scoped wakeup may expire during cleanup. Defer it
++                # only across the nonblocking exact owned-group stop attempt;
++                # no child inherits this mask, and no wait runs under it.
++                stop_mask = signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGALRM})
++                probe_failure = None
++                try:
+                     try:
+-                        os.killpg(process.pid, signal.SIGKILL)
+-                    except ProcessLookupError:
+-                        pass
+-            except BaseException as exc:
+-                stop_errors.append(exc)
+-                stop_errors.extend(getattr(exc, 'friday_custody_secondary', ()))
+-            remaining = deadline - time.monotonic()
+-            partial = dict(returncode=process.returncode, timeout=True,
+-                           pid=process.pid, starttime_ticks=starttime,
+-                           reaped=process.returncode is not None, reason='command_timeout',
+-                           elapsed_seconds=round(time.monotonic() - start, 3))
++                        running = process.poll() is None
++                    except BaseException as exc:
++                        probe_failure = exc
++                        running = process.returncode is None
++                    if running:
++                        try: os.killpg(process.pid,signal.SIGKILL)
++                        except ProcessLookupError: pass
++                finally:
++                    signal.pthread_sigmask(signal.SIG_SETMASK,stop_mask)
++                if probe_failure is not None:
++                    raise probe_failure
++            elif process.poll() is None:
++                # A namespace callback retains its existing custody authority.
++                # Interruption/failure never substitutes a group kill for it.
++                try:
++                    stop_on_timeout(process,starttime)
++                except Exception as exc:
++                    stop_errors.append(exc)
++                    stop_errors.extend(getattr(exc,'friday_custody_secondary',()))
++            remaining = (start + timeout if deadline is None else deadline) - time.monotonic()
+             if remaining <= 0:
+-                stopped, primary = unconfirmed('STOP_UNCONFIRMED: original cleanup budget exhausted', partial)
+-                raise stopped from primary
+-            try:
+-                out, err = process.communicate(timeout=remaining)
+-            except BaseException as exc:
+-                stopped, primary = unconfirmed('STOP_UNCONFIRMED: contained command not reaped', partial, (exc,))
+-                raise stopped from primary
+-        else:
+-            os.killpg(process.pid, signal.SIGTERM)
+-            try:
+-                out, err = process.communicate(timeout=5)
+-            except subprocess.TimeoutExpired:
+-                os.killpg(process.pid, signal.SIGKILL)
+-                out, err = process.communicate(timeout=5)
++                stopped, primary = unconfirmed('STOP_UNCONFIRMED: original interruption cleanup budget exhausted',
++                    partial,(interrupted,))
++                raise stopped from interrupted
++            process.communicate(timeout=remaining)
++            if stop_errors:
++                partial.update(returncode=process.returncode,reaped=process.returncode is not None)
++                stopped, primary = unconfirmed('STOP_UNCONFIRMED: interrupted native stop failed',
++                    partial,(interrupted,))
++                raise stopped from interrupted
++        except BaseException as cleanup:
++            if cleanup is custody_failure:
++                raise
++            stopped, primary = unconfirmed('STOP_UNCONFIRMED: interrupted command cleanup incomplete',
++                partial,(interrupted,cleanup))
++            raise stopped from interrupted
++        raise
++    finally:
++        if defer: signal.signal(signal.SIGALRM,previous_alarm)
+     reason = ('device_null_unavailable' if
+               "fatal: could not open '/dev/null' for reading and writing: Permission denied" in err
+               else 'command_timeout' if timed_out else 'command_nonzero_exit' if process.returncode else 'command_succeeded')
