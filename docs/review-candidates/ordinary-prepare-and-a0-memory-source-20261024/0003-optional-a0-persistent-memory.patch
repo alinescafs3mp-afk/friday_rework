@@ -1,0 +1,471 @@
+--- a/plugins/friday_rework/adapters/a0.py
++++ b/plugins/friday_rework/adapters/a0.py
+@@ -45,6 +45,9 @@
+     lifetime_hours: float = 24
+     agent_profile: str = "agent0"
+     project_name: str | None = None
++    # Host-only data sealing after the normal, already mandatory native stop.
++    # The host callback catches data errors; it grants no native effects.
++    memory_stopped: Callable | None = None
+ 
+ 
+ def job_prefix(row):
+@@ -128,6 +131,7 @@
+     def __init__(self, config: A0HostConfig, boundary: A0NativeBoundary, *, clock=time.time):
+         self.config, self.boundary, self.clock = config, boundary, clock
+         self.inflight = False
++        self.memory_seal_attempted = False
+         for p in (config.workspace_root, config.input_root, config.staging_root): _private(p)
+         require(type(config.max_file_bytes) is int and 0 < config.max_file_bytes <= 16 * 1024**2
+                 and type(config.max_response_bytes) is int
+@@ -243,6 +247,10 @@
+         # Uses last checked identity; state/receipt corruption cannot block stop.
+         unit = self.boundary.stop(association)
+         self.config.key_material.remove(cessation_confirmed=unit.quiescent)
++        if unit.quiescent and self.config.memory_stopped is not None and not self.memory_seal_attempted:
++            self.memory_seal_attempted = True
++            try: self.config.memory_stopped()
++            except Exception: pass # Data sealing cannot weaken or replay owned stop.
+         return unit
+ 
+     def _cleanup(self, row, error):
+--- a/plugins/friday_rework/adapters/a0_config.py
++++ b/plugins/friday_rework/adapters/a0_config.py
+@@ -89,6 +89,20 @@
+     port: int = 5000
+     web: dict | None = None
+     memory_guard: PinnedFile | None = None
++    user_memory: dict | None = None
++
++    def memory_mounts(self):
++        if self.user_memory is None: return []
++        v = self.user_memory
++        require(isinstance(v,dict) and set(v)=={'home','lineage','memory_dir','cache_dir'}
++                and isinstance(v['lineage'],dict), 'invalid_memory_descriptor')
++        root = Path(v['home']) / 'workers/a0'; key = digest(v['lineage'])
++        require(v['memory_dir']==str(root/'memory'/key/'stores')
++                and v['cache_dir']==str(root/'cache/embeddings'/key/'bytes')
++                and all(Path(v[k]).is_absolute() and '..' not in Path(v[k]).parts
++                        and not any(c in v[k] for c in '\n\r\x00,') for k in ('home','memory_dir','cache_dir')),
++                'memory_lineage_or_path_changed')
++        return [(v['memory_dir'],'/a0/usr/memory'),(v['cache_dir'],'/a0/tmp/memory/embeddings')]
+ 
+     def checked(self):
+         self.docker.read(); self.daemon_unit.read(); self.network.checked()
+@@ -96,6 +110,7 @@
+             c in self.socket for c in "\n\r\x00 ,"), "unsafe_daemon_socket")
+         require(re.fullmatch(r"sha256:[0-9a-f]{64}", self.image), "unpinned_image")
+         _private(self.state_dir)
++        self.memory_mounts() # Static declaration only; never block stop on data drift.
+         require(self.git_dir.is_absolute() and self.git_dir.resolve() == self.git_dir
+                 and self.git_dir.is_dir(), "unsafe_git_mount")
+         require(not any(c in str(p) for p in (self.state_dir, self.git_dir, self.docker.path, self.daemon_unit.path)
+@@ -137,6 +152,8 @@
+             require(isinstance(value, str) and value and not any(c in value for c in "\n\r\x00"),
+                     "invalid_native_labels")
+             args += ["--label", key + "=" + value]
++        for source,target in self.memory_mounts():
++            args += ['--mount',f'type=bind,src={source},dst={target},bind-propagation=rprivate']
+         if self.memory_guard is not None:
+             require(len(self.memory_guard.read()) == 28559, 'unreviewed_memory_guard_source')
+             args += ['--mount',f'type=bind,src={self.memory_guard.path},dst=/friday-source-memory.py,readonly,bind-propagation=rprivate']
+--- a/plugins/friday_rework/adapters/a0_native.py
++++ b/plugins/friday_rework/adapters/a0_native.py
+@@ -297,13 +297,17 @@
+                 and h.get("PidMode", "") == "" and h.get("IpcMode") in {"", "private"}
+                 and h.get("RestartPolicy") == {"Name": "no", "MaximumRetryCount": 0}, "native_exposure_changed")
+         mounts = obj.get("Mounts", [])
+-        require(len(mounts) == (3 if self.config.web else 2) + (1 if self.config.memory_guard else 0)
++        require(len(mounts) == (3 if self.config.web else 2) + (1 if self.config.memory_guard else 0) + len(self.config.memory_mounts())
+                 and len({m.get("Destination") for m in mounts}) == len(mounts),
+                 "native_mounts_changed")
+         for target, source, rw in [("/a0/usr", self.config.state_dir, True), ("/a0/.git", self.config.git_dir, False)]:
+             m = next((m for m in mounts if m.get("Destination") == target), {})
+             require(m.get("Type") == "bind" and m.get("Source") == str(source)
+                     and m.get("RW") is rw and m.get("Propagation") == "rprivate", "native_mounts_changed")
++        for source,target in self.config.memory_mounts():
++            m = next((m for m in mounts if m.get('Destination')==target),{})
++            require(m.get('Type')=='bind' and m.get('Source')==source
++                    and m.get('RW') is True and m.get('Propagation')=='rprivate', 'native_memory_mount_changed')
+         if self.config.memory_guard:
+             m = next((m for m in mounts if m.get('Destination') == '/friday-source-memory.py'), {})
+             require(m.get('Type') == 'bind' and m.get('Source') == str(self.config.memory_guard.path)
+--- a/plugins/friday_rework/host_record.py
++++ b/plugins/friday_rework/host_record.py
+@@ -116,6 +116,19 @@
+                     or guard.get('bytes') != 28559 or guard.get('image') != p['image']):
+                 raise ValueError()
+             identity_input['memory_guard']=guard
++        if 'memory' in runtime:
++            binding=row['host']['binding']; authority=binding.get('user_authority')
++            if not isinstance(authority,dict): raise ValueError()
++            lineage={'provider':'other','model':runtime['deployment']['embedding']['model'],
++                'endpoint':runtime['deployment']['embedding']['endpoint'],**runtime['memory'],
++                'store_format':'a0-faiss-native-e3051fb-guard-dcd46c2b-v1',
++                'principal':authority['principal_id'],'runtime_profile':binding['runtime']['runtime_profile']}
++            home=Path(binding['runtime']['runtime_home']); root=home/'workers/a0'; key=compact_hash(lineage)
++            expected={'home':str(home),'lineage':lineage,'memory_dir':str(root/'memory'/key/'stores'),
++                      'cache_dir':str(root/'cache/embeddings'/key/'bytes')}
++            if p.get('user_memory') != expected: raise ValueError()
++            identity_input['user_memory']=expected
++        elif 'user_memory' in p: raise ValueError()
+         plan_bytes = (json.dumps(p,sort_keys=True,indent=2)+'\n').encode()
+         if (p['identity'] != compact_hash(identity_input)
+                 or p['schema'] != 'friday.a0.runtime-plan.v2' or p['mode'] != 'runtime'
+--- a/plugins/friday_rework/host_runtime.py
++++ b/plugins/friday_rework/host_runtime.py
+@@ -267,8 +267,16 @@
+             raise HostUnavailable('invalid_a0_bounds')
+     a = value['a0']
+     a_fields = {'runtime','launcher','docker','daemon_unit','git_metadata','expected_files','capability','policy','owner_slot'}
+-    if (not isinstance(a,dict) or set(a) not in (a_fields,a_fields|{'deployment'},a_fields|{'web'},a_fields|{'deployment','web'})):
++    if (not isinstance(a,dict) or not a_fields <= set(a) <= a_fields | {'deployment','web','memory'}):
+         raise HostUnavailable('invalid_a0_config')
++    if 'memory' in a:
++        memory = a['memory']
++        if ('deployment' not in a or not isinstance(memory,dict)
++                or set(memory) != {'embedding_dimensions','embedding_revision'}
++                or type(memory['embedding_dimensions']) is not int or not 1 <= memory['embedding_dimensions'] <= 65536
++                or not isinstance(memory['embedding_revision'],str)
++                or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,255}',memory['embedding_revision'])):
++            raise HostUnavailable('explicit_memory_embedding_identity_required')
+     if 'web' in a:
+         from .adapters.a0_web import checked_web
+         try: checked_web(a['web'])
+@@ -741,14 +749,28 @@
+                 else tuple('http://' + x['ip'] + ':' + str(x['port']) + '/v1' for x in n['endpoints']),
+                 policy, a.get('deployment')), web=a.get('web'),
+             memory_guard=_pin({'path': plan['memory_guard']['source'], 'sha256': plan['memory_guard']['sha256']})
+-                if 'memory_guard' in plan else None)
++                if 'memory_guard' in plan else None, user_memory=plan.get('user_memory'))
+ 
+     def _plan(self, m, row, network):
+         from .adapters.dsh import _identity
+         a = row['host']['a0']['acceptance']
++        user_memory = None
++        if 'memory' in self.config['a0']:
++            from hermes_cli.friday_user_scope import current, check_retained_job
++            from .worker_provision import own_runtime
++            check_retained_job(row)
++            scope = current()
++            if scope is None: raise HostUnavailable('managed_user_memory_scope_required')
++            scope.check()
++            own_runtime(scope.home,scope.profile,'a0',self.config)
++            if row['host']['binding'].get('user_authority') != {
++                    'principal_id':scope.key,'generation':scope.admission_generation}:
++                raise HostUnavailable('foreign_user_memory_scope')
++            user_memory = m.memory_descriptor(scope.home,scope.key,scope.profile,
++                self.config['a0']['deployment'],self.config['a0']['memory'])
+         p=m.plan(row['created_at_unix'],row['deadline_unix'],assignment=row['existing_task_id'],generation=1,
+             owner_slot=self.config['a0']['owner_slot'],original_budget_seconds=row['budget_seconds'],git_metadata=self.config['a0']['git_metadata'],
+-            network=network,deployment=self.config['a0'].get('deployment'),web=self.config['a0'].get('web'),association_binding=_identity(row),accepted_monotonic_ns=a['accepted_monotonic_ns'],boot_id=a['boot_id'])
++            network=network,deployment=self.config['a0'].get('deployment'),web=self.config['a0'].get('web'),association_binding=_identity(row),accepted_monotonic_ns=a['accepted_monotonic_ns'],boot_id=a['boot_id'],user_memory=user_memory)
+         if (str(m.DOCKER) != self.config['a0']['docker']['path']
+                 or p['docker_sha256'] != self.config['a0']['docker']['sha256']
+                 or str(m.PROJECT/'.runtime/rootless-docker/supervisor/friday-rework-docker.service') != self.config['a0']['daemon_unit']['path']
+@@ -882,6 +904,9 @@
+         self.startup_active=True
+         def before_ui(usr):
+             self._current(row)
++            if 'user_memory' in p:
++                from hermes_cli.friday_user_scope import check_retained_job
++                check_retained_job(row) # Current revocation/generation after data admission.
+             scope=current_secret_scope();names={'FRIDAY_LLM_API_KEY','FRIDAY_EMBEDDINGS_API_KEY'}
+             if 'web' in self.config['a0']: names.add('SEARXNG_SECRET')
+             if scope is None or current_secret_scope_home() != self.config['runtime_home'] or not names.issubset(scope):
+@@ -941,7 +966,8 @@
+             outputs.mkdir(mode=0o700)
+             self.adapter=A0Adapter(A0HostConfig(Path(self.config['workspace_root']),staging,outputs,
+                 lambda current:self.store.get(current['existing_task_id'],current['owner']),expected,self.keys,
+-                max_file_bytes=min(self.config['max_file_bytes'],self.config['max_total_bytes'])),self.boundary,clock=self.store.clock)
++                max_file_bytes=min(self.config['max_file_bytes'],self.config['max_total_bytes']),
++                memory_stopped=(lambda: self._seal_memory(row)) if 'user_memory' in p else None),self.boundary,clock=self.store.clock)
+             self._api_ready(row)
+         except BaseException as error:
+             try:self.emergency_stop(row)
+@@ -950,6 +976,22 @@
+         finally:
+             self.startup_active=False
+             self.launching=False
++
++    def _seal_memory(self,row):
++        # Optional data work follows the adapter's existing confirmed stop.
++        # A refused/expired seal cannot weaken cessation or repeat native work.
++        status = {'status':'MEMORY_DATA_NOT_SEALED'}
++        try:
++            m = self._module()
++            status = m.seal_memory(self.plan['user_memory'],self.plan['deployment'],
++                                  budget=lambda: self._startup_left(row))
++        except Exception:
++            pass
++        try:
++            m.write_json(Path(row['workspace_reference'])/'a0-memory-status.json',status)
++        except Exception:
++            pass
++        return status
+ 
+     def prepare(self,row,brief,inputs):
+         self.preparing=True
+--- a/scripts/a0_runtime.py
++++ b/scripts/a0_runtime.py
+@@ -959,10 +959,192 @@
+     return route
+ 
+ 
++def memory_options(value):
++    """Explicit installation declarations, never a claim of model observation."""
++    require(isinstance(value, dict) and set(value) == {'embedding_dimensions', 'embedding_revision'}
++            and type(value['embedding_dimensions']) is int and 1 <= value['embedding_dimensions'] <= 65536
++            and isinstance(value['embedding_revision'], str)
++            and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,255}', value['embedding_revision']),
++            'explicit_memory_embedding_identity_required')
++    return dict(value)
++
++
++def memory_descriptor(home, principal, runtime_profile, deployment, options):
++    """Only data paths under an existing authenticated managed home are reusable.
++
++    The host checks current UserScope. This pure descriptor grants no access,
++    native identity, time, routes or continuation. A changed declared embedding
++    identity selects fresh data; previous stores are never migrated/reembedded.
++    """
++    home = Path(home)
++    require(home.is_absolute() and str(home) != '/' and '..' not in home.parts
++            and re.fullmatch(r'/[A-Za-z0-9_./-]+', str(home))
++            and isinstance(principal, str) and re.fullmatch(r'[0-9a-f]{64}', principal)
++            and isinstance(runtime_profile, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,64}', runtime_profile),
++            'invalid_memory_user_binding')
++    p = profile_module().checked_profile(deployment)
++    options = memory_options(options)
++    lineage = {'provider': 'other', 'model': p['embedding']['model'],
++               'endpoint': p['embedding']['endpoint'], **options,
++               'store_format': 'a0-faiss-native-e3051fb-guard-dcd46c2b-v1',
++               'principal': principal, 'runtime_profile': runtime_profile}
++    key = digest(lineage)
++    root = home / 'workers/a0'
++    return {'home': str(home), 'lineage': lineage,
++            'memory_dir': str(root / 'memory' / key / 'stores'),
++            'cache_dir': str(root / 'cache/embeddings' / key / 'bytes')}
++
++
++def checked_memory_descriptor(value, deployment):
++    require(isinstance(value, dict) and set(value) == {'home', 'lineage', 'memory_dir', 'cache_dir'}
++            and isinstance(value['lineage'], dict), 'invalid_memory_descriptor')
++    v = value['lineage']
++    expected = memory_descriptor(value['home'], v.get('principal'), v.get('runtime_profile'), deployment,
++        {k: v.get(k) for k in ('embedding_dimensions', 'embedding_revision')})
++    require(value == expected, 'memory_lineage_or_path_changed')
++    return expected
++
++
++def memory_mounts(value):
++    return [(value['memory_dir'], '/a0/usr/memory'),
++            (value['cache_dir'], '/a0/tmp/memory/embeddings')]
++
++
++def _memory_ancestors(path, home):
++    """No linked, foreign or nonprivate component within the managed home."""
++    path, home = Path(path), Path(home)
++    require(path.is_relative_to(home) and path.resolve() == path, 'unsafe_memory_path')
++    private(home, directory=True)
++    for part in reversed(path.relative_to(home).parents):
++        if str(part) != '.':
++            private(home / part, directory=True)
++    private(path, directory=True)
++
++
++def _memory_json(path, maximum=1024**2):
++    path = private(path); fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
++    try:
++        before = os.fstat(fd)
++        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
++                and stat.S_IMODE(before.st_mode) in {0o400,0o600}
++                and before.st_nlink == 1 and 0 <= before.st_size <= maximum, 'unsafe_memory_metadata')
++        data = b''
++        while chunk := os.read(fd, min(65536, maximum + 1 - len(data))):
++            data += chunk; require(len(data) <= maximum, 'unsafe_memory_metadata')
++        identity = lambda s: (s.st_dev,s.st_ino,s.st_mode,s.st_uid,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
++        require(identity(before) == identity(os.fstat(fd)) == identity(path.lstat()), 'memory_metadata_changed')
++        return json.loads(data)
++    finally: os.close(fd)
++
++
++def _memory_snapshot(value, budget=None):
++    """Bounded stable hashes only. In particular, never deserialize index.pkl."""
++    manifest, contents, count, total = {}, {}, 0, 0
++    for label in ('memory_dir', 'cache_dir'):
++        root = Path(value[label]); _memory_ancestors(root, value['home'])
++        pending = [root]
++        while pending:
++            metadata_budget(budget)
++            directory = pending.pop(); before = directory.lstat()
++            private(directory, directory=True)
++            names = sorted(os.listdir(directory))
++            require(count + len(names) <= 4096, 'memory_storage_limit')
++            for name in names:
++                count += 1; path = directory / name; st = path.lstat()
++                require(st.st_uid == os.getuid() and not st.st_mode & 0o077
++                        and not stat.S_ISLNK(st.st_mode), 'unsafe_memory_entry')
++                key = label + '/' + path.relative_to(root).as_posix()
++                if stat.S_ISDIR(st.st_mode):
++                    pending.append(path); manifest[key] = {'directory': True}; continue
++                require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1
++                        and 0 <= st.st_size <= 32 * 1024**2, 'unsafe_memory_file')
++                total += st.st_size; require(total <= 128 * 1024**2, 'memory_storage_limit')
++                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
++                try:
++                    initial = os.fstat(fd); h = hashlib.sha256(); size = 0; head = b''
++                    while chunk := os.read(fd, 65536):
++                        metadata_budget(budget); size += len(chunk)
++                        require(size <= st.st_size, 'memory_changed_during_read')
++                        h.update(chunk)
++                        if len(head) < 65536: head += chunk[:65536-len(head)]
++                    identity = lambda s: (s.st_dev,s.st_ino,s.st_mode,s.st_uid,s.st_nlink,
++                                          s.st_size,s.st_mtime_ns,s.st_ctime_ns)
++                    require(size == st.st_size and identity(st) == identity(initial)
++                            == identity(os.fstat(fd)) == identity(path.lstat()), 'memory_changed_during_read')
++                finally: os.close(fd)
++                manifest[key] = {'size': size, 'sha256': h.hexdigest()}
++                if label == 'memory_dir': contents[path] = head
++            after = directory.lstat()
++            require((before.st_dev,before.st_ino,before.st_mtime_ns,before.st_ctime_ns)
++                    == (after.st_dev,after.st_ino,after.st_mtime_ns,after.st_ctime_ns)
++                    and names == sorted(os.listdir(directory)), 'memory_tree_changed_during_read')
++    root = Path(value['memory_dir']); stores = {p.parent for p in contents}
++    for store in stores:
++        required = {'index.faiss', 'index.pkl', 'index.faiss.sha256', 'embedding.json'}
++        require(required <= {p.name for p in contents if p.parent == store}, 'unknown_or_incomplete_memory_store')
++        require(len(contents[store/'embedding.json']) == manifest['memory_dir/' + (store/'embedding.json').relative_to(root).as_posix()]['size'],
++                'unsafe_memory_embedding_metadata')
++        try: meta = json.loads(contents[store/'embedding.json'])
++        except (ValueError, UnicodeError): raise RuntimeErrorBoundary('invalid_memory_embedding_metadata') from None
++        lineage = value['lineage']
++        require(meta == {'model_provider': lineage['provider'], 'model_name': lineage['model']},
++                'memory_embedding_identity_changed')
++        header = contents[store/'index.faiss']
++        require(len(header) >= 8 and header[:4] == b'IxFI'
++                and int.from_bytes(header[4:8], 'little') == lineage['embedding_dimensions'],
++                'memory_vector_dimensions_changed')
++        key = 'memory_dir/' + (store/'index.faiss').relative_to(root).as_posix()
++        require(contents[store/'index.faiss.sha256'].decode('ascii').strip() == manifest[key]['sha256'],
++                'memory_index_hash_changed')
++    return manifest
++
++
++def prepare_memory(value, deployment, *, budget=None):
++    """Admit existing sealed data, or create only an entirely new namespace."""
++    value = checked_memory_descriptor(value, deployment)
++    user = _memory_json(Path(value['home']) / '.friday-user-scope.json',65536)
++    require(user.get('schema') == 'friday.user-home.v1'
++            and user.get('principal') == value['lineage']['principal']
++            and user.get('profile') == value['lineage']['runtime_profile'], 'foreign_memory_user_marker')
++    roots = [Path(value['memory_dir']), Path(value['cache_dir'])]
++    seal = roots[0].parent / 'seal.json'
++    for root in roots:
++        parent = Path(value['home'])
++        private(parent, directory=True)
++        for name in root.relative_to(parent).parts[:-2]:
++            parent /= name
++            if not parent.exists() and not parent.is_symlink(): parent.mkdir(mode=0o700)
++            private(parent, directory=True)
++    if any(p.parent.exists() or p.parent.is_symlink() for p in roots):
++        retained = _memory_json(seal)
++        require(retained == {'lineage': value['lineage'], 'files': _memory_snapshot(value, budget)},
++                'memory_seal_changed_or_unknown')
++    else:
++        for root in roots:
++            root.parent.mkdir(mode=0o700); root.mkdir(mode=0o700)
++        write_json(seal, {'lineage': value['lineage'], 'files': _memory_snapshot(value, budget)})
++    return value
++
++
++def seal_memory(value, deployment, *, budget=None):
++    """Called only after the existing adapter proves native cessation.
++
++    Data integrity receipt outside both writable mounts; it conveys no user,
++    launch or cleanup authority. Unknown/partial stores remain untouched.
++    """
++    value = checked_memory_descriptor(value, deployment)
++    seal = Path(value['memory_dir']).parent / 'seal.json'
++    retained = _memory_json(seal)
++    require(retained.get('lineage') == value['lineage'], 'memory_seal_lineage_changed')
++    snapshot = _memory_snapshot(value, budget)
++    write_json(seal, {'lineage': value['lineage'], 'files': snapshot}, replace=True)
++    return {'status': 'MEMORY_DATA_SEALED', 'files': len(snapshot)}
++
++
+ def plan(accepted_unix, deadline_unix, *, assignment, generation, owner_slot,
+          original_budget_seconds, mode='runtime', pins=None, git_metadata=None, network=None,
+          association_binding=None, accepted_monotonic_ns=None, boot_id=None, deployment=None, web=None,
+-         check_source_files=True):
++         check_source_files=True, user_memory=None):
+     """Create operator input, never a launch grant or implicit continuation.
+ 
+     The private reviewed plan retains the original independent phase identity
+@@ -1014,6 +1196,11 @@
+     if mode == 'runtime':
+         guard = memory_guard_descriptor(web['image'] if web is not None else IMAGE, check_file=check_source_files)
+         identity_input['memory_guard'] = guard
++    if user_memory is not None:
++        require(mode == 'runtime' and association_binding is not None and deployment is not None,
++                'memory_requires_current_managed_host')
++        user_memory = checked_memory_descriptor(user_memory, deployment)
++        identity_input['user_memory'] = user_memory
+     identity = digest(identity_input)
+     if pins is None:
+         pins = {'code_sha256': sha(__file__), 'docker_sha256': sha(DOCKER),
+@@ -1036,7 +1223,8 @@
+             **({'deployment': deployment, 'profile_source_sha256': sha(PROFILE_SOURCE)} if deployment is not None else {}),
+             **({'web':web,'web_source_sha256':sha(WEB_SOURCE)} if web is not None else {}),
+             **({'git_metadata': dict(git_metadata)} if git_metadata is not None else {}),
+-             **({'memory_guard': guard} if mode == 'runtime' else {})}
++             **({'memory_guard': guard} if mode == 'runtime' else {}),
++             **({'user_memory': user_memory} if user_memory is not None else {})}
+     if association_binding is not None:
+         result.update(association_binding=binding, accepted_monotonic_ns=accepted_monotonic_ns,
+                       boot_id=boot_id, unit=binding['supervisor']['unit'],
+@@ -1072,7 +1260,7 @@
+                     network=None if p['network'] == 'none' else p['network'],
+                     association_binding=p.get('association_binding'),
+                     accepted_monotonic_ns=p.get('accepted_monotonic_ns'), boot_id=p.get('boot_id'), deployment=p.get('deployment'), web=p.get('web'),
+-                    check_source_files=check_files)
++                    check_source_files=check_files, user_memory=p.get('user_memory'))
+     require(p == expected, 'plan_identity_or_boundary_changed')
+     if check_files and 'git_metadata' in p:
+         check_git_metadata(p['git_metadata'], **({} if budget is None else {'budget': budget}))
+@@ -1113,6 +1301,9 @@
+     if p['mode'] == 'inventory':
+         return args + ['--read-only', '--entrypoint=/bin/bash', IMAGE, '-ceu', INVENTORY_COMMAND]
+     args += ['--mount', 'type=bind,src=' + p['state_dir'] + ',dst=/a0/usr']
++    if 'user_memory' in p:
++        for source, target in memory_mounts(p['user_memory']):
++            args += ['--mount', 'type=bind,src=' + source + ',dst=' + target + ',bind-propagation=rprivate']
+     if 'memory_guard' in p:
+         g = p['memory_guard']
+         args += ['--mount', 'type=bind,src=' + g['source'] + ',dst=' + g['stage'] + ',readonly,bind-propagation=rprivate']
+@@ -1171,9 +1362,15 @@
+     else:
+         mounts = obj.get('Mounts')
+         require(h.get('ReadonlyRootfs') is False and isinstance(mounts, list)
+-                and len(mounts) == (2 if 'git_metadata' in p else 1) + (1 if 'web' in p else 0) + (1 if 'memory_guard' in p else 0),
++                and len(mounts) == (2 if 'git_metadata' in p else 1) + (1 if 'web' in p else 0) + (1 if 'memory_guard' in p else 0) + (2 if 'user_memory' in p else 0),
+                 'runtime_mounts_changed')
+         by_dest = {m.get('Destination'): m for m in mounts}
++        if 'user_memory' in p:
++            for source, target in memory_mounts(p['user_memory']):
++                m = by_dest.get(target, {})
++                require(m.get('Type') == 'bind' and m.get('Source') == source
++                        and m.get('RW') is True and m.get('Propagation') == 'rprivate',
++                        'user_memory_mount_changed')
+         require(len(by_dest) == len(mounts) and '/a0/usr' in by_dest, 'runtime_mounts_changed')
+         m = by_dest['/a0/usr']
+         require(m.get('Type') == 'bind' and m.get('Source') == p['state_dir']
+@@ -1444,6 +1641,8 @@
+             write_json(self.directory / 'attempt.json', {'plan_sha256': digest(self.p), 'phase': 'CREATE_UNKNOWN'})
+             if self.p['mode'] == 'runtime':
+                 materialize(self.directory / 'usr', self.p.get('deployment'), self.p.get('web'))
++                if 'user_memory' in self.p:
++                    prepare_memory(self.p['user_memory'], self.p['deployment'], budget=lambda: remaining(self.p))
+                 if before_ui is not None:
+                     before_ui(self.directory / 'usr')
+                     remaining(self.p)
