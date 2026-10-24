@@ -1,0 +1,7 @@
+# Actual installed native administrative read journey
+
+The installed Source120/project316 native Dashboard completed a real operator password login, verified native identity, compiled React users-list read, anonymous access refusal and own-session logout. All 12 checks passed. The complete current two-user document stayed unchanged; no user rights or product state were modified. TLS used the current native CA/leaf proof and an exact approved leaf SPKI in Chromium, with `ignore_https_errors=false`.
+
+The existing normal Dashboard command reused its current compiled assets through the normal native build lock. No new installation, dependency fetch or frontend compilation was needed. Startup, browser test and service used separate original finite clocks. After the accepted browser test, the exact owned foreground service received one SIGTERM; its PID, listener, native role record and token were absent, its lock was free, and the process was reaped. Browser processes and temporary credential material were cleaned up.
+
+The optional Source121 skip-build correction is published separately as source-only and was not involved in this run. The earlier unsupported skip-build refusal is preserved. This proves only the listed read journey; changes to users, onboarding, retirement, other tabs, second-identity isolation, workers and full release readiness remain unaccepted. `FACTS.json` preserves the exact scope, negative control and private evidence digests.
