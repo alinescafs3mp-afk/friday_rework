@@ -1,0 +1,572 @@
+--- a/scripts/rootless_docker_launch.py
++++ b/scripts/rootless_docker_launch.py
+@@ -18,0 +19,3 @@
++import socket
++import select
++import signal
+@@ -474,0 +478 @@
++    return proc_identity(manager_pid)
+@@ -484 +488 @@
+-        host_namespace_authority(ns, fds)
++        manager = host_namespace_authority(ns, fds)
+@@ -485,0 +490 @@
++        require(me['ppid'] == manager['pid'], 'route_attester_reaper_unavailable')
+@@ -488,0 +494 @@
++    context['attester'] = start_parent_attester(context, request, manager)
+@@ -494,7 +500,114 @@
+-def child_identity(context):
+-    require(os.getuid() == 0 and os.geteuid() == 0 and context['parent']['pid'] == context['parent_pid'], 'wrong_route_child_uid')
+-    parent = proc_identity(context['parent_pid'])
+-    require(parent == context['parent'] and parent['cgroup'] == '0::' + SERVICE_GROUP + '/dockerd', 'route_parent_reused')
+-    require(Path('/proc', str(parent['pid']), 'exe').resolve() == tool_paths()['rootlesskit'], 'route_parent_executable')
+-    current = proc_identity(os.getpid())
+-    require(current['boot'] == parent['boot'] and current['cgroup'] == parent['cgroup'], 'foreign_route_child_cgroup')
++ATTESTER_PACKET_LIMIT = 16384
++ATTESTER_SOCKET = 'preexec-attester.sock'
++
++
++def attester_remaining(deadline):
++    left = (deadline - time.monotonic_ns()) / 10**9
++    require(0 < left <= 20, 'route_attester_deadline')
++    return left
++
++
++def attester_poll(fd, deadline):
++    poll = select.poll(); poll.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
++    require(bool(poll.poll(max(1, int(attester_remaining(deadline) * 1000)))), 'route_attester_timeout')
++
++
++def attester_packet(sock, deadline, value=None):
++    sock.settimeout(attester_remaining(deadline))
++    if value is not None:
++        data = canonical(value).encode()
++        require(len(data) <= ATTESTER_PACKET_LIMIT and sock.send(data) == len(data), 'route_attester_packet_write')
++        return
++    data, ancillary, flags, _ = sock.recvmsg(ATTESTER_PACKET_LIMIT)
++    require(data and not ancillary and flags == 0, 'route_attester_packet_shape')
++    return exact_json(data.decode())
++
++
++def attester_peer(sock):
++    return struct.unpack('3i', sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
++
++
++def attester_state(context, uid):
++    # RootlessKit's /run copy-up may alias an ancestor. As in write_guard,
++    # accept only the held, non-symlink leaf with the host-pinned identity.
++    fd = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
++    try:
++        st = os.fstat(fd); named = STATE.lstat()
++        require(stat.S_ISDIR(st.st_mode) and st.st_uid == uid
++                and stat.S_IMODE(st.st_mode) == 0o700
++                and [st.st_dev, st.st_ino] == context['state_identity']
++                and (named.st_dev, named.st_ino, named.st_mode, named.st_uid)
++                == (st.st_dev, st.st_ino, st.st_mode, st.st_uid), 'route_attester_state_changed')
++    finally:
++        os.close(fd)
++
++
++def attester_socket_identity(context, uid):
++    attester_state(context, uid)
++    path = STATE / ATTESTER_SOCKET
++    require(len(os.fsencode(path)) < 108 and path.parent == STATE, 'route_attester_path_length')
++    st = path.lstat()
++    require(stat.S_ISSOCK(st.st_mode) and st.st_uid == uid
++            and stat.S_IMODE(st.st_mode) == 0o600 and st.st_nlink == 1, 'route_attester_socket_changed')
++    return [st.st_dev, st.st_ino]
++
++
++def checked_attester_descriptor(context):
++    descriptor = context['attester']; parent = context['parent']
++    require(type(descriptor) is dict
++            and set(descriptor) == {'schema', 'identity', 'reaper', 'socket_identity', 'deadline_monotonic_ns'}
++            and descriptor['schema'] == 'friday.a0.preexec-attester.v1'
++            and all(type(descriptor[k]) is dict and set(descriptor[k]) == {'pid', 'start', 'ppid', 'cgroup', 'boot'}
++                    for k in ('identity', 'reaper'))
++            and all(type(descriptor[k]['pid']) is int and descriptor[k]['pid'] > 0
++                    and type(descriptor[k]['ppid']) is int and descriptor[k]['ppid'] > 0
++                    and type(descriptor[k]['start']) is str and descriptor[k]['start'].isdecimal()
++                    for k in ('identity', 'reaper'))
++            and descriptor['identity']['pid'] not in (parent['pid'], descriptor['reaper']['pid'])
++            and descriptor['identity']['ppid'] == descriptor['reaper']['pid'] == parent['ppid']
++            and descriptor['identity']['cgroup'] == parent['cgroup'] == '0::' + SERVICE_GROUP + '/dockerd'
++            and descriptor['identity']['boot'] == descriptor['reaper']['boot'] == parent['boot']
++            and type(descriptor['socket_identity']) is list and len(descriptor['socket_identity']) == 2
++            and all(type(x) is int and x > 0 for x in descriptor['socket_identity'])
++            and type(descriptor['deadline_monotonic_ns']) is int and descriptor['deadline_monotonic_ns'] > 0,
++            'route_attester_descriptor_changed')
++    return descriptor
++
++
++def attester_unlink(context, expected):
++    require(attester_socket_identity(context, UID) == expected, 'route_attester_cleanup_changed')
++    (STATE / ATTESTER_SOCKET).unlink()
++
++
++def parent_executable_checked(parent, request):
++    """Observe the current process executable, not merely a pinned binary FD."""
++    require(proc_identity(parent['pid']) == parent, 'route_parent_reused')
++    proc = Path('/proc', str(parent['pid']), 'exe')
++    path = tool_paths()['rootlesskit']
++    require(proc.resolve(strict=True) == path, 'route_parent_executable')
++    fd = os.open(proc, os.O_RDONLY | os.O_CLOEXEC)
++    try:
++        before = os.fstat(fd); named = path.stat()
++        key = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
++        require(stat.S_ISREG(before.st_mode) and 0 < before.st_size <= 64*1024*1024
++                and key(before) == key(named), 'route_parent_executable_identity')
++        digest = hashlib.sha256(); count = 0
++        while True:
++            block = os.read(fd, 1024*1024)
++            if not block: break
++            count += len(block)
++            require(count <= 64*1024*1024, 'route_parent_executable_size')
++            digest.update(block)
++        require(count == before.st_size and digest.hexdigest() == request['tools']['rootlesskit']
++                and key(before) == key(os.fstat(fd)) == key(proc.stat()) == key(path.stat())
++                and proc.resolve(strict=True) == path and proc_identity(parent['pid']) == parent,
++                'route_parent_executable_drift')
++        return {'path': str(path), 'sha256': digest.hexdigest(), 'file': [before.st_dev, before.st_ino]}
++    finally:
++        os.close(fd)
++
++
++def attester_snapshot(pid, context):
++    current = proc_identity(pid); parent = context['parent']
++    require(current['boot'] == parent['boot'] and current['cgroup'] == parent['cgroup']
++            and current['pid'] != parent['pid'], 'route_attester_foreign_child')
+@@ -505 +618 @@
+-    require(ancestor == parent, 'foreign_route_child_lineage')
++    require(ancestor == parent, 'route_attester_child_lineage')
+@@ -508 +621 @@
+-        rows = [list(map(int, line.split())) for line in Path('/proc/self/' + kind + '_map').read_text().splitlines()]
++        rows = [list(map(int, row.split())) for row in Path('/proc', str(pid), kind + '_map').read_text().splitlines()]
+@@ -510 +623 @@
+-                and rows[1][0] == 1 and rows[1][1] > UID and rows[1][2] >= 65536, 'route_mapping_changed')
++                and rows[1][0] == 1 and rows[1][1] > UID and rows[1][2] >= 65536, 'route_attester_child_maps')
+@@ -512 +625,352 @@
+-    return current, mappings
++    with namespaces(pid) as (ns, _):
++        require(all(ns[k] != context['host_namespaces'][k] for k in ns), 'route_attester_child_namespaces')
++    require(proc_identity(pid) == current, 'route_attester_child_drift')
++    return {'child': current, 'mappings': mappings, 'namespaces': ns}
++
++
++def attester_reply(context, request, descriptor, message, peer, stage):
++    deadline = descriptor['deadline_monotonic_ns']; attester_remaining(deadline)
++    require(set(message) == {'schema', 'stage', 'challenge', 'context_sha256', 'snapshot'}
++            and message['schema'] == 'friday.a0.preexec-query.v1' and message['stage'] == stage
++            and type(message['challenge']) is str and re.fullmatch('[0-9a-f]{32}', message['challenge'])
++            and message['context_sha256'] == hashlib.sha256(canonical(context).encode()).hexdigest()
++            and peer[1:] == (UID, UID), 'route_attester_query_binding')
++    snapshot = attester_snapshot(peer[0], context)
++    require(snapshot == message['snapshot'] and unit_identity(timeout=min(5, attester_remaining(deadline)))
++            == {k: context[k] for k in ('invocation_id', 'parent_pid')}
++            and request_checked(UID) == request
++            and hashlib.sha256(stable_bytes(REQUEST, UID)).hexdigest() == context['request_sha256'], 'route_attester_source_binding')
++    executable = parent_executable_checked(context['parent'], request)
++    require(proc_identity(os.getpid()) == descriptor['identity']
++            and proc_identity(descriptor['reaper']['pid']) == descriptor['reaper']
++            and attester_snapshot(peer[0], context) == snapshot, 'route_attester_current_drift')
++    attester_remaining(deadline)
++    return {'schema': 'friday.a0.preexec-proof.v1', 'stage': stage,
++            'challenge': message['challenge'], 'context_sha256': message['context_sha256'],
++            'request_sha256': context['request_sha256'], 'nonce': request['nonce'],
++            'parent': context['parent'], 'snapshot': snapshot, 'executable': executable,
++            'attester': descriptor['identity'], 'checked_monotonic_ns': time.monotonic_ns()}
++
++
++def parent_attester_server(context, request, manager, ready, go, deadline):
++    """One adopted host helper, one client, two ordered checks; never a worker."""
++    listener = connection = None; socket_identity = None
++    def expired(*_): raise TimeoutError('route_attester_deadline')
++    signal.signal(signal.SIGALRM, expired)
++    signal.setitimer(signal.ITIMER_REAL, attester_remaining(deadline))
++    try:
++        attester_poll(go, deadline); require(os.read(go, 1) == b'G', 'route_attester_parent_missing')
++        os.close(go); go = -1
++        me = proc_identity(os.getpid())
++        require(me['ppid'] == manager['pid'] and proc_identity(manager['pid']) == manager
++                and me['cgroup'] == context['parent']['cgroup'], 'route_attester_not_adopted')
++        with namespaces(os.getpid()) as (ns, _):
++            require(ns == context['host_namespaces'], 'route_attester_not_host')
++        attester_state(context, UID)
++        path = STATE / ATTESTER_SOCKET
++        require(not path.exists() and not path.is_symlink() and len(os.fsencode(path)) < 108, 'route_attester_prior_socket')
++        listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
++        listener.bind(str(path)); os.chmod(path, 0o600)
++        socket_identity = attester_socket_identity(context, UID)
++        listener.listen(1)
++        descriptor = {'schema': 'friday.a0.preexec-attester.v1', 'identity': me, 'reaper': manager,
++                      'socket_identity': socket_identity, 'deadline_monotonic_ns': deadline}
++        context = dict(context, attester=descriptor)
++        data = canonical(descriptor).encode()
++        require(len(data) <= 4096 and os.write(ready, data) == len(data), 'route_attester_ready_write')
++        os.close(ready); ready = -1
++        listener.settimeout(attester_remaining(deadline)); connection, _ = listener.accept()
++        peer = attester_peer(connection)
++        require(peer[1:] == (UID, UID), 'route_attester_peer_uid')
++        # No pathname survives authentication. The connected kernel endpoint is
++        # the sole channel and later clients cannot consume the second stage.
++        attester_snapshot(peer[0], context)
++        attester_unlink(context, socket_identity); socket_identity = None
++        listener.close(); listener = None
++        challenges = set()
++        for stage in ('before_policy', 'after_policy'):
++            message = attester_packet(connection, deadline)
++            proof = attester_reply(context, request, descriptor, message, peer, stage)
++            require(proof['challenge'] not in challenges, 'route_attester_replayed_challenge')
++            challenges.add(proof['challenge'])
++            attester_packet(connection, deadline, proof)
++    finally:
++        if connection is not None: connection.close()
++        if listener is not None: listener.close()
++        if socket_identity is not None: attester_unlink(context, socket_identity)
++        if ready >= 0: os.close(ready)
++        if go >= 0: os.close(go)
++        signal.setitimer(signal.ITIMER_REAL, 0)
++
++
++def attester_original_gone(identity):
++    """A pidfd exit notification alone still permits an unreaped zombie."""
++    try:
++        current = proc_identity(identity['pid'])
++    except FileNotFoundError:
++        try:
++            Path('/proc', str(identity['pid'])).lstat()
++        except FileNotFoundError:
++            return True
++        require(False, 'route_attester_reap_unconfirmed')
++    require(current['boot'] == identity['boot'], 'route_attester_reap_unconfirmed')
++    return current['start'] != identity['start']
++
++
++def attester_wait_gone(pidfd, identity, deadline):
++    """Require exit and disappearance of this exact original process."""
++    poll = select.poll(); poll.register(pidfd, select.POLLIN | select.POLLHUP)
++    events = poll.poll(max(1, int(attester_remaining(deadline) * 1000)))
++    require(any(fd == pidfd and flags & (select.POLLIN | select.POLLHUP)
++                and not flags & (select.POLLERR | select.POLLNVAL)
++                for fd, flags in events), 'route_attester_exit_unconfirmed')
++    if attester_original_gone(identity):
++        attester_remaining(deadline)
++        return
++    # Ignore level-triggered exit readability while the manager still owns a
++    # zombie. A reaped pidfd delivers HUP; /proc independently confirms it.
++    poll.modify(pidfd, 0)
++    events = poll.poll(max(1, int(attester_remaining(deadline) * 1000)))
++    require(any(fd == pidfd and flags & select.POLLHUP
++                and not flags & (select.POLLERR | select.POLLNVAL)
++                for fd, flags in events), 'route_attester_reap_unconfirmed')
++    require(attester_original_gone(identity), 'route_attester_reap_unconfirmed')
++    attester_remaining(deadline)
++
++
++def attester_reap_child(pid, deadline, pidfd=None):
++    """Exact-child wait even if pidfd allocation failed; never wait unbounded."""
++    pause = select.poll()
++    while True:
++        waited, status = os.waitpid(pid, os.WNOHANG)
++        if waited == pid:
++            return status
++        require(waited == 0, 'route_attester_reap_unconfirmed')
++        attester_remaining(deadline)
++        if pidfd is not None:
++            attester_poll(pidfd, deadline)
++        else:
++            pause.poll(max(1, min(10, int(attester_remaining(deadline) * 1000))))
++
++
++def start_parent_attester(context, request, manager):
++    deadline = min(time.monotonic_ns() + 20*10**9,
++                   request['accepted_monotonic_ns'] + (request['original_budget_seconds'] - 25)*10**9)
++    attester_remaining(deadline)
++    ready_r = ready_w = go_r = go_w = middle_fd = -1
++    middle = None; middle_reaped = False
++    try:
++        ready_r, ready_w = os.pipe2(os.O_CLOEXEC)
++        go_r, go_w = os.pipe2(os.O_CLOEXEC)
++        middle = os.fork()
++        if middle == 0:
++            try:
++                os.close(ready_r); os.close(go_w)
++                helper = os.fork()
++                if helper != 0: os._exit(0)
++                # Only the two private pipes and standard I/O survive here.
++                for fd in list(map(int, os.listdir('/proc/self/fd'))):
++                    if fd > 2 and fd not in (ready_w, go_r):
++                        try: os.close(fd)
++                        except OSError: pass
++                try:
++                    parent_attester_server(context, request, manager, ready_w, go_r, deadline)
++                except BaseException:
++                    os._exit(1)
++                os._exit(0)
++            except BaseException:
++                os._exit(1)
++        os.close(ready_w); ready_w = -1
++        os.close(go_r); go_r = -1
++        middle_fd = os.pidfd_open(middle)
++        status = attester_reap_child(middle, deadline, middle_fd)
++        middle_reaped = True
++        require(os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, 'route_attester_fork_failed')
++        attester_remaining(deadline)
++        require(os.write(go_w, b'G') == 1, 'route_attester_go_failed')
++        os.close(go_w); go_w = -1
++        attester_poll(ready_r, deadline)
++        descriptor = exact_json(os.read(ready_r, 4096).decode())
++        checked_attester_descriptor(dict(context, attester=descriptor))
++        require(descriptor['deadline_monotonic_ns'] == deadline and descriptor['reaper'] == manager
++                and proc_identity(descriptor['identity']['pid']) == descriptor['identity']
++                and descriptor['identity']['ppid'] == manager['pid']
++                and attester_socket_identity(context, UID) == descriptor['socket_identity'], 'route_attester_ready_binding')
++        return descriptor
++    finally:
++        # Closing GO also releases a not-yet-ready helper on every failed start.
++        close_failed = False
++        for fd in (ready_r, ready_w, go_r, go_w):
++            if fd >= 0:
++                try: os.close(fd)
++                except OSError: close_failed = True
++        try:
++            if middle is not None and middle > 0 and not middle_reaped:
++                attester_reap_child(middle, deadline, middle_fd if middle_fd >= 0 else None)
++        finally:
++            if middle_fd >= 0:
++                try: os.close(middle_fd)
++                except OSError: close_failed = True
++        require(not close_failed, 'route_attester_fd_cleanup_unconfirmed')
++
++
++class ParentAttester:
++    def __init__(self, context, request):
++        self.context, self.request, self.sock, self.pidfd = context, request, None, None
++        self.proofs = []
++
++    def __enter__(self):
++        descriptor = checked_attester_descriptor(self.context); self.deadline = descriptor['deadline_monotonic_ns']
++        try:
++            require(proc_identity(descriptor['identity']['pid']) == descriptor['identity']
++                    and attester_socket_identity(self.context, 0) == descriptor['socket_identity'], 'route_attester_endpoint_changed')
++            self.pidfd = os.pidfd_open(descriptor['identity']['pid'])
++            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
++            self.sock.settimeout(attester_remaining(self.deadline)); self.sock.connect(str(STATE / ATTESTER_SOCKET))
++            require(attester_peer(self.sock) == (descriptor['identity']['pid'], 0, 0)
++                    and proc_identity(descriptor['identity']['pid']) == descriptor['identity'], 'route_attester_peer_changed')
++            return self
++        except BaseException:
++            self.close(); raise
++
++    def verify(self, parent, stage):
++        require(stage == ('before_policy', 'after_policy')[len(self.proofs)]
++                and parent == self.context['parent'], 'route_attester_stage_changed')
++        snapshot = attester_snapshot(os.getpid(), self.context)
++        message = {'schema': 'friday.a0.preexec-query.v1', 'stage': stage, 'challenge': os.urandom(16).hex(),
++                   'context_sha256': hashlib.sha256(canonical(self.context).encode()).hexdigest(), 'snapshot': snapshot}
++        attester_packet(self.sock, self.deadline, message)
++        proof = attester_packet(self.sock, self.deadline)
++        require(set(proof) == {'schema', 'stage', 'challenge', 'context_sha256', 'request_sha256', 'nonce',
++                              'parent', 'snapshot', 'executable', 'attester', 'checked_monotonic_ns'}
++                and proof['schema'] == 'friday.a0.preexec-proof.v1'
++                and all(proof[k] == message[k] for k in ('stage', 'challenge', 'context_sha256'))
++                and proof['request_sha256'] == self.context['request_sha256'] and proof['nonce'] == self.request['nonce']
++                and proof['parent'] == parent and proof['snapshot'] == snapshot
++                and proof['attester'] == self.context['attester']['identity']
++                and type(proof['executable']) is dict and set(proof['executable']) == {'path', 'sha256', 'file'}
++                and proof['executable']['path'] == str(tool_paths()['rootlesskit'])
++                and proof['executable']['sha256'] == self.request['tools']['rootlesskit']
++                and type(proof['executable']['file']) is list and len(proof['executable']['file']) == 2
++                and all(type(x) is int and x > 0 for x in proof['executable']['file'])
++                and type(proof['checked_monotonic_ns']) is int
++                and self.deadline - 20*10**9 < proof['checked_monotonic_ns'] <= time.monotonic_ns() < self.deadline
++                and proc_identity(parent['pid']) == parent
++                and attester_snapshot(os.getpid(), self.context) == snapshot, 'route_attester_proof_changed')
++        self.proofs.append(proof)
++        return True
++
++    def close(self):
++        if self.sock is not None: self.sock.close(); self.sock = None
++        if self.pidfd is not None: os.close(self.pidfd); self.pidfd = None
++
++    def __exit__(self, kind, value, traceback):
++        try:
++            if kind is None:
++                require(len(self.proofs) == 2, 'route_attester_incomplete')
++                attester_wait_gone(self.pidfd, self.context['attester']['identity'], self.deadline)
++                require(not (STATE / ATTESTER_SOCKET).exists() and not (STATE / ATTESTER_SOCKET).is_symlink(), 'route_attester_cleanup_missing')
++        finally:
++            self.close()
++
++
++def checked_attestation_receipt(receipt):
++    """Join retained evidence; live authority still comes from host rechecks."""
++    context, request = receipt['context'], receipt['request']
++    descriptor = checked_attester_descriptor(context); proofs = receipt['parent_attestations']
++    require(set(descriptor) == {'schema', 'identity', 'reaper', 'socket_identity', 'deadline_monotonic_ns'}
++            and descriptor['schema'] == 'friday.a0.preexec-attester.v1'
++            and descriptor['identity']['ppid'] == descriptor['reaper']['pid'] == context['parent']['ppid']
++            and descriptor['identity']['cgroup'] == context['parent']['cgroup']
++            and descriptor['identity']['boot'] == descriptor['reaper']['boot'] == context['parent']['boot']
++            and type(descriptor['deadline_monotonic_ns']) is int
++            and request['accepted_monotonic_ns'] < descriptor['deadline_monotonic_ns']
++            <= request['accepted_monotonic_ns'] + (request['original_budget_seconds'] - 25)*10**9
++            and type(proofs) is list and len(proofs) == 2, 'guard_attestation_shape')
++    challenges = set(); checked = 0
++    for stage, proof in zip(('before_policy', 'after_policy'), proofs):
++        require(set(proof) == {'schema', 'stage', 'challenge', 'context_sha256', 'request_sha256', 'nonce',
++                              'parent', 'snapshot', 'executable', 'attester', 'checked_monotonic_ns'}
++                and proof['schema'] == 'friday.a0.preexec-proof.v1' and proof['stage'] == stage
++                and type(proof['challenge']) is str and re.fullmatch('[0-9a-f]{32}', proof['challenge'])
++                and proof['challenge'] not in challenges
++                and proof['context_sha256'] == hashlib.sha256(canonical(context).encode()).hexdigest()
++                and proof['request_sha256'] == context['request_sha256'] and proof['nonce'] == request['nonce']
++                and proof['parent'] == context['parent'] and proof['attester'] == descriptor['identity']
++                and proof['snapshot'] == {'child': receipt['daemon'], 'namespaces': receipt['namespaces'], 'mappings': receipt['mappings']}
++                and set(proof['executable']) == {'path', 'sha256', 'file'}
++                and proof['executable']['path'] == str(tool_paths()['rootlesskit'])
++                and proof['executable']['sha256'] == request['tools']['rootlesskit']
++                and type(proof['executable']['file']) is list and len(proof['executable']['file']) == 2
++                and all(type(x) is int and x > 0 for x in proof['executable']['file'])
++                and type(proof['checked_monotonic_ns']) is int
++                and max(checked, descriptor['deadline_monotonic_ns'] - 20*10**9)
++                < proof['checked_monotonic_ns'] < descriptor['deadline_monotonic_ns'], 'guard_attestation_binding')
++        challenges.add(proof['challenge']); checked = proof['checked_monotonic_ns']
++    return True
++
++
++# Failure-only diagnostics. Missing flags mean NOT OBSERVED, never PASS.
++IDENTITY_STAGES = ('before_policy', 'after_policy')
++IDENTITY_CHECK_IDS = ('entry', 'parent_read', 'parent_match',
++                      'parent_executable_read', 'parent_executable_match',
++                      'child_read', 'child_match', 'lineage', 'uid_map', 'gid_map')
++IDENTITY_FLAG_IDS = ('uid_root', 'euid_root', 'context_parent_pid',
++                     'parent_pid', 'parent_start', 'parent_ppid', 'parent_cgroup',
++                     'parent_boot', 'parent_full', 'parent_service_cgroup',
++                     'parent_executable_observed', 'parent_executable_matches',
++                     'child_boot', 'child_cgroup', 'lineage_matches',
++                     'uid_map_matches', 'gid_map_matches')
++
++
++def child_identity(context, *, stage='before_policy', attester=None):
++    require(type(stage) is str and stage in IDENTITY_STAGES, 'route_identity_stage_changed')
++    checks = {}; check = 'entry'
++    try:
++        checks['uid_root'] = os.getuid() == 0
++        checks['euid_root'] = os.geteuid() == 0
++        checks['context_parent_pid'] = context['parent']['pid'] == context['parent_pid']
++        require(checks['uid_root'] and checks['euid_root'] and checks['context_parent_pid'], 'wrong_route_child_uid')
++        check = 'parent_read'
++        parent = proc_identity(context['parent_pid'])
++        check = 'parent_match'
++        for name in ('pid', 'start', 'ppid', 'cgroup', 'boot'):
++            checks['parent_' + name] = parent[name] == context['parent'][name]
++        checks['parent_full'] = parent == context['parent']
++        checks['parent_service_cgroup'] = parent['cgroup'] == '0::' + SERVICE_GROUP + '/dockerd'
++        require(checks['parent_full'] and checks['parent_service_cgroup'], 'route_parent_reused')
++        check = 'parent_executable_read'
++        checks['parent_executable_observed'] = False
++        # The mapped child cannot inspect a host executable. A kernel-authenticated
++        # host helper performs the same current executable check at both stages.
++        require(attester is not None and attester.verify(parent, stage), 'route_parent_attestation_unavailable')
++        checks['parent_executable_observed'] = True
++        check = 'parent_executable_match'
++        checks['parent_executable_matches'] = True
++        require(checks['parent_executable_matches'], 'route_parent_executable')
++        check = 'child_read'
++        current = proc_identity(os.getpid())
++        check = 'child_match'
++        checks['child_boot'] = current['boot'] == parent['boot']
++        checks['child_cgroup'] = current['cgroup'] == parent['cgroup']
++        require(checks['child_boot'] and checks['child_cgroup'], 'foreign_route_child_cgroup')
++        check = 'lineage'
++        ancestor = current
++        for _ in range(16):
++            if ancestor['pid'] == parent['pid']: break
++            ancestor = proc_identity(ancestor['ppid'])
++        checks['lineage_matches'] = ancestor == parent
++        require(checks['lineage_matches'], 'foreign_route_child_lineage')
++        mappings = {}
++        for kind in ('uid', 'gid'):
++            check = kind + '_map'
++            rows = [list(map(int, line.split())) for line in Path('/proc/self/' + kind + '_map').read_text().splitlines()]
++            checks[kind + '_map_matches'] = (len(rows) == 2 and rows[0] == [0, UID, 1]
++                    and rows[1][0] == 1 and rows[1][1] > UID and rows[1][2] >= 65536)
++            require(checks[kind + '_map_matches'], 'route_mapping_changed')
++            mappings[kind] = rows
++        return current, mappings
++    except Exception as exc:
++        # Retain only static IDs and booleans, no identity values or message.
++        exc._frw_identity_diagnostic = {'stage': stage, 'check': check, 'checks': checks}
++        raise
+@@ -545,22 +1009,23 @@
+-    current, mappings = child_identity(context)
+-    with namespaces(os.getpid()) as (ns, _):
+-        require(all(ns[k] != context['host_namespaces'][k] for k in ns), 'host_or_detached_route_namespace')
+-        interfaces = {x.split(':', 1)[0].strip() for x in Path('/proc/net/dev').read_text().splitlines()[2:]}
+-        require(interfaces == {'lo', 'tap0'} and not GUARD.exists(), 'route_interface_or_prior_state')
+-        existing = exact_json(native_call([str(NFT), '--json', 'list', 'ruleset']))
+-        require(set(existing) == {'nftables'} and all(set(x) == {'metainfo'} for x in existing['nftables']), 'conflicting_namespace_policy')
+-        native_call([str(NFT), '--check', '--file', '-'], data=policy(request.get('web'), request['endpoints']))
+-        native_call([str(NFT), '--file', '-'], data=policy(request.get('web'), request['endpoints']))
+-        checked_policy(native_call([str(NFT), '--json', '--numeric-priority', 'list', 'table', 'inet', 'frw_a0_local']), request.get('web'), request['endpoints'])
+-        require(child_identity(context) == (current, mappings), 'route_identity_changed_before_exec')
+-        require(request_checked(0) == request, 'route_source_changed_before_exec')
+-        receipt = {'schema': 'friday.a0.local-route-guard.v1', 'request': request,
+-                   'context': context, 'daemon': current, 'namespaces': ns, 'mappings': mappings,
+-                   'policy_sha256': policy_hash(request.get('web'), request['endpoints']), 'status': 'GUARDED_BEFORE_DOCKERD'}
+-        write_guard(receipt)
+-        fd = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+-        try:
+-            leaf = os.open('route-guard.json', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+-            try: require(exact_json(os.read(leaf, 1024*1024).decode()) == receipt, 'route_receipt_not_retained')
+-            finally: os.close(leaf)
+-        finally: os.close(fd)
++    with ParentAttester(context, request) as attester:
++        current, mappings = child_identity(context, stage='before_policy', attester=attester)
++        with namespaces(os.getpid()) as (ns, _):
++            require(all(ns[k] != context['host_namespaces'][k] for k in ns), 'host_or_detached_route_namespace')
++            interfaces = {x.split(':', 1)[0].strip() for x in Path('/proc/net/dev').read_text().splitlines()[2:]}
++            require(interfaces == {'lo', 'tap0'} and not GUARD.exists(), 'route_interface_or_prior_state')
++            existing = exact_json(native_call([str(NFT), '--json', 'list', 'ruleset']))
++            require(set(existing) == {'nftables'} and all(set(x) == {'metainfo'} for x in existing['nftables']), 'conflicting_namespace_policy')
++            native_call([str(NFT), '--check', '--file', '-'], data=policy(request.get('web'), request['endpoints']))
++            native_call([str(NFT), '--file', '-'], data=policy(request.get('web'), request['endpoints']))
++            checked_policy(native_call([str(NFT), '--json', '--numeric-priority', 'list', 'table', 'inet', 'frw_a0_local']), request.get('web'), request['endpoints'])
++            require(child_identity(context, stage='after_policy', attester=attester) == (current, mappings), 'route_identity_changed_before_exec')
++            require(request_checked(0) == request, 'route_source_changed_before_exec')
++            receipt = {'schema': 'friday.a0.local-route-guard.v1', 'request': request,
++                       'context': context, 'parent_attestations': attester.proofs, 'daemon': current, 'namespaces': ns, 'mappings': mappings,
++                       'policy_sha256': policy_hash(request.get('web'), request['endpoints']), 'status': 'GUARDED_BEFORE_DOCKERD'}
++            write_guard(receipt)
++            fd = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++            try:
++                leaf = os.open('route-guard.json', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
++                try: require(exact_json(os.read(leaf, 1024*1024).decode()) == receipt, 'route_receipt_not_retained')
++                finally: os.close(leaf)
++            finally: os.close(fd)
+@@ -595,0 +1061,2 @@
++    checked_attestation_receipt(receipt)
++    parent_executable_checked(parent, request)
+@@ -616,0 +1084 @@
++            parent_executable_checked(parent, request)
+@@ -793,2 +1261,13 @@
+-    return {'phase': phase, 'exception_class': kind, 'errno': number,
+-            'source': 'launch.py', 'line': line}
++    diagnostic = {'phase': phase, 'exception_class': kind, 'errno': number,
++                  'source': 'launch.py', 'line': line}
++    identity = vars(exc).get('_frw_identity_diagnostic')
++    if (type(identity) is dict and len(identity) == 3
++            and all(type(k) is str and k in ('stage', 'check', 'checks') for k in identity)
++            and type(identity['stage']) is str and identity['stage'] in IDENTITY_STAGES
++            and type(identity['check']) is str and identity['check'] in IDENTITY_CHECK_IDS
++            and type(identity['checks']) is dict and len(identity['checks']) <= len(IDENTITY_FLAG_IDS)
++            and all(type(k) is str and k in IDENTITY_FLAG_IDS and type(v) is bool
++                    for k, v in identity['checks'].items())):
++        diagnostic['identity'] = {'stage': identity['stage'], 'check': identity['check'],
++                                  'checks': dict(identity['checks'])}
++    return diagnostic
+--- a/scripts/a0_runtime.py
++++ b/scripts/a0_runtime.py
+@@ -842 +842 @@
+-        Runtime._command(['/usr/bin/systemctl','--user','start',DAEMON],min(5,budget()))
++        Runtime._command(['/usr/bin/systemctl','--user','start',DAEMON],min(limits['start_seconds']+5,budget()))
