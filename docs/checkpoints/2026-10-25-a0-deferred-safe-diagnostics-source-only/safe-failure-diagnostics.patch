@@ -1,0 +1,221 @@
+--- a/scripts/rootless_docker_launch.py
++++ b/scripts/rootless_docker_launch.py
+@@ -490,7 +490,8 @@
+         require(me['ppid'] == manager['pid'], 'route_attester_reaper_unavailable')
+         context = {'parent': me, 'host_namespaces': ns, **unit,
+                    'state_identity': [STATE.stat().st_dev, STATE.stat().st_ino],
+-                   'request_sha256': hashlib.sha256(stable_bytes(REQUEST, UID)).hexdigest()}
++                   'request_sha256': hashlib.sha256(stable_bytes(REQUEST, UID)).hexdigest(),
++                   'attester_failure_diagnostics': ATTESTER_FAILURE_SCHEMA}
+     context['attester'] = start_parent_attester(context, request, manager)
+     env.update({'DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS': 'false',
+                 'DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK': 'true',
+@@ -521,6 +522,80 @@
+     data, ancillary, flags, _ = sock.recvmsg(ATTESTER_PACKET_LIMIT)
+     require(data and not ancillary and flags == 0, 'route_attester_packet_shape')
+     return exact_json(data.decode())
++
++
++
++ATTESTER_FAILURE_SCHEMA = 'friday.a0.preexec-failure.v1'
++ATTESTER_FAILURE_PHASES = ('parent_wait', 'host_identity', 'endpoint', 'ready',
++                           'accept', 'peer', 'receive', 'verify', 'challenge', 'send')
++ATTESTER_FAILURE_CLASSES = (RuntimeError, TimeoutError, OSError, ValueError,
++                            TypeError, KeyError, PermissionError, FileNotFoundError)
++
++
++def attester_failure_record(context, stage, phase, exc):
++    """Fixed labels and validated digests only; cleanup has not been observed."""
++    request_digest = context.get('request_sha256')
++    require(type(request_digest) is str and re.fullmatch('[0-9a-f]{64}', request_digest),
++            'route_attester_failure_request')
++    digest = hashlib.sha256(canonical(context).encode()).hexdigest()
++    return {'schema': ATTESTER_FAILURE_SCHEMA, 'request_sha256': request_digest,
++            'context_sha256': digest,
++            'stage': stage if type(stage) is str and stage in ('startup', 'before_policy', 'after_policy') else 'UNKNOWN',
++            'phase': phase if type(phase) is str and phase in ATTESTER_FAILURE_PHASES else 'UNKNOWN',
++            'exception_class': type(exc).__name__ if any(type(exc) is kind for kind in ATTESTER_FAILURE_CLASSES) else 'UNKNOWN',
++            'cleanup': 'UNKNOWN'}
++
++
++def attester_failure_checked(value, context, stage):
++    require(type(context.get('attester_failure_diagnostics')) is str
++            and context['attester_failure_diagnostics'] == ATTESTER_FAILURE_SCHEMA
++            and type(value) is dict and all(type(k) is str for k in value)
++            and all(type(v) is str for v in value.values())
++            and type(stage) is str and stage in ('startup', 'before_policy', 'after_policy')
++            and set(value) == {'schema', 'request_sha256', 'context_sha256',
++                'stage', 'phase', 'exception_class', 'cleanup'}
++            and value['schema'] == ATTESTER_FAILURE_SCHEMA
++            and type(value['request_sha256']) is str and re.fullmatch('[0-9a-f]{64}', value['request_sha256'])
++            and value['request_sha256'] == context['request_sha256']
++            and value['context_sha256'] == hashlib.sha256(canonical(context).encode()).hexdigest()
++            and value['stage'] == stage
++            and value['phase'] in (*ATTESTER_FAILURE_PHASES, 'UNKNOWN')
++            and value['exception_class'] in (*[x.__name__ for x in ATTESTER_FAILURE_CLASSES], 'UNKNOWN')
++            and value['cleanup'] == 'UNKNOWN', 'route_attester_failure_shape')
++    return dict(value)
++
++
++def attester_failure_raise(value, context, stage):
++    diagnostic = attester_failure_checked(value, context, stage)
++    exc = RuntimeError('route_attester_failed')
++    exc._frw_attester_diagnostic = diagnostic
++    raise exc
++
++
++def attester_failure_transport(exc, context, stage, reason):
++    diagnostic = attester_failure_record(context, stage, 'UNKNOWN', Exception())
++    diagnostic['transport'] = reason
++    exc._frw_attester_diagnostic = diagnostic
++
++
++def attester_failure_send(context, stage, phase, exc, deadline, ready, connection):
++    """One nonblocking best-effort write, under the original deadline."""
++    try:
++        if (type(context.get('attester_failure_diagnostics')) is not str
++                or context['attester_failure_diagnostics'] != ATTESTER_FAILURE_SCHEMA):
++            return
++        attester_remaining(deadline)
++        data = canonical(attester_failure_record(context, stage, phase, exc)).encode()
++        require(len(data) <= 1024, 'route_attester_failure_size')
++        attester_remaining(deadline)
++        if ready >= 0:
++            os.set_blocking(ready, False)
++            os.write(ready, data)
++        elif connection is not None:
++            connection.setblocking(False)
++            connection.send(data, socket.MSG_DONTWAIT | socket.MSG_NOSIGNAL)
++    except BaseException:
++        pass  # Reporting never replaces the failure or its original cleanup.
+ 
+ 
+ def attester_peer(sock):
+@@ -655,17 +730,20 @@
+ def parent_attester_server(context, request, manager, ready, go, deadline):
+     """One adopted host helper, one client, two ordered checks; never a worker."""
+     listener = connection = None; socket_identity = None
++    initial_context = context; phase = 'parent_wait'; stage = 'startup'; message = None; authenticated = False
+     def expired(*_): raise TimeoutError('route_attester_deadline')
+     signal.signal(signal.SIGALRM, expired)
+     signal.setitimer(signal.ITIMER_REAL, attester_remaining(deadline))
+     try:
+         attester_poll(go, deadline); require(os.read(go, 1) == b'G', 'route_attester_parent_missing')
+         os.close(go); go = -1
++        phase = 'host_identity'
+         me = proc_identity(os.getpid())
+         require(me['ppid'] == manager['pid'] and proc_identity(manager['pid']) == manager
+                 and me['cgroup'] == context['parent']['cgroup'], 'route_attester_not_adopted')
+         with namespaces(os.getpid()) as (ns, _):
+             require(ns == context['host_namespaces'], 'route_attester_not_host')
++        phase = 'endpoint'
+         attester_state(context, UID)
+         path = STATE / ATTESTER_SOCKET
+         require(not path.exists() and not path.is_symlink() and len(os.fsencode(path)) < 108, 'route_attester_prior_socket')
+@@ -676,24 +754,36 @@
+         descriptor = {'schema': 'friday.a0.preexec-attester.v1', 'identity': me, 'reaper': manager,
+                       'socket_identity': socket_identity, 'deadline_monotonic_ns': deadline}
+         context = dict(context, attester=descriptor)
++        phase = 'ready'
+         data = canonical(descriptor).encode()
+         require(len(data) <= 4096 and os.write(ready, data) == len(data), 'route_attester_ready_write')
+         os.close(ready); ready = -1
++        phase = 'accept'
+         listener.settimeout(attester_remaining(deadline)); connection, _ = listener.accept()
++        phase = 'peer'
+         peer = attester_peer(connection)
+         require(peer[1:] == (UID, UID), 'route_attester_peer_uid')
+         # No pathname survives authentication. The connected kernel endpoint is
+         # the sole channel and later clients cannot consume the second stage.
+         attester_snapshot(peer[0], context)
++        authenticated = True
+         attester_unlink(context, socket_identity); socket_identity = None
+         listener.close(); listener = None
+         challenges = set()
+         for stage in ('before_policy', 'after_policy'):
++            message = None; phase = 'receive'
+             message = attester_packet(connection, deadline)
++            phase = 'verify'
+             proof = attester_reply(context, request, descriptor, message, peer, stage)
++            phase = 'challenge'
+             require(proof['challenge'] not in challenges, 'route_attester_replayed_challenge')
+             challenges.add(proof['challenge'])
++            phase = 'send'
+             attester_packet(connection, deadline, proof)
++    except BaseException as exc:
++        attester_failure_send(initial_context if ready >= 0 else context, stage, phase, exc, deadline,
++                              ready, connection if authenticated else None)
++        raise
+     finally:
+         if connection is not None: connection.close()
+         if listener is not None: listener.close()
+@@ -789,8 +879,21 @@
+         attester_remaining(deadline)
+         require(os.write(go_w, b'G') == 1, 'route_attester_go_failed')
+         os.close(go_w); go_w = -1
+-        attester_poll(ready_r, deadline)
+-        descriptor = exact_json(os.read(ready_r, 4096).decode())
++        try:
++            attester_poll(ready_r, deadline)
++        except Exception as exc:
++            attester_failure_transport(exc, context, 'startup', 'UNKNOWN')
++            raise
++        try:
++            data = os.read(ready_r, 4096)
++            require(data, 'route_attester_ready_eof')
++            descriptor = exact_json(data.decode())
++            if type(descriptor) is dict and descriptor.get('schema') == ATTESTER_FAILURE_SCHEMA:
++                attester_failure_raise(descriptor, context, 'startup')
++        except Exception as exc:
++            if '_frw_attester_diagnostic' not in vars(exc):
++                attester_failure_transport(exc, context, 'startup', 'UNKNOWN')
++            raise
+         checked_attester_descriptor(dict(context, attester=descriptor))
+         require(descriptor['deadline_monotonic_ns'] == deadline and descriptor['reaper'] == manager
+                 and proc_identity(descriptor['identity']['pid']) == descriptor['identity']
+@@ -839,8 +942,15 @@
+         snapshot = attester_snapshot(os.getpid(), self.context)
+         message = {'schema': 'friday.a0.preexec-query.v1', 'stage': stage, 'challenge': os.urandom(16).hex(),
+                    'context_sha256': hashlib.sha256(canonical(self.context).encode()).hexdigest(), 'snapshot': snapshot}
+-        attester_packet(self.sock, self.deadline, message)
+-        proof = attester_packet(self.sock, self.deadline)
++        try:
++            attester_packet(self.sock, self.deadline, message)
++            proof = attester_packet(self.sock, self.deadline)
++            if type(proof) is dict and proof.get('schema') == ATTESTER_FAILURE_SCHEMA:
++                attester_failure_raise(proof, self.context, stage)
++        except Exception as exc:
++            if '_frw_attester_diagnostic' not in vars(exc):
++                attester_failure_transport(exc, self.context, stage, 'UNKNOWN')
++            raise
+         require(set(proof) == {'schema', 'stage', 'challenge', 'context_sha256', 'request_sha256', 'nonce',
+                               'parent', 'snapshot', 'executable', 'attester', 'checked_monotonic_ns'}
+                 and proof['schema'] == 'friday.a0.preexec-proof.v1'
+@@ -1270,6 +1380,27 @@
+                     for k, v in identity['checks'].items())):
+         diagnostic['identity'] = {'stage': identity['stage'], 'check': identity['check'],
+                                   'checks': dict(identity['checks'])}
++    attester = vars(exc).get('_frw_attester_diagnostic')
++    if type(attester) is dict:
++        try:
++            # Revalidate static labels and shapes without logging arbitrary attached data.
++            require(all(type(k) is str for k in attester)
++                    and all(type(v) is str for v in attester.values())
++                    and set(attester) in ({'schema', 'request_sha256', 'context_sha256', 'stage',
++                       'phase', 'exception_class', 'cleanup'},
++                      {'schema', 'request_sha256', 'context_sha256', 'stage',
++                       'phase', 'exception_class', 'cleanup', 'transport'})
++                    and attester['schema'] == ATTESTER_FAILURE_SCHEMA
++                    and attester['stage'] in ('startup', 'before_policy', 'after_policy')
++                    and all(type(attester[k]) is str and re.fullmatch('[0-9a-f]{64}', attester[k])
++                            for k in ('request_sha256', 'context_sha256'))
++                    and attester['phase'] in (*ATTESTER_FAILURE_PHASES, 'UNKNOWN')
++                    and attester['exception_class'] in (*[x.__name__ for x in ATTESTER_FAILURE_CLASSES], 'UNKNOWN')
++                    and attester['cleanup'] == 'UNKNOWN'
++                    and attester.get('transport', 'UNKNOWN') == 'UNKNOWN', 'route_attester_diagnostic_shape')
++            diagnostic['attester'] = dict(attester)
++        except Exception:
++            pass
+     return diagnostic
+ 
+ 
