@@ -1,6 +1,6 @@
 # A0 executable compatibility repair — reviewed source
 
-The installed version remains native 121 / 17717 native files / project 318 / plugin 47. Gateway and Dashboard retain their permanent owners. The launcher/runtime repair in this checkpoint is not installed, and neither pending Telegram worker task has been sent.
+The canonical source repair is installed and accepted on native 121 / 17717 native files / project 318 / plugin 47. The external launcher and registered runtime source mirrors still require their separate service-source publication. Gateway and Dashboard are stopped for that coherent maintenance; neither pending Telegram worker task has been sent. Runtime and user acceptance remain open.
 
 An isolated kernel run of the reviewed implementation completed both executable checks, in their original order before and after policy setup. The mapped child still received permission error 13 when directly reading its parent's executable. A finite host helper verified the executable and process bindings through authenticated local IPC instead. That helper exited successfully and was actually reaped; its socket, processes and temporary files were removed. The measured run took 0.667 seconds.
 
@@ -10,4 +10,6 @@ The implementation retains both executable checks and current identity, path, ow
 
 The patch and manifest publish the implementation pair with exact before/after hashes. Deployment-specific declaration, current receipt, private history consumer and prepared-data bindings are separate. A temporary two-file application check reproduced the accepted hashes and was removed immediately. The earlier line-attribution correction is retained in the preceding runtime checkpoint.
 
-The next boundary is the existing bounded source-maintenance path: publish the changed files and dependent bindings, check the installed version in fresh processes, and return Gateway and Dashboard to permanent operation. Existing native installation, completed preparation, current policy and retired failed attempts are preserved. Ordinary qualification and real DSH/A0 file tasks with same-chat continuation remain required. No product readiness is claimed.
+The successful source updater took 174.377 seconds. Fresh installed verification took 166.448 seconds including process reaping. These are separate intervals; preparation, runtime publication and future user response time are not included or added as nested work. Earlier checker rejections remain recorded. Their corrections preserve the exact retired native failure and 25 previously archived files, while rechecking current file identities, modes, hashes and mutable state. The committed source installation was not repeated.
+
+The next boundary is the existing service-source publication and current preparation derivative, followed by restoration of permanent Gateway and Dashboard management. Completed preparation, current policy and retired failed attempts are preserved. Ordinary qualification and real DSH/A0 file tasks with same-chat continuation remain required. No product readiness is claimed.
