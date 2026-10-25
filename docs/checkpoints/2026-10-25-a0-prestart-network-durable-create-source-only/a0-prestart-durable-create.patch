@@ -1,0 +1,188 @@
+--- a/scripts/a0_runtime.py
++++ b/scripts/a0_runtime.py
+@@ -1135,11 +1135,13 @@
+                    '--workdir=/a0', '--entrypoint=/bin/bash', p['image'], '-ceu', startup_script(p)]
+ 
+ 
+-def container_checked(p, obj, cid=None, *, stop_owned=False):
++def container_checked(p, obj, cid=None, *, stop_owned=False, pre_start=False):
+     """Validate exact owner/ID/exposure; resource drift cannot block owned stop.
+ 
+     Launch/observation still require exact resource limits. Only the checked
+     same container stop path may omit mutable resource admission limits.
++    The explicit post-create phase permits Docker 29 pending network IDs only
++    after proving that the exact object has never entered a running lifecycle.
+     """
+     require(isinstance(obj, dict) and re.fullmatch(r'[0-9a-f]{64}', obj.get('Id', '')),
+             'invalid_container_id')
+@@ -1154,6 +1156,20 @@
+     require(type(state.get('Running')) is bool and type(state.get('Pid')) is int
+             and state['Pid'] >= 0 and (state['Running'] or state['Pid'] == 0),
+             'inconsistent_container_state')
++    require(type(pre_start) is bool and not (pre_start and stop_owned), 'invalid_container_phase')
++    if pre_start:
++        # This boundary consumes Docker inspect, whose explicit created Status
++        # joins zero timestamps and inactive flags. The engine's persisted
++        # config-state alone is not sufficient evidence of this phase.
++        require(state['Running'] is False and state['Pid'] == 0
++                and state.get('Status') == 'created'
++                and all(state.get(k) is False for k in ('Paused', 'Restarting', 'OOMKilled', 'Dead'))
++                and type(state.get('ExitCode')) is int and state['ExitCode'] == 0
++                and state.get('StartedAt') == '0001-01-01T00:00:00Z'
++                and state.get('FinishedAt') == '0001-01-01T00:00:00Z'
++                and state.get('Error', '') == ''
++                and type(obj.get('RestartCount', 0)) is int and obj.get('RestartCount', 0) == 0,
++                'container_not_never_started')
+     require(h.get('NetworkMode') == ('none' if p['network'] == 'none' else p['network']['id']) and not h.get('Privileged')
+             and not h.get('PortBindings') and not h.get('PublishAllPorts')
+             and not h.get('Binds') and not h.get('Devices') and not h.get('DeviceRequests')
+@@ -1166,7 +1182,17 @@
+         networks = obj.get('NetworkSettings', {}).get('Networks')
+         value = p['network']
+         require(isinstance(networks, dict) and set(networks) == {value['name']}
+-                and networks[value['name']].get('NetworkID') == value['id'], 'container_network_changed')
++                and isinstance(networks[value['name']], dict), 'container_network_changed')
++        network = networks[value['name']]
++        pending = (pre_start and network.get('NetworkID') == '' and network.get('EndpointID') == ''
++                   and all(not network.get(k) for k in ('Gateway', 'IPAddress', 'IPv6Gateway',
++                                                        'GlobalIPv6Address', 'MacAddress', 'DesiredMacAddress',
++                                                        'IPPrefixLen', 'GlobalIPv6PrefixLen', 'GwPriority',
++                                                        'IPAMOperational', 'IPAMConfig', 'DriverOpts', 'Links')))
++        allocated = (network.get('NetworkID') == value['id']
++                     and isinstance(network.get('EndpointID'), str)
++                     and re.fullmatch(r'[0-9a-f]{64}', network['EndpointID']) is not None)
++        require(allocated or pending, 'container_network_changed')
+         # No injected proxy, DNS override or implicit cloud transport.
+         env = obj['Config'].get('Env')
+         require(isinstance(env, list) and all(isinstance(x, str) for x in env)
+@@ -1311,8 +1337,29 @@
+             r = json.loads(private(self.receipt_path).read_text())
+         require(r.get('plan_sha256') == digest(self.p), 'receipt_plan_changed')
+         require(re.fullmatch(r'[0-9a-f]{64}', r.get('container_id', '')), 'receipt_container_unknown')
++        require('native_start_attempted' not in r or type(r['native_start_attempted']) is bool,
++                'receipt_start_outcome_unknown')
+         self.known = r
+         return r
++
++    def durable_receipt(self):
++        """Merge only an existing exact receipt; never manufacture custody."""
++        retained = self.receipt()
++        latest = json.loads(private(self.receipt_path).read_text())
++        require(isinstance(latest, dict)
++                and all(k in latest and latest[k] == retained[k]
++                        for k in ('plan_sha256', 'container_id', 'invocation_id'))
++                and latest.get('native_start_attempted') == retained.get('native_start_attempted')
++                and ('native_start_attempted' not in latest
++                     or type(latest['native_start_attempted']) is bool)
++                and isinstance(latest.get('observations'), list)
++                and isinstance(retained.get('observations'), list), 'native_receipt_owner_drift')
++        # A concurrent ordinary observer may have retained more descendants.
++        # Cached samples remain authoritative even when a later write failed.
++        for sample in latest['observations']:
++            if sample not in retained['observations']:
++                retained['observations'].append(sample)
++        return retained
+ 
+     def association(self, r):
+         a = {'supervisor': {'scope': 'user', 'unit': self.p['unit']},
+@@ -1321,10 +1368,10 @@
+             a['native'] = {'invocation_id': r['invocation_id'], 'worker_reference': r['container_id']}
+         return a
+ 
+-    def inspect(self, r, *, stop_owned=False, timeout=10):
++    def inspect(self, r, *, stop_owned=False, timeout=10, pre_start=False):
+         xs = json.loads(self.docker('inspect', r['container_id'], timeout=timeout))
+         require(isinstance(xs, list) and len(xs) == 1, 'container_observation_unknown')
+-        obj = container_checked(self.p, xs[0], r['container_id'], stop_owned=stop_owned)
++        obj = container_checked(self.p, xs[0], r['container_id'], stop_owned=stop_owned, pre_start=pre_start)
+         if not stop_owned:
+             self.check_network(container_id=r['container_id'])
+         return obj
+@@ -1462,12 +1509,18 @@
+                 cid = self.runner(create_argv(self.p), 10).strip()
+                 require(re.fullmatch(r'[0-9a-f]{64}', cid), 'create_outcome_unknown')
+                 self.known = {'plan_sha256': digest(self.p), 'container_id': cid,
+-                              'invocation_id': '', 'observations': []}
++                              'invocation_id': '', 'observations': [], 'native_start_attempted': False}
++                # Cache and fsync actual create identity before callbacks or
++                # inspection can fail. No callback can erase the native owner.
++                write_json(self.receipt_path, self.known)
+                 if on_created is not None:
+                     on_created(self.known)
+-                self.inspect(self.known)
+-                write_json(self.receipt_path, self.known)
+-                self.runner(self.unit_argv(cid, plan_path, plan_file_sha), 10)
++                self.inspect(self.known, pre_start=True)
++                argv = self.unit_argv(cid, plan_path, plan_file_sha)
++                submission = dict(self.known, native_start_attempted=True)
++                write_json(self.receipt_path, submission, replace=True)
++                self.known = submission
++                self.runner(argv, 10)
+                 obs = self.supervisor.observe(self.association(self.known))
+                 require(not obs.missing and obs.invocation_id, 'unit_submission_unknown')
+                 self.known['invocation_id'] = obs.invocation_id
+@@ -1630,18 +1683,34 @@
+         work_budget = self.budget; self.budget = None
+         try:
+             with self.locked():
+-                r = self.receipt(); obj = self.inspect(r,stop_owned=True)
++                r = self.durable_receipt(); obj = self.inspect(r,stop_owned=True)
+                 unit = self.supervisor.observe(self.association(r))
+                 require(obj['State']['Running'] is False and obj['State']['Pid'] == 0
+                         and unit.quiescent and (unit.missing or unit.invocation_id==r['invocation_id']),
+                         'initial_probe_not_stopped')
+                 stopped = json.loads(private(self.directory/'stop.json').read_text())
++                # A durable pre-submission receipt can prove that a created
++                # initial probe never ran. Absence alone grants no cleanup:
++                # legacy/unknown starts still require retained descendants.
++                state = obj['State']
++                never_started = (r.get('native_start_attempted') is False
++                        and r['invocation_id'] == '' and unit.missing and not r['observations']
++                        and state['Running'] is False and state['Pid'] == 0
++                        and state.get('Status') == 'created'
++                        and all(state.get(k) is False for k in ('Paused', 'Restarting', 'OOMKilled', 'Dead'))
++                        and type(state.get('ExitCode')) is int and state['ExitCode'] == 0
++                        and state.get('StartedAt') == '0001-01-01T00:00:00Z'
++                        and state.get('FinishedAt') == '0001-01-01T00:00:00Z'
++                        and state.get('Error', '') == ''
++                        and type(obj.get('RestartCount', 0)) is int and obj.get('RestartCount', 0) == 0)
++                observed_exit = (r.get('native_start_attempted') is not False
++                        and bool(r['observations'])
++                        and all(cessation(s)['confirmed'] for s in r['observations']))
+                 require(stopped.get('status')=='STOP_CONFIRMED'
+                         and stopped.get('current_sampling') != 'UNKNOWN'
+                         and stopped.get('container_id')==r['container_id']
+                         and stopped.get('native_container_stopped') is True
+-                        and r['observations'] and all(cessation(s)['confirmed'] for s in r['observations']),
+-                        'initial_probe_cessation_unconfirmed')
++                        and (never_started or observed_exit), 'initial_probe_cessation_unconfirmed')
+                 ack = self.docker('rm',r['container_id'],timeout=5).strip()
+                 require(ack==r['container_id'], 'initial_probe_retirement_unknown')
+                 result = {'status':'INITIAL_PROBE_RETIRED','container_id':r['container_id'],
+--- a/plugins/friday_rework/a0_bootstrap.py
++++ b/plugins/friday_rework/a0_bootstrap.py
+@@ -320,18 +320,16 @@
+                         # Other existing observers can add descendant samples.
+                         # Reconcile their exact receipt without losing the cached
+                         # stop identity if persistence itself is damaged.
+-                        disk = self.m.private(self.runtime.receipt_path)
+-                        latest = json.loads(disk.read_text())
+-                        if (latest['plan_sha256']!=known['plan_sha256']
+-                                or latest['container_id']!=known['container_id']
+-                                or latest['invocation_id']!=known['invocation_id']):
+-                            raise RuntimeError('native receipt owner drift')
+-                        for sample in latest['observations']:
+-                            if sample not in known['observations']:known['observations'].append(sample)
++                        self.runtime.durable_receipt()
+                     except BaseException as exc: errors.append(exc)
+                     for sample in self.samples:
+                         if sample not in known['observations']: known['observations'].append(sample)
+                     container = self.runtime.stop()
++                    # Stop itself may add descendants. Keep its exact custody
++                    # and samples even after an earlier callback write failed.
++                    self.created = copy.deepcopy(known)
++                    try: self.retain(created=known, samples=self.samples)
++                    except BaseException as exc: errors.append(exc)
+                     if (container['status'] != 'STOP_CONFIRMED' or self.pending_sample
+                             or self.sampling_uncertainty or container.get('current_sampling') == 'UNKNOWN'):
+                         raise RuntimeError('incomplete native sampling')
