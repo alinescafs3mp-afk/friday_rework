@@ -1,0 +1,11 @@
+# Bounded published receipt reader
+
+Source-only patch for `scripts/friday_worker_declarations.py`. It is not installed. The patch admits a published maintenance receipt with mode `0400` or `0600` only beneath the exact home anchored by the existing historical source constant. Grants and all other strict `0600` readers remain unchanged.
+
+The reader keeps the exact transaction path, owner, link count, no-follow directory walk, private directory barrier, descriptor and named-file identity, size, digest, strict JSON and checked-content fences. It changes one maintenance read call; it does not enable workers or grant authority.
+
+The accepted predecessor implementation has SHA-256 `886500a97c7ef470f7f28d51e04dd295191349956f14b78f70305d29934a90b1`. That implementation adds a machine-specific home literal and cannot be published verbatim under this packet's privacy boundary. This patch replaces only that literal expression with `_absolute(R399_SOURCE_SUCCESSOR['path']).parents[2]`, which selects the same exact home in the pinned baseline. It is an explicitly different source variant; its output hash is in `MANIFEST.json`. The existing constant remains part of the authenticated source and must not be rebound as caller input.
+
+The earlier independent source review is reused. The additional expression and publication boundary receive a separate limited review. No operational receiver, history walk, service, worker, model or Telegram execution is performed by this packet. Separately authenticated installation-specific maintenance has already been applied; this does not install the canonical patch. Worker qualification and user artifact acceptance remain pending at this checkpoint.
+
+For offline verification, use an exact baseline file whose SHA-256 matches the manifest, in a disposable directory containing `scripts/friday_worker_declarations.py`. Apply `patch --batch --fuzz=0 -p1 -i /path/to/receipt-reader-mode0400.patch`, verify the output SHA-256, then reverse with `patch --batch --fuzz=0 -R -p1 -i /path/to/receipt-reader-mode0400.patch` and verify the baseline hash. These commands are source checks, not installation instructions. Publication and any future installation belong to the existing integration workflow.
