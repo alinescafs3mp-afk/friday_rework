@@ -91,6 +91,20 @@ def require(ok, code):
         raise RuntimeErrorBoundary(code)
 
 
+def web_probe_failure_checked(data):
+    phases = {'probe', 'secret', 'source_pins', 'settings', 'supervisor',
+              'process_environment', 'http_config'}
+    classes = {'ModuleNotFoundError', 'ImportError', 'PermissionError', 'FileNotFoundError',
+               'TimeoutError', 'ConnectionError', 'AssertionError', 'ValueError', 'KeyError',
+               'TypeError', 'OSError', 'Exception'}
+    require(isinstance(data, dict) and set(data) == {'status', 'phase', 'error_class'}
+            and data['status'] == 'NATIVE_WEB_PROBE_REFUSED'
+            and type(data['phase']) is str and type(data['error_class']) is str
+            and data['phase'] in phases and data['error_class'] in classes,
+            'a0_native_web_probe_diagnostic_invalid')
+    return dict(data)
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
@@ -170,7 +184,13 @@ def web_module():
 
 
 def startup_script(p):
-    return web_module().START_SCRIPT if 'web' in p else START_SCRIPT
+    script = web_module().START_SCRIPT if 'web' in p else START_SCRIPT
+    if 'web' not in p:
+        return script
+    marker = '. /ins/copy_A0.sh; '
+    require(script.count(marker) == 1, 'web_startup_boundary_changed')
+    command = shlex.join(['python', '-B', '-c', web_module().install_script(p['web'])]) + ' || exit $?; '
+    return script.replace(marker, marker + command, 1)
 
 
 def metadata_descriptor(value):
@@ -1204,8 +1224,32 @@ class Runtime:
             r = json.loads(private(self.receipt_path).read_text())
         require(r.get('plan_sha256') == digest(self.p), 'receipt_plan_changed')
         require(re.fullmatch(r'[0-9a-f]{64}', r.get('container_id', '')), 'receipt_container_unknown')
+        if 'web_probe_failure' in r:
+            web_probe_failure_checked(r['web_probe_failure'])
         self.known = r
         return r
+
+    def durable_receipt(self):
+        """Merge only an existing exact receipt; never manufacture custody."""
+        retained = self.receipt()
+        latest = json.loads(private(self.receipt_path).read_text())
+        require(isinstance(latest, dict)
+                and all(k in latest and latest[k] == retained[k]
+                        for k in ('plan_sha256', 'container_id', 'invocation_id'))
+                and isinstance(latest.get('observations'), list)
+                and isinstance(retained.get('observations'), list), 'native_receipt_owner_drift')
+        # A concurrent ordinary observer may have retained more descendants.
+        # Cached samples remain authoritative even when a later write failed.
+        for sample in latest['observations']:
+            if sample not in retained['observations']:
+                retained['observations'].append(sample)
+        if 'web_probe_failure' in latest:
+            failure = web_probe_failure_checked(latest['web_probe_failure'])
+            require('web_probe_failure' not in retained or retained['web_probe_failure'] == failure,
+                    'native_receipt_web_probe_failure_changed')
+            retained['web_probe_failure'] = failure
+        return retained
+
 
     def association(self, r):
         a = {'supervisor': {'scope': 'user', 'unit': self.p['unit']},
@@ -1264,6 +1308,21 @@ class Runtime:
         script = 'import contextlib,io\nwith contextlib.redirect_stderr(io.StringIO()):\n' + '\n'.join(' '+line for line in script.splitlines())
         data = json.loads(self.docker('exec','--workdir=/usr/local/searxng/searxng-src',container_id,
             '/usr/local/searxng/searx-pyenv/bin/python','-B','-c',script,timeout=min(5,remaining(self.p))))
+        if isinstance(data, dict) and data.get('status') == 'NATIVE_WEB_PROBE_REFUSED':
+            data = web_probe_failure_checked(data)
+            # Reuse this owned native receipt: no new runtime artifact or
+            # inventory path. Categorical evidence must survive outer cleanup.
+            error = RuntimeErrorBoundary('a0_native_web_probe_' + data['phase'] + '_' + data['error_class'])
+            self.web_probe_failure = dict(data)
+            try:
+                with self.locked():
+                    r = self.durable_receipt()
+                    require(r['container_id'] == container_id, 'web_probe_receipt_owner_changed')
+                    r['web_probe_failure'] = dict(data)
+                    write_json(self.receipt_path, r, replace=True)
+            except BaseException:
+                error.add_note('web_probe_failure_receipt_unconfirmed')
+            raise error
         require(isinstance(data,dict) and set(data)=={'status','version','processes'}
                 and data['status']=='CURRENT_NATIVE_WEB_SERVICE_CHECKED' and data['version']==self.p['web']['version']
                 and isinstance(data['processes'],list) and len(data['processes'])==2
@@ -1386,7 +1445,7 @@ class Runtime:
         checked = None
         try:
             with self.locked():
-                r = self.receipt(); obj = self.inspect(r, stop_owned=True)
+                r = self.durable_receipt(); obj = self.inspect(r, stop_owned=True)
                 unit = self.supervisor.observe(self.association(r))
                 if not r.get('invocation_id') and unit.invocation_id:
                     r['invocation_id'] = unit.invocation_id

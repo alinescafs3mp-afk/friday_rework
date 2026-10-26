@@ -254,7 +254,7 @@ def test_a0_web_plan_binds_image_service_source_and_route_permission(tmp_path,mo
     n={'schema':'friday.a0.local-network.v1','owner':'astra:fixture#1','nonce':'c'*32,
        'name':'frw-a0-local-'+'c'*12,'id':'f'*64,'bridge':guard.BRIDGE,
        'labels':{'friday.rework.owner':'astra:fixture#1','friday.rework.route':'c'*32},
-       'endpoints':copy.deepcopy(guard.ENDPOINTS),'launcher_sha256':'d'*64,
+       'endpoints':copy.deepcopy(a0.LOCAL_ENDPOINTS),'launcher_sha256':'d'*64,
        'policy_sha256':guard.policy_hash(),'request_sha256':'e'*64,
        'guard_receipt_sha256':'a'*64,'invocation_id':'b'*32,
        'namespaces':{'user':[4,501],'mnt':[4,502],'net':[4,503]}}
@@ -262,7 +262,9 @@ def test_a0_web_plan_binds_image_service_source_and_route_permission(tmp_path,mo
     with patch.object(a0,'RUNTIME',tmp_path):
         now=time.time();p=a0.plan(now,now+1800,assignment='fixture',generation=1,owner_slot='astra',original_budget_seconds=1800,network=n,web=w)
         assert p['image']==w['image'] and p['web_source_sha256']==hashlib.sha256(a0.WEB_SOURCE.read_bytes()).hexdigest()
-        assert a0.create_argv(p)[-1]==a0.web_module().START_SCRIPT
+        command = a0.create_argv(p)[-1]
+        assert command == a0.startup_script(p)
+        assert command.index('. /ins/copy_A0.sh; ') < command.index('native_web_overlay_refused') < command.index('exec /usr/bin/supervisord')
         assert '/etc/searxng/settings.yml,readonly' in ' '.join(a0.create_argv(p))
         old=copy.deepcopy(p);old['web']['version']='stale'
         with pytest.raises(RuntimeError):a0.validate(old)
