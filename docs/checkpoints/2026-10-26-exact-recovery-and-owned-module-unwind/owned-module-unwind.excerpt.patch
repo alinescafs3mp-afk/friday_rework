@@ -1,0 +1,220 @@
+--- a/source/factory/root_private_loader.py
++++ b/source/factory/root_private_loader.py
+@@ -76,12 +76,83 @@
+         and project_files.get('plugins/friday_rework/runtime_process.py')==CANONICAL_RUNTIME_PROCESS_CONSUMER_SHA256,
+         'exact_ordinary_history_deadline_dependencies_required')
+ 
++
++_MANAGED_MODULE_ROOTS = ('scripts', 'tools', 'plugins', PACKAGE_NAME,
++    '_friday_install_validation_plugins', '_friday_install_validation')
++
++class _OwnedModuleUnwind:
++    """Opt-in, cold-namespace, exact identity CAS for one loader context.
++
++    No preexisting namespace is evicted. Authentication is supplied by the
++    existing held-FD reader; unrelated modules are never changed.
++    """
++    def __init__(self, authenticate):
++        self.authenticate = authenticate
++        self.original_modules = sys.modules
++        self.original_path_object = sys.path
++        self.original_path = list(sys.path)
++        self.original_bytecode = sys.dont_write_bytecode
++        self.expected_paths = [list(sys.path)]
++        self.observed = {}
++        need(not self.graph(), 'owned_unwind_requires_cold_namespaces')
++
++    @staticmethod
++    def graph():
++        return {name: module for name, module in tuple(sys.modules.items())
++            if any(name == root or name.startswith(root + '.')
++                for root in _MANAGED_MODULE_ROOTS)}
++
++    @staticmethod
++    def signature(module):
++        spec = getattr(module, '__spec__', None)
++        return (id(module), getattr(module, '__file__', None),
++            id(spec), getattr(spec, 'origin', None),
++            id(getattr(module, '__loader__', None)),
++            getattr(module, '__package__', None),
++            tuple(getattr(module, '__path__', ())),
++            tuple(getattr(spec, 'submodule_search_locations', ()) or ()))
++
++    def checkpoint(self):
++        need(sys.modules is self.original_modules and sys.path is self.original_path_object,
++            'owned_global_container_identity_changed')
++        graph = self.graph()
++        need(set(self.observed) <= set(graph), 'owned_module_removed_before_unwind')
++        for name, (module, signature) in self.observed.items():
++            need(graph[name] is module and self.signature(module) == signature,
++                'owned_module_identity_or_namespace_changed')
++        for name, module in graph.items():
++            self.authenticate(name, module)
++            self.observed.setdefault(name, (module, self.signature(module)))
++        # Existing packages must expose the exact module object for each child.
++        for name, module in graph.items():
++            parent, _, child = name.rpartition('.')
++            if parent in graph:
++                need(getattr(graph[parent], child, None) is module,
++                    'owned_parent_child_identity_changed')
++
++    def close(self):
++        self.checkpoint()
++        need(any(sys.path == expected for expected in self.expected_paths),
++            'owned_sys_path_CAS_changed')
++        need(sys.dont_write_bytecode is True, 'owned_bytecode_policy_changed')
++        graph = self.graph()
++        need(set(graph) == set(self.observed) and all(graph[name] is module
++            and self.signature(module) == signature
++            for name, (module, signature) in self.observed.items()),
++            'owned_module_final_CAS_changed')
++        # All checks precede any mutation. Every removed key was absent on entry.
++        for name in sorted(graph, key=lambda value: value.count('.'), reverse=True):
++            del sys.modules[name]
++        sys.path[:] = self.original_path
++        sys.dont_write_bytecode = self.original_bytecode
++
+ @contextlib.contextmanager
+-def load_consumer(reviewed_consumer_ref, *, package_refs, canonical_project, project_files, feature_binding=None, installed_verification=False, capture_binding=None, maintenance_receiver=None, maintenance_receipt=None, maintenance_registration=None, validator_source=None, source_preflight=False, installed_input=None):
++def load_consumer(reviewed_consumer_ref, *, package_refs, canonical_project, project_files, feature_binding=None, installed_verification=False, capture_binding=None, maintenance_receiver=None, maintenance_receipt=None, maintenance_registration=None, validator_source=None, source_preflight=False, installed_input=None, unwind_owned_modules=False):
+     """Normal private package, genuine canonical scripts, held source FD custody.
+ 
+     The caller is the existing Root native entry. This function cannot grant
+-    native admission and never patches api(), f.ROOT, argv or sys.modules.
++    native admission and never patches api(), f.ROOT or argv. Opt-in unwind
++    removes only authenticated modules absent at entry, after exact graph CAS.
+     """
+     # No operational/native access until the final reviewed source shape is bound.
+     need(type(CONSUMER_SHA256)is str and type(RECEIPT_SHA256)is str
+@@ -94,6 +165,8 @@
+         'final_reviewed_source_bindings_UNBOUND')
+     need(type(installed_verification)is bool,'explicit_verification_mode_required')
+     need(type(source_preflight)is bool,'explicit_source_preflight_required')
++    need(type(unwind_owned_modules)is bool and not (source_preflight and unwind_owned_modules),
++        'explicit_nonpreflight_owned_unwind_required')
+     maintenance = maintenance_receiver is not None or maintenance_receipt is not None
+     need(not source_preflight or maintenance,'source_preflight_maintenance_only')
+     if maintenance:
+@@ -245,9 +318,71 @@
+                     'validator_source':validator_source,'package_refs':package_refs,'installed_input':installed_input,'generation':(generation['name'] if validator_source is not None else None)},None,None,None,source_stable
+             finally:source_stable()
+             return
++        native=None
++        receipt=None
++        owned_read_cache={}
++        def owned_read(pin,mode=0o600):
++            key=(pin['path'],pin['sha256'],mode)
++            if key not in owned_read_cache:owned_read_cache[key]=read(pin,mode)
++            return owned_read_cache[key]
++        def authenticate_owned(name,module):
++            need(type(module) is type(sys), 'owned_real_module_required')
++            origin=getattr(getattr(module,'__spec__',None),'origin',None)
++            filename=getattr(module,'__file__',None)
++            roots={'scripts':(canonical/'scripts',),
++                '_friday_install_validation_plugins':(canonical/'plugins',),
++                '_friday_install_validation':(canonical/'tools',)}
++            if name in roots:
++                allowed=list(map(str,roots[name]))
++                if name=='scripts' and native is not None:
++                    allowed.append(str(native/'scripts'))
++                actual=list(getattr(module,'__path__',()))
++                need(filename is None and origin is None and actual
++                    and actual==allowed[:len(actual)], 'owned_namespace_origin_changed')
++                return
++            expected=None
++            if name==PACKAGE_NAME or name.startswith(PACKAGE_NAME+'.'):
++                relative=('__init__.py' if name==PACKAGE_NAME else
++                    name[len(PACKAGE_NAME)+1:].replace('.','/')+'.py')
++                pin=package_refs.get(relative)
++                need(pin is not None,'owned_private_module_not_pinned')
++                expected=pathlib.Path(pin['path'])
++                owned_read(pin)
++            else:
++                prefix=name.split('.')[0]
++                if prefix in ('_friday_install_validation_plugins','_friday_install_validation'):
++                    suffix=name[len(prefix)+1:].replace('.','/')
++                    subtree='plugins' if prefix.endswith('_plugins') else 'tools'
++                    relative=subtree+'/'+suffix+('/__init__.py' if hasattr(module,'__path__') else '.py')
++                    expected=canonical/relative
++                    need(relative in project_files,'owned_validator_module_not_pinned')
++                    owned_read({'path':str(expected),'sha256':project_files[relative]})
++                else:
++                    relative=name.replace('.','/')+('/__init__.py' if hasattr(module,'__path__') else '.py')
++                    if filename==str(canonical/relative) and relative in project_files:
++                        expected=canonical/relative
++                        owned_read({'path':str(expected),'sha256':project_files[relative]})
++                    else:
++                        need(native is not None and receipt is not None
++                            and relative in receipt['files'],'owned_native_module_not_pinned')
++                        row=receipt['files'][relative]
++                        need(row.get('mode')=='100644','owned_native_module_mode_required')
++                        expected=native/relative
++                        physical_mode=stat.S_IMODE(expected.lstat().st_mode)
++                        need(physical_mode in (0o644,0o664),'owned_native_physical_mode_refused')
++                        raw=owned_read({'path':str(expected),'sha256':row['sha256']},mode=physical_mode)
++                        need(len(raw)==row['bytes'],'owned_native_module_size_changed')
++            need(filename==str(expected) and origin==str(expected),
++                'owned_module_origin_changed')
++            if hasattr(module,'__path__'):
++                allowed=[str(expected.parent)]
++                if name in ('tools','plugins'):allowed.append(str(canonical/name))
++                need(list(module.__path__) in (allowed,allowed[:1]),'owned_package_path_changed')
++        unwind=_OwnedModuleUnwind(authenticate_owned) if unwind_owned_modules else None
+         sys.dont_write_bytecode=True
+         inserted=[str(canonical),str(root.parent)]
+         sys.path[:0]=inserted
++        if unwind is not None:unwind.expected_paths.append(inserted+unwind.original_path)
+         try:
+             scripts_spec=importlib.machinery.PathFinder.find_spec('scripts',sys.path)
+             private_spec=importlib.machinery.PathFinder.find_spec(PACKAGE_NAME,sys.path)
+@@ -282,6 +417,7 @@
+                     need(stat.S_ISDIR(info.st_mode) and info.st_uid==os.getuid()
+                         and not info.st_mode & 0o022,'native_source_directory_owner_mode_required')
+                     directories[path]=identity(info)
++            if unwind is not None:unwind.expected_paths.append([str(native)]+inserted+unwind.original_path)
+             f.native_packages(native)
+             ordinary=importlib.import_module('scripts.friday_ordinary_install')
+             shared=importlib.import_module('scripts.install_containment')
+@@ -304,6 +440,7 @@
+                 directories[path]=identity(info)
+             native_namespace_names={path:set(p.name for p in path.iterdir())for path in native_custody_directories}
+             def stable():
++                if unwind is not None:unwind.checkpoint()
+                 if selected_validator is not None:
+                     need(selected_validator.__file__==validator_source['path']
+                         and selected_validator.__spec__.origin==validator_source['path']
+@@ -369,10 +506,12 @@
+             finally:
+                 stable()
+         finally:
+-            # Existing native_packages may add its authenticated native path.
+-            # Remove only our own two search entries, preserving its additions.
+-            for entry in inserted:
+-                if entry in sys.path:sys.path.remove(entry)
++            if unwind is not None:
++                unwind.close()
++            else:
++                # Preserve historical default behavior for existing callers.
++                for entry in inserted:
++                    if entry in sys.path:sys.path.remove(entry)
+ 
+ def _target_binding_matches(b):
+     need(all(type(x)is dict for x in (BASE_INPUT,TARGET_INPUT,TARGET_FROZEN,TARGET_CONTRACT,COMPOSITION_BASE_INPUT))
+@@ -406,14 +545,15 @@
+     return all(b.get(k)==expected.get(k)for k in fixed)
+ 
+ @contextlib.contextmanager
+-def load_maintenance(receiver_ref, *, package_refs, canonical_project, project_files, installed_receipt, maintenance_registration=None, validator_source=None, source_preflight=False, installed_input=None):
++def load_maintenance(receiver_ref, *, package_refs, canonical_project, project_files, installed_receipt, maintenance_registration=None, validator_source=None, source_preflight=False, installed_input=None, unwind_owned_modules=False):
+     """Private receiver invocation only; never updater or feature authority."""
+     need(receiver_ref is not None and installed_receipt is not None,'maintenance_actual_UNBOUND')
+     with load_consumer(package_refs['friday_ordinary_install.py'],
+             package_refs=package_refs,canonical_project=canonical_project,
+             project_files=project_files,maintenance_receiver=receiver_ref,
+             maintenance_receipt=installed_receipt,maintenance_registration=maintenance_registration,
+-            validator_source=validator_source,source_preflight=source_preflight,installed_input=installed_input) as (ordinary,registration,f,Budget,stable):
++            validator_source=validator_source,source_preflight=source_preflight,installed_input=installed_input,
++            unwind_owned_modules=unwind_owned_modules) as (ordinary,registration,f,Budget,stable):
+         if source_preflight:
+             yield ordinary,None,stable
+             return
