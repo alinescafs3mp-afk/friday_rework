@@ -19,6 +19,8 @@ from .worker_declarations import (
     DeclarationError, _read_reference, _reference, _same, fingerprint,
     load_declaration_source, plan_declaration_delta, require, _at, _replace,
     TEMPLATE_INPUTS,
+    SERVICE_ANCHOR, WEB_PROBE_TARGET, WEB_PROBE_SERVICE_DISCRIMINATOR,
+    service_installation_delta, service_publication_sources,
     validate_declaration_source,
 )
 
@@ -118,6 +120,9 @@ def validate_installation_delta(previous, current, plan):
     also carries the matching policy/endpoints consumed by worker_install's
     real validator; these three leaves derive from the same typed declaration.
     """
+    if _service_publication_names(plan):
+        service_installation_delta(previous, current, plan)
+        return
     require(type(previous) is dict and type(current) is dict
         and type(previous.get('product')) is dict
         and type(current.get('product')) is dict,
@@ -148,8 +153,40 @@ def validate_installation_delta(previous, current, plan):
         'worker_declaration_runtime_must_remain_disabled')
 
 
+def _service_publication_names(plan):
+    """Select the sole reviewed source edge; an unknown discriminator refuses."""
+    if 'service_source_transition' not in plan:
+        return ()
+    require(plan['service_source_transition'] == WEB_PROBE_SERVICE_DISCRIMINATOR,
+        'worker_declaration_exact_public_web_service_transition_required')
+    return ('worker-runtime-source/plugins/friday_rework/adapters/a0_web.py',
+        'worker-runtime-source/scripts/a0_runtime.py')
+
+
+def _service_afterimages(authority, plan):
+    """Join pinned canonical donor bytes to the exact two existing mirrors."""
+    names = _service_publication_names(plan)
+    if not names:
+        return {}
+    donors = getattr(authority, 'service_after', None)
+    require(type(donors) is dict and set(donors) == set(names)
+        and all(name in authority.before for name in names),
+        'worker_declaration_service_donor_inventory_changed')
+    for name in names:
+        require(type(donors[name]) is dict and type(donors[name].get('data')) is bytes
+            and authority.before[name]['mode'] in (0o400, 0o600),
+            'worker_declaration_service_donor_state_changed')
+    before = {name: {'path': str(authority.home / name),
+        'sha256': hashlib.sha256(authority.before[name]['data']).hexdigest()}
+        for name in names}
+    after = {name: hashlib.sha256(donors[name]['data']).hexdigest() for name in names}
+    service_publication_sources(before, after, SERVICE_ANCHOR, WEB_PROBE_TARGET,
+        authority.home)
+    return donors
+
+
 def prepare_afterimages(authority, plan, stage):
-    """Build five private afterimages with real native serializers/resealers.
+    """Build exact afterimages with real native serializers/resealers.
 
     This helper grants no authority and publishes no live file. The owning
     apply entry retains StoppedOperator custody before and after invoking it.
@@ -169,6 +206,7 @@ def prepare_afterimages(authority, plan, stage):
     prefix = str(profile_home.relative_to(home)) + '/'
     root_cfg, own_cfg = plan['root_config'], plan['profile_config']
     validate_installation_delta(authority.previous, authority.current, plan)
+    service_after = _service_afterimages(authority, plan)
     templates = root_cfg['plugins']['entries']['friday_rework']['settings']['onboarding']['templates']
     for template in templates.values():
         validate_template(template)
@@ -186,6 +224,9 @@ def prepare_afterimages(authority, plan, stage):
     stage = Path(stage)
     f.directory(stage)
     require(not list(stage.iterdir()), 'worker_declaration_empty_stage_required')
+    for name, donor in service_after.items():
+        ordinary.private_parents(stage, name)
+        ordinary.write(stage / name, donor['data'], authority.before[name]['mode'])
     for name, cfg in (('config.yaml', root_cfg), (prefix + 'config.yaml', own_cfg)):
         ordinary.private_parents(stage, name)
         atomic_config_write(stage / name, cfg)
@@ -217,8 +258,11 @@ def prepare_afterimages(authority, plan, stage):
     profile_policy(stage, root_cfg)
     result = {name: ordinary.update_file_state(stage / name)
         for name in authority.before}
-    require(len(result) == 5 and all(state is not None and state['mode'] == 0o600
-        for state in result.values()), 'worker_declaration_exact_five_afterimages_required')
+    require(len(result) == 5 + len(service_after)
+        and all(state is not None and state['mode'] == (authority.before[name]['mode']
+            if name in service_after else 0o600) for name, state in result.items()),
+        'worker_declaration_exact_afterimages_required' if service_after
+            else 'worker_declaration_exact_five_afterimages_required')
     for directory in sorted((p for p in stage.rglob('*') if p.is_dir()),
             key=lambda p: len(p.parts), reverse=True):
         f.directory(directory)
@@ -337,7 +381,7 @@ def apply_declarations(request, *, request_path=None, request_sha256=None):
             # publication/rollback through a replaced parent path.
             with ordinary.SourceUpdateDirectories(authority.home, authority.before, []) as directories:
                 try:
-                    order = ['config.yaml', prefix + 'config.yaml',
+                    order = list(_service_publication_names(plan)) + ['config.yaml', prefix + 'config.yaml',
                         prefix + '.friday-onboarding.json', prefix + '.friday-user-scope.json', f.MARKER]
                     require(set(order) == set(authority.before),
                         'worker_declaration_publication_set_changed')

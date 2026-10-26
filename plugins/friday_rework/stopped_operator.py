@@ -20,7 +20,11 @@ import stat
 import sys
 import time
 
-from .worker_declarations import DeclarationError, _read_reference, _reference, _same
+from .worker_declarations import (
+    DeclarationError, _read_reference, _reference, _same, SERVICE_SCHEMA,
+    WEB_PROBE_TARGET, SERVICE_ANCHOR, WEB_PROBE_SERVICE_DISCRIMINATOR,
+    service_installation_delta, service_source_transition,
+)
 
 SCHEMA = 'friday.worker-declarations.apply.v1'
 CLOCK_SCHEMA = 'friday.worker-declarations.clock.v1'
@@ -70,8 +74,9 @@ class StoppedOperator:
     consumption is durable before the first native host claim, including a
     partial/uncertain claim.  A failed request has no retry entrypoint here.
     ``prove`` checks retained custody during publication without demanding the
-    old five beforeimages.  ``before_unchanged`` adds that comparison explicitly.
-    The owning writer alone stages, publishes and rolls back the five targets.
+    old beforeimages.  ``before_unchanged`` adds that comparison explicitly.
+    The owning writer alone stages, publishes and rolls back the declared set:
+    five native files, plus two mirrors for the exact service maintenance edge.
     """
     def __init__(self, request, budget, *, request_reference=None):
         self.request = copy.deepcopy(request)
@@ -362,6 +367,28 @@ class StoppedOperator:
         _require(state['mode'] == 0o600, 'worker_declaration_existing_native_state_required')
         self.external[self.access_path] = state
 
+    def _service_source_layout(self):
+        """Retain exact installed donors and the two existing mutable mirrors.
+
+        Only the worker copies enter publication custody. Canonical project
+        files remain immutable external pins throughout commit and rollback.
+        """
+        service_installation_delta(self.previous, self.current,
+            {'service_source_transition': WEB_PROBE_SERVICE_DISCRIMINATOR})
+        self.service_after = {}
+        changed = service_source_transition(SERVICE_ANCHOR, WEB_PROBE_TARGET)
+        for relative, digest in WEB_PROBE_TARGET.items():
+            path = self._pin({'path': str(self.f.ROOT / relative),
+                'sha256': digest}, private=False)
+            if relative not in changed:
+                continue
+            name = 'worker-runtime-source/' + relative
+            ref = self.request['before'].get(name)
+            _require(_reference(ref) == self.home / name
+                and ref['sha256'] == SERVICE_ANCHOR[relative],
+                'worker_declaration_service_before_reference_changed')
+            self.service_after[name] = self.external[path]
+
     def preflight(self):
         """Read-only native validation, before durable single-use consumption."""
         from scripts import friday_ordinary_install as ordinary
@@ -387,26 +414,38 @@ class StoppedOperator:
         self.access_path = self.home / 'plugin-data' / _plugin_data_namespace('friday_rework', '') / 'state.json'
         self._state_layout()
         self.clock = self._clock()
+        companion = request['declaration_source']
+        _require(type(companion) is dict and set(companion) == {'bundle', 'worker_inputs', 'identity'},
+            'worker_declaration_exact_source_companion_required')
+        for ref in companion.values():
+            self._pin(ref)
+        from .worker_declarations import load_declaration_source
+        self.declaration_bundle, self.worker_inputs, self.identity = load_declaration_source(companion)
+        self.service_source_transition = self.declaration_bundle.get('schema') == SERVICE_SCHEMA
         self.previous = self.f.read_json(self._pin(request['previous_input']))
         self.current = self.f.read_json(self._pin(request['current_input']))
-        _require(request['previous_input'] != request['current_input']
+        _require((self.service_source_transition or request['previous_input'] != request['current_input'])
             and self.previous.get('home') == self.current.get('home') == str(self.home)
             and type(self.previous.get('product')) is dict and type(self.current.get('product')) is dict
             and self.previous['product'].get('runtime') == self.current['product'].get('runtime') == {'enabled': False},
             'worker_declaration_exact_input_successor_required')
-        restored = copy.deepcopy(self.current)
-        for components in (('product', 'a0_deployment'), ('worker_install', 'a0', 'policy'),
-                ('worker_install', 'a0', 'network', 'policy'),
-                ('worker_install', 'a0', 'network', 'endpoints')):
-            old, new = self.previous, restored
-            for key in components[:-1]:
-                _require(type(old) is dict and type(new) is dict and key in old and key in new,
+        if self.service_source_transition:
+            service_installation_delta(self.previous, self.current,
+                {'service_source_transition': WEB_PROBE_SERVICE_DISCRIMINATOR})
+        else:
+            restored = copy.deepcopy(self.current)
+            for components in (('product', 'a0_deployment'), ('worker_install', 'a0', 'policy'),
+                    ('worker_install', 'a0', 'network', 'policy'),
+                    ('worker_install', 'a0', 'network', 'endpoints')):
+                old, new = self.previous, restored
+                for key in components[:-1]:
+                    _require(type(old) is dict and type(new) is dict and key in old and key in new,
+                        'worker_declaration_input_counterpart_required')
+                    old, new = old[key], new[key]
+                _require(type(old) is dict and type(new) is dict and components[-1] in old and components[-1] in new,
                     'worker_declaration_input_counterpart_required')
-                old, new = old[key], new[key]
-            _require(type(old) is dict and type(new) is dict and components[-1] in old and components[-1] in new,
-                'worker_declaration_input_counterpart_required')
-            new[components[-1]] = copy.deepcopy(old[components[-1]])
-        _require(_same(restored, self.previous), 'worker_declaration_exact_input_successor_required')
+                new[components[-1]] = copy.deepcopy(old[components[-1]])
+            _require(_same(restored, self.previous), 'worker_declaration_exact_input_successor_required')
         # These real validators include all project/native files and source
         # overlays, supported worker input validation, and the native marker.
         self.budget.call(self.f.inspect, self.previous, request['previous_input']['sha256'])
@@ -427,13 +466,6 @@ class StoppedOperator:
             'worker_declaration_native_operator_entry_required')
         self._pin(entry['script'], private=False)
         self._pin(request['native_unit'], private=False)
-        companion = request['declaration_source']
-        _require(type(companion) is dict and set(companion) == {'bundle', 'worker_inputs', 'identity'},
-            'worker_declaration_exact_source_companion_required')
-        for ref in companion.values():
-            self._pin(ref)
-        from .worker_declarations import load_declaration_source
-        self.declaration_bundle, self.worker_inputs, self.identity = load_declaration_source(companion)
         _require(type(self.identity.get('source_refs')) is dict,
             'worker_declaration_identity_source_references_required')
         _require(_reference(self.identity['source_refs']['access_state']) == self.access_path,
@@ -473,9 +505,13 @@ class StoppedOperator:
         self._worker_runtime_layout()
         self.receipt = self.f.read_json(self.home / 'hermes-agent.source.json')
         self._origins()
+        if self.service_source_transition:
+            self._service_source_layout()
         prefix = 'profiles/' + PROFILE + '/'
         before_names = {'config.yaml', self.f.MARKER, prefix + 'config.yaml',
             prefix + user.ONBOARDING, prefix + user.MARKER}
+        if self.service_source_transition:
+            before_names.update(self.service_after)
         _require(type(request['before']) is dict and set(request['before']) == before_names,
             'worker_declaration_exact_before_inventory_required')
         self.before = {}
@@ -483,7 +519,8 @@ class StoppedOperator:
             _require(_reference(ref) == self.home / name,
                 'worker_declaration_exact_before_path_required')
             state = self._state(self.home / name)
-            _require(state['mode'] == 0o600 and _sha(state['data']) == ref['sha256'],
+            modes = (0o400, 0o600) if name in getattr(self, 'service_after', {}) else (0o600,)
+            _require(state['mode'] in modes and _sha(state['data']) == ref['sha256'],
                 'worker_declaration_beforeimage_changed')
             self.before[name] = state
         self.access_path = self.home / 'plugin-data' / _plugin_data_namespace('friday_rework', '') / 'state.json'

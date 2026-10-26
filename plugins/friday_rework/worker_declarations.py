@@ -39,6 +39,207 @@ NATIVE_GAPS = (
 )
 MAX_SOURCE_BYTES = 32 * 1024 * 1024
 
+# These are public source bytes, not an installed worker/service receipt.  The
+# guarded-six operational predecessor has additional private history and is not
+# interchangeable with this five-file public predecessor.
+SERVICE_SCHEMA = 'friday.worker-web-service-source-declaration.v1'
+SERVICE_FILES = frozenset({
+    'scripts/a0_runtime.py', 'scripts/rootless_docker_launch.py',
+    'plugins/friday_rework/adapters/a0_profile.py',
+    'plugins/friday_rework/adapters/a0_web.py',
+    'scripts/friday-rework-docker.service',
+})
+SERVICE_ANCHOR = {
+    'scripts/a0_runtime.py': 'd46880a70ac70dadefb56281d21137e1aa12e1042f71e47ba455956e2477cc32',
+    'scripts/rootless_docker_launch.py': 'b6825c510a7b50be20419fc0f57fee042dc9beef6d10a58b10fef1592da2fd77',
+    'plugins/friday_rework/adapters/a0_profile.py': 'a0ebc0925111dfb06c99e381c20a8cea079761e9ddea8ef2ef2af7a68cc57bc9',
+    'plugins/friday_rework/adapters/a0_web.py': '1daf09d50e2443d0984b26d40356478c7a3d210ccd373d92e0781ec5e78d7bf0',
+    'scripts/friday-rework-docker.service': '53e6d86ff912f4ad0761362bc5e7937d2131e48892469236be09db6b49bcd0ba',
+}
+WEB_PROBE_RUNTIME_SHA256 = 'f02f471dc6546999e8d33d004768650ab51f3eefe5d1ab36b1ab0eee928f59b8'
+WEB_PROBE_SOURCE_SHA256 = 'ba8c7a73ef8452184d1b832fc207f1d954a8efe15ac0b8ab799b5b1986a34d76'
+WEB_PROBE_TARGET = dict(SERVICE_ANCHOR, **{
+    'scripts/a0_runtime.py': WEB_PROBE_RUNTIME_SHA256,
+    'plugins/friday_rework/adapters/a0_web.py': WEB_PROBE_SOURCE_SHA256,
+})
+WEB_PROBE_SERVICE_DISCRIMINATOR = 'PUBLIC_A0_WEB_OVERLAY_XMLRPC_EXACT'
+SERVICE_INPUT_PATHS = (
+    ('workers', 'a0', 'a0', 'runtime', 'sha256'),
+    ('workers', 'a0', 'a0', 'launcher', 'sha256'),
+)
+
+
+def web_probe_service_transition(old, new):
+    """Recognize only the reviewed public two-file web/runtime source edge."""
+    return (type(old) is dict and type(new) is dict
+        and old == SERVICE_ANCHOR and new == WEB_PROBE_TARGET)
+
+
+def service_source_transition(old, new):
+    require(web_probe_service_transition(old, new),
+        'worker_declaration_exact_public_web_service_transition_required')
+    return ('plugins/friday_rework/adapters/a0_web.py', 'scripts/a0_runtime.py')
+
+
+def service_transition_discriminator(old, new):
+    service_source_transition(old, new)
+    return WEB_PROBE_SERVICE_DISCRIMINATOR
+
+
+def service_project_sources(project):
+    require(type(project) is dict,
+        'worker_declaration_service_project_inventory_required')
+    return {name: project.get(name) for name in SERVICE_FILES}
+
+
+def service_source_edge(previous, current, anchor, *, target=None):
+    """Distinguish pending publication from unchanged source observations."""
+    if target is None:
+        target = WEB_PROBE_TARGET
+    service_source_transition(anchor, target)
+    left = service_project_sources(previous)
+    right = service_project_sources(current)
+    require(any(left == a and right == b for a, b in (
+        (anchor, anchor), (anchor, target), (target, target))),
+        'worker_declaration_exact_public_web_service_edge_changed')
+    return left == anchor and right == target
+
+
+def pending_service_project(previous, current):
+    require(type(previous) is dict and type(current) is dict
+        and type(previous.get('project_files')) is dict
+        and type(current.get('project_files')) is dict,
+        'worker_declaration_service_project_inventory_required')
+    old = service_project_sources(previous['project_files'])
+    new = service_project_sources(current['project_files'])
+    if old == new:
+        return None
+    service_source_transition(old, new)
+    require(_same({k: v for k, v in previous.items() if k != 'project_files'},
+        {k: v for k, v in current.items() if k != 'project_files'}),
+        'worker_declaration_service_project_operational_delta_refused')
+    return copy.deepcopy(current['project_files'])
+
+
+def service_pending_target(anchor, current, future):
+    service_source_transition(anchor, future)
+    require(type(current) is dict and current in (anchor, future),
+        'worker_declaration_exact_public_web_pending_required')
+
+
+def service_publication_sources(before, after, old, new, home):
+    """Join both existing source mirrors; never publish or grant authority."""
+    changed = service_source_transition(old, new)
+    require(type(before) is dict and type(after) is dict and set(before) == set(after),
+        'worker_declaration_service_publication_inventory_required')
+    root = _absolute(str(home))
+    for staged, ref in before.items():
+        require(type(staged) is str and staged.startswith('worker-runtime-source/')
+            and _reference(ref) == root / staged,
+            'worker_declaration_service_publication_plan_join_changed')
+        if staged not in {'worker-runtime-source/' + name for name in changed}:
+            require(after[staged] == ref['sha256'],
+                'worker_declaration_service_unrelated_publication_delta')
+    for name in changed:
+        staged = 'worker-runtime-source/' + name
+        require(staged in before and _reference(before[staged]) == root / staged
+            and before[staged]['sha256'] == old[name]
+            and after.get(staged) == new[name],
+            'worker_declaration_service_publication_plan_join_changed')
+
+
+def service_worker_inputs(before, after, home):
+    """Update the public runtime donor hash, retaining every other input."""
+    require(type(before) is dict and type(after) is dict,
+        'worker_declaration_service_worker_inputs_required')
+    restored = copy.deepcopy(after)
+    root = _absolute(str(home))
+    for path, name in zip(SERVICE_INPUT_PATHS,
+            ('scripts/a0_runtime.py', 'scripts/rootless_docker_launch.py')):
+        require(_at(before, path) == SERVICE_ANCHOR[name]
+            and _at(after, path) == WEB_PROBE_TARGET[name],
+            'worker_declaration_exact_service_input_pin_required')
+        old_ref, new_ref = _at(before, path[:-1]), _at(after, path[:-1])
+        require(_reference(old_ref) == _reference(new_ref)
+            and (name != 'scripts/a0_runtime.py'
+                or old_ref['path'] == str(root / 'worker-runtime-source' / name)),
+            'worker_declaration_service_input_path_changed')
+        _replace(restored, path, SERVICE_ANCHOR[name])
+    require(_same(before, restored),
+        'worker_declaration_service_unrelated_worker_input_delta')
+
+
+def service_installation_delta(previous, current, plan):
+    """Maintain two worker mirrors only after canonical source installation.
+
+    This writer never installs project/native code. Both installation tuples
+    describe the same already-installed public target; only the separate
+    declaration and the two existing worker mirrors may change.
+    """
+    require(type(plan) is dict and plan.get('service_source_transition') ==
+        WEB_PROBE_SERVICE_DISCRIMINATOR,
+        'worker_declaration_exact_service_plan_required')
+    require(type(previous) is dict and type(current) is dict
+        and _same(previous, current)
+        and type(current.get('project_files')) is dict
+        and service_project_sources(current['project_files']) == WEB_PROBE_TARGET,
+        'worker_declaration_installed_service_target_required')
+    require(_same(_at(current, ('product', 'runtime')), {'enabled': False}),
+        'worker_declaration_runtime_must_remain_disabled')
+
+
+def service_declaration_plan(root_config, profile_config, worker_inputs, identity, bundle):
+    """Plan the exact public mirror edge; native custody is still required."""
+    require(type(root_config) is dict and type(profile_config) is dict
+        and type(worker_inputs) is dict and type(bundle) is dict,
+        'worker_declaration_documents_required')
+    require(bundle.get('schema') == SERVICE_SCHEMA and bundle.get('state') ==
+        'PROPOSED_NOT_APPLIED_NOT_AN_EXECUTABLE_MIGRATION_REQUEST',
+        'worker_declaration_service_schema_required')
+    _reference(bundle.get('identity_reference'))
+    home, profile_home = _identity_join(root_config, profile_config, identity, bundle)
+    require(worker_inputs.get('required') == ['dsh', 'a0']
+        and type(worker_inputs.get('workers')) is dict
+        and set(worker_inputs['workers']) == {'dsh', 'a0'}
+        and all(type(worker_inputs['workers'][name]) is dict for name in ('dsh', 'a0'))
+        and _same(worker_inputs.get('source_scope'),
+            {'home': str(home), 'profile': identity['binding']['transport_profile']}),
+        'worker_declaration_service_scope_changed')
+    before = _at(root_config, TEMPLATE_INPUTS)
+    service_worker_inputs(before, worker_inputs, home)
+    deployment = _at(worker_inputs, ('workers', 'a0', 'a0', 'deployment'))
+    require(type(deployment) is dict and type(deployment.get('chat')) is dict
+        and type(deployment.get('utility')) is dict
+        and type(deployment.get('embedding')) is dict
+        and all(_same(deployment, _at(cfg, path)) for cfg, path in (
+            (root_config, ROOT_A0), (profile_config, ROOT_A0),
+            (root_config, TEMPLATE_A0))),
+        'worker_declaration_service_deployment_must_remain_unchanged')
+    rows = bundle.get('changes')
+    require(type(rows) is list and len(rows) == 1 and type(rows[0]) is dict
+        and set(rows[0]) == {'document', 'path', 'before_sha256', 'after_reference'}
+        and rows[0]['document'] == 'root_config'
+        and rows[0]['path'] == list(TEMPLATE_INPUTS)
+        and rows[0]['before_sha256'] == fingerprint(before),
+        'worker_declaration_service_exact_input_change_required')
+    _reference(rows[0]['after_reference'])
+    result = copy.deepcopy(root_config)
+    _replace(result, TEMPLATE_INPUTS, worker_inputs)
+    return {'schema': 'friday.worker-declaration-delta.v1',
+        'state': 'SOURCE_DECLARATION_DELTA_ONLY_NOT_NATIVE_AUTHORITY',
+        'ready': False, 'native_authority': False,
+        'native_apply_implemented': True, 'workers_enabled': False,
+        'service_source_transition': WEB_PROBE_SERVICE_DISCRIMINATOR,
+        'root_config': result, 'profile_config': copy.deepcopy(profile_config),
+        'semantic_changes': [{'document': 'root_config', 'path': list(TEMPLATE_INPUTS),
+            'before_sha256': fingerprint(before), 'after_sha256': fingerprint(worker_inputs)}],
+        'principal': identity['principal'], 'generation': identity['generation'],
+        'profile': str(profile_home),
+        'launcher': {'reference': copy.deepcopy(_at(worker_inputs,
+            ('workers', 'a0', 'a0', 'launcher'))),
+            'state': 'UNCHANGED_PUBLIC_LAUNCHER_SOURCE_ONLY', 'installed': False},
+        'missing_native_prerequisites': list(NATIVE_GAPS)}
+
 
 class DeclarationError(ValueError):
     """Bounded public code; never interpolate a path or private document."""
@@ -305,6 +506,8 @@ def plan_declaration_delta(root_config, profile_config, worker_inputs, identity,
     require(type(root_config) is dict and type(profile_config) is dict
         and type(worker_inputs) is dict and type(bundle) is dict,
         'worker_declaration_documents_required')
+    if bundle.get('schema') == SERVICE_SCHEMA:
+        return service_declaration_plan(root_config, profile_config, worker_inputs, identity, bundle)
     require(bundle.get('schema') == 'frw.current-both-spark-declaration-change-data.v1'
         and bundle.get('state') ==
             'PROPOSED_NOT_APPLIED_NOT_AN_EXECUTABLE_MIGRATION_REQUEST',
@@ -422,7 +625,8 @@ def validate_declaration_source(companion, root_config, profile_config, *, root_
             _read_reference(ref, json_document=False)
     return {'schema': 'friday.worker-declaration-source-join.v1',
         'state': plan['state'], 'status': 'SOURCE_JOIN_ONLY_NOT_NATIVE_AUTHORITY',
-        'ready': False, 'native_authority': False, 'native_apply_implemented': True,
+        'ready': False, 'native_authority': False,
+        'native_apply_implemented': plan['native_apply_implemented'],
         'binding_sha256': identity['binding_sha256'],
         'generation': identity['generation'], 'principal': identity['principal'],
         'stale_attachment_sha256': identity['source_refs']['stale_attachment']['sha256'],
