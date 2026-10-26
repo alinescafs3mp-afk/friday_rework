@@ -130,3 +130,60 @@ def test_source_runtime_refuses_foreign_private_namespace(kind):
     result = subprocess.run([sys.executable, '-I', '-B', '-c', code, str(root), kind],
                             capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.fixture
+def pinned_probe_loader(tmp_path):
+    """Use the real plugin import and native sources without starting a gateway."""
+    import hashlib
+    root = Path(__file__).resolve().parents[1]
+    alias = 'hermes_plugins.friday_pinned_probe_test'
+    _import_plugin({'path': str(root / 'plugins/friday_rework'),
+                    'module_name': alias, 'name': 'friday_rework'})
+    hr = importlib.import_module(alias + '.host_runtime')
+    native = tmp_path / 'pinned-probe-loader/scripts/a0_runtime.py'
+    native.parent.mkdir(parents=True)
+    native.write_bytes((root / 'scripts/a0_runtime.py').read_bytes())
+    for filename in ('a0_profile.py', 'a0_web.py'):
+        target = native.parent.parent / 'plugins/friday_rework/adapters' / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((root / 'plugins/friday_rework/adapters' / filename).read_bytes())
+        target.chmod(0o400)
+    def config():
+        return {'a0': {'runtime': {'path': str(native),
+                                  'sha256': hashlib.sha256(native.read_bytes()).hexdigest()}}}
+    try:
+        yield hr, native, config
+    finally:
+        for name in tuple(sys.modules):
+            if name == alias or name.startswith(alias + '.'):
+                del sys.modules[name]
+
+
+def test_pinned_native_probe_source_compiles_without_global_import_changes(pinned_probe_loader):
+    import inspect
+    hr, _, config = pinned_probe_loader
+    before_source, before_path = inspect.getsource, tuple(sys.path)
+    before_modules = {name: module for name, module in sys.modules.items()
+                      if name.startswith(('frw_pinned_a0_runtime', 'frw_a0_'))}
+    native = hr.a0_runtime_module(config())
+    assert native.__name__ not in sys.modules
+    script = native.probe_script()
+    compile(script, '<pinned-native-probe-source-only>', 'exec')
+    assert 'class RuntimeErrorBoundary(RuntimeError):' in script
+    assert inspect.getsource is before_source and tuple(sys.path) == before_path
+    assert {name: module for name, module in sys.modules.items()
+            if name.startswith(('frw_pinned_a0_runtime', 'frw_a0_'))} == before_modules
+
+
+def test_pinned_native_probe_source_refuses_changed_definitions(pinned_probe_loader):
+    hr, source, config = pinned_probe_loader
+    native = hr.a0_runtime_module(config())
+    native.native_probe = lambda deployment=None: None
+    with pytest.raises(hr.HostUnavailable, match='a0_runtime_probe_source_mismatch'):
+        native.probe_script()
+    # Updating the file pin cannot authorize a duplicate renderer definition.
+    source.write_bytes(source.read_bytes() +
+                       b'\ndef native_probe(deployment=None):\n    return None\n')
+    with pytest.raises(hr.HostUnavailable, match='a0_runtime_probe_source_mismatch'):
+        hr.a0_runtime_module(config())

@@ -338,16 +338,110 @@ def a0_binding(value, associations, row):
 
 
 def a0_runtime_module(config):
-    """Load the exact configured native code and unchanged profile/web helpers."""
+    """Load pinned native code with helpers from this authenticated package."""
+    import ast
+    import builtins
     import types
     pin = _pin(config['a0']['runtime']); data = pin.read()
+    # Only this legacy helper is replaced: its sole extra operation mutates
+    # global sys.path. Future native checks must be reviewed, never discarded.
+    legacy_supervisor = (
+        "def native_supervisor():\n"
+        "    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))\n"
+        "    from plugins.friday_rework.supervision import NativeSupervisor\n"
+        "    return NativeSupervisor()\n"
+    )
+    tree = ast.parse(data, filename=str(pin.path))
+    definitions = [node for node in tree.body
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and node.name == 'native_supervisor']
+    if (len(definitions) != 1 or ast.dump(definitions[0]) !=
+            ast.dump(ast.parse(legacy_supervisor).body[0])):
+        raise HostUnavailable('a0_runtime_supervisor_source_mismatch')
     m = types.ModuleType('frw_pinned_a0_runtime'); m.__file__ = str(pin.path)
+    native_import = builtins.__import__
+
+    def scoped_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if (type(name) is str and type(level) is int and level == 0
+                and globals is m.__dict__ and type(fromlist) is tuple
+                and len(fromlist) == 1 and type(fromlist[0]) is str):
+            if (name == 'plugins.friday_rework.supervision'
+                    and fromlist == ('NativeSupervisor',)):
+                from . import supervision
+                return supervision
+            if (name == 'plugins.friday_rework.adapters.a0_native'
+                    and fromlist == ('_duration',)):
+                from .adapters import a0_native
+                return a0_native
+        return native_import(name, globals, locals, fromlist, level)
+
+    m.__dict__['__builtins__'] = {**vars(builtins), '__import__': scoped_import}
     exec(compile(data,str(pin.path),'exec'),m.__dict__)
-    for name, filename in [('PROFILE_SOURCE','a0_profile.py'), ('WEB_SOURCE','a0_web.py')]:
+    original_supervisor = getattr(m, 'native_supervisor', None)
+    if (type(original_supervisor) is not types.FunctionType
+            or original_supervisor.__globals__ is not m.__dict__
+            or original_supervisor.__code__.co_firstlineno != definitions[0].lineno):
+        raise HostUnavailable('a0_runtime_supervisor_source_mismatch')
+    checks = [('PROFILE_SOURCE','a0_profile.py'), ('WEB_SOURCE','a0_web.py')]
+    if hasattr(m, 'MEMORY_SOURCE'):
+        checks.append(('MEMORY_SOURCE','a0_memory_guard.py'))
+    for name, filename in checks:
         if hashlib.sha256(getattr(m,name).read_bytes()).digest() != hashlib.sha256(
                 (Path(__file__).parent / 'adapters' / filename).read_bytes()).digest():
             raise HostUnavailable('a0_runtime_profile_source_mismatch' if name == 'PROFILE_SOURCE'
-                                  else 'a0_runtime_web_source_mismatch')
+                                  else 'a0_runtime_web_source_mismatch' if name == 'WEB_SOURCE' else 'a0_runtime_memory_source_mismatch')
+
+    def native_supervisor():
+        from .supervision import NativeSupervisor
+        return NativeSupervisor()
+
+    # The private module deliberately has no process-global sys.modules entry.
+    # inspect.getsource cannot resolve its classes; use only the exact pinned
+    # top-level definitions requested by the unchanged native probe renderer.
+    probe_names = ('RuntimeErrorBoundary', 'require', 'probe_config_checked', 'native_probe')
+    source_lines = data.decode('utf-8').splitlines(keepends=True)
+    probe_sources = []
+    for name in probe_names:
+        nodes = [node for node in tree.body
+                 if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name == name]
+        if len(nodes) != 1 or nodes[0].decorator_list:
+            raise HostUnavailable('a0_runtime_probe_source_mismatch')
+        node = nodes[0]; value = getattr(m, name, None)
+        if name == 'RuntimeErrorBoundary':
+            valid = (type(value) is type and value.__module__ == m.__name__
+                     and value.__qualname__ == name and value.__bases__ == (RuntimeError,)
+                     and isinstance(node, ast.ClassDef) and not node.keywords
+                     and len(node.bases) == 1 and isinstance(node.bases[0], ast.Name)
+                     and node.bases[0].id == 'RuntimeError')
+            code = None
+        else:
+            valid = (type(value) is types.FunctionType and value.__globals__ is m.__dict__
+                     and value.__module__ == m.__name__ and value.__qualname__ == name
+                     and value.__code__.co_filename == str(pin.path)
+                     and value.__code__.co_firstlineno == node.lineno)
+            code = value.__code__ if valid else None
+        if not valid:
+            raise HostUnavailable('a0_runtime_probe_source_mismatch')
+        probe_sources.append((name, value, code,
+                              ''.join(source_lines[node.lineno - 1:node.end_lineno])))
+
+    def probe_source(value):
+        for name, original, code, source in probe_sources:
+            if value is original:
+                if (getattr(m, name, None) is not original or original.__module__ != m.__name__
+                        or original.__qualname__ != name
+                        or (code is None and original.__bases__ != (RuntimeError,))
+                        or (code is not None and (original.__globals__ is not m.__dict__
+                            or original.__code__ is not code
+                            or code.co_filename != str(pin.path)))):
+                    raise HostUnavailable('a0_runtime_probe_source_mismatch')
+                return source
+        raise HostUnavailable('a0_runtime_probe_source_mismatch')
+
+    # This facade belongs only to this private native namespace. No shared
+    # inspect object, import path, renderer or exception identity is modified.
+    m.inspect = types.SimpleNamespace(getsource=probe_source)
+    m.native_supervisor = native_supervisor
     return m
 
 
