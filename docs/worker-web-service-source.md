@@ -13,6 +13,27 @@ operational guarded-memory runtime, so their source hashes and inventories
 must not be substituted. No historical transitions or embedding changes are
 introduced by this port.
 
+A second exact public edge keeps that first target as its predecessor and uses
+`PUBLIC_A0_WEB_HTTP_CONFIG_GIT_EXACT`. It advances only the web adapter to
+`b16fb6681372223c4c6c04e6e7021eb53993cea56136bfe28419ac566976d5b6`
+and the public runtime to
+`943b399247db9636dbf6aaf96f79ae988852f4366f3f7ef3893e77433425d11a`.
+The first edge remains valid; skipping it, mixing tuples or substituting an
+operational runtime is refused. The declaration planner, stopped operator and
+mirror writer select the same exact edge and preserve the existing transaction.
+
+This repair writes a single-directory `safe.directory` entry to `/etc/gitconfig`
+only inside a newly owned container. It checks the source file, parents, tracked
+source pins and version module, and refuses an existing target. HTTP diagnostics
+retain `http_config` for connection failures and distinguish `http_status`,
+`http_body_bound`, `http_json`, `http_version` and `http_engines` without exporting
+response content. A known limitation remains: `urllib` raises `HTTPError` before
+a response is returned, so that failure still reports `http_config`/`OSError`,
+including HTTP 503. The HTTP status code is not retained; a synthetic returned
+non-200 response is different from a raised `HTTPError`. This is accepted bounded
+technical debt. This port preserves the reviewed web bytes and does not change
+that behavior. This source package does not establish an installed result.
+
 `service_source_transition` checks the complete service maps. The project-edge
 helpers distinguish unchanged predecessor, pending transition and unchanged
 target. Reverse, partial and mixed transitions fail. `service_publication_sources`
@@ -67,6 +88,8 @@ Run the focused source controls from the repository root:
 python3 -I -B tests/test_worker_service_source.py
 python3 -I -B tests/test_worker_service_native.py
 python3 -I -B tests/test_worker_service_publication.py
+python3 -B -m unittest discover -s tests -p 'test_worker_service_http.py'
+python3 -B -m unittest discover -s tests -p 'test_a0_web*.py'
 ```
 
 These controls use synthetic dictionaries and standalone standard-library

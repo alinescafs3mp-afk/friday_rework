@@ -63,6 +63,13 @@ WEB_PROBE_TARGET = dict(SERVICE_ANCHOR, **{
     'plugins/friday_rework/adapters/a0_web.py': WEB_PROBE_SOURCE_SHA256,
 })
 WEB_PROBE_SERVICE_DISCRIMINATOR = 'PUBLIC_A0_WEB_OVERLAY_XMLRPC_EXACT'
+WEB_HTTP_RUNTIME_SHA256 = '943b399247db9636dbf6aaf96f79ae988852f4366f3f7ef3893e77433425d11a'
+WEB_HTTP_SOURCE_SHA256 = 'b16fb6681372223c4c6c04e6e7021eb53993cea56136bfe28419ac566976d5b6'
+WEB_HTTP_TARGET = dict(WEB_PROBE_TARGET, **{
+    'scripts/a0_runtime.py': WEB_HTTP_RUNTIME_SHA256,
+    'plugins/friday_rework/adapters/a0_web.py': WEB_HTTP_SOURCE_SHA256,
+})
+WEB_HTTP_SERVICE_DISCRIMINATOR = 'PUBLIC_A0_WEB_HTTP_CONFIG_GIT_EXACT'
 SERVICE_INPUT_PATHS = (
     ('workers', 'a0', 'a0', 'runtime', 'sha256'),
     ('workers', 'a0', 'a0', 'launcher', 'sha256'),
@@ -75,15 +82,40 @@ def web_probe_service_transition(old, new):
         and old == SERVICE_ANCHOR and new == WEB_PROBE_TARGET)
 
 
+def web_http_service_transition(old, new):
+    """The exact public first web tuple to its HTTP/Git repair."""
+    return (type(old) is dict and type(new) is dict
+        and old == WEB_PROBE_TARGET and new == WEB_HTTP_TARGET)
+
+
+def service_transition_pair(discriminator):
+    """Resolve only published public source edges, never installed history."""
+    if discriminator == WEB_PROBE_SERVICE_DISCRIMINATOR:
+        return copy.deepcopy(SERVICE_ANCHOR), copy.deepcopy(WEB_PROBE_TARGET)
+    require(discriminator == WEB_HTTP_SERVICE_DISCRIMINATOR,
+        'worker_declaration_exact_public_web_service_transition_required')
+    return copy.deepcopy(WEB_PROBE_TARGET), copy.deepcopy(WEB_HTTP_TARGET)
+
+
+def service_installed_discriminator(project):
+    target = service_project_sources(project)
+    if target == WEB_PROBE_TARGET:
+        return WEB_PROBE_SERVICE_DISCRIMINATOR
+    require(target == WEB_HTTP_TARGET,
+        'worker_declaration_installed_service_target_required')
+    return WEB_HTTP_SERVICE_DISCRIMINATOR
+
+
 def service_source_transition(old, new):
-    require(web_probe_service_transition(old, new),
+    require(web_probe_service_transition(old, new) or web_http_service_transition(old, new),
         'worker_declaration_exact_public_web_service_transition_required')
     return ('plugins/friday_rework/adapters/a0_web.py', 'scripts/a0_runtime.py')
 
 
 def service_transition_discriminator(old, new):
     service_source_transition(old, new)
-    return WEB_PROBE_SERVICE_DISCRIMINATOR
+    return (WEB_HTTP_SERVICE_DISCRIMINATOR if web_http_service_transition(old, new)
+        else WEB_PROBE_SERVICE_DISCRIMINATOR)
 
 
 def service_project_sources(project):
@@ -95,7 +127,7 @@ def service_project_sources(project):
 def service_source_edge(previous, current, anchor, *, target=None):
     """Distinguish pending publication from unchanged source observations."""
     if target is None:
-        target = WEB_PROBE_TARGET
+        target = WEB_HTTP_TARGET if anchor == WEB_PROBE_TARGET else WEB_PROBE_TARGET
     service_source_transition(anchor, target)
     left = service_project_sources(previous)
     right = service_project_sources(current)
@@ -148,23 +180,32 @@ def service_publication_sources(before, after, old, new, home):
             'worker_declaration_service_publication_plan_join_changed')
 
 
+def service_worker_discriminator(after):
+    runtime_after = _at(after, SERVICE_INPUT_PATHS[0])
+    require(runtime_after in (WEB_PROBE_RUNTIME_SHA256, WEB_HTTP_RUNTIME_SHA256),
+        'worker_declaration_exact_service_input_pin_required')
+    return (WEB_HTTP_SERVICE_DISCRIMINATOR
+        if runtime_after == WEB_HTTP_RUNTIME_SHA256 else WEB_PROBE_SERVICE_DISCRIMINATOR)
+
+
 def service_worker_inputs(before, after, home):
     """Update the public runtime donor hash, retaining every other input."""
     require(type(before) is dict and type(after) is dict,
         'worker_declaration_service_worker_inputs_required')
+    anchor, target = service_transition_pair(service_worker_discriminator(after))
     restored = copy.deepcopy(after)
     root = _absolute(str(home))
     for path, name in zip(SERVICE_INPUT_PATHS,
             ('scripts/a0_runtime.py', 'scripts/rootless_docker_launch.py')):
-        require(_at(before, path) == SERVICE_ANCHOR[name]
-            and _at(after, path) == WEB_PROBE_TARGET[name],
+        require(_at(before, path) == anchor[name]
+            and _at(after, path) == target[name],
             'worker_declaration_exact_service_input_pin_required')
         old_ref, new_ref = _at(before, path[:-1]), _at(after, path[:-1])
         require(_reference(old_ref) == _reference(new_ref)
             and (name != 'scripts/a0_runtime.py'
                 or old_ref['path'] == str(root / 'worker-runtime-source' / name)),
             'worker_declaration_service_input_path_changed')
-        _replace(restored, path, SERVICE_ANCHOR[name])
+        _replace(restored, path, anchor[name])
     require(_same(before, restored),
         'worker_declaration_service_unrelated_worker_input_delta')
 
@@ -176,13 +217,12 @@ def service_installation_delta(previous, current, plan):
     describe the same already-installed public target; only the separate
     declaration and the two existing worker mirrors may change.
     """
-    require(type(plan) is dict and plan.get('service_source_transition') ==
-        WEB_PROBE_SERVICE_DISCRIMINATOR,
-        'worker_declaration_exact_service_plan_required')
+    require(type(plan) is dict, 'worker_declaration_exact_service_plan_required')
+    _, target = service_transition_pair(plan.get('service_source_transition'))
     require(type(previous) is dict and type(current) is dict
         and _same(previous, current)
         and type(current.get('project_files')) is dict
-        and service_project_sources(current['project_files']) == WEB_PROBE_TARGET,
+        and service_project_sources(current['project_files']) == target,
         'worker_declaration_installed_service_target_required')
     require(_same(_at(current, ('product', 'runtime')), {'enabled': False}),
         'worker_declaration_runtime_must_remain_disabled')
@@ -207,6 +247,7 @@ def service_declaration_plan(root_config, profile_config, worker_inputs, identit
         'worker_declaration_service_scope_changed')
     before = _at(root_config, TEMPLATE_INPUTS)
     service_worker_inputs(before, worker_inputs, home)
+    discriminator = service_worker_discriminator(worker_inputs)
     deployment = _at(worker_inputs, ('workers', 'a0', 'a0', 'deployment'))
     require(type(deployment) is dict and type(deployment.get('chat')) is dict
         and type(deployment.get('utility')) is dict
@@ -229,7 +270,7 @@ def service_declaration_plan(root_config, profile_config, worker_inputs, identit
         'state': 'SOURCE_DECLARATION_DELTA_ONLY_NOT_NATIVE_AUTHORITY',
         'ready': False, 'native_authority': False,
         'native_apply_implemented': True, 'workers_enabled': False,
-        'service_source_transition': WEB_PROBE_SERVICE_DISCRIMINATOR,
+        'service_source_transition': discriminator,
         'root_config': result, 'profile_config': copy.deepcopy(profile_config),
         'semantic_changes': [{'document': 'root_config', 'path': list(TEMPLATE_INPUTS),
             'before_sha256': fingerprint(before), 'after_sha256': fingerprint(worker_inputs)}],

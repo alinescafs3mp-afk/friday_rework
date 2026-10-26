@@ -22,7 +22,7 @@ import time
 
 from .worker_declarations import (
     DeclarationError, _read_reference, _reference, _same, SERVICE_SCHEMA,
-    WEB_PROBE_TARGET, SERVICE_ANCHOR, WEB_PROBE_SERVICE_DISCRIMINATOR,
+    service_installed_discriminator, service_transition_pair,
     service_installation_delta, service_source_transition,
 )
 
@@ -373,11 +373,13 @@ class StoppedOperator:
         Only the worker copies enter publication custody. Canonical project
         files remain immutable external pins throughout commit and rollback.
         """
+        discriminator = service_installed_discriminator(self.current['project_files'])
         service_installation_delta(self.previous, self.current,
-            {'service_source_transition': WEB_PROBE_SERVICE_DISCRIMINATOR})
+            {'service_source_transition': discriminator})
         self.service_after = {}
-        changed = service_source_transition(SERVICE_ANCHOR, WEB_PROBE_TARGET)
-        for relative, digest in WEB_PROBE_TARGET.items():
+        anchor, target = service_transition_pair(discriminator)
+        changed = service_source_transition(anchor, target)
+        for relative, digest in target.items():
             path = self._pin({'path': str(self.f.ROOT / relative),
                 'sha256': digest}, private=False)
             if relative not in changed:
@@ -385,7 +387,7 @@ class StoppedOperator:
             name = 'worker-runtime-source/' + relative
             ref = self.request['before'].get(name)
             _require(_reference(ref) == self.home / name
-                and ref['sha256'] == SERVICE_ANCHOR[relative],
+                and ref['sha256'] == anchor[relative],
                 'worker_declaration_service_before_reference_changed')
             self.service_after[name] = self.external[path]
 
@@ -431,7 +433,8 @@ class StoppedOperator:
             'worker_declaration_exact_input_successor_required')
         if self.service_source_transition:
             service_installation_delta(self.previous, self.current,
-                {'service_source_transition': WEB_PROBE_SERVICE_DISCRIMINATOR})
+                {'service_source_transition': service_installed_discriminator(
+                    self.current['project_files'])})
         else:
             restored = copy.deepcopy(self.current)
             for components in (('product', 'a0_deployment'), ('worker_install', 'a0', 'policy'),

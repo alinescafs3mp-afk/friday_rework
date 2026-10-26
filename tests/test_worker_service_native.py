@@ -125,6 +125,8 @@ def operator_namespace():
         '_sha': lambda data: hashlib.sha256(data).hexdigest(),
         'service_installation_delta': declaration.service_installation_delta,
         'service_source_transition': declaration.service_source_transition,
+        'service_transition_pair': declaration.service_transition_pair,
+        'service_installed_discriminator': declaration.service_installed_discriminator,
         'SERVICE_ANCHOR': declaration.SERVICE_ANCHOR,
         'WEB_PROBE_TARGET': declaration.WEB_PROBE_TARGET,
         'WEB_PROBE_SERVICE_DISCRIMINATOR': declaration.WEB_PROBE_SERVICE_DISCRIMINATOR})
@@ -387,7 +389,8 @@ class NeutralTransaction:
             'prepare_afterimages': self.stage, '_native_final_check': self.final_check,
             '_native_rollback_check': lambda authority: self.events.append('rollback-check'),
             '_new_journal': self.journal,
-            'WEB_PROBE_SERVICE_DISCRIMINATOR': declaration.WEB_PROBE_SERVICE_DISCRIMINATOR}
+            'WEB_PROBE_SERVICE_DISCRIMINATOR': declaration.WEB_PROBE_SERVICE_DISCRIMINATOR,
+            'service_transition_pair': declaration.service_transition_pair}
         return extract(MODULES / 'worker_declaration_writer.py',
             ('apply_declarations', '_service_publication_names'), namespace)
 

@@ -93,7 +93,8 @@ def require(ok, code):
 
 def web_probe_failure_checked(data):
     phases = {'probe', 'secret', 'source_pins', 'settings', 'supervisor',
-              'process_environment', 'http_config'}
+              'process_environment', 'http_config', 'http_status', 'http_body_bound',
+              'http_json', 'http_version', 'http_engines'}
     classes = {'ModuleNotFoundError', 'ImportError', 'PermissionError', 'FileNotFoundError',
                'TimeoutError', 'ConnectionError', 'AssertionError', 'ValueError', 'KeyError',
                'TypeError', 'OSError', 'Exception'}

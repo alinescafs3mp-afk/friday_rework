@@ -19,7 +19,7 @@ from .worker_declarations import (
     DeclarationError, _read_reference, _reference, _same, fingerprint,
     load_declaration_source, plan_declaration_delta, require, _at, _replace,
     TEMPLATE_INPUTS,
-    SERVICE_ANCHOR, WEB_PROBE_TARGET, WEB_PROBE_SERVICE_DISCRIMINATOR,
+    service_transition_pair,
     service_installation_delta, service_publication_sources,
     validate_declaration_source,
 )
@@ -154,11 +154,10 @@ def validate_installation_delta(previous, current, plan):
 
 
 def _service_publication_names(plan):
-    """Select the sole reviewed source edge; an unknown discriminator refuses."""
+    """Select a reviewed public source edge; an unknown discriminator refuses."""
     if 'service_source_transition' not in plan:
         return ()
-    require(plan['service_source_transition'] == WEB_PROBE_SERVICE_DISCRIMINATOR,
-        'worker_declaration_exact_public_web_service_transition_required')
+    service_transition_pair(plan['service_source_transition'])
     return ('worker-runtime-source/plugins/friday_rework/adapters/a0_web.py',
         'worker-runtime-source/scripts/a0_runtime.py')
 
@@ -180,8 +179,8 @@ def _service_afterimages(authority, plan):
         'sha256': hashlib.sha256(authority.before[name]['data']).hexdigest()}
         for name in names}
     after = {name: hashlib.sha256(donors[name]['data']).hexdigest() for name in names}
-    service_publication_sources(before, after, SERVICE_ANCHOR, WEB_PROBE_TARGET,
-        authority.home)
+    anchor, target = service_transition_pair(plan['service_source_transition'])
+    service_publication_sources(before, after, anchor, target, authority.home)
     return donors
 
 

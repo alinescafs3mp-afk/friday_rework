@@ -117,7 +117,7 @@ class WebStartup(unittest.TestCase):
         # neutral owned files. Exact production payload hashes are checked above.
         with patch.object(web, 'NATIVE_WEB_OVERLAYS', rows), patch.object(web, 'checked_web',
                 return_value={'source_pins': {row[0]: row[3] for row in rows}}):
-            return compile(web.install_script({}), '<neutral-installer>', 'exec')
+            return compile(web._install_native_overlays({}), '<neutral-installer>', 'exec')
 
     def test_installer_exact_preimages_atomic_outputs_modes_and_no_replay(self):
         with tempfile.TemporaryDirectory() as tmp:
