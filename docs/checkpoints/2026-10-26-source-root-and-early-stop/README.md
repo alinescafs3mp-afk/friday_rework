@@ -1,0 +1,13 @@
+# Source-root compatibility and earlier stopped-state refusal
+
+This checkpoint preserves two independently reviewed source deltas and the actual maintenance outcome. It is an analysis snapshot, not an installed release or worker acceptance.
+
+`operator-source-root.canonical.patch` fixes the staging check of the installed operator script. An authenticated generation names its original source root while the executing factory uses a protected overlay clone. The unchanged full input/generation/source-map checks authenticate the original root; the script must pin that exact path and installed hash. Ordinary execution retains its exact factory-root check. Identical bytes at an unrelated path do not pass.
+
+`early-stopped-boundary.canonical.patch` is a separate optional branch from the same accepted base. It checks basic receiving-principal admission and the real stopped-launcher context before expensive history work, releases that slot, and retains the original full final custody checks. Its native context has effects; it has not been qualified by these source controls. The ordinary stopped-consumer context remains at its original final boundary because its host locks and PID helpers have effects. This optional improvement is not a prerequisite for the current repair and is not silently composed into the recovery source.
+
+The two patch files are exact canonical branch deltas with only their headers normalized for publication. Their common base and branch hashes are in `SOURCE-MANIFEST.json`; they are not a combined release patch. Private operational bindings, archives, host identities and configuration are excluded.
+
+The actual updater passed the corrected retained inventory and source overlay checks, then failed during staging on the operator-root comparison. Its consumed transaction rolled back; physical before-images, retained files and installed plugins were reconciled unchanged. The original attempt is closed and will not be replayed. The missing stage requires the existing explicitly reconciled recovery mechanism, with exact old archive, a new finite budget and a single recovery claim. Its nearest reader/binder compatibility is being repaired before another expensive invocation.
+
+The already installed corrected source remains installed. Gateway and Dashboard were restored under permanent existing management; Telegram is connected and the signed Dashboard attachment passed a fresh native process check. Test windows do not expire these services. Genuine coding and engineering file tasks through Telegram are still unsent; no worker or product READY claim is made.
