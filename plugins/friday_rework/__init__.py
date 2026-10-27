@@ -27,6 +27,18 @@ def register(ctx):
                     "worker": {"type": "string", "enum": ["dsh", "a0"]},
                     "brief": {"type": "string", "description": "Bounded task brief."},
                     "goal_check": {"type": "string", "description": "Observable completion check."},
+                    "retained_inputs": {
+                        "type": "object",
+                        "description": "For a Telegram coding correction, select complete files from a prior DSH result in this conversation. The current original attachment is still required.",
+                        "properties": {
+                            "reference": {"type": "string", "pattern": "^native-[0-9a-f]{64}$"},
+                            "paths": {"type": "array", "minItems": 1, "maxItems": 16,
+                                      "uniqueItems": True,
+                                      "items": {"type": "string", "maxLength": 2048}},
+                        },
+                        "required": ["reference", "paths"],
+                        "additionalProperties": False,
+                    },
                 },
                 "required": ["worker", "brief", "goal_check"],
                 "additionalProperties": False,

@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextvars import copy_context
 from dataclasses import dataclass
 import json
+import re
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,30 @@ def parse_brief(args):
         if size > limit:
             raise ValueError("task_text_too_large")
     return WorkBrief(**args)
+
+
+
+def parse_retained_inputs(value):
+    """Validate requested file selection; it carries no owner or byte authority."""
+    from .results import selection_names
+    if (not isinstance(value, dict) or set(value) != {"reference", "paths"}
+            or not isinstance(value["reference"], str)
+            or not re.fullmatch(r"native-[0-9a-f]{64}", value["reference"])):
+        raise ValueError("invalid_retained_inputs")
+    selection_names(value["paths"])
+    return {"reference": value["reference"], "paths": list(value["paths"])}
+
+
+def parse_request(args):
+    """Keep historical WorkBrief serialization and hashes unchanged."""
+    required = {"worker", "brief", "goal_check"}
+    if not isinstance(args, dict) or set(args) not in (required, required | {"retained_inputs"}):
+        raise ValueError("invalid_fields")
+    brief = parse_brief({key: args[key] for key in required})
+    selection = parse_retained_inputs(args["retained_inputs"]) if "retained_inputs" in args else None
+    if selection is not None and brief.worker != "dsh":
+        raise ValueError("retained_inputs_requires_dsh")
+    return brief, selection
 
 
 def bound_owner(*, session_id=None):

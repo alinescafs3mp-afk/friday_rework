@@ -67,12 +67,13 @@ def _inputs_digest(inputs):
 
 
 class Controller:
-    def __init__(self, associations: Associations, bindings: Mapping[str, WorkerBinding]):
+    def __init__(self, associations: Associations, bindings: Mapping[str, WorkerBinding], *, failure_diagnostic=None):
         if any(k not in {"dsh", "a0"} or not isinstance(v, WorkerBinding)
                or not callable(v.emergency_stop) for k, v in bindings.items()):
             raise ControllerError("invalid_worker_binding")
         self.associations = associations
         self.bindings = dict(bindings)
+        self._failure_diagnostic = failure_diagnostic
 
     def _binding(self, row):
         try:
@@ -130,6 +131,12 @@ class Controller:
         return None
 
     def _stop_on_error(self, row, error):
+        # Preserve original phase/class/site before cleanup can raise again.
+        try:
+            if self._failure_diagnostic is not None:
+                self._failure_diagnostic(row, "controller_cleanup", error)
+        except BaseException:
+            pass  # Diagnostic failure never withholds exact-owned stop.
         # No fresh state read or receipt write may prevent this attempt.
         try:
             observed = self._binding(row).emergency_stop(copy.deepcopy(row))

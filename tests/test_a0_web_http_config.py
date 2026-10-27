@@ -74,7 +74,7 @@ class HttpConfigControls(unittest.TestCase):
         self.assertNotIn('503', str(failure))
         self.assertNotIn('PRIVATE_', str(failure))
 
-    def git_fixture(self, root):
+    def git_fixture(self, root, *, etc_mode=0o775):
         git_data = b'[safe]\n\tdirectory = /usr/local/searxng/searxng-src\n'
         paths = {name: root / name.lstrip('/') for name in (
             '/a0', '/a0/usr', '/a0/usr/web/gitconfig', '/etc', '/etc/gitconfig',
@@ -82,13 +82,18 @@ class HttpConfigControls(unittest.TestCase):
         for path in paths.values(): path.parent.mkdir(parents=True, exist_ok=True)
         for directory in root.rglob('*'):
             if directory.is_dir(): directory.chmod(0o700)
+        # Match the reviewed image's /etc metadata before its bounded
+        # normalization; all effects still target this neutral temporary tree.
+        paths['/etc'].chmod(etc_mode)
         paths['/a0/usr/web/gitconfig'].write_bytes(git_data)
         paths['/a0/usr/web/gitconfig'].chmod(0o600)
         version = paths['/usr/local/searxng/searxng-src/searx/version.py']
         version.write_bytes(b'neutral version fixture')
         donor = root / 'neutral-donor'; donor.write_bytes(b'neutral donor')
         pins = {str(donor): hashlib.sha256(donor.read_bytes()).hexdigest()}
-        with (patch.object(web, 'checked_web', return_value={'source_pins': pins}),
+        with (patch.object(web, 'checked_web', return_value={
+                  'source_pins': pins,
+                  'image': 'sha256:6b300a0a4341632f021fb1b5d2641296ff4882ba7636e228f57c58bc9105c4f8'}),
               patch.object(web, '_install_native_overlays', return_value='')):
             source = web.install_script({})
         self.assertIn("hashlib.sha256(version_path.read_bytes()).hexdigest()=='eb975f55c2041e150412cbf5f4f2d7da60dea9e24a37e349e2b3cefc1932cfa0'", source)
@@ -102,30 +107,37 @@ class HttpConfigControls(unittest.TestCase):
                 return node
             def visit_Compare(self, node):
                 self.generic_visit(node)
-                if isinstance(node.left, ast.Attribute) and node.left.attr == 'st_uid':
+                if isinstance(node.left, ast.Attribute) and node.left.attr in {'st_uid', 'st_gid'}:
                     assert len(node.comparators) == 1 and node.comparators[0].value == 0
-                    node.comparators[0] = ast.copy_location(ast.Constant(os.geteuid()), node.comparators[0])
+                    owner = os.geteuid() if node.left.attr == 'st_uid' else os.getegid()
+                    node.comparators[0] = ast.copy_location(ast.Constant(owner), node.comparators[0])
                 return node
         code = compile(ast.fix_missing_locations(NeutralPaths().visit(ast.parse(stage))), '<actual-git-stage-neutral-paths>', 'exec')
         def check(ok):
             if not ok: raise RuntimeError('native_web_overlay_refused')
-        namespace = {'Path': Path, 'os': os, 'hashlib': hashlib, 'check': check}
+        namespace = {'Path': Path, 'os': os, 'stat': stat, 'hashlib': hashlib, 'check': check}
         return code, namespace, paths, git_data, donor
 
     def test_git_exact_config_mode_and_no_overwrite(self):
         self.assertEqual(web.service_files(web_plan())['web/gitconfig'],
             '[safe]\n\tdirectory = /usr/local/searxng/searxng-src\n')
-        with tempfile.TemporaryDirectory() as tmp:
-            code, namespace, paths, expected, _ = self.git_fixture(Path(tmp))
-            exec(code, namespace)
-            target = paths['/etc/gitconfig']
-            self.assertEqual(target.read_bytes(), expected)
-            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
-            with self.assertRaises(FileExistsError): exec(code, namespace)
-            self.assertEqual(target.read_bytes(), expected)
+        for etc_mode in (0o755, 0o775):
+            with self.subTest(etc_mode=oct(etc_mode)), tempfile.TemporaryDirectory() as tmp:
+                code, namespace, paths, expected, _ = self.git_fixture(Path(tmp), etc_mode=etc_mode)
+                original = paths['/etc'].stat()
+                exec(code, namespace)
+                current = paths['/etc'].stat()
+                self.assertEqual((current.st_dev, current.st_ino), (original.st_dev, original.st_ino))
+                self.assertEqual(stat.S_IMODE(current.st_mode), 0o755)
+                target = paths['/etc/gitconfig']
+                self.assertEqual(target.read_bytes(), expected)
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+                with self.assertRaises(FileExistsError): exec(code, namespace)
+                self.assertEqual(target.read_bytes(), expected)
 
     def test_git_rejects_changed_inputs_and_unsafe_paths_before_target_write(self):
-        for fault in ('config', 'config-mode', 'config-link', 'parent-mode', 'version', 'donor', 'target-link'):
+        for fault in ('config', 'config-mode', 'config-link', 'parent-mode', 'version', 'donor',
+                      'target-link', 'etc-private-mode', 'etc-world-write', 'etc-link'):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
                 code, namespace, paths, _, donor = self.git_fixture(Path(tmp))
                 source, target = paths['/a0/usr/web/gitconfig'], paths['/etc/gitconfig']
@@ -136,6 +148,11 @@ class HttpConfigControls(unittest.TestCase):
                 elif fault == 'parent-mode': source.parent.chmod(0o777)
                 elif fault == 'version': paths['/usr/local/searxng/searxng-src/searx/version.py'].write_bytes(b'changed')
                 elif fault == 'donor': donor.write_bytes(b'changed')
+                elif fault == 'etc-private-mode': paths['/etc'].chmod(0o700)
+                elif fault == 'etc-world-write': paths['/etc'].chmod(0o777)
+                elif fault == 'etc-link':
+                    held = paths['/etc'].with_name('held-etc')
+                    paths['/etc'].rename(held); paths['/etc'].symlink_to(held, target_is_directory=True)
                 else: target.symlink_to(donor)
                 with self.assertRaises((RuntimeError, FileExistsError, OSError)): exec(code, namespace)
                 if fault != 'target-link': self.assertFalse(target.exists())

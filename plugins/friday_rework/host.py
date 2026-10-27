@@ -18,7 +18,7 @@ from pathlib import Path
 from .admission import _snapshot, delivery_route
 from .adapters.contract import NativeObservation, VerifiedInput
 from .associations import AssociationError, _native, _sync_directory
-from .boundary import bound_owner, parse_brief
+from .boundary import bound_owner, parse_brief, parse_request
 from .controller import Controller
 from .host_record import association_address, owner_from_ingress, quiescence_record
 from .host_runtime import HostUnavailable, check_runtime, select_runtime, dsh_binding, a0_binding, private_directory
@@ -36,6 +36,131 @@ def status(row):
             "quiescent": host["quiescence"] is not None,
             "goal_verification": row["goal_verification"], "delivery": row["delivery"],
             "deadline_unix": row["deadline_unix"], "elapsed_seconds": row["elapsed_seconds"]}
+
+
+def _record_async_failure(directory, row, phase, error, *, control=None):
+    """First bounded, private metadata per job/phase; no state or retry authority.
+
+    No exception text, arbitrary class/function/file names, locals, credentials,
+    task content or principal identifiers. Failure never withholds owned stop.
+    """
+    import os
+    import stat
+    import secrets
+    import sys
+    try:
+        phases = {'controller_cleanup', 'host_cleanup', 'reconcile', 'executor_submit',
+                  'await_start', 'wait_observation', 'runtime_check', 'stop_requested',
+                  'observe', 'notify_finished'}
+        reference = row.get('existing_task_id')
+        if control is None:
+            if (row.get('worker_kind') != 'dsh' or phase not in phases
+                    or type(reference) is not str
+                    or not re.fullmatch(r'native-[0-9a-f]{64}', reference)):
+                return False
+            record_name = 'worker-failure-' + reference + '-' + phase + '.json'
+        else:
+            if (type(control) is not dict or set(control) != {'request_sha256', 'command', 'correlation_kind'}
+                    or control['command'] not in {'friday-stop', 'friday-pause', 'friday-status'}
+                    or control['correlation_kind'] not in {'native_receipt', 'local_only'}
+                    or type(control['request_sha256']) is not str
+                    or not re.fullmatch('[0-9a-f]{64}', control['request_sha256'])
+                    or phase not in {'control_context', 'control_principal', 'control_candidates',
+                                     'control_snapshot', 'control_row', 'control_lease', 'control_action'}
+                    or (reference is not None and (type(reference) is not str
+                        or not re.fullmatch(r'native-[0-9a-f]{64}', reference)))):
+                return False
+            record_name = 'worker-control-failure-' + control['request_sha256'] + '-' + phase + '.json'
+        known = {OSError: 'os_error', PermissionError: 'permission_error',
+                 FileNotFoundError: 'file_not_found', RuntimeError: 'runtime_error',
+                 TypeError: 'type_error', ValueError: 'value_error', KeyError: 'key_error',
+                 IndexError: 'index_error', TimeoutError: 'timeout_error',
+                 AssertionError: 'assertion_error', asyncio.CancelledError: 'cancelled_error',
+                 HostUnavailable: 'host_unavailable', AssociationError: 'association_error',
+                 json.JSONDecodeError: 'json_decode_error'}
+        for module, name, label in (('adapters.dsh', 'AdapterError', 'dsh_adapter_error'),
+                                   ('controller', 'ControllerError', 'controller_error')):
+            loaded = sys.modules.get(__package__ + '.' + module)
+            cls = vars(loaded).get(name) if loaded is not None else None
+            if isinstance(cls, type): known[cls] = label
+        if control is not None:
+            scope_module = sys.modules.get('hermes_cli.friday_user_scope')
+            scope_error = vars(scope_module).get('ScopeDenied') if scope_module is not None else None
+            if isinstance(scope_error, type): known[scope_error] = 'scope_denied'
+        root = Path(__file__).absolute().parent
+        modules = ('host.py', 'controller.py', 'associations.py', 'host_record.py',
+                   'host_runtime.py', 'supervision.py', 'adapters/dsh.py',
+                   'adapters/contract.py', 'results.py', 'result_tool.py', 'artifacts.py')
+        allowed = {str(root/name): name for name in modules}
+        for name in ('friday_cli_caller', 'friday_user_scope', 'friday_cli_work',
+                     'plugins_state', 'plugins_gateway_work'):
+            loaded = sys.modules.get('hermes_cli.' + name)
+            path = vars(loaded).get('__file__') if loaded is not None else None
+            if type(path) is str: allowed[path] = 'hermes_cli/' + name + '.py'
+        def location(exc, limit):
+            frames = []
+            tb = BaseException.__traceback__.__get__(exc)
+            for _ in range(64):
+                if tb is None: break
+                module = allowed.get(tb.tb_frame.f_code.co_filename)
+                if module is not None and 0 < tb.tb_lineno < 2**31:
+                    frames.append({'module': module, 'line': tb.tb_lineno})
+                    frames = frames[-limit:]
+                tb = tb.tb_next
+            return {'exception_type': known.get(type(exc), 'other'),
+                    'source_frames': frames, 'trace_truncated': tb is not None}
+        primary = location(error, 8)
+        causes, seen, cursor = [], {id(error)}, error
+        for _ in range(2):
+            cause = BaseException.__cause__.__get__(cursor)
+            if cause is None: cause = BaseException.__context__.__get__(cursor)
+            if cause is None or id(cause) in seen: break
+            seen.add(id(cause)); causes.append(location(cause, 4)); cursor = cause
+        native = row.get('native') or {}
+        invocation = native.get('invocation_id')
+        if type(invocation) is not str or not re.fullmatch('[0-9a-f]{32}', invocation):
+            invocation = None
+        value = {'schema': 'friday.worker-async-failure.v1', 'reference': reference,
+                 'invocation_id': invocation, 'phase': phase,
+                 **primary, 'causes': causes,
+                 'observed_unix': time.time(), 'observed_monotonic': time.monotonic(),
+                 'execution_outcome': 'UNPROVEN', 'cleanup_outcome': 'NOT_ASSERTED'}
+        if control is not None:
+            value.update(schema='friday.worker-control-failure.v1', **control)
+        data = (json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)+'\n').encode()
+        if len(data) > 4096: return False
+        directory = Path(directory)
+        if not directory.is_absolute() or directory.resolve() != directory: return False
+        parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        temporary = '.worker-failure-' + secrets.token_hex(16)
+        created = False
+        def identity(st):
+            return st.st_dev, st.st_ino, st.st_uid, st.st_gid, st.st_mode
+        try:
+            info = os.fstat(parent)
+            if (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700
+                    or identity(directory.lstat()) != identity(info)):
+                return False
+            name = record_name
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=parent)
+            created = True
+            with os.fdopen(fd, 'wb') as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                if stream.write(data) != len(data): raise OSError('short_diagnostic_write')
+                stream.flush(); os.fsync(stream.fileno())
+            if identity(directory.lstat()) != identity(info): return False
+            # Link a complete fsynced inode once. Never replace earlier evidence.
+            os.link(temporary, name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+            os.fsync(parent)
+            return True
+        finally:
+            try:
+                if created: os.unlink(temporary, dir_fd=parent)
+            finally:
+                os.close(parent)
+    except BaseException:
+        return False
 
 
 class WorkerHost:
@@ -66,13 +191,59 @@ class WorkerHost:
             controller = self._a0_controllers.setdefault(address, controller)
             controller.bindings['a0'].adapter._same(row)
             return controller
-        return Controller(self.store, {"dsh": dsh_binding(row["host"]["binding"]["runtime"], self.store)})
+        return Controller(self.store, {"dsh": dsh_binding(row["host"]["binding"]["runtime"], self.store)},
+                          failure_diagnostic=self._failure_diagnostic)
+
+    def _retained_input_source(self, selection, correlation, ingress, owner, runtime):
+        """Resolve selected content against the current native admission only."""
+        from hermes_constants import get_hermes_home
+        from hermes_cli.friday_user_scope import check_retained_job
+        from .results import require_result_quiescence, selection_names
+        ingress = _snapshot(ingress)
+        if ingress["platform"] != "telegram":
+            raise AssociationError("retained_input_platform_unsupported")
+        media = ingress["message"]["media"]
+        if (len(media) != 1 or media[0].get("content") is None or media[0]["origin"] is None
+                or media[0]["origin"]["message_id"] not in
+                {ingress["message"]["message_id"], ingress["message"]["reply_to_message_id"]}):
+            raise AssociationError("required_original_input_missing")
+        if Path(media[0]["local_reference"]).name in selection_names(selection["paths"]):
+            raise AssociationError("duplicate_input_name")
+        if (media[0]["content"]["size_bytes"] > runtime["max_file_bytes"]
+                or media[0]["content"]["size_bytes"] > runtime["max_total_bytes"]):
+            raise AssociationError("input_too_large")
+        if owner != owner_from_ingress(correlation, ingress):
+            raise AssociationError("foreign_retained_output_owner")
+        previous = self.store.snapshot().get(selection["reference"])
+        if not previous or "host" not in previous:
+            raise AssociationError("unknown_retained_output")
+        binding, original = previous["host"]["binding"], previous["owner"]
+        old_ingress = binding["ingress"]
+        owner_fields = ("bot_id", "user_id", "chat_id", "thread_id", "session_key", "session_id", "profile")
+        if (previous["worker_kind"] != "dsh" or old_ingress["platform"] != "telegram"
+                or previous["existing_task_id"] == association_address(correlation, ingress)
+                or any(original.get(key) != owner.get(key) for key in owner_fields)
+                or any(old_ingress.get(key) != ingress.get(key)
+                       for key in ("source_profile", "transport_profile", "runtime_profile", "chat_type"))
+                or original != owner_from_ingress(binding["correlation"], old_ingress)
+                or Path(binding["runtime"]["runtime_home"]) != get_hermes_home()
+                or binding["runtime"]["runtime_home"] != runtime["runtime_home"]):
+            raise AssociationError("foreign_retained_output_owner")
+        # The exact old owner is used for store lookup; current generation and
+        # native scope are independently required before accessing its output.
+        previous = self.store.get(previous["existing_task_id"], original)
+        check_retained_job(previous)
+        require_result_quiescence(previous)
+        if ("result" in previous
+                and previous["result"]["source_paths"] != selection["paths"]):
+            raise AssociationError("result_selection_already_retained")
+        return previous, dict(media[0]["content"])
 
     def handle(self, args, **kwargs):
         try:
             if Path(self.store.state.data_dir) != self._state_directory:
                 raise HostUnavailable("foreign_runtime_home")
-            brief = parse_brief(args)
+            brief, retained_selection = parse_request(args)
             owner = bound_owner(session_id=kwargs.get("session_id"))
             from hermes_cli.friday_user_scope import current
             scope = current()
@@ -102,7 +273,8 @@ class WorkerHost:
                 # new scheduler task, cache restaging or implicit continuation.
                 binding = old.get("host", {}).get("binding", {})
                 if (binding.get("correlation") != correlation or binding.get("ingress") != ingress
-                        or binding.get("brief") != vars(brief)):
+                        or binding.get("brief") != vars(brief)
+                        or binding.get("retained_inputs") != retained_selection):
                     raise AssociationError("admission_conflict")
                 return json.dumps(status(old))
             configured = self.ctx.get_config("runtime")
@@ -127,6 +299,11 @@ class WorkerHost:
             if scope is not None:
                 host_binding["user_authority"] = {"principal_id": scope.key,
                                                   "generation": scope.admission_generation}
+            if retained_selection is not None:
+                # Reserve the selector with this native call before any copying.
+                # Neither the selector nor prompt text supplies byte authority.
+                self._retained_input_source(retained_selection, correlation, ingress, owner, runtime)
+                host_binding["retained_inputs"] = copy.deepcopy(retained_selection)
             acceptance = None
             if brief.worker == 'a0':
                 acceptance = {'accepted_unix': self.store.clock(), 'accepted_monotonic_ns': time.monotonic_ns(),
@@ -164,11 +341,46 @@ class WorkerHost:
                 directory.mkdir(mode=0o700)
                 private_directory(directory)
                 _sync_directory(directory.parent)
-            inputs = stage_inputs(
+            # Native admission now records the already verified own-workspace
+            # copy. This is input staging authority only, not a runtime mount or
+            # permission to browse another user's or the shared gateway cache.
+            input_roots = list(runtime["cache_roots"])
+            if scope is not None:
+                from hermes_cli.friday_user_scope import check_retained_job
+                check_retained_job(row)
+                if Path(runtime["runtime_home"]) != scope.home:
+                    raise HostUnavailable("foreign_worker_runtime_home")
+                received = str(scope.home / "workspace" / "received")
+                if received not in input_roots:
+                    input_roots.append(received)
+            input_options = dict(
                 matched_ingress=ingress, admitted_reference="association:" + address + "#ingress",
-                cache_roots=runtime["cache_roots"], staging_root=staging,
+                cache_roots=input_roots, staging_root=staging,
                 worker_input_root="/job-input/verified", max_file_bytes=runtime["max_file_bytes"],
                 max_total_bytes=runtime["max_total_bytes"])
+            if retained_selection is None:
+                inputs = stage_inputs(**input_options)
+            else:
+                from .inputs import stage_retained_outputs
+                from .results import collect_outputs
+                from hermes_cli.friday_user_scope import check_retained_job
+                check_retained_job(row)
+                previous, required_input = self._retained_input_source(
+                    retained_selection, correlation, ingress, owner, runtime)
+                # The existing output collector owns first-copy integrity and
+                # immutable selection. Expected sizes/hashes come only from its
+                # validated manifest, never model arguments or a preview/ZIP.
+                previous = collect_outputs(self.store, previous, retained_selection["paths"])
+                expectations = {path: {key: artifact[key] for key in ("size_bytes", "sha256")}
+                                for path, artifact in zip(retained_selection["paths"],
+                                                          previous["result"]["artifacts"])}
+                check_retained_job(row)
+                check_retained_job(previous)
+                inputs = stage_retained_outputs(
+                    store=self.store, retained_row=previous,
+                    retained_paths=retained_selection["paths"], retained_expectations=expectations,
+                    required_input=required_input, current_owner=owner, **input_options)
+                check_retained_job(row)
             if brief.worker == 'a0':
                 from .adapters.a0 import input_path
                 if len(inputs) > 16 or sum(v.size_bytes for v in inputs) > runtime['max_file_bytes']:
@@ -286,7 +498,47 @@ class WorkerHost:
             self._stop_on_error(row, error)
             raise
 
+    def _failure_diagnostic(self, row, phase, error):
+        try:
+            return _record_async_failure(self._state_directory, row, phase, error)
+        except BaseException:
+            return False  # Includes diagnostic import/setup failure; stop still runs.
+
+    def _control_failure_diagnostic(self, row, command, phase, error):
+        try:
+            # Read only the already leased native receipt for correlation. This
+            # does not establish a UserScope or grant permission to act.
+            from hermes_cli.plugin_command_context import get_command_context
+            import hashlib
+            import secrets
+            try:
+                receipt = get_command_context(self.ctx)
+            except Exception:
+                receipt = None
+            receipt = receipt if isinstance(receipt, dict) else {}
+            ingress = receipt.get('admitted_ingress')
+            message = ingress.get('message', {}) if isinstance(ingress, dict) else {}
+            message = message if isinstance(message, dict) else {}
+            identity = {k: message.get(k) for k in
+                        ('bot_id', 'user_id', 'chat_id', 'thread_id', 'message_id', 'platform_update_id')}
+            if all(type(identity[k]) is str and identity[k]
+                   for k in ('bot_id', 'user_id', 'chat_id', 'message_id', 'platform_update_id')):
+                identity.update(command=command, session_key=receipt.get('session_key'),
+                                native_operation=receipt.get('native_operation'))
+                correlation = hashlib.sha256(json.dumps(identity, sort_keys=True,
+                             separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+                kind = 'native_receipt'
+            else:
+                # A broken/expired lease must not hide its own failure. This
+                # private local ID is explicitly not an authenticated receipt.
+                correlation, kind = secrets.token_hex(32), 'local_only'
+            return _record_async_failure(self._state_directory, row or {}, phase, error,
+                       control={'request_sha256': correlation, 'command': command, 'correlation_kind': kind})
+        except BaseException:
+            return False  # Diagnostic failure never replaces the control failure.
+
     def _stop_on_error(self, row, error):
+        self._failure_diagnostic(row, "host_cleanup", error)
         # No storage access or owned coroutine is required for emergency stop.
         # A changed runtime home cannot turn cached ownership into authority.
         try:
@@ -363,6 +615,7 @@ class WorkerHost:
             with self.store.lock_budget():
                 return self._reconcile_checked(row)
         except BaseException as error:
+            self._failure_diagnostic(row, "reconcile", error)
             if not any(note.startswith("owned execution STOP_")
                        for note in getattr(error, "__notes__", ())):
                 self._stop_on_error(row, error)
@@ -421,21 +674,30 @@ class WorkerHost:
         # Existing asyncio default executor, no custom thread pool. Shield the
         # actual executor future so cancellation cannot make its thread vanish.
         loop = asyncio.get_running_loop()
-        execution = loop.run_in_executor(None, copy_context().run, self._start, row)
+        execution = None
+        phase = "executor_submit"
         try:
+            execution = loop.run_in_executor(None, copy_context().run, self._start, row)
+            phase = "await_start"
             current = await asyncio.shield(execution)
             while current["host"]["quiescence"] is None:
+                phase = "wait_observation"
                 await asyncio.sleep(min(1.0, max(.01, current["deadline_unix"] - self.store.clock())))
+                phase = "runtime_check"
                 from hermes_cli.friday_cli_work import should_stop
                 if (self._closed or (row['owner'].get('platform') == 'cli' and should_stop())
                         or select_runtime(self.ctx.get_config("runtime"), row["worker_kind"]) != row["host"]["binding"]["runtime"]):
+                    phase = "stop_requested"
                     current = await asyncio.to_thread(self._stop, current, "cancel")
                 else:
+                    phase = "observe"
                     current = await asyncio.to_thread(self._reconcile, current)
+            phase = "notify_finished"
             from .result_tool import notify_finished
             await notify_finished(self, current)
             return status(current)
         except asyncio.CancelledError as error:
+            self._failure_diagnostic(row, phase, error)
             # Native stop first, then wait for the bounded in-flight launch to
             # settle and stop again. Future.cancel alone is never quiescence.
             try:
@@ -443,7 +705,8 @@ class WorkerHost:
             except BaseException as stop_error:
                 error.add_note("owned execution STOP_UNCONFIRMED: " + type(stop_error).__name__)
             try:
-                await asyncio.shield(execution)
+                if execution is not None:
+                    await asyncio.shield(execution)
             except BaseException as execution_error:
                 error.add_note("owned launch settlement failed: " + type(execution_error).__name__)
             try:
@@ -452,6 +715,7 @@ class WorkerHost:
                 error.add_note("owned execution STOP_UNCONFIRMED: " + type(stop_error).__name__)
             raise
         except Exception as error:
+            self._failure_diagnostic(row, phase, error)
             try:
                 await asyncio.to_thread(self._stop, self._owned.get(row["existing_task_id"], row), "cancel")
             except BaseException as stop_error:
@@ -543,10 +807,12 @@ class WorkerHost:
     def _control_bounded(self, command, raw_args):
         cached = None
         receipt = None
+        phase = 'control_context'
         try:
             if Path(self.store.state.data_dir) != self._state_directory:
                 raise HostUnavailable("foreign_runtime_home")
             receipt = self.ctx.get_command_context()
+            phase = 'control_principal'
             principal = self._principal(receipt, command)
             builtin = receipt.get("native_operation") is not None
             if not isinstance(raw_args, str) or (builtin and raw_args != ""):
@@ -557,12 +823,14 @@ class WorkerHost:
                 for owned in tuple(self._owned.values()):
                     if (not reference or owned['existing_task_id'] == reference):
                         check_local_job(self, owned)
+            phase = 'control_candidates'
             candidates = [r for r in tuple(self._owned.values())
                           if (not reference or r["existing_task_id"] == reference)
                           and self._matches_control(r, principal, receipt)]
             if len(candidates) == 1:
                 cached = copy.deepcopy(candidates[0])
             if not reference:
+                phase = 'control_snapshot'
                 rows = [r for r in self.store.snapshot().values()
                         if self._matches_control(r, principal, receipt)]
                 if builtin and not rows:
@@ -573,6 +841,7 @@ class WorkerHost:
                 # snapshot validated the same durable ownership and transport;
                 # a subsequent metadata wait cannot withhold this checked stop.
                 cached = copy.deepcopy(rows[0])
+            phase = 'control_row'
             row = self.store.get_for_control(reference, principal)
             from hermes_cli.friday_cli_work import check_local_job
             check_local_job(self, row)
@@ -583,18 +852,23 @@ class WorkerHost:
                 raise HostUnavailable("foreign_control_profile")
             self._remember(row)
             cached = row
+            phase = 'control_lease'
             if self.ctx.get_command_context() != receipt:
                 raise HostUnavailable("expired_control_lease")
+            phase = 'control_action'
             if command == "friday-status":
                 row = self._reconcile(row)
             else:
                 row = self._stop(row, "pause" if command == "friday-pause" else "cancel")
             return json.dumps(status(row))
         except (ValueError, RuntimeError, OSError, TypeError) as error:
-            if (cached is not None and self.ctx.get_command_context() == receipt
-                    and not any(note.startswith("owned execution STOP_")
-                                for note in getattr(error, "__notes__", ()))):
-                self._stop_on_error(cached, error)
+            try:
+                if (cached is not None and self.ctx.get_command_context() == receipt
+                        and not any(note.startswith("owned execution STOP_")
+                                    for note in getattr(error, "__notes__", ()))):
+                    self._stop_on_error(cached, error)
+            finally:
+                self._control_failure_diagnostic(cached, command, phase, error)
             answer = {"accepted": False, "error": "control_unavailable"}
             if any("STOP_UNCONFIRMED" in note for note in getattr(error, "__notes__", ())):
                 answer["cleanup"] = "STOP_UNCONFIRMED"

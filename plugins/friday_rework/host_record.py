@@ -9,7 +9,7 @@ import math
 import re
 
 from .associations import AssociationError, _number, _text
-from .boundary import parse_brief
+from .boundary import parse_brief, parse_retained_inputs
 from .supervision import UnitObservation
 
 
@@ -102,6 +102,20 @@ def validate_a0_record(row):
             'accepted_monotonic_ns':a['acceptance']['accepted_monotonic_ns'],'boot_id':a['acceptance']['boot_id'],
             'local_network':p['network'],'git_metadata':runtime['git_metadata']}
         compact_hash = lambda v: hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
+        # Producer parity is structural and source-independent: recovery/stop
+        # must not import drifted launch code or read a retained user's data.
+        for key, source_key in [('deployment','profile_source_sha256'),('web','web_source_sha256')]:
+            if key in runtime:
+                if p.get(key) != runtime[key] or not re.fullmatch('[0-9a-f]{64}',p.get(source_key,'')):
+                    raise ValueError()
+                identity_input.update({key:p[key],source_key:p[source_key]})
+            elif key in p: raise ValueError()
+        if 'memory_guard' in p:
+            guard=p['memory_guard']
+            if (not isinstance(guard,dict) or guard.get('sha256') != 'dcd46c2b896a20ac2dc3e18f82168f09845e54b8982fbdb06ecbb6d7e2fb049a'
+                    or guard.get('bytes') != 28559 or guard.get('image') != p['image']):
+                raise ValueError()
+            identity_input['memory_guard']=guard
         plan_bytes = (json.dumps(p,sort_keys=True,indent=2)+'\n').encode()
         if (p['identity'] != compact_hash(identity_input)
                 or p['schema'] != 'friday.a0.runtime-plan.v2' or p['mode'] != 'runtime'
@@ -309,7 +323,8 @@ def validate_host_record(row):
             raise ValueError()
         binding = host["binding"]
         fields = {"correlation", "ingress", "brief", "runtime"}
-        if not isinstance(binding, dict) or set(binding) not in (fields, fields | {"user_authority"}):
+        if (not isinstance(binding, dict) or not fields <= set(binding)
+                or set(binding) - fields - {"user_authority", "retained_inputs"}):
             raise ValueError()
         call = binding["correlation"]
         if not isinstance(call, dict) or set(call) != set(CALL_FIELDS):
@@ -329,6 +344,12 @@ def validate_host_record(row):
                         (ingress['user_id'] if ingress['platform'] == 'cli' else ingress["message"]["user_id"]))):
                 raise ValueError()
         brief = parse_brief(binding["brief"])
+        selection = None
+        if "retained_inputs" in binding:
+            selection = parse_retained_inputs(binding["retained_inputs"])
+            if (brief.worker != "dsh" or ingress["platform"] != "telegram"
+                    or selection["reference"] == row["existing_task_id"]):
+                raise ValueError()
         runtime = validate_runtime(binding["runtime"])
         if row['worker_kind'] == 'a0':
             if 'a0' not in runtime:
@@ -349,6 +370,8 @@ def validate_host_record(row):
             if not isinstance(host["inputs"], list):
                 raise ValueError()
             inputs = tuple(VerifiedInput(**item) for item in host["inputs"])
+            if selection is not None and len(inputs) != 1 + len(selection["paths"]):
+                raise ValueError()
             _inputs_digest(inputs)
             staging = Path(runtime["staging_root"]) / address
             from .adapters.a0 import input_path
