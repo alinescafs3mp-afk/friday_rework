@@ -124,3 +124,15 @@ These are separate phase durations, not a combined service-start measurement.
 Gateway and Dashboard remain stopped for this maintenance boundary. Worker
 qualification and the new DSH/A0 Telegram file tasks have not run; no product
 or end-to-end readiness is claimed by these installation results.
+
+## Accepted historical-reader source correction
+
+The [sanitized HTTP history inventory patch and source evidence](review-candidates/http-history-inventory-20261027/README.md)
+correct that exact omission and check the complete publication inventory before
+walking authenticated ancestry. The full-map publication validator and the
+other 38 guard predicates are preserved. This accepted source-only delta targets
+an omitted private historical reader; it is analysis material, not an installed
+public runtime. At export preparation, the R475 configuration derivative was in
+progress and not yet accepted; worker qualification and the new Telegram file
+tasks remained unperformed. The original operational observations above remain
+unchanged.
