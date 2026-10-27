@@ -1,0 +1,173 @@
+--- a/plugins/friday_rework/host.py
++++ b/plugins/friday_rework/host.py
+@@ -38,7 +38,7 @@
+             "deadline_unix": row["deadline_unix"], "elapsed_seconds": row["elapsed_seconds"]}
+ 
+ 
+-def _record_async_failure(directory, row, phase, error):
++def _record_async_failure(directory, row, phase, error, *, control=None):
+     """First bounded, private metadata per job/phase; no state or retry authority.
+ 
+     No exception text, arbitrary class/function/file names, locals, credentials,
+@@ -53,10 +53,24 @@
+                   'await_start', 'wait_observation', 'runtime_check', 'stop_requested',
+                   'observe', 'notify_finished'}
+         reference = row.get('existing_task_id')
+-        if (row.get('worker_kind') != 'dsh' or phase not in phases
+-                or type(reference) is not str
+-                or not re.fullmatch(r'native-[0-9a-f]{64}', reference)):
+-            return False
++        if control is None:
++            if (row.get('worker_kind') != 'dsh' or phase not in phases
++                    or type(reference) is not str
++                    or not re.fullmatch(r'native-[0-9a-f]{64}', reference)):
++                return False
++            record_name = 'worker-failure-' + reference + '-' + phase + '.json'
++        else:
++            if (type(control) is not dict or set(control) != {'request_sha256', 'command', 'correlation_kind'}
++                    or control['command'] not in {'friday-stop', 'friday-pause', 'friday-status'}
++                    or control['correlation_kind'] not in {'native_receipt', 'local_only'}
++                    or type(control['request_sha256']) is not str
++                    or not re.fullmatch('[0-9a-f]{64}', control['request_sha256'])
++                    or phase not in {'control_context', 'control_principal', 'control_candidates',
++                                     'control_snapshot', 'control_row', 'control_lease', 'control_action'}
++                    or (reference is not None and (type(reference) is not str
++                        or not re.fullmatch(r'native-[0-9a-f]{64}', reference)))):
++                return False
++            record_name = 'worker-control-failure-' + control['request_sha256'] + '-' + phase + '.json'
+         known = {OSError: 'os_error', PermissionError: 'permission_error',
+                  FileNotFoundError: 'file_not_found', RuntimeError: 'runtime_error',
+                  TypeError: 'type_error', ValueError: 'value_error', KeyError: 'key_error',
+@@ -69,6 +83,10 @@
+             loaded = sys.modules.get(__package__ + '.' + module)
+             cls = vars(loaded).get(name) if loaded is not None else None
+             if isinstance(cls, type): known[cls] = label
++        if control is not None:
++            scope_module = sys.modules.get('hermes_cli.friday_user_scope')
++            scope_error = vars(scope_module).get('ScopeDenied') if scope_module is not None else None
++            if isinstance(scope_error, type): known[scope_error] = 'scope_denied'
+         root = Path(__file__).absolute().parent
+         modules = ('host.py', 'controller.py', 'associations.py', 'host_record.py',
+                    'host_runtime.py', 'supervision.py', 'adapters/dsh.py',
+@@ -107,6 +125,8 @@
+                  **primary, 'causes': causes,
+                  'observed_unix': time.time(), 'observed_monotonic': time.monotonic(),
+                  'execution_outcome': 'UNPROVEN', 'cleanup_outcome': 'NOT_ASSERTED'}
++        if control is not None:
++            value.update(schema='friday.worker-control-failure.v1', **control)
+         data = (json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)+'\n').encode()
+         if len(data) > 4096: return False
+         directory = Path(directory)
+@@ -121,7 +141,7 @@
+             if (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700
+                     or identity(directory.lstat()) != identity(info)):
+                 return False
+-            name = 'worker-failure-' + reference + '-' + phase + '.json'
++            name = record_name
+             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                          0o600, dir_fd=parent)
+             created = True
+@@ -410,6 +430,39 @@
+         except BaseException:
+             return False  # Includes diagnostic import/setup failure; stop still runs.
+ 
++    def _control_failure_diagnostic(self, row, command, phase, error):
++        try:
++            # Read only the already leased native receipt for correlation. This
++            # does not establish a UserScope or grant permission to act.
++            from hermes_cli.plugin_command_context import get_command_context
++            import hashlib
++            import secrets
++            try:
++                receipt = get_command_context(self.ctx)
++            except Exception:
++                receipt = None
++            receipt = receipt if isinstance(receipt, dict) else {}
++            ingress = receipt.get('admitted_ingress')
++            message = ingress.get('message', {}) if isinstance(ingress, dict) else {}
++            message = message if isinstance(message, dict) else {}
++            identity = {k: message.get(k) for k in
++                        ('bot_id', 'user_id', 'chat_id', 'thread_id', 'message_id', 'platform_update_id')}
++            if all(type(identity[k]) is str and identity[k]
++                   for k in ('bot_id', 'user_id', 'chat_id', 'message_id', 'platform_update_id')):
++                identity.update(command=command, session_key=receipt.get('session_key'),
++                                native_operation=receipt.get('native_operation'))
++                correlation = hashlib.sha256(json.dumps(identity, sort_keys=True,
++                             separators=(',', ':'), allow_nan=False).encode()).hexdigest()
++                kind = 'native_receipt'
++            else:
++                # A broken/expired lease must not hide its own failure. This
++                # private local ID is explicitly not an authenticated receipt.
++                correlation, kind = secrets.token_hex(32), 'local_only'
++            return _record_async_failure(self._state_directory, row or {}, phase, error,
++                       control={'request_sha256': correlation, 'command': command, 'correlation_kind': kind})
++        except BaseException:
++            return False  # Diagnostic failure never replaces the control failure.
++
+     def _stop_on_error(self, row, error):
+         self._failure_diagnostic(row, "host_cleanup", error)
+         # No storage access or owned coroutine is required for emergency stop.
+@@ -680,10 +733,12 @@
+     def _control_bounded(self, command, raw_args):
+         cached = None
+         receipt = None
++        phase = 'control_context'
+         try:
+             if Path(self.store.state.data_dir) != self._state_directory:
+                 raise HostUnavailable("foreign_runtime_home")
+             receipt = self.ctx.get_command_context()
++            phase = 'control_principal'
+             principal = self._principal(receipt, command)
+             builtin = receipt.get("native_operation") is not None
+             if not isinstance(raw_args, str) or (builtin and raw_args != ""):
+@@ -694,12 +749,14 @@
+                 for owned in tuple(self._owned.values()):
+                     if (not reference or owned['existing_task_id'] == reference):
+                         check_local_job(self, owned)
++            phase = 'control_candidates'
+             candidates = [r for r in tuple(self._owned.values())
+                           if (not reference or r["existing_task_id"] == reference)
+                           and self._matches_control(r, principal, receipt)]
+             if len(candidates) == 1:
+                 cached = copy.deepcopy(candidates[0])
+             if not reference:
++                phase = 'control_snapshot'
+                 rows = [r for r in self.store.snapshot().values()
+                         if self._matches_control(r, principal, receipt)]
+                 if builtin and not rows:
+@@ -710,6 +767,7 @@
+                 # snapshot validated the same durable ownership and transport;
+                 # a subsequent metadata wait cannot withhold this checked stop.
+                 cached = copy.deepcopy(rows[0])
++            phase = 'control_row'
+             row = self.store.get_for_control(reference, principal)
+             from hermes_cli.friday_cli_work import check_local_job
+             check_local_job(self, row)
+@@ -720,18 +778,23 @@
+                 raise HostUnavailable("foreign_control_profile")
+             self._remember(row)
+             cached = row
++            phase = 'control_lease'
+             if self.ctx.get_command_context() != receipt:
+                 raise HostUnavailable("expired_control_lease")
++            phase = 'control_action'
+             if command == "friday-status":
+                 row = self._reconcile(row)
+             else:
+                 row = self._stop(row, "pause" if command == "friday-pause" else "cancel")
+             return json.dumps(status(row))
+         except (ValueError, RuntimeError, OSError, TypeError) as error:
+-            if (cached is not None and self.ctx.get_command_context() == receipt
+-                    and not any(note.startswith("owned execution STOP_")
+-                                for note in getattr(error, "__notes__", ()))):
+-                self._stop_on_error(cached, error)
++            try:
++                if (cached is not None and self.ctx.get_command_context() == receipt
++                        and not any(note.startswith("owned execution STOP_")
++                                    for note in getattr(error, "__notes__", ()))):
++                    self._stop_on_error(cached, error)
++            finally:
++                self._control_failure_diagnostic(cached, command, phase, error)
+             answer = {"accepted": False, "error": "control_unavailable"}
+             if any("STOP_UNCONFIRMED" in note for note in getattr(error, "__notes__", ())):
+                 answer["cleanup"] = "STOP_UNCONFIRMED"
