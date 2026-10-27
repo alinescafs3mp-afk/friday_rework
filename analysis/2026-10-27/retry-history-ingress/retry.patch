@@ -1,0 +1,94 @@
+--- a/gateway/slash_commands_session.py
++++ b/gateway/slash_commands_session.py
+@@ -10,6 +10,7 @@
+ 
+ import asyncio
+ import contextlib
++import copy
+ import dataclasses
+ import logging
+ import os
+@@ -434,7 +435,7 @@
+         # Resolve text + scaffold-preserving prefix BEFORE any write; messaging retries cannot
+         # reconstruct attachments, so media/unknown content is rejected with the session untouched.
+         try:
+-            truncated, live_view = history_before_user_originated_turn(history, last_user_idx)
++            _, live_view = history_before_user_originated_turn(history, last_user_idx)
+             last_user_msg = retryable_user_text(live_view.get("content"))
+             handoff, _ = split_user_originated_turn(history[last_user_idx])
+         except ValueError as exc:
+@@ -445,8 +446,6 @@
+             # archives it and inserts the pure scaffold atomically, reselecting the latest carrier
+             # on the same snapshot so a concurrent newer turn is never removed for stale text.
+             try:
+-                # Plain turns keep the existing rewrite path below; #84078 owns its separate
+-                # archive_dropped/prefix-CAS semantics.
+                 rewind_result = await self.async_session_store.rewind_session(
+                     session_entry.session_id, 1, require_retryable_composite=True)
+             except ValueError as exc:
+@@ -454,15 +453,29 @@
+             if rewind_result is None:
+                 return t("gateway.retry.failed_unchanged")
+             last_user_msg = rewind_result["target_text"]
+-        # active_only preserves the active=0/compacted=1 archive left by in-place compaction.
+-        elif not await self.async_session_store.rewrite_transcript(
+-            session_entry.session_id, truncated, active_only=True, reject_active_turn_lease=True):
+-            return t("gateway.retry.failed_unchanged")
++        else:
++            # Plain turns use the same durable, lease/CAS-checked archive operation. Re-select
++            # and validate the current target there, then replay the exact text it archived.
++            try:
++                rewind_result = await self.async_session_store.rewind_session(
++                    session_entry.session_id, 1, require_retryable=True)
++            except ValueError as exc:
++                return t("gateway.retry.unsafe", error=exc)
++            if rewind_result is None:
++                return t("gateway.retry.failed_unchanged")
++            last_user_msg = rewind_result["target_text"]
+         session_entry.last_prompt_tokens = 0  # transcript was truncated
+         self._record_model_friction("retry", source, session_entry.session_id)
+-        return await self._handle_message(MessageEvent(
+-            text=last_user_msg, message_type=MessageType.TEXT, source=source,
+-            raw_message=event.raw_message, channel_prompt=event.channel_prompt))
++        # This is the CURRENT command's real ingress, not an admission reconstructed from
++        # history. A shallow copy also retains init=False and adapter-private attributes;
++        # dataclasses.replace would silently reset them. Leave the original event untouched.
++        retry_event = copy.copy(event)
++        # Attachment rehoming adds new cache receipts; isolate that mapping while retaining
++        # every original receipt and its native source/content identity.
++        retry_event._telegram_media_receipts = event._telegram_media_receipts.copy()
++        retry_event.text = last_user_msg
++        retry_event.message_type = MessageType.TEXT
++        return await self._handle_message(retry_event)
+ 
+     def _record_model_friction(self, signal: str, source, session_id: str, turns: int = 1) -> None:
+         """Slash dispatch does not install the routed profile's scope, so a multiplexed runner
+--- a/gateway/session_transcript.py
++++ b/gateway/session_transcript.py
+@@ -595,13 +595,14 @@
+ 
+     def rewind_session(
+         self, session_id: str, n: int = 1, *, require_retryable_composite: bool = False,
++        require_retryable: bool = False,
+     ) -> Optional[Dict[str, Any]]:
+         """Back up ``n`` user turns via soft-delete (``active=0``), mirroring CLI ``/undo [N]``.
+         Returns ``{"rewound_count", "turns_undone", "target_text"}`` or ``None`` (no DB / no rewindable
+         turn / persistence failure); ``n`` clamps to the oldest user turn. ``require_retryable_composite``
+-        is the gateway ``/retry`` guard: the selected turn must be a composite carrier whose live payload
+-        is losslessly replayable as text — that replay-policy ``ValueError`` propagates so /retry can
+-        explain why the carrier is unsafe."""
++        additionally requires a composite carrier. ``require_retryable`` allows either plain or
++        composite turns, requiring lossless text replay before any write. Both propagate replay-policy
++        ``ValueError`` so /retry can explain why a turn is unsafe."""
+         db = self._db_for_session_id(session_id)
+         if not db:
+             return None
+@@ -609,7 +610,7 @@
+         with self._get_transcript_drain_lock():
+             try:
+                 outcome = db.rewind_user_turn(
+-                    session_id, -max(n, 1), require_retryable=require_retryable_composite,
++                    session_id, -max(n, 1), require_retryable=(require_retryable or require_retryable_composite),
+                     require_composite=require_retryable_composite)
+             except RewindTargetUnavailableError as e:
+                 logger.debug("rewind_session: %s", e)
