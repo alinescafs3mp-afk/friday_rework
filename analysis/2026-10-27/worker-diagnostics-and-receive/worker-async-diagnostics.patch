@@ -1,0 +1,228 @@
+--- a/plugins/friday_rework/host.py
++++ b/plugins/friday_rework/host.py
+@@ -36,6 +36,111 @@
+             "quiescent": host["quiescence"] is not None,
+             "goal_verification": row["goal_verification"], "delivery": row["delivery"],
+             "deadline_unix": row["deadline_unix"], "elapsed_seconds": row["elapsed_seconds"]}
++
++
++def _record_async_failure(directory, row, phase, error):
++    """First bounded, private metadata per job/phase; no state or retry authority.
++
++    No exception text, arbitrary class/function/file names, locals, credentials,
++    task content or principal identifiers. Failure never withholds owned stop.
++    """
++    import os
++    import stat
++    import secrets
++    import sys
++    try:
++        phases = {'controller_cleanup', 'host_cleanup', 'reconcile', 'executor_submit',
++                  'await_start', 'wait_observation', 'runtime_check', 'stop_requested',
++                  'observe', 'notify_finished'}
++        reference = row.get('existing_task_id')
++        if (row.get('worker_kind') != 'dsh' or phase not in phases
++                or type(reference) is not str
++                or not re.fullmatch(r'native-[0-9a-f]{64}', reference)):
++            return False
++        known = {OSError: 'os_error', PermissionError: 'permission_error',
++                 FileNotFoundError: 'file_not_found', RuntimeError: 'runtime_error',
++                 TypeError: 'type_error', ValueError: 'value_error', KeyError: 'key_error',
++                 IndexError: 'index_error', TimeoutError: 'timeout_error',
++                 AssertionError: 'assertion_error', asyncio.CancelledError: 'cancelled_error',
++                 HostUnavailable: 'host_unavailable', AssociationError: 'association_error',
++                 json.JSONDecodeError: 'json_decode_error'}
++        for module, name, label in (('adapters.dsh', 'AdapterError', 'dsh_adapter_error'),
++                                   ('controller', 'ControllerError', 'controller_error')):
++            loaded = sys.modules.get(__package__ + '.' + module)
++            cls = vars(loaded).get(name) if loaded is not None else None
++            if isinstance(cls, type): known[cls] = label
++        root = Path(__file__).absolute().parent
++        modules = ('host.py', 'controller.py', 'associations.py', 'host_record.py',
++                   'host_runtime.py', 'supervision.py', 'adapters/dsh.py',
++                   'adapters/contract.py', 'results.py', 'result_tool.py', 'artifacts.py')
++        allowed = {str(root/name): name for name in modules}
++        for name in ('friday_cli_caller', 'friday_user_scope', 'friday_cli_work',
++                     'plugins_state', 'plugins_gateway_work'):
++            loaded = sys.modules.get('hermes_cli.' + name)
++            path = vars(loaded).get('__file__') if loaded is not None else None
++            if type(path) is str: allowed[path] = 'hermes_cli/' + name + '.py'
++        def location(exc, limit):
++            frames = []
++            tb = BaseException.__traceback__.__get__(exc)
++            for _ in range(64):
++                if tb is None: break
++                module = allowed.get(tb.tb_frame.f_code.co_filename)
++                if module is not None and 0 < tb.tb_lineno < 2**31:
++                    frames.append({'module': module, 'line': tb.tb_lineno})
++                    frames = frames[-limit:]
++                tb = tb.tb_next
++            return {'exception_type': known.get(type(exc), 'other'),
++                    'source_frames': frames, 'trace_truncated': tb is not None}
++        primary = location(error, 8)
++        causes, seen, cursor = [], {id(error)}, error
++        for _ in range(2):
++            cause = BaseException.__cause__.__get__(cursor)
++            if cause is None: cause = BaseException.__context__.__get__(cursor)
++            if cause is None or id(cause) in seen: break
++            seen.add(id(cause)); causes.append(location(cause, 4)); cursor = cause
++        native = row.get('native') or {}
++        invocation = native.get('invocation_id')
++        if type(invocation) is not str or not re.fullmatch('[0-9a-f]{32}', invocation):
++            invocation = None
++        value = {'schema': 'friday.worker-async-failure.v1', 'reference': reference,
++                 'invocation_id': invocation, 'phase': phase,
++                 **primary, 'causes': causes,
++                 'observed_unix': time.time(), 'observed_monotonic': time.monotonic(),
++                 'execution_outcome': 'UNPROVEN', 'cleanup_outcome': 'NOT_ASSERTED'}
++        data = (json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)+'\n').encode()
++        if len(data) > 4096: return False
++        directory = Path(directory)
++        if not directory.is_absolute() or directory.resolve() != directory: return False
++        parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++        temporary = '.worker-failure-' + secrets.token_hex(16)
++        created = False
++        def identity(st):
++            return st.st_dev, st.st_ino, st.st_uid, st.st_gid, st.st_mode
++        try:
++            info = os.fstat(parent)
++            if (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700
++                    or identity(directory.lstat()) != identity(info)):
++                return False
++            name = 'worker-failure-' + reference + '-' + phase + '.json'
++            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
++                         0o600, dir_fd=parent)
++            created = True
++            with os.fdopen(fd, 'wb') as stream:
++                os.fchmod(stream.fileno(), 0o600)
++                if stream.write(data) != len(data): raise OSError('short_diagnostic_write')
++                stream.flush(); os.fsync(stream.fileno())
++            if identity(directory.lstat()) != identity(info): return False
++            # Link a complete fsynced inode once. Never replace earlier evidence.
++            os.link(temporary, name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
++            os.fsync(parent)
++            return True
++        finally:
++            try:
++                if created: os.unlink(temporary, dir_fd=parent)
++            finally:
++                os.close(parent)
++    except BaseException:
++        return False
+ 
+ 
+ class WorkerHost:
+@@ -66,7 +171,8 @@
+             controller = self._a0_controllers.setdefault(address, controller)
+             controller.bindings['a0'].adapter._same(row)
+             return controller
+-        return Controller(self.store, {"dsh": dsh_binding(row["host"]["binding"]["runtime"], self.store)})
++        return Controller(self.store, {"dsh": dsh_binding(row["host"]["binding"]["runtime"], self.store)},
++                          failure_diagnostic=self._failure_diagnostic)
+ 
+     def handle(self, args, **kwargs):
+         try:
+@@ -286,7 +392,14 @@
+             self._stop_on_error(row, error)
+             raise
+ 
++    def _failure_diagnostic(self, row, phase, error):
++        try:
++            return _record_async_failure(self._state_directory, row, phase, error)
++        except BaseException:
++            return False  # Includes diagnostic import/setup failure; stop still runs.
++
+     def _stop_on_error(self, row, error):
++        self._failure_diagnostic(row, "host_cleanup", error)
+         # No storage access or owned coroutine is required for emergency stop.
+         # A changed runtime home cannot turn cached ownership into authority.
+         try:
+@@ -363,6 +476,7 @@
+             with self.store.lock_budget():
+                 return self._reconcile_checked(row)
+         except BaseException as error:
++            self._failure_diagnostic(row, "reconcile", error)
+             if not any(note.startswith("owned execution STOP_")
+                        for note in getattr(error, "__notes__", ())):
+                 self._stop_on_error(row, error)
+@@ -421,21 +535,30 @@
+         # Existing asyncio default executor, no custom thread pool. Shield the
+         # actual executor future so cancellation cannot make its thread vanish.
+         loop = asyncio.get_running_loop()
+-        execution = loop.run_in_executor(None, copy_context().run, self._start, row)
+-        try:
++        execution = None
++        phase = "executor_submit"
++        try:
++            execution = loop.run_in_executor(None, copy_context().run, self._start, row)
++            phase = "await_start"
+             current = await asyncio.shield(execution)
+             while current["host"]["quiescence"] is None:
++                phase = "wait_observation"
+                 await asyncio.sleep(min(1.0, max(.01, current["deadline_unix"] - self.store.clock())))
++                phase = "runtime_check"
+                 from hermes_cli.friday_cli_work import should_stop
+                 if (self._closed or (row['owner'].get('platform') == 'cli' and should_stop())
+                         or select_runtime(self.ctx.get_config("runtime"), row["worker_kind"]) != row["host"]["binding"]["runtime"]):
++                    phase = "stop_requested"
+                     current = await asyncio.to_thread(self._stop, current, "cancel")
+                 else:
++                    phase = "observe"
+                     current = await asyncio.to_thread(self._reconcile, current)
++            phase = "notify_finished"
+             from .result_tool import notify_finished
+             await notify_finished(self, current)
+             return status(current)
+         except asyncio.CancelledError as error:
++            self._failure_diagnostic(row, phase, error)
+             # Native stop first, then wait for the bounded in-flight launch to
+             # settle and stop again. Future.cancel alone is never quiescence.
+             try:
+@@ -443,7 +566,8 @@
+             except BaseException as stop_error:
+                 error.add_note("owned execution STOP_UNCONFIRMED: " + type(stop_error).__name__)
+             try:
+-                await asyncio.shield(execution)
++                if execution is not None:
++                    await asyncio.shield(execution)
+             except BaseException as execution_error:
+                 error.add_note("owned launch settlement failed: " + type(execution_error).__name__)
+             try:
+@@ -452,6 +576,7 @@
+                 error.add_note("owned execution STOP_UNCONFIRMED: " + type(stop_error).__name__)
+             raise
+         except Exception as error:
++            self._failure_diagnostic(row, phase, error)
+             try:
+                 await asyncio.to_thread(self._stop, self._owned.get(row["existing_task_id"], row), "cancel")
+             except BaseException as stop_error:
+--- a/plugins/friday_rework/controller.py
++++ b/plugins/friday_rework/controller.py
+@@ -67,12 +67,13 @@
+ 
+ 
+ class Controller:
+-    def __init__(self, associations: Associations, bindings: Mapping[str, WorkerBinding]):
++    def __init__(self, associations: Associations, bindings: Mapping[str, WorkerBinding], *, failure_diagnostic=None):
+         if any(k not in {"dsh", "a0"} or not isinstance(v, WorkerBinding)
+                or not callable(v.emergency_stop) for k, v in bindings.items()):
+             raise ControllerError("invalid_worker_binding")
+         self.associations = associations
+         self.bindings = dict(bindings)
++        self._failure_diagnostic = failure_diagnostic
+ 
+     def _binding(self, row):
+         try:
+@@ -130,6 +131,12 @@
+         return None
+ 
+     def _stop_on_error(self, row, error):
++        # Preserve original phase/class/site before cleanup can raise again.
++        try:
++            if self._failure_diagnostic is not None:
++                self._failure_diagnostic(row, "controller_cleanup", error)
++        except BaseException:
++            pass  # Diagnostic failure never withholds exact-owned stop.
+         # No fresh state read or receipt write may prevent this attempt.
+         try:
+             observed = self._binding(row).emergency_stop(copy.deepcopy(row))

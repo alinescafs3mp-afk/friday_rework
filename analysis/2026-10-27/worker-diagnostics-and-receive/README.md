@@ -1,0 +1,13 @@
+# Worker diagnostics and Telegram receive — 2026-10-27
+
+This inactive source checkpoint adds protected failure metadata before owned worker cleanup and gives ordinary Telegram receive polls a separate 30-second HTTP limit. Both deltas are reviewed source candidates; neither was installed when this checkpoint was prepared.
+
+The worker patch changes two existing plugin modules. It records bounded phase, exception category and allowlisted source locations without exception messages, user content, credentials or arbitrary local variables. Diagnostic failure cannot suppress the existing owned stop. Executor submission is moved inside the existing cleanup boundary. Stop rules, cancellation, original deadlines and outcome classification remain intact. The previous DSH termination is still unexplained; this patch does not retroactively identify its cause.
+
+The Telegram patch opts only ordinary getUpdates polling into a 30-second HTTP cap. Default 10-second limits remain for other callers, including sends, downloads and terminal drain. Original wall and monotonic deadlines, full capture, cursor custody, refusal and rate-limit behavior remain unchanged. No retry is introduced. An in-flight poll can now delay observer-stop detection up to 30 seconds. A future operation needs enough unchanged post-cutoff budget for polling, terminal drain and reporting. The remote cause of the observed network stalls remains unknown.
+
+The code patches are byte-identical to the accepted private candidates. The source contract records exact preimages and afterimages; these are analysis materials, not an active overlay manifest. Public main may not contain their full installed predecessor chain. Do not apply them by removing prerequisite checks or assume that publication activates them.
+
+Reused validation: 54 worker diagnostic controls also passed on the actual native Python 3.14 interpreter, plus an independent overlapping 20-case review; these are not 128 unique tests. The receive delta has 12 offline controls, including the real alarm boundary without network access, and independent review. Tests were not repeated merely for publication.
+
+Current product evidence remains incomplete. DSH produced a partial archive, but stopped before completion and delivery; its sample input was changed, so it is not accepted. The independent A0 Telegram request was rejected before worker submission because the received-file path did not match the configured cache roots; a subsequent call met the retained capacity reservation. A file written by the main agent is not an A0 result. Those repairs continue separately. Permanent gateway and Dashboard services remain running; publication neither restarts services nor repeats a user task.
