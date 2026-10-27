@@ -337,3 +337,19 @@ BOTH-worker or Telegram user-task acceptance is claimed from these separate
 observations.
 
 Gateway and Dashboard remain running. Both Telegram file tasks remain unsent.
+
+## R483: current-boot DSH safety observation
+
+The installed final consumer rejected the historical DSH safety execution
+because its resource envelope belonged to an earlier boot. The saved A0 and
+DSH smoke/network results remained usable. A separate call to the existing
+safety-only observer completed all eight controls in one native scope in
+3.216797 seconds. It used a new 120-second operation with a 20-second reserve;
+the native scope itself was limited to 20 seconds.
+
+The old safety record was preserved. Raw native output was saved before
+parsing, and the installed DSH consumer accepted the new safety observation
+together with the saved smoke/network observations. Each stage retained its
+own original clock. This subcheck does not establish a combined qualification,
+runtime attachment or Telegram user-task acceptance. Healthy permanent
+services were preserved.
