@@ -71,6 +71,32 @@ class EventTests(unittest.TestCase):
                             {"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"failed"}}))
         self.assertTrue(e.failed); self.assertFalse(e.completed)
 
+    def test_max_tokens_final_is_failed_native_completion(self):
+        data = lines(OPEN, {"type": "status", "phase": "turn_start", "turn": 1},
+                     {"type": "status", "phase": "turn_end", "turn": 1, "reason": {"kind": "max-tokens"}},
+                     {"type": "final", "text": "\n\n"})
+        e = self.reduce(data)
+        self.assertTrue(e.turn_ended and e.final and e.failed)
+        self.assertFalse(e.completed)
+        for extra in ({"type": "final", "text": "duplicate"},
+                      {"type": "status", "phase": "turn_start", "turn": 1}):
+            with self.subTest(extra=extra), self.assertRaises(AdapterError):
+                self.reduce(data + lines(extra))
+
+    def test_failed_final_keeps_tool_pairing_and_text_checks(self):
+        prefix = lines(OPEN, {"type": "status", "phase": "turn_start", "turn": 1},
+                       {"type": "status", "phase": "step_start", "turn": 1, "step": 1},
+                       {"type": "tool_call", "callId": "pending", "tool": "read", "input": {}},
+                       {"type": "status", "phase": "step_end", "turn": 1, "step": 1},
+                       {"type": "status", "phase": "turn_end", "turn": 1, "reason": {"kind": "max-tokens"}})
+        with self.assertRaises(AdapterError):
+            self.reduce(prefix + lines({"type": "final", "text": ""}))
+        for text in (None, 7, {}, []):
+            with self.subTest(text=text), self.assertRaises(AdapterError):
+                self.reduce(lines(OPEN, {"type": "status", "phase": "turn_start", "turn": 1},
+                                  {"type": "status", "phase": "turn_end", "turn": 1, "reason": {"kind": "max-tokens"}},
+                                  {"type": "final", "text": text}))
+
     def test_tool_results_must_match_calls(self):
         prefix=lines(OPEN,{"type":"status","phase":"turn_start","turn":1},
                      {"type":"status","phase":"step_start","turn":1,"step":1},
@@ -235,6 +261,32 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.row["goal_verification"],"NOT_RUN");self.assertEqual(self.row["delivery"],"NOT_RUN")
         (c/"events.ndjson").write_bytes(lines(OPEN))
         self.assertEqual(self.adapter.observe(self.row,p).state,"failed")
+
+    def test_max_tokens_observation_preserves_failure_without_cleanup(self):
+        p = self.prep(); c = Path(p.receipt_reference).parent
+        from friday_dsh_adapter_test.adapters.dsh import _identity, credential_fingerprints
+        _write(c / "credential-guard.json", {"schema": 1, "identity": _identity(self.row),
+                                            "keys": credential_fingerprints(self.config.environment())})
+        self.sup.launched = True
+        _write(c / "invocation.json", {"invocation_id": INV})
+        data = lines(OPEN, {"type": "status", "phase": "turn_start", "turn": 1},
+                     {"type": "status", "phase": "turn_end", "turn": 1, "reason": {"kind": "max-tokens"}},
+                     {"type": "final", "text": "\n\n"})
+        (c / "events.ndjson").write_bytes(data)
+        # Even an exit-zero receipt cannot turn model truncation into success.
+        for service, code in (("exit-code", "1"), ("success", "0")):
+            (c / "terminal.json").unlink(missing_ok=True)
+            _write(c / "terminal.json", {"INVOCATION_ID": INV, "SERVICE_RESULT": service,
+                                         "EXIT_CODE": "exited", "EXIT_STATUS": code})
+            with self.subTest(service=service):
+                observed = self.adapter.observe(self.row, p)
+                self.assertEqual(observed.state, "failed")
+                self.assertEqual(observed.invocation_id, INV)
+                self.assertEqual(self.sup.stops, 0)
+                self.assertIsNone(self.row["stop_intent"])
+                self.assertEqual(self.row["goal_verification"], "NOT_RUN")
+                self.assertEqual(self.row["delivery"], "NOT_RUN")
+                self.assertEqual((c / "events.ndjson").read_bytes(), data)
 
     def test_malformed_observation_stops_owned_boundary(self):
         p=self.prep();c=Path(p.receipt_reference).parent;self.sup.launched=True;self.sup.running=True

@@ -204,6 +204,7 @@ class NativeEvents:
         self.turn = None
         self.step = None
         self.completed = False
+        self.turn_ended = False
         self.final = False
         self.failed = False
         self.calls = set()
@@ -234,7 +235,7 @@ class NativeEvents:
                 phase = v.get("phase")
                 if type(v.get("turn")) is not int or v["turn"] != 1:
                     raise ValueError()
-                if phase == "turn_start" and self.turn is None and not self.completed:
+                if phase == "turn_start" and self.turn is None and not self.turn_ended:
                     self.turn = 1
                 elif phase == "step_start" and self.turn == 1 and self.step is None:
                     if type(v.get("step")) is not int or v["step"] <= 0:
@@ -243,6 +244,7 @@ class NativeEvents:
                 elif phase == "step_end" and self.step is not None and v.get("step") == self.step:
                     self.step = None
                 elif phase == "turn_end" and self.turn == 1 and self.step is None:
+                    self.turn_ended = True
                     self.completed = v.get("reason", {}).get("kind") == "completed"
                     self.failed |= not self.completed
                     self.turn = None
@@ -261,7 +263,7 @@ class NativeEvents:
             elif kind in {"thinking", "text"} and self.turn == 1:
                 if not isinstance(v.get("text"), str):
                     raise ValueError()
-            elif kind == "final" and self.completed and not self.final:
+            elif kind == "final" and self.turn_ended and not self.final:
                 if not isinstance(v.get("text"), str) or self.calls != self.results:
                     raise ValueError()
                 self.final = True
