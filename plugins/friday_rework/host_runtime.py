@@ -753,9 +753,23 @@ class A0HostSession:
         self.store.a0_observation(row['existing_task_id'], row['owner'])
 
     def _finish_sample(self, row, sample):
+        # Runtime keeps its original native sample for cessation. The host
+        # record has a narrower PID/start identity projection with decimal text.
+        from .host_record import validate_a0_observations
+        projection = copy.deepcopy(sample)
+        for process in projection['processes']:
+            if set(process) == {'pid', 'start_ticks', 'state'}:
+                if (type(process['start_ticks']) is not int
+                        or not isinstance(process['state'], str)
+                        or len(process['state']) != 1):
+                    raise HostUnavailable('invalid_native_process_sample')
+                process.pop('state')
+                process['start_ticks'] = str(process['start_ticks'])
+        validate_a0_observations({'pending': False, 'samples': [projection]},
+                                 self.created['container_id'])
         # Keep the new identity in memory even if the durable write fails.
-        self.retained_samples.append(copy.deepcopy(sample))
-        self.store.a0_observation(row['existing_task_id'], row['owner'], sample)
+        self.retained_samples.append(copy.deepcopy(projection))
+        self.store.a0_observation(row['existing_task_id'], row['owner'], projection)
         self.observation_pending = False
 
     def _retain_sample(self, m, r, sample):
@@ -1099,6 +1113,17 @@ class A0HostSession:
                 raise HostUnavailable('STOP_UNCONFIRMED; unexpected pre-container worker')
             self.unit=unit;self.route_only_confirmed=True;self.native_cessation=True
             return unit
+        if (self.boundary is None and self.grant is None and self.runtime is None
+                and self.plan is not None and self.created is not None):
+            # Pure restoration of exact retained stop custody; no launch path,
+            # original budget reset, key recovery or observation-history reset.
+            m = self._route_module() if self.route is not None else self._module()
+            runtime = m.Runtime(self.plan, stopping=True)
+            known = runtime.durable_receipt()
+            if (known['container_id'] != self.created['container_id']
+                    or known['plan_sha256'] != self.created['plan_sha256']):
+                raise HostUnavailable('STOP_UNCONFIRMED; retained pre-grant identity changed')
+            self.runtime = runtime
         if self.boundary is None:
             if self.grant is not None:
                 self.boundary=self._boundary(row,stop_only=True)
