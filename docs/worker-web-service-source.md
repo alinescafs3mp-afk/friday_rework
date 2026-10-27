@@ -353,3 +353,42 @@ together with the saved smoke/network observations. Each stage retained its
 own original clock. This subcheck does not establish a combined qualification,
 runtime attachment or Telegram user-task acceptance. Healthy permanent
 services were preserved.
+
+## R485–R489: installed source and combined qualification accepted
+
+The two-file host-runtime correction was committed through the existing narrow
+source updater. The installed input digest is
+`ef576982eb40dde2c319eeb093c6ccffffea7cfe1eee0341eb2bd3cf175af2f2`.
+The native runtime, web adapter, launcher and prepared worker declarations were
+preserved. A fresh installed process verified the committed source using the
+accepted historical receipt compatibility; the source installation was not
+repeated after the first verifier rejected that historical discriminator.
+
+Gateway and Dashboard were refreshed once under their existing permanent
+management so they loaded the installed correction. The service verification
+confirmed their new process identities, gateway restart policy and the
+CA-verified Dashboard response. Kimi's existing process and session were
+preserved. These services have no test-window expiry.
+
+The first attempt to publish the saved worker qualification failed before
+authentication or publication: the direct native entry had not loaded the
+configured authentication environment. This pre-authentication failure was
+closed and retained. A separate narrow entry correction loaded only the
+configured authentication keys through the installed secret parser, preserved
+and restored the prior environment, and retired its temporary authentication
+session. It did not repeat A0 startup, DSH smoke/network/safety observations,
+installation or service refresh.
+
+The resulting publication attached both own deployments. A separate fresh
+installed process then passed the real runtime and deployment-health consumers.
+The accepted state is `ADMITTED_BOTH_WORKERS_ATTACHED`, generation 2, with both
+workers qualified. This is deployment qualification; the recorded execution
+state remains `OWN_DEPLOYMENTS_QUALIFIED_LIVE_JOURNEYS_NOT_RUN`.
+
+The Root acceptance digest is
+`43be84ab67e0eac504b79aa973c26dfc8fbabeced38e8cc478a166076f27d84b`.
+The retained qualification, failed attempts and cleanup evidence remain private.
+No Telegram artifact or contextual follow-up is accepted by this checkpoint.
+The next step is the previously prepared DSH file task, followed by the A0
+engineering task. Neither source status nor combined qualification substitutes
+for those user results.
