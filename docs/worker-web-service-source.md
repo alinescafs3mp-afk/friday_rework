@@ -238,3 +238,16 @@ archive action had started at that point. Native archival then completed in
 must not be added. R479 uses the final diagnostic revision and has started its
 necessary source-validation stage; qualification and both Telegram results remain
 unaccepted.
+
+R479 then failed after 511.954 seconds, including 498.319 seconds of source
+validation before the worker stage. This time the diagnostic captured the owned
+container's exit code 1, `OOMKilled=false`, and the startup exception
+`native_web_overlay_refused` at the Git installer's parent-directory guard.
+The pinned image ships `/etc` as `0775`; the unchanged guard rejects its group
+write bit. The [narrow parent-mode patch](review-candidates/a0-web-parent-mode-20261027/README.md)
+is reviewed source only and still needs coherent installation.
+
+R479's container, network and introduced keys were reconciled, and its stopped
+daemon execution metadata was archived and retired in a separate 5.726-second
+maintenance operation. Permanent gateway, Dashboard and Kimi processes were
+preserved. Both Telegram file tasks remain unexecuted.
