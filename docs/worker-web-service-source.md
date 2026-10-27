@@ -152,8 +152,32 @@ requires. Direct evaluation by the installed deployment-contract consumer
 reproduced that mismatch; the other seven entries matched. The rootless daemon
 was inactive and no new A0 bootstrap, probe plan or runtime receipt existed.
 
-The accepted source, native mirrors and configuration derivative remain in
-place, and the permanent services remain running. The remaining repair is the
-missing manifest entry and its digest reference, with explicit maintenance
-provenance for the next qualification. The failed attempt and its saved DSH
-safety observation are retained. Neither new Telegram file task has been sent.
+At that checkpoint, the accepted source, native mirrors and configuration
+derivative remained in place, with the permanent services running. The missing
+manifest entry and its digest reference still required repair; the failed
+attempt and its saved DSH safety observation were retained.
+
+The subsequent R476 repair committed exactly two files: the A0 native-input
+manifest gained `web/gitconfig`, and `runtime-input.json` gained the updated
+manifest digest reference. The accepted source, native installation and
+configuration-derivative receipts were preserved without reinstallation.
+
+Preparation before apply took 1,266.545 seconds, including 70.094 seconds of
+staging preparation. Authenticated apply took 7.770 seconds. A separate fresh
+process running the installed deployment-contract consumer accepted the repaired
+inputs in 4.719 seconds. Both processes exited 0 and were reaped; these apply
+and observation durations are separate from preparation.
+
+The failed qualification's two files were archived byte-for-byte, and its DSH
+safety observation was kept for reuse without rerunning it. Gateway, Dashboard and Kimi
+kept the same permanent processes. At repair acceptance, no new worker
+qualification had completed and neither new Telegram file task had been sent.
+Worker qualification, both user tasks and the broader acceptance scope remain
+open.
+
+The following R477 qualification attempt ended after 8.438 seconds, before
+worker startup. Its historical inventory reader still followed an old
+preparation's manifest reference to the repaired current file and rejected the
+changed digest. The installed repair remains accepted. The remaining correction
+is an exact retained-file mapping for that historical reader; no installation
+or worker action needs to be repeated to correct it.
