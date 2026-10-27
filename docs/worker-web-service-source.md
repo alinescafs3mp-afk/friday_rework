@@ -181,3 +181,16 @@ preparation's manifest reference to the repaired current file and rejected the
 changed digest. The installed repair remains accepted. The remaining correction
 is an exact retained-file mapping for that historical reader; no installation
 or worker action needs to be repeated to correct it.
+
+## Accepted nested-manifest reader correction
+
+The [redacted S411 historical native-input reader delta](review-candidates/historical-native-input-20261027/README.md)
+adds one exact original-path-and-digest mapping to the accepted retained
+beforeimage; the current manifest remains separately checked. Independent review
+recorded 12 positive and 9 negative cached preparation checks with bounded IO and
+`private_check` seams, not a full live inventory pass. This private-adapter export
+is source-only analysis material, not a public runtime installer.
+
+R476 remains installed and accepted by a fresh installed consumer. At this
+checkpoint, R478 qualification is running and has not been accepted; neither new
+DSH/A0 Telegram file task has succeeded. The R477 failure is preserved above.
