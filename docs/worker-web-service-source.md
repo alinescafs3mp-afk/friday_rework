@@ -277,12 +277,31 @@ family correction passed the actual bound loader and complete budget guard.
 The existing capture and original source clock were retained. These refusals
 remain separate from the subsequent completed source installation.
 
-At this checkpoint, native web remains at
-`b16fb6681372223c4c6c04e6e7021eb53993cea56136bfe28419ac566976d5b6`,
-and native runtime remains at
+The subsequent native data capture took 498.344391 seconds. Its first apply
+stopped before transaction creation after 506.711190 seconds: the retained-input
+consumer rejected the legitimate absence of SQLite WAL/SHM sidecars. The core
+database and all 11 before-state hashes remained unchanged. That attempt was
+closed without a native update; its clock and evidence were preserved.
+
+After the narrow reader correction, a separate native apply committed in
+833.396566 seconds using the saved capture. The native web adapter now has the
+same `975bfd8c75e43b18e6d55d66f172d0d5929f100c83c16611a98efb841dd32b76`
+digest as canonical source. Native runtime remains
 `4111e677a103b93ef3d898757e67cea7dad1da68c34d542689707286b802cdd9`.
-The new native update has not been accepted. Gateway and Dashboard are
-temporarily stopped for coherent installation; Kimi is preserved. Worker
-qualification and both new DSH/A0 Telegram file tasks remain open, and neither
-task has been sent. Source acceptance does not establish runtime or user
-acceptance; no product READY is claimed.
+A fresh installed process verified the adapter against the existing runtime
+input; no source installation, input capture or prepared derivative was repeated.
+
+Gateway and Dashboard were restored under their existing permanent management.
+Verification covered the 47 plugin files, six native files, process identities,
+gateway systemd state and a CA-verified HTTPS 200 response. Kimi was preserved.
+The maintenance and service lifetimes are separate: these services remain up
+while worker qualification proceeds.
+
+The next qualification preflight stopped before a qualification clock,
+operation directory or worker launch: its private reader expected mode `0600`
+for the native mechanism's immutable `0400` receipt. Reader compatibility is
+being corrected without changing receipt permissions, repeating installation
+or restarting healthy services. Both new DSH/A0 Telegram file tasks remain
+unsent. Installation and service restoration do not establish worker or user
+acceptance; no product READY is claimed. The durations above are separate
+intervals and must not be summed with enclosing observations.

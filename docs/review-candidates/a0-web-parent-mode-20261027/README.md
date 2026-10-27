@@ -1,4 +1,4 @@
-# A0 web installer parent-mode fix — canonical source installed, native pending
+# A0 web installer parent-mode fix — installed, worker qualification pending
 
 R479's captured startup output identifies `native_web_overlay_refused` at the
 generated installer's parent-directory check. The owned container exited with
@@ -31,8 +31,8 @@ is claimed by this source package.
 
 R480 installed this web adapter and its exact declaration edge into canonical
 source. A fresh installed process accepted the installed input and verified
-47 physical plugin files. The native web copy still has its previous digest;
-the native update and a real container startup have not been accepted.
+47 physical plugin files. The later separate native update committed and its
+six files were verified; a real container startup has not yet been accepted.
 The 21 replay cases above remain source evidence, and neither new DSH/A0
 Telegram file task has been sent. See the
 [R480 installation checkpoint](../../worker-web-service-source.md#r480-canonical-source-installation)
@@ -89,9 +89,14 @@ the closed first attempt's authority; it also does not prove a new native run.
 | Canonical source installation | Accepted; preserved without reinstall |
 | First native apply | Closed: preflight refusal, no native update transaction |
 | Private sidecar-absence correction | Source accepted; exact limited delta |
-| Separately admitted R2 native apply | **Pending; no outcome claimed here** |
+| Separately admitted R2 native apply | Committed and physically verified in 833.396566 seconds |
+| Gateway and Dashboard | Restored permanently; process/systemd/HTTPS checks passed |
 | Fresh container/runtime and Telegram file tasks | Not accepted by this source checkpoint |
 
 The compact [result record](sidecar-absence-results.json) carries the same scope
-and pending R2 status. R2 needs its own actual consumer result and postconditions;
-this source acceptance alone does not establish native, runtime or user acceptance.
+and actual R2 status. R2 reused the saved capture and did not repeat canonical
+installation. A fresh installed process checked the native adapter against the
+existing runtime input. The next qualification preflight exposed a separate
+reader compatibility issue with immutable `0400` native receipts and stopped
+before worker admission. Receipt permissions and healthy services are preserved.
+These results do not establish worker or Telegram user acceptance.
