@@ -732,8 +732,14 @@ class A0HostSession:
         return self._capability(row, pin)
 
     def _startup_left(self, row):
+        return self._startup_left_snapshot(self._current(row))
+
+    def _startup_left_snapshot(self, row):
+        # Only for read-only validation bracketed by fresh _current checks.
+        # Cancellation and the original clocks remain live on every callback;
+        # the already checked row avoids rereading the whole association store.
         import time
-        current = self._current(row)
+        current = self._eligible(row)
         a = current['host']['a0']['acceptance']
         left = min(current['deadline_unix'] - self.store.clock(),
                    current['budget_seconds'] - (time.monotonic_ns()-a['accepted_monotonic_ns'])/1e9) - 25
@@ -912,8 +918,14 @@ class A0HostSession:
         if self.route is not None and (self.route['pending'] is not None
                 or self.route['network'] != network or self.route['settlement'] is not None):
             raise HostUnavailable('a0_route_custody_changed')
-        plan = self._plan(m, self._current(row), network)
-        runtime = m.Runtime(plan, budget=lambda: self._startup_left(row))
+        row = self._current(row)
+        plan = self._plan(m, row, network)
+        # The constructor only validates pinned metadata. Its per-file checks
+        # need live cancellation/clocks, not a full store read for every path.
+        runtime = m.Runtime(plan, budget=lambda: self._startup_left_snapshot(row))
+        self._startup_left(row)
+        # Restore current owner/stop/CAS reads before any native route probe.
+        runtime.budget = lambda: self._startup_left(row)
         # Same current route consumer used by native preparation/API admission;
         # this object performs no start and acquires no worker cleanup custody.
         observed = runtime.check_network(budget=lambda: self._startup_left(row))
