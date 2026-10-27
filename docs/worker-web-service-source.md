@@ -99,3 +99,28 @@ The native control suite simulates authority/serialization boundaries explicitly
 The publication suite extracts the genuine existing descriptor-held file
 publication and rollback primitives and runs them only on its own temporary
 files. Neither suite claims a real native grant or production transaction.
+
+## Operational observations, 27 October 2026
+
+The operational six-file deployment is separate from the public five-file
+source map above. Its installed input is
+`3ca27f16dcb13840eb869bf29c5bc1c240bd170a81075526283807e1681e0142`.
+The source installation completed, followed by a committed native update to
+runtime `4111e677a103b93ef3d898757e67cea7dad1da68c34d542689707286b802cdd9`
+and web adapter `b16fb6681372223c4c6c04e6e7021eb53993cea56136bfe28419ac566976d5b6`.
+The native update took 647.801 seconds; its six physical files and committed
+receipt were checked after the process exited and was reaped.
+
+The following prepared-worker configuration update was refused after 414.873
+seconds by `ordinary_a0_source_successor_publication_inventory_changed`.
+The historical receipt reader included the web file for the earlier web-probe
+transition but omitted it from the expected inventory for the HTTP transition.
+This refusal occurred before the derivative transaction was created. The nine
+input pins, complete 31-entry worker tree, installed native files and marker
+were checked unchanged. The completed source and native installations remain
+accepted; only the missing configuration stage requires correction.
+
+These are separate phase durations, not a combined service-start measurement.
+Gateway and Dashboard remain stopped for this maintenance boundary. Worker
+qualification and the new DSH/A0 Telegram file tasks have not run; no product
+or end-to-end readiness is claimed by these installation results.
