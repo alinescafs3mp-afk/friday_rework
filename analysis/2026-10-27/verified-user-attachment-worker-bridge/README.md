@@ -1,0 +1,13 @@
+# Verified user attachment to worker bridge — 2026-10-27
+
+A real Telegram engineering request reached Friday, but the worker rejected its attachment before submission: the admission snapshot still named the shared transport cache, while the worker accepted only its private cache. The later ordinary message preparation had already made a verified private copy for the user, too late for that snapshot.
+
+The native post-admission path now reuses the existing authenticated attachment rehome before capturing the worker input receipt, only for managed ordinary user scope. The worker host accepts the current user's exact `workspace/received` directory for input staging after the existing retained-owner/generation check. Its runtime configuration and worker mounts remain unchanged. Other users' paths and the shared transport cache are not added to this staging permission. Unmanaged profiles retain their previous ordering.
+
+The patch is relative to the already reviewed worker diagnostics source in the preceding checkpoint. Review found and fixed two defects before installation: the wrong owner-record shape at the renewed check, and unintended early rehome for unmanaged profiles. The final changed path was tested with 65 tests and 61 parameterized subcases, including the actual retained attachment bytes, corrupted contents, foreign scope/home/principal/generation, missing receipts, symlink/nonregular files and legacy paths. Those counts are not a claim of 126 independent cases.
+
+The final source was installed as one mixed native/plugin update together with the previously published diagnostics. Actual native composition, the A0 source-descendant reader and the DSH installed-source reader passed on both an isolated physical overlay and the real installed version. Gateway and Dashboard were restored under their existing permanent management; HTTPS verification passed. Source, installation and service restoration do not prove a completed worker task.
+
+The original A0 reservation remains a separate current obstacle. It was never submitted to A0, and a subsequent same-user native stop returned `control_unavailable`; the original send and failure were preserved without retry. No worker artifact or contextual followup is accepted yet. The DSH partial archive remains preserved and unaccepted. Repair continues from those facts.
+
+This directory is an inactive analysis checkpoint, not an active overlay manifest. Private input files, exact operational references, credential/session material and case-specific tester admission data are excluded. Use the source contract and existing predecessor checks when reviewing or composing the patch.
