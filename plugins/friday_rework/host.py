@@ -163,6 +163,122 @@ def _record_async_failure(directory, row, phase, error, *, control=None):
         return False
 
 
+def _record_request_failure(directory, phase, error, *, public_error, task_id=None, session_id=None):
+    """Write bounded private refusal metadata; never grant authority or retry.
+
+    The caller retains the original public refusal. No exception text, task
+    arguments, environment, raw principal or path is serialized.
+    """
+    import hashlib
+    import os
+    import secrets
+    import stat
+    import sys
+    try:
+        admission_phases = {'state_directory', 'request', 'owner', 'user_scope',
+                            'native_match', 'cli_correlation', 'scope_owner'}
+        setup_phases = {'availability', 'existing_job', 'runtime_configuration',
+                        'runtime_check', 'runtime_binding', 'retained_input_source',
+                        'association_claim', 'input_staging', 'scheduler'}
+        if ((public_error == 'unproved_admission' and phase not in admission_phases)
+                or (public_error == 'worker_not_available' and phase not in setup_phases)
+                or public_error not in {'unproved_admission', 'worker_not_available'}):
+            return False
+        from .admission import CALL_FIELDS, _call
+        call = _call.get()
+        def valid(value):
+            return (type(value) is str and bool(value.strip()) and '\x00' not in value
+                    and len(value.encode('utf-8')) <= 512)
+        native = (type(call) is tuple and len(call) == len(CALL_FIELDS)
+                  and all(valid(value) for value in call))
+        local = valid(task_id) and valid(session_id)
+        correlation = list(call) if native else ['local', secrets.token_hex(16)]
+        digest = hashlib.sha256(json.dumps(correlation, ensure_ascii=False,
+                                           separators=(',', ':')).encode()).hexdigest()
+        local_digest = (hashlib.sha256(json.dumps([task_id, session_id], ensure_ascii=False,
+                                                 separators=(',', ':')).encode()).hexdigest()
+                        if local else None)
+        known = {ValueError: 'value_error', RuntimeError: 'runtime_error',
+                 OSError: 'os_error', PermissionError: 'permission_error',
+                 FileNotFoundError: 'file_not_found', TimeoutError: 'timeout_error',
+                 TypeError: 'type_error', KeyError: 'key_error',
+                 HostUnavailable: 'host_unavailable', AssociationError: 'association_error',
+                 json.JSONDecodeError: 'json_decode_error'}
+        loaded = sys.modules.get('hermes_cli.friday_user_scope')
+        cls = vars(loaded).get('ScopeDenied') if loaded is not None else None
+        if isinstance(cls, type):
+            known[cls] = 'scope_denied'
+        root = Path(__file__).absolute().parent
+        allowed = {str(root/name): name for name in
+                   ('host.py', 'boundary.py', 'admission.py', 'associations.py', 'results.py',
+                    'host_runtime.py', 'inputs.py', 'adapters/dsh.py')}
+        for name in ('friday_user_scope', 'friday_cli_work', 'plugins_state'):
+            loaded = sys.modules.get('hermes_cli.' + name)
+            path = vars(loaded).get('__file__') if loaded is not None else None
+            if type(path) is str:
+                allowed[path] = 'hermes_cli/' + name + '.py'
+        frames, tb = [], BaseException.__traceback__.__get__(error)
+        for _ in range(64):
+            if tb is None:
+                break
+            module = allowed.get(tb.tb_frame.f_code.co_filename)
+            if module is not None and 0 < tb.tb_lineno < 2**31:
+                frames.append({'module': module, 'line': tb.tb_lineno})
+                frames = frames[-8:]
+            tb = tb.tb_next
+        value = {'schema': 'friday.worker-request-failure.v1', 'phase': phase,
+                 'public_error': public_error,
+                 'request_sha256': digest,
+                 'correlation_kind': 'native_call' if native else 'local_only',
+                 'task_session_sha256': local_digest,
+                 'native_scope_present': call is not None,
+                 'native_scope_valid': native,
+                 'native_task_session_matches': call[:2] == (task_id, session_id) if native else None,
+                 'exception_type': known.get(type(error), 'other'),
+                 'source_frames': frames, 'trace_truncated': tb is not None,
+                 'observed_unix': time.time(), 'observed_monotonic': time.monotonic(),
+                 'admission_outcome': 'REFUSED' if public_error == 'unproved_admission' else 'PASSED',
+                 'execution_outcome': 'NOT_ASSERTED'}
+        data = (json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)+'\n').encode()
+        if len(data) > 4096:
+            return False
+        directory = Path(directory)
+        if not directory.is_absolute() or directory.resolve() != directory:
+            return False
+        parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        temporary = '.worker-request-failure-' + secrets.token_hex(16)
+        created = False
+        def identity(st):
+            return st.st_dev, st.st_ino, st.st_uid, st.st_gid, st.st_mode
+        try:
+            info = os.fstat(parent)
+            if (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700
+                    or identity(directory.lstat()) != identity(info)):
+                return False
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=parent)
+            created = True
+            with os.fdopen(fd, 'wb') as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                if stream.write(data) != len(data):
+                    raise OSError('short_diagnostic_write')
+                stream.flush(); os.fsync(stream.fileno())
+            if identity(directory.lstat()) != identity(info):
+                return False
+            name = 'worker-request-failure-' + digest + '-' + phase + '.json'
+            os.link(temporary, name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+            os.fsync(parent)
+            return True
+        finally:
+            try:
+                if created:
+                    os.unlink(temporary, dir_fd=parent)
+            finally:
+                os.close(parent)
+    except BaseException:
+        return False
+
+
 class WorkerHost:
     def __init__(self, ctx, admission):
         self.ctx, self.admission = ctx, admission
@@ -240,28 +356,40 @@ class WorkerHost:
         return previous, dict(media[0]["content"])
 
     def handle(self, args, **kwargs):
+        admission_phase = 'state_directory'
         try:
             if Path(self.store.state.data_dir) != self._state_directory:
                 raise HostUnavailable("foreign_runtime_home")
+            admission_phase = 'request'
             brief, retained_selection = parse_request(args)
+            admission_phase = 'owner'
             owner = bound_owner(session_id=kwargs.get("session_id"))
+            admission_phase = 'user_scope'
             from hermes_cli.friday_user_scope import current
             scope = current()
+            admission_phase = 'native_match'
             ingress, correlation = self.admission.match(
                 owner, task_id=kwargs.get("task_id"), session_id=kwargs.get("session_id"))
+            admission_phase = 'cli_correlation'
             if owner.get('platform') == 'cli' and any(kwargs.get(k) != correlation[k] for k in correlation):
                 raise HostUnavailable('missing_native_cli_call')
             if scope is not None:
+                admission_phase = 'scope_owner'
                 scope.require_owner(owner, ingress)
-        except (ValueError, RuntimeError, OSError):
+        except (ValueError, RuntimeError, OSError) as error:
+            _record_request_failure(self._state_directory, admission_phase, error,
+                                      public_error='unproved_admission',
+                                      task_id=kwargs.get('task_id'), session_id=kwargs.get('session_id'))
             return json.dumps({"accepted": False, "error": "unproved_admission"})
         if brief.worker not in {'dsh', 'a0'}:
             return json.dumps({"accepted": False, "error": "worker_not_admitted"})
         row = None
+        request_phase = 'availability'
         try:
             if (self._closed or correlation["task_id"] != correlation["session_id"]
                     or Path(self.store.state.data_dir) != self._state_directory):
                 raise HostUnavailable("worker_not_available")
+            request_phase = 'existing_job'
             address = association_address(correlation, ingress)
             old = self.store.snapshot().get(address)
             if old is not None:
@@ -277,6 +405,7 @@ class WorkerHost:
                         or binding.get("retained_inputs") != retained_selection):
                     raise AssociationError("admission_conflict")
                 return json.dumps(status(old))
+            request_phase = 'runtime_configuration'
             configured = self.ctx.get_config("runtime")
             if not isinstance(configured, dict) or configured.get("enabled") is not True:
                 return json.dumps({"accepted": False, "error": "worker_not_admitted"})
@@ -287,7 +416,9 @@ class WorkerHost:
             elif any(not callable(getattr(self.ctx, api, None))
                      for api in ("get_command_context", "schedule_gateway_work")):
                 raise HostUnavailable("worker_not_available")
+            request_phase = 'runtime_check'
             runtime = check_runtime(select_runtime(configured, brief.worker), self.store)
+            request_phase = 'runtime_binding'
             if ('a0' in runtime) != (brief.worker == 'a0'):
                 raise HostUnavailable('worker_runtime_mismatch')
             if runtime["runtime_profile"] != ingress["runtime_profile"]:
@@ -302,12 +433,14 @@ class WorkerHost:
             if retained_selection is not None:
                 # Reserve the selector with this native call before any copying.
                 # Neither the selector nor prompt text supplies byte authority.
+                request_phase = 'retained_input_source'
                 self._retained_input_source(retained_selection, correlation, ingress, owner, runtime)
                 host_binding["retained_inputs"] = copy.deepcopy(retained_selection)
             acceptance = None
             if brief.worker == 'a0':
                 acceptance = {'accepted_unix': self.store.clock(), 'accepted_monotonic_ns': time.monotonic_ns(),
                               'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+            request_phase = 'association_claim'
             row, fresh = self.store.claim(
                 task_id=address, admission_key=address, owner=owner, brief=brief,
                 workspace_reference=str(Path(runtime["workspace_root"]) / address),
@@ -324,6 +457,7 @@ class WorkerHost:
                 if row['host']['binding'] != host_binding:
                     raise AssociationError('admission_conflict')
                 return json.dumps(status(row))
+            request_phase = 'input_staging'
             self._owned[address] = copy.deepcopy(row)
             if ingress['platform'] == 'cli':
                 from hermes_cli.friday_cli_work import retain_local_owner
@@ -392,12 +526,16 @@ class WorkerHost:
                 # Only the host's native producer can provide current evidence,
                 # after durable reservation and byte-verified input retention.
                 return json.dumps(self.produce_a0_capability(address, owner))
+            request_phase = 'scheduler'
             if ingress['platform'] == 'cli':
                 answer = self.ctx.run_cli_work(self._run(row), route=route, name='friday:' + address)
                 return json.dumps({**answer, 'scheduling': 'FINITE_FOREGROUND'})
             self.ctx.schedule_gateway_work(self._run(row), route=route, name="friday:" + address)
             return json.dumps(status(row))
         except (ValueError, RuntimeError, OSError, TypeError, KeyError) as error:
+            _record_request_failure(self._state_directory, request_phase, error,
+                                      public_error='worker_not_available',
+                                      task_id=kwargs.get('task_id'), session_id=kwargs.get('session_id'))
             # Any admitted partial setup remains reserved and non-replayable.
             # Explicit stop can withdraw an unsubmitted row. Never claim queued
             # execution when scheduling or input verification failed.
