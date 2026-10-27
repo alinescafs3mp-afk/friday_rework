@@ -228,3 +228,13 @@ captures selected failure state and bounded private startup output in the next
 scoped probe. Its runtime and source-binding checks passed, including an isolated
 real systemd output-limit check. No subsequent A0 startup or Telegram task has
 yet been accepted. The installed runtime bytes remain unchanged.
+
+Before R479, the closed R478 qualification records, bootstrap records and probe
+plan were moved together into the protected archive. The real archive consumer
+accepted their preserved identities and contents. A prelaunch source-permission
+refusal was corrected within the same original maintenance clock; no native
+archive action had started at that point. Native archival then completed in
+4.175 seconds, within the total 52.631-second phase. Those intervals overlap and
+must not be added. R479 uses the final diagnostic revision and has started its
+necessary source-validation stage; qualification and both Telegram results remain
+unaccepted.

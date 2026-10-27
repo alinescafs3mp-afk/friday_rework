@@ -13,15 +13,17 @@ Runtime instance. `prepare_start_scope.py` inserts that binding into the exact
 existing start scope. Their source references grant no execution authority.
 The installed runtime and its original source checks remain unchanged.
 
-The delta retains the first rejected inspection's selected state and network
-fields, and only the size/hash of arbitrary Docker error text. Startup stdout
+The final delta retains selected state and network fields from the first rejected
+inspection or successfully inspected terminal container. The latter covers a
+subsequent startup refusal after inspection itself returned normally. Only the
+size/hash of arbitrary Docker error text is retained in that record. Startup stdout
 and stderr go to private files, each limited to 128 KiB. Output overflow can
 terminate the attached process; this is a bounded diagnostic operation, not
 passive observation. Network ownership, readiness and cleanup predicates are
 unchanged.
 
-Validation recorded eleven distinct runtime tests and sixteen scope/recipe
-checks, including the authentic private runtime loader, rejected foreign or
+Validation covered fourteen runtime tests (eleven affected tests rerun, three
+unchanged results reused) and sixteen scope/recipe checks, including the authentic private runtime loader, rejected foreign or
 missing network fields, retained first failure, cleanup on diagnostic failure,
 source substitution and metadata changes. A read may update access time; inode,
 ownership, mode, size, modification/change times and content digest remain

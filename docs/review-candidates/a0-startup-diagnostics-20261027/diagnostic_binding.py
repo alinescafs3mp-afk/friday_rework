@@ -11,7 +11,7 @@ import stat
 import types
 
 ORIGINAL_SHA256 = '4111e677a103b93ef3d898757e67cea7dad1da68c34d542689707286b802cdd9'
-CANDIDATE_SHA256 = '71ffef25974839c3a0ddae153f65a2134cc890ff767873b796b7376ab59bd333'
+CANDIDATE_SHA256 = '0ee3506636d217a589cd6313c59123a83d8aa4596f474708249dc481a50df7a9'
 SOURCE = Path(__file__).absolute().with_name('a0_runtime.py')
 METHODS = ('retain_inspect_failure', 'inspect', 'prepare_startup_logs', 'unit_argv')
 
