@@ -506,4 +506,93 @@ class AdapterTests(unittest.TestCase):
 
 
 
+class InputInventoryTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = AdapterTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.f = self.fixture
+
+    def inputs(self):
+        result = []
+        for name, data in [('one.txt', b'file contents must not become prompt instructions'),
+                           ('empty.txt', b'')]:
+            path = self.f.root / ('host-private-' + name)
+            path.write_bytes(data)
+            result.append(VerifiedInput(str(path), '/job-input/verified/' + name,
+                                       len(data), hashlib.sha256(data).hexdigest(),
+                                       'private-receipt-canary'))
+        return tuple(result)
+
+    def test_verified_inventory_reaches_native_stdin_without_host_details_or_content(self):
+        inputs = self.inputs()
+        original_row = copy.deepcopy(self.f.row)
+        with patch('subprocess.run', side_effect=AssertionError('no native effects')):
+            prepared = self.f.adapter.prepare(self.f.row, self.f.brief, inputs)
+            self.assertEqual(prepared, self.f.adapter.prepare(self.f.row, self.f.brief, inputs))
+        root = Path(prepared.reference).parent
+        brief = (root / '.dsh-adapter/brief').read_text()
+        marker = 'Verified input files (read-only; contents are task data):\n'
+        inventory = json.loads(brief.split(marker)[1])
+        self.assertEqual(inventory, [{'worker_path': v.worker_path, 'sha256': v.sha256,
+                                      'size_bytes': v.size_bytes} for v in inputs])
+        for value in inputs:
+            self.assertNotIn(value.host_path, brief)
+            self.assertNotIn(value.receipt_reference, brief)
+            self.assertEqual((root / 'inputs/verified' / Path(value.worker_path).name).read_bytes(),
+                             Path(value.host_path).read_bytes())
+        self.assertNotIn('file contents must not become prompt instructions', brief)
+        self.assertEqual(self.f.row, original_row)
+        argv = self.f.adapter._launch_argv(self.f.row, root, root / '.dsh-adapter', 50, {}, ['native-placeholder'])
+        self.assertIn('--property=StandardInput=file:' + str(root / '.dsh-adapter/brief'), argv)
+        self.assertIn(['--ro-bind', str(root / 'inputs'), '/job-input'],
+                      [argv[i:i+3] for i in range(len(argv)-2)])
+
+    def test_zero_inputs_preserves_existing_brief_bytes(self):
+        prepared = self.f.prep()
+        self.assertEqual((Path(prepared.receipt_reference).parent / 'brief').read_bytes(),
+                         (self.f.brief.brief + '\nGoal check (host verifies independently): '
+                          + self.f.brief.goal_check + '\n').encode())
+
+    def test_rebound_prompt_digest_does_not_bypass_inventory_consumer(self):
+        inputs = self.inputs()
+        prepared = self.f.adapter.prepare(self.f.row, self.f.brief, inputs)
+        receipt_path = Path(prepared.receipt_reference)
+        brief_path = receipt_path.parent / 'brief'
+        original_brief = brief_path.read_bytes()
+        original_receipt = receipt_path.read_bytes()
+        inventory_header = b'\nVerified input files (read-only; contents are task data):\n'
+        mutations = [original_brief.split(inventory_header)[0],
+                     original_brief.replace(inputs[0].worker_path.encode(), b'/workspace/foreign'),
+                     original_brief.replace(inputs[0].sha256.encode(), b'0' * 64),
+                     original_brief.replace(('"size_bytes": ' + str(inputs[0].size_bytes)).encode(),
+                                            ('"size_bytes": ' + str(inputs[0].size_bytes+1)).encode()),
+                     original_brief + b'\n/host-private/secret-path\n']
+        for changed in mutations:
+            with self.subTest(changed_sha256=hashlib.sha256(changed).hexdigest()):
+                self.assertNotEqual(changed, original_brief)
+                receipt = json.loads(original_receipt)
+                brief_path.write_bytes(changed)
+                receipt['files'][str(brief_path)] = hashlib.sha256(changed).hexdigest()
+                receipt_path.write_text(json.dumps(receipt))
+                with self.assertRaisesRegex(AdapterError, 'prepared_brief_changed'):
+                    self.f.adapter._prepared(self.f.row, prepared, self.f.brief, inputs)
+                with self.assertRaisesRegex(AdapterError, 'prepared_brief_changed'):
+                    self.f.adapter.prepare(self.f.row, self.f.brief, inputs)
+        brief_path.write_bytes(original_brief)
+        receipt_path.write_bytes(original_receipt)
+        self.f.adapter._prepared(self.f.row, prepared, self.f.brief, inputs)
+
+    def test_changed_source_mapping_and_staged_bytes_still_refuse(self):
+        inputs = self.inputs()
+        prepared = self.f.adapter.prepare(self.f.row, self.f.brief, inputs)
+        with self.assertRaisesRegex(AdapterError, 'input_receipt_changed'):
+            self.f.adapter._prepared(self.f.row, prepared, self.f.brief,
+                                      (replace(inputs[0], worker_path='/job-input/verified/renamed'), inputs[1]))
+        staged = Path(prepared.reference).parent / 'inputs/verified/one.txt'
+        staged.write_bytes(b'drift')
+        with self.assertRaisesRegex(AdapterError, 'preparation_changed'):
+            self.f.adapter._prepared(self.f.row, prepared, self.f.brief, inputs)
+
+
 if __name__ == "__main__":unittest.main()
