@@ -319,8 +319,21 @@ the A0 cleanup phase after that observation was saved. The original failure is
 `STOP_UNCONFIRMED`; no complete BOTH-worker proof or runtime attachment was
 accepted. Subsequent read-only reconciliation confirmed stopped native units,
 empty retained process groups and removal of the route, network and guard.
-The stopped container still needs retirement, followed by the remaining DSH
-observation and final qualification publication. The successful A0 observation
-is retained for that continuation; restarting it is not the default recovery.
+The missing retirement and introduced-key cleanup subsequently completed in a
+separate 3.193394-second maintenance operation. Its fresh postcheck confirmed
+the retired container, removed keys and stopped route without repeating A0 or
+the original stop. The first postcheck compared access time as part of file
+identity and refused its newly read result; a reviewed identity-only correction
+checked the same unchanged result. Both original refusals remain preserved.
+The remaining DSH observation then completed through the existing native
+observer in a separate bounded stage: four CLI smoke commands and the network
+probe passed, with all five commands reaped. It took 5.801276 seconds. The
+300-second stage allocated a 270-second observer deadline and retained a
+30-second outer reserve. A0 and its stop were not repeated.
+
+Both worker observations are now saved. Their clocks remain distinct, and
+final coherent qualification/readiness publication is still open. No complete
+BOTH-worker or Telegram user-task acceptance is claimed from these separate
+observations.
 
 Gateway and Dashboard remain running. Both Telegram file tasks remain unsent.

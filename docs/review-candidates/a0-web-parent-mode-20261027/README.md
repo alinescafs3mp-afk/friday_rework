@@ -125,9 +125,18 @@ from these reader checks.
 The resumed R481 qualification subsequently saved a successful real A0 startup
 observation: local route, native Web UI and configured local model slots passed
 the no-model startup check. Cleanup then returned `STOP_UNCONFIRMED`. Read-only
-reconciliation confirmed stopped units and processes, with the route removed;
-retirement of the stopped container and the remaining DSH/final qualification
-steps are still pending. The saved A0 result is preserved for continuation.
+reconciliation confirmed stopped units and processes, with the route removed.
+A separate maintenance operation then retired the stopped container and removed
+its introduced keys in 3.193394 seconds. A fresh postcheck verified that cleanup
+on the same result after correcting an access-time comparison in the checker;
+the cleanup operation was not repeated. The remaining real DSH observer then
+passed four smoke commands and a network probe in 5.801276 seconds; all five
+commands were reaped. Its separate 300-second operation used a 270-second
+observer deadline and a 30-second outer reserve. A0 was not restarted.
+
+The two observations remain individually preserved. Final qualification and
+runtime attachment still require a consumer that correctly accounts for their
+distinct original clocks; these observations alone are not a Telegram result.
 
 ## Early structural checks — source proposal, not integrated
 
