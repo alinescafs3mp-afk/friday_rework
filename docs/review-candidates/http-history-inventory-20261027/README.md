@@ -55,3 +55,29 @@ patch is byte-identical to the accepted sanitized delta.
 | S408 source result | `1ef21c99aa284eaf4181dcd5e7061a890b7a82eac86a1d4a967a93e437518a61` |
 | Independent final-delta review | `42dd9595b3230a40d4403fb4bf76e02e76563e6345524b831cf7298331b141b2` |
 | Root source-only acceptance | `67a94fb5b6b320ccf1fb005a2d73384b11a93fac911f7fef57999a1f298235c5` |
+
+## Native attachment bootstrap correction
+
+The related existing-owner collector called the genuine native attachment
+function without first loading the native scoped environment. Its ownership
+check consequently refused the invocation before the live ownership probe.
+The permanent service itself remained running.
+
+[native-attachment-bootstrap.patch](native-attachment-bootstrap.patch) sets the
+exact CLI arguments, invokes the existing `load_hermes_dotenv` bootstrap, and
+then calls `_attach_to_host_backend`. A normal return still exits with code 78;
+no server-start fallback is introduced. Credentials and service settings are
+unchanged. The entry is embedded by the private collector; this standalone
+patch is analysis material for that entry, not a public runtime installer.
+
+A separate source review checked the delta and its next consumers. On the
+unchanged running service, the native ownership checks and a fresh signed
+attachment then succeeded. The earlier refusal is retained as a distinct
+observation; it was not converted into a successful result.
+
+| Material | SHA-256 |
+| --- | --- |
+| Original attachment entry | `26db360d47c7a5880f0b49b67bd884c1f3a1f1b4a71d7ef088a086985cc33f55` |
+| Corrected attachment entry | `1d311c14410aaf31fbf8fb81c26483899cd19e47df35d215406a9a1366d0724c` |
+| Independent source review | `6f8f6027b645d91156bfa92436602a4a0c028f96c31759202dc0634d75b6032b` |
+| Actual signed attachment result | `a6602ede700e5485e102e398867010c9f5b41ccca3b7a2df5a7d54091d9e141b` |

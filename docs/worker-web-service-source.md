@@ -121,9 +121,9 @@ were checked unchanged. The completed source and native installations remain
 accepted; only the missing configuration stage requires correction.
 
 These are separate phase durations, not a combined service-start measurement.
-Gateway and Dashboard remain stopped for this maintenance boundary. Worker
-qualification and the new DSH/A0 Telegram file tasks have not run; no product
-or end-to-end readiness is claimed by these installation results.
+At that checkpoint, Gateway and Dashboard were stopped for the maintenance
+boundary. Worker qualification and the new DSH/A0 Telegram file tasks had not
+run; no product or end-to-end readiness was claimed by those installation results.
 
 ## Accepted historical-reader source correction
 
@@ -136,3 +136,24 @@ public runtime. At export preparation, the R475 configuration derivative was in
 progress and not yet accepted; worker qualification and the new Telegram file
 tasks remained unperformed. The original operational observations above remain
 unchanged.
+
+## Subsequent installed state
+
+The corrected configuration-derivative operation completed in 499.220 seconds
+and its committed files were verified. Gateway and Dashboard were restored
+under their existing permanent management. HTTPS returned 200 and the native
+signed ownership check passed; interactive operator login was not tested.
+
+The next qualification attempt ended after 493.332 seconds, before an A0
+instance was started. Its first-worker segment reached a configuration check
+about 1.295 seconds after allocation. The prepared native-input manifest still
+had seven entries and lacked `web/gitconfig`, which the installed web adapter
+requires. Direct evaluation by the installed deployment-contract consumer
+reproduced that mismatch; the other seven entries matched. The rootless daemon
+was inactive and no new A0 bootstrap, probe plan or runtime receipt existed.
+
+The accepted source, native mirrors and configuration derivative remain in
+place, and the permanent services remain running. The remaining repair is the
+missing manifest entry and its digest reference, with explicit maintenance
+provenance for the next qualification. The failed attempt and its saved DSH
+safety observation are retained. Neither new Telegram file task has been sent.
