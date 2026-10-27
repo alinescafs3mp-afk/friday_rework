@@ -1,0 +1,187 @@
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -1140,10 +1140,19 @@
+             raise RuntimeError("tool_result_foreign_original_caller")
+ 
+     def evidence_only():
+-        return (call.stopped.is_set() or call.turn.stopped.is_set()
++        if (call.stopped.is_set() or call.turn.stopped.is_set()
+                 or getattr(agent, "_interrupt_requested", False)
+-                or time.monotonic() >= call.deadline()
+-                or call.turn.failure is not None)
++                or call.turn.failure is not None):
++            return True
++        try:
++            deadline = call.deadline()
++        except RuntimeError as exc:
++            if str(exc) != "web_original_deadline_required":
++                raise
++            # Exempt non-web calls can have no finite original clock. Their
++            # result is evidence, never permission to acquire an environment.
++            return True
++        return time.monotonic() >= deadline
+ 
+     check_original_caller()
+     if evidence_only():
+--- /dev/null
++++ b/hermes_cli/friday_plugin_source.py
+@@ -0,0 +1,75 @@
++"""The installed Friday worker code for a prepared, isolated user profile.
++
++Only code is shared. PluginManager still registers tools, config and state in the
++calling profile, and normal manifest enable/disable checks still apply there.
++"""
++import json
++from pathlib import Path
++
++
++def _enabled(config):
++    plugins = config.get('plugins', {})
++    if not isinstance(plugins, dict):
++        return False
++    enabled, disabled = plugins.get('enabled', []), plugins.get('disabled', [])
++    return (isinstance(enabled, list) and isinstance(disabled, list)
++            and 'friday_rework' in enabled and 'friday_rework' not in disabled)
++
++
++def prepared_friday_plugin(home):
++    """Return the one installed plugin directory, or fail closed without loading it."""
++    source = Path(__file__).resolve().parents[1]
++    root = source.parent
++    home = Path(home)
++    if home.parent != root / 'profiles' or not (home / '.friday-user-scope.json').exists():
++        return None
++    from hermes_cli.friday_dashboard_owner import read_owned, require, sha
++    from hermes_cli.friday_user_scope import MARKER, ScopeDenied, _private, _fingerprint, authority, policy
++    from hermes_cli.friday_product_access import principal_id
++    from hermes_cli.config import load_config_storage_readonly
++
++    try:
++        require(home.resolve() == home and root.resolve() == root)
++        _private(root, directory=True)
++        _private(home.parent, directory=True)
++        _private(home, directory=True)
++        require(_enabled(load_config_storage_readonly()))
++        active = policy(root)
++        rows = [] if active is None else [r for r in active['bindings']
++                                          if r['runtime_profile'] == home.name]
++        require(len(rows) == 1)
++        binding = rows[0]
++        marker = json.loads(read_owned(home / MARKER, private=True))
++        expected = {'schema': 'friday.user-home.v1',
++                    'principal': principal_id(*(binding[k] for k in
++                                              ('platform', 'transport_profile', 'account_id', 'user_id'))),
++                    'profile': home.name, 'binding_sha256': _fingerprint(binding)}
++        if 'onboarding_sha256' in marker:
++            expected['onboarding_sha256'] = sha(read_owned(home / '.friday-onboarding.json', private=True))
++        require(marker == expected)
++        with authority(root):
++            require(_enabled(load_config_storage_readonly()))
++        receipt = json.loads(read_owned(root / 'FRIDAY-INSTALL.json', private=True))
++        require(receipt.get('schema') == 'friday.native-install.v1'
++                and receipt.get('state') == 'INSTALLED_TEMPLATE_INCOMPLETE'
++                and receipt.get('home') == str(root) and receipt.get('source') == str(source))
++        files = receipt.get('plugin_files')
++        require(isinstance(files, dict) and 'plugins/friday_rework/plugin.yaml' in files)
++        target = root / 'plugins/friday_rework'
++        _private(target.parent, directory=True)
++        _private(target, directory=True)
++        for name, digest in files.items():
++            path = Path(name)
++            require(not path.is_absolute() and '..' not in path.parts
++                    and path.parts[:2] == ('plugins', 'friday_rework') and str(path) == name)
++            require(sha(read_owned(root / path, private=True)) == digest)
++        present = set()
++        for path in target.rglob('*'):
++            if path.is_dir():
++                _private(path, directory=True)
++            else:
++                present.add(str(path.relative_to(root)))
++        require(present == set(files))
++        return target
++    except (OSError, ValueError, TypeError, KeyError, ScopeDenied):
++        return None
+--- a/hermes_cli/friday_workspace_revision.py
++++ b/hermes_cli/friday_workspace_revision.py
+@@ -12,8 +12,8 @@
+ import json
+ import os
+ import stat
++import time
+ import uuid
+-from tools import file_state
+ from tools import file_tools_read_tracking as tracking
+ from hermes_cli.friday_user_scope import ScopeDenied
+ 
+@@ -189,6 +189,35 @@
+                        'effect_disposition':'unknown' if unknown else 'none'})
+ 
+ 
++
++# Local ceiling only: the original capability/call deadline can expire sooner.
++_WRITE_LOCK_WAIT_SECONDS = 2.0
++_WRITE_LOCK_POLL_SECONDS = 0.02
++
++
++def _acquire_write_lock(cap, fd):
++    """Wait briefly for this held directory, without extending native authority.
++
++    scoped_file opens a separate directory description for each call. Its flock
++    serializes distinct leaves and the same leaf across threads/processes, so an
++    additional unbounded per-path threading lock is unnecessary on this path.
++    """
++    deadline = time.monotonic() + _WRITE_LOCK_WAIT_SECONDS
++    while True:
++        check(cap)
++        try:
++            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            return True
++        except BlockingIOError as exc:
++            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
++                raise
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                check(cap)
++                return False
++            time.sleep(min(_WRITE_LOCK_POLL_SECONDS, remaining))
++
++
+ def write(cap,fd,leaf,path,content,task_id):
+     """No overwrite syscall: capture current name then publish only if absent.
+ 
+@@ -199,9 +228,7 @@
+     tag=hashlib.sha256(leaf.encode()).hexdigest()[:32]
+     fence='.friday-revision-'+tag
+     ref=uuid.uuid4().hex
+-    with file_state.lock_path(str(cap.home/'workspace'/path)):
+-        # Descriptor flock serializes these native writes across processes too.
+-        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
++    if _acquire_write_lock(cap, fd):
+         try:
+             check(cap)
+             try: os.stat(fence,dir_fd=fd,follow_symlinks=False)
+@@ -327,6 +354,8 @@
+                 return _failure('file_revision_not_committed',tag)
+             finally: os.close(tx)
+         finally: fcntl.flock(fd,fcntl.LOCK_UN)
++    return json.dumps({'success':False,'error':'workspace_write_busy',
++                       'retryable':True,'effect_disposition':'none'})
+ 
+ 
+ def _move(source_fd,source,target_fd,target):
+--- a/hermes_cli/plugins_discovery.py
++++ b/hermes_cli/plugins_discovery.py
+@@ -209,6 +209,13 @@
+     user_dir = get_hermes_home() / "plugins"
+     logger.debug("Scanning user plugins: %s", user_dir)
+     _scan("user", user_dir, "user")
++    if not any(manifest_key(item) == "friday_rework" for item in manifests):
++        from hermes_cli.friday_plugin_source import prepared_friday_plugin
++        friday_dir = prepared_friday_plugin(get_hermes_home())
++        if friday_dir is not None:
++            friday = parse_manifest_file(friday_dir / "plugin.yaml", friday_dir, "user", "")
++            if friday is not None:
++                manifests.append(friday)
+     if _origin._env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
+         project_dir = Path.cwd() / ".hermes" / "plugins"
+         logger.debug("Scanning project plugins: %s", project_dir)
