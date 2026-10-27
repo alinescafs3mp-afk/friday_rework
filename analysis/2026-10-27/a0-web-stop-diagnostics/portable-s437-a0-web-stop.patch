@@ -1,0 +1,336 @@
+--- a/plugins/friday_rework/host.py
++++ b/plugins/friday_rework/host.py
+@@ -54,7 +54,7 @@
+                   'observe', 'notify_finished'}
+         reference = row.get('existing_task_id')
+         if control is None:
+-            if (row.get('worker_kind') != 'dsh' or phase not in phases
++            if (row.get('worker_kind') not in {'dsh', 'a0'} or phase not in phases
+                     or type(reference) is not str
+                     or not re.fullmatch(r'native-[0-9a-f]{64}', reference)):
+                 return False
+@@ -79,7 +79,8 @@
+                  HostUnavailable: 'host_unavailable', AssociationError: 'association_error',
+                  json.JSONDecodeError: 'json_decode_error'}
+         for module, name, label in (('adapters.dsh', 'AdapterError', 'dsh_adapter_error'),
+-                                   ('controller', 'ControllerError', 'controller_error')):
++                                   ('controller', 'ControllerError', 'controller_error'),
++                                   ('adapters.a0', 'A0Error', 'a0_adapter_error')):
+             loaded = sys.modules.get(__package__ + '.' + module)
+             cls = vars(loaded).get(name) if loaded is not None else None
+             if isinstance(cls, type): known[cls] = label
+@@ -90,7 +91,8 @@
+         root = Path(__file__).absolute().parent
+         modules = ('host.py', 'controller.py', 'associations.py', 'host_record.py',
+                    'host_runtime.py', 'supervision.py', 'adapters/dsh.py',
+-                   'adapters/contract.py', 'results.py', 'result_tool.py', 'artifacts.py')
++                   'adapters/contract.py', 'adapters/a0.py', 'adapters/a0_native.py',
++                   'results.py', 'result_tool.py', 'artifacts.py')
+         allowed = {str(root/name): name for name in modules}
+         for name in ('friday_cli_caller', 'friday_user_scope', 'friday_cli_work',
+                      'plugins_state', 'plugins_gateway_work'):
+@@ -303,7 +305,8 @@
+                 old.bindings['a0'].adapter._same(row)
+                 return old
+             binding = a0_binding(row['host']['binding']['runtime'], self.store, row)
+-            controller = A0Controller(self.store, {'a0': binding})
++            controller = A0Controller(self.store, {'a0': binding},
++                                      failure_diagnostic=self._failure_diagnostic)
+             controller = self._a0_controllers.setdefault(address, controller)
+             controller.bindings['a0'].adapter._same(row)
+             return controller
+--- a/plugins/friday_rework/adapters/a0_web.py
++++ b/plugins/friday_rework/adapters/a0_web.py
+@@ -176,6 +176,17 @@
+   return UnixHTTPConnection(host,timeout=2)
+ server=xmlrpc.client.ServerProxy('http://127.0.0.1',transport=UnixTransport())
+ rows=server.supervisor.getAllProcessInfo()
++# Only fixed service names, state labels and bounded integers leave this probe.
++# No command, spawn error, description, environment or exception text is retained.
++states={'STOPPED','STARTING','RUNNING','BACKOFF','STOPPING','EXITED','FATAL','UNKNOWN'}
++def number(value):
++ return value if type(value) is int and 0<=value<2**63 else 0
++supervisor={'count':min(len(rows),4096),'processes':[
++ {'name':r.get('name') if r.get('name') in {'run_ui','run_searxng'} else 'unexpected',
++  'statename':r.get('statename') if r.get('statename') in states else 'UNKNOWN',
++  'pid':number(r.get('pid')),'start':number(r.get('start')),
++  'exitstatus':r.get('exitstatus') if type(r.get('exitstatus')) is int and -255<=r['exitstatus']<=255 else 0}
++ for r in rows[:3] if isinstance(r,dict)]}
+ assert len(rows)==2 and {r['name'] for r in rows}=={'run_ui','run_searxng'}
+ assert all(r['statename']=='RUNNING' and type(r['pid']) is int and r['pid']>0 for r in rows)
+ phase='process_environment'
+@@ -183,8 +194,14 @@
+  env=pathlib.Path('/proc',str(r['pid']),'environ').read_bytes().split(b'\\0')
+  assert env.count(b'SEARXNG_SECRET='+secret.encode())==1
+ phase='http_config'
+-import urllib.request
+-with urllib.request.urlopen('http://127.0.0.1:55510/config',timeout=2) as response:
++import urllib.request,urllib.error,errno
++try:
++ response=urllib.request.urlopen('http://127.0.0.1:55510/config',timeout=2)
++except urllib.error.URLError as error:
++ if isinstance(error.reason,OSError) and error.reason.errno==errno.ECONNREFUSED:
++  phase='http_connecting'
++ raise
++with response:
+  phase='http_status'
+  assert response.status==200
+  phase='http_body_bound'
+@@ -200,11 +217,12 @@
+ '''
+     # Preserve only bounded categorical failure evidence. Native exception text,
+     # traceback, import output and service configuration never leave the probe.
+-    return ("import contextlib,json,os\nphase='probe'\ntry:\n"
++    return ("import contextlib,json,os\nphase='probe'\nsupervisor=None\ntry:\n"
+             " with open(os.devnull,'w') as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):\n"
+             + '\n'.join('  '+line for line in body.splitlines())
+             + "\nexcept Exception as error:\n"
+             " classes=(ModuleNotFoundError,ImportError,PermissionError,FileNotFoundError,TimeoutError,ConnectionError,AssertionError,ValueError,KeyError,TypeError,OSError)\n"
+             " category=next((c.__name__ for c in classes if isinstance(error,c)),'Exception')\n"
+             " report={'status':'NATIVE_WEB_PROBE_REFUSED','phase':phase,'error_class':category}\n"
++            " if supervisor is not None: report['supervisor']=supervisor\n"
+             "print(json.dumps(report))\n")
+--- a/scripts/a0_runtime.py
++++ b/scripts/a0_runtime.py
+@@ -93,16 +93,34 @@
+ 
+ def web_probe_failure_checked(data):
+     phases = {'probe', 'secret', 'source_pins', 'settings', 'supervisor',
+-              'process_environment', 'http_config', 'http_status', 'http_body_bound',
++              'process_environment', 'http_config', 'http_connecting', 'http_status', 'http_body_bound',
+               'http_json', 'http_version', 'http_engines'}
+     classes = {'ModuleNotFoundError', 'ImportError', 'PermissionError', 'FileNotFoundError',
+                'TimeoutError', 'ConnectionError', 'AssertionError', 'ValueError', 'KeyError',
+                'TypeError', 'OSError', 'Exception'}
+-    require(isinstance(data, dict) and set(data) == {'status', 'phase', 'error_class'}
++    require(isinstance(data, dict) and set(data) in ({'status', 'phase', 'error_class'},
++                {'status', 'phase', 'error_class', 'supervisor'})
+             and data['status'] == 'NATIVE_WEB_PROBE_REFUSED'
+             and type(data['phase']) is str and type(data['error_class']) is str
+             and data['phase'] in phases and data['error_class'] in classes,
+             'a0_native_web_probe_diagnostic_invalid')
++    if 'supervisor' in data:
++        observed = data['supervisor']
++        require(isinstance(observed, dict) and set(observed) == {'count', 'processes'}
++                and type(observed['count']) is int and 0 <= observed['count'] <= 4096
++                and isinstance(observed['processes'], list) and len(observed['processes']) <= 3,
++                'a0_native_web_probe_diagnostic_invalid')
++        for process in observed['processes']:
++            require(isinstance(process, dict)
++                    and set(process) == {'name', 'statename', 'pid', 'start', 'exitstatus'}
++                    and type(process['name']) is str
++                    and process['name'] in {'run_ui', 'run_searxng', 'unexpected'}
++                    and type(process['statename']) is str
++                    and process['statename'] in {'STOPPED','STARTING','RUNNING','BACKOFF',
++                                                'STOPPING','EXITED','FATAL','UNKNOWN'}
++                    and all(type(process[k]) is int and 0 <= process[k] < 2**63 for k in ('pid','start'))
++                    and type(process['exitstatus']) is int and -255 <= process['exitstatus'] <= 255,
++                    'a0_native_web_probe_diagnostic_invalid')
+     return dict(data)
+ 
+ 
+@@ -1296,7 +1314,7 @@
+         namespace['observe_guard'](n, **({} if budget is None else {'budget': budget}))
+         return {'status': 'CURRENT_LOCAL_NETWORK_CHECKED', 'id': n['id']}
+ 
+-    def check_web(self, container_id):
++    def check_web(self, container_id, *, startup=False):
+         if 'web' not in self.p: return None
+         remaining(self.p); self.check_network(container_id=container_id)
+         for relative, value in web_module().service_files(self.p['web']).items():
+@@ -1307,8 +1325,38 @@
+         script = web_module().service_probe(self.p['web'])
+         # Suppress native import/error output; export only the bounded report.
+         script = 'import contextlib,io\nwith contextlib.redirect_stderr(io.StringIO()):\n' + '\n'.join(' '+line for line in script.splitlines())
+-        data = json.loads(self.docker('exec','--workdir=/usr/local/searxng/searxng-src',container_id,
+-            '/usr/local/searxng/searx-pyenv/bin/python','-B','-c',script,timeout=min(5,remaining(self.p))))
++        startup_identity = None
++        while True:
++            data = json.loads(self.docker('exec','--workdir=/usr/local/searxng/searxng-src',container_id,
++                '/usr/local/searxng/searx-pyenv/bin/python','-B','-c',script,timeout=min(5,remaining(self.p))))
++            if not isinstance(data, dict) or data.get('status') != 'NATIVE_WEB_PROBE_REFUSED':
++                break
++            data = web_probe_failure_checked(data)
++            observed = data.get('supervisor', {})
++            processes = observed.get('processes', [])
++            starting = (data['phase'] == 'supervisor' and data['error_class'] == 'AssertionError'
++                and observed.get('count') == len(processes) == 2
++                and {p['name'] for p in processes} == {'run_ui', 'run_searxng'}
++                and all(p['statename'] in {'STARTING', 'RUNNING'} and p['pid'] > 0
++                        and p['start'] > 0 for p in processes)
++                and any(p['statename'] == 'STARTING' for p in processes))
++            connecting = (data['phase'] == 'http_connecting' and data['error_class'] == 'OSError'
++                and observed.get('count') == len(processes) == 2
++                and {p['name'] for p in processes} == {'run_ui', 'run_searxng'}
++                and all(p['statename'] == 'RUNNING' and p['pid'] > 0 and p['start'] > 0
++                        for p in processes))
++            if not (startup and (starting or connecting)):
++                break
++            identity = sorted((p['name'], p['pid'], p['start']) for p in processes)
++            require(startup_identity in (None, identity), 'a0_native_web_service_replaced')
++            startup_identity = identity
++            # Passive observation only, bounded by the existing original clock
++            # and host startup runner. No create/start/model effect is replayed.
++            left = remaining(self.p)
++            if getattr(self, 'budget', None) is not None:
++                left = min(left, metadata_budget(self.budget))
++            time.sleep(min(.1, left))
++            self.check_network(container_id=container_id)
+         if isinstance(data, dict) and data.get('status') == 'NATIVE_WEB_PROBE_REFUSED':
+             data = web_probe_failure_checked(data)
+             # Reuse this owned native receipt: no new runtime artifact or
+@@ -1331,6 +1379,10 @@
+                 and all(set(x)=={'name','pid','start','statename'} and x['statename']=='RUNNING'
+                         and type(x['pid']) is int and x['pid']>0 and type(x['start']) is int
+                         and x['start']>0 for x in data['processes']), 'a0_effective_web_service_not_ready')
++        if startup_identity is not None:
++            require(startup_identity == sorted((p['name'], p['pid'], p['start'])
++                                               for p in data['processes']),
++                    'a0_native_web_service_replaced')
+         if getattr(self,'web_observation',None) is not None:
+             require(self.web_observation==data, 'a0_native_web_service_replaced')
+         self.check_network(container_id=container_id); remaining(self.p)
+--- a/plugins/friday_rework/host_runtime.py
++++ b/plugins/friday_rework/host_runtime.py
+@@ -1034,8 +1034,12 @@
+             self.runtime.check_network(container_id=r['container_id'])
+             g=NativeGrant(r['container_id'],p['container_name'],r['invocation_id'],m.labels(p),row['created_at_unix'],row['deadline_unix'],
+                 sample['group'],a['boot_id'],True,self.keys.prepared_monotonic,fields['InvocationID'],a['accepted_monotonic_ns']/1e9)
++            # A failed web readiness check is still pre-grant custody. Publish
++            # the grant before constructing its boundary so stop and durable
++            # quiescence always use the same phase, including setup failures.
++            self.runtime.check_web(r['container_id'], startup=True)
+             self.grant=asdict(g)
+-            self.runtime.check_web(r['container_id'])
++            self.store.retain_a0(row['existing_task_id'],row['owner'],'grant',self.grant)
+             self.boundary=self._boundary(row)
+             native_runner=self.boundary.runner
+             def bounded_api_runner(argv,data,timeout):
+@@ -1048,7 +1052,6 @@
+                     if self.startup_active: timeout=min(timeout,self._startup_left(row))
+                     return unit_command(arguments,timeout)
+                 self.boundary.supervisor._command=bounded_unit_command
+-            self.store.retain_a0(row['existing_task_id'],row['owner'],'grant',self.grant)
+             def expected(current):
+                 return tuple(ExpectedFile('/a0/usr/workdir/'+job_prefix(current)+'/'+job_prefix(current)+'-'+x['logical_name'],**x)
+                              for x in current['host']['a0']['expected_files'])
+@@ -1174,7 +1177,8 @@
+             return {'kind':'a0_no_create','at_unix':self.store.clock(),'observation':{
+                 'unit':asdict(self.unit),'plan_sha256':self.runtime.p['identity'],
+                 'create_attempted':False,'pending':False,'key_cleanup':self.key_cleanup}}
+-        if self.pre_grant_confirmed:
++        if self.pre_grant_confirmed or (self.created is not None
++                                       and row['host']['a0']['grant'] is None):
+             return {'kind':'a0_pre_grant','at_unix':self.store.clock(),'observation':{
+                 'unit':asdict(self.unit),**self.created,'native_cessation':True,'key_cleanup':self.key_cleanup}}
+         if self.grant is None:return None
+--- /dev/null
++++ b/tests/test_s437_portable_delta.py
+@@ -0,0 +1,107 @@
++"""Focused source controls; no native, model, service or external network effects."""
++import ast
++import contextlib
++import copy
++from dataclasses import dataclass
++import importlib.util
++import json
++from pathlib import Path
++import tempfile
++import types
++import unittest
++from unittest.mock import patch
++
++from test_a0_web_startup import runtime, web, web_plan
++import test_a0_web_startup as fixtures
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def failure(state='STARTING', phase='supervisor', error='AssertionError', pid=11):
++    return {'status': 'NATIVE_WEB_PROBE_REFUSED', 'phase': phase, 'error_class': error,
++        'supervisor': {'count': 2, 'processes': [
++            {'name': 'run_ui', 'statename': state, 'pid': pid, 'start': 10, 'exitstatus': 0},
++            {'name': 'run_searxng', 'statename': 'RUNNING', 'pid': 12, 'start': 10, 'exitstatus': 0}]}}
++
++
++def healthy(pid=11):
++    return {'status': 'CURRENT_NATIVE_WEB_SERVICE_CHECKED', 'version': 'offline-version',
++        'processes': [dict(name='run_ui', statename='RUNNING', pid=pid, start=10),
++                      dict(name='run_searxng', statename='RUNNING', pid=12, start=10)]}
++
++
++class PortableDelta(unittest.TestCase):
++    def run_probe(self, observations, *, startup):
++        raw = tempfile.TemporaryDirectory()
++        self.addCleanup(raw.cleanup)
++        root = Path(raw.name)
++        instance = fixtures.WebStartup().receipt_runtime(root)
++        for relative, value in web.service_files(web_plan()).items():
++            path = root / 'usr' / relative
++            path.parent.mkdir(parents=True, exist_ok=True)
++            path.write_text(value if isinstance(value, str) else json.dumps(value))
++        instance.check_network = lambda **kw: None
++        instance.locked = contextlib.nullcontext
++        responses = iter(observations)
++        seen = []
++        def docker(*args, **kw):
++            seen.append(args)
++            return json.dumps(next(responses))
++        instance.docker = docker
++        with patch.object(runtime, 'web_module', return_value=web), patch.object(runtime.time, 'sleep'):
++            result = instance.check_web('a' * 64, startup=startup)
++        return result, seen
++
++    def test_starting_and_connecting_only_observe_same_identity(self):
++        got, seen = self.run_probe([failure(), failure('RUNNING', 'http_connecting', 'OSError'), healthy()], startup=True)
++        self.assertEqual(got, healthy())
++        self.assertEqual(len(seen), 3)
++        self.assertTrue(all(args[0] == 'exec' for args in seen))
++
++    def test_nonstartup_and_fatal_fail_without_passive_retry(self):
++        for observed, startup in [(failure(), False), (failure('FATAL'), True),
++                (failure('RUNNING', 'http_config', 'OSError'), True)]:
++            with self.subTest(observed=observed, startup=startup):
++                with self.assertRaisesRegex(runtime.RuntimeErrorBoundary, 'a0_native_web_probe_'):
++                    self.run_probe([observed], startup=startup)
++
++    def test_changed_identity_refuses_on_retry_and_final_success(self):
++        for followup in (failure(pid=13), healthy(pid=13)):
++            with self.subTest(followup=followup):
++                with self.assertRaisesRegex(runtime.RuntimeErrorBoundary, 'a0_native_web_service_replaced'):
++                    self.run_probe([failure(), followup], startup=True)
++
++    def test_supervisor_fields_are_typed_bounded_and_closed(self):
++        observed = failure()
++        self.assertEqual(runtime.web_probe_failure_checked(observed), observed)
++        bad = []
++        for name, value in [('pid', True), ('start', 2**63), ('exitstatus', 256),
++                ('name', 'PRIVATE_SENTINEL'), ('statename', 'PRIVATE_SENTINEL')]:
++            item = copy.deepcopy(observed)
++            item['supervisor']['processes'][0][name] = value
++            bad.append(item)
++        item = copy.deepcopy(observed); item['supervisor']['message'] = 'PRIVATE_SENTINEL'; bad.append(item)
++        for item in bad:
++            with self.subTest(item=item), self.assertRaises(runtime.RuntimeErrorBoundary):
++                runtime.web_probe_failure_checked(item)
++
++    def test_retained_created_without_grant_has_pregrant_cessation(self):
++        tree = ast.parse((ROOT / 'plugins/friday_rework/host_runtime.py').read_text())
++        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'A0HostSession')
++        method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'quiescence')
++        # The two imports are irrelevant to the pre-grant path; retain its exact body.
++        method.body = [n for n in method.body if not isinstance(n, ast.ImportFrom)]
++        namespace = {}
++        exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])), '<quiescence>', 'exec'), namespace)
++        subject = types.SimpleNamespace(native_cessation=True, unit=types.SimpleNamespace(), route=None,
++            route_only_confirmed=False, no_create_confirmed=False, pre_grant_confirmed=False,
++            created={'container_id': 'a'*64, 'plan_sha256': 'b'*64}, grant={'container_id': 'a'*64},
++            store=types.SimpleNamespace(clock=lambda: 123), key_cleanup='REMOVED')
++        # Supply dataclass serialization for the neutral unit only.
++        namespace['asdict'] = lambda obj: {'quiescent': True}
++        row = {'host': {'a0': {'grant': None}}}
++        self.assertEqual(namespace['quiescence'](subject, row)['kind'], 'a0_pre_grant')
++
++
++if __name__ == '__main__':
++    unittest.main(verbosity=2)

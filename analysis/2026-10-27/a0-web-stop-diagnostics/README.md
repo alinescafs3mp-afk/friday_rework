@@ -1,0 +1,13 @@
+# A0 diagnostics, web startup and pre-grant stop source delta
+
+This analysis patch isolates generic A0 changes from the exact source-input transition `8bcf1282` → `5c9e39ca` and rebases only those hunks onto public `807b6b27`. It extends protected asynchronous diagnostics to A0, records bounded supervisor state, permits passive startup observations for the same STARTING/connecting processes within the existing budget, and keeps stop custody consistent with the durable pre-grant/grant phase.
+
+The patch is published for analysis. Product source and service declarations remain unchanged by this publication. Public declarations recognize only their existing exact WEB_PROBE/WEB_HTTP tuples; both the current public web inventory and the proposed portable runtime/web inventory fall outside those tuples. Connecting this delta therefore needs a separately reviewed public source edge. Private deployment history and its transition registry are excluded.
+
+The host and web-adapter outputs equal the exact reviewed after-source hashes. The portable runtime and host-runtime outputs intentionally differ: unrelated older public-to-private memory, routing, container, qualification and postboot changes are excluded. The provenance manifest records all before/after hashes and the rejected nearest declaration-consumer joins. DSH private receipt paths, user data and operational inputs are absent.
+
+Cache validation passed 17 existing web tests, five existing protected request-diagnostic controls and five focused startup/stop controls. The focused controls exercise passive STARTING/connection-refused startup, refusal outside startup, fatal states, changed service identity, diagnostic field bounds and retained pre-grant cessation. The runtime checker and readiness method, plus host quiescence method, match the exact after-source AST. Historical S437 composition45 and service-preparation27 checks are retained as separate evidence, without treating them as checks of the rebased patch.
+
+At the pinned handoff snapshot, project/plugin source acceptance was separate from native runtime installation: the external A0 runtime still had SHA-256 `4111e677…`, while the newer exact source was `4ad534e0…`. This assignment made no installation, runtime, service, model or Telegram effects and establishes no user acceptance.
+
+To inspect the proposed source delta, apply `portable-s437-a0-web-stop.patch` to a separate copy of public commit `807b6b27`, then run the commands recorded in `source-provenance.json`. The added focused test uses the two existing web test fixtures; no live worker is started.
