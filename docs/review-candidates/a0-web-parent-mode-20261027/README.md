@@ -46,3 +46,52 @@ private maintenance corrections used for this installation. The finalizer
 patch is a function excerpt for analysis; private invocation bindings and
 execution records are intentionally omitted. These patches do not constitute
 a standalone installer or a native/runtime acceptance result.
+
+
+## R480 native preflight refusal and sidecar-absence correction
+
+The first R480 native apply refused during retained-input preflight, before a
+native update transaction was created. The producer records already absent
+`kanban.db-wal` and `kanban.db-shm` files; the private consumer's absence allowlist
+did not admit those two names. The closed attempt left all 11 pinned before-state
+hashes unchanged, the core database unchanged, both sidecars absent and no native
+leader. This is a confirmed no-update result, not an unknown native effect.
+The accepted canonical source installation and its capture remain preserved;
+this correction does not require replaying that installation.
+
+The [sidecar-absence patch excerpt](sidecar-absence-excerpt.patch) changes only
+the private retained-input consumer. It admits an absent WAL or SHM only for the
+exact parent-mode service family, with both input digests equal to the accepted
+installed input, and a non-null core database reference having exactly `path`
+and `sha256` fields at the expected home-relative path. The caller must still
+prove physical absence with `os.path.lexists`. The core database continues
+through the unchanged retained-pin guard; access, attachment, native-unit and
+full-admission checks remain in place. Other files and service families do not
+gain an absence exception.
+
+The excerpt uses a generic `private-worker/` header; its hunk body is the exact
+accepted private-source delta, including the fixed input digest. It is published
+for analysis, not as a standalone installer. No captured request or user data is
+included. The final private worker digest is
+`f0e40a05f63e7ff485c755e5c9911f1856e832fcd1878084714c372310ce99fe`.
+
+Source checks covered byte-exact inverse reconstruction, the retained-input
+consumer and unchanged guards, including rejection of present sidecars,
+wrong input digests or family, missing/invalid core references, unrelated
+absence entries, and changed access/attachment joins. Independent source review
+recorded 178 passing checks with no high or medium findings. Its retained-loop
+replay used a virtual filesystem: it is source/metadata evidence, not live
+runtime acceptance. A separate 24-check binder supplement preserves refusal of
+the closed first attempt's authority; it also does not prove a new native run.
+
+| Stage | State at this checkpoint |
+| --- | --- |
+| Canonical source installation | Accepted; preserved without reinstall |
+| First native apply | Closed: preflight refusal, no native update transaction |
+| Private sidecar-absence correction | Source accepted; exact limited delta |
+| Separately admitted R2 native apply | **Pending; no outcome claimed here** |
+| Fresh container/runtime and Telegram file tasks | Not accepted by this source checkpoint |
+
+The compact [result record](sidecar-absence-results.json) carries the same scope
+and pending R2 status. R2 needs its own actual consumer result and postconditions;
+this source acceptance alone does not establish native, runtime or user acceptance.
