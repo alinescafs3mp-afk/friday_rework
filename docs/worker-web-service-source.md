@@ -194,3 +194,24 @@ is source-only analysis material, not a public runtime installer.
 R476 remains installed and accepted by a fresh installed consumer. At this
 checkpoint, R478 qualification is running and has not been accepted; neither new
 DSH/A0 Telegram file task has succeeded. The R477 failure is preserved above.
+
+
+## R478 native execution observation
+
+R478 passed the former historical-input refusal and started the A0 worker stage.
+Preparation before that stage took 497.770 seconds. The native container process
+was started, then its systemd manager recorded exit status 1 about two seconds
+later. The subsequent container inspection refused `container_network_changed`;
+the worker stage ended after 13.432 seconds.
+
+The recorded cleanup and a separate current-resource check confirmed that the
+container was stopped and retired, its network was absent, introduced keys were
+removed, and the permanent services were unchanged. Stopped daemon execution
+metadata still requires its existing exact retirement procedure before another
+admission. The original attempt and clocks remain preserved.
+
+The underlying container exit cause is undetermined: this runtime mode sent
+stdout and stderr to null, and the failed raw inspection was not retained before
+retirement. The next scoped diagnostic change must preserve that evidence.
+Neither Telegram file task has been sent; the installed R476 repair and accepted
+S411 historical-reader correction remain in place.
