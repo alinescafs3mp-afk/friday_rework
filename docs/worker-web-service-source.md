@@ -251,3 +251,38 @@ R479's container, network and introduced keys were reconciled, and its stopped
 daemon execution metadata was archived and retired in a separate 5.726-second
 maintenance operation. Permanent gateway, Dashboard and Kimi processes were
 preserved. Both Telegram file tasks remain unexecuted.
+
+## R480 canonical source installation
+
+The reviewed parent-mode repair and its exact declaration edge are now installed
+in canonical source. A fresh installed process accepted input
+`587a372be1ad9d67ba68f6b1d181ddad31da07be6e00235b6a65bcb65245bb12`;
+physical verification covered all 47 plugin files. Exactly two canonical source
+files changed: the web adapter is
+`975bfd8c75e43b18e6d55d66f172d0d5929f100c83c16611a98efb841dd32b76`,
+and the declarations module is
+`2bd351b6cd76673a8fbbdc9c8371ff69d10ed5d24f1ad1401212fa85f8b8bf79`.
+
+Input capture took 498.024959 seconds. The successful source updater took
+552.056111 seconds. These are separate phases; they are not a combined
+installation-to-service measurement.
+
+Before that successful updater, two native entry attempts were refused before
+update dispatch or canonical transaction creation. The first, after 0.667658
+seconds, exposed tuple-to-list conversion in JSON finalization. The second,
+after 1.219230 seconds, exposed a missing exact family in the private
+maintenance budget-provenance guard. Both attempts were closed and reconciled,
+and the installed state was checked unchanged. The typed finalizer and exact
+family correction passed the actual bound loader and complete budget guard.
+The existing capture and original source clock were retained. These refusals
+remain separate from the subsequent completed source installation.
+
+At this checkpoint, native web remains at
+`b16fb6681372223c4c6c04e6e7021eb53993cea56136bfe28419ac566976d5b6`,
+and native runtime remains at
+`4111e677a103b93ef3d898757e67cea7dad1da68c34d542689707286b802cdd9`.
+The new native update has not been accepted. Gateway and Dashboard are
+temporarily stopped for coherent installation; Kimi is preserved. Worker
+qualification and both new DSH/A0 Telegram file tasks remain open, and neither
+task has been sent. Source acceptance does not establish runtime or user
+acceptance; no product READY is claimed.
