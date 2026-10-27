@@ -1,0 +1,141 @@
+--- a/scripts/a0_runtime.py
++++ b/scripts/a0_runtime.py
+@@ -41,6 +41,7 @@
+ PIDS = 256
+ STARTUP_SECONDS = 120
+ STOP_SECONDS = 2
++STARTUP_LOG_LIMIT = 131072  # per file; native over-limit writes fail closed
+ ENV = {'PATH': '/usr/bin:/bin', 'HOME': '/home/jericho', 'LC_ALL': 'C',
+        'XDG_RUNTIME_DIR': '/run/user/1000',
+        'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/1000/bus',
+@@ -105,6 +106,50 @@
+             and data['phase'] in phases and data['error_class'] in classes,
+             'a0_native_web_probe_diagnostic_invalid')
+     return dict(data)
++
++
++def inspect_failure_snapshot(p, r, obj, error, *, stop_owned=False, pre_start=False):
++    """Allowlisted observations only; this evidence never grants custody/readiness."""
++    obj = obj if isinstance(obj, dict) else {}
++    state = obj.get('State'); state = state if isinstance(state, dict) else {}
++    status = state.get('Status')
++    selected = {'Status': status if isinstance(status, str) and status in {'created', 'running', 'paused', 'restarting',
++                                             'removing', 'exited', 'dead'} else None}
++    for key in ('Running', 'Paused', 'Restarting', 'OOMKilled', 'Dead'):
++        selected[key] = state.get(key) if type(state.get(key)) is bool else None
++    for key in ('Pid', 'ExitCode'):
++        selected[key] = state.get(key) if type(state.get(key)) is int and -(2**31) <= state[key] < 2**31 else None
++    for key in ('StartedAt', 'FinishedAt'):
++        value = state.get(key)
++        selected[key] = value if (isinstance(value, str) and len(value) <= 40
++                                  and re.fullmatch(r'[0-9TZ:.+\-]+', value)) else None
++    value = state.get('Error')
++    # Never retain Docker's arbitrary error text in a receipt or exception note.
++    raw = value.encode('utf-8', errors='replace') if isinstance(value, str) else None
++    selected['Error'] = {'present': bool(raw) if raw is not None else None,
++                         'bytes': len(raw) if raw is not None else None,
++                         'sha256': hashlib.sha256(raw).hexdigest() if raw is not None else None}
++    settings = obj.get('NetworkSettings')
++    networks = settings.get('Networks') if isinstance(settings, dict) else None
++    expected = p.get('network')
++    name = expected.get('name') if isinstance(expected, dict) else None
++    network = networks.get(name) if isinstance(networks, dict) else None
++    network = network if isinstance(network, dict) else {}
++    net = {'count': len(networks) if isinstance(networks, dict) else None,
++           'expected_only': set(networks) == {name} if isinstance(networks, dict) else None}
++    for key in ('NetworkID', 'EndpointID'):
++        value = network.get(key)
++        net[key] = value if (isinstance(value, str) and
++                            (value == '' or re.fullmatch(r'[0-9a-f]{64}', value))) else None
++    code = str(error) if isinstance(error, RuntimeErrorBoundary) else ''
++    return {'schema': 'friday.a0.inspect-failure.v1', 'plan_sha256': digest(p),
++            'container_id': r['container_id'], 'invocation_id': r.get('invocation_id', ''),
++            'phase': 'pre_start' if pre_start else 'stop_owned' if stop_owned else 'observe',
++            'refusal': code if re.fullmatch(r'[a-z0-9_]{1,96}', code) else 'native_inspection_failed',
++            'observed_id_matches': obj.get('Id') == r['container_id'],
++            'state': selected, 'network': net,
++            'restart_count': obj.get('RestartCount') if type(obj.get('RestartCount')) is int and 0 <= obj['RestartCount'] < 2**31 else None,
++            'authority': 'DIAGNOSTIC_ONLY'}
+ 
+ 
+ def digest(value):
+@@ -1397,13 +1442,31 @@
+             a['native'] = {'invocation_id': r['invocation_id'], 'worker_reference': r['container_id']}
+         return a
+ 
++    def retain_inspect_failure(self, r, obj, error, *, stop_owned=False, pre_start=False):
++        """Best effort before cleanup; failure cannot replace the original refusal."""
++        output = self.directory / 'inspect-failure.private.json'
++        if output.exists() or output.is_symlink():
++            private(output)  # Preserve the first failure, never overwrite evidence.
++            return
++        write_json(output, inspect_failure_snapshot(self.p, r, obj, error,
++                   stop_owned=stop_owned, pre_start=pre_start))
++
+     def inspect(self, r, *, stop_owned=False, timeout=10, pre_start=False):
+-        xs = json.loads(self.docker('inspect', r['container_id'], timeout=timeout))
+-        require(isinstance(xs, list) and len(xs) == 1, 'container_observation_unknown')
+-        obj = container_checked(self.p, xs[0], r['container_id'], stop_owned=stop_owned, pre_start=pre_start)
+-        if not stop_owned:
+-            self.check_network(container_id=r['container_id'])
+-        return obj
++        xs = None
++        try:
++            xs = json.loads(self.docker('inspect', r['container_id'], timeout=timeout))
++            require(isinstance(xs, list) and len(xs) == 1, 'container_observation_unknown')
++            obj = container_checked(self.p, xs[0], r['container_id'], stop_owned=stop_owned, pre_start=pre_start)
++            if not stop_owned:
++                self.check_network(container_id=r['container_id'])
++            return obj
++        except BaseException as original:
++            try:
++                obj = xs[0] if isinstance(xs, list) and len(xs) == 1 else None
++                self.retain_inspect_failure(r, obj, original, stop_owned=stop_owned, pre_start=pre_start)
++            except BaseException:
++                original.add_note('inspect_failure_diagnostic_unconfirmed')
++            raise
+ 
+     def check_network(self, *, container_id=None, budget=None):
+         budget = getattr(self,'budget',None) if budget is None else budget
+@@ -1475,6 +1538,29 @@
+         self.web_observation=data
+         return data
+ 
++    def prepare_startup_logs(self):
++        """Precreate exact private native output files; no public journal content."""
++        private(self.directory, directory=True)
++        paths = [self.directory / ('startup.' + stream + '.private.log')
++                 for stream in ('stdout', 'stderr')]
++        for path in paths:
++            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
++            try:
++                item = os.fstat(fd)
++                require(stat.S_ISREG(item.st_mode) and item.st_uid == os.getuid()
++                        and stat.S_IMODE(item.st_mode) == 0o600 and item.st_nlink == 1
++                        and item.st_size == 0, 'startup_log_identity_changed')
++                opened_identity = (item.st_dev, item.st_ino)
++                os.fsync(fd)
++            finally:
++                os.close(fd)
++            item = private(path).lstat()
++            require(item.st_nlink == 1 and item.st_size == 0
++                    and (item.st_dev, item.st_ino) == opened_identity,
++                    'startup_log_identity_changed')
++        sync_dir(self.directory)
++        return paths
++
+     def unit_argv(self, cid, plan_path, plan_file_sha):
+         seconds = min(remaining(self.p), STARTUP_SECONDS)
+         require(re.fullmatch(r'[0-9a-f]{64}', cid), 'invalid_container_id')
+@@ -1491,6 +1577,11 @@
+                   if self.p['mode'] == 'inventory' else 'StandardOutput=null')]
+         if self.p['mode'] == 'inventory':
+             props.append('RemainAfterExit=yes')
++        else:
++            stdout, stderr = self.prepare_startup_logs()
++            props = [x for x in props if not x.startswith(('StandardOutput=', 'StandardError='))]
++            props += ['StandardOutput=append:' + str(stdout), 'StandardError=append:' + str(stderr),
++                      'LimitFSIZE=' + str(STARTUP_LOG_LIMIT)]
+         return ['/usr/bin/systemd-run', '--user', '--unit=' + self.p['unit'],
+                 '--service-type=exec', '--expand-environment=no',
+                 *['--property=' + x for x in props], str(DOCKER), '--host', SOCKET,

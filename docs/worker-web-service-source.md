@@ -215,3 +215,16 @@ stdout and stderr to null, and the failed raw inspection was not retained before
 retirement. The next scoped diagnostic change must preserve that evidence.
 Neither Telegram file task has been sent; the installed R476 repair and accepted
 S411 historical-reader correction remain in place.
+
+The subsequent bounded maintenance completed in 5.721 seconds: the two stopped
+execution-state files and twelve directories were archived and retired, then the
+existing registered stopped-launcher consumer passed. The daemon state directory
+remains empty, persistent Docker data was preserved, and gateway, Dashboard and
+Kimi kept their original processes. This closes the failed attempt's resource
+cleanup; it does not qualify either worker or explain the startup exit.
+
+The [reviewed startup diagnostic delta](review-candidates/a0-startup-diagnostics-20261027/README.md)
+captures selected failure state and bounded private startup output in the next
+scoped probe. Its runtime and source-binding checks passed, including an isolated
+real systemd output-limit check. No subsequent A0 startup or Telegram task has
+yet been accepted. The installed runtime bytes remain unchanged.
