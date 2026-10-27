@@ -299,9 +299,28 @@ while worker qualification proceeds.
 
 The next qualification preflight stopped before a qualification clock,
 operation directory or worker launch: its private reader expected mode `0600`
-for the native mechanism's immutable `0400` receipt. Reader compatibility is
-being corrected without changing receipt permissions, repeating installation
-or restarting healthy services. Both new DSH/A0 Telegram file tasks remain
+for the native mechanism's immutable `0400` receipt. The corrected local reader
+passed its actual nearest consumer without changing receipt permissions,
+repeating installation or restarting healthy services. Both new DSH/A0 Telegram file tasks remain
 unsent. Installation and service restoration do not establish worker or user
 acceptance; no product READY is claimed. The durations above are separate
 intervals and must not be summed with enclosing observations.
+
+## R481: real A0 startup observed; completion remains open
+
+The resumed qualification preserved its input and alias checks, reused the
+accepted DSH safety observation, and started the real A0 container. Its saved
+observation confirms the local route, native Web UI and configured local chat,
+utility and embedding slots. The no-model startup probe passed. This resolves
+the earlier startup refusal; it is not a coding or engineering user-task result.
+
+The native qualification process returned after 603.307093 seconds, failing in
+the A0 cleanup phase after that observation was saved. The original failure is
+`STOP_UNCONFIRMED`; no complete BOTH-worker proof or runtime attachment was
+accepted. Subsequent read-only reconciliation confirmed stopped native units,
+empty retained process groups and removal of the route, network and guard.
+The stopped container still needs retirement, followed by the remaining DSH
+observation and final qualification publication. The successful A0 observation
+is retained for that continuation; restarting it is not the default recovery.
+
+Gateway and Dashboard remain running. Both Telegram file tasks remain unsent.

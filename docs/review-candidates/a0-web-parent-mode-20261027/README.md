@@ -100,3 +100,44 @@ existing runtime input. The next qualification preflight exposed a separate
 reader compatibility issue with immutable `0400` native receipts and stopped
 before worker admission. Receipt permissions and healthy services are preserved.
 These results do not establish worker or Telegram user acceptance.
+
+## Qualification reader and immutable native receipts
+
+The post-install qualification preflight stopped before creating its operation
+directory or clock: its private document reader expected `0600`, while the native
+mechanism had correctly sealed the new receipt and commit at `0400`. No worker
+was started by that refusal. The installed source, services and signed owner
+observation were preserved.
+
+The [reader delta](immutable-receipt-reader.patch) admits `0400` only for the two
+exact current native receipt references in the bound qualification input and
+their canonical transaction directory. Existing owner, protected-parent, link,
+identity and content checks remain. A separate callback keeps the exact prior
+service receipt on the nonprivate protected-read contract already used by the
+historical derivative reader. Other private `0400` files remain refused.
+
+The actual nearest consumer passed 130 reads across 76 pinned files; independent
+review covered the narrow policy and caller graph. The existing driver then
+started a distinct qualification with the repaired local reader, retaining the
+installation and owner proof. Qualification and Telegram results are separate
+from these reader checks.
+
+The resumed R481 qualification subsequently saved a successful real A0 startup
+observation: local route, native Web UI and configured local model slots passed
+the no-model startup check. Cleanup then returned `STOP_UNCONFIRMED`. Read-only
+reconciliation confirmed stopped units and processes, with the route removed;
+retirement of the stopped container and the remaining DSH/final qualification
+steps are still pending. The saved A0 result is preserved for continuation.
+
+## Early structural checks — source proposal, not integrated
+
+The [early-input patch](cheap-input-preflight.patch) checks impossible request
+shapes before native input reads, inspection or history traversal. It validates
+required source companions, static inventory entries, relative paths and the
+existing narrowly permitted absence cases. All physical custody, current state,
+complete dynamic inventory, history and authority checks remain at their original
+boundaries. A well-formed but wrong hash still needs the later content check.
+
+This independent source proposal passed structural and caller-prefix checks and
+a separate review. It is not integrated into the running qualification or the
+installed runtime and is not a condition for the pending Telegram tasks.
