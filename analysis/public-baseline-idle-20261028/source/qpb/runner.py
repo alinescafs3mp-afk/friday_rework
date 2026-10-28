@@ -57,6 +57,8 @@ def _summarize(store: RunStore, corpus, pilot_only: bool) -> dict:
     errors = 0
     truncations = 0
     active = 0.0
+    technical_losses = 0
+    unmeasured_sent_attempts = 0
     walls = {"ifbench": [], "gpqa": [], "lcb": []}
     for path in store.iter_request_files():
         from qpb.atomic import load_json_result
@@ -68,6 +70,10 @@ def _summarize(store: RunStore, corpus, pilot_only: bool) -> dict:
         record = loaded["value"]
         attempts += 1
         wall = record.get("wall_s")
+        if record.get("outcome") == "technical_loss":
+            technical_losses += 1
+        if record.get("sent") is True and not isinstance(wall, (int, float)):
+            unmeasured_sent_attempts += 1
         if isinstance(wall, (int, float)):
             active += float(wall)
             bench = record.get("benchmark")
@@ -75,7 +81,7 @@ def _summarize(store: RunStore, corpus, pilot_only: bool) -> dict:
                 walls[bench].append(float(wall))
         if record.get("truncated"):
             truncations += 1
-        if record.get("outcome") in {"transport_error", "OUTCOME_UNKNOWN", "protocol_diagnostic", "PARTIAL_RECORD"}:
+        if record.get("outcome") in {"transport_error", "OUTCOME_UNKNOWN", "protocol_diagnostic", "PARTIAL_RECORD", "technical_loss"}:
             errors += 1
     completed = 0
     for benchmark in ("ifbench", "gpqa", "lcb"):
@@ -86,7 +92,9 @@ def _summarize(store: RunStore, corpus, pilot_only: bool) -> dict:
         "attempts": attempts,
         "errors": errors,
         "truncations": truncations,
-        "active_s": active,
+        "active_s": active,  # Known observations only; not a zero-cost claim.
+        "technical_losses": technical_losses,
+        "unmeasured_sent_attempts": unmeasured_sent_attempts,
         "completed": completed,
         "walls": walls,
         "pilot_only": pilot_only,
@@ -98,7 +106,9 @@ def _progress_line(progress: dict) -> str:
         f"run={progress['run_id']} profile={progress['profile']} bench={progress.get('benchmark') or '-'} "
         f"{progress['completed']}/{progress['expected']} attempts={progress['attempts']} "
         f"errors={progress['errors']} trunc={progress['truncations']} "
-        f"current={progress.get('current') or '-'} active_s={progress['active_s']:.1f} "
+        f"current={progress.get('current') or '-'} active_known_s={progress['active_s']:.1f} "
+        f"unmeasured_sent_attempts={progress.get('unmeasured_sent_attempts', 0)} "
+        f"technical_losses={progress.get('technical_losses', 0)} "
         f"window={progress.get('window') or '-'} eta={progress.get('eta') or '-'} "
         f"state={progress['state']}"
     )
@@ -286,6 +296,9 @@ class Runner:
             "truncations": summary["truncations"],
             "current": current,
             "active_s": summary["active_s"],
+            "active_s_complete": summary["unmeasured_sent_attempts"] == 0,
+            "technical_losses": summary["technical_losses"],
+            "unmeasured_sent_attempts": summary["unmeasured_sent_attempts"],
             "window": window,
             "eta": _format_eta(self.corpus, self.store, summary["walls"], self.pilot_only),
             "state": state,
@@ -606,7 +619,7 @@ class IdleRunner(Runner):
                     if not loaded["ok"]:
                         raise IdleBlocked("RECOVERY_REQUIRED: partial historical request")
                     record = loaded["value"]
-                    if other.attempt_blocks_send(record) in {"SENDING", "OUTCOME_UNKNOWN", "PARTIAL_RECORD", "transport_error_sent"}:
+                    if other.attempt_blocks_send(record) in {"SENDING", "OUTCOME_UNKNOWN", "PARTIAL_RECORD", "transport_error_sent", "technical_loss_not_authorized"}:
                         if not other.prediction_complete(record.get("benchmark", ""), record.get("task_id", "")):
                             raise IdleBlocked("RECOVERY_REQUIRED: historical possibly accepted POST")
             return super().execute()
@@ -733,6 +746,9 @@ class IdleRunner(Runner):
                       "body": body, "request_hash": sha256_obj(body), "generation_fingerprint": self.fingerprint,
                       "server_request_id": permit["rid"], "permit": permit, "started_at": _now(),
                       "started_epoch": time.time(), "success": False}
+            if previous and previous.get("outcome") == "technical_loss":
+                record["recovery_retry_of"] = previous["attempt_id"]
+                record["recovery_evidence_ref"] = previous["recovery"]["evidence_ref"]
             headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "Accept": "text/event-stream"}
             record["headers"] = redact_headers(headers)
             self.store.save_request(record)

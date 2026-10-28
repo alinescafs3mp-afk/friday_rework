@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import json
+import stat
 import os
 import re
 from pathlib import Path
@@ -17,6 +20,67 @@ from qpb.atomic import (
 
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,80}\Z")
 COMPLETE_OUTCOMES = {"complete"}
+TECHNICAL_LOSS = "technical_loss"
+
+
+def technical_loss_retry_authorized(record: dict) -> bool:
+    """Accept only a protected, hash-bound reconciliation for this exact loss.
+
+    This does not discover or clear unknown requests. The one-off Root recovery
+    must first confirm the old request is no longer active and explicitly permit
+    its next attempt. The lost result and its cost remain unknown.
+    """
+    try:
+        recovery = record["recovery"]
+        if not isinstance(recovery, dict):
+            return False
+        if (record.get("outcome") != TECHNICAL_LOSS
+                or record.get("state") != "LOST_RESPONSE_AFTER_CLIENT_REBOOT"
+                or record.get("sent") is not True
+                or recovery.get("result_unknown") is not True
+                or recovery.get("request_no_longer_active") is not True
+                or recovery.get("repeat_authorized") is not True
+                or recovery.get("authorized_next_attempt_n") != record["attempt_n"] + 1):
+            return False
+        path = Path(recovery["evidence_ref"])
+        if not path.is_absolute():
+            return False
+        for parent in path.parents:
+            st = parent.lstat()
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid not in (0, os.getuid()) or st.st_mode & 0o022:
+                return False
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1 or st.st_mode & 0o077 or st.st_size > 1048576:
+                return False
+            with os.fdopen(os.dup(fd), "rb") as stream:
+                raw = stream.read(1048577)
+            after = os.fstat(fd)
+            named = path.lstat()
+            fields = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if any(getattr(st, k) != getattr(after, k) or getattr(st, k) != getattr(named, k) for k in fields):
+                return False
+        finally:
+            os.close(fd)
+        if hashlib.sha256(raw).hexdigest() != recovery["evidence_sha256"]:
+            return False
+        evidence = json.loads(raw)
+        if not isinstance(evidence, dict) or evidence.get("schema") != "frw.baseline.orphan-reconciliation.v1":
+            return False
+        expected = {"attempt_id": record["attempt_id"], "run_id": record["permit"]["run_id"],
+                    "rid": record["server_request_id"], "request_hash": record["request_hash"],
+                    "generation_fingerprint": record["generation_fingerprint"],
+                    "original_request_sha256": recovery["original_request_sha256"],
+                    "authorized_next_attempt_n": record["attempt_n"] + 1}
+        return (all(evidence.get(k) == v for k, v in expected.items())
+                and evidence.get("repeat_authorized") is True
+                and evidence.get("result_unknown") is True
+                and evidence.get("request_no_longer_active") is True
+                and evidence.get("empty_backend_verified") is True
+                and evidence.get("same_serving_verified") is True)
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
 
 
 class RunIdError(ValueError):
@@ -222,6 +286,8 @@ class RunStore:
         if record is None:
             return None
         outcome = record.get("outcome") or record.get("state")
+        if outcome == TECHNICAL_LOSS:
+            return None if technical_loss_retry_authorized(record) else "technical_loss_not_authorized"
         if outcome in {"OUTCOME_UNKNOWN", "PARTIAL_RECORD"}:
             return outcome
         if record.get("state") == "SENDING":

@@ -50,6 +50,9 @@ def _benchmark_block(store: RunStore, manifest: dict, benchmark: str) -> dict:
     truncated = 0
     transport = 0
     unknown = 0
+    technical_losses = 0
+    technical_retries = 0
+    unmeasured_sent_attempts = 0
     for task_id in ids:
         loaded = store.read_prediction(benchmark, task_id)
         if not loaded["ok"]:
@@ -64,6 +67,12 @@ def _benchmark_block(store: RunStore, manifest: dict, benchmark: str) -> dict:
             continue
         record = loaded["value"]
         attempts += 1
+        if record.get("outcome") == "technical_loss":
+            technical_losses += 1
+        if record.get("recovery_retry_of") and record.get("sent") is True:
+            technical_retries += 1
+        if record.get("sent") is True and not isinstance(record.get("wall_s"), (int, float)):
+            unmeasured_sent_attempts += 1
         if record.get("outcome") == "transport_error":
             transport += 1
         if record.get("outcome") == "OUTCOME_UNKNOWN":
@@ -95,6 +104,9 @@ def _benchmark_block(store: RunStore, manifest: dict, benchmark: str) -> dict:
         "truncated_responses": truncated,
         "transport_errors": transport,
         "outcome_unknown": unknown,
+        "technical_losses": technical_losses,
+        "technical_retries": technical_retries,
+        "unmeasured_sent_attempts": unmeasured_sent_attempts,
         "not_run": None if not scored_rows else not_run,
         "parse_errors": None if not scored_rows else _count(scored_rows, "parse_error"),
         "extraction_errors": None if not scored_rows else _count(scored_rows, "extraction_error"),
@@ -180,7 +192,9 @@ def build_report(store: RunStore) -> dict:
         "model": manifest.get("model"),
         "generation_fingerprint": manifest.get("generation_fingerprint"),
         "benchmarks": benchmarks,
-        "active_model_seconds": active,
+        "active_model_seconds": active if not any(b["unmeasured_sent_attempts"] for b in benchmarks.values()) else None,
+        "known_active_model_seconds": active,
+        "attempt_cost_complete": not any(b["unmeasured_sent_attempts"] for b in benchmarks.values()),
         "cpu_scoring_seconds": None,
         "calendar_seconds_including_pauses": None,
         "note": _note(kind, partial),
@@ -235,7 +249,7 @@ def render_markdown(document: dict) -> str:
     lines.append(f"- live_checked: `{document['live_checked']}`")
     lines.append(f"- full_model_baseline: `{document['full_model_baseline']}`")
     lines.append(f"- generation fingerprint: `{document.get('generation_fingerprint')}`")
-    lines.append(f"- активное время модели, с: `{document['active_model_seconds']}`")
+    lines.append(f"- активное время модели, с: `{document['active_model_seconds']}`; известная сумма: `{document['known_active_model_seconds']}`; полнота стоимости: `{document['attempt_cost_complete']}`")
     lines.append("- CPU scoring и календарное время с паузами в этом отчёте не смешиваются с активным временем. CPU здесь null, пока отдельный таймер скоринга не записан.")
     lines.append("")
     lines.append("Сырые ответы: `requests/`, `predictions/`. Оценки: `reviews/`.")
@@ -250,7 +264,9 @@ def render_markdown(document: dict) -> str:
         )
         lines.append(
             f"- attempts {block['generation_attempts']}, truncated {block['truncated_responses']}, "
-            f"transport_errors {block['transport_errors']}, outcome_unknown {block['outcome_unknown']}"
+            f"transport_errors {block['transport_errors']}, outcome_unknown {block['outcome_unknown']}, "
+            f"technical_losses {block['technical_losses']}, technical_retries {block['technical_retries']}, "
+            f"unmeasured_sent_attempts {block['unmeasured_sent_attempts']}"
         )
         lines.append(
             f"- not_run {block['not_run']}, parse_errors {block['parse_errors']}, "
