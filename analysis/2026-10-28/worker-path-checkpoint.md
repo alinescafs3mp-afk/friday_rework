@@ -97,3 +97,16 @@ The previous qualification1200 is closed: the retained-owner guard refused it, t
 At this snapshot, no subsequent A0 qualification or genuine A0 engineering file, checked Telegram delivery and contextual continuation is accepted. The prior accepted DSH file, delivery and continuation remain preserved. Permanent service readiness is tracked separately by the integrator; this export makes no service-readiness claim.
 
 Source76 follow-through: the installed current-state check passed and permanent gateway/Dashboard are verified. A local startup JSON/source-reader mismatch was repaired without repeating installation. The corrected qualification is running; the A0 user result remains unaccepted. The existing baseline run yielded at 176/673, errors=0.
+
+
+## Delta: Source77 legacy conversion installed; native completion remains open
+
+Source77 is installed and source-accepted in a fresh native process. Two worker plugins changed; the native tree and existing external A0 runtime were retained. This establishes installed source, while A0 qualification and user-result acceptance remain separate.
+
+The Source76 qualifier is closed after consuming its request and failing in conversion before bootstrap. Its actual retained configuration used the older runtime tuple; that original input remains unchanged. No model or worker started, the operator session was revoked, and its stage remained absent. The closed clock and effect are preserved without replay.
+
+The [Source77 archival semantic delta](source77-legacy-conversion/README.md) restores full historical validation before current runtime normalization, enforces strict current-config verification, and propagates source compatibility through both wrapper layers. A separate v4 qualification boundary authenticates the closed Source76 request/files and corrected consumers, requires a fresh clock, and compares monotonic order only within the same boot. Qualification1200/reserve30, profile720, runtime600 and native daemon480/start45/stop20 limits remain unchanged.
+
+Source controls passed: 59 adapter cases, 25 private-glue cases, 21 reused closed-boundary checks and 10 boot-delta checks. The final package and real-namespace source gate passed separately. The profiled actual outer `runtime480` diagnostic was CPU-killed with exit 137 before completion; no completion proof was produced. Prior Source76 runtime evidence is retained only within its original scope. No Source77 product qualification has run at this snapshot, and this export makes no new permanent-service-readiness claim.
+
+The accepted DSH-produced file, Telegram delivery and contextual continuation remain preserved. A genuine A0 engineering file, checked Telegram delivery and contextual continuation remain unaccepted.
