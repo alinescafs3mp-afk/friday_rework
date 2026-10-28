@@ -1,0 +1,2124 @@
+"""Dedicated intact A0 container through existing Docker/user-systemd only.
+
+Preparation is offline. Live operations require an exact reviewed plan and a
+separate current Astra CONTROL; the CLI hash is an integrity check, not permission.
+No API message submission, model calls, daemon start, retry, pull or image removal.
+"""
+from __future__ import annotations
+
+import argparse
+import configparser
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import inspect
+import json
+import math
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+PROJECT = Path('/home/jericho/jericho/Friday_rework')
+RUNTIME = PROJECT / '.runtime/a0-runtime-sol'
+DOCKER = PROJECT / '.runtime/docker-29.8.2/docker/docker'
+SOCKET = 'unix:///run/user/1000/friday-rework-docker/docker.sock'
+LAUNCHER = PROJECT / '.runtime/rootless-docker/launch.py'
+LOCAL_ENDPOINTS = [{'ip': '192.168.1.78', 'port': 8001, 'transport': 'tcp'},
+                   {'ip': '192.168.1.78', 'port': 8002, 'transport': 'tcp'}]
+DAEMON = 'friday-rework-docker.service'
+IMAGE = 'sha256:6b300a0a4341632f021fb1b5d2641296ff4882ba7636e228f57c58bc9105c4f8'
+DONOR = 'e3051fb584b1a36be2b0a0c90606f1c2c2d356ec'
+DONOR_TREE = 'f7bfedfa472b9d1bc28a88caf8be08d17daf8813'
+DONOR_DESCRIBE = 'e3051fb'
+MEMORY = 2 * 1024**3
+PIDS = 256
+STARTUP_SECONDS = 120
+DAEMON_SECONDS = 480
+DAEMON_WORKER_RESERVE_SECONDS = 25
+WORKER_START_SECONDS = 10
+STOP_SECONDS = 2
+ENV = {'PATH': '/usr/bin:/bin', 'HOME': '/home/jericho', 'LC_ALL': 'C',
+       'XDG_RUNTIME_DIR': '/run/user/1000',
+       'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/1000/bus',
+       'DOCKER_CONFIG': str(PROJECT / '.runtime/docker-client')}
+START_SCRIPT = ('umask 077; . /ins/setup_venv.sh; . /ins/copy_A0.sh; '
+                'mkdir -p /a0/usr/uploads; cd /a0; '
+                'exec python run_ui.py --dockerized=true --host=127.0.0.1 --port=5000')
+INVENTORY_SCRIPT = '''import importlib.metadata as m,json,platform,sys
+print(json.dumps({"python":sys.version,"executable":sys.executable,
+ "platform":platform.platform(),"distributions":sorted(
+ [{"name":d.metadata["Name"],"version":d.version} for d in m.distributions()],
+ key=lambda x:(x["name"].lower(),x["version"]))}))'''
+INVENTORY_COMMAND = '; '.join(shlex.join([python, '-B', '-c', INVENTORY_SCRIPT])
+                             for python in ['/opt/venv-a0/bin/python', '/opt/venv/bin/python'])
+HEALTH_SCRIPT = '''import json,urllib.request
+try:
+ with urllib.request.urlopen("http://127.0.0.1:5000/api/health",timeout=3) as r:
+  data=json.load(r)
+ print(json.dumps({"http":200,"gitinfo_present":bool(data.get("gitinfo")),
+  "native_error_present":bool(data.get("error"))}))
+except Exception:
+ print(json.dumps({"http":None,"status":"NOT_READY"}))
+ raise SystemExit(1)'''
+# Read effective native token within the container; never return or log it.
+AUTH_SCRIPT = '''import json,urllib.request,urllib.error
+from helpers import dotenv,settings,runtime
+runtime.initialize();dotenv.load_dotenv()
+url="http://127.0.0.1:5000/api/api_log_get?context_id=frw-nonexistent&length=1"
+for label,key in [("wrong","frw-invalid-key"),("native",settings.create_auth_token())]:
+ try:
+  with urllib.request.urlopen(urllib.request.Request(url,headers={"X-API-KEY":key}),timeout=3) as r:
+   status=r.status
+ except urllib.error.HTTPError as e: status=e.code
+ except Exception: status=None
+ print(json.dumps({"key_kind":label,"http":status}))'''
+
+
+class RuntimeErrorBoundary(RuntimeError):
+    """Categorical errors only; captured native error text is never printed."""
+
+
+class RuntimeStopUnconfirmed(RuntimeErrorBoundary):
+    """Exact owned cleanup was attempted but native cessation is unconfirmed."""
+
+
+def require(ok, code):
+    if not ok:
+        raise RuntimeErrorBoundary(code)
+
+
+
+def web_probe_failure_checked(data):
+    phases = {'probe', 'secret', 'source_pins', 'settings', 'supervisor',
+              'process_environment', 'http_config', 'http_connecting', 'http_status', 'http_body_bound',
+              'http_json', 'http_version', 'http_engines'}
+    classes = {'ModuleNotFoundError', 'ImportError', 'PermissionError', 'FileNotFoundError',
+               'TimeoutError', 'ConnectionError', 'AssertionError', 'ValueError', 'KeyError',
+               'TypeError', 'OSError', 'Exception'}
+    require(isinstance(data, dict) and set(data) in ({'status', 'phase', 'error_class'},
+                {'status', 'phase', 'error_class', 'supervisor'})
+            and data['status'] == 'NATIVE_WEB_PROBE_REFUSED'
+            and type(data['phase']) is str and type(data['error_class']) is str
+            and data['phase'] in phases and data['error_class'] in classes,
+            'a0_native_web_probe_diagnostic_invalid')
+    if 'supervisor' in data:
+        observed = data['supervisor']
+        require(isinstance(observed, dict) and set(observed) == {'count', 'processes'}
+                and type(observed['count']) is int and 0 <= observed['count'] <= 4096
+                and isinstance(observed['processes'], list) and len(observed['processes']) <= 3,
+                'a0_native_web_probe_diagnostic_invalid')
+        for process in observed['processes']:
+            require(isinstance(process, dict)
+                    and set(process) == {'name', 'statename', 'pid', 'start', 'exitstatus'}
+                    and type(process['name']) is str
+                    and process['name'] in {'run_ui', 'run_searxng', 'unexpected'}
+                    and type(process['statename']) is str
+                    and process['statename'] in {'STOPPED','STARTING','RUNNING','BACKOFF',
+                                                'STOPPING','EXITED','FATAL','UNKNOWN'}
+                    and all(type(process[k]) is int and 0 <= process[k] < 2**63 for k in ('pid','start'))
+                    and type(process['exitstatus']) is int and -255 <= process['exitstatus'] <= 255,
+                    'a0_native_web_probe_diagnostic_invalid')
+    return dict(data)
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def sha(path):
+    with Path(path).open('rb') as f:
+        return hashlib.file_digest(f, 'sha256').hexdigest()
+
+
+def private(path, *, directory=False):
+    p = Path(path)
+    require(p.is_absolute() and p.resolve() == p, 'unsafe_private_path')
+    s = p.lstat()
+    require(s.st_uid == os.getuid() and (stat.S_ISDIR(s.st_mode) if directory else stat.S_ISREG(s.st_mode))
+            and stat.S_IMODE(s.st_mode) in ({0o700} if directory else {0o400, 0o600}),
+            'private_identity_or_mode')
+    return p
+
+
+def sync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_json(path, value, *, replace=False):
+    """Atomic, private, fsynced native receipt; no task/queue store."""
+    path = Path(path)
+    private(path.parent, directory=True)
+    fd, name = tempfile.mkstemp(prefix='.receipt-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(value, f, sort_keys=True, indent=2)
+            f.write('\n'); f.flush(); os.fsync(f.fileno())
+        if replace:
+            private(path)
+            os.replace(name, path)
+        else:
+            os.link(name, path)
+        sync_dir(path.parent)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+PROFILE_SOURCE = Path(__file__).resolve().parents[1] / 'plugins/friday_rework/adapters/a0_profile.py'
+
+
+def profile_module():
+    import types
+    p = PROFILE_SOURCE
+    require(p.resolve() == p and p.is_file() and not p.stat().st_mode & 0o022,
+            'profile_source_identity_changed')
+    data = p.read_bytes()
+    require(len(data) <= 65536, 'profile_source_identity_changed')
+    m = types.ModuleType('frw_a0_profile')
+    exec(compile(data, str(p), 'exec'), m.__dict__)
+    return m
+
+
+def templates(deployment=None):
+    return profile_module().profile_templates(deployment)
+
+
+WEB_SOURCE = Path(__file__).resolve().parents[1] / 'plugins/friday_rework/adapters/a0_web.py'
+
+
+def web_module():
+    import types
+    p = WEB_SOURCE
+    require(p.resolve() == p and p.is_file() and not p.stat().st_mode & 0o022, 'web_source_identity_changed')
+    data = p.read_bytes(); require(len(data)<=65536, 'web_source_identity_changed')
+    m = types.ModuleType('frw_a0_web'); m.__file__ = str(p)
+    exec(compile(data,str(p),'exec'),m.__dict__)
+    return m
+
+
+MEMORY_SOURCE = Path(__file__).resolve().parents[1] / 'plugins/friday_rework/adapters/a0_memory_guard.py'
+MEMORY_BASE_SHA256 = '25daaf04cd781629bf1acfb25c1936d5a40e6364731d6c77d3048d87d164a1a2'
+MEMORY_GUARD_SHA256 = 'dcd46c2b896a20ac2dc3e18f82168f09845e54b8982fbdb06ecbb6d7e2fb049a'
+MEMORY_GUARD_BYTES = 28559
+MEMORY_TARGET = '/a0/plugins/_memory/helpers/memory.py'
+MEMORY_STAGE = '/friday-source-memory.py'
+
+
+def memory_guard_descriptor(image, *, check_file=True):
+    """Exact accepted S202 bytes; source identity never grants native effects."""
+    require(isinstance(image, str) and re.fullmatch(r'sha256:[0-9a-f]{64}', image),
+            'memory_guard_image_required')
+    if check_file:
+        p = MEMORY_SOURCE
+        require(p.is_absolute() and p.resolve() == p and ',' not in str(p), 'memory_guard_source_path_changed')
+        st = p.lstat()
+        require(stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
+                and not st.st_mode & 0o022 and st.st_size == MEMORY_GUARD_BYTES,
+                'memory_guard_source_identity_changed')
+        require(sha(p) == MEMORY_GUARD_SHA256, 'memory_guard_source_bytes_changed')
+    return {'source': str(MEMORY_SOURCE), 'sha256': MEMORY_GUARD_SHA256,
+            'bytes': MEMORY_GUARD_BYTES, 'before_sha256': MEMORY_BASE_SHA256,
+            'donor': DONOR, 'donor_tree': DONOR_TREE, 'image': image,
+            'target': MEMORY_TARGET, 'stage': MEMORY_STAGE}
+
+
+def memory_guard_install_script(p):
+    """Verify the native copy before replacing only code in this new container."""
+    g = p['memory_guard']
+    require(g == memory_guard_descriptor(p['image'], check_file=False),
+            'memory_guard_plan_lineage_changed')
+    # Explicit checks survive Python -O/PYTHONOPTIMIZE from an image. No app
+    # imports, retained usr reads or model/cache construction occur here.
+    return """from pathlib import Path
+import hashlib,os,stat,tempfile
+
+def check(ok):
+    if not ok:
+        raise RuntimeError('memory_guard_source_refused')
+target=Path(%r)
+source=Path(%r)
+check(target.resolve()==target and source.resolve()==source)
+check(stat.S_ISREG(target.lstat().st_mode) and stat.S_ISREG(source.lstat().st_mode))
+with target.open('rb') as f:
+    before=f.read(26602)
+with source.open('rb') as f:
+    data=f.read(28560)
+check(len(before)==26601 and hashlib.sha256(before).hexdigest()==%r)
+check(len(data)==%r and hashlib.sha256(data).hexdigest()==%r)
+fd,name=tempfile.mkstemp(prefix='.friday-memory-',dir=target.parent)
+try:
+    with os.fdopen(fd,'wb') as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(name,0o644)
+    os.replace(name,target)
+    check(hashlib.sha256(target.read_bytes()).hexdigest()==%r)
+finally:
+    Path(name).unlink(missing_ok=True)
+""" % (g['target'],g['stage'],g['before_sha256'],g['bytes'],g['sha256'],g['sha256'])
+
+
+def startup_script(p):
+    script = web_module().START_SCRIPT if 'web' in p else START_SCRIPT
+    installers = []
+    if 'memory_guard' in p:
+        installers.append(memory_guard_install_script(p))
+    if 'web' in p:
+        installers.append(web_module().install_script(p['web']))
+    if not installers:
+        return script
+    marker = '. /ins/copy_A0.sh; '
+    require(script.count(marker) == 1, 'memory_guard_startup_boundary_changed')
+    commands = ''.join(shlex.join(['python', '-B', '-c', code]) + ' || exit $?; ' for code in installers)
+    return script.replace(marker, marker + commands, 1)
+
+
+def metadata_descriptor(value):
+    """Only a new owned standalone clone; never a donor or worktree pointer."""
+    require(isinstance(value, dict) and set(value) == {'source', 'manifest_sha256'}
+            and isinstance(value['source'], str)
+            and re.fullmatch(r'[0-9a-f]{64}', value.get('manifest_sha256', '')),
+            'invalid_git_metadata_pin')
+    p = Path(value['source'])
+    root = RUNTIME / 'git-metadata'
+    require(p.is_absolute() and len(p.parts) == len(root.parts) + 3
+            and p.parent.parent.parent == root and p.name == '.git'
+            and p.parent.name == 'repo'
+            and re.fullmatch(r'[0-9a-f]{64}', p.parent.parent.name)
+            and not any(c in str(p) for c in ',\n\r'), 'foreign_git_metadata_path')
+    return p
+
+
+def metadata_budget(budget, maximum=10):
+    """Use the caller's original stop/clock check for each bounded read."""
+    if budget is None:
+        return maximum
+    left = budget()
+    require(type(left) in (int, float) and math.isfinite(left) and left > 0,
+            'git_metadata_budget_exhausted')
+    return min(maximum, left)
+
+
+def metadata_sha(path, budget):
+    if budget is None:
+        return sha(path)
+    h = hashlib.sha256()
+    metadata_budget(budget)
+    with open(path, 'rb') as stream:
+        while block := stream.read(1024 * 1024):
+            metadata_budget(budget)
+            h.update(block)
+    metadata_budget(budget)
+    return h.hexdigest()
+
+
+def git_metadata_snapshot(source, *, budget=None):
+    """Read-only proof of authentic objects and a self-contained clone.
+
+    Parent stages/reviews the clone separately. This function never clones,
+    fetches, edits configuration or manufactures history. Files are all pinned;
+    later admission refuses any drift. Stop uses the recorded mount identity.
+    """
+    metadata_budget(budget)
+    source = metadata_descriptor({'source': str(source), 'manifest_sha256': '0' * 64})
+    for p in (RUNTIME, RUNTIME / 'git-metadata', source.parent.parent, source.parent):
+        private(p, directory=True)
+    require(source.is_dir() and source.resolve() == source, 'git_metadata_pointer_or_missing')
+    records = {}; total = 0
+    for base, dirs, names in os.walk(source, followlinks=False):
+        metadata_budget(budget)
+        for name in dirs + names:
+            metadata_budget(budget)
+            p = Path(base) / name; s = p.lstat(); rel = p.relative_to(source).as_posix()
+            require(s.st_uid == os.getuid() and not s.st_mode & 0o022
+                    and (stat.S_ISDIR(s.st_mode) or stat.S_ISREG(s.st_mode))
+                    and not p.is_symlink(), 'unsafe_git_metadata_file')
+            require(name not in {'gitdir', 'commondir', 'alternates', 'http-alternates', 'grafts'}
+                    and not rel.startswith('refs/replace/'), 'external_git_metadata_reference')
+            if stat.S_ISREG(s.st_mode):
+                require(not rel.startswith('refs/'), 'git_metadata_refs_changed')
+                total += s.st_size
+                require(s.st_nlink == 1 and total <= 512 * 1024**2 and len(records) < 4096,
+                        'git_metadata_sharing_or_size')
+                records[rel] = {'sha256': metadata_sha(p, budget), 'size': s.st_size}
+    require(source.lstat().st_uid == os.getuid() and not source.lstat().st_mode & 0o022,
+            'unsafe_git_metadata_file')
+    require((source / 'HEAD').read_text() == DONOR + '\n' and 'index' in records
+            and 'config' in records, 'git_metadata_head_or_index_changed')
+    require('shallow' in records and (source / 'shallow').read_text() == DONOR + '\n',
+            'git_metadata_shallow_changed')
+    # Reject include/external-command configuration BEFORE invoking Git. A
+    # normal owned clone has only these four local core settings after origin
+    # removal; no host/global configuration is copied or inherited.
+    local = configparser.ConfigParser(interpolation=None, strict=True)
+    local.read_string((source / 'config').read_text())
+    require(local.sections() == ['core'] and not local.defaults()
+            and set(local['core']) == {'repositoryformatversion', 'filemode', 'bare', 'logallrefupdates'},
+            'git_metadata_config_changed')
+    env = {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LC_ALL': 'C',
+           'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
+           'GIT_OPTIONAL_LOCKS': '0'}
+    def git(*args):
+        timeout = metadata_budget(budget)
+        try:
+            r = subprocess.run(['/usr/bin/git', '--no-optional-locks', '--git-dir=' + str(source),
+                                '--work-tree=' + str(source.parent), '-c', 'core.fsmonitor=false',
+                                '-c', 'core.hooksPath=/dev/null', *args], env=env,
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            raise RuntimeErrorBoundary('git_metadata_read_failed') from None
+        metadata_budget(budget)
+        require(r.returncode == 0, 'git_metadata_objects_invalid')
+        if args[0] == 'for-each-ref':
+            require(not r.stderr, 'git_metadata_refs_changed')
+        return r.stdout
+    config = dict(item.split('\n', 1) for item in git('config', '--local', '--null', '--list').split('\0') if item)
+    require(set(config) == {'core.repositoryformatversion', 'core.filemode', 'core.bare', 'core.logallrefupdates'}
+            and config['core.repositoryformatversion'] == '0' and config['core.bare'] == 'false'
+            and config['core.logallrefupdates'] == 'true' and config['core.filemode'] in {'true', 'false'},
+            'git_metadata_config_changed')
+    # The authentic pinned donor is detached/shallow with NO refs. Enumerate
+    # packed and loose refs before interpreting objects with ordinary Git
+    # replacement semantics (the native reader does not disable replacements).
+    require(git('for-each-ref', '--format=%(refname)') == '', 'git_metadata_refs_changed')
+    require(git('rev-parse', '--is-shallow-repository').strip() == 'true',
+            'git_metadata_shallow_changed')
+    require(git('describe', '--tags', '--always').strip() == DONOR_DESCRIBE,
+            'git_metadata_describe_changed')
+    require(git('rev-parse', '--verify', 'HEAD^{commit}').strip() == DONOR
+            and git('rev-parse', '--verify', 'HEAD^{tree}').strip() == DONOR_TREE,
+            'git_metadata_object_identity_changed')
+    # Compare stage-zero path/mode/object entries directly, without write-tree
+    # (which may write objects/index). NUL records preserve unusual filenames.
+    entries = []; paths = []
+    for row in git('ls-tree', '-r', '--full-tree', '-z', DONOR_TREE).split('\0')[:-1]:
+        metadata_budget(budget)
+        header, path = row.split('\t', 1)
+        mode, kind, oid = header.split(' ')
+        entries.append(f'{mode} {oid} 0\t{path}\0'); paths.append(path)
+    require(git('ls-files', '--stage', '-z') == ''.join(entries), 'git_metadata_index_changed')
+    # Flags such as assume-valid, skip-worktree and intent-to-add can mask
+    # differences from native readers even when mode/object entries agree.
+    debug = git('ls-files', '--debug', '-z'); offset = 0
+    stats = re.compile(r'  ctime: [0-9]+:[0-9]+\n  mtime: [0-9]+:[0-9]+\n'
+                       r'  dev: [0-9]+\tino: [0-9]+\n  uid: [0-9]+\tgid: [0-9]+\n'
+                       r'  size: [0-9]+\tflags: 0\n')
+    for path in paths:
+        metadata_budget(budget)
+        prefix = path + '\0'
+        require(debug.startswith(prefix, offset), 'git_metadata_index_flags_changed')
+        match = stats.match(debug, offset + len(prefix))
+        require(match is not None, 'git_metadata_index_flags_changed')
+        offset = match.end()
+    require(offset == len(debug), 'git_metadata_index_flags_changed')
+    git('fsck', '--full', '--no-reflogs')
+    # Git reads must leave every observed file intact (including the index).
+    require(all(metadata_sha(source / n, budget) == r['sha256'] for n, r in records.items()), 'git_metadata_read_drift')
+    metadata_budget(budget)
+    return {'donor': DONOR, 'tree': DONOR_TREE, 'files': records}
+
+
+def check_git_metadata(value, *, budget=None):
+    metadata_budget(budget)
+    source = metadata_descriptor(value)
+    manifest = private(source.parent.parent / 'metadata.json')
+    data = manifest.read_bytes()
+    require(hashlib.sha256(data).hexdigest() == value['manifest_sha256'], 'git_metadata_manifest_changed')
+    require(json.loads(data) == git_metadata_snapshot(source, budget=budget), 'git_metadata_manifest_mismatch')
+    metadata_budget(budget)
+
+
+def probe_config_checked(cfg, configured, expected, preset_name='Default'):
+    """Check the resolved startup scope, including unexpected override fields."""
+    require(isinstance(cfg, dict) and configured == preset_name and cfg.get('model_preset') == preset_name
+            and set(cfg) <= {'model_preset', 'allow_chat_override', 'vision_model',
+                            'chat_model', 'utility_model', 'embedding_model'}
+            and cfg.get('vision_model', {}) == {}, 'native_preset_or_override_changed')
+    for slot in ('chat', 'utility', 'embedding'):
+        require(cfg.get(slot + '_model') == expected[slot], 'native_slot_changed')
+
+
+def native_probe(deployment=None):
+    """Finite no-model startup inspection; only allowlisted facts are returned."""
+    from contextlib import redirect_stdout, redirect_stderr
+    # Native imports/hooks/errors may print; their output is never exported.
+    with open(os.devnull, 'w') as sink, redirect_stdout(sink), redirect_stderr(sink):
+        base = Path('/a0/usr')
+        expected = templates(deployment)
+        for name, value in expected.items():
+            p = base / name
+            require(p.is_file() and p.resolve() == p and json.loads(p.read_text()) == value,
+                    'native_input_missing_or_changed')
+        from helpers import plugins, providers
+        from plugins._model_config.helpers import model_config
+        import models
+        selected = plugins.find_plugin_asset('_model_config', 'config.json',
+                                             project_name='', agent_profile='agent0')
+        require(selected and Path(selected['path']).resolve() == base / 'plugins/_model_config/config.json',
+                'native_scope_override_changed')
+        cfg = model_config.get_config(agent_profile='agent0', project_name=None)
+        configured = model_config.get_configured_preset_name(agent_profile='agent0', project_name=None)
+        preset = expected['plugins/_model_config/presets.yaml'][0]
+        probe_config_checked(cfg, configured, preset, preset['name'])
+        slots = {}
+        for slot in ('chat', 'utility', 'embedding'):
+            typ = models.ModelType.EMBEDDING if slot == 'embedding' else models.ModelType.CHAT
+            mc = model_config.build_model_config(cfg[slot + '_model'], typ)
+            want = preset[slot]
+            require(mc.provider == want['provider'] and mc.name == want['name']
+                    and mc.api_base == want['api_base'] and not mc.api_key
+                    and mc.ctx_length == want.get('ctx_length', 0) and mc.vision is False
+                    and mc.limit_requests == mc.limit_input == mc.limit_output == 0
+                    and mc.kwargs == want['kwargs'], 'native_constructed_slot_changed')
+            provider = providers.get_provider_config('embedding' if slot == 'embedding' else 'chat', mc.provider)
+            require(provider and provider.get('litellm_provider') == 'openai'
+                    and provider.get('kwargs', {}) == ({} if slot == 'embedding' else {'a0_api_mode': 'chat'}),
+                    'native_provider_mapping_changed')
+            slots[slot] = {'provider': mc.provider, 'transport_provider': 'openai', 'name': mc.name,
+                           'api_base': mc.api_base, 'ctx_length': mc.ctx_length,
+                           'max_tokens': mc.kwargs.get('max_tokens'), 'timeout': mc.kwargs['timeout'],
+                           'api_mode': mc.kwargs.get('a0_api_mode')}
+        keys = {}
+        for provider in ('openai', 'other'):
+            key = models.get_api_key(provider)
+            keys[provider] = isinstance(key, str) and bool(key.strip()) and key.strip() not in {'None', 'NA'}
+        require(all(keys.values()), 'native_distinct_key_not_ready')
+        try:
+            from helpers import tokens
+            text = 'Friday native token probe. Привет, Дест.'
+            count = tokens.count_tokens(text)
+            approx = tokens.approximate_tokens(text)
+            require(type(count) is int and 0 < count < 256 and approx == int(count * 1.1), 'native_token_counter_changed')
+        except RuntimeErrorBoundary:
+            raise
+        except Exception:
+            raise RuntimeErrorBoundary('native_token_cache_unavailable') from None
+    return {'status': 'NO_MODEL_STARTUP_PROBE_PASS', 'scope': 'agent0/no-project/no-context',
+            'configured_preset': preset['name'], 'selected_preset': preset['name'], 'slots': slots,
+            'key_ready': keys, 'tokens': {'encoding': 'cl100k_base', 'count': count, 'approximate': approx},
+            'temporary_test': deployment is None or deployment['name'] == 'legacy-local-test', 'hard_total_prompt_bound': False}
+
+
+def probe_script(deployment=None):
+    # Same tested functions; no parallel implementation of native resolution.
+    # Embed the exact shared pure renderer in the existing bounded probe;
+    # the intact donor remains unmodified and needs no host import path.
+    source = PROFILE_SOURCE.read_text()
+    parts = [source, 'import json,os\nfrom pathlib import Path\n']
+    parts.append('def templates(deployment=None):\n return profile_templates(deployment)\n')
+    parts += [inspect.getsource(x) for x in (RuntimeErrorBoundary, require, probe_config_checked, native_probe)]
+    parts.append('DEPLOYMENT=' + repr(deployment))
+    parts.append("try:\n print(json.dumps(native_probe(DEPLOYMENT),sort_keys=True))\nexcept Exception as exc:\n print(json.dumps({'status':'REFUSED','code':str(exc) if isinstance(exc,RuntimeErrorBoundary) else 'native_probe_failed'}))\n")
+    return '\n'.join(parts)
+
+
+def probe_report_checked(data, deployment=None):
+    require(isinstance(data, dict) and set(data) == {'status', 'scope', 'configured_preset',
+            'selected_preset', 'slots', 'key_ready', 'tokens', 'temporary_test', 'hard_total_prompt_bound'}
+            and data['status'] == 'NO_MODEL_STARTUP_PROBE_PASS'
+            and data['scope'] == 'agent0/no-project/no-context'
+            and data['configured_preset'] == data['selected_preset'] == templates(deployment)['plugins/_model_config/config.json']['model_preset']
+            and data['temporary_test'] is (deployment is None or deployment['name'] == 'legacy-local-test') and data['hard_total_prompt_bound'] is False
+            and data['key_ready'] == {'openai': True, 'other': True}
+            and all(type(x) is bool for x in data['key_ready'].values()), 'native_probe_report_changed')
+    expected = {}
+    for slot in ('chat', 'utility', 'embedding'):
+        cfg = templates(deployment)['plugins/_model_config/presets.yaml'][0][slot]
+        expected[slot] = {'provider': cfg['provider'], 'transport_provider': 'openai', 'name': cfg['name'],
+                          'api_base': cfg['api_base'], 'ctx_length': cfg.get('ctx_length', 0),
+                          'max_tokens': cfg['kwargs'].get('max_tokens'), 'timeout': cfg['kwargs']['timeout'],
+                          'api_mode': cfg['kwargs'].get('a0_api_mode')}
+    require(data['slots'] == expected, 'native_probe_report_changed')
+    t = data['tokens']
+    require(isinstance(t, dict) and set(t) == {'encoding', 'count', 'approximate'}
+            and t['encoding'] == 'cl100k_base' and type(t['count']) is int and 0 < t['count'] < 256
+            and type(t['approximate']) is int and t['approximate'] == int(t['count'] * 1.1),
+            'native_probe_report_changed')
+    return data
+
+
+def local_network(value, owner, deployment=None, web=None):
+    """A previously created bridge and fresh guarded namespace, never permission."""
+    keys = {'schema', 'name', 'id', 'owner', 'nonce', 'labels', 'bridge', 'endpoints',
+            'launcher_sha256', 'policy_sha256', 'request_sha256', 'guard_receipt_sha256',
+            'invocation_id', 'namespaces'}
+    require(isinstance(value, dict) and set(value) == (keys | {'web'} if web is not None else keys)
+            and value['schema'] == 'friday.a0.local-network.v1'
+            and value['owner'] == owner
+            and isinstance(value['nonce'], str) and re.fullmatch(r'[0-9a-f]{32}', value['nonce'])
+            and value['name'] == 'frw-a0-local-' + value['nonce'][:12]
+            and value['bridge'] == 'br-frwa0local' and value['endpoints'] == (LOCAL_ENDPOINTS if deployment is None else profile_module().network_endpoints(deployment))
+            and value['labels'] == {'friday.rework.owner': owner, 'friday.rework.route': value['nonce']},
+            'invalid_local_network')
+    require(all(isinstance(value[k], str) and re.fullmatch(r'[0-9a-f]{64}', value[k])
+                for k in ('id', 'launcher_sha256', 'policy_sha256', 'request_sha256', 'guard_receipt_sha256'))
+            and isinstance(value['invocation_id'], str) and re.fullmatch(r'[0-9a-f]{32}', value['invocation_id']),
+            'invalid_local_network_pins')
+    if web is not None:
+        require(value['web'] == web_module().route_web(web), 'a0_web_route_permission_changed')
+    ns = value['namespaces']
+    require(isinstance(ns, dict) and set(ns) == {'user', 'mnt', 'net'}
+            and all(isinstance(x, list) and len(x) == 2 and all(type(y) is int and y > 0 for y in x)
+                    for x in ns.values()), 'invalid_local_network_namespace')
+    return json.loads(json.dumps(value))
+
+
+def checked_launcher(expected_sha256):
+    # Load only exact reviewed bytes, no import-path fallback or helper service.
+    before = LAUNCHER.lstat()
+    require(LAUNCHER.resolve() == LAUNCHER and stat.S_ISREG(before.st_mode)
+            and before.st_uid == os.getuid() and before.st_nlink == 1
+            and not before.st_mode & 0o022 and before.st_size <= 128*1024, 'local_launcher_identity_changed')
+    fd = os.open(LAUNCHER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        source = os.read(fd, 128*1024 + 1)
+        after = os.fstat(fd); named = LAUNCHER.lstat()
+        key = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_mode)
+        require(key(before) == key(after) == key(named)
+                and hashlib.sha256(source).hexdigest() == expected_sha256, 'local_launcher_pin_changed')
+    finally: os.close(fd)
+    namespace = {'__file__': str(LAUNCHER), '__name__': 'frw_checked_local_launcher'}
+    exec(compile(source, str(LAUNCHER), 'exec'), namespace)
+    return namespace
+
+
+def network_checked(value, obj, *, container_id=None):
+    require(isinstance(obj, dict) and obj.get('Id') == value['id'] and obj.get('Name') == value['name']
+            and obj.get('Driver') == 'bridge' and obj.get('Scope') == 'local'
+            and obj.get('EnableIPv6') is False and obj.get('Internal') is False
+            and obj.get('Attachable') is False and obj.get('Ingress') is False
+            and obj.get('ConfigOnly') is False and obj.get('Labels') == value['labels']
+            and obj.get('Options') == {'com.docker.network.bridge.name': value['bridge'],
+                                      'com.docker.network.bridge.enable_icc': 'false'}, 'local_network_identity_changed')
+    members = obj.get('Containers')
+    require(isinstance(members, dict) and set(members).issubset({container_id} if container_id else set()),
+            'foreign_local_network_member')
+    for member in members.values():
+        require(isinstance(member, dict) and re.fullmatch(r'[0-9a-f]{64}', member.get('EndpointID', '')),
+                'local_endpoint_unknown')
+    return obj
+
+
+def current_network(association, acceptance, *, owner_slot, launcher_sha256,
+                    docker_sha256, deployment=None, web=None):
+    """Observe an already prepared, exact current route; never create/adopt it.
+
+    The request must have been prepared by its existing native owner after the
+    durable reservation. Missing preparation is a blocker, not a reason to
+    start a daemon, create a bridge, reset time or reuse a historical route.
+    """
+    binding = host_identity(association)
+    require(owner_slot in {'astra', 'sol'} and isinstance(acceptance, dict)
+            and set(acceptance) == {'accepted_unix', 'accepted_monotonic_ns', 'boot_id'}
+            and acceptance['accepted_unix'] == binding['created_at_unix'], 'foreign_host_route_clock')
+    clock = {'association_binding': binding, 'accepted_unix': binding['created_at_unix'],
+             'deadline_unix': binding['deadline_unix'], 'original_budget_seconds': binding['budget_seconds'],
+             'accepted_monotonic_ns': acceptance['accepted_monotonic_ns'], 'boot_id': acceptance['boot_id']}
+    remaining(clock)
+    owner = f"{owner_slot}:{binding['existing_task_id']}#1"
+    launcher = checked_launcher(launcher_sha256)
+    request = launcher['request_checked'](os.getuid())
+    endpoints = LOCAL_ENDPOINTS if deployment is None else profile_module().network_endpoints(deployment)
+    require(request['endpoints'] == endpoints, 'foreign_host_route_deployment')
+    require(request['owner'] == owner and request['accepted_unix'] == clock['accepted_unix']
+            and request['deadline_unix'] == clock['deadline_unix']
+            and request['original_budget_seconds'] == clock['original_budget_seconds']
+            and request['accepted_monotonic_ns'] == clock['accepted_monotonic_ns'], 'foreign_host_route_clock')
+    if 'host' in request:
+        require(request['host']=={'association_sha256':digest(binding),'boot_id':acceptance['boot_id'],
+                                  'deployment_sha256':digest(deployment)}, 'foreign_host_route_binding')
+    # Stable original bytes supply observations, never caller-configured IDs.
+    guard_bytes = launcher['stable_bytes'](launcher['GUARD'], os.getuid())
+    guard = launcher['private_json'](launcher['GUARD'], os.getuid())
+    require(guard == launcher['exact_json'](guard_bytes.decode()), 'guard_receipt_changed')
+    n = {'schema': 'friday.a0.local-network.v1', 'owner': owner, 'nonce': request['nonce'],
+         'name': 'frw-a0-local-' + request['nonce'][:12], 'bridge': launcher['BRIDGE'],
+         'endpoints': request['endpoints'], 'launcher_sha256': launcher_sha256,
+         'policy_sha256': request['policy_sha256'],
+         'request_sha256': hashlib.sha256(launcher['stable_bytes'](launcher['REQUEST'], os.getuid())).hexdigest(),
+         'guard_receipt_sha256': hashlib.sha256(guard_bytes).hexdigest(),
+         'invocation_id': guard['context']['invocation_id'], 'namespaces': guard['namespaces'],
+         'labels': {'friday.rework.owner': owner, 'friday.rework.route': request['nonce']}}
+    if web is not None:
+        n['web'] = web_module().route_web(web)
+    require(request.get('web') == n.get('web'), 'guard_web_permission_changed')
+    # observe_guard reopens held namespace FDs and checks the actual unit,
+    # daemon PID/start/executable and nft semantic readback before Docker use.
+    launcher['observe_guard'](n, budget=lambda: remaining(clock))
+    require(sha(DOCKER) == docker_sha256, 'docker_binary_changed')
+    xs = launcher['exact_json'](Runtime._command(
+        [str(DOCKER), '--host', SOCKET, 'network', 'inspect', n['name']],
+        timeout=min(5, remaining(clock))))
+    require(isinstance(xs, list) and len(xs) == 1, 'local_network_unknown')
+    require(isinstance(xs[0], dict), 'local_network_unknown')
+    n['id'] = xs[0].get('Id')
+    n = local_network(n, owner, deployment, web)
+    network_checked(n, xs[0])
+    # A successful inspect cannot conceal a concurrent namespace/daemon swap.
+    launcher['observe_guard'](n, budget=lambda: remaining(clock))
+    remaining(clock)
+    return n
+
+
+def _route_unit(launcher, runner, timeout):
+    """The existing dedicated unit, never a new supervisor or runtime override."""
+    names = ('ActiveState', 'InvocationID', 'MainPID', 'ControlGroup', 'FragmentPath',
+             'DropInPaths', 'Restart', 'KillMode', 'SendSIGKILL', 'DelegateSubgroup',
+             'MemoryMax', 'TasksMax', 'CPUQuotaPerSecUSec', 'RuntimeMaxUSec',
+             'TimeoutStartUSec', 'TimeoutStopUSec', 'ActiveEnterTimestampMonotonic')
+    raw = runner(['/usr/bin/systemctl', '--user', 'show', DAEMON,
+                  '--property='+','.join(names)], timeout)
+    pairs = [x.split('=',1) for x in raw.splitlines()]
+    fields = dict(pairs)
+    require(len(fields)==len(pairs) and set(fields)==set(names), 'route_native_unit_unknown')
+    expected = {'DropInPaths':'', 'Restart':'no', 'KillMode':'control-group', 'SendSIGKILL':'yes',
+                'DelegateSubgroup':'dockerd', 'MemoryMax':str(20*1024**3),
+                'TasksMax':'2048', 'CPUQuotaPerSecUSec':'8s'}
+    require(all(fields[k]==v for k,v in expected.items()), 'route_native_boundary_changed')
+    require(fields['FragmentPath'] in {str(launcher['ROOT']/'supervisor'/DAEMON),str(launcher['INSTALLED_UNIT'])},
+            'route_native_registration_changed')
+    require(fields['MainPID'].isdecimal() and fields['ControlGroup'] in ('',launcher['SERVICE_GROUP'])
+            and fields['ActiveEnterTimestampMonotonic'].isdecimal(), 'route_native_unit_unknown')
+    return fields
+
+
+def _route_limits(fields, left):
+    # An infinite daemon lifetime cannot be patched over by a host coroutine.
+    # Qualification/configuration of the existing unit is an operator action.
+    from plugins.friday_rework.adapters.a0_native import _duration
+    try:
+        limits = dict(zip(('runtime_seconds','start_seconds','stop_seconds'),
+                         (_duration(fields[k]) for k in ('RuntimeMaxUSec','TimeoutStartUSec','TimeoutStopUSec'))))
+    except RuntimeError:
+        raise RuntimeErrorBoundary('a0_route_native_deadline_unavailable') from None
+    require(limits['runtime_seconds'] == DAEMON_SECONDS
+            and 0 < limits['start_seconds'] <= 45 and 0 < limits['stop_seconds'] <= 20
+            and sum(limits.values())+5 <= left, 'a0_route_native_deadline_unavailable')
+    return {**limits, 'admitted_remaining_seconds':left}
+
+
+
+def host_daemon_seconds(plan, fields, *, now=None):
+    """Reserve the existing worker start timeout plus daemon cleanup margin."""
+    from plugins.friday_rework.adapters.a0_native import _duration
+    now = time.monotonic() if now is None else now
+    require(math.isfinite(now) and fields['ActiveState'] == 'active'
+            and fields['InvocationID'] == plan['network']['invocation_id']
+            and re.fullmatch('[0-9a-f]{32}', fields['InvocationID'])
+            and fields['ActiveEnterTimestampMonotonic'].isdecimal(), 'host_daemon_identity_changed')
+    started = int(fields['ActiveEnterTimestampMonotonic']) / 1e6
+    runtime = _duration(fields['RuntimeMaxUSec'])
+    stop = _duration(fields['TimeoutStopUSec'])
+    accepted = plan['accepted_monotonic_ns'] / 1e9
+    require(runtime == DAEMON_SECONDS and stop == 20
+            and accepted <= started <= now
+            and started + runtime + stop <= accepted + plan['original_budget_seconds'] - 25,
+            'host_daemon_original_deadline_changed')
+    seconds = math.floor(started + runtime - now - DAEMON_WORKER_RESERVE_SECONDS - WORKER_START_SECONDS)
+    require(seconds >= 5, 'host_daemon_budget_exhausted')
+    return seconds
+
+
+def _exclusive_bytes(path, data):
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    try:
+        require(os.write(fd,data)==len(data), 'route_short_write');os.fsync(fd)
+    finally:os.close(fd)
+    sync_dir(Path(path).parent)
+
+
+def _route_launcher(route):
+    """Recorded checked code for stop, independent of mutable launch sources."""
+    p=private(route['stop_launcher']['path'])
+    require(sha(p)==route['stop_launcher']['sha256'], 'route_stop_launcher_changed')
+    scope={'__file__':str(p),'__name__':'frw_owned_route_stop_launcher'}
+    exec(compile(p.read_bytes(),str(p),'exec'),scope)
+    return scope
+
+
+def _route_descriptor(route, launcher):
+    r=route['request'];g=route['daemon']['receipt']
+    n={'schema':'friday.a0.local-network.v1','owner':r['owner'],'nonce':r['nonce'],
+       'name':'frw-a0-local-'+r['nonce'][:12], 'bridge':launcher['BRIDGE'],
+       'endpoints':r['endpoints'], 'launcher_sha256':r['launcher_sha256'],
+       'policy_sha256':r['policy_sha256'],'request_sha256':route['request_sha256'],
+       'guard_receipt_sha256':hashlib.sha256(launcher['stable_bytes'](launcher['GUARD'],os.getuid())).hexdigest(),
+       'invocation_id':g['context']['invocation_id'],'namespaces':g['namespaces'],
+       'labels':{'friday.rework.owner':r['owner'],'friday.rework.route':r['nonce']}}
+    if 'web' in r:n['web']=r['web']
+    return n
+
+
+def _route_guard(route, launcher, fields):
+    """Recover only this submitted request's real immutable native identity."""
+    require(launcher['stable_bytes'](launcher['REQUEST'],os.getuid()) ==
+            (launcher['canonical'](route['request'])+'\n').encode(), 'route_request_changed')
+    g=launcher['private_json'](launcher['GUARD'],os.getuid())
+    require(g['schema']=='friday.a0.local-route-guard.v1' and g['status']=='GUARDED_BEFORE_DOCKERD'
+            and g['request']==route['request'] and g['policy_sha256']==route['request']['policy_sha256']
+            and g['context']['request_sha256']==route['request_sha256']
+            and g['context']['invocation_id']==fields['InvocationID']
+            and g['context']['parent_pid']==int(fields['MainPID'])
+            and g['daemon']['boot']==g['context']['parent']['boot']==route['acceptance']['boot_id'],
+            'route_daemon_owner_unknown')
+    for p in (g['daemon'],g['context']['parent']):
+        require(launcher['proc_identity'](p['pid'])==p
+                and p['cgroup']=='0::'+launcher['SERVICE_GROUP']+'/dockerd', 'route_process_identity_changed')
+    require(launcher['Path']('/proc',str(g['daemon']['pid']),'exe').resolve()==launcher['tool_paths']()['dockerd'],
+            'route_daemon_executable_changed')
+    with launcher['namespaces'](g['daemon']['pid']) as (ns,_):
+        require(ns==g['namespaces'] and all(ns[k]!=g['context']['host_namespaces'][k] for k in ns),
+                'route_daemon_namespace_changed')
+    return {'receipt':g}
+
+
+def configured_route(native, launcher):
+    """Exact own deployment and declared policy before any route effects."""
+    endpoints = LOCAL_ENDPOINTS if 'deployment' not in native else profile_module().network_endpoints(native['deployment'])
+    endpoints = launcher['checked_endpoints'](endpoints)
+    web = web_module().route_web(native['web']) if 'web' in native else None
+    policy_sha256 = launcher['policy_hash'](web, endpoints)
+    require(isinstance(native.get('policy'), dict)
+            and native['policy'].get('sha256') == policy_sha256,
+            'a0_route_configured_policy_mismatch')
+    return endpoints, web, policy_sha256
+
+
+def route_preflight(association, acceptance, native, *, budget):
+    """Read-only initial-probe admission, before claiming any setup attempt.
+
+    These are the same existing route prerequisites. Preparation repeats them
+    under its native runtime lock immediately before effects; this inspection
+    neither starts a daemon nor turns installed source into a runtime grant.
+    """
+    binding = host_identity(association)
+    require(acceptance['accepted_unix'] == binding['created_at_unix']
+            and acceptance['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            'foreign_host_route_clock')
+    require(type(acceptance['accepted_monotonic_ns']) is int
+            and 0 < acceptance['accepted_monotonic_ns'] <= time.monotonic_ns()
+            < acceptance['accepted_monotonic_ns'] + binding['budget_seconds']*10**9
+            and binding['created_at_unix'] <= time.time() < binding['deadline_unix'],
+            'foreign_host_route_clock')
+    launcher = checked_launcher(native['launcher']['sha256'])
+    endpoints, web, policy_sha256 = configured_route(native, launcher)
+    require(sha(private(native['policy']['path'])) == policy_sha256, 'a0_route_configured_policy_changed')
+    require(sha(DOCKER) == native['docker']['sha256'], 'docker_binary_changed')
+    launcher['checked_unit_registration']()
+    worker = native_supervisor().observe(binding)
+    require(worker.missing and worker.quiescent, 'prior_worker_unit_blocks_route')
+    fields = _route_unit(launcher, Runtime._command, min(5, budget()))
+    require(fields['ActiveState'] in ('inactive', 'failed') and fields['MainPID'] == '0'
+            and cgroup_snapshot(launcher['SERVICE_GROUP'])['populated'] is False,
+            'foreign_or_active_daemon_blocks_route')
+    for path in (launcher['REQUEST'], launcher['GUARD'], launcher['STATE'] / 'rootlesskit/child_pid'):
+        require(not path.exists() and not path.is_symlink(), 'prior_or_uncertain_route_blocks_start')
+    _route_limits(fields, budget())
+    for path in launcher['tool_paths']().values():
+        info = path.lstat()
+        require(path.resolve() == path and stat.S_ISREG(info.st_mode)
+                and not info.st_mode & 0o022 and info.st_mode & 0o111, 'route_tool_changed')
+        sha(path); budget()
+
+
+# One legacy retained object lacks a completed historical stop receipt. This
+# immutable custody exception admits only a currently inert object; its original
+# UNKNOWN outcome remains UNKNOWN and grants no replay, removal or old route use.
+RETAINED_UNKNOWN_COMPAT = {
+    '26d97f27de048ba15f7979f8ba7e16f4147d84b9b5005e85c631c82e870bc0e0': {
+        'plan_sha256': 'f384d81b567350f3f933827d6c08db9f5193a40d7cf7695a6acd13e290f6ba6c',
+        'native_sha256': 'e73e66f34ea8928b98401b17c990d6f30bcbce9464d2513c43feb1ef278affe9'}}
+
+
+def retained_containers_checked(binding, native, launcher, *, budget):
+    """Classify retained prior A0 objects; never change them or their receipts.
+
+    Normal owned cleanup retains stopped containers. Only exact same-profile
+    plan/native custody plus confirmed stop can survive preparation. The single
+    legacy exception additionally reconciles every retained process observation
+    now, without inventing a historical STOP_CONFIRMED result.
+    """
+    code = 'foreign_container_blocks_route'
+    held = []
+    identity = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_nlink,
+                          s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    def directory(path):
+        path = private(path, directory=True)
+        held.append((path, identity(path.lstat()), None))
+        return path
+    def record(path):
+        path = private(path)
+        before = identity(path.lstat())
+        data = launcher['stable_bytes'](path, os.getuid())
+        require(before == identity(path.lstat()), code)
+        held.append((path, before, data))
+        value = launcher['exact_json'](data.decode())
+        require(isinstance(value, dict), code)
+        return value, hashlib.sha256(data).hexdigest()
+    def inventory():
+        raw = Runtime._command([str(DOCKER), '--host', SOCKET, 'ps', '-aq', '--no-trunc'], min(5, budget()))
+        ids = raw.splitlines()
+        require(all(re.fullmatch('[0-9a-f]{64}', cid) for cid in ids)
+                and len(ids) == len(set(ids)), code)
+        return sorted(ids)
+    ids = inventory()
+    if not ids:
+        return
+    jobs = directory(Path(binding['workspace_reference']).parent)
+    directory(RUNTIME)
+    for cid in ids:
+        budget()
+        xs = launcher['exact_json'](Runtime._command(
+            [str(DOCKER), '--host', SOCKET, 'inspect', cid], min(5, budget())))
+        require(isinstance(xs, list) and len(xs) == 1 and isinstance(xs[0], dict), code)
+        obj = xs[0]
+        actual = obj.get('Config', {}).get('Labels') or {}
+        assignment = actual.get('friday.rework.assignment', '')
+        require(isinstance(assignment, str) and re.fullmatch('native-[0-9a-f]{64}', assignment)
+                and assignment != binding['existing_task_id']
+                and obj.get('Name') != '/frw-a0-' + binding['existing_task_id'][7:39], code)
+        job = directory(jobs / assignment)
+        p, _ = record(job / 'a0-plan.json')
+        prior = host_identity(p.get('association_binding'))
+        require(prior['existing_task_id'] == assignment
+                and prior['workspace_reference'] == str(job)
+                and all(prior['owner'][k] == binding['owner'][k]
+                        for k in ('profile', 'bot_id', 'user_id', 'chat_id', 'thread_id', 'session_key'))
+                and p.get('assignment') == assignment and p.get('generation') == 1
+                and p.get('owner_slot') == native['owner_slot'] and p.get('mode') == 'runtime', code)
+        validate(p, check_files=False, budget=budget)
+        root = directory(RUNTIME / p['identity'])
+        r, native_sha = record(root / 'native.json')
+        require(r.get('plan_sha256') == digest(p) and r.get('container_id') == cid
+                and ('native_start_attempted' not in r or type(r['native_start_attempted']) is bool)
+                and isinstance(r.get('invocation_id'), str)
+                and (re.fullmatch('[0-9a-f]{32}', r['invocation_id'])
+                     or r['invocation_id'] == '' and r.get('native_start_attempted') is False
+                        and r.get('observations') == [])
+                and isinstance(r.get('observations'), list), code)
+        container_checked(p, obj, cid, stop_owned=True)
+        state = obj['State']
+        require(state['Running'] is False and state['Pid'] == 0
+                and state.get('Status') in ('created', 'exited')
+                and all(state.get(k) is False for k in ('Paused', 'Restarting', 'Dead')), code)
+        if r['invocation_id'] == '':
+            require(state.get('Status') == 'created' and state.get('OOMKilled') is False
+                    and type(state.get('ExitCode')) is int and state['ExitCode'] == 0
+                    and state.get('StartedAt') == '0001-01-01T00:00:00Z'
+                    and state.get('FinishedAt') == '0001-01-01T00:00:00Z'
+                    and state.get('Error', '') == ''
+                    and type(obj.get('RestartCount', 0)) is int and obj.get('RestartCount', 0) == 0, code)
+        networks = obj.get('NetworkSettings', {}).get('Networks')
+        require(isinstance(networks, dict), code)
+        if networks:
+            n = p['network']
+            require(isinstance(n, dict) and set(networks) == {n['name']}
+                    and isinstance(networks[n['name']], dict), code)
+            endpoint = networks[n['name']]
+            require(endpoint.get('NetworkID') == n['id']
+                    and all(not endpoint.get(k) for k in ('EndpointID', 'Gateway', 'IPAddress',
+                        'IPv6Gateway', 'GlobalIPv6Address', 'MacAddress', 'DesiredMacAddress')),
+                    code)
+        stop = root / 'stop.json'
+        if stop.exists() or stop.is_symlink():
+            stopped, _ = record(stop)
+            require(stopped.get('status') == 'STOP_CONFIRMED'
+                    and stopped.get('container_id') == cid and stopped.get('native_container_stopped') is True
+                    and stopped.get('current_sampling') == 'OBSERVED_OR_ALREADY_EXITED'
+                    and stopped.get('pid_start_sampling') in ('RETAINED', 'NOT_RETAINED')
+                    and isinstance(stopped.get('descendant_checks'), list)
+                    and all(isinstance(x, dict) and x.get('confirmed') is True
+                            for x in stopped['descendant_checks']), code)
+        else:
+            require(RETAINED_UNKNOWN_COMPAT.get(cid) == {
+                'plan_sha256': digest(p), 'native_sha256': native_sha}, code)
+        # Fresh cessation is read-only and does not write a stop success for any
+        # old task. Exact scope suffix and PID-start identities remain required.
+        for sample in r['observations']:
+            require(isinstance(sample, dict) and set(sample) == {'group', 'populated', 'processes'}
+                    and isinstance(sample['group'], str) and sample['group'].startswith('/user.slice/')
+                    and sample['group'].endswith('/docker-' + cid + '.scope')
+                    and '..' not in Path(sample['group']).parts
+                    and type(sample['populated']) is bool and isinstance(sample['processes'], list)
+                    and all(isinstance(x, dict) and set(x) == {'pid', 'start_ticks', 'state'}
+                            and type(x['pid']) is int and x['pid'] > 0
+                            and type(x['start_ticks']) is int and x['start_ticks'] > 0
+                            and isinstance(x['state'], str) for x in sample['processes']), code)
+            budget()
+            require(cessation(sample)['confirmed'] is True, code)
+    require(inventory() == ids, code)
+    # Receipt replacement or edits during readback cannot carry old custody
+    # across this admission, even when the replacement repeats the same bytes.
+    for path, before, data in held:
+        require(identity(path.lstat()) == before, code)
+        if data is not None:
+            require(launcher['stable_bytes'](path, os.getuid()) == data
+                    and identity(path.lstat()) == before, code)
+
+
+def prepare_route(association, acceptance, native, *, retain, budget):
+    """Real fresh preparation for the reserved row, before current_network.
+
+    Persist each submission intent first. Existing daemon native deadlines must
+    already cover startup, work and stop without the gateway. The current
+    unbounded development unit is therefore refused, without changing it.
+    """
+    binding=host_identity(association)
+    require(acceptance['accepted_unix']==binding['created_at_unix'], 'foreign_host_route_clock')
+    launcher=checked_launcher(native['launcher']['sha256'])
+    endpoints,web,policy_sha256=configured_route(native,launcher)
+    require(sha(private(native['policy']['path']))==policy_sha256, 'a0_route_configured_policy_changed')
+    require(sha(DOCKER)==native['docker']['sha256'], 'docker_binary_changed')
+    launcher['checked_unit_registration']()
+    worker=native_supervisor().observe(binding)
+    require(worker.missing and worker.quiescent, 'prior_worker_unit_blocks_route')
+    # Same native runtime lock; no second capacity mechanism or ownership store.
+    locker=Runtime.__new__(Runtime)
+    with locker.locked():
+        fields=_route_unit(launcher,Runtime._command,min(5,budget()))
+        require(fields['ActiveState'] in ('inactive','failed') and fields['MainPID']=='0'
+                and cgroup_snapshot(launcher['SERVICE_GROUP'])['populated'] is False,
+                'foreign_or_active_daemon_blocks_route')
+        for p in (launcher['REQUEST'],launcher['GUARD'],launcher['STATE']/'rootlesskit/child_pid'):
+            require(not p.exists() and not p.is_symlink(), 'prior_or_uncertain_route_blocks_start')
+        limits=_route_limits(fields,budget())
+        tools={}
+        for name,path in launcher['tool_paths']().items():
+            info=path.lstat()
+            require(path.resolve()==path and stat.S_ISREG(info.st_mode) and not info.st_mode&0o022
+                    and info.st_mode&0o111, 'route_tool_changed')
+            tools[name]=sha(path);budget()
+        request={'schema':'friday.a0.local-route-request.v1',
+                 'owner':native['owner_slot']+':'+binding['existing_task_id']+'#1', 'nonce':secrets.token_hex(16),
+                 'accepted_unix':binding['created_at_unix'], 'deadline_unix':binding['deadline_unix'],
+                 'original_budget_seconds':binding['budget_seconds'],
+                 'accepted_monotonic_ns':acceptance['accepted_monotonic_ns'],
+                 'launcher_sha256':native['launcher']['sha256'], 'policy_sha256':policy_sha256,
+                 'tools':tools,'endpoints':endpoints,
+                 'host':{'association_sha256':digest(binding),'boot_id':acceptance['boot_id'],
+                         'deployment_sha256':digest(native.get('deployment'))}}
+        if web is not None:request['web']=web
+        launcher['checked_request'](request)
+        root=private(binding['workspace_reference'],directory=True)
+        stops={}
+        for key,name,source in [('stop_source','a0-route-stop.py','runtime'),
+                                 ('stop_launcher','a0-route-launcher.py','launcher')]:
+            source_path=Path(native[source]['path']);data=source_path.read_bytes()
+            require(hashlib.sha256(data).hexdigest()==native[source]['sha256'], 'route_stop_source_changed')
+            path=root/name;_exclusive_bytes(path,data);path.chmod(0o400);sync_dir(root)
+            stops[key]={'path':str(path),'sha256':native[source]['sha256']}
+        raw=(launcher['canonical'](request)+'\n').encode()
+        route={'schema':'friday.a0.host-route.v1','association':binding,'acceptance':acceptance,
+               'request':request,'request_sha256':hashlib.sha256(raw).hexdigest(), **stops,
+               'daemon_limits':limits,'docker':native['docker'],'pending':'request','daemon':None,'network':None,'samples':[],
+               'request_published':False,'daemon_attempted':False,'network_attempted':False,'settlement':None}
+        route['network_removed']=False
+        retain(route);budget()
+        launcher['owned_directory'](launcher['REQUEST'].parent)
+        _exclusive_bytes(launcher['REQUEST'],raw)
+        route['request_published']=True;route['pending']=None;retain(route);budget()
+        # Reobserve all admission inputs before the one daemon start. No
+        # set-property, reload, unit replacement or borrowed historical permit.
+        fields=_route_unit(launcher,Runtime._command,min(5,budget()))
+        require(fields['ActiveState'] in ('inactive','failed') and fields['MainPID']=='0'
+                and cgroup_snapshot(launcher['SERVICE_GROUP'])['populated'] is False,
+                'foreign_or_active_daemon_blocks_route')
+        rechecked=_route_limits(fields,budget())
+        require(all(rechecked[k]==limits[k] for k in ('runtime_seconds','start_seconds','stop_seconds')),
+                'route_native_deadline_changed')
+        launcher['request_checked'](os.getuid());budget()
+        route['daemon_attempted']=True;route['pending']='daemon';retain(route);budget()
+        Runtime._command(['/usr/bin/systemctl','--user','start',DAEMON],min(limits['start_seconds']+5,budget()))
+        fields=_route_unit(launcher,Runtime._command,min(5,budget()))
+        require(fields['ActiveState']=='active' and re.fullmatch('[0-9a-f]{32}',fields['InvocationID']),
+                'route_daemon_start_unknown')
+        started=int(fields['ActiveEnterTimestampMonotonic'])/1e6
+        require(acceptance['accepted_monotonic_ns']/1e9 <= started <= time.monotonic()
+                and started+limits['runtime_seconds']+limits['stop_seconds'] <=
+                acceptance['accepted_monotonic_ns']/1e9+binding['budget_seconds']-25,
+                'route_native_deadline_changed')
+        route['daemon']=_route_guard(route,launcher,fields);route['pending']='sample';retain(route)
+        route['samples'].append(cgroup_snapshot(launcher['SERVICE_GROUP']))
+        route['pending']=None;retain(route);budget()
+        n=_route_descriptor(route,launcher)
+        launcher['observe_guard'](n,budget=budget)
+        retained_containers_checked(binding, native, launcher, budget=budget)
+        # Both a historical bridge and an ambiguous earlier attempt refuse.
+        raw=Runtime._command([str(DOCKER),'--host',SOCKET,'network','ls','--format={{json .}}'],min(5,budget()))
+        listing=[launcher['exact_json'](line) for line in raw.splitlines()]
+        require(len({x.get('Name') for x in listing})==len(listing)
+                and all((x.get('Name'),x.get('Driver')) in {('bridge','bridge'),('host','host'),('none','null')}
+                        for x in listing), 'prior_docker_network_requires_reconciliation')
+        route['network_attempted']=True;route['pending']='network';retain(route);budget()
+        argv=[str(DOCKER),'--host',SOCKET,'network','create','--driver=bridge',
+              '--opt=com.docker.network.bridge.name='+n['bridge'],
+              '--opt=com.docker.network.bridge.enable_icc=false',
+              '--label=friday.rework.owner='+n['owner'],'--label=friday.rework.route='+n['nonce'],n['name']]
+        cid=Runtime._command(argv,min(5,budget())).strip()
+        require(re.fullmatch('[0-9a-f]{64}',cid), 'route_bridge_submission_unknown')
+        n['id']=cid
+        xs=launcher['exact_json'](Runtime._command([str(DOCKER),'--host',SOCKET,'network','inspect',cid],min(5,budget())))
+        require(isinstance(xs,list) and len(xs)==1, 'route_bridge_submission_unknown')
+        network_checked(n,xs[0]);launcher['observe_guard'](n,budget=budget)
+        route['network']=n;route['pending']=None;retain(route);budget()
+        return route
+
+
+def stop_route(route, *, retain, container_id=None):
+    """Exact recorded custody only; no work clock, launch validation or restart.
+
+    Missing immutable daemon evidence remains unknown even after its independent
+    native timeout. An uncertain network create can be reconciled once by this
+    current request's name/nonce under the recorded daemon, never resubmitted.
+    """
+    if route['settlement'] is not None:return route
+    route=json.loads(json.dumps(route));l=_route_launcher(route)
+    require(Path('/proc/sys/kernel/random/boot_id').read_text().strip()==route['acceptance']['boot_id'],
+            'STOP_UNCONFIRMED; original route boot changed')
+    require(str(DOCKER)==route['docker']['path'] and sha(DOCKER)==route['docker']['sha256'], 'docker_binary_changed')
+    request_bytes=(l['canonical'](route['request'])+'\n').encode()
+    checks=[];network_removed=not route['network_attempted'] or route['network_removed']
+    history_incomplete=route['pending']=='sample'
+    if route['daemon_attempted']:
+        fields=_route_unit(l,Runtime._command,3)
+        if route['daemon'] is None:
+            # Only an actual private original guard can resolve a lost start ACK.
+            route['daemon']=_route_guard(route,l,fields);route['pending']='sample';retain(route)
+        g=route['daemon']['receipt'];inv=g['context']['invocation_id']
+        def same_daemon_or_empty_quiescent(value):
+            if value['InvocationID']==inv:
+                return True
+            if not (value['InvocationID']=='' and value['ActiveState'] in ('inactive','failed')
+                    and value['MainPID']=='0'):
+                return False
+            require(l['stable_bytes'](l['REQUEST'],os.getuid())==request_bytes
+                    and l['private_json'](l['GUARD'],os.getuid())==g,
+                    'STOP_UNCONFIRMED; empty daemon invocation needs exact retained receipts')
+            return True
+        require(same_daemon_or_empty_quiescent(fields), 'STOP_UNCONFIRMED; daemon invocation changed')
+        live=fields['ActiveState'] not in ('inactive','failed') or fields['MainPID']!='0'
+        if live:
+            require(_route_guard(route,l,fields)==route['daemon'], 'STOP_UNCONFIRMED; daemon identity changed')
+            sample=cgroup_snapshot(l['SERVICE_GROUP']);route['samples'].append(sample);retain(route)
+            if route['network_attempted'] and not route['network_removed']:
+                n=route['network'] or _route_descriptor(route,l)
+                target=n.get('id',n['name'])
+                xs=l['exact_json'](Runtime._command([str(DOCKER),'--host',SOCKET,'network','inspect',target],3))
+                require(isinstance(xs,list) and len(xs)==1, 'STOP_UNCONFIRMED; network outcome unknown')
+                if 'id' not in n:n['id']=xs[0].get('Id')
+                network_checked(n,xs[0],container_id=container_id)
+                if xs[0]['Containers']:
+                    # Only the recorded already-stopped worker endpoint. Keep
+                    # all container/results/source bytes; do not remove it.
+                    objs=l['exact_json'](Runtime._command([str(DOCKER),'--host',SOCKET,'inspect',container_id],3))
+                    require(isinstance(objs,list) and len(objs)==1 and objs[0].get('Id')==container_id
+                            and objs[0].get('State',{}).get('Running') is False
+                            and objs[0].get('State',{}).get('Pid')==0,
+                            'STOP_UNCONFIRMED; network worker not stopped')
+                    Runtime._command([str(DOCKER),'--host',SOCKET,'network','disconnect',n['id'],container_id],3)
+                    xs=l['exact_json'](Runtime._command([str(DOCKER),'--host',SOCKET,'network','inspect',n['id']],3))
+                    require(isinstance(xs,list) and len(xs)==1, 'STOP_UNCONFIRMED; network disconnect unknown')
+                    network_checked(n,xs[0])
+                if route['network'] is None:route['network']=n;retain(route)
+                Runtime._command([str(DOCKER),'--host',SOCKET,'network','rm',n['id']],3)
+                # Docker's actual successful immutable-ID removal is the ACK;
+                # a lost response stays uncertain rather than being retried.
+                network_removed=True
+                route['network_removed']=True;retain(route)
+            require(not Runtime._command([str(DOCKER),'--host',SOCKET,'ps','-q'],3).strip(),
+                    'STOP_UNCONFIRMED; foreign running container')
+            latest=_route_unit(l,Runtime._command,3)
+            require(latest['InvocationID']==inv and _route_guard(route,l,latest)==route['daemon'],
+                    'STOP_UNCONFIRMED; daemon changed before stop')
+            Runtime._command(['/usr/bin/systemctl','--user','stop',DAEMON],20)
+            fields=_route_unit(l,Runtime._command,3)
+        require(same_daemon_or_empty_quiescent(fields) and fields['ActiveState'] in ('inactive','failed')
+                and fields['MainPID']=='0', 'STOP_UNCONFIRMED; daemon stop unknown')
+        # Cgroup disappearance alone cannot erase a surviving sampled process.
+        identity_sample={'group':l['SERVICE_GROUP'],'populated':True,
+                         'processes':[{'pid':p['pid'],'start_ticks':int(p['start']),'state':'S'}
+                                      for p in (g['daemon'],g['context']['parent'])]}
+        checks=[cessation(s) for s in [*route['samples'],identity_sample]]
+        require(not history_incomplete and route['samples'] and all(x['confirmed'] for x in checks),
+                'STOP_UNCONFIRMED; daemon descendants or interrupted history')
+    require(network_removed, 'STOP_UNCONFIRMED; retained bridge needs reconciliation')
+    # Keep exact route receipts if any native outcome remains uncertain.
+    for path,expected in [(l['REQUEST'],request_bytes),
+                           (l['GUARD'],None if route['daemon'] is None else route['daemon']['receipt'])]:
+        if path.exists() or path.is_symlink():
+            data=l['stable_bytes'](path,os.getuid())
+            require((data==expected if isinstance(expected,bytes) else expected is not None and l['exact_json'](data.decode())==expected),
+                    'STOP_UNCONFIRMED; foreign route receipt')
+            path.unlink();sync_dir(path.parent)
+    route['pending']=None
+    route['settlement']={'status':'STOP_CONFIRMED','request_removed':True,'guard_removed':True,
+                         'network_removed':True,'daemon_checks':checks}
+    retain(route)
+    return route
+
+
+def plan(accepted_unix, deadline_unix, *, assignment, generation, owner_slot,
+         original_budget_seconds, mode='runtime', pins=None, git_metadata=None, network=None,
+         association_binding=None, accepted_monotonic_ns=None, boot_id=None, deployment=None, web=None,
+         check_source_files=True):
+    """Create operator input, never a launch grant or implicit continuation.
+
+    The private reviewed plan retains the original independent phase identity
+    and time bounds. No identity or budget is inferred from historical tasks.
+    """
+    require(mode in {'runtime', 'inventory'}, 'invalid_mode')
+    require(isinstance(assignment, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,95}', assignment)
+            and type(generation) is int and generation > 0
+            and isinstance(owner_slot, str) and owner_slot in {'astra', 'sol'}, 'invalid_phase_identity')
+    require(type(original_budget_seconds) is int and 30 <= original_budget_seconds <= 1800,
+            'invalid_phase_budget')
+    require(all(type(x) in (int, float) and math.isfinite(x) for x in [accepted_unix, deadline_unix])
+            and accepted_unix > 0 and deadline_unix - accepted_unix == original_budget_seconds,
+            'original_budget_mismatch')
+    if deployment is not None:
+        require(mode == 'runtime', 'inventory_profile_refused')
+        deployment = profile_module().checked_profile(deployment)
+    if web is not None:
+        require(mode == 'runtime' and network is not None, 'web_requires_current_network')
+        web = web_module().checked_web(web)
+    owner = f'{owner_slot}:{assignment}#{generation}'
+    identity_input = {'owner': owner, 'assignment': assignment, 'generation': generation,
+                      'accepted_unix': accepted_unix, 'mode': mode}
+    if association_binding is not None:
+        binding = host_identity(association_binding)
+        require(mode == 'runtime' and generation == 1 and assignment == binding['existing_task_id']
+                and accepted_unix == binding['created_at_unix']
+                and deadline_unix == binding['deadline_unix']
+                and original_budget_seconds == binding['budget_seconds'], 'foreign_host_plan')
+        require(type(accepted_monotonic_ns) is int and accepted_monotonic_ns > 0
+                and isinstance(boot_id, str) and re.fullmatch('[0-9a-f-]{36}', boot_id),
+                'original_host_clock_missing')
+        identity_input.update(association_binding=binding,
+                              accepted_monotonic_ns=accepted_monotonic_ns, boot_id=boot_id)
+    else:
+        require(accepted_monotonic_ns is None and boot_id is None, 'unbound_host_clock')
+    if web is not None:
+        identity_input.update(web=web,web_source_sha256=sha(WEB_SOURCE))
+    if deployment is not None:
+        identity_input.update(deployment=deployment, profile_source_sha256=sha(PROFILE_SOURCE))
+    if network is not None:
+        require(mode == 'runtime', 'inventory_local_network_refused')
+        network = local_network(network, owner, deployment, web)
+        identity_input['local_network'] = network
+    if git_metadata is not None:
+        require(mode == 'runtime', 'inventory_git_mount_refused')
+        metadata_descriptor(git_metadata)
+        identity_input['git_metadata'] = dict(git_metadata)
+    if mode == 'runtime':
+        guard = memory_guard_descriptor(web['image'] if web is not None else IMAGE, check_file=check_source_files)
+        identity_input['memory_guard'] = guard
+    identity = digest(identity_input)
+    if pins is None:
+        pins = {'code_sha256': sha(__file__), 'docker_sha256': sha(DOCKER),
+                'daemon_unit_sha256': sha(PROJECT / '.runtime/rootless-docker/supervisor/friday-rework-docker.service')}
+    require(set(pins) == {'code_sha256', 'docker_sha256', 'daemon_unit_sha256'}
+            and all(isinstance(x, str) and re.fullmatch(r'[0-9a-f]{64}', x) for x in pins.values()),
+            'invalid_pins')
+    result = {'schema': 'friday.a0.runtime-plan.v2', 'assignment': assignment,
+            'generation': generation, 'owner_slot': owner_slot, 'owner': owner, 'identity': identity,
+            'image': web['image'] if web is not None else IMAGE, 'donor': DONOR, 'mode': mode,
+            'runtime_root': str(RUNTIME), 'state_dir': str(RUNTIME / identity / 'usr'),
+            'unit': 'friday-rework-worker-' + identity[:32] + '.service',
+            'container_name': 'frw-a0-' + identity[:32],
+            'accepted_unix': accepted_unix, 'deadline_unix': deadline_unix,
+            'original_budget_seconds': original_budget_seconds,
+            'network': 'none' if network is None else network, 'ports': [],
+            'memory_bytes': MEMORY, 'cpus': 2, 'pids': PIDS,
+            'startup_seconds': STARTUP_SECONDS, 'stop_seconds': STOP_SECONDS,
+            'templates_sha256': digest(templates(deployment)), **pins,
+            **({'deployment': deployment, 'profile_source_sha256': sha(PROFILE_SOURCE)} if deployment is not None else {}),
+            **({'web':web,'web_source_sha256':sha(WEB_SOURCE)} if web is not None else {}),
+            **({'git_metadata': dict(git_metadata)} if git_metadata is not None else {}),
+             **({'memory_guard': guard} if mode == 'runtime' else {})}
+    if association_binding is not None:
+        result.update(association_binding=binding, accepted_monotonic_ns=accepted_monotonic_ns,
+                      boot_id=boot_id, unit=binding['supervisor']['unit'],
+                      container_name='frw-a0-' + assignment[7:39])
+    return result
+
+
+def host_identity(value):
+    fields = {'existing_task_id', 'admission_hash', 'owner', 'worker_kind', 'brief_sha256',
+              'workspace_reference', 'supervisor', 'created_at_unix', 'budget_seconds', 'deadline_unix'}
+    require(isinstance(value, dict) and set(value) == fields
+            and re.fullmatch('native-[0-9a-f]{64}', value['existing_task_id'])
+            and value['worker_kind'] == 'a0'
+            and all(re.fullmatch('[0-9a-f]{64}', value[x]) for x in ('admission_hash', 'brief_sha256'))
+            and value['admission_hash'] == hashlib.sha256(value['existing_task_id'].encode()).hexdigest()
+            and value['supervisor'] == {'scope': 'user', 'unit': 'friday-rework-worker-' + value['existing_task_id'][7:39] + '.service'}
+            and isinstance(value['owner'], dict)
+            and set(value['owner']) == {'bot_id', 'user_id', 'chat_id', 'thread_id', 'message_id', 'session_key', 'session_id', 'profile'}
+            and all(isinstance(x, str) and len(x) <= 512 and '\x00' not in x for x in value['owner'].values())
+            and isinstance(value['workspace_reference'], str)
+            and Path(value['workspace_reference']).is_absolute()
+            and '..' not in Path(value['workspace_reference']).parts, 'invalid_host_identity')
+    return json.loads(json.dumps(value, allow_nan=False))
+
+
+def validate(p, *, check_files=True, budget=None):
+    metadata_budget(budget)
+    pins = None if check_files else {k: p[k] for k in ['code_sha256', 'docker_sha256', 'daemon_unit_sha256']}
+    expected = plan(p['accepted_unix'], p['deadline_unix'], assignment=p['assignment'],
+                    generation=p['generation'], owner_slot=p['owner_slot'],
+                    original_budget_seconds=p['original_budget_seconds'], mode=p['mode'], pins=pins,
+                    git_metadata=p.get('git_metadata'),
+                    network=None if p['network'] == 'none' else p['network'],
+                    association_binding=p.get('association_binding'),
+                    accepted_monotonic_ns=p.get('accepted_monotonic_ns'), boot_id=p.get('boot_id'), deployment=p.get('deployment'), web=p.get('web'),
+                    check_source_files=check_files)
+    require(p == expected, 'plan_identity_or_boundary_changed')
+    if check_files and 'git_metadata' in p:
+        check_git_metadata(p['git_metadata'], **({} if budget is None else {'budget': budget}))
+    metadata_budget(budget)
+    return p
+
+
+def remaining(p, now=None):
+    now = time.time() if now is None else now
+    # Never grant extra time on clock rollback, or reset the accepted budget.
+    require(math.isfinite(now) and now >= p['accepted_unix'], 'clock_rollback')
+    value = p['deadline_unix'] - now - 25  # native container + cleanup reserve
+    if 'association_binding' in p:
+        require(p['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'host_boot_changed')
+        elapsed = (time.monotonic_ns() - p['accepted_monotonic_ns']) / 1e9
+        require(elapsed >= 0, 'host_monotonic_rollback')
+        value = min(value, p['original_budget_seconds'] - elapsed - 25)
+    require(value >= 5, 'budget_exhausted')
+    return int(value)
+
+
+def labels(p):
+    return {'friday.rework.owner': p['owner'], 'friday.rework.assignment': p['assignment'],
+            'friday.rework.generation': str(p['generation']),
+            'friday.rework.plan': p.get('association_binding', {}).get('admission_hash', digest(p))}
+
+
+def create_argv(p):
+    validate(p)
+    args = [str(DOCKER), '--host', SOCKET, 'create', '--name', p['container_name'],
+            '--pull=never', '--network=' + ('none' if p['network'] == 'none' else p['network']['id']), '--restart=no', '--cap-drop=ALL',
+            '--security-opt=no-new-privileges', '--pids-limit=' + str(PIDS),
+            '--memory=' + str(MEMORY), '--memory-swap=' + str(MEMORY), '--cpus=2',
+            '--stop-timeout=' + str(STOP_SECONDS), '--ulimit=nofile=65535:65535',
+            '--log-driver=none']
+    for k, v in labels(p).items():
+        args += ['--label', k + '=' + v]
+    if p['mode'] == 'inventory':
+        return args + ['--read-only', '--entrypoint=/bin/bash', IMAGE, '-ceu', INVENTORY_COMMAND]
+    args += ['--mount', 'type=bind,src=' + p['state_dir'] + ',dst=/a0/usr']
+    if 'memory_guard' in p:
+        g = p['memory_guard']
+        args += ['--mount', 'type=bind,src=' + g['source'] + ',dst=' + g['stage'] + ',readonly,bind-propagation=rprivate']
+    if 'git_metadata' in p:
+        args += ['--mount', 'type=bind,src=' + p['git_metadata']['source'] + ',dst=/a0/.git,readonly,bind-propagation=rprivate']
+    if 'web' in p:
+        args += ['--mount','type=bind,src='+p['state_dir']+'/web/settings.yml,dst=/etc/searxng/settings.yml,readonly,bind-propagation=rprivate']
+    return args + [
+                   '--env=HF_HUB_OFFLINE=1', '--env=TRANSFORMERS_OFFLINE=1',
+                   '--workdir=/a0', '--entrypoint=/bin/bash', p['image'], '-ceu', startup_script(p)]
+
+
+def container_checked(p, obj, cid=None, *, stop_owned=False, pre_start=False):
+    """Validate exact owner/ID/exposure; resource drift cannot block owned stop.
+
+    Launch/observation still require exact resource limits. Only the checked
+    same container stop path may omit mutable resource admission limits.
+    The explicit post-create phase permits Docker 29 pending network IDs only
+    after proving that the exact object has never entered a running lifecycle.
+    """
+    require(isinstance(obj, dict) and re.fullmatch(r'[0-9a-f]{64}', obj.get('Id', '')),
+            'invalid_container_id')
+    require(cid is None or obj['Id'] == cid, 'container_replaced')
+    actual_labels = obj['Config'].get('Labels') or {}
+    require(obj.get('Name') == '/' + p['container_name'] and obj.get('Image') == p['image']
+            and obj['Config'].get('Image') == p['image']
+            and {k: v for k, v in actual_labels.items() if k.startswith('friday.rework.')} == labels(p),
+            'container_owner_or_image_changed')
+    h = obj['HostConfig']
+    state = obj['State']
+    require(type(state.get('Running')) is bool and type(state.get('Pid')) is int
+            and state['Pid'] >= 0 and (state['Running'] or state['Pid'] == 0),
+            'inconsistent_container_state')
+    require(type(pre_start) is bool and not (pre_start and stop_owned), 'invalid_container_phase')
+    if pre_start:
+        # This boundary consumes Docker inspect, whose explicit created Status
+        # joins zero timestamps and inactive flags. The engine's persisted
+        # config-state alone is not sufficient evidence of this phase.
+        require(state['Running'] is False and state['Pid'] == 0
+                and state.get('Status') == 'created'
+                and all(state.get(k) is False for k in ('Paused', 'Restarting', 'OOMKilled', 'Dead'))
+                and type(state.get('ExitCode')) is int and state['ExitCode'] == 0
+                and state.get('StartedAt') == '0001-01-01T00:00:00Z'
+                and state.get('FinishedAt') == '0001-01-01T00:00:00Z'
+                and state.get('Error', '') == ''
+                and type(obj.get('RestartCount', 0)) is int and obj.get('RestartCount', 0) == 0,
+                'container_not_never_started')
+    require(h.get('NetworkMode') == ('none' if p['network'] == 'none' else p['network']['id']) and not h.get('Privileged')
+            and not h.get('PortBindings') and not h.get('PublishAllPorts')
+            and not h.get('Binds') and not h.get('Devices') and not h.get('DeviceRequests')
+            and h.get('PidMode', '') == '' and h.get('IpcMode') in {'private', ''}
+            and h.get('RestartPolicy') == {'Name': 'no', 'MaximumRetryCount': 0}
+            and h.get('CapDrop') == ['ALL'] and not h.get('CapAdd')
+            and h.get('SecurityOpt') == ['no-new-privileges'],
+            'container_boundary_changed')
+    if p['network'] != 'none' and not stop_owned:
+        networks = obj.get('NetworkSettings', {}).get('Networks')
+        value = p['network']
+        require(isinstance(networks, dict) and set(networks) == {value['name']}
+                and isinstance(networks[value['name']], dict), 'container_network_changed')
+        network = networks[value['name']]
+        pending = (pre_start and network.get('NetworkID') == '' and network.get('EndpointID') == ''
+                   and all(not network.get(k) for k in ('Gateway', 'IPAddress', 'IPv6Gateway',
+                                                        'GlobalIPv6Address', 'MacAddress', 'DesiredMacAddress',
+                                                        'IPPrefixLen', 'GlobalIPv6PrefixLen', 'GwPriority',
+                                                        'IPAMOperational', 'IPAMConfig', 'DriverOpts', 'Links')))
+        allocated = (network.get('NetworkID') == value['id']
+                     and isinstance(network.get('EndpointID'), str)
+                     and re.fullmatch(r'[0-9a-f]{64}', network['EndpointID']) is not None)
+        require(allocated or pending, 'container_network_changed')
+        # No injected proxy, DNS override or implicit cloud transport.
+        env = obj['Config'].get('Env')
+        require(isinstance(env, list) and all(isinstance(x, str) for x in env)
+                and not any(x.partition('=')[0].lower() in {
+                    'http_proxy', 'https_proxy', 'all_proxy', 'ftp_proxy', 'no_proxy'} for x in env)
+                and not h.get('Dns') and not h.get('DnsOptions') and not h.get('DnsSearch')
+                and not h.get('ExtraHosts') and not h.get('Links'), 'local_transport_override_changed')
+    if p['mode'] == 'inventory':
+        require(h.get('ReadonlyRootfs') is True and obj.get('Mounts') == []
+                and obj['Config'].get('Entrypoint') == ['/bin/bash']
+                and obj['Config'].get('Cmd') == ['-ceu', INVENTORY_COMMAND], 'inventory_boundary_changed')
+    else:
+        mounts = obj.get('Mounts')
+        require(h.get('ReadonlyRootfs') is False and isinstance(mounts, list)
+                and len(mounts) == (2 if 'git_metadata' in p else 1) + (1 if 'web' in p else 0) + (1 if 'memory_guard' in p else 0),
+                'runtime_mounts_changed')
+        by_dest = {m.get('Destination'): m for m in mounts}
+        require(len(by_dest) == len(mounts) and '/a0/usr' in by_dest, 'runtime_mounts_changed')
+        m = by_dest['/a0/usr']
+        require(m.get('Type') == 'bind' and m.get('Source') == p['state_dir']
+                and m.get('Destination') == '/a0/usr' and m.get('RW') is True
+                and m.get('Propagation') == 'rprivate', 'runtime_mounts_changed')
+        if 'memory_guard' in p:
+            g = p['memory_guard']
+            require(g == memory_guard_descriptor(p['image'], check_file=False), 'memory_guard_plan_lineage_changed')
+            m = by_dest.get(g['stage'], {})
+            require(m.get('Type') == 'bind' and m.get('Source') == g['source']
+                    and m.get('Destination') == g['stage'] and m.get('RW') is False
+                    and m.get('Propagation') == 'rprivate', 'memory_guard_mount_changed')
+        if 'git_metadata' in p:
+            m = by_dest.get('/a0/.git', {})
+            require(m.get('Type') == 'bind' and m.get('Source') == p['git_metadata']['source']
+                    and m.get('Destination') == '/a0/.git' and m.get('RW') is False
+                    and m.get('Propagation') == 'rprivate', 'git_mount_identity_changed')
+        if 'web' in p:
+            w = by_dest.get('/etc/searxng/settings.yml',{})
+            require(w.get('Type')=='bind' and w.get('Source')==p['state_dir']+'/web/settings.yml'
+                    and w.get('RW') is False and w.get('Propagation')=='rprivate', 'web_service_mount_changed')
+        require(obj['Config'].get('Entrypoint') == ['/bin/bash']
+                and obj['Config'].get('Cmd') == ['-ceu', startup_script(p)]
+                and obj['Config'].get('WorkingDir') == '/a0', 'runtime_command_changed')
+    if not stop_owned:
+        require(h.get('Memory') == MEMORY and h.get('MemorySwap') == MEMORY
+                and h.get('NanoCpus') == 2_000_000_000 and h.get('PidsLimit') == PIDS,
+                'container_resource_boundary_changed')
+    return obj
+
+
+def process_identity(pid):
+    try:
+        s = Path('/proc', str(pid), 'stat').read_text()
+        fields = s[s.rfind(')') + 2:].split()
+        return {'pid': pid, 'start_ticks': int(fields[19]), 'state': fields[0]}
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
+def cgroup_snapshot(group):
+    root = Path('/sys/fs/cgroup') / group.lstrip('/')
+    require(group.startswith('/') and root.resolve() == root, 'invalid_cgroup')
+    if not root.exists():
+        return {'group': group, 'populated': False, 'processes': []}
+    events = dict(x.split() for x in (root / 'cgroup.events').read_text().splitlines())
+    require(events.get('populated') in {'0', '1'}, 'unknown_cgroup_state')
+    ids = set()
+    for f in root.rglob('cgroup.procs'):
+        try:
+            ids.update(map(int, f.read_text().split()))
+        except FileNotFoundError:
+            pass
+    return {'group': group, 'populated': events['populated'] == '1',
+            'processes': [x for pid in sorted(ids) if (x := process_identity(pid))]}
+
+
+def cessation(before):
+    survivors = []
+    for x in before['processes']:
+        current = process_identity(x['pid'])
+        if current and current['start_ticks'] == x['start_ticks'] and current['state'] != 'Z':
+            survivors.append(current)
+    after = cgroup_snapshot(before['group'])
+    return {'confirmed': not survivors and after['populated'] is False, 'before': before,
+            'survivors': survivors, 'after': after}
+
+
+def native_supervisor():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from plugins.friday_rework.supervision import NativeSupervisor
+    return NativeSupervisor()
+
+
+class Runtime:
+    """Single native boundary wrapper; no scheduler, daemon or message replay."""
+    def __init__(self, p, *, runner=None, supervisor=None, stopping=False, budget=None):
+        # Stop-only reconstruction must remain available after the work clock.
+        validation_budget = None if stopping else budget
+        self.p = validate(p, check_files=not stopping, budget=validation_budget)
+        # A corrected host wrapper may stop an old reviewed plan, but an
+        # unverified executable must never receive an effectful control call.
+        require(sha(DOCKER) == p['docker_sha256'], 'docker_binary_changed')
+        metadata_budget(validation_budget)
+        self.runner = runner or self._command
+        self.budget = validation_budget
+        self.supervisor = supervisor or native_supervisor()
+        self.directory = RUNTIME / p['identity']
+        self.receipt_path = self.directory / 'native.json'
+        self.known = None
+        self.create_attempted = False
+
+    @staticmethod
+    def _command(argv, timeout=10):
+        try:
+            r = subprocess.run(argv, env=ENV, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=timeout, check=False)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise RuntimeErrorBoundary('native_control_uncertain') from e
+        require(r.returncode == 0, 'native_command_failed')
+        return r.stdout
+
+    def docker(self, *args, timeout=10):
+        if getattr(self,'budget',None) is not None:
+            timeout = min(timeout, metadata_budget(self.budget))
+        return self.runner([str(DOCKER), '--host', SOCKET, *args], timeout)
+
+    @contextmanager
+    def locked(self):
+        # This is not a writer-lock bypass; a busy runtime refuses immediately.
+        private(RUNTIME, directory=True)
+        fd = os.open(RUNTIME / 'runtime.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            s = os.fstat(fd)
+            require(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid()
+                    and stat.S_IMODE(s.st_mode) == 0o600, 'unsafe_runtime_lock')
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield
+        finally:
+            os.close(fd)
+
+    def receipt(self):
+        r = self.known
+        if r is None:
+            r = json.loads(private(self.receipt_path).read_text())
+        require(r.get('plan_sha256') == digest(self.p), 'receipt_plan_changed')
+        require(re.fullmatch(r'[0-9a-f]{64}', r.get('container_id', '')), 'receipt_container_unknown')
+        require('native_start_attempted' not in r or type(r['native_start_attempted']) is bool,
+                'receipt_start_outcome_unknown')
+        if 'web_probe_failure' in r:
+            web_probe_failure_checked(r['web_probe_failure'])
+        self.known = r
+        return r
+
+    def durable_receipt(self):
+        """Merge only an existing exact receipt; never manufacture custody."""
+        retained = self.receipt()
+        latest = json.loads(private(self.receipt_path).read_text())
+        require(isinstance(latest, dict)
+                and all(k in latest and latest[k] == retained[k]
+                        for k in ('plan_sha256', 'container_id', 'invocation_id'))
+                and latest.get('native_start_attempted') == retained.get('native_start_attempted')
+                and ('native_start_attempted' not in latest
+                     or type(latest['native_start_attempted']) is bool)
+                and isinstance(latest.get('observations'), list)
+                and isinstance(retained.get('observations'), list), 'native_receipt_owner_drift')
+        # A concurrent ordinary observer may have retained more descendants.
+        # Cached samples remain authoritative even when a later write failed.
+        for sample in latest['observations']:
+            if sample not in retained['observations']:
+                retained['observations'].append(sample)
+        if 'web_probe_failure' in latest:
+            failure = web_probe_failure_checked(latest['web_probe_failure'])
+            require('web_probe_failure' not in retained or retained['web_probe_failure'] == failure,
+                    'native_receipt_web_probe_failure_changed')
+            retained['web_probe_failure'] = failure
+        return retained
+
+    def association(self, r):
+        a = {'supervisor': {'scope': 'user', 'unit': self.p['unit']},
+             'admission_hash': self.p.get('association_binding', {}).get('admission_hash', digest(self.p))}
+        if r.get('invocation_id'):
+            a['native'] = {'invocation_id': r['invocation_id'], 'worker_reference': r['container_id']}
+        return a
+
+    def inspect(self, r, *, stop_owned=False, timeout=10, pre_start=False):
+        xs = json.loads(self.docker('inspect', r['container_id'], timeout=timeout))
+        require(isinstance(xs, list) and len(xs) == 1, 'container_observation_unknown')
+        obj = container_checked(self.p, xs[0], r['container_id'], stop_owned=stop_owned, pre_start=pre_start)
+        if not stop_owned:
+            self.check_network(container_id=r['container_id'])
+        return obj
+
+    def check_network(self, *, container_id=None, budget=None):
+        budget = getattr(self,'budget',None) if budget is None else budget
+        if self.p['network'] == 'none': return None
+        n = self.p['network']; local_network(n, self.p['owner'], self.p.get('deployment'), self.p.get('web'))
+        namespace = checked_launcher(n['launcher_sha256'])
+        # Current native unit, live PID-start/boot, owned held namespace FDs and
+        # nft semantic readback are all checked here; a boolean is insufficient.
+        if budget is None:
+            namespace['observe_guard'](n)
+        else:
+            namespace['observe_guard'](n, budget=budget)
+        request = namespace['request_checked'](os.getuid())
+        require(request['accepted_unix'] == self.p['accepted_unix']
+                and request['deadline_unix'] == self.p['deadline_unix']
+                and request['original_budget_seconds'] == self.p['original_budget_seconds'], 'local_original_budget_changed')
+        if 'association_binding' in self.p:
+            require(request['owner'] == self.p['owner']
+                    and request['accepted_monotonic_ns'] == self.p['accepted_monotonic_ns']
+                    and self.p['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                    'foreign_host_route_clock')
+        limits = {} if budget is None else {'timeout': min(5, budget())}
+        xs = json.loads(self.docker('network', 'inspect', n['id'], **limits))
+        require(isinstance(xs, list) and len(xs) == 1, 'local_network_unknown')
+        network_checked(n, xs[0], container_id=container_id)
+        # Docker readback may race daemon/request/namespace replacement. Check
+        # the same pinned guard again before publishing current readiness.
+        namespace['observe_guard'](n, **({} if budget is None else {'budget': budget}))
+        return {'status': 'CURRENT_LOCAL_NETWORK_CHECKED', 'id': n['id']}
+
+    def check_web(self, container_id, *, startup=False):
+        if 'web' not in self.p: return None
+        remaining(self.p); self.check_network(container_id=container_id)
+        for relative, value in web_module().service_files(self.p['web']).items():
+            path=Path(self.p['state_dir'])/relative
+            require(path.resolve()==path and path.is_file(), 'a0_web_service_input_changed')
+            actual=path.read_text() if isinstance(value,str) else json.loads(path.read_text())
+            require(actual==value, 'a0_web_service_input_changed')
+        script = web_module().service_probe(self.p['web'])
+        # Suppress native import/error output; export only the bounded report.
+        script = 'import contextlib,io\nwith contextlib.redirect_stderr(io.StringIO()):\n' + '\n'.join(' '+line for line in script.splitlines())
+        startup_identity = None
+        while True:
+            data = json.loads(self.docker('exec','--workdir=/usr/local/searxng/searxng-src',container_id,
+                '/usr/local/searxng/searx-pyenv/bin/python','-B','-c',script,timeout=min(5,remaining(self.p))))
+            if not isinstance(data, dict) or data.get('status') != 'NATIVE_WEB_PROBE_REFUSED':
+                break
+            data = web_probe_failure_checked(data)
+            observed = data.get('supervisor', {})
+            processes = observed.get('processes', [])
+            starting = (data['phase'] == 'supervisor' and data['error_class'] == 'AssertionError'
+                and observed.get('count') == len(processes) == 2
+                and {p['name'] for p in processes} == {'run_ui', 'run_searxng'}
+                and all(p['statename'] in {'STARTING', 'RUNNING'} and p['pid'] > 0
+                        and p['start'] > 0 for p in processes)
+                and any(p['statename'] == 'STARTING' for p in processes))
+            connecting = (data['phase'] == 'http_connecting' and data['error_class'] == 'OSError'
+                and observed.get('count') == len(processes) == 2
+                and {p['name'] for p in processes} == {'run_ui', 'run_searxng'}
+                and all(p['statename'] == 'RUNNING' and p['pid'] > 0 and p['start'] > 0
+                        for p in processes))
+            if not (startup and (starting or connecting)):
+                break
+            identity = sorted((p['name'], p['pid'], p['start']) for p in processes)
+            require(startup_identity in (None, identity), 'a0_native_web_service_replaced')
+            startup_identity = identity
+            # Passive observation only, bounded by the existing original clock
+            # and host startup runner. No create/start/model effect is replayed.
+            left = remaining(self.p)
+            if getattr(self, 'budget', None) is not None:
+                left = min(left, metadata_budget(self.budget))
+            time.sleep(min(.1, left))
+            self.check_network(container_id=container_id)
+        if isinstance(data, dict) and data.get('status') == 'NATIVE_WEB_PROBE_REFUSED':
+            data = web_probe_failure_checked(data)
+            # Reuse this owned native receipt: no new runtime artifact or
+            # inventory path. Categorical evidence must survive outer cleanup.
+            error = RuntimeErrorBoundary('a0_native_web_probe_' + data['phase'] + '_' + data['error_class'])
+            self.web_probe_failure = dict(data)
+            try:
+                with self.locked():
+                    r = self.durable_receipt()
+                    require(r['container_id'] == container_id, 'web_probe_receipt_owner_changed')
+                    r['web_probe_failure'] = dict(data)
+                    write_json(self.receipt_path, r, replace=True)
+            except BaseException:
+                error.add_note('web_probe_failure_receipt_unconfirmed')
+            raise error
+        require(isinstance(data,dict) and set(data)=={'status','version','processes'}
+                and data['status']=='CURRENT_NATIVE_WEB_SERVICE_CHECKED' and data['version']==self.p['web']['version']
+                and isinstance(data['processes'],list) and len(data['processes'])==2
+                and {x.get('name') for x in data['processes']}=={'run_ui','run_searxng'}
+                and all(set(x)=={'name','pid','start','statename'} and x['statename']=='RUNNING'
+                        and type(x['pid']) is int and x['pid']>0 and type(x['start']) is int
+                        and x['start']>0 for x in data['processes']), 'a0_effective_web_service_not_ready')
+        if startup_identity is not None:
+            require(startup_identity == sorted((p['name'], p['pid'], p['start'])
+                                               for p in data['processes']),
+                    'a0_native_web_service_replaced')
+        if getattr(self,'web_observation',None) is not None:
+            require(self.web_observation==data, 'a0_native_web_service_replaced')
+        self.check_network(container_id=container_id); remaining(self.p)
+        self.web_observation=data
+        return data
+
+    def unit_argv(self, cid, plan_path, plan_file_sha):
+        seconds = min(remaining(self.p), STARTUP_SECONDS)
+        if 'association_binding' in self.p:
+            # Cold runtime work shares this exact daemon invocation's finite
+            # lifetime. STARTUP_SECONDS still bounds inventory/unbound probes.
+            names = ('ActiveState', 'InvocationID', 'RuntimeMaxUSec',
+                     'ActiveEnterTimestampMonotonic', 'TimeoutStopUSec')
+            raw = self.runner(['/usr/bin/systemctl', '--user', 'show', DAEMON,
+                               '--property=' + ','.join(names)], min(5, remaining(self.p)))
+            pairs = [line.split('=', 1) for line in raw.splitlines()]
+            fields = dict(pairs)
+            require(len(pairs) == len(fields) and set(fields) == set(names),
+                    'host_daemon_deadline_unknown')
+            seconds = min(remaining(self.p), host_daemon_seconds(self.p, fields))
+        require(re.fullmatch(r'[0-9a-f]{64}', cid), 'invalid_container_id')
+        # Native timeout cleanup uses the immutable, already checked actual ID.
+        # It must not depend on a receipt write/read, current plan expiry or a
+        # concurrent observer's file lock. Docker IDs cannot be reassigned.
+        cleanup = shlex.join([str(DOCKER), '--host', SOCKET, 'stop', '--time', str(STOP_SECONDS), cid])
+        props = ['Description=Friday rework ' + self.association({})['admission_hash'], 'Restart=no',
+                 'RuntimeMaxSec=' + str(seconds) + 's', 'TimeoutStartSec=' + str(WORKER_START_SECONDS) + 's',
+                 'TimeoutStopSec=20s', 'KillMode=control-group', 'SendSIGKILL=yes',
+                 'UMask=0077', 'MemoryMax=256M', 'CPUQuota=100%', 'TasksMax=64',
+                 'ExecStopPost=' + cleanup, 'StandardError=null',
+                 ('StandardOutput=append:' + str(self.directory / 'inventory.jsonl')
+                  if self.p['mode'] == 'inventory' else 'StandardOutput=null')]
+        if self.p['mode'] == 'inventory':
+            props.append('RemainAfterExit=yes')
+        return ['/usr/bin/systemd-run', '--user', '--unit=' + self.p['unit'],
+                '--service-type=exec', '--expand-environment=no',
+                *['--property=' + x for x in props], str(DOCKER), '--host', SOCKET,
+                'start', '--attach', cid]
+
+    def start(self, plan_path, plan_file_sha, *, before_ui=None, on_created=None):
+        try:
+            return self._start_locked(plan_path, plan_file_sha, before_ui=before_ui, on_created=on_created)
+        except BaseException as original:
+            if self.known is not None:
+                try:
+                    # The inner receipt lock has been released before stopping
+                    # the actual native unit; no nested writer or lock bypass.
+                    self.supervisor.stop(self.association(self.known))
+                except BaseException:
+                    original.add_note('STOP_UNCONFIRMED; native unit cleanup not confirmed')
+            raise
+
+    def _start_locked(self, plan_path, plan_file_sha, *, before_ui=None, on_created=None):
+        require('association_binding' in self.p or before_ui is None and on_created is None,
+                'unbound_host_hook')
+        require('association_binding' not in self.p or callable(before_ui) and callable(on_created),
+                'host_pre_ui_hook_required')
+        # Daemon start is deliberately outside this wrapper; current CONTROL
+        # must first authorize and inspect the existing dedicated daemon.
+        with self.locked():
+            reviewed = private(plan_path)
+            require(sha(reviewed) == plan_file_sha
+                    and json.loads(reviewed.read_text()) == self.p, 'reviewed_plan_changed')
+            validate(self.p); remaining(self.p)
+            require(not self.directory.exists(), 'prior_or_uncertain_attempt_blocks_restart')
+            daemon = self.runner(['/usr/bin/systemctl', '--user', 'show', DAEMON,
+                                  '--property=ActiveState,DelegateSubgroup,MemoryMax,TasksMax,CPUQuotaPerSecUSec,Restart,KillMode,SendSIGKILL,DropInPaths'], 5)
+            fields = dict(x.split('=', 1) for x in daemon.splitlines())
+            require(fields == {'ActiveState': 'active', 'DelegateSubgroup': 'dockerd',
+                               'MemoryMax': str(20 * 1024**3), 'TasksMax': '2048',
+                               'CPUQuotaPerSecUSec': '8s', 'Restart': 'no',
+                               'KillMode': 'control-group', 'SendSIGKILL': 'yes',
+                               'DropInPaths': ''}, 'dedicated_daemon_not_ready')
+            info = json.loads(self.docker('info', '--format={{json .}}'))
+            require(info.get('CgroupVersion') == '2' and info.get('CgroupDriver') == 'systemd'
+                    and 'name=rootless' in info.get('SecurityOptions', [])
+                    and info.get('ServerVersion') == '29.8.2', 'native_docker_boundary_unsupported')
+            require(all(info.get(k) is True for k in ['MemoryLimit', 'SwapLimit', 'CpuCfsPeriod', 'CpuCfsQuota', 'PidsLimit']),
+                    'native_docker_resource_limits_unsupported')
+            require(not self.docker('ps', '-q').strip(), 'active_container_blocks_admission')
+            # Any prior native object with this exact name blocks replacement.
+            require(not self.docker('ps', '-aq', '--filter', 'name=^/' + self.p['container_name'] + '$').strip(),
+                    'existing_container_blocks_admission')
+            self.check_network()
+            self.directory.mkdir(mode=0o700)
+            write_json(self.directory / 'attempt.json', {'plan_sha256': digest(self.p), 'phase': 'CREATE_UNKNOWN'})
+            if self.p['mode'] == 'runtime':
+                materialize(self.directory / 'usr', self.p.get('deployment'), self.p.get('web'))
+                if before_ui is not None:
+                    before_ui(self.directory / 'usr')
+                    remaining(self.p)
+            try:
+                self.create_attempted = True
+                cid = self.runner(create_argv(self.p), 10).strip()
+                require(re.fullmatch(r'[0-9a-f]{64}', cid), 'create_outcome_unknown')
+                self.known = {'plan_sha256': digest(self.p), 'container_id': cid,
+                              'invocation_id': '', 'observations': [], 'native_start_attempted': False}
+                # Cache and fsync actual create identity before callbacks or
+                # inspection can fail. No callback can erase the native owner.
+                write_json(self.receipt_path, self.known)
+                if on_created is not None:
+                    on_created(self.known)
+                self.inspect(self.known, pre_start=True)
+                submission = dict(self.known, native_start_attempted=True)
+                write_json(self.receipt_path, submission, replace=True)
+                self.known = submission
+                # Compute the native runtime after the durable intent fsync,
+                # immediately before the bounded submit/start operation.
+                argv = self.unit_argv(cid, plan_path, plan_file_sha)
+                self.runner(argv, WORKER_START_SECONDS)
+                obs = self.supervisor.observe(self.association(self.known))
+                require(not obs.missing and obs.invocation_id, 'unit_submission_unknown')
+                self.known['invocation_id'] = obs.invocation_id
+                write_json(self.receipt_path, self.known, replace=True)
+                return {'status': 'STARTED_NATIVE_BOUNDARY', 'container_id': cid,
+                        'invocation_id': obs.invocation_id, 'health': 'NOT_RUN'}
+            except BaseException as original:
+                # An uncertain create/start is never replayed. Reconcile only
+                # this plan's exact named, labelled image object, then stop.
+                try:
+                    if self.known is None:
+                        xs = json.loads(self.docker('inspect', self.p['container_name']))
+                        require(len(xs) == 1, 'create_outcome_unknown')
+                        obj = container_checked(self.p, xs[0], stop_owned=True)
+                        self.known = {'plan_sha256': digest(self.p), 'container_id': obj['Id'],
+                                      'invocation_id': '', 'observations': []}
+                    self._stop(self.known)
+                except BaseException:
+                    original.add_note('STOP_UNCONFIRMED; exact native attempt retained; no replay')
+                raise
+
+    def observe(self):
+        checked = None
+        try:
+            with self.locked():
+                r = self.durable_receipt(); obj = self.inspect(r, stop_owned=True)
+                unit = self.supervisor.observe(self.association(r))
+                if not r.get('invocation_id') and unit.invocation_id:
+                    r['invocation_id'] = unit.invocation_id
+                checked = r
+                self.check_network(container_id=r['container_id'])
+                container_checked(self.p, obj, r['container_id'])
+                state = obj['State']
+                sample = {'unit_quiescent': unit.quiescent, 'running': state['Running'],
+                          'pid': state['Pid'], 'exit_code': state['ExitCode'], 'cgroup': None}
+                if state['Running']:
+                    snapshot = self.snapshot_container(obj)
+                    # Retain this observation in checked memory before caps or
+                    # receipt I/O can fail; cleanup must not reread bad storage.
+                    r['observations'].append(snapshot)
+                    group = snapshot['group']
+                    cg = Path('/sys/fs/cgroup') / group.lstrip('/')
+                    caps = {n: (cg / n).read_text().strip()
+                            for n in ['memory.max', 'memory.swap.max', 'cpu.max', 'pids.max']}
+                    q, period = caps['cpu.max'].split()
+                    require(caps['memory.max'] == str(MEMORY) and caps['memory.swap.max'] == '0'
+                            and caps['pids.max'] == str(PIDS)
+                            and q != 'max' and int(q) == 2 * int(period), 'container_actual_caps_changed')
+                    sample['cgroup'] = snapshot; sample['caps'] = caps
+                    self.known = r
+                    write_json(self.receipt_path, r, replace=True)
+                return sample
+        except BaseException as original:
+            if checked is not None:
+                self.failure_cleanup(checked, original)
+            raise
+
+    def failure_cleanup(self, checked, original):
+        """Only after container AND native ownership checks, outside file lock.
+
+        Always attempt both independent boundaries. NativeSupervisor rechecks
+        invocation/owner immediately before stop; no foreign/replaced fallback.
+        Receipt/cgroup failure cannot prevent requesting native stop.
+        """
+        uncertain = False
+        try:
+            self.supervisor.stop(self.association(checked))
+        except BaseException as error:
+            uncertain = True
+            original.add_note('STOP_UNCONFIRMED; native cleanup: ' + type(error).__name__)
+        try:
+            with self.locked():
+                self._stop(checked)
+        except BaseException as error:
+            uncertain = True
+            original.add_note('STOP_UNCONFIRMED; container/cgroup/receipt cleanup: ' + type(error).__name__)
+        if uncertain:
+            raise RuntimeStopUnconfirmed('STOP_UNCONFIRMED: exact A0 ownership requires reconciliation') from original
+
+    def snapshot_container(self, obj):
+        pid = obj['State']['Pid']
+        require(type(pid) is int and pid > 0, 'container_pid_unknown')
+        line = Path('/proc', str(pid), 'cgroup').read_text().strip()
+        require(line.startswith('0::/') and '\n' not in line, 'container_cgroup_unknown')
+        group = line[3:]
+        # systemd's rootless Docker scope can be a sibling of the daemon
+        # service; assert exact container scope and its own limits, never
+        # falsely claim inheritance from the daemon's 20 GiB/8 CPU bound.
+        require(group.endswith('/docker-' + obj['Id'] + '.scope'), 'container_cgroup_identity_changed')
+        snapshot = cgroup_snapshot(group)
+        require(snapshot['populated'] and snapshot['processes'], 'container_descendants_unknown')
+        return snapshot
+
+    def _stop(self, r):
+        # The inherited work deadline bounds probes, never revokes the existing
+        # stop-only authority. Keep original finite cleanup/ownership checks;
+        # restore the expired work clock afterwards, without granting a retry.
+        work_budget = getattr(self, 'budget', None)
+        self.budget = None
+        try:
+            return self._stop_checked(r)
+        finally:
+            self.budget = work_budget
+
+    def _stop_checked(self, r):
+        obj = self.inspect(r, stop_owned=True)
+        initial = None
+        sampling_error = None
+        if obj['State']['Running']:
+            try:
+                r['observations'].append(self.snapshot_container(obj))
+            except BaseException as e:
+                sampling_error = e
+        # Stop intent storage never precedes required stop on a failure path.
+        try:
+            if obj['State']['Running']:
+                self.docker('stop', '--time', str(STOP_SECONDS), r['container_id'], timeout=8)
+        except BaseException as e:
+            initial = e
+        try:
+            after = self.inspect(r, stop_owned=True)
+            checks = [cessation(x) for x in r.get('observations', [])]
+            stopped = after['State']['Running'] is False and after['State']['Pid'] == 0
+            require(stopped and all(x['confirmed'] for x in checks), 'STOP_UNCONFIRMED')
+        except BaseException as error:
+            if initial is not None:
+                initial.add_note('STOP_UNCONFIRMED; post-stop reconciliation: ' + type(error).__name__)
+                raise initial
+            raise
+        if initial:
+            raise initial
+        result = {'status': 'STOP_CONFIRMED', 'container_id': r['container_id'],
+                'descendant_checks': checks,
+                'pid_start_sampling': 'RETAINED' if checks else 'NOT_RETAINED',
+                'current_sampling': 'UNKNOWN' if sampling_error else 'OBSERVED_OR_ALREADY_EXITED',
+                'native_container_stopped': True}
+        output = self.directory / 'stop.json'
+        write_json(output, result, replace=output.exists())
+        return result
+
+    def stop(self, *, from_stop_post=False):
+        work_budget = getattr(self, 'budget', None)
+        self.budget = None
+        try:
+            return self._stop_native(from_stop_post=from_stop_post)
+        finally:
+            self.budget = work_budget
+
+    def retire_initial_probe(self):
+        """Exact stopped setup object only; keep host state, receipts and image.
+
+        The existing route producer refuses every retained container. A bounded
+        initial probe has no user job/writable artifacts in its container layer,
+        so its acknowledged retirement is necessary before declaring capacity
+        available. No force, volumes, image removal or ordinary job cleanup.
+        Lost removal ACK remains unknown and is never automatically retried.
+        """
+        require(self.p.get('association_binding',{}).get('owner',{}).get('session_key')
+                == 'own-profile-initial-probe', 'ordinary_job_retirement_refused')
+        work_budget = self.budget; self.budget = None
+        try:
+            with self.locked():
+                r = self.durable_receipt(); obj = self.inspect(r,stop_owned=True)
+                unit = self.supervisor.observe(self.association(r))
+                require(obj['State']['Running'] is False and obj['State']['Pid'] == 0
+                        and unit.quiescent and (unit.missing or unit.invocation_id==r['invocation_id']),
+                        'initial_probe_not_stopped')
+                stopped = json.loads(private(self.directory/'stop.json').read_text())
+                # A durable pre-submission receipt can prove that a created
+                # initial probe never ran. Absence alone grants no cleanup:
+                # legacy/unknown starts still require retained descendants.
+                state = obj['State']
+                never_started = (r.get('native_start_attempted') is False
+                        and r['invocation_id'] == '' and unit.missing and not r['observations']
+                        and state['Running'] is False and state['Pid'] == 0
+                        and state.get('Status') == 'created'
+                        and all(state.get(k) is False for k in ('Paused', 'Restarting', 'OOMKilled', 'Dead'))
+                        and type(state.get('ExitCode')) is int and state['ExitCode'] == 0
+                        and state.get('StartedAt') == '0001-01-01T00:00:00Z'
+                        and state.get('FinishedAt') == '0001-01-01T00:00:00Z'
+                        and state.get('Error', '') == ''
+                        and type(obj.get('RestartCount', 0)) is int and obj.get('RestartCount', 0) == 0)
+                observed_exit = (r.get('native_start_attempted') is not False
+                        and bool(r['observations'])
+                        and all(cessation(s)['confirmed'] for s in r['observations']))
+                require(stopped.get('status')=='STOP_CONFIRMED'
+                        and stopped.get('current_sampling') != 'UNKNOWN'
+                        and stopped.get('container_id')==r['container_id']
+                        and stopped.get('native_container_stopped') is True
+                        and (never_started or observed_exit), 'initial_probe_cessation_unconfirmed')
+                ack = self.docker('rm',r['container_id'],timeout=5).strip()
+                require(ack==r['container_id'], 'initial_probe_retirement_unknown')
+                result = {'status':'INITIAL_PROBE_RETIRED','container_id':r['container_id'],
+                          'host_state_retained':True,'image_retained':True,'volumes_removed':False}
+                write_json(self.directory/'retirement.json',result)
+                return result
+        finally:self.budget = work_budget
+
+    def _stop_native(self, *, from_stop_post=False):
+        checked = None
+        try:
+            with self.locked():
+                r = self.receipt()
+                self.inspect(r, stop_owned=True)
+                unit = self.supervisor.observe(self.association(r))
+                if not r.get('invocation_id') and unit.invocation_id:
+                    r['invocation_id'] = unit.invocation_id
+                checked = r
+                result = self._stop(r)
+        except BaseException as original:
+            if checked is not None:
+                self.failure_cleanup(checked, original)
+            raise
+        # Native stop is attempted once; uncertainty must not replay it.
+        # Directory/attempt tombstone forbids replacement while stopping.
+        if not from_stop_post:
+            self.supervisor.stop(self.association(r))
+        return result
+
+    def health(self, *, auth=False):
+        try:
+            return self._health(auth=auth)
+        except BaseException as original:
+            if self.p['network'] != 'none' and self.known is not None:
+                # Outside the receipt lock. Both existing stop paths recheck
+                # their own immutable ownership; guard/key/setup I/O cannot
+                # keep an admitted dedicated worker running.
+                self.failure_cleanup(self.known, original)
+            raise
+
+    def _health(self, *, auth=False):
+        with self.locked():
+            r = self.receipt(); obj = self.inspect(r)
+            require(obj['State']['Running'] and self.p['mode'] == 'runtime', 'runtime_not_running')
+            # GET only; no model request/POST/replay. Native errors not exported.
+            script = AUTH_SCRIPT if auth else HEALTH_SCRIPT
+            return self.docker('exec', '--workdir=/a0', r['container_id'],
+                               '/opt/venv-a0/bin/python', '-c', script, timeout=10)
+
+    def probe(self):
+        try:
+            return self._probe()
+        except BaseException as original:
+            if self.p['network'] != 'none' and self.known is not None:
+                self.failure_cleanup(self.known, original)
+            raise
+
+    def _probe(self):
+        with self.locked():
+            budget = getattr(self,'budget',None)
+            validate(self.p,budget=budget); seconds = min(15,remaining(self.p),metadata_budget(budget,15))
+            r = self.receipt(); obj = self.inspect(r)
+            require(obj['State']['Running'] and self.p['mode'] == 'runtime', 'runtime_not_running')
+            unit = self.supervisor.observe(self.association(r))
+            require(not unit.missing and unit.invocation_id == r.get('invocation_id')
+                    and not unit.quiescent, 'native_probe_unit_changed')
+            # Existing network=none/container/native deadline, no wrappers/calls.
+            data = json.loads(self.docker('exec', '--workdir=/a0', r['container_id'],
+                             '/opt/venv-a0/bin/python', '-B', '-c', probe_script(self.p.get('deployment')), timeout=seconds))
+            if data.get('status') == 'REFUSED':
+                code = data.get('code')
+                allowed = {'native_input_missing_or_changed', 'native_scope_override_changed',
+                           'native_preset_or_override_changed', 'native_slot_changed',
+                           'native_constructed_slot_changed', 'native_provider_mapping_changed',
+                           'native_distinct_key_not_ready', 'native_token_counter_changed',
+                           'native_token_cache_unavailable', 'native_probe_failed'}
+                raise RuntimeErrorBoundary(code if code in allowed else 'native_probe_refused')
+            return probe_report_checked(data, self.p.get('deployment'))
+
+
+def materialize(usr, deployment=None, web=None):
+    """New owned usr only. No existing state, credentials or source is copied."""
+    usr.mkdir(mode=0o700)
+    for relative, value in templates(deployment).items():
+        p = usr / relative
+        parent = usr
+        for name in Path(relative).parts[:-1]:
+            parent /= name
+            parent.mkdir(mode=0o700, exist_ok=True)
+            private(parent, directory=True)
+        # JSON is a supported YAML subset; no host dependency/install needed.
+        write_json(p, value)
+    if web is not None:
+        for relative, value in web_module().service_files(web).items():
+            path = usr / relative; path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+            if isinstance(value,str):
+                path.write_text(value); path.chmod(0o600)
+            else: write_json(path,value)
+        # The native SearXNG uid needs its nonsecret settings. Secret remains
+        # root-owned 0600 and is passed only to the native supervisor environment.
+        (usr/'web').chmod(0o755); (usr/'web/settings.yml').chmod(0o644)
+    for name in ['uploads', 'workdir']:
+        (usr / name).mkdir(mode=0o700)
+    fd = os.open(usr / '.env', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write('AUTH_LOGIN=friday-rework\nAUTH_PASSWORD=' + secrets.token_hex(32) + '\n'
+                'A0_PERSISTENT_RUNTIME_ID=' + secrets.token_hex(16) + '\n'
+                'WEB_UI_HOST=127.0.0.1\nWEB_UI_PORT=5000\n')
+        f.flush(); os.fsync(f.fileno())
+    sync_dir(usr)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('action', choices=['start', 'observe', 'stop', 'health', 'auth-check', 'config-probe'])
+    ap.add_argument('--plan', type=Path, required=True)
+    ap.add_argument('--reviewed-plan-sha256', required=True)
+    args = ap.parse_args()
+    p = private(args.plan)
+    require(sha(p) == args.reviewed_plan_sha256, 'reviewed_plan_changed')
+    runtime = Runtime(json.loads(p.read_text()), stopping=args.action == 'stop')
+    if args.action == 'start':
+        result = runtime.start(p, args.reviewed_plan_sha256)
+    elif args.action == 'observe':
+        result = runtime.observe()
+    elif args.action == 'stop':
+        result = runtime.stop()
+    elif args.action == 'config-probe':
+        result = runtime.probe()
+    else:
+        result = {'checks': [json.loads(x) for x in runtime.health(auth=args.action == 'auth-check').splitlines()]}
+    print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        # No raw native output, paths containing credentials, chained traceback.
+        code = str(exc) if isinstance(exc, RuntimeErrorBoundary) else 'runtime_control_failed'
+        print(json.dumps({'status': 'REFUSED_OR_UNCONFIRMED', 'code': code}), file=sys.stderr)
+        raise SystemExit(1) from None
