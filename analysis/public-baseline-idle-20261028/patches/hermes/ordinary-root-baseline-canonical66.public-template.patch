@@ -1,0 +1,339 @@
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -10,6 +10,7 @@
+ 
+ import contextlib
+ from agent.bounded_context import physical_aux_create
++from agent.friday_baseline_bridge import tracked, atracked
+ import contextvars
+ import functools
+ import hashlib
+@@ -8021,6 +8022,7 @@
+         latency_info[key] = _elapsed_ms(started_at)
+ 
+ 
++@tracked("friday-auxiliary")
+ @_relay_auxiliary_call
+ def call_llm(
+     task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
+@@ -8333,6 +8335,7 @@
+     return text
+ 
+ 
++@atracked("friday-auxiliary-async")
+ @_relay_auxiliary_call_async
+ async def async_call_llm(
+     task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
+--- a/agent/bounded_context.py
++++ b/agent/bounded_context.py
+@@ -6,6 +6,8 @@
+ kind grants live model acceptance or changes context-length metadata.
+ """
+ from __future__ import annotations
++
++from agent.friday_baseline_bridge import physical_create
+ 
+ from dataclasses import dataclass, replace
+ from contextlib import contextmanager
+@@ -634,7 +636,7 @@
+                           context.get("api_mode") or "chat_completions", client, request)
+     from agent.bounded_summary_output import guard_format
+     guard_format(request, physical=True)
+-    return client.chat.completions.create(**request)
++    return physical_create(client, request)
+ 
+ 
+ def check_bounded_feasibility(agent: Any) -> bool:
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -8,6 +8,8 @@
+ """
+ 
+ from __future__ import annotations
++
++from agent.friday_baseline_bridge import physical_create
+ 
+ import contextlib
+ import contextvars
+@@ -788,7 +790,7 @@
+         _completions = getattr(getattr(agent.client, "chat", None), "completions", None)
+         if not callable(getattr(_completions, "prepare", None)):
+             api_kwargs.pop("_moa_prepared_request", None)
+-        return agent.client.chat.completions.create(**api_kwargs)
++        return physical_create(agent.client, api_kwargs)
+     request_client = make_client("chat_completion_request")
+     from agent.bounded_context import guard_main_request
+     guard_main_request(agent, api_kwargs, request_client)
+@@ -796,7 +798,7 @@
+     # request transform. No-op unless this really is the OpenAI SDK, so the
+     # MoA facade above and the suite's stand-in clients are unaffected.
+     api_kwargs = bypass_chat_sdk_request_transform(api_kwargs, request_client)
+-    return request_client.chat.completions.create(**api_kwargs)
++    return physical_create(request_client, api_kwargs)
+ 
+ 
+ def should_use_direct_api_call(agent) -> bool:
+@@ -3118,7 +3120,7 @@
+         guard_main_request(self.agent, stream_kwargs, request_client)
+         stream_kwargs = bypass_chat_sdk_request_transform(stream_kwargs, request_client)
+         self._budget_before_dispatch()
+-        return request_client.chat.completions.create(**stream_kwargs)
++        return physical_create(request_client, stream_kwargs)
+ 
+     def _chat_stream_created(self, raw_stream: Any) -> None:
+         response = self._attempt_stream_response = getattr(raw_stream, "response", None)
+--- /dev/null
++++ b/agent/friday_baseline_bridge.py
+@@ -0,0 +1,153 @@
++"""Optional idle-baseline bridge. This file is the only native addition.
++
++Friday remains available if the separately prepared baseline package breaks.
++No package installation, network, service, watcher or credential handling.
++"""
++from __future__ import annotations
++
++import functools
++import importlib
++import os
++from pathlib import Path
++import sys
++import uuid
++import hashlib
++
++BASELINE_ROOT = Path("/opt/friday-public-baseline")
++COORDINATOR = BASELINE_ROOT / "runs/.admission/PUBLIC_COORDINATOR_SLOT"
++ENV = "FRIDAY_BASELINE_COORDINATOR_DIR"
++
++
++def _fault(reason):
++    """Use the canonical slot even if an environment path is malformed."""
++    try:
++        if COORDINATOR.is_symlink():
++            return  # The baseline coordinator rejects this independently.
++        COORDINATOR.mkdir(parents=True, exist_ok=True, mode=0o700)
++        st = COORDINATOR.stat()
++        if st.st_uid != os.getuid() or st.st_mode & 0o077:
++            return  # Independently fails the background safe-directory check.
++        fd = os.open(COORDINATOR / "FAULT", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
++        try:
++            os.write(fd, ("friday_bridge:" + reason[:96] + "\n").encode())
++            os.fsync(fd)
++        finally:
++            os.close(fd)
++    except (Exception, SystemExit):
++        pass
++
++
++def _load():
++    try:
++        value = os.environ.get(ENV)
++        if not value:
++            # This finite native installation activates the one canonical
++            # admission slot for every ordinary client, including fresh CLI
++            # processes that did not inherit a gateway service environment.
++            value = str(COORDINATOR)
++            os.environ[ENV] = value
++        given = Path(value)
++        if given.is_symlink() or given.resolve() != COORDINATOR.resolve():
++            raise ValueError("noncanonical_coordinator")
++        # A protected owner home supplies the ancestor boundary. Do not chmod
++        # historical files merely to satisfy this reader.
++        for path in (BASELINE_ROOT, BASELINE_ROOT / "qpb", BASELINE_ROOT / "qpb/friday_adapter.py"):
++            if path.is_symlink() or path.stat().st_uid != os.getuid():
++                raise ValueError("foreign_baseline_path")
++        existing = sys.modules.get("qpb")
++        if existing is not None and Path(existing.__file__).resolve().parent != BASELINE_ROOT / "qpb":
++            raise ValueError("foreign_qpb_module")
++        root = str(BASELINE_ROOT)
++        if root not in sys.path:
++            sys.path.insert(0, root)
++        module = importlib.import_module("qpb.friday_adapter")
++        if Path(module.__file__).resolve() != BASELINE_ROOT / "qpb/friday_adapter.py":
++            raise ValueError("foreign_adapter_module")
++        return module
++    except (Exception, SystemExit) as exc:
++        _fault(type(exc).__name__)
++        return None
++
++
++def _call(name, *args, **kwargs):
++    module = _load()
++    if module is None:
++        return None
++    try:
++        result = getattr(module, name)(*args, **kwargs)
++        if (name == "begin" and result is None) or (name == "end" and result is False):
++            _fault(name + "_failed")
++        return result
++    except (Exception, SystemExit) as exc:
++        _fault(type(exc).__name__)
++        return None
++
++
++def physical_create(client, request):
++    module = _load()
++    if module is None:
++        return client.chat.completions.create(**request)
++    try:
++        callback = getattr(module, "physical_create")
++        if not callable(callback):
++            raise TypeError("physical_create unavailable")
++    except (Exception, SystemExit) as exc:
++        _fault(type(exc).__name__)
++        return client.chat.completions.create(**request)
++    # Do not catch-and-retry here: an exception can be the actual accepted
++    # model request's failure, which the original Friday caller must see.
++    return callback(client, request)
++
++
++def tracked(client):
++    def decorate(function):
++        @functools.wraps(function)
++        def wrapped(*args, **kwargs):
++            token = _call("begin", client, uuid.uuid4().hex)
++            try:
++                result = function(*args, **kwargs)
++            except BaseException:
++                _call("end", token, outcome_known=False)
++                raise
++            _call("end", token)
++            return result
++        return wrapped
++    return decorate
++
++
++def atracked(client):
++    def decorate(function):
++        @functools.wraps(function)
++        async def wrapped(*args, **kwargs):
++            token = _call("begin", client, uuid.uuid4().hex)
++            try:
++                result = await function(*args, **kwargs)
++            except BaseException:
++                _call("end", token, outcome_known=False)
++                raise
++            _call("end", token)
++            return result
++        return wrapped
++    return decorate
++
++
++def observe_worker(row):
++    _call("observe_worker", row)
++
++
++def start_worker(row):
++    _call("start_worker", row)
++
++
++def session_guard_change(adapter, session_key, old_guard, new_guard):
++    try:
++        group = hashlib.sha256(f"{os.getpid()}:{id(adapter)}:{session_key}".encode()).hexdigest()
++        pending = session_key in getattr(adapter, "_pending_messages", {})
++        runner = getattr(adapter, "gateway_runner", None)
++        if runner is not None and hasattr(runner, "_overflow_queue"):
++            pending = pending or bool(runner._overflow_queue(session_key))
++        _call("session_guard_change", group,
++              str(id(old_guard)) if old_guard is not None else None,
++              str(id(new_guard)) if new_guard is not None else None, pending)
++    except (Exception, SystemExit) as exc:
++        _fault("session_guard:" + type(exc).__name__)
+--- a/agent/turn_facade.py
++++ b/agent/turn_facade.py
+@@ -11,6 +11,7 @@
+ from typing import Any, Dict, List, Optional
+ 
+ from agent.lazy_forward import forward as _forward
++from agent.friday_baseline_bridge import tracked
+ 
+ # Same logger name as the origin module so log records / caplog filters are unchanged.
+ logger = logging.getLogger("run_agent")
+@@ -19,6 +20,7 @@
+ class TurnFacadeMixin:
+     """run_conversation()/chat() (see module docstring)."""
+ 
++    @tracked("friday-whole-turn")
+     def run_conversation(
+         self, user_message: Any, system_message: str=None,
+         conversation_history: List[Dict[str, Any]]=None, task_id: str=None,
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -1,4 +1,6 @@
+ """Base platform adapter interface; every platform adapter inherits from BasePlatformAdapter."""
++
++from agent.friday_baseline_bridge import session_guard_change
+ 
+ import asyncio
+ import contextlib
+@@ -3955,6 +3957,7 @@
+         if current_guard is None or (guard is not None and current_guard is not guard):
+             return
+         del self._active_sessions[session_key]
++        session_guard_change(self, session_key, current_guard, None)
+ 
+     def _session_task_is_stale(self, session_key: str) -> bool:
+         """True if the recorded owner task for ``session_key`` has exited. No owner task at all is
+@@ -3969,11 +3972,12 @@
+             return False
+         logger.warning("[%s] Healing stale session lock for %s (owner task is done/absent)",
+                        self.name, session_key)
+-        self._active_sessions.pop(session_key, None)
++        _baseline_old_guard = self._active_sessions.pop(session_key, None)
+         self._pending_messages.pop(session_key, None)
+         self._requeue_counts.pop(session_key, None)
+         self._session_tasks.pop(session_key, None)
+         self._discard_text_debounce(session_key)
++        session_guard_change(self, session_key, _baseline_old_guard, None)
+         return True
+ 
+     def _start_session_processing(self, event: MessageEvent, session_key: str, *,
+@@ -3982,6 +3986,7 @@
+         ``create_task`` is stubbed with a non-Task sentinel (tests), the guard is rolled back
+         (False)."""
+         guard = interrupt_event or asyncio.Event()
++        session_guard_change(self, session_key, self._active_sessions.get(session_key), guard)
+         self._active_sessions[session_key] = guard
+         task = asyncio.create_task(self._process_message_background(event, session_key))
+         if not self._track_session_task(session_key, task):
+@@ -4051,6 +4056,7 @@
+         logger.debug("[%s] Command '/%s' bypassing active-session guard for %s", self.name, cmd, session_key)
+         current_guard = self._active_sessions.get(session_key)
+         command_guard = asyncio.Event()
++        session_guard_change(self, session_key, current_guard, command_guard)
+         self._active_sessions[session_key] = command_guard
+         try:
+             # Send BEFORE cancelling so cancellation side effects can't drop the "/new"
+@@ -4061,6 +4067,7 @@
+             # On failure restore the original guard so the session isn't left half-reset.
+             if self._active_sessions.get(session_key) is command_guard:
+                 if session_key in self._session_tasks and current_guard is not None:
++                    session_guard_change(self, session_key, command_guard, current_guard)
+                     self._active_sessions[session_key] = current_guard
+                 else:
+                     self._release_session_guard(session_key, guard=command_guard)
+@@ -4645,6 +4652,7 @@
+                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
+         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
++        session_guard_change(self, session_key, self._active_sessions.get(session_key), interrupt_event)
+         self._active_sessions[session_key] = interrupt_event
+         _thread_metadata = _thread_metadata_for_event(event)
+         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -20,6 +20,7 @@
+ from pathlib import Path
+ 
+ from agent.i18n import t
++from agent.friday_baseline_bridge import atracked
+ from gateway.config import Platform
+ from gateway.platforms.base import EphemeralReply
+ from gateway.platforms.event import MessageEvent, MessageType
+@@ -1293,6 +1294,7 @@
+             logger.debug("FIFO orphan rescue pre-claim failed for %s", _quick_key, exc_info=True)
+             return event, source, is_internal
+ 
++    @atracked("friday-inbound-pending")
+     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+         """Handle an incoming message from any platform: auth → command check → running-agent
+         interrupt → get/create session → build context → run agent → return response."""
