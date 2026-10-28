@@ -84,3 +84,16 @@ At the 2026-10-28 18:49 MSK snapshot, the separate v2 qualification1200 was runn
 ## Delta: v2 qualification reached native route, retained-container guard refused
 
 The actual v2 qualification subsequently passed native budget admission with 964.15 seconds remaining. It started the dedicated daemon and recorded policy attestations, then refused the retained-container plan/owner compatibility check before worker-container creation or key preparation. The exact compatibility correction is under investigation. The new route and daemon were stopped and reconciled; the operator session was revoked. This is a closed failed qualification, not a successful worker run or user result. Its clock is not resumed. The older unknown user effect remains preserved and is not replayed. Permanent gateway and Dashboard continue running.
+
+
+## Delta: Source76 retained-owner repair and separate runtime transition
+
+Source76 is now installed and source-accepted in a fresh native process: two worker plugins changed, with no native-tree file change. A separate actual operation replaced one external A0 runtime file and passed fresh verification in 38.050 seconds. The installed source, actual runtime transition and A0 user acceptance remain separate facts.
+
+The retained-owner correction applies only to an authenticated operator initial probe with empty conversation fields and an exact native task/session join. Ordinary user work preserves exact conversation isolation. The new source/helper pins authenticate the current runtime and retain the historical conversion boundary; no model or configuration setting changed.
+
+The previous qualification1200 is closed: the retained-owner guard refused it, the daemon and route were stopped, and the operator session was revoked before worker-container or key creation. The next bounded qualification has a distinct v3 request/grant tied to that closure and the changed consumer. Neither the closed clock nor the older UNKNOWN user effect is replayed. The [minimal semantic patches and observed boundaries](source76-retained-owner/README.md) separate source checks, installation and the actual one-file transition.
+
+At this snapshot, no subsequent A0 qualification or genuine A0 engineering file, checked Telegram delivery and contextual continuation is accepted. The prior accepted DSH file, delivery and continuation remain preserved. Permanent service readiness is tracked separately by the integrator; this export makes no service-readiness claim.
+
+Source76 follow-through: the installed current-state check passed and permanent gateway/Dashboard are verified. A local startup JSON/source-reader mismatch was repaired without repeating installation. The corrected qualification is running; the A0 user result remains unaccepted. The existing baseline run yielded at 176/673, errors=0.
