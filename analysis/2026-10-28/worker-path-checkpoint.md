@@ -110,3 +110,19 @@ The [Source77 archival semantic delta](source77-legacy-conversion/README.md) res
 Source controls passed: 59 adapter cases, 25 private-glue cases, 21 reused closed-boundary checks and 10 boot-delta checks. The final package and real-namespace source gate passed separately. The profiled actual outer `runtime480` diagnostic was CPU-killed with exit 137 before completion; no completion proof was produced. Prior Source76 runtime evidence is retained only within its original scope. No Source77 product qualification has run at this snapshot, and this export makes no new permanent-service-readiness claim.
 
 The accepted DSH-produced file, Telegram delivery and contextual continuation remain preserved. A genuine A0 engineering file, checked Telegram delivery and contextual continuation remain unaccepted.
+
+
+## Delta: Source78 installed; saved probe cleanup closed, metadata and A0 result pending
+
+Source78 is installed and source-accepted in a fresh process. Two worker plugins changed; the native tree and external A0 runtime were retained. See the [complete archival semantic deltas](source78-same-observation/README.md) for exact-observation completion and single strict verification with preserved proof shape and mutation isolation.
+
+The Source77 inner no-model startup probe reported `NO_MODEL_STARTUP_PROBE_PASS` and completed its web check. The qualifier then raised `StopUnconfirmed` during teardown: the container stopped, native unit stop returned an error, and no final qualified receipt was returned. A separate exact cleanup subsequently removed the target container and introduced keys, confirmed resource cessation, and preserved the foreign stopped container and source credentials. Original failure, request, clock and observation remain unchanged; no probe was replayed and historical UNKNOWN is not resolved by this cleanup.
+
+Metadata completion, the ordinary final qualified receipt and genuine A0 file/delivery/continuation remain pending. Root identified a saved-request verifier mismatch between the historical Source77 and current Source78 markers; a separate Source79 correction is pending, without new acceptance. Source-only checks are not a user result or a native latency measurement. The accepted DSH file/delivery/continuation is preserved without repetition. Permanent service restoration is separate; this snapshot makes no new service-readiness claim.
+
+
+## Delta: Source79 historical-reference correction installed
+
+Source79 is installed and source-accepted in a fresh process. The [historical-reference delta](source79-history-binding/README.md) binds the exact consumed Source77 request to its original corrected-conversion verifier and source acceptance, while keeping the current installed verifier as a separate authority. The full actual marker/history/native-CAS/historical-source chain passed with four negative controls. Source78's strict-proof reduction and saved-observation/resource-closure work remain preserved.
+
+Two worker plugin files changed; the native tree and existing external A0 runtime were retained. This supersedes the earlier Source78 entry's pending-source-fix status only. Metadata completion, final qualified receipt and genuine A0 file/delivery/continuation remain pending. Gateway/dashboard restoration is in progress, with no new service-readiness claim here. Accepted DSH results are preserved without repetition; the old clock, failure and observation remain unchanged and historical UNKNOWN remains unresolved.
