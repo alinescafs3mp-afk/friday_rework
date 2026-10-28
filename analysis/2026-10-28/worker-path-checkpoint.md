@@ -126,3 +126,12 @@ Metadata completion, the ordinary final qualified receipt and genuine A0 file/de
 Source79 is installed and source-accepted in a fresh process. The [historical-reference delta](source79-history-binding/README.md) binds the exact consumed Source77 request to its original corrected-conversion verifier and source acceptance, while keeping the current installed verifier as a separate authority. The full actual marker/history/native-CAS/historical-source chain passed with four negative controls. Source78's strict-proof reduction and saved-observation/resource-closure work remain preserved.
 
 Two worker plugin files changed; the native tree and existing external A0 runtime were retained. This supersedes the earlier Source78 entry's pending-source-fix status only. Metadata completion, final qualified receipt and genuine A0 file/delivery/continuation remain pending. Gateway/dashboard restoration is in progress, with no new service-readiness claim here. Accepted DSH results are preserved without repetition; the old clock, failure and observation remain unchanged and historical UNKNOWN remains unresolved.
+
+
+## Delta: Source80 installed; permanent services verified, A0 result pending
+
+Source80 is installed and source-accepted in a fresh process; two worker plugins changed, while the native tree and external A0 runtime were retained. The [observation-pins and storage-reader projections](source80-observation-pins/README.md) preserve the original Source77 observation while checking current source authority and the full historical acceptance chain. The pinned canonical storage reader supplies the missing native read-only API within a narrowly scoped module namespace.
+
+Six focused observation controls passed. Root separately passed the full actual converted-config input and observation consumers. Earlier incorrect-checker failures and the bounded no-output attempt remain recorded as unsuccessful observations. The saved no-model probe, original StopUnconfirmed, exact cleanup, original clock and historical UNKNOWN remain unchanged; nothing was replayed.
+
+Gateway and Dashboard are verified as running permanent services. The earlier Source79 metadata attempt failed before metadata writes and revoked its authorization. Source80 metadata completion is in progress; no final qualified receipt, worker readiness or A0 file/delivery/continuation is accepted here. The accepted DSH result remains preserved. This updates the earlier entries' source and service status, without changing their historical observations.
