@@ -1,6 +1,6 @@
 # Worker path checkpoint — 2026-10-28
 
-This is a factual integration checkpoint, not full-product readiness.
+This is a factual integration checkpoint, not full-product readiness. Sections are chronological; the final delta gives the latest installed and user-result state.
 
 The coding path retains a genuine DSH-produced file, checked contents, Telegram delivery and a completed contextual continuation. That accepted result was not rerun.
 
@@ -44,3 +44,18 @@ The earlier A0 admission failed before any outbound intent. Its zero-send canoni
 Root’s first installer call found a missing required private work directory before locks, beforeimage, intent or replacement. Source custody still matched the old installed bytes. Root created only that input and completed the same stage within its original clock; no installed or unknown effect was replayed. A separate genuine A0 continuation has now been sent and observed at native ingress. Its full 600-second capture is running; no A0 worker artifact, delivery or contextual follow-up is accepted at this checkpoint. DSH’s already accepted worker file and contextual follow-up are preserved.
 
 The owner separately authorized adapting the existing compression endpoint from 40,960 to its reported 65,536 context. The coherent credential/config/postboot source delta has isolated checks and independent review, but the capacity transition is not installed. The current A0 attempt retains its admitted snapshot. Source/config successor and the next safe maintenance boundary are being prepared without repeating worker qualification or changing the main model’s 262,144 context.
+
+
+## Delta: installed Source72 and Source73, native preflight still incomplete
+
+Source72 and then Source73 were actually installed and source-accepted in fresh native processes. Their acceptance record digests are `b5f2e97b9e4915c2cfe2b407053706f230cfb728857b196ee62f0550399aac48` and `f7bdb6976f0451031f69b9b107f267f14d7f1cf2291fb779d0a68e494c3c85bd`. Source73 updates the two worker plugins while retaining the native tree. These are installed source facts, not A0 runtime or user-result acceptance. The earlier Source6 and pending-context paragraphs describe earlier points in this day's sequence.
+
+The first qualification carrier was refused before operation creation, a clock, intent, authentication or worker work: `/usr/bin/timeout` resolved to Rust uutils. The narrow correction selects the existing GNU `/usr/bin/gnutimeout` while preserving exact executable/argument checks and the original budget contract. A subsequent GNU-carried attempt created preparation files and an original clock, then failed at native preflight before runner intent, authentication or worker work.
+
+Repair of that preflight path exposed two history API mismatches. The historical wrapper incorrectly treated the selected native verifier's zero-argument `module()` factory as a two-argument loader. A retained `source_proof` wrapper also incorrectly required an argument where the original API allowed `None`. Source73 carries both corrections with authenticated parent and digest checks preserved. The [minimal diagnostic source export](native-history-carrier/README.md) records the exact patch provenance and the scope of the existing narrow checks.
+
+Fresh actual Source73 `current480` preflight subsequently failed: the retained runtime refers to its immutable Source71 acceptance, while the successor admitted only its immediate Source72 parent or current Source73 acceptance. This is a separate authenticated-ancestry gap. Source73 installed source acceptance remains valid; its actual native preflight did **not** pass. Source74 is being developed for that gap and is not claimed ready, installed or accepted. Original failures, preparation files and clocks remain preserved; closed or uncertain effects were not replayed.
+
+After Source73 maintenance, the permanent gateway and Dashboard were restored and separately verified: Telegram connected and the Dashboard returned CA-verified HTTPS 200. The current compression context is 65,536; the Source72/73 source operations did not change model or configuration settings. Service readiness does not establish worker readiness or a new baseline certification. Healthy permanent services remain independent of worker test windows.
+
+The accepted DSH-produced file, Telegram delivery and contextual continuation remain accepted and were not repeated. A read-only reconciliation also confirmed that the input-map and keyless-web alias fixes were already installed; the earlier not-installed backlog labels were stale. This does not claim live web retrieval acceptance. The A0 engineering file and contextual continuation remain unaccepted. The retained baseline's latest observation remains idle; its two foreground interruptions were confirmed against the original event stream, without a technical error. No new A0 user outcome or baseline certification is claimed.
