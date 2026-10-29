@@ -1,0 +1,973 @@
+diff --git a/hermes-agent/agent/context_compressor.py b/hermes-agent/agent/context_compressor.py
+index 3551e067878b7472048149a5f2a75d32ed114a84..4f1b06e87ee7445379780f4a97fbbf0a015507f4 100644
+--- a/hermes-agent/agent/context_compressor.py
++++ b/hermes-agent/agent/context_compressor.py
+@@ -970,7 +970,8 @@ _LEAN_TAIL_DEMOTE_MIN_CHARS = 1_500
+ 
+ def _lean_recovery_stub(tool_name: str, content_len: int, session_id: str) -> str:
+     """One-line replacement for a demoted tail tool result."""
+-    hint = f" Recover with session_search(query=..., session_id='{session_id}')" if session_id else ""
++    hint = (f" Recover with session_search(query=..., role_filter='user,assistant,tool'), then scroll the hit for session '{session_id}' "
++            "using its match_message_id.") if session_id else ""
+     return (
+         f"[{tool_name or 'tool'} output demoted at compaction — {content_len:,} "
+         f"chars preserved in session history.{hint}]"
+@@ -1032,8 +1033,9 @@ def _build_recovery_footer(session_id: str, region_len: int) -> str:
+         "session history. If you need any detail this summary does not carry "
+         "(exact command output, file contents, error text, earlier "
+         "reasoning), recover it with: "
+-        f"session_search(query='<keywords>', session_id='{session_id}') — "
+-        "do not guess at lost specifics when you can look them up."
++        "session_search(query='<keywords>', role_filter='user,assistant,tool'), then select the result for "
++        f"session '{session_id}' and scroll with session_search(session_id='<returned session_id>', "
++        "around_message_id=<match_message_id>). Do not guess at lost specifics when you can look them up."
+     )
+ 
+ 
+diff --git a/hermes-agent/agent/inline_tool_executors.py b/hermes-agent/agent/inline_tool_executors.py
+index 4ab27172cd10f0c143267aadfdfca59564a81a2d..3d5c27a95f79547212fdfde06e15e5f9a46ec845 100644
+--- a/hermes-agent/agent/inline_tool_executors.py
++++ b/hermes-agent/agent/inline_tool_executors.py
+@@ -156,7 +156,7 @@ def _session_search(agent, args: dict, ctx: InlineToolContext) -> Any:
+             ("session_id", "session_id"), ("around_message_id", "around_message_id"),
+             ("window", "window", 5), ("sort", "sort"), ("profile", "profile"),
+             ("detail", "detail", "adaptive"), ("after", "after"), ("before", "before"),
+-            ("exclude_session_ids", "exclude_session_ids"),
++            ("exclude_session_ids", "exclude_session_ids"), ("content_offset", "content_offset", 0),
+         ),
+         db=session_db, current_session_id=agent.session_id,
+     )
+diff --git a/hermes-agent/gateway/run_busy.py b/hermes-agent/gateway/run_busy.py
+index 3f5769fb2b9e5e1776dece5dd00dec9d7627f46e..8560bcf2cb4ca66477cdc601d1dcd9792b7dc462 100644
+--- a/hermes-agent/gateway/run_busy.py
++++ b/hermes-agent/gateway/run_busy.py
+@@ -405,8 +405,11 @@ class GatewayBusySessionMixin:
+             getattr(existing, "message_type", None),
+             getattr(event, "message_type", None),
+         }
++        from gateway.session_identity import requires_original_source
+         if (
+             same_security_context
++            and (event.internal or not requires_original_source(event.source))
++            and (existing.internal or not requires_original_source(existing.source))
+             and MessageType.PHOTO in merge_types
+             and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
+         ):
+@@ -859,6 +862,7 @@ class GatewayBusySessionMixin:
+             event.message_type == MessageType.TEXT
+             and self._effective_busy_text_mode(event.source) == "queue"
+             and effective_mode != "steer"
++            and getattr(event.source, '_friday_user_scope', None) is None
+         ):
+             return False
+ 
+diff --git a/hermes-agent/gateway/run_plugin_delivery.py b/hermes-agent/gateway/run_plugin_delivery.py
+index fe0e4b5ee2a1f8388821ba7a3b35a6205c0bb03e..5975f4def8ab6ba1ddb2a2b1498617027e0c3223 100644
+--- a/hermes-agent/gateway/run_plugin_delivery.py
++++ b/hermes-agent/gateway/run_plugin_delivery.py
+@@ -75,7 +75,7 @@ def resolve_document_route(runner, context, route):
+     return source, adapter
+ 
+ 
+-async def deliver_document(runner, context, *, route, data, file_name, caption, timeout):
++async def deliver_document(runner, context, *, route, data, file_name, caption, timeout, authority_check=None):
+     if (type(data) is not bytes or not isinstance(file_name, str) or not file_name
+             or len(file_name) > 255 or any(ord(c) < 32 or c in "/\\" for c in file_name)
+             or file_name in {".", ".."} or (caption is not None and not isinstance(caption, str))
+@@ -83,6 +83,7 @@ async def deliver_document(runner, context, *, route, data, file_name, caption,
+             or not math.isfinite(timeout) or timeout <= 0):
+         return {"state": "FAILED", "error": "invalid_document"}
+     try:
++        route = freeze_route(route)
+         source, adapter = resolve_document_route(runner, context, route)
+     except Exception:  # health: allow BLE001 -- This route refusal precedes every send; safe to retry only after configuration repair.
+         return {"state": "FAILED", "error": "gateway_document_route_rejected"}
+@@ -94,10 +95,18 @@ async def deliver_document(runner, context, *, route, data, file_name, caption,
+         "bytes": len(data), "file_name": file_name, "bot_id": route["bot_id"],
+         "chat_id": source.chat_id, "thread_id": source.thread_id, "reply_to": source.message_id,
+     }
++    def check():
++        if authority_check is not None:
++            authority_check()
++        if resolve_document_route(runner, context, route)[1] is not adapter:
++            raise ValueError('original_adapter_replaced')
++    metadata = _thread_metadata_for_source(source, source.message_id) or {}
++    metadata['_friday_document_authority'] = (check, freeze_route(route))
+     try:
++        check()
+         result = await asyncio.wait_for(adapter.send_document_bytes(
+             source.chat_id, data, file_name=file_name, caption=caption, reply_to=source.message_id,
+-            metadata=_thread_metadata_for_source(source, source.message_id)), timeout)
++            metadata=metadata), timeout)
+     except Exception:  # health: allow BLE001 -- Transport failures may have committed; never expose SDK error text or traceback.
+         return {"state": "UNKNOWN", "error": "document_ack_unavailable", **expected}
+     proof = result.raw_response if isinstance(result, SendResult) else None
+@@ -224,46 +233,53 @@ def _begin_ordinary_document(cap, relative, data, route, file_name):
+     return state, selection, value
+ 
+ 
++def _ordinary_authority(adapter, source):
++    """Retain the admitted ingress and recheck its live authority at the SDK boundary."""
++    from types import SimpleNamespace
++    from hermes_cli.friday_user_scope import current, ordinary_file_source
++    from gateway.session_identity import identity_of
++    cap = current(required=True)
++    route = freeze_route(getattr(source, '_friday_document_route', None))
++    runner = getattr(adapter, 'gateway_runner', None)
++    context = SimpleNamespace(_manager=SimpleNamespace(home_path=cap.home))
++    def check():
++        cap.check()
++        identity = identity_of(source)
++        if (current(required=True) is not cap or ordinary_file_source() is not source
++                or source.platform != Platform.TELEGRAM or identity is None or identity.transport_inferred
++                or identity.runtime_home != cap.home or identity.runtime_profile != cap.profile
++                or identity.transport_profile != cap.principal[1] or source.user_id != cap.principal[3]
++                or runner is None or getattr(adapter, 'gateway_runner', None) is not runner
++                or str(getattr(getattr(adapter, '_bot', None), 'id', '')) != cap.principal[2]):
++            raise ValueError('original_source_required')
++        actual = freeze_route({'transport_profile': identity.transport_profile,
++            'runtime_profile': cap.profile, 'bot_id': cap.principal[2],
++            'source': {'platform': source.platform.value, **{key: getattr(source, key) for key in
++                ('chat_id', 'chat_type', 'user_id', 'thread_id', 'message_id')}}})
++        if actual != route or freeze_route(getattr(source, '_friday_document_route', None)) != route:
++            raise ValueError('native_original_route_required')
++        if resolve_document_route(runner, context, route)[1] is not adapter:
++            raise ValueError('original_adapter_replaced')
++    check()
++    return cap, runner, context, freeze_route(route), check
++
++
+ async def deliver_ordinary_document(adapter, source, path, *, caption=None, file_name=None):
+     """Managed ordinary MEDIA uses the plugin's exact original-route byte send.
+ 
+     No worker, synthetic task or product activation is introduced. The native
+     source capability authorizes the own workspace, bot and original reply.
+     """
+-    from types import SimpleNamespace
+     from pathlib import Path
+-    from hermes_cli.friday_user_scope import current, ordinary_file_source, workspace_document
+-    from gateway.session_identity import identity_of
++    from hermes_cli.friday_user_scope import workspace_document
+     from gateway.platforms.base import SendResult
+     try:
+-        cap = current(required=True)
+-        if ordinary_file_source() is not source or source.platform != Platform.TELEGRAM:
+-            raise ValueError('original_source_required')
+-        identity = identity_of(source)
+-        runner = getattr(adapter, 'gateway_runner', None)
+-        if (identity is None or identity.transport_inferred or identity.runtime_home != cap.home
+-                or identity.runtime_profile != cap.profile or identity.transport_profile != cap.principal[1]
+-                or source.user_id != cap.principal[3] or runner is None
+-                or str(getattr(getattr(adapter, '_bot', None), 'id', '')) != cap.principal[2]):
+-            raise ValueError('original_source_required')
+-        route = freeze_route({'transport_profile': identity.transport_profile,
+-                              'runtime_profile': cap.profile, 'bot_id': cap.principal[2],
+-                              'source': {key: getattr(source, key) for key in
+-                                  ('chat_id', 'chat_type', 'user_id', 'thread_id', 'message_id')} |
+-                                        {'platform': source.platform.value}})
+-        retained = getattr(source, '_friday_document_route', None)
+-        if retained is None or freeze_route(retained) != route:
+-            raise ValueError('native_original_route_required')
+-        route = freeze_route(retained)
+-        context = SimpleNamespace(_manager=SimpleNamespace(home_path=cap.home))
+-        _, live_adapter = resolve_document_route(runner, context, route)
+-        if live_adapter is not adapter:
+-            raise ValueError('original_adapter_replaced')
++        cap, runner, context, route, check = _ordinary_authority(adapter, source)
+         if caption is not None:
+             from hermes_cli.friday_user_scope import guard_gateway_reply
+             guarded, blocked = guard_gateway_reply(source, caption)
+             if blocked or guarded != caption or not _ordinary_caption_fits(caption):
+-                raise ValueError('ordinary_caption_rejected')
++                return SendResult(success=False, error='gateway_document_caption_rejected')
+         data, relative = workspace_document(path)
+         name = file_name or Path(relative).name
+         if (not isinstance(name, str) or not name or len(name) > 255
+@@ -280,7 +296,7 @@ async def deliver_ordinary_document(adapter, source, path, *, caption=None, file
+         cap.check()
+         await _ordinary_transcript(runner, session_id, relative, 'UNKNOWN', hashlib.sha256(data).hexdigest())
+         receipt = await deliver_document(runner, context, route=route, data=data,
+-                                         file_name=name, caption=caption, timeout=30)
++                                         file_name=name, caption=caption, timeout=30, authority_check=check)
+         cap.check()
+         if receipt.get('state') != 'DELIVERED':
+             return SendResult(success=False, error='document_delivery_UNKNOWN')
+@@ -328,24 +344,87 @@ async def deliver_ordinary_files(adapter, source, paths, *, record_delivery=None
+     for path in paths:
+         result = await deliver_ordinary_document(adapter, source, path, caption=caption)
+         if record_delivery is not None: record_delivery(result)
+-        if not result.success and not (caption is not None
+-                and result.error == 'gateway_document_preflight_rejected'):
+-            # A caption preflight refusal authorizes no outbound warning either.
+-            # Ordinary conversation receives the uncertainty too, including the
+-            # streaming path whose textual final has already been delivered.
+-            notify = getattr(adapter, 'emit_warning', None)
+-            if callable(notify):
+-                from gateway.platforms.base import _thread_metadata_for_source
+-                try:
+-                    await notify(source.chat_id,
+-                        'Доставка файла не подтверждена (UNKNOWN) или отклонена до отправки. '
+-                        'Не отправляю его повторно без проверки результата.',
+-                        metadata=_thread_metadata_for_source(source, source.message_id))
+-                except Exception:
+-                    pass
++        if not result.success and result.error != 'gateway_document_caption_rejected':
++            # A requested file's outcome is an ordinary reply, independently of
++            # optional diagnostic suppression. Its own uncertain effect is fenced.
++            await _ordinary_document_outcome(adapter, source, path, record_delivery)
+     return True
+ 
+ 
++async def _ordinary_document_outcome(adapter, source, path, record_delivery):
++    import copy
++    import os
++    from hermes_cli.plugins_state import PluginState
++    from hermes_cli.friday_native_state import encoded
++    from gateway.platforms.base import SendResult, _thread_metadata_for_source
++    try:
++        cap, runner, _, route, check = _ordinary_authority(adapter, source)
++        session_id = getattr(source, '_friday_document_session_id', None)
++        if not isinstance(session_id, str) or not session_id:
++            return
++        path_key = os.path.normpath(os.path.join(str(cap.home / 'workspace'), os.fspath(path)))
++        outcome_id = hashlib.sha256(encoded([cap.key, path_key, route])).hexdigest()
++        marker = encoded({'schema': 'friday.ordinary-document-outcome.v1',
++                          'outcome_id': outcome_id, 'route': route, 'state': 'PENDING'})
++        state = PluginState('friday_rework')
++        previous = state.get(_ORDINARY_DOCUMENTS)
++        if previous is not None and (not isinstance(previous, dict)
++                or previous.get('schema') != _ORDINARY_DOCUMENTS or not isinstance(previous.get('files'), dict)):
++            return
++        value = copy.deepcopy(previous) if previous is not None else {'schema': _ORDINARY_DOCUMENTS, 'files': {}}
++        outcomes = value.setdefault('outcomes', {})
++        if (not isinstance(outcomes, dict) or outcome_id in outcomes or len(outcomes) >= 10000
++                or (state.data_dir / ('friday-unknown-' + hashlib.sha256(marker).hexdigest() + '.json')).exists()):
++            return
++        outcomes[outcome_id] = {'state': 'PENDING', 'route': route}
++        check()
++        _ordinary_commit(state, value, previous, journals=(('unknown', marker),))
++    except Exception:
++        return
++    result = SendResult(success=False, error='document_outcome_UNKNOWN')
++    status = 'UNKNOWN'
++    try:
++        await _ordinary_outcome_transcript(runner, session_id, 'PENDING')
++        metadata = _thread_metadata_for_source(source, source.message_id) or {}
++        metadata['_friday_document_outcome'] = (check, freeze_route(route))
++        check()
++        sent = await asyncio.wait_for(adapter.send(route['source']['chat_id'],
++            'Доставка файла не подтверждена (UNKNOWN) или отклонена до отправки. '
++            'Не отправляю его повторно без проверки результата.',
++            reply_to=route['source']['message_id'], metadata=metadata), 30)
++        if isinstance(sent, SendResult):
++            message_id = sent.message_id
++            confirmed = (sent.success is True and isinstance(message_id, str) and message_id.isascii()
++                         and message_id.isdecimal() and int(message_id) > 0)
++            status = ('CONFIRMED' if confirmed else 'UNKNOWN' if sent.error == 'document_outcome_UNKNOWN'
++                      or sent.success is not False else 'FAILED')
++            result = SendResult(success=confirmed, message_id=message_id if confirmed else None,
++                                error=None if confirmed else 'document_outcome_' + status)
++    except Exception:
++        result = SendResult(success=False, error='document_outcome_UNKNOWN')
++    if record_delivery is not None:
++        record_delivery(result)
++    try:
++        check()
++        candidate = copy.deepcopy(value)
++        candidate['outcomes'][outcome_id]['state'] = status
++        receipt = encoded({'schema': 'friday.ordinary-document-outcome.v1',
++                           'outcome_id': outcome_id, 'route': route, 'state': status})
++        _ordinary_commit(state, candidate, value, journals=(('candidate', receipt),))
++        await _ordinary_outcome_transcript(runner, session_id, status)
++    except Exception:
++        # PENDING is durable and blocks another status when acknowledgement or
++        # custody cannot be confirmed. Never trade that fence for a retry.
++        return
++
++
++async def _ordinary_outcome_transcript(runner, session_id, state):
++    import time
++    await runner.async_session_store.append_to_transcript(session_id,
++        {'role': 'assistant', 'content': '', 'timestamp': time.time(), 'display_kind': 'hidden',
++         'display_metadata': {'friday_file_delivery_observation': {'outcome': {'state': state}}}})
++
++
+ async def _ordinary_transcript(runner, session_id, relative, state, digest):
+     """Keep host evidence out of assistant prose, retaining safe follow-up context.
+ 
+diff --git a/hermes-agent/gateway/run_topics.py b/hermes-agent/gateway/run_topics.py
+index 2d01dee33a1a183a8122a1cebef72fb6cdf33ffd..f80a016f6d9ac9404075e00f849a044ae2dbc1dd 100644
+--- a/hermes-agent/gateway/run_topics.py
++++ b/hermes-agent/gateway/run_topics.py
+@@ -167,6 +167,12 @@ class GatewayTopicThreadsMixin:
+         """Pin lobby-shaped topic-mode DM replies (missing ``message_thread_id`` or General) to the
+         user's most-recent bound topic. Never rewrite a non-lobby, unbound thread id: a brand-new DM
+         topic is also "unknown" until its first message is recorded. None = leave the source alone."""
++        from gateway.session_identity import requires_original_source
++        if requires_original_source(source):
++            # Managed history and file delivery keep the actual SDK lane. Real
++            # topic messages still work; the existing lobby guidance handles a
++            # topic-mode DM without a topic instead of silently retargeting it.
++            return None
+         if (
+             not self._is_telegram_dm(source) or not source.chat_id or not source.user_id
+             or not self._telegram_topic_mode_enabled(source)
+diff --git a/hermes-agent/gateway/run_turn.py b/hermes-agent/gateway/run_turn.py
+index d90a993dc2a8f833dd173629c92d2d71286a128d..6b8d139b6f0cee567b29adca0c52f0b7873ee070 100644
+--- a/hermes-agent/gateway/run_turn.py
++++ b/hermes-agent/gateway/run_turn.py
+@@ -3694,6 +3694,26 @@ class GatewayTurnMixin:
+         )
+         pending_event = None
+         pending = None
++        if (result and adapter and session_key and not self._draining
++                and getattr(source, '_friday_user_scope', None) is not None
++                and not (result.get('pending_steer') or '').strip()):
++            # A human managed event must retain its own admitted source through
++            # session resolution AND final caption/file delivery. The recursive
++            # lane skips that binding and returns its final to the first event's
++            # reply anchor. Let the adapter's existing post-delivery drain run
++            # the intact event in this same conversation instead.
++            slot = getattr(adapter, '_pending_messages', None)
++            if isinstance(slot, dict):
++                queued = slot.get(session_key)
++                if queued is None:
++                    queued = self._promote_queued_event(session_key, adapter, None)
++                    if queued is not None:
++                        slot[session_key] = queued
++                queued_source = getattr(queued, 'source', None)
++                if (queued is not None and not queued.internal
++                        and getattr(queued_source, 'platform', None) == Platform.TELEGRAM
++                        and getattr(queued_source, '_friday_user_scope', None) is not None):
++                    return None, None
+         if result and adapter and session_key:
+             pending_event = _dequeue_pending_event(adapter, session_key)
+             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
+diff --git a/hermes-agent/gateway/session_identity.py b/hermes-agent/gateway/session_identity.py
+index aba8789b506c8a05f05c6ad4310bbf9c7041e7ed..2733aa8b513cafeb61f0cd23475472ba1822bf69 100644
+--- a/hermes-agent/gateway/session_identity.py
++++ b/hermes-agent/gateway/session_identity.py
+@@ -91,6 +91,28 @@ def identity_of(source: Any) -> Optional[RoutingIdentity]:
+     return identity if isinstance(identity, RoutingIdentity) else None
+ 
+ 
++def requires_original_source(source: Any) -> bool:
++    """Preserve managed ingress shape before admission; this grants no authority.
++
++    A declared isolated runtime needs the real SDK event for later file proof.
++    Never recover a different thread or merge transport messages on its behalf.
++    Unknown policy preserves the input; normal admission still has to succeed.
++    """
++    if getattr(source, "_friday_user_scope", None) is not None:
++        return True
++    identity = identity_of(source)
++    if identity is None:
++        return False
++    try:
++        from hermes_cli.friday_user_scope import policy
++        active = policy(identity.authorization_home)
++        return active is not None and any(
++            row["runtime_profile"] == identity.runtime_profile
++            for row in active["bindings"])
++    except Exception:  # Policy failure must not authorize an irreversible source rewrite.
++        return True
++
++
+ def clear_identity(source: Any) -> None:
+     """Drop the pinned identity AND the routed runtime profile so the next :func:`canonical_identity`
+     re-routes from scratch — for sources a caller reuses across events whose routing may differ (a
+diff --git a/hermes-agent/hermes_cli/friday_workspace_docx.py b/hermes-agent/hermes_cli/friday_workspace_docx.py
+index 7a6b1c65faca1c5fe1b837610d9d2e991e6baf59..cebe72ce28c1f489c22a7ed23454f5261491af5b 100644
+--- a/hermes-agent/hermes_cli/friday_workspace_docx.py
++++ b/hermes-agent/hermes_cli/friday_workspace_docx.py
+@@ -187,6 +187,9 @@ def _check_parent(cap, fd, path):
+             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fresh)
+             os.close(fresh)
+             fresh = child
++            info = os.fstat(fresh)
++            if info.st_uid != os.getuid() or info.st_mode & 0o077:
++                raise ScopeDenied()
+         named, held = os.fstat(fresh), os.fstat(fd)
+         if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
+             raise ScopeDenied()
+diff --git a/hermes-agent/hermes_cli/friday_workspace_revision.py b/hermes-agent/hermes_cli/friday_workspace_revision.py
+index 6fa5d4b2933f5c2998724d7c80b5c19cfad5fb8d..2e39b6a80df954c93c8801bff24cb9cc0b135472 100644
+--- a/hermes-agent/hermes_cli/friday_workspace_revision.py
++++ b/hermes-agent/hermes_cli/friday_workspace_revision.py
+@@ -246,15 +246,14 @@ def write(cap,fd,leaf,path,content,task_id):
+                     except FileNotFoundError: pass
+                     else: return _failure('file_revision_reconciliation_required',name[len('.friday-before-'):],True)
+                 finally: os.close(archive_fd)
+-            try:
+-                item=os.open(leaf,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)
+-            except FileExistsError: item=None
+-            if item is not None:
+-                with os.fdopen(item,'wb') as stream:
+-                    stream.write(data);stream.flush();os.fsync(stream.fileno())
+-                check(cap)
+-                return json.dumps({'success':True,'path':path,'bytes_written':len(data),
+-                    'scope':'own_user_workspace','create_only':True})
++            try: os.stat(leaf,dir_fd=fd,follow_symlinks=False)
++            except FileNotFoundError:
++                # Text needs the same complete-byte publication and uncertain-
++                # effect accounting as documents. Never expose a partial final
++                # name or report a post-publication failure as an absent write.
++                # Late import: the publisher shares this module's check/_move.
++                from hermes_cli.friday_workspace_docx import _create_bytes
++                return _create_bytes(cap,fd,leaf,path,data,output_format='text')
+             original,version=snapshot(fd,leaf)
+             if _baseline(cap,task_id,path) != version:
+                 return json.dumps({'success':False,'error':'file_revision_requires_current_full_read',
+diff --git a/hermes-agent/hermes_state_messages.py b/hermes-agent/hermes_state_messages.py
+index e6c4d55a069eb28f5b8de341cee3fbc53de49da3..fd19ba8bdab0eefed13789614eac7f330f88c7fc 100644
+--- a/hermes-agent/hermes_state_messages.py
++++ b/hermes-agent/hermes_state_messages.py
+@@ -1450,17 +1450,18 @@ class SessionMessagesMixin:
+ 
+     def get_messages_around(self, session_id: str, around_message_id: int, window: int = 5) -> Dict[str, Any]:
+         """Up to *window* messages either side of an anchor id (ascending). ``messages_before``/``_after`` count
+-        strictly around the anchor (fewer than *window* = session boundary). Empty for a foreign anchor."""
++        strictly around the anchor (fewer than *window* = session boundary). Recall includes compacted
++        originals, but never Undo/Rewind rows. Empty for a foreign or retracted anchor."""
+         window = max(window, 0)
+         with self._read_ctx() as conn:
+-            if not conn.execute("SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
++            if not conn.execute(f"SELECT 1 FROM messages WHERE id = ? AND session_id = ?{_DISPLAY_ACTIVE_CLAUSE} LIMIT 1",
+                                 (around_message_id, session_id)).fetchone():
+                 return {"window": [], "messages_before": 0, "messages_after": 0}
+             before_rows = conn.execute(
+-                "SELECT * FROM messages WHERE session_id = ? AND id <= ? ORDER BY id DESC LIMIT ?",
++                f"SELECT * FROM messages WHERE session_id = ? AND id <= ?{_DISPLAY_ACTIVE_CLAUSE} ORDER BY id DESC LIMIT ?",
+                 (session_id, around_message_id, window + 1)).fetchall()
+             after_rows = conn.execute(
+-                "SELECT * FROM messages WHERE session_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
++                f"SELECT * FROM messages WHERE session_id = ? AND id > ?{_DISPLAY_ACTIVE_CLAUSE} ORDER BY id ASC LIMIT ?",
+                 (session_id, around_message_id, window)).fetchall()
+         window_msgs = [self._row_to_message_dict(r, warn_context="get_messages_around", summary_flag=False)
+                        for r in (*reversed(before_rows), *after_rows)]
+diff --git a/hermes-agent/hermes_state_search.py b/hermes-agent/hermes_state_search.py
+index d041ac2788f0179c00531e555ba333ca8e9681ee..bc67e4206a8cc9f7ef49aa1fefdbc298a9ff9828 100644
+--- a/hermes-agent/hermes_state_search.py
++++ b/hermes-agent/hermes_state_search.py
+@@ -782,7 +782,7 @@ class SessionSearchMixin:
+                 def _bookend(op: str, boundary_id: int, order: str):
+                     return conn.execute(
+                         f"SELECT * FROM messages "
+-                        f"WHERE session_id = ? AND id {op} ?{role_clause} "
++                        f"WHERE session_id = ? AND id {op} ?{self._active_clause(False, True)}{role_clause} "
+                         f"AND length(content) > 0 "
+                         f"ORDER BY id {order} LIMIT ?",
+                         (session_id, boundary_id, *role_params, bookend),
+diff --git a/hermes-agent/plugins/platforms/telegram/adapter.py b/hermes-agent/plugins/platforms/telegram/adapter.py
+index bcbcf6f6c1c7bc79be3da4967361ebce259cde63..a20ba1702ddf9619ebf41921eda0bd1ca19468da 100644
+--- a/hermes-agent/plugins/platforms/telegram/adapter.py
++++ b/hermes-agent/plugins/platforms/telegram/adapter.py
+@@ -3630,6 +3630,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+     async def send(
+         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+         """Send a message to a Telegram chat."""
++        if isinstance(metadata, dict) and '_friday_document_outcome' in metadata:
++            from .telegram_document_bytes import send_document_outcome
++            return await send_document_outcome(self, chat_id, content, reply_to=reply_to, metadata=metadata)
+         if not self._bot:
+             live = self._replacement_telegram_adapter()
+             if live is not None:
+@@ -6596,9 +6599,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+     # -- Text message aggregation (handles Telegram client-side splits) --
+ 
+     def _text_batch_key(self, event: MessageEvent) -> str:
+-        """Session-scoped batching key; topic recovery first so DM-topic batches coalesce on the recovered lane."""
+-        self._apply_topic_recovery(event)
+-        return super()._text_batch_key(event)
++        from .telegram_ingress import text_batch_key
++        return text_batch_key(self, event)
+ 
+     def _enqueue_text_event(self, event: MessageEvent) -> None:
+         """Buffer a text chunk, or hold it while delayed delivery must be dropped."""
+@@ -6640,17 +6642,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+                 tasks.pop(key, None)
+ 
+     def _text_batch_delay_for(self, pending: Optional[MessageEvent]) -> float:
+-        """Adaptive delay: near-split-point last chunk → long delay (continuation almost certain);
+-        short/medium totals → capped fast delays; else configured cap (all min()'d with the operator cap)."""
+-        last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
+-        total_len = len(getattr(pending, "text", "") or "") if pending else 0
+-        if last_len >= self._SPLIT_THRESHOLD:
+-            return self._text_batch_split_delay_seconds
+-        if total_len <= self._TEXT_BATCH_FAST_LEN:
+-            return min(self._text_batch_delay_seconds, self._TEXT_BATCH_FAST_DELAY_S)
+-        if total_len <= self._TEXT_BATCH_SHORT_LEN:
+-            return min(self._text_batch_delay_seconds, self._TEXT_BATCH_SHORT_DELAY_S)
+-        return self._text_batch_delay_seconds
++        from .telegram_ingress import text_batch_delay_for
++        return text_batch_delay_for(self, pending)
+ 
+     async def _flush_text_batch(self, key: str) -> None:
+         """Telegram keeps its own flush body: a cancel after the pop must HOLD the event and re-raise
+@@ -6664,10 +6657,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+     # -- Photo batching --
+ 
+     def _photo_batch_key(self, event: MessageEvent, msg: Message) -> str:
+-        """Return a batching key for Telegram photos/albums."""
+-        session_key = self._event_session_key(event)
+-        media_group_id = getattr(msg, "media_group_id", None)
+-        return f"{session_key}:album:{media_group_id}" if media_group_id else f"{session_key}:photo-burst"
++        from .telegram_ingress import photo_batch_key
++        return photo_batch_key(self, event, msg)
+ 
+     async def _flush_photo_batch(self, batch_key: str) -> None:
+         """Send a buffered photo burst/album as a single MessageEvent."""
+@@ -6823,17 +6814,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+         await self.handle_message(event)
+ 
+     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
+-        """Debounce album items (shared media_group_id) into one MessageEvent so the second image isn't
+-        treated as a new message interrupting the first."""
+-        if self._should_drop_delayed_delivery():
+-            self._hold_inbound_event(event, where="media-group-enqueue")
+-            return
+-        self._merge_into_pending(self._media_group_events, media_group_id, event)
+-        self._accept_update()
+-        prior_task = self._media_group_tasks.get(media_group_id)
+-        if prior_task:
+-            prior_task.cancel()
+-        self._media_group_tasks[media_group_id] = asyncio.create_task(self._flush_media_group_event(media_group_id))
++        from .telegram_ingress import queue_media_group_event
++        await queue_media_group_event(self, media_group_id, event)
+ 
+     async def _flush_media_group_event(self, media_group_id: str) -> None:
+         await self._flush_buffered(
+diff --git a/hermes-agent/plugins/platforms/telegram/telegram_document_bytes.py b/hermes-agent/plugins/platforms/telegram/telegram_document_bytes.py
+index e110af3acc31fa74f0424cdb4f945c7892713a11..aad292aaebe0c39a20f61721283ecb32f03b22e9 100644
+--- a/hermes-agent/plugins/platforms/telegram/telegram_document_bytes.py
++++ b/hermes-agent/plugins/platforms/telegram/telegram_document_bytes.py
+@@ -7,6 +7,62 @@ import io
+ from gateway.platforms.base import SendResult
+ 
+ 
++def _original_route_kwargs(adapter, chat_id, reply_to, metadata, authority_key):
++    """Use the frozen ingress verbatim; no latest-topic/reply or replacement bot."""
++    from gateway.run_plugin_delivery import freeze_route
++    check, supplied = metadata[authority_key]
++    route = freeze_route(supplied)
++    source = route['source']
++    if (not callable(check) or str(chat_id) != source['chat_id'] or reply_to != source['message_id']
++            or adapter._metadata_thread_id(metadata) != source['thread_id']):
++        raise ValueError('original_route_required')
++    _, kwargs = adapter._media_send_kwargs(chat_id, reply_to, metadata)
++    if (str(kwargs.get('chat_id')) != source['chat_id']
++            or kwargs.get('reply_to_message_id') != int(source['message_id'])
++            or kwargs.get('message_thread_id') != adapter._message_thread_id_for_send(source['thread_id'])
++            or kwargs.get('direct_messages_topic_id') is not None
++            or kwargs.get('allow_sending_without_reply') is True):
++        raise ValueError('original_route_required')
++    bot = adapter._bot
++    check()
++    if (adapter.is_connected is not True or bot is None or adapter._bot is not bot
++            or str(bot.id) != route['bot_id']):
++        raise ValueError('original_bot_offline')
++    return bot, kwargs
++
++
++async def send_document_outcome(adapter, chat_id, content, *, reply_to, metadata):
++    """One bounded plain response; any ambiguous acknowledgement stays uncertain."""
++    try:
++        if not isinstance(content, str) or not content or len(content.encode('utf-16-le')) // 2 > 1024:
++            return SendResult(success=False, error='document_outcome_rejected')
++        async with adapter._chat_send_lock(chat_id):
++            if (getattr(adapter, '_send_path_degraded', False)
++                    or adapter._send_flood_cooldown_remaining(chat_id) is not None):
++                return SendResult(success=False, error='document_outcome_rejected')
++            delay = adapter._chat_outbound_slot_remaining(chat_id)
++            if delay > 0:
++                import asyncio
++                await asyncio.sleep(delay)
++            if (getattr(adapter, '_send_path_degraded', False)
++                    or adapter._send_flood_cooldown_remaining(chat_id) is not None):
++                return SendResult(success=False, error='document_outcome_rejected')
++            adapter._hold_chat_outbound_slot(chat_id)
++            bot, kwargs = _original_route_kwargs(adapter, chat_id, reply_to, metadata, '_friday_document_outcome')
++            message = await bot.send_message(**kwargs, text=content)
++        message_id = getattr(message, 'message_id', None)
++        if (type(message_id) is int and message_id > 0
++                and str(getattr(getattr(message, 'chat', None), 'id', '')) == str(chat_id)
++                and getattr(message, 'message_thread_id', None) == kwargs.get('message_thread_id')):
++            return SendResult(success=True, message_id=str(message_id))
++    except Exception as exc:
++        # No rich/plain retry, topic fallback, reply removal or SDK error prose.
++        retry_after = getattr(exc, 'retry_after', None)
++        if retry_after is not None:
++            adapter._record_send_flood_cooldown(chat_id, float(retry_after))
++    return SendResult(success=False, error='document_outcome_UNKNOWN')
++
++
+ async def send_document_bytes(adapter, chat_id, data, *, file_name, reply_to, caption, metadata):
+     if type(data) is not bytes:
+         raise TypeError("document data must be immutable bytes")
+@@ -14,13 +70,18 @@ async def send_document_bytes(adapter, chat_id, data, *, file_name, reply_to, ca
+         return SendResult(success=False, error="original_bot_offline")
+     if not reply_to:
+         return SendResult(success=False, error="original_reply_required")
+-    _, kwargs = adapter._media_send_kwargs(chat_id, reply_to, metadata)
+     # Retrying without a missing reply/topic silently changes the authorized destination.
+     # Use the existing bot and native media routing, but attempt precisely once.
+     try:
+         with io.BytesIO(data) as stream:
+-            message = await adapter._bot.send_document(
+-                **kwargs, document=stream, filename=file_name, caption=adapter._caption_1024(caption))
++            bounded_caption = adapter._caption_1024(caption)
++            if isinstance(metadata, dict) and '_friday_document_authority' in metadata:
++                bot, kwargs = _original_route_kwargs(adapter, chat_id, reply_to, metadata, '_friday_document_authority')
++            else:
++                bot = adapter._bot
++                _, kwargs = adapter._media_send_kwargs(chat_id, reply_to, metadata)
++            message = await bot.send_document(
++                **kwargs, document=stream, filename=file_name, caption=bounded_caption)
+         document = getattr(message, "document", None)
+         message_id = getattr(message, "message_id", None)
+         if (document is None or not getattr(document, "file_id", None)
+@@ -31,7 +92,7 @@ async def send_document_bytes(adapter, chat_id, data, *, file_name, reply_to, ca
+             return SendResult(success=False, error="document_ack_unavailable")
+         proof = {
+             "kind": "document", "sha256": hashlib.sha256(data).hexdigest(),
+-            "bytes": len(data), "file_name": file_name, "bot_id": str(adapter._bot.id),
++            "bytes": len(data), "file_name": file_name, "bot_id": str(bot.id),
+             "chat_id": str(chat_id), "thread_id": adapter._metadata_thread_id(metadata),
+             "reply_to": str(reply_to), "message_id": str(message_id),
+         }
+diff --git a/hermes-agent/plugins/platforms/telegram/telegram_ingress.py b/hermes-agent/plugins/platforms/telegram/telegram_ingress.py
+index afe56bcf6dbfcb6db31e883eff64bac269d1219c..68957c9c164ec68ef7ca87e8ee5e9db4a6de8a51 100644
+--- a/hermes-agent/plugins/platforms/telegram/telegram_ingress.py
++++ b/hermes-agent/plugins/platforms/telegram/telegram_ingress.py
+@@ -1,7 +1,69 @@
+-"""Identity from the receiving native Telegram Message, without a network call."""
++"""Original Telegram event boundaries and SDK provenance, without a network call."""
+ from __future__ import annotations
+ 
+ 
++def _original_event(adapter, event):
++    if event.internal:
++        return False
++    from gateway.session_identity import requires_original_source
++    adapter._canonicalize(event.source)
++    return requires_original_source(event.source)
++
++
++def _per_event_key(key, event):
++    # Scheduling only: SDK message_provenance still validates both identifiers.
++    # Keep original messages intact rather than inventing a merged authority.
++    return f"{key}:message:{event.message_id}:update:{event.platform_update_id}"
++
++
++def text_batch_key(adapter, event):
++    if _original_event(adapter, event):
++        return _per_event_key(adapter._event_session_key(event), event)
++    adapter._apply_topic_recovery(event)
++    return adapter._event_session_key(event)
++
++
++def text_batch_delay_for(adapter, pending):
++    from gateway.session_identity import requires_original_source
++    if pending is not None and not pending.internal and requires_original_source(pending.source):
++        # Equal delays keep sequential native messages in arrival order; no
++        # split-message coalescing is promised for this original-event lane.
++        return adapter._text_batch_delay_seconds
++    last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
++    total_len = len(getattr(pending, "text", "") or "") if pending else 0
++    if last_len >= adapter._SPLIT_THRESHOLD:
++        return adapter._text_batch_split_delay_seconds
++    if total_len <= adapter._TEXT_BATCH_FAST_LEN:
++        return min(adapter._text_batch_delay_seconds, adapter._TEXT_BATCH_FAST_DELAY_S)
++    if total_len <= adapter._TEXT_BATCH_SHORT_LEN:
++        return min(adapter._text_batch_delay_seconds, adapter._TEXT_BATCH_SHORT_DELAY_S)
++    return adapter._text_batch_delay_seconds
++
++
++def photo_batch_key(adapter, event, message):
++    session_key = adapter._event_session_key(event)
++    group = getattr(message, "media_group_id", None)
++    key = f"{session_key}:album:{group}" if group else f"{session_key}:photo-burst"
++    return _per_event_key(key, event) if _original_event(adapter, event) else key
++
++
++async def queue_media_group_event(adapter, media_group_id, event):
++    """Use existing album timers/hold queue, retaining each managed SDK event."""
++    import asyncio
++    if adapter._should_drop_delayed_delivery():
++        adapter._hold_inbound_event(event, where="media-group-enqueue")
++        return
++    key = media_group_id
++    if _original_event(adapter, event):
++        key = _per_event_key(f"{adapter._event_session_key(event)}:album:{media_group_id}", event)
++    adapter._merge_into_pending(adapter._media_group_events, key, event)
++    adapter._accept_update()
++    prior_task = adapter._media_group_tasks.get(key)
++    if prior_task:
++        prior_task.cancel()
++    adapter._media_group_tasks[key] = asyncio.create_task(adapter._flush_media_group_event(key))
++
++
+ def _id(value, *, signed=False):
+     if type(value) is not int or (value == 0 if signed else value <= 0):
+         raise ValueError("unresolved_telegram_identity")
+diff --git a/hermes-agent/tools/browser_scoped.py b/hermes-agent/tools/browser_scoped.py
+index 4bb386bf85ad9034c8ab740d72c0a18c82f3348c..bb56307a14103155262944714a073d81c4a291e4 100644
+--- a/hermes-agent/tools/browser_scoped.py
++++ b/hermes-agent/tools/browser_scoped.py
+@@ -144,11 +144,19 @@ def exchange(registry, session, call, payload):
+             raise RuntimeError('browser_original_task_stopped')
+         rd, wr, _ = select.select([proc.stdout], [proc.stdin] if offset < len(raw) else [], [], min(.05, remaining))
+         if wr:
+-            with call.turn.lock:
+-                call.check()
+-                if session.web_stop_requested:
++            from tools.interrupt import run_if_not_interrupted
++            def write_input():
++                nonlocal offset
++                if (session.web_stop_requested or call.stopped.is_set()
++                        or call.turn.stopped.is_set()):
+                     raise RuntimeError('browser_original_task_stopped')
+                 offset += os.write(proc.stdin.fileno(), raw[offset:])
++            with call.turn.lock:
++                call.check()
++                # Match web_exchange: an interrupt that wins before stdin
++                # publication must not release a new browser command.
++                if not run_if_not_interrupted(write_input):
++                    raise RuntimeError('web_call_stopped')
+         if rd:
+             part = os.read(proc.stdout.fileno(), 8192)
+             if not part:
+diff --git a/hermes-agent/tools/process_registry_web.py b/hermes-agent/tools/process_registry_web.py
+index a78134b71b4f4aa8762719e31f42101d1a3b1d58..be73b8c312e6974cf63d481e95d82f5c88e4415c 100644
+--- a/hermes-agent/tools/process_registry_web.py
++++ b/hermes-agent/tools/process_registry_web.py
+@@ -88,7 +88,11 @@ class WebProcessMixin:
+         # Intent precedes any observation/lock. In-progress Popen/checkpoint and
+         # stdin writers observe the same call fence; recovery retains the bit.
+         session.web_stop_requested = True
+-        for event in getattr(session, 'web_stop_events', ()):
++        # Settling one call must not cancel the shared turn: a confirmed web
++        # failure fences web capability while independent file/memory work stays
++        # available. Whole-turn interruption is owned by WebTurn.stop().
++        event = getattr(session, 'web_call_stop_event', None)
++        if event is not None:
+             event.set()
+ 
+     def has_web_custody_for_session(self, session_key, *, parent_session_id='', profile_home):
+@@ -236,6 +240,7 @@ class WebProcessMixin:
+         session.systemd_unit = 'hermes-worker-web-'+session.id+'.service'
+         session.parent_session_id = call.session_id
+         session.web_tool_call_id=call.call_id or "";session.web_turn_id=call.turn_id
++        session.web_call_stop_event=call.stopped
+         session.web_stop_events=(call.stopped,call.turn.stopped)
+         with self._lock:
+             if any(s.web_custody and s.web_unconfirmed
+diff --git a/hermes-agent/tools/session_search_tool.py b/hermes-agent/tools/session_search_tool.py
+index 2e48f48c210173425cae01bb46d4ca4fde22740e..56ef63603e1f8dcfef1ba03f6388262bffce48e6 100644
+--- a/hermes-agent/tools/session_search_tool.py
++++ b/hermes-agent/tools/session_search_tool.py
+@@ -250,7 +250,7 @@ def _is_compacted_message(db, message_id) -> bool:
+ 
+ 
+ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None,
+-                   max_content_len: Optional[int] = None) -> Dict[str, Any]:
++                   max_content_len: Optional[int] = None, content_offset: int = 0) -> Dict[str, Any]:
+     """Slim a message row; keeps ``content`` even when empty (tool-call-only turns)."""
+     content = m.get("content")
+     if isinstance(content, str) and "\x1b" in content:  # archived terminal output carries ANSI
+@@ -260,9 +260,15 @@ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None,
+     entry.update({k: m.get(k) for k in ("tool_name", "tool_calls", "tool_call_id") if m.get(k)})
+     if anchor_id is not None and m.get("id") == anchor_id:
+         entry["anchor"] = True
+-    if max_content_len and content and len(content) > max_content_len:
+-        entry.update(content=content[:max_content_len] + "…", content_truncated=True,
+-                     original_content_chars=len(content))
++    if content_offset and (not isinstance(content, str) or content_offset >= len(content)):
++        raise ValueError("content_offset must point inside the anchor message text")
++    if max_content_len and isinstance(content, str) and (content_offset or len(content) > max_content_len):
++        end = min(len(content), content_offset + max_content_len)
++        entry.update(content=content[content_offset:end] + ("…" if end < len(content) else ""),
++                     content_truncated=True, original_content_chars=len(content),
++                     content_offset=content_offset)
++        if end < len(content):
++            entry["next_content_offset"] = end
+     return {k: v for k, v in entry.items() if v is not None or k == "content"}
+ 
+ 
+@@ -588,7 +594,7 @@ def _anchor_in_live_context(db, anchor_state, anchor_sid: str, current_session_i
+ 
+ 
+ def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
+-            current_session_id: str = None) -> str:
++            current_session_id: str = None, content_offset: int = 0) -> str:
+     """Scroll shape: a window centered on an anchor (no FTS5, no bookends)."""
+     try:
+         around_message_id = int(around_message_id)
+@@ -622,12 +628,20 @@ def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
+             session_meta = _get_session_meta(db, owning) or session_meta
+     if not messages:
+         return tool_error(f"around_message_id {around_message_id} not in session_id {session_id}", success=False)
++    try:
++        shaped = [_shape_message(m, anchor_id=around_message_id, max_content_len=4000,
++                                 content_offset=content_offset if m.get("id") == around_message_id else 0)
++                  for m in messages]
++    except ValueError as exc:
++        return tool_error(str(exc), success=False)
+     return _ok(
+         mode="scroll", session_id=session_id, around_message_id=around_message_id,
+         session_meta=_session_meta_block(session_meta), window=window,
+-        messages=[_shape_message(m, anchor_id=around_message_id) for m in messages],
++        messages=shaped,
+         messages_before=view.get("messages_before", 0), messages_after=view.get("messages_after", 0),
+-        hint=("Scroll forward: re-call with around_message_id = the LAST message's "
++        hint=("To continue a truncated message, re-call with its id as around_message_id "
++              "and its next_content_offset as content_offset. Offsets count displayed text characters. "
++              "Scroll forward: re-call with around_message_id = the LAST message's "
+               "id; backward: the FIRST message's id (the boundary message repeats "
+               "as an orientation marker). messages_before/messages_after < window "
+               "means you've hit that end of the session."), **extra)
+@@ -635,7 +649,7 @@ def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
+ 
+ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
+               around_message_id, window, sort, profile, detail, owned_dbs,
+-              after=None, before=None, exclude_session_ids=None) -> str:
++              after=None, before=None, exclude_session_ids=None, content_offset=0) -> str:
+     """Mode dispatch (see module docstring); scroll wins when an anchor is set.
+     Profile DBs opened here are appended to *owned_dbs* for the caller to close."""
+     # A raw `@session:<profile>/<id>` link as session_id: ids never contain "/", so
+@@ -658,7 +672,7 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
+         owned_dbs.append(profile_db)
+     if isinstance(session_id, str) and session_id.strip():
+         if around_message_id is not None:
+-            return _scroll(db, session_id.strip(), around_message_id, window, current_session_id)
++            return _scroll(db, session_id.strip(), around_message_id, window, current_session_id, content_offset)
+         return _read_scoped(db, session_id.strip(), profile)
+     limit = _clamp_int(limit, 3, 1, 10)
+     if not query or not isinstance(query, str) or not query.strip():
+@@ -679,10 +693,22 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
+ def session_search(query: str = "", role_filter: str = None, limit: int = 3, db=None,
+                    current_session_id: str = None, session_id: str = None, around_message_id: int = None,
+                    window: int = 5, sort: str = None, profile: str = None, detail: str = "adaptive",
+-                   after: str = None, before: str = None, exclude_session_ids: Optional[List[str]] = None) -> str:
++                   after: str = None, before: str = None, exclude_session_ids: Optional[List[str]] = None,
++                   content_offset: int = 0) -> str:
+     """Run session search, closing DBs opened here. Positional order is frozen for old callers;
+     new parameters are appended after ``detail``."""
+     from hermes_cli.friday_user_scope import check_search, ScopeDenied, ordinary_tool_error_json
++    if isinstance(session_id, str) and session_id.strip().startswith("@session:"):
++        session_id = session_id.strip()[len("@session:"):]
++        parts = session_id.split("/")
++        if (len(parts) > 2 or any(not part or part in {".", ".."} or "@session:" in part for part in parts)
++                or (len(parts) == 2 and profile not in (None, "", parts[0]))):
++            return tool_error("Invalid or conflicting session link", success=False)
++    content_offset = 0 if content_offset is None else content_offset
++    if type(content_offset) is not int or content_offset < 0:
++        return tool_error("content_offset must be a non-negative integer", success=False)
++    if content_offset and (not isinstance(session_id, str) or not session_id.strip() or around_message_id is None):
++        return tool_error("content_offset requires session_id and around_message_id", success=False)
+     try:
+         check_search(profile, session_id, db)
+     except ScopeDenied:
+@@ -698,7 +724,8 @@ def session_search(query: str = "", role_filter: str = None, limit: int = 3, db=
+     try:
+         return _dispatch(query, role_filter, limit, db, current_session_id, session_id,
+                          around_message_id, window, sort, profile, detail, owned_dbs,
+-                         after=after, before=before, exclude_session_ids=exclude_session_ids)
++                         after=after, before=before, exclude_session_ids=exclude_session_ids,
++                         content_offset=content_offset)
+     finally:
+         for owned_db in reversed(owned_dbs):
+             _quiet(lambda: release_or_close(owned_db), None, "Failed to close session_search SessionDB")
+@@ -801,9 +828,17 @@ SESSION_SEARCH_SCHEMA = {
+             "session_id": {
+                 "type": "string",
+                 "description": (
+-                    "Scroll shape. Session to read inside. Use the session_id returned "
+-                    "from a prior discovery call. Must be paired with "
+-                    "around_message_id."
++                    "Session to read, or a returned @session: link. Used alone for read; "
++                    "pair with around_message_id to scroll inside the session."
++                ),
++            },
++            "content_offset": {
++                "type": "integer",
++                "minimum": 0,
++                "description": (
++                    "Scroll only. Character offset inside the anchor message's displayed text. "
++                    "To continue a truncated message, use its id as around_message_id and "
++                    "its next_content_offset here. Defaults to 0; does not alter saved history."
+                 ),
+             },
+             "around_message_id": {
+@@ -854,6 +889,7 @@ registry.register(
+     schema=SESSION_SEARCH_SCHEMA,
+     handler=lambda args, **kw: session_search(
+         query=args.get("query") or "", limit=args.get("limit", 3), window=args.get("window", 5),
++        content_offset=args.get("content_offset", 0),
+         detail=args.get("detail", "adaptive"), db=kw.get("db"), current_session_id=kw.get("current_session_id"),
+         **{k: args.get(k) for k in ("role_filter", "session_id", "around_message_id", "sort", "profile",
+                                     "after", "before", "exclude_session_ids")}),
+diff --git a/plugins/friday_rework/admin_settings.py b/plugins/friday_rework/admin_settings.py
+index b2645717af77dc28cb41345e4f60182a037f15d1..64206a016e8d53b1ef220c2b8650c5187a763ec7 100644
+--- a/plugins/friday_rework/admin_settings.py
++++ b/plugins/friday_rework/admin_settings.py
+@@ -60,6 +60,10 @@ def options(cfg, home):
+             "required_skills": sorted(ESSENTIAL_SKILLS),
+             "web_backends": ["exa-paid", "exa-keyless"],
+             "operational": ["agent.max_turns", "streaming.enabled", "tools.tool_search.defer", "tools.tool_search.enabled"],
++            "operational_values": {
++                "tools.tool_search.enabled": ["off"],
++                "tools.tool_search.defer": [sorted(_memory_disclosure_defer(cfg))],
++            },
+             "model_slots": ["main", *[k for k, v in (cfg.get("auxiliary") or {}).items() if isinstance(v, dict)]]}
+ 
+ 
+diff --git a/plugins/friday_rework/dashboard/index.js b/plugins/friday_rework/dashboard/index.js
+index abde7c136092d7f61cc92b8a59d8c72a394c98d5..7944ecff898d624369fceb50cb78d8e54147f02d 100644
+--- a/plugins/friday_rework/dashboard/index.js
++++ b/plugins/friday_rework/dashboard/index.js
+@@ -36,9 +36,17 @@
+     if (selected === "onboarding") return strings(value.templates) && strings(value.worker_templates) &&
+       rows(value.pending) && value.pending.every(preparedShape);
+     if (selected === "health") return rows(value.workers) && value.workers.every(row => typeof row.deployment_verified === "boolean") && strings(value.missing_workers);
+-    if (selected === "effective") return object(value.typed_options) &&
+-      ["model_slots", "web_backends", "toolsets", "skills", "operational"].every(k => strings(value.typed_options[k])) &&
+-      rows(value.typed_options.local_routes);
++    if (selected === "effective") {
++      const typed = value.typed_options;
++      if (!object(typed) ||
++          !["model_slots", "web_backends", "toolsets", "skills", "operational"].every(k => strings(typed[k])) ||
++          !rows(typed.local_routes)) return false;
++      const fixed = typed.operational_values;
++      return object(fixed) && strings(fixed["tools.tool_search.enabled"]) &&
++        fixed["tools.tool_search.enabled"].length === 1 &&
++        Array.isArray(fixed["tools.tool_search.defer"]) && fixed["tools.tool_search.defer"].length === 1 &&
++        strings(fixed["tools.tool_search.defer"][0]);
++    }
+     return false;
+   }
+   const sessionShape = (value, profile) => object(value) && (value.profile === undefined || value.profile === profile) &&
+@@ -341,7 +349,9 @@
+         if (edit.kind === "model") values = {slot: edit.slot, ...data.typed_options.local_routes[Number(edit.route)]};
+         else if (edit.kind === "web") values = {profile: edit.web, extract_timeout: Number(edit.timeout), extract_char_limit: Number(edit.chars)};
+         else if (["toolset", "skill"].includes(edit.kind)) values = {name: edit.name, enabled: edit.enabled};
+-        else values = {key: edit.key, value: edit.key === "streaming.enabled" ? edit.enabled : Number(edit.value)};
++        else if (edit.key === "streaming.enabled") values = {key: edit.key, value: edit.enabled};
++        else if (edit.key === "agent.max_turns") values = {key: edit.key, value: Number(edit.value)};
++        else values = {key: edit.key, value: data.typed_options.operational_values[edit.key][0]};
+         setControl(await fetchJSON(base + "/settings?" + new URLSearchParams({profile}), {
+           method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({kind: edit.kind, expected_sha256: data.config_sha256, values})}));
+         await readState("effective", base + "/effective?" + new URLSearchParams({profile}));
+@@ -475,7 +485,11 @@
+             ...data.typed_options.local_routes.map((r, i) => h("option", {key: i, value: String(i)}, `${r.provider} / ${r.model} / ${r.base_url}`)))) : null,
+         edit.kind === "web" ? h("div", null, select("web", data.typed_options.web_backends), number("timeout"), number("chars")) : null,
+         ["toolset", "skill"].includes(edit.kind) ? h("div", null, select("name", ["", ...data.typed_options[edit.kind === "toolset" ? "toolsets" : "skills"]]), enabled()) : null,
+-        edit.kind === "operational" ? h("div", null, select("key", data.typed_options.operational), edit.key === "streaming.enabled" ? enabled() : number("value")) : null,
++        edit.kind === "operational" ? h("div", null, select("key", data.typed_options.operational),
++          edit.key === "streaming.enabled" ? enabled() : edit.key === "agent.max_turns" ? number("value") :
++            h("p", null, edit.key === "tools.tool_search.enabled" ? "This control writes the supported value: off." :
++              "This control restores the native memory-disclosure defer list: " +
++                data.typed_options.operational_values[edit.key][0].join(", "))) : null,
+         button("Save operational settings", saveSettings),
+         h("p", null, "Saved settings apply through the next native session or reload. Existing worker bindings and original deadlines remain fixed.")) : null,
+       h("p", null, "Control needs the owning gateway and a valid native administrator session. Lost responses remain unknown. Channel roles do not grant Dashboard access."));
