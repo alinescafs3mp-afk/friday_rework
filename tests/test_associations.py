@@ -154,9 +154,9 @@ class AssociationTests(unittest.TestCase):
             began = time.monotonic()
             holder.stdin.write("release\n")
             holder.stdin.flush()
-            row = self.store.get("existing-task", OWNER)
+            rows = self.store.snapshot()
             elapsed = time.monotonic() - began
-            self.assertEqual(row["existing_task_id"], "existing-task")
+            self.assertEqual(rows["existing-task"]["existing_task_id"], "existing-task")
             self.assertGreaterEqual(elapsed, .05)
             self.assertLess(elapsed, 1.0)
         finally:
@@ -176,7 +176,7 @@ class AssociationTests(unittest.TestCase):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             with self.assertRaisesRegex(TimeoutError, "association_lock_deadline"):
-                self.store.get("existing-task", OWNER)
+                self.store.request_stop("existing-task", OWNER, "cancel")
         finally:
             os.close(fd)
         target = self.state.data_dir / "outside"
@@ -186,6 +186,31 @@ class AssociationTests(unittest.TestCase):
         with self.assertRaises(OSError):
             self.store.get("existing-task", OWNER)
         self.assertEqual(target.read_text(), "preserve")
+
+    def test_read_skips_compound_lock_without_changing_owner_or_state(self):
+        import fcntl
+        self.store.claim(**self.args)
+        before = copy.deepcopy(self.state.data)
+        fd = os.open(self.state.data_dir / "admission.lock", os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            row = self.store.get("existing-task", OWNER)
+            self.assertEqual(row["existing_task_id"], "existing-task")
+            self.assertEqual(self.state.data, before)
+            with self.assertRaisesRegex(AssociationError, "unknown_or_foreign_task"):
+                self.store.get("existing-task", {**OWNER, "chat_id": "foreign"})
+            self.assertEqual(self.state.data, before)
+        finally:
+            os.close(fd)
+
+    def test_read_refuses_nonprivate_admission_lock(self):
+        self.store.claim(**self.args)
+        before = copy.deepcopy(self.state.data)
+        lock = self.state.data_dir / "admission.lock"
+        lock.chmod(0o640)
+        with self.assertRaisesRegex(AssociationError, "unsafe_admission_lock"):
+            self.store.get("existing-task", OWNER)
+        self.assertEqual(self.state.data, before)
 
 
 try:
@@ -246,6 +271,52 @@ class NativeAssociationTests(unittest.TestCase):
 
         with patch("os.fsync", sync), patch("os.replace", replace):
             yield events
+
+    def test_real_read_during_compound_mutation_returns_only_committed_state(self):
+        import threading
+        from contextvars import copy_context
+        with self.fixture("read-during-compound-mutation") as (state, store, args):
+            store.claim(**args)
+            entered = threading.Event()
+            release = threading.Event()
+            errors = []
+
+            def hold_compound_writer():
+                try:
+                    with store._locked() as data:
+                        data["jobs"][args["task_id"]]["stop_intent"] = "cancel"
+                        entered.set()
+                        if not release.wait(3):
+                            raise TimeoutError("compound writer fixture release")
+                except BaseException as exc:
+                    errors.append(exc)
+
+            writer = threading.Thread(target=copy_context().run, args=(hold_compound_writer,))
+            writer.start()
+            acquired = entered.wait(3)
+            try:
+                self.assertEqual(errors, [])
+                self.assertTrue(acquired, "compound writer did not acquire admission lock")
+                before = state.path.read_bytes()
+                row = store.get(args["task_id"], OWNER)
+                self.assertEqual(row["existing_task_id"], args["task_id"])
+                self.assertIsNone(row["stop_intent"])
+                with self.assertRaisesRegex(AssociationError, "unknown_or_foreign_task"):
+                    store.get(args["task_id"], {**OWNER, "chat_id": "foreign"})
+                self.assertEqual(state.path.read_bytes(), before)
+            finally:
+                release.set()
+                writer.join(4)
+            self.assertFalse(writer.is_alive())
+            self.assertEqual(errors, [])
+            import fcntl
+            native_fd = os.open(state.data_dir / ".state.json.lock", os.O_RDWR)
+            try:
+                fcntl.flock(native_fd, fcntl.LOCK_EX)
+                with self.assertRaisesRegex(TimeoutError, "Plugin state lock deadline exceeded"):
+                    store.get(args["task_id"], OWNER)
+            finally:
+                os.close(native_fd)
 
     def test_real_native_writer_and_marker_commit_before_return(self):
         with self.fixture("ordering") as (state, store, args), self.trace() as events:

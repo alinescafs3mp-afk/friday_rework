@@ -242,6 +242,51 @@ class Associations:
             self._check_local_state()
             return value
 
+    def _read_committed(self):
+        """Read one native-locked document without waiting for compound writers."""
+        self._check_local_state()
+        directory = Path(self.state.data_dir)
+        if not directory.is_absolute() or directory.resolve() != directory:
+            raise AssociationError("unsafe_state_directory")
+        ds = directory.stat(follow_symlinks=False)
+        if (not stat.S_ISDIR(ds.st_mode) or ds.st_uid != os.getuid()
+                or stat.S_IMODE(ds.st_mode) != 0o700):
+            raise AssociationError("state_directory_not_private")
+        fd = os.open(directory / "admission.lock",
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        try:
+            before = os.fstat(fd)
+            def safe(info):
+                return (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                        and info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600)
+            def signature(info):
+                return (info.st_dev, info.st_ino, info.st_size,
+                        info.st_mtime_ns, info.st_ctime_ns)
+            if not safe(before):
+                raise AssociationError("unsafe_admission_lock")
+            if os.pread(fd, 4, 0) != b"v1\n":
+                raise AssociationError("invalid_admission_marker")
+            missing = object()
+            data = self.state_get(KEY, missing)
+            if data is missing:
+                raise AssociationError("association_store_lost")
+            _validate_store(data)
+            self._check_local_state()
+            current_directory = Path(self.state.data_dir)
+            current_ds = current_directory.stat(follow_symlinks=False)
+            if (current_directory != directory or not stat.S_ISDIR(current_ds.st_mode)
+                    or current_ds.st_uid != os.getuid()
+                    or stat.S_IMODE(current_ds.st_mode) != 0o700
+                    or (current_ds.st_dev, current_ds.st_ino) != (ds.st_dev, ds.st_ino)):
+                raise AssociationError("association_state_directory_changed")
+            linked = os.stat(directory / "admission.lock", follow_symlinks=False)
+            if (not safe(linked) or signature(linked) != signature(before)
+                    or os.pread(fd, 4, 0) != b"v1\n"):
+                raise AssociationError("admission_lock_changed")
+            return data
+        finally:
+            os.close(fd)
+
     def state_set(self, key, value):
         self._check_local_state()
         if self._operator is not None:
@@ -679,8 +724,8 @@ class Associations:
             return self.consumer_copy(row)
 
     def get(self, task_id, owner):
-        with self._locked() as data:
-            return self.consumer_copy(self._owned(data, task_id, owner))
+        data = self._read_committed()
+        return self.consumer_copy(self._owned(data, task_id, owner))
 
     def get_for_control(self, task_id, principal):
         """Resolve a new authorized control message to the original owner.

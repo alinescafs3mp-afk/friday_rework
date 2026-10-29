@@ -103,6 +103,23 @@ class ControllerTests(unittest.TestCase):
     def row(self):
         return self.store.get("task", OWNER)
 
+    def test_unknown_without_native_reads_committed_row_during_compound_lock(self):
+        import fcntl
+        import os
+        row = self.row()
+        before = self.state.path.read_bytes()
+        fd = os.open(self.state.data_dir / "admission.lock", os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            current = self.controller._record(
+                row, NativeObservation("", "", "owned-unknown-receipt", 0, "unknown"))
+            self.assertEqual(current["existing_task_id"], "task")
+            self.assertIsNone(current["native"])
+            self.assertEqual(self.state.path.read_bytes(), before)
+            self.assertEqual(self.adapter.submits, 0)
+        finally:
+            os.close(fd)
+
     def test_preparation_reopen_and_duplicate_no_reexecution(self):
         self.assertEqual(self.prepare(), PREPARED)
         self.controller = self.reopen()

@@ -262,6 +262,40 @@ class AdapterTests(unittest.TestCase):
         (c/"events.ndjson").write_bytes(lines(OPEN))
         self.assertEqual(self.adapter.observe(self.row,p).state,"failed")
 
+    def test_events_read_during_compound_association_lock_uses_committed_row(self):
+        import fcntl
+        import os
+        from hermes_cli.plugins_state import PluginState
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from friday_dsh_adapter_test.associations import Associations, KEY
+        from friday_dsh_adapter_test.adapters.dsh import _identity, credential_fingerprints
+        p = self.prep()
+        c = Path(p.receipt_reference).parent
+        _write(c / "credential-guard.json", {"schema": 1, "identity": _identity(self.row),
+                                            "keys": credential_fingerprints(self.config.environment())})
+        (c / "events.ndjson").write_bytes(COMPLETE)
+        token = set_hermes_home_override(self.root / "hermes-home")
+        self.addCleanup(reset_hermes_home_override, token)
+        state = PluginState("friday_rework")
+        state.set(KEY, {"schema_version": 1, "jobs": {self.row["existing_task_id"]: copy.deepcopy(self.row)}})
+        admission = state.data_dir / "admission.lock"
+        admission.write_bytes(b"v1\n")
+        admission.chmod(0o600)
+        store = Associations(state, clock=lambda: self.now)
+        self.adapter.config = replace(self.config, current_association=lambda association: store.get(
+            association["existing_task_id"], association["owner"]))
+        before = state.path.read_bytes()
+        fd = os.open(admission, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            events = self.adapter._events(c)
+            self.assertTrue(events.completed)
+            self.assertTrue(events.final)
+            self.assertEqual(state.path.read_bytes(), before)
+            self.assertEqual(self.sup.stops, 0)
+        finally:
+            os.close(fd)
+
     def test_max_tokens_observation_preserves_failure_without_cleanup(self):
         p = self.prep(); c = Path(p.receipt_reference).parent
         from friday_dsh_adapter_test.adapters.dsh import _identity, credential_fingerprints
