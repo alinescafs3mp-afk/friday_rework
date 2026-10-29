@@ -17,7 +17,7 @@ import re
 from typing import Callable, Mapping
 
 from .adapters.contract import NativeObservation, PreparedNative, VerifiedInput, WorkerAdapter
-from .associations import Associations, _native, _sync_directory, _text
+from .associations import Associations, AssociationLockBusy, _native, _sync_directory, _text
 from .boundary import WorkBrief, parse_brief
 from .supervision import UnitObservation
 
@@ -269,10 +269,12 @@ class Controller:
         self._record(row, value)
         return value
 
-    def reconcile(self, task_id, owner):
+    def reconcile(self, task_id, owner, *, defer_preparation_busy=False):
         row = self.associations.get(task_id, owner)
+        preparation_loaded = False
         try:
             prepared = self._load(row)
+            preparation_loaded = True
             intent = self._intent(row)
             if intent:
                 return self._stop(row, prepared, intent)
@@ -282,6 +284,13 @@ class Controller:
                 return self._stop(row, prepared, self._intent(row))
             return value
         except BaseException as exc:
+            # Only the owning background host may defer an unavailable metadata
+            # read BEFORE any adapter observation/stop. It rechecks its current
+            # custody, original deadline and stop obligations on propagation.
+            # Later failures still require exact-owned emergency cleanup.
+            if (defer_preparation_busy is True and not preparation_loaded
+                    and isinstance(exc, AssociationLockBusy)):
+                raise
             self._stop_on_error(row, exc)
             raise
 

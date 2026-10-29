@@ -37,6 +37,11 @@ class AssociationError(RuntimeError):
     pass
 
 
+class AssociationLockBusy(TimeoutError):
+    """Metadata lock contention exhausted its existing acquisition allowance."""
+    pass
+
+
 def _text(value, limit=512, empty=False):
     if not isinstance(value, str) or (not empty and not value.strip()) or "\x00" in value:
         raise AssociationError("invalid_reference")
@@ -308,8 +313,10 @@ class Associations:
         with self.lock_budget():
             with self._lock_allowance.get().acquiring() as deadline:
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or not self._thread_lock.acquire(timeout=remaining):
+                if remaining <= 0:
                     raise TimeoutError("association_lock_deadline")
+                if not self._thread_lock.acquire(timeout=remaining):
+                    raise AssociationLockBusy("association_lock_deadline")
             prior_native_expected = self._native_expected.set(None)
             try:
                 self._check_local_state()
@@ -351,15 +358,19 @@ class Associations:
             if (not stat.S_ISREG(ls.st_mode) or ls.st_uid != os.getuid()
                     or ls.st_nlink != 1 or stat.S_IMODE(ls.st_mode) != 0o600):
                 raise AssociationError("unsafe_admission_lock")
+            contended = False
             with self._lock_allowance.get().acquiring() as deadline:
                 while True:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
+                        if contended:
+                            raise AssociationLockBusy("association_lock_deadline")
                         raise TimeoutError("association_lock_deadline")
                     try:
                         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         break
                     except BlockingIOError:
+                        contended = True
                         time.sleep(min(.01, remaining))
             self._check_local_state()
             self._check_native_paths(directory)

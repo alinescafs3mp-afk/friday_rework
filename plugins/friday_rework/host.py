@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .admission import _snapshot, delivery_route
 from .adapters.contract import NativeObservation, VerifiedInput
-from .associations import AssociationError, _native, _sync_directory
+from .associations import AssociationError, AssociationLockBusy, _native, _sync_directory
 from .boundary import bound_owner, parse_brief, parse_request
 from .controller import Controller
 from .host_record import association_address, owner_from_ingress, quiescence_record
@@ -636,6 +636,25 @@ class WorkerHost:
             self._stop_on_error(row, error)
             raise
 
+    def _can_defer_owned_busy(self, row, *, defer_owned_busy):
+        if defer_owned_busy is not True:
+            return False
+        # Checked custody never grants a new native effect or deadline. Only
+        # the existing background observation loop opts into this refusal.
+        from hermes_cli.friday_user_scope import check_retained_job
+        from hermes_cli.friday_cli_work import check_local_job, should_stop
+        check_retained_job(row)
+        check_local_job(self, row)
+        if Path(self.store.state.data_dir) != self._state_directory:
+            raise HostUnavailable("foreign_runtime_home")
+        return not (self._closed or row["stop_intent"]
+                    or row["submission_observation"] != "OBSERVED" or row["native"] is None
+                    or row["host"]["terminal"] is not None or row["host"]["quiescence"] is not None
+                    or self.store.clock() >= row["deadline_unix"]
+                    or row["elapsed_seconds"] >= row["budget_seconds"]
+                    or select_runtime(self.ctx.get_config("runtime"), row["worker_kind"]) != row["host"]["binding"]["runtime"]
+                    or (row["owner"].get("platform") == "cli" and should_stop()))
+
     def _failure_diagnostic(self, row, phase, error):
         try:
             return _record_async_failure(self._state_directory, row, phase, error)
@@ -748,10 +767,10 @@ class WorkerHost:
         check_local_job(self, row)
         return self._settle(row, controller.start(row["existing_task_id"], row["owner"], brief, inputs))
 
-    def _reconcile(self, row):
+    def _reconcile(self, row, *, defer_owned_busy=False):
         try:
             with self.store.lock_budget():
-                return self._reconcile_checked(row)
+                return self._reconcile_checked(row, defer_owned_busy=defer_owned_busy)
         except BaseException as error:
             self._failure_diagnostic(row, "reconcile", error)
             if not any(note.startswith("owned execution STOP_")
@@ -759,7 +778,7 @@ class WorkerHost:
                 self._stop_on_error(row, error)
             raise
 
-    def _reconcile_checked(self, row):
+    def _reconcile_checked(self, row, *, defer_owned_busy=False):
         row = self._remember(self.store.get(row["existing_task_id"], row["owner"]))
         if row["host"]["terminal"] is not None and row["host"]["quiescence"] is not None:
             return row
@@ -777,7 +796,23 @@ class WorkerHost:
         check_retained_job(row)
         from hermes_cli.friday_cli_work import check_local_job
         check_local_job(self, row)
-        return self._settle(row, self._controller(row).reconcile(row["existing_task_id"], row["owner"]))
+        try:
+            controller = self._controller(row)
+            if row["worker_kind"] == "dsh":
+                observation = controller.reconcile(row["existing_task_id"], row["owner"],
+                                                   defer_preparation_busy=defer_owned_busy)
+            else:
+                observation = controller.reconcile(row["existing_task_id"], row["owner"])
+        except AssociationLockBusy as error:
+            # Controller propagates only a pre-adapter refusal without cleanup.
+            # Later failures which required stop must never be hidden.
+            if (row["worker_kind"] == "dsh"
+                    and not any(note.startswith("owned execution STOP_")
+                        for note in getattr(error, "__notes__", ()))
+                    and self._can_defer_owned_busy(row, defer_owned_busy=defer_owned_busy)):
+                return row  # No new observation, completion or clock allowance.
+            raise
+        return self._settle(row, observation)
 
     def _stop(self, row, intent):
         with self.store.lock_budget():
@@ -829,7 +864,7 @@ class WorkerHost:
                     current = await asyncio.to_thread(self._stop, current, "cancel")
                 else:
                     phase = "observe"
-                    current = await asyncio.to_thread(self._reconcile, current)
+                    current = await asyncio.to_thread(self._reconcile, current, defer_owned_busy=True)
             phase = "notify_finished"
             from .result_tool import notify_finished
             await notify_finished(self, current)
