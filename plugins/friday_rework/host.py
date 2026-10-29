@@ -77,6 +77,7 @@ def _record_async_failure(directory, row, phase, error, *, control=None):
                  IndexError: 'index_error', TimeoutError: 'timeout_error',
                  AssertionError: 'assertion_error', asyncio.CancelledError: 'cancelled_error',
                  HostUnavailable: 'host_unavailable', AssociationError: 'association_error',
+                 AssociationLockBusy: 'association_lock_busy',
                  json.JSONDecodeError: 'json_decode_error'}
         for module, name, label in (('adapters.dsh', 'AdapterError', 'dsh_adapter_error'),
                                    ('controller', 'ControllerError', 'controller_error')):
