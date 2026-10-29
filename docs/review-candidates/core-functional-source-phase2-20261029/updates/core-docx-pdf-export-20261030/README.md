@@ -1,0 +1,13 @@
+# CORE DOCX to PDF export — source checkpoint
+
+This source-only delta extends `b99211759c50133465e4ec915ec52b05af0e5b2b`. Apply [core.patch](core.patch) after the [DOCX preserving edit delta](../core-docx-preserving-edit-20261029/README.md). The package contains exactly four Hermes product files, including one new PDF helper. It is review material, not an installer. Exact source and artifact hashes are in [MANIFEST.json](MANIFEST.json); acceptance boundaries are in [STATUS.json](STATUS.json).
+
+The new `write_file` format `docx_pdf` accepts a new `.pdf` output path and JSON content with exactly `source`, naming an existing `.docx` in the user's own workspace. It exports a supported DOCX subset through a fixed, already provisioned LibreOffice toolchain, retains the original document, and refuses overwrites. The ordinary tool schema and prompt guidance expose this route. There is no fifth native module.
+
+Rendering uses an isolated local child with network isolation, fixed executable paths, bounded input/output, and the existing native deadline and cancellation interface. The final helper adapts `WebCall.stop` to synchronous renderer cleanup. Input package limits remain inherited from the DOCX validator; PDF output is at most 1,000,000 bytes and 1–200 pages. Unsupported DOCX features and unavailable renderer prerequisites are refused. Word-exact pagination or visual/layout equivalence is not claimed.
+
+Source review accepted the final four-file candidate. Historical evidence has distinct scopes: 15 renderer controls and one real synthetic render belong to the upstream helper (`541b55a0…`); the final helper (`b86a67b5…`) has 11 focused stop controls. The final source integration also has 21 integration controls and 5 nearest-consumer controls. These observations do not establish 52 unique tests or a real render of the final helper. The unchanged rendering algorithm's earlier evidence is reused with that boundary. Publication packaging ran no product tests or render.
+
+At this checkpoint Source98 is not installed; the installed source remains Source97. Fresh installed-native compatibility, renderer prerequisites, ordinary tool selection, returned PDF delivery, semantic acceptance and conversation continuation remain separate pending checks. This package does not claim runtime acceptance or product readiness, and it changes no running service. A0 remains deferred and DSH is untouched.
+
+Only product source and anonymous source observations are included. Private integration/installer changes, private evidence payloads, user/chat identifiers, document contents, credentials, and private local paths are excluded. Parent Hermes license and attribution notices continue to apply.
