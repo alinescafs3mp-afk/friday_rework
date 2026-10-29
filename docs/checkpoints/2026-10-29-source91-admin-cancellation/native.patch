@@ -1,0 +1,155 @@
+--- /dev/null
++++ b/hermes_cli/friday_admin_control.py
+@@ -0,0 +1,141 @@
++"""Finite verified operator authority for an existing Friday control call.
++
++This trusted in-process seam accepts the original host's operator verifier, not
++tool data. It authorizes one existing PluginState and one immutable job identity;
++it never creates a UserScope, admits work, or survives its synchronous context.
++"""
++from contextlib import contextmanager
++from contextvars import ContextVar
++import hashlib
++import json
++from pathlib import Path
++import re
++
++from hermes_cli import friday_user_scope as users
++from hermes_cli.friday_user_scope import ScopeDenied
++
++_CURRENT = ContextVar('friday_verified_admin_control', default=None)
++_CONTEXT = ContextVar('friday_verified_admin_control_context', default=None)
++
++
++def _verify(verify, profile):
++    from hermes_constants import get_process_hermes_home
++    from hermes_cli.config import load_config_readonly
++    from hermes_cli.dashboard_auth.base import Session
++    from hermes_cli.dashboard_auth.registry import get_provider
++    from hermes_cli.friday_product_access import admin_policy, session_allowed
++    session = verify()
++    consent = (load_config_readonly().get('plugins') or {}).get('entries', {}).get('friday_rework', {})
++    policy = admin_policy()
++    if (consent.get('allow_gateway_control') is not True or policy is None
++            or profile not in policy['profiles'] or not isinstance(session, Session)):
++        raise ScopeDenied()
++    provider = get_provider(session.provider, scope=str(get_process_hermes_home()))
++    if provider is None or provider.supports_session is not True:
++        raise ScopeDenied()
++    # A no-op callback or fabricated Session is not an administrative grant.
++    fresh = provider.verify_session(access_token=session.access_token)
++    if not session_allowed(fresh) or fresh.provider != session.provider:
++        raise ScopeDenied()
++
++
++def _checked(state):
++    from hermes_constants import get_hermes_home
++    from hermes_cli.plugins_state import PluginState
++    authority = _CURRENT.get()
++    if authority is None or not authority['active'] or users._CURRENT.get() is not None:
++        raise ScopeDenied()
++    # ContextVar values alone can be inherited by copied contexts. The token
++    # belongs to the exact synchronous entry, so those copies have no authority.
++    try:
++        _CONTEXT.reset(authority['token'])
++    except (ValueError, RuntimeError):
++        raise ScopeDenied() from None
++    authority['token'] = _CONTEXT.set(None)
++    _verify(authority['verify'], authority['profile'])
++    if (state is not authority['state'] or type(state) is not PluginState
++            or get_hermes_home() != authority['home']
++            or state._plugin_id != 'friday_rework'
++            or state._data_namespace != authority['namespace']
++            or Path(state.directory_storage_readonly) != authority['directory']):
++        raise ScopeDenied()
++    return authority
++
++
++@contextmanager
++def verified_store(state, directory, profile, reference, action, verify):
++    """Use only with the loaded host's original native operator verifier."""
++    from hermes_constants import get_hermes_home
++    from hermes_cli.friday_product_access import profile_name
++    from hermes_cli.plugins_state import PluginState
++    if (_CURRENT.get() is not None or users._CURRENT.get() is not None or type(state) is not PluginState
++            or action not in {'status', 'pause', 'cancel'} or not callable(verify)
++            or type(reference) is not str
++            or re.fullmatch(r'native-[a-f0-9]{64}', reference) is None):
++        raise ScopeDenied()
++    profile_name(profile)
++    _verify(verify, profile)
++    home, directory = get_hermes_home(), Path(directory)
++    if (state._plugin_id != 'friday_rework'
++            or directory != home / 'plugin-data' / state._data_namespace
++            or Path(state.directory_storage_readonly) != directory):
++        raise ScopeDenied()
++    authority = {'active': True, 'state': state, 'directory': directory,
++                 'namespace': state._data_namespace, 'home': home, 'profile': profile,
++                 'reference': reference, 'action': action, 'verify': verify, 'job': None}
++    token = _CURRENT.set(authority)
++    authority['token'] = _CONTEXT.set(None)
++    try:
++        yield
++    finally:
++        authority['active'] = False
++        try:
++            _CONTEXT.reset(authority['token'])
++        finally:
++            _CURRENT.reset(token)
++
++
++def check_store(state):
++    """Return False outside this seam; ordinary native checks still run."""
++    if _CURRENT.get() is None:
++        return False
++    _checked(state)
++    return True
++
++
++def _job_identity(authority, row):
++    try:
++        binding = row['host']['binding']
++        if (row['existing_task_id'] != authority['reference']
++                or (row['owner']['profile'] or 'default') != authority['profile']
++                or binding['ingress']['runtime_profile'] != authority['profile']
++                or Path(binding['runtime']['runtime_home']) != authority['home']):
++            raise ScopeDenied()
++        # These fields are immutable throughout observation/stop/settlement.
++        value = {k: row[k] for k in ('existing_task_id', 'owner', 'admission_hash',
++                                     'brief_sha256', 'worker_kind', 'workspace_reference',
++                                     'supervisor', 'budget_seconds', 'deadline_unix')}
++        value['binding'] = binding
++        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
++                                         allow_nan=False).encode()).hexdigest()
++    except (KeyError, TypeError, ValueError):
++        raise ScopeDenied() from None
++
++
++def bind_job(state, row):
++    """Pin only after the host validates the selected durable/cached record."""
++    authority = _checked(state)
++    identity = _job_identity(authority, row)
++    if authority['job'] is not None and authority['job'] != identity:
++        raise ScopeDenied()
++    authority['job'] = identity
++
++
++def check_job(state, row):
++    """Separate administrative observation/settlement from user admission."""
++    if _CURRENT.get() is None:
++        return False
++    authority = _checked(state)
++    if authority['job'] is None or authority['job'] != _job_identity(authority, row):
++        raise ScopeDenied()
++    return True
+--- a/hermes_cli/friday_cli_work.py
++++ b/hermes_cli/friday_cli_work.py
+@@ -268,6 +268,8 @@
+ 
+ def check_store(cap,state,*,storage_readonly=False):
+     if cap is None:
++        from hermes_cli.friday_admin_control import check_store as check_admin_store
++        if check_admin_store(state): return
+         if is_cli(): raise users.ScopeDenied()
+         return
+     directory = state.directory_storage_readonly if storage_readonly else state.data_dir
