@@ -176,8 +176,8 @@ def _sync_directory(directory):
 class Associations:
     """Serializes compound operations around the native atomic get/set API.
 
-    Threads sharing this owned store serialize short metadata operations before
-    taking the nonblocking flock. Another writer still receives admission_busy;
+    Threads sharing this owned store serialize short metadata operations. File
+    lock contention waits only within the same cumulative acquisition allowance;
     native preparation/control never holds either metadata lock.
     """
     def __init__(self, native_state, *, clock=time.time, _operator=None):
@@ -306,11 +306,16 @@ class Associations:
             if (not stat.S_ISREG(ls.st_mode) or ls.st_uid != os.getuid()
                     or ls.st_nlink != 1 or stat.S_IMODE(ls.st_mode) != 0o600):
                 raise AssociationError("unsafe_admission_lock")
-            try:
-                with self._lock_allowance.get().acquiring():
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise AssociationError("admission_busy") from exc
+            with self._lock_allowance.get().acquiring() as deadline:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("association_lock_deadline")
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(min(.01, remaining))
             self._check_local_state()
             self._check_native_paths(directory)
             marker = os.pread(fd, 4, 0)

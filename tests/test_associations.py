@@ -4,8 +4,11 @@ import importlib.util
 import os
 from pathlib import Path
 import json
+import select
 import stat
+import subprocess
 import sys
+import time
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -131,14 +134,48 @@ class AssociationTests(unittest.TestCase):
         with self.assertRaisesRegex(AssociationError, "association_store_lost"):
             self.store.claim(**self.args)
 
-    def test_nonblocking_lock_and_alias_controls(self):
+    def test_writer_waits_for_process_lock_release_within_budget(self):
+        self.store.claim(**self.args)
+        lock = self.state.data_dir / "admission.lock"
+        code = ("import fcntl, os, sys, time\n"
+                "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+                "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                "print('locked', flush=True)\n"
+                "sys.stdin.readline()\n"
+                "time.sleep(.08)\n"
+                "os.close(fd)\n")
+        holder = subprocess.Popen([sys.executable, "-I", "-B", "-c", code, str(lock)],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertTrue(select.select([holder.stdout], [], [], 3)[0],
+                            "lock holder did not become ready")
+            self.assertEqual(holder.stdout.readline(), "locked\n")
+            began = time.monotonic()
+            holder.stdin.write("release\n")
+            holder.stdin.flush()
+            row = self.store.get("existing-task", OWNER)
+            elapsed = time.monotonic() - began
+            self.assertEqual(row["existing_task_id"], "existing-task")
+            self.assertGreaterEqual(elapsed, .05)
+            self.assertLess(elapsed, 1.0)
+        finally:
+            try:
+                _, errors = holder.communicate("release\n", timeout=3)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.communicate()
+                raise
+        self.assertEqual(holder.returncode, 0, errors)
+
+    def test_bounded_writer_lock_and_alias_controls(self):
         import fcntl
         self.store.claim(**self.args)
         lock = self.state.data_dir / "admission.lock"
         fd = os.open(lock, os.O_RDWR)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            with self.assertRaisesRegex(AssociationError, "admission_busy"):
+            with self.assertRaisesRegex(TimeoutError, "association_lock_deadline"):
                 self.store.get("existing-task", OWNER)
         finally:
             os.close(fd)
