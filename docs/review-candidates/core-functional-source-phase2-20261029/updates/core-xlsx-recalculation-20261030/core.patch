@@ -1,0 +1,1076 @@
+--- a/hermes_cli/friday_prompt_scope.py
++++ b/hermes_cli/friday_prompt_scope.py
+@@ -158,6 +158,7 @@
+     'source/old_text/new_text и новым именем выходного файла. docx/docx_structured создают '
+     'документ заново и не сохраняют исходный пакет. Чтение текста не проверяет оформление. '
+     'Для экспорта DOCX в новый PDF используй write_file format=docx_pdf и JSON {"source":"report.docx"}; исходник остаётся неизменным. '
++    'Для пересчёта XLSX используй write_file format=xlsx_recalculate, новое имя .xlsx и JSON {"source":"edited.xlsx"}; после правки пересчитывай уже возвращённый файл, не повторяй правку. '
+     'При отказе сохраняющего редактирования не подменяй его пересборкой из извлечённого текста; '
+     'сообщи ограничение или уточни нужный уникальный фрагмент.')
+ ORDINARY_CAPABILITY_GUIDANCE = ('Помогай с задачами в пределах фактически доступных инструментов. '
+@@ -244,7 +245,8 @@
+             'a JSON string with source (the existing own-workspace .xlsx path), sheet, cell, '
+             'expected (current numeric value), value (new numeric value). Example content: '
+             '{"source":"orders.xlsx","sheet":"Orders","cell":"C3","expected":6,"value":7}. '
+-            'Other archive parts and formulas are preserved; formula caches are not recalculated. '
++            'Other archive parts and formulas are preserved; formula caches are not recalculated by format=xlsx. '
++            'To recalculate an existing own-workspace XLSX, use format=xlsx_recalculate, a NEW .xlsx path, and content JSON with exactly source, e.g. {"source":"orders-edited.xlsx"}. A bounded local LibreOffice engine recomputes supported numeric formulas and ordinary chart reference caches; source, formulas, tables, names and other package content are preserved. Unsupported formulas, packages and chart caches refuse without publishing. After an XLSX edit, recalculate that returned copy when requested; do not repeat the edit. '
+             'Never rebuild a workbook from extracted text or substitute CSV, XML, or .xls for XLSX. '
+             'For normal UTF-8 text, omit format (up to 1000000 bytes). '
+             'Existing parent directories are required. To replace existing text, first read '
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -912,8 +912,12 @@
+         if name != 'write_file':
+             raise ScopeDenied()
+         output_format = args.get('format', 'text')
+-        if output_format not in ('text', 'docx', 'docx_structured', 'docx_edit', 'docx_pdf', 'xlsx'):
+-            raise ScopeDenied()
++        if output_format not in ('text', 'docx', 'docx_structured', 'docx_edit', 'docx_pdf', 'xlsx', 'xlsx_recalculate'):
++            raise ScopeDenied()
++        if output_format == 'xlsx_recalculate':
++            if path.suffix.lower() != '.xlsx': raise ScopeDenied()
++            from hermes_cli.friday_workspace_xlsx_recalculate import create_recalculated
++            return create_recalculated(cap, fd, parts[-1], path.as_posix(), args.get('content'))
+         if output_format == 'xlsx':
+             if path.suffix.lower() != '.xlsx': raise ScopeDenied()
+             from hermes_cli.friday_workspace_xlsx import create_copy
+@@ -940,6 +944,8 @@
+                     'To edit an existing own-workspace XLSX, use write_file with format=xlsx, '
+                     'path set to a NEW .xlsx name, and content a JSON string with source, '
+                     'sheet, cell, expected (current numeric value), value (new numeric value). '
++                    'To recalculate a supported existing workbook, use format=xlsx_recalculate, '
++                    'a NEW .xlsx path and content JSON with exactly source. '
+                     'Do not write extracted text, CSV or XML under an XLSX filename.')
+             elif path.suffix.lower() == '.pdf':
+                 refusal['hint'] = ('To export an existing DOCX, use format=docx_pdf, a NEW .pdf path, '
+--- /dev/null
++++ b/hermes_cli/friday_workspace_xlsx_recalculate.py
+@@ -0,0 +1,710 @@
++"""Finite local XLSX recalculation, preserving the original OOXML package.
++
++Only numeric formulas in a conservative local subset are admitted. LibreOffice
++receives a disposable, cache-cleared copy in the existing document sandbox.
++Only verified numeric cell caches and ordinary chart reference caches return;
++the engine's rewritten workbook is never published. No formula evaluator here.
++"""
++from io import BytesIO
++from decimal import Decimal, InvalidOperation
++import hashlib
++import json
++import os
++from pathlib import Path
++import posixpath
++import re
++import shutil
++import stat
++import subprocess
++import sys
++import tempfile
++from xml.etree import ElementTree as ET
++from xml.parsers import expat
++from xml.sax.saxutils import escape
++from zipfile import ZipFile, BadZipFile, ZIP_STORED, ZIP_DEFLATED
++import zlib
++
++S = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
++R = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
++P = '{http://schemas.openxmlformats.org/package/2006/relationships}'
++C = '{http://schemas.openxmlformats.org/drawingml/2006/chart}'
++MAX_BYTES = 1000000
++MAX_EXPANDED = 4000000
++TAG = rb'(?:[A-Za-z_][\w.-]*:)?'
++FUNCTIONS = frozenset('SUM AVERAGE MIN MAX COUNT COUNTA ABS ROUND ROUNDUP ROUNDDOWN INT MOD SQRT POWER IF AND OR NOT SUMIF COUNTIF'.split())
++RELATIONS = frozenset('officeDocument core-properties extended-properties worksheet styles theme sharedStrings table drawing chart'.split())
++PATH = re.compile(r'(?:\[Content_Types\]\.xml|_rels/\.rels|docProps/(?:core|app)\.xml|xl/(?:workbook\.xml|styles\.xml|sharedStrings\.xml|_rels/workbook\.xml\.rels|theme/theme[0-9]+\.xml|worksheets/sheet[0-9]+\.xml|worksheets/_rels/sheet[0-9]+\.xml\.rels|tables/table[0-9]+\.xml|drawings/drawing[0-9]+\.xml|drawings/_rels/drawing[0-9]+\.xml\.rels|charts/chart[0-9]+\.xml))\Z')
++REF = re.compile(r"(?:'((?:[^']|'')+)'|([^'!\[\]]+))!\$?([A-Z]{1,3})\$?([1-9][0-9]{0,6})(?::\$?([A-Z]{1,3})\$?([1-9][0-9]{0,6}))?\Z")
++
++
++class RecalculationRefused(ValueError):
++    """Public finite reason only; never expose XML, paths or engine output."""
++
++
++def _deny(reason='unsupported_workbook'):
++    raise RecalculationRefused(reason)
++
++
++def _xml(raw, *, engine=False):
++    if (b'<!DOCTYPE' in raw.upper() or b'<!ENTITY' in raw.upper() or b'\x00' in raw
++            or re.search(br'<\?xml[^>]*encoding\s*=\s*[\'"](?!utf-8[\'"]|UTF-8[\'"])', raw)):
++        _deny()
++    root = ET.fromstring(raw)
++    stack = [(root, 0)]; count = 0
++    while stack:
++        node, depth = stack.pop(); count += 1
++        if count > 50000 or depth > 64: _deny()
++        if node.tag.rsplit('}', 1)[-1] in ({'AlternateContent', 'externalReferences',
++                'oleObjects', 'controls', 'webPublishItems', 'connections', 'queryTable',
++                'pivotTableDefinition', 'calculatedColumnFormula', 'totalsRowFormula'} | (set() if engine else {'extLst'})):
++            _deny()
++        stack.extend((child, depth+1) for child in node)
++    return root
++
++
++def _numeric(raw):
++    if not isinstance(raw, str) or not re.fullmatch(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[Ee][+-]?[0-9]+)?', raw): _deny('invalid_formula_result')
++    value = Decimal(raw)
++    if not value.is_finite() or abs(value) > Decimal('1e100'): _deny('invalid_formula_result')
++    return value
++
++
++TOKEN = re.compile(r"\s*(?:(?P<ref>(?:(?:'(?:[^']|'')+'|[A-Za-z_][A-Za-z0-9_.]*)!)?\$?[A-Za-z]{1,3}\$?[1-9][0-9]{0,6}(?::\$?[A-Za-z]{1,3}\$?[1-9][0-9]{0,6})?)(?![A-Za-z0-9_])|(?P<number>(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[Ee][+-]?[0-9]+)?)|(?P<name>[A-Za-z_][A-Za-z0-9_.]*)|(?P<op><>|<=|>=|[+*/^%(),=<>-]))")
++
++
++def _formula(text, names=()):
++    """Parse a finite numeric grammar; return references, never their values."""
++    if not isinstance(text, str) or not 1 <= len(text) <= 4096: _deny()
++    tokens = []; offset = 0
++    while offset < len(text.rstrip()):
++        match = TOKEN.match(text, offset)
++        if not match: _deny()
++        tokens.append((match.lastgroup, match.group(match.lastgroup))); offset = match.end()
++    if not tokens or len(tokens) > 1024: _deny()
++    index = 0; refs = []
++    priorities = {'=': 1, '<>': 1, '<': 1, '>': 1, '<=': 1, '>=': 1,
++                  '+': 2, '-': 2, '*': 3, '/': 3, '^': 4}
++    def expression(minimum=0, depth=0):
++        nonlocal index
++        if depth > 64 or index >= len(tokens): _deny()
++        kind, value = tokens[index]; index += 1
++        if value in ('+', '-'):
++            expression(5, depth+1)
++        elif value == '(':
++            expression(0, depth+1)
++            if index >= len(tokens) or tokens[index][1] != ')': _deny()
++            index += 1
++        elif kind == 'number': _numeric(value)
++        elif kind == 'ref': refs.append(('ref', value))
++        elif kind == 'name':
++            if index < len(tokens) and tokens[index][1] == '(':
++                if value.upper() not in FUNCTIONS: _deny()
++                index += 1; arguments = 0
++                while index < len(tokens) and tokens[index][1] != ')':
++                    expression(0, depth+1); arguments += 1
++                    if index < len(tokens) and tokens[index][1] == ',': index += 1
++                    else: break
++                if not arguments or index >= len(tokens) or tokens[index][1] != ')': _deny()
++                index += 1
++            elif value.upper() not in {'TRUE', 'FALSE'}: refs.append(('name', value.upper()))
++        else: _deny()
++        while index < len(tokens):
++            op = tokens[index][1]
++            if op == '%': index += 1; continue
++            priority = priorities.get(op, -1)
++            if priority < minimum: break
++            index += 1; expression(priority+1, depth+1)
++    expression()
++    if index != len(tokens): _deny()
++    return refs
++
++
++def _coord(value):
++    match = re.fullmatch(r'([A-Z]{1,3})([1-9][0-9]{0,6})', value or '')
++    if not match: _deny()
++    col = 0
++    for char in match[1]: col = col*26+ord(char)-64
++    if col > 16384 or int(match[2]) > 1048576: _deny()
++    return col, int(match[2])
++
++
++class Book:
++    def __init__(self, data, *, engine=False, checkpoint=lambda: None):
++        self.checkpoint = checkpoint
++        try:
++            self._load(data, engine=engine)
++        except (BadZipFile, ET.ParseError, ValueError, KeyError, TypeError, OSError,
++                RuntimeError, NotImplementedError, zlib.error, InvalidOperation):
++            _deny()
++
++    def _load(self, data, *, engine=False):
++        if not isinstance(data, bytes) or not 0 < len(data) <= MAX_BYTES: _deny()
++        with ZipFile(BytesIO(data)) as package:
++            self.infos = package.infolist(); self.comment = package.comment
++            if not 1 <= len(self.infos) <= 128 or sum(i.file_size for i in self.infos) > MAX_EXPANDED: _deny()
++            self.parts = {}; self.roots = {}
++            for info in self.infos:
++                self.checkpoint()
++                name = info.filename
++                engine_extra = engine and re.fullmatch(r'xl/charts/(?:_rels/chart[0-9]+\.xml\.rels|(?:style|colors)[0-9]+\.xml)', name)
++                if (name in self.parts or not (PATH.fullmatch(name) or engine_extra) or info.flag_bits & 1
++                        or info.compress_type not in (ZIP_STORED, ZIP_DEFLATED)
++                        or stat.S_ISLNK(info.external_attr >> 16)
++                        or info.file_size > MAX_EXPANDED or info.file_size > max(4096, info.compress_size*200)):
++                    _deny()
++                raw = package.read(info)
++                if len(raw) != info.file_size: _deny()
++                self.parts[name] = raw; self.roots[name] = _xml(raw, engine=engine)
++        ct = '{http://schemas.openxmlformats.org/package/2006/content-types}'
++        types = self.roots['[Content_Types].xml']
++        if types.tag != ct+'Types': _deny()
++        overrides = {}
++        allowed_types = {'application/xml', 'application/vnd.openxmlformats-package.relationships+xml',
++            'application/vnd.openxmlformats-package.core-properties+xml',
++            'application/vnd.openxmlformats-officedocument.extended-properties+xml',
++            'application/vnd.openxmlformats-officedocument.theme+xml',
++            'application/vnd.openxmlformats-officedocument.drawing+xml',
++            'application/vnd.openxmlformats-officedocument.drawingml.chart+xml'}
++        allowed_types.update('application/vnd.openxmlformats-officedocument.spreadsheetml.'+suffix+'+xml'
++            for suffix in ('sheet.main', 'worksheet', 'styles', 'sharedStrings', 'table'))
++        if engine: allowed_types.update({'application/vnd.ms-office.chartstyle+xml', 'application/vnd.ms-office.chartcolorstyle+xml'})
++        for node in types:
++            mime = node.get('ContentType', '')
++            if engine and node.tag == ct+'Default' and node.get('Extension') in {'fntdata', 'jpeg', 'png'}:
++                continue  # LibreOffice declares these even with no such member.
++            if mime not in allowed_types: _deny()
++            if node.tag == ct+'Override':
++                name = node.get('PartName', '')
++                if name in overrides or name.lstrip('/') not in self.parts: _deny()
++                overrides[name] = mime
++            elif node.tag != ct+'Default' or node.get('Extension') not in {'xml', 'rels'}: _deny()
++        if overrides.get('/xl/workbook.xml') != 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml': _deny()
++        self.links = {}
++        for name, root in self.roots.items():
++            if not name.endswith('.rels'): continue
++            if root.tag != P+'Relationships': _deny()
++            parent = '' if name == '_rels/.rels' else name.rsplit('/_rels/', 1)[0]
++            links = {}
++            for node in root:
++                target = node.get('Target', ''); ident = node.get('Id')
++                if (node.tag != P+'Relationship' or not ident or ident in links
++                        or node.get('TargetMode') is not None or ':' in target or '\\' in target
++                        or node.get('Type', '').rsplit('/', 1)[-1] not in (RELATIONS | ({'chartStyle', 'chartColorStyle'} if engine else set()))): _deny()
++                resolved = posixpath.normpath(target.lstrip('/') if target.startswith('/') else posixpath.join(parent, target))
++                if resolved not in self.parts or resolved.startswith('../'): _deny()
++                links[ident] = (node.get('Type'), resolved)
++            self.links[name] = links
++        offices = [target for kind, target in self.links['_rels/.rels'].values() if kind == R[1:-1]+'/officeDocument']
++        if offices != ['xl/workbook.xml']: _deny()
++        workbook = self.roots['xl/workbook.xml']
++        if workbook.tag != S+'workbook': _deny()
++        protection = workbook.find(S+'workbookProtection')
++        if protection is not None and (len(protection) or (protection.text or '').strip()
++                or any(key not in {'lockStructure', 'lockWindows', 'lockRevision'} or value not in {'0', 'false'}
++                       for key, value in protection.attrib.items())): _deny()
++        self.sheets = {}; self.cells = {}; self.formulas = {}
++        settings = workbook.find(S+'calcPr')
++        if settings is not None and settings.get('iterate', '0') not in ('0', 'false'): _deny()
++        if settings is not None and settings.get('fullPrecision', '1') not in ('1', 'true'): _deny()
++        definitions = workbook.findall(S+'definedNames/'+S+'definedName')
++        self.names = {}; self.name_expressions = {}
++        for node in definitions:
++            self.checkpoint()
++            name = node.get('name', '').upper(); local = node.get('localSheetId')
++            if any(node.get(key, '0') not in ('0', 'false') for key in ('function', 'vbProcedure', 'xlm')): _deny()
++            if not name or (local, name) in self.names: _deny()
++            self.names[local, name] = _formula(node.text)
++            self.name_expressions[local, name] = node.text
++        for sheet in workbook.findall(S+'sheets/'+S+'sheet'):
++            name = sheet.get('name'); link = self.links['xl/_rels/workbook.xml.rels'].get(sheet.get(R+'id'))
++            if not name or name in self.sheets or not link or link[0] != R[1:-1]+'/worksheet': _deny()
++            part = link[1]; root = self.roots[part]
++            if root.tag != S+'worksheet' or root.find(S+'sheetProtection') is not None: _deny()
++            self.sheets[name] = part; self.cells[name] = {}; self.formulas[name] = {}
++            for cell in root.findall(S+'sheetData/'+S+'row/'+S+'c'):
++                if len(self.cells[name]) % 256 == 0: self.checkpoint()
++                address = cell.get('r'); _coord(address)
++                if address in self.cells[name] or len(self.cells[name]) >= 4096: _deny()
++                self.cells[name][address] = cell
++                fs = cell.findall(S+'f')
++                if fs:
++                    allowed = {'aca': 'false'} if engine else {}
++                    if len(fs) != 1 or any(allowed.get(k) != v for k, v in fs[0].attrib.items()) or cell.get('t', 'n') not in ('n', 'e'): _deny()
++                    _formula(fs[0].text)
++                    self.formulas[name][address] = fs[0].text
++                elif cell.get('t', 'n') == 'n' and cell.find(S+'v') is not None:
++                    _numeric(cell.find(S+'v').text)
++        if not self.sheets or sum(map(len, self.formulas.values())) > 4096: _deny()
++        # All formula sites outside cells/names are either simple chart ranges or refused.
++        for part, root in self.roots.items():
++            for node in root.iter():
++                if node.tag == C+'f': self.range(node.text)
++                elif node.tag.rsplit('}', 1)[-1] in {'formula', 'formula1', 'formula2'}: _formula(node.text)
++        self._dependencies()
++
++    def _dependencies(self):
++        graph = {}; edges = 0; ordered = list(self.sheets); memo = {}; operations = 0
++        def expand(tokens, sheet, seen=()):
++            nonlocal operations
++            result = set()
++            for kind, value in tokens:
++                operations += 1
++                if operations > 100000: _deny('formula_dependency_limit')
++                if operations % 256 == 0: self.checkpoint()
++                if kind == 'name':
++                    scope = str(ordered.index(sheet)); key = (scope, value)
++                    if key not in self.names: key = (None, value)
++                    if key not in self.names or key in seen or len(seen) > 32: _deny()
++                    identity = key, sheet
++                    if identity not in memo: memo[identity] = expand(self.names[key], sheet, seen+(key,))
++                    result.update(memo[identity])
++                else:
++                    qualified = value if '!' in value else "'"+sheet.replace("'", "''")+"'!"+value
++                    target, addresses = self.range(qualified.upper() if '!' not in value else qualified, casefold=True)
++                    operations += len(addresses)
++                    if operations > 100000: _deny('formula_dependency_limit')
++                    result.update((target, address) for address in addresses)
++                if len(result) > 20000: _deny('formula_dependency_limit')
++            return result
++        for (scope, _), tokens in self.names.items():
++            if scope is not None and (not scope.isdecimal() or int(scope) >= len(ordered)): _deny()
++            expand(tokens, ordered[int(scope)] if scope is not None else ordered[0])
++        for sheet, formulas in self.formulas.items():
++            for address, text in formulas.items():
++                refs = expand(_formula(text), sheet); edges += len(refs)
++                if edges > 20000: _deny()
++                graph[sheet, address] = refs
++        active = set(); done = set()
++        def visit(node, depth=0):
++            if node in done or node not in graph: return
++            if node in active or depth > 128: _deny('circular_or_deep_formula')
++            active.add(node)
++            for child in graph[node]: visit(child, depth+1)
++            active.remove(node); done.add(node)
++        for node in graph: visit(node)
++        self.checkpoint()
++
++    def range(self, text, casefold=False):
++        match = REF.fullmatch(text or '') if not casefold else re.fullmatch(REF.pattern, text or '', re.I)
++        if not match: _deny('unsupported_chart')
++        sheet = (match[1] or match[2]).replace("''", "'")
++        if casefold:
++            matches = [name for name in self.sheets if name.casefold() == sheet.casefold()]
++            if len(matches) != 1: _deny()
++            sheet = matches[0]
++        if sheet not in self.sheets: _deny('unsupported_chart')
++        c1, r1 = _coord(match[3].upper()+match[4]); c2, r2 = _coord((match[5] or match[3]).upper()+(match[6] or match[4]))
++        if c1 > c2 or r1 > r2 or (not casefold and c1 != c2 and r1 != r2) or (c2-c1+1)*(r2-r1+1) > 4096: _deny('unsupported_chart')
++        def col(n):
++            s = ''
++            while n: n, rem = divmod(n-1, 26); s = chr(65+rem)+s
++            return s
++        return sheet, [col(c)+str(r) for r in range(r1, r2+1) for c in range(c1, c2+1)]
++
++    def pack(self, changed):
++        output = BytesIO()
++        with ZipFile(output, 'w') as package:
++            package.comment = self.comment
++            for info in self.infos: package.writestr(info, changed.get(info.filename, self.parts[info.filename]))
++        data = output.getvalue()
++        if len(data) > MAX_BYTES: _deny('output_too_large')
++        return data
++
++
++def _tag_end(raw, offset):
++    quote = None
++    for index in range(offset, len(raw)):
++        char = raw[index]
++        if quote:
++            if char == quote: quote = None
++        elif char in (34, 39): quote = char
++        elif char == 62: return index+1
++    _deny()
++
++
++def _patch_cells(raw, values):
++    """Use XML parser byte offsets, so comments/foreign tags cannot be cells."""
++    parser = expat.ParserCreate(namespace_separator='}')
++    stack = []; cells = {}; current = None
++    def start(name, attrs):
++        nonlocal current
++        stack.append(name)
++        offset = parser.CurrentByteIndex
++        if stack == [S[1:]+'worksheet', S[1:]+'sheetData', S[1:]+'row', S[1:]+'c']:
++            address = attrs.get('r')
++            if address in values:
++                if address in cells: _deny()
++                current = {'start': offset, 'open_end': _tag_end(raw, offset), 'v': []}
++                cells[address] = current
++        elif current is not None and len(stack) == 5 and name == S[1:]+'v':
++            current['v'].append([offset, None, raw[offset:_tag_end(raw, offset)].rstrip().endswith(b'/>')])
++    def end(name):
++        nonlocal current
++        if current is not None and len(stack) == 5 and name == S[1:]+'v':
++            record = current['v'][-1]
++            record[1] = parser.CurrentByteIndex if record[2] else _tag_end(raw, parser.CurrentByteIndex)
++        elif current is not None and len(stack) == 4 and name == S[1:]+'c':
++            current['close'] = parser.CurrentByteIndex; current = None
++        stack.pop()
++    parser.StartElementHandler = start; parser.EndElementHandler = end
++    parser.Parse(raw, True)
++    if set(cells) != set(values): _deny()
++    edits = []
++    for address, record in cells.items():
++        opening = raw[record['start']:record['open_end']]
++        prefix = re.match(rb'<((?:[A-Za-z_][\w.-]*:)?)c\b', opening)
++        if prefix is None or len(record['v']) > 1: _deny()
++        adjusted = re.sub(rb'\s+t\s*=\s*([\'"])[^\'"]*\1', b'', opening)
++        if adjusted != opening: edits.append((record['start'], record['open_end'], adjusted))
++        replacement = b'<'+prefix[1]+b'v>'+values[address].encode('ascii')+b'</'+prefix[1]+b'v>'
++        if record['v']:
++            start, end, _ = record['v'][0]; edits.append((start, end, replacement))
++        else: edits.append((record['close'], record['close'], replacement))
++    output = raw
++    for start, end, replacement in sorted(edits, reverse=True): output = output[:start]+replacement+output[end:]
++    # Prove only the admitted cache/type changed, including unusual attributes.
++    before = _xml(raw); after = _xml(output)
++    for root in (before, after):
++        for cell in root.findall(S+'sheetData/'+S+'row/'+S+'c'):
++            if cell.get('r') in values:
++                cell.attrib.pop('t', None)
++                for value in cell.findall(S+'v'): cell.remove(value)
++    if ET.tostring(before) != ET.tostring(after): _deny('preservation_failed')
++    return output
++
++
++def prepare(book):
++    changes = {}
++    for name, formulas in book.formulas.items():
++        if formulas: changes[book.sheets[name]] = _patch_cells(book.parts[book.sheets[name]], dict.fromkeys(formulas, ''))
++    raw = book.parts['xl/workbook.xml']
++    prefix = re.match(rb'(?:<\?xml[^>]*>\s*)?<((?:[A-Za-z_][\w.-]*:)?)workbook\b', raw)
++    if not prefix: _deny()
++    calc = b'<'+prefix[1]+b'calcPr calcId="0" calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>'
++    pattern = rb'<'+TAG+rb'calcPr\b[^>]*(?:/>|>.*?</'+TAG+rb'calcPr\s*>)'
++    if re.search(pattern, raw, re.S): raw = re.sub(pattern, lambda _: calc, raw, flags=re.S)
++    else:
++        offset = raw.rfind(b'</'); raw = raw[:offset]+calc+raw[offset:]
++    changes['xl/workbook.xml'] = raw
++    return book.pack(changes)
++
++
++def _literal(book, cell):
++    kind = cell.get('t', 'n')
++    if kind == 'n':
++        raw = cell.findtext(S+'v')
++        return ('empty', None) if raw is None else ('number', _numeric(raw))
++    if kind == 'b' and cell.findtext(S+'v') in ('0', '1'): return ('bool', cell.findtext(S+'v'))
++    if kind == 'inlineStr': return ('text', _string(cell.find(S+'is')))
++    if kind == 's':
++        try: return ('text', _string(book.roots['xl/sharedStrings.xml'].findall(S+'si')[int(cell.findtext(S+'v'))]))
++        except (KeyError, ValueError, IndexError): _deny()
++    _deny()
++
++
++def _string(node):
++    if node is None: _deny()
++    return ''.join(child.text or '' for child in node.findall(S+'t')+node.findall(S+'r/'+S+'t'))
++
++
++def _canonical_reference(value):
++    if '!' in value:
++        sheet, cells = value.rsplit('!', 1)
++        if sheet.startswith("'"): sheet = sheet[1:-1].replace("''", "'")
++        sheet = sheet.casefold()
++    else: sheet, cells = None, value
++    addresses = cells.upper().split(':')
++    if len(addresses) == 2 and addresses[0] == addresses[1]: addresses.pop()
++    return sheet, tuple(addresses)
++
++
++def _canonical_formula(value):
++    # Token boundaries discard grammar whitespace, never whitespace in labels.
++    result = []; offset = 0
++    while offset < len(value.rstrip()):
++        match = TOKEN.match(value, offset)
++        if not match: _deny('engine_result_mismatch')
++        kind = match.lastgroup; text = match.group(kind); offset = match.end()
++        result.append((kind, _canonical_reference(text) if kind == 'ref'
++                       else _numeric(text) if kind == 'number' else text.upper()))
++    return tuple(result)
++
++
++def _patch_chart(raw, caches):
++    """Edit actual reference/cache XML spans, preserving opaque outside markup."""
++    parser = expat.ParserCreate(namespace_separator='}')
++    records = []; active = None; depth = 0
++    def start(name, attrs):
++        nonlocal depth, active
++        depth += 1
++        offset = parser.CurrentByteIndex; end = _tag_end(raw, offset)
++        if name in (C[1:]+'numRef', C[1:]+'strRef'):
++            if active is not None: _deny('unsupported_chart')
++            active = {'start': offset, 'open_end': end, 'depth': depth,
++                      'kind': name.rsplit('}', 1)[1], 'cache': None}
++            records.append(active)
++        elif active is not None and depth == active['depth']+1 and name in (C[1:]+'numCache', C[1:]+'strCache'):
++            if active['cache'] is not None: _deny('unsupported_chart')
++            active['cache'] = {'start': offset, 'open_end': end,
++                'empty': raw[offset:end].rstrip().endswith(b'/>'), 'kind': name.rsplit('}', 1)[1]}
++    def finish(name):
++        nonlocal depth, active
++        if active is not None:
++            if active['cache'] is not None and depth == active['depth']+1 and name in (C[1:]+'numCache', C[1:]+'strCache'):
++                item = active['cache']
++                item['end'] = item['open_end'] if item['empty'] else _tag_end(raw, parser.CurrentByteIndex)
++            elif depth == active['depth']:
++                active['close'] = parser.CurrentByteIndex
++                active['end'] = _tag_end(raw, parser.CurrentByteIndex); active = None
++        depth -= 1
++    parser.StartElementHandler = start; parser.EndElementHandler = finish
++    parser.Parse(raw, True)
++    if len(records) != len(caches): _deny('unsupported_chart')
++    edits = []
++    for record, (ref_kind, kind, fmt, points) in zip(records, caches):
++        opening = raw[record['start']:record['open_end']]
++        match = re.match(rb'<((?:[A-Za-z_][\w.-]*:)?)'+record['kind'].encode()+rb'\b', opening)
++        if match is None: _deny('unsupported_chart')
++        prefix = match[1].decode()
++        if record['kind'] != ref_kind:
++            if (record['kind'], ref_kind) != ('numRef', 'strRef'): _deny('unsupported_chart')
++            edits.append((record['start'], record['open_end'], opening[:len(match[1])+1]+b'strRef'+opening[len(match[1])+7:]))
++            closing = raw[record['close']:record['end']]
++            edits.append((record['close'], record['end'], closing[:len(match[1])+2]+b'strRef'+closing[len(match[1])+8:]))
++        cache = record['cache']
++        if cache is None:
++            cache_open = '<'+prefix+kind+'>'
++        else:
++            cache_open = raw[cache['start']:cache['open_end']].decode()
++            cache_prefix = re.match(r'<((?:[A-Za-z_][\w.-]*:)?)'+cache['kind']+r'\b', cache_open)
++            if cache_prefix is None: _deny('unsupported_chart')
++            prefix = cache_prefix[1]
++            offset = len(prefix)+1
++            cache_open = cache_open[:offset]+kind+cache_open[offset+len(cache['kind']):]
++            if cache['empty']: cache_open = cache_open.rstrip()[:-2]+'>'
++        def element(tag, body): return '<'+prefix+tag+'>'+body+'</'+prefix+tag+'>'
++        body = element('formatCode', escape(fmt)) if fmt is not None else ''
++        body += '<'+prefix+'ptCount val="'+str(len(points))+'"/>'
++        body += ''.join('<'+prefix+'pt idx="'+str(i)+'">'+element('v', escape(value))+'</'+prefix+'pt>' for i, value in points)
++        replacement = (cache_open+body+'</'+prefix+kind+'>').encode()
++        if cache is None: edits.append((record['close'], record['close'], replacement))
++        else: edits.append((cache['start'], cache['end'], replacement))
++    before = _xml(raw)
++    for start, end, replacement in sorted(edits, reverse=True): raw = raw[:start]+replacement+raw[end:]
++    after = _xml(raw)
++    old_refs = [node for node in before.iter() if node.tag in {C+'numRef', C+'strRef'}]
++    new_refs = [node for node in after.iter() if node.tag in {C+'numRef', C+'strRef'}]
++    if len(new_refs) != len(caches): _deny('preservation_failed')
++    for old, new, (ref_kind, kind, fmt, points) in zip(old_refs, new_refs, caches):
++        actual = new.find(C+kind)
++        if (new.tag != C+ref_kind or actual is None or actual.findtext(C+'formatCode') != fmt
++                or actual.find(C+'ptCount').get('val') != str(len(points))
++                or [(node.get('idx'), node.findtext(C+'v')) for node in actual.findall(C+'pt')]
++                    != [(str(i), value) for i, value in points]): _deny('preservation_failed')
++        for node in (old, new):
++            for child in list(node):
++                if child.tag in {C+'numCache', C+'strCache'}: node.remove(child)
++        new.tag = old.tag
++    if ET.tostring(before) != ET.tostring(after): _deny('preservation_failed')
++    return raw
++
++
++def transplant(book, calculated):
++    engine = Book(calculated, engine=True, checkpoint=book.checkpoint)
++    if list(engine.sheets) != list(book.sheets): _deny('engine_result_mismatch')
++    def date_system(item):
++        props = item.roots['xl/workbook.xml'].find(S+'workbookPr')
++        return props is not None and props.get('date1904', '0') in ('1', 'true')
++    if date_system(book) != date_system(engine): _deny('engine_result_mismatch')
++    changes = {}; values = {}; count = 0
++    canonical_names = lambda item: {key: _canonical_formula(value) for key, value in item.name_expressions.items()}
++    if canonical_names(book) != canonical_names(engine): _deny('engine_result_mismatch')
++    for name, formulas in book.formulas.items():
++        book.checkpoint()
++        if set(formulas) != set(engine.formulas[name]): _deny('engine_result_mismatch')
++        for address, cell in book.cells[name].items():
++            if address in formulas: continue
++            expected = _literal(book, cell)
++            actual = engine.cells[name].get(address)
++            if actual is None:
++                if expected != ('empty', None): _deny('engine_result_mismatch')
++            elif _literal(engine, actual) != expected: _deny('engine_result_mismatch')
++        for address, cell in engine.cells[name].items():
++            if address not in book.cells[name] and _literal(engine, cell) != ('empty', None): _deny('engine_result_mismatch')
++        current = {}
++        for address, formula in formulas.items():
++            cell = engine.cells[name][address]; vals = cell.findall(S+'v')
++            if _canonical_formula(formula) != _canonical_formula(engine.formulas[name][address]) or cell.get('t', 'n') != 'n' or len(vals) != 1: _deny('engine_result_mismatch')
++            _numeric(vals[0].text); current[address] = vals[0].text; count += 1
++        values[name] = current
++        if current: changes[book.sheets[name]] = _patch_cells(book.parts[book.sheets[name]], current)
++    charts = 0; chart_adjustments = 0
++    for part, root in book.roots.items():
++        book.checkpoint()
++        if not part.startswith('xl/charts/'): continue
++        raw = book.parts[part]
++        caches = []
++        parents = {child: parent for parent in root.iter() for child in parent}
++        for node in root.iter():
++            if node.tag in {C+'multiLvlStrRef', C+'numLit', C+'strLit'}: _deny('unsupported_chart')
++            if node.tag not in {C+'numRef', C+'strRef'}: continue
++            sheet, addresses = book.range(node.findtext(C+'f'))
++            numeric = node.tag == C+'numRef'; kind = 'numCache' if numeric else 'strCache'
++            cache = node.find(C+kind)
++            if any(child.tag not in {C+'f', C+kind} for child in node) or len(node.findall(C+'f')) != 1 or len(node.findall(C+kind)) > 1: _deny('unsupported_chart')
++            if cache is not None:
++                if (any(child.tag not in {C+'formatCode', C+'ptCount', C+'pt'} for child in cache)
++                        or len(cache.findall(C+'formatCode')) > 1 or len(cache.findall(C+'ptCount')) > 1): _deny('unsupported_chart')
++                for child in cache:
++                    allowed = {'idx'} if child.tag == C+'pt' else {'val'} if child.tag == C+'ptCount' else set()
++                    if set(child.attrib) != allowed: _deny('unsupported_chart')
++                    if child.tag == C+'pt':
++                        if len(child) != 1 or child[0].tag != C+'v' or child[0].attrib or len(child[0]): _deny('unsupported_chart')
++                    elif len(child): _deny('unsupported_chart')
++            ref_kind = 'numRef' if numeric else 'strRef'
++            cells = [book.cells[sheet].get(address) for address in addresses]
++            if any(cell is None for cell in cells): _deny('unsupported_chart')
++            if numeric and all(cell.get('t') in {'s', 'inlineStr'} for cell in cells):
++                if parents[node].tag != C+'cat' or (cache is not None and len(cache)): _deny('unsupported_chart')
++                numeric = False; kind = 'strCache'; ref_kind = 'strRef'; chart_adjustments += 1
++            points = []
++            for index, address in enumerate(addresses):
++                cell = book.cells[sheet].get(address)
++                if cell is None: _deny('unsupported_chart')
++                if numeric:
++                    value = values[sheet].get(address, cell.findtext(S+'v'))
++                    if cell.get('t', 'n') not in ('n', 'e'): _deny('unsupported_chart')
++                    _numeric(value)
++                elif cell.get('t') in {'inlineStr', 's'}: value = _literal(book, cell)[1]
++                else: _deny('unsupported_chart')
++                points.append((index, value))
++            caches.append((ref_kind, kind, cache.findtext(C+'formatCode') if cache is not None else None, points)); charts += 1
++        raw = _patch_chart(raw, caches)
++        if raw != book.parts[part]: changes[part] = raw
++    result = book.pack(changes)
++    checked = Book(result, checkpoint=book.checkpoint)
++    if checked.formulas != book.formulas: _deny('preservation_failed')
++    for name, formulas in book.formulas.items():
++        for address in formulas:
++            cell = checked.cells[name][address]
++            if cell.get('t', 'n') != 'n' or cell.findtext(S+'v') != values[name][address]: _deny('preservation_failed')
++    return result, count, charts, chart_adjustments
++
++
++def _argv(work, toolchain):
++    from hermes_cli.friday_workspace_pdf import _argv as pdf_argv
++    # Reuse the document namespace/custody unchanged, only its fixed input name.
++    return [arg.replace('input.docx', 'input.xlsx') for arg in pdf_argv(work, toolchain)]
++
++
++def render(cap, book):
++    from hermes_cli.friday_workspace_pdf import _toolchain, _run, _private_bytes, ExportRefused
++    from hermes_cli.friday_workspace_revision import check
++    work = Path(tempfile.mkdtemp(prefix='friday-xlsx-recalculate-'))
++    try:
++        work.chmod(0o700)
++        for name in ('out', 'home', 'tmp'): (work/name).mkdir(mode=0o700)
++        (work/'input.xlsx').write_bytes(prepare(book)); (work/'input.xlsx').chmod(0o600)
++        (work/'renderer.py').write_bytes(Path(__file__).read_bytes()); (work/'renderer.py').chmod(0o600)
++        _run(cap, _argv(work, _toolchain()), work)
++        root = output = None
++        try:
++            root = os.open(work, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
++            output = os.open('out', os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW, dir_fd=root)
++            for descriptor in (root, output):
++                info = os.fstat(descriptor)
++                if info.st_uid != os.getuid() or info.st_mode & 0o077: _deny('invalid_engine_output')
++            data = _private_bytes(output, 'input.xlsx', MAX_BYTES)
++        finally:
++            if output is not None: os.close(output)
++            if root is not None: os.close(root)
++        check(cap)
++        return transplant(book, data)
++    finally:
++        try: shutil.rmtree(work)
++        except OSError:
++            from agent.web_call_context import _current
++            call = _current.get()
++            if call is not None and hasattr(call, 'agent'): call.agent._friday_reply_effect_unknown = True
++            raise ExportRefused('renderer_cleanup_unconfirmed') from None
++
++
++def create_recalculated(cap, fd, leaf, path, content):
++    from hermes_cli.friday_user_scope import ScopeDenied, workspace_document
++    from hermes_cli.friday_workspace_revision import check
++    from hermes_cli.friday_workspace_docx import _create_bytes, _check_parent
++    from hermes_cli.friday_workspace_pdf import ExportRefused
++    check(cap); _check_parent(cap, fd, path)
++    try:
++        def pairs(items):
++            result = {}
++            for key, value in items:
++                if key in result: raise ScopeDenied()
++                result[key] = value
++            return result
++        if not isinstance(content, str) or len(content) > 4096: raise ScopeDenied()
++        spec = json.loads(content, object_pairs_hook=pairs)
++        if not isinstance(spec, dict) or set(spec) != {'source'}: raise ScopeDenied()
++        raw = spec['source']
++        if not isinstance(raw, str) or not raw or '\x00' in raw: raise ScopeDenied()
++        root = cap.home/'workspace'; source = Path(raw)
++        if not source.is_absolute(): source = root/source
++        relative = source.relative_to(root)
++        if (not relative.parts or any(p in ('.', '..') or p.startswith('.') for p in relative.parts)
++                or source.suffix.lower() != '.xlsx' or relative.as_posix() == path): raise ScopeDenied()
++    except (ValueError, TypeError, KeyError, RecursionError): raise ScopeDenied() from None
++    try:
++        os.stat(leaf, dir_fd=fd, follow_symlinks=False)
++        return json.dumps({'success': False, 'error': 'document_already_exists', 'path': path})
++    except FileNotFoundError: pass
++    try:
++        data, _, identity = workspace_document(str(source), with_identity=True)
++        book = Book(data, checkpoint=lambda: check(cap))
++        rendered, count, charts, chart_adjustments = render(cap, book)
++        def verify():
++            check(cap)
++            current, _, version = workspace_document(str(source), with_identity=True)
++            if current != data or version != identity: raise ScopeDenied()
++        result = json.loads(_create_bytes(cap, fd, leaf, path, rendered, output_format='xlsx', verify_source=verify))
++        if result.get('success'):
++            result.update(source=relative.as_posix(), source_sha256=hashlib.sha256(data).hexdigest(),
++                          source_unchanged=True, formula_cache_recomputed=True,
++                          recalculated_formula_cells=count, refreshed_chart_references=charts,
++                          recalculation_engine='LibreOffice', unrelated_parts_preserved=True,
++                          preservation_mode='original_parts_with_cache_updates_and_reported_chart_adjustments',
++                          chart_category_references_normalized=chart_adjustments)
++        return json.dumps(result)
++    except (RecalculationRefused, ExportRefused) as error:
++        unknown = str(error) == 'renderer_cleanup_unconfirmed'
++        return json.dumps({'success': False, 'error': 'xlsx_recalculation_refused', 'reason': str(error),
++                           'effect_disposition': 'unknown' if unknown else 'none'})
++    except (TimeoutError, RuntimeError, OSError):
++        return json.dumps({'success': False, 'error': 'xlsx_recalculation_stopped', 'effect_disposition': 'none'})
++
++
++def _render_child():
++    import resource
++    os.umask(0o077)
++    os.sched_setaffinity(0, sorted(os.sched_getaffinity(0))[:2])
++    for key, value in ((resource.RLIMIT_AS, 2*1024**3), (resource.RLIMIT_CPU, 35),
++                       (resource.RLIMIT_FSIZE, 16*1024**2), (resource.RLIMIT_CORE, 0),
++                       (resource.RLIMIT_NOFILE, 128)):
++        resource.setrlimit(key, (value, value))
++    prefix = '/opt/friday-document-toolchain'; program = prefix+'/root/usr/lib/libreoffice/program'
++    env = {'PATH': '/usr/bin:/bin', 'HOME': '/work/home', 'TMPDIR': '/work/tmp',
++           'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'SAL_USE_VCLPLUGIN': 'svp',
++           'XDG_CACHE_HOME': '/work/home/cache', 'XDG_CONFIG_HOME': '/work/home/config',
++           'XDG_RUNTIME_DIR': '/work/tmp',
++           'LD_LIBRARY_PATH': program+':'+prefix+'/root/usr/lib/x86_64-linux-gnu'}
++    command = [program+'/soffice', '--headless', '--norestore', '--nodefault',
++               '--nolockcheck', '--nofirststartwizard',
++               '-env:UserInstallation=file:///work/home/profile', '--convert-to',
++               'xlsx:Calc MS Excel 2007 XML', '--outdir', '/work/out', '/work/input.xlsx']
++    subprocess.run(command, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
++                   stderr=subprocess.DEVNULL, timeout=35, check=True)
++
++
++if __name__ == '__main__':
++    if sys.argv[1:] != ['--render']: raise SystemExit(2)
++    try: _render_child()
++    except BaseException: raise SystemExit(1)
+--- /dev/null
++++ b/tests/test_xlsx_recalculate.py
+@@ -0,0 +1,296 @@
++"""Synthetic finite recalculation controls; no product/user files or models."""
++from io import BytesIO
++import importlib.util
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++sys.dont_write_bytecode = True
++import tempfile
++import unittest
++from unittest.mock import patch
++import contextlib
++import threading
++import time
++from types import SimpleNamespace
++from xml.etree import ElementTree as ET
++from zipfile import ZipFile, ZIP_DEFLATED
++
++ROOT = Path(__file__).resolve().parents[1]
++INSTALLED = Path(os.environ.get('FRIDAY_XLSX_TEST_BASE', ROOT))
++sys.path.insert(0, str(INSTALLED))
++SPEC = importlib.util.spec_from_file_location('recalc_candidate', ROOT/'hermes_cli/friday_workspace_xlsx_recalculate.py')
++M = importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(M)
++S = M.S; R = M.R[1:-1]; P = M.P[1:-1]; C = M.C[1:-1]
++
++def package(parts):
++    out = BytesIO()
++    with ZipFile(out, 'w', ZIP_DEFLATED) as z:
++        for name, raw in parts.items(): z.writestr(name, raw)
++    return out.getvalue()
++
++def fixture():
++    parts = {
++        '[Content_Types].xml': '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/><Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/><Override PartName="/xl/tables/table1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/></Types>',
++        '_rels/.rels': f'<Relationships xmlns="{P}"><Relationship Id="r1" Type="{R}/officeDocument" Target="xl/workbook.xml"/></Relationships>',
++        'xl/workbook.xml': f'<workbook xmlns="{S[1:-1]}" xmlns:r="{R}"><sheets><sheet name="Orders" sheetId="1" r:id="r1"/><sheet name="Summary" sheetId="2" r:id="r2"/></sheets><definedNames><definedName name="Quantity">Orders!$A$2</definedName></definedNames><calcPr calcMode="auto"/></workbook>',
++        'xl/_rels/workbook.xml.rels': f'<Relationships xmlns="{P}"><Relationship Id="r1" Type="{R}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="r2" Type="{R}/worksheet" Target="worksheets/sheet2.xml"/></Relationships>',
++        'xl/worksheets/sheet1.xml': f'<worksheet xmlns="{S[1:-1]}" xmlns:r="{R}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Quantity</t></is></c><c r="B1" t="inlineStr"><is><t>Price</t></is></c><c r="C1" t="inlineStr"><is><t>Total</t></is></c></row><row r="2"><c r="A2"><v>2</v></c><c r="B2"><v>3</v></c><c r="C2"><f>A2*B2</f><v>999</v></c></row></sheetData><drawing r:id="r1"/><tableParts count="1"><tablePart r:id="r2"/></tableParts></worksheet>',
++        'xl/worksheets/sheet2.xml': f'<worksheet xmlns="{S[1:-1]}"><sheetData><row r="1"><c r="A1"><f>SUM(Orders!C2:C2)</f><v>-5</v></c></row></sheetData></worksheet>',
++        'xl/worksheets/_rels/sheet1.xml.rels': f'<Relationships xmlns="{P}"><Relationship Id="r1" Type="{R}/drawing" Target="../drawings/drawing1.xml"/><Relationship Id="r2" Type="{R}/table" Target="../tables/table1.xml"/></Relationships>',
++        'xl/tables/table1.xml': f'<table xmlns="{S[1:-1]}" id="1" name="OrderTable" displayName="OrderTable" ref="A1:C2" totalsRowShown="0"><autoFilter ref="A1:C2"/><tableColumns count="3"><tableColumn id="1" name="Quantity"/><tableColumn id="2" name="Price"/><tableColumn id="3" name="Total"/></tableColumns></table>',
++        'xl/drawings/drawing1.xml': f'<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="{R}"><xdr:oneCellAnchor><xdr:from><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="4000000" cy="3000000"/><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="1" name="chart"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="{C}"><c:chart xmlns:c="{C}" r:id="r1"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>',
++        'xl/drawings/_rels/drawing1.xml.rels': f'<Relationships xmlns="{P}"><Relationship Id="r1" Type="{R}/chart" Target="../charts/chart1.xml"/></Relationships>',
++        'xl/charts/chart1.xml': f'<c:chartSpace xmlns:c="{C}"><c:chart><c:plotArea><c:layout/><c:barChart><c:barDir val="col"/><c:grouping val="clustered"/><c:ser><c:idx val="0"/><c:order val="0"/><c:cat><c:strRef><c:f>Orders!$A$1</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>stale label</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:f>Summary!$A$1</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="1"/><c:pt idx="0"><c:v>999</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser><c:axId val="10"/><c:axId val="20"/></c:barChart><c:catAx><c:axId val="10"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:axPos val="b"/><c:crossAx val="20"/></c:catAx><c:valAx><c:axId val="20"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:axPos val="l"/><c:crossAx val="10"/></c:valAx></c:plotArea></c:chart></c:chartSpace>'}
++    return {name: raw.encode() for name, raw in parts.items()}
++
++class RecalculateTests(unittest.TestCase):
++    def test_preflight_and_cache_clear(self):
++        book = M.Book(package(fixture()))
++        prepared = M.Book(M.prepare(book))
++        for name, formulas in book.formulas.items():
++            for address in formulas:
++                self.assertIsNone(prepared.cells[name][address].find(S+'v').text)
++        self.assertEqual(prepared.formulas, book.formulas)
++
++    def test_negative_preflight(self):
++        for mutate in (
++            lambda p: p.update({'xl/vbaProject.bin': b'x'}),
++            lambda p: p.update({'xl/worksheets/sheet1.xml': p['xl/worksheets/sheet1.xml'].replace(b'A2*B2', b'WEBSERVICE(A2)')}),
++            lambda p: p.update({'xl/worksheets/sheet1.xml': p['xl/worksheets/sheet1.xml'].replace(b'A2*B2', b'C2+1')}),
++            lambda p: p.update({'xl/worksheets/sheet1.xml': p['xl/worksheets/sheet1.xml'].replace(b'A2*B2', b'SUM(A1:XFD1048576)')}),
++            lambda p: p.update({'xl/_rels/workbook.xml.rels': p['xl/_rels/workbook.xml.rels'].replace(b'Target="worksheets/sheet1.xml"', b'Target="https://example.com" TargetMode="External"')}),
++            lambda p: p.update({'xl/worksheets/sheet1.xml': p['xl/worksheets/sheet1.xml'].replace(b'<f>', b'<f t="shared" si="1">')}),
++        ):
++            parts = fixture(); mutate(parts)
++            with self.assertRaises(M.RecalculationRefused): M.Book(package(parts))
++
++    def test_transplant_preserves_and_refuses_mismatch(self):
++        original = M.Book(package(fixture()))
++        parts = fixture()
++        parts['xl/worksheets/sheet1.xml'] = parts['xl/worksheets/sheet1.xml'].replace(b'<v>999</v>', b'<v>6</v>')
++        parts['xl/worksheets/sheet2.xml'] = parts['xl/worksheets/sheet2.xml'].replace(b'<v>-5</v>', b'<v>6</v>')
++        result, count, charts, adjustments = M.transplant(original, package(parts))
++        after = M.Book(result)
++        self.assertEqual((count, charts), (2, 2))
++        for part, raw in original.parts.items():
++            if part not in {'xl/worksheets/sheet1.xml', 'xl/worksheets/sheet2.xml', 'xl/charts/chart1.xml'}:
++                self.assertEqual(raw, after.parts[part], part)
++        self.assertEqual(original.formulas, after.formulas)
++        self.assertIn(b'<c:v>6</c:v>', after.parts['xl/charts/chart1.xml'])
++        self.assertIn(b'<c:v>Quantity</c:v>', after.parts['xl/charts/chart1.xml'])
++        parts['xl/worksheets/sheet1.xml'] = parts['xl/worksheets/sheet1.xml'].replace(b'A2*B2', b'A2+B2')
++        with self.assertRaises(M.RecalculationRefused): M.transplant(original, package(parts))
++
++
++    def test_xml_cache_boundaries_and_quoted_sheets(self):
++        original = fixture()
++        for cache in (b'<!--<c:numCache>decoy</c:numCache>--><c:numCache/>',
++                      b'<numCache xmlns="'+C.encode()+b'"><ptCount val="0"/></numCache>'):
++            parts = dict(original)
++            import re
++            parts['xl/charts/chart1.xml'] = re.sub(rb'<c:numCache>.*?</c:numCache>', lambda _: cache, parts['xl/charts/chart1.xml'])
++            book = M.Book(package(parts))
++            engine = dict(original)
++            engine['xl/worksheets/sheet1.xml'] = engine['xl/worksheets/sheet1.xml'].replace(b'<v>999</v>', b'<v>6</v>')
++            engine['xl/worksheets/sheet2.xml'] = engine['xl/worksheets/sheet2.xml'].replace(b'<v>-5</v>', b'<v>6</v>')
++            result, _, _, _ = M.transplant(book, package(engine))
++            chart = M.Book(result).roots['xl/charts/chart1.xml']
++            self.assertEqual(chart.find('.//'+M.C+'numCache/'+M.C+'pt/'+M.C+'v').text, '6')
++        self.assertNotEqual(M._canonical_formula("SUM('A B'!C2:C2)"), M._canonical_formula("SUM('AB'!C2:C2)"))
++
++
++    def test_inactive_protection_missing_chart_caches_and_string_categories(self):
++        import re
++        parts = fixture()
++        parts['xl/workbook.xml'] = parts['xl/workbook.xml'].replace(b'<sheets>', b'<workbookProtection/><sheets>')
++        chart = parts['xl/charts/chart1.xml']
++        chart = re.sub(rb'<c:(?:strCache|numCache)>.*?</c:(?:strCache|numCache)>', b'', chart)
++        chart = chart.replace(b'<c:cat><c:strRef>', b'<c:cat><c:numRef keep="yes">').replace(b'</c:strRef></c:cat>', b'</c:numRef></c:cat>')
++        parts['xl/charts/chart1.xml'] = chart
++        original = M.Book(package(parts))
++        calculated = fixture()
++        calculated['xl/worksheets/sheet1.xml'] = calculated['xl/worksheets/sheet1.xml'].replace(b'<v>999</v>', b'<v>6</v>')
++        calculated['xl/worksheets/sheet2.xml'] = calculated['xl/worksheets/sheet2.xml'].replace(b'<v>-5</v>', b'<v>6</v>')
++        result, count, charts, adjustments = M.transplant(original, package(calculated))
++        self.assertEqual((count, charts, adjustments), (2, 2, 1))
++        after = M.Book(result)
++        self.assertEqual(after.parts['xl/workbook.xml'], original.parts['xl/workbook.xml'])
++        category = after.roots['xl/charts/chart1.xml'].find('.//'+M.C+'cat/'+M.C+'strRef')
++        self.assertEqual(category.get('keep'), 'yes')
++        self.assertEqual(category.findtext(M.C+'f'), 'Orders!$A$1')
++        self.assertEqual(category.findtext(M.C+'strCache/'+M.C+'pt/'+M.C+'v'), 'Quantity')
++        for payload in (b'<workbookProtection lockStructure="1"/>', b'<workbookProtection workbookPassword="ABCD"/>', b'<workbookProtection lockWindows="true"/>', b'<workbookProtection arbitrary="0"/>'):
++            bad = dict(parts); bad['xl/workbook.xml'] = bad['xl/workbook.xml'].replace(b'<workbookProtection/>', payload)
++            with self.assertRaises(M.RecalculationRefused): M.Book(package(bad))
++        for payload in (b'<workbookProtection/>', b'<workbookProtection lockStructure="0" lockWindows="false"/>'):
++            safe = dict(parts); safe['xl/workbook.xml'] = safe['xl/workbook.xml'].replace(b'<workbookProtection/>', payload)
++            M.Book(package(safe))
++        for bad_chart in (chart.replace(b'<c:cat>', b'<c:yVal>').replace(b'</c:cat>', b'</c:yVal>'),
++                          chart.replace(b'Orders!$A$1', b'Orders!$A$1:$A$2'),
++                          chart.replace(b'<c:numRef keep="yes">', b'<c:numRef keep="yes"><c:unhandled/>'),
++                          chart.replace(b'<c:numRef keep="yes">', b'<c:numRef keep="yes"><c:numCache><c:opaque/></c:numCache>')):
++            bad = dict(parts); bad['xl/charts/chart1.xml'] = bad_chart
++            with self.assertRaises(M.RecalculationRefused): M.transplant(M.Book(package(bad)), package(calculated))
++
++    def test_named_dependency_dag_and_cycle(self):
++        parts = fixture()
++        names = '<definedName name="Name_0">Orders!A2</definedName>'
++        names += ''.join('<definedName name="Name_'+str(i)+'">Name_'+str(i-1)+'+Name_'+str(i-1)+'</definedName>' for i in range(1, 32))
++        parts['xl/workbook.xml'] = parts['xl/workbook.xml'].replace(b'<definedNames>', ('<definedNames>'+names).encode())
++        start = time.monotonic(); M.Book(package(parts))
++        self.assertLess(time.monotonic()-start, 1)
++        parts['xl/workbook.xml'] = parts['xl/workbook.xml'].replace(b'Orders!A2</definedName>', b'Name_31</definedName>')
++        with self.assertRaises(M.RecalculationRefused): M.Book(package(parts))
++
++    def test_literal_name_and_missing_cache_rejected(self):
++        book = M.Book(package(fixture()))
++        for before, after in ((b'<v>2</v>', b'<v>7</v>'), (b'<v>999</v>', b''), (b'Orders!$A$2', b'Orders!$B$2')):
++            parts = {name: raw.replace(before, after) for name, raw in fixture().items()}
++            with self.assertRaises(M.RecalculationRefused): M.transplant(book, package(parts))
++
++    def test_source_contract_and_create_only(self):
++        import hermes_cli.friday_user_scope as scope
++        import hermes_cli.friday_workspace_docx as docx
++        with tempfile.TemporaryDirectory(prefix='xlsx-source-boundary-') as folder:
++            home = Path(folder); home.chmod(0o700)
++            workspace = home/'workspace'; workspace.mkdir(mode=0o700)
++            source = workspace/'edited.xlsx'; source.write_bytes(package(fixture())); source.chmod(0o600)
++            st = home.stat()
++            cap = SimpleNamespace(home=home, directory_identity=(st.st_dev, st.st_ino))
++            cap.check = lambda: cap
++            token = scope._CURRENT.set(cap)
++            fd = os.open(workspace, os.O_RDONLY|os.O_DIRECTORY)
++            try:
++                with patch.object(M, 'render', side_effect=AssertionError('must not launch')):
++                    (workspace/'exists.xlsx').write_bytes(b'existing')
++                    result = json.loads(M.create_recalculated(cap, fd, 'exists.xlsx', 'exists.xlsx', '{"source":"edited.xlsx"}'))
++                    self.assertEqual(result['error'], 'document_already_exists')
++                    for content in ('{"source":"edited.xlsx","source":"edited.xlsx"}', '{"source":"../edited.xlsx"}', '{"source":"edited.xlsx","extra":1}'):
++                        with self.assertRaises(scope.ScopeDenied): M.create_recalculated(cap, fd, 'new.xlsx', 'new.xlsx', content)
++                rendered = source.read_bytes()
++                with patch.object(M, 'render', return_value=(rendered, 2, 2, 0)):
++                    result = json.loads(M.create_recalculated(cap, fd, 'new.xlsx', 'new.xlsx', '{"source":"edited.xlsx"}'))
++                    self.assertTrue(result['success']); self.assertTrue(result['formula_cache_recomputed'])
++                    self.assertEqual(source.read_bytes(), rendered)
++                def changed(_cap, _book):
++                    source.write_bytes(rendered+b'changed')
++                    return rendered, 2, 2, 0
++                with patch.object(M, 'render', side_effect=changed):
++                    refused = json.loads(M.create_recalculated(cap, fd, 'refused.xlsx', 'refused.xlsx', '{"source":"edited.xlsx"}'))
++                    self.assertEqual(refused['error'], 'document_not_created')
++                    self.assertEqual(refused['effect_disposition'], 'none')
++                self.assertFalse((workspace/'refused.xlsx').exists())
++                source.write_bytes(rendered); source.chmod(0o640)
++                self.assertFalse(json.loads(M.create_recalculated(cap, fd, 'mode.xlsx', 'mode.xlsx', '{"source":"edited.xlsx"}'))['success'])
++                source.chmod(0o600)
++                (workspace/'link.xlsx').symlink_to(source)
++                self.assertFalse(json.loads(M.create_recalculated(cap, fd, 'link-out.xlsx', 'link-out.xlsx', '{"source":"link.xlsx"}'))['success'])
++            finally:
++                os.close(fd); scope._CURRENT.reset(token)
++
++    def test_native_stop_reaps_owned_process(self):
++        from hermes_cli.friday_workspace_pdf import _run
++        from agent.web_call_context import WebTurn, WebCall, bind_web_call
++        import agent.web_call_context as context
++        cap = SimpleNamespace(check=lambda: None)
++        call = WebCall(WebTurn(), time.monotonic()+5, 'synthetic', 'synthetic', 'synthetic')
++        with tempfile.TemporaryDirectory(prefix='xlsx-stop-boundary-') as folder:
++            work = Path(folder)
++            worker = work/'child.py'; worker.write_text('import time\ntime.sleep(30)\n')
++            def stop():
++                limit = time.monotonic()+2
++                while call.session is None and time.monotonic() < limit: time.sleep(.005)
++                call.stop()
++            stopper = threading.Thread(target=stop)
++            with patch.object(context, 'same_web_authority', return_value=True), patch.dict(sys.modules, {'tools.interrupt': SimpleNamespace(is_interrupted=lambda: False)}), bind_web_call(call):
++                stopper.start()
++                with self.assertRaises((RuntimeError, TimeoutError, ValueError)):
++                    _run(cap, [sys.executable, str(worker)], work)
++                stopper.join(2)
++            self.assertFalse(stopper.is_alive())
++            self.assertIsNone(call.session)
++            self.assertEqual(call.receipt['status'], 'QUIESCENT')
++
++
++
++    def test_schema_and_projected_prompt(self):
++        import ast
++        schema_tree = ast.parse((ROOT/'tools/file_tools.py').read_text())
++        assignment = next(node for node in schema_tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'WRITE_FILE_SCHEMA' for target in node.targets))
++        schema = ast.literal_eval(assignment.value)
++        self.assertIn('xlsx_recalculate', schema['parameters']['properties']['format']['enum'])
++        prompt_tree = ast.parse((ROOT/'hermes_cli/friday_prompt_scope.py').read_text())
++        function = next(node for node in prompt_tree.body if isinstance(node, ast.FunctionDef) and node.name == 'ordinary_file_schema')
++        namespace = {'current': lambda: object()}
++        exec(compile(ast.Module(body=[function], type_ignores=[]), 'candidate-file-schema', 'exec'), namespace)
++        projected = namespace['ordinary_file_schema']({'type': 'function', 'function': schema})
++        self.assertIn('format=xlsx_recalculate', projected['function']['description'])
++        self.assertIn('do not repeat the edit', projected['function']['description'])
++
++    def test_existing_xlsx_edit_preserved(self):
++        from hermes_cli.friday_workspace_xlsx import render_copy
++        source = package(fixture())
++        edited = M.Book(render_copy(source, 'Orders', 'A2', 2, 4))
++        self.assertEqual(edited.cells['Orders']['A2'].findtext(S+'v'), '4')
++        self.assertEqual(edited.cells['Orders']['C2'].findtext(S+'v'), '999')
++        self.assertEqual(edited.formulas, M.Book(source).formulas)
++
++    @unittest.skipUnless(os.environ.get('FRIDAY_TEST_REAL_XLSX_ENGINE') == '1', 'explicit isolated engine control')
++    def test_real_write_file_route(self):
++        import ast
++        import hermes_cli.friday_user_scope as scope
++        import hermes_cli.friday_credential_admission as credential
++        import agent.web_call_context as context
++        tree = ast.parse((ROOT/'hermes_cli/friday_user_scope.py').read_text())
++        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'scoped_file')
++        namespace = dict(vars(scope)); namespace['guard_tool'] = lambda *a, **k: None
++        exec(compile(ast.Module(body=[function], type_ignores=[]), 'candidate-scoped_file', 'exec'), namespace)
++        with tempfile.TemporaryDirectory(prefix='xlsx-route-synthetic-') as folder:
++            home = Path(folder); home.chmod(0o700); (home/'workspace').mkdir(mode=0o700)
++            from hermes_cli.friday_workspace_xlsx import render_copy
++            source = home/'workspace/edited.xlsx'
++            original = render_copy(package(fixture()), 'Orders', 'A2', 2, 4)
++            source.write_bytes(original); source.chmod(0o600)
++            st = home.stat(); cap = SimpleNamespace(home=home, directory_identity=(st.st_dev, st.st_ino))
++            cap.check = lambda: cap
++            token = scope._CURRENT.set(cap)
++            call = context.WebCall(context.WebTurn(), time.monotonic()+10, 'synthetic', 'synthetic', 'synthetic')
++            try:
++                with patch.object(credential, 'ordinary_readonly_file', return_value=None), patch.object(credential, 'session_artifact_file', return_value=None), patch.object(context, 'same_web_authority', return_value=True), patch.dict(sys.modules, {'hermes_cli.friday_workspace_xlsx_recalculate': M, 'tools.interrupt': SimpleNamespace(is_interrupted=lambda: False)}), context.bind_web_call(call):
++                    result = json.loads(namespace['scoped_file']('write_file', {'path': 'calculated.xlsx', 'format': 'xlsx_recalculate', 'content': '{"source":"edited.xlsx"}'}))
++                self.assertTrue(result['success'], result)
++                self.assertEqual(result['recalculated_formula_cells'], 2)
++                self.assertEqual(result['refreshed_chart_references'], 2)
++                self.assertEqual(source.read_bytes(), original)
++                final = M.Book((home/'workspace/calculated.xlsx').read_bytes())
++                self.assertEqual(final.cells['Summary']['A1'].findtext(S+'v'), '12')
++                self.assertEqual(final.cells['Orders']['A2'].findtext(S+'v'), '4')
++                self.assertIsNone(call.session)
++            finally: scope._CURRENT.reset(token)
++
++    @unittest.skipUnless(os.environ.get('FRIDAY_TEST_REAL_XLSX_ENGINE') == '1', 'explicit isolated engine control')
++    def test_real_engine(self):
++        from hermes_cli.friday_workspace_pdf import _toolchain
++        book = M.Book(package(fixture()))
++        with tempfile.TemporaryDirectory(prefix='xlsx-recalc-synthetic-') as folder:
++            work = Path(folder); work.chmod(0o700)
++            for name in ('out', 'home', 'tmp'): (work/name).mkdir(mode=0o700)
++            (work/'input.xlsx').write_bytes(M.prepare(book)); (work/'input.xlsx').chmod(0o600)
++            (work/'renderer.py').write_bytes(Path(M.__file__).read_bytes()); (work/'renderer.py').chmod(0o600)
++            result = subprocess.run(M._argv(work, _toolchain()), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
++            self.assertEqual(result.returncode, 0, result.stderr[:1000])
++            raw = (work/'out/input.xlsx').read_bytes()
++            # Keep tiny synthetic engine output for independent source review.
++            if os.environ.get('FRIDAY_XLSX_TEST_EVIDENCE'):
++                (Path(os.environ['FRIDAY_XLSX_TEST_EVIDENCE'])/'synthetic-engine-output.xlsx').write_bytes(raw)
++            output, count, charts, adjustments = M.transplant(book, raw)
++            final = M.Book(output)
++            for sheet, cell in (('Orders', 'C2'), ('Summary', 'A1')):
++                self.assertEqual(M._numeric(final.cells[sheet][cell].findtext(S+'v')), 6)
++            self.assertEqual((count, charts), (2, 2))
++            if os.environ.get('FRIDAY_XLSX_TEST_EVIDENCE'):
++                (Path(os.environ['FRIDAY_XLSX_TEST_EVIDENCE'])/'synthetic-recalculated.xlsx').write_bytes(output)
++
++if __name__ == '__main__': unittest.main()
+--- a/tools/file_tools.py
++++ b/tools/file_tools.py
+@@ -1180,13 +1180,13 @@
+ 
+ WRITE_FILE_SCHEMA = {
+     "name": "write_file",
+-    "description": 'Export an existing own-workspace DOCX to a NEW PDF with format=docx_pdf and content JSON {"source":"report.docx"}. Uses a bounded local renderer, leaves the source untouched, refuses existing output names, unsafe packages and unavailable rendering. Only DOCX to PDF is supported; no arbitrary conversion commands. ' 'For preserving edits to an existing DOCX, use format=docx_edit, path a NEW .docx name, and content JSON with source, old_text, new_text. Example: {"source":"draft.docx","old_text":"Old deadline","new_text":"New deadline"}. Replaces exactly one literal occurrence within one main-body/table paragraph, including equally formatted split runs; other package parts and XML structure remain unchanged. Missing/ambiguous matches, mixed formatting across runs, fields/anchor boundaries and unsupported packages refuse without creating a file. Use a longer unique old_text for context. No regex, paragraph-spanning edits, header/footer/note edits or overwrite. Never reconstruct an existing DOCX from extracted text to claim layout preservation. docx and docx_structured only CREATE new documents; they do not preserve an existing source. ' 'Word titles/headings/tables require format=docx_structured. Content is JSON {"blocks":[...]}; blocks: title(text), heading(text,level=1..9), paragraph(text), table(rows of string cells). Plain format=docx keeps Markdown/tabs literal. XLSX: format=xlsx; content JSON keys source,sheet,cell,expected,value creates a NEW one-cell numeric copy; preserves other parts/formulas, no recalculation. ' "For own user workspace, format=xlsx creates a NEW workbook copy changing one numeric cell; content JSON requires source, sheet, cell, expected, value. Preserves other parts/formulas, no formula recalculation. Never write spreadsheet text under .xlsx/.xls. Explicit format=docx creates a NEW .docx from short plain paragraphs (100000 UTF-8 bytes, 2000 paragraphs); existing names are refused. For preserving revisions use docx_edit with the original source; these creation modes rebuild documents. Omit format for normal text. Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. For an EXISTING file, call read_file first: write_file refuses (file untouched) when this task has no current full read/write of the file or the file changed on disk since; on refusal, read_file, merge, then retry. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed.",
++    "description": 'To recalculate an existing own-workspace XLSX, use format=xlsx_recalculate, a NEW .xlsx path, and content JSON with exactly source, e.g. {"source":"orders-edited.xlsx"}. A bounded local LibreOffice engine recomputes supported numeric formulas and ordinary chart reference caches; source, formulas, tables, names and other package content are preserved. Unsupported formulas, packages and chart caches refuse without publishing. After an XLSX edit, recalculate that returned copy when requested; do not repeat the edit. ' 'Export an existing own-workspace DOCX to a NEW PDF with format=docx_pdf and content JSON {"source":"report.docx"}. Uses a bounded local renderer, leaves the source untouched, refuses existing output names, unsafe packages and unavailable rendering. Only DOCX to PDF is supported; no arbitrary conversion commands. ' 'For preserving edits to an existing DOCX, use format=docx_edit, path a NEW .docx name, and content JSON with source, old_text, new_text. Example: {"source":"draft.docx","old_text":"Old deadline","new_text":"New deadline"}. Replaces exactly one literal occurrence within one main-body/table paragraph, including equally formatted split runs; other package parts and XML structure remain unchanged. Missing/ambiguous matches, mixed formatting across runs, fields/anchor boundaries and unsupported packages refuse without creating a file. Use a longer unique old_text for context. No regex, paragraph-spanning edits, header/footer/note edits or overwrite. Never reconstruct an existing DOCX from extracted text to claim layout preservation. docx and docx_structured only CREATE new documents; they do not preserve an existing source. ' 'Word titles/headings/tables require format=docx_structured. Content is JSON {"blocks":[...]}; blocks: title(text), heading(text,level=1..9), paragraph(text), table(rows of string cells). Plain format=docx keeps Markdown/tabs literal. XLSX: format=xlsx; content JSON keys source,sheet,cell,expected,value creates a NEW one-cell numeric copy; preserves other parts/formulas, no recalculation. ' "For own user workspace, format=xlsx creates a NEW workbook copy changing one numeric cell; content JSON requires source, sheet, cell, expected, value. Preserves other parts/formulas, no formula recalculation. Never write spreadsheet text under .xlsx/.xls. Explicit format=docx creates a NEW .docx from short plain paragraphs (100000 UTF-8 bytes, 2000 paragraphs); existing names are refused. For preserving revisions use docx_edit with the original source; these creation modes rebuild documents. Omit format for normal text. Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. For an EXISTING file, call read_file first: write_file refuses (file untouched) when this task has no current full read/write of the file or the file changed on disk since; on refusal, read_file, merge, then retry. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed.",
+     "parameters": {
+         "type": "object",
+         "properties": {
+             "path": {"type": "string", "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)"},
+             "content": {"type": "string", "description": 'For docx_pdf, JSON with exactly source (existing own-workspace DOCX). For docx_edit, JSON with exactly source, old_text, new_text; unique exact text replacement into a NEW .docx copy. ' "Complete content. With docx_structured, a JSON string {\"blocks\":[...]} using title/paragraph blocks {\"type\":\"title\",\"text\":\"Report\"}, headings {\"type\":\"heading\",\"level\":1,\"text\":\"Data\"}, and tables {\"type\":\"table\",\"rows\":[[\"Item\",\"Amount\"],[\"Work\",\"800\"]]}. Exact keys only; table cells are strings, rows rectangular (1-32 columns). 100000 UTF-8 bytes total, at most 2000 paragraphs including table cells."},
+-            "format": {"type": "string", "enum": ["text", "docx", "docx_structured", "docx_edit", "docx_pdf", "xlsx"], "description": 'docx_pdf exports source DOCX to NEW PDF; content is JSON with exactly source. docx_edit preserves an existing DOCX in a NEW copy using content JSON source/old_text/new_text. ' "Default text. docx creates new plain paragraphs, preserving literal Markdown. For real Word titles, outline headings or tables, use docx_structured and the JSON blocks content contract. Both DOCX modes create a NEW .docx only. xlsx edits one existing numeric cell into a NEW own-workspace copy; content is JSON with source, sheet, cell, expected, value. Example: {\"source\":\"orders.xlsx\",\"sheet\":\"Orders\",\"cell\":\"C3\",\"expected\":4,\"value\":5}. Other archive parts and formulas preserved; formula caches are not recalculated."},
++            "format": {"type": "string", "enum": ["text", "docx", "docx_structured", "docx_edit", "docx_pdf", "xlsx", "xlsx_recalculate"], "description": 'To recalculate an existing own-workspace XLSX, use format=xlsx_recalculate, a NEW .xlsx path, and content JSON with exactly source, e.g. {"source":"orders-edited.xlsx"}. A bounded local LibreOffice engine recomputes supported numeric formulas and ordinary chart reference caches; source, formulas, tables, names and other package content are preserved. Unsupported formulas, packages and chart caches refuse without publishing. After an XLSX edit, recalculate that returned copy when requested; do not repeat the edit. ' 'docx_pdf exports source DOCX to NEW PDF; content is JSON with exactly source. docx_edit preserves an existing DOCX in a NEW copy using content JSON source/old_text/new_text. ' "Default text. docx creates new plain paragraphs, preserving literal Markdown. For real Word titles, outline headings or tables, use docx_structured and the JSON blocks content contract. Both DOCX modes create a NEW .docx only. xlsx edits one existing numeric cell into a NEW own-workspace copy; content is JSON with source, sheet, cell, expected, value. Example: {\"source\":\"orders.xlsx\",\"sheet\":\"Orders\",\"cell\":\"C3\",\"expected\":4,\"value\":5}. Other archive parts and formulas preserved; formula caches are not recalculated."},
+             # NOTE: the handler still accepts `cross_profile` (bool) — it now
+             # bypasses only the #32049 sandbox-mirror lost-write guards, whose
+             # rejection error teaches it. Unadvertised: the cross-PROFILE
