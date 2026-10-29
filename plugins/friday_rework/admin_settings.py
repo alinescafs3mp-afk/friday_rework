@@ -173,11 +173,12 @@ def edit(profile, home, body, verify):
                 raise ValueError("invalid_web_bounds")
             # Exact existing Exa native profile; retrieval is separate from model
             # inference and remains mandatory. No keys or alternative providers.
+            # Retain the current cache policy when editing retrieval settings.
             candidate.setdefault("web", {}).update(backend="exa", search_backend="exa", extract_backend="exa",
                 keyless_fallback=values["profile"] == "exa-keyless", keyless_rescue=False,
                 provider_tier={"exa": "free" if values["profile"] == "exa-keyless" else "paid",
                     "parallel": "paid", "firecrawl": "paid", "keenable": "paid"},
-                extract_timeout=timeout, extract_char_limit=chars, cache_enabled=False)
+                extract_timeout=timeout, extract_char_limit=chars)
             changed = ["web"]
         elif kind in ("toolset", "skill"):
             if set(values) != {"name", "enabled"} or type(values["enabled"]) is not bool:

@@ -32,6 +32,17 @@
         .catch(() => { if (active) setError("Administrator access or native configuration unavailable."); });
       return () => { active = false; };
     }, []);
+    function setLoadedData(selected, value) {
+      const object = item => item !== null && typeof item === "object" && !Array.isArray(item);
+      if (selected === "effective" && object(value) && object(value.settings) && object(value.settings.web)) {
+        const web = value.settings.web;
+        const tier = object(web.provider_tier) && web.provider_tier.exa;
+        setEdit(previous => ({...previous, web: tier === "free" || (tier !== "paid" && web.keyless_fallback === true) ? "exa-keyless" : "exa-paid",
+          timeout: String(web.extract_timeout == null ? 30 : web.extract_timeout),
+          chars: String(web.extract_char_limit == null ? 15000 : web.extract_char_limit)}));
+      }
+      setData(value);
+    }
     async function load(selected = view) {
       if (!profile || busy) return;
       setBusy(true); setError(""); setSession(null);
@@ -41,7 +52,7 @@
           params.set("query", query); params.set("offset", String(offset));
           Object.entries(filters).forEach(([k, v]) => { if (v) params.set(k, v); });
         }
-        setData(await fetchJSON(base + "/" + selected + "?" + params));
+        setLoadedData(selected, await fetchJSON(base + "/" + selected + "?" + params));
       } catch (_) { setError("Native state unavailable or request refused."); setData(null); }
       finally { setBusy(false); }
     }
@@ -157,7 +168,7 @@
         } else throw Error("Unknown typed setting");
         setControl(await fetchJSON(base + "/settings?" + new URLSearchParams({profile}), {
           method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({kind: edit.kind, expected_sha256: data.config_sha256, values})}));
-        setData(await fetchJSON(base + "/effective?" + new URLSearchParams({profile})));
+        setLoadedData("effective", await fetchJSON(base + "/effective?" + new URLSearchParams({profile})));
       } catch (_) { setError("Configuration write refused or unconfirmed. Reload before another edit."); }
       finally { setBusy(false); }
     }
