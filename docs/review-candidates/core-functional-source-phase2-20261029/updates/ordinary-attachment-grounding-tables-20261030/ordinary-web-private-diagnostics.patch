@@ -1,0 +1,174 @@
+--- a/agent/web_call_context.py
++++ b/agent/web_call_context.py
+@@ -8,6 +8,75 @@
+ 
+ _current = ContextVar('native_web_call', default=None)
+ _child_deadline = ContextVar('native_web_child_deadline', default=None)
++_child_diagnostics = ContextVar('native_web_child_diagnostics', default=None)
++
++# Metadata only. No exception message, response body, URL, query or traceback is
++# accepted on this private lane. These records grant no retry/stop authority.
++_DIAGNOSTIC_PHASES = frozenset(('keyless_exception', 'keyless_request', 'keyless_response', 'keyless_text'))
++_DIAGNOSTIC_CODES = frozenset((
++    'keyless tool refused', 'keyless arguments refused', 'keyless search bounds refused',
++    'keyless fetch bounds refused', 'keyless URL refused', 'keyless IP URL refused',
++    'keyless provider unavailable', 'keyless encoding refused', 'keyless response bound',
++    'keyless timeout', 'keyless timeout refused', 'keyless envelope refused', 'keyless result refused',
++    'keyless text bound', 'keyless bounded request failed',
++))
++_DIAGNOSTIC_EXCEPTIONS = frozenset((
++    'builtins.ValueError', 'builtins.TypeError', 'builtins.KeyError',
++    'builtins.AttributeError', 'builtins.OSError', 'builtins.TimeoutError',
++    'builtins.RuntimeError', 'builtins.UnicodeDecodeError', 'json.decoder.JSONDecodeError',
++    'requests.exceptions.RequestException', 'requests.exceptions.ConnectionError',
++    'requests.exceptions.Timeout', 'requests.exceptions.ConnectTimeout',
++    'requests.exceptions.ReadTimeout', 'requests.exceptions.ChunkedEncodingError',
++    'requests.exceptions.ContentDecodingError', 'requests.exceptions.SSLError',
++    'urllib3.exceptions.ReadTimeoutError', 'urllib3.exceptions.ProtocolError',
++    'plugins.web.keyless_mcp.KeylessMCPError', 'other',
++))
++
++
++def begin_child_web_diagnostics():
++    _child_diagnostics.set(([], threading.Lock()))
++
++
++def record_child_web_diagnostic(phase, *, exception=None, code=None, http_status=None):
++    state = _child_diagnostics.get()
++    if state is None or phase not in _DIAGNOSTIC_PHASES:
++        return
++    record = {'phase': phase}
++    if exception is not None:
++        cls = type(exception)
++        identity = cls.__module__ + '.' + cls.__name__
++        record['exception'] = identity if identity in _DIAGNOSTIC_EXCEPTIONS else 'other'
++    if isinstance(code, str) and code in _DIAGNOSTIC_CODES:
++        record['code'] = code
++    if type(http_status) is int and 100 <= http_status <= 599:
++        record['http_status'] = http_status
++    with state[1]:
++        if len(state[0]) < 8 and record not in state[0]:
++            state[0].append(record)
++
++
++def child_web_diagnostics():
++    state = _child_diagnostics.get()
++    if state is None:
++        return []
++    with state[1]:
++        return [dict(record) for record in state[0]]
++
++
++def validate_child_web_diagnostics(records):
++    if not isinstance(records, list) or len(records) > 8:
++        raise RuntimeError('web_result_invalid')
++    for record in records:
++        if (not isinstance(record, dict) or not set(record) <= {'phase', 'exception', 'code', 'http_status'}
++                or not isinstance(record.get('phase'), str) or record['phase'] not in _DIAGNOSTIC_PHASES
++                or ('exception' in record and (not isinstance(record['exception'], str)
++                    or record['exception'] not in _DIAGNOSTIC_EXCEPTIONS))
++                or ('code' in record and (not isinstance(record['code'], str)
++                    or record['code'] not in _DIAGNOSTIC_CODES))
++                or ('http_status' in record and (type(record['http_status']) is not int
++                    or not 100 <= record['http_status'] <= 599))):
++            raise RuntimeError('web_result_invalid')
++    return [dict(record) for record in records]
+ 
+ 
+ class WebTurn:
+--- a/plugins/web/keyless_mcp.py
++++ b/plugins/web/keyless_mcp.py
+@@ -31,6 +31,12 @@
+ 
+ class KeylessMCPError(RuntimeError):
+     """A keyless MCP call failed (transport, rate limit, or tool error)."""
++
++    def __init__(self, *args):
++        super().__init__(*args)
++        from agent.web_call_context import record_child_web_diagnostic
++        record_child_web_diagnostic('keyless_exception', exception=self,
++                                    code=args[0] if len(args) == 1 else None)
+ 
+ 
+ _RATE_LIMIT_MARKERS = ("rate limit", "rate-limit", "ratelimit", "too many requests", "429", "quota exceeded", "slow down")
+@@ -247,8 +253,10 @@
+                 return read_response(response, deadline, KeylessMCPError, text_handler=_text_handler)
+     except KeylessMCPError:
+         raise
+-    except Exception:
++    except Exception as exc:
+         # No foreign response, key or remote instruction appears in errors.
++        from agent.web_call_context import record_child_web_diagnostic
++        record_child_web_diagnostic('keyless_request', exception=exc)
+         raise KeylessMCPError("keyless bounded request failed") from None
+ 
+ 
+--- a/plugins/web/keyless_mcp_bounded.py
++++ b/plugins/web/keyless_mcp_bounded.py
+@@ -33,7 +33,11 @@
+ 
+ 
+ def read_response(response, deadline, KeylessMCPError, *, text_handler=None):
+-    if response.status_code != 200: raise KeylessMCPError("keyless provider unavailable")
++    if response.status_code != 200:
++        from agent.web_call_context import record_child_web_diagnostic
++        # This is the MCP provider endpoint status, never the source page status.
++        record_child_web_diagnostic('keyless_response', http_status=response.status_code)
++        raise KeylessMCPError("keyless provider unavailable")
+     if response.headers.get('Content-Encoding','identity') != 'identity':
+         raise KeylessMCPError('keyless encoding refused')
+     if int(response.headers.get('Content-Length', '0')) > 1000000:
+@@ -73,9 +77,11 @@
+     if text_handler is not None:
+         try:
+             text = text_handler(text, deadline)
+-        except Exception:
++        except Exception as exc:
+             # Preserve the original fixed refusal if parsing/private recovery
+             # cannot complete; never refetch or leak a foreign exception body.
++            from agent.web_call_context import record_child_web_diagnostic
++            record_child_web_diagnostic('keyless_text', exception=exc)
+             raise KeylessMCPError("keyless text bound") from None
+     if time.monotonic() >= deadline:
+         raise KeylessMCPError("keyless timeout")
+--- a/tools/web_process.py
++++ b/tools/web_process.py
+@@ -151,8 +151,15 @@
+             raise RuntimeError('web_native_child_failed')
+         current()  # Recheck the retained active principal/generation before publication.
+         result=json.loads(raw)
+-        if set(result)!= {'value','search_memo'} or not isinstance(result['value'],str):
++        if (set(result) not in ({'value','search_memo'}, {'value','search_memo','diagnostics'})
++                or not isinstance(result['value'],str)):
+             raise RuntimeError('web_result_invalid')
++        from agent.web_call_context import validate_child_web_diagnostics
++        for diagnostic in validate_child_web_diagnostics(result.get('diagnostics', [])):
++            # Validated fixed metadata, independent of provider/page result bytes.
++            # Older children omit it; absence never becomes a recovery grant.
++            logger.warning('Private web child diagnostic: process_id=%s tool=%s metadata=%s',
++                           session.id, name, json.dumps(diagnostic, sort_keys=True))
+         if name=='web_search':
+             search_memo.import_query(result['search_memo'],args.get('query',''),args.get('limit',5))
+         call.check()
+--- a/tools/web_process_child.py
++++ b/tools/web_process_child.py
+@@ -24,7 +24,8 @@
+     mode=data.get('options',{}).get('PARALLEL_SEARCH_MODE','agentic')
+     if mode not in ('fast','one-shot','agentic'):mode='agentic'
+     os.environ['PARALLEL_SEARCH_MODE']=mode
+-    from agent.web_call_context import child_deadline
++    from agent.web_call_context import child_deadline, begin_child_web_diagnostics, child_web_diagnostics
++    begin_child_web_diagnostics()
+     child_deadline(data['deadline'])
+     # The parent uses isolated store Python. Activate only its committed
+     # dependencies after trusted input; never run source-install sync here.
+@@ -91,7 +92,8 @@
+         value=redact_sensitive_text(value,force=True)
+         memo=json.loads(redact_sensitive_text(json.dumps(memo,ensure_ascii=True),force=True))
+         users.current()
+-    body=json.dumps({'result':json.dumps({'value':value,'search_memo':memo},ensure_ascii=True)},ensure_ascii=True)
++    body=json.dumps({'result':json.dumps({'value':value,'search_memo':memo,
++                                         'diagnostics':child_web_diagnostics()},ensure_ascii=True)},ensure_ascii=True)
+     if len(body.encode())>2_000_000:raise RuntimeError('web_result_too_large')
+     output.write(body+'\n');output.flush()
+ 
