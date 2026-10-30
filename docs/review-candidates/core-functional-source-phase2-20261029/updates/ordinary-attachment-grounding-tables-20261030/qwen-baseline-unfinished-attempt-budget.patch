@@ -1,0 +1,364 @@
+--- a/qpb/runner.py
++++ b/qpb/runner.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import math
+ import time
+ from datetime import datetime, timezone
+ from pathlib import Path
+@@ -50,6 +51,76 @@
+         return pilot
+     chosen = set(pilot)
+     return pilot + [task for task in _scope(corpus, False) if task not in chosen]
++
++
++def _attempt_budget(store: RunStore) -> tuple[dict, dict]:
++    """Known unfinished wall time, once per attempt, independent of retry rights.
++
++    A prediction for a successor does not finish its failed predecessor. A
++    prediction committed before its request record, however, finishes that exact
++    attempt. Missing duration for a possibly sent attempt remains unknown.
++    """
++    from qpb.atomic import load_json_result
++
++    def wall(value):
++        return (float(value) if isinstance(value, (int, float))
++                and not isinstance(value, bool) and math.isfinite(value)
++                and value >= 0 else None)
++
++    attempts = {}
++    for path in store.iter_request_files():
++        loaded = load_json_result(path)
++        record = loaded["value"] if loaded["ok"] else {}
++        if not isinstance(record, dict):
++            record = {}
++        attempt_id = record.get("attempt_id") or path.stem.removesuffix(".partial")
++        item = attempts.setdefault(attempt_id, {
++            "task": (record.get("benchmark"), record.get("task_id")),
++            "walls": [], "interrupted_walls": [], "foreground": False,
++            "possibly_sent": False,
++        })
++        top_wall = wall(record.get("wall_s"))
++        timing = record.get("partial_response_timing")
++        partial_wall = wall(timing.get("wall_s")) if isinstance(timing, dict) else None
++        observed = max((value for value in (top_wall, partial_wall) if value is not None), default=None)
++        if observed is not None:
++            item["walls"].append(observed)
++        outcome = record.get("outcome")
++        if outcome == "INTERRUPTED_BY_FOREGROUND":
++            item["foreground"] = True
++        if outcome in {"INTERRUPTED_BY_FOREGROUND", "CANCELLED_BY_STOP"} and top_wall is not None:
++            item["interrupted_walls"].append(top_wall)
++        item["possibly_sent"] |= record.get("sent") is not False
++
++    interruptions, interrupted_wall, unfinished_wall, unmeasured = {}, 0.0, 0.0, 0
++    predictions = {}
++    for attempt_id, item in attempts.items():
++        task = item["task"]
++        if item["foreground"] and all(task):
++            interruptions[task] = interruptions.get(task, 0) + 1
++        # Retain the historical foreground/stop metric, distinct from the cap.
++        interrupted_wall += max(item["interrupted_walls"], default=0.0)
++        if all(task) and task not in predictions:
++            loaded = store.read_prediction(*task)
++            value = loaded["value"] if loaded["ok"] else {}
++            predictions[task] = value if isinstance(value, dict) else {}
++        prediction = predictions.get(task, {})
++        if (prediction.get("attempt_id") == attempt_id
++                and prediction.get("outcome") == "complete"
++                and prediction.get("finish_reason")):
++            continue
++        if item["walls"]:
++            # Duplicate retained copies cannot charge an attempt twice. Use the
++            # largest saved observation rather than undercount conflicting copies.
++            unfinished_wall += max(item["walls"])
++        elif item["possibly_sent"]:
++            unmeasured += 1
++    return interruptions, {
++        "interrupted_wall_s": interrupted_wall,
++        "unfinished_attempt_wall_s": unfinished_wall,
++        "unmeasured_unfinished_attempts": unmeasured,
++        "unfinished_attempt_wall_complete": unmeasured == 0,
++    }
+ 
+ 
+ def _summarize(store: RunStore, corpus, pilot_only: bool) -> dict:
+@@ -305,6 +376,10 @@
+         }
+         if summary.get("tail"):
+             progress["tail"] = summary["tail"]
++        for key in ("interrupted_wall_s", "unfinished_attempt_wall_s",
++                    "unmeasured_unfinished_attempts", "unfinished_attempt_wall_complete"):
++            if key in summary:
++                progress[key] = summary[key]
+         self.store.write_progress(progress)
+         print(_progress_line(progress), flush=True)
+         return progress
+@@ -681,19 +756,12 @@
+                 state = "AUTHORIZATION_EXPIRED"
+             elif deadline is not None and time.monotonic() >= deadline:
+                 state = "MANUAL_PAUSED"
+-            interruptions, interrupted_wall = {}, 0.0
+-            for path in self.store.iter_request_files():
+-                from qpb.atomic import read_json
+-                record = read_json(path)
+-                if record.get("outcome") == "INTERRUPTED_BY_FOREGROUND":
+-                    key = (record["benchmark"], record["task_id"])
+-                    interruptions[key] = interruptions.get(key, 0) + 1
+-                if record.get("outcome") in {"INTERRUPTED_BY_FOREGROUND", "CANCELLED_BY_STOP"}:
+-                    interrupted_wall += float(record.get("wall_s") or 0)
+-            if interrupted_wall >= self.policy["max_interrupted_attempt_wall_seconds"]:
++            interruptions, budget = _attempt_budget(self.store)
++            summary.update(budget)
++            if budget["unfinished_attempt_wall_s"] >= self.policy["max_interrupted_attempt_wall_seconds"]:
+                 state = state or "PAUSED_POLICY"
+             if state:
+-                self._set_state(state, interrupted_wall_s=interrupted_wall)
++                self._set_state(state, **budget)
+                 self._emit(state, None, None, summary, deadline, started)
+                 return 0
+             pending, deferred = [], []
+@@ -702,7 +770,7 @@
+                     continue
+                 previous = self.store.latest_attempt(benchmark, task_id)
+                 if self.store.attempt_blocks_send(previous):
+-                    self._set_state("RECOVERY_REQUIRED")
++                    self._set_state("RECOVERY_REQUIRED", **budget)
+                     return 2
+                 if interruptions.get((benchmark, task_id), 0) >= self.policy["max_foreground_interruptions_per_task"]:
+                     deferred.append(f"{benchmark}:{task_id}")
+@@ -710,7 +778,7 @@
+                     pending.append((benchmark, task_id, previous))
+             if not pending:
+                 state = "NEEDS_QUIET_WINDOW" if deferred else ("PILOT_DONE" if self.pilot_only else "COMPLETE")
+-                self._set_state(state, deferred_ids=deferred)
++                self._set_state(state, deferred_ids=deferred, **budget)
+                 self._emit(state, None, None, summary, deadline, started)
+                 return 0
+             benchmark, task_id, previous = pending[0]
+@@ -732,7 +800,7 @@
+                     return 2
+                 state = "YIELDED_FOR_FOREGROUND" if "FOREGROUND" in reason else "COOLDOWN"
+                 if state != last_state:
+-                    self._set_state(state, deferred_ids=deferred, idle_blockers=[reason])
++                    self._set_state(state, deferred_ids=deferred, idle_blockers=[reason], **budget)
+                     self._emit(state, benchmark, None, summary, deadline, started)
+                     last_state = state
+                 time.sleep(1)
+@@ -760,7 +828,7 @@
+                 self.coordinator.dispatch(permit)
+                 record.update(state="SENDING", sent=True, sending_at=_now())
+                 self.store.save_request(record)
+-            self._set_state("RUNNING", idle_blockers=[], deferred_ids=deferred)
++            self._set_state("RUNNING", idle_blockers=[], deferred_ids=deferred, **budget)
+             self._emit("RUNNING", benchmark, attempt_id, summary, deadline, started)
+             last_state = "RUNNING"
+             try:
+@@ -800,5 +868,6 @@
+                         self.store.set_control(pause=True, stop=True)
+                     self.coordinator.unknown(permit, type(exc).__name__)
+                     self._unknown(record, type(exc).__name__)
+-                    self._set_state("RECOVERY_REQUIRED", stop_reason="OUTCOME_UNKNOWN")
+-                return 2
++                    self._set_state("RECOVERY_REQUIRED", stop_reason="OUTCOME_UNKNOWN",
++                                    **_attempt_budget(self.store)[1])
++                return 2
+--- a/qpb/cli.py
++++ b/qpb/cli.py
+@@ -153,12 +153,15 @@
+         import json
+         import time
+         from qpb.idle import Coordinator
++        from qpb.runner import _attempt_budget
++        _, budget = _attempt_budget(store)
+         snapshot = Coordinator(manifest["coordinator_dir"]).snapshot()
+         print(json.dumps({"admission": snapshot, "control": store.control(),
+                           "authorization_expires_epoch": manifest.get("authorization_expires_epoch"),
+                           "authorization_remaining_s": max(0, manifest.get("authorization_expires_epoch", 0) - time.time()),
+                           "deferred_ids": manifest.get("deferred_ids", []),
+-                          "interrupted_wall_s": manifest.get("interrupted_wall_s", 0),
++                          **budget,
++                          "max_interrupted_attempt_wall_seconds": manifest.get("idle_policy", {}).get("max_interrupted_attempt_wall_seconds"),
+                           "expected": 673}, ensure_ascii=False))
+     return 0
+ 
+--- a/qpb/report.py
++++ b/qpb/report.py
+@@ -200,6 +200,11 @@
+         "note": _note(kind, partial),
+     }
+     document["full_model_baseline"] = is_full_model_baseline(document)
++    if manifest.get("mode") == "idle":
++        from qpb.runner import _attempt_budget
++        _, budget = _attempt_budget(store)
++        document["unfinished_attempt_budget"] = dict(
++            budget, max_interrupted_attempt_wall_seconds=manifest.get("idle_policy", {}).get("max_interrupted_attempt_wall_seconds"))
+     return document
+ 
+ 
+@@ -250,6 +255,12 @@
+     lines.append(f"- full_model_baseline: `{document['full_model_baseline']}`")
+     lines.append(f"- generation fingerprint: `{document.get('generation_fingerprint')}`")
+     lines.append(f"- активное время модели, с: `{document['active_model_seconds']}`; известная сумма: `{document['known_active_model_seconds']}`; полнота стоимости: `{document['attempt_cost_complete']}`")
++    if "unfinished_attempt_budget" in document:
++        budget = document["unfinished_attempt_budget"]
++        lines.append(f"- незавершённые попытки, известное время, с: `{budget['unfinished_attempt_wall_s']}`; "
++                     f"без измерения: `{budget['unmeasured_unfinished_attempts']}`; "
++                     f"лимит: `{budget['max_interrupted_attempt_wall_seconds']}`; "
++                     f"историческое foreground/stop время: `{budget['interrupted_wall_s']}`")
+     lines.append("- CPU scoring и календарное время с паузами в этом отчёте не смешиваются с активным временем. CPU здесь null, пока отдельный таймер скоринга не записан.")
+     lines.append("")
+     lines.append("Сырые ответы: `requests/`, `predictions/`. Оценки: `reviews/`.")
+--- a/tests/test_unfinished_budget.py
++++ b/tests/test_unfinished_budget.py
+@@ -0,0 +1,148 @@
++"""Finite offline checks of the existing idle runner's attempt wall cap."""
++from contextlib import redirect_stdout
++from io import StringIO
++from pathlib import Path
++import json
++import tempfile
++import unittest
++
++from qpb.atomic import atomic_write_json
++from qpb.cli import _status
++from qpb.report import build_report
++from qpb.runner import IdleRunner, _attempt_budget
++from qpb.store import RunStore
++
++
++class UnfinishedBudgetTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory(prefix="qpb-unfinished-")
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        self.store = RunStore(self.root, "fixture")
++        self.store.ensure_dirs()
++
++    def record(self, n=1, outcome="technical_loss", wall=5, task="t", **extra):
++        value = dict(attempt_id=f"gpqa__{task}__a{n}", attempt_n=n,
++                     benchmark="gpqa", task_id=task, outcome=outcome,
++                     state=outcome, sent=True, wall_s=wall)
++        value.update(extra)
++        self.store.save_request(value)
++        return value
++
++    def saved(self, record):
++        self.store.save_prediction(dict(record, outcome="complete", finish_reason="stop"))
++
++    def test_all_unfinished_outcomes_and_exact_successor_identity(self):
++        failed = self.record(wall=5)
++        successor = self.record(2, "complete", wall=100)
++        self.saved(successor)
++        self.record(task="fg", outcome="INTERRUPTED_BY_FOREGROUND", wall=7)
++        self.record(task="stop", outcome="CANCELLED_BY_STOP", wall=11)
++        self.record(task="unknown", outcome="OUTCOME_UNKNOWN", wall=None,
++                    partial_response_timing={"wall_s": 13})
++        self.record(task="protocol", outcome="protocol_diagnostic", wall=17)
++        interruptions, budget = _attempt_budget(self.store)
++        self.assertEqual(interruptions, {("gpqa", "fg"): 1})
++        self.assertEqual(budget["interrupted_wall_s"], 18)
++        self.assertEqual(budget["unfinished_attempt_wall_s"], 53)
++        self.assertEqual(budget["unmeasured_unfinished_attempts"], 0)
++        self.assertTrue(budget["unfinished_attempt_wall_complete"])
++        # Crash between prediction and request commit: the saved exact attempt
++        # is complete despite its stale SENDING/unknown request record.
++        self.saved(failed)
++        self.assertEqual(_attempt_budget(self.store)[1]["unfinished_attempt_wall_s"], 148)
++
++    def test_dedup_saved_top_and_partial_wall_and_foreground_count(self):
++        record = self.record(outcome="INTERRUPTED_BY_FOREGROUND", wall=5,
++                             partial_response_timing={"wall_s": 5})
++        atomic_write_json(self.store.requests / "duplicate.json", record)
++        interruptions, budget = _attempt_budget(self.store)
++        self.assertEqual(interruptions, {("gpqa", "t"): 1})
++        self.assertEqual(budget["unfinished_attempt_wall_s"], 5)
++        self.assertEqual(budget["interrupted_wall_s"], 5)
++        # Same B103 recovered timing appears both top-level and in partial timing.
++        record.update(outcome="technical_loss", state="LOST_RESPONSE_AFTER_STREAM_FAILURE")
++        self.store.save_request(record)
++        atomic_write_json(self.store.requests / "duplicate.json", record)
++        self.assertEqual(_attempt_budget(self.store)[1]["unfinished_attempt_wall_s"], 5)
++
++    def test_conflicting_observations_are_not_summed_or_underestimated(self):
++        record = self.record(wall=3, partial_response_timing={"wall_s": 5})
++        atomic_write_json(self.store.requests / "duplicate.json", dict(record, wall_s=7))
++        self.assertEqual(_attempt_budget(self.store)[1]["unfinished_attempt_wall_s"], 7)
++
++    def test_unknown_expense_is_not_zero_or_nan_and_not_sent_is_known(self):
++        for i, value in enumerate((None, True, -1, float("nan"), float("inf"))):
++            self.record(task=str(i), wall=value)
++        self.record(task="not-sent", outcome="interrupted_before_send", wall=None, sent=False)
++        self.record(task="fallback", wall=True, partial_response_timing={"wall_s": 2})
++        _, budget = _attempt_budget(self.store)
++        self.assertEqual(budget["unfinished_attempt_wall_s"], 2)
++        self.assertEqual(budget["unmeasured_unfinished_attempts"], 5)
++        self.assertFalse(budget["unfinished_attempt_wall_complete"])
++
++    def test_partial_copy_of_same_attempt_is_counted_once(self):
++        self.record(wall=None)
++        (self.store.requests / "gpqa__t__a1.partial.json").write_text("{")
++        self.assertEqual(_attempt_budget(self.store)[1]["unmeasured_unfinished_attempts"], 1)
++
++    def runner(self, cap):
++        runner = object.__new__(IdleRunner)
++        runner.store = self.store
++        runner.pilot_only = False
++        runner.window_hours = None
++        runner.policy = {"max_interrupted_attempt_wall_seconds": cap,
++                         "max_foreground_interruptions_per_task": 3}
++        order = {"ifbench": [], "gpqa": ["t"], "lcb": []}
++        runner.corpus = type("Corpus", (), {"order": order, "pilot": order})()
++        self.store.write_manifest({"authorization_expires_epoch": 10**12})
++        return runner
++
++    def test_exact_policy_boundary_stops_before_admission_and_is_reported(self):
++        self.record(wall=5)
++        self.record(2, outcome="OUTCOME_UNKNOWN", wall=None,
++                    partial_response_timing={"wall_s": 7})
++        runner = self.runner(12)
++        # Direct existing loop: no client, network, admission or recovery effect.
++        with redirect_stdout(StringIO()):
++            self.assertEqual(runner._loop(), 0)
++        self.assertEqual(self.store.manifest()["state"], "PAUSED_POLICY")
++        self.assertEqual(self.store.manifest()["interrupted_wall_s"], 0)
++        self.assertEqual(self.store.manifest()["unfinished_attempt_wall_s"], 12)
++        self.assertEqual(self.store.progress()["unfinished_attempt_wall_s"], 12)
++        self.assertTrue(self.store.progress()["unfinished_attempt_wall_complete"])
++
++    def test_manual_pause_is_retained_when_cap_is_exhausted(self):
++        self.record(wall=5)
++        runner = self.runner(5)
++        self.store.set_control(pause=True, stop=False)
++        with redirect_stdout(StringIO()):
++            self.assertEqual(runner._loop(), 0)
++        self.assertEqual(self.store.manifest()["state"], "MANUAL_PAUSED")
++        self.assertTrue(self.store.control()["pause"])
++
++    def test_below_cap_preserves_unknown_retry_block(self):
++        self.record(outcome="OUTCOME_UNKNOWN", wall=5)
++        runner = self.runner(6)
++        self.assertEqual(runner._loop(), 2)
++        self.assertEqual(self.store.manifest()["state"], "RECOVERY_REQUIRED")
++        self.assertEqual(self.store.manifest()["unfinished_attempt_wall_s"], 5)
++
++    def test_nearest_status_and_report_recompute_saved_budget(self):
++        self.record(wall=5)
++        self.store.write_manifest(dict(mode="idle", coordinator_dir=str(self.root / "admission"),
++            idle_policy={"max_interrupted_attempt_wall_seconds": 12},
++            authorization_expires_epoch=10**12,
++            datasets={b: {"ids": []} for b in ("ifbench", "gpqa", "lcb")}))
++        with redirect_stdout(StringIO()) as output:
++            self.assertEqual(_status(self.root, self.root, "fixture"), 0)
++        status = json.loads(output.getvalue().splitlines()[-1])
++        report = build_report(self.store)["unfinished_attempt_budget"]
++        for value in (status, report):
++            self.assertEqual(value["unfinished_attempt_wall_s"], 5)
++            self.assertEqual(value["max_interrupted_attempt_wall_seconds"], 12)
++            self.assertTrue(value["unfinished_attempt_wall_complete"])
++
++
++if __name__ == "__main__":
++    unittest.main()
