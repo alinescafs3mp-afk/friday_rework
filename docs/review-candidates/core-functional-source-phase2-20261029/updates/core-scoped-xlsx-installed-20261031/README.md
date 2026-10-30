@@ -1,0 +1,13 @@
+# Scoped XLSX reader installed; permanent services restored
+
+Source111 now includes the [scoped formula reader](../core-scoped-xlsx-formulas-20261031/README.md). Its source transaction committed, a separate native generation was selected, and a fresh isolated process verified the installed source and native selection. Dependency stamp, extras and lock stayed unchanged. The [first failed attempt and recovery](../core-scoped-xlsx-carrier-recovery-20261031/README.md) remain closed historical results.
+
+A second historical reference needed correction after publication: the component's pre-installation reader hash referred to the mutable installed file. The current verifier authenticates that old hash against the exact committed before-image. A separate finite transaction updated only the JOIN verifier reference and installation marker, including the matching operator source view. Original source commit, Hermes receipt and native refresh remain intact. Current installed file custody is checked separately from historical archives. Neither Hermes nor native was reinstalled for this two-file correction.
+
+The preparer stopped twice before that transaction entered: once on an unsupported cleanup argument and once because the strict native checker shared a process with the service bootstrap. The cleanup call was corrected against its actual API; the native checker now runs in a separate isolated process. Original clocks and refusal evidence were retained. The final correction and current service launchers received independent review, and the final installed state passed a new isolated check.
+
+Gateway and Dashboard were each started once through their native consumers and verified as permanent services. Gateway readiness was observed in 110.270 seconds within its original 180-second cold-start window. The complete service restoration verification took 167.803 seconds; these intervals overlap and must not be added. Dashboard returned a CA-verified HTTPS login response with status 200. Healthy services continue after the test window.
+
+This establishes installation and service readiness. The ordinary Telegram comparison task and its same-conversation continuation remain pending. The closed spreadsheet creation failure and partial recalculation observation remain unchanged; no model, upload or artifact was replayed for a pass. The S17 caller's receiving and predecessor fixes have source acceptance only. Full product acceptance still requires the complete audited scope, including all 170 cases, 120 formats and applicable variants.
+
+[OBSERVATIONS.json](OBSERVATIONS.json) contains sanitized facts. Private packages, installation paths, session and process identifiers, workbooks and runtime records are excluded.
