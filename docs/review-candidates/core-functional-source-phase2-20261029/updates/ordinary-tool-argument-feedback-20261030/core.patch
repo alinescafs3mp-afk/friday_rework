@@ -1,0 +1,306 @@
+diff --git a/tools/tool_search_validation.py b/tools/tool_search_validation.py
+--- a/tools/tool_search_validation.py
++++ b/tools/tool_search_validation.py
+@@ -136,6 +136,19 @@
+         return None
+ 
+ 
++class ToolCallArgumentError(str):
++    """String-compatible local input error, separate from bridge policy refusals.
++
++    Names are retained for deny-only preflight; the raw message is never a safe
++    ordinary-user diagnostic because it may include caller-controlled text.
++    """
++    def __new__(cls, message, raw_calls=()):
++        value = super().__new__(cls, message)
++        value.tool_names = tuple(str(item.get('name') or '').strip()
++            for item in raw_calls if isinstance(item, dict) and item.get('name'))
++        return value
++
++
+ def normalize_tool_call_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+     """Normalize ``tool_call`` arguments into a ``calls[]`` list of entries.
+ 
+@@ -149,7 +162,7 @@
+     if raw_calls is None:
+         # Legacy single shape.
+         if not str(args.get("name") or "").strip():
+-            return [], "tool_call requires 'calls' (an array of {name, arguments})"
++            return [], ToolCallArgumentError("tool_call requires 'calls' (an array of {name, arguments})")
+         raw_calls = [{"name": args.get("name"), "arguments": args.get("arguments")}]
+     if isinstance(raw_calls, str):
+         # Tolerate the model emitting the batch envelope as a JSON string —
+@@ -157,19 +170,19 @@
+         try:
+             raw_calls = json.loads(raw_calls)
+         except json.JSONDecodeError as e:
+-            return [], f"tool_call 'calls' is not valid JSON: {e}"
++            return [], ToolCallArgumentError(f"tool_call 'calls' is not valid JSON: {e}")
+     if isinstance(raw_calls, dict):
+         raw_calls = [raw_calls]
+     if not isinstance(raw_calls, list) or not raw_calls:
+-        return [], "tool_call 'calls' must be a non-empty array of {name, arguments}"
++        return [], ToolCallArgumentError("tool_call 'calls' must be a non-empty array of {name, arguments}")
+ 
+     entries: List[Dict[str, Any]] = []
+     for position, raw in enumerate(raw_calls):
+         if not isinstance(raw, dict):
+-            return [], f"tool_call calls[{position}] must be an object with 'name' and 'arguments'"
++            return [], ToolCallArgumentError(f"tool_call calls[{position}] must be an object with 'name' and 'arguments'", raw_calls)
+         name = str(raw.get("name") or "").strip()
+         if not name:
+-            return [], f"tool_call calls[{position}] requires a 'name'"
++            return [], ToolCallArgumentError(f"tool_call calls[{position}] requires a 'name'", raw_calls)
+         if name in BRIDGE_TOOL_NAMES:
+             return [], f"tool_call cannot invoke '{name}' (it is itself a bridge tool)"
+         raw_args = raw.get("arguments")
+@@ -183,9 +196,9 @@
+             try:
+                 raw_args = json.loads(raw_args)
+             except json.JSONDecodeError as e:
+-                return [], f"tool_call calls[{position}].arguments is not valid JSON: {e}"
++                return [], ToolCallArgumentError(f"tool_call calls[{position}].arguments is not valid JSON: {e}", raw_calls)
+         if not isinstance(raw_args, dict):
+-            return [], f"tool_call calls[{position}].arguments must be an object"
++            return [], ToolCallArgumentError(f"tool_call calls[{position}].arguments must be an object", raw_calls)
+         entries.append({"name": name, "arguments": raw_args})
+     return entries, None
+ 
+diff --git a/hermes_cli/friday_user_scope.py b/hermes_cli/friday_user_scope.py
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -71,6 +71,33 @@
+ class ScopeDenied(PermissionError):
+     def __init__(self):
+         super().__init__('product_user_scope_refused')
++
++
++class ScopeArgumentError(ScopeDenied):
++    """Known pure input validation failure; all unhandled consumers still deny.
++
++    Only fixed public schema guidance is exposed, never raw validator messages,
++    caller content, paths or authorization details.
++    """
++    _HINTS = {
++        'tool_call': ('calls', 'Use calls as a non-empty array of {name, arguments}; '
++            'each arguments value must be an object. JSON strings must be complete valid JSON. '
++            'No tool was dispatched.'),
++        'docx_structured': ('content', 'For docx_structured, content must be a complete JSON string '
++            '{"blocks":[...]}. Use title/paragraph blocks with type,text; heading with '
++            'type,text,level (integer 1..9); table with type,rows (rectangular string cells). '
++            'Use non-empty blocks, at most 2000 paragraphs including table cells, '
++            'and 1..32 table columns. Exact keys only. The document was not created.'),
++    }
++
++    def __init__(self, kind):
++        super().__init__()
++        self.argument, self.hint = self._HINTS[kind]
++
++    def result_json(self):
++        from tools.registry import tool_error
++        return tool_error('Invalid tool arguments.', success=False,
++            error_type='invalid_arguments', argument=self.argument, hint=self.hint)
+ 
+ 
+ def _owner_uid():
+@@ -411,11 +438,22 @@
+     if name == 'tool_call':
+         # Use the donor's actual normalizer for advertised/legacy/JSON forms.
+         # Preflight the entire envelope before native expansion or dispatch.
+-        from tools.tool_search_validation import normalize_tool_call_entries
++        from tools.tool_search_validation import normalize_tool_call_entries, ToolCallArgumentError
+         from tools.connectors.gateway.config import MAX_CALLS_PER_DISPATCH
+         if not isinstance(args, dict):
+             raise ScopeDenied()
+         entries, error = normalize_tool_call_entries(args)
++        if isinstance(error, ToolCallArgumentError):
++            delegated = _DELEGATION.get()
++            if delegated is not None:
++                check_delegation(delegated)
++            # A parseable forbidden sibling must keep the authority refusal even
++            # when another entry is malformed. This preflight grants no effects.
++            for attempted_name in error.tool_names:
++                if attempted_name in BRIDGES:
++                    raise ScopeDenied()
++                guard_tool(attempted_name, {}, registry_scope, execution=False)
++            raise ScopeArgumentError('tool_call')
+         if error or not 1 <= len(entries) <= MAX_CALLS_PER_DISPATCH:
+             raise ScopeDenied()
+         for entry in entries:
+@@ -985,6 +1023,8 @@
+             raise ScopeDenied()
+         from hermes_cli.friday_workspace_revision import write
+         return write(cap,fd,parts[-1],path.as_posix(),content,task_id)
++    except ScopeArgumentError:
++        raise
+     except (OSError, ValueError):
+         raise ScopeDenied() from None
+     finally:
+@@ -1308,14 +1348,16 @@
+         public['error'] = PUBLIC_WEB_FAILURE_COPY
+     return public, cause
+ 
+-def ordinary_tool_error_json(code):
++def ordinary_tool_error_json(code, *, cause=None):
+     """Public JSON for an exact known machine refusal at the ordinary tool boundary.
+ 
+-    Exact refusal codes stay in private logs and unmanaged diagnostics. Access
+-    refusal is never translated as absence, and an uncertain operation is never
+-    reported completed. Returns None outside ordinary presentation so callers
+-    keep their existing raw result.
+-    """
++    Typed local input failures retain fixed schema guidance. Access refusal
++    codes stay private and are never translated as absence; uncertain operations
++    are never reported completed. For policy refusals, returns None outside
++    ordinary presentation so callers keep their existing raw result.
++    """
++    if code == 'product_user_scope_refused' and isinstance(cause, ScopeArgumentError):
++        return cause.result_json()
+     if code == 'product_user_scope_refused' and ordinary_presentation():
+         # Fixed origin: preserve the true cause only in existing private logs.
+         import logging
+diff --git a/hermes_cli/friday_workspace_docx.py b/hermes_cli/friday_workspace_docx.py
+--- a/hermes_cli/friday_workspace_docx.py
++++ b/hermes_cli/friday_workspace_docx.py
+@@ -17,7 +17,7 @@
+ from xml.parsers import expat
+ from xml.sax.saxutils import escape
+ from zipfile import ZipFile, ZIP_DEFLATED, ZIP_STORED, BadZipFile
+-from hermes_cli.friday_user_scope import ScopeDenied
++from hermes_cli.friday_user_scope import ScopeDenied, ScopeArgumentError
+ from hermes_cli.friday_workspace_revision import check, _move
+ 
+ MAX_TEXT = 100000
+@@ -40,6 +40,15 @@
+ 
+ 
+ def _structured(content):
++    # This validator is pure and runs after current scope/path admission and
++    # before any stage/publication. Its failures cannot contain execution state.
++    try:
++        return _structured_blocks(content)
++    except ScopeDenied:
++        raise ScopeArgumentError('docx_structured') from None
++
++
++def _structured_blocks(content):
+     """Explicit JSON contract only: never reinterpret ordinary document text."""
+     def pairs(items):
+         value={}
+diff --git a/tools/file_tools.py b/tools/file_tools.py
+--- a/tools/file_tools.py
++++ b/tools/file_tools.py
+@@ -875,8 +875,8 @@
+         scoped = scoped_file("write_file", dict(path=path, content=content, format=format), task_id=task_id)
+         if scoped is not None:
+             return scoped
+-    except ScopeDenied:
+-        return ordinary_tool_error_json("product_user_scope_refused") or json.dumps({"success": False, "error": "product_user_scope_refused"})
++    except ScopeDenied as cause:
++        return ordinary_tool_error_json("product_user_scope_refused", cause=cause) or json.dumps({"success": False, "error": "product_user_scope_refused"})
+     if format != "text":
+         return json.dumps({"success": False, "error": "document_creation_requires_user_scope"})
+     # write_file checks the binary-document guard before the mirror guard.
+diff --git a/tools/registry.py b/tools/registry.py
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -897,9 +897,11 @@
+         self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
+         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
+         results normalized, every exception returned as ``{"error": ...}``."""
+-        from hermes_cli.friday_user_scope import guard_tool, ScopeDenied
++        from hermes_cli.friday_user_scope import guard_tool, ScopeDenied, ScopeArgumentError
+         try:
+             guard_tool(name, args, scope)
++        except ScopeArgumentError as error:
++            return error.result_json()
+         except ScopeDenied:
+             from hermes_cli.friday_user_scope import ordinary_presentation
+             if ordinary_presentation():
+diff --git a/model_tools.py b/model_tools.py
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -995,8 +995,8 @@
+     from hermes_cli.friday_user_scope import guard_tool, ScopeDenied, ordinary_tool_error_json
+     try:
+         guard_tool(function_name, function_args)
+-    except ScopeDenied:
+-        return ordinary_tool_error_json("product_user_scope_refused") or tool_error("product_user_scope_refused")
++    except ScopeDenied as cause:
++        return ordinary_tool_error_json("product_user_scope_refused", cause=cause) or tool_error("product_user_scope_refused")
+     function_args = coerce_tool_args(function_name, function_args)
+     if not isinstance(function_args, dict):
+         function_args = {}
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -468,8 +468,8 @@
+         try:
+             check_agent(agent)
+             guard_tool(name, args)
+-        except ScopeDenied:
+-            return _ParsedCall(tool_call, name, args, [], ordinary_tool_error_json("product_user_scope_refused") or "product_user_scope_refused", None)
++        except ScopeDenied as cause:
++            return _ParsedCall(tool_call, name, args, [], ordinary_tool_error_json("product_user_scope_refused", cause=cause) or "product_user_scope_refused", None)
+     if parse_error is None:
+         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
+     return _ParsedCall(tool_call, name, args, [], parse_error, scope_block)
+@@ -1838,8 +1838,9 @@
+     try:
+         check_agent(agent)
+         guard_tool(function_name, function_args)
+-    except ScopeDenied:
+-        return _SequentialDispatch(lambda next_args: ordinary_tool_error_json("product_user_scope_refused") or json.dumps({"error": "product_user_scope_refused"}))
++    except ScopeDenied as cause:
++        refusal = ordinary_tool_error_json("product_user_scope_refused", cause=cause) or json.dumps({"error": "product_user_scope_refused"})
++        return _SequentialDispatch(lambda next_args: refusal)
+     if function_name != "delegate_task" and function_name in INLINE_TOOL_EXECUTORS:
+         # Agent-level tools that need live AIAgent state; table shared with invoke_tool.
+         inline_executor = INLINE_TOOL_EXECUTORS[function_name]
+@@ -1870,8 +1871,8 @@
+         try:
+             check_agent(agent)
+             guard_tool(function_name, next_args)
+-        except ScopeDenied:
+-            return ordinary_tool_error_json("product_user_scope_refused") or json.dumps({"error": "product_user_scope_refused"})
++        except ScopeDenied as cause:
++            return ordinary_tool_error_json("product_user_scope_refused", cause=cause) or json.dumps({"error": "product_user_scope_refused"})
+         import model_tools
+ 
+         with model_tools.suppress_post_tool_call_hook():
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -2568,8 +2568,8 @@
+     try:
+         check_agent(agent)
+         guard_tool(function_name, function_args)
+-    except ScopeDenied:
+-        return ordinary_tool_error_json("product_user_scope_refused") or json.dumps({"error": "product_user_scope_refused"})
++    except ScopeDenied as cause:
++        return ordinary_tool_error_json("product_user_scope_refused", cause=cause) or json.dumps({"error": "product_user_scope_refused"})
+     from agent.inline_tool_executors import (
+         InlineToolContext, apply_transform_tool_result, emit_terminal_post_tool_call,
+         resolve_invoke_tool_executor, tool_hook_ids, _pre_tool_block_message
+@@ -2611,8 +2611,8 @@
+             try:
+                 check_agent(agent)
+                 guard_tool(function_name, next_args)
+-            except ScopeDenied:
+-                return ordinary_tool_error_json("product_user_scope_refused") or json.dumps({"error": "product_user_scope_refused"})
++            except ScopeDenied as cause:
++                return ordinary_tool_error_json("product_user_scope_refused", cause=cause) or json.dumps({"error": "product_user_scope_refused"})
+             result = inline_executor(agent, next_args, inline_ctx)
+             call_args = next_args if isinstance(next_args, dict) else function_args
+             duration_ms = int((time.monotonic() - tool_start_time) * 1000)
+@@ -2630,8 +2630,8 @@
+             try:
+                 check_agent(agent)
+                 guard_tool(function_name, next_args)
+-            except ScopeDenied:
+-                return ordinary_tool_error_json("product_user_scope_refused") or json.dumps({"error": "product_user_scope_refused"})
++            except ScopeDenied as cause:
++                return ordinary_tool_error_json("product_user_scope_refused", cause=cause) or json.dumps({"error": "product_user_scope_refused"})
+             dispatch_kwargs = dict(
+                 tool_call_id=tool_call_id, session_id=agent.session_id or "",
+                 turn_id=getattr(agent, "_current_turn_id", "") or "",

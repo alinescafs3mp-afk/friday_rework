@@ -18,7 +18,15 @@ Independent offline inspection found two distinct usable documents. Rendering th
 
 The product also created an unrequested local probe during its own troubleshooting. It was retained as an observed effect and was not delivered as a user result. The complete bounded late-reply batch contained exactly the two requested documents.
 
-The main delay involved repeated malformed local tool-call JSON and malformed structured-document content. The installed structured DOCX route did work with valid arguments. A separate source-only improvement to safe argument-error feedback is being prepared; no malformed payload is repaired or executed automatically, and access denials remain protected.
+The main delay involved repeated malformed local tool-call JSON and malformed structured-document content. The installed structured DOCX route did work with valid arguments. A separately reviewed [source-only argument-error feedback patch](../ordinary-tool-argument-feedback-20261030/README.md) is available; no malformed payload is repaired or executed automatically, and access denials remain protected.
+
+## D06: file delivered; wrong retained original selected
+
+A single genuine Telegram request explicitly named the previously uploaded original and asked for a section-2-only change, preserving its title, appendix, other sections, table, headers, footer, comments and formatting. The original was not uploaded again. The product completed in about 67 seconds, and the receiver downloaded its DOCX within the unchanged complete 180-second observation.
+
+Semantic acceptance is **FAIL / WRONG_ORIGINAL_SELECTED**. The native trace shows an unsuccessful read of the named original followed by editing a newer, smaller document from the conversation. The received bytes match that actual edit. Independent package comparison confirms that only the requested text in its body changed and every other package member of the chosen newer file stayed byte-identical. This proves preservation of the chosen input; it does not satisfy the requested historical source.
+
+The rich historical original remains present and unchanged. The product did not invoke scoped history or memory search before selecting the substitute. No task, edit or delivery was repeated. The original failed result is retained, and the dependent D07 comparison has not been issued while this lookup dependency is investigated. This observation alone does not establish a DOCX editor formatting defect.
 
 ## Runtime continuity and remaining work
 
