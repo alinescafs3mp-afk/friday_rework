@@ -1,0 +1,137 @@
+--- before/m12_issue.py
++++ candidate/m12_issue.py
+@@ -9,7 +9,7 @@
+ BUDGET = D/'m12_budget.py'
+ BUDGET_SHA = 'fd99d62639df63b7a51d83cdc8b77f38ccf361ae4d47cf6f6e8994046eeb7bc0'
+ NATIVE = D/'m12_native.py'
+-NATIVE_SHA = '4c8c55b388fb4985b8a31ba90385d06f8f80637ea6bb769875e36ff9de9cbdbf'
++NATIVE_SHA = '1cbc1fb1d0420cd196f359ab63dc77f6d6cbccff5cdf1ea7a56637b0533f07d9'
+ RECIPE_SHA = '802126c3f507bb8bcb00eb4e9871304dd4f36622a707fbc8751ce9d0983647f2'
+ CANDIDATE_CONSUMER_SHA = 'cd328fc8c9afcf71cbb4d65df1cecb3eae82088d75342d234eac05fc1e85a7c1'
+ CONSUMER_SHA = None
+--- before/m12_native.py
++++ candidate/m12_native.py
+@@ -46,6 +46,14 @@
+     return dict(id=row['id'],sha256=b['sha'](b['encoded']({k:v for k,v in row.items() if k not in ('active','compacted','display_order','display_identity')})))
+ 
+ 
++def upload_copy_payload(b,row):
++    # Native in-place compression can assign fresh IDs to exact protected-row
++    # copies. Metadata, API sidecars, causal IDs and timestamps must agree too;
++    # matching source text alone is never sufficient to deduplicate requests.
++    return b['sha'](b['encoded']({k:v for k,v in row.items()
++        if k not in ('id','active','compacted','display_order','display_identity')}))
++
++
+ def protected_payload(b,row):
+     # Native archive inserts fresh IDs for protected head/tail copies. Match all replay payload/identity fields.
+     keys=('role','content','tool_calls','tool_call_id','tool_name','finish_reason','reasoning',
+@@ -80,12 +88,16 @@
+ def retained_carrier(b,m,run,row,raw,witness,active,sid):
+     m['need'](row.get('session_id')==sid,'inline_carrier_selected_session_required')
+     upload=run['scenario']['steps'][0]['input']
+-    next_user=min((item['id'] for item in active if item['role']=='user' and item['id']>row['id']),default=float('inf'))
+-    tools=[item for item in active if item['role']=='tool' and row['id'] < item['id'] < next_user
+-           and item.get('session_id')==sid and row['timestamp'] <= item['timestamp'] <= run['capture_until']]
+     if inline_complete(raw,row,upload,witness['native_file']['relative']):
+         return dict(content_carrier='native_inline_utf8',carrier_row_ids=[row['id']],tool_row_ids=[],
+                     complete_original_contents=True,complete_original_lines=True)
++    # The historical branch is deliberately limited to these whole-inline text
++    # uploads. It never reconstructs an original from archived tool fragments.
++    m['need'](row.get('active')==1,'archived_upload_requires_exact_native_inline_utf8_carrier')
++    next_user=min((item['id'] for item in active if item['role']=='user' and item['id']>row['id']),default=float('inf'))
++    tools=[item for item in active if item['role']=='tool' and row['id'] < item['id'] < next_user
++           and item.get('active')==1 and item.get('session_id')==sid
++           and row['timestamp'] <= item['timestamp'] <= run['capture_until']]
+     m['need'](retained_lines_complete(raw,tools),'complete_original_inline_or_same_turn_tools_required')
+     return dict(content_carrier='retained_same_turn_tool_contents',carrier_row_ids=[item['id'] for item in tools],
+                 tool_row_ids=[item['id'] for item in tools],complete_original_contents=True,complete_original_lines=True)
+@@ -202,8 +214,15 @@
+             or not re.fullmatch(r'received/telegram_[0-9a-f]{64}_[A-Za-z0-9_.-]+',file['path'])
+             or file['path'] not in (row.get('content') or '')): continue
+         candidates.append((row,file))
+-    m['need'](len(candidates)==1,'one_exact_native_upload_metadata_task_file_join_required')
+-    row,file=candidates[0];path=m['SCOPED']/'workspace'/file['path']
++    m['need'](candidates,'one_exact_native_upload_metadata_task_file_join_required')
++    m['need'](all((item['active'],item.get('compacted')) in ((1,0),(0,1))
++                  for item,_ in candidates), 'native_upload_active_or_compacted_archive_required')
++    m['need'](len({upload_copy_payload(b,item) for item,_ in candidates})==1
++              and len([item for item,_ in candidates if item['active']==1])<=1,
++              'only_exact_native_request_copies_may_share_upload_custody')
++    # Resolve the earliest retained original, rather than requiring that this
++    # upload still occupy the current main-model window after auto-compaction.
++    row,file=min(candidates,key=lambda item:item[0]['id']);path=m['SCOPED']/'workspace'/file['path']
+     before=b['identity'](path);directory=readers['absolute_directory'](path.parent)
+     try: raw=readers['verified_bytes'](directory,(path.name,),dict(size_bytes=file['size_bytes'],sha256=file['sha256']))
+     finally: os.close(directory)
+@@ -214,7 +233,10 @@
+         tester_sent_message_id=run['sent_message_id'],native_platform_message_id=row['platform_message_id'],
+         timestamp=row['timestamp'],ack=run['sent_api_ack_reference'],task=run['sent_task_reference'],
+         native_file=dict(path=str(path),relative=file['path'],sha256=file['sha256'],bytes=len(raw),identity=before),
+-        native_presentation_scope=dict(readers['scope']),receiver_source_pins=dict(RECEIVER_PINS))
++        native_presentation_scope=dict(readers['scope']),receiver_source_pins=dict(RECEIVER_PINS),
++        custody_scope='exact_native_original_or_compacted_archive_no_summary',
++        native_request_copies=[dict(row_fingerprint(b,item),active=item['active'],compacted=item['compacted'])
++                               for item,_ in sorted(candidates,key=lambda pair:pair[0]['id'])])
+     return row,raw,witness
+ 
+ 
+@@ -291,13 +313,22 @@
+ 
+ def preflight(b, m, runner, predecessor, chain_reference, chain_runs, current, originals_reviewed):
+     sid = current['session']['session_id']
+-    # SELECT all original columns so preservation covers tool/reasoning/identity metadata too.
+-    active=b['rows'](m['SCOPED']/'state.db','SELECT * FROM messages WHERE session_id=? AND active=1 ORDER BY id',(sid,))
++    # Read the current active window once plus only candidate user copies at
++    # the twelve independently retained send timestamps. Do not reread the
++    # session's unrelated historical content to reconstruct upload custody.
++    dates=tuple(run['sent_date'] for run,_,_ in chain_runs)
++    marks=','.join('?' for _ in dates)
++    rows=b['rows'](m['SCOPED']/'state.db',
++        'SELECT * FROM messages WHERE session_id=? AND (active=1 OR (role=\'user\' AND timestamp IN ('+marks+'))) ORDER BY id',
++        (sid,*dates))
++    active=[row for row in rows if row['active']==1]
+     m['need'](active,'actual_active_native_rows_required')
+     witnesses=[];readers=custody_readers(b,m,current)
+     for run,old,control in chain_runs:
+-        row,raw,witness=upload_custody(b,m,runner,run,old,current,active,readers)
+-        witness.update(retained_carrier(b,m,run,row,raw,witness,active,sid),input_sha256=b['sha'](raw))
++        row,raw,witness=upload_custody(b,m,runner,run,old,current,rows,readers)
++        witness.update(retained_carrier(b,m,run,row,raw,witness,rows,sid),input_sha256=b['sha'](raw))
++        custody_ids=set(witness['carrier_row_ids'])|{item['id'] for item in witness['native_request_copies']}
++        witness['custody_rows']=[row_fingerprint(b,item) for item in rows if item['id'] in custody_ids]
+         witnesses.append(witness)
+     middle_ids,byte_bound,selector,routes=native_projection(b,m,active)
+     ids=[row['id'] for row in active]
+@@ -359,10 +390,30 @@
+     log_window=existing_telemetry_event(b,m,pre['telemetry_cursor'],sid,telemetry)
+     m['need'](compact_run['scenario']['steps'][0].get('request')=='/compact'
+          and compact_run['scenario']['steps'][0]['observe']['window_seconds']==600,'actual_closed_full600_compact_required')
+-    rows=b['rows'](m['SCOPED']/'state.db','SELECT * FROM messages WHERE session_id=? ORDER BY id',(sid,))
++    retained_ids=sorted(set(pre['active_ids'])|{pin['id'] for witness in pre['upload_native_witnesses']
++                                              for pin in witness['custody_rows']})
++    marks=','.join('?' for _ in retained_ids)
++    rows=b['rows'](m['SCOPED']/'state.db',
++        'SELECT * FROM messages WHERE session_id=? AND (active=1 OR id IN ('+marks+')) ORDER BY id',
++        (sid,*retained_ids))
+     by_id={row['id']:row for row in rows}
+     m['need'](all(pin['id'] in by_id and row_fingerprint(b,by_id[pin['id']])==pin for pin in pre['original_rows']),
+               'every_original_payload_tool_reasoning_and_identity_must_be_preserved')
++    m['need'](all(pin['id'] in by_id and row_fingerprint(b,by_id[pin['id']])==pin
++                 for witness in pre['upload_native_witnesses'] for pin in witness['custody_rows']),
++              'every_exact_uploaded_original_and_native_copy_must_remain_preserved')
++    m['need'](all((by_id[pin['id']]['active'],by_id[pin['id']]['compacted'])==(0,1)
++                 for witness in pre['upload_native_witnesses'] for pin in witness['native_request_copies']
++                 if pin['active']==0), 'previously_compacted_upload_custody_flags_must_remain_unchanged')
++    readers=custody_readers(b,m,current)
++    for witness in pre['upload_native_witnesses']:
++        file=witness['native_file'];path=m['SCOPED']/'workspace'/file['relative']
++        m['need'](str(path)==file['path'] and b['identity'](path)==file['identity'],
++                  'postcompact_original_file_identity_changed')
++        directory=readers['absolute_directory'](path.parent)
++        try: readers['verified_bytes'](directory,(path.name,),dict(size_bytes=file['bytes'],sha256=file['sha256']))
++        finally: os.close(directory)
++        m['need'](b['identity'](path)==file['identity'],'postcompact_original_file_CAS_changed')
+     compacted=[row_id for row_id in pre['active_ids'] if by_id[row_id]['active']==0 and by_id[row_id]['compacted']==1]
+     m['need'](set(pre['compactable_ids']).issubset(compacted),'every_native_selected_original_archived_as_compacted_required')
+     m['need'](all(by_id[row_id]['active']==0 for row_id in pre['active_ids']),
