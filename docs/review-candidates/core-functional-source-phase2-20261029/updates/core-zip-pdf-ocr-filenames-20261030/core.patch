@@ -1,0 +1,1090 @@
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -26,7 +26,9 @@
+ from gateway.platforms.event import MessageEvent, MessageType
+ from gateway.run_busy import approval_input_words
+ from gateway.run_common import _UNSET
+-from gateway.run_inbound_media import owned_attachment_model_path, rehome_inbound_media
++from gateway.run_inbound_media import (
++    owned_attachment_display_name, owned_attachment_model_path, rehome_inbound_media,
++)
+ from gateway.run_plugin_injection import GatewayPluginInjectionMixin
+ from gateway.run_inbound_unauthorized import (
+     UnauthorizedOwnerNotifier, pairing_code_reply, pairing_profile_arg, pairing_rate_limited_reply,
+@@ -1601,6 +1603,7 @@
+             # must still tell the agent the file exists.
+             display_name, agent_path = cls._inbound_attachment_display_name(path)
+             agent_path = owned_attachment_model_path(event, path) or agent_path
++            display_name = owned_attachment_display_name(event, path) or display_name
+             inline_flag = inline_flags[i] if i < len(inline_flags) else None
+             context_note = _build_document_context_note(
+                 display_name, agent_path, mtype, content_inlined=inline_flag is not False,
+--- a/gateway/run_inbound_media.py
++++ b/gateway/run_inbound_media.py
+@@ -229,8 +229,11 @@
+         rewritten.append(str(destination))
+         # Keep the origin receipt too. Remapping a verified byte copy lets the
+         # native producer prove this same event on an idempotent second call.
+-        event._telegram_media_receipts[str(destination)] = {
+-            'origin': dict(receipt['origin']), 'content': dict(receipt['content'])}
++        retained_receipt = {'origin': dict(receipt['origin']), 'content': dict(receipt['content'])}
++        presentation = receipt.get('presentation')
++        if isinstance(presentation, dict) and isinstance(presentation.get('original_filename'), str):
++            retained_receipt['presentation'] = {'original_filename': presentation['original_filename']}
++        event._telegram_media_receipts[str(destination)] = retained_receipt
+         if event.text:
+             event.text = event.text.replace(raw, str(destination))
+     event.media_urls = rewritten
+@@ -256,6 +259,19 @@
+         return Path(path).relative_to(cap.home / 'workspace').as_posix()
+     except ValueError:
+         raise ScopeDenied() from None
++
++
++def owned_attachment_display_name(event, path):
++    """Return this verified attachment's original name for presentation, never for file access."""
++    if owned_attachment_model_path(event, path) is None:
++        return None
++    receipts = getattr(event, '_telegram_media_receipts', None)
++    receipt = receipts.get(path) if isinstance(receipts, dict) else None
++    presentation = receipt.get('presentation') if isinstance(receipt, dict) else None
++    original = presentation.get('original_filename') if isinstance(presentation, dict) else None
++    if not isinstance(original, str) or not 0 < len(original) <= 4096:
++        return None
++    return re.sub(r'[^\w.\- ]', '_', original).strip() or None
+ 
+ 
+ def rehome_inbound_media(event: MessageEvent) -> None:
+--- a/hermes_cli/friday_prompt_scope.py
++++ b/hermes_cli/friday_prompt_scope.py
+@@ -240,11 +240,24 @@
+         function['description'] = (
+             'Read an own-workspace UTF-8 text file with numbered lines. Use offset, limit and the '
+             'returned next_offset/next_char_offset for continuation. PDF, DOCX and XLSX extract text '
+-            'only; images and layout are not covered. Other binary formats are unsupported. '
++            'only; images and layout are not covered. ZIP returns a checked archive member registry; '
++            'offset and limit paginate whole archive entries. If partial is true, continue at next_offset; '
++            'total_entries and sha256 identify the full archive. '
++            'use write_file format=zip_extract to extract into a NEW folder, then read those returned paths. '
++            '7z and other binary formats are unsupported. '
+             'Before replacing an existing text file, read its complete current content in this task.')
+     else:
+         function['description'] = (
+             'Own-workspace write: path + content string; choose format. '
++            'ZIP: format=zip needs a NEW .zip path and content JSON {"entries":[{"source":"report.docx","member":"Docs/report.docx"}]}; '
++            'only the exact listed files are included, with unchanged bytes and the requested nested member names. '
++            'format=zip_extract needs a NEW folder path and content JSON {"source":"materials.zip"}. '
++            'When registry_omitted is true, creation/extraction still succeeded: use read_file on '
++            'registry_read_file and continue its next_offset to inspect entries; do not repeat the write. '
++            'Extraction puts those entries under the returned folder path. '
++            'Existing destinations, unsafe paths, links, encrypted members, unsupported compression and oversized archives refuse. '
++            'ZIP limits: 128 entries, 1 MB total uncompressed bytes; UTF-8 names and extensionless files are supported. '
++            'No 7z codec or conversion is available. '
+             'XLSX content JSON: format=xlsx_recalculate {source}; format=xlsx_merge {base,update,sheet,key,revision}; '
+             'format=xlsx {source,sheet,cell,expected,value}. XLSX outputs need NEW .xlsx names; xlsx edits never recalculate. '
+             'DOCX: docx/docx_structured create; docx_edit {source,old_text,new_text}; docx_pdf {source}. '
+@@ -280,6 +293,8 @@
+             'No search or reread is needed merely to discover the created file path.')
+         content = function['parameters']['properties']['content']
+         content['description'] = (
++            'ZIP content JSON: zip uses exactly {"entries":[{"source":"note","member":"Folder/note"}]}; '
++            'zip_extract uses exactly {"source":"materials.zip"}. ZIP writes need a new .zip file; extraction needs a new folder. '
+             'XLSX content is a JSON string: xlsx_recalculate uses exactly {"source":"edited.xlsx"}; '
+             'xlsx_merge uses exactly {"base":"base.xlsx","update":"update.xlsx","sheet":"Orders","key":"order_id","revision":"revision"}; '
+             'xlsx uses exactly {"source":"orders.xlsx","sheet":"Orders","cell":"C3","expected":4,"value":5}. '
+--- a/hermes_cli/friday_user_scope.py
++++ b/hermes_cli/friday_user_scope.py
+@@ -814,13 +814,22 @@
+         cap.check()
+         if name == 'read_file':
+             from hermes_cli import friday_workspace_revision as revision
++            if path.suffix.lower() == '.zip':
++                from hermes_cli.friday_workspace_zip import read_archive
++                return read_archive(cap, path.as_posix(), offset=args.get('offset', 1),
++                                    limit=args.get('limit', 2000), char_offset=args.get('char_offset', 0))
++            if path.suffix.lower() == '.7z':
++                return json.dumps({'success': False, 'error': 'archive_codec_unavailable', 'format': '7z'})
+             document_format = path.suffix.lower().lstrip('.') if path.suffix.lower() in {'.docx', '.pdf', '.xlsx'} else None
++            extraction_metadata = None
+             if document_format:
+                 from tools.read_extract import extract_scoped_document_bytes, ScopedExtractionError
+                 data, _ = workspace_document(str(root / path), max_bytes=1000000)
+                 revision.check(cap)
+                 try:
+                     text = extract_scoped_document_bytes(data, document_format)
++                    # Authored by the trusted extractor; preserve on every page.
++                    extraction_metadata = getattr(text, 'extraction_metadata', None)
+                 except ScopedExtractionError as exc:
+                     revision.check(cap)
+                     return json.dumps({'success': False, 'error': 'document_extraction_failed',
+@@ -863,6 +872,9 @@
+                 if document_format:
+                     result.update(extracted_document=True, format=document_format,
+                                   coverage='text_only; images_and_layout_not_covered')
++                    if extraction_metadata is not None:
++                        result.update(extraction=extraction_metadata,
++                                      coverage=extraction_metadata['coverage'])
+                 encode = lambda: json.dumps(result, ensure_ascii=False, separators=(',', ':'))
+                 if serialized_bytes(encode()) > budget:
+                     if document_format: revision.check(cap)
+@@ -912,8 +924,15 @@
+         if name != 'write_file':
+             raise ScopeDenied()
+         output_format = args.get('format', 'text')
+-        if output_format not in ('text', 'docx', 'docx_structured', 'docx_edit', 'docx_pdf', 'xlsx', 'xlsx_recalculate', 'xlsx_merge'):
+-            raise ScopeDenied()
++        if output_format not in ('text', 'docx', 'docx_structured', 'docx_edit', 'docx_pdf', 'xlsx', 'xlsx_recalculate', 'xlsx_merge', 'zip', 'zip_extract'):
++            raise ScopeDenied()
++        if output_format == 'zip':
++            if path.suffix.lower() != '.zip': raise ScopeDenied()
++            from hermes_cli.friday_workspace_zip import create_zip
++            return create_zip(cap, fd, parts[-1], path.as_posix(), args.get('content'))
++        if output_format == 'zip_extract':
++            from hermes_cli.friday_workspace_zip import extract_zip
++            return extract_zip(cap, fd, parts[-1], path.as_posix(), args.get('content'))
+         if output_format == 'xlsx_merge':
+             if path.suffix.lower() != '.xlsx': raise ScopeDenied()
+             from hermes_cli.friday_workspace_xlsx_merge import create_merge
+@@ -940,7 +959,7 @@
+             from hermes_cli.friday_workspace_docx import create
+             return create(cap, fd, parts[-1], path.as_posix(), args.get('content'),
+                           structured=output_format == 'docx_structured')
+-        if path.suffix.lower() in {'.docx', '.pdf', '.xlsx', '.xls'}:
++        if path.suffix.lower() in {'.docx', '.pdf', '.xlsx', '.xls', '.zip', '.7z'}:
+             refusal = {'success': False, 'error': 'document_write_unsupported',
+                        'format': path.suffix.lower().lstrip('.')}
+             if path.suffix.lower() == '.xlsx':
+--- /dev/null
++++ b/hermes_cli/friday_workspace_zip.py
+@@ -0,0 +1,441 @@
++"""Bounded ordinary ZIPs: explicit files only, descriptor custody, no payload execution.
++
++No globbing, shell, external codec, in-place archive editing or overwrite. Extraction
++builds a private new tree before one atomic NOREPLACE publication. ZIP is the only
++format here; an extension change never claims conversion to 7z.
++"""
++from io import BytesIO
++from pathlib import PurePosixPath
++import hashlib
++import json
++import os
++import stat
++import unicodedata
++import uuid
++from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED, ZIP_STORED, BadZipFile
++
++from hermes_cli.friday_user_scope import ScopeDenied, workspace_document
++from hermes_cli.friday_workspace_revision import check, _move
++from hermes_cli.friday_workspace_docx import _check_parent, _create_bytes
++
++MAX_BYTES = 1000000
++MAX_ENTRIES = 128
++MAX_DEPTH = 16
++MAX_SECRET_SCAN = 10000000
++
++
++def _secret_name(part):
++    lower = part.casefold()
++    return (lower in {'credentials', 'credentials.json', 'secrets', 'secrets.json',
++                     'secrets.txt', 'token', 'token.txt', 'id_rsa', 'id_ed25519'}
++            or lower.endswith(('.pem', '.key', '.p12', '.pfx')))
++
++
++def _path(value, *, directory=False):
++    if not isinstance(value, str) or not value or len(value.encode('utf-8')) > 512:
++        raise ScopeDenied()
++    name = value[:-1] if directory and value.endswith('/') else value
++    pieces = name.split('/')
++    if (not name or len(pieces) > MAX_DEPTH or name != unicodedata.normalize('NFC', name)
++            or any(c in name for c in ('\\', ':', '\x00'))
++            or any(unicodedata.category(c).startswith('C') for c in name)
++            or any(not p or p in ('.', '..') or p.startswith('.') for p in pieces)):
++        raise ScopeDenied()
++    # Own-workspace confinement already excludes service secrets. Also refuse
++    # explicit credential-shaped members; never silently omit them from a ZIP.
++    for part in pieces:
++        if _secret_name(part):
++            raise ScopeDenied()
++    return name
++
++
++def _object(content, field):
++    if not isinstance(content, str) or len(content.encode('utf-8')) > 100000:
++        raise ScopeDenied()
++    def pairs(items):
++        result = {}
++        for key, value in items:
++            if key in result:
++                raise ScopeDenied()
++            result[key] = value
++        return result
++    try:
++        value = json.loads(content, object_pairs_hook=pairs)
++    except (ValueError, RecursionError):
++        raise ScopeDenied() from None
++    if not isinstance(value, dict) or set(value) != {field}:
++        raise ScopeDenied()
++    return value[field]
++
++
++def _source(cap, relative):
++    relative = _path(relative)
++    data, actual, identity = workspace_document(
++        str(cap.home / 'workspace' / relative), max_bytes=MAX_BYTES, with_identity=True)
++    if actual != relative:
++        raise ScopeDenied()
++    check(cap)
++    return data, identity
++
++
++def _check_secrets(data, *, depth=0, budget=None):
++    """Reuse native secret detection without altering a user's archived bytes.
++
++    Inspect bounded nested ZIP document parts too (DOCX/XLSX are ZIP packages).
++    Unsupported depth, encrypted inner data and over-budget scans refuse the
++    whole operation; they never become silent secret-scan exceptions.
++    """
++    from agent.redact import redact_sensitive_text, _is_secret_file_arg
++    if budget is None:
++        budget = [MAX_SECRET_SCAN]
++    budget[0] -= len(data)
++    if budget[0] < 0:
++        raise ScopeDenied()
++    text = data.decode('utf-8', errors='ignore')
++    if redact_sensitive_text(text, force=True, redact_url_credentials=True) != text:
++        raise ScopeDenied()
++    if data.startswith((b'PK\x03\x04', b'PK\x05\x06')):
++        if depth >= 2:
++            raise ScopeDenied()
++        try:
++            with ZipFile(BytesIO(data)) as nested:
++                infos = nested.infolist()
++                if len(infos) > 256:
++                    raise ScopeDenied()
++                for info in infos:
++                    if (_is_secret_file_arg(info.filename)
++                            or any(_secret_name(p) for p in info.filename.replace('\\', '/').split('/'))
++                            or info.flag_bits & 1
++                            or info.compress_type not in (ZIP_STORED, ZIP_DEFLATED)
++                            or info.file_size > budget[0]):
++                        raise ScopeDenied()
++                    if info.is_dir():
++                        continue
++                    with nested.open(info) as stream:
++                        part = stream.read(min(info.file_size, budget[0]) + 1)
++                    if len(part) != info.file_size:
++                        raise ScopeDenied()
++                    _check_secrets(part, depth=depth+1, budget=budget)
++        except (BadZipFile, EOFError, OSError, RuntimeError, NotImplementedError, ValueError):
++            raise ScopeDenied() from None
++
++
++def _verify(cap, sources):
++    for relative, data, identity in sources:
++        current, current_identity = _source(cap, relative)
++        if current_identity != identity or current != data:
++            raise ScopeDenied()
++
++
++def _rows(data):
++    """Inspect everything before any write; inflate at most one MiB in total."""
++    if not isinstance(data, bytes) or len(data) > MAX_BYTES:
++        raise ScopeDenied()
++    try:
++        with ZipFile(BytesIO(data)) as archive:
++            infos = archive.infolist()
++            if not 1 <= len(infos) <= MAX_ENTRIES:
++                raise ScopeDenied()
++            names = set(); files = set(); rows = []; total = 0
++            for info in infos:
++                directory = info.is_dir()
++                name = _path(info.filename, directory=directory)
++                mode = info.external_attr >> 16
++                kind = stat.S_IFMT(mode)
++                if (name in names or info.orig_filename != info.filename
++                        or info.flag_bits & 1 or info.compress_type not in (ZIP_STORED, ZIP_DEFLATED)
++                        or kind not in (0, stat.S_IFDIR if directory else stat.S_IFREG)
++                        or info.file_size > MAX_BYTES
++                        or info.file_size > max(4096, info.compress_size * 200)
++                        or directory and info.file_size):
++                    raise ScopeDenied()
++                names.add(name)
++                if not directory:
++                    files.add(name)
++                total += info.file_size
++                if total > MAX_BYTES:
++                    raise ScopeDenied()
++                with archive.open(info) as stream:
++                    payload = stream.read(info.file_size + 1)
++                if len(payload) != info.file_size:
++                    raise ScopeDenied()
++                rows.append((name, directory, payload))
++            for name in names:
++                if any(str(parent) in files for parent in PurePosixPath(name).parents
++                       if str(parent) != '.'):
++                    raise ScopeDenied()
++            return rows
++    except (BadZipFile, EOFError, OSError, RuntimeError, NotImplementedError, ValueError):
++        raise ScopeDenied() from None
++
++
++def _manifest(rows, prefix=''):
++    return [dict(path=prefix + name, directory=directory, bytes=len(data),
++                 **({} if directory else {'sha256': hashlib.sha256(data).hexdigest()}))
++            for name, directory, data in rows]
++
++
++def _encode(value):
++    return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
++
++
++def _inline_budget():
++    from agent.bounded_context import bounded_tool_result_budget
++    budget = bounded_tool_result_budget()
++    return 100000 if budget is None else budget
++
++
++def _fits(value, budget):
++    # The tool result is itself a JSON string inside the provider payload.
++    from agent.bounded_context import serialized_bytes
++    return serialized_bytes(_encode(value)) <= budget
++
++
++def _capacity(budget, *, total=None, offset=None):
++    result = dict(success=False, error='capacity: archive result exceeds inline budget',
++                  effect_disposition='none')
++    if total is not None:
++        result.update(total_entries=total, partial=offset <= total, next_offset=offset)
++    if not _fits(result, budget):
++        result = dict(success=False, error='capacity')
++        if total is not None:
++            result.update(total_entries=total, partial=offset <= total, next_offset=offset)
++        else:
++            result['effect_disposition'] = 'none'
++    # No archive effect has started. A budget too small even for this native
++    # failure envelope cannot be repaired by discarding a successful effect.
++    return _encode(result)
++
++
++def _omitted_receipt(result, rows, archive_path):
++    return dict(result, member_count=len(rows), registry_omitted=True,
++                registry_read_file=archive_path, next_offset=1)
++
++
++def _effect_receipt(result, rows, archive_path, budget, *, prefix=''):
++    if not result.get('success'):
++        return _encode(result)
++    full = dict(result, member_count=len(rows), registry_omitted=False,
++                archive_members=_manifest(rows, prefix))
++    if _fits(full, budget):
++        return _encode(full)
++    # This exact compact success envelope was capacity-checked BEFORE the
++    # publication. Never report failure or repeat creation to recover a list.
++    return _encode(_omitted_receipt(result, rows, archive_path))
++
++
++def read_archive(cap, relative, *, offset=1, limit=2000, char_offset=0):
++    if (type(offset) is not int or type(limit) is not int or type(char_offset) is not int
++            or not 1 <= offset <= 1000000 or not 1 <= limit <= 2000 or char_offset != 0):
++        raise ScopeDenied()
++    budget = _inline_budget()
++    data, identity = _source(cap, relative)
++    rows = _rows(data)
++    _verify(cap, [(relative, data, identity)])
++    start = min(offset, len(rows) + 1)
++    result = dict(success=True, format='zip', path=relative,
++        scope='own_user_workspace', archive_members=[], extracted=False,
++        sha256=hashlib.sha256(data).hexdigest(), total_entries=len(rows),
++        partial=start <= len(rows), next_offset=start)
++    if not _fits(result, budget):
++        return _capacity(budget, total=len(rows), offset=start)
++    for index in range(start - 1, min(len(rows), start - 1 + limit)):
++        entry = _manifest([rows[index]])[0]
++        candidate = dict(result, archive_members=result['archive_members'] + [entry],
++                         partial=index + 1 < len(rows), next_offset=index + 2)
++        if not _fits(candidate, budget):
++            if not result['archive_members']:
++                return _capacity(budget, total=len(rows), offset=start)
++            break
++        result = candidate
++    return _encode(result)
++
++
++def create_zip(cap, fd, leaf, relative, content):
++    _check_parent(cap, fd, relative)
++    budget = _inline_budget()
++    entries = _object(content, 'entries')
++    if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_ENTRIES:
++        raise ScopeDenied()
++    sources = []; names = set(); rows = []; total = 0
++    scan_budget = [MAX_SECRET_SCAN]
++    for entry in entries:
++        if not isinstance(entry, dict) or set(entry) != {'source', 'member'}:
++            raise ScopeDenied()
++        source = _path(entry['source']); member = _path(entry['member'])
++        if member in names:
++            raise ScopeDenied()
++        names.add(member)
++        data, identity = _source(cap, source)
++        _check_secrets(data, budget=scan_budget)
++        total += len(data)
++        if total > MAX_BYTES:
++            raise ScopeDenied()
++        sources.append((source, data, identity)); rows.append((member, False, data))
++    for name in names:
++        if any(str(parent) in names for parent in PurePosixPath(name).parents if str(parent) != '.'):
++            raise ScopeDenied()
++    output = BytesIO()
++    with ZipFile(output, 'w', compression=ZIP_DEFLATED, allowZip64=False) as archive:
++        for member, _, data in rows:
++            check(cap)
++            info = ZipInfo(member)
++            info.compress_type = ZIP_DEFLATED
++            info.create_system = 3; info.external_attr = (stat.S_IFREG | 0o600) << 16
++            archive.writestr(info, data)
++    data = output.getvalue()
++    receipt = dict(success=True, format='zip', path=relative,
++        scope='own_user_workspace', create_only=True, verified=True,
++        bytes_written=len(data), sha256=hashlib.sha256(data).hexdigest())
++    if not _fits(_omitted_receipt(receipt, rows, relative), budget):
++        return _capacity(budget)
++    result = json.loads(_create_bytes(cap, fd, leaf, relative, data,
++        output_format='zip', verify_source=lambda: _verify(cap, sources)))
++    return _effect_receipt(result, rows, relative, budget)
++
++
++def _tree_snapshot(fd, rows):
++    """Reject changed bytes, links, permissions and unexpected private-stage files."""
++    expected = {}
++    for name, directory, data in rows:
++        parts = name.split('/')
++        for index in range(1, len(parts)):
++            expected['/'.join(parts[:index])] = None
++        expected[name] = None if directory else data
++    seen = {}
++    def walk(parent, prefix=''):
++        for leaf in os.listdir(parent):
++            name = prefix + leaf
++            info = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
++            if name not in expected or info.st_uid != os.getuid() or info.st_mode & 0o077:
++                raise ScopeDenied()
++            if stat.S_ISDIR(info.st_mode) and expected[name] is None:
++                child = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
++                try:
++                    if os.fstat(child).st_ino != info.st_ino or os.fstat(child).st_dev != info.st_dev:
++                        raise ScopeDenied()
++                    seen[name] = None; walk(child, name + '/')
++                finally:
++                    os.close(child)
++            elif stat.S_ISREG(info.st_mode) and expected[name] is not None and info.st_nlink == 1:
++                item = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
++                try:
++                    before = os.fstat(item)
++                    if (before.st_dev, before.st_ino) != (info.st_dev, info.st_ino):
++                        raise ScopeDenied()
++                    with os.fdopen(os.dup(item), 'rb') as stream:
++                        data = stream.read(MAX_BYTES + 1)
++                    after = os.fstat(item)
++                    named = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
++                    fields = ('st_dev','st_ino','st_size','st_mtime_ns','st_ctime_ns','st_mode','st_uid','st_nlink')
++                    if (data != expected[name] or any(getattr(before, key) != getattr(after, key)
++                            or getattr(after, key) != getattr(named, key) for key in fields)):
++                        raise ScopeDenied()
++                    seen[name] = data
++                finally:
++                    os.close(item)
++            else:
++                raise ScopeDenied()
++        os.fsync(parent)
++    walk(fd)
++    if seen != expected:
++        raise ScopeDenied()
++
++
++def _remove_private_tree(fd):
++    # fd belongs only to our random staging tree; never follows an entry link.
++    for leaf in os.listdir(fd):
++        info = os.stat(leaf, dir_fd=fd, follow_symlinks=False)
++        if stat.S_ISDIR(info.st_mode):
++            child = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
++            try:
++                _remove_private_tree(child)
++            finally:
++                os.close(child)
++            os.rmdir(leaf, dir_fd=fd)
++        else:
++            os.unlink(leaf, dir_fd=fd)
++
++
++def extract_zip(cap, fd, leaf, relative, content):
++    _check_parent(cap, fd, relative)
++    budget = _inline_budget()
++    source = _path(_object(content, 'source'))
++    data, identity = _source(cap, source); rows = _rows(data)
++    verify = lambda: _verify(cap, [(source, data, identity)])
++    receipt = dict(success=True, format='zip_extract', path=relative,
++        scope='own_user_workspace', create_only=True, verified=True,
++        source_sha256=hashlib.sha256(data).hexdigest())
++    if not _fits(_omitted_receipt(receipt, rows, source), budget):
++        return _capacity(budget)
++    try:
++        os.stat(leaf, dir_fd=fd, follow_symlinks=False)
++    except FileNotFoundError:
++        pass
++    else:
++        return json.dumps(dict(success=False, error='archive_destination_exists', path=relative))
++    stage = '.friday-zip-' + uuid.uuid4().hex
++    tree = None; published = False; uncertain = False; cleanup_failed = False
++    try:
++        os.mkdir(stage, 0o700, dir_fd=fd)
++        tree = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
++        for name, directory, payload in rows:
++            check(cap); current = os.dup(tree)
++            try:
++                parts = name.split('/')
++                for part in (parts if directory else parts[:-1]):
++                    try:
++                        os.mkdir(part, 0o700, dir_fd=current)
++                    except FileExistsError:
++                        pass
++                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
++                    os.close(current); current = child
++                if not directory:
++                    item = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
++                                   0o600, dir_fd=current)
++                    with os.fdopen(item, 'wb') as stream:
++                        stream.write(payload); stream.flush(); os.fsync(stream.fileno())
++                os.fsync(current)
++            finally:
++                os.close(current)
++        _tree_snapshot(tree, rows); os.fsync(tree); verify(); _check_parent(cap, fd, relative)
++        uncertain = True
++        _move(fd, stage, fd, leaf)
++        published = True; uncertain = False
++        os.fsync(fd); _check_parent(cap, fd, relative)
++        named = os.stat(leaf, dir_fd=fd, follow_symlinks=False); held = os.fstat(tree)
++        if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
++            raise ScopeDenied()
++        _tree_snapshot(tree, rows); verify(); check(cap)
++        result = receipt
++    except (OSError, ScopeDenied, RuntimeError, TimeoutError):
++        if uncertain and tree is not None:
++            try:
++                named = os.stat(stage, dir_fd=fd, follow_symlinks=False); held = os.fstat(tree)
++                if (named.st_dev, named.st_ino) == (held.st_dev, held.st_ino):
++                    uncertain = False
++            except OSError:
++                pass
++        unknown = published or uncertain
++        result = dict(success=False, error='archive_publication_uncertain' if unknown else 'archive_not_extracted',
++                      effect_disposition='unknown' if unknown else 'none')
++    finally:
++        if tree is not None:
++            try:
++                named = os.stat(stage, dir_fd=fd, follow_symlinks=False); held = os.fstat(tree)
++                if (named.st_dev, named.st_ino) == (held.st_dev, held.st_ino):
++                    _remove_private_tree(tree); os.rmdir(stage, dir_fd=fd); os.fsync(fd)
++            except FileNotFoundError:
++                pass
++            except (OSError, ScopeDenied):
++                cleanup_failed = True
++            finally:
++                os.close(tree)
++    if cleanup_failed:
++        result = dict(success=False, error='archive_cleanup_incomplete', effect_disposition='unknown')
++    if result.get('effect_disposition') == 'unknown':
++        from agent.web_call_context import _current
++        call = _current.get()
++        if call is not None and hasattr(call, 'agent'):
++            call.agent._friday_reply_effect_unknown = True
++    return _effect_receipt(result, rows, source, budget, prefix=relative + '/')
+--- a/plugins/platforms/telegram/telegram_file_boundary.py
++++ b/plugins/platforms/telegram/telegram_file_boundary.py
+@@ -159,7 +159,11 @@
+                   "declared_bytes": file.file_size}
+     except (AttributeError, RuntimeError, TypeError, ValueError):
+         return  # synthetic/legacy events cannot acquire a native source receipt
+-    event._telegram_media_receipts[path] = {"origin": origin, "content": dict(content)}
++    receipt = {"origin": origin, "content": dict(content)}
++    original_filename = getattr(file, "file_name", None)
++    if isinstance(original_filename, str) and original_filename:
++        receipt["presentation"] = {"original_filename": original_filename}
++    event._telegram_media_receipts[path] = receipt
+ 
+ 
+ async def cache_inbound_document(self, msg, event) -> bool:
+--- a/tools/file_tools.py
++++ b/tools/file_tools.py
+@@ -1186,7 +1186,7 @@
+         "properties": {
+             "path": {"type": "string", "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)"},
+             "content": {"type": "string", "description": 'For docx_pdf, JSON with exactly source (existing own-workspace DOCX). For docx_edit, JSON with exactly source, old_text, new_text; unique exact text replacement into a NEW .docx copy. ' "Complete content. With docx_structured, a JSON string {\"blocks\":[...]} using title/paragraph blocks {\"type\":\"title\",\"text\":\"Report\"}, headings {\"type\":\"heading\",\"level\":1,\"text\":\"Data\"}, and tables {\"type\":\"table\",\"rows\":[[\"Item\",\"Amount\"],[\"Work\",\"800\"]]}. Exact keys only; table cells are strings, rows rectangular (1-32 columns). 100000 UTF-8 bytes total, at most 2000 paragraphs including table cells."},
+-            "format": {"type": "string", "enum": ["text", "docx", "docx_structured", "docx_edit", "docx_pdf", "xlsx", "xlsx_recalculate", "xlsx_merge"], "description": 'Merge two supported own-workspace XLSX sources with format=xlsx_merge, a NEW .xlsx path, and JSON {"base":"orders_base.xlsx","update":"orders_update.xlsx","sheet":"Orders","key":"order_id","revision":"revision"}. Text keys stay text. Equal rows deduplicate; strictly newer integer revision wins; equal-revision conflicts refuse. Only dense inline-text/numeric rows, row-local scalar formulas, identical styles and explicit SUM summaries are supported; tables/charts/names and other cross-row structures refuse. Base package parts are preserved; caches are cleared, not recomputed. Recalculate the merged copy separately if requested. ' 'To recalculate an existing own-workspace XLSX, use format=xlsx_recalculate, a NEW .xlsx path, and content JSON with exactly source, e.g. {"source":"orders-edited.xlsx"}. A bounded local LibreOffice engine recomputes supported numeric formulas and ordinary chart reference caches; source, formulas, tables, names and other package content are preserved. Unsupported formulas, packages and chart caches refuse without publishing. After an XLSX edit, recalculate that returned copy when requested; do not repeat the edit. ' 'docx_pdf exports source DOCX to NEW PDF; content is JSON with exactly source. docx_edit preserves an existing DOCX in a NEW copy using content JSON source/old_text/new_text. ' "Default text. docx creates new plain paragraphs, preserving literal Markdown. For real Word titles, outline headings or tables, use docx_structured and the JSON blocks content contract. Both DOCX modes create a NEW .docx only. xlsx edits one existing numeric cell into a NEW own-workspace copy; content is JSON with source, sheet, cell, expected, value. Example: {\"source\":\"orders.xlsx\",\"sheet\":\"Orders\",\"cell\":\"C3\",\"expected\":4,\"value\":5}. Other archive parts and formulas preserved; formula caches are not recalculated."},
++            "format": {"type": "string", "enum": ["text", "docx", "docx_structured", "docx_edit", "docx_pdf", "xlsx", "xlsx_recalculate", "xlsx_merge", "zip", "zip_extract"], "description": 'Merge two supported own-workspace XLSX sources with format=xlsx_merge, a NEW .xlsx path, and JSON {"base":"orders_base.xlsx","update":"orders_update.xlsx","sheet":"Orders","key":"order_id","revision":"revision"}. Text keys stay text. Equal rows deduplicate; strictly newer integer revision wins; equal-revision conflicts refuse. Only dense inline-text/numeric rows, row-local scalar formulas, identical styles and explicit SUM summaries are supported; tables/charts/names and other cross-row structures refuse. Base package parts are preserved; caches are cleared, not recomputed. Recalculate the merged copy separately if requested. ' 'To recalculate an existing own-workspace XLSX, use format=xlsx_recalculate, a NEW .xlsx path, and content JSON with exactly source, e.g. {"source":"orders-edited.xlsx"}. A bounded local LibreOffice engine recomputes supported numeric formulas and ordinary chart reference caches; source, formulas, tables, names and other package content are preserved. Unsupported formulas, packages and chart caches refuse without publishing. After an XLSX edit, recalculate that returned copy when requested; do not repeat the edit. ' 'docx_pdf exports source DOCX to NEW PDF; content is JSON with exactly source. docx_edit preserves an existing DOCX in a NEW copy using content JSON source/old_text/new_text. ' "Default text. docx creates new plain paragraphs, preserving literal Markdown. For real Word titles, outline headings or tables, use docx_structured and the JSON blocks content contract. Both DOCX modes create a NEW .docx only. xlsx edits one existing numeric cell into a NEW own-workspace copy; content is JSON with source, sheet, cell, expected, value. Example: {\"source\":\"orders.xlsx\",\"sheet\":\"Orders\",\"cell\":\"C3\",\"expected\":4,\"value\":5}. Other archive parts and formulas preserved; formula caches are not recalculated."},
+             # NOTE: the handler still accepts `cross_profile` (bool) — it now
+             # bypasses only the #32049 sandbox-mirror lost-write guards, whose
+             # rejection error teaches it. Unadvertised: the cross-PROFILE
+--- a/tools/read_extract.py
++++ b/tools/read_extract.py
+@@ -144,15 +144,12 @@
+ 
+ 
+ def extract_scoped_document_bytes(data: bytes, format: str) -> str:
+-    """Convert own immutable snapshots; never install, OCR, reopen or shell out.
+-
+-    DOCX/XLSX reuse the native parsers below with bounded ZIP/XML parts. PDF
+-    uses only the already installed anydoc byte API, explicitly rejecting
+-    hosted OCR, plus an authoritative per-page plain-text view from the
+-    existing local pdftotext pass over a private temp copy (the coverage-note
+-    mechanism, never a network/hosted route), prepended ahead of the complete
+-    unpaged converter text. Text extraction does not establish source
+-    image/layout completeness or raw write authority.
++    """Convert own immutable snapshots; never install or use hosted OCR.
++
++    DOCX/XLSX reuse bounded native parsers. PDF keeps the existing installed
++    anydoc text route, with a bounded networkless local OCR fallback only for
++    its scanned-page signal. OCR returns a string-compatible trusted metadata
++    result; neither route establishes exact image content or raw write authority.
+     """
+     if not isinstance(data, bytes) or len(data) > 1000000:
+         raise ScopedExtractionError('input_limit')
+@@ -175,9 +172,15 @@
+             text = module.to_markdown_bytes(data, format='pdf', ocr='reject')
+         except Exception as exc:
+             needs_ocr = getattr(module, 'NeedsOcrError', None)
+-            reason = 'needs_ocr' if needs_ocr is not None and isinstance(exc, needs_ocr) else 'malformed_or_unsupported'
+-            raise ScopedExtractionError(reason) from None
+-        text = _pdf_scoped_page_view(data, text)
++            if needs_ocr is None or not isinstance(exc, needs_ocr):
++                raise ScopedExtractionError('malformed_or_unsupported') from None
++            from tools.scoped_pdf_ocr import extract_local_pdf, LocalOCRFailure
++            try:
++                text = extract_local_pdf(data)
++            except LocalOCRFailure as error:
++                raise ScopedExtractionError(str(error)) from None
++        else:
++            text = _pdf_scoped_page_view(data, text)
+     else:
+         raise ScopedExtractionError('unsupported_format')
+     if not isinstance(text, str) or not text.strip():
+--- /dev/null
++++ b/tools/scoped_pdf_ocr.py
+@@ -0,0 +1,418 @@
++"""Finite local PDF OCR of immutable bytes in a networkless private namespace.
++
++The outer ordinary document reader owns user authorization. No path, command,
++OCR language, endpoint or executable is selected by document content.
++"""
++from __future__ import annotations
++
++import contextlib
++import csv
++import io
++import json
++import os
++from pathlib import Path
++import pwd
++import re
++import resource
++import shutil
++import signal
++import stat
++import subprocess
++import sys
++import tempfile
++import threading
++import time
++
++MAX_INPUT = 1_000_000
++MAX_OUTPUT = 1_000_000
++MAX_PAGES = 12
++MAX_OCR_PAGES = 6
++MAX_EDGE = 2000
++MAX_PIXELS = MAX_EDGE * MAX_EDGE
++WALL_SECONDS = 100
++CPU_SECONDS = 80
++TOOLCHAIN = 'tesseract-5.5.0-ubuntu26.04-amd64'
++PREFIX = '/opt/local-ocr'
++
++
++class LocalOCRFailure(Exception):
++    """Finite codes only; never expose private paths or child diagnostics."""
++
++
++class ScopedPDFText(str):
++    """String-compatible result with metadata authored by the trusted extractor."""
++    def __new__(cls, text, metadata):
++        result = super().__new__(cls, text)
++        result.extraction_metadata = metadata
++        return result
++
++
++def _toolchain():
++    root = Path(pwd.getpwuid(os.getuid()).pw_dir) / '.jericho/toolchains' / TOOLCHAIN
++    try:
++        st = root.lstat()
++        if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid()
++                or st.st_mode & 0o277 or root.resolve() != root):
++            raise LocalOCRFailure('local_ocr_unavailable')
++        for relative in ('usr/bin/tesseract', 'usr/share/tesseract-ocr/5/tessdata/rus.traineddata',
++                         'usr/share/tesseract-ocr/5/tessdata/eng.traineddata'):
++            path = root / relative
++            st = path.stat()
++            if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
++                    or st.st_mode & 0o022 or not path.resolve().is_relative_to(root)):
++                raise LocalOCRFailure('local_ocr_unavailable')
++        for path in ('/usr/bin/bwrap', '/usr/bin/pdftoppm', '/usr/bin/pdftotext',
++                     '/usr/bin/pdfinfo', '/usr/bin/python3'):
++            if not Path(path).is_file():
++                raise LocalOCRFailure('local_ocr_unavailable')
++    except OSError:
++        raise LocalOCRFailure('local_ocr_unavailable') from None
++    return root
++
++
++def _argv(work, toolchain):
++    # Popen(start_new_session=True) already owns a terminal-free host session.
++    # A second setsid inside bwrap would move namespace PID 1 out of that group,
++    # letting it and detached descendants survive our group stop.
++    argv = ['/usr/bin/bwrap', '--unshare-all', '--die-with-parent',
++            '--as-pid-1', '--cap-drop', 'ALL', '--clearenv', '--ro-bind', '/usr', '/usr']
++    for alias in ('bin', 'sbin', 'lib', 'lib64'):
++        target = (Path('/') / alias).resolve()
++        if not target.is_relative_to('/usr'):
++            raise LocalOCRFailure('local_ocr_unavailable')
++        argv += ['--symlink', str(target), '/' + alias]
++    argv += ['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--dir', '/opt',
++             '--ro-bind', str(toolchain), PREFIX, '--bind', str(work), '/work',
++             '--ro-bind', str(work / 'input.pdf'), '/work/input.pdf',
++             '--ro-bind', str(work / 'runner.py'), '/work/runner.py',
++             '--ro-bind', str(work / 'input.pdf'), '/input.pdf',
++             '--ro-bind', str(work / 'runner.py'), '/runner.py',
++             '--chdir', '/work', '--remount-ro', '/', '--',
++             '/usr/bin/python3', '-I', '-B', '-S', '/runner.py', '--child']
++    return argv
++
++
++class _Custody:
++    uses_web = False
++
++    def __init__(self):
++        self.process = None
++        self.lock = threading.RLock()
++        self.settled = False
++
++    def stop(self):
++        with self.lock:
++            if self.settled:
++                return {'status': 'QUIESCENT'}
++            if self.process is not None:
++                try:
++                    deadline = time.monotonic() + 2
++                    # Kill even if namespace init has just exited; the owned group
++                    # and PID namespace jointly cover subprocess descendants.
++                    try:
++                        os.killpg(self.process.pid, signal.SIGKILL)
++                    except ProcessLookupError:
++                        pass
++                    self.process.wait(timeout=max(.001, deadline - time.monotonic()))
++                    # wait() reaps bwrap, not necessarily the namespace init.
++                    # Its death kills even descendants that called setsid().
++                    # Do not report quiescence during asynchronous kernel exit.
++                    while True:
++                        try:
++                            os.killpg(self.process.pid, 0)
++                        except ProcessLookupError:
++                            break
++                        if time.monotonic() >= deadline:
++                            raise subprocess.TimeoutExpired('local_ocr_stop', 2)
++                        time.sleep(.01)
++                except (OSError, subprocess.TimeoutExpired):
++                    return {'status': 'STOP_UNCONFIRMED', 'reason': 'local_ocr_unsettled'}
++            self.settled = True
++            return {'status': 'QUIESCENT'}
++
++    def settle_web(self, session, *, stop):
++        if session is not self or stop is not True:
++            return {'status': 'STOP_UNCONFIRMED', 'reason': 'local_ocr_custody_mismatch'}
++        return self.stop()
++
++
++def _run(argv, work):
++    # Offline byte consumers may have no native call. In production the existing
++    # call's original deadline, cancellation and authenticated turn own the child.
++    from agent.web_call_context import _current, same_web_authority
++    call = _current.get()
++    custody = _Custody()
++    lock = call.turn.lock if call is not None else threading.RLock()
++    bound = False
++    deadline = time.monotonic() + WALL_SECONDS
++    try:
++        with lock:
++            if call is not None:
++                if not same_web_authority(call):
++                    raise LocalOCRFailure('local_ocr_authority')
++                call.check()
++                deadline = min(deadline, call.deadline())
++                if call.session is not None or call.registry is not None:
++                    raise LocalOCRFailure('local_ocr_custody_busy')
++                call.session, call.registry = custody, custody
++                call.turn.calls.add(custody)
++                bound = True
++            custody.process = subprocess.Popen(argv, cwd=work, stdin=subprocess.DEVNULL,
++                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
++                start_new_session=True, env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'})
++        while custody.process.poll() is None:
++            if call is not None:
++                call.check()
++                if not same_web_authority(call):
++                    raise LocalOCRFailure('local_ocr_authority')
++            if time.monotonic() >= deadline:
++                raise LocalOCRFailure('local_ocr_timeout')
++            try:
++                custody.process.wait(timeout=min(.05, max(.001, deadline - time.monotonic())))
++            except subprocess.TimeoutExpired:
++                pass
++        if call is not None:
++            call.check()
++        if custody.process.returncode != 0:
++            raise LocalOCRFailure('local_ocr_failed')
++    finally:
++        receipt = custody.stop()
++        with lock:
++            if bound and receipt['status'] == 'QUIESCENT':
++                if call.session is not custody or call.registry is not custody:
++                    receipt = {'status': 'STOP_UNCONFIRMED'}
++                else:
++                    call.session = call.registry = None
++                    call.turn.calls.discard(custody)
++        if receipt['status'] != 'QUIESCENT':
++            if call is not None and hasattr(call, 'agent'):
++                call.agent._friday_reply_effect_unknown = True
++            raise LocalOCRFailure('local_ocr_cleanup_unconfirmed')
++
++
++def _private_read(path, limit):
++    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
++    try:
++        before = os.fstat(fd)
++        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
++                or before.st_nlink != 1 or before.st_mode & 0o077
++                or not 0 < before.st_size <= limit):
++            raise LocalOCRFailure('local_ocr_invalid_output')
++        data = os.read(fd, limit + 1)
++        after = os.fstat(fd)
++        named = os.stat(path, follow_symlinks=False)
++        fields = ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
++        identity = lambda value: tuple(getattr(value, field) for field in fields)
++        if (len(data) != before.st_size or identity(before) != identity(after)
++                or identity(after) != identity(named)):
++            raise LocalOCRFailure('local_ocr_invalid_output')
++        return data
++    finally:
++        os.close(fd)
++
++
++def extract_local_pdf(data):
++    if not isinstance(data, bytes) or not 0 < len(data) <= MAX_INPUT:
++        raise LocalOCRFailure('input_limit')
++    toolchain = _toolchain()
++    work = Path(tempfile.mkdtemp(prefix='friday-local-ocr-'))
++    try:
++        work.chmod(0o700)
++        (work / 'input.pdf').write_bytes(data)
++        (work / 'input.pdf').chmod(0o600)
++        (work / 'runner.py').write_bytes(Path(__file__).read_bytes())
++        (work / 'runner.py').chmod(0o600)
++        _run(_argv(work, toolchain), work)
++        payload = json.loads(_private_read(work / 'result.json', MAX_OUTPUT))
++        if 'error' in payload:
++            allowed = {'pdf_page_limit', 'pdf_ocr_page_limit', 'local_ocr_timeout',
++                       'local_ocr_failed', 'extracted_text_limit', 'malformed_or_unsupported'}
++            raise LocalOCRFailure(payload['error'] if payload['error'] in allowed else 'local_ocr_failed')
++        if (set(payload) != {'text', 'metadata'} or not isinstance(payload['text'], str)
++                or not isinstance(payload['metadata'], dict)):
++            raise LocalOCRFailure('local_ocr_invalid_output')
++        return ScopedPDFText(payload['text'], payload['metadata'])
++    except (OSError, ValueError, TypeError):
++        raise LocalOCRFailure('local_ocr_failed') from None
++    finally:
++        try:
++            shutil.rmtree(work)
++        except OSError:
++            raise LocalOCRFailure('local_ocr_cleanup_unconfirmed') from None
++
++
++# Everything below runs only inside the fixed private namespace.
++def _execute(argv, output, env, deadline):
++    remaining = deadline - time.monotonic()
++    if remaining <= 0:
++        raise LocalOCRFailure('local_ocr_timeout')
++    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
++    own = resource.getrusage(resource.RUSAGE_SELF)
++    cpu_left = int(CPU_SECONDS - usage.ru_utime - usage.ru_stime - own.ru_utime - own.ru_stime)
++    if cpu_left < 2:
++        raise LocalOCRFailure('local_ocr_timeout')
++    def limit_cpu():
++        resource.setrlimit(resource.RLIMIT_CPU, (cpu_left, cpu_left))
++    with open(output, 'wb') as stream:
++        subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=stream,
++                       stderr=subprocess.DEVNULL, env=env, check=True,
++                       timeout=min(15, remaining), preexec_fn=limit_cpu)
++
++
++def _pgm_read(path):
++    data = Path(path).read_bytes()
++    match = re.match(rb'P5\s+(\d+)\s+(\d+)\s+255\s', data)
++    if not match:
++        raise LocalOCRFailure('local_ocr_failed')
++    width, height = int(match[1]), int(match[2])
++    pixels = data[match.end():]
++    if (not 0 < width <= MAX_EDGE or not 0 < height <= MAX_EDGE
++            or width * height > MAX_PIXELS or len(pixels) != width * height):
++        raise LocalOCRFailure('local_ocr_failed')
++    return width, height, pixels
++
++
++def _rotate(width, height, pixels):
++    # Clockwise 90 degrees, bounded grayscale raster, no third-party image loader.
++    rotated = bytearray(width * height)
++    for x in range(width):
++        rotated[x * height:(x + 1) * height] = pixels[x::width][::-1]
++    return height, width, bytes(rotated)
++
++
++def _tokens(data):
++    rows = []
++    reader = csv.DictReader(io.StringIO(data.decode('utf-8')), delimiter='\t', quoting=csv.QUOTE_NONE)
++    for row in reader:
++        if row.get('level') != '5' or not row.get('text', '').strip():
++            continue
++        text = row['text'].strip()
++        confidence = float(row['conf'])
++        if (not -1 <= confidence <= 100 or len(text) > 4096
++                or any(ord(ch) < 32 for ch in text)):
++            raise LocalOCRFailure('local_ocr_failed')
++        key = tuple(int(row[x]) for x in ('block_num', 'par_num', 'line_num'))
++        rows.append((key, text, confidence))
++    return rows
++
++
++def _recognized(rows):
++    lines, last, current, uncertain, numbers = [], None, [], 0, 0
++    for key, text, confidence in rows:
++        if key != last and current:
++            lines.append(' '.join(current)); current = []
++        last = key
++        # An OCR score is not calibrated certainty. Numeric fields ALWAYS stay
++        # explicitly unverified; lost/occluded digits cannot be reconstructed.
++        if confidence < 80:
++            uncertain += 1
++        if any(ch.isdigit() for ch in text):
++            numbers += 1
++            text = '[unverified OCR numeric token: ' + text + ']'
++        elif confidence < 80:
++            text = '[uncertain OCR token: ' + text + ']'
++        current.append(text)
++    if current:
++        lines.append(' '.join(current))
++    return '\n'.join(lines), uncertain, numbers
++
++
++def _child():
++    os.umask(0o077)
++    os.sched_setaffinity(0, sorted(os.sched_getaffinity(0))[:2])
++    for key, value in ((resource.RLIMIT_AS, 768 * 1024**2), (resource.RLIMIT_CPU, CPU_SECONDS),
++                       (resource.RLIMIT_FSIZE, 12 * 1024**2), (resource.RLIMIT_CORE, 0),
++                       (resource.RLIMIT_NOFILE, 64), (resource.RLIMIT_NPROC, 32)):
++        resource.setrlimit(key, (value, value))
++    # RLIMIT_CPU is per process; the single namespace worker also enforces a
++    # cumulative reaped-child CPU budget before each page/orientation launch.
++    deadline = time.monotonic() + WALL_SECONDS - 2
++    env = {'PATH': '/usr/bin:/bin', 'HOME': '/work', 'TMPDIR': '/tmp',
++           'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'OMP_THREAD_LIMIT': '2',
++           'OMP_NUM_THREADS': '2', 'TESSDATA_PREFIX': PREFIX + '/usr/share/tesseract-ocr/5/tessdata',
++           'LD_LIBRARY_PATH': PREFIX + '/usr/lib/x86_64-linux-gnu'}
++    def budget():
++        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
++        own = resource.getrusage(resource.RUSAGE_SELF)
++        if usage.ru_utime + usage.ru_stime + own.ru_utime + own.ru_stime > CPU_SECONDS - 2:
++            raise LocalOCRFailure('local_ocr_timeout')
++    _execute(['/usr/bin/pdfinfo', '/input.pdf'], '/work/info', env, deadline)
++    info = Path('/work/info').read_bytes()
++    page_lines = re.findall(rb'^Pages:\s+([1-9][0-9]*)\s*$', info, re.MULTILINE)
++    if len(info) > 8192 or len(page_lines) != 1:
++        raise LocalOCRFailure('malformed_or_unsupported')
++    count = int(page_lines[0])
++    if count > MAX_PAGES:
++        raise LocalOCRFailure('pdf_page_limit')
++    _execute(['/usr/bin/pdftotext', '/input.pdf', '-'], '/work/text', env, deadline)
++    plain = Path('/work/text').read_bytes()
++    if len(plain) > MAX_OUTPUT:
++        raise LocalOCRFailure('extracted_text_limit')
++    pages = plain.decode('utf-8').split('\f')
++    if len(pages) == count + 1 and not pages[-1].strip():
++        pages.pop()
++    if len(pages) != count or any(re.search(r'\[page \d+|\[PDF extraction warning:', page) for page in pages):
++        raise LocalOCRFailure('malformed_or_unsupported')
++    scans = [index for index, text in enumerate(pages) if len(text.strip()) < 20]
++    if len(scans) > MAX_OCR_PAGES:
++        raise LocalOCRFailure('pdf_ocr_page_limit')
++    sections, details = [], []
++    for index, text in enumerate(pages, 1):
++        budget()
++        if index - 1 not in scans:
++            sections.append(f'[page {index}; native text layer; image content not covered]\n' + text.strip())
++            details.append({'page': index, 'method': 'native_text', 'image_coverage': False})
++            continue
++        _execute(['/usr/bin/pdftoppm', '-f', str(index), '-l', str(index), '-singlefile',
++                  '-gray', '-scale-to', str(MAX_EDGE), '/input.pdf', '/work/page'],
++                 '/work/render-log', env, deadline)
++        width, height, pixels = _pgm_read('/work/page.pgm')
++        best, best_score, angle = [], -1, 0
++        for rotation in range(4):
++            budget()
++            Path('/work/rotation.pgm').write_bytes(f'P5\n{width} {height}\n255\n'.encode() + pixels)
++            _execute([PREFIX + '/usr/bin/tesseract', '/work/rotation.pgm', 'stdout',
++                      '-l', 'rus+eng', '--psm', '6', 'tsv'], '/work/ocr.tsv', env, deadline)
++            raw = Path('/work/ocr.tsv').read_bytes()
++            if len(raw) > MAX_OUTPUT:
++                raise LocalOCRFailure('extracted_text_limit')
++            rows = _tokens(raw)
++            score = sum(max(conf - 40, 0) * min(sum(ch.isalnum() for ch in token), 12)
++                        for _, token, conf in rows)
++            if score > best_score:
++                best, best_score, angle = rows, score, rotation * 90
++            width, height, pixels = _rotate(width, height, pixels)
++        recognized, uncertain, numbers = _recognized(best)
++        preserved = ('[native text layer fragments]\n' + text.strip() + '\n[local OCR candidate]\n') if text.strip() else ''
++        sections.append(f'[page {index}; local OCR candidate; NOT exact source text; rotation {angle} degrees]\n'
++                        + preserved + (recognized or '[no legible OCR text; page content unavailable]'))
++        details.append({'page': index, 'method': 'local_ocr', 'rotation_degrees': angle,
++                        'native_text_preserved': bool(text.strip()),
++                        'low_confidence_tokens': uncertain, 'unverified_numeric_tokens': numbers,
++                        'text_found': bool(recognized), 'exact': False})
++    warning = ('Local OCR is an uncertain transcription, not exact source text. Numeric tokens are '
++               'UNVERIFIED, including high-confidence OCR: digits may be lost or guessed. Do not '
++               'invent or confirm obscured digits, totals, dates, or exact quotations from OCR. '
++               'Report unreadable or ambiguous characters explicitly; request a clearer source '
++               'when exact values matter. Native text and OCR do not establish image/layout coverage.')
++    text = '[PDF extraction warning: ' + warning + ']\n\n' + '\n\n'.join(sections)
++    metadata = {'method': 'local_pdf_ocr', 'pages': count, 'page_results': details,
++                'coverage': 'native_text_and_uncertain_local_ocr; images_and_layout_not_covered',
++                'ocr_exact': False, 'numeric_values_verified': False, 'warning': warning,
++                'page_coverage': 'all_pages_processed', 'content_completeness': 'unverified',
++                'pages_without_text': [row['page'] for row in details if not row.get('text_found', True)]}
++    payload = json.dumps({'text': text, 'metadata': metadata}, ensure_ascii=False).encode()
++    if len(payload) > MAX_OUTPUT:
++        raise LocalOCRFailure('extracted_text_limit')
++    Path('/work/result.json').write_bytes(payload)
++
++
++if __name__ == '__main__':
++    if sys.argv[1:] != ['--child']:
++        raise SystemExit(2)
++    try:
++        _child()
++    except LocalOCRFailure as exc:
++        Path('/work/result.json').write_text(json.dumps({'error': str(exc)}))
++    except BaseException:
++        raise SystemExit(1)
