@@ -1,0 +1,11 @@
+# Scoped XLSX carrier: closed installation attempt and archive repair
+
+The [scoped formula reader](../core-scoped-xlsx-formulas-20261031/README.md) remains an independently checked source component. Its first coherent carrier installation attempt did not complete. The installation transaction rolled back exactly; all ten original file contents and original file identities were verified, followed by a fresh check of the retained installed native version. Modification/change timestamps advanced during rollback and are not treated as unchanged custody.
+
+The failure came from the carrier guard: saved parent metadata referenced a mutable installation marker. After the transaction published its own new marker, its next parent check rejected that reference. The correction requires all three saved metadata references to point to the exact committed parent archives and joins each archive hash to both the accepted parent proof and committed after-image. Current installation bytes and full file custody remain separate checks at the next boundary. No product permission or writer rule is relaxed.
+
+The failed attempt is closed and cannot be retried. The retained installed version was restored to permanent gateway and Dashboard service in a separate finite runtime operation, with a CA-verified HTTPS login response. No source/native reinstall was needed. Gateway readiness was not verified within the original cold-start 180 seconds; that timing result remains uncredited and was not reset to obtain a pass. Healthy service lifetime is independent of the verification window.
+
+[OBSERVATIONS.json](OBSERVATIONS.json) records 23 source preparation controls, including real guard/package predicates at every publication phase, and six independent checks of the changed archive boundary. The original guard failure was reproduced offline. These checks establish the prepared correction only. A new coherent service binding and fresh current custody are required before a separate installation attempt. The scoped reader has not acquired installation, user delivery or semantic acceptance from this repair.
+
+The snapshot contains sanitized observations only. Private carrier packages, paths, sessions, workbooks and runtime records are excluded. The complete audited feature scope and previous user-task outcomes remain unchanged.
