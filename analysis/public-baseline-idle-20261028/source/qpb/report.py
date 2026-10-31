@@ -201,10 +201,12 @@ def build_report(store: RunStore) -> dict:
     }
     document["full_model_baseline"] = is_full_model_baseline(document)
     if manifest.get("mode") == "idle":
-        from qpb.runner import _attempt_budget
+        from qpb.runner import _attempt_budget, unfinished_attempt_cap
         _, budget = _attempt_budget(store)
+        cap = unfinished_attempt_cap(manifest["idle_policy"])
         document["unfinished_attempt_budget"] = dict(
-            budget, max_interrupted_attempt_wall_seconds=manifest.get("idle_policy", {}).get("max_interrupted_attempt_wall_seconds"))
+            budget, max_interrupted_attempt_wall_seconds=cap,
+            unfinished_attempt_cap_enabled=cap is not None)
     return document
 
 
@@ -257,9 +259,10 @@ def render_markdown(document: dict) -> str:
     lines.append(f"- активное время модели, с: `{document['active_model_seconds']}`; известная сумма: `{document['known_active_model_seconds']}`; полнота стоимости: `{document['attempt_cost_complete']}`")
     if "unfinished_attempt_budget" in document:
         budget = document["unfinished_attempt_budget"]
+        cap_text = "отключён (null)" if budget["max_interrupted_attempt_wall_seconds"] is None else budget["max_interrupted_attempt_wall_seconds"]
         lines.append(f"- незавершённые попытки, известное время, с: `{budget['unfinished_attempt_wall_s']}`; "
                      f"без измерения: `{budget['unmeasured_unfinished_attempts']}`; "
-                     f"лимит: `{budget['max_interrupted_attempt_wall_seconds']}`; "
+                     f"лимит: `{cap_text}`; "
                      f"историческое foreground/stop время: `{budget['interrupted_wall_s']}`")
     lines.append("- CPU scoring и календарное время с паузами в этом отчёте не смешиваются с активным временем. CPU здесь null, пока отдельный таймер скоринга не записан.")
     lines.append("")

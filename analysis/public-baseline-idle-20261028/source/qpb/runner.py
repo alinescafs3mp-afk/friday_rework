@@ -53,6 +53,21 @@ def _idle_scope(corpus, pilot_only):
     return pilot + [task for task in _scope(corpus, False) if task not in chosen]
 
 
+def unfinished_attempt_cap(policy):
+    """An explicit null disables only the aggregate unfinished-attempt cap.
+
+    Omission or malformed values must not silently grant unlimited work. Other
+    policy fields, attempt accounting and per-request bounds remain independent.
+    """
+    if not isinstance(policy, dict) or "max_interrupted_attempt_wall_seconds" not in policy:
+        raise ValueError("explicit unfinished-attempt cap required")
+    value = policy["max_interrupted_attempt_wall_seconds"]
+    if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value < 0):
+        raise ValueError("unfinished-attempt cap must be null or finite nonnegative seconds")
+    return value
+
+
+
 def _attempt_budget(store: RunStore) -> tuple[dict, dict]:
     """Known unfinished wall time, once per attempt, independent of retry rights.
 
@@ -657,9 +672,10 @@ class Runner:
 class IdleRunner(Runner):
     """One finite public-core run, waiting only on local admission state."""
     def __init__(self, *args, coordinator_dir=None, policy=None, **kwargs):
-        super().__init__(*args, **kwargs)
         from qpb.idle import Coordinator, POLICY, endpoint_key
         self.policy = dict(POLICY if policy is None else policy)
+        unfinished_attempt_cap(self.policy)
+        super().__init__(*args, **kwargs)
         canonical_directory = self.coordinator.dir.resolve()
         if coordinator_dir is not None and self.endpoint.get("kind") != "fixture" and Path(coordinator_dir).resolve() != canonical_directory:
             raise RunRefused("production endpoint uses its canonical admission directory regardless of runs-root")
@@ -729,7 +745,7 @@ class IdleRunner(Runner):
         # unresolved attempt. Parent checks the shared endpoint before here.
         if time.time() >= current.get("authorization_expires_epoch", 0):
             return {"error": "AUTHORIZATION_EXPIRED; original window is retained"}
-        allowed = {"MANUAL_PAUSED", "WAITING_IDLE", "COOLDOWN", "YIELDED_FOR_FOREGROUND", "NEEDS_QUIET_WINDOW", "RECOVERY_REQUIRED"}
+        allowed = {"MANUAL_PAUSED", "WAITING_IDLE", "COOLDOWN", "YIELDED_FOR_FOREGROUND", "NEEDS_QUIET_WINDOW", "RECOVERY_REQUIRED", "PAUSED_POLICY"}
         if current.get("state") in allowed:
             current = dict(current, state="PAUSED")
         return super()._continue_decision(current)
@@ -758,7 +774,8 @@ class IdleRunner(Runner):
                 state = "MANUAL_PAUSED"
             interruptions, budget = _attempt_budget(self.store)
             summary.update(budget)
-            if budget["unfinished_attempt_wall_s"] >= self.policy["max_interrupted_attempt_wall_seconds"]:
+            cap = unfinished_attempt_cap(self.policy)
+            if cap is not None and budget["unfinished_attempt_wall_s"] >= cap:
                 state = state or "PAUSED_POLICY"
             if state:
                 self._set_state(state, **budget)
