@@ -1,0 +1,13 @@
+# Original report: created artifact and receive guard
+
+The original report case produced a real narrative and a two-page PDF in the installed product, but the case is not accepted. Review of those same created bytes found correct arithmetic and calculation method, readable Cyrillic and tables, and no material clipping on either page. The PDF also made an unsupported claim about the structure of the source data. That semantic defect is a FAIL even though the calculations and presentation passed their individual checks. Private source data, report content and expected values are omitted.
+
+Source114 remains installed with its verified native build. Gateway and Dashboard were observed healthy under permanent management. This checkpoint changes neither the product source nor its installation or services. Source review, installation, native creation, transport delivery and semantic acceptance are separate facts.
+
+Before the original task, a coherent tester admission repair received independent review and 92 offline controls. A read-only check covered the known input collisions and retained history without rewriting it; tester-only adoption and fresh installed-tester qualification then completed. These checks establish the tested admission boundary, not the user result.
+
+The original task was sent once. Its canonical receive checker exited with code 2, and the existing cleanup guard refused. The exact failed guard condition and any earlier exception remain UNKNOWN. Native report creation and normal assistant completion were observed separately; neither those facts nor two empty delivery tails establish actual Telegram delivery or canonical custody of a received artifact. The full 180-second observation was not completed. The original UNKNOWN record is preserved, and no model request, task send or artifact creation was repeated for this review.
+
+A separate diagnostic source delta preserves the acceptance, clock, stop, resource and replay guards. It passed 76 controls and independent delta review, but is not installed. It is preparation for a future bounded diagnostic operation; it neither proves the cause of the original refusal nor changes the original result.
+
+Read-only resource reconciliation closed the original operation's resource ownership without a new stop attempt or token mutation. The same original uncapped baseline then resumed at 419 of 673 completed cases, retaining its counters, four sealed unknown outcomes and three unmeasured attempts. This is a point-in-time observation, not a final baseline result. A0 remains deferred; full-scope, format and mandatory-variant acceptance remain unestablished.
