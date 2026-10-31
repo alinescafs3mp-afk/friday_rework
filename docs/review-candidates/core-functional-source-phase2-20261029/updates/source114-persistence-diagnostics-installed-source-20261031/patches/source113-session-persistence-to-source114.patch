@@ -1,0 +1,122 @@
+--- a/agent/session_persistence.py
++++ b/agent/session_persistence.py
+@@ -2,6 +2,7 @@
+ with intrinsic ``_DB_PERSISTED_MARKER`` dedup, ephemeral-scaffolding filtering, explicit
+ trajectory export."""
+ import hashlib
++import json
+ 
+ import logging
+ import re
+@@ -180,6 +181,50 @@
+ 
+ 
+ # --- flush phases (module-level so the flush also works bound onto duck-typed agents) ---
++
++def _db_exception_metadata(error):
++    """Bounded source locations and exception types; never exception text/locals."""
++    def identifier(value):
++        return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.<>-]{0,159}", value) else "unknown"
++    result, seen = [], set()
++    while isinstance(error, BaseException) and id(error) not in seen and len(result) < 4:
++        seen.add(id(error))
++        kind = type(error)
++        item = {"exception_class": identifier(kind.__module__) + "." + identifier(kind.__qualname__)}
++        trace = error.__traceback__
++        while trace is not None and trace.tb_next is not None:
++            trace = trace.tb_next
++        if trace is not None:
++            item["place"] = {"module": identifier(trace.tb_frame.f_globals.get("__name__")),
++                "function": identifier(trace.tb_frame.f_code.co_name), "line": trace.tb_lineno}
++        result.append(item)
++        error = error.__cause__ if error.__cause__ is not None else error.__context__
++    return result
++
++
++def _db_flush_failure_metadata(agent, error):
++    # The native inbound platform ID is set by turn_context, never model prose.
++    # Hash the tuple rather than logging a session/principal/platform identifier.
++    session_id = getattr(agent, "session_id", None)
++    platform_id = getattr(agent, "_persist_user_message_platform_id", None)
++    correlation = None
++    if (type(session_id) is str and 0 < len(session_id) <= 512
++            and type(platform_id) in (str, int) and 0 < len(str(platform_id)) <= 512):
++        pair = [session_id, str(platform_id)]
++        correlation = hashlib.sha256(json.dumps(pair, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
++    phases = {"ensure_session", "collect_rows", "build_row", "guard_generated_rows",
++              "append_messages_batch", "sync_flushed_markers", "drop_shadowed_checkpoints"}
++    phase = getattr(agent, "_db_flush_phase", None)
++    reason = getattr(agent, "_friday_reply_withheld_reason", None)
++    reasons = {"unsupported_self_deployment_claim", "restricted_deployment_value", "privacy_boundary_unavailable"}
++    details = {"schema": "friday.persistence-failure.v1", "request_correlation_sha256": correlation,
++               "phase": phase if phase in phases else "unknown", "exception_chain": _db_exception_metadata(error),
++               "reply_boundary_reason": reason if reason in reasons else None}
++    boundary = getattr(agent, "_friday_reply_boundary_failure", None)
++    if isinstance(boundary, list):
++        details["reply_boundary_exception_chain"] = boundary
++    return details
++
+ 
+ def _db_flush_seed_ids(agent) -> set:
+     """One-shot ``_flushed_db_message_ids`` seed (same session, after a non-empty flush); the scan translates
+@@ -250,6 +295,7 @@
+                       replay_history: bool = False):
+     """Scan for un-flushed messages; returns ``(rows, msgs)`` to write in one transaction. ``replay_history``
+     (session-row heal) writes the history prefix again instead of stamping it as already durable."""
++    agent._db_flush_phase = "collect_rows"
+     seed_ids = _db_flush_seed_ids(agent)
+     history_ids = {id(item) for item in (conversation_history or []) if isinstance(item, dict)}
+     ov_idx = getattr(agent, "_persist_user_message_idx", None)
+@@ -282,8 +328,10 @@
+             # minted (same-batch pairing happens inside the insert).
+             if (tool_uid := tool_call_uid_from_history(messages, msg_idx, tool_uid_owners)) is not None:
+                 msg[TOOL_CALL_UID] = tool_uid
++        agent._db_flush_phase = "build_row"
+         row = _db_flush_row(agent, msg, ov_idx == msg_idx or msg is pending_cli_message)
+         if not is_history:
++            agent._db_flush_phase = "guard_generated_rows"
+             from hermes_cli.friday_user_scope import guard_generated_rows
+             guard_generated_rows(agent, [row], [msg])
+         batch_rows.append(row)
+@@ -295,13 +343,16 @@
+     """One transaction for the turn's new rows: on failure nothing lands and no markers are stamped."""
+     if not batch_rows:
+         return
++    agent._db_flush_phase = "append_messages_batch"
+     agent._session_db.append_messages_batch(
+         session_id=agent.session_id, messages=batch_rows,
+         compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
+         turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+         turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+     )
++    agent._db_flush_phase = "sync_flushed_markers"
+     sync_flushed_message_markers(batch_msgs, batch_rows)
++    agent._db_flush_phase = "drop_shadowed_checkpoints"
+     if _newest_checkpoint_carrier(batch_msgs, "codex_reasoning_items") >= 0:
+         # The insert already rewrote the older rows (SessionDB._drop_shadowed_checkpoint_rows); mirror it on
+         # the live transcript so forks/compaction built from memory carry one checkpoint too. Markers stay:
+@@ -349,6 +400,7 @@
+     deleted under the live agent and has been recreated (unparented for a delegate child whose parent went
+     with it); flush markers are reset so the caller replays the full in-memory transcript. Either retry is
+     taken at most once (``adoption_budget``)."""
++    agent._last_persistence_failure = _db_flush_failure_metadata(agent, e)
+     agent._db_flush_scan_prefix = None  # full re-scan next flush: an exception mid-loop leaves mixed dispositions
+     # The only place the SQLite error is visible before it becomes a bare False — classify it so the turn-end
+     # explanation names the real cause.
+@@ -409,7 +461,7 @@
+         if adoption_budget > 0 and _db_flush_adopt_compression_tip(agent):
+             return "adopted"
+         agent._compression_adoption_failed = True  # lets the turn explanation name rotation, not full-disk advice
+-    logger.warning("Session DB append_message failed: %s", e)
++    logger.warning("Session DB append_message failed (safe metadata): %s", agent._last_persistence_failure)
+     return None
+ 
+ 
+@@ -496,6 +548,7 @@
+             return None
+         batch_rows: List[Dict[str, Any]] = []
+         try:
++            self._db_flush_phase = "ensure_session"
+             if not self._session_db_created:  # retry row creation if the earlier attempt failed transiently
+                 self._ensure_db_session()
+             # getattr: object.__new__ test agents flush without running AIAgent init.
