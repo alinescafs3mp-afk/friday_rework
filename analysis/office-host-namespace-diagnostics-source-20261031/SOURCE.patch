@@ -1,0 +1,459 @@
+--- a/recalculate_received_units.py
++++ b/recalculate_received_units.py
+@@ -32 +32 @@
+-CAP = 64 * 1024 * 1024
++CAP = 72 * 1024 * 1024
+@@ -33,0 +34,3 @@
++# --ro-bind-data copies admitted sealed bytes into bwrap's private base tmpfs.
++# Count possible overlap with original snapshots; cgroup memory guards stay unchanged.
++BWRAP_COPY_CAP = SNAPSHOT_CAP
+@@ -93,0 +97,112 @@
++# Failure diagnostics share the existing31MiB export ceiling. Normal artifacts
++# leave room for one bounded raw combined log and its numeric/resource record.
++HELPER_LOG_CAP = 64 * 1024
++HELPER_DIAGNOSTIC_CAP = 16 * 1024
++DIAGNOSTIC_RESERVE = 128 * 1024
++
++
++def helper_resource_snapshot(cgroup):
++    """Allowlisted resource facts only: no environment or document contents."""
++    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
++    observed = {'children_user_cpu_seconds': usage.ru_utime,
++                'children_system_cpu_seconds': usage.ru_stime,
++                'children_maxrss_kib_high_water': usage.ru_maxrss,
++                'cgroup': {}}
++    for name in ('memory.events', 'memory.peak', 'memory.current', 'cpu.stat', 'pids.current'):
++        try:
++            with (cgroup / name).open('rb') as stream:
++                data = stream.read(513)
++            require(len(data) <= 512, 'resource observation cap')
++            observed['cgroup'][name] = data.decode('ascii').strip()
++        except Exception as exc:
++            observed['cgroup'][name] = {'unavailable_class': type(exc).__name__}
++    return observed
++
++
++def observed_helper(argv, helper_env, end, scratch, records, emit_data,
++                    stage=None, stage_states=None):
++    """Run once; export protected bounded failure facts before propagating failure.
++
++    Raw combined stdout/stderr remains a private artifact. A truncated log is
++    explicitly an exact prefix, never described as the complete helper output.
++    """
++    index = len(records)
++    log = scratch / ('helper-' + str(index) + '.log')
++    record = {'argv': argv, 'state': 'INTENT_BEFORE_POPEN', 'exit_code': None,
++              'started_monotonic': time.monotonic(), 'pid': None,
++              'process_reaped': False,
++              'resource_before': helper_resource_snapshot(Path('/mnt/observer-cgroup'))}
++    if stage is not None:
++        record['stage'] = stage
++    records.append(record)
++    process, failure = None, None
++    try:
++        with log.open('xb') as stream:
++            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
++                                       env=helper_env, start_new_session=True)
++            record.update(pid=process.pid, state='STARTED_EFFECT_UNKNOWN_UNTIL_RECONCILED')
++            if stage_states is not None:
++                stage_states[stage] = 'STARTED_EFFECT_UNKNOWN_UNTIL_RECONCILED'
++            try:
++                process.wait(timeout=max(0.01, end - time.monotonic() - 2))
++            except BaseException:
++                try:
++                    os.killpg(process.pid, signal.SIGKILL)
++                except ProcessLookupError:
++                    pass
++                process.wait(timeout=min(1, max(0.01, end - time.monotonic())))
++                raise
++        record['state'] = 'PROCESS_RETURNED'
++        require(process.returncode == 0, 'helper did not complete successfully')
++    except BaseException as exc:
++        failure = exc
++        record['exception_class'] = type(exc).__name__
++        if process is None:
++            record['state'] = 'POPEN_NOT_COMPLETED_EFFECT_NOT_ESTABLISHED'
++    finally:
++        if process is not None:
++            record['exit_code'] = process.returncode
++            record['process_reaped'] = process.returncode is not None
++            record['exit_signal'] = -process.returncode if process.returncode is not None and process.returncode < 0 else None
++        record['observation_monotonic'] = time.monotonic()
++        if record['process_reaped']:
++            record['process_returned_monotonic'] = record['observation_monotonic']
++            record['process_elapsed_seconds'] = record['process_returned_monotonic'] - record['started_monotonic']
++        record['resource_after'] = helper_resource_snapshot(Path('/mnt/observer-cgroup'))
++        if failure is not None:
++            try:
++                try:
++                    with log.open('rb') as stream:
++                        retained = stream.read(HELPER_LOG_CAP)
++                        total = os.fstat(stream.fileno()).st_size
++                    log_ref = {'name': log.name, 'source_bytes': total, 'retained_bytes': len(retained),
++                               'retained_range': [0, len(retained)], 'complete': total == len(retained),
++                               'sha256': digest(retained), 'stream': 'EXACT_COMBINED_STDOUT_STDERR_BYTES',
++                               'handling': 'PROTECTED_NOT_FOR_PUBLICATION'}
++                except OSError as exc:
++                    retained = None
++                    log_ref = {'name': log.name, 'complete': False, 'source_bytes': None,
++                               'unavailable_class': type(exc).__name__}
++                diagnostic = {'schema': 'frw.helper-failure-diagnostics.v1', 'helper': record,
++                              'log': log_ref, 'cause': 'UNKNOWN_UNLESS_EXACT_OBSERVATIONS_ESTABLISH_IT',
++                              'effect_repeat_authorized': False}
++                payload = json_bytes(diagnostic)
++                require(len(payload) <= HELPER_DIAGNOSTIC_CAP, 'helper diagnostic cap')
++                result_name = 'HELPER-' + str(index) + '-RESULT.json'
++                # No scratch copies: even ENOSPC in the bounded tmpfs must not
++                # discard an existing log. Outer receiver fsyncs owned0600 files.
++                # Keep the same worker end; no extra operation/cleanup budget.
++                if retained is not None:
++                    emit_data(log.name, retained, diagnostic=True)
++                emit_data(result_name, payload, diagnostic=True)
++                record['failure_diagnostics'] = {'log': log_ref,
++                    'result_name': result_name, 'result_sha256': digest(payload)}
++            except Exception as exc:
++                record['diagnostic_export_error_class'] = type(exc).__name__
++    if failure is not None:
++        raise failure
++    with log.open('rb') as stream:
++        stream.seek(max(0, os.fstat(stream.fileno()).st_size - 8192))
++        return stream.read(8192).decode('utf-8', 'replace')
++
++
+@@ -200 +315 @@
+-                require(name in EXPORT_NAMES, 'unexpected artifact name')
++                require(name in EXPORT_NAMES or re.fullmatch(r'(?:helper-[01]\.log|HELPER-[01]-RESULT\.json)', name), 'unexpected artifact name')
+@@ -646 +761,2 @@
+-              'budget_partition': {'sealed_snapshots': SNAPSHOT_CAP, 'tmpfs_all_worker_files': TMPFS_CAP,
++              'budget_partition': {'sealed_snapshots': SNAPSHOT_CAP, 'bwrap_base_tmpfs_copies': BWRAP_COPY_CAP,
++                                   'tmpfs_worker_scratch': TMPFS_CAP,
+@@ -681,0 +798,2 @@
++        # bwrap 0.11.1 --ro-bind-fd realpath rejects anonymous memfds. Its data
++        # operation consumes each sealed fd at offset 0 and makes an unlinked readonly copy.
+@@ -686,2 +804,2 @@
+-            target = '/observer/recalculate_received_units.py' if name == 'observer.py' else '/input/' + name
+-            binds += ['--ro-bind-fd', str(fd), target]
++            target = '/mnt/observer/recalculate_received_units.py' if name == 'observer.py' else '/mnt/input/' + name
++            binds += ['--perms', '0400', '--ro-bind-data', str(fd), target]
+@@ -700 +818 @@
+-        argv = [BWRAP, '--unshare-all', '--disable-userns', '--die-with-parent', '--new-session', '--ro-bind', '/', '/',
++        argv = [BWRAP, '--unshare-user', '--unshare-all', '--disable-userns', '--die-with-parent', '--new-session', '--ro-bind', '/', '/',
+@@ -704 +822 @@
+-                '--ro-bind-fd', str(wrapper_fd), LIBREOFFICE,
++                '--perms', '0500', '--ro-bind-data', str(wrapper_fd), LIBREOFFICE,
+@@ -706 +824,4 @@
+-                '--tmpfs', '/mnt', '--remount-ro', '/mnt', '--tmpfs', '/media', '--remount-ro', '/media',
++                '--tmpfs', '/mnt', '--dir', '/mnt/observer',
++                '--ro-bind', str(cgroup.path), '/mnt/observer-cgroup',
++                '--dir', '/mnt/input', *binds, '--remount-ro', '/mnt',
++                '--tmpfs', '/media', '--remount-ro', '/media',
+@@ -712,3 +833 @@
+-                '--tmpfs', '/run', '--remount-ro', '/run', '--dir', '/observer',
+-                '--ro-bind', str(cgroup.path), '/observer-cgroup',
+-                '--dir', '/input', *binds, '--chdir', '/tmp', '--clearenv',
++                '--tmpfs', '/run', '--remount-ro', '/run', '--chdir', '/tmp', '--clearenv',
+@@ -721 +840 @@
+-                '/observer/recalculate_received_units.py', '--worker', '--worker-end', str(worker_end),
++                '/mnt/observer/recalculate_received_units.py', '--worker', '--worker-end', str(worker_end),
+@@ -868 +987 @@
+-        result['aggregate_generated_hard_bound_bytes'] = SNAPSHOT_CAP + TMPFS_CAP + EXPORT_CAP + RESULT_CAP
++        result['aggregate_generated_hard_bound_bytes'] = SNAPSHOT_CAP + BWRAP_COPY_CAP + TMPFS_CAP + EXPORT_CAP + RESULT_CAP
+@@ -895 +1014 @@
+-    cg = Path('/observer-cgroup')
++    cg = Path('/mnt/observer-cgroup')
+@@ -911 +1030 @@
+-    payloads = {name: Path('/input/' + name).read_bytes() for name in ('received.xlsx', 'original.xlsx', 'oracle.json', 'custody.json', 'artifact-map.json')}
++    payloads = {name: Path('/mnt/input/' + name).read_bytes() for name in ('received.xlsx', 'original.xlsx', 'oracle.json', 'custody.json', 'artifact-map.json')}
+@@ -925 +1044 @@
+-    def emit(path):
++    def emit_data(name, data, diagnostic=False):
+@@ -927,5 +1046,8 @@
+-        check()
+-        require(path.is_file() and not path.is_symlink(), 'nonregular artifact')
+-        data = path.read_bytes()
+-        require(path.name not in emitted and len(emitted) < 32 and export_bytes + len(data) <= EXPORT_CAP, 'artifact export cap')
+-        sys.stdout.buffer.write(json.dumps({'name': path.name, 'bytes': len(data), 'sha256': digest(data)}, separators=(',', ':')).encode() + b'\n')
++        if diagnostic:
++            require(time.monotonic() < end, 'diagnostic shared worker deadline exhausted')
++        else:
++            check()
++        require(isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,120}', name), 'unsafe artifact filename')
++        limit = EXPORT_CAP if diagnostic else EXPORT_CAP - DIAGNOSTIC_RESERVE
++        require(name not in emitted and len(emitted) < 32 and export_bytes + len(data) <= limit, 'artifact export cap')
++        sys.stdout.buffer.write(json.dumps({'name': name, 'bytes': len(data), 'sha256': digest(data)}, separators=(',', ':')).encode() + b'\n')
+@@ -935 +1057 @@
+-        emitted.add(path.name)
++        emitted.add(name)
+@@ -936,0 +1059,3 @@
++    def emit(path, diagnostic=False):
++        require(path.is_file() and not path.is_symlink(), 'nonregular artifact')
++        emit_data(path.name, path.read_bytes(), diagnostic)
+@@ -942 +1066,0 @@
+-        log = scratch / ('helper-' + str(len(records)) + '.log')
+@@ -946,20 +1070 @@
+-        record = {'stage': stage, 'argv': argv, 'state': 'INTENT_BEFORE_POPEN', 'exit_code': None, 'started_monotonic': time.monotonic()}
+-        records.append(record)
+-        with log.open('xb') as stream:
+-            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stream, stderr=stream, env=helper_env, start_new_session=True)
+-            record['state'] = 'STARTED_EFFECT_UNKNOWN_UNTIL_RECONCILED'
+-            stage_states[stage] = 'STARTED_EFFECT_UNKNOWN_UNTIL_RECONCILED'
+-            try:
+-                code = process.wait(timeout=max(0.01, end - time.monotonic() - 2))
+-            except BaseException:
+-                try:
+-                    os.killpg(process.pid, signal.SIGKILL)
+-                except ProcessLookupError:
+-                    pass
+-                process.wait(timeout=1)
+-                raise
+-        record['exit_code'] = code
+-        record['process_returned_monotonic'] = time.monotonic()
+-        record['process_elapsed_seconds'] = record['process_returned_monotonic'] - record['started_monotonic']
+-        record['state'] = 'PROCESS_RETURNED'
+-        require(code == 0, 'office did not complete successfully')
++        observed_helper(argv, helper_env, end, scratch, records, emit_data, stage, stage_states)
+--- a/render_received_s12.py
++++ b/render_received_s12.py
+@@ -28 +28 @@
+-CAP = 64 * 1024 * 1024
++CAP = 72 * 1024 * 1024
+@@ -29,0 +30,3 @@
++# --ro-bind-data copies admitted sealed bytes into bwrap's private base tmpfs.
++# Count possible overlap with original snapshots; cgroup memory guards stay unchanged.
++BWRAP_COPY_CAP = SNAPSHOT_CAP
+@@ -74,0 +78,112 @@
++
++
++# Failure diagnostics share the existing31MiB export ceiling. Normal artifacts
++# leave room for one bounded raw combined log and its numeric/resource record.
++HELPER_LOG_CAP = 64 * 1024
++HELPER_DIAGNOSTIC_CAP = 16 * 1024
++DIAGNOSTIC_RESERVE = 128 * 1024
++
++
++def helper_resource_snapshot(cgroup):
++    """Allowlisted resource facts only: no environment or document contents."""
++    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
++    observed = {'children_user_cpu_seconds': usage.ru_utime,
++                'children_system_cpu_seconds': usage.ru_stime,
++                'children_maxrss_kib_high_water': usage.ru_maxrss,
++                'cgroup': {}}
++    for name in ('memory.events', 'memory.peak', 'memory.current', 'cpu.stat', 'pids.current'):
++        try:
++            with (cgroup / name).open('rb') as stream:
++                data = stream.read(513)
++            require(len(data) <= 512, 'resource observation cap')
++            observed['cgroup'][name] = data.decode('ascii').strip()
++        except Exception as exc:
++            observed['cgroup'][name] = {'unavailable_class': type(exc).__name__}
++    return observed
++
++
++def observed_helper(argv, helper_env, end, scratch, records, emit_data,
++                    stage=None, stage_states=None):
++    """Run once; export protected bounded failure facts before propagating failure.
++
++    Raw combined stdout/stderr remains a private artifact. A truncated log is
++    explicitly an exact prefix, never described as the complete helper output.
++    """
++    index = len(records)
++    log = scratch / ('helper-' + str(index) + '.log')
++    record = {'argv': argv, 'state': 'INTENT_BEFORE_POPEN', 'exit_code': None,
++              'started_monotonic': time.monotonic(), 'pid': None,
++              'process_reaped': False,
++              'resource_before': helper_resource_snapshot(Path('/mnt/observer-cgroup'))}
++    if stage is not None:
++        record['stage'] = stage
++    records.append(record)
++    process, failure = None, None
++    try:
++        with log.open('xb') as stream:
++            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
++                                       env=helper_env, start_new_session=True)
++            record.update(pid=process.pid, state='STARTED_EFFECT_UNKNOWN_UNTIL_RECONCILED')
++            if stage_states is not None:
++                stage_states[stage] = 'STARTED_EFFECT_UNKNOWN_UNTIL_RECONCILED'
++            try:
++                process.wait(timeout=max(0.01, end - time.monotonic() - 2))
++            except BaseException:
++                try:
++                    os.killpg(process.pid, signal.SIGKILL)
++                except ProcessLookupError:
++                    pass
++                process.wait(timeout=min(1, max(0.01, end - time.monotonic())))
++                raise
++        record['state'] = 'PROCESS_RETURNED'
++        require(process.returncode == 0, 'helper did not complete successfully')
++    except BaseException as exc:
++        failure = exc
++        record['exception_class'] = type(exc).__name__
++        if process is None:
++            record['state'] = 'POPEN_NOT_COMPLETED_EFFECT_NOT_ESTABLISHED'
++    finally:
++        if process is not None:
++            record['exit_code'] = process.returncode
++            record['process_reaped'] = process.returncode is not None
++            record['exit_signal'] = -process.returncode if process.returncode is not None and process.returncode < 0 else None
++        record['observation_monotonic'] = time.monotonic()
++        if record['process_reaped']:
++            record['process_returned_monotonic'] = record['observation_monotonic']
++            record['process_elapsed_seconds'] = record['process_returned_monotonic'] - record['started_monotonic']
++        record['resource_after'] = helper_resource_snapshot(Path('/mnt/observer-cgroup'))
++        if failure is not None:
++            try:
++                try:
++                    with log.open('rb') as stream:
++                        retained = stream.read(HELPER_LOG_CAP)
++                        total = os.fstat(stream.fileno()).st_size
++                    log_ref = {'name': log.name, 'source_bytes': total, 'retained_bytes': len(retained),
++                               'retained_range': [0, len(retained)], 'complete': total == len(retained),
++                               'sha256': digest(retained), 'stream': 'EXACT_COMBINED_STDOUT_STDERR_BYTES',
++                               'handling': 'PROTECTED_NOT_FOR_PUBLICATION'}
++                except OSError as exc:
++                    retained = None
++                    log_ref = {'name': log.name, 'complete': False, 'source_bytes': None,
++                               'unavailable_class': type(exc).__name__}
++                diagnostic = {'schema': 'frw.helper-failure-diagnostics.v1', 'helper': record,
++                              'log': log_ref, 'cause': 'UNKNOWN_UNLESS_EXACT_OBSERVATIONS_ESTABLISH_IT',
++                              'effect_repeat_authorized': False}
++                payload = json_bytes(diagnostic)
++                require(len(payload) <= HELPER_DIAGNOSTIC_CAP, 'helper diagnostic cap')
++                result_name = 'HELPER-' + str(index) + '-RESULT.json'
++                # No scratch copies: even ENOSPC in the bounded tmpfs must not
++                # discard an existing log. Outer receiver fsyncs owned0600 files.
++                # Keep the same worker end; no extra operation/cleanup budget.
++                if retained is not None:
++                    emit_data(log.name, retained, diagnostic=True)
++                emit_data(result_name, payload, diagnostic=True)
++                record['failure_diagnostics'] = {'log': log_ref,
++                    'result_name': result_name, 'result_sha256': digest(payload)}
++            except Exception as exc:
++                record['diagnostic_export_error_class'] = type(exc).__name__
++    if failure is not None:
++        raise failure
++    with log.open('rb') as stream:
++        stream.seek(max(0, os.fstat(stream.fileno()).st_size - 8192))
++        return stream.read(8192).decode('utf-8', 'replace')
+@@ -184 +299,2 @@
+-                        or re.fullmatch(r'page-[1-9][0-9]*-[0-9]+\.png', name), 'unexpected artifact name')
++                        or re.fullmatch(r'page-[1-9][0-9]*-[0-9]+\.png', name)
++                        or re.fullmatch(r'(?:helper-[0-5]\.log|HELPER-[0-5]-RESULT\.json)', name), 'unexpected artifact name')
+@@ -249 +365,2 @@
+-              'budget_partition': {'sealed_snapshots': SNAPSHOT_CAP, 'tmpfs_all_worker_files': TMPFS_CAP,
++              'budget_partition': {'sealed_snapshots': SNAPSHOT_CAP, 'bwrap_base_tmpfs_copies': BWRAP_COPY_CAP,
++                                   'tmpfs_worker_scratch': TMPFS_CAP,
+@@ -280 +397,3 @@
+-        # Bind immutable memfds; helpers never reopen original user files.
++        # Copy immutable sealed inputs; helpers never reopen original user files.
++        # bwrap 0.11.1 --ro-bind-fd realpath rejects anonymous memfds. Its data
++        # operation consumes each sealed fd at offset 0 and makes an unlinked readonly copy.
+@@ -285 +404 @@
+-            binds += ['--ro-bind-fd', str(fd), '/input/' + name]
++            binds += ['--perms', '0400', '--ro-bind-data', str(fd), '/mnt/input/' + name]
+@@ -298 +417 @@
+-        argv = [BWRAP, '--unshare-all', '--disable-userns', '--die-with-parent', '--new-session', '--ro-bind', '/', '/',
++        argv = [BWRAP, '--unshare-user', '--unshare-all', '--disable-userns', '--die-with-parent', '--new-session', '--ro-bind', '/', '/',
+@@ -302 +421 @@
+-                '--ro-bind-fd', str(wrapper_fd), LIBREOFFICE,
++                '--perms', '0500', '--ro-bind-data', str(wrapper_fd), LIBREOFFICE,
+@@ -304 +423,4 @@
+-                '--tmpfs', '/mnt', '--remount-ro', '/mnt', '--tmpfs', '/media', '--remount-ro', '/media',
++                '--tmpfs', '/mnt', '--ro-bind', str(Path(__file__).parent), '/mnt/observer',
++                '--ro-bind', str(cgroup.path), '/mnt/observer-cgroup',
++                '--dir', '/mnt/input', *binds, '--remount-ro', '/mnt',
++                '--tmpfs', '/media', '--remount-ro', '/media',
+@@ -310,3 +432 @@
+-                '--tmpfs', '/run', '--remount-ro', '/run', '--ro-bind', str(Path(__file__).parent), '/observer',
+-                '--ro-bind', str(cgroup.path), '/observer-cgroup',
+-                '--dir', '/input', *binds, '--chdir', '/tmp', '--clearenv',
++                '--tmpfs', '/run', '--remount-ro', '/run', '--chdir', '/tmp', '--clearenv',
+@@ -319 +439 @@
+-                '/observer/render_received_s12.py', '--worker', '--worker-end', str(worker_end),
++                '/mnt/observer/render_received_s12.py', '--worker', '--worker-end', str(worker_end),
+@@ -440 +560 @@
+-        result['aggregate_generated_hard_bound_bytes'] = SNAPSHOT_CAP + TMPFS_CAP + EXPORT_CAP + RESULT_CAP
++        result['aggregate_generated_hard_bound_bytes'] = SNAPSHOT_CAP + BWRAP_COPY_CAP + TMPFS_CAP + EXPORT_CAP + RESULT_CAP
+@@ -467 +587 @@
+-    cg = Path('/observer-cgroup')
++    cg = Path('/mnt/observer-cgroup')
+@@ -497,4 +617,4 @@
+-    received_data = Path('/input/received.xlsx').read_bytes()
+-    original_data = Path('/input/original.xlsx').read_bytes()
+-    oracle_data = Path('/input/oracle.json').read_bytes()
+-    custody_data = Path('/input/custody.json').read_bytes()
++    received_data = Path('/mnt/input/received.xlsx').read_bytes()
++    original_data = Path('/mnt/input/original.xlsx').read_bytes()
++    oracle_data = Path('/mnt/input/oracle.json').read_bytes()
++    custody_data = Path('/mnt/input/custody.json').read_bytes()
+@@ -546,0 +667,19 @@
++    emitted, export_bytes = set(), 0
++    def emit_data(name, data, diagnostic=False):
++        nonlocal export_bytes
++        if diagnostic:
++            require(time.monotonic() < end, 'diagnostic shared worker deadline exhausted')
++        else:
++            check()
++        require(isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,120}', name), 'unsafe artifact filename')
++        limit = EXPORT_CAP if diagnostic else EXPORT_CAP - DIAGNOSTIC_RESERVE
++        require(name not in emitted and len(emitted) < 32 and export_bytes + len(data) <= limit, 'artifact export cap')
++        sys.stdout.buffer.write(json.dumps({'name': name, 'bytes': len(data), 'sha256': digest(data)}, separators=(',', ':')).encode() + b'\n')
++        sys.stdout.buffer.write(data)
++        sys.stdout.buffer.write(b'\n')
++        sys.stdout.buffer.flush()
++        emitted.add(name)
++        export_bytes += len(data)
++    def emit(path, diagnostic=False):
++        require(path.is_file() and not path.is_symlink(), 'nonregular artifact')
++        emit_data(path.name, path.read_bytes(), diagnostic)
+@@ -550 +688,0 @@
+-        log = scratch / ('helper-' + str(len(records)) + '.log')
+@@ -555,15 +693 @@
+-        # No pipes and no unread-buffer deadlock. Every helper and descendant is
+-        # in the one outer cgroup, PID/network namespace, and bounded tmpfs.
+-        with log.open('xb') as stream:
+-            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stream, stderr=stream, env=helper_env, start_new_session=True)
+-            try:
+-                code = process.wait(timeout=max(0.01, end - time.monotonic() - 2))
+-            except BaseException:
+-                try:
+-                    os.killpg(process.pid, signal.SIGKILL)
+-                except ProcessLookupError:
+-                    pass
+-                process.wait(timeout=1)
+-                raise
+-        records.append({'argv': argv, 'exit_code': code})
+-        require(code == 0, 'helper did not complete successfully')
++        text = observed_helper(argv, helper_env, end, scratch, records, emit_data)
+@@ -571 +695 @@
+-        return log.read_bytes()[-8192:].decode('utf-8', 'replace')
++        return text
+@@ -573 +697,14 @@
+-    run([ENGINE, profile, '--headless', '--nologo', '--nodefault', '--nofirststartwizard', '--norestore', '--convert-to', 'xlsx', '--outdir', str(scratch / 'probe-out'), str(probe)])
++    try:
++        run([ENGINE, profile, '--headless', '--nologo', '--nodefault', '--nofirststartwizard', '--norestore', '--convert-to', 'xlsx', '--outdir', str(scratch / 'probe-out'), str(probe)])
++    except Exception as exc:
++        report = {'state': 'OBSERVER_INCOMPLETE_NOT_PRODUCT_FAIL',
++                  'formula_observation_status': 'NOT_OBSERVED',
++                  'visual_acceptance': 'UNACCEPTED_REQUIRES_HUMAN_RENDER_INSPECTION',
++                  'printed_acceptance': 'UNACCEPTED_REQUIRES_HUMAN_RENDER_INSPECTION',
++                  'helpers': records, 'all_helpers_network_namespace_isolated': True,
++                  'first_helper_error': {'class': type(exc).__name__},
++                  'source_verifier_sha256': digest(Path(__file__).with_name('verify_s12.py').read_bytes())}
++        report_path = artifacts / 'WORKER-RESULT.json'
++        report_path.write_bytes(json_bytes(report))
++        emit(report_path, diagnostic=True)
++        return 2
+@@ -623,13 +759,0 @@
+-    emitted, export_bytes = set(), 0
+-    def emit(path):
+-        nonlocal export_bytes
+-        check()
+-        require(path.is_file() and not path.is_symlink(), 'nonregular artifact')
+-        data = path.read_bytes()
+-        require(path.name not in emitted and len(emitted) < 32 and export_bytes + len(data) <= EXPORT_CAP, 'artifact export cap')
+-        sys.stdout.buffer.write(json.dumps({'name': path.name, 'bytes': len(data), 'sha256': digest(data)}, separators=(',', ':')).encode() + b'\n')
+-        sys.stdout.buffer.write(data)
+-        sys.stdout.buffer.write(b'\n')
+-        sys.stdout.buffer.flush()
+-        emitted.add(path.name)
+-        export_bytes += len(data)
