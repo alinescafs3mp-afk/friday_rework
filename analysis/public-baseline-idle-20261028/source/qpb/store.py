@@ -35,7 +35,7 @@ def technical_loss_retry_authorized(record: dict) -> bool:
         if not isinstance(recovery, dict):
             return False
         if (record.get("outcome") != TECHNICAL_LOSS
-                or record.get("state") != "LOST_RESPONSE_AFTER_CLIENT_REBOOT"
+                or record.get("state") not in {"LOST_RESPONSE_AFTER_CLIENT_REBOOT", "LOST_RESPONSE_AFTER_CANCEL_REQUEST", "LOST_RESPONSE_AFTER_STREAM_FAILURE"}
                 or record.get("sent") is not True
                 or recovery.get("result_unknown") is not True
                 or recovery.get("request_no_longer_active") is not True
@@ -67,6 +67,13 @@ def technical_loss_retry_authorized(record: dict) -> bool:
             return False
         evidence = json.loads(raw)
         if not isinstance(evidence, dict) or evidence.get("schema") != "frw.baseline.orphan-reconciliation.v1":
+            return False
+        # A distinct observed loss does not establish a terminal model outcome.
+        # Bind it to the preserved UNKNOWN request, prove inactivity, and permit
+        # only the next attempt through separate exact Root authority.
+        if record["state"] in {"LOST_RESPONSE_AFTER_CANCEL_REQUEST", "LOST_RESPONSE_AFTER_STREAM_FAILURE"} and (
+                evidence.get("loss_state") != record["state"]
+                or evidence.get("original_request_state") != "OUTCOME_UNKNOWN"):
             return False
         expected = {"attempt_id": record["attempt_id"], "run_id": record["permit"]["run_id"],
                     "rid": record["server_request_id"], "request_hash": record["request_hash"],

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,76 @@ def _idle_scope(corpus, pilot_only):
         return pilot
     chosen = set(pilot)
     return pilot + [task for task in _scope(corpus, False) if task not in chosen]
+
+
+def _attempt_budget(store: RunStore) -> tuple[dict, dict]:
+    """Known unfinished wall time, once per attempt, independent of retry rights.
+
+    A prediction for a successor does not finish its failed predecessor. A
+    prediction committed before its request record, however, finishes that exact
+    attempt. Missing duration for a possibly sent attempt remains unknown.
+    """
+    from qpb.atomic import load_json_result
+
+    def wall(value):
+        return (float(value) if isinstance(value, (int, float))
+                and not isinstance(value, bool) and math.isfinite(value)
+                and value >= 0 else None)
+
+    attempts = {}
+    for path in store.iter_request_files():
+        loaded = load_json_result(path)
+        record = loaded["value"] if loaded["ok"] else {}
+        if not isinstance(record, dict):
+            record = {}
+        attempt_id = record.get("attempt_id") or path.stem.removesuffix(".partial")
+        item = attempts.setdefault(attempt_id, {
+            "task": (record.get("benchmark"), record.get("task_id")),
+            "walls": [], "interrupted_walls": [], "foreground": False,
+            "possibly_sent": False,
+        })
+        top_wall = wall(record.get("wall_s"))
+        timing = record.get("partial_response_timing")
+        partial_wall = wall(timing.get("wall_s")) if isinstance(timing, dict) else None
+        observed = max((value for value in (top_wall, partial_wall) if value is not None), default=None)
+        if observed is not None:
+            item["walls"].append(observed)
+        outcome = record.get("outcome")
+        if outcome == "INTERRUPTED_BY_FOREGROUND":
+            item["foreground"] = True
+        if outcome in {"INTERRUPTED_BY_FOREGROUND", "CANCELLED_BY_STOP"} and top_wall is not None:
+            item["interrupted_walls"].append(top_wall)
+        item["possibly_sent"] |= record.get("sent") is not False
+
+    interruptions, interrupted_wall, unfinished_wall, unmeasured = {}, 0.0, 0.0, 0
+    predictions = {}
+    for attempt_id, item in attempts.items():
+        task = item["task"]
+        if item["foreground"] and all(task):
+            interruptions[task] = interruptions.get(task, 0) + 1
+        # Retain the historical foreground/stop metric, distinct from the cap.
+        interrupted_wall += max(item["interrupted_walls"], default=0.0)
+        if all(task) and task not in predictions:
+            loaded = store.read_prediction(*task)
+            value = loaded["value"] if loaded["ok"] else {}
+            predictions[task] = value if isinstance(value, dict) else {}
+        prediction = predictions.get(task, {})
+        if (prediction.get("attempt_id") == attempt_id
+                and prediction.get("outcome") == "complete"
+                and prediction.get("finish_reason")):
+            continue
+        if item["walls"]:
+            # Duplicate retained copies cannot charge an attempt twice. Use the
+            # largest saved observation rather than undercount conflicting copies.
+            unfinished_wall += max(item["walls"])
+        elif item["possibly_sent"]:
+            unmeasured += 1
+    return interruptions, {
+        "interrupted_wall_s": interrupted_wall,
+        "unfinished_attempt_wall_s": unfinished_wall,
+        "unmeasured_unfinished_attempts": unmeasured,
+        "unfinished_attempt_wall_complete": unmeasured == 0,
+    }
 
 
 def _summarize(store: RunStore, corpus, pilot_only: bool) -> dict:
@@ -305,6 +376,10 @@ class Runner:
         }
         if summary.get("tail"):
             progress["tail"] = summary["tail"]
+        for key in ("interrupted_wall_s", "unfinished_attempt_wall_s",
+                    "unmeasured_unfinished_attempts", "unfinished_attempt_wall_complete"):
+            if key in summary:
+                progress[key] = summary[key]
         self.store.write_progress(progress)
         print(_progress_line(progress), flush=True)
         return progress
@@ -681,19 +756,12 @@ class IdleRunner(Runner):
                 state = "AUTHORIZATION_EXPIRED"
             elif deadline is not None and time.monotonic() >= deadline:
                 state = "MANUAL_PAUSED"
-            interruptions, interrupted_wall = {}, 0.0
-            for path in self.store.iter_request_files():
-                from qpb.atomic import read_json
-                record = read_json(path)
-                if record.get("outcome") == "INTERRUPTED_BY_FOREGROUND":
-                    key = (record["benchmark"], record["task_id"])
-                    interruptions[key] = interruptions.get(key, 0) + 1
-                if record.get("outcome") in {"INTERRUPTED_BY_FOREGROUND", "CANCELLED_BY_STOP"}:
-                    interrupted_wall += float(record.get("wall_s") or 0)
-            if interrupted_wall >= self.policy["max_interrupted_attempt_wall_seconds"]:
+            interruptions, budget = _attempt_budget(self.store)
+            summary.update(budget)
+            if budget["unfinished_attempt_wall_s"] >= self.policy["max_interrupted_attempt_wall_seconds"]:
                 state = state or "PAUSED_POLICY"
             if state:
-                self._set_state(state, interrupted_wall_s=interrupted_wall)
+                self._set_state(state, **budget)
                 self._emit(state, None, None, summary, deadline, started)
                 return 0
             pending, deferred = [], []
@@ -702,7 +770,7 @@ class IdleRunner(Runner):
                     continue
                 previous = self.store.latest_attempt(benchmark, task_id)
                 if self.store.attempt_blocks_send(previous):
-                    self._set_state("RECOVERY_REQUIRED")
+                    self._set_state("RECOVERY_REQUIRED", **budget)
                     return 2
                 if interruptions.get((benchmark, task_id), 0) >= self.policy["max_foreground_interruptions_per_task"]:
                     deferred.append(f"{benchmark}:{task_id}")
@@ -710,7 +778,7 @@ class IdleRunner(Runner):
                     pending.append((benchmark, task_id, previous))
             if not pending:
                 state = "NEEDS_QUIET_WINDOW" if deferred else ("PILOT_DONE" if self.pilot_only else "COMPLETE")
-                self._set_state(state, deferred_ids=deferred)
+                self._set_state(state, deferred_ids=deferred, **budget)
                 self._emit(state, None, None, summary, deadline, started)
                 return 0
             benchmark, task_id, previous = pending[0]
@@ -732,7 +800,7 @@ class IdleRunner(Runner):
                     return 2
                 state = "YIELDED_FOR_FOREGROUND" if "FOREGROUND" in reason else "COOLDOWN"
                 if state != last_state:
-                    self._set_state(state, deferred_ids=deferred, idle_blockers=[reason])
+                    self._set_state(state, deferred_ids=deferred, idle_blockers=[reason], **budget)
                     self._emit(state, benchmark, None, summary, deadline, started)
                     last_state = state
                 time.sleep(1)
@@ -760,7 +828,7 @@ class IdleRunner(Runner):
                 self.coordinator.dispatch(permit)
                 record.update(state="SENDING", sent=True, sending_at=_now())
                 self.store.save_request(record)
-            self._set_state("RUNNING", idle_blockers=[], deferred_ids=deferred)
+            self._set_state("RUNNING", idle_blockers=[], deferred_ids=deferred, **budget)
             self._emit("RUNNING", benchmark, attempt_id, summary, deadline, started)
             last_state = "RUNNING"
             try:
@@ -800,5 +868,6 @@ class IdleRunner(Runner):
                         self.store.set_control(pause=True, stop=True)
                     self.coordinator.unknown(permit, type(exc).__name__)
                     self._unknown(record, type(exc).__name__)
-                    self._set_state("RECOVERY_REQUIRED", stop_reason="OUTCOME_UNKNOWN")
+                    self._set_state("RECOVERY_REQUIRED", stop_reason="OUTCOME_UNKNOWN",
+                                    **_attempt_budget(self.store)[1])
                 return 2

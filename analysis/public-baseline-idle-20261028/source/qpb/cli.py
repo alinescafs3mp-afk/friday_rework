@@ -153,12 +153,15 @@ def _status(root: Path, runs_root: Path, run_id: str | None) -> int:
         import json
         import time
         from qpb.idle import Coordinator
+        from qpb.runner import _attempt_budget
+        _, budget = _attempt_budget(store)
         snapshot = Coordinator(manifest["coordinator_dir"]).snapshot()
         print(json.dumps({"admission": snapshot, "control": store.control(),
                           "authorization_expires_epoch": manifest.get("authorization_expires_epoch"),
                           "authorization_remaining_s": max(0, manifest.get("authorization_expires_epoch", 0) - time.time()),
                           "deferred_ids": manifest.get("deferred_ids", []),
-                          "interrupted_wall_s": manifest.get("interrupted_wall_s", 0),
+                          **budget,
+                          "max_interrupted_attempt_wall_seconds": manifest.get("idle_policy", {}).get("max_interrupted_attempt_wall_seconds"),
                           "expected": 673}, ensure_ascii=False))
     return 0
 
