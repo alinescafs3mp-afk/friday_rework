@@ -1,0 +1,182 @@
+--- a/agent/web_call_context.py
++++ b/agent/web_call_context.py
+@@ -227,0 +228,19 @@
++def web_call_readonly(call, agent, registry):
++    """Project one original call; caller holds its turn and registry locks."""
++    from copy import deepcopy
++    session = call.session
++    registered = getattr(agent, '_tool_result_calls', {})
++    return dict(call_id=call.call_id, task_id=call.task_id,
++        session_id=call.session_id, session_key=call.session_key, turn_id=call.turn_id,
++        user_authority=deepcopy(call.user_authority), uses_web=call.uses_web,
++        stopped=call.stopped.is_set(), turn_stopped=call.turn.stopped.is_set(),
++        turn_failed=call.turn.failure is not None,
++        same_active_agent=getattr(call, 'agent', None) is agent,
++        same_registry_session=bool(session is not None and call.registry is registry
++            and registry._running.get(session.id) is session
++            and session.web_tool_call_id == call.call_id
++            and session.web_turn_id == call.turn_id),
++        same_web_turn=call.turn is getattr(agent, '_web_turn', None),
++        registered_on_agent=registered.get((call.task_id, call.call_id)) is call)
++
++
+--- a/gateway/ordinary_turn_projection.py
++++ b/gateway/ordinary_turn_projection.py
+@@ -21,0 +22,108 @@
++
++
++def _own_web_attribution(session, call, identity, recovery_blocked):
++    recovery = ([ 'registry_recovery_blocked' ] if recovery_blocked else [])
++    if session['detached']:
++        recovery.append('detached_registry_session')
++    if recovery:
++        return 'RECOVERY', recovery
++    if call is None:
++        return 'UNMATCHED', ['registered_call_unavailable']
++    foreign, unknown = [], []
++    comparisons = (
++        ('parent_session', session['parent_session_id'], call['session_id']),
++        ('session_key', session['session_key'], call['session_key']),
++        ('task', session['owner_task_id'], call['task_id']),
++        ('raw_task', session['task_id'], call['task_id']),
++        ('turn', session['web_turn_id'], call['turn_id']),
++        ('call', session['web_tool_call_id'], call['call_id']),
++        ('principal', session['user_authority'], call['user_authority']),
++        ('active_session', call['session_id'], identity['session_id']),
++        ('active_key', call['session_key'], identity['session_key']),
++        ('active_task', call['task_id'], identity['task_id']),
++        ('active_turn', call['turn_id'], identity['turn_id']),
++        ('active_principal', call['user_authority'], identity['user_authority']),
++    )
++    for name, left, right in comparisons:
++        if left is None or right is None or left == '' or right == '':
++            unknown.append(name + '_missing')
++        elif left != right:
++            foreign.append(name + '_mismatch')
++    for flag in ('same_active_agent', 'same_web_turn'):
++        if call[flag] is not True:
++            foreign.append(flag)
++    for flag in ('same_registry_session', 'registered_on_agent', 'uses_web'):
++        if call[flag] is not True:
++            unknown.append(flag)
++    if session['web_custody'] is not True:
++        unknown.append('web_custody_missing')
++    if foreign:
++        return 'FOREIGN', sorted(foreign + unknown)
++    if unknown:
++        return 'UNKNOWN', sorted(unknown)
++    return 'OWN', []
++
++
++def _own_web_inflight(agent, registry, generation, event):
++    """Join native registry custody to exact current calls, never by IDs alone."""
++    from copy import deepcopy
++    from agent.web_call_context import web_call_readonly
++    turn = getattr(agent, '_web_turn', None)
++    owner = (turn, getattr(agent, '_current_task_id', None),
++             getattr(agent, '_current_turn_id', None), id(getattr(agent, '_tool_result_calls', None)))
++    locked = turn is not None
++    if locked and not turn.lock.acquire(timeout=0.25):
++        raise RuntimeError('own_web_projection_racing')
++    try:
++        if not registry._lock.acquire(timeout=0.25):
++            raise RuntimeError('own_web_registry_projection_racing')
++        try:
++            if owner != (getattr(agent, '_web_turn', None), getattr(agent, '_current_task_id', None),
++                         getattr(agent, '_current_turn_id', None), id(getattr(agent, '_tool_result_calls', None))):
++                raise RuntimeError('own_web_scope_projection_racing')
++            observed = registry.web_custody_readonly()
++            original_observed = deepcopy(observed)
++            calls = sorted(turn.calls, key=lambda c: (c.task_id, c.call_id)) if turn is not None else []
++            rows = [(call, web_call_readonly(call, agent, registry)) for call in calls]
++            web_rows = [(call, row) for call, row in rows if row['uses_web'] or call.session is not None]
++            authorities = [row['user_authority'] for _, row in web_rows]
++            authority = (deepcopy(authorities[0]) if authorities
++                         and all(item == authorities[0] for item in authorities[1:]) else None)
++            identity = dict(session_id=SID, session_key=KEY,
++                task_id=getattr(agent, '_current_task_id', None),
++                turn_id=getattr(agent, '_current_turn_id', None), user_authority=authority)
++            linked = set()
++            sessions = []
++            for session in observed['sessions']:
++                matches = [(call, row) for call, row in web_rows
++                    if call.session is not None and call.session.id == session['id']
++                    and registry._running.get(session['id']) is call.session]
++                call_row = None
++                if len(matches) == 1:
++                    call_row = deepcopy(matches[0][1])
++                linked.update(id(call) for call, _ in matches)
++                session['call'] = call_row
++                session['attribution'], session['attribution_reasons'] = _own_web_attribution(
++                    session, call_row, identity, observed['recovery_blocked'])
++                if len(matches) > 1:
++                    session['attribution'] = 'UNKNOWN'
++                    session['attribution_reasons'] = ['ambiguous_registry_call_association']
++                sessions.append(session)
++            unretained = [deepcopy(row) for call, row in web_rows if id(call) not in linked]
++            result = dict(schema='frw.gateway.own-web-inflight-readonly.v1',
++                session_id=SID, session_key=KEY, generation=generation,
++                event_message_id=None if event is None else str(event.message_id),
++                task_id=identity['task_id'], turn_id=identity['turn_id'], user_authority=authority,
++                recovery_blocked=observed['recovery_blocked'], sessions=sessions,
++                unretained_calls=unretained)
++            if (owner != (getattr(agent, '_web_turn', None), getattr(agent, '_current_task_id', None),
++                          getattr(agent, '_current_turn_id', None), id(getattr(agent, '_tool_result_calls', None)))
++                    or any(row != web_call_readonly(call, agent, registry) for call, row in rows)
++                    or original_observed != registry.web_custody_readonly()):
++                raise RuntimeError('own_web_scope_projection_racing')
++            return result, observed['receipt']
++        finally:
++            registry._lock.release()
++    finally:
++        if locked:
++            turn.lock.release()
+@@ -53,2 +161,8 @@
+-    # These existing APIs read custody and recovery flags, and do not settle work.
+-    web = registry.web_custody_receipt()
++    # The existing loop has no await here; also reject any owner/scope change
++    # observed while bounded worker locks are acquired.
++    active_agent = None if turn is None else turn.agent
++    event_id = None if event is None else str(event.message_id)
++    ctx_fields = None if ctx is None else (ctx.inbound_message_id, ctx.run_generation)
++    # One locked custody window preserves legacy coverage and exact own-call joins.
++    own_web, web = _own_web_inflight(active_agent,
++                                    registry, generation, event)
+@@ -69,0 +184,11 @@
++    if (sys.modules.get('tools.process_registry') is not registry_module
++            or getattr(registry_module, 'process_registry', None) is not registry
++            or runner._peek_session_state(KEY) is not state
++            or runner.session_store._entries.get(KEY) is not entry or entry.session_id != SID
++            or (state is not None and (state.turn is not turn or state.persistent is not persistent
++                or persistent.run_generation != generation or state.conversation is not conversation))
++            or (turn is not None and (turn.agent is not active_agent or turn.ctx is not ctx
++                or turn.event is not event))
++            or (None if event is None else str(event.message_id)) != event_id
++            or (None if ctx is None else (ctx.inbound_message_id, ctx.run_generation)) != ctx_fields):
++        raise RuntimeError('ordinary_scope_projection_racing')
+@@ -87 +212,2 @@
+-        durable_pending_delegations=durable_delegations,web_custody=web,terminal_custody=terminal)
++        durable_pending_delegations=durable_delegations,web_custody=web,
++        own_web_inflight=own_web,terminal_custody=terminal)
+--- a/tools/process_registry_web.py
++++ b/tools/process_registry_web.py
+@@ -130,0 +131,19 @@
++
++    def web_custody_readonly(self):
++        """Project exact retained custody without settling or adopting foreign work."""
++        from copy import deepcopy
++        with self._lock:
++            retained = [s for s in self._running.values()
++                        if s.web_custody and (not s.web_settled or s._scope_stop_pending)]
++            blocked = bool(getattr(self, '_custody_recovery_blocked', False))
++            receipt = {'status':'STOP_UNCONFIRMED' if retained or blocked else 'QUIESCENT',
++                       'sessions':[s.id for s in retained], 'recovery_blocked':blocked}
++            sessions = [dict(id=s.id, task_id=s.task_id, owner_task_id=s.owner_task_id,
++                session_key=s.session_key, parent_session_id=s.parent_session_id,
++                user_authority=deepcopy(s.user_authority), web_tool_call_id=s.web_tool_call_id,
++                web_turn_id=s.web_turn_id, web_boot_id=s.web_boot_id, web_deadline=s.web_deadline,
++                web_custody=s.web_custody, web_unconfirmed=s.web_unconfirmed,
++                web_settled=s.web_settled, web_stop_requested=s.web_stop_requested,
++                detached=s.detached, exited=s.exited, scope_stop_pending=s._scope_stop_pending,
++                call=None) for s in retained]
++        return {'receipt':receipt, 'recovery_blocked':blocked, 'sessions':sessions}
