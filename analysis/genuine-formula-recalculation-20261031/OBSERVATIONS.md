@@ -1,0 +1,13 @@
+The received spreadsheet passed both previously missing formula recalculation stages on 2026-10-31. This accepts the formula behavior of the retained artifact; the original Telegram FIRST remains UNKNOWN/full180=false. The full 170 cases, 120 formats and mandatory variants remain unaccepted.
+
+The source delta sets MAX_CONCURRENCY=2 only in the disposable Office helper environment. The existing two CPU allocation, 1 GiB address space, memory, process, filesystem, isolation, wall and cleanup limits remain unchanged. LibreOffice reads this environment variable when choosing its thread pool size ([exact 26.2.5.2 source](https://github.com/LibreOffice/core/blob/libreoffice-26.2.5.2/comphelper/source/misc/threadpool.cxx#L124)).
+
+The preceding changed trace ended with signal 11 and supervised exit 134 during export; no stage completed. Its original clock and failure are retained. Earlier generic write errors are not automatically assigned the same cause. The successful attempt establishes that this bounded candidate works on these bytes; it does not establish a deterministic explanation of all previous failures.
+
+Actual verification completed in 2.82 seconds including cleanup. Both Office calls exited 0. After removing only the three cached totals in a disposable copy, the recalculated results were 2.4 kg, 4 m and 20 items. A separate copy changed Details!E2 from 1.25 to 2.25; its totals became 3.4 kg, 4 m and 20 items. The three formulas were preserved. Independent ZIP/CRC/XML checks confirmed that only the expected input cell and mass cache changed between the returned copies.
+
+The first result, its evidence and trace were hash checked and fsynced before the second Office effect was admitted. Both completed stages are closed and must not be repeated. The original received file is unchanged. All owned processes were reconciled to zero and the scope is inactive. No model, Telegram or Spark call was made; the idle baseline continued.
+
+Validation reuses the unchanged 17 Root delta checks, 54 protocol controls and independent static review of the tracing helper. The one-line concurrency delta has 10 independent controls, including real nested environment propagation and missing/changed-value negatives. Root then checked the exact source delta and actual returned workbooks. These are separate source, execution and artifact observations.
+
+This directory contains a publication projection of the local observer delta and sanitized observations. It does not install a product overlay or expose raw traces, private paths, user contents, runtime identities, credentials or handoff materials. Permanent product services were not changed.
