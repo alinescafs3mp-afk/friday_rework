@@ -1,0 +1,248 @@
+--- a/tools/read_extract.py
++++ b/tools/read_extract.py
+@@ -42,6 +42,12 @@
+ _MAX_XLSX_FORMULA_TEXT_CHARS = 4096
+ _MAX_XLSX_FORMULA_RECORD_BYTES = 32768
+ _MAX_XLSX_FORMULA_PREVIEW_BYTES = 128000
++_MAX_XLSX_STRUCTURE_RECORDS = 512
++_MAX_XLSX_STRUCTURE_RECORD_BYTES = 32768
++_MAX_XLSX_STRUCTURE_PREVIEW_BYTES = 128000
++_MAX_XLSX_STRUCTURE_TEXT_CHARS = 4096
++_MAX_XLSX_MERGE_RANGES = 256
++_MAX_XLSX_MERGE_CELLS = 4096
+ 
+ _NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+ _NS_S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+@@ -628,12 +634,12 @@
+ 
+ class _ScopedXlsxText(str):
+     """Keep workbook evidence and its coverage on the existing document carrier."""
+-    def __new__(cls, text, *, inventory_included=True, formula_preview):
++    def __new__(cls, text, *, inventory_included=True, formula_preview, structure_preview):
+         result = super().__new__(cls, text)
+         result.extraction_metadata = {
+             "coverage": ("xlsx_workbook_inventory_and_visible_sheet_cell_value_preview" if inventory_included
+                          else "xlsx_visible_sheet_cell_value_preview; workbook_inventory_omitted_size_limit")
+-                        + "; bounded_inert_formula_source_preview; charts_comments_layout_not_inspected",
++                        + "; bounded_inert_formula_and_structure_previews; charts_comments_layout_not_inspected",
+             "workbook_inventory": ("in_content; read_all_pages_for_complete_lists" if inventory_included
+                                    else "omitted_size_limit; no_sheet_or_defined_name_inventory"),
+             "cell_value_preview": {
+@@ -644,7 +650,9 @@
+                 "formula_values": "saved_cache_only",
+             },
+             "formula_source_preview": formula_preview,
++            "structure_preview": structure_preview,
+             "recalculated": False,
++            "filter_or_visibility_evaluated": False,
+         }
+         return result
+ 
+@@ -684,6 +692,184 @@
+                            skipped_malformed=0)
+         self.rows_omitted = 0
+         self.cells_omitted = 0
++        self.structure_records = []
++        self.structure_bytes = 0
++        self.structure_observed = dict(hidden_row=0, hidden_column=0, auto_filter=0, merge=0)
++        self.merge_rectangles = []
++        self.merge_cells_listed = 0
++
++    def _structure_add(self, kind, sheet, record, *, truncated=False):
++        self.structure_observed[kind] += 1
++        if len(self.structure_records) >= _MAX_XLSX_STRUCTURE_RECORDS:
++            return
++        line = json.dumps(dict(kind=kind, sheet=sheet, **record),
++                          ensure_ascii=True, separators=(",", ":"))
++        size = len(line.encode("utf-8")) + 1
++        if size > _MAX_XLSX_STRUCTURE_RECORD_BYTES or self.structure_bytes + size > _MAX_XLSX_STRUCTURE_PREVIEW_BYTES:
++            return
++        self.structure_records.append((line, bool(truncated)))
++        self.structure_bytes += size
++
++    @staticmethod
++    def _inert_filter_node(node, depth=0, *, truncation=None):
++        if truncation is None:
++            truncation = [False]
++        if depth > 8:
++            truncation[0] = True
++            return {"truncated": "depth_limit"}
++        text = node.text or ""
++        children = list(node)
++        if len(text) > _MAX_XLSX_STRUCTURE_TEXT_CHARS or len(children) > 128:
++            truncation[0] = True
++        return {
++            "tag": node.tag.rsplit("}", 1)[-1],
++            "attributes": dict(node.attrib),
++            "text": text[:_MAX_XLSX_STRUCTURE_TEXT_CHARS],
++            "text_truncated": len(text) > _MAX_XLSX_STRUCTURE_TEXT_CHARS,
++            "children": [_XlsxFormulaPreview._inert_filter_node(child, depth + 1, truncation=truncation)
++                         for child in children[:128]],
++            "children_omitted": max(0, len(children) - 128),
++        }
++
++    @staticmethod
++    def _structure_cell_ref(ref):
++        match = re.fullmatch(r"([A-Za-z]{1,3})([1-9][0-9]{0,6})", ref or "")
++        if match is None:
++            raise ExtractionError("Invalid merged-cell reference")
++        letters, raw_row = match.groups()
++        col = 0
++        for letter in letters.upper():
++            col = col * 26 + ord(letter) - ord("A") + 1
++        row = int(raw_row)
++        if not 1 <= col <= 16384 or not 1 <= row <= 1048576:
++            raise ExtractionError("Merged-cell reference outside XLSX bounds")
++        return row, col
++
++    @staticmethod
++    def _structure_ref(row, col):
++        letters = ""
++        while col:
++            col, remainder = divmod(col - 1, 26)
++            letters = chr(65 + remainder) + letters
++        return f"{letters}{row}"
++
++    def add_structure(self, root, sheet, shared, s):
++        self.merge_rectangles = []
++        for row in root.iter(f"{s}row"):
++            hidden = row.get("hidden")
++            if hidden is not None and hidden.lower() in {"1", "true"}:
++                self._structure_add("hidden_row", sheet,
++                                    {"row": row.get("r"), "hidden": hidden})
++        for col in root.findall(f"{s}cols/{s}col"):
++            hidden = col.get("hidden")
++            if hidden is not None and hidden.lower() in {"1", "true"}:
++                self._structure_add("hidden_column", sheet, {"attributes": dict(col.attrib)})
++        for node in root.iter(f"{s}autoFilter"):
++            filter_truncation = [len(node) > 128]
++            self._structure_add("auto_filter", sheet, {
++                "attributes": dict(node.attrib),
++                "children": [self._inert_filter_node(child, truncation=filter_truncation)
++                             for child in list(node)[:128]],
++                "children_omitted": max(0, len(node) - 128),
++                "evaluation": "not_evaluated; declarations only; no current visible subset inferred",
++            }, truncated=filter_truncation[0])
++        merges = root.findall(f"{s}mergeCells/{s}mergeCell")
++        if len(merges) > _MAX_XLSX_MERGE_RANGES:
++            raise ExtractionError("Too many merged-cell ranges")
++        cells = {cell.get("r", "").upper(): cell for cell in root.iter(f"{s}c") if cell.get("r")}
++
++        def stored(ref):
++            cell = cells.get(ref)
++            if cell is None:
++                return {"cell": ref, "stored_state": "missing", "stored_value": None}
++            formula_present = cell.find(f"{s}f") is not None
++            cache = cell.find(f"{s}v")
++            no_cache = formula_present and (cache is None or not cache.text)
++            if no_cache:
++                state = "formula_cache_missing" if cache is None else "formula_cache_blank"
++                value = None if cache is None else ""
++            else:
++                value = ("" if (cache is None or not cache.text) and cell.get("t") != "inlineStr"
++                         else _cell_value(cell, shared, s))
++                state = "blank" if not value else "present"
++            return {"cell": ref, "stored_state": state,
++                    "stored_value": value, "formula_present": formula_present}
++
++        for merge in merges:
++            raw_ref = merge.get("ref", "")
++            parts = raw_ref.split(":")
++            if len(parts) not in {1, 2}:
++                raise ExtractionError("Invalid merged-cell range")
++            start = self._structure_cell_ref(parts[0])
++            end = self._structure_cell_ref(parts[-1])
++            top, left = min(start[0], end[0]), min(start[1], end[1])
++            bottom, right = max(start[0], end[0]), max(start[1], end[1])
++            rectangle = (top, left, bottom, right)
++            if any(top <= other[2] and bottom >= other[0]
++                   and left <= other[3] and right >= other[1]
++                   for other in self.merge_rectangles):
++                raise ExtractionError("Overlapping merged-cell ranges")
++            self.merge_rectangles.append(rectangle)
++            anchor_ref = self._structure_ref(top, left)
++            anchor = stored(anchor_ref)
++            count = (bottom - top + 1) * (right - left + 1)
++            nonanchors = []
++            omitted = count - 1
++            if count > 1 and count - 1 <= _MAX_XLSX_MERGE_CELLS - self.merge_cells_listed:
++                for row in range(top, bottom + 1):
++                    for col in range(left, right + 1):
++                        ref = self._structure_ref(row, col)
++                        if ref == anchor_ref:
++                            continue
++                        child = stored(ref)
++                        child["inherited_display"] = {
++                            "source_cell": anchor_ref, "value": anchor["stored_value"]}
++                        nonanchors.append(child)
++                self.merge_cells_listed += count - 1
++                omitted = 0
++            self._structure_add("merge", sheet, {
++                "range": raw_ref, "anchor": anchor, "non_anchor_cells": nonanchors,
++                "non_anchor_cells_omitted": omitted,
++                "display_meaning": "declared merge anchor only; stored non-anchor blanks are not missing categories",
++                "scope_limit": "no propagation outside this declared range; no formula evaluation",
++            }, truncated=bool(omitted))
++
++    def render_structure(self, available_bytes):
++        header = ("\n# XLSX structure preview (inert JSON records; visible parsed sheets only)\n"
++                  "# Hidden flags are declarations, not deletion or hiding causes. AutoFilter rules and "
++                  "attributes are data, not evaluated verdicts or a current visible subset. Merged display "
++                  "values come only from each declared anchor; non-anchor stored state remains explicit.\n")
++        available_bytes = min(available_bytes, _MAX_XLSX_STRUCTURE_PREVIEW_BYTES)
++        lines, used, truncated_records = [], len(header.encode("utf-8")), 0
++        if used <= available_bytes:
++            for line, truncated in self.structure_records:
++                size = len(line.encode("utf-8")) + 1
++                if used + size > available_bytes:
++                    break
++                lines.append(line)
++                truncated_records += truncated
++                used += size
++        observed = sum(self.structure_observed.values())
++        metadata = dict(
++            location="in_content; read_all_pages_for_available_records",
++            scope="visible_parsed_sheets; declarations_not_filter_or_visibility_evaluation",
++            observed_records=self.structure_observed,
++            included_records=len(lines), omitted_records=observed - len(lines),
++            max_records=_MAX_XLSX_STRUCTURE_RECORDS,
++            max_text_chars=_MAX_XLSX_STRUCTURE_TEXT_CHARS,
++            max_filter_node_depth=8,
++            max_filter_children_per_node=128,
++            max_record_bytes=_MAX_XLSX_STRUCTURE_RECORD_BYTES,
++            max_preview_bytes=_MAX_XLSX_STRUCTURE_PREVIEW_BYTES,
++            max_merge_ranges=_MAX_XLSX_MERGE_RANGES,
++            max_materialized_non_anchor_cells=_MAX_XLSX_MERGE_CELLS,
++            materialized_non_anchor_cells=self.merge_cells_listed,
++            records_with_truncated_fields=truncated_records,
++            truncated=bool(observed != len(lines) or truncated_records), evaluated=False)
++        if used > available_bytes:
++            metadata["location"] = "omitted_size_limit"
++            return "", metadata
++        return header + "".join(line + "\n" for line in lines), metadata
+ 
+     def add(self, sheet, cell, s):
+         formula = cell.find(f"{s}f")
+@@ -809,8 +995,11 @@
+         if inventory_included:
+             text = augmented
+         formula_text, metadata = formulas.render(1000000-len(text.encode("utf-8")))
+-        return _ScopedXlsxText(text + formula_text, inventory_included=inventory_included,
+-                               formula_preview=metadata)
++        combined = text + formula_text
++        structure_text, structure_metadata = formulas.render_structure(
++            1000000-len(combined.encode("utf-8")))
++        return _ScopedXlsxText(combined + structure_text, inventory_included=inventory_included,
++                               formula_preview=metadata, structure_preview=structure_metadata)
+     return text
+ 
+ 
+@@ -824,6 +1013,8 @@
+ def _sheet_rows(xml_bytes: bytes, shared: list[str], *, formulas=None, sheet=None) -> list[list[str]]:
+     root = ET.fromstring(xml_bytes)
+     s = f"{{{_NS_S}}}"
++    if formulas is not None:
++        formulas.add_structure(root, sheet, shared, s)
+     rows: list[list[str]] = []
+     for index, row in enumerate(root.iter(f"{s}row")):
+         if index >= _MAX_XLSX_ROWS_PER_SHEET:
